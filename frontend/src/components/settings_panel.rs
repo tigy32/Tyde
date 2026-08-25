@@ -2514,7 +2514,7 @@ impl LaunchProfileForm {
             ));
         }
         let backend_kind = self.backend_kind.get_untracked();
-        let acp = if backend_kind == BackendKind::Acp {
+        let acp = if backend_kind == BackendKind::Kiro {
             let command = self.acp_command.get_untracked().trim().to_string();
             if command.is_empty() {
                 return Err("An ACP profile needs the command that starts the agent.".to_string());
@@ -2699,7 +2699,7 @@ fn LaunchProfileEditor(
     let acp_command_sig = form.acp_command;
     let acp_args_sig = form.acp_args;
     let acp_adapter_sig = form.acp_adapter;
-    let is_acp = move || backend_kind_sig.get() == BackendKind::Acp;
+    let is_acp = move || backend_kind_sig.get() == BackendKind::Kiro;
 
     let error_sig: RwSignal<Option<String>> = RwSignal::new(None);
 
@@ -6367,7 +6367,7 @@ fn parse_backend_kind(value: &str) -> Option<BackendKind> {
         "tycode" => Some(BackendKind::Tycode),
         // "kiro" is the pre-rename spelling; still accepted so a stale
         // select value cannot silently fail to parse.
-        "acp" | "kiro" => Some(BackendKind::Acp),
+        "acp" | "kiro" => Some(BackendKind::Kiro),
         "claude" => Some(BackendKind::Claude),
         "codex" => Some(BackendKind::Codex),
         "antigravity" => Some(BackendKind::Antigravity),
@@ -6379,7 +6379,7 @@ fn parse_backend_kind(value: &str) -> Option<BackendKind> {
 fn backend_value(kind: BackendKind) -> &'static str {
     match kind {
         BackendKind::Tycode => "tycode",
-        BackendKind::Acp => "acp",
+        BackendKind::Kiro => "acp",
         BackendKind::Claude => "claude",
         BackendKind::Codex => "codex",
         BackendKind::Antigravity => "antigravity",
@@ -6390,7 +6390,7 @@ fn backend_value(kind: BackendKind) -> &'static str {
 fn backend_label(kind: BackendKind) -> &'static str {
     match kind {
         BackendKind::Tycode => "Tycode",
-        BackendKind::Acp => "Kiro",
+        BackendKind::Kiro => "Kiro",
         BackendKind::Claude => "Claude",
         BackendKind::Codex => "Codex",
         BackendKind::Antigravity => "Antigravity",
@@ -6401,7 +6401,7 @@ fn backend_label(kind: BackendKind) -> &'static str {
 fn backend_description(kind: BackendKind) -> &'static str {
     match kind {
         BackendKind::Tycode => "Tycode subprocess backend",
-        BackendKind::Acp => "Kiro — and any other agent that speaks ACP",
+        BackendKind::Kiro => "Kiro — and any other agent that speaks ACP",
         BackendKind::Claude => "Anthropic Claude — advanced reasoning and coding",
         BackendKind::Codex => "OpenAI Codex — code completion and generation",
         BackendKind::Antigravity => "Google Antigravity CLI — agentic coding assistant",
@@ -6412,7 +6412,7 @@ fn backend_description(kind: BackendKind) -> &'static str {
 fn backend_badge_class(kind: BackendKind) -> &'static str {
     match kind {
         BackendKind::Tycode => "backend-badge tycode",
-        BackendKind::Acp => "backend-badge acp",
+        BackendKind::Kiro => "backend-badge acp",
         BackendKind::Claude => "backend-badge claude",
         BackendKind::Codex => "backend-badge codex",
         BackendKind::Antigravity => "backend-badge antigravity",
@@ -8106,7 +8106,7 @@ mod wasm_tests {
         let form = LaunchProfileForm::blank();
         form.id.set("acp:my-agent".to_owned());
         form.label.set("My Agent".to_owned());
-        form.backend_kind.set(BackendKind::Acp);
+        form.backend_kind.set(BackendKind::Kiro);
 
         // Without a command there is nothing to launch, and the server rejects
         // it too — failing here is what keeps the user from saving a profile

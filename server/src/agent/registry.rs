@@ -194,7 +194,7 @@ pub(crate) struct ResolvedSpawnRequest {
     pub session_settings_schema: Option<SessionSettingsSchema>,
     pub backend_config: protocol::BackendConfigValues,
     /// Which ACP agent to launch, resolved from `launch_profile_id`. Only set
-    /// for [`BackendKind::Acp`].
+    /// for [`BackendKind::Kiro`].
     pub acp_agent: Option<protocol::AcpAgentSpec>,
     pub startup_mcp_servers: Vec<StartupMcpServer>,
     pub resolved_spawn_config: ResolvedSpawnConfig,

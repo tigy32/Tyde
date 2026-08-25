@@ -1507,7 +1507,7 @@ mod wasm_tests {
             "h-cap-order",
             0,
             vec![
-                silent(BackendKind::Acp),
+                silent(BackendKind::Kiro),
                 silent(BackendKind::Antigravity),
                 claude_known(),
                 codex_known(),

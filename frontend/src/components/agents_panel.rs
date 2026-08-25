@@ -110,7 +110,7 @@ fn persist_sidebar(state: &AppState, sidebar: AgentsSidebarPreferences) {
 pub(crate) fn backend_class(kind: protocol::BackendKind) -> &'static str {
     match kind {
         protocol::BackendKind::Tycode => "backend-badge tycode",
-        protocol::BackendKind::Acp => "backend-badge kiro",
+        protocol::BackendKind::Kiro => "backend-badge kiro",
         protocol::BackendKind::Claude => "backend-badge claude",
         protocol::BackendKind::Codex => "backend-badge codex",
         protocol::BackendKind::Antigravity => "backend-badge antigravity",
@@ -128,7 +128,7 @@ pub(crate) const BACKENDS_BY_PREFERENCE: [protocol::BackendKind; 6] = [
     protocol::BackendKind::Hermes,
     protocol::BackendKind::Antigravity,
     protocol::BackendKind::Tycode,
-    protocol::BackendKind::Acp,
+    protocol::BackendKind::Kiro,
 ];
 
 /// Position in `BACKENDS_BY_PREFERENCE`, for use as a sort key.
@@ -142,7 +142,7 @@ pub(crate) fn backend_rank(kind: protocol::BackendKind) -> usize {
 pub(crate) fn backend_label(kind: protocol::BackendKind) -> &'static str {
     match kind {
         protocol::BackendKind::Tycode => "Tycode",
-        protocol::BackendKind::Acp => "Kiro",
+        protocol::BackendKind::Kiro => "Kiro",
         protocol::BackendKind::Claude => "Claude",
         protocol::BackendKind::Codex => "Codex",
         protocol::BackendKind::Antigravity => "Antigravity",

@@ -953,7 +953,7 @@ async fn tool_policy_rejection_for_non_claude_backends() {
         ),
         (
             "kiro-deny",
-            BackendKind::Acp,
+            BackendKind::Kiro,
             ToolPolicy::DenyList {
                 tools: vec!["Edit".to_string()],
             },

@@ -572,14 +572,14 @@ pub fn SessionSettingsBar(
             BackendKind::Codex => "Session Settings (Codex)",
             BackendKind::Antigravity => "Session Settings (Antigravity)",
             BackendKind::Hermes => "Session Settings (Hermes)",
-            BackendKind::Acp => "Session Settings (Kiro)",
+            BackendKind::Kiro => "Session Settings (Kiro)",
             BackendKind::Tycode => "Session Settings",
         }
     }
 
     fn missing_schema_message(backend_kind: BackendKind) -> &'static str {
         match backend_kind {
-            BackendKind::Acp => "Kiro models unavailable — check the agent command",
+            BackendKind::Kiro => "Kiro models unavailable — check the agent command",
             BackendKind::Claude => "Claude settings unavailable — check installation",
             BackendKind::Codex => "Codex settings unavailable — check installation",
             BackendKind::Antigravity => "Antigravity settings unavailable — check installation",
@@ -590,7 +590,7 @@ pub fn SessionSettingsBar(
 
     fn pending_schema_message(backend_kind: BackendKind) -> &'static str {
         match backend_kind {
-            BackendKind::Acp => "Kiro models are loading...",
+            BackendKind::Kiro => "Kiro models are loading...",
             BackendKind::Claude => "Claude settings are loading...",
             BackendKind::Codex => "Codex settings are loading...",
             BackendKind::Antigravity => "Antigravity settings are loading...",
@@ -1811,10 +1811,10 @@ mod wasm_tests {
         crate::dispatch::prime_host_for_tests(&draft_state, host_id);
         draft_state.session_schemas.update(|map| {
             map.entry(host_id.to_owned()).or_default().insert(
-                BackendKind::Acp,
+                BackendKind::Kiro,
                 SessionSchemaEntry::Ready {
                     schema: SessionSettingsSchema {
-                        backend_kind: BackendKind::Acp,
+                        backend_kind: BackendKind::Kiro,
                         fields: vec![SessionSettingField {
                             key: "model".to_owned(),
                             label: "Model".to_owned(),
@@ -1837,7 +1837,7 @@ mod wasm_tests {
                 kind: LaunchProfileKind::Custom,
                 label: "QA ACP".to_owned(),
                 description: None,
-                backend_kind: BackendKind::Acp,
+                backend_kind: BackendKind::Kiro,
                 session_settings: SessionSettingsValues::default(),
             },
             None,
@@ -1865,7 +1865,7 @@ mod wasm_tests {
         );
 
         let active_container = make_container();
-        let active_state = make_state_for_backend("h-acp-active", "root", true, BackendKind::Acp);
+        let active_state = make_state_for_backend("h-acp-active", "root", true, BackendKind::Kiro);
         let _active_handle = mount_bar(&active_container, active_state);
         for _ in 0..4 {
             next_tick().await;

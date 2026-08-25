@@ -2572,7 +2572,7 @@ async fn spawn_backend(
             let session_id = Backend::session_id(&b);
             Ok((Box::new(b), events, session_id))
         }
-        BackendKind::Acp => {
+        BackendKind::Kiro => {
             let (b, events) = KiroBackend::spawn(workspace_roots, config, initial_input).await?;
             let session_id = Backend::session_id(&b);
             Ok((Box::new(b), events, session_id))
@@ -2645,7 +2645,7 @@ async fn resume_backend(
             let (b, events) = TycodeBackend::resume(workspace_roots, config, session_id).await?;
             (Box::new(b), events)
         }
-        BackendKind::Acp => {
+        BackendKind::Kiro => {
             let (b, events) = KiroBackend::resume(workspace_roots, config, session_id).await?;
             (Box::new(b), events)
         }
@@ -2712,7 +2712,7 @@ async fn fork_backend(
             let session_id = Backend::session_id(&b);
             Ok((Box::new(b), events, session_id))
         }
-        BackendKind::Acp => {
+        BackendKind::Kiro => {
             let (b, events) =
                 KiroBackend::fork(workspace_roots, config, from_session_id, initial_input).await?;
             let session_id = Backend::session_id(&b);
@@ -8037,7 +8037,7 @@ fn backend_startup_drop_cancels_workers(backend_kind: BackendKind) -> bool {
         backend_kind,
         BackendKind::Claude
             | BackendKind::Codex
-            | BackendKind::Acp
+            | BackendKind::Kiro
             | BackendKind::Hermes
             | BackendKind::Tycode
     )
@@ -9963,7 +9963,7 @@ fn backend_session_is_resumable(
             workspace_roots,
             resolved_spawn_config,
         ),
-        BackendKind::Tycode | BackendKind::Acp | BackendKind::Claude | BackendKind::Codex => true,
+        BackendKind::Tycode | BackendKind::Kiro | BackendKind::Claude | BackendKind::Codex => true,
     }
 }
 

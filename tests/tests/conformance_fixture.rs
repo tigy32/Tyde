@@ -106,7 +106,7 @@ fn enabled_backends() -> Vec<BackendKind> {
         Err(_) => vec![
             BackendKind::Claude,
             BackendKind::Codex,
-            BackendKind::Acp,
+            BackendKind::Kiro,
             BackendKind::Hermes,
             BackendKind::Tycode,
         ],
@@ -120,7 +120,7 @@ fn enabled_backends() -> Vec<BackendKind> {
                 let backend = match value.to_ascii_lowercase().as_str() {
                     "claude" => BackendKind::Claude,
                     "codex" => BackendKind::Codex,
-                    "kiro" | "acp" => BackendKind::Acp,
+                    "kiro" | "acp" => BackendKind::Kiro,
                     "hermes" => BackendKind::Hermes,
                     "tycode" => BackendKind::Tycode,
                     other => panic!("unknown backend {other:?} in TYDE_REAL_BACKENDS"),
@@ -1012,7 +1012,7 @@ pub fn spawn_tool_backend_name(backend_kind: BackendKind) -> &'static str {
     match backend_kind {
         BackendKind::Claude => "claude",
         BackendKind::Codex => "codex",
-        BackendKind::Acp => "kiro",
+        BackendKind::Kiro => "kiro",
         BackendKind::Hermes => "hermes",
         BackendKind::Tycode => "tycode",
         BackendKind::Antigravity => "antigravity",
@@ -1786,7 +1786,7 @@ fn backend_label(backend_kind: BackendKind) -> &'static str {
         BackendKind::Codex => "codex",
         BackendKind::Antigravity => "antigravity",
         BackendKind::Tycode => "tycode",
-        BackendKind::Acp => "kiro",
+        BackendKind::Kiro => "kiro",
         BackendKind::Hermes => "hermes",
     }
 }

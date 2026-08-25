@@ -219,7 +219,7 @@ impl AcpAgentAdapter for KiroAdapter {
                 let timestamp = kiro_impl::extract_session_timestamp(&metadata);
                 sessions.push(BackendSession {
                     id: SessionId(session_id),
-                    backend_kind: BackendKind::Acp,
+                    backend_kind: BackendKind::Kiro,
                     workspace_roots: if cwd.is_empty() {
                         Vec::new()
                     } else {

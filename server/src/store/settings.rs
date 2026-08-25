@@ -17,7 +17,7 @@ use settings_model::{
 
 const CANONICAL_BACKENDS: [BackendKind; 6] = [
     BackendKind::Tycode,
-    BackendKind::Acp,
+    BackendKind::Kiro,
     BackendKind::Claude,
     BackendKind::Codex,
     BackendKind::Antigravity,
@@ -31,7 +31,7 @@ const DEFAULT_BACKEND_PREFERENCE: [BackendKind; 6] = [
     BackendKind::Codex,
     BackendKind::Antigravity,
     BackendKind::Hermes,
-    BackendKind::Acp,
+    BackendKind::Kiro,
     BackendKind::Tycode,
 ];
 
@@ -865,7 +865,7 @@ fn validate_launch_profile_configs(
         // than persisting a profile that can't launch or that lies about what
         // it does.
         match (profile.backend_kind, profile.acp.as_ref()) {
-            (BackendKind::Acp, None) => {
+            (BackendKind::Kiro, None) => {
                 return Err(format!(
                     "launch profile {} targets the ACP backend but has no agent command configured",
                     profile.id
@@ -875,7 +875,7 @@ fn validate_launch_profile_configs(
             // adapter resolves `kiro-cli-chat` as a sibling of `kiro-cli`), so
             // it may leave the command blank. A stock agent cannot be
             // discovered, so its command is required.
-            (BackendKind::Acp, Some(spec))
+            (BackendKind::Kiro, Some(spec))
                 if spec.adapter == protocol::AcpAdapterId::Stock
                     && spec.command.trim().is_empty() =>
             {
@@ -884,7 +884,7 @@ fn validate_launch_profile_configs(
                     profile.id
                 ));
             }
-            (kind, Some(_)) if kind != BackendKind::Acp => {
+            (kind, Some(_)) if kind != BackendKind::Kiro => {
                 return Err(format!(
                     "launch profile {} configures an ACP agent but targets {kind:?}",
                     profile.id
@@ -900,7 +900,7 @@ fn validate_launch_profile_configs(
 fn backend_slug(backend_kind: BackendKind) -> &'static str {
     match backend_kind {
         BackendKind::Tycode => "tycode",
-        BackendKind::Acp => "kiro",
+        BackendKind::Kiro => "kiro",
         BackendKind::Claude => "claude",
         BackendKind::Codex => "codex",
         BackendKind::Antigravity => "antigravity",

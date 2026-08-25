@@ -924,7 +924,7 @@ pub fn ChatView(
                     {move || agent_backend().map(|kind| {
                         let (badge_class, label) = match kind {
                             BackendKind::Tycode => ("backend-badge tycode", "Tycode"),
-                            BackendKind::Acp => ("backend-badge acp", "Kiro"),
+                            BackendKind::Kiro => ("backend-badge acp", "Kiro"),
                             BackendKind::Claude => ("backend-badge claude", "Claude"),
                             BackendKind::Codex => ("backend-badge codex", "Codex"),
                             BackendKind::Antigravity => ("backend-badge antigravity", "Antigravity"),

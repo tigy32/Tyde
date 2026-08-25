@@ -595,7 +595,7 @@ const BACKENDS: [BackendKind; 6] = [
     BackendKind::Claude,
     BackendKind::Codex,
     BackendKind::Tycode,
-    BackendKind::Acp,
+    BackendKind::Kiro,
     BackendKind::Antigravity,
     BackendKind::Hermes,
 ];

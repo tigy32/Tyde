@@ -2292,7 +2292,7 @@ fn event_target_checked(ev: &web_sys::Event) -> bool {
 pub(crate) fn backend_kind_label(kind: BackendKind) -> &'static str {
     match kind {
         BackendKind::Tycode => "Tycode",
-        BackendKind::Acp => "Kiro",
+        BackendKind::Kiro => "Kiro",
         BackendKind::Claude => "Claude",
         BackendKind::Codex => "Codex",
         BackendKind::Antigravity => "Antigravity",
@@ -2303,7 +2303,7 @@ pub(crate) fn backend_kind_label(kind: BackendKind) -> &'static str {
 fn backend_kind_value(kind: BackendKind) -> &'static str {
     match kind {
         BackendKind::Tycode => "tycode",
-        BackendKind::Acp => "kiro",
+        BackendKind::Kiro => "kiro",
         BackendKind::Claude => "claude",
         BackendKind::Codex => "codex",
         BackendKind::Antigravity => "antigravity",
@@ -2314,7 +2314,7 @@ fn backend_kind_value(kind: BackendKind) -> &'static str {
 fn parse_backend_kind(value: &str) -> Option<BackendKind> {
     match value {
         "tycode" => Some(BackendKind::Tycode),
-        "kiro" => Some(BackendKind::Acp),
+        "kiro" => Some(BackendKind::Kiro),
         "claude" => Some(BackendKind::Claude),
         "codex" => Some(BackendKind::Codex),
         "antigravity" => Some(BackendKind::Antigravity),

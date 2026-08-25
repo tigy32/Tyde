@@ -1857,7 +1857,7 @@ async fn agents_view_preferences_smart_views_manage_lifecycle_and_reject_built_i
             host_ids: vec![HostFilterId(LOCAL_HOST_ID.to_owned())],
             project_ids: vec![],
             statuses: vec![AgentStatusFilter::Compacting],
-            backends: vec![BackendKind::Acp],
+            backends: vec![BackendKind::Kiro],
             origins: vec![protocol::AgentOrigin::Workflow],
             tags: vec![],
         },

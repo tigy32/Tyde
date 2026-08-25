@@ -626,11 +626,16 @@ impl fmt::Display for McpServerId {
 #[serde(rename_all = "snake_case")]
 pub enum BackendKind {
     Tycode,
-    /// Any agent speaking the Agent Client Protocol over stdio. The specific
-    /// agent (binary, args, quirks adapter) is carried by the session's launch
-    /// profile via [`AcpAgentSpec`], not by this enum. Kiro is the built-in
-    /// `acp:kiro` profile.
-    Acp,
+    /// Kiro. It reaches the agent over the Agent Client Protocol, and the
+    /// binary, args and quirks adapter come from the session's launch profile
+    /// via [`AcpAgentSpec`] — so any other ACP-speaking agent can be pointed at
+    /// this backend — but the backend is named for the agent it is actually
+    /// run with, and for the Kiro-specific behaviour worth reading out of it.
+    ///
+    /// Serialized as `"acp"`: the on-disk and on-the-wire spelling is unchanged
+    /// by this rename, so stores written by any released build keep loading.
+    #[serde(rename = "acp")]
+    Kiro,
     Claude,
     Codex,
     Antigravity,
@@ -640,7 +645,7 @@ pub enum BackendKind {
 impl BackendKind {
     /// Coarse composer affordance: may this backend ever accept image input?
     ///
-    /// For [`Self::Acp`] the authoritative answer is per-session — it comes
+    /// For [`Self::Kiro`] the authoritative answer is per-session — it comes
     /// from `promptCapabilities.image` in the agent's `initialize` response,
     /// which isn't known until the session is live. This returns `true` so the
     /// composer offers attachment, and the ACP backend rejects an image sent to
@@ -648,7 +653,7 @@ impl BackendKind {
     /// than silently dropping it.
     pub const fn supports_image_input(self) -> bool {
         match self {
-            Self::Acp | Self::Claude | Self::Codex => true,
+            Self::Kiro | Self::Claude | Self::Codex => true,
             Self::Tycode | Self::Antigravity | Self::Hermes => false,
         }
     }
@@ -660,7 +665,8 @@ pub const LEGACY_KIRO_BACKEND: &str = "kiro";
 /// Serialized name of the agent origin session forks carried before they
 /// became ordinary top-level agents. Only migrations should reference this.
 pub const LEGACY_SIDE_QUESTION_ORIGIN: &str = "side_question";
-/// Serialized name of [`BackendKind::Acp`].
+/// Serialized name of [`BackendKind::Kiro`]. Spelled `acp` for historical
+/// reasons: the variant was renamed to match the agent, the wire value was not.
 pub const ACP_BACKEND: &str = "acp";
 /// Launch profile id of the built-in Kiro agent. Reserved against
 /// user-configured launch-profile ids.
@@ -680,7 +686,7 @@ pub enum AcpAdapterId {
 }
 
 /// How to launch one ACP agent. Carried by a launch profile whose
-/// `backend_kind` is [`BackendKind::Acp`].
+/// `backend_kind` is [`BackendKind::Kiro`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct AcpAgentSpec {
     /// Executable to spawn. Resolved against the host PATH when not absolute.

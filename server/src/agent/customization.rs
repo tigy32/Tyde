@@ -162,7 +162,7 @@ impl SkillDelivery {
             // Hermes replaces the shared skill block with its own name-only
             // catalog, so every body it was handed was read and thrown away.
             BackendKind::Hermes => Self::NamesOnly,
-            BackendKind::Acp | BackendKind::Antigravity => Self::InlineBodies,
+            BackendKind::Kiro | BackendKind::Antigravity => Self::InlineBodies,
         }
     }
 

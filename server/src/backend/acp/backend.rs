@@ -3294,7 +3294,7 @@ fn session_settings_schema_from_known_models(
     }
 
     Ok(protocol::SessionSettingsSchema {
-        backend_kind: protocol::BackendKind::Acp,
+        backend_kind: protocol::BackendKind::Kiro,
         fields: vec![protocol::SessionSettingField {
             key: "model".to_string(),
             label: "Model".to_string(),
@@ -3472,7 +3472,7 @@ fn acp_session_info_to_backend_session(info: &Value) -> Option<BackendSession> {
 
     Some(BackendSession {
         id: SessionId(session_id.to_string()),
-        backend_kind: BackendKind::Acp,
+        backend_kind: BackendKind::Kiro,
         workspace_roots: cwd.map(|cwd| vec![cwd.to_string()]).unwrap_or_default(),
         title: info
             .get("title")
@@ -3842,7 +3842,7 @@ impl Backend for KiroBackend {
     }
 
     fn session_settings_schema() -> protocol::SessionSettingsSchema {
-        empty_session_settings_schema(BackendKind::Acp)
+        empty_session_settings_schema(BackendKind::Kiro)
     }
 
     fn compaction_capability(&self) -> BackendCompactionCapability {
@@ -4226,7 +4226,7 @@ impl Backend for KiroBackend {
         _initial_input: protocol::SendMessagePayload,
     ) -> Result<(Self, EventStream), BackendStartupError> {
         Err(BackendStartupError::unsupported(
-            backend_fork_unsupported_message(BackendKind::Acp),
+            backend_fork_unsupported_message(BackendKind::Kiro),
         ))
     }
 

@@ -139,10 +139,24 @@ eligible under the case's capability requirements; never substitute a different
 scenario or oracle for one provider.
 
 Real-backend tests are expensive, so prefer targeted conformance tests while
-iterating. Running them is pre-authorized. Before shipping a backend-provider
-change, the complete conformance suite must pass for each changed backend. If a
-conformance test is added or changed, it must pass against every supported
-backend.
+iterating.
+
+**Running them is pre-authorized when one of these criteria is hit, and you do
+not need to ask first:**
+
+- You changed a backend, or anything below the backend boundary it goes
+  through.
+- You added or changed a conformance test.
+- You are chasing a backend bug that the suite is the only way to observe.
+
+Before shipping a backend-provider change, the complete conformance suite must
+pass for each changed backend. If a conformance test is added or changed, it
+must pass against every supported backend.
+
+**Do not run them when no criterion is hit.** In particular, cutting a release
+is not a criterion: the suite does not run as part of a release, on a schedule,
+or as a routine "just to be safe" check. It runs because something it covers
+actually changed.
 
 A backend fix is incomplete until its regression test, `./dev.sh check`, and
 the required real-backend conformance runs pass.

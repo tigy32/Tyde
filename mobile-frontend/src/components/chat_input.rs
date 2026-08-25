@@ -417,7 +417,7 @@ fn QueuedMessageControlRow(row: QueuedRowRef) -> impl IntoView {
 fn backend_value(backend: protocol::BackendKind) -> &'static str {
     match backend {
         protocol::BackendKind::Tycode => "tycode",
-        protocol::BackendKind::Acp => "acp",
+        protocol::BackendKind::Kiro => "acp",
         protocol::BackendKind::Claude => "claude",
         protocol::BackendKind::Codex => "codex",
         protocol::BackendKind::Antigravity => "antigravity",
@@ -428,7 +428,7 @@ fn backend_value(backend: protocol::BackendKind) -> &'static str {
 fn backend_label(backend: protocol::BackendKind) -> &'static str {
     match backend {
         protocol::BackendKind::Tycode => "Tycode",
-        protocol::BackendKind::Acp => "Kiro",
+        protocol::BackendKind::Kiro => "Kiro",
         protocol::BackendKind::Claude => "Claude",
         protocol::BackendKind::Codex => "Codex",
         protocol::BackendKind::Antigravity => "Antigravity",
@@ -439,7 +439,7 @@ fn backend_label(backend: protocol::BackendKind) -> &'static str {
 fn parse_backend(value: &str) -> Option<protocol::BackendKind> {
     match value {
         "tycode" => Some(protocol::BackendKind::Tycode),
-        "acp" => Some(protocol::BackendKind::Acp),
+        "acp" => Some(protocol::BackendKind::Kiro),
         "claude" => Some(protocol::BackendKind::Claude),
         "codex" => Some(protocol::BackendKind::Codex),
         "antigravity" => Some(protocol::BackendKind::Antigravity),

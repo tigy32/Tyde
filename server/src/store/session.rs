@@ -1107,7 +1107,7 @@ where
                 && is_antigravity_resumable(&record.id)
         }
         BackendKind::Tycode
-        | BackendKind::Acp
+        | BackendKind::Kiro
         | BackendKind::Claude
         | BackendKind::Codex
         | BackendKind::Hermes => record.resumable,

@@ -17,7 +17,7 @@ use crate::state::{
 fn backend_class(kind: BackendKind) -> &'static str {
     match kind {
         BackendKind::Tycode => "backend-badge tycode",
-        BackendKind::Acp => "backend-badge kiro",
+        BackendKind::Kiro => "backend-badge kiro",
         BackendKind::Claude => "backend-badge claude",
         BackendKind::Codex => "backend-badge codex",
         BackendKind::Antigravity => "backend-badge antigravity",
@@ -28,7 +28,7 @@ fn backend_class(kind: BackendKind) -> &'static str {
 fn backend_label(kind: BackendKind) -> &'static str {
     match kind {
         BackendKind::Tycode => "Tycode",
-        BackendKind::Acp => "Kiro",
+        BackendKind::Kiro => "Kiro",
         BackendKind::Claude => "Claude",
         BackendKind::Codex => "Codex",
         BackendKind::Antigravity => "Antigravity",

@@ -29,7 +29,7 @@ pub struct HostLaunchProfileConfig {
     pub backend_kind: BackendKind,
     #[serde(default)]
     pub session_settings: SessionSettingsValues,
-    /// Required when `backend_kind` is [`BackendKind::Acp`], rejected
+    /// Required when `backend_kind` is [`BackendKind::Kiro`], rejected
     /// otherwise. Validated in the settings store rather than the type system
     /// so an invalid persisted profile surfaces a named error instead of
     /// failing to deserialize the whole settings file.

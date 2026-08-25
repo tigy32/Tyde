@@ -27,7 +27,7 @@ fn backend_label(kind: BackendKind) -> &'static str {
         BackendKind::Codex => "Codex",
         BackendKind::Antigravity => "Antigravity",
         BackendKind::Hermes => "Hermes",
-        BackendKind::Acp => "Kiro",
+        BackendKind::Kiro => "Kiro",
         BackendKind::Tycode => "Tycode",
     }
 }
@@ -42,7 +42,7 @@ fn backend_rank(kind: BackendKind) -> usize {
         BackendKind::Hermes => 2,
         BackendKind::Antigravity => 3,
         BackendKind::Tycode => 4,
-        BackendKind::Acp => 5,
+        BackendKind::Kiro => 5,
     }
 }
 
@@ -939,7 +939,7 @@ mod wasm_tests {
             "h-cap-buckets",
             vec![
                 BackendCapacitySnapshot {
-                    backend_kind: BackendKind::Acp,
+                    backend_kind: BackendKind::Kiro,
                     state: BackendCapacityState::Unsupported {
                         reason: CapacityUnsupportedReason::BackendHasNoCapacitySource,
                     },
