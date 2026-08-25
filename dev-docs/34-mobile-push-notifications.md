@@ -142,10 +142,19 @@ of the payload are code in this repository, so the crypto tests prove
 self-consistency, not RFC conformance. A shared misreading of RFC 8291 would pass
 them. Only delivery to a real browser proves interop — see below.
 
-**Not yet run on a real device.** No iPhone or Android browser has received a
-notification from this code. The encryption, the VAPID signature, and the service
-worker handlers are all exercised only against this repository's own
-implementations.
+**Verified on a real device (2026-08-24).** A Home Screen-installed iPhone
+received an idle notification from a paired host running 0.8.19-beta.74: real
+Safari, real APNs, real end-to-end payload. That closes the interop question the
+paragraph above raises — the RFC 8291 encryption and RFC 8292 VAPID signature are
+accepted and decrypted by an implementation that is not this repository's. An
+earlier desktop rig had proven the same against real Chrome/FCM.
+
+Suppression was observed working in the same session, and it is the thing that
+makes this awkward to test: a notification for the agent you are chatting with
+*from the phone* will never arrive, because that phone is in `connected_tasks`.
+Testing it means letting the connection drop before the turn ends. The delivery
+that did arrive first was a different top-level agent going idle ten seconds
+later, which reads as a wrong-agent bug until you check the timestamps.
 
 **Known coverage gap:** suppression-while-connected is not covered by an
 automated test. Registering a subscription needs a mobile-origin connection, and
