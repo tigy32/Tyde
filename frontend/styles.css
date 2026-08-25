@@ -8607,19 +8607,41 @@ math merror {
     gap: var(--space-2);
 }
 
-.settings-backend-list-rich {
-    gap: var(--space-3);
-}
-
 .settings-backend-card {
-    padding: var(--space-3);
+    padding: var(--space-2) var(--space-3);
     background: var(--surface-2);
     border: 1px solid var(--border-primary);
     border-radius: 8px;
 }
 
-.settings-backend-card-rich {
-    background: linear-gradient(180deg, var(--surface-2), var(--surface-1));
+/* One backend, one line: identity and state on the left, the enable toggle
+   pinned right, and an install action only when the host probe found work to
+   do. Anything taller than this belongs on the backend's own page or Usage. */
+.settings-backend-row {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    min-height: 32px;
+}
+
+.settings-backend-row > .settings-toggle {
+    margin-left: var(--space-2);
+}
+
+/* Fixed columns for the two chips: without them every row starts its
+   description at a different x, and a six-row list reads as ragged. */
+.settings-backend-row > .backend-badge,
+.settings-backend-row > .settings-status-chip {
+    flex-shrink: 0;
+    text-align: center;
+}
+
+.settings-backend-row > .backend-badge {
+    min-width: 84px;
+}
+
+.settings-backend-row > .settings-status-chip {
+    min-width: 108px;
 }
 
 .settings-tier-list {
@@ -8735,18 +8757,6 @@ math merror {
 
 .settings-backend-config-input {
     width: 100%;
-}
-
-.settings-backend-card-footer {
-    display: flex;
-    justify-content: flex-end;
-    margin-top: var(--space-3);
-    padding-top: var(--space-2);
-    border-top: 1px solid var(--border-primary);
-}
-
-.settings-backend-configure-btn {
-    font-size: 0.85rem;
 }
 
 /* Explicit locked state on a backend settings page: the page never goes
@@ -9792,25 +9802,6 @@ math merror {
     outline-offset: 2px;
 }
 
-.settings-backend-header {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    margin-bottom: var(--space-1);
-}
-
-.settings-backend-header-rich {
-    align-items: flex-start;
-    gap: var(--space-3);
-}
-
-.settings-backend-title-wrap {
-    display: flex;
-    align-items: center;
-    gap: var(--space-2);
-    flex-wrap: wrap;
-}
-
 .settings-status-chip {
     font-size: 0.769rem;
     font-weight: 700;
@@ -9849,41 +9840,36 @@ math merror {
     background: var(--surface-3);
 }
 
+/* The description is the only elastic member of the row, so it is what gives
+   way first: it truncates rather than wrapping the row onto a second line. */
 .settings-backend-desc {
+    flex: 1;
+    min-width: 0;
     font-size: 0.923rem;
     color: var(--text-secondary);
     line-height: 1.4;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
 }
 
 .settings-backend-version {
+    flex-shrink: 0;
     font-family: var(--font-mono);
     font-size: 0.846rem;
     color: var(--text-tertiary);
-    margin-top: var(--space-2);
 }
 
-.settings-backend-setup {
-    margin-top: var(--space-3);
+.settings-backend-install-btn {
+    flex-shrink: 0;
+    font-size: 0.85rem;
+}
+
+.settings-backend-notes {
     display: flex;
     flex-direction: column;
-    gap: var(--space-2);
-}
-
-.settings-backend-actions {
-    display: flex;
-    align-items: center;
-    gap: var(--space-2);
-    flex-wrap: wrap;
-}
-
-.settings-doc-link {
-    font-size: 0.846rem;
-    color: var(--accent-primary);
-    margin-left: auto;
-}
-
-.settings-doc-link:hover {
-    color: var(--accent-hover);
+    gap: var(--space-1);
+    margin-top: var(--space-2);
 }
 
 .settings-backend-note {
@@ -9909,12 +9895,10 @@ math merror {
         align-items: stretch;
     }
 
-    .settings-backend-actions {
-        width: 100%;
-    }
-
-    .settings-doc-link {
-        margin-left: 0;
+    /* Too narrow for one line: the description drops out rather than
+       squeezing the status and toggle into illegibility. */
+    .settings-backend-desc {
+        display: none;
     }
 }
 
@@ -13574,15 +13558,6 @@ pre.tool-error-pre {
 .capacity-card[data-capacity-state="auth-error"],
 .capacity-card[data-capacity-state="rate-limited"] {
     border-left-color: var(--error);
-}
-
-.settings-backend-card > .capacity-card-embedded {
-    margin-top: var(--space-3);
-    padding: var(--space-3) 0 0;
-    background: transparent;
-    border: 0;
-    border-top: 1px solid var(--border-primary);
-    border-radius: 0;
 }
 
 .capacity-card-head {

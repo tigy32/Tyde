@@ -630,7 +630,7 @@ fn plan_text(report: &CapacityReport) -> String {
     }
 }
 
-fn snapshot_card(snapshot: &BackendCapacitySnapshot, embedded: bool) -> AnyView {
+fn snapshot_card(snapshot: &BackendCapacitySnapshot) -> AnyView {
     let kind = snapshot.backend_kind;
     let state = &snapshot.state;
     let headline = state_headline(state, kind);
@@ -643,14 +643,11 @@ fn snapshot_card(snapshot: &BackendCapacitySnapshot, embedded: bool) -> AnyView 
     view! {
         <div
             class="capacity-card"
-            class:capacity-card-embedded=embedded
             data-capacity-backend=format!("{kind:?}").to_lowercase()
             data-capacity-state=slug
         >
             <div class="capacity-card-head">
-                {(!embedded).then(|| view! {
-                    <span class="capacity-backend">{backend_label(kind)}</span>
-                })}
+                <span class="capacity-backend">{backend_label(kind)}</span>
                 <span class="capacity-state" data-capacity-state=slug>{headline}</span>
             </div>
 
@@ -691,32 +688,6 @@ fn snapshot_card(snapshot: &BackendCapacitySnapshot, embedded: bool) -> AnyView 
         </div>
     }
     .into_any()
-}
-
-/// Capacity embedded in one backend's enable/install card. Backends and auth
-/// modes without subscription capacity render nothing rather than repeating an
-/// unsupported explanation on every provider card.
-#[component]
-pub fn BackendSubscriptionCapacity(kind: BackendKind) -> impl IntoView {
-    let state = expect_context::<AppState>();
-    let snapshot = Memo::new(move |_| -> Option<BackendCapacitySnapshot> {
-        let host_id = state.selected_host_id.get()?;
-        let snapshot = state
-            .backend_capacity
-            .get()
-            .get(&host_id)
-            .and_then(|by_kind| by_kind.get(&kind))
-            .cloned()?;
-        if matches!(snapshot.state, BackendCapacityState::Unsupported { .. }) {
-            None
-        } else {
-            Some(snapshot)
-        }
-    });
-
-    view! {
-        {move || snapshot.get().map(|snapshot| snapshot_card(&snapshot, true))}
-    }
 }
 
 /// The full authoritative Settings view: every backend the selected host
@@ -762,7 +733,7 @@ pub fn SubscriptionCapacitySection() -> impl IntoView {
                 }
                 view! {
                     <div class="capacity-cards">
-                        {snapshots.iter().map(|snapshot| snapshot_card(snapshot, false)).collect_view()}
+                        {snapshots.iter().map(snapshot_card).collect_view()}
                     </div>
                 }
                 .into_any()

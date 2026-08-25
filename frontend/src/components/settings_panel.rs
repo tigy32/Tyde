@@ -28,7 +28,7 @@ use settings_model::{HostExecutablePath, HostLaunchProfileConfig};
 use serde_json::{Map, Value};
 use std::collections::{HashMap, HashSet};
 
-use crate::components::backend_capacity::BackendSubscriptionCapacity;
+use crate::components::backend_capacity::SubscriptionCapacitySection;
 use crate::components::session_settings::{
     SessionSettingsControls, clear_invalid_dependent_select_values,
 };
@@ -806,6 +806,7 @@ const HOST_GROUP_TABS: [SettingsTab; 11] = [
 enum SettingsPage {
     Tab(SettingsTab),
     LaunchProfiles,
+    Usage,
     Backend(BackendKind),
 }
 
@@ -813,8 +814,9 @@ impl SettingsPage {
     fn scope(self) -> SettingsScope {
         match self {
             Self::Tab(tab) => tab.scope(),
-            // Both are derived from the selected host's server-owned catalog.
-            Self::LaunchProfiles | Self::Backend(_) => SettingsScope::Host,
+            // All three are derived from the selected host's server-owned
+            // state: its catalog, its profiles, its backends' own accounts.
+            Self::LaunchProfiles | Self::Usage | Self::Backend(_) => SettingsScope::Host,
         }
     }
 }
@@ -984,7 +986,7 @@ pub fn SettingsPanel() -> impl IntoView {
                                     SettingsTab::AiSummaries => view! { <AiSummariesTab /> }.into_any(),
                                     SettingsTab::Supervisor => view! { <SupervisorTab /> }.into_any(),
                                     SettingsTab::Subagents => view! { <SubagentsTab /> }.into_any(),
-                                    SettingsTab::Backends => view! { <BackendsTab active_page /> }.into_any(),
+                                    SettingsTab::Backends => view! { <BackendsTab /> }.into_any(),
                                     SettingsTab::CustomAgents => view! { <CustomAgentsTab /> }.into_any(),
                                     SettingsTab::McpServers => view! { <McpServersTab /> }.into_any(),
                                     SettingsTab::Steering => view! { <SteeringTab /> }.into_any(),
@@ -1000,6 +1002,7 @@ pub fn SettingsPanel() -> impl IntoView {
                                 SettingsPage::LaunchProfiles => {
                                     view! { <LaunchProfilesPage /> }.into_any()
                                 }
+                                SettingsPage::Usage => view! { <UsagePage /> }.into_any(),
                             }}
                         </div>
                     </div>
@@ -1279,6 +1282,7 @@ fn BackendsNavGroup(
     let visible = move || {
         let query = search_query.get();
         SettingsTab::Backends.matches_query(&query)
+            || usage_page_matches_query(&query)
             || launch_profiles_page_matches_query(&query)
             || schema_backends(&state)
                 .into_iter()
@@ -1300,6 +1304,15 @@ fn BackendsNavGroup(
                             }
                         >
                             "Overview"
+                        </button>
+                    </Show>
+                    <Show when=move || usage_page_matches_query(&search_query.get())>
+                        <button
+                            class="settings-nav-item"
+                            class:active=move || active_page.get() == SettingsPage::Usage
+                            on:click=move |_| active_page.set(SettingsPage::Usage)
+                        >
+                            "Usage"
                         </button>
                     </Show>
                     <Show when=move || launch_profiles_page_matches_query(&search_query.get())>
@@ -1984,7 +1997,7 @@ fn DisplayTab() -> impl IntoView {
 
         <div class="settings-field">
             <label class="settings-label">"Tool Output"</label>
-            <p class="settings-description">"How much of each tool call an agent makes is shown in the transcript. Summary prints just the header line — what ran, and whether it worked — which keeps a long agent session readable. Compact adds a short preview with a length cap. Full prints everything the tool returned, which is what you want when debugging why an agent drew the wrong conclusion, and overwhelming otherwise."</p>
+            <p class="settings-description">"How much of each tool call an agent makes is shown in the transcript. Summary and Compact both leave cards collapsed at their header line — what ran, and whether it worked — which keeps a long agent session readable; expanding a Compact card shows a short preview with a length cap, where Summary shows nothing. Full opens every card on the full output, which is what you want when debugging why an agent drew the wrong conclusion, and overwhelming otherwise. Expanding or collapsing a card yourself sticks until you change this setting."</p>
             <div class="settings-segmented-control">
                 <button
                     class=move || if state.tool_output_mode.get() == ToolOutputMode::Summary { "segment active" } else { "segment" }
@@ -2269,7 +2282,7 @@ fn SupervisorTab() -> impl IntoView {
 }
 
 #[component]
-fn BackendsTab(active_page: RwSignal<SettingsPage>) -> impl IntoView {
+fn BackendsTab() -> impl IntoView {
     let state = expect_context::<AppState>();
 
     view! {
@@ -2278,7 +2291,7 @@ fn BackendsTab(active_page: RwSignal<SettingsPage>) -> impl IntoView {
         </div>
 
         <p class="settings-description settings-panel-intro">
-            "A backend is the coding agent Tyde drives — Claude Code, Codex, Tycode, and the rest. Each one is a separate program with its own account and its own model access; Tyde starts it, feeds it your messages, and renders what it streams back. This page is where you decide which of them exist on this host: toggle them on, install them, and sign in. Install and sign-in run in the host terminal so you can watch the output and answer prompts. Each backend's own configuration lives on its page in the sidebar."
+            "A backend is the coding agent Tyde drives — Claude Code, Codex, Tycode, and the rest. Each one is a separate program with its own account and its own model access; Tyde starts it, feeds it your messages, and renders what it streams back. This page decides which of them Tyde offers on this host. A backend's own configuration lives on its page in the sidebar, and what its account has spent lives on Usage."
         </p>
 
         <div class="settings-field">
@@ -2339,14 +2352,49 @@ fn BackendsTab(active_page: RwSignal<SettingsPage>) -> impl IntoView {
 
         <div class="settings-field">
             <label class="settings-label">"Enabled Backends"</label>
-            <p class="settings-description">"Which backends are offered when creating an agent. A backend has to be installed on this host before it can do anything — the card shows its setup state and offers the install or sign-in command when one is available."</p>
-            <div class="settings-backend-list settings-backend-list-rich">
+            <p class="settings-description">"Which backends are offered when creating an agent. A backend has to be installed on this host before it can do anything, so each row reports what the host probe found and offers the install command when one is available."</p>
+            <div class="settings-backend-list">
                 {all_backends()
                     .into_iter()
-                    .map(|kind| view! { <BackendCard kind active_page /> })
+                    .map(|kind| view! { <BackendCard kind /> })
                     .collect::<Vec<_>>()}
             </div>
         </div>
+    }
+}
+
+fn usage_page_matches_query(query: &str) -> bool {
+    if query.is_empty() {
+        return true;
+    }
+    let query = query.to_lowercase();
+    [
+        "Usage",
+        "Subscription capacity",
+        "Quota",
+        "Limit",
+        "Rate limit",
+        "Credits",
+        "Plan",
+    ]
+    .iter()
+    .any(|text| text.to_lowercase().contains(&query))
+}
+
+/// Account-level quota for every backend on the selected host, split off the
+/// Backends overview. Capacity is about the accounts those backends sign in
+/// to, not about which of them Tyde offers, and it is far too tall to sit
+/// inside an enable row.
+#[component]
+fn UsagePage() -> impl IntoView {
+    view! {
+        <div class="settings-panel-header">
+            <h2 class="settings-panel-title">"Usage"</h2>
+        </div>
+        <p class="settings-description settings-panel-intro">
+            "What the backends on this host report about the accounts they are signed in to: the windows each vendor meters, how much of each is spent, and when they reset."
+        </p>
+        <SubscriptionCapacitySection />
     }
 }
 
@@ -5855,7 +5903,7 @@ fn MobileTab() -> impl IntoView {
 }
 
 #[component]
-fn BackendCard(kind: BackendKind, active_page: RwSignal<SettingsPage>) -> impl IntoView {
+fn BackendCard(kind: BackendKind) -> impl IntoView {
     let state = expect_context::<AppState>();
     let name = backend_label(kind);
     let description = backend_description(kind);
@@ -5863,11 +5911,6 @@ fn BackendCard(kind: BackendKind, active_page: RwSignal<SettingsPage>) -> impl I
     let state_for_checked = state.clone();
     let state_for_disable = state.clone();
     let state_for_setup = state.clone();
-    let state_for_configure = state.clone();
-
-    // A card links to its settings page only when the server's schema catalog
-    // says the backend is configurable — never hardcoded per backend.
-    let has_settings_page = move || schema_backends(&state_for_configure).contains(&kind);
 
     let checked = move || {
         state_for_checked
@@ -5884,6 +5927,7 @@ fn BackendCard(kind: BackendKind, active_page: RwSignal<SettingsPage>) -> impl I
     let setup_info_for_label = setup_info.clone();
     let setup_info_for_version = setup_info.clone();
     let setup_info_for_details = setup_info.clone();
+    let setup_info_for_notes = setup_info.clone();
 
     let on_toggle = {
         let state = state.clone();
@@ -5914,68 +5958,38 @@ fn BackendCard(kind: BackendKind, active_page: RwSignal<SettingsPage>) -> impl I
     };
 
     view! {
-        <div class="settings-backend-card settings-backend-card-rich">
-            <div class="settings-backend-header settings-backend-header-rich">
-                <div class="settings-backend-title-wrap">
-                    <span class=badge_class>{name}</span>
-                    <span class=move || backend_setup_status_class(setup_info_for_status().as_ref())>
-                        {move || backend_setup_status_label(setup_info_for_label().as_ref())}
-                    </span>
-                </div>
-                <label class="settings-toggle">
-                    <input
-                        type="checkbox"
-                        prop:checked=checked
-                        disabled=disable_toggle
-                        on:change=on_toggle
-                    />
-                    <span class="settings-toggle-slider"></span>
-                </label>
-            </div>
-
-            <p class="settings-backend-desc">{description}</p>
-
-            {move || setup_info_for_version().and_then(|info| info.installed_version).map(|version| {
-                view! { <p class="settings-backend-version">{version}</p> }
-            })}
-
-            {move || match setup_info_for_details() {
-                Some(info) => {
-                    let state_for_install = state.clone();
-                    let state_for_signin = state.clone();
-                    let docs_url = info.docs_url.clone();
-                    let install_runnable = info
-                        .install_command
-                        .as_ref()
-                        .map(|command| command.runnable)
-                        .unwrap_or(false);
-                    let signin_runnable = info
-                        .sign_in_command
-                        .as_ref()
-                        .map(|command| command.runnable)
-                        .unwrap_or(false);
-                    // An Unavailable backend (found but unusable) gets the same
-                    // install command as a repair action, matching the server's
-                    // "re-run the installer" diagnostics.
-                    let install_label = match info.status {
-                        BackendSetupStatus::NotInstalled => Some("Install"),
-                        BackendSetupStatus::Unavailable => Some("Repair install"),
-                        BackendSetupStatus::Installed | BackendSetupStatus::Unsupported => None,
-                    }
-                    .filter(|_| info.install_command.is_some());
-                    let show_signin = info.status == BackendSetupStatus::Installed
-                        && info.sign_in_command.is_some();
-                    let unsupported = info.status == BackendSetupStatus::Unsupported;
-                    let unavailable = info.status == BackendSetupStatus::Unavailable;
-                    // The server explains *why* a backend probe failed; show it
-                    // verbatim rather than a generic "not installed".
-                    let diagnostic_message = info.diagnostic.as_ref().map(|d| d.message.clone());
-                    view! {
-                        <div class="settings-backend-setup">
-                            <div class="settings-backend-actions">
-                                {install_label.map(|label| view! {
+        <div class="settings-backend-card">
+            <div class="settings-backend-row">
+                <span class=badge_class>{name}</span>
+                <span class=move || backend_setup_status_class(setup_info_for_status().as_ref())>
+                    {move || backend_setup_status_label(setup_info_for_label().as_ref())}
+                </span>
+                <span class="settings-backend-desc">{description}</span>
+                <span class="settings-backend-version">
+                    {move || setup_info_for_version().and_then(|info| info.installed_version)}
+                </span>
+                {move || match setup_info_for_details() {
+                    Some(info) => {
+                        let state_for_install = state.clone();
+                        let install_runnable = info
+                            .install_command
+                            .as_ref()
+                            .map(|command| command.runnable)
+                            .unwrap_or(false);
+                        // An Unavailable backend (found but unusable) gets the same
+                        // install command as a repair action, matching the server's
+                        // "re-run the installer" diagnostics.
+                        let install_label = match info.status {
+                            BackendSetupStatus::NotInstalled => Some("Install"),
+                            BackendSetupStatus::Unavailable => Some("Repair install"),
+                            BackendSetupStatus::Installed | BackendSetupStatus::Unsupported => None,
+                        }
+                        .filter(|_| info.install_command.is_some());
+                        install_label
+                            .map(|label| {
+                                view! {
                                     <button
-                                        class="settings-btn settings-btn-primary"
+                                        class="settings-btn settings-btn-primary settings-backend-install-btn"
                                         disabled=!install_runnable
                                         on:click=move |_| {
                                             send_run_backend_setup(
@@ -5987,67 +6001,63 @@ fn BackendCard(kind: BackendKind, active_page: RwSignal<SettingsPage>) -> impl I
                                     >
                                         {label}
                                     </button>
-                                })}
-                                {show_signin.then(|| view! {
-                                    <button
-                                        class="settings-btn"
-                                        disabled=!signin_runnable
-                                        on:click=move |_| {
-                                            send_run_backend_setup(
-                                                &state_for_signin,
-                                                kind,
-                                                BackendSetupAction::SignIn,
-                                            );
-                                        }
-                                    >
-                                        "Sign in"
-                                    </button>
-                                })}
-                                <a class="settings-doc-link" href=docs_url target="_blank" rel="noreferrer">"Docs"</a>
-                            </div>
+                                }
+                            })
+                            .into_any()
+                    }
+                    None => ().into_any(),
+                }}
+                <label class="settings-toggle">
+                    <input
+                        type="checkbox"
+                        prop:checked=checked
+                        disabled=disable_toggle
+                        on:change=on_toggle
+                    />
+                    <span class="settings-toggle-slider"></span>
+                </label>
+            </div>
+
+            // Second line only when the host probe has something wrong to say:
+            // a healthy backend is one row, a broken one explains itself.
+            {move || match setup_info_for_notes() {
+                Some(info) => {
+                    // The server explains *why* a backend probe failed; show it
+                    // verbatim rather than a generic "not installed".
+                    let diagnostic_message = info.diagnostic.as_ref().map(|d| d.message.clone());
+                    let unsupported = info.status == BackendSetupStatus::Unsupported;
+                    let unavailable = info.status == BackendSetupStatus::Unavailable;
+                    if diagnostic_message.is_none() && !unsupported && !unavailable {
+                        return ().into_any();
+                    }
+                    view! {
+                        <div class="settings-backend-notes">
                             {diagnostic_message.map(|message| view! {
                                 <p class="settings-backend-note settings-backend-note-warning">
                                     {message}
                                 </p>
                             })}
-                            {unavailable.then(|| {
-                                view! {
-                                    <p class="settings-backend-note">
-                                        "This backend is currently unavailable on the selected host. Resolve the issue above, then it can be used for new chats."
-                                    </p>
-                                }
+                            {unavailable.then(|| view! {
+                                <p class="settings-backend-note">
+                                    "This backend is currently unavailable on the selected host. Resolve the issue above, then it can be used for new chats."
+                                </p>
                             })}
-                            {unsupported.then(|| {
-                                view! {
-                                    <p class="settings-backend-note">
-                                        "Automatic setup is not available for this host platform. Use the docs link for manual setup steps."
-                                    </p>
-                                }
+                            {unsupported.then(|| view! {
+                                <p class="settings-backend-note">
+                                    "Automatic setup is not available for this host platform. Install it yourself and Tyde will pick it up on the next probe."
+                                </p>
                             })}
                         </div>
                     }
                     .into_any()
                 }
                 None => view! {
-                    <div class="settings-backend-setup">
+                    <div class="settings-backend-notes">
                         <p class="settings-backend-note">"Checking install status for this host…"</p>
                     </div>
                 }
                 .into_any(),
             }}
-
-            {move || has_settings_page().then(|| view! {
-                <div class="settings-backend-card-footer">
-                    <button
-                        class="settings-btn settings-backend-configure-btn"
-                        on:click=move |_| active_page.set(SettingsPage::Backend(kind))
-                    >
-                        {format!("Configure {name}")}
-                    </button>
-                </div>
-            })}
-
-            <BackendSubscriptionCapacity kind />
         </div>
     }
 }
@@ -11054,10 +11064,10 @@ mod wasm_tests {
     }
 
     /// The sidebar has a dedicated Backends group: a stable Overview entry, a
-    /// Launch Profiles page, plus one schema-derived item per configurable
-    /// backend. The overview page no longer renders any backend config fields
-    /// or the launch-profile editor; the configurable backend's card links to
-    /// its own settings page instead.
+    /// Usage page, a Launch Profiles page, plus one schema-derived item per
+    /// configurable backend. The overview page renders no backend config
+    /// fields and no launch-profile editor; navigation to a backend's own page
+    /// is the sidebar's job, so the overview row carries no duplicate link.
     #[wasm_bindgen_test]
     async fn backends_group_lists_schema_pages_and_overview_has_no_config_fields() {
         let container = make_container();
@@ -11125,16 +11135,21 @@ mod wasm_tests {
         overview.click();
         next_tick().await;
 
-        // The configurable backend's card links to its settings page.
-        find_button_by_text(&container, "Configure Hermes")
-            .expect("a configurable backend's card must offer a Configure action")
+        // The backend's own page is reached from the sidebar item, which is the
+        // single route to it: the enable row no longer duplicates the link.
+        assert!(
+            find_button_by_text(&container, "Configure Hermes").is_none(),
+            "the enable row must not duplicate the sidebar's route to the backend page"
+        );
+        find_button_by_text(&container, "Hermes")
+            .expect("the Backends group must list the configurable backend")
             .click();
         next_tick().await;
 
         assert_eq!(
             panel_title(&container),
             "Hermes",
-            "Configure must open the backend's own settings page"
+            "the sidebar item opens the backend's own settings page"
         );
         assert_eq!(
             container
@@ -11146,8 +11161,13 @@ mod wasm_tests {
         );
     }
 
+    /// Subscription capacity is account state, not backend-enablement state:
+    /// it lives on the dedicated Usage page and nowhere near the enable rows,
+    /// which are one line each so the list stays scannable. Usage reports every
+    /// backend the host has state for — including one with no capacity source,
+    /// because a missing row reads as "fine".
     #[wasm_bindgen_test]
-    async fn backend_cards_embed_subscription_capacity_and_hide_unsupported_backends() {
+    async fn capacity_lives_on_the_usage_page_not_the_backend_rows() {
         let container = make_container();
         let _handle = mount_to(container.clone(), move || {
             let state = AppState::new();
@@ -11203,44 +11223,63 @@ mod wasm_tests {
                     },
                 );
             });
+            state.settings_open.set(true);
             provide_context(state);
-            view! { <BackendsTab active_page=RwSignal::new(SettingsPage::Tab(SettingsTab::Backends)) /> }
+            view! { <SettingsPanel /> }
         });
         next_tick().await;
 
-        let cards = container
-            .query_selector_all(".settings-backend-card")
-            .expect("backend cards");
-        let mut claude_capacity = false;
-        let mut hermes_capacity = false;
-        for index in 0..cards.length() {
-            let card: HtmlElement = cards.item(index).unwrap().dyn_into().unwrap();
-            let text = card.text_content().unwrap_or_default();
-            let has_capacity = card
-                .query_selector(".capacity-card-embedded")
+        find_button_by_text(&container, "Overview")
+            .expect("the Backends group must have an Overview item")
+            .click();
+        next_tick().await;
+
+        let overview = container.text_content().unwrap_or_default();
+        assert_eq!(
+            container
+                .query_selector_all(".capacity-card")
                 .unwrap()
-                .is_some();
-            if text.contains("Claude") {
-                claude_capacity = has_capacity && text.contains("20% used");
-            }
-            if text.contains("Hermes") {
-                hermes_capacity = has_capacity;
-            }
-        }
-        assert!(
-            claude_capacity,
-            "Claude's subscription usage must be embedded in its backend card"
+                .length(),
+            0,
+            "no capacity block belongs on the Backends overview: {overview:?}"
         );
         assert!(
-            !hermes_capacity,
-            "backends without subscription capacity must render no capacity block"
+            !overview.contains("20% used"),
+            "and no capacity figure leaks into an enable row: {overview:?}"
+        );
+        // The row is the toggle plus what the host probe found — the terminal
+        // affordances the overview used to carry are gone.
+        assert!(
+            find_button_by_text(&container, "Sign in").is_none(),
+            "sign-in is a terminal task, not a settings row: {overview:?}"
+        );
+        assert_eq!(
+            container
+                .query_selector_all(".settings-backend-list a")
+                .unwrap()
+                .length(),
+            0,
+            "the per-backend docs links are gone: {overview:?}"
         );
         assert!(
-            !container
-                .text_content()
-                .unwrap_or_default()
-                .contains("Subscription capacity"),
-            "the old standalone subscription section must be removed"
+            overview.contains("Claude") && overview.contains("Hermes"),
+            "every backend still gets a row: {overview:?}"
+        );
+
+        find_button_by_text(&container, "Usage")
+            .expect("the Backends group must offer a Usage page")
+            .click();
+        next_tick().await;
+
+        assert_eq!(panel_title(&container), "Usage");
+        let usage = container.text_content().unwrap_or_default();
+        assert!(
+            usage.contains("session limit") && usage.contains("20% used"),
+            "Usage carries the vendor's reported bucket: {usage:?}"
+        );
+        assert!(
+            usage.contains("Hermes"),
+            "a backend with no capacity source is still reported, not hidden: {usage:?}"
         );
     }
 
