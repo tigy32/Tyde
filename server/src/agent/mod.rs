@@ -847,22 +847,39 @@ impl AgentActivityStatsTracker {
         usage: ModelRequestTokenUsage,
         source_seq: u64,
     ) -> bool {
-        if self.token_usage_tracking_mode != TokenUsageTrackingMode::ModelRequests {
-            return false;
-        }
         let previous = self.stats.clone();
-        self.token_usage_by_source.insert(
-            TokenUsageSource::ModelRequest(usage.request_id),
-            TaskTokenUsageScope::Known {
-                usage: Box::new(TaskTokenUsageAmount::from_token_usage(&usage.request)),
-            },
-        );
-        self.stats.token_usage = usage.cumulative;
+        let mut recorded = false;
+
+        // Token accounting belongs to whichever mode the backend reports in. A
+        // Messages-mode backend already accumulates its totals from message
+        // usage, and letting a request event overwrite `token_usage` there
+        // would replace measured totals with a second, partial view of the
+        // same turn.
+        if self.token_usage_tracking_mode == TokenUsageTrackingMode::ModelRequests {
+            self.token_usage_by_source.insert(
+                TokenUsageSource::ModelRequest(usage.request_id),
+                TaskTokenUsageScope::Known {
+                    usage: Box::new(TaskTokenUsageAmount::from_token_usage(&usage.request)),
+                },
+            );
+            self.stats.token_usage = usage.cumulative;
+            recorded = true;
+        }
+
+        // Occupancy is a measurement, not an accounting total: how full the
+        // window is, independent of how the backend's token counts are
+        // tracked. Gating it behind the accounting mode is what left every
+        // non-Codex backend unable to report it at all.
         if let Some(current) = usage.current_context_usage {
             self.stats.estimated_context_breakdown = usage
                 .estimated_context_breakdown
                 .filter(|estimate| context_estimate_matches(estimate, &current));
             self.stats.current_context_usage = Some(current);
+            recorded = true;
+        }
+
+        if !recorded {
+            return false;
         }
         self.stats.source_through_seq = Some(source_seq);
         self.stats != previous

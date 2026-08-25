@@ -33,9 +33,9 @@ use std::path::Path;
 use std::time::Duration;
 
 use protocol::{
-    AgentOrigin, BackendKind, ChatEvent, ContextCompactionStatus, MessageSender, MessageTokenUsage,
-    SessionId, TaskStatus, TokenUsage, ToolExecutionMode, ToolExecutionOutcome,
-    ToolExecutionResult, ToolRequestType,
+    AgentOrigin, BackendKind, ChatEvent, ContextCompactionStatus, CurrentContextUsage,
+    MessageSender, MessageTokenUsage, SessionId, TaskStatus, TokenUsage, ToolExecutionMode,
+    ToolExecutionOutcome, ToolExecutionResult, ToolRequestType,
 };
 use serde_json::Value;
 use tyde_agent_adapter::BackendCapability;
@@ -1289,6 +1289,7 @@ fn real_usage_accounting() {
         |mut host| async move {
             let declares_context_breakdown =
                 host.declares(BackendCapability::ContextBreakdownReported);
+            let declares_context_usage = host.declares(BackendCapability::ContextUsageReported);
             let agent = spawn_agent(&mut host, &launch_prompt()).await;
             let launched = collect_turn(&mut host, &agent, &launch_prompt()).await;
             assert_ready_handshake(&launched);
@@ -1312,6 +1313,7 @@ fn real_usage_accounting() {
                 assert_requests_sum_to_their_turn(turn);
             }
             assert_cumulative_never_shrinks(&turns);
+            assert_context_usage_capability_matches_behaviour(&turns, declares_context_usage);
             assert_context_breakdown_capability_matches_behaviour(
                 &turns,
                 declares_context_breakdown,
@@ -3704,6 +3706,86 @@ fn prompt_footprint(usage: &TokenUsage) -> u64 {
 
 /// Both directions of the context-breakdown capability, plus the one value the
 /// event stream can check against an independently normalized number.
+/// `ContextUsageReported` means "this backend can say how full its window is".
+///
+/// This is the check that was missing when Claude stopped publishing occupancy
+/// entirely: the capability had no assertion anywhere in the suite, so removing
+/// the only code that produced the evidence turned nothing red and shipped.
+///
+/// Occupancy reaches the client by two different routes, and the capability is
+/// about the *claim*, not the transport:
+///
+/// - on the agent's activity-stats frame, as `current_context_usage`
+///   (Claude, Codex) -- which is why [`Turn`] carries those snapshots, since
+///   this never rides on a `ChatEvent` and was therefore uncheckable;
+/// - on a message's `ContextBreakdown`, whose `input_tokens` and
+///   `context_window` state the same occupancy (Hermes).
+///
+/// An earlier version of this accepted only the first route and failed Hermes,
+/// which had in fact reported `input_tokens: 9349` of `context_window:
+/// 1048576` on three separate messages. Requiring one transport would have
+/// meant asserting how a backend must speak rather than what it must say. The
+/// guarantee is unchanged: a backend that declares this must report occupancy
+/// somewhere, which is exactly what Claude stopped doing.
+fn assert_context_usage_capability_matches_behaviour(turns: &[Turn], declared: bool) {
+    let mut known = 0usize;
+
+    for turn in turns {
+        for stats in turn.activity_stats() {
+            let Some(usage) = stats.current_context_usage.as_ref() else {
+                continue;
+            };
+            let CurrentContextUsage::Known {
+                input_tokens,
+                context_window,
+            } = usage
+            else {
+                // `Unknown` is a legitimate gap, not a claim about the window.
+                continue;
+            };
+            known += 1;
+            assert!(
+                declared,
+                "{}: reported context occupancy while declaring no ContextUsageReported \
+                 capability: {input_tokens} of {context_window}",
+                turn.label()
+            );
+            assert!(
+                *input_tokens > 0 && context_window >= input_tokens,
+                "{}: reported an impossible context occupancy: {input_tokens} of \
+                 {context_window}",
+                turn.label()
+            );
+        }
+
+        for message in turn.assistant_messages() {
+            let Some(breakdown) = message.context_breakdown.as_ref() else {
+                continue;
+            };
+            if breakdown.input_tokens == 0 {
+                continue;
+            }
+            known += 1;
+            assert!(
+                declared,
+                "{}: stated context occupancy on a message while declaring no \
+                 ContextUsageReported capability: {} of {}",
+                turn.label(),
+                breakdown.input_tokens,
+                breakdown.context_window
+            );
+        }
+    }
+
+    if declared {
+        assert!(
+            known > 0,
+            "backend declared ContextUsageReported but never reported a known context \
+             occupancy across the measured usage conversation, by either route"
+        );
+    }
+}
+
 fn assert_context_breakdown_capability_matches_behaviour(turns: &[Turn], declared: bool) {
     let mut breakdowns = 0usize;
     let mut usage_matches = 0usize;

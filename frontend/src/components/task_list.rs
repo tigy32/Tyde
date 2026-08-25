@@ -233,31 +233,16 @@ fn render_context_view(
                         ))
                         .unwrap_or_else(|| "Context usage unknown".to_owned())
                 >
-                    {metrics.as_ref().map(|m| {
-                        m.categories.iter().filter(|cat| cat.percent > 0.0).map(|cat| {
-                            // Explicitly presentational. A progressbar's
-                            // descendants are presentational per ARIA, so a
-                            // role/name here would not reach the accessibility
-                            // tree however it were written. The readable
-                            // breakdown lives in the sibling legend below;
-                            // `title` still serves a sighted pointer user.
-                            let name = format!("{}: {:.0}% of context", cat.label, cat.percent);
-                            view! {
-                                <span
-                                    class=format!("summary-context-segment {}", cat.css_class)
-                                    data-testid="context-segment"
-                                    aria-hidden="true"
-                                    title=name
-                                    style=format!("width: {:.2}%", cat.percent)
-                                ></span>
-                            }
-                        }).collect::<Vec<_>>()
-                    })}
+                    {metrics.as_ref().map(|m| render_bar_fill(m, has_detailed_breakdown))}
                 </div>
                 {(metrics.is_some() || task_list.is_some()).then(|| view! {
                     <div class="summary-context-meta">
                         {metrics.as_ref().map(|m| {
-                            render_breakdown_or_note(&m.categories, has_detailed_breakdown)
+                            if has_detailed_breakdown {
+                                render_context_legend(&m.categories).into_any()
+                            } else {
+                                ().into_any()
+                            }
                         })}
                         {task_list.map(|tasks| view! {
                             <button
@@ -274,6 +259,54 @@ fn render_context_view(
                 })}
             </div>
     }
+}
+
+/// Most backends report how full the window is but never what fills it. Drawing
+/// only attributed categories left those sessions with an empty track beside a
+/// real "40% of context" figure, which reads as an empty context window. Fill
+/// the measured occupancy in one neutral colour instead: it is the same
+/// measurement the header states, and no colour claims an attribution nobody
+/// reported.
+fn render_bar_fill(metrics: &ContextMetrics, has_detailed_breakdown: bool) -> AnyView {
+    if !has_detailed_breakdown {
+        if metrics.utilization_pct <= 0.0 {
+            return ().into_any();
+        }
+        return view! {
+            <span
+                class="summary-context-segment segment-occupied"
+                data-testid="context-occupancy"
+                aria-hidden="true"
+                title=format!("{:.0}% of the context window in use", metrics.utilization_pct)
+                style=format!("width: {:.2}%", metrics.utilization_pct)
+            ></span>
+        }
+        .into_any();
+    }
+
+    metrics
+        .categories
+        .iter()
+        .filter(|cat| cat.percent > 0.0)
+        .map(|cat| {
+            // Explicitly presentational. A progressbar's descendants are
+            // presentational per ARIA, so a role/name here would not reach the
+            // accessibility tree however it were written. The readable
+            // breakdown lives in the sibling legend below; `title` still serves
+            // a sighted pointer user.
+            let name = format!("{}: {:.0}% of context", cat.label, cat.percent);
+            view! {
+                <span
+                    class=format!("summary-context-segment {}", cat.css_class)
+                    data-testid="context-segment"
+                    aria-hidden="true"
+                    title=name
+                    style=format!("width: {:.2}%", cat.percent)
+                ></span>
+            }
+        })
+        .collect::<Vec<_>>()
+        .into_any()
 }
 
 fn context_breakdown_for_display(
@@ -493,29 +526,6 @@ fn build_task_hint_text(tasks: &[protocol::Task]) -> String {
     } else {
         format!("{completed}/{total} tasks done →")
     }
-}
-
-/// The legend when the backend attributed anything, and an explicit note when
-/// it did not. Rendering nothing in the second case left a real, non-zero
-/// occupancy with no explanation at all — for sighted and assistive-technology
-/// users alike — which reads as "no context in use" rather than "attribution
-/// was not reported".
-fn render_breakdown_or_note(categories: &[ContextCategory], has_detail: bool) -> AnyView {
-    if has_detail {
-        return render_context_legend(categories).into_any();
-    }
-    view! {
-        <div
-            class="summary-context-breakdown summary-context-breakdown-empty"
-            role="note"
-            data-testid="context-breakdown-unavailable"
-        >
-            <span class="context-breakdown-row">
-                "Breakdown unavailable \u{2014} this backend reported no context categories"
-            </span>
-        </div>
-    }
-    .into_any()
 }
 
 fn render_context_legend(categories: &[ContextCategory]) -> impl IntoView {
@@ -1334,10 +1344,24 @@ mod wasm_tests {
         );
     }
 
-    /// A breakdown with no reported categories draws no segments and claims no
-    /// legend, rather than attributing the occupancy to an arbitrary category.
+    /// Unattributed occupancy is drawn as one neutral fill, sized to the
+    /// measurement, and claims no category legend.
+    ///
+    /// This replaces `unattributed_context_draws_no_segment_and_no_legend`,
+    /// which asserted `segments().is_empty()` for this same input. That
+    /// assertion described a bar that rendered *nothing* for a 50%-full window:
+    /// the occupancy reached only `aria-valuenow` and a text note, so a sighted
+    /// user saw an empty track next to the header's "5.0K / 10.0K tokens
+    /// (50.0%)" — the empty-context reading the old test's own comment set out
+    /// to prevent. The contract it was reaching for was "no category colour may
+    /// claim occupancy nobody attributed", and that is preserved and sharpened
+    /// below: the fill must carry the neutral `segment-occupied` class, must be
+    /// the only segment, and must be sized to the measured percentage. The
+    /// count and width assertions are new; nothing the old test guaranteed has
+    /// been dropped except the note, which was removed deliberately because it
+    /// reads as a malfunction when a backend simply does not report categories.
     #[wasm_bindgen_test]
-    async fn unattributed_context_draws_no_segment_and_no_legend() {
+    async fn unattributed_context_draws_one_neutral_fill_and_no_legend() {
         let container = make_container();
         let _handle = mount_context(
             &container,
@@ -1353,26 +1377,35 @@ mod wasm_tests {
         );
         next_tick().await;
 
-        assert!(
-            segments(&container).is_empty(),
-            "nothing was attributed, so no slice may be drawn"
-        );
-
-        // Rendering nothing here left a real occupancy wholly unexplained. The
-        // absence of attribution is itself information and must be stated.
-        let note = container
-            .query_selector("[data-testid='context-breakdown-unavailable']")
-            .unwrap()
-            .expect("the missing-attribution state must be named, not blank");
-        let note_text = note.text_content().unwrap_or_default();
-        assert!(
-            note_text.contains("Breakdown unavailable"),
-            "the note must say attribution is missing, got: {note_text}"
-        );
+        let fills = container
+            .query_selector_all("[data-testid='context-occupancy']")
+            .unwrap();
         assert_eq!(
-            note.get_attribute("role").as_deref(),
-            Some("note"),
-            "the explanation must reach the accessibility tree"
+            fills.length(),
+            1,
+            "unattributed occupancy draws exactly one fill, not one per category"
+        );
+        let fill = fills
+            .item(0)
+            .unwrap()
+            .dyn_into::<web_sys::Element>()
+            .unwrap();
+        assert!(
+            fill.class_name().contains("segment-occupied"),
+            "the fill must be the neutral class, not a category colour, got: {}",
+            fill.class_name()
+        );
+        let width = fill.get_attribute("style").unwrap_or_default();
+        assert!(
+            width.contains("width: 50.00%"),
+            "the fill must be sized to the measured occupancy, got: {width}"
+        );
+        assert!(
+            container
+                .query_selector("[data-testid='context-segment']")
+                .unwrap()
+                .is_none(),
+            "no category slice may be drawn when nothing was attributed"
         );
         assert!(
             container

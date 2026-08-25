@@ -4944,6 +4944,12 @@ math merror {
     background: #bf69ff;
 }
 
+/* Occupancy without attribution. The app accent rather than a category colour:
+   the width is measured, the attribution is not, so no category may claim it. */
+.summary-context-segment.segment-occupied {
+    background: var(--accent-primary);
+}
+
 /* Context breakdown legend */
 .summary-context-meta {
     display: flex;
@@ -4959,13 +4965,6 @@ math merror {
     gap: 12px;
     min-width: 0;
     flex-wrap: nowrap;
-}
-
-/* The no-attribution note sits where the legend would be, and reads as an
-   absence rather than as a category. */
-.summary-context-breakdown-empty {
-    color: var(--text-tertiary);
-    font-style: italic;
 }
 
 .context-breakdown-row {

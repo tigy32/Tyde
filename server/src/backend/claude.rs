@@ -20,11 +20,11 @@ use protocol::{
     BackendAccessMode, CapacityBucket, CapacityBucketId, CapacityBucketStatus, CapacityCoverage,
     CapacityMeasure, CapacityReport, CapacityReset, CapacityScope, CapacitySource,
     CapacityUnavailableReason, CapacityWindow, ClaudeLimitType, ContextBreakdown,
-    ExitPlanModeDecision, ImageData, MessageTokenUsage, ModelInfo, ReasoningData,
-    SendMessageToolResponse, SessionId, TokenUsage, TokenUsageScope, TokenUsageUnavailableReason,
-    ToolExecutionMode, ToolExecutionOutcome, ToolExecutionResult, ToolPolicy, ToolProgressData,
-    ToolProgressUpdate, ToolRequestType, ToolUseData, ValueProvenance, WorkflowAgentState,
-    WorkflowAgentStatus, WorkflowRunState, WorkflowRunStatus,
+    CurrentContextUsage, ExitPlanModeDecision, ImageData, MessageTokenUsage, ModelInfo,
+    ReasoningData, SendMessageToolResponse, SessionId, TokenUsage, TokenUsageScope,
+    TokenUsageUnavailableReason, ToolExecutionMode, ToolExecutionOutcome, ToolExecutionResult,
+    ToolPolicy, ToolProgressData, ToolProgressUpdate, ToolRequestType, ToolUseData,
+    ValueProvenance, WorkflowAgentState, WorkflowAgentStatus, WorkflowRunState, WorkflowRunStatus,
 };
 
 use crate::agent::customization::SkillSelection;
@@ -1056,6 +1056,15 @@ struct ClaudeStdoutSummary {
     /// Sum of distinct API-call usages observed while relaying a native child.
     /// Claude does not consistently correlate a `result` frame to native children.
     accumulated_request_usage: Option<Value>,
+    /// The most recent per-request usage seen this invocation. Distinct from
+    /// `usage`, which a closing phase clears: the context window only arrives
+    /// with the `result` frame, by which point `usage` is already gone, so
+    /// occupancy could never be computed from the two together.
+    last_request_usage: Option<Value>,
+    /// Context window extracted from `result.modelUsage[model].contextWindow`.
+    /// The only place Claude Code reports the real window; without it there is
+    /// no denominator and no occupancy may be published.
+    result_context_window: Option<u64>,
     errors: Vec<String>,
     tool_calls: Vec<ClaudeToolCall>,
     seen_tool_ids: HashSet<String>,
@@ -4939,6 +4948,41 @@ impl ClaudeInner {
             turn_usage,
             cancelled,
         } = options;
+        let known_context_window = summary.result_context_window;
+        // Occupancy for the turn, published once the `result` frame has named
+        // the window. Claude reports no attribution, so no breakdown rides
+        // along -- the categories would have to be invented to fill one.
+        if let Some(current) =
+            claude_current_context_usage(summary.last_request_usage.as_ref(), known_context_window)
+        {
+            let request = summary
+                .last_request_usage
+                .clone()
+                .and_then(claude_token_usage)
+                .unwrap_or_default();
+            let turn = turn_usage
+                .as_ref()
+                .and_then(|usage| claude_token_usage(usage.turn.clone()))
+                .unwrap_or_else(|| request.clone());
+            let cumulative = turn_usage
+                .as_ref()
+                .and_then(|usage| usage.cumulative.clone())
+                .and_then(claude_token_usage)
+                .unwrap_or_else(|| turn.clone());
+            self.emitter
+                .model_request_token_usage(&protocol::ModelRequestTokenUsage {
+                    request_id: protocol::ModelRequestId {
+                        turn_id: protocol::ModelTurnId(turn_id.to_string()),
+                        sequence: 0,
+                    },
+                    request,
+                    turn,
+                    cumulative,
+                    model_context_window: known_context_window,
+                    current_context_usage: Some(current),
+                    estimated_context_breakdown: None,
+                });
+        }
         if let Some(phase) = take_phase_emission(summary) {
             let text = phase.text;
             let selected_model = phase.model.clone().or(model_hint);
@@ -9103,6 +9147,16 @@ fn consume_claude_stream_value_with_interrupt(
             if let Some(usage) = parse_token_usage(value.get("usage")) {
                 summary.result_turn_usage = Some(usage);
             }
+            // Extract contextWindow from result.modelUsage[model].contextWindow.
+            // This is the only place Claude Code reports the actual context window.
+            if let Some(model_usage) = value.get("modelUsage").and_then(Value::as_object) {
+                let preferred_model = value
+                    .get("model")
+                    .and_then(Value::as_str)
+                    .or(summary.model.as_deref());
+                summary.result_context_window =
+                    extract_context_window_from_model_usage(model_usage, preferred_model);
+            }
             let is_error = value
                 .get("is_error")
                 .and_then(Value::as_bool)
@@ -9304,6 +9358,7 @@ fn consume_assistant_message(
     }
 
     if let Some(usage) = next_usage {
+        summary.last_request_usage = Some(usage.clone());
         summary.usage = Some(usage);
     }
 
@@ -9870,6 +9925,7 @@ fn consume_stream_event(
                     .get("message")
                     .and_then(|message| message.get("usage")),
             ) {
+                summary.last_request_usage = Some(usage.clone());
                 summary.usage = Some(usage);
             }
             if let Some(message_id) = next_message_id {
@@ -9886,6 +9942,7 @@ fn consume_stream_event(
         }
         "message_delta" => {
             if let Some(usage) = parse_token_usage(event.get("usage")) {
+                summary.last_request_usage = Some(usage.clone());
                 summary.usage = Some(usage);
             }
         }
@@ -10377,6 +10434,107 @@ fn parse_token_usage(raw: Option<&Value>) -> Option<Value> {
             .unwrap_or(0),
         "context_window": context_window,
     }))
+}
+
+fn normalize_model_key_for_context_lookup(model: &str) -> String {
+    strip_context_window_suffix(model.trim()).to_ascii_lowercase()
+}
+
+fn strip_context_window_suffix(model: &str) -> &str {
+    model.strip_suffix("[1m]").unwrap_or(model)
+}
+
+fn claude_model_family_hint(model: &str) -> Option<&'static str> {
+    let normalized = normalize_model_key_for_context_lookup(model);
+    if normalized.contains("opus") {
+        return Some("opus");
+    }
+    if normalized.contains("sonnet") {
+        return Some("sonnet");
+    }
+    if normalized.contains("haiku") {
+        return Some("haiku");
+    }
+    None
+}
+
+fn extract_context_window_from_model_usage_entry(entry: &Value) -> Option<u64> {
+    entry
+        .get("contextWindow")
+        .or_else(|| entry.get("context_window"))
+        .and_then(Value::as_u64)
+        .filter(|window| *window > 0)
+}
+
+fn extract_context_window_from_model_usage(
+    model_usage: &serde_json::Map<String, Value>,
+    preferred_model: Option<&str>,
+) -> Option<u64> {
+    let with_window = model_usage
+        .iter()
+        .filter_map(|(model, entry)| {
+            extract_context_window_from_model_usage_entry(entry).map(|window| (model, window))
+        })
+        .collect::<Vec<_>>();
+
+    if with_window.is_empty() {
+        return None;
+    }
+
+    if let Some(model) = preferred_model {
+        let preferred = normalize_model_key_for_context_lookup(model);
+        if let Some((_, window)) = with_window
+            .iter()
+            .copied()
+            .find(|(model_key, _)| normalize_model_key_for_context_lookup(model_key) == preferred)
+        {
+            return Some(window);
+        }
+
+        if let Some(family) = claude_model_family_hint(model)
+            && let Some((_, window)) = with_window.iter().copied().find(|(model_key, _)| {
+                normalize_model_key_for_context_lookup(model_key).contains(family)
+            })
+        {
+            return Some(window);
+        }
+    }
+
+    if with_window.len() == 1 {
+        return Some(with_window[0].1);
+    }
+
+    with_window.first().map(|(_, window)| *window)
+}
+
+/// How full the context window is, measured -- and nothing about what fills it.
+///
+/// Claude reports the occupancy and never the attribution, so it declares
+/// `ContextUsageReported` and not `ContextBreakdownReported`. Inventing
+/// categories to fill a breakdown is what this replaces; publishing nothing at
+/// all is what removed the context panel entirely.
+///
+/// The occupied figure is the whole prompt, cached prefix included -- the same
+/// sum Codex publishes. Claude bills `input_tokens` as only the uncached
+/// remainder, so a 160k-token prompt reports `input_tokens: 2` and would read
+/// as an empty window if taken alone.
+fn claude_current_context_usage(
+    usage: Option<&Value>,
+    context_window: Option<u64>,
+) -> Option<CurrentContextUsage> {
+    let usage = usage?;
+    let context_window = context_window.filter(|window| *window > 0)?;
+    let field = |key: &str| usage.get(key).and_then(Value::as_u64).unwrap_or(0);
+    let input_tokens = field("input_tokens")
+        .saturating_add(field("cached_prompt_tokens"))
+        .saturating_add(field("cache_creation_input_tokens"));
+    if input_tokens == 0 {
+        return None;
+    }
+    Some(CurrentContextUsage::Known {
+        input_tokens,
+        context_window,
+    })
 }
 
 fn usage_value_u64(usage: &Value, key: &str) -> u64 {
@@ -13319,6 +13477,18 @@ async fn forward_claude_backend_event(
     }
 
     match raw.get("kind").and_then(Value::as_str).unwrap_or_default() {
+        "ModelRequestTokenUsage" => {
+            let Some(data) = raw.get("data") else {
+                return true;
+            };
+            if let Ok(usage) =
+                serde_json::from_value::<protocol::ModelRequestTokenUsage>(data.clone())
+            {
+                return events_tx
+                    .send(BackendEvent::ModelRequestTokenUsage(usage))
+                    .is_ok();
+            }
+        }
         "BackendCompaction" => {
             let Some(data) = raw.get("data") else {
                 return true;
@@ -13718,6 +13888,10 @@ impl Backend for ClaudeBackend {
             tyde_agent_adapter::BackendCapability::GenericOtherTool,
             tyde_agent_adapter::BackendCapability::CapacityTelemetry,
             tyde_agent_adapter::BackendCapability::RetryTelemetry,
+            // Occupancy only. Claude reports how full the window is, in
+            // `result.modelUsage[model].contextWindow`, and never reports what
+            // fills it -- so deliberately no `ContextBreakdownReported`.
+            tyde_agent_adapter::BackendCapability::ContextUsageReported,
         ]
         .into()
     }

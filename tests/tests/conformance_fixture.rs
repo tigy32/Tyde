@@ -17,9 +17,10 @@ use std::time::Duration;
 
 use futures_util::FutureExt;
 use protocol::{
-    AgentBootstrapEvent, AgentBootstrapPayload, AgentCompactPayload, AgentErrorPayload, AgentId,
-    AgentStartPayload, AskUserQuestion, BackendKind, ChatEvent, ChatMessage, ChatMessageId,
-    ClientErrorPayload, ContextCompactionNotifyPayload, ContextCompactionTimelineEvent, Envelope,
+    AgentActivityStats, AgentActivityStatsPayload, AgentBootstrapEvent, AgentBootstrapPayload,
+    AgentCompactPayload, AgentErrorPayload, AgentId, AgentStartPayload, AskUserQuestion,
+    BackendKind, ChatEvent, ChatMessage, ChatMessageId, ClientErrorPayload,
+    ContextCompactionNotifyPayload, ContextCompactionTimelineEvent, Envelope,
     FetchSessionHistoryPayload, FrameKind, HistoryPageRequestId, ListSessionsPayload,
     McpServerConfig, McpServerId, McpServerUpsertPayload, McpTransportConfig,
     MessageMetadataUpdateData, MessageSender, MessageTokenUsage, NewAgentPayload,
@@ -143,9 +144,18 @@ pub struct Turn {
     backend: BackendKind,
     prompt: String,
     events: Vec<ChatEvent>,
+    /// Activity-stats snapshots seen while this turn ran. Some evidence never
+    /// rides on a `ChatEvent` -- `current_context_usage` is reported on the
+    /// agent's stats frame -- so a turn that only collected chat events could
+    /// not assert on it at all.
+    activity_stats: Vec<AgentActivityStats>,
 }
 
 impl Turn {
+    pub fn activity_stats(&self) -> &[AgentActivityStats] {
+        &self.activity_stats
+    }
+
     pub fn backend(&self) -> BackendKind {
         self.backend
     }
@@ -754,6 +764,7 @@ pub async fn collect_turn(host: &mut Host, agent: &Agent, prompt: &str) -> Turn 
     let label = backend_label(backend);
     let context = format!("{label} turn for prompt {prompt:?}");
     let mut events = Vec::new();
+    let mut activity_stats = Vec::new();
     let mut saw_echo = false;
     let mut saw_stream_end = false;
 
@@ -762,6 +773,13 @@ pub async fn collect_turn(host: &mut Host, agent: &Agent, prompt: &str) -> Turn 
         let envelope = host.next_envelope(Duration::from_secs(240), &context).await;
         fail_on_agent_error(&envelope, &context);
         if envelope.stream != agent.stream {
+            continue;
+        }
+
+        if envelope.kind == FrameKind::AgentActivityStats {
+            let payload: AgentActivityStatsPayload =
+                envelope.parse_payload().expect("parse AgentActivityStats");
+            activity_stats.push(payload.stats);
             continue;
         }
 
@@ -793,6 +811,7 @@ pub async fn collect_turn(host: &mut Host, agent: &Agent, prompt: &str) -> Turn 
                     backend,
                     prompt: prompt.to_owned(),
                     events,
+                    activity_stats,
                 };
             }
         }
@@ -970,11 +989,13 @@ pub async fn delegate(
             backend,
             prompt: prompt.to_owned(),
             events: parent_events,
+            activity_stats: Vec::new(),
         },
         child: Turn {
             backend,
             prompt: child_prompt.to_owned(),
             events: child_events,
+            activity_stats: Vec::new(),
         },
         // `child_idle` cannot be set before the child exists.
         child_agent: child_agent.expect("a child that ran a turn was created"),
@@ -1213,6 +1234,7 @@ pub async fn collect_until_idle(host: &mut Host, agent: &Agent, label: &str) -> 
                     backend,
                     prompt: label.to_owned(),
                     events,
+                    activity_stats: Vec::new(),
                 };
             }
         }
@@ -1423,6 +1445,7 @@ pub async fn interrupt_turn(
             backend,
             prompt: prompt.to_owned(),
             events,
+            activity_stats: Vec::new(),
         },
         settled_in,
     }

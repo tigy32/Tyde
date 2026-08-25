@@ -375,23 +375,27 @@ pub fn ChatView(
     let current_context_usage: Signal<Option<protocol::CurrentContextUsage>> =
         Signal::derive(move || {
             let active = agent_ref.get()?;
+            // Occupancy reported out-of-band, on the agent's activity stats
+            // rather than on a message. Keyed on the data being there and not
+            // on which backend produced it: Codex was simply the first to
+            // report this way, and hardcoding it meant a second backend that
+            // did the same was ignored and rendered no context panel at all.
+            let reported_out_of_band = state.agent_activity_stats.with(|stats| {
+                stats
+                    .get(&crate::state::ActiveAgentRef {
+                        host_id: active.host_id,
+                        agent_id: active.agent_id,
+                    })
+                    .and_then(|stats| stats.current_context_usage.clone())
+            });
+            if let Some(usage) = reported_out_of_band {
+                return Some(usage);
+            }
             if current_agent
                 .get()
                 .is_some_and(|agent| agent.backend_kind == BackendKind::Codex)
             {
-                return Some(
-                    state
-                        .agent_activity_stats
-                        .with(|stats| {
-                            stats
-                                .get(&crate::state::ActiveAgentRef {
-                                    host_id: active.host_id,
-                                    agent_id: active.agent_id,
-                                })
-                                .and_then(|stats| stats.current_context_usage.clone())
-                        })
-                        .unwrap_or(protocol::CurrentContextUsage::Unknown),
-                );
+                return Some(protocol::CurrentContextUsage::Unknown);
             }
 
             // Backends that report occupancy per message have ordinary gaps —
