@@ -4181,6 +4181,10 @@ kbd {
     display: flex;
     align-items: center;
     justify-content: center;
+    /* Flex centering alone leaves the glyph ~0.6-0.9px low: WebKit's UA button
+       padding is asymmetric (2px top, 3px bottom) and the multiplication sign's
+       ink sits below the line box's centre. Measured at 10x in both engines. */
+    padding: 0 0 2px;
     background: transparent;
     color: var(--text-secondary);
     border: 1px solid var(--border-secondary);
