@@ -502,42 +502,40 @@ pub fn ToolCardView(
     };
 
     let is_ask_user_question = matches!(tool_type, ToolRequestType::AskUserQuestion { .. });
+    let is_exit_plan_mode = matches!(tool_type, ToolRequestType::ExitPlanMode { .. });
     let body_tool_type = tool_type.clone();
     let body_outcome = result.as_ref().map(|r| r.outcome.clone());
     let body_tool_type_slot = StoredValue::new_local(body_tool_type);
     let body_outcome_slot = StoredValue::new_local(body_outcome);
     let malformed_payload_slot = StoredValue::new_local(malformed_payload);
     let tool_call_id_slot = StoredValue::new_local(tool_call_id);
-    let details_open = RwSignal::new(
-        is_ask_user_question
-            || !has_result
-            || !result_success
-            || normalization_failed
-            || background_running.get_untracked(),
-    );
-    let default_open_for_body = move || {
-        is_ask_user_question
-            || !has_result
-            || !result_success
-            || normalization_failed
-            || background_running.get()
-            || tool_output_mode.get() != ToolOutputMode::Summary
-    };
-    let default_open_for_prop = move || {
-        is_ask_user_question
-            || !has_result
-            || !result_success
-            || normalization_failed
-            || background_running.get()
-            || tool_output_mode.get() != ToolOutputMode::Summary
-    };
-    let render_body_when = move || default_open_for_body() || details_open.get();
+    // An approval-gated card *is* its own interaction surface: collapsed, a
+    // question is unanswerable and a plan unapprovable, so those two ignore the
+    // mode default. Malformed drift is separately pinned open in `on:toggle`.
+    let always_open = is_ask_user_question || is_exit_plan_mode || normalization_failed;
+    // `Full` opens; `Compact` and `Summary` start at the header line. Nothing
+    // here reads live progress: the running/failed state used to feed this and
+    // re-asserted the default on every progress tick, which reopened a card the
+    // user had collapsed mid-run.
+    let mode_default_open = move || always_open || tool_output_mode.get() == ToolOutputMode::Full;
+    // `None` until the user works the disclosure themselves, after which their
+    // choice outranks the default until the output mode changes under them.
+    let user_open: RwSignal<Option<bool>> = RwSignal::new(None);
+    Effect::new(move |_| {
+        tool_output_mode.track();
+        user_open.set(None);
+    });
+    let card_open = move || user_open.get().unwrap_or_else(mode_default_open);
+    // A collapsed body still renders (and stays mounted across a toggle) so a
+    // card keeps its "Show more" and draft-feedback state; `<details>` owns
+    // the hiding. `Summary` has no body to render until it is opened.
+    let render_body_when = move || tool_output_mode.get() != ToolOutputMode::Summary || card_open();
 
     view! {
         <details
             class=if normalization_failed { "tool-card tool-card-malformed" } else { "tool-card" }
             aria-label=normalization_failed.then_some("Tool failed: canonical data could not be normalized")
-            prop:open=default_open_for_prop
+            prop:open=card_open
             on:toggle=move |ev: leptos::ev::Event| {
                 if let Some(target) = ev.target()
                     && let Ok(el) = target.dyn_into::<web_sys::HtmlDetailsElement>()
@@ -545,7 +543,7 @@ pub fn ToolCardView(
                     if normalization_failed && !el.open() {
                         el.set_open(true);
                     }
-                    details_open.set(el.open());
+                    user_open.set(Some(el.open()));
                 }
             }
         >
@@ -1527,6 +1525,160 @@ mod live_card_wasm_tests {
         assert!(body.contains("claude-a.txt") && body.contains("claude-b.txt"));
     }
 
+    /// A running `RunCommand` card, which is what the disclosure default is
+    /// most visible on: its body while running only re-prints the command the
+    /// header already shows.
+    fn running_command_entry() -> ToolRequestEntry {
+        ToolRequestEntry {
+            tool_name: "Bash".to_owned(),
+            request: ToolRequest {
+                tool_call_id: "toolu_run".to_owned(),
+                tool_type: ToolRequestType::RunCommand {
+                    command: "./dev.sh check".to_owned(),
+                    working_directory: "/tmp".to_owned(),
+                },
+            },
+            result: None,
+        }
+    }
+
+    fn card_details(container: &HtmlElement) -> web_sys::HtmlDetailsElement {
+        container
+            .query_selector("details.tool-card")
+            .expect("query card")
+            .expect("tool card present")
+            .dyn_into::<web_sys::HtmlDetailsElement>()
+            .expect("details element")
+    }
+
+    /// Drive the disclosure the way a click does: set `open` and let the
+    /// `toggle` handler record it as the user's own choice.
+    fn set_card_open(container: &HtmlElement, open: bool) {
+        let details = card_details(container);
+        details.set_open(open);
+        details
+            .dispatch_event(&web_sys::Event::new("toggle").expect("toggle event"))
+            .expect("dispatch toggle");
+    }
+
+    /// The output mode owns the disclosure default: `Compact` is a header line
+    /// until asked otherwise, `Full` is open. Running is not an input — a card
+    /// that is still working looks the same as one that finished.
+    #[wasm_bindgen_test]
+    async fn output_mode_owns_the_disclosure_default() {
+        let (container, state) = mount_card(running_command_entry(), None);
+        next_tick().await;
+        assert!(
+            !card_details(&container).open(),
+            "a running card in Compact stays at its header line"
+        );
+
+        state.tool_output_mode.set(ToolOutputMode::Full);
+        next_tick().await;
+        assert!(
+            card_details(&container).open(),
+            "Full opens the same running card"
+        );
+
+        state.tool_output_mode.set(ToolOutputMode::Compact);
+        next_tick().await;
+        assert!(
+            !card_details(&container).open(),
+            "switching back to Compact collapses it again"
+        );
+    }
+
+    /// Regression lock: the disclosure used to be re-asserted from live
+    /// progress, so a card the user opened (or collapsed) mid-run snapped back
+    /// to the default on the next progress snapshot. Progress must not move it.
+    #[wasm_bindgen_test]
+    async fn progress_ticks_never_override_the_user_disclosure() {
+        let entry = completed_other_request("toolu_wf", "Workflow");
+        let (container, state) =
+            mount_card(entry, Some(workflow_progress(WorkflowRunStatus::Running)));
+        next_tick().await;
+
+        set_card_open(&container, true);
+        next_tick().await;
+        assert!(card_details(&container).open(), "the user opened the card");
+
+        let key = (chat_agent_ref().agent_id, ToolCallId("toolu_wf".to_owned()));
+        let signal = state
+            .tool_progress
+            .with_untracked(|map| map.get(&key).cloned())
+            .expect("progress signal");
+        for _ in 0..3 {
+            signal.set(workflow_progress(WorkflowRunStatus::Running));
+            next_tick().await;
+        }
+        assert!(
+            card_details(&container).open(),
+            "progress snapshots leave the opened card open"
+        );
+
+        set_card_open(&container, false);
+        next_tick().await;
+        for _ in 0..3 {
+            signal.set(workflow_progress(WorkflowRunStatus::Running));
+            next_tick().await;
+        }
+        assert!(
+            !card_details(&container).open(),
+            "and a card the user collapsed mid-run stays collapsed"
+        );
+
+        // The run ending is still not a reason to reopen it.
+        signal.set(workflow_progress(WorkflowRunStatus::Completed));
+        next_tick().await;
+        assert!(
+            !card_details(&container).open(),
+            "completion does not reopen it either"
+        );
+        assert_eq!(tool_header_status(&container), "Done");
+    }
+
+    /// Approval-gated cards are the exception, in every mode: collapsed, the
+    /// question has no answer buttons and the plan has no approve button.
+    #[wasm_bindgen_test]
+    async fn approval_cards_open_regardless_of_mode() {
+        let entry = ToolRequestEntry {
+            tool_name: "AskUserQuestion".to_owned(),
+            request: ToolRequest {
+                tool_call_id: "toolu_ask".to_owned(),
+                tool_type: ToolRequestType::AskUserQuestion {
+                    questions: vec![protocol::AskUserQuestion {
+                        id: None,
+                        question: "Which language?".to_owned(),
+                        header: Some("Lang".to_owned()),
+                        multi_select: false,
+                        options: vec![protocol::AskUserQuestionOption {
+                            label: "Rust".to_owned(),
+                            description: Some("systems".to_owned()),
+                        }],
+                    }],
+                },
+            },
+            result: None,
+        };
+        let (container, state) = mount_card(entry, None);
+        for mode in [
+            ToolOutputMode::Summary,
+            ToolOutputMode::Compact,
+            ToolOutputMode::Full,
+        ] {
+            state.tool_output_mode.set(mode);
+            next_tick().await;
+            assert!(
+                card_details(&container).open(),
+                "an unanswered question is reachable in {mode:?}"
+            );
+            assert!(
+                text(&container).contains("Which language?"),
+                "and its question renders in {mode:?}"
+            );
+        }
+    }
+
     #[wasm_bindgen_test]
     async fn background_command_header_uses_actual_command_not_summary() {
         let tool_call_id = "tool-background";
@@ -2343,9 +2495,9 @@ mod live_card_wasm_tests {
         }
     }
 
-    /// Force the card's disclosure open. In `Summary` a completed, successful
-    /// card is collapsed by default (true of every tool), so the body has to be
-    /// opened before its contents can be asserted on.
+    /// Force the card's disclosure open. Only `Full` opens a card by default
+    /// (true of every tool bar the approval-gated ones), so `Summary` and
+    /// `Compact` bodies have to be opened before asserting on their contents.
     fn open_card(container: &HtmlElement) {
         let details = container
             .query_selector("details.tool-card")
