@@ -5,10 +5,10 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use protocol::{
-    ACP_BACKEND, BackendKind, CompactionMethod, CompactionMetrics, CompactionMutation,
-    CompactionOperationId, CompactionTrigger, CustomAgentId, KIRO_LAUNCH_PROFILE_ID,
-    LEGACY_KIRO_BACKEND, LaunchProfileId, ProjectId, SessionId, SessionListScope,
-    SessionSettingsValues, SessionSummary, TaskList,
+    BackendKind, CompactionMethod, CompactionMetrics, CompactionMutation, CompactionOperationId,
+    CompactionTrigger, CustomAgentId, KIRO_BACKEND, KIRO_LAUNCH_PROFILE_ID, LEGACY_ACP_BACKEND,
+    LaunchProfileId, ProjectId, SessionId, SessionListScope, SessionSettingsValues, SessionSummary,
+    TaskList,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -868,24 +868,38 @@ impl SessionStore {
             let Some(record) = record.as_object_mut() else {
                 continue;
             };
-            if record.get("backend_kind").and_then(Value::as_str) != Some(LEGACY_KIRO_BACKEND) {
-                continue;
+            // Two legacy shapes converge here, and each needs a different
+            // half of the fix. A record spelled `acp` was written after the
+            // backend was named for the protocol: it already carries a launch
+            // profile, and only the spelling is stale. A record spelled `kiro`
+            // predates that rename entirely: the spelling is canonical again,
+            // but it was written before the built-in profile existed, so it is
+            // the one that needs the profile filled in. Doing both to both
+            // would hand the built-in Kiro profile to a modern record whose
+            // custom profile was deliberately removed.
+            match record.get("backend_kind").and_then(Value::as_str) {
+                Some(LEGACY_ACP_BACKEND) => {
+                    record.insert(
+                        "backend_kind".to_string(),
+                        Value::String(KIRO_BACKEND.to_string()),
+                    );
+                    changed = true;
+                }
+                Some(KIRO_BACKEND) => {
+                    let needs_profile = !matches!(
+                        record.get("launch_profile_id"),
+                        Some(Value::String(existing)) if !existing.trim().is_empty()
+                    );
+                    if needs_profile {
+                        record.insert(
+                            "launch_profile_id".to_string(),
+                            Value::String(KIRO_LAUNCH_PROFILE_ID.to_string()),
+                        );
+                        changed = true;
+                    }
+                }
+                _ => continue,
             }
-            record.insert(
-                "backend_kind".to_string(),
-                Value::String(ACP_BACKEND.to_string()),
-            );
-            let needs_profile = !matches!(
-                record.get("launch_profile_id"),
-                Some(Value::String(existing)) if !existing.trim().is_empty()
-            );
-            if needs_profile {
-                record.insert(
-                    "launch_profile_id".to_string(),
-                    Value::String(KIRO_LAUNCH_PROFILE_ID.to_string()),
-                );
-            }
-            changed = true;
         }
 
         if changed {

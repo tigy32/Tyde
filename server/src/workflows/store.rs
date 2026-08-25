@@ -111,9 +111,9 @@ fn read_from_disk(path: &Path) -> Result<HashMap<WorkflowRunId, WorkflowRunSnaps
                 )
             })?;
             // A coordinator spec persists a typed `BackendKind`, so a run
-            // recorded against the old `"kiro"` name would fail the whole file
-            // and take every other run's history with it.
-            crate::store::legacy_backend_kind::rewrite_legacy_kiro_backend_kinds(&mut value);
+            // recorded against the old `"acp"` name is normalized here rather
+            // than being written back out in the stale spelling forever.
+            crate::store::legacy_backend_kind::rewrite_legacy_acp_backend_kinds(&mut value);
             let store: StoreFile = serde_json::from_value(value).map_err(|err| {
                 format!(
                     "failed to parse workflow run store {}: {err}",

@@ -400,10 +400,11 @@ impl AgentsViewPreferencesStore {
                 ),
             )
         })?;
-        // Saved filters and smart views hold `Vec<BackendKind>`, which rejects
-        // the legacy `"kiro"` spelling outright — without this rename the whole
-        // store reads as corrupt and the user loses every saved view.
-        crate::store::legacy_backend_kind::rewrite_legacy_kiro_backend_kinds(&mut value);
+        // Saved filters and smart views hold `Vec<BackendKind>`. The legacy
+        // `"acp"` spelling parses through a serde alias, but without this
+        // rename the store would keep rewriting it back out and hold two
+        // spellings of one kind forever.
+        crate::store::legacy_backend_kind::rewrite_legacy_acp_backend_kinds(&mut value);
         // Same failure mode for the origin filter: `Vec<AgentOrigin>` rejects
         // the removed `"side_question"` spelling and takes every saved view
         // down with it.

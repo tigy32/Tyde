@@ -1150,6 +1150,56 @@ fn invalid_persisted_default_backend_is_rejected() {
     );
 }
 
+/// The Kiro backend has been persisted under two names: `kiro` before it was
+/// renamed for the protocol it speaks, then `acp`. `kiro` is canonical again,
+/// so a store written by *either* released build has to load and normalize onto
+/// it — including the map keys and launch profiles, which are separate code
+/// paths from the backend list.
+#[test]
+fn the_legacy_acp_backend_spelling_is_migrated_to_kiro() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let path = dir.path().join("settings.json");
+    fs::write(
+        &path,
+        r#"{
+  "settings": {
+    "enabled_backends": ["acp", "claude"],
+    "default_backend": "acp",
+    "backend_tier_configs": { "acp": { "low": { "model": { "string": "haiku" } } } }
+  }
+}"#,
+    )
+    .expect("write settings store");
+
+    let store = HostSettingsStore::load(path.clone()).expect("load settings store");
+    let settings = store.get().expect("read canonicalized settings");
+
+    assert_eq!(
+        settings.enabled_backends,
+        vec![BackendKind::Kiro, BackendKind::Claude],
+        "the legacy acp spelling must load as the Kiro backend"
+    );
+    assert_eq!(settings.default_backend, Some(BackendKind::Kiro));
+    // A map keyed by backend kind is a separate code path from the list, and
+    // the one that silently loses data: an unmigrated key is dropped as an
+    // unknown backend rather than failing the load.
+    assert!(
+        settings
+            .backend_tier_configs
+            .contains_key(&BackendKind::Kiro),
+        "the per-backend tier-config map is keyed by kind and must migrate too, got: {:?}",
+        settings.backend_tier_configs.keys().collect::<Vec<_>>()
+    );
+
+    // The rename is persisted, not just applied in memory: the next build to
+    // read this file must not have to migrate it again.
+    let on_disk = fs::read_to_string(&path).expect("re-read settings store");
+    assert!(
+        on_disk.contains("\"kiro\"") && !on_disk.contains("\"acp\""),
+        "the store must be rewritten in the canonical spelling, got: {on_disk}"
+    );
+}
+
 #[test]
 fn persisted_backend_lists_are_canonicalized_but_not_defaulted() {
     let dir = tempfile::tempdir().expect("create tempdir");

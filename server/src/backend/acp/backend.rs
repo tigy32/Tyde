@@ -1045,7 +1045,7 @@ impl KiroInner {
                         .cloned()
                         .unwrap_or_default(),
                     "message_count": Value::Null,
-                    "backend_kind": protocol::ACP_BACKEND,
+                    "backend_kind": protocol::KIRO_BACKEND,
                 })
             })
             .collect::<Vec<_>>();

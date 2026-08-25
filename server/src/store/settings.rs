@@ -3,7 +3,7 @@ use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::{collections::BTreeMap, mem};
 
-use protocol::{ACP_BACKEND, BackendKind, BrokerUrl, LEGACY_KIRO_BACKEND, LaunchProfileId};
+use protocol::{BackendKind, BrokerUrl, KIRO_BACKEND, LEGACY_ACP_BACKEND, LaunchProfileId};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use settings_model::{
@@ -309,16 +309,18 @@ impl HostSettingsStore {
         Ok(())
     }
 
-    /// Rename the retired `kiro` backend kind to `acp`.
+    /// Normalize the Kiro backend kind onto its canonical `kiro` spelling.
     ///
-    /// Kiro stopped being a backend of its own and became the built-in
-    /// `acp:kiro` launch profile. Every place the old kind was persisted is
-    /// rewritten here: the enabled list, the default, the tier-config and
-    /// backend-config maps (keyed by kind), and any user launch profile that
-    /// targeted it.
+    /// Two legacy spellings exist. `kiro` is what the kind was called before it
+    /// was renamed for the protocol it speaks; `acp` is what it was called
+    /// after. `kiro` is canonical again, so the `acp` spelling is rewritten
+    /// everywhere it was persisted: the enabled list, the default, the
+    /// tier-config and backend-config maps (keyed by kind), and any user launch
+    /// profile that targeted it.
     ///
-    /// A migrated launch profile also gains the Kiro agent spec, because an
-    /// `acp` profile without one fails validation.
+    /// A profile still on the older `kiro` spelling gains the Kiro agent spec,
+    /// because it predates the spec and a Kiro profile without one fails
+    /// validation.
     fn migrate_legacy_kiro_settings(path: &Path) -> Result<(), String> {
         let contents = match std::fs::read_to_string(path) {
             Ok(contents) => contents,
@@ -345,12 +347,12 @@ impl HostSettingsStore {
             .and_then(Value::as_array_mut)
         {
             for backend in enabled.iter_mut() {
-                if backend.as_str() == Some(LEGACY_KIRO_BACKEND) {
-                    *backend = Value::String(ACP_BACKEND.to_string());
+                if backend.as_str() == Some(LEGACY_ACP_BACKEND) {
+                    *backend = Value::String(KIRO_BACKEND.to_string());
                     changed = true;
                 }
             }
-            // `kiro` and `acp` could both be present if a profile was already
+            // `acp` and `kiro` could both be present if a profile was already
             // added by hand; collapse the duplicate rather than persisting it.
             let mut seen = std::collections::HashSet::new();
             let before = enabled.len();
@@ -361,21 +363,23 @@ impl HostSettingsStore {
             changed |= enabled.len() != before;
         }
 
-        if settings.get("default_backend").and_then(Value::as_str) == Some(LEGACY_KIRO_BACKEND) {
+        if settings.get("default_backend").and_then(Value::as_str) == Some(LEGACY_ACP_BACKEND) {
             settings.insert(
                 "default_backend".to_string(),
-                Value::String(ACP_BACKEND.to_string()),
+                Value::String(KIRO_BACKEND.to_string()),
             );
             changed = true;
         }
 
         for map_key in ["backend_tier_configs", "backend_config"] {
             if let Some(map) = settings.get_mut(map_key).and_then(Value::as_object_mut)
-                && let Some(existing) = map.remove(LEGACY_KIRO_BACKEND)
+                && let Some(newer) = map.remove(LEGACY_ACP_BACKEND)
             {
-                // A pre-existing `acp` entry was written deliberately by a
-                // newer build; don't let the legacy value clobber it.
-                map.entry(ACP_BACKEND.to_string()).or_insert(existing);
+                // Precedence is the other way round from the previous rename:
+                // an `acp` entry is the *newer* of the two spellings, so it
+                // wins over a `kiro` entry left behind by a build old enough to
+                // predate the first rename.
+                map.insert(KIRO_BACKEND.to_string(), newer);
                 changed = true;
             }
         }
@@ -390,18 +394,27 @@ impl HostSettingsStore {
                 let Some(profile) = profile.as_object_mut() else {
                     continue;
                 };
-                if profile.get("backend_kind").and_then(Value::as_str) != Some(LEGACY_KIRO_BACKEND)
-                {
-                    continue;
+                // Same split as the session store: `acp` needs only the
+                // spelling fixed, while `kiro` predates the agent spec and is
+                // the shape that needs one synthesized.
+                match profile.get("backend_kind").and_then(Value::as_str) {
+                    Some(LEGACY_ACP_BACKEND) => {
+                        profile.insert(
+                            "backend_kind".to_string(),
+                            Value::String(KIRO_BACKEND.to_string()),
+                        );
+                        changed = true;
+                    }
+                    Some(KIRO_BACKEND) => {
+                        if !profile.contains_key("acp") {
+                            profile
+                                .entry("acp".to_string())
+                                .or_insert_with(kiro_agent_spec_value);
+                            changed = true;
+                        }
+                    }
+                    _ => continue,
                 }
-                profile.insert(
-                    "backend_kind".to_string(),
-                    Value::String(ACP_BACKEND.to_string()),
-                );
-                profile
-                    .entry("acp".to_string())
-                    .or_insert_with(kiro_agent_spec_value);
-                changed = true;
             }
         }
 

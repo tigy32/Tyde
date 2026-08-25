@@ -13,7 +13,7 @@ use serde_json::Value;
 /// `protocol::TydeReleaseVersion`.
 pub use host_config::{LOCAL_HOST_ID, TydeReleaseVersion};
 
-pub const PROTOCOL_VERSION: u32 = 49;
+pub const PROTOCOL_VERSION: u32 = 50;
 pub const TYDE_VERSION: Version = Version {
     major: 0,
     minor: 8,
@@ -632,9 +632,12 @@ pub enum BackendKind {
     /// this backend — but the backend is named for the agent it is actually
     /// run with, and for the Kiro-specific behaviour worth reading out of it.
     ///
-    /// Serialized as `"acp"`: the on-disk and on-the-wire spelling is unchanged
-    /// by this rename, so stores written by any released build keep loading.
-    #[serde(rename = "acp")]
+    /// Serialized as `"kiro"`. `"acp"` — the spelling this kind carried while
+    /// it was named for the protocol — is still accepted on read, and the store
+    /// migrations rewrite it, so a store written by any released build loads.
+    /// Emitting the new spelling is a wire break for an un-updated client,
+    /// which is what the `PROTOCOL_VERSION` bump to 50 exists to catch.
+    #[serde(alias = "acp")]
     Kiro,
     Claude,
     Codex,
@@ -659,17 +662,23 @@ impl BackendKind {
     }
 }
 
-/// Serialized name of the backend kind Kiro had before it became an ACP
-/// launch profile. Only migrations should reference this.
-pub const LEGACY_KIRO_BACKEND: &str = "kiro";
+/// Serialized name the Kiro backend kind carried while it was named for the
+/// protocol it speaks rather than the agent it runs. Only migrations should
+/// reference this.
+pub const LEGACY_ACP_BACKEND: &str = "acp";
 /// Serialized name of the agent origin session forks carried before they
 /// became ordinary top-level agents. Only migrations should reference this.
 pub const LEGACY_SIDE_QUESTION_ORIGIN: &str = "side_question";
-/// Serialized name of [`BackendKind::Kiro`]. Spelled `acp` for historical
-/// reasons: the variant was renamed to match the agent, the wire value was not.
-pub const ACP_BACKEND: &str = "acp";
+/// Serialized name of [`BackendKind::Kiro`].
+pub const KIRO_BACKEND: &str = "kiro";
 /// Launch profile id of the built-in Kiro agent. Reserved against
 /// user-configured launch-profile ids.
+///
+/// Deliberately still spelled `acp:kiro` after the backend kind became `kiro`:
+/// this is an opaque id persisted in every session record that ever used the
+/// built-in profile, so changing it is its own migration with no user-visible
+/// benefit. It is not derived from, and never compared against, the backend
+/// kind's serialized name.
 pub const KIRO_LAUNCH_PROFILE_ID: &str = "acp:kiro";
 
 /// Which quirks implementation drives an ACP agent. Stock speaks the

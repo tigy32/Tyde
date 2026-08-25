@@ -818,10 +818,9 @@ fn migrate_store_file(
     if migrate_legacy_gemini_members(path, &mut value, refs)? {
         changed = true;
     }
-    // Unlike the Gemini rename this needs no session purge: an ACP session is
-    // the same Kiro session under a new backend name, so members keep their
-    // `session_id` and stay resumable.
-    if crate::store::legacy_backend_kind::rewrite_legacy_kiro_backend_kinds(&mut value) {
+    // Unlike the Gemini rename this needs no session purge: the backend only
+    // changed name, so members keep their `session_id` and stay resumable.
+    if crate::store::legacy_backend_kind::rewrite_legacy_acp_backend_kinds(&mut value) {
         changed = true;
     }
     let file = serde_json::from_value::<AgentTeamsStoreFile>(value).map_err(|err| {

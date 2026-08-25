@@ -417,7 +417,7 @@ fn QueuedMessageControlRow(row: QueuedRowRef) -> impl IntoView {
 fn backend_value(backend: protocol::BackendKind) -> &'static str {
     match backend {
         protocol::BackendKind::Tycode => "tycode",
-        protocol::BackendKind::Kiro => "acp",
+        protocol::BackendKind::Kiro => "kiro",
         protocol::BackendKind::Claude => "claude",
         protocol::BackendKind::Codex => "codex",
         protocol::BackendKind::Antigravity => "antigravity",
@@ -439,7 +439,9 @@ fn backend_label(backend: protocol::BackendKind) -> &'static str {
 fn parse_backend(value: &str) -> Option<protocol::BackendKind> {
     match value {
         "tycode" => Some(protocol::BackendKind::Tycode),
-        "acp" => Some(protocol::BackendKind::Kiro),
+        // `acp` is the spelling this value carried before the backend was
+        // named for the agent; a persisted selection still parses.
+        "kiro" | "acp" => Some(protocol::BackendKind::Kiro),
         "claude" => Some(protocol::BackendKind::Claude),
         "codex" => Some(protocol::BackendKind::Codex),
         "antigravity" => Some(protocol::BackendKind::Antigravity),

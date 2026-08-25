@@ -6379,7 +6379,7 @@ fn parse_backend_kind(value: &str) -> Option<BackendKind> {
 fn backend_value(kind: BackendKind) -> &'static str {
     match kind {
         BackendKind::Tycode => "tycode",
-        BackendKind::Kiro => "acp",
+        BackendKind::Kiro => "kiro",
         BackendKind::Claude => "claude",
         BackendKind::Codex => "codex",
         BackendKind::Antigravity => "antigravity",
