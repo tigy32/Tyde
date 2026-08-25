@@ -633,9 +633,16 @@ pub fn SubscriptionCapacitySection() -> impl IntoView {
             .get(&host_id)
             .map(|by_kind| by_kind.values().cloned().collect())
             .unwrap_or_default();
-        // Stable order so a fresh snapshot for one backend never reshuffles the
-        // list under the reader's cursor.
-        snapshots.sort_by_key(|snapshot| format!("{:?}", snapshot.backend_kind));
+        // Backends that actually report quota come first: a page whose subject
+        // is how much you have left should not open on six rows saying nobody
+        // knows. Within each group the order is the backend name, so a fresh
+        // snapshot never reshuffles the list under the reader's cursor — only
+        // a backend gaining or losing its report moves, which is the one
+        // change worth seeing.
+        snapshots.sort_by_key(|snapshot| {
+            let reports = state_report(&snapshot.state).is_some();
+            (!reports, format!("{:?}", snapshot.backend_kind))
+        });
         snapshots
     });
 
@@ -1473,6 +1480,92 @@ mod wasm_tests {
                 "the backend must still render a visible row (case {index})"
             );
         }
+    }
+
+    /// The page's subject is how much quota you have left, so the backends that
+    /// actually report some come first. Alphabetical order alone buried Claude
+    /// and Codex — the only two vendors with a capacity source — under ACP and
+    /// Antigravity, which can never have anything to say.
+    ///
+    /// Order within each group stays the backend name, so the list is stable:
+    /// only a backend gaining or losing its report moves a card.
+    #[wasm_bindgen_test]
+    async fn reporting_backends_sort_above_silent_ones() {
+        let container = make_container();
+        let state = state_with_host("h-cap-order");
+        let silent = |kind| {
+            snapshot_with_state(
+                kind,
+                BackendCapacityState::Unsupported {
+                    reason: CapacityUnsupportedReason::BackendHasNoCapacitySource,
+                },
+                fresh(),
+            )
+        };
+        dispatch_capacity(
+            &state,
+            "h-cap-order",
+            0,
+            vec![
+                silent(BackendKind::Acp),
+                silent(BackendKind::Antigravity),
+                claude_known(),
+                codex_known(),
+                silent(BackendKind::Hermes),
+            ],
+        );
+        let _handle = mount_settings(&container, state);
+        for _ in 0..4 {
+            next_tick().await;
+        }
+
+        let cards = container.query_selector_all(".capacity-card").unwrap();
+        assert_eq!(cards.length(), 5, "every backend still renders a card");
+        let title_of = |index: u32| -> String {
+            cards
+                .item(index)
+                .unwrap()
+                .dyn_into::<HtmlElement>()
+                .unwrap()
+                .query_selector(".capacity-backend")
+                .unwrap()
+                .expect("each card names its vendor")
+                .text_content()
+                .unwrap_or_default()
+        };
+
+        assert_eq!(title_of(0), "Claude", "a reporting backend leads the list");
+        assert_eq!(title_of(1), "Codex", "then the other reporting backend");
+        assert_eq!(
+            (title_of(2), title_of(3), title_of(4)),
+            (
+                "ACP".to_owned(),
+                "Antigravity".to_owned(),
+                "Hermes".to_owned()
+            ),
+            "backends with no capacity source fall below, in name order"
+        );
+
+        // Vertical geometry, not just DOM order: the reader sees the numbers
+        // first.
+        let claude_top = cards
+            .item(0)
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap()
+            .get_bounding_client_rect()
+            .top();
+        let acp_top = cards
+            .item(2)
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap()
+            .get_bounding_client_rect()
+            .top();
+        assert!(
+            claude_top < acp_top,
+            "the reporting card must render above the silent one, got {claude_top} vs {acp_top}"
+        );
     }
 
     /// Freshness comes from the server's `CapacityFreshness` and nothing else.

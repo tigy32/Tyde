@@ -633,7 +633,16 @@ pub fn SubscriptionCapacitySection() -> impl IntoView {
             .get(&host)
             .map(|by_kind| by_kind.values().cloned().collect())
             .unwrap_or_default();
-        snapshots.sort_by_key(|snapshot| format!("{:?}", snapshot.backend_kind));
+        // Reporting backends first (desktop does the same): the rows with a
+        // number are what the page is for. Backend name orders each group, so
+        // only gaining or losing a report moves a card.
+        // Reporting backends first (desktop does the same): the rows with a
+        // number are what the page is for. Backend name orders each group, so
+        // only gaining or losing a report moves a card.
+        snapshots.sort_by_key(|snapshot| {
+            let reports = state_report(&snapshot.state).is_some();
+            (!reports, format!("{:?}", snapshot.backend_kind))
+        });
         snapshots
     });
 
@@ -905,24 +914,57 @@ mod wasm_tests {
 
     /// Mobile shows the same authoritative meaning as desktop: every vendor
     /// bucket, each with its own unit and window, plus the coverage statement.
-    /// Nothing is dropped for lack of screen width.
+    /// Nothing is dropped for lack of screen width. The ACP snapshot is a
+    /// backend with no capacity source at all — it still renders, and it sorts
+    /// below the two that report, so the numbers lead on the small screen too.
     #[wasm_bindgen_test]
     async fn mobile_renders_every_bucket_and_coverage() {
         let container = make_container();
         let _handle = mount_with(
             &container,
             "h-cap-buckets",
-            vec![claude_known(), codex_known()],
+            vec![
+                BackendCapacitySnapshot {
+                    backend_kind: BackendKind::Acp,
+                    state: BackendCapacityState::Unsupported {
+                        reason: CapacityUnsupportedReason::BackendHasNoCapacitySource,
+                    },
+                    retrieved_at_ms: now_ms(),
+                    freshness: fresh(),
+                },
+                claude_known(),
+                codex_known(),
+            ],
         );
         for _ in 0..4 {
             next_tick().await;
         }
 
-        // Claude's 1 bucket + Codex's 3.
+        // Claude's 1 bucket + Codex's 3; ACP contributes none.
         assert_eq!(
             count(&container, ".capacity-bucket"),
             4,
             "mobile renders one row per vendor bucket, same as desktop"
+        );
+        // Name order alone would put ACP first; reporting backends lead.
+        let cards = container.query_selector_all(".capacity-card").unwrap();
+        assert_eq!(cards.length(), 3, "every backend still renders a card");
+        let vendor_of = |index: u32| -> String {
+            cards
+                .item(index)
+                .unwrap()
+                .dyn_into::<HtmlElement>()
+                .unwrap()
+                .query_selector(".capacity-backend")
+                .unwrap()
+                .expect("each card names its vendor")
+                .text_content()
+                .unwrap_or_default()
+        };
+        assert_eq!(
+            (vendor_of(0), vendor_of(1), vendor_of(2)),
+            ("Claude".to_owned(), "Codex".to_owned(), "ACP".to_owned()),
+            "backends that report quota sort above the ones that cannot"
         );
 
         let text = text_of(&container);
