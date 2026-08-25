@@ -4,9 +4,6 @@ run-name: Pre-tag release build ${{ inputs.request_id }}
 on:
   workflow_dispatch:
     inputs:
-      source_ref:
-        description: 'Pushed branch, tag, or commit SHA to validate'
-        required: true
       request_id:
         description: 'Unique correlation ID (the release tool supplies this)'
         required: false
@@ -40,20 +37,25 @@ jobs:
     runs-on: ${{ matrix.platform }}
 
     steps:
+      # No `ref:` input. The candidate is selected by the workflow ref the run
+      # is dispatched on, so the Actions cache scope is the candidate branch
+      # rather than the default branch. Building a caller-supplied ref here
+      # would hand main's cache-write token to unreviewed code, and release.yml
+      # restores that scope into the signed build.
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.source_ref }}
           persist-credentials: false
 
       - name: Verify exact source commit
         shell: bash
         env:
-          SOURCE_REF: ${{ inputs.source_ref }}
+          SOURCE_REF: ${{ github.ref }}
+          SOURCE_SHA: ${{ github.sha }}
         run: |
-          requested_sha=$(git rev-parse --verify --end-of-options "${SOURCE_REF}^{commit}")
+          echo "Validating ${SOURCE_REF} at ${SOURCE_SHA}"
           actual_sha=$(git rev-parse HEAD)
-          if [[ "$actual_sha" != "$requested_sha" ]]; then
-            echo "::error::checkout mismatch: HEAD=$actual_sha requested=$requested_sha"
+          if [[ "$actual_sha" != "$SOURCE_SHA" ]]; then
+            echo "::error::checkout mismatch: HEAD=$actual_sha dispatched=$SOURCE_SHA"
             exit 1
           fi
           git diff --exit-code

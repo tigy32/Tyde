@@ -881,18 +881,64 @@ class PreTagReleaseBuildContractTests(unittest.TestCase):
         ):
             self.assertNotIn(forbidden, lowered)
 
-    def test_checks_out_and_verifies_the_exact_untrusted_ref(self) -> None:
-        self.assertEqual(self.workflow.count("${{ inputs.source_ref }}"), 2)
-        self.assertIn("ref: ${{ inputs.source_ref }}", self.workflow)
-        self.assertIn("persist-credentials: false", self.workflow)
-        self.assertIn("SOURCE_REF: ${{ inputs.source_ref }}", self.workflow)
-        self.assertIn(
-            'git rev-parse --verify --end-of-options "${SOURCE_REF}^{commit}"',
-            self.workflow,
-        )
+    @staticmethod
+    def _run_script_bodies(workflow: str) -> list[str]:
+        bodies: list[str] = []
+        lines = workflow.splitlines()
+        for index, line in enumerate(lines):
+            stripped = line.strip()
+            if not stripped.startswith("run:"):
+                continue
+            if stripped != "run: |":
+                bodies.append(stripped[len("run:") :])
+                continue
+            indent = len(line) - len(line.lstrip())
+            for follow in lines[index + 1 :]:
+                if follow.strip() and len(follow) - len(follow.lstrip()) <= indent:
+                    break
+                bodies.append(follow)
+        return bodies
+
+    def test_builds_only_the_dispatched_ref_so_the_cache_scope_matches(self) -> None:
+        # The candidate must be selected by the workflow ref the run is
+        # dispatched on. A caller-supplied `ref:` would run unreviewed code with
+        # write access to the default branch's Actions cache scope, which
+        # release.yml restores into the signed build (CodeQL
+        # actions/cache-poisoning/poisonable-step).
+        self.assertNotIn("source_ref", self.workflow)
+        self.assertNotIn("ref: ${{ inputs.", self.workflow)
+        checkout = self.workflow.split("- uses: actions/checkout@v4", 1)[1].split(
+            "\n      - name:", 1
+        )[0]
+        self.assertIn("persist-credentials: false", checkout)
+        self.assertNotIn("ref:", checkout)
+        self.assertIn("SOURCE_SHA: ${{ github.sha }}", self.workflow)
         self.assertIn("actual_sha=$(git rev-parse HEAD)", self.workflow)
-        self.assertIn('[[ "$actual_sha" != "$requested_sha" ]]', self.workflow)
-        self.assertNotIn("${{ inputs.source_ref }}", self.workflow.split("run: |", 1)[1])
+        self.assertIn('[[ "$actual_sha" != "$SOURCE_SHA" ]]', self.workflow)
+
+        # Dispatch inputs and ref names reach shell only as environment values.
+        for body in self._run_script_bodies(self.workflow):
+            self.assertNotIn("${{ inputs.", body)
+            self.assertNotIn("${{ github.", body)
+
+    def test_dispatch_tool_targets_the_candidate_ref_not_main(self) -> None:
+        tool = (REPO_ROOT / "tools/pretag_release_build.py").read_text(
+            encoding="utf-8"
+        )
+        dispatch = tool.split("def dispatch(", 1)[1].split("\ndef ", 1)[0]
+        self.assertIn('"--ref",\n        source_ref,', dispatch)
+        self.assertNotIn('"main"', dispatch)
+        self.assertNotIn("source_ref={source_ref}", dispatch)
+        # A bare SHA cannot be a workflow ref, so it must be rejected up front
+        # rather than silently falling back to a default-branch dispatch.
+        self.assertIn('re.fullmatch(r"[0-9a-fA-F]{7,40}", source_ref)', tool)
+
+    def test_signed_release_build_restores_a_narrow_cache(self) -> None:
+        cache = self.release_workflow.split("uses: swatinem/rust-cache@v2", 1)[
+            1
+        ].split("\n      - name:", 1)[0]
+        self.assertIn("prefix-key: release", cache)
+        self.assertIn("cache-bin: false", cache)
 
     def test_matrix_has_exact_release_runner_target_pairs(self) -> None:
         entries = re.findall(

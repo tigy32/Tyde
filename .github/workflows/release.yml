@@ -140,17 +140,22 @@ jobs:
       - name: Install build Rust targets
         run: rustup target add ${{ matrix.rust-target }} ${{ matrix.server-target }}
 
+      # The signed, publishing build restores a cache, so keep what it restores
+      # as narrow as possible. `prefix-key` gives release runs their own
+      # namespace instead of sharing the default one with every other workflow,
+      # and `cache-bin: false` keeps executables out of the restore entirely:
+      # nothing here is `cargo install`ed, so caching ~/.cargo/bin only bought a
+      # way for cache contents to land on PATH ahead of the real toolchain.
       - name: Rust cache
         uses: swatinem/rust-cache@v2
         with:
           workspaces: . -> target
+          prefix-key: release
+          cache-bin: false
 
-      # Install trunk AFTER the cache restore: swatinem/rust-cache has
-      # cache-bin:true and restores ~/.cargo/bin, which could otherwise clobber
-      # the freshly-installed binary with a stale wrong-arch one. Installing
-      # last makes this step authoritative. taiki-e/install-action is
-      # arch-aware (fetches aarch64 vs x86_64 correctly); jetli/trunk-action
-      # @v0.5.0 hardcoded the x86_64 linux tarball and broke arm64 runners.
+      # taiki-e/install-action is arch-aware (fetches aarch64 vs x86_64
+      # correctly); jetli/trunk-action@v0.5.0 hardcoded the x86_64 linux tarball
+      # and broke arm64 runners.
       - name: Install trunk
         uses: taiki-e/install-action@v2
         with:
