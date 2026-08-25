@@ -27,8 +27,22 @@ fn backend_label(kind: BackendKind) -> &'static str {
         BackendKind::Codex => "Codex",
         BackendKind::Antigravity => "Antigravity",
         BackendKind::Hermes => "Hermes",
-        BackendKind::Acp => "ACP",
+        BackendKind::Acp => "Kiro",
         BackendKind::Tycode => "Tycode",
+    }
+}
+
+/// Position in the shared backend preference order (desktop's
+/// `BACKENDS_BY_PREFERENCE`), for use as a sort key. Not alphabetical: the
+/// backends in daily use lead every list.
+fn backend_rank(kind: BackendKind) -> usize {
+    match kind {
+        BackendKind::Codex => 0,
+        BackendKind::Claude => 1,
+        BackendKind::Hermes => 2,
+        BackendKind::Antigravity => 3,
+        BackendKind::Tycode => 4,
+        BackendKind::Acp => 5,
     }
 }
 
@@ -637,11 +651,11 @@ pub fn SubscriptionCapacitySection() -> impl IntoView {
         // number are what the page is for. Backend name orders each group, so
         // only gaining or losing a report moves a card.
         // Reporting backends first (desktop does the same): the rows with a
-        // number are what the page is for. Backend name orders each group, so
+        // number are what the page is for. The preference order breaks ties, so
         // only gaining or losing a report moves a card.
         snapshots.sort_by_key(|snapshot| {
             let reports = state_report(&snapshot.state).is_some();
-            (!reports, format!("{:?}", snapshot.backend_kind))
+            (!reports, backend_rank(snapshot.backend_kind))
         });
         snapshots
     });
@@ -963,7 +977,7 @@ mod wasm_tests {
         };
         assert_eq!(
             (vendor_of(0), vendor_of(1), vendor_of(2)),
-            ("Claude".to_owned(), "Codex".to_owned(), "ACP".to_owned()),
+            ("Codex".to_owned(), "Claude".to_owned(), "Kiro".to_owned()),
             "backends that report quota sort above the ones that cannot"
         );
 

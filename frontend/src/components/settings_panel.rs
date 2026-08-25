@@ -6334,14 +6334,7 @@ pub(super) fn send_hermes_disabled_providers(
 }
 
 fn all_backends() -> [BackendKind; 6] {
-    [
-        BackendKind::Tycode,
-        BackendKind::Acp,
-        BackendKind::Claude,
-        BackendKind::Codex,
-        BackendKind::Antigravity,
-        BackendKind::Hermes,
-    ]
+    crate::components::agents_panel::BACKENDS_BY_PREFERENCE
 }
 
 /// Mirror the server's reserved launch-profile id rule (`store::settings`):
@@ -6397,7 +6390,7 @@ fn backend_value(kind: BackendKind) -> &'static str {
 fn backend_label(kind: BackendKind) -> &'static str {
     match kind {
         BackendKind::Tycode => "Tycode",
-        BackendKind::Acp => "ACP",
+        BackendKind::Acp => "Kiro",
         BackendKind::Claude => "Claude",
         BackendKind::Codex => "Codex",
         BackendKind::Antigravity => "Antigravity",
@@ -6408,7 +6401,7 @@ fn backend_label(kind: BackendKind) -> &'static str {
 fn backend_description(kind: BackendKind) -> &'static str {
     match kind {
         BackendKind::Tycode => "Tycode subprocess backend",
-        BackendKind::Acp => "Agent Client Protocol — Kiro and any other ACP agent",
+        BackendKind::Acp => "Kiro — and any other agent that speaks ACP",
         BackendKind::Claude => "Anthropic Claude — advanced reasoning and coding",
         BackendKind::Codex => "OpenAI Codex — code completion and generation",
         BackendKind::Antigravity => "Google Antigravity CLI — agentic coding assistant",
@@ -11264,6 +11257,26 @@ mod wasm_tests {
         assert!(
             overview.contains("Claude") && overview.contains("Hermes"),
             "every backend still gets a row: {overview:?}"
+        );
+        // Rows are ordered by how often the backend is reached for, not
+        // alphabetically, and the ACP backend is named for the agent it runs.
+        let rows = container
+            .query_selector_all(".settings-backend-card .backend-badge")
+            .unwrap();
+        let names: Vec<String> = (0..rows.length())
+            .map(|index| rows.item(index).unwrap().text_content().unwrap_or_default())
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "Codex".to_owned(),
+                "Claude".to_owned(),
+                "Hermes".to_owned(),
+                "Antigravity".to_owned(),
+                "Tycode".to_owned(),
+                "Kiro".to_owned(),
+            ],
+            "the enable rows follow the preference order and name Kiro, not ACP"
         );
 
         find_button_by_text(&container, "Usage")

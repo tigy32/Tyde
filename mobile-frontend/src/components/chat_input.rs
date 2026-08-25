@@ -428,7 +428,7 @@ fn backend_value(backend: protocol::BackendKind) -> &'static str {
 fn backend_label(backend: protocol::BackendKind) -> &'static str {
     match backend {
         protocol::BackendKind::Tycode => "Tycode",
-        protocol::BackendKind::Acp => "ACP",
+        protocol::BackendKind::Acp => "Kiro",
         protocol::BackendKind::Claude => "Claude",
         protocol::BackendKind::Codex => "Codex",
         protocol::BackendKind::Antigravity => "Antigravity",

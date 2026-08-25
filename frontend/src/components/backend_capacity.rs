@@ -28,7 +28,7 @@ use protocol::{
     CapacityUnsupportedReason, CapacityWindow, ClaudeLimitType, CodexLimitSlot,
 };
 
-use crate::components::agents_panel::backend_label;
+use crate::components::agents_panel::{backend_label, backend_rank};
 use crate::state::AppState;
 
 // ── Formatting ──────────────────────────────────────────────────────────────
@@ -635,13 +635,13 @@ pub fn SubscriptionCapacitySection() -> impl IntoView {
             .unwrap_or_default();
         // Backends that actually report quota come first: a page whose subject
         // is how much you have left should not open on six rows saying nobody
-        // knows. Within each group the order is the backend name, so a fresh
-        // snapshot never reshuffles the list under the reader's cursor — only
-        // a backend gaining or losing its report moves, which is the one
+        // knows. Within each group the shared preference order applies, so a
+        // fresh snapshot never reshuffles the list under the reader's cursor —
+        // only a backend gaining or losing its report moves, which is the one
         // change worth seeing.
         snapshots.sort_by_key(|snapshot| {
             let reports = state_report(&snapshot.state).is_some();
-            (!reports, format!("{:?}", snapshot.backend_kind))
+            (!reports, backend_rank(snapshot.backend_kind))
         });
         snapshots
     });
@@ -1483,12 +1483,12 @@ mod wasm_tests {
     }
 
     /// The page's subject is how much quota you have left, so the backends that
-    /// actually report some come first. Alphabetical order alone buried Claude
-    /// and Codex — the only two vendors with a capacity source — under ACP and
-    /// Antigravity, which can never have anything to say.
+    /// actually report some come first. Alphabetical order alone buried Codex
+    /// and Claude — the only two vendors with a capacity source — under Kiro
+    /// and Antigravity, which can never have anything to say.
     ///
-    /// Order within each group stays the backend name, so the list is stable:
-    /// only a backend gaining or losing its report moves a card.
+    /// Order within each group is the shared preference order, so the list is
+    /// stable: only a backend gaining or losing its report moves a card.
     #[wasm_bindgen_test]
     async fn reporting_backends_sort_above_silent_ones() {
         let container = make_container();
@@ -1534,28 +1534,28 @@ mod wasm_tests {
                 .unwrap_or_default()
         };
 
-        assert_eq!(title_of(0), "Claude", "a reporting backend leads the list");
-        assert_eq!(title_of(1), "Codex", "then the other reporting backend");
+        assert_eq!(title_of(0), "Codex", "a reporting backend leads the list");
+        assert_eq!(title_of(1), "Claude", "then the other reporting backend");
         assert_eq!(
             (title_of(2), title_of(3), title_of(4)),
             (
-                "ACP".to_owned(),
+                "Hermes".to_owned(),
                 "Antigravity".to_owned(),
-                "Hermes".to_owned()
+                "Kiro".to_owned()
             ),
-            "backends with no capacity source fall below, in name order"
+            "backends with no capacity source fall below, in preference order"
         );
 
         // Vertical geometry, not just DOM order: the reader sees the numbers
         // first.
-        let claude_top = cards
+        let codex_top = cards
             .item(0)
             .unwrap()
             .dyn_into::<HtmlElement>()
             .unwrap()
             .get_bounding_client_rect()
             .top();
-        let acp_top = cards
+        let kiro_top = cards
             .item(2)
             .unwrap()
             .dyn_into::<HtmlElement>()
@@ -1563,8 +1563,8 @@ mod wasm_tests {
             .get_bounding_client_rect()
             .top();
         assert!(
-            claude_top < acp_top,
-            "the reporting card must render above the silent one, got {claude_top} vs {acp_top}"
+            codex_top < kiro_top,
+            "the reporting card must render above the silent one, got {codex_top} vs {kiro_top}"
         );
     }
 

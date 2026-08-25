@@ -572,14 +572,14 @@ pub fn SessionSettingsBar(
             BackendKind::Codex => "Session Settings (Codex)",
             BackendKind::Antigravity => "Session Settings (Antigravity)",
             BackendKind::Hermes => "Session Settings (Hermes)",
-            BackendKind::Acp => "Session Settings (ACP)",
+            BackendKind::Acp => "Session Settings (Kiro)",
             BackendKind::Tycode => "Session Settings",
         }
     }
 
     fn missing_schema_message(backend_kind: BackendKind) -> &'static str {
         match backend_kind {
-            BackendKind::Acp => "ACP agent models unavailable — check the agent command",
+            BackendKind::Acp => "Kiro models unavailable — check the agent command",
             BackendKind::Claude => "Claude settings unavailable — check installation",
             BackendKind::Codex => "Codex settings unavailable — check installation",
             BackendKind::Antigravity => "Antigravity settings unavailable — check installation",
@@ -590,7 +590,7 @@ pub fn SessionSettingsBar(
 
     fn pending_schema_message(backend_kind: BackendKind) -> &'static str {
         match backend_kind {
-            BackendKind::Acp => "ACP agent models are loading...",
+            BackendKind::Acp => "Kiro models are loading...",
             BackendKind::Claude => "Claude settings are loading...",
             BackendKind::Codex => "Codex settings are loading...",
             BackendKind::Antigravity => "Antigravity settings are loading...",
@@ -1851,8 +1851,9 @@ mod wasm_tests {
             .expect("custom ACP draft settings toggle");
         let draft_text = draft_toggle.text_content().unwrap_or_default();
         assert!(
-            draft_text.contains("Session Settings (ACP)") && !draft_text.contains("Kiro"),
-            "custom ACP draft must use backend identity, got: {draft_text}"
+            draft_text.contains("Session Settings (Kiro)") && !draft_text.contains("QA"),
+            "custom Kiro draft must use the backend identity, not the profile label \"QA ACP\", \
+             got: {draft_text}"
         );
         assert_eq!(
             draft_state
@@ -1874,8 +1875,8 @@ mod wasm_tests {
             .expect("active ACP agent settings toggle");
         let active_text = active_toggle.text_content().unwrap_or_default();
         assert!(
-            active_text.contains("Session Settings (ACP)") && !active_text.contains("Kiro"),
-            "active ACP agent must retain backend identity, got: {active_text}"
+            active_text.contains("Session Settings (Kiro)"),
+            "active Kiro agent must retain the backend identity, got: {active_text}"
         );
     }
 

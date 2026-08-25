@@ -1018,7 +1018,7 @@ pub(crate) fn ReviewSidebar(
 fn backend_kind_label(kind: BackendKind) -> &'static str {
     match kind {
         BackendKind::Tycode => "Tycode",
-        BackendKind::Acp => "ACP",
+        BackendKind::Acp => "Kiro",
         BackendKind::Claude => "Claude",
         BackendKind::Codex => "Codex",
         BackendKind::Antigravity => "Antigravity",
@@ -1130,9 +1130,9 @@ fn effective_submit_target(
 fn parse_backend_kind(s: &str) -> Option<BackendKind> {
     match s {
         "Tycode" => Some(BackendKind::Tycode),
-        // "Kiro" is the pre-rename label; still parsed so a persisted review
-        // reviewer string keeps resolving.
-        "ACP" | "Kiro" => Some(BackendKind::Acp),
+        // "ACP" is the label this backend carried for one release; still parsed
+        // so a persisted review reviewer string keeps resolving.
+        "Kiro" | "ACP" => Some(BackendKind::Acp),
         "Claude" => Some(BackendKind::Claude),
         "Codex" => Some(BackendKind::Codex),
         "Antigravity" => Some(BackendKind::Antigravity),

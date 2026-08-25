@@ -2292,7 +2292,7 @@ fn event_target_checked(ev: &web_sys::Event) -> bool {
 pub(crate) fn backend_kind_label(kind: BackendKind) -> &'static str {
     match kind {
         BackendKind::Tycode => "Tycode",
-        BackendKind::Acp => "ACP",
+        BackendKind::Acp => "Kiro",
         BackendKind::Claude => "Claude",
         BackendKind::Codex => "Codex",
         BackendKind::Antigravity => "Antigravity",
