@@ -281,13 +281,49 @@ A new test must prove it can fail: it fails against the broken behavior it
 guards and passes against the fix. A test that cannot fail is noise and gets
 rejected in review.
 
+## Confirmation / alert dialogs
+
+Do **not** call `window.confirm`, `window.alert`, or `window.prompt` (or the
+`web_sys::Window::confirm_with_message` / `alert_with_message` wrappers) from
+the frontend. They are silently no-op'd inside Tauri's WKWebView, so the prompt
+never appears and any branch that reads the return value is broken.
+
+Use the async helper instead:
+
+```rust
+if !crate::bridge::confirm_dialog("Title", &message).await {
+    return;
+}
+```
+
+It's wired through `tauri-plugin-dialog` and shows a real native dialog on
+desktop and mobile. Call sites need to be `async` (or run inside `spawn_local`)
+since the helper is async.
+
 ## Frontend UI tests are load-bearing
 
 Component-level wasm tests live inline in their component file under
 `#[cfg(all(test, target_arch = "wasm32"))] mod wasm_tests` and are exercised by
 `./dev.sh check`. They mount real Leptos components into a real DOM in headless
 Chrome. Their whole point is to be something an agent cannot silently route
-around.
+around. The first one lives at `frontend/src/components/file_view.rs` →
+`mod wasm_tests`; it catches the class of bug where the file view double-spaces
+lines (or any per-row text mangling).
+
+**How to write them.** Assert on what the user perceives, not on internal
+structure:
+
+- Visible text content of rendered elements (`element.text_content()`).
+- Geometry — `getBoundingClientRect()` for sizes, gaps between elements,
+  alignment. The headless renderer is deterministic for synchronous render, so
+  geometry assertions are not flaky as long as you let the reactive runtime
+  flush a tick (`next_tick().await` in our tests).
+- Element counts that match the input fixture.
+
+Avoid asserting on specific CSS class names (a rename would break the test for
+no real reason), internal DOM structure beyond what's needed to find rendered
+output, or anything an AI refactor could trivially "fix" by editing the
+assertion rather than the code.
 
 **Never weaken, delete, or rewrite a test to make it pass.** A red test is a
 claim that something is wrong; deleting the claim does not make it false. Green
