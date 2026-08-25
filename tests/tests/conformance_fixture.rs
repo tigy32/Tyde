@@ -25,7 +25,8 @@ use protocol::{
     MessageMetadataUpdateData, MessageSender, MessageTokenUsage, NewAgentPayload,
     QueuedMessagesPayload, SendMessagePayload, SendMessageToolResponse, SessionHistoryPayload,
     SessionId, SessionListPayload, SessionSettingValue, SessionSettingsValues, SessionSummary,
-    SpawnAgentParams, SpawnAgentPayload, SpawnCostHint, StreamPath, TaskList,
+    SpawnAgentParams, SpawnAgentPayload, SpawnCostHint, Steering, SteeringId,
+    SteeringNotifyPayload, SteeringScope, SteeringUpsertPayload, StreamPath, TaskList,
     ToolExecutionCompletedData, ToolExecutionOutcome, ToolExecutionResult, ToolRequest,
     ToolUseData,
 };
@@ -580,6 +581,40 @@ pub async fn install_mcp_server(host: &mut Host, name: &str, command: &str, args
         if envelope.kind == FrameKind::McpServerNotify {
             break;
         }
+    }
+}
+
+/// Install host-wide steering before a backend resolves its spawn configuration.
+pub async fn install_host_steering(host: &mut Host, content: &str) {
+    let steering = Steering {
+        id: SteeringId(format!("conformance-{}", Uuid::new_v4())),
+        scope: SteeringScope::Host,
+        title: "AGENTS.md conformance".to_owned(),
+        content: content.to_owned(),
+    };
+    host.client
+        .steering_upsert(SteeringUpsertPayload {
+            steering: steering.clone(),
+        })
+        .await
+        .expect("steering_upsert failed");
+    loop {
+        let envelope = host.next_envelope(CONTROL_TIMEOUT, "SteeringNotify").await;
+        fail_on_client_error(&envelope, "install_host_steering");
+        if envelope.kind != FrameKind::SteeringNotify {
+            continue;
+        }
+        let notify: SteeringNotifyPayload = envelope
+            .parse_payload()
+            .expect("parse SteeringNotifyPayload");
+        assert_eq!(
+            notify,
+            SteeringNotifyPayload::Upsert {
+                steering: steering.clone(),
+            },
+            "host acknowledged a different steering mutation"
+        );
+        break;
     }
 }
 

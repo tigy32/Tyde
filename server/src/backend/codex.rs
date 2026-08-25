@@ -7849,6 +7849,20 @@ impl CodexInner {
         self.terminalize_dynamic_awaits(None).await;
         self.state.lock().await.pending_resume_thread_id = Some(session_id.clone());
         let resumed = async {
+            let developer_instructions = self
+                .steering_tempfile
+                .as_ref()
+                .map(std::fs::read_to_string)
+                .transpose()
+                .map_err(|error| format!("Failed to read Codex resume steering: {error}"))?;
+            tracing::debug!(
+                steering_bytes = developer_instructions.as_deref().map_or(0, str::len),
+                "Reapplying Tyde steering to resumed Codex thread"
+            );
+            let mut params = json!({ "threadId": session_id });
+            if let Some(developer_instructions) = developer_instructions {
+                params["developerInstructions"] = Value::String(developer_instructions);
+            }
             let response = self
                 .rpc
                 // Deliberately *not* passing `experimentalRawEvents` here.
@@ -7856,7 +7870,7 @@ impl CodexInner {
                 // sending it changes nothing: a resumed thread still emits only
                 // typed `item/*` notifications and never a single `rawResponse*`
                 // one. Measured, not assumed — see the splitter below.
-                .request("thread/resume", json!({ "threadId": session_id }))
+                .request("thread/resume", params)
                 .await?;
 
             let thread = response

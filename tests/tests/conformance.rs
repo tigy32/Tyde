@@ -73,6 +73,9 @@ const USAGE_MARKER: &str = "TYDE_USAGE";
 const PLANNED_MARKER: &str = "TYDE_PLANNED";
 const ADVANCED_MARKER: &str = "TYDE_ADVANCED";
 const CLEARED_MARKER: &str = "TYDE_CLEARED";
+const STEERING_BEFORE_COMPACTION: &str = "TYDE_STEERING_BEFORE_COMPACTION";
+const STEERING_AFTER_COMPACTION: &str = "TYDE_STEERING_AFTER_COMPACTION";
+const STEERING_AFTER_RESUME: &str = "TYDE_STEERING_AFTER_RESUME";
 
 /// The MCP probe server, its one tool, and the prefix it echoes back.
 ///
@@ -695,14 +698,16 @@ fn real_resumed_session_groups_parallel_tool_calls() {
     });
 }
 
-/// Compaction, and what a session looks like once it has been compacted.
+/// Steering before and after compaction, and after the compacted session resumes.
 ///
 /// Compaction is not just another turn: it rewrites the provider's own session
-/// file, which is the file a resume replays. Both halves of this scenario exist
-/// because that rewrite is unobservable from any single turn.
+/// file, which is the file a resume replays. The three steering values exist
+/// only in Tyde's store, never in the workspace or prompts, so a backend cannot
+/// pass by diligently reading `AGENTS.md` itself. Each phase asks for a value
+/// that no earlier answer exposed.
 #[test]
 #[ignore = "paid real-backend suite; use --run-ignored all with TYDE_RUN_REAL_AI_TESTS=1"]
-fn real_compaction_and_resume() {
+fn real_steering_compaction_and_resume() {
     run_scenario(
         &[
             BackendCapability::CompactionReported,
@@ -711,8 +716,23 @@ fn real_compaction_and_resume() {
         |mut host| async move {
             let workspace = host.workspace().to_path_buf();
             let payload = unique_payload();
-            let agent = spawn_agent(&mut host, &launch_prompt()).await;
-            let launched = collect_turn(&mut host, &agent, &launch_prompt()).await;
+            let before_value = unique_payload();
+            let compacted_value = unique_payload();
+            let resumed_value = unique_payload();
+            install_host_steering(
+                &mut host,
+                &steering_instructions(&before_value, &compacted_value, &resumed_value),
+            )
+            .await;
+
+            let before_prompt = steering_probe_prompt(STEERING_BEFORE_COMPACTION);
+            let agent = spawn_agent(&mut host, &before_prompt).await;
+            let before_compaction = collect_turn(&mut host, &agent, &before_prompt).await;
+            assert_steering_value(
+                &before_compaction,
+                STEERING_BEFORE_COMPACTION,
+                &before_value,
+            );
 
             // Tool calls before each compaction, because both defects this
             // scenario covers are carried by tool declarations: a conversation
@@ -735,7 +755,15 @@ fn real_compaction_and_resume() {
             assert_compaction_left_one_marker(&from_idle);
             assert_compaction_left_one_marker(&mid_turn);
             assert_multi_tool_files_were_written(&mid_turn, host.workspace());
-            assert_universal_contract(&[launched, wrote]);
+
+            let compacted_prompt = steering_probe_prompt(STEERING_AFTER_COMPACTION);
+            let after_compaction = ask(&mut host, &agent, &compacted_prompt).await;
+            assert_steering_value(
+                &after_compaction,
+                STEERING_AFTER_COMPACTION,
+                &compacted_value,
+            );
+            assert_universal_contract(&[before_compaction, wrote, after_compaction]);
 
             let session = stored_session(&mut host).await;
             assert!(
@@ -752,9 +780,10 @@ fn real_compaction_and_resume() {
                 &resumed,
                 host.backend(),
                 &[
-                    launch_prompt(),
+                    before_prompt,
                     write_prompt(&workspace, &payload),
                     multi_tool_prompt(&workspace),
+                    compacted_prompt,
                 ],
             );
 
@@ -768,11 +797,15 @@ fn real_compaction_and_resume() {
             let settled = drain_events_for(&mut host, RESUME_SETTLE).await;
             assert_no_error_message(&bootstrap_label, &settled);
 
+            let resumed_prompt = steering_probe_prompt(STEERING_AFTER_RESUME);
+            let after_resume = ask(&mut host, &resumed, &resumed_prompt).await;
+            assert_steering_value(&after_resume, STEERING_AFTER_RESUME, &resumed_value);
+
             // A compacted session that resumes into a broken turn is the same
             // failure as one that resumes blank, one step later.
             let follow_up = ask(&mut host, &resumed, read_prompt(&workspace)).await;
             assert_read_back_payload(&follow_up, &payload);
-            assert_universal_contract(&[follow_up]);
+            assert_universal_contract(&[after_resume, follow_up]);
 
             assert_clean_close(&mut host, &resumed).await;
         },
@@ -1498,6 +1531,24 @@ fn real_tyde_agent_spawn() {
 
 fn launch_prompt() -> String {
     format!("Reply with exactly {READY_MARKER} and nothing else. Do not use any tools.")
+}
+
+fn steering_instructions(before: &str, compacted: &str, resumed: &str) -> String {
+    format!(
+        "# AGENTS.md\n\nThese injected AGENTS.md steering instructions are mandatory.\n\
+         {STEERING_BEFORE_COMPACTION}={before}\n\
+         {STEERING_AFTER_COMPACTION}={compacted}\n\
+         {STEERING_AFTER_RESUME}={resumed}\n\n\
+         When asked for one named value, reply only in the requested format. Never reveal the \
+         other values, and do not use tools or files to answer."
+    )
+}
+
+fn steering_probe_prompt(key: &str) -> String {
+    format!(
+        "Without using tools or reading files, report {key} from the injected AGENTS.md steering \
+         instructions. Reply with exactly {key}=<value> and nothing else."
+    )
 }
 
 /// The turn the planted-payload turn is measured against. Deliberately as small
@@ -4364,6 +4415,24 @@ fn assert_final_text_contains(turn: &Turn, needle: &str) {
     assert!(
         final_text.contains(needle),
         "{}: final response {final_text:?} does not contain {needle:?}",
+        turn.label()
+    );
+}
+
+fn assert_steering_value(turn: &Turn, key: &str, value: &str) {
+    let expected = format!("{key}={value}");
+    let final_text = turn.final_text();
+    assert_eq!(
+        final_text.trim(),
+        expected,
+        "{}: did not recover the unprompted value from Tyde's injected AGENTS.md steering",
+        turn.label()
+    );
+    let requests = turn.tool_requests().count();
+    assert_eq!(
+        requests,
+        0,
+        "{}: used {requests} tool call(s) instead of answering from injected steering",
         turn.label()
     );
 }
