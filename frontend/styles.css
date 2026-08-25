@@ -13683,9 +13683,6 @@ pre.tool-error-pre {
     font-variant-numeric: tabular-nums;
 }
 
-/* Each figure carries its own provenance directly beneath it. The used
-   percentage is the vendor's; the remaining percentage is Tyde's complement.
-   One caption spanning both would tar the vendor's number as derived. */
 .capacity-figure {
     display: flex;
     flex-direction: column;
@@ -13694,19 +13691,6 @@ pre.tool-error-pre {
 
 .capacity-used {
     color: var(--text-primary);
-}
-
-.capacity-remaining {
-    color: var(--text-tertiary);
-}
-
-.capacity-provenance {
-    font-size: 0.66rem;
-    color: var(--text-tertiary);
-}
-
-.capacity-provenance-vendor {
-    color: var(--text-secondary);
 }
 
 .capacity-no-magnitude,

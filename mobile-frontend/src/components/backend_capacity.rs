@@ -17,7 +17,6 @@ use protocol::{
     CapacityBucketStatus, CapacityCoverage, CapacityErrorCode, CapacityFreshness, CapacityMeasure,
     CapacityReport, CapacityReset, CapacityScope, CapacitySource, CapacityUnavailableReason,
     CapacityUnsupportedReason, CapacityWindow, ClaudeLimitType, CodexLimitSlot,
-    PercentValueProvenance,
 };
 
 use crate::state::AppState;
@@ -218,20 +217,6 @@ fn bucket_label_text(bucket: &CapacityBucket) -> String {
     }
 }
 
-/// Provenance is per value, and the protocol says which is which. Mobile never
-/// inspects `ValueProvenance.vendor_reported` itself: it asks
-/// `used_percent_provenance()` and `remaining_percent_provenance()`, because
-/// those answer different questions and the raw flag only answers the first.
-/// `used` is the vendor's magnitude; `remaining` is **always**
-/// `DerivedComplement`, since Tyde computes `100 - used`.
-fn provenance_text(provenance: PercentValueProvenance) -> &'static str {
-    match provenance {
-        PercentValueProvenance::VendorReported => "vendor reported",
-        PercentValueProvenance::DerivedFromVendorTotals => "derived from vendor totals",
-        PercentValueProvenance::DerivedComplement => "derived (100 \u{2212} used)",
-    }
-}
-
 fn error_code_text(code: CapacityErrorCode) -> &'static str {
     match code {
         CapacityErrorCode::NotAuthenticated => "not authenticated",
@@ -371,42 +356,25 @@ fn plan_text(report: &CapacityReport) -> String {
 /// The one bucket that owns a bar: the most constrained window the vendor gave
 /// a magnitude for. Credits and magnitude-less buckets are never eligible.
 ///
-/// Returns the used and remaining figures with it, so no caller has to re-match
-/// the measure and invent a value for the arms that cannot occur.
-fn authoritative_bucket(report: &CapacityReport) -> Option<(&CapacityBucket, u8, u8)> {
+/// Returns the used figure with it, so no caller has to re-match the measure
+/// and invent a value for the arms that cannot occur.
+fn authoritative_bucket(report: &CapacityReport) -> Option<(&CapacityBucket, u8)> {
     report
         .buckets
         .iter()
         .filter_map(|bucket| match &bucket.measure {
-            CapacityMeasure::UsedPercent {
-                used_percent,
-                remaining_percent,
-                ..
-            } => Some((bucket, *used_percent, *remaining_percent)),
+            CapacityMeasure::UsedPercent { used_percent, .. } => Some((bucket, *used_percent)),
             CapacityMeasure::Credits { .. } | CapacityMeasure::ReportedWithoutMagnitude => None,
         })
-        .max_by_key(|(_, used_percent, _)| *used_percent)
+        .max_by_key(|(_, used_percent)| *used_percent)
 }
 
-fn bucket_aria_label(bucket: &CapacityBucket, used_percent: u8, remaining_percent: u8) -> String {
+fn bucket_aria_label(bucket: &CapacityBucket, used_percent: u8) -> String {
     let mut parts = vec![
         bucket_label_text(bucket),
         bucket_vendor_id_text(&bucket.id).to_owned(),
+        format!("{used_percent} percent used"),
     ];
-    parts.push(match bucket.measure.used_percent_provenance() {
-        Some(provenance) => format!(
-            "{used_percent} percent used, {}",
-            provenance_text(provenance)
-        ),
-        None => format!("{used_percent} percent used"),
-    });
-    parts.push(match bucket.measure.remaining_percent_provenance() {
-        Some(provenance) => format!(
-            "{remaining_percent} percent remaining, {}",
-            provenance_text(provenance)
-        ),
-        None => format!("{remaining_percent} percent remaining"),
-    });
     match &bucket.reset {
         CapacityReset::At { at_ms } => {
             parts.push(format!("resets {}", format_absolute_utc(*at_ms)));
@@ -420,8 +388,8 @@ fn bucket_aria_label(bucket: &CapacityBucket, used_percent: u8, remaining_percen
 }
 
 /// Decorative. The text beside it is the source of truth.
-fn percent_bar(bucket: &CapacityBucket, used_percent: u8, remaining_percent: u8) -> AnyView {
-    let aria = bucket_aria_label(bucket, used_percent, remaining_percent);
+fn percent_bar(bucket: &CapacityBucket, used_percent: u8) -> AnyView {
+    let aria = bucket_aria_label(bucket, used_percent);
     let width = used_percent.min(100);
     view! {
         <div class="capacity-bar" role="img" aria-label=aria>
@@ -433,44 +401,14 @@ fn percent_bar(bucket: &CapacityBucket, used_percent: u8, remaining_percent: u8)
 
 fn measure_view(bucket: &CapacityBucket) -> AnyView {
     match &bucket.measure {
-        CapacityMeasure::UsedPercent {
-            used_percent,
-            remaining_percent,
-            ..
-        } => {
+        CapacityMeasure::UsedPercent { used_percent, .. } => {
             let used = *used_percent;
-            let remaining = *remaining_percent;
-            // Two protocol helpers, two different questions. Neither figure's
-            // provenance is inferred from the raw flag here.
-            let used_provenance = bucket
-                .measure
-                .used_percent_provenance()
-                .map(provenance_text);
-            let remaining_provenance = bucket
-                .measure
-                .remaining_percent_provenance()
-                .map(provenance_text);
             view! {
                 <div class="capacity-measure">
-                    {percent_bar(bucket, used, remaining)}
+                    {percent_bar(bucket, used)}
                     <span class="capacity-figures">
                         <span class="capacity-figure capacity-figure-used">
                             <span class="capacity-used">{format!("{used}% used")}</span>
-                            {used_provenance.map(|text| view! {
-                                <span class="capacity-provenance capacity-provenance-vendor">
-                                    {text}
-                                </span>
-                            })}
-                        </span>
-                        <span class="capacity-figure capacity-figure-remaining">
-                            <span class="capacity-remaining">
-                                {format!("{remaining}% remaining")}
-                            </span>
-                            {remaining_provenance.map(|text| view! {
-                                <span class="capacity-provenance capacity-provenance-remaining">
-                                    {text}
-                                </span>
-                            })}
                         </span>
                     </span>
                 </div>
@@ -611,7 +549,7 @@ fn compact_row(snapshot: &BackendCapacitySnapshot) -> AnyView {
                 matches!(report.coverage, CapacityCoverage::RepresentativeBucketOnly)
                     .then(|| "\u{26a0} only the binding limit is reported".to_owned());
             match authoritative_bucket(report) {
-                Some((bucket, used_percent, remaining)) => {
+                Some((bucket, used_percent)) => {
                     let other_count = report.buckets.len().saturating_sub(1);
                     let more = (other_count > 0).then(|| format!("+{other_count} more below"));
                     // Label + vendor type: "weekly limit" alone cannot tell
@@ -623,7 +561,7 @@ fn compact_row(snapshot: &BackendCapacitySnapshot) -> AnyView {
                             <div class="capacity-compact-bucket">
                                 <span class="capacity-compact-label">{label}</span>
                                 <span class="capacity-compact-vendor">{vendor_id}</span>
-                                {percent_bar(bucket, used_percent, remaining)}
+                                {percent_bar(bucket, used_percent)}
                                 <span class="capacity-compact-figures">
                                     {format!("{used_percent}% used")}
                                 </span>
@@ -799,9 +737,8 @@ mod wasm_tests {
     // `backend_capacity_snapshots`:
     //
     //   * `provenance.vendor_reported: true` is the ONLY `UsedPercent` shape
-    //     either adapter produces, so `used_percent_provenance()` is
-    //     `VendorReported`. `remaining_percent_provenance()` is
-    //     `DerivedComplement` regardless — Tyde computes it.
+    //     either adapter produces. The complement travels on the wire but the
+    //     UI never renders it.
     //   * Claude: `scope` and `window` are ALWAYS `NotReported`; `status` is
     //     ALWAYS `Some`; `plan` is ALWAYS `None`. Labels are all distinct
     //     ("weekly limit" vs "Fable 5 limit", …).
@@ -995,31 +932,24 @@ mod wasm_tests {
             "both coverage statements must survive on mobile, got: {text}"
         );
         assert!(
-            text.contains("82% used") && text.contains("18% remaining"),
-            "used/remaining render on the 0-100 scale, got: {text}"
+            text.contains("82% used"),
+            "the used figure renders on the 0-100 scale, got: {text}"
         );
         assert!(
             !text.contains("0.82") && !text.contains("8200"),
             "the 0..1 fraction must never reach the DOM, got: {text}"
         );
-        // Provenance is per value, from the protocol helpers: the vendor's used
-        // figure is `VendorReported` and is never captioned as derived; the
-        // remaining figure is always `DerivedComplement` and is never attributed
-        // to the vendor.
+        // One figure per bucket, same as desktop: the vendor's own used
+        // percentage, with no complement and no provenance caption.
         let used = query(&container, ".capacity-figure-used").expect("used figure renders");
-        let remaining =
-            query(&container, ".capacity-figure-remaining").expect("remaining figure renders");
         let used_text = used.text_content().unwrap_or_default();
-        let remaining_text = remaining.text_content().unwrap_or_default();
         assert!(
-            used_text.contains("vendor reported") && !used_text.contains("derived"),
-            "the vendor's used percentage must never read as derived, got: {used_text}"
+            !used_text.contains("vendor reported") && !used_text.contains("derived"),
+            "figures carry no provenance caption, got: {used_text}"
         );
         assert!(
-            remaining_text.contains("derived (100 \u{2212} used)")
-                && !remaining_text.contains("vendor reported"),
-            "the remaining complement is Tyde's and must never be attributed to the vendor, \
-             got: {remaining_text}"
+            !text.contains("remaining") && !text.contains("18%"),
+            "the complement is never rendered \u{2014} the reader can subtract, got: {text}"
         );
         // The server's labels are distinct, and the vendor's own bucket type is
         // rendered beside each of them — it is the durable identity, and it is
