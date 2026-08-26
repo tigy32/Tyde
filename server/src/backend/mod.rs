@@ -33,6 +33,7 @@ use protocol::{
     BackendConfigValues, BackendKind, ChatEvent, CustomAgentId, ImageData, ModelRequestTokenUsage,
     SendMessagePayload, SessionId, SessionSettingField, SessionSettingFieldType,
     SessionSettingValue, SessionSettingsSchema, SessionSettingsValues, SpawnCostHint,
+    ToolExecutionOutcome, ToolExecutionResult, ToolRequestType,
 };
 use serde_json::Value;
 use settings_model::BackendTierConfig;
@@ -482,6 +483,15 @@ struct PendingDelta {
     deadline: tokio::time::Instant,
 }
 
+/// A turn cannot have this many tools open at once; the cap only stops an
+/// unmatched request from growing the map without bound.
+const OPEN_TOOL_NAME_CAP: usize = 1024;
+
+struct OpenToolCall {
+    name: String,
+    arguments: Value,
+}
+
 pub struct EventStream {
     rx: EventStreamReceiver,
     buffered: VecDeque<BackendEvent>,
@@ -494,6 +504,10 @@ pub struct EventStream {
     /// answer *starting*; holding that back to fill a window would trade a
     /// visible regression for the fix. Only the flood after it is batched.
     response_started_streaming: bool,
+    /// Provider tool name and arguments per open call. A completion carries
+    /// only the call id, and both of the things needed to type it and to close
+    /// its progress arrived with the request.
+    open_tool_names: HashMap<String, OpenToolCall>,
 }
 
 impl EventStream {
@@ -503,6 +517,7 @@ impl EventStream {
             buffered: VecDeque::new(),
             pending_delta: None,
             response_started_streaming: false,
+            open_tool_names: HashMap::new(),
             resume_replay_complete: None,
             transcript_metadata_projector: None,
         }
@@ -514,6 +529,7 @@ impl EventStream {
             buffered: VecDeque::new(),
             pending_delta: None,
             response_started_streaming: false,
+            open_tool_names: HashMap::new(),
             resume_replay_complete: None,
             transcript_metadata_projector: None,
         }
@@ -528,6 +544,7 @@ impl EventStream {
             buffered: VecDeque::new(),
             pending_delta: None,
             response_started_streaming: false,
+            open_tool_names: HashMap::new(),
             resume_replay_complete: None,
             transcript_metadata_projector: Some(Arc::new(projector)),
         }
@@ -542,6 +559,7 @@ impl EventStream {
             buffered: VecDeque::new(),
             pending_delta: None,
             response_started_streaming: false,
+            open_tool_names: HashMap::new(),
             resume_replay_complete: Some(resume_replay_complete),
             transcript_metadata_projector: None,
         }
@@ -556,6 +574,7 @@ impl EventStream {
             buffered: VecDeque::new(),
             pending_delta: None,
             response_started_streaming: false,
+            open_tool_names: HashMap::new(),
             resume_replay_complete: Some(resume_replay_complete),
             transcript_metadata_projector: None,
         }
@@ -571,6 +590,7 @@ impl EventStream {
             buffered: VecDeque::new(),
             pending_delta: None,
             response_started_streaming: false,
+            open_tool_names: HashMap::new(),
             resume_replay_complete: Some(resume_replay_complete),
             transcript_metadata_projector: Some(Arc::new(projector)),
         }
@@ -654,8 +674,18 @@ impl EventStream {
                 // than disappearing with it.
                 return self.take_pending_delta();
             };
+            let (event, follow_up) = self.project_tyde_agent_control(event);
             if let Some(ready) = self.absorb(event) {
+                // After `absorb`, never before: on a pending delta it parks the
+                // primary event in `buffered`, and the follow-up has to queue
+                // behind it rather than overtake it.
+                if let Some(follow_up) = follow_up {
+                    self.buffered.push_back(follow_up);
+                }
                 return Some(ready);
+            }
+            if let Some(follow_up) = follow_up {
+                self.buffered.push_back(follow_up);
             }
         }
     }
@@ -664,6 +694,106 @@ impl EventStream {
         match rx {
             EventStreamReceiver::Chat(rx) => rx.recv().await.map(BackendEvent::Chat),
             EventStreamReceiver::Backend(rx) => rx.recv().await,
+        }
+    }
+
+    /// Types Tyde's own agent-control tools once, here, instead of in each
+    /// backend. Every backend's events reach the actor through this stream, so
+    /// a backend that never learned to project them still gets typed cards --
+    /// and, more than cosmetics, still registers its awaits with the actor,
+    /// which keys `active_agent_await_ids` off the typed request.
+    ///
+    /// Only an `Other` request is rewritten: a backend that already produced
+    /// the typed form keeps it, and third-party tools are never touched.
+    fn project_tyde_agent_control(
+        &mut self,
+        event: BackendEvent,
+    ) -> (BackendEvent, Option<BackendEvent>) {
+        match event {
+            BackendEvent::Chat(ChatEvent::ToolRequest(mut request)) => {
+                let args = match &request.tool_type {
+                    ToolRequestType::Other { args } => Some(args.clone()),
+                    _ => None,
+                };
+                if let Some(args) = &args
+                    && let Some(typed) =
+                        agent_control_progress::tyde_tool_request_type(&request.tool_name, args)
+                {
+                    request.tool_type = typed;
+                }
+                let progress = args.as_ref().and_then(|args| {
+                    agent_control_progress::await_progress_data_for_tool(
+                        &request.tool_call_id,
+                        &request.tool_name,
+                        args,
+                    )
+                });
+                if !request.tool_name.is_empty() {
+                    if self.open_tool_names.len() >= OPEN_TOOL_NAME_CAP {
+                        self.open_tool_names.clear();
+                    }
+                    self.open_tool_names.insert(
+                        request.tool_call_id.clone(),
+                        OpenToolCall {
+                            name: request.tool_name.clone(),
+                            arguments: args.unwrap_or(Value::Null),
+                        },
+                    );
+                }
+                (
+                    BackendEvent::Chat(ChatEvent::ToolRequest(request)),
+                    progress.map(|data| BackendEvent::Chat(ChatEvent::ToolProgress(data))),
+                )
+            }
+            BackendEvent::Chat(ChatEvent::ToolExecutionCompleted(mut completion)) => {
+                let Some(open) = self.open_tool_names.remove(&completion.tool_call_id) else {
+                    return (
+                        BackendEvent::Chat(ChatEvent::ToolExecutionCompleted(completion)),
+                        None,
+                    );
+                };
+                // Read off the outcome rather than sniffed from an error
+                // string: a cancelled await must not close its card as done.
+                let status = match &completion.outcome {
+                    ToolExecutionOutcome::Succeeded { .. } => {
+                        protocol::AgentControlProgressStatus::Completed
+                    }
+                    ToolExecutionOutcome::Cancelled { .. } => {
+                        protocol::AgentControlProgressStatus::Stopped
+                    }
+                    ToolExecutionOutcome::Failed { .. } => {
+                        protocol::AgentControlProgressStatus::Failed
+                    }
+                };
+                let mut progress = agent_control_progress::terminal_await_progress_data_for_tool(
+                    &completion.tool_call_id,
+                    &open.name,
+                    &open.arguments,
+                    status,
+                );
+                if let ToolExecutionOutcome::Succeeded {
+                    result: ToolExecutionResult::Other { result },
+                } = &completion.outcome
+                {
+                    progress = progress.or_else(|| {
+                        agent_control_progress::spawn_progress_data_for_tool_result(
+                            &completion.tool_call_id,
+                            &open.name,
+                            result,
+                        )
+                    });
+                    if let Ok(Some(typed)) =
+                        agent_control_progress::tyde_tool_result(&open.name, result)
+                    {
+                        completion.outcome = ToolExecutionOutcome::Succeeded { result: typed };
+                    }
+                }
+                (
+                    BackendEvent::Chat(ChatEvent::ToolExecutionCompleted(completion)),
+                    progress.map(|data| BackendEvent::Chat(ChatEvent::ToolProgress(data))),
+                )
+            }
+            other => (other, None),
         }
     }
 
@@ -737,10 +867,15 @@ impl EventStream {
         if let Some(event) = self.buffered.pop_front() {
             return Ok(event);
         }
-        match &mut self.rx {
+        let event = match &mut self.rx {
             EventStreamReceiver::Chat(rx) => rx.try_recv().map(BackendEvent::Chat),
             EventStreamReceiver::Backend(rx) => rx.try_recv(),
+        }?;
+        let (event, follow_up) = self.project_tyde_agent_control(event);
+        if let Some(follow_up) = follow_up {
+            self.buffered.push_back(follow_up);
         }
+        Ok(event)
     }
 
     pub(crate) fn restore_backend_events(

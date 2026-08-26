@@ -316,6 +316,7 @@ mod wasm_tests {
             tool_name: "ExitPlanMode".to_owned(),
             request: ToolRequest {
                 tool_call_id: "toolu_plan".to_owned(),
+                tool_name: "ExitPlanMode".to_owned(),
                 tool_type: exit_plan_req(),
             },
             result: Some(if success {
@@ -548,6 +549,7 @@ mod wasm_tests {
             tool_name: "ExitPlanMode".to_owned(),
             request: ToolRequest {
                 tool_call_id: "toolu_plan".to_owned(),
+                tool_name: "ExitPlanMode".to_owned(),
                 tool_type: exit_plan_req(),
             },
             result: None,

@@ -871,6 +871,7 @@ async fn stream_end_first_exit_plan_gates_the_completion() {
     );
     let request = protocol::ToolRequest {
         tool_call_id: "epm-sef".to_owned(),
+        tool_name: "exit_plan_mode".to_owned(),
         tool_type: protocol::ToolRequestType::ExitPlanMode {
             plan: Some("# Plan".to_owned()),
             plan_path: Some("/tmp/mock/mock-plan.md".to_owned()),

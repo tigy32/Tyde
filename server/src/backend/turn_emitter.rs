@@ -973,8 +973,16 @@ impl TurnEmitterState {
                 execution_mode: ToolExecutionMode::Foreground,
             },
         );
+        let tool_name = self
+            .declared_tools
+            .get(tool_call_id)
+            .expect("validated declared tool")
+            .declaration
+            .name
+            .clone();
         self.send_chat(ChatEvent::ToolRequest(ToolRequest {
             tool_call_id: tool_call_id.to_owned(),
+            tool_name,
             tool_type,
         }));
         true

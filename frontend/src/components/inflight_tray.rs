@@ -1518,6 +1518,7 @@ mod wasm_tests {
     fn command_request() -> ChatEvent {
         ChatEvent::ToolRequest(ToolRequest {
             tool_call_id: "toolu_bg_bash".to_owned(),
+            tool_name: "run_command".to_owned(),
             tool_type: ToolRequestType::RunCommand {
                 command: "./dev.sh check --locked".to_owned(),
                 working_directory: "/tmp/work".to_owned(),
@@ -2893,6 +2894,7 @@ mod wasm_tests {
                 tool_name: tool_name.to_owned(),
                 request: ToolRequest {
                     tool_call_id: format!("toolu_{tool_name}"),
+                    tool_name: tool_name.to_owned(),
                     tool_type: ToolRequestType::Other { args: json!({}) },
                 },
                 result: Some(succeeded_completion(

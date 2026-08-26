@@ -7468,8 +7468,18 @@ pub struct StreamEndData {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolRequest {
     pub tool_call_id: String,
-    /// Tyde's normalized executable form. The provider name and arguments are
-    /// read from the owning response's `ToolUseData`.
+    /// The provider's own name for the tool, as declared by the owning
+    /// response's `ToolUseData`. Carried here so a consumer can identify the
+    /// tool without waiting for that response: backends disagree on whether
+    /// the request or its declaring `StreamEnd` arrives first, and the server
+    /// projects Tyde's own MCP tools onto typed requests by this name.
+    ///
+    /// Empty only for requests replayed from a session log written before this
+    /// field existed.
+    #[serde(default)]
+    pub tool_name: String,
+    /// Tyde's normalized executable form. The arguments are read from the
+    /// owning response's `ToolUseData`.
     pub tool_type: ToolRequestType,
 }
 

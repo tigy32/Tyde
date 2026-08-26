@@ -4991,8 +4991,13 @@ async fn agent_control_await_tool_call_emits_correlated_completion_when_child_be
     .await;
     let ToolRequest {
         tool_call_id,
+        tool_name,
         tool_type,
     } = await_request;
+    assert_eq!(
+        tool_name, "tyde_await_agents",
+        "the request must carry the provider's own tool name"
+    );
     assert_eq!(
         tool_type,
         ToolRequestType::TydeAwaitAgents {

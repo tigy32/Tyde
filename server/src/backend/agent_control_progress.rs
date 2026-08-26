@@ -2,9 +2,9 @@ use std::collections::HashSet;
 
 use protocol::{
     AgentControlAgentRef, AgentControlProgress, AgentControlProgressKind,
-    AgentControlProgressStatus, AgentId, ChatEvent, ToolExecutionMode,
+    AgentControlProgressStatus, AgentExecutionMode, AgentId, ChatEvent, ToolExecutionMode,
     ToolExecutionNormalizationFailure, ToolExecutionOutcome, ToolExecutionResult, ToolProgressData,
-    ToolProgressUpdate, TydeAgentWaitStatus,
+    ToolProgressUpdate, ToolRequestType, TydeAgentWaitStatus,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -69,6 +69,78 @@ struct SendAgentMessageResult {
 struct AwaitAgentsResult {
     ready: Vec<TydeAgentWaitStatus>,
     still_thinking: Vec<TydeAgentWaitStatus>,
+}
+
+/// Projects a call to one of Tyde's own agent-control MCP tools onto its typed
+/// request.
+///
+/// Every backend reaches these tools through the same MCP servers but reports
+/// the name its own way -- `tyde_await_agents`, `mcp_tyde_tyde_await_agents`,
+/// `mcp__tyde_agent_await__tyde_await_agents` -- which the matchers normalize.
+///
+/// This lives above the individual backends on purpose. A projection written
+/// inside one backend is a projection the other four silently lack, which is
+/// exactly how four of five ended up rendering the await as an untyped card
+/// and never registering it as an active await.
+pub(crate) fn tyde_tool_request_type(
+    tool_name: &str,
+    arguments: &Value,
+) -> Option<ToolRequestType> {
+    if is_tyde_agent_control_await_tool_name(tool_name) {
+        let agent_ids: Vec<AgentId> = parse_await_agent_refs(arguments)
+            .into_iter()
+            .map(|agent| agent.agent_id)
+            .collect();
+        // An await naming nobody is not an await card; leaving it untyped keeps
+        // the raw arguments visible instead of rendering an empty watch list.
+        return (!agent_ids.is_empty()).then_some(ToolRequestType::TydeAwaitAgents { agent_ids });
+    }
+    if is_tyde_agent_control_spawn_tool_name(tool_name) {
+        return Some(ToolRequestType::AgentSpawn {
+            prompt: find_string_field(arguments, "prompt", 0),
+            name: find_string_field(arguments, "name", 0),
+            // Tyde owns the child's lifetime, not the turn that asked for it:
+            // the parent goes idle while the child runs and picks the result up
+            // through `tyde_await_agents`.
+            execution_mode: AgentExecutionMode::Background,
+        });
+    }
+    if is_tyde_agent_control_send_message_tool_name(tool_name) {
+        let agent_id = find_string_field(arguments, "agent_id", 0)?;
+        let message = find_string_field(arguments, "message", 0)?;
+        return Some(ToolRequestType::TydeSendAgentMessage {
+            agent_id: AgentId(agent_id),
+            message,
+        });
+    }
+    None
+}
+
+/// Mirrors [`parse_await_agent_refs`]'s tolerance: providers wrap arguments in
+/// their own envelope (Codex nests them under `args`) and some deliver them as
+/// a JSON string.
+fn find_string_field(value: &Value, key: &str, depth: usize) -> Option<String> {
+    if depth > MAX_PARSE_DEPTH {
+        return None;
+    }
+    match value {
+        Value::Object(map) => {
+            if let Some(found) = map.get(key).and_then(Value::as_str)
+                && !found.is_empty()
+            {
+                return Some(found.to_owned());
+            }
+            ARGUMENT_WRAPPER_KEYS
+                .iter()
+                .filter_map(|wrapper| map.get(*wrapper))
+                .find_map(|nested| find_string_field(nested, key, depth + 1))
+        }
+        Value::String(text) => {
+            let parsed = parse_embedded_json(text)?;
+            find_string_field(&parsed, key, depth + 1)
+        }
+        _ => None,
+    }
 }
 
 pub(crate) fn tyde_tool_result(

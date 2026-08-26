@@ -692,6 +692,7 @@ mod wasm_tests {
             tool_name: "run".to_owned(),
             request: protocol::ToolRequest {
                 tool_call_id: id.to_owned(),
+                tool_name: "probe_tool".to_owned(),
                 tool_type: protocol::ToolRequestType::Other {
                     args: serde_json::json!({}),
                 },

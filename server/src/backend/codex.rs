@@ -34,10 +34,9 @@ use crate::agent_control_mcp::{
     AGENT_CONTROL_AWAIT_MCP_SERVER_NAME, AGENT_CONTROL_MCP_SERVER_NAME,
 };
 use crate::backend::agent_control_progress::{
-    PendingToolNormalizationFailure, await_progress_data_for_tool,
-    is_tyde_agent_control_await_tool_name, is_tyde_agent_control_send_message_tool_name,
-    is_tyde_agent_control_spawn_tool_name, normalize_tyde_chat_event, parse_await_agent_refs,
-    tyde_tool_result,
+    PendingToolNormalizationFailure, is_tyde_agent_control_await_tool_name,
+    is_tyde_agent_control_send_message_tool_name, is_tyde_agent_control_spawn_tool_name,
+    normalize_tyde_chat_event, tyde_tool_result,
 };
 use crate::backend::turn_emitter::{
     AgentName, ResponseHandle, RetryAttemptPayload, StreamEndPayload, TurnEmitter,
@@ -15060,19 +15059,10 @@ impl CodexInner {
         if !self.emitter.has_pending_tool_request(tool_call_id) {
             return;
         }
-        if is_tyde_agent_control_await_tool_name(tool_name) {
-            let Some(mut progress) =
-                await_progress_data_for_tool(tool_call_id, tool_name, arguments)
-            else {
-                return;
-            };
-            let ToolProgressUpdate::AgentControl(update) = &mut progress.update else {
-                unreachable!()
-            };
-            update.status = status;
-            self.emitter.tool_progress(&progress);
-            return;
-        }
+        // Tyde's own await is handled once for every backend in
+        // `EventStream::project_tyde_agent_control`. What is left here is the
+        // Codex-native wait, whose watched agents can only be resolved from
+        // Codex's own thread state.
         if !is_codex_native_wait_tool(tool_name) {
             return;
         }
@@ -18991,27 +18981,9 @@ fn javascript_object_string_field(source: &str, field: &str) -> Option<String> {
 }
 
 fn codex_public_tool_request_type(tool_name: &str, arguments: &Value) -> Value {
-    let public_arguments = codex_generic_tool_arguments(arguments);
-    if is_tyde_agent_control_await_tool_name(tool_name) {
-        let agent_ids = parse_await_agent_refs(&public_arguments)
-            .into_iter()
-            .map(|agent| agent.agent_id)
-            .collect();
-        return serde_json::to_value(protocol::ToolRequestType::TydeAwaitAgents { agent_ids })
-            .expect("serialize Codex Tyde await request");
-    }
-    if is_tyde_agent_control_send_message_tool_name(tool_name)
-        && let (Some(agent_id), Some(message)) = (
-            public_arguments.get("agent_id").and_then(Value::as_str),
-            public_arguments.get("message").and_then(Value::as_str),
-        )
-    {
-        return serde_json::to_value(protocol::ToolRequestType::TydeSendAgentMessage {
-            agent_id: protocol::AgentId(agent_id.to_owned()),
-            message: message.to_owned(),
-        })
-        .expect("serialize Codex Tyde send-message request");
-    }
+    // Tyde's own agent-control tools are typed once for every backend in
+    // `EventStream::project_tyde_agent_control`; only Codex-native tools are
+    // projected here.
     if tool_name.eq_ignore_ascii_case("spawnAgent") {
         return serde_json::to_value(protocol::ToolRequestType::AgentSpawn {
             prompt: arguments

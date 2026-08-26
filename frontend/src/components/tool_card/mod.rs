@@ -1353,6 +1353,7 @@ mod live_card_wasm_tests {
             tool_name: tool_name.to_owned(),
             request: ToolRequest {
                 tool_call_id: tool_call_id.to_owned(),
+                tool_name: "probe_tool".to_owned(),
                 tool_type: ToolRequestType::Other { args: json!({}) },
             },
             result: Some(succeeded_completion(
@@ -1373,6 +1374,7 @@ mod live_card_wasm_tests {
             tool_name: "Read".to_owned(),
             request: ToolRequest {
                 tool_call_id: tool_call_id.to_owned(),
+                tool_name: "read_files".to_owned(),
                 tool_type: ToolRequestType::ReadFiles {
                     file_paths: file_paths.into_iter().map(str::to_owned).collect(),
                 },
@@ -1533,6 +1535,7 @@ mod live_card_wasm_tests {
             tool_name: "Bash".to_owned(),
             request: ToolRequest {
                 tool_call_id: "toolu_run".to_owned(),
+                tool_name: "run_command".to_owned(),
                 tool_type: ToolRequestType::RunCommand {
                     command: "./dev.sh check".to_owned(),
                     working_directory: "/tmp".to_owned(),
@@ -1645,6 +1648,7 @@ mod live_card_wasm_tests {
             tool_name: "AskUserQuestion".to_owned(),
             request: ToolRequest {
                 tool_call_id: "toolu_ask".to_owned(),
+                tool_name: "ask_user_question".to_owned(),
                 tool_type: ToolRequestType::AskUserQuestion {
                     questions: vec![protocol::AskUserQuestion {
                         id: None,
@@ -1686,6 +1690,7 @@ mod live_card_wasm_tests {
             tool_name: "Bash".to_owned(),
             request: ToolRequest {
                 tool_call_id: tool_call_id.to_owned(),
+                tool_name: "run_command".to_owned(),
                 tool_type: ToolRequestType::RunCommand {
                     command: "sleep 60".to_owned(),
                     working_directory: "/tmp".to_owned(),
@@ -2461,6 +2466,7 @@ mod live_card_wasm_tests {
             tool_name: "tyde_send_agent_message".to_owned(),
             request: ToolRequest {
                 tool_call_id: "toolu_send".to_owned(),
+                tool_name: "tyde_send_agent_message".to_owned(),
                 tool_type: ToolRequestType::TydeSendAgentMessage {
                     agent_id: AgentId("agent-sub".to_owned()),
                     message: message.to_owned(),
@@ -2478,6 +2484,7 @@ mod live_card_wasm_tests {
             tool_name: "tyde_await_agents".to_owned(),
             request: ToolRequest {
                 tool_call_id: "toolu_agent_control".to_owned(),
+                tool_name: "tyde_await_agents".to_owned(),
                 tool_type: ToolRequestType::TydeAwaitAgents {
                     agent_ids: vec![AgentId("agent-sub".to_owned())],
                 },
@@ -2653,6 +2660,7 @@ mod live_card_wasm_tests {
             tool_name: "mcp__tyde-agent-control__tyde_send_agent_message".to_owned(),
             request: ToolRequest {
                 tool_call_id: "toolu_send_3".to_owned(),
+                tool_name: "probe_tool".to_owned(),
                 tool_type: ToolRequestType::Other {
                     args: json!({
                         "tool": "mcp__tyde-agent-control__tyde_send_agent_message",

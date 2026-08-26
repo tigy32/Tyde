@@ -311,6 +311,7 @@ pub(super) fn agent_control_send_message_frames(
         stream_start("mock", Some(MOCK_MODEL.to_owned())),
         tool_request(ToolRequest {
             tool_call_id: tool_call_id.clone(),
+            tool_name: "tyde_send_agent_message".to_owned(),
             tool_type: ToolRequestType::TydeSendAgentMessage { agent_id, message },
         }),
         tool_completed(ToolExecutionCompletedData {
@@ -349,6 +350,7 @@ pub(super) fn exit_plan_mode_request_frames(
     }
     frames.push(tool_request(ToolRequest {
         tool_call_id: tool_call_id.to_owned(),
+        tool_name: "exit_plan_mode".to_owned(),
         tool_type: ToolRequestType::ExitPlanMode {
             plan: Some(plan.to_owned()),
             plan_path: Some(plan_path.to_owned()),
@@ -394,6 +396,7 @@ pub(super) fn codex_internal_error_tail_frames() -> Vec<BackendEvent> {
         typing(true),
         tool_request(ToolRequest {
             tool_call_id: TOOL_CALL_ID.to_owned(),
+            tool_name: "run_command".to_owned(),
             tool_type: ToolRequestType::RunCommand {
                 command: "printf done".to_owned(),
                 working_directory: "/tmp/test".to_owned(),
@@ -424,6 +427,7 @@ pub(super) fn background_task_started_frames(tool_call_id: &str) -> Vec<BackendE
     vec![
         tool_request(ToolRequest {
             tool_call_id: tool_call_id.to_owned(),
+            tool_name: "run_command".to_owned(),
             tool_type: ToolRequestType::RunCommand {
                 command: "mock background command".to_owned(),
                 working_directory: "/tmp/test".to_owned(),
@@ -459,6 +463,7 @@ pub(super) fn tool_failure_without_idle_frames(tool_call_id: &str) -> Vec<Backen
         stream_start("mock", Some(MOCK_MODEL.to_owned())),
         tool_request(ToolRequest {
             tool_call_id: tool_call_id.to_owned(),
+            tool_name: "run_command".to_owned(),
             tool_type: ToolRequestType::RunCommand {
                 command: "mock interrupted command".to_owned(),
                 working_directory: "/tmp/test".to_owned(),
@@ -491,6 +496,7 @@ pub(super) async fn spawn_native_child(
     };
     let _ = events_tx.send_event(tool_request(ToolRequest {
         tool_call_id: tool_use_id.clone(),
+        tool_name: "Task".to_owned(),
         tool_type: ToolRequestType::AgentSpawn {
             prompt: Some(child.prompt.clone()),
             name: Some(child.name.clone()),
@@ -691,6 +697,7 @@ pub(super) async fn agent_control_await(
 
     if !events_tx.send_event(tool_request(ToolRequest {
         tool_call_id: tool_call_id.clone(),
+        tool_name: tool_name.to_owned(),
         tool_type: ToolRequestType::TydeAwaitAgents {
             agent_ids: typed_agent_ids,
         },

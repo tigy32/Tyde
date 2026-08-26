@@ -762,6 +762,7 @@ mod wasm_tests {
             tool_name: "AskUserQuestion".to_owned(),
             request: ToolRequest {
                 tool_call_id: "toolu_ask".to_owned(),
+                tool_name: "AskUserQuestion".to_owned(),
                 tool_type: single_select_req(),
             },
             result: Some(succeeded_completion(
@@ -796,6 +797,7 @@ mod wasm_tests {
             tool_name: "AskUserQuestion".to_owned(),
             request: ToolRequest {
                 tool_call_id: "toolu_ask".to_owned(),
+                tool_name: "AskUserQuestion".to_owned(),
                 tool_type: single_select_req(),
             },
             result: Some(failed_completion(
@@ -1090,6 +1092,7 @@ mod wasm_tests {
             tool_name: "AskUserQuestion".to_owned(),
             request: ToolRequest {
                 tool_call_id: "toolu_ask_agent_a".to_owned(),
+                tool_name: "AskUserQuestion".to_owned(),
                 tool_type: single_select_req(),
             },
             result: None,

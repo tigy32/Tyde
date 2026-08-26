@@ -2139,6 +2139,12 @@ fn mobile_message_tool_name(message: &protocol::ChatMessage, tool_call_id: &str)
 }
 
 fn mobile_fallback_tool_name(request: &protocol::ToolRequest) -> String {
+    // Parity with the desktop card: the provider's own name when the request
+    // carried one, and only a pre-`tool_name` session log falls through to
+    // naming the card after its shape.
+    if !request.tool_name.is_empty() {
+        return request.tool_name.clone();
+    }
     use protocol::ToolRequestType;
 
     match &request.tool_type {

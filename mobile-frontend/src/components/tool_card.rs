@@ -1800,6 +1800,7 @@ mod wasm_tests {
             tool_name: "AskUserQuestion".to_owned(),
             request: ToolRequest {
                 tool_call_id: "toolu_ask".to_owned(),
+                tool_name: "AskUserQuestion".to_owned(),
                 tool_type: ToolRequestType::AskUserQuestion {
                     questions: vec![AskUserQuestion {
                         id: None,
@@ -2786,6 +2787,7 @@ mod wasm_tests {
             tool_name: "ExitPlanMode".to_owned(),
             request: ToolRequest {
                 tool_call_id: "toolu_plan".to_owned(),
+                tool_name: "ExitPlanMode".to_owned(),
                 tool_type: ToolRequestType::ExitPlanMode {
                     plan: Some("Step 1: do the thing\nStep 2: verify it".to_owned()),
                     plan_path: Some("docs/plan.md".to_owned()),
@@ -3074,6 +3076,7 @@ mod wasm_tests {
             tool_name: "mcp__tyde-agent-control__tyde_send_agent_message".to_owned(),
             request: ToolRequest {
                 tool_call_id: "toolu_send_3".to_owned(),
+                tool_name: "mcp__tyde-agent-control__tyde_send_agent_message".to_owned(),
                 tool_type: ToolRequestType::Other {
                     args: serde_json::json!({
                         "tool": "mcp__tyde-agent-control__tyde_send_agent_message",
@@ -3298,6 +3301,7 @@ mod wasm_tests {
             tool_name: "tyde_spawn_agent".to_owned(),
             request: ToolRequest {
                 tool_call_id: "toolu_spawn".to_owned(),
+                tool_name: "tyde_spawn_agent".to_owned(),
                 tool_type: ToolRequestType::Other {
                     args: serde_json::json!({ "prompt": "do the thing" }),
                 },
@@ -3579,6 +3583,7 @@ mod wasm_tests {
             tool_name: "tyde_send_agent_message".to_owned(),
             request: ToolRequest {
                 tool_call_id: "toolu_send".to_owned(),
+                tool_name: "tyde_send_agent_message".to_owned(),
                 tool_type: ToolRequestType::TydeSendAgentMessage {
                     agent_id: AgentId("agent-sub".to_owned()),
                     message: SEND_MESSAGE.to_owned(),
@@ -3604,6 +3609,7 @@ mod wasm_tests {
             tool_name: "tyde_await_agents".to_owned(),
             request: ToolRequest {
                 tool_call_id: "toolu_await".to_owned(),
+                tool_name: "tyde_await_agents".to_owned(),
                 tool_type: ToolRequestType::TydeAwaitAgents {
                     agent_ids: vec![AgentId("agent-sub".to_owned())],
                 },

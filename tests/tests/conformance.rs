@@ -2373,6 +2373,7 @@ fn assert_universal_contract(turns: &[Turn]) {
         assert_streams_are_balanced(turn);
         assert_no_empty_response(turn);
         assert_every_request_was_declared(turn);
+        assert_every_request_is_named(turn);
         assert_declarations_carry_provider_arguments(turn);
         assert_every_request_completed_exactly_once(turn);
         assert_no_completion_without_request(turn);
@@ -2544,6 +2545,38 @@ fn assert_streams_are_balanced(turn: &Turn) {
 /// `acp/backend.rs` — Hermes builds `ChatEvent::ToolRequest` directly
 /// (`hermes.rs:4757`) and emits it before the `StreamEnd` that declares it.
 /// Asserting order would encode an emitter detail as a universal law.
+/// Every tool request names the tool the provider actually called.
+///
+/// The name is what identifies a tool to everything above the backend: the card
+/// the user reads, and the server's projection of Tyde's own MCP tools onto
+/// typed requests. A backend that reports a call without one leaves both
+/// guessing, and the guess is the generic word "tool".
+///
+/// Asserted against the declaration rather than a fixed string, so this holds
+/// for third-party MCP servers and native tools alike, whatever each provider
+/// chooses to call them.
+fn assert_every_request_is_named(turn: &Turn) {
+    for request in turn.tool_requests() {
+        let declared = turn.declared_name(&request.tool_call_id);
+        assert!(
+            !request.tool_name.is_empty(),
+            "{}: tool request '{}' carried no tool name (its response declared it as {declared:?})",
+            turn.label(),
+            request.tool_call_id
+        );
+        if let Some(declared) = declared {
+            assert_eq!(
+                request.tool_name,
+                declared,
+                "{}: tool request '{}' is named '{}' but its own response declared it as '{declared}'",
+                turn.label(),
+                request.tool_call_id,
+                request.tool_name
+            );
+        }
+    }
+}
+
 fn assert_every_request_was_declared(turn: &Turn) {
     let mut declared = BTreeSet::new();
     for event in turn.events() {

@@ -5119,6 +5119,12 @@ fn message_tool_name(message: &protocol::ChatMessage, tool_call_id: &str) -> Opt
 fn fallback_tool_name(request: &protocol::ToolRequest) -> String {
     use protocol::ToolRequestType;
 
+    // The provider's own name, when the request carried one. Only a request
+    // replayed from a session log written before that field existed falls
+    // through to naming the card after its shape.
+    if !request.tool_name.is_empty() {
+        return request.tool_name.clone();
+    }
     match &request.tool_type {
         ToolRequestType::ModifyFile { .. } => "modify_file",
         ToolRequestType::RunCommand { .. } => "run_command",
@@ -8600,6 +8606,7 @@ mod wasm_tests {
             &agent_id,
             ChatEvent::ToolRequest(protocol::ToolRequest {
                 tool_call_id: "toolu_send_3".to_owned(),
+                tool_name: "probe_tool".to_owned(),
                 tool_type: protocol::ToolRequestType::Other {
                     args: serde_json::json!({
                         "tool": tool_name,
@@ -8759,6 +8766,7 @@ mod wasm_tests {
         };
         let request = protocol::ToolRequest {
             tool_call_id: "toolu_send_3".to_owned(),
+            tool_name: "probe_tool".to_owned(),
             tool_type: protocol::ToolRequestType::Other {
                 args: serde_json::json!({
                     "tool": tool_name,

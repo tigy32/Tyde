@@ -25,9 +25,8 @@ use uuid::Uuid;
 
 use crate::agent::customization::{ResolvedSpawnConfig, SkillSelection};
 use crate::backend::agent_control_progress::{
-    PendingToolNormalizationFailure, await_progress_data_for_tool,
-    is_tyde_agent_control_spawn_tool_name, normalize_tyde_chat_event,
-    spawn_progress_data_for_tool_result, terminal_await_progress_data_for_tool,
+    PendingToolNormalizationFailure, is_tyde_agent_control_spawn_tool_name,
+    normalize_tyde_chat_event,
 };
 use crate::backend::hermes_config::{self, HermesProfileRef};
 use crate::backend::{
@@ -4970,15 +4969,13 @@ impl HermesEventMapper {
                 goals: hermes_delegation_goals(&arguments),
             });
         }
-        let mut events = vec![ChatEvent::ToolRequest(ToolRequest {
+        // Agent-control progress is emitted once for every backend in
+        // `EventStream::project_tyde_agent_control`.
+        Ok(vec![ChatEvent::ToolRequest(ToolRequest {
             tool_call_id: tool_call_id.clone(),
+            tool_name: tool_name.clone(),
             tool_type,
-        })];
-        if let Some(progress) = await_progress_data_for_tool(&tool_call_id, &tool_name, &arguments)
-        {
-            events.push(ChatEvent::ToolProgress(progress));
-        }
-        Ok(events)
+        })])
     }
 
     fn map_tool_progress(&mut self, payload: Option<Value>) -> Result<Vec<ChatEvent>, String> {
@@ -5037,23 +5034,6 @@ impl HermesEventMapper {
             .or(provider_error);
         let completion_tool_call_id = tool_call_id.clone();
         let mut events = Vec::new();
-        if let Some(progress) = terminal_await_progress_data_for_tool(
-            &completion_tool_call_id,
-            &tool_name,
-            &arguments,
-            if success {
-                protocol::AgentControlProgressStatus::Completed
-            } else if error.as_ref().is_some_and(|error| {
-                error.to_ascii_lowercase().contains("cancel")
-                    || error.to_ascii_lowercase().contains("interrupt")
-            }) {
-                protocol::AgentControlProgressStatus::Stopped
-            } else {
-                protocol::AgentControlProgressStatus::Failed
-            },
-        ) {
-            events.push(ChatEvent::ToolProgress(progress));
-        }
         self.opaque_progress_tools.remove(&completion_tool_call_id);
         let outcome = if success {
             let tool_result = normalized_mcp
@@ -5102,12 +5082,6 @@ impl HermesEventMapper {
         let native_subagent_dispatch = success
             && is_hermes_delegate_tool(&tool_name)
             && optional_string(&result, &["status"]).as_deref() == Some("dispatched");
-        if success
-            && let Some(progress) =
-                spawn_progress_data_for_tool_result(&completion_tool_call_id, &tool_name, &result)
-        {
-            events.push(ChatEvent::ToolProgress(progress));
-        }
         if background_task_id.is_none() && !native_subagent_dispatch {
             events.push(ChatEvent::ToolExecutionCompleted(
                 ToolExecutionCompletedData {
@@ -5393,6 +5367,7 @@ impl HermesEventMapper {
             .insert(tool_call_id.clone(), "approval.request".to_string());
         Ok(vec![ChatEvent::ToolRequest(ToolRequest {
             tool_call_id,
+            tool_name: "approval.request".to_string(),
             tool_type: ToolRequestType::ExitPlanMode {
                 plan: Some(question),
                 plan_path: None,
@@ -6627,6 +6602,7 @@ fn hermes_history_to_chat_events(value: &Value) -> Result<Vec<ChatEvent>, String
                 });
             events.push(ChatEvent::ToolRequest(ToolRequest {
                 tool_call_id: tool_call.tool_call_id,
+                tool_name: tool_call.name,
                 tool_type,
             }));
         }
