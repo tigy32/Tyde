@@ -903,6 +903,80 @@ pub async fn collect_turn(host: &mut Host, agent: &Agent, prompt: &str) -> Turn 
     }
 }
 
+/// Collect a native-subagent turn through every spawned child's completion.
+/// Detached provider-native children can outlive the first idle boundary, so
+/// the ordinary turn collector cannot establish their lifecycle contract.
+fn native_subagent_lifecycle_complete(
+    turn: &Turn,
+    spawned: &[String],
+    final_markers: &[&str],
+) -> bool {
+    spawned.iter().all(|tool_call_id| {
+        turn.tool_completions()
+            .any(|completion| &completion.tool_call_id == tool_call_id)
+    }) && turn.assistant_messages().last().is_some_and(|message| {
+        final_markers
+            .iter()
+            .all(|marker| message.content.contains(marker))
+    })
+}
+
+pub async fn collect_native_subagent_turn(
+    host: &mut Host,
+    agent: &Agent,
+    prompt: &str,
+    final_markers: &[&str],
+) -> Turn {
+    let mut turn = collect_turn(host, agent, prompt).await;
+    let spawned = turn
+        .tool_requests()
+        .filter(|request| {
+            matches!(
+                request.tool_type,
+                protocol::ToolRequestType::AgentSpawn { .. }
+            )
+        })
+        .map(|request| request.tool_call_id.clone())
+        .collect::<Vec<_>>();
+    if spawned.is_empty() || native_subagent_lifecycle_complete(&turn, &spawned, final_markers) {
+        return turn;
+    }
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return turn;
+        }
+        let envelope = match tokio::time::timeout(remaining, host.client.next_event()).await {
+            Ok(Ok(Some(envelope))) => envelope,
+            Ok(Ok(None)) => return turn,
+            Err(_) => return turn,
+            Ok(Err(error)) => panic!("native subagent settle next_event failed: {error:?}"),
+        };
+        fail_on_agent_error(&envelope, "native subagent settle");
+        fail_on_client_error(&envelope, "native subagent settle");
+        if envelope.stream != agent.stream {
+            continue;
+        }
+        if envelope.kind == FrameKind::AgentActivityStats {
+            let payload: AgentActivityStatsPayload = envelope
+                .parse_payload()
+                .expect("parse native subagent AgentActivityStats");
+            turn.activity_stats.push(payload.stats);
+            continue;
+        }
+        for event in chat_events_in(&envelope) {
+            eprintln!("{} {event:?}", backend_label(turn.backend));
+            let idle = matches!(event, ChatEvent::TypingStatusChanged(false));
+            turn.events.push(event);
+            if idle && native_subagent_lifecycle_complete(&turn, &spawned, final_markers) {
+                return turn;
+            }
+        }
+    }
+}
+
 /// One agent-control spawn: the parent's turn, and the child the host made
 /// while it ran.
 pub struct Delegation {

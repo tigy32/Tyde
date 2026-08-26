@@ -5501,6 +5501,13 @@ fn extract_run_in_background(block: &Value) -> Option<bool> {
         .and_then(Value::as_bool)
 }
 
+fn claude_subagent_execution(run_in_background: Option<bool>) -> SubAgentExecution {
+    match run_in_background {
+        Some(false) => SubAgentExecution::Foreground,
+        Some(true) | None => SubAgentExecution::Background,
+    }
+}
+
 /// Extract sub-agent spawn info from a tool_use content block.
 fn extract_spawn_description(input: Option<&Value>) -> String {
     let Some(input) = input else {
@@ -8576,13 +8583,7 @@ async fn detect_subagent_spawns(
             "detect_subagent_spawns: found tool_use block: name={block_name} id={block_id}"
         );
         if let Some((tool_use_id, name, description, agent_type)) = extract_spawn_info(&block) {
-            let requested_execution = extract_run_in_background(&block).map(|background| {
-                if background {
-                    SubAgentExecution::Background
-                } else {
-                    SubAgentExecution::Foreground
-                }
-            });
+            let requested_execution = claude_subagent_execution(extract_run_in_background(&block));
             let spec = SubAgentSpawnSpec {
                 tool_use_id: tool_use_id.clone(),
                 parent_tool_name: Some(block_name.to_owned()),
@@ -8590,7 +8591,7 @@ async fn detect_subagent_spawns(
                 description: description.clone(),
                 agent_type,
                 session_id_hint: None,
-                execution: requested_execution.unwrap_or_default(),
+                execution: requested_execution,
             };
             if parent_emitter.has_known_tool_request(&tool_use_id) {
                 ensure_subagent_stream(emitter, parent_emitter, streams, spec).await;
@@ -8598,10 +8599,8 @@ async fn detect_subagent_spawns(
                 pending_spawns.insert(tool_use_id.clone(), spec);
                 continue;
             }
-            if let Some(stream) = streams.get_mut(&tool_use_id)
-                && let Some(execution) = requested_execution
-            {
-                stream.execution = execution;
+            if let Some(stream) = streams.get_mut(&tool_use_id) {
+                stream.execution = requested_execution;
             }
         }
     }
@@ -9434,12 +9433,16 @@ fn consume_user_tool_result(
             .tool_call_by_id
             .get(&completion.tool_call_id)
             .is_some_and(|tool| {
-                (claude_is_run_command_tool_name(&tool.name) || is_subagent_tool_name(&tool.name))
-                    && tool
-                        .arguments
-                        .get("run_in_background")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false)
+                if is_subagent_tool_name(&tool.name) {
+                    claude_subagent_execution(claude_argument_bool(
+                        &tool.arguments,
+                        &["run_in_background"],
+                    )) == SubAgentExecution::Background
+                } else {
+                    claude_is_run_command_tool_name(&tool.name)
+                        && claude_argument_bool(&tool.arguments, &["run_in_background"])
+                            .unwrap_or(false)
+                }
             });
         if background_launch {
             continue;
@@ -11491,12 +11494,14 @@ fn claude_tool_request_type(
             .or_else(|| claude_argument_string(arguments, &["description"]));
         let name = claude_argument_string(arguments, &["name"])
             .or_else(|| claude_argument_string(arguments, &["description"]));
-        let execution_mode =
-            if claude_argument_bool(arguments, &["run_in_background"]).unwrap_or(false) {
-                protocol::AgentExecutionMode::Background
-            } else {
-                protocol::AgentExecutionMode::Foreground
-            };
+        let execution_mode = match claude_subagent_execution(claude_argument_bool(
+            arguments,
+            &["run_in_background"],
+        )) {
+            SubAgentExecution::Background => protocol::AgentExecutionMode::Background,
+            SubAgentExecution::Foreground => protocol::AgentExecutionMode::Foreground,
+            SubAgentExecution::Unknown => unreachable!("Claude Agent execution is classified"),
+        };
         return serde_json::to_value(protocol::ToolRequestType::AgentSpawn {
             prompt,
             name,

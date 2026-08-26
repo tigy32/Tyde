@@ -1186,13 +1186,32 @@ fn real_conversation_in_native_subagent() {
         &[BackendCapability::ForegroundSubagents],
         |mut host| async move {
             let workspace = host.workspace().to_path_buf();
-            let payload = unique_payload();
-            let prompt = subagent_prompt(&workspace, &payload);
+            let first = unique_payload();
+            let second = unique_payload();
+            let prompt = subagent_prompt(&workspace, &first, &second);
             let agent = spawn_agent(&mut host, &prompt).await;
-            let delegated = collect_turn(&mut host, &agent, &prompt).await;
+            let delegated = collect_native_subagent_turn(
+                &mut host,
+                &agent,
+                &prompt,
+                &[first.as_str(), second.as_str()],
+            )
+            .await;
 
-            assert_wrote_file(&delegated, host.workspace(), &payload);
-            assert_read_back_payload(&delegated, &payload);
+            assert_universal_contract(std::slice::from_ref(&delegated));
+            assert_wrote_file(&delegated, host.workspace(), &first);
+            let second_path = host.workspace().join(BG_FILE);
+            let second_contents = std::fs::read_to_string(&second_path).ok();
+            assert!(
+                second_contents
+                    .as_deref()
+                    .is_some_and(|contents| contents.contains(&second)),
+                "{}: {} does not contain {second:?} (contents: {second_contents:?})",
+                delegated.label(),
+                second_path.display()
+            );
+            assert_read_back_payload(&delegated, &first);
+            assert_read_back_payload(&delegated, &second);
 
             let spawns = delegated
                 .tool_requests()
@@ -1203,15 +1222,16 @@ fn real_conversation_in_native_subagent() {
                     )
                 })
                 .count();
+            // A provider may batch both children into one native call. The two
+            // filesystem and response oracles above prove both delegations ran;
+            // this assertion proves the native call remained visible as a card.
             assert!(
                 spawns > 0,
-                "{}: declares ForegroundSubagents but the turn emitted no normalized AgentSpawn \
-                 request; delegated work produced no sub-agent card. Tool requests seen: {:?}",
+                "{}: asked for two concurrent native delegations but emitted no normalized \
+                 AgentSpawn request. Tool requests seen: {:?}",
                 delegated.label(),
                 delegated.tool_request_names()
             );
-            assert_universal_contract(&[delegated]);
-
             assert_clean_close(&mut host, &agent).await;
         },
     );
@@ -2344,12 +2364,14 @@ fn parallel_tool_prompt(workspace: &Path, files: [&str; 3]) -> String {
     )
 }
 
-fn subagent_prompt(workspace: &Path, payload: &str) -> String {
+fn subagent_prompt(workspace: &Path, first: &str, second: &str) -> String {
     format!(
-        "Delegate the following task to a single sub-agent and wait for it to finish: create a \
-         file named {HELLO_FILE} in {} whose entire contents are exactly \
-         {payload} followed by a newline, then read that file back. When the sub-agent is done, \
-         reply with exactly the contents of {HELLO_FILE} and nothing else.",
+        "Delegate these two independent tasks to two sub-agents concurrently, issuing both \
+         delegations at once, then wait for both to finish. The first must create {HELLO_FILE} in \
+         {} containing exactly {first} followed by a newline and read it back. The second must \
+         create {BG_FILE} beside it containing exactly {second} followed by a newline and read it \
+         back. When both are done, reply with exactly {first} followed by a newline and {second} \
+         and nothing else.",
         workspace_root(workspace)
     )
 }
