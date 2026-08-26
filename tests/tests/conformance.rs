@@ -1182,59 +1182,75 @@ fn real_background_task_cancel() {
 #[test]
 #[ignore = "paid real-backend suite; use --run-ignored all with TYDE_RUN_REAL_AI_TESTS=1"]
 fn real_conversation_in_native_subagent() {
-    run_scenario(
-        &[BackendCapability::ForegroundSubagents],
-        |mut host| async move {
-            let workspace = host.workspace().to_path_buf();
-            let first = unique_payload();
-            let second = unique_payload();
-            let prompt = subagent_prompt(&workspace, &first, &second);
-            let agent = spawn_agent(&mut host, &prompt).await;
-            let delegated = collect_native_subagent_turn(
-                &mut host,
-                &agent,
-                &prompt,
-                &[first.as_str(), second.as_str()],
-            )
-            .await;
+    run_scenario(&[BackendCapability::Subagents], |mut host| async move {
+        let workspace = host.workspace().to_path_buf();
+        let first = unique_payload();
+        let second = unique_payload();
+        let prompt = subagent_prompt(host.backend(), &workspace, &first, &second);
+        let agent = spawn_agent(&mut host, &prompt).await;
+        let delegated = collect_native_subagent_turn(
+            &mut host,
+            &agent,
+            &prompt,
+            &[first.as_str(), second.as_str()],
+        )
+        .await;
 
-            assert_universal_contract(std::slice::from_ref(&delegated));
-            assert_wrote_file(&delegated, host.workspace(), &first);
-            let second_path = host.workspace().join(BG_FILE);
-            let second_contents = std::fs::read_to_string(&second_path).ok();
-            assert!(
-                second_contents
-                    .as_deref()
-                    .is_some_and(|contents| contents.contains(&second)),
-                "{}: {} does not contain {second:?} (contents: {second_contents:?})",
-                delegated.label(),
-                second_path.display()
-            );
-            assert_read_back_payload(&delegated, &first);
-            assert_read_back_payload(&delegated, &second);
+        assert_universal_contract(std::slice::from_ref(&delegated));
+        assert_wrote_file(&delegated, host.workspace(), &first);
+        let second_path = host.workspace().join(BG_FILE);
+        let second_contents = std::fs::read_to_string(&second_path).ok();
+        assert!(
+            second_contents
+                .as_deref()
+                .is_some_and(|contents| contents.contains(&second)),
+            "{}: {} does not contain {second:?} (contents: {second_contents:?})",
+            delegated.label(),
+            second_path.display()
+        );
+        assert_read_back_payload(&delegated, &first);
+        assert_read_back_payload(&delegated, &second);
 
-            let spawns = delegated
-                .tool_requests()
-                .filter(|request| {
-                    matches!(
-                        request.tool_type,
-                        protocol::ToolRequestType::AgentSpawn { .. }
-                    )
-                })
-                .count();
-            // A provider may batch both children into one native call. The two
-            // filesystem and response oracles above prove both delegations ran;
-            // this assertion proves the native call remained visible as a card.
-            assert!(
-                spawns > 0,
-                "{}: asked for two concurrent native delegations but emitted no normalized \
+        let spawns = delegated
+            .tool_requests()
+            .filter(|request| {
+                matches!(
+                    request.tool_type,
+                    protocol::ToolRequestType::AgentSpawn { .. }
+                )
+            })
+            .count();
+        // A provider may batch both children into one native call. The two
+        // filesystem and response oracles above prove both delegations ran;
+        // this assertion proves the native call remained visible as a card.
+        assert!(
+            spawns > 0,
+            "{}: asked for two concurrent native delegations but emitted no normalized \
                  AgentSpawn request. Tool requests seen: {:?}",
+            delegated.label(),
+            delegated.tool_request_names()
+        );
+        for request in delegated.tool_requests().filter(|request| {
+            matches!(
+                request.tool_type,
+                protocol::ToolRequestType::AgentSpawn { .. }
+            )
+        }) {
+            let completion = delegated
+                .tool_completions()
+                .find(|completion| completion.tool_call_id == request.tool_call_id)
+                .expect("universal contract already proved every spawn completed");
+            assert!(
+                matches!(completion.outcome, ToolExecutionOutcome::Succeeded { .. }),
+                "{}: native sub-agent request {:?} completed as {:?}; delegated work must be \
+                     performed by successful native children, not retried directly by the parent",
                 delegated.label(),
-                delegated.tool_request_names()
+                request.tool_call_id,
+                completion.outcome
             );
-            assert_clean_close(&mut host, &agent).await;
-        },
-    );
+        }
+        assert_clean_close(&mut host, &agent).await;
+    });
 }
 
 /// Everything about a native workflow, in one conversation.
@@ -2364,8 +2380,8 @@ fn parallel_tool_prompt(workspace: &Path, files: [&str; 3]) -> String {
     )
 }
 
-fn subagent_prompt(workspace: &Path, first: &str, second: &str) -> String {
-    format!(
+fn subagent_prompt(backend: BackendKind, workspace: &Path, first: &str, second: &str) -> String {
+    let behavior = format!(
         "Delegate these two independent tasks to two sub-agents concurrently, issuing both \
          delegations at once, then wait for both to finish. The first must create {HELLO_FILE} in \
          {} containing exactly {first} followed by a newline and read it back. The second must \
@@ -2373,7 +2389,38 @@ fn subagent_prompt(workspace: &Path, first: &str, second: &str) -> String {
          back. When both are done, reply with exactly {first} followed by a newline and {second} \
          and nothing else.",
         workspace_root(workspace)
-    )
+    );
+    match backend {
+        BackendKind::Codex => format!(
+            "{behavior} You must use Codex's native collaboration spawn_agent tool twice in \
+             parallel and then its await_agents tool. Do not use exec, apply_patch, or any \
+             file/terminal tool in the parent, and do not perform either delegated task yourself. \
+             In each spawn_agent task, require the child to use exec_command exactly once: the \
+             first child must run `printf '{first}\\n' > {}/{HELLO_FILE} && cat \
+             {}/{HELLO_FILE}`, and the second must run `printf '{second}\\n' > {}/{BG_FILE} && \
+             cat {}/{BG_FILE}`.",
+            workspace_root(workspace),
+            workspace_root(workspace),
+            workspace_root(workspace),
+            workspace_root(workspace),
+        ),
+        BackendKind::Hermes => format!(
+            "{behavior} You must use Hermes's native delegate_task tool twice, once for each \
+             task. Do not use any mcp_tyde tool, terminal tool, or file tool in the parent. Each \
+             delegate_task call returns immediately and runs in the background, so issue both \
+             calls and let their automatic completion messages resume you. In each delegated \
+             goal, require the child to use its terminal tool exactly once: the first child must \
+             run `printf '{first}\\n' > {}/{HELLO_FILE} && cat {}/{HELLO_FILE}`, and the second \
+             must run `printf '{second}\\n' > {}/{BG_FILE} && cat {}/{BG_FILE}`. Once both \
+             completion messages arrive, return the required two-line response immediately \
+             without inspecting or repairing their work in the parent.",
+            workspace_root(workspace),
+            workspace_root(workspace),
+            workspace_root(workspace),
+            workspace_root(workspace),
+        ),
+        _ => behavior,
+    }
 }
 
 /// A nonce, so a stale file from an earlier run can never satisfy the oracle.

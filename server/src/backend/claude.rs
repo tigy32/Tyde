@@ -2117,6 +2117,7 @@ impl ClaudeInner {
         ephemeral: bool,
         model_hint: Option<String>,
     ) {
+        eprintln!("TYDE CLAUDE TURN FINALIZE START turn={turn_id}");
         let pending_question_failure = match &outcome {
             TurnOutcome::Cancelled { .. } => Some("Claude turn cancelled.".to_string()),
             TurnOutcome::Failed { error, .. } => Some(error.clone()),
@@ -2204,8 +2205,7 @@ impl ClaudeInner {
             }
         }
 
-        let quiesced_waiters = self.clear_active_turn(turn_id).await;
-        self.emit_typing_status(false);
+        let quiesced_waiters = self.clear_active_turn_and_emit_idle(turn_id).await;
         notify_turn_quiesced(quiesced_waiters);
         if self.take_restart_process_after_turn().await {
             self.shutdown_process().await;
@@ -2242,15 +2242,15 @@ impl ClaudeInner {
     }
 
     async fn emit_idle_if_no_active_turn(&self) {
-        let turn_active = self
-            .state
-            .lock()
-            .await
-            .active_turn
-            .as_ref()
-            .is_some_and(|turn| {
-                !matches!(turn.owner, ClaudeTurnOwner::User) || turn.outcome_tx.is_some()
-            });
+        let state = self.state.lock().await;
+        let active_turn = state.active_turn.as_ref().map(|turn| turn.id);
+        let turn_active = state.active_turn.as_ref().is_some_and(|turn| {
+            !matches!(turn.owner, ClaudeTurnOwner::User) || turn.outcome_tx.is_some()
+        });
+        eprintln!(
+            "TYDE CLAUDE IDLE CHECK active_turn={active_turn:?} turn_active={turn_active} stream_open={}",
+            self.emitter.is_stream_open()
+        );
         if !turn_active {
             self.emit_idle_if_quiescent();
         }
@@ -2310,6 +2310,7 @@ impl ClaudeInner {
         };
 
         let message_id = format!("claude-msg-{turn_id}");
+        eprintln!("TYDE CLAUDE WAKE TURN BEGIN turn={turn_id} message={message_id}");
         self.emit_typing_status(true);
         self.emit_stream_start(&message_id, model_hint.clone());
 
@@ -4320,6 +4321,31 @@ impl ClaudeInner {
                 .unwrap_or_default();
         }
         Vec::new()
+    }
+
+    async fn clear_active_turn_and_emit_idle(&self, turn_id: u64) -> Vec<oneshot::Sender<()>> {
+        let mut state = self.state.lock().await;
+        let cleared = state
+            .active_turn
+            .as_ref()
+            .is_some_and(|active| active.id == turn_id);
+        let waiters = if cleared {
+            state
+                .active_turn
+                .take()
+                .map(|active| active.quiesced_waiters)
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        eprintln!(
+            "TYDE CLAUDE TURN FINALIZE IDLE turn={turn_id} cleared={cleared} stream_open={}",
+            self.emitter.is_stream_open()
+        );
+        if cleared {
+            self.emit_typing_status(false);
+        }
+        waiters
     }
 
     /// Commit the Claude CLI session_id into backend state.
