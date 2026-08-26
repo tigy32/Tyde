@@ -986,6 +986,10 @@ pub struct AppState {
     pub task_lists: RwSignal<HashMap<AgentRef, TaskList>>,
     pub agent_message_queue: RwSignal<HashMap<AgentRef, Vec<QueuedMessageEntry>>>,
     pub agent_turn_active: RwSignal<HashMap<AgentRef, bool>>,
+    /// The server's per-agent activity stats — the same `AgentActivityStats`
+    /// frame desktop consumes, replayed on bootstrap and re-emitted on change.
+    /// Mobile reads its current context occupancy.
+    pub agent_activity_stats: RwSignal<HashMap<AgentRef, protocol::AgentActivityStats>>,
     pub transient_events: RwSignal<HashMap<AgentRef, Vec<TransientEvent>>>,
     pub agent_session_settings: RwSignal<HashMap<AgentRef, SessionSettingsValues>>,
     pub agent_compactions: RwSignal<HashMap<AgentRef, AgentCompactNotifyPayload>>,
@@ -1090,6 +1094,7 @@ impl AppState {
             task_lists: RwSignal::new(HashMap::new()),
             agent_message_queue: RwSignal::new(HashMap::new()),
             agent_turn_active: RwSignal::new(HashMap::new()),
+            agent_activity_stats: RwSignal::new(HashMap::new()),
             transient_events: RwSignal::new(HashMap::new()),
             agent_session_settings: RwSignal::new(HashMap::new()),
             agent_compactions: RwSignal::new(HashMap::new()),
@@ -1803,6 +1808,9 @@ impl AppState {
             m.retain(|k, _| k.local_host_id != *host);
         });
         self.agent_turn_active.update(|m| {
+            m.retain(|k, _| k.local_host_id != *host);
+        });
+        self.agent_activity_stats.update(|m| {
             m.retain(|k, _| k.local_host_id != *host);
         });
         self.transient_events.update(|m| {

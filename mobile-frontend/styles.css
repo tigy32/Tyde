@@ -1055,6 +1055,32 @@ html[data-keyboard-open] .mobile-app {
     position: relative;
 }
 
+/* A couple of pixels of context occupancy along the header's bottom edge:
+   the 1px border becomes a 2px track with the used share filled in. */
+.chat-context-bar {
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: -1px;
+    height: 2px;
+    background: var(--border-default);
+    overflow: hidden;
+}
+
+.chat-context-bar-fill {
+    height: 100%;
+    background: var(--accent-primary);
+    transition: width var(--motion-slow) var(--ease-standard);
+}
+
+.chat-context-bar[data-context-level="warning"] .chat-context-bar-fill {
+    background: var(--accent-warning);
+}
+
+.chat-context-bar[data-context-level="danger"] .chat-context-bar-fill {
+    background: var(--accent-error);
+}
+
 .chat-back-button {
     min-width: 72px;
     display: inline-flex;

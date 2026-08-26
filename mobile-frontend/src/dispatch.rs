@@ -984,21 +984,24 @@ pub fn dispatch_envelope(state: &AppState, host: &LocalHostId, envelope: Envelop
                 apply_agent_compact_notify(state, host, payload);
             }
         }
-        // Desktop-only surfaces (the await progress card, the Files-explorer
-        // code-intel footer, and launch-profile menus). Mobile has no UI for
-        // these, so parse to validate the wire shape and intentionally drop
-        // them — quietly, without the "unhandled frame kind" warning below.
         FrameKind::AgentActivityStats => {
-            if let Err(error) = envelope.parse_payload::<AgentActivityStatsPayload>() {
-                log::error!(
+            match envelope.parse_payload::<AgentActivityStatsPayload>() {
+                Ok(payload) => {
+                    apply_agent_activity_stats(state, host, &envelope.stream, payload);
+                }
+                Err(error) => log::error!(
                     "failed to parse AgentActivityStats host={} stream={} seq={}: {}",
                     host,
                     envelope.stream,
                     envelope.seq,
                     error
-                );
+                ),
             }
         }
+        // Desktop-only surfaces (the Files-explorer code-intel footer and
+        // launch-profile menus). Mobile has no UI for these, so parse to
+        // validate the wire shape and intentionally drop them — quietly,
+        // without the "unhandled frame kind" warning below.
         FrameKind::CodeIntelOverview => {
             if let Err(error) = envelope.parse_payload::<CodeIntelOverviewPayload>() {
                 log::error!(
@@ -1229,6 +1232,9 @@ fn drop_agent_state(state: &AppState, agent_ref: &AgentRef) {
     state.agent_turn_active.update(|m| {
         m.remove(agent_ref);
     });
+    state.agent_activity_stats.update(|m| {
+        m.remove(agent_ref);
+    });
     state.transient_events.update(|m| {
         m.remove(agent_ref);
     });
@@ -1402,6 +1408,37 @@ fn resolve_project_id(stream: &StreamPath) -> Option<ProjectId> {
         return None;
     }
     Some(ProjectId(suffix.to_string()))
+}
+
+/// Store the server's activity stats for the agent the payload names. The
+/// frame travels on that agent's own stream, so a payload naming a different
+/// agent is a server bug: log it and keep the previous figure rather than
+/// attribute one agent's context to another.
+fn apply_agent_activity_stats(
+    state: &AppState,
+    host: &LocalHostId,
+    stream: &StreamPath,
+    payload: AgentActivityStatsPayload,
+) {
+    let agent_ref = AgentRef {
+        local_host_id: host.clone(),
+        agent_id: payload.agent_id,
+    };
+    if let Some(stream_agent) = resolve_agent_ref(state, host, stream)
+        && stream_agent != agent_ref
+    {
+        log::error!(
+            "agent_activity_stats agent mismatch host={} stream={} expected={} got={}",
+            host,
+            stream,
+            stream_agent.agent_id,
+            agent_ref.agent_id
+        );
+        return;
+    }
+    state.agent_activity_stats.update(|stats| {
+        stats.insert(agent_ref, payload.stats);
+    });
 }
 
 fn resolve_review_id(stream: &StreamPath) -> Option<ReviewId> {
@@ -2786,6 +2823,9 @@ fn apply_agent_bootstrap(
     state.agent_turn_active.update(|m| {
         m.remove(&agent_ref);
     });
+    state.agent_activity_stats.update(|m| {
+        m.remove(&agent_ref);
+    });
     state.transient_events.update(|m| {
         m.remove(&agent_ref);
     });
@@ -2895,10 +2935,9 @@ fn apply_agent_bootstrap(
                         });
                 }
             }
-            // Mobile does not surface the agent-control activity stats line
-            // (no await progress card UX), mirroring how it drops the
-            // `AgentActivitySummary` frame above.
-            AgentBootstrapEvent::AgentActivityStats(_) => {}
+            AgentBootstrapEvent::AgentActivityStats(inner) => {
+                apply_agent_activity_stats(state, host, stream, inner);
+            }
         }
     }
     // Fatal is terminal authority, and it wins over the snapshot's own
@@ -4725,6 +4764,126 @@ mod wasm_tests {
                 .rows
                 .iter()
                 .any(|entry| matches!(entry.message.sender, protocol::MessageSender::Error))
+        );
+    }
+
+    /// The context figure on the chat header comes from the server's
+    /// `AgentActivityStats`: a live frame updates it, a bootstrap replays the
+    /// server's snapshot over it, a frame naming another agent is refused, and
+    /// closing the agent drops it.
+    #[wasm_bindgen_test]
+    fn agent_activity_stats_land_live_on_bootstrap_and_leave_with_the_agent() {
+        let state = AppState::new();
+        let host = primed_host(&state, "mobile-activity-stats");
+        let instance_stream = StreamPath("/agent/a-1/inst".to_owned());
+        let agent_ref = register_agent(
+            &state,
+            &host,
+            "/host/mobile-activity-stats",
+            0,
+            "a-1",
+            &instance_stream,
+        );
+        let stats = |input_tokens: u64| protocol::AgentActivityStats {
+            current_context_usage: Some(protocol::CurrentContextUsage::Known {
+                input_tokens,
+                context_window: 200_000,
+            }),
+            ..Default::default()
+        };
+        let reported = |state: &AppState| {
+            state.agent_activity_stats.with_untracked(|m| {
+                m.get(&agent_ref)
+                    .and_then(|stats| stats.current_context_usage.as_ref())
+                    .and_then(protocol::CurrentContextUsage::known)
+            })
+        };
+
+        let bootstrap = protocol::AgentBootstrapPayload {
+            events: vec![protocol::AgentBootstrapEvent::AgentActivityStats(
+                protocol::AgentActivityStatsPayload {
+                    agent_id: AgentId("a-1".to_owned()),
+                    stats: stats(120_000),
+                },
+            )],
+            latest_output: Default::default(),
+            turn_active: false,
+        };
+        dispatch_envelope(
+            &state,
+            &host,
+            envelope(&instance_stream.0, FrameKind::AgentBootstrap, 0, &bootstrap),
+        );
+        assert_eq!(
+            reported(&state),
+            Some((120_000, 200_000)),
+            "a bootstrap replays the server's snapshot"
+        );
+
+        dispatch_envelope(
+            &state,
+            &host,
+            envelope(
+                &instance_stream.0,
+                FrameKind::AgentActivityStats,
+                1,
+                &protocol::AgentActivityStatsPayload {
+                    agent_id: AgentId("a-1".to_owned()),
+                    stats: stats(60_000),
+                },
+            ),
+        );
+        assert_eq!(
+            reported(&state),
+            Some((60_000, 200_000)),
+            "a live frame replaces the figure"
+        );
+
+        dispatch_envelope(
+            &state,
+            &host,
+            envelope(
+                &instance_stream.0,
+                FrameKind::AgentActivityStats,
+                2,
+                &protocol::AgentActivityStatsPayload {
+                    agent_id: AgentId("someone-else".to_owned()),
+                    stats: stats(1),
+                },
+            ),
+        );
+        assert_eq!(
+            reported(&state),
+            Some((60_000, 200_000)),
+            "a frame naming another agent on this stream is refused"
+        );
+        assert!(
+            state.agent_activity_stats.with_untracked(|m| {
+                !m.contains_key(&AgentRef {
+                    local_host_id: host.clone(),
+                    agent_id: AgentId("someone-else".to_owned()),
+                })
+            }),
+            "…and is not attributed to that other agent either"
+        );
+
+        dispatch_envelope(
+            &state,
+            &host,
+            envelope(
+                "/host/mobile-activity-stats",
+                FrameKind::AgentClosed,
+                1,
+                &protocol::AgentClosedPayload {
+                    agent_id: AgentId("a-1".to_owned()),
+                },
+            ),
+        );
+        assert!(
+            state
+                .agent_activity_stats
+                .with_untracked(|m| !m.contains_key(&agent_ref)),
+            "a closed agent leaves no stale figure behind"
         );
     }
 }

@@ -42,6 +42,14 @@ fn merge_timeline_rows(
     rows
 }
 
+fn format_token_count(tokens: u64) -> String {
+    if tokens >= 1_000 {
+        format!("{:.1}K", tokens as f64 / 1_000.0)
+    } else {
+        tokens.to_string()
+    }
+}
+
 fn context_compaction_status_label(
     status: &protocol::ContextCompactionStatus,
 ) -> Option<&'static str> {
@@ -377,6 +385,57 @@ pub fn ChatView() -> impl IntoView {
                 .map(|a| format!("{:?}", a.backend_kind))
         })
     };
+
+    let s_context = state.clone();
+    // Occupancy of the active agent's most recent request, as (used, window).
+    // Same precedence as desktop's chat view: a `CurrentContextUsage` on the
+    // activity stats wins outright — Known renders, Unknown is a gap and renders
+    // nothing — and only backends that report per message fall back to the
+    // latest assistant row's breakdown.
+    let context_occupancy = Memo::new(move |_| -> Option<(u64, u64)> {
+        let active = s_context.active_agent.get()?;
+        let agent_ref = active.as_agent_ref();
+        let backend = s_context.agents.with(|agents| {
+            agents
+                .iter()
+                .find(|a| a.local_host_id == active.local_host_id && a.agent_id == active.agent_id)
+                .map(|a| a.backend_kind)
+        })?;
+        let reported = s_context.agent_activity_stats.with(|stats| {
+            stats
+                .get(&agent_ref)
+                .and_then(|stats| stats.current_context_usage.clone())
+        });
+        match reported {
+            Some(protocol::CurrentContextUsage::Known {
+                input_tokens,
+                context_window,
+            }) => return Some((input_tokens, context_window)),
+            Some(protocol::CurrentContextUsage::Unknown) => return None,
+            None => {}
+        }
+        if backend == protocol::BackendKind::Codex {
+            return None;
+        }
+        s_context.chat_messages.with(|messages| {
+            let rows = messages.get(&agent_ref)?;
+            for entry in rows.iter().rev() {
+                if !matches!(
+                    entry.message.sender,
+                    protocol::MessageSender::Assistant { .. }
+                ) {
+                    continue;
+                }
+                if let Some(breakdown) = &entry.message.context_breakdown {
+                    return Some((breakdown.input_tokens, breakdown.context_window));
+                }
+                if entry.message.tool_calls.is_empty() {
+                    return None;
+                }
+            }
+            None
+        })
+    });
 
     let s_interrupt = state.clone();
     let on_interrupt = Callback::new(move |_: ()| {
@@ -779,6 +838,41 @@ pub fn ChatView() -> impl IntoView {
                         }.into_any()
                     }
                 }}
+                {move || context_occupancy.get().map(|(used, window)| {
+                    let window = window.max(1);
+                    let pct = ((used as f64 / window as f64) * 100.0).clamp(0.0, 100.0);
+                    // A `String`, not a `&'static str`: Leptos treats a `&'static str`
+                    // attribute value as immutable and does not re-apply it when this
+                    // block reruns on the same mounted node, so the level would freeze
+                    // at whichever variant first rendered.
+                    let level = if pct > 95.0 {
+                        "danger"
+                    } else if pct > 80.0 {
+                        "warning"
+                    } else {
+                        "ok"
+                    }
+                    .to_owned();
+                    view! {
+                        <div
+                            class="chat-context-bar"
+                            data-mobile-test="chat-context-bar"
+                            data-context-level=level
+                            role="progressbar"
+                            aria-label="Context usage"
+                            aria-valuemin="0"
+                            aria-valuemax="100"
+                            aria-valuenow=(pct.round() as i64).to_string()
+                            aria-valuetext=format!(
+                                "{} of {} tokens ({pct:.0}%)",
+                                format_token_count(used),
+                                format_token_count(window),
+                            )
+                        >
+                            <div class="chat-context-bar-fill" style:width=format!("{pct:.1}%")></div>
+                        </div>
+                    }
+                })}
             </div>
             <div
                 class="chat-messages"
@@ -2657,5 +2751,177 @@ mod wasm_tests {
             !state.viewing_chat.get_untracked(),
             "back navigation must clear viewing_chat"
         );
+    }
+
+    fn context_bar(container: &HtmlElement) -> Option<web_sys::Element> {
+        container
+            .query_selector("[data-mobile-test='chat-context-bar']")
+            .unwrap()
+    }
+
+    fn context_bar_value(container: &HtmlElement) -> Option<String> {
+        context_bar(container).and_then(|bar| bar.get_attribute("aria-valuenow"))
+    }
+
+    fn context_bar_fill_colour(container: &HtmlElement) -> String {
+        let fill = context_bar(container)
+            .expect("bar")
+            .first_element_child()
+            .expect("fill");
+        web_sys::window()
+            .unwrap()
+            .get_computed_style(&fill)
+            .unwrap()
+            .expect("computed style")
+            .get_property_value("background-color")
+            .unwrap()
+    }
+
+    fn reported_stats(usage: protocol::CurrentContextUsage) -> protocol::AgentActivityStats {
+        protocol::AgentActivityStats {
+            current_context_usage: Some(usage),
+            ..Default::default()
+        }
+    }
+
+    /// The header carries a couple of pixels of context occupancy for the
+    /// active agent: filled in proportion to the latest reported figure,
+    /// following the server's activity stats when they speak and the last
+    /// assistant row's breakdown otherwise, and absent — never stale or
+    /// invented — when nothing has reported.
+    #[wasm_bindgen_test]
+    async fn header_context_bar_tracks_the_latest_reported_occupancy() {
+        crate::components::test_styles::ensure_styles_loaded();
+        let container = make_container();
+        container.style().set_property("width", "390px").unwrap();
+        let state = mount_active_chat(container.clone());
+        settle_autoscroll().await;
+        assert!(
+            context_bar(&container).is_none(),
+            "a chat that never reported occupancy shows no bar"
+        );
+
+        let agent_ref = state
+            .active_agent
+            .get_untracked()
+            .expect("active agent")
+            .as_agent_ref();
+        let mut reported = make_message(
+            MessageSender::Assistant {
+                agent: "Coder".to_owned(),
+            },
+            "Done.",
+        );
+        reported.message.context_breakdown = Some(protocol::ContextBreakdown {
+            system_prompt_bytes: 0,
+            tool_io_bytes: 0,
+            conversation_history_bytes: 0,
+            reasoning_bytes: 0,
+            context_injection_bytes: 0,
+            input_tokens: 60_000,
+            context_window: 100_000,
+        });
+        state.chat_messages.update(|m| {
+            m.insert(
+                agent_ref.clone(),
+                vec![make_message(MessageSender::User, "Go"), reported],
+            );
+        });
+        settle_autoscroll().await;
+
+        let bar =
+            context_bar(&container).expect("an assistant row with a breakdown puts the bar up");
+        assert_eq!(context_bar_value(&container).as_deref(), Some("60"));
+        let track = bar.get_bounding_client_rect();
+        let header = bar
+            .parent_element()
+            .expect("header")
+            .get_bounding_client_rect();
+        let fill = bar
+            .first_element_child()
+            .expect("fill")
+            .get_bounding_client_rect();
+        assert!(
+            (1.5..=3.0).contains(&track.height()),
+            "a couple of pixels, not a widget: {}px",
+            track.height()
+        );
+        assert!(
+            track.width() >= header.width() - 1.0,
+            "the track spans the header edge ({} vs {})",
+            track.width(),
+            header.width()
+        );
+        let share = fill.width() / track.width();
+        assert!(
+            (share - 0.60).abs() < 0.02,
+            "the fill is the used share of the window, got {share}"
+        );
+        let calm = context_bar_fill_colour(&container);
+
+        // The server's activity stats, when they speak, win over the transcript.
+        state.agent_activity_stats.update(|m| {
+            m.insert(
+                agent_ref.clone(),
+                reported_stats(protocol::CurrentContextUsage::Known {
+                    input_tokens: 150_000,
+                    context_window: 200_000,
+                }),
+            );
+        });
+        settle_autoscroll().await;
+        assert_eq!(context_bar_value(&container).as_deref(), Some("75"));
+        assert_eq!(context_bar_fill_colour(&container), calm);
+
+        // Past 80% the fill changes colour, and again past 95%.
+        state.agent_activity_stats.update(|m| {
+            m.insert(
+                agent_ref.clone(),
+                reported_stats(protocol::CurrentContextUsage::Known {
+                    input_tokens: 190_000,
+                    context_window: 200_000,
+                }),
+            );
+        });
+        settle_autoscroll().await;
+        assert_eq!(context_bar_value(&container).as_deref(), Some("95"));
+        let warning = context_bar_fill_colour(&container);
+        assert_ne!(warning, calm, "a nearly full window must look different");
+        state.agent_activity_stats.update(|m| {
+            m.insert(
+                agent_ref.clone(),
+                reported_stats(protocol::CurrentContextUsage::Known {
+                    input_tokens: 196_000,
+                    context_window: 200_000,
+                }),
+            );
+        });
+        settle_autoscroll().await;
+        assert_eq!(context_bar_value(&container).as_deref(), Some("98"));
+        let danger = context_bar_fill_colour(&container);
+        assert_ne!(
+            danger, warning,
+            "a critically full window must look different again"
+        );
+
+        // A reported gap is a gap: nothing is shown, and nothing stale either.
+        state.agent_activity_stats.update(|m| {
+            m.insert(
+                agent_ref.clone(),
+                reported_stats(protocol::CurrentContextUsage::Unknown),
+            );
+        });
+        settle_autoscroll().await;
+        assert!(
+            context_bar(&container).is_none(),
+            "an Unknown occupancy renders no bar rather than the last figure"
+        );
+
+        // With the stats silent again, the transcript's figure is back.
+        state.agent_activity_stats.update(|m| {
+            m.remove(&agent_ref);
+        });
+        settle_autoscroll().await;
+        assert_eq!(context_bar_value(&container).as_deref(), Some("60"));
     }
 }
