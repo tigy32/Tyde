@@ -3097,7 +3097,17 @@ mod wasm_tests {
         assert!(credential_result.borrow().is_none());
 
         fetch.release_delayed_response();
-        for _ in 0..5 {
+        // IndexedDB completion is browser-event-driven, so wait for both spawned
+        // tasks instead of assuming they finish within a fixed number of ticks.
+        let deadline_ms = js_sys::Date::now() + 10_000.0;
+        while boot_result.borrow().is_none() || credential_result.borrow().is_none() {
+            if js_sys::Date::now() >= deadline_ms {
+                panic!(
+                    "timed out waiting for boot callback and credential tasks; boot completed: {}, credential completed: {}",
+                    boot_result.borrow().is_some(),
+                    credential_result.borrow().is_some()
+                );
+            }
             next_tick().await;
         }
         let boot_auth = boot_result
