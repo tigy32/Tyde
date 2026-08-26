@@ -2954,14 +2954,50 @@ fn assert_create_maps_to_a_diff(turn: &Turn, workspace: &Path, payload: &str) {
         turn.final_text()
     );
 
+    // Counted over the writes that actually happened, not over every card.
+    //
+    // A provider that has a write rejected and retries it emits two accurate
+    // cards: one for the attempt that failed and one for the attempt that
+    // worked. Measured 2026-08-25 on Antigravity — `agy` refuses a
+    // `write_to_file` carrying `ArtifactMetadata` to a path outside its
+    // artifact directory ("is not a valid artifact path"), the card records
+    // that `Failed`, and the model immediately rewrites the same file without
+    // it. Rejecting that made the test a check on whether a provider ever
+    // retries rather than on how a write is rendered.
+    //
+    // The failed attempts are still held to being failures, so a second
+    // *successful* write of the same file — the duplicate-card defect this
+    // guards — is still rejected.
     let cards = diff_cards(turn, workspace);
-    let [(tool_call_id, _, before, after)] = cards.as_slice() else {
+    let written = cards
+        .iter()
+        .filter(|(tool_call_id, ..)| result_for(turn, tool_call_id).is_some())
+        .copied()
+        .collect::<Vec<_>>();
+    let rejected = cards
+        .iter()
+        .filter(|(tool_call_id, ..)| result_for(turn, tool_call_id).is_none())
+        .collect::<Vec<_>>();
+    for (tool_call_id, ..) in &rejected {
+        let outcome = turn
+            .tool_completions()
+            .find(|completion| completion.tool_call_id == **tool_call_id)
+            .map(|completion| &completion.outcome);
+        assert!(
+            matches!(outcome, Some(ToolExecutionOutcome::Failed { .. })),
+            "{}: the ModifyFile card {tool_call_id} for {MAPPING_FILE} neither succeeded nor \
+             failed (outcome: {outcome:?}). A write is either rendered as a diff that happened or \
+             reported as one that did not.",
+            turn.label()
+        );
+    }
+    let [(tool_call_id, _, before, after)] = written.as_slice() else {
         panic!(
-            "{}: writing {MAPPING_FILE} produced {} ModifyFile card(s) naming it, expected exactly \
-             one. The file was written, so a tool ran — every other mapping renders the write as \
-             something that is not a diff. Requests seen: {:?}",
+            "{}: writing {MAPPING_FILE} produced {} successful ModifyFile card(s) naming it, \
+             expected exactly one. The file was written, so a tool ran — every other mapping \
+             renders the write as something that is not a diff. Requests seen: {:?}",
             turn.label(),
-            cards.len(),
+            written.len(),
             turn.tool_request_names()
         );
     };

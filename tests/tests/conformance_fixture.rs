@@ -104,15 +104,16 @@ fn enabled_backends() -> Vec<BackendKind> {
         "set TYDE_RUN_REAL_AI_TESTS=1 to authorize the paid conformance suite"
     );
     match std::env::var("TYDE_REAL_BACKENDS") {
-        // Antigravity is excluded from real-backend conformance. `BackendKind`
-        // has no enumeration to derive this from — the server hand-writes the
-        // same list in `backend/mod.rs:1250` and `host.rs:19689`.
+        // Every supported backend. `BackendKind` has no enumeration to derive
+        // this from — the server hand-writes the same list in
+        // `backend_config_schema_catalog`.
         Err(_) => vec![
             BackendKind::Claude,
             BackendKind::Codex,
             BackendKind::Kiro,
             BackendKind::Hermes,
             BackendKind::Tycode,
+            BackendKind::Antigravity,
         ],
         Ok(configured) => {
             let mut selected = Vec::new();
@@ -127,6 +128,7 @@ fn enabled_backends() -> Vec<BackendKind> {
                     "kiro" | "acp" => BackendKind::Kiro,
                     "hermes" => BackendKind::Hermes,
                     "tycode" => BackendKind::Tycode,
+                    "antigravity" | "agy" => BackendKind::Antigravity,
                     other => panic!("unknown backend {other:?} in TYDE_REAL_BACKENDS"),
                 };
                 if !selected.contains(&backend) {
@@ -779,8 +781,26 @@ pub async fn collect_turn(host: &mut Host, agent: &Agent, prompt: &str) -> Turn 
     let context = format!("{label} turn for prompt {prompt:?}");
     let mut events = Vec::new();
     let mut activity_stats = Vec::new();
-    let mut saw_echo = false;
     let mut saw_stream_end = false;
+
+    // A backend fast enough to echo the prompt before the client subscribes
+    // delivers that echo on the `AgentBootstrap` frame instead of live, and
+    // `await_agent_start` has already drained it into `replayed_history`.
+    // Measured 2026-08-25: Antigravity publishes the echo at zero subscribers
+    // because its `spawn` completes the whole provider handshake before
+    // returning, while Claude publishes at one. Both clients see the message —
+    // the agent replays chat history to a late subscriber
+    // (`attach_subscriber_with_latest_output`) — so waiting only on the live
+    // stream makes this a race on backend startup latency rather than a check
+    // of anything. The turn still has to reach `StreamEnd` and go idle below.
+    let echoed_in_bootstrap = agent
+        .replayed_history
+        .iter()
+        .position(|event| is_user_echo(event, prompt));
+    let mut saw_echo = echoed_in_bootstrap.is_some();
+    if let Some(start) = echoed_in_bootstrap {
+        events.extend(agent.replayed_history[start..].iter().cloned());
+    }
 
     loop {
         // Sized for several model round trips plus real tool execution.
@@ -800,10 +820,7 @@ pub async fn collect_turn(host: &mut Host, agent: &Agent, prompt: &str) -> Turn 
         for event in chat_events_in(&envelope) {
             eprintln!("{label} {event:?}");
 
-            if let ChatEvent::MessageAdded(message) = &event
-                && matches!(message.sender, MessageSender::User)
-                && message.content.contains(prompt)
-            {
+            if is_user_echo(&event, prompt) {
                 saw_echo = true;
             }
             if !saw_echo {
@@ -1031,6 +1048,15 @@ pub fn spawn_tool_backend_name(backend_kind: BackendKind) -> &'static str {
         BackendKind::Tycode => "tycode",
         BackendKind::Antigravity => "antigravity",
     }
+}
+
+/// The chat event that echoes `prompt` back as the user's own message.
+fn is_user_echo(event: &ChatEvent, prompt: &str) -> bool {
+    matches!(
+        event,
+        ChatEvent::MessageAdded(message)
+            if matches!(message.sender, MessageSender::User) && message.content.contains(prompt)
+    )
 }
 
 fn chat_events_in(envelope: &Envelope) -> Vec<ChatEvent> {

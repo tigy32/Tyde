@@ -1,49 +1,59 @@
 use std::collections::HashMap;
 use std::fs;
-use std::io::Write;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::process::{ExitStatus, Stdio};
+use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::LazyLock;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use command_group::AsyncCommandGroup;
+use command_group::{AsyncCommandGroup, AsyncGroupChild};
 use protocol::{
-    AgentInput, BackendAccessMode, BackendKind, ChatEvent, ChatMessage, MessageSender,
-    MessageTokenUsage, ModelInfo, OperationCancelledData, SelectOption, SessionId,
+    AgentInput, BackendAccessMode, BackendKind, ChatEvent, MessageTokenUsage, ModelInfo,
+    ModelRequestId, ModelRequestTokenUsage, ModelTurnId, SelectOption, SessionId,
     SessionSettingField, SessionSettingFieldType, SessionSettingValue, SessionSettingsSchema,
-    SessionSettingsValues, SpawnCostHint, StreamEndData, StreamStartData, StreamTextDeltaData,
-    TokenUsageUnavailableReason,
+    SessionSettingsValues, SpawnCostHint, ToolExecutionOutcome, ToolExecutionResult,
+    ToolRequestType, ToolUseData,
 };
 use serde_json::{Map, Value, json, to_value};
-use tokio::io::{AsyncReadExt, BufReader};
-use tokio::process::{ChildStderr, ChildStdout, Command};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::process::{ChildStdin, Command};
 use tokio::sync::{Mutex, mpsc, oneshot};
 use uuid::Uuid;
 
+use crate::backend::antigravity_stream::{
+    AgyFrame, AgyResult, AgyStep, AgyUsage, MCP_DISPATCH_TOOL, STATE_ACTIVE, STATE_DONE,
+    STATE_ERROR, STEP_AGENT_RESPONSE, STEP_CHECKPOINT, STEP_SUBAGENT, STEP_SYSTEM_MESSAGE,
+    STEP_TOOL, STEP_UNKNOWN, STEP_USER_INPUT, TranscriptReader, answers_from_result,
+    exit_code_from_result, mcp_inner_call, parse_frame, subagent_request_type, tool_request_type,
+};
+use crate::backend::turn_emitter::{AgentName, ResponseHandle, StreamEndPayload, TurnEmitter};
 use crate::backend::{
     Backend, BackendCompactionAvailability, BackendCompactionCapability,
     BackendCompactionCapabilityEvidence, BackendCompactionCoordinator,
     BackendCompactionNotDispatchedReason, BackendCompactionRequest, BackendCompactionStart,
-    BackendCompactionUnavailableReason, BackendSession, BackendSpawnConfig, BackendStartupError,
-    EventStream, StartupMcpServer, StartupMcpTransport, backend_fork_unsupported_message,
-    protocol_images_to_attachments, render_combined_spawn_instructions,
+    BackendCompactionUnavailableReason, BackendEvent, BackendSession, BackendSpawnConfig,
+    BackendStartupError, EventStream, StartupMcpServer, StartupMcpTransport,
+    backend_fork_unsupported_message, render_combined_spawn_instructions,
     resolve_settings as resolve_backend_settings,
 };
 use crate::process_env;
-use crate::subprocess::ImageAttachment;
 
 const ANTIGRAVITY_AGENT_NAME: &str = "antigravity";
-const ANTIGRAVITY_SPAWN_TIMEOUT: Duration = Duration::from_secs(120);
-const ANTIGRAVITY_PRINT_TIMEOUT: &str = "5m";
-const ANTIGRAVITY_LOG_POLL_INTERVAL: Duration = Duration::from_millis(50);
-const ANTIGRAVITY_DEFAULT_MODEL: &str = "Gemini 3.5 Flash (Medium)";
-const ANTIGRAVITY_LOW_MODEL: &str = "Gemini 3.5 Flash (Low)";
+const ANTIGRAVITY_STARTUP_TIMEOUT: Duration = Duration::from_secs(120);
+/// How long a wait for the shared MCP config lock has to reach before it is
+/// worth telling someone about.
+const ANTIGRAVITY_MCP_LOCK_WARN_AFTER: Duration = Duration::from_secs(5);
+/// How long `agy` gets to finalize its conversation after `SIGTERM`. Measured
+/// at well under a second; the margin is for a loaded machine.
+const ANTIGRAVITY_GRACEFUL_EXIT_TIMEOUT: Duration = Duration::from_secs(15);
+/// `agy` ends a turn on its own after this long. It is a provider-side cap on a
+/// single turn, not a Tyde timeout over local state, so it stays generous.
+const ANTIGRAVITY_PRINT_TIMEOUT: &str = "60m";
+const ANTIGRAVITY_DEFAULT_MODEL: &str = "Gemini 3.7 Flash (Medium)";
+const ANTIGRAVITY_LOW_MODEL: &str = "Gemini 3.7 Flash (Low)";
 const ANTIGRAVITY_HIGH_MODEL: &str = "Gemini 3.1 Pro (High)";
-const ANTIGRAVITY_ERROR_PREFIXES: &[&str] = &["Authentication required", "Error:"];
 
-static ANTIGRAVITY_TURN_COUNTER: AtomicU64 = AtomicU64::new(1);
 static ANTIGRAVITY_MCP_CONFIG_MUTEX: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 #[derive(Clone)]
@@ -56,110 +66,1057 @@ pub struct AntigravityBackend {
 }
 
 struct AntigravityInner {
-    events_tx: mpsc::UnboundedSender<ChatEvent>,
+    emitter: Arc<TurnEmitter>,
     state: Mutex<AntigravityState>,
 }
 
 struct AntigravityState {
-    session_id: Option<SessionId>,
-    conversations_dir: PathBuf,
-    primary_root: String,
-    extra_roots: Vec<String>,
-    startup_mcp_servers: Vec<StartupMcpServer>,
-    combined_instructions: Option<String>,
-    session_settings: SessionSettingsValues,
-    access_mode: BackendAccessMode,
-    active_turn: Option<ActiveTurn>,
-    /// Set by `shutdown`. Blocks new turns so a racing send cannot spawn a
-    /// fresh agy process after the backend has been told to close.
-    closing: bool,
-}
-
-struct ActiveTurn {
-    id: u64,
-    cancel_tx: Option<oneshot::Sender<()>>,
-}
-
-struct PreparedTurn {
-    turn_id: u64,
-    conversation_id: Option<SessionId>,
-    mcp_namespace: String,
-    primary_root: String,
-    extra_roots: Vec<String>,
-    startup_mcp_servers: Vec<StartupMcpServer>,
-    log_file: PathBuf,
-    prompt: String,
     model: String,
+    /// True between accepting a message and seeing that turn's `result`.
+    turn_active: bool,
+    closing: bool,
+    /// Resolves once the supervisor has killed the `agy` process and released
+    /// its MCP config entries.
+    shutdown_complete: Option<oneshot::Receiver<()>>,
+}
+
+/// Everything a spawned `agy` process needs, kept so the supervisor can restart
+/// it after an interrupt without re-deriving any of it.
+struct AgyLaunch {
+    primary_root: String,
+    extra_roots: Vec<String>,
     access_mode: BackendAccessMode,
-    message_id: String,
-    cancel_rx: Option<oneshot::Receiver<()>>,
-    session_capture: Option<SessionCapture>,
+    model: String,
+    mcp_namespace: String,
+    startup_mcp_servers: Vec<StartupMcpServer>,
 }
 
-#[derive(Debug, Eq, PartialEq)]
-struct AntigravityCliInvocation {
-    executable: &'static str,
-    args: Vec<String>,
-    current_dir: String,
+impl AgyLaunch {
+    fn args(&self, conversation_id: Option<&str>) -> Vec<String> {
+        let mut args = vec![
+            "--print-timeout".to_string(),
+            ANTIGRAVITY_PRINT_TIMEOUT.to_string(),
+            "--input-format".to_string(),
+            "stream-json".to_string(),
+            "--output-format".to_string(),
+            "stream-json".to_string(),
+        ];
+        match self.access_mode {
+            // `agy` has no workspace-write middle mode. ReadOnly is advisory, so it
+            // must use the non-sandbox path to let build/test commands write target/.
+            BackendAccessMode::Unrestricted | BackendAccessMode::ReadOnly => {
+                args.push("--dangerously-skip-permissions".to_string())
+            }
+        }
+        args.push("--model".to_string());
+        args.push(self.model.clone());
+        if let Some(conversation_id) = conversation_id {
+            args.push(format!("--conversation={conversation_id}"));
+        }
+        args.push("--add-dir".to_string());
+        args.push(self.primary_root.clone());
+        for root in &self.extra_roots {
+            args.push("--add-dir".to_string());
+            args.push(root.clone());
+        }
+        args
+    }
 }
 
-struct AntigravityStdoutSummary {
-    stdout: String,
-    streamed_text: String,
-    stream_started: bool,
-    blocked_error_prefix: bool,
+/// A running `agy` process and the two ends of its stream-json conversation.
+struct AgyProcess {
+    child: AsyncGroupChild,
+    stdin: ChildStdin,
+    frames_rx: mpsc::UnboundedReceiver<Result<AgyFrame, String>>,
+    conversation_id: String,
 }
 
-enum WaitResult {
-    Exited(Result<ExitStatus, String>),
-    Cancelled,
-}
+impl AgyProcess {
+    /// Starts `agy` and blocks until its `init` frame names the conversation.
+    ///
+    /// A resumed process is handed the id it must adopt; a fresh one learns its
+    /// own. Either way the id `init` reports is the one this returns, so a
+    /// resume that silently landed on a different conversation is caught here
+    /// rather than becoming a session that writes to the wrong transcript.
+    async fn start(
+        launch: &AgyLaunch,
+        resume: Option<&str>,
+        emitter: Arc<TurnEmitter>,
+    ) -> Result<Self, String> {
+        let mut command = Command::new("agy");
+        command.args(launch.args(resume));
+        if let Some(path) = process_env::resolved_child_process_path() {
+            command.env("PATH", path);
+        }
+        command
+            .current_dir(&launch.primary_root)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
 
-enum TurnOutcome {
-    Completed(AntigravityStdoutSummary),
-    Cancelled(AntigravityStdoutSummary),
-    Failed {
-        summary: AntigravityStdoutSummary,
-        error: String,
-    },
-}
+        let mut child = command
+            .group_spawn()
+            .map_err(|err| format!("Failed to start Antigravity CLI: {err:?}"))?;
+        let stdin = child
+            .inner()
+            .stdin
+            .take()
+            .ok_or_else(|| "Failed to capture Antigravity stdin".to_string())?;
+        let stdout = child
+            .inner()
+            .stdout
+            .take()
+            .ok_or_else(|| "Failed to capture Antigravity stdout".to_string())?;
+        let stderr = child
+            .inner()
+            .stderr
+            .take()
+            .ok_or_else(|| "Failed to capture Antigravity stderr".to_string())?;
 
-#[derive(Clone)]
-struct SessionCapture {
-    tx: mpsc::UnboundedSender<Result<SessionId, String>>,
-}
-
-impl SessionCapture {
-    fn new(ready_tx: oneshot::Sender<Result<SessionId, String>>) -> Self {
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (frames_tx, mut frames_rx) = mpsc::unbounded_channel();
         tokio::spawn(async move {
-            if let Some(result) = rx.recv().await {
-                let _ = ready_tx.send(result);
+            let mut lines = BufReader::new(stdout).lines();
+            loop {
+                match lines.next_line().await {
+                    Ok(Some(line)) => {
+                        let trimmed = line.trim();
+                        if trimmed.is_empty() {
+                            continue;
+                        }
+                        if frames_tx.send(parse_frame(trimmed)).is_err() {
+                            return;
+                        }
+                    }
+                    Ok(None) => return,
+                    Err(err) => {
+                        let _ = frames_tx
+                            .send(Err(format!("Failed to read Antigravity stdout: {err}")));
+                        return;
+                    }
+                }
             }
         });
-        Self { tx }
+
+        let stderr_emitter = Arc::clone(&emitter);
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(stderr).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                if !line.trim().is_empty() {
+                    stderr_emitter.subprocess_stderr(&line);
+                }
+            }
+        });
+
+        let init = tokio::time::timeout(ANTIGRAVITY_STARTUP_TIMEOUT, async {
+            while let Some(frame) = frames_rx.recv().await {
+                match frame? {
+                    AgyFrame::Init(init) => return Ok(init.conversation_id),
+                    // `agy` answers a startup failure — no credentials, a model
+                    // the account cannot use — with a terminal `result` before
+                    // any `init`. Its message is the only useful diagnostic.
+                    AgyFrame::Result(result) => {
+                        return Err(startup_failure_message(&result));
+                    }
+                    _ => continue,
+                }
+            }
+            Err("Antigravity CLI exited before reporting a conversation".to_string())
+        })
+        .await
+        .map_err(|_| {
+            format!(
+                "Antigravity CLI did not start within {}s",
+                ANTIGRAVITY_STARTUP_TIMEOUT.as_secs()
+            )
+        })??;
+
+        if let Some(expected) = resume
+            && expected != init
+        {
+            return Err(format!(
+                "Antigravity resumed conversation {init} when {expected} was requested"
+            ));
+        }
+
+        Ok(Self {
+            child,
+            stdin,
+            frames_rx,
+            conversation_id: init,
+        })
     }
 
-    fn succeed(&self, session_id: SessionId) {
-        let _ = self.tx.send(Ok(session_id));
+    async fn send_turn(&mut self, message: &str) -> Result<(), String> {
+        let line = serde_json::to_string(&json!({
+            "event": "user",
+            "message": { "content": message },
+        }))
+        .map_err(|err| format!("Failed to encode Antigravity turn: {err}"))?;
+        self.stdin
+            .write_all(format!("{line}\n").as_bytes())
+            .await
+            .map_err(|err| format!("Failed to send turn to Antigravity: {err}"))?;
+        self.stdin
+            .flush()
+            .await
+            .map_err(|err| format!("Failed to flush Antigravity stdin: {err}"))
     }
 
-    fn fail(&self, error: impl Into<String>) {
-        let _ = self.tx.send(Err(error.into()));
+    /// Ends the turn the way an interrupt has to end it.
+    ///
+    /// `SIGKILL` stops the command that is running, but it also leaves the
+    /// tool's step marked RUNNING in `agy`'s own conversation store, and
+    /// resuming that conversation re-executes it. Measured 2026-08-25: a
+    /// `sleep 20 && write proof` command killed with `SIGKILL` had not written
+    /// its proof file at kill time and *had* written it 30 seconds after the
+    /// resume — the cancelled command ran to completion anyway, which is
+    /// exactly the defect `real_interruption` exists to catch. A new user turn
+    /// sent immediately on resume does not pre-empt it either.
+    ///
+    /// `SIGTERM` gives `agy` the chance to finalize the step before it exits,
+    /// and the same measurement then shows the proof file absent both at kill
+    /// time and 30 seconds after the resume. Asking politely is platform
+    /// specific — see `request_graceful_exit` — and where there is no way to
+    /// ask, this falls back to the kill and its consequence.
+    async fn terminate(&mut self) {
+        if self.request_graceful_exit() {
+            // Waiting on the provider to finish its own shutdown, not on local
+            // state: if it will not exit, killing it still has to end it, and
+            // the re-run on resume is the lesser of the two failures.
+            let graceful =
+                tokio::time::timeout(ANTIGRAVITY_GRACEFUL_EXIT_TIMEOUT, self.child.wait()).await;
+            if graceful.is_ok() {
+                return;
+            }
+            tracing::warn!(
+                "Antigravity did not exit within {}s of the graceful stop; killing it, which \
+                 leaves its in-flight tool step resumable",
+                ANTIGRAVITY_GRACEFUL_EXIT_TIMEOUT.as_secs()
+            );
+        }
+        // The job object takes the whole process tree with it, so the command
+        // does stop either way. What is lost is `agy`'s chance to finalize the
+        // step, which is what stops a resume from re-running it.
+        let _ = self.child.kill().await;
+        let _ = self.child.wait().await;
+    }
+
+    /// Asks `agy` to stop rather than killing it, where the platform has a way
+    /// to ask.
+    ///
+    /// Returns whether the request was delivered, so the caller knows whether
+    /// waiting for a clean exit is worth anything.
+    #[cfg(unix)]
+    fn request_graceful_exit(&mut self) -> bool {
+        use command_group::{Signal, UnixChildExt};
+
+        self.child.signal(Signal::SIGTERM).is_ok()
+    }
+
+    /// Windows has no `SIGTERM`, and the console-control event that comes
+    /// closest needs the child spawned into its own process group plus a
+    /// `kernel32` call — neither of which this crate has today, and neither of
+    /// which can be verified from the machines this is developed on. So an
+    /// interrupt here is the kill path: the command still stops, but `agy`
+    /// never finalizes the step, and resuming that conversation re-runs it.
+    #[cfg(windows)]
+    fn request_graceful_exit(&mut self) -> bool {
+        false
+    }
+}
+
+fn startup_failure_message(result: &AgyResult) -> String {
+    let detail = result
+        .error
+        .as_deref()
+        .map(str::trim)
+        .filter(|error| !error.is_empty())
+        .unwrap_or_else(|| result.response.trim());
+    if detail.is_empty() {
+        "Antigravity CLI failed to start".to_string()
+    } else {
+        format!("Antigravity CLI failed to start: {detail}")
+    }
+}
+/// The per-turn mapping state.
+///
+/// `agy` reports a turn as a flat, strictly ordered run of steps: an
+/// `agent_response` step is one model request, and the `tool` steps it issued
+/// follow it. The response that owns those tools is therefore already `DONE` by
+/// the time the first of them arrives, so a response is held open until the
+/// *next* model request starts or the turn ends. That is what lets a message
+/// carry the tool calls it actually made instead of splitting each call onto a
+/// message of its own.
+struct TurnMapper {
+    turn_id: ModelTurnId,
+    model: String,
+    response: Option<OpenResponse>,
+    open_tools: HashMap<u64, OpenTool>,
+    turn_usage: AgyUsage,
+    cumulative_usage: AgyUsage,
+    /// Question cards this turn opened and deliberately did not close.
+    pending_questions: Vec<String>,
+    request_sequence: u32,
+    transcript: TranscriptReader,
+    /// The usage of a model request that issued tool calls. Its message does
+    /// not exist yet: the `tool` steps that will populate it arrive after the
+    /// `agent_response` step closes.
+    pending_usage: Option<AgyUsage>,
+}
+
+struct OpenResponse {
+    handle: ResponseHandle,
+    step_index: u64,
+    text: String,
+    declarations: Vec<ToolUseData>,
+    usage: Option<AgyUsage>,
+}
+
+struct OpenTool {
+    tool_call_id: String,
+    name: String,
+    /// Kept so the completion can be reported in the same shape as the request.
+    /// A `ModifyFile` that finishes as `Other` leaves the card with no `+A -B`
+    /// footer, and a `RunCommand` with no exit code.
+    tool_type: ToolRequestType,
+}
+
+impl TurnMapper {
+    fn new(
+        turn_id: String,
+        model: String,
+        transcript: TranscriptReader,
+        cumulative: AgyUsage,
+    ) -> Self {
+        Self {
+            turn_id: ModelTurnId(turn_id),
+            model,
+            response: None,
+            open_tools: HashMap::new(),
+            turn_usage: AgyUsage::default(),
+            cumulative_usage: cumulative,
+            pending_questions: Vec::new(),
+            request_sequence: 0,
+            transcript,
+            pending_usage: None,
+        }
+    }
+
+    fn handle_step(&mut self, emitter: &TurnEmitter, step: AgyStep) {
+        match step.step_type.as_str() {
+            STEP_AGENT_RESPONSE => self.handle_agent_response(emitter, step),
+            STEP_TOOL | STEP_SUBAGENT | STEP_UNKNOWN => self.handle_tool_like(emitter, step),
+            // Tyde emits the user's own message, `agy` re-states the prompt it
+            // was given, and a checkpoint is the CLI's private context
+            // bookkeeping. A `system_message` is how a subagent's reply and a
+            // background task's completion reach the model; the stream carries
+            // no text for it, so there is nothing to show.
+            STEP_USER_INPUT | STEP_CHECKPOINT | STEP_SYSTEM_MESSAGE => {}
+            other => {
+                tracing::debug!("Antigravity step type {other:?} has no Tyde mapping");
+            }
+        }
+    }
+
+    fn handle_agent_response(&mut self, emitter: &TurnEmitter, step: AgyStep) {
+        // A new model request begins: whatever the previous one was holding
+        // open, including the tools it declared, is now complete.
+        if self
+            .response
+            .as_ref()
+            .is_some_and(|open| open.step_index != step.step_index)
+        {
+            self.close_response(emitter);
+        }
+
+        if let Some(delta) = step.text_delta.as_deref().filter(|text| !text.is_empty()) {
+            let open = self.ensure_response(emitter, step.step_index);
+            emitter.stream_delta(&open.handle, delta);
+            open.text.push_str(delta);
+        }
+
+        if step.state == STATE_DONE
+            && let Some(usage) = step.usage
+        {
+            self.turn_usage = self.turn_usage.saturating_add(usage);
+            self.cumulative_usage = self.cumulative_usage.saturating_add(usage);
+            self.request_sequence = self.request_sequence.saturating_add(1);
+            emitter.model_request_token_usage(&ModelRequestTokenUsage {
+                request_id: ModelRequestId {
+                    turn_id: self.turn_id.clone(),
+                    sequence: self.request_sequence,
+                },
+                request: usage.to_protocol(),
+                turn: self.turn_usage.to_protocol(),
+                cumulative: self.cumulative_usage.to_protocol(),
+                model_context_window: None,
+                current_context_usage: None,
+                estimated_context_breakdown: None,
+            });
+            // Attach the request's own usage to the message it produced. The
+            // response is not closed here: its tool steps have not arrived yet.
+            if let Some(open) = self
+                .response
+                .as_mut()
+                .filter(|open| open.step_index == step.step_index)
+            {
+                open.usage = Some(usage);
+            } else {
+                self.pending_usage = Some(usage);
+            }
+        }
+    }
+
+    fn ensure_response(&mut self, emitter: &TurnEmitter, step_index: u64) -> &mut OpenResponse {
+        if self.response.is_none() {
+            let handle = emitter.stream_start(Some(&self.model));
+            self.response = Some(OpenResponse {
+                handle,
+                step_index,
+                text: String::new(),
+                declarations: Vec::new(),
+                usage: self.pending_usage.take(),
+            });
+        }
+        self.response.as_mut().expect("response just created")
+    }
+
+    fn handle_tool_like(&mut self, emitter: &TurnEmitter, step: AgyStep) {
+        let step_index = step.step_index;
+        // An `unknown` step carries no `tool_name` and no `tool_info`, so the
+        // transcript is the only place its identity exists.
+        if step.step_type == STEP_UNKNOWN {
+            self.transcript.refresh();
+        }
+        let tool_name = step
+            .tool_name
+            .clone()
+            .or_else(|| step.tool_info.as_ref().and_then(|info| info.name.clone()))
+            .or_else(|| {
+                self.transcript
+                    .unnamed_call_for_tool_step(step_index)
+                    .map(|call| call.name.clone())
+            })
+            .unwrap_or_else(|| step.step_type.clone());
+
+        match step.state.as_str() {
+            STATE_ACTIVE => self.open_tool(emitter, step_index, &tool_name, &step),
+            STATE_DONE | STATE_ERROR => {
+                // A tool whose ACTIVE never arrived still gets a card, so the
+                // work shows up rather than vanishing.
+                if !self.open_tools.contains_key(&step_index) {
+                    self.open_tool(emitter, step_index, &tool_name, &step);
+                }
+                self.close_tool(emitter, step_index, &step);
+            }
+            other => {
+                tracing::debug!("Antigravity tool step state {other:?} has no Tyde mapping");
+            }
+        }
+    }
+
+    fn open_tool(
+        &mut self,
+        emitter: &TurnEmitter,
+        step_index: u64,
+        tool_name: &str,
+        step: &AgyStep,
+    ) {
+        let tool_call_id = format!("agy-{}-{step_index}", self.turn_id.0);
+        let mut card_name = tool_name.to_string();
+
+        // The stream's `tool_info.parameters` is a summary; the transcript has
+        // the arguments the model really passed. Whichever is available is both
+        // what the type is derived from and what the declaration carries, so
+        // the card and the record can never disagree.
+        let (provider_arguments, tool_type) = if step.step_type == STEP_SUBAGENT {
+            let subagent = step
+                .subagent_info
+                .as_ref()
+                .and_then(|info| info.subagents.first());
+            let arguments = step
+                .subagent_info
+                .as_ref()
+                .and_then(|info| to_value(info).ok())
+                .unwrap_or(Value::Null);
+            let tool_type =
+                subagent
+                    .map(subagent_request_type)
+                    .unwrap_or_else(|| ToolRequestType::Other {
+                        args: arguments.clone(),
+                    });
+            (arguments, tool_type)
+        } else {
+            self.transcript.refresh();
+            let enriched = self
+                .transcript
+                .call_for_tool_step(step_index, tool_name)
+                .map(|call| call.args.clone());
+            let summary = step
+                .tool_info
+                .as_ref()
+                .and_then(|info| info.parameters.clone())
+                .unwrap_or(Value::Null);
+            let (args, enriched) = match enriched {
+                Some(args) => (args, true),
+                None => (summary, false),
+            };
+            let tool_type = tool_request_type(tool_name, &args, enriched);
+            // An MCP call's own arguments, not the dispatcher's envelope.
+            if tool_name == MCP_DISPATCH_TOOL {
+                let (inner_name, inner_args) = mcp_inner_call(&args);
+                card_name = inner_name;
+                (inner_args, tool_type)
+            } else {
+                (args, tool_type)
+            }
+        };
+
+        // The provider's own arguments, never a re-serialization of the
+        // normalized type. The normalized form already rides on the request;
+        // copying it here would discard the only record of what the model
+        // actually passed.
+        let arguments = provider_arguments;
+        let declaration = ToolUseData {
+            tool_call_id: tool_call_id.clone(),
+            name: card_name.clone(),
+            arguments,
+            content_offset: None,
+        };
+
+        let handle = {
+            let open = self.ensure_response(emitter, step_index);
+            open.declarations.push(declaration.clone());
+            open.handle.clone()
+        };
+        emitter.declare_streaming_tools(&handle, vec![declaration]);
+        emitter.tool_request(&tool_call_id, tool_type.clone());
+        self.open_tools.insert(
+            step_index,
+            OpenTool {
+                tool_call_id,
+                name: card_name,
+                tool_type,
+            },
+        );
+    }
+
+    fn close_tool(&mut self, emitter: &TurnEmitter, step_index: u64, step: &AgyStep) {
+        let Some(open) = self.open_tools.remove(&step_index) else {
+            return;
+        };
+        if step.state == STATE_ERROR {
+            let message = step
+                .tool_info
+                .as_ref()
+                .and_then(|info| info.error.as_ref())
+                .and_then(|error| error.message.clone())
+                .unwrap_or_else(|| format!("{} failed", open.name));
+            emitter.tool_completed(
+                &open.tool_call_id,
+                ToolExecutionOutcome::Failed {
+                    message,
+                    details: None,
+                    normalization_failure: None,
+                },
+            );
+            return;
+        }
+
+        // A question outlives its turn on purpose. `agy` answers its own
+        // questions headlessly — "A1: User Skipped" — and ends the turn, but
+        // that is precisely the shape Tyde expects: the turn ends so the user
+        // can act on the card, and `TurnEmitter` exempts an open question from
+        // the cancellation it applies to every other tool still running at
+        // idle. Completing it here would terminalize the card behind the user
+        // and make their answer arrive for an id that has already been retired.
+        if matches!(open.tool_type, ToolRequestType::AskUserQuestion { .. }) {
+            self.pending_questions.push(open.tool_call_id);
+            return;
+        }
+
+        self.transcript.refresh();
+        let transcript_result = self
+            .transcript
+            .result_for_tool_step(step_index)
+            .map(str::to_string);
+        let output = step
+            .tool_info
+            .as_ref()
+            .and_then(|info| info.output.clone())
+            .unwrap_or_default();
+        emitter.tool_completed(
+            &open.tool_call_id,
+            ToolExecutionOutcome::Succeeded {
+                result: tool_execution_result(
+                    &open.tool_type,
+                    &output,
+                    transcript_result.as_deref(),
+                ),
+            },
+        );
+    }
+
+    fn close_response(&mut self, emitter: &TurnEmitter) {
+        let Some(open) = self.response.take() else {
+            return;
+        };
+        // A response with no text and no tool calls would render as an empty
+        // bubble. `agy` produces one whenever a model request is pure
+        // bookkeeping, so it is dropped rather than published.
+        if open.text.is_empty() && open.declarations.is_empty() {
+            emitter.stream_end(
+                open.handle,
+                StreamEndPayload {
+                    content: String::new(),
+                    ..Default::default()
+                },
+            );
+            return;
+        }
+        emitter.stream_end(
+            open.handle,
+            StreamEndPayload {
+                content: open.text,
+                model_info: Some(ModelInfo {
+                    model: self.model.clone(),
+                }),
+                token_usage: open.usage.map(|usage| {
+                    MessageTokenUsage::request_and_turn_known(
+                        usage.to_protocol(),
+                        self.turn_usage.to_protocol(),
+                    )
+                }),
+                tool_calls: open.declarations,
+                ..Default::default()
+            },
+        );
+    }
+
+    fn take_pending_questions(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.pending_questions)
+    }
+
+    /// Drops the mapper's own bookkeeping for an interrupted turn.
+    ///
+    /// The cards themselves are closed by `TurnEmitter::operation_cancelled`,
+    /// which discards the open response and completes every pending tool as
+    /// cancelled. Doing it here as well would report each card twice.
+    fn abandon_open_work(&mut self) {
+        self.open_tools.clear();
+        self.response = None;
+    }
+}
+/// Owns the `agy` process for the life of the session.
+///
+/// One process serves every turn — measured, a second turn on the same process
+/// recalled what the first was told — so the supervisor's job is to keep it
+/// alive, feed it one NDJSON line per turn, and rebuild it around an interrupt.
+struct Supervisor {
+    inner: Arc<AntigravityInner>,
+    launch: AgyLaunch,
+    brain_dir: PathBuf,
+    mcp_guard: Option<AntigravityMcpConfigGuard>,
+    mapper: Option<TurnMapper>,
+    cumulative: AgyUsage,
+    turn_counter: u64,
+    /// Question cards waiting on a human. They survive the turn that asked, and
+    /// are cleared either by an answer or by a cancel.
+    pending_questions: Vec<String>,
+    shutdown_complete: oneshot::Sender<()>,
+}
+
+impl Supervisor {
+    async fn run(
+        mut self,
+        mut process: AgyProcess,
+        mut input_rx: mpsc::UnboundedReceiver<AgentInput>,
+        mut interrupt_rx: mpsc::UnboundedReceiver<()>,
+        initial_message: Option<String>,
+    ) {
+        let emitter = Arc::clone(&self.inner.emitter);
+
+        if let Some(message) = initial_message
+            && !self.start_turn(&mut process, &message, true).await
+        {
+            self.shutdown(process).await;
+            return;
+        }
+
+        loop {
+            tokio::select! {
+                biased;
+
+                interrupt = interrupt_rx.recv() => {
+                    let Some(()) = interrupt else { break };
+                    if !self.interrupt(&mut process).await {
+                        break;
+                    }
+                }
+
+                frame = process.frames_rx.recv() => {
+                    match frame {
+                        Some(Ok(frame)) => self.handle_frame(frame).await,
+                        // A line we cannot read is the provider telling us
+                        // something we do not understand. Surfacing it beats
+                        // dropping it and reporting a turn that quietly lost
+                        // half its events.
+                        Some(Err(err)) => emitter.backend_error(&err),
+                        None => {
+                            if self.inner.state.lock().await.turn_active {
+                                emitter.backend_error(
+                                    "Antigravity CLI exited while a turn was still running",
+                                );
+                                self.finish_turn().await;
+                            }
+                            break;
+                        }
+                    }
+                }
+
+                incoming = input_rx.recv() => {
+                    let Some(input) = incoming else { break };
+                    if !self.handle_input(&mut process, input).await {
+                        break;
+                    }
+                }
+            }
+        }
+
+        self.shutdown(process).await;
+    }
+
+    /// `agy` has no cancel message: its stdin vocabulary is user turns only,
+    /// and SIGINT kills the process outright while reporting a bogus "timeout
+    /// waiting for response". So an interrupt is a kill plus a resume, which is
+    /// safe because `--conversation=<id>` restores the conversation exactly.
+    async fn interrupt(&mut self, process: &mut AgyProcess) -> bool {
+        if let Some(mapper) = self.mapper.as_mut() {
+            mapper.abandon_open_work();
+        }
+        self.mapper = None;
+        // `operation_cancelled` completes every pending tool as cancelled,
+        // including any question still waiting on the user.
+        self.pending_questions.clear();
+        self.inner
+            .emitter
+            .operation_cancelled("Antigravity turn cancelled.");
+        self.inner.state.lock().await.turn_active = false;
+
+        let conversation_id = process.conversation_id.clone();
+        process.terminate().await;
+        match AgyProcess::start(
+            &self.launch,
+            Some(&conversation_id),
+            Arc::clone(&self.inner.emitter),
+        )
+        .await
+        {
+            Ok(restarted) => {
+                *process = restarted;
+                true
+            }
+            Err(err) => {
+                self.inner.emitter.backend_error(&format!(
+                    "Antigravity could not resume after the interrupt: {err}"
+                ));
+                false
+            }
+        }
+    }
+
+    async fn handle_input(&mut self, process: &mut AgyProcess, input: AgentInput) -> bool {
+        match input {
+            AgentInput::SendMessage(payload) => {
+                if let Some(response) = payload.tool_response.clone()
+                    && !self.answer_question(response).await
+                {
+                    return true;
+                }
+                // A tool response is not a chat message, so it produces no user
+                // bubble — the card the user acted on is the record of it.
+                let echo = payload.tool_response.is_none();
+                self.start_turn(process, &payload.message, echo).await
+            }
+            AgentInput::UpdateSessionSettings(payload) => {
+                match self.apply_settings(process, payload.values).await {
+                    Ok(()) => true,
+                    Err(err) => {
+                        self.inner.emitter.backend_error(&err);
+                        false
+                    }
+                }
+            }
+            AgentInput::EditQueuedMessage(_)
+            | AgentInput::CancelQueuedMessage(_)
+            | AgentInput::SendQueuedMessageNow(_) => {
+                panic!(
+                    "queued-message inputs must be handled by the agent actor before reaching the \
+                     backend"
+                );
+            }
+        }
+    }
+
+    /// Closes the card the user acted on, so their answer and the transcript
+    /// agree, and reports a mismatch rather than silently dropping it.
+    async fn answer_question(&mut self, response: protocol::SendMessageToolResponse) -> bool {
+        let protocol::SendMessageToolResponse::AskUserQuestion {
+            tool_call_id,
+            answer,
+        } = response
+        else {
+            self.inner.emitter.backend_error(
+                "Antigravity received a plan-approval response, which it never requests",
+            );
+            return false;
+        };
+        let Some(position) = self
+            .pending_questions
+            .iter()
+            .position(|pending| *pending == tool_call_id)
+        else {
+            self.inner.emitter.backend_error(&format!(
+                "Antigravity received an answer for question {tool_call_id}, which is not waiting \
+                 on one"
+            ));
+            return false;
+        };
+        self.pending_questions.remove(position);
+        self.inner.emitter.tool_completed(
+            &tool_call_id,
+            ToolExecutionOutcome::Succeeded {
+                result: ToolExecutionResult::Other {
+                    result: json!({ "answer": answer }),
+                },
+            },
+        );
+        true
+    }
+
+    async fn start_turn(
+        &mut self,
+        process: &mut AgyProcess,
+        message: &str,
+        echo_user_message: bool,
+    ) -> bool {
+        self.turn_counter += 1;
+        let model = {
+            let mut state = self.inner.state.lock().await;
+            state.turn_active = true;
+            state.model.clone()
+        };
+        self.mapper = Some(TurnMapper::new(
+            format!("{}-{}", process.conversation_id, self.turn_counter),
+            model,
+            TranscriptReader::new(&self.brain_dir, &process.conversation_id),
+            self.cumulative,
+        ));
+        if echo_user_message {
+            self.inner.emitter.user_message(message, None);
+        }
+        self.inner.emitter.typing_status_changed(true);
+        if let Err(err) = process.send_turn(message).await {
+            self.inner.emitter.backend_error(&err);
+            self.inner.emitter.typing_status_changed(false);
+            self.inner.state.lock().await.turn_active = false;
+            self.mapper = None;
+            return false;
+        }
+        true
+    }
+
+    async fn handle_frame(&mut self, frame: AgyFrame) {
+        match frame {
+            AgyFrame::Step(step) => {
+                if let Some(mapper) = self.mapper.as_mut() {
+                    mapper.handle_step(&self.inner.emitter, step);
+                }
+            }
+            AgyFrame::Result(result) => {
+                if let Some(mapper) = self.mapper.as_ref() {
+                    self.cumulative = mapper.cumulative_usage;
+                }
+                if result.status.eq_ignore_ascii_case("ERROR") {
+                    let detail = result
+                        .error
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|error| !error.is_empty())
+                        .unwrap_or("Antigravity reported a failed turn");
+                    self.inner.emitter.error_message(detail);
+                }
+                self.finish_turn().await;
+            }
+            // `command_result` is emitted only by the read-only slash commands,
+            // which never run inside a turn, and `init` was consumed at start.
+            AgyFrame::CommandResult(_) | AgyFrame::Init(_) => {}
+            AgyFrame::Unrecognized { event } => {
+                tracing::debug!("Antigravity emitted unrecognized event {event:?}");
+            }
+        }
+    }
+
+    async fn finish_turn(&mut self) {
+        if let Some(mut mapper) = self.mapper.take() {
+            mapper.close_response(&self.inner.emitter);
+            self.pending_questions
+                .extend(mapper.take_pending_questions());
+        }
+        self.inner.emitter.typing_status_changed(false);
+        self.inner.state.lock().await.turn_active = false;
+    }
+
+    /// A model change is a process restart: `--model` is a launch flag and
+    /// `agy` takes no equivalent over stdin. The conversation survives it.
+    async fn apply_settings(
+        &mut self,
+        process: &mut AgyProcess,
+        values: SessionSettingsValues,
+    ) -> Result<(), String> {
+        let model = selected_model(&values)?;
+        {
+            let mut state = self.inner.state.lock().await;
+            if state.model == model {
+                return Ok(());
+            }
+            state.model = model.clone();
+        }
+        self.launch.model = model;
+        let conversation_id = process.conversation_id.clone();
+        let replacement = AgyProcess::start(
+            &self.launch,
+            Some(&conversation_id),
+            Arc::clone(&self.inner.emitter),
+        )
+        .await?;
+        process.terminate().await;
+        *process = replacement;
+        Ok(())
+    }
+
+    async fn shutdown(self, mut process: AgyProcess) {
+        process.terminate().await;
+        if let Some(guard) = self.mcp_guard
+            && let Err(err) = guard.remove(&self.launch.startup_mcp_servers).await
+        {
+            tracing::warn!("{err}");
+        }
+        let _ = self.shutdown_complete.send(());
+    }
+}
+
+/// Reports a completion in the same shape as the request that opened it.
+///
+/// The card's footer is rendered from the typed result — `+A -B` for a diff, an
+/// exit code for a command — so a completion that falls back to `Other` leaves
+/// a finished tool with no summary of what it did.
+fn tool_execution_result(
+    tool_type: &ToolRequestType,
+    output: &str,
+    transcript_result: Option<&str>,
+) -> ToolExecutionResult {
+    match tool_type {
+        ToolRequestType::ModifyFile { before, after, .. } => {
+            let (lines_added, lines_removed) = crate::backend::estimate_line_delta(before, after);
+            ToolExecutionResult::ModifyFile {
+                lines_added,
+                lines_removed,
+            }
+        }
+        ToolRequestType::RunCommand { .. } => ToolExecutionResult::RunCommand {
+            // The stream reports a command's output but never its status. The
+            // transcript records "The command exited with code N", which is the
+            // only place a non-zero exit is stated, so a failing command does
+            // not render as a card that looks like it succeeded.
+            exit_code: transcript_result
+                .and_then(exit_code_from_result)
+                .unwrap_or(0),
+            stdout: output.to_string(),
+            stderr: String::new(),
+        },
+        ToolRequestType::ReadFiles { file_paths } => ToolExecutionResult::ReadFiles {
+            // `agy` summarises a read as "4 lines, 17 bytes" and reports the
+            // size nowhere else, so the size is measured rather than parsed out
+            // of a sentence whose wording is not a contract.
+            files: file_paths
+                .iter()
+                .map(|path| protocol::FileInfo {
+                    path: path.clone(),
+                    bytes: fs::metadata(path).map(|meta| meta.len()).unwrap_or(0),
+                })
+                .collect(),
+        },
+        ToolRequestType::WebSearch { .. } => ToolExecutionResult::WebSearch,
+        ToolRequestType::Sleep { .. } => ToolExecutionResult::Sleep,
+        ToolRequestType::GenerateImage { .. } => ToolExecutionResult::GenerateImage {
+            revised_prompt: None,
+            image_count: 1,
+        },
+        ToolRequestType::TydeSendAgentMessage { .. } => ToolExecutionResult::TydeSendAgentMessage,
+        // Headless `agy` answers its own questions. Saying so is the whole
+        // value of the card: the alternative is a question card that looks
+        // like it is still waiting for the user who never saw it.
+        ToolRequestType::AskUserQuestion { .. } => ToolExecutionResult::Other {
+            result: json!({
+                "answers": transcript_result.map(answers_from_result).unwrap_or_default(),
+            }),
+        },
+        _ => ToolExecutionResult::Other {
+            result: json!({ "output": output }),
+        },
+    }
+}
+
+/// Where `agy` keeps the per-conversation transcript the tool cards are
+/// enriched from. It is the sibling of the conversations directory, so a caller
+/// that redirects one redirects both rather than reading transcripts from a
+/// store it is not writing to.
+fn antigravity_brain_dir(conversations_dir: &Path) -> PathBuf {
+    match conversations_dir.parent() {
+        Some(parent) => parent.join("brain"),
+        None => conversations_dir.join("brain"),
     }
 }
 
 impl Backend for AntigravityBackend {
+    /// What this backend measurably emits, and nothing else.
+    ///
+    /// Several capabilities are deliberately absent because headless `agy`
+    /// provably cannot do them, each verified against agy 1.1.20 on
+    /// 2026-08-25:
+    ///
+    /// * `ImageInput` — stream-json accepts only `"text"` content blocks and
+    ///   rejects `"image"` outright.
+    /// * `ReasoningDeltas` — no `thinking` or `reasoning` step is ever emitted,
+    ///   even by a model billing hundreds of thinking tokens.
+    /// * `TaskUpdates` and friends — `manage_task` manages background tasks,
+    ///   not a plan. `agy` has no task-list tool.
+    /// * `BackgroundTasks` — a backgrounded command does not outlive its turn:
+    ///   `agy` holds the turn's `result` open until the task finishes, and
+    ///   withholds every later step until then.
+    /// * `ForkSession` — no headless fork exists.
     fn capabilities() -> tyde_agent_adapter::BackendCapabilities {
+        use tyde_agent_adapter::BackendCapability as Cap;
         [
-            tyde_agent_adapter::BackendCapability::ResumeSession,
-            tyde_agent_adapter::BackendCapability::Interrupt,
-            tyde_agent_adapter::BackendCapability::SessionSettings,
-            tyde_agent_adapter::BackendCapability::StartupMcpServers,
-            tyde_agent_adapter::BackendCapability::AgentControlTools,
-            tyde_agent_adapter::BackendCapability::WorkspaceInstructions,
-            tyde_agent_adapter::BackendCapability::Customization,
-            tyde_agent_adapter::BackendCapability::GenericOtherTool,
+            Cap::ResumeSession,
+            Cap::Interrupt,
+            Cap::SessionSettings,
+            Cap::StartupMcpServers,
+            Cap::AgentControlTools,
+            Cap::WorkspaceInstructions,
+            Cap::Customization,
+            Cap::UserQuestionRequests,
+            Cap::TurnUsageReported,
+            Cap::ModelRequestUsageReported,
+            Cap::Subagents,
+            Cap::ForegroundSubagents,
+            Cap::GenericModifyFile,
+            Cap::GenericReadFiles,
+            Cap::GenericWebSearch,
+            Cap::GenericGenerateImage,
+            Cap::GenericSleep,
+            Cap::GenericOtherTool,
         ]
         .into()
     }
@@ -253,11 +1210,9 @@ impl Backend for AntigravityBackend {
         // requeueing instead of letting the actor task reject and drop it.
         if let AgentInput::SendMessage(payload) = &input
             && payload.tool_response.is_none()
+            && self.inner.state.lock().await.turn_active
         {
-            let state = self.inner.state.lock().await;
-            if state.active_turn.is_some() {
-                return SendOutcome::Busy(input);
-            }
+            return SendOutcome::Busy(input);
         }
         if self.input_tx.send(input).is_ok() {
             SendOutcome::Accepted
@@ -270,9 +1225,232 @@ impl Backend for AntigravityBackend {
         self.interrupt_tx.send(()).is_ok()
     }
 
+    /// Waits for the supervisor to confirm the `agy` process is gone.
+    ///
+    /// Dropping the input channel alone is not enough: the supervisor can be
+    /// inside a process restart when it happens, and a returning `shutdown`
+    /// that leaves the child running leaks it past the caller's teardown.
     async fn shutdown(self) {
-        self.inner.state.lock().await.closing = true;
-        let _ = self.interrupt_tx.send(());
+        let done = {
+            let mut state = self.inner.state.lock().await;
+            state.closing = true;
+            state.shutdown_complete.take()
+        };
+        drop(self.input_tx);
+        drop(self.interrupt_tx);
+        if let Some(done) = done {
+            let _ = done.await;
+        }
+    }
+}
+
+impl AntigravityBackend {
+    pub(crate) async fn spawn_with_conversations_dir(
+        workspace_roots: Vec<String>,
+        config: BackendSpawnConfig,
+        initial_input: protocol::SendMessagePayload,
+        conversations_dir: PathBuf,
+    ) -> Result<(Self, EventStream), String> {
+        Self::start(
+            workspace_roots,
+            config,
+            Some(initial_input),
+            None,
+            &conversations_dir,
+        )
+        .await
+    }
+
+    pub(crate) async fn resume_with_conversations_dir(
+        workspace_roots: Vec<String>,
+        config: BackendSpawnConfig,
+        session_id: SessionId,
+        conversations_dir: PathBuf,
+    ) -> Result<(Self, EventStream), String> {
+        ensure_antigravity_conversation_exists(&session_id, &conversations_dir)?;
+        Self::start(
+            workspace_roots,
+            config,
+            None,
+            Some(session_id),
+            &conversations_dir,
+        )
+        .await
+    }
+
+    async fn start(
+        workspace_roots: Vec<String>,
+        config: BackendSpawnConfig,
+        initial_input: Option<protocol::SendMessagePayload>,
+        resume: Option<SessionId>,
+        conversations_dir: &Path,
+    ) -> Result<(Self, EventStream), String> {
+        if initial_input.as_ref().is_some_and(|input| {
+            input
+                .images
+                .as_ref()
+                .is_some_and(|images| !images.is_empty())
+        }) {
+            return Err(
+                "Antigravity CLI does not support image input in headless print mode.".to_string(),
+            );
+        }
+
+        let (primary_root, extra_roots) = resolve_workspace_roots(&workspace_roots)?;
+        let settings = resolve_session_settings(&config);
+        let model = selected_model(&settings)?;
+        let combined_instructions =
+            render_combined_spawn_instructions(&config.resolved_spawn_config);
+
+        // Namespaced by conversation so two Antigravity sessions can hold
+        // entries in the shared config at once. A resumed session reuses its
+        // conversation's namespace; a fresh one cannot know its id yet, so it
+        // takes a random one.
+        let mcp_namespace = resume
+            .as_ref()
+            .map(|id| id.0.clone())
+            .unwrap_or_else(|| Uuid::new_v4().to_string());
+
+        let launch = AgyLaunch {
+            primary_root,
+            extra_roots,
+            access_mode: config.resolved_spawn_config.access_mode,
+            model: model.clone(),
+            mcp_namespace,
+            startup_mcp_servers: config.startup_mcp_servers.clone(),
+        };
+
+        let mcp_guard =
+            install_antigravity_mcp_config(&launch.mcp_namespace, &launch.startup_mcp_servers)
+                .await?;
+
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let emitter = Arc::new(TurnEmitter::new_for_agent(
+            event_tx,
+            AgentName(ANTIGRAVITY_AGENT_NAME),
+        ));
+
+        let process = match AgyProcess::start(
+            &launch,
+            resume.as_ref().map(|id| id.0.as_str()),
+            Arc::clone(&emitter),
+        )
+        .await
+        {
+            Ok(process) => process,
+            Err(err) => {
+                if let Some(guard) = mcp_guard {
+                    let _ = guard.remove(&launch.startup_mcp_servers).await;
+                }
+                return Err(err);
+            }
+        };
+
+        let session_id = SessionId(process.conversation_id.clone());
+        let inner = Arc::new(AntigravityInner {
+            emitter: Arc::clone(&emitter),
+            state: Mutex::new(AntigravityState {
+                model,
+                turn_active: false,
+                closing: false,
+                shutdown_complete: None,
+            }),
+        });
+
+        // Workspace instructions ride the first prompt of a new conversation.
+        // A resumed one already has them in its history, and repeating them
+        // every turn would pay for them again on every request.
+        let initial_message = initial_input.map(|input| {
+            if resume.is_none() {
+                build_prompt(combined_instructions.as_deref(), &input.message)
+            } else {
+                input.message
+            }
+        });
+
+        let (input_tx, input_rx) = mpsc::unbounded_channel::<AgentInput>();
+        let (interrupt_tx, interrupt_rx) = mpsc::unbounded_channel::<()>();
+
+        let (shutdown_complete_tx, shutdown_complete_rx) = oneshot::channel();
+        inner.state.lock().await.shutdown_complete = Some(shutdown_complete_rx);
+        let supervisor = Supervisor {
+            inner: Arc::clone(&inner),
+            launch,
+            brain_dir: antigravity_brain_dir(conversations_dir),
+            mcp_guard,
+            mapper: None,
+            cumulative: AgyUsage::default(),
+            turn_counter: 0,
+            pending_questions: Vec::new(),
+            shutdown_complete: shutdown_complete_tx,
+        };
+        tokio::spawn(async move {
+            supervisor
+                .run(process, input_rx, interrupt_rx, initial_message)
+                .await;
+        });
+
+        let (backend_tx, backend_rx) = mpsc::unbounded_channel::<BackendEvent>();
+        tokio::spawn(async move {
+            let mut event_rx = event_rx;
+            while let Some(raw) = event_rx.recv().await {
+                let Some(event) = map_emitter_event(&raw) else {
+                    continue;
+                };
+                if backend_tx.send(event).is_err() {
+                    return;
+                }
+            }
+        });
+
+        Ok((
+            Self {
+                input_tx,
+                interrupt_tx,
+                session_id,
+                provider_version: config.provider_version.clone(),
+                inner,
+            },
+            EventStream::new_backend(backend_rx),
+        ))
+    }
+}
+
+/// `TurnEmitter` speaks a slightly wider vocabulary than `ChatEvent`: token
+/// usage rides its own `BackendEvent`, and a few kinds exist only for backends
+/// that learn their session id late, which this one does not.
+fn map_emitter_event(raw: &Value) -> Option<BackendEvent> {
+    if let Ok(event) = serde_json::from_value::<ChatEvent>(raw.clone()) {
+        return Some(BackendEvent::Chat(event));
+    }
+    match raw.get("kind").and_then(Value::as_str).unwrap_or_default() {
+        "ModelRequestTokenUsage" => {
+            serde_json::from_value::<ModelRequestTokenUsage>(raw.get("data")?.clone())
+                .ok()
+                .map(BackendEvent::ModelRequestTokenUsage)
+        }
+        "Error" => Some(BackendEvent::Chat(ChatEvent::MessageAdded(
+            protocol::ChatMessage {
+                message_id: None,
+                timestamp: now_ms(),
+                sender: protocol::MessageSender::Error,
+                content: raw
+                    .get("data")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Antigravity backend error")
+                    .to_string(),
+                reasoning: None,
+                tool_calls: Vec::new(),
+                model_info: None,
+                token_usage: None,
+                context_breakdown: None,
+                images: None,
+            },
+        ))),
+        other => {
+            tracing::debug!("Antigravity emitter event {other:?} has no BackendEvent");
+            None
+        }
     }
 }
 
@@ -289,683 +1467,6 @@ fn antigravity_compaction_capability(
         evidence: BackendCompactionCapabilityEvidence::AdapterContract,
     }
 }
-
-impl AntigravityBackend {
-    pub(crate) async fn spawn_with_conversations_dir(
-        workspace_roots: Vec<String>,
-        config: BackendSpawnConfig,
-        initial_input: protocol::SendMessagePayload,
-        conversations_dir: PathBuf,
-    ) -> Result<(Self, EventStream), String> {
-        let provider_version = config.provider_version.clone();
-        let (primary_root, extra_roots) = resolve_workspace_roots(&workspace_roots)?;
-        let resolved_settings = resolve_session_settings(&config);
-        let _ = selected_model(&resolved_settings)?;
-        let combined_instructions =
-            render_combined_spawn_instructions(&config.resolved_spawn_config);
-        let (input_tx, input_rx) = mpsc::unbounded_channel::<AgentInput>();
-        let (interrupt_tx, interrupt_rx) = mpsc::unbounded_channel::<()>();
-        let (events_tx, events_rx) = mpsc::unbounded_channel::<ChatEvent>();
-        let inner = Arc::new(AntigravityInner {
-            events_tx,
-            state: Mutex::new(AntigravityState {
-                session_id: None,
-                conversations_dir,
-                primary_root,
-                extra_roots,
-                startup_mcp_servers: config.startup_mcp_servers,
-                combined_instructions,
-                session_settings: resolved_settings,
-                access_mode: config.resolved_spawn_config.access_mode,
-                active_turn: None,
-                closing: false,
-            }),
-        });
-
-        let inner_task = Arc::clone(&inner);
-        let (ready_tx, ready_rx) = oneshot::channel::<Result<SessionId, String>>();
-        tokio::spawn(async move {
-            run_antigravity_actor(
-                inner_task,
-                input_rx,
-                interrupt_rx,
-                Some(initial_input),
-                Some(ready_tx),
-            )
-            .await;
-        });
-
-        let session_id = match tokio::time::timeout(ANTIGRAVITY_SPAWN_TIMEOUT, ready_rx).await {
-            Ok(Ok(Ok(session_id))) => session_id,
-            Ok(Ok(Err(err))) => {
-                let _ = interrupt_tx.send(());
-                return Err(err);
-            }
-            Ok(Err(_)) => {
-                return Err(
-                    "Antigravity spawn initialization task ended before reporting a native conversation ID"
-                        .to_string(),
-                );
-            }
-            Err(_) => {
-                let _ = interrupt_tx.send(());
-                return Err(
-                    "Timed out waiting for Antigravity to report a native conversation ID"
-                        .to_string(),
-                );
-            }
-        };
-
-        Ok((
-            Self {
-                input_tx,
-                interrupt_tx,
-                session_id,
-                provider_version,
-                inner,
-            },
-            EventStream::new(events_rx),
-        ))
-    }
-
-    pub(crate) async fn resume_with_conversations_dir(
-        workspace_roots: Vec<String>,
-        config: BackendSpawnConfig,
-        session_id: SessionId,
-        conversations_dir: PathBuf,
-    ) -> Result<(Self, EventStream), String> {
-        let provider_version = config.provider_version.clone();
-        if !is_antigravity_native_session_id(&session_id) {
-            return Err(format!(
-                "Antigravity resume requires a native agy conversation UUID, got {session_id}"
-            ));
-        }
-        ensure_antigravity_conversation_exists(&session_id, &conversations_dir)?;
-
-        let (primary_root, extra_roots) = resolve_workspace_roots(&workspace_roots)?;
-        let resolved_settings = resolve_session_settings(&config);
-        let _ = selected_model(&resolved_settings)?;
-        let combined_instructions =
-            render_combined_spawn_instructions(&config.resolved_spawn_config);
-        let (input_tx, input_rx) = mpsc::unbounded_channel::<AgentInput>();
-        let (interrupt_tx, interrupt_rx) = mpsc::unbounded_channel::<()>();
-        let (events_tx, events_rx) = mpsc::unbounded_channel::<ChatEvent>();
-        let inner = Arc::new(AntigravityInner {
-            events_tx,
-            state: Mutex::new(AntigravityState {
-                session_id: Some(session_id.clone()),
-                conversations_dir,
-                primary_root,
-                extra_roots,
-                startup_mcp_servers: config.startup_mcp_servers,
-                combined_instructions,
-                session_settings: resolved_settings,
-                access_mode: config.resolved_spawn_config.access_mode,
-                active_turn: None,
-                closing: false,
-            }),
-        });
-
-        let inner_task = Arc::clone(&inner);
-        tokio::spawn(async move {
-            run_antigravity_actor(inner_task, input_rx, interrupt_rx, None, None).await;
-        });
-
-        Ok((
-            Self {
-                input_tx,
-                interrupt_tx,
-                session_id,
-                provider_version,
-                inner,
-            },
-            EventStream::new(events_rx),
-        ))
-    }
-}
-
-async fn run_antigravity_actor(
-    inner: Arc<AntigravityInner>,
-    mut input_rx: mpsc::UnboundedReceiver<AgentInput>,
-    mut interrupt_rx: mpsc::UnboundedReceiver<()>,
-    initial_input: Option<protocol::SendMessagePayload>,
-    initial_session_capture_tx: Option<oneshot::Sender<Result<SessionId, String>>>,
-) {
-    if let Some(initial_input) = initial_input {
-        let initial_session_capture = initial_session_capture_tx.map(SessionCapture::new);
-        inner
-            .handle_send_message(initial_input, initial_session_capture)
-            .await;
-    }
-
-    loop {
-        tokio::select! {
-            incoming = input_rx.recv() => {
-                let Some(input) = incoming else {
-                    break;
-                };
-                match input {
-                    AgentInput::SendMessage(payload) => inner.handle_send_message(payload, None).await,
-                    AgentInput::UpdateSessionSettings(payload) => inner.handle_update_settings(payload.values).await,
-                    AgentInput::EditQueuedMessage(_)
-                    | AgentInput::CancelQueuedMessage(_)
-                    | AgentInput::SendQueuedMessageNow(_) => {
-                        panic!("queued-message inputs must be handled by the agent actor before reaching the backend");
-                    }
-                }
-            }
-            interrupt = interrupt_rx.recv() => {
-                let Some(()) = interrupt else {
-                    break;
-                };
-                inner.cancel_active_turn().await;
-            }
-        }
-    }
-
-    inner.cancel_active_turn().await;
-}
-
-impl AntigravityInner {
-    async fn handle_send_message(
-        self: &Arc<Self>,
-        payload: protocol::SendMessagePayload,
-        session_capture: Option<SessionCapture>,
-    ) {
-        let images = protocol_images_to_attachments(payload.images);
-        self.emit_user_message(&payload.message, images.as_deref());
-        if images.as_ref().is_some_and(|images| !images.is_empty()) {
-            let error = "Antigravity CLI does not support image input in headless print mode.";
-            if let Some(capture) = session_capture {
-                capture.fail(error);
-            }
-            self.emit_error(error);
-            return;
-        }
-
-        let prepared = match self.prepare_turn(payload.message, session_capture).await {
-            Ok(turn) => turn,
-            Err(err) => {
-                self.emit_error(&err);
-                return;
-            }
-        };
-
-        let this = Arc::clone(self);
-        tokio::spawn(async move {
-            this.run_prepared_turn(prepared).await;
-        });
-    }
-
-    async fn handle_update_settings(&self, values: SessionSettingsValues) {
-        let update_result = {
-            let mut state = self.state.lock().await;
-            crate::backend::apply_session_settings_update(&mut state.session_settings, &values);
-            selected_model(&state.session_settings)
-        };
-        if let Err(err) = update_result {
-            self.emit_error(&format!("Invalid Antigravity session settings: {err}"));
-        }
-    }
-
-    async fn prepare_turn(
-        &self,
-        message: String,
-        mut session_capture: Option<SessionCapture>,
-    ) -> Result<PreparedTurn, String> {
-        let mut state = self.state.lock().await;
-        if state.closing {
-            let err = "Antigravity backend is shutting down; the message was not sent.".to_string();
-            fail_session_capture(&mut session_capture, &err);
-            return Err(err);
-        }
-        if state.active_turn.is_some() {
-            // Busy sends are handed back by `send_with_outcome` before input
-            // reaches this actor, so this branch is an invariant breach, not
-            // an expected path — fail visibly rather than dropping silently.
-            let err = "Antigravity is still processing the previous turn.".to_string();
-            fail_session_capture(&mut session_capture, &err);
-            return Err(err);
-        }
-
-        Self::prepare_turn_locked(&mut state, message, session_capture)
-    }
-
-    /// Build a turn while holding the state lock, reserving `active_turn`
-    /// before the lock is released so no other send can double-start.
-    fn prepare_turn_locked(
-        state: &mut AntigravityState,
-        message: String,
-        mut session_capture: Option<SessionCapture>,
-    ) -> Result<PreparedTurn, String> {
-        let model = match selected_model(&state.session_settings) {
-            Ok(model) => model,
-            Err(err) => {
-                fail_session_capture(&mut session_capture, &err);
-                return Err(err);
-            }
-        };
-        let turn_id = ANTIGRAVITY_TURN_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let log_file = match new_antigravity_log_file_path(turn_id) {
-            Ok(path) => path,
-            Err(err) => {
-                fail_session_capture(&mut session_capture, &err);
-                return Err(err);
-            }
-        };
-        let message_id = format!("antigravity-msg-{turn_id}");
-        let conversation_id = state.session_id.clone();
-        if let Some(session_id) = conversation_id.as_ref()
-            && let Err(err) =
-                ensure_antigravity_conversation_exists(session_id, &state.conversations_dir)
-        {
-            fail_session_capture(&mut session_capture, &err);
-            return Err(err);
-        }
-        let prompt = build_prompt(
-            conversation_id
-                .is_none()
-                .then_some(state.combined_instructions.as_deref())
-                .flatten(),
-            &message,
-        );
-        let mcp_namespace = conversation_id
-            .as_ref()
-            .map(|session_id| session_id.0.clone())
-            .unwrap_or_else(|| format!("pending-{turn_id}-{}", Uuid::new_v4()));
-        let (cancel_tx, cancel_rx) = oneshot::channel();
-        state.active_turn = Some(ActiveTurn {
-            id: turn_id,
-            cancel_tx: Some(cancel_tx),
-        });
-
-        Ok(PreparedTurn {
-            turn_id,
-            conversation_id,
-            mcp_namespace,
-            primary_root: state.primary_root.clone(),
-            extra_roots: state.extra_roots.clone(),
-            startup_mcp_servers: state.startup_mcp_servers.clone(),
-            log_file,
-            prompt,
-            model,
-            access_mode: state.access_mode,
-            message_id,
-            cancel_rx: Some(cancel_rx),
-            session_capture,
-        })
-    }
-
-    async fn run_prepared_turn(self: Arc<Self>, mut prepared: PreparedTurn) {
-        self.emit_typing_status(true);
-        let outcome = self.run_turn(&mut prepared).await;
-
-        match outcome {
-            TurnOutcome::Completed(summary) => {
-                let text = summary.streamed_text;
-                if summary.stream_started {
-                    self.emit_stream_end(&prepared.message_id, text.clone(), Some(&prepared.model));
-                    self.clear_active_turn(prepared.turn_id).await;
-                } else {
-                    self.emit_error("Antigravity returned no assistant output.");
-                    self.clear_active_turn(prepared.turn_id).await;
-                }
-            }
-            TurnOutcome::Cancelled(summary) => {
-                if summary.stream_started {
-                    self.emit_stream_end(
-                        &prepared.message_id,
-                        summary.streamed_text,
-                        Some(&prepared.model),
-                    );
-                }
-                self.emit_operation_cancelled("Antigravity turn cancelled.");
-                self.clear_active_turn(prepared.turn_id).await;
-            }
-            TurnOutcome::Failed { summary, error } => {
-                if summary.stream_started {
-                    self.emit_stream_end(
-                        &prepared.message_id,
-                        summary.streamed_text,
-                        Some(&prepared.model),
-                    );
-                }
-                self.emit_error(&error);
-                self.clear_active_turn(prepared.turn_id).await;
-            }
-        }
-
-        self.emit_typing_status(false);
-    }
-
-    async fn run_turn(self: &Arc<Self>, prepared: &mut PreparedTurn) -> TurnOutcome {
-        let invocation = AntigravityCliInvocation::new(
-            prepared.access_mode,
-            &prepared.model,
-            &prepared.primary_root,
-            &prepared.extra_roots,
-            prepared.conversation_id.as_ref(),
-            &prepared.log_file,
-            &prepared.prompt,
-        );
-
-        let mcp_guard = match install_antigravity_mcp_config(
-            &prepared.mcp_namespace,
-            &prepared.startup_mcp_servers,
-        )
-        .await
-        {
-            Ok(guard) => guard,
-            Err(err) => {
-                prepared.fail_session_capture(&err);
-                return TurnOutcome::Failed {
-                    summary: AntigravityStdoutSummary::empty(),
-                    error: err,
-                };
-            }
-        };
-
-        let outcome = self.run_turn_process(prepared, &invocation).await;
-        restore_antigravity_mcp_config(mcp_guard, outcome)
-    }
-
-    async fn run_turn_process(
-        self: &Arc<Self>,
-        prepared: &mut PreparedTurn,
-        invocation: &AntigravityCliInvocation,
-    ) -> TurnOutcome {
-        let mut command = Command::new(invocation.executable);
-        command.args(&invocation.args);
-        if let Some(path) = process_env::resolved_child_process_path() {
-            command.env("PATH", path);
-        }
-        command
-            .current_dir(&invocation.current_dir)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-
-        let mut child = match command.group_spawn() {
-            Ok(child) => child,
-            Err(err) => {
-                prepared.fail_session_capture(&format!("Failed to start Antigravity CLI: {err:?}"));
-                return TurnOutcome::Failed {
-                    summary: AntigravityStdoutSummary::empty(),
-                    error: format!("Failed to start Antigravity CLI: {err:?}"),
-                };
-            }
-        };
-
-        let session_capture = prepared.session_capture.take();
-        let stdout_session_capture = prepared
-            .conversation_id
-            .is_none()
-            .then(|| session_capture.clone())
-            .flatten();
-        let log_watcher = start_antigravity_log_watcher(
-            Arc::clone(self),
-            prepared.log_file.clone(),
-            prepared.conversation_id.clone(),
-            session_capture,
-        );
-
-        let stdout = match child.inner().stdout.take() {
-            Some(stdout) => stdout,
-            None => {
-                fail_pending_session_capture(
-                    stop_antigravity_log_watcher(log_watcher).await,
-                    "Failed to capture Antigravity stdout",
-                );
-                return TurnOutcome::Failed {
-                    summary: AntigravityStdoutSummary::empty(),
-                    error: "Failed to capture Antigravity stdout".to_string(),
-                };
-            }
-        };
-        let stderr = match child.inner().stderr.take() {
-            Some(stderr) => stderr,
-            None => {
-                fail_pending_session_capture(
-                    stop_antigravity_log_watcher(log_watcher).await,
-                    "Failed to capture Antigravity stderr",
-                );
-                return TurnOutcome::Failed {
-                    summary: AntigravityStdoutSummary::empty(),
-                    error: "Failed to capture Antigravity stderr".to_string(),
-                };
-            }
-        };
-
-        let stdout_task = tokio::spawn(read_antigravity_stdout(
-            stdout,
-            self.events_tx.clone(),
-            prepared.model.clone(),
-            stdout_session_capture,
-        ));
-        let stderr_task = tokio::spawn(read_antigravity_stderr(stderr));
-
-        let Some(mut cancel_rx) = prepared.cancel_rx.take() else {
-            fail_pending_session_capture(
-                stop_antigravity_log_watcher(log_watcher).await,
-                "Antigravity turn cancellation channel was already consumed",
-            );
-            return TurnOutcome::Failed {
-                summary: AntigravityStdoutSummary::empty(),
-                error: "Antigravity turn cancellation channel was already consumed".to_string(),
-            };
-        };
-        let wait_result = tokio::select! {
-            _ = &mut cancel_rx => WaitResult::Cancelled,
-            status = child.wait() => {
-                WaitResult::Exited(status.map_err(|err| format!("Failed to wait for Antigravity process: {err:?}")))
-            }
-        };
-
-        if matches!(wait_result, WaitResult::Cancelled) {
-            let _ = child.kill().await;
-            let _ = child.wait().await;
-        }
-
-        let summary = match stdout_task.await {
-            Ok(summary) => summary,
-            Err(err) => {
-                fail_pending_session_capture(
-                    stop_antigravity_log_watcher(log_watcher).await,
-                    &format!("Failed to collect Antigravity stdout: {err:?}"),
-                );
-                return TurnOutcome::Failed {
-                    summary: AntigravityStdoutSummary::empty(),
-                    error: format!("Failed to collect Antigravity stdout: {err:?}"),
-                };
-            }
-        };
-        let stderr_output = match stderr_task.await {
-            Ok(stderr) => stderr,
-            Err(err) => {
-                fail_pending_session_capture(
-                    stop_antigravity_log_watcher(log_watcher).await,
-                    &format!("Failed to collect Antigravity stderr: {err:?}"),
-                );
-                return TurnOutcome::Failed {
-                    summary,
-                    error: format!("Failed to collect Antigravity stderr: {err:?}"),
-                };
-            }
-        };
-
-        let log_result = stop_antigravity_log_watcher(log_watcher).await;
-        let outcome = match wait_result {
-            WaitResult::Cancelled => TurnOutcome::Cancelled(summary),
-            WaitResult::Exited(Err(error)) => TurnOutcome::Failed { summary, error },
-            WaitResult::Exited(Ok(status)) => evaluate_exit_status(status, summary, &stderr_output),
-        };
-        self.finalize_turn_conversation(prepared, log_result, outcome, &stderr_output)
-            .await
-    }
-
-    async fn finalize_turn_conversation(
-        &self,
-        prepared: &PreparedTurn,
-        log_result: AntigravityLogWatchResult,
-        outcome: TurnOutcome,
-        stderr_output: &str,
-    ) -> TurnOutcome {
-        match prepared.conversation_id.as_ref() {
-            Some(expected) => {
-                finalize_expected_conversation(&prepared.log_file, expected, log_result, outcome)
-            }
-            None => {
-                self.finalize_new_conversation(
-                    &prepared.log_file,
-                    log_result,
-                    outcome,
-                    stderr_output,
-                )
-                .await
-            }
-        }
-    }
-
-    async fn finalize_new_conversation(
-        &self,
-        log_file: &Path,
-        mut log_result: AntigravityLogWatchResult,
-        outcome: TurnOutcome,
-        stderr_output: &str,
-    ) -> TurnOutcome {
-        if let Some(session_id) = log_result.ids.authoritative_for_new_session() {
-            if let Err(err) = self.set_native_session_id(session_id.clone()).await {
-                if let Some(capture) = log_result.session_capture.take() {
-                    capture.fail(err.clone());
-                }
-                return fail_outcome_if_not_failed(outcome, err);
-            }
-            if let Some(capture) = log_result.session_capture.take() {
-                capture.succeed(session_id);
-            }
-            return outcome;
-        }
-
-        let error = missing_conversation_error(log_file, &outcome, stderr_output);
-        if let Some(capture) = log_result.session_capture.take() {
-            capture.fail(error.clone());
-        }
-        fail_outcome_if_not_failed(outcome, error)
-    }
-
-    async fn cancel_active_turn(&self) {
-        let cancel_tx = {
-            let mut state = self.state.lock().await;
-            state
-                .active_turn
-                .as_mut()
-                .and_then(|turn| turn.cancel_tx.take())
-        };
-        if let Some(cancel_tx) = cancel_tx {
-            let _ = cancel_tx.send(());
-        }
-    }
-
-    async fn set_native_session_id(&self, session_id: SessionId) -> Result<(), String> {
-        let mut state = self.state.lock().await;
-        match state.session_id.as_ref() {
-            Some(existing) if existing == &session_id => Ok(()),
-            Some(existing) => Err(format!(
-                "Antigravity reported conversation {session_id}, but session is already bound to {existing}"
-            )),
-            None => {
-                state.session_id = Some(session_id);
-                Ok(())
-            }
-        }
-    }
-
-    async fn clear_active_turn(&self, turn_id: u64) {
-        let mut state = self.state.lock().await;
-        if state
-            .active_turn
-            .as_ref()
-            .is_some_and(|active| active.id == turn_id)
-        {
-            state.active_turn = None;
-        }
-    }
-
-    fn emit_user_message(&self, content: &str, images: Option<&[ImageAttachment]>) {
-        let images = images
-            .unwrap_or(&[])
-            .iter()
-            .map(|image| protocol::ImageData {
-                media_type: image.media_type.clone(),
-                data: image.data.clone(),
-            })
-            .collect::<Vec<_>>();
-        let images = (!images.is_empty()).then_some(images);
-        let _ = self.events_tx.send(ChatEvent::MessageAdded(ChatMessage {
-            message_id: None,
-            timestamp: now_ms(),
-            sender: MessageSender::User,
-            content: content.to_string(),
-            reasoning: None,
-            tool_calls: Vec::new(),
-            model_info: None,
-            token_usage: None,
-            context_breakdown: None,
-            images,
-        }));
-    }
-
-    fn emit_typing_status(&self, typing: bool) {
-        let _ = self.events_tx.send(ChatEvent::TypingStatusChanged(typing));
-    }
-
-    fn emit_stream_end(&self, message_id: &str, content: String, model: Option<&str>) {
-        let _ = self.events_tx.send(ChatEvent::StreamEnd(StreamEndData {
-            message: ChatMessage {
-                message_id: Some(protocol::ChatMessageId(message_id.to_string())),
-                timestamp: now_ms(),
-                sender: MessageSender::Assistant {
-                    agent: ANTIGRAVITY_AGENT_NAME.to_string(),
-                },
-                content,
-                reasoning: None,
-                tool_calls: Vec::new(),
-                model_info: model.map(|model| ModelInfo {
-                    model: model.to_string(),
-                }),
-                token_usage: Some(MessageTokenUsage::unavailable(
-                    TokenUsageUnavailableReason::BackendDidNotReport,
-                )),
-                context_breakdown: None,
-                images: None,
-            },
-        }));
-    }
-
-    fn emit_operation_cancelled(&self, message: &str) {
-        let _ = self
-            .events_tx
-            .send(ChatEvent::OperationCancelled(OperationCancelledData {
-                message: message.to_string(),
-            }));
-    }
-
-    fn emit_error(&self, content: &str) {
-        let _ = self.events_tx.send(ChatEvent::MessageAdded(ChatMessage {
-            message_id: None,
-            timestamp: now_ms(),
-            sender: MessageSender::Error,
-            content: content.to_string(),
-            reasoning: None,
-            tool_calls: Vec::new(),
-            model_info: None,
-            token_usage: None,
-            context_breakdown: None,
-            images: None,
-        }));
-    }
-}
-
 fn resolve_workspace_roots(workspace_roots: &[String]) -> Result<(String, Vec<String>), String> {
     if workspace_roots.iter().all(|root| root.trim().is_empty()) {
         let no_root_cwd = antigravity_no_root_cwd()?;
@@ -1015,313 +1516,6 @@ fn antigravity_no_root_cwd() -> Result<PathBuf, String> {
         .join("antigravity")
         .join("no-root"))
 }
-
-fn new_antigravity_log_file_path(turn_id: u64) -> Result<PathBuf, String> {
-    let dir = crate::paths::home_dir()?
-        .join(".tyde")
-        .join("antigravity")
-        .join("logs");
-    fs::create_dir_all(&dir).map_err(|err| {
-        format!(
-            "Failed to create Antigravity log directory {}: {err}",
-            dir.display()
-        )
-    })?;
-    Ok(dir.join(format!("turn-{turn_id}-{}.log", Uuid::new_v4())))
-}
-
-impl AntigravityCliInvocation {
-    fn new(
-        access_mode: BackendAccessMode,
-        model: &str,
-        primary_root: &str,
-        extra_roots: &[String],
-        conversation_id: Option<&SessionId>,
-        log_file: &Path,
-        prompt: &str,
-    ) -> Self {
-        let mut args = vec![
-            "--print-timeout".to_string(),
-            ANTIGRAVITY_PRINT_TIMEOUT.to_string(),
-            "--log-file".to_string(),
-            log_file.to_string_lossy().to_string(),
-        ];
-        match access_mode {
-            // `agy` has no workspace-write middle mode. ReadOnly is advisory, so it
-            // must use the non-sandbox path to let build/test commands write target/.
-            BackendAccessMode::Unrestricted => {
-                args.push("--dangerously-skip-permissions".to_string())
-            }
-            BackendAccessMode::ReadOnly => args.push("--dangerously-skip-permissions".to_string()),
-        }
-        args.push("--model".to_string());
-        args.push(model.to_string());
-        if let Some(conversation_id) = conversation_id {
-            args.push(format!("--conversation={conversation_id}"));
-        }
-        args.push("--add-dir".to_string());
-        args.push(primary_root.to_string());
-        for root in extra_roots {
-            args.push("--add-dir".to_string());
-            args.push(root.clone());
-        }
-        args.push("-p".to_string());
-        args.push(prompt.to_string());
-        Self {
-            executable: "agy",
-            args,
-            current_dir: primary_root.to_string(),
-        }
-    }
-}
-
-impl PreparedTurn {
-    fn fail_session_capture(&mut self, error: &str) {
-        if let Some(capture) = self.session_capture.take() {
-            capture.fail(error);
-        }
-    }
-}
-
-fn fail_session_capture(capture: &mut Option<SessionCapture>, error: &str) {
-    if let Some(capture) = capture.take() {
-        capture.fail(error);
-    }
-}
-
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-struct AntigravityConversationLogIds {
-    created: Option<SessionId>,
-    active: Option<SessionId>,
-}
-
-impl AntigravityConversationLogIds {
-    fn authoritative_for_new_session(&self) -> Option<SessionId> {
-        self.active.clone().or_else(|| self.created.clone())
-    }
-}
-
-#[derive(Default)]
-struct AntigravityLogWatchResult {
-    ids: AntigravityConversationLogIds,
-    session_capture: Option<SessionCapture>,
-}
-
-struct AntigravityLogWatcher {
-    stop_tx: oneshot::Sender<()>,
-    task: tokio::task::JoinHandle<AntigravityLogWatchResult>,
-}
-
-fn start_antigravity_log_watcher(
-    inner: Arc<AntigravityInner>,
-    log_file: PathBuf,
-    expected_conversation_id: Option<SessionId>,
-    session_capture: Option<SessionCapture>,
-) -> AntigravityLogWatcher {
-    let (stop_tx, stop_rx) = oneshot::channel();
-    let task = tokio::spawn(watch_antigravity_log_for_conversation(
-        inner,
-        log_file,
-        expected_conversation_id,
-        session_capture,
-        stop_rx,
-    ));
-    AntigravityLogWatcher { stop_tx, task }
-}
-
-async fn stop_antigravity_log_watcher(watcher: AntigravityLogWatcher) -> AntigravityLogWatchResult {
-    let _ = watcher.stop_tx.send(());
-    watcher.task.await.unwrap_or_default()
-}
-
-async fn watch_antigravity_log_for_conversation(
-    inner: Arc<AntigravityInner>,
-    log_file: PathBuf,
-    expected_conversation_id: Option<SessionId>,
-    mut session_capture: Option<SessionCapture>,
-    mut stop_rx: oneshot::Receiver<()>,
-) -> AntigravityLogWatchResult {
-    loop {
-        let ids = read_antigravity_conversation_ids_from_log(&log_file);
-        if let Some(active) = ids.active.as_ref() {
-            match expected_conversation_id.as_ref() {
-                Some(expected) if active == expected => {
-                    return AntigravityLogWatchResult {
-                        ids,
-                        session_capture,
-                    };
-                }
-                Some(_) => {}
-                None => {
-                    match inner.set_native_session_id(active.clone()).await {
-                        Ok(()) => {
-                            if let Some(capture) = session_capture.take() {
-                                capture.succeed(active.clone());
-                            }
-                        }
-                        Err(err) => {
-                            if let Some(capture) = session_capture.take() {
-                                capture.fail(err);
-                            }
-                        }
-                    }
-                    return AntigravityLogWatchResult {
-                        ids,
-                        session_capture,
-                    };
-                }
-            }
-        }
-
-        tokio::select! {
-            _ = &mut stop_rx => {
-                return AntigravityLogWatchResult {
-                    ids: read_antigravity_conversation_ids_from_log(&log_file),
-                    session_capture,
-                };
-            }
-            _ = tokio::time::sleep(ANTIGRAVITY_LOG_POLL_INTERVAL) => {}
-        }
-    }
-}
-
-fn finalize_expected_conversation(
-    log_file: &Path,
-    expected: &SessionId,
-    mut log_result: AntigravityLogWatchResult,
-    outcome: TurnOutcome,
-) -> TurnOutcome {
-    if let Some(capture) = log_result.session_capture.take() {
-        match log_result.ids.active.as_ref() {
-            Some(active) if active == expected => {
-                capture.succeed(expected.clone());
-            }
-            Some(active) => {
-                capture.fail(format!(
-                    "Antigravity resumed conversation {active}, expected exact conversation {expected}"
-                ));
-            }
-            None => {
-                capture.fail(expected_conversation_missing_error(
-                    log_file,
-                    expected,
-                    &log_result.ids,
-                ));
-            }
-        }
-    }
-
-    match outcome {
-        TurnOutcome::Completed(summary) => match log_result.ids.active.as_ref() {
-            Some(active) if active == expected => TurnOutcome::Completed(summary),
-            Some(active) => TurnOutcome::Failed {
-                summary,
-                error: format!(
-                    "Antigravity resumed conversation {active}, expected exact conversation {expected}"
-                ),
-            },
-            None => TurnOutcome::Failed {
-                summary,
-                error: expected_conversation_missing_error(log_file, expected, &log_result.ids),
-            },
-        },
-        TurnOutcome::Cancelled(summary) => TurnOutcome::Cancelled(summary),
-        TurnOutcome::Failed { summary, error } => TurnOutcome::Failed { summary, error },
-    }
-}
-
-fn expected_conversation_missing_error(
-    log_file: &Path,
-    expected: &SessionId,
-    ids: &AntigravityConversationLogIds,
-) -> String {
-    match ids.created.as_ref() {
-        Some(created) => format!(
-            "Antigravity log created conversation {created} but did not confirm exact conversation {expected}: {}",
-            log_file.display()
-        ),
-        None => format!(
-            "Antigravity log did not confirm exact conversation {expected}: {}",
-            log_file.display()
-        ),
-    }
-}
-
-fn missing_conversation_error(
-    log_file: &Path,
-    outcome: &TurnOutcome,
-    stderr_output: &str,
-) -> String {
-    if let TurnOutcome::Failed { error, .. } = outcome {
-        return error.clone();
-    }
-    let stderr = stderr_output.trim();
-    if !stderr.is_empty() {
-        return format!(
-            "Antigravity log did not report a native conversation UUID: {}; stderr: {stderr}",
-            log_file.display()
-        );
-    }
-    format!(
-        "Antigravity log did not report a native conversation UUID: {}",
-        log_file.display()
-    )
-}
-
-fn fail_outcome_if_not_failed(outcome: TurnOutcome, error: String) -> TurnOutcome {
-    match outcome {
-        TurnOutcome::Completed(summary) | TurnOutcome::Cancelled(summary) => {
-            TurnOutcome::Failed { summary, error }
-        }
-        TurnOutcome::Failed {
-            summary,
-            error: existing,
-        } => TurnOutcome::Failed {
-            summary,
-            error: existing,
-        },
-    }
-}
-
-fn fail_pending_session_capture(mut result: AntigravityLogWatchResult, error: &str) {
-    if let Some(capture) = result.session_capture.take() {
-        capture.fail(error);
-    }
-}
-
-fn read_antigravity_conversation_ids_from_log(path: &Path) -> AntigravityConversationLogIds {
-    let Ok(contents) = fs::read_to_string(path) else {
-        return AntigravityConversationLogIds::default();
-    };
-    parse_antigravity_conversation_ids(&contents)
-}
-
-fn parse_antigravity_conversation_ids(log: &str) -> AntigravityConversationLogIds {
-    let mut created = None;
-    let mut active = None;
-    for line in log.lines() {
-        if let Some(uuid) = parse_uuid_after_marker(line, "Created conversation ") {
-            created = Some(SessionId(uuid.to_string()));
-        }
-        if let Some(uuid) = parse_uuid_after_marker(line, "conversation=") {
-            active = Some(SessionId(uuid.to_string()));
-        }
-    }
-    AntigravityConversationLogIds { created, active }
-}
-
-fn parse_uuid_after_marker(line: &str, marker: &str) -> Option<Uuid> {
-    let start = line.find(marker)? + marker.len();
-    let candidate = line[start..]
-        .chars()
-        .take_while(|ch| ch.is_ascii_hexdigit() || *ch == '-')
-        .collect::<String>();
-    if candidate.is_empty() {
-        return None;
-    }
-    Uuid::parse_str(&candidate).ok()
-}
-
 pub(crate) fn is_antigravity_native_session_id(session_id: &SessionId) -> bool {
     session_id.0.len() == 36 && Uuid::parse_str(&session_id.0).is_ok()
 }
@@ -1366,10 +1560,15 @@ pub(crate) fn resolve_antigravity_conversations_dir(
 }
 
 pub(crate) fn antigravity_known_models() -> Vec<SelectOption> {
+    // `--model` takes the display label, not the id, and these are the labels
+    // `agy models` reports for agy 1.1.20.
     [
         ANTIGRAVITY_LOW_MODEL,
         ANTIGRAVITY_DEFAULT_MODEL,
-        "Gemini 3.5 Flash (High)",
+        "Gemini 3.7 Flash (High)",
+        "Gemini 3.6 Flash (Low)",
+        "Gemini 3.6 Flash (Medium)",
+        "Gemini 3.6 Flash (High)",
         "Gemini 3.1 Pro (Low)",
         ANTIGRAVITY_HIGH_MODEL,
         "Claude Sonnet 4.6 (Thinking)",
@@ -1434,278 +1633,18 @@ fn build_prompt(instructions: Option<&str>, message: &str) -> String {
         None => message.to_string(),
     }
 }
-
-async fn read_antigravity_stdout(
-    stdout: ChildStdout,
-    events_tx: mpsc::UnboundedSender<ChatEvent>,
-    model: String,
-    startup_capture: Option<SessionCapture>,
-) -> AntigravityStdoutSummary {
-    let mut state = AntigravityStdoutState::new(events_tx, model, startup_capture);
-    let mut reader = BufReader::new(stdout);
-    let mut buffer = [0_u8; 4096];
-    loop {
-        match reader.read(&mut buffer).await {
-            Ok(0) => break,
-            Ok(n) => {
-                let text = String::from_utf8_lossy(&buffer[..n]).to_string();
-                state.consume_chunk(&text);
-            }
-            Err(err) => {
-                state.consume_chunk(&format!(
-                    "\nError: failed to read Antigravity stdout: {err}"
-                ));
-                break;
-            }
-        }
-    }
-    state.finish()
-}
-
-async fn read_antigravity_stderr(stderr: ChildStderr) -> String {
-    let mut out = String::new();
-    let mut reader = BufReader::new(stderr);
-    let _ = reader.read_to_string(&mut out).await;
-    out
-}
-
-struct AntigravityStdoutState {
-    events_tx: mpsc::UnboundedSender<ChatEvent>,
-    model: String,
-    stdout: String,
-    streamed_text: String,
-    stream_started: bool,
-    blocked_error_prefix: bool,
-    startup_capture: Option<SessionCapture>,
-}
-
-impl AntigravityStdoutState {
-    fn new(
-        events_tx: mpsc::UnboundedSender<ChatEvent>,
-        model: String,
-        startup_capture: Option<SessionCapture>,
-    ) -> Self {
-        Self {
-            events_tx,
-            model,
-            stdout: String::new(),
-            streamed_text: String::new(),
-            stream_started: false,
-            blocked_error_prefix: false,
-            startup_capture,
-        }
-    }
-
-    fn consume_chunk(&mut self, text: &str) {
-        if text.is_empty() {
-            return;
-        }
-        self.stdout.push_str(text);
-        if self.blocked_error_prefix {
-            self.fail_startup_capture_if_ready();
-            return;
-        }
-        if !self.stream_started {
-            match classify_initial_stdout(self.stdout.trim_start()) {
-                InitialStdoutClassification::Pending => return,
-                InitialStdoutClassification::Error => {
-                    self.blocked_error_prefix = true;
-                    self.fail_startup_capture_if_ready();
-                    return;
-                }
-                InitialStdoutClassification::Assistant => {
-                    self.startup_capture = None;
-                    self.start_stream_with_buffer();
-                    return;
-                }
-            }
-        }
-        self.streamed_text.push_str(text);
-        let _ = self
-            .events_tx
-            .send(ChatEvent::StreamDelta(StreamTextDeltaData {
-                text: text.to_string(),
-            }));
-    }
-
-    fn fail_startup_capture_if_ready(&mut self) {
-        let Some(error) = startup_error_capture_message(&self.stdout) else {
-            return;
-        };
-        if let Some(capture) = self.startup_capture.take() {
-            capture.fail(error);
-        }
-    }
-
-    fn start_stream_with_buffer(&mut self) {
-        if self.stream_started || self.stdout.trim_start().is_empty() {
-            return;
-        }
-        let _ = self.events_tx.send(ChatEvent::StreamStart(StreamStartData {
-            agent: ANTIGRAVITY_AGENT_NAME.to_string(),
-            model: Some(self.model.clone()),
-        }));
-        self.stream_started = true;
-        self.streamed_text.push_str(&self.stdout);
-        let _ = self
-            .events_tx
-            .send(ChatEvent::StreamDelta(StreamTextDeltaData {
-                text: self.stdout.clone(),
-            }));
-    }
-
-    fn finish(mut self) -> AntigravityStdoutSummary {
-        if !self.stream_started
-            && !self.blocked_error_prefix
-            && !self.stdout.trim_start().is_empty()
-        {
-            self.start_stream_with_buffer();
-        }
-        AntigravityStdoutSummary {
-            stdout: self.stdout,
-            streamed_text: self.streamed_text,
-            stream_started: self.stream_started,
-            blocked_error_prefix: self.blocked_error_prefix,
-        }
-    }
-}
-
-enum InitialStdoutClassification {
-    Pending,
-    Error,
-    Assistant,
-}
-
-fn startup_error_capture_message(stdout: &str) -> Option<String> {
-    let trimmed = stdout.trim_start();
-    if let Some(rest) = trimmed.strip_prefix("Error:") {
-        return startup_error_capture_message_after_prefix(trimmed, "Error:", rest, false);
-    }
-    if let Some(rest) = trimmed.strip_prefix("Authentication required") {
-        return startup_error_capture_message_after_prefix(
-            trimmed,
-            "Authentication required",
-            rest,
-            true,
-        );
-    }
-    None
-}
-
-fn startup_error_capture_message_after_prefix(
-    trimmed: &str,
-    prefix: &str,
-    rest: &str,
-    allow_bare_prefix: bool,
-) -> Option<String> {
-    let has_detail = rest.chars().any(|ch| !ch.is_whitespace());
-    if !has_detail {
-        return allow_bare_prefix.then(|| prefix.to_string());
-    }
-
-    let first_line = trimmed.lines().next().unwrap_or(trimmed).trim_end();
-    let message = if first_line == prefix {
-        trimmed.trim_end()
-    } else {
-        first_line
-    };
-    if message == prefix && !allow_bare_prefix {
-        None
-    } else {
-        Some(message.to_string())
-    }
-}
-
-fn classify_initial_stdout(trimmed_start: &str) -> InitialStdoutClassification {
-    if trimmed_start.is_empty() {
-        return InitialStdoutClassification::Pending;
-    }
-    for prefix in ANTIGRAVITY_ERROR_PREFIXES {
-        if trimmed_start.starts_with(prefix) {
-            return InitialStdoutClassification::Error;
-        }
-        if prefix.starts_with(trimmed_start) {
-            return InitialStdoutClassification::Pending;
-        }
-    }
-    InitialStdoutClassification::Assistant
-}
-
-impl AntigravityStdoutSummary {
-    fn empty() -> Self {
-        Self {
-            stdout: String::new(),
-            streamed_text: String::new(),
-            stream_started: false,
-            blocked_error_prefix: false,
-        }
-    }
-
-    fn error_message(&self) -> Option<String> {
-        let trimmed = self.stdout.trim();
-        if trimmed.is_empty() {
-            return None;
-        }
-        if self.blocked_error_prefix || trimmed.contains("Authentication required") {
-            return Some(trimmed.to_string());
-        }
-        if trimmed
-            .lines()
-            .any(|line| line.trim_start().starts_with("Error:"))
-        {
-            return Some(trimmed.to_string());
-        }
-        None
-    }
-}
-
-fn evaluate_exit_status(
-    status: ExitStatus,
-    summary: AntigravityStdoutSummary,
-    stderr_output: &str,
-) -> TurnOutcome {
-    if status.code() == Some(130) {
-        return TurnOutcome::Cancelled(summary);
-    }
-    if let Some(error) = summary.error_message() {
-        return TurnOutcome::Failed { summary, error };
-    }
-    if status.success() {
-        return TurnOutcome::Completed(summary);
-    }
-    let stderr = stderr_output.trim();
-    let error = if stderr.is_empty() {
-        format!("Antigravity exited with status {status}")
-    } else {
-        stderr.to_string()
-    };
-    TurnOutcome::Failed { summary, error }
-}
-
-fn restore_antigravity_mcp_config(
-    guard: Option<AntigravityMcpConfigGuard>,
-    outcome: TurnOutcome,
-) -> TurnOutcome {
-    let Some(guard) = guard else {
-        return outcome;
-    };
-    match guard.restore() {
-        Ok(()) => outcome,
-        Err(restore_error) => match outcome {
-            TurnOutcome::Completed(summary) | TurnOutcome::Cancelled(summary) => {
-                TurnOutcome::Failed {
-                    summary,
-                    error: restore_error,
-                }
-            }
-            TurnOutcome::Failed { summary, error } => TurnOutcome::Failed {
-                summary,
-                error: format!("{error}; additionally, {restore_error}"),
-            },
-        },
-    }
-}
-
+/// Adds this session's MCP servers to `agy`'s shared config.
+///
+/// `agy` reads `mcp_config.json` once, at process start, and takes no
+/// per-invocation override, so the entries have to be in the file for the whole
+/// session rather than for the length of one turn.
+///
+/// The previous implementation snapshotted the file and restored those exact
+/// bytes afterwards. With a session-long hold that is actively wrong: two
+/// Antigravity sessions overlap, and whichever finishes second restores a
+/// snapshot that erases the other's servers. Entries are namespaced per
+/// conversation already, so shutdown removes this session's keys and leaves
+/// every other key alone.
 async fn install_antigravity_mcp_config(
     namespace: &str,
     startup_mcp_servers: &[StartupMcpServer],
@@ -1713,103 +1652,166 @@ async fn install_antigravity_mcp_config(
     if startup_mcp_servers.is_empty() {
         return Ok(None);
     }
-    let guard = ANTIGRAVITY_MCP_CONFIG_MUTEX.lock().await;
     let path = antigravity_mcp_config_path()?;
-    let restore = AntigravityMcpConfigGuard::install(path, namespace, startup_mcp_servers, guard)?;
-    Ok(Some(restore))
+    let _guard = ANTIGRAVITY_MCP_CONFIG_MUTEX.lock().await;
+    let _file_lock = AntigravityMcpConfigLock::acquire(&path).await?;
+    let original = read_optional_bytes(&path)?;
+    let merged = merge_antigravity_mcp_config(original.as_deref(), namespace, startup_mcp_servers)
+        .map_err(|err| {
+            format!(
+                "Failed to prepare Antigravity MCP config {}: {err}",
+                path.display()
+            )
+        })?;
+    write_bytes_atomically(&path, &merged).map_err(|err| {
+        format!(
+            "Failed to write Antigravity MCP config {}: {err}",
+            path.display()
+        )
+    })?;
+    Ok(Some(AntigravityMcpConfigGuard {
+        path,
+        namespace: namespace.to_string(),
+    }))
 }
 
+struct AntigravityMcpConfigGuard {
+    path: PathBuf,
+    namespace: String,
+}
+
+impl AntigravityMcpConfigGuard {
+    async fn remove(self, startup_mcp_servers: &[StartupMcpServer]) -> Result<(), String> {
+        let _guard = ANTIGRAVITY_MCP_CONFIG_MUTEX.lock().await;
+        let _file_lock = AntigravityMcpConfigLock::acquire(&self.path).await?;
+        let Some(bytes) = read_optional_bytes(&self.path)? else {
+            return Ok(());
+        };
+        let mut value = serde_json::from_slice::<Value>(&bytes).map_err(|err| {
+            format!(
+                "Failed to read Antigravity MCP config {} for cleanup: {err}",
+                self.path.display()
+            )
+        })?;
+        let Some(servers) = value
+            .as_object_mut()
+            .and_then(|object| object.get_mut("mcpServers"))
+            .and_then(Value::as_object_mut)
+        else {
+            return Ok(());
+        };
+        for server in startup_mcp_servers {
+            servers.remove(&antigravity_mcp_server_key(&self.namespace, &server.name));
+        }
+        let serialized = serde_json::to_vec_pretty(&value).map_err(|err| {
+            format!("Failed to serialize Antigravity MCP config for cleanup: {err}")
+        })?;
+        write_bytes_atomically(&self.path, &serialized).map_err(|err| {
+            format!(
+                "Failed to write Antigravity MCP config {}: {err}",
+                self.path.display()
+            )
+        })
+    }
+}
+
+/// A cross-process lock over `agy`'s shared `mcp_config.json`.
+///
+/// The in-process mutex orders tasks inside one Tyde, and that is all it can
+/// do. `agy` reads a single user-level config, so two Tyde processes — or the
+/// conformance suite, where every scenario is its own process — otherwise
+/// read-modify-write the same file concurrently and drop each other's servers.
+/// A backend that quietly loses its MCP entries looks exactly like a model that
+/// declined to use a tool, which is the worst way for this to fail.
+struct AntigravityMcpConfigLock {
+    file: fs::File,
+}
+
+impl AntigravityMcpConfigLock {
+    /// Taken on a blocking thread: `lock_exclusive` parks the calling thread
+    /// until the holder releases, and parking a runtime worker stalls every
+    /// other task scheduled on it — including, when several Tyde processes
+    /// contend, the child agent whose own spawn is waiting behind it.
+    async fn acquire(path: &Path) -> Result<Self, String> {
+        let path = path.to_path_buf();
+        tokio::task::spawn_blocking(move || Self::acquire_blocking(&path))
+            .await
+            .map_err(|err| format!("Antigravity MCP config lock task failed: {err}"))?
+    }
+
+    fn acquire_blocking(path: &Path) -> Result<Self, String> {
+        use fs2::FileExt;
+
+        let lock_path = path.with_extension("json.tyde-lock");
+        if let Some(parent) = lock_path.parent() {
+            fs::create_dir_all(parent).map_err(|err| {
+                format!(
+                    "Failed to create Antigravity MCP config directory {}: {err}",
+                    parent.display()
+                )
+            })?;
+        }
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&lock_path)
+            .map_err(|err| {
+                format!(
+                    "Failed to open Antigravity MCP config lock {}: {err}",
+                    lock_path.display()
+                )
+            })?;
+        // Reported rather than waited on silently. This is the only blocking
+        // step between deciding to start a backend and actually starting it,
+        // so a lock that is never released presents as an agent that was
+        // created and then simply never ran — with nothing in the log to say
+        // why.
+        let waited_from = std::time::Instant::now();
+        if FileExt::try_lock_exclusive(&file).is_err() {
+            FileExt::lock_exclusive(&file).map_err(|err| {
+                format!(
+                    "Failed to lock Antigravity MCP config {}: {err}",
+                    lock_path.display()
+                )
+            })?;
+            let waited = waited_from.elapsed();
+            if waited >= ANTIGRAVITY_MCP_LOCK_WARN_AFTER {
+                tracing::warn!(
+                    "Waited {:.1}s for the Antigravity MCP config lock {}",
+                    waited.as_secs_f64(),
+                    lock_path.display()
+                );
+            }
+        }
+        Ok(Self { file })
+    }
+}
+
+impl Drop for AntigravityMcpConfigLock {
+    fn drop(&mut self) {
+        use fs2::FileExt;
+
+        let _ = FileExt::unlock(&self.file);
+    }
+}
+
+fn read_optional_bytes(path: &Path) -> Result<Option<Vec<u8>>, String> {
+    match fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(format!(
+            "Failed to read Antigravity MCP config {}: {err}",
+            path.display()
+        )),
+    }
+}
 fn antigravity_mcp_config_path() -> Result<PathBuf, String> {
     Ok(crate::paths::home_dir()?
         .join(".gemini")
         .join("config")
         .join("mcp_config.json"))
 }
-
-struct AntigravityMcpConfigGuard {
-    path: PathBuf,
-    original_bytes: Option<Vec<u8>>,
-    restored: bool,
-    _mutex_guard: tokio::sync::MutexGuard<'static, ()>,
-}
-
-impl AntigravityMcpConfigGuard {
-    fn install(
-        path: PathBuf,
-        namespace: &str,
-        startup_mcp_servers: &[StartupMcpServer],
-        mutex_guard: tokio::sync::MutexGuard<'static, ()>,
-    ) -> Result<Self, String> {
-        let original_bytes = match fs::read(&path) {
-            Ok(bytes) => Some(bytes),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
-            Err(err) => {
-                return Err(format!(
-                    "Failed to read Antigravity MCP config {}: {err}",
-                    path.display()
-                ));
-            }
-        };
-        let merged =
-            merge_antigravity_mcp_config(original_bytes.as_deref(), namespace, startup_mcp_servers)
-                .map_err(|err| {
-                    format!(
-                        "Failed to prepare Antigravity MCP config {}: {err}",
-                        path.display()
-                    )
-                })?;
-        write_bytes_atomically(&path, &merged).map_err(|err| {
-            format!(
-                "Failed to write Antigravity MCP config {}: {err}",
-                path.display()
-            )
-        })?;
-        Ok(Self {
-            path,
-            original_bytes,
-            restored: false,
-            _mutex_guard: mutex_guard,
-        })
-    }
-
-    fn restore(mut self) -> Result<(), String> {
-        self.restore_inner().map_err(|err| {
-            format!(
-                "Failed to restore Antigravity MCP config {}: {err}",
-                self.path.display()
-            )
-        })?;
-        self.restored = true;
-        Ok(())
-    }
-
-    fn restore_inner(&self) -> Result<(), String> {
-        match &self.original_bytes {
-            Some(bytes) => write_bytes_atomically(&self.path, bytes),
-            None => match fs::remove_file(&self.path) {
-                Ok(()) => Ok(()),
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                Err(err) => Err(err.to_string()),
-            },
-        }
-    }
-}
-
-impl Drop for AntigravityMcpConfigGuard {
-    fn drop(&mut self) {
-        if self.restored {
-            return;
-        }
-        if let Err(err) = self.restore_inner() {
-            tracing::error!(
-                path = %self.path.display(),
-                error = %err,
-                "failed to restore Antigravity MCP config"
-            );
-        }
-    }
-}
-
 fn merge_antigravity_mcp_config(
     original_bytes: Option<&[u8]>,
     namespace: &str,
@@ -1832,6 +1834,11 @@ fn merge_antigravity_mcp_config(
         .and_then(Value::as_object_mut)
         .ok_or_else(|| "existing mcp_config.json mcpServers must be a JSON object".to_string())?;
 
+    let pruned = prune_dead_tyde_mcp_servers(servers);
+    if pruned > 0 {
+        tracing::info!("Removed {pruned} Antigravity MCP entries left by dead Tyde sessions");
+    }
+
     for server in startup_mcp_servers {
         let Some(config) = antigravity_mcp_server_config(server) else {
             continue;
@@ -1847,6 +1854,62 @@ fn merge_antigravity_mcp_config(
 
     serde_json::to_vec_pretty(&value)
         .map_err(|err| format!("failed to serialize merged mcp_config.json: {err}"))
+}
+
+/// Drops the entries other Tyde sessions left behind when they died.
+///
+/// `mcp_config.json` outlives every process that writes to it, and Tyde's
+/// servers are loopback HTTP endpoints on a port that belongs to one run. A
+/// session that is killed rather than shut down never removes its own keys, so
+/// they accumulate: measured after a day of conformance runs, 32 entries, all
+/// pointing at ports nothing was listening on. That is not merely untidy —
+/// `agy` advertises every configured server, so a model told to use
+/// `tyde_spawn_agent` picks between sixteen of them and mostly reaches a dead
+/// one, which fails the call with `connection refused`.
+///
+/// Liveness is the test rather than age or ownership: an entry whose port
+/// answers belongs to a Tyde that is still running and is left alone, and one
+/// that refuses is garbage by construction. Only `tyde_`-prefixed keys are
+/// considered, so a user's own servers are never touched.
+fn prune_dead_tyde_mcp_servers(servers: &mut Map<String, Value>) -> usize {
+    let dead = servers
+        .iter()
+        .filter(|(key, value)| {
+            key.starts_with("tyde_")
+                && tyde_mcp_loopback_port(value).is_some_and(|port| !loopback_port_is_open(port))
+        })
+        .map(|(key, _)| key.clone())
+        .collect::<Vec<_>>();
+    for key in &dead {
+        servers.remove(key);
+    }
+    dead.len()
+}
+
+fn tyde_mcp_loopback_port(value: &Value) -> Option<u16> {
+    let url = value
+        .get("serverUrl")
+        .or_else(|| value.get("url"))
+        .and_then(Value::as_str)?;
+    let rest = url
+        .strip_prefix("http://127.0.0.1:")
+        .or_else(|| url.strip_prefix("http://localhost:"))?;
+    let end = rest
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(rest.len());
+    rest[..end].parse::<u16>().ok()
+}
+
+/// A refused loopback connect returns immediately, so this costs a syscall per
+/// entry rather than a wait.
+fn loopback_port_is_open(port: u16) -> bool {
+    use std::net::{Ipv4Addr, SocketAddr, TcpStream};
+
+    TcpStream::connect_timeout(
+        &SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
+        Duration::from_millis(200),
+    )
+    .is_ok()
 }
 
 fn antigravity_mcp_server_key(namespace: &str, server_name: &str) -> String {

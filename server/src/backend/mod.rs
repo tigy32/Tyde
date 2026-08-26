@@ -5,6 +5,7 @@ pub mod acp;
 pub use acp::backend as kiro;
 pub mod agent_control_progress;
 pub mod antigravity;
+pub mod antigravity_stream;
 pub mod claude;
 pub mod claude_skills;
 pub mod codex;
