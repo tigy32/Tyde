@@ -2401,112 +2401,203 @@ html[data-keyboard-open] .mobile-app {
 }
 
 /* ── Settings View ──────────────────────────────────────────────────── */
+/* A grouped list, the way a phone's own settings read: a small-caps heading
+   over each card of rows, every row a full touch target, values right-aligned
+   and allowed to wrap rather than clip. Selects are 16px so iOS does not zoom
+   the page when one is focused. */
+
+.settings-body {
+    padding: var(--space-3) var(--space-4) var(--space-6);
+}
 
 .settings-section {
     margin-bottom: var(--space-5);
 }
 
 .settings-section-title {
-    font-size: 13px;
-    font-weight: 600;
+    margin: 0 0 var(--space-2);
+    padding: 0 var(--space-4);
+    font-size: var(--text-sm);
+    font-weight: var(--weight-semibold);
     text-transform: uppercase;
-    letter-spacing: 0.5px;
-    color: var(--text-secondary);
-    margin-bottom: var(--space-3);
+    letter-spacing: 0.06em;
+    color: var(--text-tertiary);
+}
+
+.settings-group,
+.settings-info {
+    background: var(--bg-surface);
+    border: 1px solid var(--border-default);
+    border-radius: var(--radius-md);
+    overflow: hidden;
+}
+
+.settings-group > * + *,
+.settings-info > * + * {
+    border-top: 1px solid var(--border-default);
 }
 
 .settings-row {
     display: flex;
-    justify-content: space-between;
     align-items: center;
-    padding: var(--space-3) 0;
-    border-bottom: 1px solid var(--border-default);
+    justify-content: space-between;
+    gap: var(--space-3);
+    min-height: var(--hit-area);
+    padding: var(--space-2) var(--space-4);
+}
+
+.settings-row-toggle {
+    cursor: pointer;
+}
+
+.settings-row-action {
+    padding: var(--space-3) var(--space-4);
 }
 
 .settings-label {
-    font-size: 15px;
-}
-
-.settings-value {
-    font-size: 14px;
-    color: var(--text-secondary);
-    text-align: right;
-    max-width: 60%;
-    overflow: hidden;
-    text-overflow: ellipsis;
-}
-
-.settings-select {
-    background: var(--bg-surface-2);
-    border: 1px solid var(--border-default);
-    border-radius: var(--radius-sm);
-    padding: var(--space-1) var(--space-3);
-    font-size: 14px;
+    flex: 1 1 auto;
+    min-width: 0;
+    font-size: var(--text-base);
     color: var(--text-primary);
 }
 
-.settings-info {
-    padding: var(--space-2) 0;
+.settings-value {
+    flex: 0 1 auto;
+    min-width: 0;
+    max-width: 62%;
+    font-size: var(--text-base);
+    font-variant-numeric: tabular-nums;
+    color: var(--text-secondary);
+    text-align: right;
+    overflow-wrap: anywhere;
 }
 
-.settings-muted {
-    color: var(--text-tertiary);
-    font-size: 14px;
+.settings-value-mono {
+    font-family: var(--font-mono);
+    font-size: var(--text-sm);
 }
 
-.backend-setup-list {
-    display: flex;
-    flex-direction: column;
-    gap: var(--space-2);
-}
-
-.backend-setup-card {
-    padding: var(--space-3) var(--space-4);
-    background: var(--bg-surface);
+.settings-select {
+    flex: 0 1 auto;
+    min-height: var(--hit-area);
+    max-width: 62%;
+    padding: 0 var(--space-3);
+    background: var(--bg-surface-2);
     border: 1px solid var(--border-default);
-    border-radius: var(--radius-md);
+    border-radius: var(--radius-button);
+    font-size: var(--text-md);
+    color: var(--text-primary);
 }
 
-.backend-name {
-    font-size: 15px;
-    font-weight: 500;
+.settings-select:focus {
+    outline: none;
+    border-color: var(--accent-primary);
 }
 
-.backend-status {
-    font-size: 13px;
-    color: var(--accent-error);
-    margin-top: var(--space-1);
+/* The auto-connect checkbox drawn as a switch. It stays a checkbox: the row
+   is its label, so the whole row toggles it. */
+.settings-toggle {
+    appearance: none;
+    -webkit-appearance: none;
+    flex-shrink: 0;
+    position: relative;
+    width: 50px;
+    height: 30px;
+    margin: 0;
+    border-radius: var(--radius-full);
+    background: var(--bg-surface-3);
+    border: 1px solid var(--border-strong);
+    transition:
+        background-color var(--motion-base) var(--ease-standard),
+        border-color var(--motion-base) var(--ease-standard);
 }
 
-.backend-status.ready {
-    color: var(--accent-success);
+.settings-toggle::before {
+    content: "";
+    position: absolute;
+    top: 2px;
+    left: 2px;
+    width: 24px;
+    height: 24px;
+    border-radius: 50%;
+    background: #ffffff;
+    box-shadow: var(--shadow-sm);
+    transition: transform var(--motion-base) var(--ease-standard);
 }
 
-.backend-instructions {
-    margin-top: var(--space-2);
-    font-size: 13px;
+.settings-toggle:checked {
+    background: var(--accent-primary);
+    border-color: var(--accent-primary);
+}
+
+.settings-toggle:checked::before {
+    transform: translateX(20px);
+}
+
+.settings-toggle:focus-visible {
+    outline: 2px solid var(--accent-primary);
+    outline-offset: 2px;
+}
+
+.settings-note,
+.settings-empty,
+.settings-muted {
+    display: block;
+    margin: 0;
+    padding: var(--space-3) var(--space-4);
+    font-size: var(--text-sm);
+    line-height: var(--line-relaxed);
     color: var(--text-secondary);
 }
 
-.custom-agent-list {
+.settings-empty,
+.settings-muted {
+    color: var(--text-tertiary);
+}
+
+.settings-error {
+    margin: 0;
+    padding: var(--space-2) var(--space-4) var(--space-3);
+    font-size: var(--text-sm);
+    line-height: var(--line-relaxed);
+    color: var(--accent-error);
+}
+
+.settings-footnote {
+    margin: var(--space-2) 0 0;
+    padding: 0 var(--space-4);
+    font-size: 12px;
+    line-height: var(--line-relaxed);
+    color: var(--text-tertiary);
+}
+
+/* Inventory rows (custom agents, MCP servers, steering, skills): a title over
+   a subtitle, since the subtitles are prose that a side-by-side row squeezed
+   into a sliver. */
+.settings-item {
     display: flex;
     flex-direction: column;
-    gap: var(--space-1);
+    justify-content: center;
+    gap: 2px;
+    min-height: var(--hit-area);
+    padding: var(--space-2) var(--space-4);
 }
 
-.custom-agent-card {
-    display: flex;
-    justify-content: space-between;
-    padding: var(--space-2) var(--space-3);
-    background: var(--bg-surface);
-    border: 1px solid var(--border-default);
-    border-radius: var(--radius-sm);
-    font-size: 14px;
+.settings-item-title {
+    font-size: var(--text-base);
+    color: var(--text-primary);
+    overflow-wrap: anywhere;
 }
 
-.custom-agent-backend {
+.settings-item-subtitle {
+    font-size: var(--text-sm);
+    line-height: var(--line-snug);
     color: var(--text-tertiary);
-    font-size: 12px;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+    overflow-wrap: anywhere;
 }
 
 /* ── Scrollbar ──────────────────────────────────────────────────────── */
@@ -3214,54 +3305,7 @@ html[data-keyboard-open] .mobile-app {
     font-size: var(--text-xs);
 }
 
-/* ── Settings list rows ─────────────────────────────────────────── */
-
-.settings-list {
-    display: flex;
-    flex-direction: column;
-    gap: var(--space-3);
-    padding: var(--space-3);
-}
-
-.settings-group {
-    background: var(--bg-surface);
-    border: 1px solid var(--border-default);
-    border-radius: var(--radius-md);
-    overflow: hidden;
-}
-
-.settings-group-heading {
-    padding: var(--space-3) var(--space-4) var(--space-1);
-    font-size: var(--text-xs);
-    text-transform: uppercase;
-    letter-spacing: 0.06em;
-    color: var(--text-tertiary);
-}
-
-.settings-row {
-    display: flex;
-    align-items: center;
-    gap: var(--space-3);
-    padding: var(--space-3) var(--space-4);
-    border-top: 1px solid var(--border-default);
-    min-height: var(--hit-area);
-}
-
-.settings-row:first-of-type {
-    border-top: none;
-}
-
-.settings-row-label {
-    flex: 1;
-    color: var(--text-primary);
-    font-size: var(--text-sm);
-}
-
-.settings-row-value {
-    color: var(--text-secondary);
-    font-size: var(--text-sm);
-    text-align: right;
-}
+/* ── Chat: queued hint and rename bar ─────────────────────────── */
 
 .chat-input-queued-hint {
     margin-bottom: var(--space-2);

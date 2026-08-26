@@ -5,7 +5,7 @@ use wasm_bindgen_futures::spawn_local;
 use crate::bridge;
 use crate::components::backend_capacity::SubscriptionCapacitySection;
 use crate::components::host_browser::HostBrowser;
-use crate::components::ui::{Button, ButtonSize, ButtonVariant, ConfirmModal, EmptyState};
+use crate::components::ui::{Button, ButtonVariant, ConfirmModal, EmptyState, Pill, PillTone};
 use crate::push::PushAvailability;
 use crate::state::{AppState, PairedHostSummary, ToolOutputMode};
 
@@ -58,6 +58,40 @@ pub fn restore_appearance(state: &AppState) {
         },
         Ok(None) => persist_tool_output_mode(state.tool_output_mode.get_untracked()),
         Err(e) => log::warn!("failed to read tool_output_mode from localStorage: {e:?}"),
+    }
+}
+
+/// One label/control line of a settings group. Every row is at least a full
+/// touch target tall so the screen reads as a list, not a form.
+#[component]
+fn SettingsRow(#[prop(into)] label: String, children: Children) -> impl IntoView {
+    view! {
+        <div class="settings-row" data-mobile-test="settings-row">
+            <span class="settings-label">{label}</span>
+            {children()}
+        </div>
+    }
+}
+
+/// A group with nothing to list.
+#[component]
+fn SettingsEmpty(
+    #[prop(into)] text: String,
+    #[prop(optional)] data_mobile_test: Option<&'static str>,
+) -> impl IntoView {
+    view! {
+        <div class="settings-group">
+            <p class="settings-empty" data-mobile-test=data_mobile_test>{text}</p>
+        </div>
+    }
+}
+
+fn backend_setup_status(status: &protocol::BackendSetupStatus) -> (&'static str, PillTone) {
+    match status {
+        protocol::BackendSetupStatus::Installed => ("Installed", PillTone::Success),
+        protocol::BackendSetupStatus::NotInstalled => ("Not installed", PillTone::Error),
+        protocol::BackendSetupStatus::Unavailable => ("Unavailable", PillTone::Error),
+        protocol::BackendSetupStatus::Unsupported => ("Unsupported", PillTone::Error),
     }
 }
 
@@ -117,59 +151,62 @@ fn NotificationsSection() -> impl IntoView {
     };
 
     view! {
-        <div class="settings-section" data-mobile-test="settings-notifications">
+        <section class="settings-section" data-mobile-test="settings-notifications">
             <h2 class="settings-section-title">"Notifications"</h2>
-            <div class="settings-info">
+            <div class="settings-group">
                 {move || match availability.get() {
                     PushAvailability::Unsupported => view! {
-                        <span class="settings-muted">
+                        <p class="settings-note">
                             "This browser cannot receive notifications. On iPhone, add Tyde to your Home Screen and open it from there."
-                        </span>
+                        </p>
                     }.into_any(),
                     PushAvailability::Denied => view! {
-                        <span class="settings-muted">
+                        <p class="settings-note">
                             "Notifications are blocked for this site. Re-enable them in your browser settings."
-                        </span>
+                        </p>
                     }.into_any(),
                     PushAvailability::Prompt => view! {
                         <>
-                            <span class="settings-muted">
+                            <p class="settings-note">
                                 "Get notified when an agent finishes a turn or asks you something."
-                            </span>
-                            <Button
-                                label="Enable notifications"
-                                size=ButtonSize::Compact
-                                variant=ButtonVariant::Primary
-                                data_mobile_test="settings-notifications-enable"
-                                disabled=Signal::derive(move || busy.get())
-                                on_click=Callback::new(enable.clone())
-                            />
+                            </p>
+                            <div class="settings-row settings-row-action">
+                                <Button
+                                    label="Enable notifications"
+                                    variant=ButtonVariant::Primary
+                                    full_width=true
+                                    data_mobile_test="settings-notifications-enable"
+                                    disabled=Signal::derive(move || busy.get())
+                                    on_click=Callback::new(enable.clone())
+                                />
+                            </div>
                         </>
                     }.into_any(),
                     PushAvailability::Granted => view! {
                         <>
-                            <div class="settings-row">
-                                <span class="settings-label">"Agent idle alerts"</span>
+                            <SettingsRow label="Agent idle alerts">
                                 <span class="settings-value">"On"</span>
+                            </SettingsRow>
+                            <div class="settings-row settings-row-action">
+                                <Button
+                                    label="Turn off"
+                                    variant=ButtonVariant::Secondary
+                                    full_width=true
+                                    data_mobile_test="settings-notifications-disable"
+                                    disabled=Signal::derive(move || busy.get())
+                                    on_click=Callback::new(disable.clone())
+                                />
                             </div>
-                            <Button
-                                label="Turn off"
-                                size=ButtonSize::Compact
-                                variant=ButtonVariant::Secondary
-                                data_mobile_test="settings-notifications-disable"
-                                disabled=Signal::derive(move || busy.get())
-                                on_click=Callback::new(disable.clone())
-                            />
                         </>
                     }.into_any(),
                 }}
                 {move || error.get().map(|message| view! {
-                    <span class="settings-error" data-mobile-test="settings-notifications-error">
+                    <p class="settings-error" role="alert" data-mobile-test="settings-notifications-error">
                         {message}
-                    </span>
+                    </p>
                 })}
             </div>
-        </div>
+        </section>
     }
 }
 
@@ -182,181 +219,183 @@ pub fn SettingsView() -> impl IntoView {
             <div class="view-header">
                 <h1 class="view-title">"Settings"</h1>
             </div>
-            <div class="view-body">
-                <div class="settings-section" data-mobile-test="settings-appearance">
+            <div class="view-body settings-body">
+                <section class="settings-section" data-mobile-test="settings-appearance">
                     <h2 class="settings-section-title">"Appearance"</h2>
-                    <div class="settings-row">
-                        <span class="settings-label">"Theme"</span>
-                        <select
-                            class="settings-select"
-                            data-mobile-test="settings-theme"
-                            aria-label="Theme"
-                            prop:value=move || state.theme.get()
-                            on:change=move |ev| {
-                                state.theme.set(event_target_value(&ev));
-                            }
-                        >
-                            <option value="dark">"Dark"</option>
-                            <option value="light">"Light"</option>
-                        </select>
-                    </div>
-                    <div class="settings-row">
-                        <span class="settings-label">"Tool Output"</span>
-                        <select
-                            class="settings-select"
-                            data-mobile-test="settings-tool-output"
-                            aria-label="Tool output mode"
-                            prop:value=move || tool_output_mode_to_str(state.tool_output_mode.get()).to_owned()
-                            on:change=move |ev| {
-                                let raw = event_target_value(&ev);
-                                if let Some(mode) = tool_output_mode_from_str(&raw) {
-                                    state.tool_output_mode.set(mode);
-                                    persist_tool_output_mode(mode);
+                    <div class="settings-group">
+                        <SettingsRow label="Theme">
+                            <select
+                                class="settings-select"
+                                data-mobile-test="settings-theme"
+                                aria-label="Theme"
+                                prop:value=move || state.theme.get()
+                                on:change=move |ev| {
+                                    state.theme.set(event_target_value(&ev));
                                 }
-                            }
-                        >
-                            <option value=TOOL_OUTPUT_MODE_SUMMARY>"Summary"</option>
-                            <option value=TOOL_OUTPUT_MODE_COMPACT>"Compact"</option>
-                            <option value=TOOL_OUTPUT_MODE_FULL>"Full"</option>
-                        </select>
+                            >
+                                <option value="dark">"Dark"</option>
+                                <option value="light">"Light"</option>
+                            </select>
+                        </SettingsRow>
+                        <SettingsRow label="Tool output">
+                            <select
+                                class="settings-select"
+                                data-mobile-test="settings-tool-output"
+                                aria-label="Tool output mode"
+                                prop:value=move || tool_output_mode_to_str(state.tool_output_mode.get()).to_owned()
+                                on:change=move |ev| {
+                                    let raw = event_target_value(&ev);
+                                    if let Some(mode) = tool_output_mode_from_str(&raw) {
+                                        state.tool_output_mode.set(mode);
+                                        persist_tool_output_mode(mode);
+                                    }
+                                }
+                            >
+                                <option value=TOOL_OUTPUT_MODE_SUMMARY>"Summary"</option>
+                                <option value=TOOL_OUTPUT_MODE_COMPACT>"Compact"</option>
+                                <option value=TOOL_OUTPUT_MODE_FULL>"Full"</option>
+                            </select>
+                        </SettingsRow>
                     </div>
-                </div>
+                </section>
 
                 <PairedHostSection />
 
                 <NotificationsSection />
 
-                <div class="settings-section">
+                <section class="settings-section" data-mobile-test="settings-host">
                     <h2 class="settings-section-title">"Host"</h2>
                     {let state = state.clone(); move || {
-                        let settings = state.active_host_settings();
-                        match settings {
+                        match state.active_host_settings() {
                             Some(hs) => {
                                 let backends: Vec<String> = hs.enabled_backends.iter().map(|b| format!("{b:?}")).collect();
                                 let default = hs.default_backend.map(|b| format!("{b:?}")).unwrap_or_else(|| "None".to_string());
                                 view! {
-                                    <div class="settings-info">
-                                        <div class="settings-row">
-                                            <span class="settings-label">"Enabled Backends"</span>
+                                    <div class="settings-group">
+                                        <SettingsRow label="Enabled backends">
                                             <span class="settings-value">{backends.join(", ")}</span>
-                                        </div>
-                                        <div class="settings-row">
-                                            <span class="settings-label">"Default Backend"</span>
+                                        </SettingsRow>
+                                        <SettingsRow label="Default backend">
                                             <span class="settings-value">{default}</span>
-                                        </div>
+                                        </SettingsRow>
                                     </div>
                                 }.into_any()
                             }
-                            None => {
-                                view! {
-                                    <div class="settings-info">
-                                        <span class="settings-muted">"Not connected to a host"</span>
-                                    </div>
-                                }.into_any()
-                            }
+                            None => view! { <SettingsEmpty text="Not connected to a host" /> }.into_any(),
                         }
                     }}
-                </div>
+                </section>
 
-                <div class="settings-section">
-                    <h2 class="settings-section-title">"Backend Setup"</h2>
+                <section class="settings-section" data-mobile-test="settings-backend-setup">
+                    <h2 class="settings-section-title">"Backend setup"</h2>
                     {let state = state.clone(); move || {
                         let setup = state.active_host_backend_setup();
                         if setup.is_empty() {
-                            return view! {
-                                <div class="settings-info">
-                                    <span class="settings-muted">"No backend setup info"</span>
-                                </div>
-                            }.into_any();
+                            return view! { <SettingsEmpty text="No backend setup info" /> }.into_any();
                         }
                         view! {
-                            <div class="backend-setup-list">
-                                {setup.into_iter().map(|info| {
-                                    let backend = format!("{:?}", info.backend_kind);
-                                    let is_installed = matches!(info.status, protocol::BackendSetupStatus::Installed);
-                                    let status_text = format!("{:?}", info.status);
+                            <div class="settings-group" data-mobile-test="settings-backend-setup-list">
+                                {setup.iter().map(|info| {
+                                    let (label, tone) = backend_setup_status(&info.status);
                                     view! {
-                                        <div class="backend-setup-card">
-                                            <div class="backend-name">{backend}</div>
-                                            <div class="backend-status" class:ready=is_installed>
-                                                {status_text}
-                                            </div>
-                                        </div>
+                                        <SettingsRow label=format!("{:?}", info.backend_kind)>
+                                            <Pill label=label tone=tone data_mobile_test="settings-backend-status" />
+                                        </SettingsRow>
                                     }
                                 }).collect::<Vec<_>>()}
                             </div>
                         }.into_any()
                     }}
-                </div>
+                </section>
 
                 <SubscriptionCapacitySection />
 
-                <div class="settings-section" data-mobile-test="settings-custom-agents">
-                    <h2 class="settings-section-title">"Custom Agents"</h2>
+                <section class="settings-section" data-mobile-test="settings-custom-agents">
+                    <h2 class="settings-section-title">"Custom agents"</h2>
                     {let state = state.clone(); move || {
                         let agents = state.active_host_custom_agents();
                         if agents.is_empty() {
                             return view! {
-                                <div class="settings-info">
-                                    <span class="settings-muted" data-mobile-test="settings-custom-agents-empty">"No custom agents configured"</span>
-                                </div>
+                                <SettingsEmpty
+                                    text="No custom agents configured"
+                                    data_mobile_test="settings-custom-agents-empty"
+                                />
                             }.into_any();
                         }
                         let mut sorted: Vec<_> = agents.into_values().collect();
                         sorted.sort_by(|a, b| a.name.cmp(&b.name));
                         view! {
-                            <div class="custom-agent-list" data-mobile-test="settings-custom-agents-list">
+                            <div class="settings-group settings-list" data-mobile-test="settings-custom-agents-list">
                                 {sorted.into_iter().map(|agent| {
                                     let name = agent.name.clone();
                                     let desc = agent.description.clone();
                                     view! {
-                                        <div class="custom-agent-card" data-mobile-test="settings-custom-agent-row">
-                                            <span class="custom-agent-name">{name}</span>
-                                            <span class="custom-agent-backend">{desc}</span>
+                                        <div class="settings-item" data-mobile-test="settings-custom-agent-row">
+                                            <span class="settings-item-title">{name}</span>
+                                            <span class="settings-item-subtitle">{desc}</span>
                                         </div>
                                     }
                                 }).collect::<Vec<_>>()}
                             </div>
                         }.into_any()
                     }}
-                </div>
+                </section>
 
                 <McpServersSection />
                 <SteeringSection />
                 <SkillsSection />
                 <HostToolsSection />
 
-                <div class="settings-section" data-mobile-test="settings-native-voice">
-                    <h2 class="settings-section-title">"Native Voice"</h2>
+                <section class="settings-section" data-mobile-test="settings-native-voice">
+                    <h2 class="settings-section-title">"Native voice"</h2>
                     {move || {
-                        let settings=state.active_local_host_id.get().and_then(|host|state.host_settings_by_host.with(|values|values.get(&host).cloned()));
+                        let settings = state
+                            .active_local_host_id
+                            .get()
+                            .and_then(|host| state.host_settings_by_host.with(|values| values.get(&host).cloned()));
                         match settings {
-                            Some(settings) => view! {
-                                <div class="settings-info">
-                                    <div class="settings-row"><span class="settings-label">"Status"</span><span class="settings-value">{if settings.voice.enabled {"Enabled"} else {"Disabled"}}</span></div>
-                                    <div class="settings-row"><span class="settings-label">"Model"</span><span class="settings-value">{settings.voice.nova_model}</span></div>
-                                    <div class="settings-row"><span class="settings-label">"Turn ending"</span><span class="settings-value">{match settings.voice.endpointing_sensitivity { settings_model::VoiceEndpointingSensitivity::High => "Fast", settings_model::VoiceEndpointingSensitivity::Medium => "Balanced", settings_model::VoiceEndpointingSensitivity::Low => "Patient" }}</span></div>
-                                    <p class="settings-muted">"Voice capture is foreground-only and uses this device’s echo cancellation, noise suppression, and gain control. Configure AWS profile and region on the desktop host."</p>
-                                </div>
+                            Some(settings) => {
+                                let status = if settings.voice.enabled { "Enabled" } else { "Disabled" };
+                                let turn_ending = match settings.voice.endpointing_sensitivity {
+                                    settings_model::VoiceEndpointingSensitivity::High => "Fast",
+                                    settings_model::VoiceEndpointingSensitivity::Medium => "Balanced",
+                                    settings_model::VoiceEndpointingSensitivity::Low => "Patient",
+                                };
+                                view! {
+                                    <div class="settings-group">
+                                        <SettingsRow label="Status">
+                                            <span class="settings-value">{status}</span>
+                                        </SettingsRow>
+                                        <SettingsRow label="Model">
+                                            <span class="settings-value">{settings.voice.nova_model}</span>
+                                        </SettingsRow>
+                                        <SettingsRow label="Turn ending">
+                                            <span class="settings-value">{turn_ending}</span>
+                                        </SettingsRow>
+                                    </div>
+                                    <p class="settings-footnote">
+                                        "Voice capture is foreground-only and uses this device’s echo cancellation, noise suppression, and gain control. Configure AWS profile and region on the desktop host."
+                                    </p>
+                                }.into_any()
+                            }
+                            None => view! {
+                                <SettingsEmpty text="Connect a host to see voice availability." />
                             }.into_any(),
-                            None => view! { <span class="settings-muted">"Connect a host to see voice availability."</span> }.into_any(),
                         }
                     }}
-                </div>
+                </section>
 
-                <div class="settings-section">
+                <section class="settings-section" data-mobile-test="settings-about">
                     <h2 class="settings-section-title">"About"</h2>
-                    <div class="settings-info">
-                        <div class="settings-row">
-                            <span class="settings-label">"App"</span>
+                    <div class="settings-group">
+                        <SettingsRow label="App">
                             <span class="settings-value">"Tyde Mobile"</span>
-                        </div>
-                        <div class="settings-row">
-                            <span class="settings-label">"Version"</span>
+                        </SettingsRow>
+                        <SettingsRow label="Version">
                             <span class="settings-value">"0.1.0"</span>
-                        </div>
+                        </SettingsRow>
                     </div>
-                </div>
+                </section>
             </div>
         </div>
     }
@@ -370,8 +409,8 @@ pub fn SettingsView() -> impl IntoView {
 fn PairedHostSection() -> impl IntoView {
     let state = use_context::<AppState>().unwrap();
     view! {
-        <div class="settings-section">
-            <h2 class="settings-section-title">"Paired Host"</h2>
+        <section class="settings-section" data-mobile-test="settings-paired-host">
+            <h2 class="settings-section-title">"Paired host"</h2>
             {move || {
                 let Some(active_id) = state.active_local_host_id.get() else {
                     return view! {
@@ -402,7 +441,7 @@ fn PairedHostSection() -> impl IntoView {
                 };
                 view! { <PairedHostCard host=host /> }.into_any()
             }}
-        </div>
+        </section>
     }
 }
 
@@ -471,60 +510,61 @@ fn PairedHostCard(host: PairedHostSummary) -> impl IntoView {
     });
 
     view! {
-        <div>
-            <div class="settings-row">
-                <span class="settings-label">"Label"</span>
+        <div class="settings-group">
+            <SettingsRow label="Label">
                 <span class="settings-value">{host_label}</span>
-            </div>
-            <div class="settings-row">
-                <span class="settings-label">"Broker"</span>
-                <span class="settings-value broker-url" title=broker_url.clone()>{broker_url.clone()}</span>
-            </div>
-            <div class="settings-row">
-                <span class="settings-label">"Room"</span>
-                <span class="settings-value room-id">{room_id}</span>
-            </div>
-            <div class="settings-row">
-                <span class="settings-label">"Credential"</span>
-                <span class="settings-value credential-fingerprint">{credential_fingerprint}</span>
-            </div>
-            <div class="settings-row">
-                <span class="settings-label">"Last Connected"</span>
+            </SettingsRow>
+            <SettingsRow label="Broker">
+                <span class="settings-value settings-value-mono" data-mobile-test="settings-broker-url">
+                    {broker_url}
+                </span>
+            </SettingsRow>
+            <SettingsRow label="Room">
+                <span class="settings-value settings-value-mono">{room_id}</span>
+            </SettingsRow>
+            <SettingsRow label="Credential">
+                <span class="settings-value settings-value-mono">{credential_fingerprint}</span>
+            </SettingsRow>
+            <SettingsRow label="Last connected">
                 <span class="settings-value">{last_connected}</span>
-            </div>
-            <div class="settings-row">
+            </SettingsRow>
+            // The whole row is the switch's label, so the tap target is the row.
+            <label class="settings-row settings-row-toggle" data-mobile-test="settings-row">
                 <span class="settings-label">"Auto-connect"</span>
                 <input
                     class="settings-toggle"
                     type="checkbox"
+                    role="switch"
+                    data-mobile-test="settings-auto-connect"
                     prop:checked=auto_connect_checked
                     on:change=on_toggle_auto
                 />
-            </div>
-            <div class="settings-row">
+            </label>
+            <div class="settings-row settings-row-action">
                 <Button
                     label="Forget host"
                     variant=ButtonVariant::Destructive
+                    full_width=true
                     data_mobile_test="settings-forget-host"
                     aria_label="Forget paired host on this device".to_string()
                     on_click=on_request_forget
                 />
-                <p class="settings-hint">
-                    "Forget removes the pairing on this device only. To revoke server-side, use Settings → Mobile on the desktop."
-                </p>
             </div>
-            <ConfirmModal
-                open=confirming_forget
-                title="Forget host?"
-                message=format!("This removes the saved pairing for \"{forget_host_label}\" on this device. You can re-pair from the host's QR.")
-                confirm_label="Forget"
-                cancel_label="Cancel"
-                destructive=true
-                data_mobile_test="settings-forget-host-modal"
-                on_confirm=on_confirm_forget
-                on_cancel=on_cancel_forget
-            />
         </div>
+        <p class="settings-footnote" data-mobile-test="settings-forget-host-hint">
+            "Forget removes the pairing on this device only. To revoke server-side, use Settings → Mobile on the desktop."
+        </p>
+        <ConfirmModal
+            open=confirming_forget
+            title="Forget host?"
+            message=format!("This removes the saved pairing for \"{forget_host_label}\" on this device. You can re-pair from the host's QR.")
+            confirm_label="Forget"
+            cancel_label="Cancel"
+            destructive=true
+            data_mobile_test="settings-forget-host-modal"
+            on_confirm=on_confirm_forget
+            on_cancel=on_cancel_forget
+        />
     }
 }
 
@@ -536,15 +576,11 @@ fn PairedHostCard(host: PairedHostSummary) -> impl IntoView {
 fn McpServersSection() -> impl IntoView {
     let state = use_context::<AppState>().unwrap();
     view! {
-        <div class="settings-section" data-mobile-test="settings-mcp-servers">
-            <h2 class="settings-section-title">"MCP Servers"</h2>
+        <section class="settings-section" data-mobile-test="settings-mcp-servers">
+            <h2 class="settings-section-title">"MCP servers"</h2>
             {move || {
                 let Some(host) = state.active_local_host_id.get() else {
-                    return view! {
-                        <div class="settings-info">
-                            <span class="settings-muted">"Not connected to a host"</span>
-                        </div>
-                    }.into_any();
+                    return view! { <SettingsEmpty text="Not connected to a host" /> }.into_any();
                 };
                 let servers = state
                     .mcp_servers_by_host
@@ -552,29 +588,30 @@ fn McpServersSection() -> impl IntoView {
                     .unwrap_or_default();
                 if servers.is_empty() {
                     return view! {
-                        <div class="settings-info">
-                            <span class="settings-muted" data-mobile-test="settings-mcp-servers-empty">"No MCP servers configured"</span>
-                        </div>
+                        <SettingsEmpty
+                            text="No MCP servers configured"
+                            data_mobile_test="settings-mcp-servers-empty"
+                        />
                     }.into_any();
                 }
                 let mut sorted: Vec<_> = servers.into_values().collect();
                 sorted.sort_by(|a, b| a.name.cmp(&b.name));
                 view! {
-                    <div class="custom-agent-list" data-mobile-test="settings-mcp-servers-list">
+                    <div class="settings-group settings-list" data-mobile-test="settings-mcp-servers-list">
                         {sorted.into_iter().map(|server| {
                             let name = server.name.clone();
                             let transport = mcp_transport_label(&server.transport);
                             view! {
-                                <div class="custom-agent-card" data-mobile-test="settings-mcp-server-row">
-                                    <span class="custom-agent-name">{name}</span>
-                                    <span class="custom-agent-backend">{transport}</span>
+                                <div class="settings-item" data-mobile-test="settings-mcp-server-row">
+                                    <span class="settings-item-title">{name}</span>
+                                    <span class="settings-item-subtitle">{transport}</span>
                                 </div>
                             }
                         }).collect::<Vec<_>>()}
                     </div>
                 }.into_any()
             }}
-        </div>
+        </section>
     }
 }
 
@@ -597,15 +634,11 @@ fn mcp_transport_label(transport: &protocol::McpTransportConfig) -> String {
 fn SteeringSection() -> impl IntoView {
     let state = use_context::<AppState>().unwrap();
     view! {
-        <div class="settings-section" data-mobile-test="settings-steering">
+        <section class="settings-section" data-mobile-test="settings-steering">
             <h2 class="settings-section-title">"Steering"</h2>
             {move || {
                 let Some(host) = state.active_local_host_id.get() else {
-                    return view! {
-                        <div class="settings-info">
-                            <span class="settings-muted">"Not connected to a host"</span>
-                        </div>
-                    }.into_any();
+                    return view! { <SettingsEmpty text="Not connected to a host" /> }.into_any();
                 };
                 let docs = state
                     .steering_by_host
@@ -613,15 +646,16 @@ fn SteeringSection() -> impl IntoView {
                     .unwrap_or_default();
                 if docs.is_empty() {
                     return view! {
-                        <div class="settings-info">
-                            <span class="settings-muted" data-mobile-test="settings-steering-empty">"No steering documents configured"</span>
-                        </div>
+                        <SettingsEmpty
+                            text="No steering documents configured"
+                            data_mobile_test="settings-steering-empty"
+                        />
                     }.into_any();
                 }
                 let mut sorted: Vec<_> = docs.into_values().collect();
                 sorted.sort_by(|a, b| a.title.cmp(&b.title));
                 view! {
-                    <div class="custom-agent-list" data-mobile-test="settings-steering-list">
+                    <div class="settings-group settings-list" data-mobile-test="settings-steering-list">
                         {sorted.into_iter().map(|doc| {
                             let title = doc.title.clone();
                             let scope_label = match doc.scope {
@@ -629,16 +663,16 @@ fn SteeringSection() -> impl IntoView {
                                 protocol::SteeringScope::Project(pid) => format!("Project: {}", pid.0),
                             };
                             view! {
-                                <div class="custom-agent-card" data-mobile-test="settings-steering-row">
-                                    <span class="custom-agent-name">{title}</span>
-                                    <span class="custom-agent-backend">{scope_label}</span>
+                                <div class="settings-item" data-mobile-test="settings-steering-row">
+                                    <span class="settings-item-title">{title}</span>
+                                    <span class="settings-item-subtitle">{scope_label}</span>
                                 </div>
                             }
                         }).collect::<Vec<_>>()}
                     </div>
                 }.into_any()
             }}
-        </div>
+        </section>
     }
 }
 
@@ -648,15 +682,11 @@ fn SteeringSection() -> impl IntoView {
 fn SkillsSection() -> impl IntoView {
     let state = use_context::<AppState>().unwrap();
     view! {
-        <div class="settings-section" data-mobile-test="settings-skills">
+        <section class="settings-section" data-mobile-test="settings-skills">
             <h2 class="settings-section-title">"Skills"</h2>
             {move || {
                 let Some(host) = state.active_local_host_id.get() else {
-                    return view! {
-                        <div class="settings-info">
-                            <span class="settings-muted">"Not connected to a host"</span>
-                        </div>
-                    }.into_any();
+                    return view! { <SettingsEmpty text="Not connected to a host" /> }.into_any();
                 };
                 let skills = state
                     .skills_by_host
@@ -664,29 +694,30 @@ fn SkillsSection() -> impl IntoView {
                     .unwrap_or_default();
                 if skills.is_empty() {
                     return view! {
-                        <div class="settings-info">
-                            <span class="settings-muted" data-mobile-test="settings-skills-empty">"No skills installed"</span>
-                        </div>
+                        <SettingsEmpty
+                            text="No skills installed"
+                            data_mobile_test="settings-skills-empty"
+                        />
                     }.into_any();
                 }
                 let mut sorted: Vec<_> = skills.into_values().collect();
                 sorted.sort_by(|a, b| a.name.cmp(&b.name));
                 view! {
-                    <div class="custom-agent-list" data-mobile-test="settings-skills-list">
+                    <div class="settings-group settings-list" data-mobile-test="settings-skills-list">
                         {sorted.into_iter().map(|skill| {
                             let display = skill.title.clone().unwrap_or_else(|| skill.name.clone());
                             let subtitle = skill.description.clone().unwrap_or_else(|| skill.name.clone());
                             view! {
-                                <div class="custom-agent-card" data-mobile-test="settings-skill-row">
-                                    <span class="custom-agent-name">{display}</span>
-                                    <span class="custom-agent-backend">{subtitle}</span>
+                                <div class="settings-item" data-mobile-test="settings-skill-row">
+                                    <span class="settings-item-title">{display}</span>
+                                    <span class="settings-item-subtitle">{subtitle}</span>
                                 </div>
                             }
                         }).collect::<Vec<_>>()}
                     </div>
                 }.into_any()
             }}
-        </div>
+        </section>
     }
 }
 
@@ -747,19 +778,17 @@ fn HostToolsSection() -> impl IntoView {
     });
 
     view! {
-        <div class="settings-section" data-mobile-test="settings-host-tools">
+        <section class="settings-section" data-mobile-test="settings-host-tools">
             <h2 class="settings-section-title">"Host tools"</h2>
-            <div class="settings-info">
-                <div class="settings-row">
-                    <span class="settings-label">"Browse host filesystem"</span>
+            <div class="settings-group">
+                <SettingsRow label="Browse host filesystem">
                     <Button
                         label="Open"
                         variant=ButtonVariant::Ghost
-                        size=ButtonSize::Compact
                         data_mobile_test="settings-open-host-browser"
                         on_click=on_open_browser
                     />
-                </div>
+                </SettingsRow>
             </div>
             {move || {
                 let Some(stream) = browse_stream.get() else { return view! { <div></div> }.into_any(); };
@@ -775,7 +804,7 @@ fn HostToolsSection() -> impl IntoView {
                     </div>
                 }.into_any()
             }}
-        </div>
+        </section>
     }
 }
 
@@ -1047,5 +1076,252 @@ mod wasm_tests {
                 );
             }
         }
+    }
+
+    fn host_summary_with_long_values(id: &str) -> PairedHostSummary {
+        PairedHostSummary {
+            local_host_id: LocalHostId(id.to_owned()),
+            host_label: "Studio Mac".to_owned(),
+            broker: mobile_shell_types::BrokerEndpointSummary {
+                url: protocol::BrokerUrl::new(
+                    "wss://a1b2c3d4e5f6g7h8i9j0-ats.iot.us-west-2.amazonaws.com:443/mqtt/tyde-mobile-broker",
+                )
+                .unwrap(),
+                auth: mobile_shell_types::BrokerAuthSummary::Anonymous,
+            },
+            room: mobile_shell_types::RoomIdSummary("AQEBAQEBAQEBAQEBAQEBAQ".to_owned()),
+            credential_fingerprint: "SHA256:8f3c1d9e7b2a4c6e0f1a2b3c4d5e6f70".to_owned(),
+            auto_connect: true,
+            last_connected_at_ms: Some(0),
+        }
+    }
+
+    fn seed_populated_settings(state: &AppState, host: &LocalHostId) {
+        state.active_local_host_id.set(Some(host.clone()));
+        state.host_streams.update(|streams| {
+            streams.insert(
+                host.clone(),
+                protocol::StreamPath("/host/host-1".to_owned()),
+            );
+        });
+        state
+            .paired_hosts
+            .set(vec![host_summary_with_long_values(&host.0)]);
+        state.host_settings_by_host.update(|m| {
+            m.insert(
+                host.clone(),
+                settings_model::HostSettings {
+                    enabled_backends: vec![
+                        protocol::BackendKind::Claude,
+                        protocol::BackendKind::Codex,
+                    ],
+                    default_backend: Some(protocol::BackendKind::Claude),
+                    ..settings_model::HostSettings::default()
+                },
+            );
+        });
+        state.backend_setup_by_host.update(|m| {
+            m.insert(
+                host.clone(),
+                vec![
+                    protocol::BackendSetupInfo {
+                        backend_kind: protocol::BackendKind::Claude,
+                        status: protocol::BackendSetupStatus::Installed,
+                        installed_version: Some("2.1.0".to_owned()),
+                        docs_url: "https://example.test/claude".to_owned(),
+                        install_command: None,
+                        diagnostic: None,
+                        sign_in_command: None,
+                    },
+                    protocol::BackendSetupInfo {
+                        backend_kind: protocol::BackendKind::Codex,
+                        status: protocol::BackendSetupStatus::NotInstalled,
+                        installed_version: None,
+                        docs_url: "https://example.test/codex".to_owned(),
+                        install_command: None,
+                        diagnostic: None,
+                        sign_in_command: None,
+                    },
+                ],
+            );
+        });
+        let mut skills = HashMap::new();
+        skills.insert(
+            SkillId("sk-1".to_owned()),
+            Skill {
+                id: SkillId("sk-1".to_owned()),
+                name: "release-notes".to_owned(),
+                title: Some("Release notes".to_owned()),
+                description: Some(
+                    "Drafts release notes from the merged pull requests since the last tag, \
+                     groups them by area, and flags anything that needs a migration note \
+                     before publishing."
+                        .to_owned(),
+                ),
+            },
+        );
+        state.skills_by_host.update(|m| {
+            m.insert(host.clone(), skills);
+        });
+        let mut mcp = HashMap::new();
+        mcp.insert(
+            McpServerId("m-1".to_owned()),
+            McpServerConfig {
+                id: McpServerId("m-1".to_owned()),
+                name: "filesystem".to_owned(),
+                supports_parallel_tool_calls: false,
+                transport: McpTransportConfig::Http {
+                    url: "https://mcp.example.test/workspaces/tyde/some/very/long/path/that/keeps/going/v1/endpoint"
+                        .to_owned(),
+                    headers: HashMap::new(),
+                    bearer_token_env_var: None,
+                },
+            },
+        );
+        state.mcp_servers_by_host.update(|m| {
+            m.insert(host.clone(), mcp);
+        });
+    }
+
+    fn rect_of(element: &web_sys::Element) -> web_sys::DomRect {
+        element.get_bounding_client_rect()
+    }
+
+    /// Settings reads as a deliberate, touchable list at phone width: every
+    /// control is at least a 44pt target, nothing runs off the right edge,
+    /// no row value is clipped, each row's label and value sit side by side
+    /// on one centre line, and the Forget hint sits under its button rather
+    /// than crushed beside it.
+    #[wasm_bindgen_test]
+    async fn settings_lays_out_as_a_touchable_list_at_phone_width() {
+        crate::components::test_styles::ensure_styles_loaded();
+        let host = LocalHostId("host-1".to_owned());
+        let host_for_mount = host.clone();
+        let container = make_container();
+        container.style().set_property("width", "390px").unwrap();
+        let _h = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            seed_populated_settings(&state, &host_for_mount);
+            provide_context(state);
+            view! { <SettingsView /> }
+        });
+        next_tick().await;
+        next_tick().await;
+
+        // Every control is a full touch target. A checkbox is tapped through
+        // its row, so its target is the enclosing label.
+        let controls = container
+            .query_selector_all("button, select, input")
+            .unwrap();
+        let mut measured = 0;
+        for index in 0..controls.length() {
+            let control: web_sys::Element = controls.get(index).unwrap().dyn_into().unwrap();
+            let target = control
+                .closest("label")
+                .unwrap()
+                .unwrap_or_else(|| control.clone());
+            let rect = rect_of(&target);
+            if rect.width() == 0.0 && rect.height() == 0.0 {
+                continue;
+            }
+            measured += 1;
+            assert!(
+                rect.height() >= 44.0 && rect.width() >= 44.0,
+                "{} #{index} must be at least 44pt on both axes, got {}x{}",
+                control.tag_name(),
+                rect.width(),
+                rect.height()
+            );
+        }
+        assert!(
+            measured >= 5,
+            "expected the two selects, the toggle, and the action buttons; measured {measured}"
+        );
+
+        // Nothing runs off the right edge at phone width.
+        let view = container
+            .query_selector("[data-mobile-test='settings-view']")
+            .unwrap()
+            .expect("settings view");
+        assert!(
+            view.scroll_width() <= view.client_width(),
+            "settings must not overflow horizontally: {} > {}",
+            view.scroll_width(),
+            view.client_width()
+        );
+
+        // Each row: label then value, no overlap, one centre line, no clipping.
+        let rows = container
+            .query_selector_all("[data-mobile-test='settings-row']")
+            .unwrap();
+        let mut checked = 0;
+        for index in 0..rows.length() {
+            let row: web_sys::Element = rows.get(index).unwrap().dyn_into().unwrap();
+            if row.child_element_count() < 2 {
+                continue;
+            }
+            let label = row.first_element_child().unwrap();
+            let value = row.last_element_child().unwrap();
+            let (l, v) = (rect_of(&label), rect_of(&value));
+            let text = label.text_content().unwrap_or_default();
+            assert!(
+                v.left() >= l.right() - 0.5,
+                "row '{text}': value must not overlap its label ({} < {})",
+                v.left(),
+                l.right()
+            );
+            let (lc, vc) = (l.top() + l.height() / 2.0, v.top() + v.height() / 2.0);
+            assert!(
+                (lc - vc).abs() <= 6.0,
+                "row '{text}': label and value must share a centre line ({lc} vs {vc})"
+            );
+            assert!(
+                value.scroll_width() <= value.client_width() + 1,
+                "row '{text}': the value must wrap, not clip ({} > {})",
+                value.scroll_width(),
+                value.client_width()
+            );
+            assert!(
+                rect_of(&row).height() >= 44.0,
+                "row '{text}' must be at least a touch target tall"
+            );
+            checked += 1;
+        }
+        assert!(
+            checked >= 12,
+            "expected the host, appearance, voice and about rows; checked {checked}"
+        );
+
+        // The Forget hint explains the button; it belongs under it.
+        let forget = container
+            .query_selector("[data-mobile-test='settings-forget-host']")
+            .unwrap()
+            .expect("forget button");
+        let hint = container
+            .query_selector("[data-mobile-test='settings-forget-host-hint']")
+            .unwrap()
+            .expect("forget hint");
+        assert!(
+            rect_of(&hint).top() >= rect_of(&forget).bottom(),
+            "the forget hint must sit below the button, not beside it"
+        );
+
+        // The long broker URL is shown in full, wrapped.
+        let broker = container
+            .query_selector("[data-mobile-test='settings-broker-url']")
+            .unwrap()
+            .expect("broker url");
+        assert!(
+            broker
+                .text_content()
+                .unwrap_or_default()
+                .contains("tyde-mobile-broker"),
+            "the broker URL is shown to the end"
+        );
+        let status_text = container.text_content().unwrap_or_default();
+        assert!(
+            status_text.contains("Installed") && status_text.contains("Not installed"),
+            "backend setup states are spelled out, got {status_text:?}"
+        );
     }
 }
