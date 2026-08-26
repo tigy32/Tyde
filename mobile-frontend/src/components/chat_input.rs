@@ -1003,7 +1003,11 @@ pub fn ChatInput() -> impl IntoView {
     });
 
     view! {
-        <div class="chat-input-container" data-mobile-test="chat-input-container">
+        <div
+            class="chat-input-container"
+            class:thinking=move || is_running.get()
+            data-mobile-test="chat-input-container"
+        >
             // The composer emptying itself is visible feedback for a sighted
             // user and silence for everyone else. This announces the move — and
             // says "queued", never "sent", because that is all the client knows.
@@ -2739,5 +2743,69 @@ mod wasm_tests {
             caret(&container).has_attribute("disabled"),
             "no session means no Fork + send, so the menu has nothing to offer"
         );
+    }
+
+    /// The composer carries desktop's thinking indicator — a blue shimmer along
+    /// its top edge while the active agent's turn is running — and puts it out
+    /// the moment the turn ends. Read from the rendered pseudo-element, which is
+    /// the only place the indicator exists.
+    #[wasm_bindgen_test]
+    async fn a_running_turn_lights_the_composer_edge_and_idle_puts_it_out() {
+        crate::components::test_styles::ensure_styles_loaded();
+        let host = LocalHostId("host-1".to_owned());
+        let agent_ref = AgentRef {
+            local_host_id: host.clone(),
+            agent_id: AgentId("agent-1".to_owned()),
+        };
+        let state = AppState::new();
+        state.active_agent.set(Some(crate::state::ActiveAgentRef {
+            local_host_id: host.clone(),
+            agent_id: AgentId("agent-1".to_owned()),
+        }));
+        state.agent_turn_active.update(|m| {
+            m.insert(agent_ref.clone(), true);
+        });
+        let container = make_container();
+        let mount_state = state.clone();
+        let _h = mount_to(container.clone(), move || {
+            provide_context(mount_state);
+            view! { <ChatInput /> }
+        });
+        next_tick().await;
+
+        let composer = container
+            .query_selector("[data-mobile-test='chat-input-container']")
+            .unwrap()
+            .expect("composer");
+        let edge = |composer: &web_sys::Element| {
+            let style = web_sys::window()
+                .unwrap()
+                .get_computed_style_with_pseudo_elt(composer, "::before")
+                .unwrap()
+                .expect("computed style for the composer edge");
+            (
+                style.get_property_value("content").unwrap(),
+                style.get_property_value("height").unwrap(),
+                style.get_property_value("background-image").unwrap(),
+            )
+        };
+
+        let (content, height, background) = edge(&composer);
+        assert_eq!(content, "\"\"", "a running turn draws the indicator");
+        assert_eq!(
+            height, "1px",
+            "the indicator is desktop's one-pixel edge line"
+        );
+        assert!(
+            background.contains("linear-gradient"),
+            "the indicator is the blue shimmer gradient, got {background}"
+        );
+
+        state.agent_turn_active.update(|m| {
+            m.remove(&agent_ref);
+        });
+        next_tick().await;
+        let (content, _, _) = edge(&composer);
+        assert_eq!(content, "none", "an idle agent shows no indicator");
     }
 }

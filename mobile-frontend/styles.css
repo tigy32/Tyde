@@ -1935,10 +1935,44 @@ html[data-keyboard-open] .mobile-app {
 }
 
 .chat-input-container {
+    position: relative;
     flex-shrink: 0;
     padding: var(--space-2) var(--space-3) max(var(--space-2), var(--active-safe-area-bottom));
     border-top: 1px solid var(--border-default);
     background: var(--bg-surface);
+}
+
+/* Desktop's thinking indicator, verbatim (`.chat-input-area.thinking::before`
+   in frontend/styles.css): a blue shimmer along the composer's top edge while
+   the active agent's turn is running. */
+.chat-input-container.thinking::before {
+    content: "";
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    height: 1px;
+    background: linear-gradient(
+        90deg,
+        transparent 0%,
+        #4a9eff 40%,
+        #6cb4ff 60%,
+        transparent 100%
+    );
+    background-size: 200% 100%;
+    animation: thinking-shimmer 1.5s ease-in-out infinite;
+}
+
+@keyframes thinking-shimmer {
+    0% { background-position: 100% 0; }
+    100% { background-position: -100% 0; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .chat-input-container.thinking::before {
+        animation: none;
+        background: #4a9eff;
+    }
 }
 
 .chat-input-row {
