@@ -4456,9 +4456,24 @@ impl HermesEventMapper {
             "terminal.close" => Ok(Vec::new()),
             "approval.request" => self.map_approval_request(payload),
             "error" => self.map_error(payload),
+            "review.summary"
+            | "notification.show"
+            | "browser.progress"
+            | "preview.restart.progress"
+            | "preview.restart.complete" => self.map_notice(payload),
+            "billing.step_up.verification" => self.map_billing_step_up(payload),
+            "moa.reference" => self.map_moa_reference(payload),
             event if event.starts_with("subagent.") => Ok(Vec::new()),
-            other => Ok(vec![ChatEvent::MessageAdded(warning_message(format!(
-                "Hermes event '{other}' is not supported by the Tyde Hermes backend"
+            // Presentation Hermes drives inside its own TUI and desktop app:
+            // a status-bar voice indicator, a theme swap, the pet animation,
+            // an aggregator spinner, and the clear half of a sticky notice
+            // Tyde never rendered. None of them describe anything that
+            // happened to the user's session here.
+            "voice.status" | "voice.transcript" | "skin.changed" | "moa.aggregating"
+            | "notification.clear" => Ok(Vec::new()),
+            event if event.starts_with("pet.") => Ok(Vec::new()),
+            other => Ok(vec![ChatEvent::MessageAdded(system_message(format!(
+                "Hermes sent an event Tyde does not recognize: '{other}'"
             )))]),
         };
 
@@ -4484,6 +4499,59 @@ impl HermesEventMapper {
         self.typing_active = false;
         self.clear_turn_state();
         events
+    }
+
+    /// Hermes' prose side-channel: the self-improvement review reporting what
+    /// it wrote to memory or skills, gateway notices, browser automation
+    /// progress, and preview-server restarts. Every one carries text Hermes
+    /// renders in its own transcript, so render that text rather than the
+    /// name of the event that delivered it.
+    fn map_notice(&mut self, payload: Option<Value>) -> Result<Vec<ChatEvent>, String> {
+        let Some(payload) = payload else {
+            return Ok(Vec::new());
+        };
+        let Some(text) = optional_string_any(&payload, &["text", "message"]) else {
+            return Ok(Vec::new());
+        };
+        let message = match optional_string(&payload, &["level"]).as_deref() {
+            Some("error") => error_message(text),
+            Some("warn" | "warning") => warning_message(text),
+            _ => system_message(text),
+        };
+        Ok(vec![ChatEvent::MessageAdded(message)])
+    }
+
+    /// The billing device flow runs in the headless gateway, which cannot open
+    /// a browser. The link is the only way the user can finish it, and the
+    /// turn stays blocked until they do.
+    fn map_billing_step_up(&mut self, payload: Option<Value>) -> Result<Vec<ChatEvent>, String> {
+        let Some(payload) = payload else {
+            return Ok(Vec::new());
+        };
+        let Some(url) = optional_string(&payload, &["verification_url"]) else {
+            return Ok(Vec::new());
+        };
+        let text = match optional_string(&payload, &["user_code"]) {
+            Some(code) => {
+                format!("Hermes needs billing access. Open {url} and enter the code {code}.")
+            }
+            None => format!("Hermes needs billing access. Open {url}."),
+        };
+        Ok(vec![ChatEvent::MessageAdded(warning_message(text))])
+    }
+
+    fn map_moa_reference(&mut self, payload: Option<Value>) -> Result<Vec<ChatEvent>, String> {
+        let Some(payload) = payload else {
+            return Ok(Vec::new());
+        };
+        let Some(text) = optional_string(&payload, &["text"]) else {
+            return Ok(Vec::new());
+        };
+        let label = optional_string(&payload, &["label"])
+            .unwrap_or_else(|| "Mixture-of-agents reference".to_string());
+        Ok(vec![ChatEvent::MessageAdded(system_message(format!(
+            "{label}: {text}"
+        )))])
     }
 
     fn map_session_info(&mut self, payload: Option<Value>) -> Result<Vec<ChatEvent>, String> {
