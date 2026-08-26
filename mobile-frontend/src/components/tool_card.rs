@@ -323,6 +323,7 @@ pub fn ToolCardView(owner_agent_ref: AgentRef, entry: ToolRequestEntry) -> impl 
     // request. Surface a sanitized copy in every mode; never infer this state
     // from a tool name, result shape, or error prose.
     let malformed_payload = malformed_request_payload(&entry);
+    let request_detail = request_detail(&entry.request.tool_type);
 
     let (status_class, status_icon, status_test, aria_label) = if normalization_failed {
         (
@@ -372,6 +373,9 @@ pub fn ToolCardView(owner_agent_ref: AgentRef, entry: ToolRequestEntry) -> impl 
                 <span class="tool-status-icon" aria-hidden="true">{status_icon}</span>
                 <span class="tool-name">{tool_name}</span>
             </div>
+            {request_detail.map(|detail| view! {
+                <div class="tool-card-detail" data-mobile-test="tool-card-detail">{detail}</div>
+            })}
             {malformed_payload.map(|payload| view! {
                 <div
                     class="tool-typed-mismatch"
@@ -446,6 +450,24 @@ fn malformed_request_payload(entry: &ToolRequestEntry) -> Option<String> {
          sanitized payload is surfaced in the card."
     );
     Some(sanitized_request_payload_json(args))
+}
+
+/// What the card shows beneath the tool name so the user can follow along
+/// without expanding it. Read from the typed request, as desktop's
+/// `tool_icon_and_detail` does, so `Bash`, `run_command`, and every other
+/// provider name for a shell call preview the same way.
+fn request_detail(tool_type: &ToolRequestType) -> Option<String> {
+    match tool_type {
+        ToolRequestType::RunCommand { command, .. } => Some(command_preview(command)),
+        _ => None,
+    }
+}
+
+/// Newlines and whitespace runs collapse to single spaces so a heredoc or a
+/// `\`-continued script previews as its first words rather than as a blank
+/// first line.
+fn command_preview(command: &str) -> String {
+    command.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 const SANITIZE_MAX_DEPTH: usize = 8;
@@ -4437,6 +4459,108 @@ mod wasm_tests {
         assert!(
             state.viewing_chat.get_untracked(),
             "and shows the chat view"
+        );
+    }
+
+    fn run_command_entry(tool_name: &str, command: &str, completed: bool) -> ToolRequestEntry {
+        ToolRequestEntry {
+            tool_name: tool_name.to_owned(),
+            request: ToolRequest {
+                tool_call_id: "toolu_cmd".to_owned(),
+                tool_name: tool_name.to_owned(),
+                tool_type: ToolRequestType::RunCommand {
+                    command: command.to_owned(),
+                    working_directory: "/repo".to_owned(),
+                },
+            },
+            result: completed.then(|| {
+                succeeded_completion(
+                    "toolu_cmd",
+                    ToolExecutionResult::RunCommand {
+                        exit_code: 0,
+                        stdout: "ok\n".to_owned(),
+                        stderr: String::new(),
+                    },
+                )
+            }),
+        }
+    }
+
+    fn command_preview_element(container: &HtmlElement) -> Option<(web_sys::Element, String)> {
+        container
+            .query_selector("[data-mobile-test='tool-card-detail']")
+            .unwrap()
+            .map(|element| {
+                let text = element.text_content().unwrap_or_default();
+                (element, text)
+            })
+    }
+
+    /// A shell card previews what was run — whatever the provider calls the
+    /// tool — on the card face, not behind the Result disclosure.
+    #[wasm_bindgen_test]
+    async fn shell_cards_preview_the_command_without_expanding() {
+        crate::components::test_styles::ensure_styles_loaded();
+        for (tool_name, completed) in [("Bash", false), ("run_command", true)] {
+            let container = mount_card_with_setup(
+                run_command_entry(tool_name, "cargo test -p server", completed),
+                |state| state.tool_output_mode.set(ToolOutputMode::Compact),
+            );
+            container.style().set_property("width", "360px").unwrap();
+            next_tick().await;
+
+            let (preview, text) = command_preview_element(&container)
+                .unwrap_or_else(|| panic!("a {tool_name} card must preview its command"));
+            assert_eq!(text, "cargo test -p server");
+            assert!(
+                preview.closest("details").unwrap().is_none(),
+                "the preview must sit on the card face, not inside a disclosure ({tool_name})"
+            );
+            assert!(
+                preview.get_bounding_client_rect().height() > 0.0,
+                "the preview must take up space on the card face ({tool_name})"
+            );
+            assert!(
+                container
+                    .text_content()
+                    .unwrap_or_default()
+                    .contains(tool_name),
+                "the preview adds to the tool name, it does not replace it"
+            );
+            if completed {
+                let result = details(&container, "tool-card-result")
+                    .expect("a completed command keeps its Result disclosure");
+                assert!(
+                    !result.open(),
+                    "the command is readable while Result stays collapsed"
+                );
+            }
+        }
+    }
+
+    /// A heredoc or a `\`-continued script previews as its first words, and a
+    /// long command is clipped to two rows rather than pushing the transcript
+    /// down.
+    #[wasm_bindgen_test]
+    async fn command_preview_is_one_flowing_line_clamped_to_two_rows() {
+        crate::components::test_styles::ensure_styles_loaded();
+        let script = "cat <<'EOF' > notes.txt\n  hello   world\nEOF\n";
+        let container = mount_card(run_command_entry("Bash", script, false));
+        container.style().set_property("width", "360px").unwrap();
+        next_tick().await;
+        let (_, text) = command_preview_element(&container).expect("preview");
+        assert_eq!(text, "cat <<'EOF' > notes.txt hello world EOF");
+
+        let long = format!("echo {}", "abcdefghij ".repeat(80));
+        let container = mount_card(run_command_entry("Bash", &long, false));
+        container.style().set_property("width", "360px").unwrap();
+        next_tick().await;
+        let (preview, _) = command_preview_element(&container).expect("preview");
+        let line_height = 12.0 * 1.35;
+        let height = preview.get_bounding_client_rect().height();
+        assert!(
+            height > line_height * 1.5 && height < line_height * 2.6,
+            "an 880-char command must render as exactly two clamped rows, got {height}px"
         );
     }
 }

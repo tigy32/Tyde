@@ -38,3 +38,32 @@ pub use pending_submissions::PendingSubmissions;
 pub use projects_view::ProjectsView;
 pub use sessions_view::SessionsView;
 pub use settings_view::SettingsView;
+
+/// The production stylesheet for wasm tests that assert on geometry or
+/// pseudo-elements — what the user actually sees — rather than class names.
+#[cfg(all(test, target_arch = "wasm32"))]
+pub(crate) mod test_styles {
+    const PROD_STYLES: &str = include_str!("../../styles.css");
+
+    pub(crate) fn ensure_styles_loaded() {
+        let document = web_sys::window().unwrap().document().unwrap();
+        if document.get_element_by_id("prod-styles").is_none() {
+            let style = document.create_element("style").unwrap();
+            style.set_id("prod-styles");
+            style.set_text_content(Some(PROD_STYLES));
+            document.head().unwrap().append_child(&style).unwrap();
+        }
+        // Unconditional, not folded into the guard above: `voice.rs` carries
+        // its own private loader for the same `#prod-styles` id and does not
+        // set a theme, so if it runs first in the shared test document, a
+        // guarded set here would silently no-op and every `var(--accent-*)`
+        // reference would fail to resolve for the rest of the suite. The app
+        // themes its root with `data-theme`; the colour tokens only resolve
+        // beneath one.
+        document
+            .document_element()
+            .unwrap()
+            .set_attribute("data-theme", "dark")
+            .unwrap();
+    }
+}

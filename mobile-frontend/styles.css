@@ -1552,6 +1552,21 @@ html[data-keyboard-open] .mobile-app {
     font-size: 12px;
 }
 
+/* The command (or other request detail) under the tool name. Clamped to two
+   lines: enough to follow along on a phone without expanding the card. */
+.tool-card-detail {
+    margin-top: 2px;
+    font-family: var(--font-mono);
+    font-size: 12px;
+    line-height: 1.35;
+    color: var(--text-secondary);
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+    overflow-wrap: anywhere;
+}
+
 .tool-result summary {
     font-size: 12px;
     color: var(--text-tertiary);
