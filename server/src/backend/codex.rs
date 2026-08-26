@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet, VecDeque, hash_map::Entry};
 use std::ffi::OsString;
-use std::io::{BufRead as _, Read};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -10,14 +10,6 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use command_group::{AsyncCommandGroup, AsyncGroupChild};
 use indexmap::IndexMap;
-use rmcp::ServiceExt;
-use rmcp::model::{
-    CallToolRequest, CallToolRequestParams, CancelledNotificationParam, ClientRequest, ServerResult,
-};
-use rmcp::service::PeerRequestOptions;
-use rmcp::transport::{
-    StreamableHttpClientTransport, streamable_http_client::StreamableHttpClientTransportConfig,
-};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -45,7 +37,7 @@ use crate::backend::agent_control_progress::{
     PendingToolNormalizationFailure, await_progress_data_for_tool,
     is_tyde_agent_control_await_tool_name, is_tyde_agent_control_send_message_tool_name,
     is_tyde_agent_control_spawn_tool_name, normalize_tyde_chat_event, parse_await_agent_refs,
-    terminal_await_progress_data_for_tool, tyde_tool_result,
+    tyde_tool_result,
 };
 use crate::backend::turn_emitter::{
     AgentName, ResponseHandle, RetryAttemptPayload, StreamEndPayload, TurnEmitter,
@@ -94,9 +86,6 @@ The partial output above was kept and the turn continued.";
 const CODEX_SKILLS_ROOT_PREFIX: &str = "tyde-codex-skills-";
 const CODEX_SKILL_MANIFEST_MAX_ENTRIES: usize = 100_000;
 const CODEX_SKILL_MANIFEST_MAX_BYTES: u64 = 1024 * 1024 * 1024;
-const CODEX_SESSION_META_MAX_BYTES: u64 = 16 * 1024 * 1024;
-const CODEX_LEGACY_AWAIT_WARNING: &str = "This saved Codex session predates Tyde's reliable sub-agent await tool. The installed Codex app-server cannot add dynamic tools while resuming or forking an existing session, so awaiting sub-agents may be unavailable here. Start a new Codex session to enable it.";
-const CODEX_UNVERIFIED_AWAIT_WARNING: &str = "Tyde could not verify that this resumed or forked Codex session contains the reliable sub-agent await tool, and Codex did not report the native await tool as available. Start a new Codex session before relying on sub-agent awaits.";
 const CODEX_RAW_EVENTS_UNAVAILABLE_WARNING: &str = "This resumed or forked Codex thread cannot expose per-response raw boundaries with the installed app-server. Tyde is retaining the legacy tool-container projection for this thread; start a new Codex session for strict provider-response message identity.";
 
 fn emit_codex_raw_events_warning_if_needed(emitter: &TurnEmitter, strict: bool) {
@@ -1485,7 +1474,6 @@ struct CodexThreadResponseConfig<'a> {
     startup_mcp_servers: &'a [StartupMcpServer],
     access_mode: BackendAccessMode,
     execution_mode: BackendExecutionMode,
-    rollout_path_local: bool,
 }
 
 struct CodexSelectedSkillContext<'a> {
@@ -1733,13 +1721,6 @@ impl CodexSession {
             "experimentalRawEvents": CODEX_ENABLE_EXPERIMENTAL_RAW_EVENTS,
             "persistExtendedHistory": false
         });
-        if let Some(await_tool) = codex_agent_await_dynamic_tool(startup_mcp_servers) {
-            // Codex 0.146 can advertise MCP tools as deferred while omitting
-            // the tool-search bridge that would make them callable. Project
-            // the load-bearing await through its direct dynamic-tool surface;
-            // execution still goes through the same real Tyde MCP endpoint.
-            thread_start_params["dynamicTools"] = json!([await_tool]);
-        }
         if execution_mode == BackendExecutionMode::InferenceOnly {
             match codex_inference_thread_config(&rpc, &cwd).await {
                 Ok(config) => thread_start_params["config"] = config,
@@ -1779,7 +1760,6 @@ impl CodexSession {
                 startup_mcp_servers,
                 access_mode,
                 execution_mode,
-                rollout_path_local: ssh_host.is_none(),
             },
             thread_started,
             "thread/start",
@@ -1967,7 +1947,6 @@ impl CodexSession {
                 startup_mcp_servers,
                 access_mode,
                 execution_mode: BackendExecutionMode::Agent,
-                rollout_path_local: ssh_host.is_none(),
             },
             thread_forked,
             "thread/fork",
@@ -1990,16 +1969,6 @@ impl CodexSession {
             skill_projection,
             skill_setup,
         } = resources;
-        let await_endpoint_configured =
-            codex_agent_await_endpoint(config.startup_mcp_servers).is_some();
-        let saved_await_warning = codex_saved_await_warning(
-            &rpc,
-            &thread_response,
-            await_endpoint_configured,
-            method,
-            config.rollout_path_local,
-        )
-        .await;
         let thread_id = thread_response
             .get("thread")
             .and_then(|t| t.get("id"))
@@ -2040,8 +2009,6 @@ impl CodexSession {
             )),
             steering_tempfile,
             skill_projection: std::sync::Mutex::new(skill_projection),
-            dynamic_awaits: Mutex::new(CodexDynamicAwaitState::default()),
-            dynamic_await_endpoint: codex_agent_await_endpoint(config.startup_mcp_servers),
         });
 
         if !skill_setup.exposed_names.is_empty() {
@@ -2054,9 +2021,6 @@ impl CodexSession {
             inner
                 .emitter
                 .subprocess_stderr(&format!("Codex warning: {diagnostic}"));
-        }
-        if let Some(warning) = saved_await_warning {
-            inner.emitter.warning_message(&warning);
         }
         emit_codex_raw_events_warning_if_needed(inner.emitter.as_ref(), strict_response_splitting);
 
@@ -2204,7 +2168,6 @@ impl CodexSession {
     }
 
     pub async fn shutdown(self) {
-        self.inner.terminalize_dynamic_awaits(None).await;
         self.inner.terminate_background_terminals().await;
         self.inner.drain_background_commands().await;
         self.inner.complete_all_codex_subagents().await;
@@ -4309,91 +4272,8 @@ struct CodexInner {
     state: Mutex<CodexState>,
     steering_tempfile: Option<std::path::PathBuf>,
     skill_projection: std::sync::Mutex<Option<CodexSkillProjection>>,
-    dynamic_awaits: Mutex<CodexDynamicAwaitState>,
-    dynamic_await_endpoint: Option<CodexAgentAwaitEndpoint>,
 }
-
-struct CodexDynamicAwaitState {
-    pending: HashMap<String, CodexPendingDynamicAwait>,
-    terminal_turns: VecDeque<String>,
-    accepting: bool,
-}
-
-impl Default for CodexDynamicAwaitState {
-    fn default() -> Self {
-        Self {
-            pending: HashMap::new(),
-            terminal_turns: VecDeque::new(),
-            accepting: true,
-        }
-    }
-}
-
-struct CodexPendingDynamicAwait {
-    turn_id: String,
-    arguments: Value,
-    cancellation: tokio_util::sync::CancellationToken,
-}
-
 impl CodexInner {
-    async fn terminalize_dynamic_awaits(&self, turn_id: Option<&str>) {
-        let pending = {
-            let mut awaits = self.dynamic_awaits.lock().await;
-            if let Some(turn_id) = turn_id {
-                if !awaits.terminal_turns.iter().any(|known| known == turn_id) {
-                    awaits.terminal_turns.push_back(turn_id.to_owned());
-                    while awaits.terminal_turns.len() > MAX_CODEX_TERMINATED_TURNS {
-                        awaits.terminal_turns.pop_front();
-                    }
-                }
-            } else {
-                awaits.accepting = false;
-            }
-            let call_ids = awaits
-                .pending
-                .iter()
-                .filter_map(|(call_id, pending)| {
-                    turn_id
-                        .is_none_or(|turn_id| pending.turn_id == turn_id)
-                        .then_some(call_id.clone())
-                })
-                .collect::<Vec<_>>();
-            call_ids
-                .into_iter()
-                .filter_map(|call_id| {
-                    awaits
-                        .pending
-                        .remove(&call_id)
-                        .map(|pending| (call_id, pending))
-                })
-                .collect::<Vec<_>>()
-        };
-        for (tool_call_id, pending) in pending {
-            tracing::info!(
-                tool_call_id,
-                turn_id = pending.turn_id,
-                "Cancelling direct Codex await MCP call"
-            );
-            if self.emitter.has_pending_tool_request(&tool_call_id)
-                && let Some(progress) = terminal_await_progress_data_for_tool(
-                    &tool_call_id,
-                    "tyde_await_agents",
-                    &pending.arguments,
-                    protocol::AgentControlProgressStatus::Stopped,
-                )
-            {
-                self.emitter.tool_progress(&progress);
-            }
-            self.emitter
-                .cancel_pending_tool(&tool_call_id, "Tyde await was interrupted");
-            let mut state = self.state.lock().await;
-            state.pending_tool_call_ids.remove(&tool_call_id);
-            state.cancelled_tool_call_ids.insert(tool_call_id);
-            drop(state);
-            pending.cancellation.cancel();
-        }
-    }
-
     async fn begin_compaction(
         self: &Arc<Self>,
         request: BackendCompactionRequest,
@@ -7344,8 +7224,6 @@ impl CodexInner {
                 terminated_background_commands,
             )
         };
-        self.terminalize_dynamic_awaits(provider_turn_id.as_deref())
-            .await;
         if let Some(stream) = active_stream {
             let finalized = self
                 .finalize_root_provider_stream(stream, CodexProviderStreamFinalization::TurnAborted)
@@ -7688,8 +7566,6 @@ impl CodexInner {
                 eprintln!(
                     "TYDE CODEX CANCEL STATE turn_id={turn_id_opt:?} interrupting_compaction={interrupting_compaction} compaction_start_pending={compaction_start_pending}"
                 );
-                self.terminalize_dynamic_awaits(turn_id_opt.as_deref())
-                    .await;
                 if foreground_ended_with_background_work {
                     self.emitter.interrupt_acknowledged(
                         "Codex foreground turn already ended; background work continues.",
@@ -7843,10 +7719,6 @@ impl CodexInner {
     }
 
     async fn resume_session(&self, session_id: String) -> Result<(), String> {
-        let active_turn_id = self.state.lock().await.active_turn_id.clone();
-        self.terminalize_dynamic_awaits(active_turn_id.as_deref())
-            .await;
-        self.terminalize_dynamic_awaits(None).await;
         self.state.lock().await.pending_resume_thread_id = Some(session_id.clone());
         let resumed = async {
             let developer_instructions = self
@@ -7890,18 +7762,10 @@ impl CodexInner {
                 .and_then(Value::as_array)
                 .cloned()
                 .ok_or_else(|| "Codex resume response missing 'turns' array".to_string())?;
-            let saved_await_warning = codex_saved_await_warning(
-                &self.rpc,
-                &response,
-                self.dynamic_await_endpoint.is_some(),
-                "thread/resume",
-                true,
-            )
-            .await;
-            Ok::<_, String>((resumed_thread_id, resumed_model, turns, saved_await_warning))
+            Ok::<_, String>((resumed_thread_id, resumed_model, turns))
         }
         .await;
-        let (resumed_thread_id, resumed_model, turns, saved_await_warning) = match resumed {
+        let (resumed_thread_id, resumed_model, turns) = match resumed {
             Ok(resumed) => resumed,
             Err(error) => {
                 self.state.lock().await.pending_resume_thread_id = None;
@@ -7955,9 +7819,6 @@ impl CodexInner {
 
         let model = resumed_model.unwrap_or_else(|| "codex".to_string());
         self.emit_resumed_thread_history(&turns, &model).await;
-        if let Some(warning) = saved_await_warning {
-            self.emitter.warning_message(&warning);
-        }
 
         Ok(())
     }
@@ -8288,7 +8149,6 @@ impl CodexInner {
                     "Codex transport closed before rawResponse/completed",
                 )
                 .await;
-                self.terminalize_dynamic_awaits(None).await;
                 self.finish_compaction_failure(
                     BackendCompactionFailureKind::TransportClosed,
                     "Codex app-server exited during compaction".to_string(),
@@ -9817,7 +9677,6 @@ impl CodexInner {
                 if provider_initiated {
                     self.emitter.typing_status_changed(true);
                 }
-                self.dynamic_awaits.lock().await.accepting = true;
             }
             "item/agentMessage/delta" => {
                 let delta = params
@@ -12935,9 +12794,6 @@ impl CodexInner {
             is_terminal_codex_error_notification(&state, params)
         };
         if terminal {
-            let active_turn_id = self.state.lock().await.active_turn_id.clone();
-            self.terminalize_dynamic_awaits(active_turn_id.as_deref())
-                .await;
             self.complete_all_codex_subagents().await;
             self.emitter.backend_error(&message);
             self.emitter.typing_status_changed(false);
@@ -13215,129 +13071,6 @@ impl CodexInner {
                     .get("tool")
                     .and_then(Value::as_str)
                     .unwrap_or("dynamic_tool");
-                if is_tyde_agent_control_await_tool_name(tool_name) {
-                    let requested_thread_id = params
-                        .get("threadId")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default();
-                    let thread_id = self.state.lock().await.thread_id.clone();
-                    if requested_thread_id != thread_id {
-                        let _ = self
-                            .rpc
-                            .respond(
-                                id,
-                                json!({
-                                    "success": false,
-                                    "contentItems": [{
-                                        "type": "inputText",
-                                        "text": "Codex dynamic await request did not belong to the active thread"
-                                    }]
-                                }),
-                            )
-                            .await;
-                        return;
-                    }
-                    let arguments = params
-                        .get("arguments")
-                        .cloned()
-                        .unwrap_or_else(|| json!({}));
-                    let call_id = params
-                        .get("callId")
-                        .and_then(Value::as_str)
-                        .map(|call_id| codex_scoped_tool_call_id(params, call_id))
-                        .unwrap_or_else(|| codex_scoped_tool_call_id(params, "dynamic-await"));
-                    let turn_id = match extract_turn_id(params) {
-                        Some(turn_id) => turn_id,
-                        None => self
-                            .state
-                            .lock()
-                            .await
-                            .active_turn_id
-                            .clone()
-                            .unwrap_or_default(),
-                    };
-                    let cancellation = tokio_util::sync::CancellationToken::new();
-                    let rejected = {
-                        let mut awaits = self.dynamic_awaits.lock().await;
-                        if !awaits.accepting
-                            || turn_id.is_empty()
-                            || awaits.terminal_turns.iter().any(|known| known == &turn_id)
-                        {
-                            true
-                        } else {
-                            awaits.pending.insert(
-                                call_id.clone(),
-                                CodexPendingDynamicAwait {
-                                    turn_id,
-                                    arguments: arguments.clone(),
-                                    cancellation: cancellation.clone(),
-                                },
-                            );
-                            false
-                        }
-                    };
-                    if rejected {
-                        let _ = self
-                            .rpc
-                            .respond(
-                                id,
-                                json!({
-                                    "success": false,
-                                    "contentItems": [{
-                                        "type": "inputText",
-                                        "text": "Tyde await arrived after its Codex turn ended"
-                                    }]
-                                }),
-                            )
-                            .await;
-                        return;
-                    }
-                    let inner = Arc::clone(self);
-                    tokio::spawn(async move {
-                        tracing::info!(
-                            tool_call_id = call_id,
-                            "Starting direct Codex await MCP call"
-                        );
-                        let result = match inner.dynamic_await_endpoint.as_ref() {
-                            Some(endpoint) => {
-                                call_codex_agent_await(endpoint, arguments, cancellation.clone())
-                                    .await
-                            }
-                            None => Err(
-                                "Tyde await MCP endpoint is unavailable for this Codex session"
-                                    .to_owned(),
-                            ),
-                        };
-                        inner.dynamic_awaits.lock().await.pending.remove(&call_id);
-                        tracing::info!(
-                            tool_call_id = call_id,
-                            success = result.is_ok(),
-                            "Finished direct Codex await MCP call"
-                        );
-                        let (success, text) = match result {
-                            Ok(result) => (
-                                !result
-                                    .get("isError")
-                                    .and_then(Value::as_bool)
-                                    .unwrap_or(false),
-                                serde_json::to_string(&result)
-                                    .unwrap_or_else(|_| "Tyde await completed".to_owned()),
-                            ),
-                            Err(error) => (false, error),
-                        };
-                        let _ = inner
-                            .rpc
-                            .respond(
-                                id,
-                                json!({
-                                    "success": success,
-                                    "contentItems": [{ "type": "inputText", "text": text }]
-                                }),
-                            )
-                            .await;
-                    });
-                    return;
-                }
                 let call_id = params
                     .get("callId")
                     .and_then(Value::as_str)
@@ -14258,10 +13991,6 @@ impl CodexInner {
                     (item_type == "mcpToolCall").then(|| normalize_mcp_call_tool_result(item));
                 let result = if let Some(normalized) = normalized_mcp.as_ref() {
                     normalized.tool_result.clone()
-                } else if item_type == "dynamicToolCall"
-                    && is_tyde_agent_control_await_tool_name(tool_name)
-                {
-                    codex_dynamic_await_result(item).unwrap_or_else(|| item.clone())
                 } else {
                     json!({
                         "kind": "Other",
@@ -14934,8 +14663,6 @@ impl CodexInner {
 
     async fn handle_turn_completed(self: &Arc<Self>, params: &Value) {
         let completed_turn_id = extract_turn_id(params);
-        self.terminalize_dynamic_awaits(completed_turn_id.as_deref())
-            .await;
         self.flush_raw_modify_failures(completed_turn_id.as_deref())
             .await;
         let consumed_terminated_turn = {
@@ -17839,137 +17566,6 @@ fn toml_quoted(value: &str) -> String {
 
 const CODEX_AGENT_AWAIT_TOOL_TIMEOUT_SECS: u64 = 315_576_000;
 
-#[derive(Clone)]
-struct CodexAgentAwaitEndpoint {
-    url: String,
-    headers: HashMap<String, String>,
-}
-
-fn codex_agent_await_endpoint(
-    startup_mcp_servers: &[StartupMcpServer],
-) -> Option<CodexAgentAwaitEndpoint> {
-    startup_mcp_servers.iter().find_map(|server| {
-        if server.name.trim() != AGENT_CONTROL_AWAIT_MCP_SERVER_NAME {
-            return None;
-        }
-        let StartupMcpTransport::Http {
-            url,
-            headers,
-            bearer_token_env_var,
-        } = &server.transport
-        else {
-            return None;
-        };
-        if url.trim().is_empty() {
-            return None;
-        }
-        let mut headers = headers.clone();
-        if let Some(variable) = bearer_token_env_var
-            .as_deref()
-            .map(str::trim)
-            .filter(|variable| !variable.is_empty())
-            && let Ok(token) = std::env::var(variable)
-        {
-            headers
-                .entry(reqwest::header::AUTHORIZATION.as_str().to_owned())
-                .or_insert_with(|| format!("Bearer {token}"));
-        }
-        Some(CodexAgentAwaitEndpoint {
-            url: url
-                .strip_suffix("/await")
-                .map(|base| format!("{base}/await-cancellable"))
-                .unwrap_or_else(|| url.clone()),
-            headers,
-        })
-    })
-}
-
-async fn call_codex_agent_await(
-    endpoint: &CodexAgentAwaitEndpoint,
-    arguments: Value,
-    cancellation: tokio_util::sync::CancellationToken,
-) -> Result<Value, String> {
-    let mut header_map = reqwest::header::HeaderMap::new();
-    for (name, value) in &endpoint.headers {
-        let name = reqwest::header::HeaderName::from_bytes(name.as_bytes())
-            .map_err(|error| format!("invalid await MCP HTTP header name '{name}': {error}"))?;
-        let value = reqwest::header::HeaderValue::from_str(value)
-            .map_err(|error| format!("invalid await MCP HTTP header value: {error}"))?;
-        header_map.insert(name, value);
-    }
-    let client = reqwest::Client::builder()
-        .default_headers(header_map)
-        .build()
-        .map_err(|error| format!("failed to build await MCP HTTP client: {error}"))?;
-    let transport = StreamableHttpClientTransport::with_client(
-        client,
-        StreamableHttpClientTransportConfig::with_uri(endpoint.url.clone()),
-    );
-    let connect = ().serve(transport);
-    let mut service = tokio::select! {
-        result = connect => result.map_err(|error| {
-            format!("failed to connect to the Tyde await MCP endpoint: {error}")
-        })?,
-        _ = cancellation.cancelled() => return Err("Tyde await was interrupted".to_owned()),
-    };
-    let arguments = arguments
-        .as_object()
-        .cloned()
-        .ok_or_else(|| "Tyde await arguments must be a JSON object".to_owned())?;
-    let peer = service.peer().clone();
-    let dispatch = peer.send_cancellable_request(
-        ClientRequest::CallToolRequest(CallToolRequest {
-            method: Default::default(),
-            params: CallToolRequestParams {
-                meta: None,
-                name: "tyde_await_agents".into(),
-                arguments: Some(arguments),
-                task: None,
-            },
-            extensions: Default::default(),
-        }),
-        PeerRequestOptions::no_options(),
-    );
-    let mut request = tokio::select! {
-        result = dispatch => result
-            .map_err(|error| format!("failed to start Tyde await MCP call: {error}"))?,
-        _ = cancellation.cancelled() => {
-            let _ = service.close_with_timeout(Duration::from_secs(1)).await;
-            return Err("Tyde await was interrupted".to_owned());
-        },
-    };
-    let result = tokio::select! {
-        result = &mut request.rx => match result {
-            Ok(Ok(ServerResult::CallToolResult(result))) => Ok(result),
-            Ok(Ok(_)) => Err("Tyde await MCP returned an unexpected response".to_owned()),
-            Ok(Err(error)) => Err(format!("Tyde await MCP call failed: {error}")),
-            Err(_) => Err("Tyde await MCP response channel closed".to_owned()),
-        },
-        _ = cancellation.cancelled() => {
-            let cancellation_result = peer
-                .notify_cancelled(CancelledNotificationParam {
-                    request_id: request.id.clone(),
-                    reason: Some("Codex await was interrupted".to_owned()),
-                })
-                .await
-                .map_err(|error| format!("failed to cancel Tyde await MCP call: {error}"));
-            match cancellation_result {
-                Err(error) => Err(error),
-                Ok(()) => match tokio::time::timeout(Duration::from_secs(1), &mut request.rx).await {
-                    Err(_) => Err("Tyde await MCP did not acknowledge cancellation".to_owned()),
-                    Ok(Err(_)) => Err("Tyde await MCP cancellation response channel closed".to_owned()),
-                    Ok(Ok(Err(error))) => Err(format!("Tyde await MCP cancellation failed: {error}")),
-                    Ok(Ok(Ok(_))) => Err("Tyde await was interrupted".to_owned()),
-                },
-            }
-        },
-    };
-    let _ = service.close_with_timeout(Duration::from_secs(1)).await;
-    let result = result?;
-    serde_json::to_value(result)
-        .map_err(|error| format!("failed to encode Tyde await MCP result: {error}"))
-}
-
 fn codex_mcp_config_overrides(
     startup_mcp_servers: &[StartupMcpServer],
     tyde_loopback_reachable: bool,
@@ -18053,146 +17649,6 @@ fn codex_mcp_config_overrides(
     }
 
     overrides
-}
-
-fn codex_agent_await_dynamic_tool(startup_mcp_servers: &[StartupMcpServer]) -> Option<Value> {
-    codex_agent_await_endpoint(startup_mcp_servers).map(|_| {
-            json!({
-                "type": "function",
-                "name": "tyde_await_agents",
-                "description": "Wait until any supplied direct child Tyde agent becomes idle or failed.",
-                "inputSchema": {
-                    "type": "object",
-                    "additionalProperties": false,
-                    "properties": {
-                        "agent_ids": {
-                            "type": "array",
-                            "minItems": 1,
-                            "items": { "type": "string", "minLength": 1 }
-                        }
-                    },
-                    "required": ["agent_ids"]
-                }
-            })
-        })
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum CodexSavedAwaitTool {
-    Present,
-    Absent,
-    Unknown,
-}
-
-fn codex_saved_await_tool(thread_response: &Value) -> CodexSavedAwaitTool {
-    // Codex exposes dynamicTools only on thread/start. Resume and fork restore
-    // them from the immutable session metadata, so inspect that record without
-    // rewriting provider-owned rollout history.
-    let Some(path) = thread_response
-        .get("thread")
-        .and_then(|thread| thread.get("path"))
-        .and_then(Value::as_str)
-        .filter(|path| !path.trim().is_empty())
-    else {
-        return CodexSavedAwaitTool::Unknown;
-    };
-    let Ok(file) = std::fs::File::open(path) else {
-        return CodexSavedAwaitTool::Unknown;
-    };
-    let mut first_line = String::new();
-    if std::io::BufReader::new(file)
-        .take(CODEX_SESSION_META_MAX_BYTES)
-        .read_line(&mut first_line)
-        .is_err()
-    {
-        return CodexSavedAwaitTool::Unknown;
-    }
-    let Ok(session_meta) = serde_json::from_str::<Value>(&first_line) else {
-        return CodexSavedAwaitTool::Unknown;
-    };
-    if session_meta.get("type").and_then(Value::as_str) != Some("session_meta") {
-        return CodexSavedAwaitTool::Unknown;
-    }
-    let Some(dynamic_tools) = session_meta
-        .get("payload")
-        .and_then(|payload| payload.get("dynamic_tools"))
-        .and_then(Value::as_array)
-    else {
-        return CodexSavedAwaitTool::Absent;
-    };
-    if dynamic_tools.iter().any(|tool| {
-        tool.get("name").and_then(Value::as_str) == Some("tyde_await_agents")
-            || tool
-                .get("tools")
-                .and_then(Value::as_array)
-                .is_some_and(|tools| {
-                    tools.iter().any(|tool| {
-                        tool.get("name").and_then(Value::as_str) == Some("tyde_await_agents")
-                    })
-                })
-    }) {
-        CodexSavedAwaitTool::Present
-    } else {
-        CodexSavedAwaitTool::Absent
-    }
-}
-
-async fn codex_saved_await_warning(
-    rpc: &CodexRpc,
-    thread_response: &Value,
-    await_endpoint_configured: bool,
-    lifecycle_method: &str,
-    rollout_path_local: bool,
-) -> Option<String> {
-    let saved_await_tool = if rollout_path_local {
-        codex_saved_await_tool(thread_response)
-    } else {
-        CodexSavedAwaitTool::Unknown
-    };
-    if !await_endpoint_configured
-        || lifecycle_method == "thread/start"
-        || saved_await_tool == CodexSavedAwaitTool::Present
-    {
-        return None;
-    }
-
-    let native_await_visible = tokio::time::timeout(
-        Duration::from_secs(2),
-        rpc.request(
-            "mcpServerStatus/list",
-            json!({"detail": "toolsAndAuthOnly", "limit": 100}),
-        ),
-    )
-    .await
-    .ok()
-    .and_then(Result::ok)
-    .and_then(|response| response.get("data").and_then(Value::as_array).cloned())
-    .is_some_and(|servers| {
-        servers.iter().any(|server| {
-            server.get("name").and_then(Value::as_str) == Some(AGENT_CONTROL_AWAIT_MCP_SERVER_NAME)
-                && server
-                    .get("tools")
-                    .and_then(Value::as_object)
-                    .is_some_and(|tools| tools.contains_key("tyde_await_agents"))
-        })
-    });
-    if native_await_visible {
-        None
-    } else {
-        tracing::warn!(
-            ?saved_await_tool,
-            lifecycle_method,
-            "Codex session has no verified sub-agent await tool"
-        );
-        Some(
-            match saved_await_tool {
-                CodexSavedAwaitTool::Absent => CODEX_LEGACY_AWAIT_WARNING,
-                CodexSavedAwaitTool::Unknown => CODEX_UNVERIFIED_AWAIT_WARNING,
-                CodexSavedAwaitTool::Present => return None,
-            }
-            .to_owned(),
-        )
-    }
 }
 
 type PendingRpcMap = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, CodexRpcError>>>>>;
@@ -19619,24 +19075,6 @@ fn codex_public_generic_tool_result(tool_name: &str, item: &Value, success: bool
                 .unwrap_or_else(|_| item.to_string()),
         })
     }
-}
-
-fn codex_dynamic_await_result(item: &Value) -> Option<Value> {
-    let envelope = item
-        .get("contentItems")?
-        .as_array()?
-        .iter()
-        .find_map(|content| content.get("text").and_then(Value::as_str))?;
-    let response: Value = serde_json::from_str(envelope).ok()?;
-    if let Some(structured) = response.get("structuredContent") {
-        return Some(structured.clone());
-    }
-    response
-        .get("content")?
-        .as_array()?
-        .iter()
-        .find_map(|content| content.get("text").and_then(Value::as_str))
-        .and_then(|text| serde_json::from_str(text).ok())
 }
 
 fn normalize_codex_tool_result(

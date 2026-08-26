@@ -1235,52 +1235,10 @@ pub fn start_server(
                         ..Default::default()
                     },
                 );
-                let cancellable_await_host = host_handle.clone();
-                let cancellable_await_credentials = server_credentials.clone();
-                let cancellable_await_active_requests = Arc::clone(&server_active_await_requests);
-                let cancellable_await_request_cancellations =
-                    Arc::clone(&server_await_request_cancellations);
-                let cancellable_await_active_send_requests =
-                    Arc::clone(&server_active_send_requests);
-                let cancellable_await_hold_send_requests = Arc::clone(&server_hold_send_requests);
-                let cancellable_await_send_release = Arc::clone(&server_send_release);
-                let cancellable_await_expiration = server_await_expiration.clone();
-                let cancellable_await_service: StreamableHttpService<
-                    TydeAgentControlMcpServer,
-                    LocalSessionManager,
-                > = StreamableHttpService::new(
-                    move || {
-                        Ok(TydeAgentControlMcpServer {
-                            host: cancellable_await_host.clone(),
-                            credentials: cancellable_await_credentials.clone(),
-                            surface: AgentControlMcpSurface::Await,
-                            active_await_requests: Arc::clone(&cancellable_await_active_requests),
-                            await_request_cancellations: Arc::clone(
-                                &cancellable_await_request_cancellations,
-                            ),
-                            active_send_requests: Arc::clone(
-                                &cancellable_await_active_send_requests,
-                            ),
-                            hold_send_requests: Arc::clone(&cancellable_await_hold_send_requests),
-                            send_release: Arc::clone(&cancellable_await_send_release),
-                            await_expiration: cancellable_await_expiration.clone(),
-                            tool_router: TydeAgentControlMcpServer::tool_router(),
-                        })
-                    },
-                    Default::default(),
-                    StreamableHttpServerConfig {
-                        // Await requests must share a live MCP session with
-                        // their cancellation notification so the server-side
-                        // RequestContext is actually cancelled.
-                        stateful_mode: true,
-                        ..Default::default()
-                    },
-                );
                 let router = Router::new()
                     .route("/healthz", get(healthz_handler))
                     .nest_service("/mcp", control_service)
-                    .nest_service("/await", await_service)
-                    .nest_service("/await-cancellable", cancellable_await_service);
+                    .nest_service("/await", await_service);
                 if let Err(err) = axum::serve(listener, router).await {
                     tracing::warn!("agent-control MCP HTTP server stopped: {err}");
                 }

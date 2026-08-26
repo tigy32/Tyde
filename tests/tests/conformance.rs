@@ -33,7 +33,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use protocol::{
-    AgentOrigin, BackendKind, ChatEvent, ContextCompactionStatus, CurrentContextUsage,
+    AgentId, AgentOrigin, BackendKind, ChatEvent, ContextCompactionStatus, CurrentContextUsage,
     MessageSender, MessageTokenUsage, SessionId, TaskStatus, TokenUsage, ToolExecutionMode,
     ToolExecutionOutcome, ToolExecutionResult, ToolRequestType,
 };
@@ -102,6 +102,7 @@ const MCP_PROBE_DIR: &str = ".mcp-probe";
 const CHILD_NAME: &str = "tyde-conformance-child";
 const SPAWNED_MARKER: &str = "TYDE_SPAWNED";
 const CHILD_DONE_MARKER: &str = "TYDE_CHILD_DONE";
+const AWAITED_MARKER: &str = "TYDE_AWAITED";
 
 /// Lines of filler the planted-payload turn carries, and the token floor that
 /// block has to move the reported input by.
@@ -1564,6 +1565,161 @@ fn real_tyde_agent_spawn() {
             assert_universal_contract(&[launched, spawned, child]);
             assert_clean_close(&mut host, &agent).await;
         },
+    );
+}
+
+/// Awaiting a child must work the same on a resumed session as a fresh one.
+///
+/// [`real_tyde_agent_spawn`] only ever exercises agent control on the session
+/// that started it, so nothing asked whether the tools survive the other two
+/// ways into a thread. For Codex they did not: `tyde_await_agents` was projected
+/// as a `dynamicTools` entry on `thread/start` only, which put it in the default
+/// namespace on a fresh session and nowhere at all on a resumed or forked one.
+/// Tyde shipped a matching apparatus (`codex_saved_await_tool`,
+/// `codex_saved_await_warning`) whose entire job was to detect that and tell the
+/// user to "Start a new Codex session" — a start-only mechanism plus a warning
+/// that it is start-only, rather than a tool.
+///
+/// It also made the default-namespace copy the one the model called, so a
+/// recorded call carried no `namespace` field while the same tool existed under
+/// `mcp__tyde_agent_await`; on a provider surface that emits real `function_call`
+/// items that mismatch is unresolvable, and since history replays on every
+/// request it bricks the conversation permanently rather than for one turn.
+///
+/// The fix is to stop being special: the await is a normal MCP tool, exactly
+/// like `tyde_spawn_agent` beside it, which every other backend already uses and
+/// which is identical on start, fork, and resume. So the contract is stated
+/// without reference to any of that — resume a session, then delegate and wait.
+///
+/// The child is spawned *after* the resume deliberately: it is the resumed
+/// session's own agent-control tools that are under test, and it keeps exactly
+/// one stored session in play at the point [`stored_session`] is consulted.
+#[test]
+#[ignore = "paid real-backend suite; use --run-ignored all with TYDE_RUN_REAL_AI_TESTS=1"]
+fn real_agent_await_survives_a_resumed_session() {
+    run_scenario(
+        &[
+            BackendCapability::AgentControlTools,
+            BackendCapability::ResumeSession,
+        ],
+        |mut host| async move {
+            let workspace = host.workspace().to_path_buf();
+            let agent = spawn_agent(&mut host, &launch_prompt()).await;
+            let launched = collect_turn(&mut host, &agent, &launch_prompt()).await;
+            assert_ready_handshake(&launched);
+            assert_clean_close(&mut host, &agent).await;
+
+            let session = stored_session(&mut host).await;
+            assert!(
+                session.resumable,
+                "{:?}: session is not resumable, so the rest of this scenario cannot run",
+                host.backend()
+            );
+            let resumed = resume_agent(&mut host, &session.id).await;
+
+            let payload = unique_payload();
+            let child_prompt = child_prompt(&workspace, &payload);
+            let spawn_prompt =
+                spawn_child_prompt(host.backend(), &host.workspace_roots(), &child_prompt);
+            let delegation = delegate(&mut host, &resumed, &spawn_prompt, &child_prompt).await;
+            let child_id = delegation.child_agent().agent_id.clone();
+            let [spawned, child] = delegation.into_turns();
+
+            // `delegate` already waited for the child to go idle, so a working
+            // await returns immediately. A missing one cannot: the tool is
+            // simply not there to call.
+            let await_prompt = await_child_prompt(&child_id);
+            let awaited = ask(&mut host, &resumed, &await_prompt).await;
+            assert!(
+                awaited
+                    .tool_request_names()
+                    .iter()
+                    .any(|name| name.contains("tyde_await_agents")),
+                "{}: a resumed session could not call tyde_await_agents. Requested instead: {:?}",
+                awaited.label(),
+                awaited.tool_request_names()
+            );
+            assert_final_text_contains(&awaited, AWAITED_MARKER);
+            assert_the_await_reported_the_child(&awaited, &child_id);
+            assert_no_await_unavailable_warning(&[&launched, &spawned, &awaited]);
+
+            assert_universal_contract(&[launched, spawned, child, awaited]);
+            assert_clean_close(&mut host, &resumed).await;
+        },
+    );
+}
+
+/// Names the tool, for the same reason [`spawn_child_prompt`] does: every
+/// backend has some native way to wait, and a prompt that described the goal
+/// would let a model satisfy it without touching the tool under test.
+fn await_child_prompt(child_id: &protocol::AgentId) -> String {
+    format!(
+        "Use the Tyde agent-control tool whose name ends in `tyde_await_agents`, exactly once, \
+         passing agent_ids [\"{child_id}\"]. Do not use any other tool. After it returns, reply \
+         with exactly {AWAITED_MARKER} and nothing else."
+    )
+}
+
+/// The await has to have actually waited on the child, not merely been called.
+///
+/// A tool that is present but wired to nothing still reports a tidy success, so
+/// the card alone cannot tell the two apart. The normalized result carries the
+/// statuses the real Tyde registry returned, and the child's own id appears
+/// there only if the call reached it.
+fn assert_the_await_reported_the_child(turn: &Turn, child_id: &protocol::AgentId) {
+    let reported: Vec<&AgentId> = turn
+        .tool_completions()
+        .filter_map(|completion| match &completion.outcome {
+            ToolExecutionOutcome::Succeeded {
+                result:
+                    ToolExecutionResult::TydeAwaitAgents {
+                        ready,
+                        still_thinking,
+                    },
+            } => Some(ready.iter().chain(still_thinking.iter())),
+            _ => None,
+        })
+        .flatten()
+        .map(|status| &status.agent_id)
+        .collect();
+    assert!(
+        reported.contains(&child_id),
+        "{}: tyde_await_agents succeeded but reported statuses for {reported:?} rather than the \
+         child {child_id} it was asked to wait for, so the call never reached Tyde's registry",
+        turn.label()
+    );
+}
+
+/// No backend may tell the user its agent-control tools are unavailable here.
+///
+/// The pre-fix Codex path degraded by emitting a warning that named the await as
+/// missing and asked the user to start a new session. Degrading with an apology
+/// is still degrading, and a scenario that only checked the happy path would
+/// have called that a pass.
+fn assert_no_await_unavailable_warning(turns: &[&Turn]) {
+    let warnings: Vec<&str> = turns
+        .iter()
+        .flat_map(|turn| turn.events())
+        .filter_map(|event| match event {
+            ChatEvent::MessageAdded(message)
+                if matches!(
+                    message.sender,
+                    MessageSender::Warning | MessageSender::Error | MessageSender::System
+                ) =>
+            {
+                Some(message.content.as_str())
+            }
+            _ => None,
+        })
+        .filter(|content| {
+            let lowered = content.to_ascii_lowercase();
+            lowered.contains("await") && lowered.contains("session")
+        })
+        .collect();
+    assert!(
+        warnings.is_empty(),
+        "a backend reported its sub-agent await as unavailable rather than simply working: \
+         {warnings:?}"
     );
 }
 
