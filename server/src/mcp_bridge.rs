@@ -25,8 +25,31 @@ const DOWNSTREAM_STARTUP_TIMEOUT: Duration = if cfg!(test) {
     Duration::from_secs(8)
 };
 
+/// Names the descriptor file for THIS backend process.
+///
+/// The whole point of the bridge: a provider CLI reads one global MCP config
+/// that every concurrent session shares, so per-session endpoints and
+/// credentials cannot live there. A single static stdio entry launches this
+/// bridge once per provider process, and the process's own environment says
+/// which endpoints it may reach.
+///
+/// Kept at the historical Hermes spelling for the same reason as
+/// [`BRIDGE_SUBCOMMAND`]: the bridge is frequently run by the *installed*
+/// `tyde-server`, which is an earlier release that reads only this name.
 pub const DESCRIPTOR_ENV: &str = "TYDE_HERMES_MCP_DESCRIPTOR";
 pub const MANAGED_SERVER_NAME: &str = "tyde";
+/// Overrides the executable a provider CLI launches as the bridge.
+pub const BRIDGE_EXECUTABLE_ENV: &str = "TYDE_HERMES_BRIDGE_EXECUTABLE";
+/// The subcommand a provider CLI launches to run the bridge.
+///
+/// Deliberately the historical Hermes spelling. The executable this resolves to
+/// is often not the running build — `resolve_bridge_executable` falls back to
+/// the installed `~/.tyde/bin/current/tyde-server` whenever the current process
+/// is not itself a Tyde binary, which is the case under test — and an installed
+/// binary from an earlier release rejects any name it does not know. Every
+/// deployed `tyde-server` accepts this one. `mcp-bridge` is accepted going
+/// forward, so the wire name can move once released binaries have rolled over.
+pub const BRIDGE_SUBCOMMAND: &str = "hermes-mcp-bridge";
 pub const DESCRIPTOR_FILE_NAME: &str = "tyde-mcp-servers.json";
 pub const READY_FILE_NAME: &str = "tyde-mcp-ready.json";
 static READY_PUBLISH_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -65,7 +88,7 @@ struct Downstream {
 }
 
 #[derive(Clone)]
-struct HermesMcpBridge {
+struct McpBridge {
     downstreams: Arc<Vec<Downstream>>,
     tools: Arc<Vec<Tool>>,
     tool_owners: Arc<HashMap<String, usize>>,
@@ -73,7 +96,7 @@ struct HermesMcpBridge {
     ready_path: Option<Arc<PathBuf>>,
 }
 
-impl ServerHandler for HermesMcpBridge {
+impl ServerHandler for McpBridge {
     fn get_info(&self) -> ServerInfo {
         ServerInfo {
             instructions: Some(
@@ -105,13 +128,13 @@ impl ServerHandler for HermesMcpBridge {
                     sequence
                 ));
                 eprintln!(
-                    "TYDE HERMES MCP READY PUBLISH sequence={sequence} path={}",
+                    "TYDE MCP READY PUBLISH sequence={sequence} path={}",
                     path.display()
                 );
                 let published = std::fs::write(&temporary_path, status.to_string())
                     .and_then(|_| std::fs::rename(&temporary_path, path.as_ref()));
                 if let Err(error) = published {
-                    eprintln!("Tyde Hermes MCP bridge failed to publish readiness: {error}");
+                    eprintln!("Tyde MCP bridge failed to publish readiness: {error}");
                 }
             });
         }
@@ -171,10 +194,122 @@ impl ServerHandler for HermesMcpBridge {
         result.structured_content = Some(Value::Object(structured));
         result.is_error = Some(false);
         eprintln!(
-            "TYDE HERMES MCP BRIDGE RESULT outbound={}",
+            "TYDE MCP BRIDGE RESULT outbound={}",
             serde_json::to_value(&result).unwrap_or(Value::Null)
         );
         Ok(result)
+    }
+}
+
+/// Real stdio, with `agy`'s pre-handshake probe answered on the way past.
+///
+/// `agy` sends a non-standard `server/discover` request *before* `initialize`.
+/// rmcp refuses any request before initialization and fails the handshake, so
+/// the bridge never gets to serve a tool: measured, `agy` listed zero tools and
+/// logged `expect initialized request, but received ... "server/discover"`.
+/// A server that answers it — even with an empty result — is then driven
+/// normally.
+///
+/// The probe is handled here rather than in `ServerHandler` because it arrives
+/// before rmcp will dispatch anything at all. Every other byte is forwarded
+/// verbatim in both directions.
+fn stdio_answering_discover_probe() -> tokio::io::DuplexStream {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    let (ours, theirs) = tokio::io::duplex(256 * 1024);
+    let (mut outbound_from_rmcp, mut inbound_to_rmcp) = tokio::io::split(ours);
+    // One writer owns real stdout so a probe reply can never interleave with
+    // rmcp's own frames.
+    let (stdout_tx, mut stdout_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+    tokio::spawn(async move {
+        let mut stdout = tokio::io::stdout();
+        while let Some(bytes) = stdout_rx.recv().await {
+            if stdout.write_all(&bytes).await.is_err() || stdout.flush().await.is_err() {
+                return;
+            }
+        }
+    });
+    let pump_tx = stdout_tx.clone();
+    tokio::spawn(async move {
+        let mut buffer = vec![0_u8; 16 * 1024];
+        loop {
+            match tokio::io::AsyncReadExt::read(&mut outbound_from_rmcp, &mut buffer).await {
+                Ok(0) | Err(_) => return,
+                Ok(read) => {
+                    if pump_tx.send(buffer[..read].to_vec()).is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+    });
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(tokio::io::stdin()).lines();
+        let mut handshake_started = false;
+        while let Ok(Some(line)) = lines.next_line().await {
+            if !handshake_started {
+                match classify_pre_handshake(&line) {
+                    PreHandshake::Initialize => handshake_started = true,
+                    PreHandshake::AnswerEmpty(reply) => {
+                        if stdout_tx.send(reply).is_err() {
+                            return;
+                        }
+                        continue;
+                    }
+                    PreHandshake::Drop => continue,
+                }
+            }
+            if inbound_to_rmcp.write_all(line.as_bytes()).await.is_err()
+                || inbound_to_rmcp.write_all(b"\n").await.is_err()
+            {
+                return;
+            }
+        }
+        // Closing real stdin has to reach rmcp, or the bridge outlives the
+        // provider that launched it and the provider waits on a child that
+        // will never exit.
+        let _ = inbound_to_rmcp.shutdown().await;
+    });
+    theirs
+}
+
+enum PreHandshake {
+    /// The real `initialize`; forward it and stop filtering.
+    Initialize,
+    /// A request rmcp would reject; answer it here.
+    AnswerEmpty(Vec<u8>),
+    /// A notification rmcp would reject; swallow it.
+    Drop,
+}
+
+/// What to do with a frame that arrived before `initialize`.
+///
+/// rmcp fails the whole handshake on *anything* other than `initialize`, and
+/// `agy` sends at least two such frames: a `server/discover` request and a
+/// `notifications/roots/list_changed` notification. Both were observed killing
+/// the handshake, leaving `agy` with zero tools. Rather than enumerate what a
+/// provider might probe with, nothing reaches rmcp until `initialize` does:
+/// requests get an empty result, notifications are dropped.
+fn classify_pre_handshake(line: &str) -> PreHandshake {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
+        // Not JSON we understand; let rmcp be the judge of it.
+        return PreHandshake::Initialize;
+    };
+    match value.get("method").and_then(serde_json::Value::as_str) {
+        Some("initialize") | None => PreHandshake::Initialize,
+        Some(_) => match value.get("id") {
+            Some(id) => {
+                let reply = serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": {} });
+                match serde_json::to_vec(&reply) {
+                    Ok(mut bytes) => {
+                        bytes.push(b'\n');
+                        PreHandshake::AnswerEmpty(bytes)
+                    }
+                    Err(_) => PreHandshake::Drop,
+                }
+            }
+            None => PreHandshake::Drop,
+        },
     }
 }
 
@@ -186,13 +321,13 @@ pub async fn run() -> Result<(), String> {
         .map(PathBuf::from)
         .map(|directory| Arc::new(directory.join(READY_FILE_NAME)));
     let service = bridge
-        .serve(rmcp::transport::io::stdio())
+        .serve(stdio_answering_discover_probe())
         .await
-        .map_err(|error| format!("Hermes MCP bridge handshake failed: {error}"))?;
+        .map_err(|error| format!("Tyde MCP bridge handshake failed: {error}"))?;
     service
         .waiting()
         .await
-        .map_err(|error| format!("Hermes MCP bridge task failed: {error}"))?;
+        .map_err(|error| format!("Tyde MCP bridge task failed: {error}"))?;
     for client in &mut clients {
         let _ = client.close_with_timeout(Duration::from_secs(1)).await;
     }
@@ -211,30 +346,30 @@ fn load_descriptor() -> Result<Option<BridgeDescriptor>, String> {
                 .filter(|path| path.is_file())
         });
     let Some(path) = path else {
-        eprintln!("Tyde Hermes MCP bridge started without a process descriptor");
+        eprintln!("Tyde MCP bridge started without a process descriptor");
         return Ok(None);
     };
     let bytes = std::fs::read(&path).map_err(|error| {
         format!(
-            "failed to read Hermes MCP bridge descriptor {}: {error}",
+            "failed to read Tyde MCP bridge descriptor {}: {error}",
             path.display()
         )
     })?;
     serde_json::from_slice::<BridgeDescriptor>(&bytes)
         .map(|descriptor| {
             eprintln!(
-                "Tyde Hermes MCP bridge loaded {} configured servers from {}",
+                "Tyde MCP bridge loaded {} configured servers from {}",
                 descriptor.servers.len(),
                 path.display()
             );
             Some(descriptor)
         })
-        .map_err(|error| format!("invalid Hermes MCP bridge descriptor: {error}"))
+        .map_err(|error| format!("invalid Tyde MCP bridge descriptor: {error}"))
 }
 
 async fn build_bridge(
     descriptor: Option<BridgeDescriptor>,
-) -> (HermesMcpBridge, Vec<RunningService<RoleClient, ()>>) {
+) -> (McpBridge, Vec<RunningService<RoleClient, ()>>) {
     let Some(descriptor) = descriptor else {
         return (empty_bridge(None), Vec::new());
     };
@@ -278,15 +413,15 @@ async fn build_bridge(
 
     if tools.is_empty() && !startup_errors.is_empty() {
         let error = startup_errors.join("; ");
-        eprintln!("Tyde Hermes MCP bridge failed: {error}");
+        eprintln!("Tyde MCP bridge failed: {error}");
         return (empty_bridge(Some(error)), clients);
     }
     for error in startup_errors {
-        eprintln!("Tyde Hermes MCP bridge warning: {error}");
+        eprintln!("Tyde MCP bridge warning: {error}");
     }
 
     (
-        HermesMcpBridge {
+        McpBridge {
             downstreams: Arc::new(downstreams),
             tools: Arc::new(tools),
             tool_owners: Arc::new(tool_owners),
@@ -304,10 +439,10 @@ async fn start_downstream(
     Result<(RunningService<RoleClient, ()>, Vec<Tool>), String>,
 ) {
     let name = server.name.clone();
-    eprintln!("Tyde Hermes MCP bridge connecting configured server '{name}'");
+    eprintln!("Tyde MCP bridge connecting configured server '{name}'");
     let result = tokio::time::timeout(DOWNSTREAM_STARTUP_TIMEOUT, async {
         let mut client = connect(&server).await.map_err(|error| error.to_string())?;
-        eprintln!("Tyde Hermes MCP bridge connected configured server '{name}'");
+        eprintln!("Tyde MCP bridge connected configured server '{name}'");
         let tools = match client.peer().list_all_tools().await {
             Ok(tools) => tools,
             Err(error) => {
@@ -316,7 +451,7 @@ async fn start_downstream(
             }
         };
         eprintln!(
-            "Tyde Hermes MCP bridge listed {} tools from configured server '{name}'",
+            "Tyde MCP bridge listed {} tools from configured server '{name}'",
             tools.len()
         );
         Ok((client, tools))
@@ -331,8 +466,8 @@ async fn start_downstream(
     (name, result)
 }
 
-fn empty_bridge(error: Option<String>) -> HermesMcpBridge {
-    HermesMcpBridge {
+fn empty_bridge(error: Option<String>) -> McpBridge {
+    McpBridge {
         downstreams: Arc::new(Vec::new()),
         tools: Arc::new(Vec::new()),
         tool_owners: Arc::new(HashMap::new()),
@@ -370,4 +505,55 @@ async fn connect(server: &BridgeServerConfig) -> Result<RunningService<RoleClien
             ().serve(transport).await.map_err(|error| error.to_string())
         }
     }
+}
+
+/// The `tyde-server` executable that a provider CLI should launch as the
+/// bridge.
+pub fn resolve_bridge_executable() -> Result<String, String> {
+    if let Some(value) = std::env::var(BRIDGE_EXECUTABLE_ENV)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    {
+        let path = PathBuf::from(&value);
+        if path.is_file() {
+            return Ok(value);
+        }
+        return Err(format!(
+            "{BRIDGE_EXECUTABLE_ENV} points to a missing file: {}",
+            path.display()
+        ));
+    }
+
+    let current = std::env::current_exe()
+        .map_err(|error| format!("Failed to locate the Tyde server executable: {error}"))?;
+    if matches!(
+        current.file_stem().and_then(|name| name.to_str()),
+        Some("tyde-server" | "tyde" | "Tyde" | "tauri-shell")
+    ) {
+        return Ok(current.to_string_lossy().to_string());
+    }
+    // A `tyde-server` built beside the running binary before the installed
+    // one. Under test the current executable is the test harness, and falling
+    // straight through to `~/.tyde/bin/current` runs whatever release happens
+    // to be installed — an older bridge than the code under test, which is a
+    // silent way for a test to exercise the wrong binary.
+    let binary = if cfg!(windows) {
+        "tyde-server.exe"
+    } else {
+        "tyde-server"
+    };
+    for directory in current.ancestors().skip(1).take(3) {
+        let sibling = directory.join(binary);
+        if sibling.is_file() {
+            return Ok(sibling.to_string_lossy().to_string());
+        }
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        let installed = PathBuf::from(home).join(".tyde/bin/current").join(binary);
+        if installed.is_file() {
+            return Ok(installed.to_string_lossy().to_string());
+        }
+    }
+    Err("Could not locate a stable tyde-server executable for the Tyde MCP bridge".to_string())
 }

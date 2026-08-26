@@ -16,7 +16,7 @@ enum CliMode {
     HostStatusUds,
     HostLaunchUds,
     HostBridgeUds,
-    HermesMcpBridge,
+    McpBridge,
     Version,
     Help,
     Error(String),
@@ -37,7 +37,7 @@ fn main() {
         CliMode::HostStatusUds => exit_on_error(run_host_status_uds()),
         CliMode::HostLaunchUds => exit_on_error(run_host_launch_uds()),
         CliMode::HostBridgeUds => exit_on_error(run_host_bridge_uds()),
-        CliMode::HermesMcpBridge => exit_on_error(run_hermes_mcp_bridge()),
+        CliMode::McpBridge => exit_on_error(run_mcp_bridge()),
         CliMode::Version => println!("{}", env!("CARGO_PKG_VERSION")),
         CliMode::Help => print_usage(),
         CliMode::Error(message) => {
@@ -126,8 +126,11 @@ where
         return CliMode::HostBridgeUds;
     }
 
-    if args.as_slice() == ["hermes-mcp-bridge"] {
-        return CliMode::HermesMcpBridge;
+    // `hermes-mcp-bridge` is the name persisted in existing Hermes configs;
+    // the bridge is shared by every backend that needs one, so both spellings
+    // resolve to it.
+    if args.as_slice() == ["mcp-bridge"] || args.as_slice() == ["hermes-mcp-bridge"] {
+        return CliMode::McpBridge;
     }
 
     match args.as_slice() {
@@ -147,15 +150,15 @@ fn print_usage() {
     println!("  tyde-server host --status-uds  Check whether the Tyde UDS host is reachable");
     println!("  tyde-server host --launch-uds  Launch the Tyde UDS host in the background");
     println!("  tyde-server host --bridge-uds  Bridge stdin/stdout to a running Tyde UDS host");
-    println!("  tyde-server hermes-mcp-bridge Run the process-local Hermes MCP bridge");
+    println!("  tyde-server mcp-bridge      Run the process-local Tyde MCP bridge");
 }
 
-fn run_hermes_mcp_bridge() -> Result<(), String> {
+fn run_mcp_bridge() -> Result<(), String> {
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
-        .map_err(|error| format!("Failed to create Hermes MCP bridge runtime: {error}"))?
-        .block_on(server::hermes_mcp_bridge::run())
+        .map_err(|error| format!("Failed to create Tyde MCP bridge runtime: {error}"))?
+        .block_on(server::mcp_bridge::run())
 }
 
 fn init_logging() -> Result<(), String> {

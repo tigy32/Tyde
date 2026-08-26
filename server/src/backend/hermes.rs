@@ -45,7 +45,7 @@ use crate::backend::{
     normalize_mcp_call_tool_result, render_combined_spawn_instructions,
     resolve_settings as resolve_backend_settings, tyde_owned_no_root_cwd,
 };
-use crate::hermes_mcp_bridge::{
+use crate::mcp_bridge::{
     BridgeDescriptor, BridgeServerConfig, BridgeTransport, DESCRIPTOR_ENV, DESCRIPTOR_FILE_NAME,
     MANAGED_SERVER_NAME, READY_FILE_NAME,
 };
@@ -59,7 +59,6 @@ const HERMES_CLI_BINARY: &str = "hermes";
 const HERMES_STARTUP_TIMEOUT_ENV: &str = "HERMES_TUI_STARTUP_TIMEOUT_MS";
 const HERMES_RPC_TIMEOUT_ENV: &str = "HERMES_TUI_RPC_TIMEOUT_MS";
 const HERMES_REMOTE_PYTHON_ENV: &str = "TYDE_REMOTE_HERMES_PYTHON";
-const HERMES_BRIDGE_EXECUTABLE_ENV: &str = "TYDE_HERMES_BRIDGE_EXECUTABLE";
 const HERMES_STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
 const HERMES_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 const HERMES_USAGE_TIMEOUT: Duration = Duration::from_secs(2);
@@ -3948,7 +3947,7 @@ async fn prepare_hermes_mcp_runtime(
         return Err("Hermes MCP tools are not yet available for SSH-backed workspaces".to_string());
     }
 
-    let bridge_program = resolve_hermes_bridge_executable()?;
+    let bridge_program = crate::mcp_bridge::resolve_bridge_executable()?;
     let selected = register_hermes_mcp_bridge(
         target,
         &bridge_program,
@@ -4317,45 +4316,6 @@ fn prepare_hermes_managed_toolsets(
             .map_err(|error| format!("Failed to protect Hermes managed tool selection: {error}"))?;
     }
     Ok(())
-}
-
-fn resolve_hermes_bridge_executable() -> Result<String, String> {
-    if let Some(value) = std::env::var(HERMES_BRIDGE_EXECUTABLE_ENV)
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-    {
-        let path = PathBuf::from(&value);
-        if path.is_file() {
-            return Ok(value);
-        }
-        return Err(format!(
-            "{HERMES_BRIDGE_EXECUTABLE_ENV} points to a missing file: {}",
-            path.display()
-        ));
-    }
-
-    let current = std::env::current_exe()
-        .map_err(|error| format!("Failed to locate the Tyde server executable: {error}"))?;
-    if matches!(
-        current.file_stem().and_then(|name| name.to_str()),
-        Some("tyde-server" | "tyde" | "Tyde" | "tauri-shell")
-    ) {
-        return Ok(current.to_string_lossy().to_string());
-    }
-    if let Some(home) = std::env::var_os("HOME") {
-        let installed = PathBuf::from(home)
-            .join(".tyde/bin/current")
-            .join(if cfg!(windows) {
-                "tyde-server.exe"
-            } else {
-                "tyde-server"
-            });
-        if installed.is_file() {
-            return Ok(installed.to_string_lossy().to_string());
-        }
-    }
-    Err("Could not locate a stable tyde-server executable for the Hermes MCP bridge".to_string())
 }
 
 async fn spawn_gateway_child(target: &HermesSpawnTarget) -> Result<AsyncGroupChild, String> {

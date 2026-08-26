@@ -561,14 +561,16 @@ pub const MCP_DISPATCH_TOOL: &str = "call_mcp_tool";
 
 /// The tool name and arguments inside a `call_mcp_tool` dispatch.
 ///
-/// The name is qualified with the server so two servers exposing the same tool
-/// name stay distinguishable, and so the agent-control matchers — which accept
-/// a namespaced name — recognise Tyde's own tools through the Tyde-generated
-/// server key.
+/// A third-party tool is qualified with its server so two servers exposing the
+/// same tool name stay distinguishable. Tools arriving through Tyde's own
+/// bridge are not: they are already unique, Tyde owns the name, and qualifying
+/// them would stop the agent-control matchers recognising a spawn — those match
+/// the bare `tyde_spawn_agent`, and `tyde__tyde_spawn_agent` normalizes to
+/// something none of their patterns accept.
 pub fn mcp_inner_call(args: &Value) -> (String, Value) {
     let tool = arg_str(args, "ToolName").unwrap_or_default();
     let server = arg_str(args, "ServerName").unwrap_or_default();
-    let qualified = if server.is_empty() {
+    let qualified = if server.is_empty() || server == crate::mcp_bridge::MANAGED_SERVER_NAME {
         tool
     } else {
         format!("{server}__{tool}")

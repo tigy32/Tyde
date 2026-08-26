@@ -5,7 +5,7 @@ enum CliMode {
     HostStatusUds,
     HostLaunchUds,
     HostBridgeUds,
-    HermesMcpBridge,
+    McpBridge,
     Version,
     Help,
     Error(String),
@@ -52,15 +52,15 @@ fn main() {
                 std::process::exit(1);
             }
         }
-        CliMode::HermesMcpBridge => {
+        CliMode::McpBridge => {
             let runtime = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()
                 .unwrap_or_else(|error| {
-                    eprintln!("ERROR: Failed to create Hermes MCP bridge runtime: {error}");
+                    eprintln!("ERROR: Failed to create Tyde MCP bridge runtime: {error}");
                     std::process::exit(1);
                 });
-            if let Err(error) = runtime.block_on(server::hermes_mcp_bridge::run()) {
+            if let Err(error) = runtime.block_on(server::mcp_bridge::run()) {
                 eprintln!("ERROR: {error}");
                 std::process::exit(1);
             }
@@ -119,8 +119,11 @@ where
         return CliMode::HostBridgeUds;
     }
 
-    if args.as_slice() == ["hermes-mcp-bridge"] {
-        return CliMode::HermesMcpBridge;
+    // `hermes-mcp-bridge` is the name persisted in existing Hermes configs;
+    // the bridge is shared by every backend that needs one, so both spellings
+    // resolve to it.
+    if args.as_slice() == ["mcp-bridge"] || args.as_slice() == ["hermes-mcp-bridge"] {
+        return CliMode::McpBridge;
     }
 
     if args.len() == 2
@@ -180,7 +183,7 @@ fn print_usage() {
     println!("  tyde host --status-uds  Check whether the Tyde UDS host is reachable");
     println!("  tyde host --launch-uds  Launch the Tyde UDS host in the background");
     println!("  tyde host --bridge-uds  Bridge stdin/stdout to a running Tyde UDS host");
-    println!("  tyde hermes-mcp-bridge  Run the process-local Hermes MCP bridge");
+    println!("  tyde mcp-bridge         Run the process-local Tyde MCP bridge");
     println!("  tyde --headless --stdio Alias for `tyde host --stdio`");
     println!("  tyde --headless --uds   Alias for `tyde host --uds`");
     println!("  tyde --headless --status-uds Alias for `tyde host --status-uds`");

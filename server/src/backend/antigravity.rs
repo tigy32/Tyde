@@ -54,6 +54,8 @@ const ANTIGRAVITY_CAPACITY_REFRESH_INTERVAL: Duration = Duration::from_secs(120)
 /// How long a wait for the shared MCP config lock has to reach before it is
 /// worth telling someone about.
 const ANTIGRAVITY_MCP_LOCK_WARN_AFTER: Duration = Duration::from_secs(5);
+/// How often the contended lock is retried while waiting.
+const ANTIGRAVITY_MCP_LOCK_POLL: Duration = Duration::from_millis(250);
 /// How long `agy` gets to finalize its conversation after `SIGTERM`. Measured
 /// at well under a second; the margin is for a loaded machine.
 const ANTIGRAVITY_GRACEFUL_EXIT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -63,6 +65,10 @@ const ANTIGRAVITY_PRINT_TIMEOUT: &str = "60m";
 const ANTIGRAVITY_DEFAULT_MODEL: &str = "Gemini 3.7 Flash (Medium)";
 const ANTIGRAVITY_LOW_MODEL: &str = "Gemini 3.7 Flash (Low)";
 const ANTIGRAVITY_HIGH_MODEL: &str = "Gemini 3.1 Pro (High)";
+
+/// The one entry Tyde owns in `agy`'s shared MCP config. Shared with the
+/// bridge so the tool-name mapping and the config agree on it.
+const ANTIGRAVITY_BRIDGE_SERVER_NAME: &str = crate::mcp_bridge::MANAGED_SERVER_NAME;
 
 static ANTIGRAVITY_MCP_CONFIG_MUTEX: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
@@ -106,8 +112,10 @@ struct AgyLaunch {
     extra_roots: Vec<String>,
     access_mode: BackendAccessMode,
     model: String,
-    mcp_namespace: String,
-    startup_mcp_servers: Vec<StartupMcpServer>,
+    /// `(name, value)` naming this session's bridge descriptor, applied to
+    /// every `agy` process this session starts — including the ones a restart
+    /// after an interrupt creates.
+    bridge_env: Option<(String, String)>,
 }
 
 impl AgyLaunch {
@@ -166,6 +174,9 @@ impl AgyProcess {
         command.args(launch.args(resume));
         if let Some(path) = process_env::resolved_child_process_path() {
             command.env("PATH", path);
+        }
+        if let Some((name, value)) = launch.bridge_env.as_ref() {
+            command.env(name, value);
         }
         command
             .current_dir(&launch.primary_root)
@@ -735,7 +746,9 @@ struct Supervisor {
     inner: Arc<AntigravityInner>,
     launch: AgyLaunch,
     brain_dir: PathBuf,
-    mcp_guard: Option<AntigravityMcpConfigGuard>,
+    /// Deleted when the supervisor exits, taking this session's credentials
+    /// with it.
+    descriptor_dir: Option<tempfile::TempDir>,
     mapper: Option<TurnMapper>,
     cumulative: AgyUsage,
     turn_counter: u64,
@@ -1048,11 +1061,10 @@ impl Supervisor {
 
     async fn shutdown(self, mut process: AgyProcess) {
         process.terminate().await;
-        if let Some(guard) = self.mcp_guard
-            && let Err(err) = guard.remove(&self.launch.startup_mcp_servers).await
-        {
-            tracing::warn!("{err}");
-        }
+        // Nothing to unregister: the shared config holds only the static,
+        // credential-free bridge entry. Dropping the descriptor directory
+        // removes this session's endpoints and bearer tokens from disk.
+        drop(self.descriptor_dir);
         let _ = self.shutdown_complete.send(());
     }
 }
@@ -1578,27 +1590,24 @@ impl AntigravityBackend {
         let combined_instructions =
             render_combined_spawn_instructions(&config.resolved_spawn_config);
 
-        // Namespaced by conversation so two Antigravity sessions can hold
-        // entries in the shared config at once. A resumed session reuses its
-        // conversation's namespace; a fresh one cannot know its id yet, so it
-        // takes a random one.
-        let mcp_namespace = resume
-            .as_ref()
-            .map(|id| id.0.clone())
-            .unwrap_or_else(|| Uuid::new_v4().to_string());
+        // Private to this session and removed with it. The descriptor holds the
+        // endpoints and bearer credentials that must never reach the config
+        // every `agy` process shares.
+        let descriptor_dir = tempfile::Builder::new()
+            .prefix("tyde-antigravity-mcp-")
+            .tempdir()
+            .map_err(|err| format!("Failed to create Antigravity MCP descriptor dir: {err}"))?;
+        let bridge =
+            install_antigravity_mcp_config(&config.startup_mcp_servers, descriptor_dir.path())
+                .await?;
 
         let launch = AgyLaunch {
             primary_root,
             extra_roots,
             access_mode: config.resolved_spawn_config.access_mode,
             model: model.clone(),
-            mcp_namespace,
-            startup_mcp_servers: config.startup_mcp_servers.clone(),
+            bridge_env: bridge.as_ref().map(AntigravityMcpBridge::env),
         };
-
-        let mcp_guard =
-            install_antigravity_mcp_config(&launch.mcp_namespace, &launch.startup_mcp_servers)
-                .await?;
 
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let emitter = Arc::new(TurnEmitter::new_for_agent(
@@ -1614,12 +1623,7 @@ impl AntigravityBackend {
         .await
         {
             Ok(process) => process,
-            Err(err) => {
-                if let Some(guard) = mcp_guard {
-                    let _ = guard.remove(&launch.startup_mcp_servers).await;
-                }
-                return Err(err);
-            }
+            Err(err) => return Err(err),
         };
 
         let session_id = SessionId(process.conversation_id.clone());
@@ -1654,7 +1658,7 @@ impl AntigravityBackend {
             inner: Arc::clone(&inner),
             launch,
             brain_dir: antigravity_brain_dir(conversations_dir),
-            mcp_guard,
+            descriptor_dir: Some(descriptor_dir),
             mapper: None,
             cumulative: AgyUsage::default(),
             turn_counter: 0,
@@ -1911,105 +1915,219 @@ fn build_prompt(instructions: Option<&str>, message: &str) -> String {
         None => message.to_string(),
     }
 }
-/// Adds this session's MCP servers to `agy`'s shared config.
+/// Points `agy` at this session's MCP servers without putting them in the file
+/// every session shares.
 ///
-/// `agy` reads `mcp_config.json` once, at process start, and takes no
-/// per-invocation override, so the entries have to be in the file for the whole
-/// session rather than for the length of one turn.
+/// `agy` reads one global `mcp_config.json`, and it re-reads it: an entry
+/// removed after startup stops working mid-session (measured). So a session's
+/// endpoint and its per-agent bearer credential cannot live there — every
+/// concurrently running session would see every other session's server, and the
+/// model picks between identically-shaped choices. Measured: a parent called
+/// `tyde_af031d82_..._tyde_agent_control` while its own process had installed
+/// only `5870064b-...`, so its spawn was executed by a different Tyde entirely.
 ///
-/// The previous implementation snapshotted the file and restored those exact
-/// bytes afterwards. With a session-long hold that is actively wrong: two
-/// Antigravity sessions overlap, and whichever finishes second restores a
-/// snapshot that erases the other's servers. Entries are namespaced per
-/// conversation already, so shutdown removes this session's keys and leaves
-/// every other key alone.
+/// Instead the shared file gets ONE static, credential-free stdio entry that
+/// launches Tyde's own MCP bridge. `agy` starts that bridge once per `agy`
+/// process, and the bridge inherits that process's environment, which names a
+/// private descriptor holding this session's URLs and headers. One entry means
+/// the model cannot pick the wrong one, and nothing secret is ever written to a
+/// file other sessions can read.
 async fn install_antigravity_mcp_config(
-    namespace: &str,
     startup_mcp_servers: &[StartupMcpServer],
-) -> Result<Option<AntigravityMcpConfigGuard>, String> {
+    descriptor_dir: &Path,
+) -> Result<Option<AntigravityMcpBridge>, String> {
     if startup_mcp_servers.is_empty() {
         return Ok(None);
     }
+    let executable = crate::mcp_bridge::resolve_bridge_executable()?;
     let path = antigravity_mcp_config_path()?;
-    let _guard = ANTIGRAVITY_MCP_CONFIG_MUTEX.lock().await;
-    let _file_lock = AntigravityMcpConfigLock::acquire(&path).await?;
-    let original = read_optional_bytes(&path)?;
-    let merged = merge_antigravity_mcp_config(original.as_deref(), namespace, startup_mcp_servers)
-        .map_err(|err| {
-            format!(
-                "Failed to prepare Antigravity MCP config {}: {err}",
-                path.display()
-            )
-        })?;
-    write_bytes_atomically(&path, &merged).map_err(|err| {
-        format!(
-            "Failed to write Antigravity MCP config {}: {err}",
-            path.display()
-        )
-    })?;
-    Ok(Some(AntigravityMcpConfigGuard {
-        path,
-        namespace: namespace.to_string(),
-    }))
-}
-
-struct AntigravityMcpConfigGuard {
-    path: PathBuf,
-    namespace: String,
-}
-
-impl AntigravityMcpConfigGuard {
-    async fn remove(self, startup_mcp_servers: &[StartupMcpServer]) -> Result<(), String> {
+    {
         let _guard = ANTIGRAVITY_MCP_CONFIG_MUTEX.lock().await;
-        let _file_lock = AntigravityMcpConfigLock::acquire(&self.path).await?;
-        let Some(bytes) = read_optional_bytes(&self.path)? else {
-            return Ok(());
-        };
-        let mut value = serde_json::from_slice::<Value>(&bytes).map_err(|err| {
-            format!(
-                "Failed to read Antigravity MCP config {} for cleanup: {err}",
-                self.path.display()
-            )
-        })?;
-        let Some(servers) = value
-            .as_object_mut()
-            .and_then(|object| object.get_mut("mcpServers"))
-            .and_then(Value::as_object_mut)
-        else {
-            return Ok(());
-        };
-        for server in startup_mcp_servers {
-            servers.remove(&antigravity_mcp_server_key(&self.namespace, &server.name));
+        let _file_lock = AntigravityMcpConfigLock::acquire(&path).await?;
+        let original = read_optional_bytes(&path)?;
+        if let Some(merged) = merge_antigravity_bridge_entry(original.as_deref(), &executable)
+            .map_err(|err| {
+                format!(
+                    "Failed to prepare Antigravity MCP config {}: {err}",
+                    path.display()
+                )
+            })?
+        {
+            write_bytes_atomically(&path, &merged).map_err(|err| {
+                format!(
+                    "Failed to write Antigravity MCP config {}: {err}",
+                    path.display()
+                )
+            })?;
         }
-        let serialized = serde_json::to_vec_pretty(&value).map_err(|err| {
-            format!("Failed to serialize Antigravity MCP config for cleanup: {err}")
-        })?;
-        write_bytes_atomically(&self.path, &serialized).map_err(|err| {
-            format!(
-                "Failed to write Antigravity MCP config {}: {err}",
-                self.path.display()
-            )
-        })
+    }
+
+    let descriptor = crate::mcp_bridge::BridgeDescriptor {
+        servers: startup_mcp_servers
+            .iter()
+            .filter_map(antigravity_bridge_server)
+            .collect(),
+        // `agy` issues tool calls one at a time in the runs measured here, so
+        // the bridge is not asked to fan out concurrent calls.
+        supports_parallel_tool_calls: false,
+    };
+    let descriptor_path = descriptor_dir.join(crate::mcp_bridge::DESCRIPTOR_FILE_NAME);
+    let contents = serde_json::to_vec(&descriptor)
+        .map_err(|err| format!("Failed to serialize Antigravity MCP descriptor: {err}"))?;
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options
+        .open(&descriptor_path)
+        .and_then(|mut file| file.write_all(&contents))
+        .map_err(|err| format!("Failed to write Antigravity MCP descriptor: {err}"))?;
+    Ok(Some(AntigravityMcpBridge { descriptor_path }))
+}
+
+/// This session's private descriptor, handed to the bridge through the `agy`
+/// process environment.
+struct AntigravityMcpBridge {
+    descriptor_path: PathBuf,
+}
+
+impl AntigravityMcpBridge {
+    fn env(&self) -> (String, String) {
+        (
+            crate::mcp_bridge::DESCRIPTOR_ENV.to_string(),
+            self.descriptor_path.to_string_lossy().to_string(),
+        )
+    }
+}
+
+fn antigravity_bridge_server(
+    server: &StartupMcpServer,
+) -> Option<crate::mcp_bridge::BridgeServerConfig> {
+    let transport = match &server.transport {
+        StartupMcpTransport::Http { url, headers, .. } => {
+            crate::mcp_bridge::BridgeTransport::Http {
+                url: url.clone(),
+                headers: headers.clone(),
+            }
+        }
+        StartupMcpTransport::Stdio { command, args, env } => {
+            crate::mcp_bridge::BridgeTransport::Stdio {
+                command: command.clone(),
+                args: args.clone(),
+                env: env.clone(),
+            }
+        }
+    };
+    Some(crate::mcp_bridge::BridgeServerConfig {
+        name: server.name.clone(),
+        transport,
+    })
+}
+
+/// Installs the one static bridge entry, returning the bytes to write only when
+/// the file actually needs to change.
+///
+/// Idempotent by design: the entry carries no session state, so a crashed Tyde
+/// leaves nothing to clean up and the next launch finds it already correct.
+fn merge_antigravity_bridge_entry(
+    original_bytes: Option<&[u8]>,
+    executable: &str,
+) -> Result<Option<Vec<u8>>, String> {
+    let mut value = match original_bytes {
+        Some(bytes) if bytes.iter().all(u8::is_ascii_whitespace) => json!({}),
+        Some(bytes) => serde_json::from_slice::<Value>(bytes)
+            .map_err(|err| format!("existing mcp_config.json is malformed: {err}"))?,
+        None => json!({}),
+    };
+    let object = value
+        .as_object_mut()
+        .ok_or_else(|| "existing mcp_config.json must be a JSON object".to_string())?;
+    if !object.contains_key("mcpServers") {
+        object.insert("mcpServers".to_string(), Value::Object(Map::new()));
+    }
+    let servers = object
+        .get_mut("mcpServers")
+        .and_then(Value::as_object_mut)
+        .ok_or_else(|| "existing mcp_config.json mcpServers must be a JSON object".to_string())?;
+
+    // Entries from the previous design: one per session, each carrying a bearer
+    // credential. They are the bug this replaces, so they go.
+    let stale = servers
+        .keys()
+        .filter(|key| key.starts_with("tyde_") && key.as_str() != ANTIGRAVITY_BRIDGE_SERVER_NAME)
+        .cloned()
+        .collect::<Vec<_>>();
+    let removed_stale = !stale.is_empty();
+    for key in stale {
+        servers.remove(&key);
+    }
+
+    let managed = json!({
+        "command": executable,
+        "args": [crate::mcp_bridge::BRIDGE_SUBCOMMAND],
+    });
+    let existing = servers.get(ANTIGRAVITY_BRIDGE_SERVER_NAME);
+    if existing == Some(&managed) && !removed_stale {
+        return Ok(None);
+    }
+    if let Some(existing) = existing
+        && existing
+            .get("args")
+            .and_then(Value::as_array)
+            .is_none_or(|args| {
+                // Either spelling of the bridge subcommand marks the entry as
+                // Tyde-managed and therefore safe to rewrite.
+                !args.iter().any(|arg| {
+                    arg.as_str().is_some_and(|arg| {
+                        arg == crate::mcp_bridge::BRIDGE_SUBCOMMAND || arg == "mcp-bridge"
+                    })
+                })
+            })
+    {
+        return Err(format!(
+            "Antigravity MCP server name {ANTIGRAVITY_BRIDGE_SERVER_NAME:?} is already user-managed"
+        ));
+    }
+    servers.insert(ANTIGRAVITY_BRIDGE_SERVER_NAME.to_string(), managed);
+
+    serde_json::to_vec_pretty(&value)
+        .map(Some)
+        .map_err(|err| format!("failed to serialize merged mcp_config.json: {err}"))
+}
+
+fn antigravity_mcp_config_path() -> Result<PathBuf, String> {
+    Ok(crate::paths::home_dir()?
+        .join(".gemini")
+        .join("config")
+        .join("mcp_config.json"))
+}
+
+fn read_optional_bytes(path: &Path) -> Result<Option<Vec<u8>>, String> {
+    match fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(format!(
+            "Failed to read Antigravity MCP config {}: {err}",
+            path.display()
+        )),
     }
 }
 
 /// A cross-process lock over `agy`'s shared `mcp_config.json`.
 ///
-/// The in-process mutex orders tasks inside one Tyde, and that is all it can
-/// do. `agy` reads a single user-level config, so two Tyde processes — or the
-/// conformance suite, where every scenario is its own process — otherwise
-/// read-modify-write the same file concurrently and drop each other's servers.
-/// A backend that quietly loses its MCP entries looks exactly like a model that
-/// declined to use a tool, which is the worst way for this to fail.
+/// The in-process mutex orders tasks inside one Tyde and nothing more. `agy`
+/// reads a single user-level config, so two Tyde processes otherwise
+/// read-modify-write it concurrently and lose each other's edits.
 struct AntigravityMcpConfigLock {
     file: fs::File,
 }
 
 impl AntigravityMcpConfigLock {
-    /// Taken on a blocking thread: `lock_exclusive` parks the calling thread
-    /// until the holder releases, and parking a runtime worker stalls every
-    /// other task scheduled on it — including, when several Tyde processes
-    /// contend, the child agent whose own spawn is waiting behind it.
+    /// Taken on a blocking thread: `lock_exclusive` parks the calling thread,
+    /// and parking a runtime worker stalls every task scheduled on it.
     async fn acquire(path: &Path) -> Result<Self, String> {
         let path = path.to_path_buf();
         tokio::task::spawn_blocking(move || Self::acquire_blocking(&path))
@@ -2040,27 +2158,27 @@ impl AntigravityMcpConfigLock {
                     lock_path.display()
                 )
             })?;
-        // Reported rather than waited on silently. This is the only blocking
-        // step between deciding to start a backend and actually starting it,
-        // so a lock that is never released presents as an agent that was
-        // created and then simply never ran — with nothing in the log to say
-        // why.
+        // Reported *while* waiting, not after: a lock that is never released
+        // otherwise presents as a backend that simply never started, with
+        // nothing in the log to say why.
         let waited_from = std::time::Instant::now();
-        if FileExt::try_lock_exclusive(&file).is_err() {
-            FileExt::lock_exclusive(&file).map_err(|err| {
-                format!(
-                    "Failed to lock Antigravity MCP config {}: {err}",
-                    lock_path.display()
-                )
-            })?;
-            let waited = waited_from.elapsed();
-            if waited >= ANTIGRAVITY_MCP_LOCK_WARN_AFTER {
+        let mut warned = false;
+        while FileExt::try_lock_exclusive(&file).is_err() {
+            if waited_from.elapsed() >= ANTIGRAVITY_MCP_LOCK_WARN_AFTER {
                 tracing::warn!(
-                    "Waited {:.1}s for the Antigravity MCP config lock {}",
-                    waited.as_secs_f64(),
+                    "Still waiting after {:.0}s for the Antigravity MCP config lock {}",
+                    waited_from.elapsed().as_secs_f64(),
                     lock_path.display()
                 );
+                warned = true;
             }
+            std::thread::sleep(ANTIGRAVITY_MCP_LOCK_POLL);
+        }
+        if warned {
+            tracing::warn!(
+                "Acquired the Antigravity MCP config lock after {:.0}s",
+                waited_from.elapsed().as_secs_f64()
+            );
         }
         Ok(Self { file })
     }
@@ -2072,196 +2190,6 @@ impl Drop for AntigravityMcpConfigLock {
 
         let _ = FileExt::unlock(&self.file);
     }
-}
-
-fn read_optional_bytes(path: &Path) -> Result<Option<Vec<u8>>, String> {
-    match fs::read(path) {
-        Ok(bytes) => Ok(Some(bytes)),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(err) => Err(format!(
-            "Failed to read Antigravity MCP config {}: {err}",
-            path.display()
-        )),
-    }
-}
-fn antigravity_mcp_config_path() -> Result<PathBuf, String> {
-    Ok(crate::paths::home_dir()?
-        .join(".gemini")
-        .join("config")
-        .join("mcp_config.json"))
-}
-fn merge_antigravity_mcp_config(
-    original_bytes: Option<&[u8]>,
-    namespace: &str,
-    startup_mcp_servers: &[StartupMcpServer],
-) -> Result<Vec<u8>, String> {
-    let mut value = match original_bytes {
-        Some(bytes) if bytes.iter().all(u8::is_ascii_whitespace) => json!({}),
-        Some(bytes) => serde_json::from_slice::<Value>(bytes)
-            .map_err(|err| format!("existing mcp_config.json is malformed: {err}"))?,
-        None => json!({}),
-    };
-    let object = value
-        .as_object_mut()
-        .ok_or_else(|| "existing mcp_config.json must be a JSON object".to_string())?;
-    if !object.contains_key("mcpServers") {
-        object.insert("mcpServers".to_string(), Value::Object(Map::new()));
-    }
-    let servers = object
-        .get_mut("mcpServers")
-        .and_then(Value::as_object_mut)
-        .ok_or_else(|| "existing mcp_config.json mcpServers must be a JSON object".to_string())?;
-
-    let pruned = prune_dead_tyde_mcp_servers(servers);
-    if pruned > 0 {
-        tracing::info!("Removed {pruned} Antigravity MCP entries left by dead Tyde sessions");
-    }
-
-    for server in startup_mcp_servers {
-        let Some(config) = antigravity_mcp_server_config(server) else {
-            continue;
-        };
-        let key = antigravity_mcp_server_key(namespace, &server.name);
-        if servers.contains_key(&key) {
-            return Err(format!(
-                "Tyde MCP server key {key:?} already exists in Antigravity MCP config"
-            ));
-        }
-        servers.insert(key, config);
-    }
-
-    serde_json::to_vec_pretty(&value)
-        .map_err(|err| format!("failed to serialize merged mcp_config.json: {err}"))
-}
-
-/// Drops the entries other Tyde sessions left behind when they died.
-///
-/// `mcp_config.json` outlives every process that writes to it, and Tyde's
-/// servers are loopback HTTP endpoints on a port that belongs to one run. A
-/// session that is killed rather than shut down never removes its own keys, so
-/// they accumulate: measured after a day of conformance runs, 32 entries, all
-/// pointing at ports nothing was listening on. That is not merely untidy —
-/// `agy` advertises every configured server, so a model told to use
-/// `tyde_spawn_agent` picks between sixteen of them and mostly reaches a dead
-/// one, which fails the call with `connection refused`.
-///
-/// Liveness is the test rather than age or ownership: an entry whose port
-/// answers belongs to a Tyde that is still running and is left alone, and one
-/// that refuses is garbage by construction. Only `tyde_`-prefixed keys are
-/// considered, so a user's own servers are never touched.
-fn prune_dead_tyde_mcp_servers(servers: &mut Map<String, Value>) -> usize {
-    let dead = servers
-        .iter()
-        .filter(|(key, value)| {
-            key.starts_with("tyde_")
-                && tyde_mcp_loopback_port(value).is_some_and(|port| !loopback_port_is_open(port))
-        })
-        .map(|(key, _)| key.clone())
-        .collect::<Vec<_>>();
-    for key in &dead {
-        servers.remove(key);
-    }
-    dead.len()
-}
-
-fn tyde_mcp_loopback_port(value: &Value) -> Option<u16> {
-    let url = value
-        .get("serverUrl")
-        .or_else(|| value.get("url"))
-        .and_then(Value::as_str)?;
-    let rest = url
-        .strip_prefix("http://127.0.0.1:")
-        .or_else(|| url.strip_prefix("http://localhost:"))?;
-    let end = rest
-        .find(|c: char| !c.is_ascii_digit())
-        .unwrap_or(rest.len());
-    rest[..end].parse::<u16>().ok()
-}
-
-/// A refused loopback connect returns immediately, so this costs a syscall per
-/// entry rather than a wait.
-fn loopback_port_is_open(port: u16) -> bool {
-    use std::net::{Ipv4Addr, SocketAddr, TcpStream};
-
-    TcpStream::connect_timeout(
-        &SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
-        Duration::from_millis(200),
-    )
-    .is_ok()
-}
-
-fn antigravity_mcp_server_key(namespace: &str, server_name: &str) -> String {
-    format!(
-        "tyde_{}_{}",
-        sanitize_mcp_key_component(namespace),
-        sanitize_mcp_key_component(server_name)
-    )
-}
-
-fn sanitize_mcp_key_component(value: &str) -> String {
-    let sanitized = value
-        .chars()
-        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
-        .collect::<String>();
-    let trimmed = sanitized.trim_matches('_');
-    if trimmed.is_empty() {
-        "unnamed".to_string()
-    } else {
-        trimmed.to_string()
-    }
-}
-
-fn antigravity_mcp_server_config(server: &StartupMcpServer) -> Option<Value> {
-    let name = server.name.trim();
-    if name.is_empty() {
-        return None;
-    }
-    match &server.transport {
-        StartupMcpTransport::Stdio { command, args, env } => {
-            build_stdio_mcp_config(command, args, env)
-        }
-        StartupMcpTransport::Http { url, headers, .. } => build_http_mcp_config(url, headers),
-    }
-}
-
-fn build_stdio_mcp_config(
-    command: &str,
-    args: &[String],
-    env: &HashMap<String, String>,
-) -> Option<Value> {
-    let command = command.trim();
-    if command.is_empty() {
-        return None;
-    }
-    let mut cfg = Map::new();
-    cfg.insert("command".to_string(), Value::String(command.to_string()));
-    cfg.insert(
-        "args".to_string(),
-        to_value(args).expect("Vec<String> is always serializable"),
-    );
-    if !env.is_empty() {
-        cfg.insert(
-            "env".to_string(),
-            to_value(env).expect("HashMap<String, String> is always serializable"),
-        );
-    }
-    Some(Value::Object(cfg))
-}
-
-fn build_http_mcp_config(url: &str, headers: &HashMap<String, String>) -> Option<Value> {
-    let url = url.trim();
-    if url.is_empty() {
-        return None;
-    }
-    let mut cfg = Map::new();
-    cfg.insert("serverUrl".to_string(), Value::String(url.to_string()));
-    if !headers.is_empty() {
-        cfg.insert(
-            "headers".to_string(),
-            to_value(headers).expect("HashMap<String, String> is always serializable"),
-        );
-    }
-    Some(Value::Object(cfg))
 }
 
 fn write_bytes_atomically(path: &Path, bytes: &[u8]) -> Result<(), String> {

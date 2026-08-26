@@ -94,6 +94,39 @@ fn hermes_session_settings() -> SessionSettingsValues {
     values
 }
 
+/// Point the MCP bridge at the `tyde-server` this checkout built.
+///
+/// `resolve_bridge_executable` uses the running executable when it is a Tyde
+/// binary and otherwise falls back to the installed
+/// `~/.tyde/bin/current/tyde-server`. Under nextest the running executable is
+/// a test harness — cloned outside `target/` by the macOS wrapper, so it has no
+/// sibling to find — and the fallback silently runs whatever release is
+/// installed. That is a bridge built from other code than the test is
+/// exercising, which is how a real handshake bug can pass here and fail for a
+/// user.
+fn use_locally_built_mcp_bridge() {
+    const ENV: &str = "TYDE_HERMES_BRIDGE_EXECUTABLE";
+    if std::env::var_os(ENV).is_some() {
+        return;
+    }
+    let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("tests crate has a workspace parent");
+    let binary = if cfg!(windows) {
+        "tyde-server.exe"
+    } else {
+        "tyde-server"
+    };
+    let built = ["debug", "release"]
+        .into_iter()
+        .map(|profile| workspace.join("target").join(profile).join(binary))
+        .find(|path| path.is_file());
+    if let Some(built) = built {
+        // SAFETY: set once, before any scenario spawns a backend.
+        unsafe { std::env::set_var(ENV, built) };
+    }
+}
+
 /// Selection only. Whether a backend can actually run is the server's question,
 /// and it answers it authoritatively when the spawn fails — a check here would
 /// be a second, divergent copy of six different installation rules.
@@ -1897,6 +1930,7 @@ where
     Fut: Future<Output = ()> + 'static,
 {
     init_tracing();
+    use_locally_built_mcp_bridge();
     let (backends, skipped): (Vec<_>, Vec<_>) = enabled_backends().into_iter().partition(|kind| {
         let capabilities = server::backend::capabilities_for_backend_kind(*kind);
         requires
