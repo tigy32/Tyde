@@ -297,7 +297,7 @@ pub fn ChatMessageView(owner_agent_ref: AgentRef, entry: ChatMessageEntry) -> im
             {(request_usage.is_some() || !detail_scopes.is_empty()).then(|| {
                 let expanded = RwSignal::new(false);
                 let summary_label = match &request_usage {
-                    Some(u) => format!("Request: in:{} out:{}", u.input_tokens, u.output_tokens),
+                    Some(u) => format!("Request: in:{} out:{}", u.prompt_tokens(), u.output_tokens),
                     None => "Tokens".to_owned(),
                 };
                 let has_details = !detail_scopes.is_empty();
@@ -344,7 +344,7 @@ pub fn ChatMessageView(owner_agent_ref: AgentRef, entry: ChatMessageEntry) -> im
                                     <div class="token-scope token-detail" data-mobile-test="chat-message-token-detail">
                                         <span class="token-label">{format!("{label}: ")}</span>
                                         <span class="token-value">
-                                            {format!("in:{} out:{}", usage.input_tokens, usage.output_tokens)}
+                                            {format!("in:{} out:{}", usage.prompt_tokens(), usage.output_tokens)}
                                         </span>
                                     </div>
                                 })
@@ -399,6 +399,21 @@ mod wasm_tests {
             total_tokens: input + output,
             cached_prompt_tokens: None,
             cache_creation_input_tokens: None,
+            reasoning_tokens: None,
+        }
+    }
+
+    /// The wire shape Claude reports on a warm prompt cache: `input_tokens` is
+    /// only the uncached slice; the rest of the prompt sits in
+    /// `cached_prompt_tokens` + `cache_creation_input_tokens`. Figures are the
+    /// issue #64 transcript record (56 / 580349 / 1462 for a 5460-token reply).
+    fn cached_usage(input: u64, cached: u64, cache_writes: u64, output: u64) -> TokenUsage {
+        TokenUsage {
+            input_tokens: input,
+            output_tokens: output,
+            total_tokens: input + output,
+            cached_prompt_tokens: Some(cached),
+            cache_creation_input_tokens: Some(cache_writes),
             reasoning_tokens: None,
         }
     }
@@ -602,6 +617,51 @@ mod wasm_tests {
             "no expand affordance when there are no hidden scopes"
         );
         assert_eq!(detail_count(&container), 0, "no detail lines exist");
+    }
+
+    /// The input figure is the whole prompt the model read — uncached input
+    /// plus cache hits plus cache writes — the same sum desktop renders. A
+    /// warm-cache Claude request must never read `in:56` on mobile (#64), in
+    /// the default request line or in the expanded turn line.
+    #[wasm_bindgen_test]
+    async fn mobile_chat_input_figure_includes_cached_prompt_tokens() {
+        let entry = assistant_entry(Some(MessageTokenUsage::request_and_turn_known(
+            cached_usage(56, 580_349, 1_462, 5460),
+            cached_usage(120, 1_160_698, 2_924, 9000),
+        )));
+        let container = mount(entry);
+        next_tick().await;
+
+        let summary = container
+            .query_selector("[data-mobile-test='chat-message-token-summary']")
+            .unwrap()
+            .expect("request scope renders a summary")
+            .text_content()
+            .unwrap_or_default();
+        assert_eq!(
+            summary, "Request: in:581867 out:5460",
+            "request input must count cached prompt tokens"
+        );
+
+        container
+            .query_selector("[data-mobile-test='chat-message-token-toggle']")
+            .unwrap()
+            .expect("turn scope offers an expand affordance")
+            .dyn_into::<HtmlElement>()
+            .unwrap()
+            .click();
+        next_tick().await;
+
+        let detail = container
+            .query_selector("[data-mobile-test='chat-message-token-detail']")
+            .unwrap()
+            .expect("turn scope renders a detail line on expand")
+            .text_content()
+            .unwrap_or_default();
+        assert_eq!(
+            detail, "Turn: in:1163742 out:9000",
+            "turn input must count cached prompt tokens"
+        );
     }
 
     /// A fully-unavailable usage (backend reported nothing) renders no token

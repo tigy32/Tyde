@@ -582,7 +582,7 @@ pub(crate) fn token_badge_data(tu: &protocol::TokenUsage) -> (String, String, St
     let cache_writes = tu.cache_creation_input_tokens.unwrap_or(0);
     let reasoning = tu.reasoning_tokens.unwrap_or(0);
 
-    let display_input = input_base + cached_hits + cache_writes;
+    let display_input = tu.prompt_tokens();
     let display_output = tu.output_tokens;
 
     let input_text = if cached_hits > 0 {

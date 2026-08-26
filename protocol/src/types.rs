@@ -7327,6 +7327,19 @@ pub struct TokenUsage {
     pub reasoning_tokens: Option<u64>,
 }
 
+impl TokenUsage {
+    /// The whole prompt the model read for this request. Backends normalize
+    /// `input_tokens` to the uncached slice only (Claude reports cache reads
+    /// and writes as separate counters; Codex subtracts its cached count to
+    /// match), so a warm-cache request reads as a few dozen tokens unless the
+    /// cache counters are added back.
+    pub fn prompt_tokens(&self) -> u64 {
+        self.input_tokens
+            .saturating_add(self.cached_prompt_tokens.unwrap_or(0))
+            .saturating_add(self.cache_creation_input_tokens.unwrap_or(0))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ModelTurnId(pub String);
 
