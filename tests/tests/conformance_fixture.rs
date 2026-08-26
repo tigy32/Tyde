@@ -98,14 +98,27 @@ fn hermes_session_settings() -> SessionSettingsValues {
 ///
 /// `resolve_bridge_executable` uses the running executable when it is a Tyde
 /// binary and otherwise falls back to the installed
-/// `~/.tyde/bin/current/tyde-server`. Under nextest the running executable is
-/// a test harness — cloned outside `target/` by the macOS wrapper, so it has no
-/// sibling to find — and the fallback silently runs whatever release is
-/// installed. That is a bridge built from other code than the test is
-/// exercising, which is how a real handshake bug can pass here and fail for a
-/// user.
-fn use_locally_built_mcp_bridge() {
+/// `~/.tyde/bin/current/tyde-server`. Under nextest the running executable is a
+/// test harness — cloned outside `target/` by the macOS wrapper, so it has no
+/// sibling to find — and that fallback runs whatever release happens to be
+/// installed.
+///
+/// Which is a trap, and it has already sprung once: `cargo nextest run -p
+/// tests` builds the `server` library but not the `tyde-server` binary, so a
+/// fresh checkout has no local build, every Antigravity MCP scenario silently
+/// ran an older bridge, and the failure read as "the model never called the
+/// tool" — a plausible-looking model problem with no hint that the bridge under
+/// test was never involved. So a missing local build is an error here, not a
+/// fallback.
+fn require_locally_built_mcp_bridge(backends: &[BackendKind]) {
     const ENV: &str = "TYDE_HERMES_BRIDGE_EXECUTABLE";
+    // Only the backends whose MCP goes through the bridge care.
+    if !backends
+        .iter()
+        .any(|kind| matches!(kind, BackendKind::Antigravity | BackendKind::Hermes))
+    {
+        return;
+    }
     if std::env::var_os(ENV).is_some() {
         return;
     }
@@ -117,14 +130,22 @@ fn use_locally_built_mcp_bridge() {
     } else {
         "tyde-server"
     };
-    let built = ["debug", "release"]
+    let candidates = ["debug", "release"]
         .into_iter()
         .map(|profile| workspace.join("target").join(profile).join(binary))
-        .find(|path| path.is_file());
-    if let Some(built) = built {
-        // SAFETY: set once, before any scenario spawns a backend.
-        unsafe { std::env::set_var(ENV, built) };
-    }
+        .collect::<Vec<_>>();
+    let built = candidates.iter().find(|path| path.is_file());
+    let Some(built) = built else {
+        panic!(
+            "the conformance suite needs this checkout's MCP bridge, and none is built.\n\
+             Run `cargo build -p tyde-server`, then re-run.\n\
+             Looked for: {candidates:?}\n\
+             Without it the suite would fall back to the installed release, testing a bridge \
+             built from different code than the one under test."
+        );
+    };
+    // SAFETY: set once, before any scenario spawns a backend.
+    unsafe { std::env::set_var(ENV, built) };
 }
 
 /// Selection only. Whether a backend can actually run is the server's question,
@@ -1930,13 +1951,13 @@ where
     Fut: Future<Output = ()> + 'static,
 {
     init_tracing();
-    use_locally_built_mcp_bridge();
     let (backends, skipped): (Vec<_>, Vec<_>) = enabled_backends().into_iter().partition(|kind| {
         let capabilities = server::backend::capabilities_for_backend_kind(*kind);
         requires
             .iter()
             .all(|requirement| capabilities.contains(*requirement))
     });
+    require_locally_built_mcp_bridge(&backends);
     if backends.is_empty() {
         eprintln!("COVERAGE: no enabled backend declares {requires:?}; this test asserts nothing");
     } else {

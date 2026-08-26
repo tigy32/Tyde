@@ -18,14 +18,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use protocol::{
-    AgentExecutionMode, AgentId, AskUserQuestion, AskUserQuestionOption, ToolRequestType,
-};
-
-use crate::backend::agent_control_progress::{
-    is_tyde_agent_control_await_tool_name, is_tyde_agent_control_send_message_tool_name,
-    is_tyde_agent_control_spawn_tool_name,
-};
+use protocol::{AgentExecutionMode, AskUserQuestion, AskUserQuestionOption, ToolRequestType};
 
 /// One line of `agy`'s stdout.
 ///
@@ -407,44 +400,20 @@ fn arg_str(args: &Value, key: &str) -> Option<String> {
 /// inventing an empty diff.
 pub fn tool_request_type(tool_name: &str, args: &Value, enriched: bool) -> ToolRequestType {
     match tool_name {
-        // Every MCP call arrives as one dispatcher tool. The card has to be
-        // about the tool the model actually reached for, not about the
-        // dispatcher — otherwise Tyde's own agent-control tools render as an
-        // opaque `call_mcp_tool` blob and nothing downstream can recognise a
-        // spawn.
+        // Every MCP call arrives as one dispatcher tool. Unwrapping it is the
+        // whole job here: the card, and the shared agent-control projection in
+        // `EventStream`, both key off the tool the model actually reached for.
+        // Left wrapped, Tyde's own tools reach that seam as `call_mcp_tool`
+        // with the real name buried in the arguments, and nothing downstream
+        // can recognise a spawn. Typing them is deliberately NOT done here —
+        // the seam does it once for every backend, and only for requests still
+        // carrying `Other`.
         MCP_DISPATCH_TOOL => {
             let (inner_name, inner_args) = mcp_inner_call(args);
-            tool_request_type(&inner_name, &inner_args, enriched)
+            // An MCP call's arguments always arrive whole, so the enrichment
+            // question does not apply to what is inside the dispatcher.
+            tool_request_type(&inner_name, &inner_args, true)
         }
-        name if is_tyde_agent_control_spawn_tool_name(name) => ToolRequestType::AgentSpawn {
-            prompt: arg_str(args, "prompt"),
-            name: arg_str(args, "name"),
-            // Tyde owns the child's lifetime, not the turn that asked for it:
-            // the parent goes idle while the child runs and picks the result up
-            // through `tyde_await_agents`.
-            execution_mode: AgentExecutionMode::Background,
-        },
-        name if is_tyde_agent_control_send_message_tool_name(name) => {
-            match (arg_str(args, "agent_id"), arg_str(args, "message")) {
-                (Some(agent_id), Some(message)) => ToolRequestType::TydeSendAgentMessage {
-                    agent_id: AgentId(agent_id),
-                    message,
-                },
-                _ => ToolRequestType::Other { args: args.clone() },
-            }
-        }
-        name if is_tyde_agent_control_await_tool_name(name) => ToolRequestType::TydeAwaitAgents {
-            agent_ids: args
-                .get("agent_ids")
-                .and_then(Value::as_array)
-                .map(|ids| {
-                    ids.iter()
-                        .filter_map(Value::as_str)
-                        .map(|id| AgentId(id.to_owned()))
-                        .collect()
-                })
-                .unwrap_or_default(),
-        },
         "run_command" => ToolRequestType::RunCommand {
             command: arg_str(args, "CommandLine").unwrap_or_default(),
             working_directory: arg_str(args, "Cwd").unwrap_or_default(),

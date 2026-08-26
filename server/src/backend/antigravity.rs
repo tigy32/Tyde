@@ -675,6 +675,7 @@ impl TurnMapper {
             .as_ref()
             .and_then(|info| info.output.clone())
             .unwrap_or_default();
+        let is_mcp_dispatch = step.tool_name.as_deref() == Some(MCP_DISPATCH_TOOL);
         emitter.tool_completed(
             &open.tool_call_id,
             ToolExecutionOutcome::Succeeded {
@@ -682,6 +683,7 @@ impl TurnMapper {
                     &open.tool_type,
                     &output,
                     transcript_result.as_deref(),
+                    is_mcp_dispatch,
                 ),
             },
         );
@@ -1078,7 +1080,18 @@ fn tool_execution_result(
     tool_type: &ToolRequestType,
     output: &str,
     transcript_result: Option<&str>,
+    is_mcp_dispatch: bool,
 ) -> ToolExecutionResult {
+    // An MCP tool's body is whatever that server returned, and the shared
+    // agent-control projection reads Tyde's own tools out of it. It recognises
+    // a result that is the provider's own payload — including a string holding
+    // JSON — but not a `{"output": ...}` envelope invented here, so an MCP
+    // result is passed through verbatim rather than wrapped.
+    if is_mcp_dispatch {
+        return ToolExecutionResult::Other {
+            result: Value::String(output.to_string()),
+        };
+    }
     match tool_type {
         ToolRequestType::ModifyFile { before, after, .. } => {
             let (lines_added, lines_removed) = crate::backend::estimate_line_delta(before, after);
@@ -1117,10 +1130,6 @@ fn tool_execution_result(
             image_count: 1,
         },
         ToolRequestType::TydeSendAgentMessage { .. } => ToolExecutionResult::TydeSendAgentMessage,
-        // The await card shows which watched agents finished and which are
-        // still thinking, so the verdict has to be read out of the tool's own
-        // JSON rather than left as an opaque blob.
-        ToolRequestType::TydeAwaitAgents { .. } => tyde_await_result(output),
         // Headless `agy` answers its own questions. Saying so is the whole
         // value of the card: the alternative is a question card that looks
         // like it is still waiting for the user who never saw it.
@@ -1245,31 +1254,6 @@ fn antigravity_capacity_bucket(group: &str, bucket: &AgyUsageBucket) -> Capacity
             })
             .unwrap_or(CapacityReset::NotReported),
         status: None,
-    }
-}
-
-/// Parses `tyde_await_agents`'s `{ready, still_thinking}` payload.
-///
-/// A malformed or absent body degrades to the raw output rather than an empty
-/// verdict: reporting "nothing was waiting" when the call did wait would be a
-/// worse card than an unparsed one.
-fn tyde_await_result(output: &str) -> ToolExecutionResult {
-    #[derive(serde::Deserialize)]
-    struct AwaitPayload {
-        #[serde(default)]
-        ready: Vec<protocol::TydeAgentWaitStatus>,
-        #[serde(default)]
-        still_thinking: Vec<protocol::TydeAgentWaitStatus>,
-    }
-
-    match serde_json::from_str::<AwaitPayload>(output.trim()) {
-        Ok(payload) => ToolExecutionResult::TydeAwaitAgents {
-            ready: payload.ready,
-            still_thinking: payload.still_thinking,
-        },
-        Err(_) => ToolExecutionResult::Other {
-            result: json!({ "output": output }),
-        },
     }
 }
 
