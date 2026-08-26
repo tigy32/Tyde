@@ -9,17 +9,17 @@ use crate::types::{
 };
 use crate::{
     AgentActivityStatsPayload, AgentActivitySummaryPayload, AgentClosedPayload, AgentOrigin,
-    AgentStartPayload, AgentsViewPreferencesNotifyPayload, BackendCapacityPayload,
-    BackendConfigSchemasPayload, BackendConfigSnapshotsPayload, BackendKind,
-    BackendNativeSettingsWritePayload, BackendSettingsRefreshPayload, BackendSetupPayload,
-    CancelWorkflowPayload, ChatEvent, ClientErrorPayload, CodeIntelDiagnosticsPayload,
-    CodeIntelErrorPayload, CodeIntelFileModelPayload, CodeIntelHoverResultPayload,
-    CodeIntelNavigateResultPayload, CodeIntelOverviewPayload, CodeIntelReferencesCompletePayload,
-    CodeIntelReferencesResultsPayload, CodeIntelStatusPayload, CommandErrorPayload,
-    ContextCompactionCapabilityPayload, ContextCompactionNotifyPayload, CustomAgentDeletePayload,
-    CustomAgentNotifyPayload, CustomAgentUpsertPayload, DeleteSessionPayload, Envelope,
-    FetchSessionHistoryPayload, FrameKind, HeartbeatPayload, HostBootstrapPayload,
-    HostBrowseClosePayload, HostBrowseEntriesPayload, HostBrowseErrorPayload,
+    AgentStartPayload, AgentTurnStateNotifyPayload, AgentsViewPreferencesNotifyPayload,
+    BackendCapacityPayload, BackendConfigSchemasPayload, BackendConfigSnapshotsPayload,
+    BackendKind, BackendNativeSettingsWritePayload, BackendSettingsRefreshPayload,
+    BackendSetupPayload, CancelWorkflowPayload, ChatEvent, ClientErrorPayload,
+    CodeIntelDiagnosticsPayload, CodeIntelErrorPayload, CodeIntelFileModelPayload,
+    CodeIntelHoverResultPayload, CodeIntelNavigateResultPayload, CodeIntelOverviewPayload,
+    CodeIntelReferencesCompletePayload, CodeIntelReferencesResultsPayload, CodeIntelStatusPayload,
+    CommandErrorPayload, ContextCompactionCapabilityPayload, ContextCompactionNotifyPayload,
+    CustomAgentDeletePayload, CustomAgentNotifyPayload, CustomAgentUpsertPayload,
+    DeleteSessionPayload, Envelope, FetchSessionHistoryPayload, FrameKind, HeartbeatPayload,
+    HostBootstrapPayload, HostBrowseClosePayload, HostBrowseEntriesPayload, HostBrowseErrorPayload,
     HostBrowseListPayload, HostBrowseOpenedPayload, HostBrowseStartPayload, HostSettingsPayload,
     InvokeSettingsActionPayload, LaunchProfileCatalogPayload, ListSessionsPayload,
     LoadAgentPayload, McpServerDeletePayload, McpServerNotifyPayload, McpServerUpsertPayload,
@@ -526,6 +526,11 @@ impl ProtocolValidator {
                     envelope.stream
                 ),
             )),
+            FrameKind::AgentTurnStateNotify => parse_host_payload::<AgentTurnStateNotifyPayload>(
+                self,
+                envelope,
+                "AgentTurnStateNotify",
+            ),
             FrameKind::TaskTokenUsage => {
                 parse_host_payload::<TaskTokenUsagePayload>(self, envelope, "TaskTokenUsage")
             }

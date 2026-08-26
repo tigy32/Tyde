@@ -3688,6 +3688,7 @@ mod wasm_tests {
                 created_at_ms,
                 instance_stream: agent_stream(agent_id),
                 activity_summary: Default::default(),
+                turn_active: false,
             },
         );
         // Prime the agent's instance stream so subsequent

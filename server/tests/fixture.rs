@@ -1229,6 +1229,72 @@ async fn connect_client_with_bootstrap(
     (client, bootstrap)
 }
 
+/// Connect as a paired mobile device over the real mobile connection path,
+/// which registers the host stream with `AgentReplayMode::Lazy`: no agent
+/// stream is attached until the client sends `LoadAgent`. Returns the client
+/// with its `HostBootstrap` already parsed.
+#[allow(dead_code)]
+pub async fn connect_mobile_client_with_bootstrap(
+    host: server::HostHandle,
+    device_id: &str,
+) -> (client::Connection, HostBootstrapPayload) {
+    let mut client = connect_raw_mobile_client(host, device_id).await;
+    let env = next_frame_matching_on(&mut client, "mobile HostBootstrap", |env| {
+        env.kind == FrameKind::HostBootstrap
+    })
+    .await;
+    let bootstrap: HostBootstrapPayload = env
+        .parse_payload()
+        .expect("parse mobile HostBootstrapPayload");
+    (client, bootstrap)
+}
+
+#[allow(dead_code)]
+pub async fn connect_raw_mobile_client(
+    host: server::HostHandle,
+    device_id: &str,
+) -> client::Connection {
+    let (client_stream, server_stream) = tokio::io::duplex(8192);
+    let server_config = server::ServerConfig::current();
+    let client_config = client::ClientConfig::current();
+    let device_id = protocol::MobileDeviceId(device_id.to_owned());
+
+    tokio::spawn(async move {
+        let conn = server::accept(&server_config, server_stream)
+            .await
+            .expect("mobile handshake failed");
+        if let Err(err) = server::run_mobile_connection(conn, host, device_id).await {
+            eprintln!("mobile connection loop failed: {err:?}");
+        }
+    });
+
+    client::connect(&client_config, client_stream)
+        .await
+        .expect("mobile client handshake failed")
+}
+
+/// Send `LoadAgent` on `agent_stream` — the lazy client's request to attach
+/// an agent's instance stream — without waiting for the reply.
+#[allow(dead_code)]
+pub async fn send_load_agent_on(client: &mut client::Connection, agent_stream: &StreamPath) {
+    let seq = client
+        .outgoing_seq
+        .get(agent_stream)
+        .copied()
+        .unwrap_or_else(|| panic!("no outgoing sequence for agent stream {agent_stream}"));
+    let envelope = Envelope::from_payload(
+        agent_stream.clone(),
+        FrameKind::LoadAgent,
+        seq,
+        &protocol::LoadAgentPayload {},
+    )
+    .expect("serialize LoadAgent");
+    client.outgoing_seq.insert(agent_stream.clone(), seq + 1);
+    protocol::write_envelope(&mut client.writer, &envelope)
+        .await
+        .expect("write LoadAgent");
+}
+
 async fn connect_raw_client(host: server::HostHandle) -> client::Connection {
     let (client_stream, server_stream) = tokio::io::duplex(8192);
     let server_config = server::ServerConfig::current();

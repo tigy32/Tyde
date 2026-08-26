@@ -10,12 +10,12 @@ use protocol::types::{AgentClosedPayload, CloseAgentPayload};
 use protocol::{
     AgentActivityStatsPayload, AgentActivitySummaryPayload, AgentBootstrapPayload,
     AgentErrorPayload, AgentId, AgentRenamedPayload, AgentStartPayload,
-    AgentsViewPreferencesNotifyPayload, BackendCapacityPayload, BackendConfigSchemasPayload,
-    BackendConfigSnapshotsPayload, BackendSettingsRefreshPayload, BackendSetupPayload,
-    BrowseBootstrapPayload, CancelBackgroundTaskPayload, CancelQueuedMessagePayload,
-    CancelWorkflowPayload, CodeIntelDiagnosticsPayload, CodeIntelErrorPayload,
-    CodeIntelFileModelPayload, CodeIntelHoverResultPayload, CodeIntelNavigateResultPayload,
-    CodeIntelOverviewPayload, CodeIntelReferencesCompletePayload,
+    AgentTurnStateNotifyPayload, AgentsViewPreferencesNotifyPayload, BackendCapacityPayload,
+    BackendConfigSchemasPayload, BackendConfigSnapshotsPayload, BackendSettingsRefreshPayload,
+    BackendSetupPayload, BrowseBootstrapPayload, CancelBackgroundTaskPayload,
+    CancelQueuedMessagePayload, CancelWorkflowPayload, CodeIntelDiagnosticsPayload,
+    CodeIntelErrorPayload, CodeIntelFileModelPayload, CodeIntelHoverResultPayload,
+    CodeIntelNavigateResultPayload, CodeIntelOverviewPayload, CodeIntelReferencesCompletePayload,
     CodeIntelReferencesResultsPayload, CodeIntelStatusPayload, CommandErrorPayload,
     ContextCompactionCapabilityPayload, ContextCompactionNotifyPayload, CustomAgentDeletePayload,
     CustomAgentNotifyPayload, CustomAgentUpsertPayload, DeleteSessionPayload,
@@ -1398,6 +1398,10 @@ impl Connection {
                 }
                 FrameKind::CommandError => {
                     let _: CommandErrorPayload =
+                        envelope.parse_payload().map_err(FrameError::Json)?;
+                }
+                FrameKind::AgentTurnStateNotify => {
+                    let _: AgentTurnStateNotifyPayload =
                         envelope.parse_payload().map_err(FrameError::Json)?;
                 }
                 FrameKind::AgentClosed => {

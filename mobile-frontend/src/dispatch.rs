@@ -10,21 +10,21 @@ use protocol::types::{AgentCompactNotifyPayload, AgentCompactStatus};
 use protocol::{
     AgentActivityStatsPayload, AgentActivitySummaryPayload, AgentBootstrapEvent,
     AgentBootstrapPayload, AgentClosedPayload, AgentErrorPayload, AgentId, AgentOrigin,
-    AgentRenamedPayload, AgentStartPayload, BackendCapacityPayload, BackendConfigSchemasPayload,
-    BackendSetupPayload, BrowseBootstrapListing, BrowseBootstrapPayload, ChatEvent,
-    ClientErrorCode, CodeIntelOverviewPayload, CommandErrorPayload,
-    ContextCompactionCapabilityPayload, ContextCompactionNotifyPayload, CustomAgentNotifyPayload,
-    Envelope, FrameKind, HeartbeatPayload, HostBrowseEntriesPayload, HostBrowseErrorPayload,
-    HostBrowseOpenedPayload, LaunchProfileCatalogPayload, ListSessionsPayload,
-    McpServerNotifyPayload, NewAgentPayload, ProjectBootstrapPayload, ProjectEventPayload,
-    ProjectFileContentsPayload, ProjectGitDiffPayload, ProjectGitStatusPayload, ProjectId,
-    ProjectNotifyPayload, QueuedMessagesPayload, RejectCode, RejectPayload, ReviewBootstrapPayload,
-    ReviewEventPayload, ReviewId, SeqMismatch, SessionHistoryPayload, SessionListPayload,
-    SessionSchemasPayload, SessionSettingsPayload, SkillNotifyPayload, SteeringNotifyPayload,
-    StreamPath, TaskTokenUsagePayload, TeamCompactNotifyPayload, TeamCompactStatus,
-    TeamContextCompactionNotifyPayload, TeamDraftNotifyPayload, TeamMemberBindingNotifyPayload,
-    TeamMemberNotifyPayload, TeamMemberShuffleSuggestionNotifyPayload, TeamNotifyPayload,
-    TeamPresetCatalogNotifyPayload,
+    AgentRenamedPayload, AgentStartPayload, AgentTurnStateNotifyPayload, BackendCapacityPayload,
+    BackendConfigSchemasPayload, BackendSetupPayload, BrowseBootstrapListing,
+    BrowseBootstrapPayload, ChatEvent, ClientErrorCode, CodeIntelOverviewPayload,
+    CommandErrorPayload, ContextCompactionCapabilityPayload, ContextCompactionNotifyPayload,
+    CustomAgentNotifyPayload, Envelope, FrameKind, HeartbeatPayload, HostBrowseEntriesPayload,
+    HostBrowseErrorPayload, HostBrowseOpenedPayload, LaunchProfileCatalogPayload,
+    ListSessionsPayload, McpServerNotifyPayload, NewAgentPayload, ProjectBootstrapPayload,
+    ProjectEventPayload, ProjectFileContentsPayload, ProjectGitDiffPayload,
+    ProjectGitStatusPayload, ProjectId, ProjectNotifyPayload, QueuedMessagesPayload, RejectCode,
+    RejectPayload, ReviewBootstrapPayload, ReviewEventPayload, ReviewId, SeqMismatch,
+    SessionHistoryPayload, SessionListPayload, SessionSchemasPayload, SessionSettingsPayload,
+    SkillNotifyPayload, SteeringNotifyPayload, StreamPath, TaskTokenUsagePayload,
+    TeamCompactNotifyPayload, TeamCompactStatus, TeamContextCompactionNotifyPayload,
+    TeamDraftNotifyPayload, TeamMemberBindingNotifyPayload, TeamMemberNotifyPayload,
+    TeamMemberShuffleSuggestionNotifyPayload, TeamNotifyPayload, TeamPresetCatalogNotifyPayload,
 };
 
 use crate::bridge;
@@ -377,6 +377,32 @@ pub fn dispatch_envelope(state: &AppState, host: &LocalHostId, envelope: Envelop
         | FrameKind::VoiceOutput
         | FrameKind::VoiceStop
         | FrameKind::VoiceError => crate::voice::handle_control(state, host, &envelope),
+        FrameKind::AgentTurnStateNotify => {
+            match envelope.parse_payload::<AgentTurnStateNotifyPayload>() {
+                Ok(payload) => {
+                    let agent_ref = AgentRef {
+                        local_host_id: host.clone(),
+                        agent_id: payload.agent_id,
+                    };
+                    log::info!(
+                        "dispatch agent_turn_state_notify host={} agent_id={} turn_active={}",
+                        host,
+                        agent_ref.agent_id,
+                        payload.turn_active
+                    );
+                    if !agent_is_fatal(state, &agent_ref) {
+                        set_agent_turn_active(state, agent_ref, payload.turn_active);
+                    }
+                }
+                Err(error) => log::error!(
+                    "failed to parse AgentTurnStateNotify host={} stream={} seq={}: {}",
+                    host,
+                    envelope.stream,
+                    envelope.seq,
+                    error
+                ),
+            }
+        }
         FrameKind::AgentActivitySummary => {
             match envelope.parse_payload::<AgentActivitySummaryPayload>() {
                 Ok(_payload) => {}
@@ -477,12 +503,14 @@ pub fn dispatch_envelope(state: &AppState, host: &LocalHostId, envelope: Envelop
                 let instance_stream = payload.instance_stream.clone();
                 let origin = payload.origin;
                 let started = payload.session_id.is_some();
+                let turn_active = payload.turn_active;
                 log::info!(
-                    "mobile_apply_new_agent host={} agent_id={} instance_stream={} origin={:?}",
+                    "mobile_apply_new_agent host={} agent_id={} instance_stream={} origin={:?} turn_active={}",
                     host,
                     agent_id,
                     instance_stream,
-                    origin
+                    origin,
+                    turn_active
                 );
                 let info = AgentInfo {
                     local_host_id: host.clone(),
@@ -504,6 +532,14 @@ pub fn dispatch_envelope(state: &AppState, host: &LocalHostId, envelope: Envelop
                     agents.retain(|a| !(a.local_host_id == *host && a.agent_id == agent_id));
                     agents.push(info);
                 });
+                set_agent_turn_active(
+                    state,
+                    AgentRef {
+                        local_host_id: host.clone(),
+                        agent_id: agent_id.clone(),
+                    },
+                    turn_active,
+                );
 
                 // User-origin agents auto-open into the chat view — the user
                 // just asked for this one. BTW forks are User-origin too.
@@ -2691,9 +2727,11 @@ fn apply_host_bootstrap(
     for dropped in &dropped_refs {
         state.forget_session_history(dropped);
     }
+    let mut turn_states = Vec::with_capacity(payload.agents.len());
     state.agents.update(|agents| {
         agents.retain(|a| a.local_host_id != *host || snapshot_ids.contains(&a.agent_id));
         for payload in payload.agents {
+            let turn_active = payload.turn_active;
             let mut info = agent_info_from_payload(host, payload);
             if let Some(existing) = agents
                 .iter_mut()
@@ -2708,10 +2746,27 @@ fn apply_host_bootstrap(
                 if info.session_id.is_none() {
                     info.session_id = existing.session_id.clone();
                 }
+                turn_states.push((info.agent_ref(), turn_active && info.fatal_error.is_none()));
                 *existing = info;
             } else {
+                turn_states.push((info.agent_ref(), turn_active));
                 agents.push(info);
             }
+        }
+    });
+    // The snapshot is the only liveness a lazy client has for agents it never
+    // opens; a fatal row keeps its settled state regardless.
+    for (agent_ref, turn_active) in turn_states {
+        set_agent_turn_active(state, agent_ref, turn_active);
+    }
+}
+
+fn set_agent_turn_active(state: &AppState, agent_ref: AgentRef, turn_active: bool) {
+    state.agent_turn_active.update(|map| {
+        if turn_active {
+            map.insert(agent_ref, true);
+        } else {
+            map.remove(&agent_ref);
         }
     });
 }
@@ -3519,6 +3574,7 @@ mod wasm_tests {
                     created_at_ms: 1,
                     instance_stream: StreamPath("/agent/old-agent/inst".to_owned()),
                     activity_summary: Default::default(),
+                    turn_active: false,
                 },
             ),
         );
@@ -3577,6 +3633,7 @@ mod wasm_tests {
                     created_at_ms: 2,
                     instance_stream: StreamPath("/agent/new-agent/inst".to_owned()),
                     activity_summary: Default::default(),
+                    turn_active: false,
                 },
             ),
         );
@@ -3801,6 +3858,7 @@ mod wasm_tests {
             created_at_ms: 1,
             instance_stream: StreamPath("/agent/a-1/inst".to_owned()),
             activity_summary: Default::default(),
+            turn_active: true,
         };
         let bootstrap = settings_model::HostBootstrapPayload {
             settings: settings_model::HostSettings {
@@ -3912,6 +3970,60 @@ mod wasm_tests {
             settings.is_some_and(|s| s.default_backend == Some(protocol::BackendKind::Codex)),
             "HostBootstrap should set host settings"
         );
+
+        // The snapshot is the only liveness a lazy client has for an agent it
+        // never opens, so a running agent must read as running straight from
+        // HostBootstrap — not only after its AgentBootstrap.
+        let agent_ref = AgentRef {
+            local_host_id: host.clone(),
+            agent_id: agent_payload.agent_id.clone(),
+        };
+        assert!(
+            state
+                .agent_turn_active
+                .with_untracked(|map| map.get(&agent_ref).copied().unwrap_or(false)),
+            "HostBootstrap turn_active=true must mark the agent's turn active"
+        );
+
+        // Later changes for an unattached agent arrive on the host stream.
+        dispatch_envelope(
+            &state,
+            &host,
+            envelope(
+                "/host/mobile-host-bootstrap",
+                FrameKind::AgentTurnStateNotify,
+                2,
+                &protocol::AgentTurnStateNotifyPayload {
+                    agent_id: agent_payload.agent_id.clone(),
+                    turn_active: false,
+                },
+            ),
+        );
+        assert!(
+            !state
+                .agent_turn_active
+                .with_untracked(|map| map.contains_key(&agent_ref)),
+            "AgentTurnStateNotify turn_active=false must settle the agent idle"
+        );
+        dispatch_envelope(
+            &state,
+            &host,
+            envelope(
+                "/host/mobile-host-bootstrap",
+                FrameKind::AgentTurnStateNotify,
+                3,
+                &protocol::AgentTurnStateNotifyPayload {
+                    agent_id: agent_payload.agent_id.clone(),
+                    turn_active: true,
+                },
+            ),
+        );
+        assert!(
+            state
+                .agent_turn_active
+                .with_untracked(|map| map.get(&agent_ref).copied().unwrap_or(false)),
+            "AgentTurnStateNotify turn_active=true must mark the agent running again"
+        );
     }
 
     #[wasm_bindgen_test]
@@ -3947,6 +4059,7 @@ mod wasm_tests {
                     created_at_ms: 1,
                     instance_stream: instance_stream.clone(),
                     activity_summary: Default::default(),
+                    turn_active: false,
                 },
             ),
         );
@@ -4061,6 +4174,7 @@ mod wasm_tests {
                     created_at_ms: 1,
                     instance_stream: instance_stream.clone(),
                     activity_summary: Default::default(),
+                    turn_active: false,
                 },
             ),
         );

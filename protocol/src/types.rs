@@ -13,7 +13,7 @@ use serde_json::Value;
 /// `protocol::TydeReleaseVersion`.
 pub use host_config::{LOCAL_HOST_ID, TydeReleaseVersion};
 
-pub const PROTOCOL_VERSION: u32 = 50;
+pub const PROTOCOL_VERSION: u32 = 51;
 pub const TYDE_VERSION: Version = Version {
     major: 0,
     minor: 8,
@@ -1158,6 +1158,7 @@ pub enum FrameKind {
     NewAgent,
     AgentActivitySummary,
     AgentActivityStats,
+    AgentTurnStateNotify,
     TaskTokenUsage,
     AgentStart,
     AgentRenamed,
@@ -1348,6 +1349,7 @@ impl fmt::Display for FrameKind {
             Self::NewAgent => f.write_str("new_agent"),
             Self::AgentActivitySummary => f.write_str("agent_activity_summary"),
             Self::AgentActivityStats => f.write_str("agent_activity_stats"),
+            Self::AgentTurnStateNotify => f.write_str("agent_turn_state_notify"),
             Self::TaskTokenUsage => f.write_str("task_token_usage"),
             Self::AgentStart => f.write_str("agent_start"),
             Self::AgentRenamed => f.write_str("agent_renamed"),
@@ -4168,6 +4170,15 @@ pub struct AgentActivitySummaryPayload {
     pub state: AgentActivitySummaryState,
 }
 
+/// Host-stream liveness update for an agent whose instance stream the
+/// subscriber has not attached. Once the stream is attached, `AgentBootstrap`
+/// and the agent's own chat events are authoritative and this frame stops.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentTurnStateNotifyPayload {
+    pub agent_id: AgentId,
+    pub turn_active: bool,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentActivityStats {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -4387,6 +4398,11 @@ pub struct NewAgentPayload {
     pub instance_stream: StreamPath,
     #[serde(default)]
     pub activity_summary: AgentActivitySummaryState,
+    /// Liveness when this descriptor was built, with the same meaning as
+    /// `AgentBootstrapPayload::turn_active`. A client that has not attached
+    /// the agent's instance stream has no other way to learn it.
+    #[serde(default)]
+    pub turn_active: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

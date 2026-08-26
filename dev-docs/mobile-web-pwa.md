@@ -68,6 +68,10 @@ Mobile is the only `AgentReplayMode::Lazy` client. `LoadAgent` followed by the
 authoritative `AgentBootstrap` is the sole gate that marks mobile chat content
 loaded; transport or protocol failures must therefore terminate that loading
 state visibly rather than leave it pending.
+Because nothing is attached before `LoadAgent`, the agent list's running/idle
+state comes from `NewAgentPayload::turn_active` in `HostBootstrap`/`NewAgent`
+and from `AgentTurnStateNotify` on the host stream for unattached agents (see
+`21-bootstrap-streams.md`).
 
 ## Why this is feasible (key findings)
 

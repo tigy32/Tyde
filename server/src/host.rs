@@ -20,9 +20,9 @@ use protocol::{
     AgentActivitySummaryState, AgentAnnotationTarget, AgentControlStatus, AgentGroupsUpdate,
     AgentId, AgentInput, AgentOrderKey, AgentOrigin, AgentPinsUpdate, AgentStartPayload,
     AgentSystemTagAssignment, AgentSystemTagDescriptor, AgentSystemTagId, AgentTagsSnapshot,
-    AgentTagsUpdate, AgentWorkflowMetadata, AgentsViewPreferencesNotifyPayload,
-    AgentsViewPreferencesSnapshot, AgentsViewPreferencesUpdate, BackendCapacityPayload,
-    BackendCapacitySnapshot, BackendCapacityState, BackendConfigSnapshot,
+    AgentTagsUpdate, AgentTurnStateNotifyPayload, AgentWorkflowMetadata,
+    AgentsViewPreferencesNotifyPayload, AgentsViewPreferencesSnapshot, AgentsViewPreferencesUpdate,
+    BackendCapacityPayload, BackendCapacitySnapshot, BackendCapacityState, BackendConfigSnapshot,
     BackendConfigSnapshotsPayload, BackendKind, BackendNativeSettingsSnapshot,
     BackendSettingsRefreshPayload, BackendSetupPayload, BrowseBootstrapListing,
     BrowseBootstrapPayload, CancelWorkflowPayload, ChatEvent, ChatMessage,
@@ -75,7 +75,7 @@ use protocol::{
     WorkflowTargetsResponse,
 };
 use settings_model::HostLaunchProfileConfig;
-use tokio::sync::{Mutex, Semaphore, mpsc, oneshot, watch};
+use tokio::sync::{Mutex, Semaphore, broadcast, mpsc, oneshot, watch};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -85,8 +85,8 @@ use crate::agent::customization::{
     protocol_mcp_servers_to_startup, resolve_spawn_config,
 };
 use crate::agent::registry::{
-    AgentRegistry, AgentStartupFailure, InitialAgentAlias, InitialAgentAliasPersistence,
-    RelaySpawnRequest, ResolvedSpawnRequest,
+    AgentRegistry, AgentStartupFailure, AgentStatusTransition, InitialAgentAlias,
+    InitialAgentAliasPersistence, RelaySpawnRequest, ResolvedSpawnRequest,
 };
 use crate::agent::{
     AgentHandle, AgentUsageSnapshot, CompactionStart, CompactionSummary,
@@ -227,7 +227,7 @@ struct HostSubscriber {
     // HostBootstrap is a point-in-time list; ListSessions opts into updates.
     session_summary_updates_subscribed: bool,
     new_agent_fanouts_in_flight: u32,
-    held_summary_count_frames: Vec<serde_json::Value>,
+    held_fanout_frames: Vec<(FrameKind, serde_json::Value)>,
     known_agent_streams: HashSet<StreamPath>,
     attached_agent_streams: HashSet<StreamPath>,
     bootstrapped_agent_streams: HashSet<StreamPath>,
@@ -249,6 +249,7 @@ struct PendingNewAgentFanout {
     instance_stream: StreamPath,
     attach_eagerly: bool,
     activity_summary: AgentActivitySummaryState,
+    turn_active: bool,
 }
 
 struct NewAgentFanoutBatchGuard {
@@ -2337,7 +2338,7 @@ impl HostHandle {
                 session_list_snapshot: None,
                 session_summary_updates_subscribed: false,
                 new_agent_fanouts_in_flight: 0,
-                held_summary_count_frames: Vec::new(),
+                held_fanout_frames: Vec::new(),
                 known_agent_streams: HashSet::new(),
                 attached_agent_streams: HashSet::new(),
                 bootstrapped_agent_streams: HashSet::new(),
@@ -2599,6 +2600,7 @@ impl HostHandle {
             });
             let start = agent_handle.snapshot();
             let activity_summary = current_agent_activity_summary_state(&state, &start.agent_id);
+            let turn_active = agent_turn_active(&state, &start.agent_id).await;
             let Some(subscriber) = state.host_streams.get_mut(&host_path) else {
                 panic!(
                     "host stream {} disappeared during registration bootstrap build",
@@ -2623,6 +2625,7 @@ impl HostHandle {
                 created_at_ms: start.created_at_ms,
                 instance_stream: instance_stream.clone(),
                 activity_summary,
+                turn_active,
             };
             subscriber
                 .known_agent_streams
@@ -2762,6 +2765,7 @@ impl HostHandle {
                 pending.instance_stream,
                 pending.attach_eagerly,
                 pending.activity_summary,
+                pending.turn_active,
             ) {
                 Ok(Some(attachment)) => {
                     agent_visibility
@@ -5130,6 +5134,7 @@ impl HostHandle {
             let mut state = self.state.lock().await;
             let activity_summary =
                 initial_agent_activity_summary_state(&mut state, &start.agent_id);
+            let turn_active = agent_turn_active(&state, &start.agent_id).await;
             let host_streams = state
                 .host_streams
                 .iter_mut()
@@ -5139,15 +5144,23 @@ impl HostHandle {
                         &start,
                         &agent_handle,
                         activity_summary.clone(),
+                        turn_active,
                     )
                     .map(
-                        |(stream, attach_eagerly, instance_stream, activity_summary)| {
+                        |(
+                            stream,
+                            attach_eagerly,
+                            instance_stream,
+                            activity_summary,
+                            turn_active,
+                        )| {
                             (
                                 path.clone(),
                                 stream,
                                 attach_eagerly,
                                 instance_stream,
                                 activity_summary,
+                                turn_active,
                             )
                         },
                     )
@@ -5172,14 +5185,16 @@ impl HostHandle {
         host_streams.sort_by(|left, right| left.0.0.cmp(&right.0.0));
         let fanout_paths = host_streams
             .iter()
-            .map(|(path, _, _, _, _)| path.clone())
+            .map(|(path, _, _, _, _, _)| path.clone())
             .collect::<Vec<_>>();
         let fanout_guard = NewAgentFanoutBatchGuard::new(Arc::clone(&self.state), fanout_paths);
 
         let mut dead_paths = Vec::new();
         let mut deferred_attachments = Vec::new();
         let mut publication_claimed = false;
-        for (path, stream, attach_eagerly, instance_stream, activity_summary) in host_streams {
+        for (path, stream, attach_eagerly, instance_stream, activity_summary, turn_active) in
+            host_streams
+        {
             if !visibility.may_emit_new_agent() {
                 break;
             }
@@ -5199,6 +5214,7 @@ impl HostHandle {
                 instance_stream,
                 attach_eagerly,
                 activity_summary,
+                turn_active,
             ) {
                 Ok(attachment) => {
                     let continue_fanout = visibility.record_new_agent_delivery(path.clone());
@@ -5580,6 +5596,7 @@ impl HostHandle {
             let mut state = self.state.lock().await;
             let activity_summary =
                 initial_agent_activity_summary_state(&mut state, &start.agent_id);
+            let turn_active = agent_turn_active(&state, &start.agent_id).await;
             let host_streams = state
                 .host_streams
                 .iter_mut()
@@ -5589,15 +5606,23 @@ impl HostHandle {
                         &start,
                         &agent_handle,
                         activity_summary.clone(),
+                        turn_active,
                     )
                     .map(
-                        |(stream, attach_eagerly, instance_stream, activity_summary)| {
+                        |(
+                            stream,
+                            attach_eagerly,
+                            instance_stream,
+                            activity_summary,
+                            turn_active,
+                        )| {
                             (
                                 path.clone(),
                                 stream,
                                 attach_eagerly,
                                 instance_stream,
                                 activity_summary,
+                                turn_active,
                             )
                         },
                     )
@@ -5612,13 +5637,15 @@ impl HostHandle {
         host_streams.sort_by(|left, right| left.0.0.cmp(&right.0.0));
         let fanout_paths = host_streams
             .iter()
-            .map(|(path, _, _, _, _)| path.clone())
+            .map(|(path, _, _, _, _, _)| path.clone())
             .collect::<Vec<_>>();
         let fanout_guard = NewAgentFanoutBatchGuard::new(Arc::clone(&self.state), fanout_paths);
 
         let mut dead_paths = Vec::new();
         let mut deferred_attachments = Vec::new();
-        for (path, stream, attach_eagerly, instance_stream, activity_summary) in host_streams {
+        for (path, stream, attach_eagerly, instance_stream, activity_summary, turn_active) in
+            host_streams
+        {
             if !visibility.may_emit_new_agent() {
                 break;
             }
@@ -5629,6 +5656,7 @@ impl HostHandle {
                 instance_stream,
                 attach_eagerly,
                 activity_summary,
+                turn_active,
             ) {
                 Ok(attachment) => {
                     let continue_fanout = visibility.record_new_agent_delivery(path.clone());
@@ -9759,6 +9787,30 @@ impl HostHandle {
         }
     }
 
+    /// Reads the agent's liveness under the host lock rather than trusting
+    /// the transition that woke us: two updates to one agent can publish out
+    /// of order, and the frame must never end the wire on a stale value.
+    async fn fan_out_agent_turn_state(&self, agent_id: &AgentId) {
+        let mut state = self.state.lock().await;
+        // A closed agent is announced by `AgentClosed`; nothing is left to say.
+        let Some(status) = state.registry.agent_status_handle(agent_id) else {
+            return;
+        };
+        let turn_active = status.snapshot().await.is_active();
+        fan_out_agent_turn_state(&mut state, agent_id, turn_active);
+    }
+
+    async fn fan_out_all_agent_turn_states(&self) {
+        let mut state = self.state.lock().await;
+        for agent_id in state.registry.agent_ids() {
+            let Some(status) = state.registry.agent_status_handle(&agent_id) else {
+                continue;
+            };
+            let turn_active = status.snapshot().await.is_active();
+            fan_out_agent_turn_state(&mut state, &agent_id, turn_active);
+        }
+    }
+
     async fn fan_out_agent_activity_summary(
         &self,
         agent_id: AgentId,
@@ -11169,6 +11221,7 @@ impl HostHandle {
             let mut state = self.state.lock().await;
             let activity_summary =
                 initial_agent_activity_summary_state(&mut state, &start.agent_id);
+            let turn_active = agent_turn_active(&state, &start.agent_id).await;
             state
                 .host_streams
                 .iter_mut()
@@ -11178,15 +11231,23 @@ impl HostHandle {
                         &start,
                         &agent_handle,
                         activity_summary.clone(),
+                        turn_active,
                     )
                     .map(
-                        |(stream, attach_eagerly, instance_stream, activity_summary)| {
+                        |(
+                            stream,
+                            attach_eagerly,
+                            instance_stream,
+                            activity_summary,
+                            turn_active,
+                        )| {
                             (
                                 path.clone(),
                                 stream,
                                 attach_eagerly,
                                 instance_stream,
                                 activity_summary,
+                                turn_active,
                             )
                         },
                     )
@@ -11195,7 +11256,7 @@ impl HostHandle {
         };
         let fanout_paths = host_streams
             .iter()
-            .map(|(path, _, _, _, _)| path.clone())
+            .map(|(path, _, _, _, _, _)| path.clone())
             .collect::<Vec<_>>();
         let fanout_guard = NewAgentFanoutBatchGuard::new(Arc::clone(&self.state), fanout_paths);
 
@@ -11268,7 +11329,9 @@ impl HostHandle {
         }
         let mut dead_paths = Vec::new();
         let mut deferred_attachments = Vec::new();
-        for (path, stream, attach_eagerly, instance_stream, activity_summary) in host_streams {
+        for (path, stream, attach_eagerly, instance_stream, activity_summary, turn_active) in
+            host_streams
+        {
             match emit_new_agent_for_stream(
                 &start,
                 &agent_handle,
@@ -11276,6 +11339,7 @@ impl HostHandle {
                 instance_stream,
                 attach_eagerly,
                 activity_summary,
+                turn_active,
             ) {
                 Ok(attachment) => {
                     agent_visibility.record_new_agent(start.agent_id.clone(), path.clone());
@@ -13964,12 +14028,27 @@ fn spawn_host_inner(
         .lock()
         .expect("spawn operation worker mutex poisoned") = Some(spawn_operation_worker);
 
-    let agent_status_transitions = host
-        .state
-        .try_lock()
-        .expect("newly created host state must be unlocked")
-        .registry
-        .subscribe_status_transitions();
+    let (agent_status_transitions, agent_turn_state_transitions) = {
+        let state = host
+            .state
+            .try_lock()
+            .expect("newly created host state must be unlocked");
+        (
+            state.registry.subscribe_status_transitions(),
+            state.registry.subscribe_status_transitions(),
+        )
+    };
+    spawn_agent_turn_state_fanout_task(
+        WeakHostHandle {
+            state: Arc::downgrade(&host.state),
+            workflow_save_lock: Arc::downgrade(&host.workflow_save_lock),
+            backend_setup_refresh_lock: Arc::downgrade(&host.backend_setup_refresh_lock),
+            session_schema_refresh_lock: Arc::downgrade(&host.session_schema_refresh_lock),
+            settings_apply_lock: Arc::downgrade(&host.settings_apply_lock),
+            spawn_operations: host.spawn_operations.clone(),
+        },
+        agent_turn_state_transitions,
+    );
 
     spawn_mobile_access_actor(
         host.clone(),
@@ -14780,6 +14859,48 @@ fn spawn_host_capacity_task(host: HostHandle, mut rx: HostCapacityRx) {
             runtime.block_on(worker);
         })
         .expect("failed to spawn host capacity task");
+}
+
+fn spawn_agent_turn_state_fanout_task(
+    host: WeakHostHandle,
+    mut transitions: broadcast::Receiver<AgentStatusTransition>,
+) {
+    let worker = async move {
+        loop {
+            let event = transitions.recv().await;
+            let Some(host) = host.upgrade() else {
+                return;
+            };
+            match event {
+                Ok(transition) => host.fan_out_agent_turn_state(&transition.agent_id).await,
+                Err(broadcast::error::RecvError::Lagged(missed)) => {
+                    tracing::warn!(
+                        missed,
+                        "agent turn-state fanout fell behind status transitions; \
+                         resending every agent's liveness"
+                    );
+                    host.fan_out_all_agent_turn_states().await;
+                }
+                Err(broadcast::error::RecvError::Closed) => return,
+            }
+        }
+    };
+
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        handle.spawn(worker);
+        return;
+    }
+
+    std::thread::Builder::new()
+        .name("tyde-agent-turn-state".to_string())
+        .spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("failed to build agent turn-state runtime");
+            runtime.block_on(worker);
+        })
+        .expect("failed to spawn agent turn-state task");
 }
 
 fn spawn_host_session_summary_count_task(host: HostHandle, mut rx: HostSessionSummaryCountRx) {
@@ -16056,8 +16177,15 @@ fn emit_or_queue_host_frame(
     kind: FrameKind,
     payload: serde_json::Value,
 ) -> Result<(), StreamClosed> {
-    if kind == FrameKind::SessionSummaryCountUpdated && subscriber.new_agent_fanouts_in_flight > 0 {
-        subscriber.held_summary_count_frames.push(payload);
+    // A NewAgent in flight carries liveness read when it was prepared, so a
+    // turn-state frame emitted meanwhile must queue behind it or the wire
+    // would end on the older value.
+    if matches!(
+        kind,
+        FrameKind::SessionSummaryCountUpdated | FrameKind::AgentTurnStateNotify
+    ) && subscriber.new_agent_fanouts_in_flight > 0
+    {
+        subscriber.held_fanout_frames.push((kind, payload));
         return Ok(());
     }
     if subscriber.bootstrapped {
@@ -16073,7 +16201,8 @@ fn prepare_new_agent_fanout_for_subscriber(
     start: &AgentStartPayload,
     agent_handle: &AgentHandle,
     activity_summary: AgentActivitySummaryState,
-) -> Option<(Stream, bool, StreamPath, AgentActivitySummaryState)> {
+    turn_active: bool,
+) -> Option<(Stream, bool, StreamPath, AgentActivitySummaryState, bool)> {
     let instance_stream = new_instance_stream(&start.agent_id);
     subscriber
         .known_agent_streams
@@ -16095,6 +16224,7 @@ fn prepare_new_agent_fanout_for_subscriber(
             attach_eagerly,
             instance_stream,
             activity_summary,
+            turn_active,
         ))
     } else {
         subscriber
@@ -16105,6 +16235,7 @@ fn prepare_new_agent_fanout_for_subscriber(
                 instance_stream,
                 attach_eagerly,
                 activity_summary,
+                turn_active,
             });
         None
     }
@@ -16134,8 +16265,8 @@ fn release_new_agent_fanout_hold(subscriber: &mut HostSubscriber) -> Result<(), 
     if subscriber.new_agent_fanouts_in_flight > 0 {
         return Ok(());
     }
-    for payload in std::mem::take(&mut subscriber.held_summary_count_frames) {
-        emit_or_queue_host_frame(subscriber, FrameKind::SessionSummaryCountUpdated, payload)?;
+    for (kind, payload) in std::mem::take(&mut subscriber.held_fanout_frames) {
+        emit_or_queue_host_frame(subscriber, kind, payload)?;
     }
     Ok(())
 }
@@ -16159,6 +16290,7 @@ fn emit_new_agent_for_stream(
     instance_stream: StreamPath,
     attach_eagerly: bool,
     activity_summary: AgentActivitySummaryState,
+    turn_active: bool,
 ) -> Result<Option<DeferredAgentAttachment>, StreamClosed> {
     let new_agent = NewAgentPayload {
         agent_id: start.agent_id.clone(),
@@ -16177,6 +16309,7 @@ fn emit_new_agent_for_stream(
         created_at_ms: start.created_at_ms,
         instance_stream: instance_stream.clone(),
         activity_summary,
+        turn_active,
     };
 
     let payload = serde_json::to_value(&new_agent)
@@ -17584,6 +17717,51 @@ fn activity_summary_from_state(state: &AgentActivitySummaryState) -> Option<Agen
         AgentActivitySummaryState::Pending { previous, .. }
         | AgentActivitySummaryState::Error { previous, .. } => previous.clone(),
         AgentActivitySummaryState::Disabled | AgentActivitySummaryState::Empty => None,
+    }
+}
+
+async fn agent_turn_active(state: &HostState, agent_id: &AgentId) -> bool {
+    let status = state
+        .registry
+        .agent_status_handle(agent_id)
+        .unwrap_or_else(|| panic!("registry missing status for listed agent {}", agent_id));
+    status.snapshot().await.is_active()
+}
+
+fn fan_out_agent_turn_state(state: &mut HostState, agent_id: &AgentId, turn_active: bool) {
+    let payload = serde_json::to_value(AgentTurnStateNotifyPayload {
+        agent_id: agent_id.clone(),
+        turn_active,
+    })
+    .expect("failed to serialize AgentTurnStateNotify payload for host stream fanout");
+    let stream_prefix = format!("/agent/{}/", agent_id);
+    let mut dead_paths = Vec::new();
+
+    for (path, subscriber) in state.host_streams.iter_mut() {
+        // Only a subscriber that knows the agent but has not attached its
+        // instance stream needs this. Once attached, `AgentBootstrap` and the
+        // agent's own events carry liveness, and a second source would race
+        // them across streams.
+        let attached = match subscriber
+            .known_agent_streams
+            .iter()
+            .find(|stream| stream.0.starts_with(&stream_prefix))
+        {
+            Some(instance_stream) => subscriber.attached_agent_streams.contains(instance_stream),
+            None => continue,
+        };
+        if attached {
+            continue;
+        }
+        if emit_or_queue_host_frame(subscriber, FrameKind::AgentTurnStateNotify, payload.clone())
+            .is_err()
+        {
+            dead_paths.push(path.clone());
+        }
+    }
+
+    for path in dead_paths {
+        state.host_streams.remove(&path);
     }
 }
 

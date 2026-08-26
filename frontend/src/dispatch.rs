@@ -6964,6 +6964,7 @@ mod restore_fixtures {
             created_at_ms: 0,
             instance_stream: StreamPath(format!("/agent/{agent}/inst")),
             activity_summary: Default::default(),
+            turn_active: false,
         }
     }
 

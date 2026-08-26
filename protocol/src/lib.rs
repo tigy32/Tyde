@@ -30,7 +30,7 @@ pub use types::{
     AgentOrigin, AgentPinsSnapshot, AgentPinsUpdate, AgentProjectFilter, AgentRenamedPayload,
     AgentSortMode, AgentStartPayload, AgentStatusFilter, AgentSystemTagAssignment,
     AgentSystemTagDescriptor, AgentSystemTagId, AgentTagColor, AgentTagRef, AgentTagsSnapshot,
-    AgentTagsUpdate, AgentWorkflowMetadata, AgentsSidebarPreferences,
+    AgentTagsUpdate, AgentTurnStateNotifyPayload, AgentWorkflowMetadata, AgentsSidebarPreferences,
     AgentsSidebarProjectVisibility, AgentsSmartViewsSnapshot, AgentsSmartViewsUpdate,
     AgentsViewFilters, AgentsViewPreferences, AgentsViewPreferencesNotifyPayload,
     AgentsViewPreferencesSnapshot, AgentsViewPreferencesStoreError,

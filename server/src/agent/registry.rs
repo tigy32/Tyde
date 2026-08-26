@@ -36,10 +36,12 @@ pub(crate) struct AgentRegistry {
     transition_tx: broadcast::Sender<AgentStatusTransition>,
 }
 
-/// An agent crossing from one `AgentControlStatus` to another. The registry
-/// owns the status, so it computes the edge where the status is mutated;
-/// consumers that need edges rather than levels subscribe here instead of
-/// mirroring every agent's last known status.
+/// An agent crossing from one `AgentControlStatus` to another, or its
+/// liveness (`AgentStatus::is_active`) flipping while the status holds — a
+/// pending user question reports `Idle` for as long as the turn stays open.
+/// The registry owns the status, so it computes the edge where the status is
+/// mutated; consumers that need edges rather than levels subscribe here
+/// instead of mirroring every agent's last known status.
 #[derive(Clone, Debug)]
 pub(crate) struct AgentStatusTransition {
     pub agent_id: AgentId,
@@ -133,14 +135,16 @@ impl AgentStatusHandle {
     {
         let mut status = self.status.lock().await;
         let from = status.status();
+        let was_active = status.is_active();
         update(&mut status);
         let to = status.status();
+        let turn_active = status.is_active();
         let pending_user_response = status.pending_user_response;
         let has_queued_messages = status.has_queued_messages;
         let restored_without_live_turn = status.restored_without_live_turn;
         drop(status);
 
-        if from != to {
+        if from != to || was_active != turn_active {
             // A send fails only with no live receivers, which is the normal
             // state; a receiver that falls behind learns about it from its own
             // `Lagged` error rather than from here.

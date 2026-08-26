@@ -245,24 +245,7 @@ fn seed_paired_device() -> tempfile::TempDir {
 
 /// Connects as the paired mobile device over the real mobile connection path.
 async fn connect_mobile(host: server::HostHandle) -> client::Connection {
-    let (client_stream, server_stream) = tokio::io::duplex(8192);
-    let server_config = server::ServerConfig::current();
-    let client_config = client::ClientConfig::current();
-
-    tokio::spawn(async move {
-        let conn = server::accept(&server_config, server_stream)
-            .await
-            .expect("mobile handshake failed");
-        if let Err(err) =
-            server::run_mobile_connection(conn, host, MobileDeviceId(DEVICE_ID.to_owned())).await
-        {
-            eprintln!("mobile connection loop failed: {err:?}");
-        }
-    });
-
-    client::connect(&client_config, client_stream)
-        .await
-        .expect("mobile client handshake failed")
+    fixture::connect_raw_mobile_client(host, DEVICE_ID).await
 }
 
 async fn register_subscription(

@@ -4,18 +4,19 @@ use std::sync::{Arc, Mutex};
 use protocol::types::{AgentClosedPayload, CloseAgentPayload};
 use protocol::{
     AgentActivityStatsPayload, AgentActivitySummaryPayload, AgentBootstrapPayload,
-    AgentErrorPayload, AgentRenamedPayload, AgentStartPayload, AgentsViewPreferencesNotifyPayload,
-    BackendCapacityPayload, BackendConfigSchemasPayload, BackendConfigSnapshotsPayload,
-    BackendSetupPayload, CancelWorkflowPayload, ChatEvent, CodeIntelDiagnosticsPayload,
-    CodeIntelErrorPayload, CodeIntelFileModelPayload, CodeIntelHoverResultPayload,
-    CodeIntelNavigateResultPayload, CodeIntelOverviewPayload, CodeIntelReferencesCompletePayload,
-    CodeIntelReferencesResultsPayload, CodeIntelStatusPayload, CommandErrorPayload,
-    ContextCompactionCapabilityPayload, ContextCompactionNotifyPayload, CustomAgentNotifyPayload,
-    Envelope, FetchSessionHistoryPayload, FrameError, FrameKind, FrameReader, HostBootstrapPayload,
-    HostSettingsPayload, InterruptPayload, LaunchProfileCatalogPayload, ListSessionsPayload,
-    McpServerNotifyPayload, MobileAccessStatePayload, MobilePairingOfferPayload, NewAgentPayload,
-    NewTerminalPayload, ProjectAccessedPayload, ProjectAddRootPayload, ProjectBootstrapPayload,
-    ProjectCreatePayload, ProjectDeletePayload, ProjectDeleteRootPayload, ProjectEventPayload,
+    AgentErrorPayload, AgentRenamedPayload, AgentStartPayload, AgentTurnStateNotifyPayload,
+    AgentsViewPreferencesNotifyPayload, BackendCapacityPayload, BackendConfigSchemasPayload,
+    BackendConfigSnapshotsPayload, BackendSetupPayload, CancelWorkflowPayload, ChatEvent,
+    CodeIntelDiagnosticsPayload, CodeIntelErrorPayload, CodeIntelFileModelPayload,
+    CodeIntelHoverResultPayload, CodeIntelNavigateResultPayload, CodeIntelOverviewPayload,
+    CodeIntelReferencesCompletePayload, CodeIntelReferencesResultsPayload, CodeIntelStatusPayload,
+    CommandErrorPayload, ContextCompactionCapabilityPayload, ContextCompactionNotifyPayload,
+    CustomAgentNotifyPayload, Envelope, FetchSessionHistoryPayload, FrameError, FrameKind,
+    FrameReader, HostBootstrapPayload, HostSettingsPayload, InterruptPayload,
+    LaunchProfileCatalogPayload, ListSessionsPayload, McpServerNotifyPayload,
+    MobileAccessStatePayload, MobilePairingOfferPayload, NewAgentPayload, NewTerminalPayload,
+    ProjectAccessedPayload, ProjectAddRootPayload, ProjectBootstrapPayload, ProjectCreatePayload,
+    ProjectDeletePayload, ProjectDeleteRootPayload, ProjectEventPayload,
     ProjectFileContentsPayload, ProjectFileListPayload, ProjectGitDiffPayload,
     ProjectGitStatusPayload, ProjectId, ProjectNotifyPayload, ProjectReadDiffPayload,
     ProjectReadFilePayload, ProjectRenamePayload, ProjectReorderPayload, ProjectStageFilePayload,
@@ -946,6 +947,13 @@ async fn handle_host_envelope(
             };
             let _ = host_tx.send(HostEvent::AgentActivitySummary(payload)).await;
             true
+        }
+        FrameKind::AgentTurnStateNotify => {
+            // Liveness for agents this client has not attached; the runtime
+            // attaches every agent it is told about, so it has no use for it.
+            envelope
+                .parse_payload::<AgentTurnStateNotifyPayload>()
+                .is_ok()
         }
         FrameKind::TaskTokenUsage => {
             let payload: TaskTokenUsagePayload = match envelope.parse_payload() {

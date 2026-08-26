@@ -25,7 +25,15 @@ that used to be replayed as many initial host frames:
 - MCP servers, skills, steering, custom agents
 - team preset catalog, drafts, teams, members, and member bindings
 - live agent descriptors (`NewAgentPayload`) so clients can register agent
-  streams before their `agent_bootstrap` frames arrive
+  streams before their `agent_bootstrap` frames arrive; each carries
+  `turn_active`, the agent's liveness when the snapshot was built
+
+A lazy client (mobile) attaches no agent stream until it sends `load_agent`,
+so the descriptor's `turn_active` is the only liveness it has for agents it
+never opens. Later changes reach it as `agent_turn_state_notify` on the host
+stream, emitted only for agents whose instance stream the subscriber knows but
+has not attached; once attached, `agent_bootstrap` and the agent's own events
+are authoritative and the host-stream frame stops.
 
 `HostBootstrap` reuses the existing `SessionSummary` type for sessions.
 Session schemas are treated as the subscriber's initial snapshot; later
