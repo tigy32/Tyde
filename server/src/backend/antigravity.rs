@@ -9,11 +9,13 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use command_group::{AsyncCommandGroup, AsyncGroupChild};
 use protocol::{
-    AgentInput, BackendAccessMode, BackendKind, ChatEvent, MessageTokenUsage, ModelInfo,
+    AgentInput, BackendAccessMode, BackendKind, CapacityBucket, CapacityBucketId, CapacityCoverage,
+    CapacityMeasure, CapacityReport, CapacityReset, CapacityScope, CapacitySource,
+    CapacityUnavailableReason, CapacityWindow, ChatEvent, MessageTokenUsage, ModelInfo,
     ModelRequestId, ModelRequestTokenUsage, ModelTurnId, SelectOption, SessionId,
     SessionSettingField, SessionSettingFieldType, SessionSettingValue, SessionSettingsSchema,
     SessionSettingsValues, SpawnCostHint, ToolExecutionOutcome, ToolExecutionResult,
-    ToolRequestType, ToolUseData,
+    ToolRequestType, ToolUseData, ValueProvenance,
 };
 use serde_json::{Map, Value, json, to_value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -22,10 +24,11 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 use uuid::Uuid;
 
 use crate::backend::antigravity_stream::{
-    AgyFrame, AgyResult, AgyStep, AgyUsage, MCP_DISPATCH_TOOL, STATE_ACTIVE, STATE_DONE,
-    STATE_ERROR, STEP_AGENT_RESPONSE, STEP_CHECKPOINT, STEP_SUBAGENT, STEP_SYSTEM_MESSAGE,
-    STEP_TOOL, STEP_UNKNOWN, STEP_USER_INPUT, TranscriptReader, answers_from_result,
-    exit_code_from_result, mcp_inner_call, parse_frame, subagent_request_type, tool_request_type,
+    AgyFrame, AgyResult, AgyStep, AgyUsage, AgyUsageBucket, AgyUsageReport, MCP_DISPATCH_TOOL,
+    STATE_ACTIVE, STATE_DONE, STATE_ERROR, STEP_AGENT_RESPONSE, STEP_CHECKPOINT, STEP_SUBAGENT,
+    STEP_SYSTEM_MESSAGE, STEP_TOOL, STEP_UNKNOWN, STEP_USER_INPUT, TranscriptReader,
+    answers_from_result, exit_code_from_result, mcp_inner_call, parse_frame, subagent_request_type,
+    tool_request_type, usage_report_from_frame,
 };
 use crate::backend::turn_emitter::{AgentName, ResponseHandle, StreamEndPayload, TurnEmitter};
 use crate::backend::{
@@ -38,9 +41,16 @@ use crate::backend::{
     resolve_settings as resolve_backend_settings,
 };
 use crate::process_env;
+use crate::sub_agent::SubAgentEmitter;
 
 const ANTIGRAVITY_AGENT_NAME: &str = "antigravity";
 const ANTIGRAVITY_STARTUP_TIMEOUT: Duration = Duration::from_secs(120);
+/// `/usage` answers locally in well under a second; this only bounds a probe
+/// that has stopped answering.
+const ANTIGRAVITY_CAPACITY_TIMEOUT: Duration = Duration::from_secs(30);
+/// How often the account's quota is re-read. Refreshing on every turn would
+/// spawn a process per turn to watch a number that moves in hours.
+const ANTIGRAVITY_CAPACITY_REFRESH_INTERVAL: Duration = Duration::from_secs(120);
 /// How long a wait for the shared MCP config lock has to reach before it is
 /// worth telling someone about.
 const ANTIGRAVITY_MCP_LOCK_WARN_AFTER: Duration = Duration::from_secs(5);
@@ -70,11 +80,20 @@ struct AntigravityInner {
     state: Mutex<AntigravityState>,
 }
 
+impl AntigravityBackend {
+    pub(crate) async fn set_subagent_emitter(&self, emitter: Arc<dyn SubAgentEmitter>) {
+        self.inner.state.lock().await.subagent_emitter = Some(emitter);
+    }
+}
+
 struct AntigravityState {
     model: String,
     /// True between accepting a message and seeing that turn's `result`.
     turn_active: bool,
     closing: bool,
+    /// Where a capacity report goes. Installed after spawn, so an early report
+    /// has nowhere to go and is simply not taken.
+    subagent_emitter: Option<Arc<dyn SubAgentEmitter>>,
     /// Resolves once the supervisor has killed the `agy` process and released
     /// its MCP config entries.
     shutdown_complete: Option<oneshot::Receiver<()>>,
@@ -723,6 +742,9 @@ struct Supervisor {
     /// Question cards waiting on a human. They survive the turn that asked, and
     /// are cleared either by an answer or by a cancel.
     pending_questions: Vec<String>,
+    /// When the account's quota was last read, so a busy session does not spawn
+    /// a probe per turn.
+    capacity_read_at: Option<std::time::Instant>,
     shutdown_complete: oneshot::Sender<()>,
 }
 
@@ -965,6 +987,35 @@ impl Supervisor {
         }
         self.inner.emitter.typing_status_changed(false);
         self.inner.state.lock().await.turn_active = false;
+        self.refresh_capacity().await;
+    }
+
+    /// Re-reads the account's remaining quota, at most once per interval.
+    ///
+    /// Turn boundaries are the trigger because that is when the number has
+    /// just moved and when the user is most likely to look at it.
+    async fn refresh_capacity(&mut self) {
+        if self
+            .capacity_read_at
+            .is_some_and(|last| last.elapsed() < ANTIGRAVITY_CAPACITY_REFRESH_INTERVAL)
+        {
+            return;
+        }
+        let (emitter, model) = {
+            let state = self.inner.state.lock().await;
+            (state.subagent_emitter.clone(), state.model.clone())
+        };
+        let Some(emitter) = emitter else {
+            return;
+        };
+        self.capacity_read_at = Some(std::time::Instant::now());
+        tokio::spawn(async move {
+            let state = match read_antigravity_capacity(&model).await {
+                Ok(report) => protocol::BackendCapacityState::Known { report },
+                Err(reason) => protocol::BackendCapacityState::Unavailable { reason },
+            };
+            emitter.on_backend_capacity(BackendKind::Antigravity, state);
+        });
     }
 
     /// A model change is a process restart: `--model` is a launch flag and
@@ -1068,6 +1119,225 @@ fn tool_execution_result(
     }
 }
 
+/// Reads the account's remaining quota without starting a turn.
+///
+/// `/usage` is answered by print mode directly — no model request, no turn,
+/// zero tokens — so this costs a short-lived process and nothing else.
+async fn read_antigravity_capacity(
+    model: &str,
+) -> Result<CapacityReport, CapacityUnavailableReason> {
+    let mut command = Command::new("agy");
+    command.args([
+        "--output-format",
+        "stream-json",
+        "--model",
+        model,
+        "-p",
+        "/usage",
+    ]);
+    if let Some(path) = process_env::resolved_child_process_path() {
+        command.env("PATH", path);
+    }
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+
+    let output = tokio::time::timeout(ANTIGRAVITY_CAPACITY_TIMEOUT, command.output())
+        .await
+        .map_err(|_| CapacityUnavailableReason::SourceTimedOut)?
+        .map_err(|_| CapacityUnavailableReason::SourceUnreachable)?;
+    if !output.status.success() {
+        return Err(CapacityUnavailableReason::SourceUnreachable);
+    }
+    let report = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| parse_frame(line.trim()).ok())
+        .find_map(|frame| usage_report_from_frame(&frame))
+        .ok_or(CapacityUnavailableReason::MalformedReport)?;
+    map_antigravity_capacity(&report)
+}
+
+fn map_antigravity_capacity(
+    report: &AgyUsageReport,
+) -> Result<CapacityReport, CapacityUnavailableReason> {
+    let buckets = report
+        .groups
+        .iter()
+        .flat_map(|group| {
+            group
+                .buckets
+                .iter()
+                .map(|bucket| antigravity_capacity_bucket(&group.name, bucket))
+        })
+        .collect::<Vec<_>>();
+    if buckets.is_empty() {
+        return Err(CapacityUnavailableReason::MalformedReport);
+    }
+    Ok(CapacityReport {
+        source: CapacitySource::AntigravityUsageCommand,
+        observed_at_ms: Some(now_ms()),
+        plan: None,
+        buckets,
+        coverage: CapacityCoverage::AllVendorBuckets,
+    })
+}
+
+fn antigravity_capacity_bucket(group: &str, bucket: &AgyUsageBucket) -> CapacityBucket {
+    // `agy` reports how much is *left*, so the used figure is its complement
+    // rather than a number the vendor stated. `ValueProvenance` describes the
+    // used value, which is why this is not `vendor_reported`.
+    let measure = match bucket.remaining_fraction {
+        Some(remaining) => {
+            let remaining_percent = (remaining * 100.0).round().clamp(0.0, 100.0) as u8;
+            CapacityMeasure::UsedPercent {
+                used_percent: 100_u8.saturating_sub(remaining_percent),
+                remaining_percent,
+                provenance: ValueProvenance {
+                    vendor_reported: false,
+                },
+            }
+        }
+        None => CapacityMeasure::ReportedWithoutMagnitude,
+    };
+    CapacityBucket {
+        id: CapacityBucketId::Antigravity {
+            bucket: bucket.id.clone(),
+        },
+        label: bucket.name.clone(),
+        measure,
+        // A group is a set of models sharing one limit — "Gemini Models",
+        // "Claude and GPT models" — which is what a model family is.
+        scope: CapacityScope::ModelFamily {
+            name: group.to_string(),
+        },
+        window: match bucket.window.as_str() {
+            "weekly" => CapacityWindow::Rolling {
+                duration_minutes: 7 * 24 * 60,
+            },
+            "5h" => CapacityWindow::Rolling {
+                duration_minutes: 5 * 60,
+            },
+            _ => CapacityWindow::NotReported,
+        },
+        reset: bucket
+            .reset_time
+            .as_deref()
+            .and_then(|stamp| chrono::DateTime::parse_from_rfc3339(stamp).ok())
+            .map(|stamp| CapacityReset::At {
+                at_ms: stamp.timestamp_millis().max(0) as u64,
+            })
+            .unwrap_or(CapacityReset::NotReported),
+        status: None,
+    }
+}
+
+/// The conversations `agy` can resume, read off its own store.
+///
+/// `agy` exposes no way to list them: `/resume` is interactive and print mode
+/// answers no equivalent command. The store is the authority anyway — resuming
+/// requires `<id>.db` to exist, which is exactly what
+/// `ensure_antigravity_conversation_exists` checks — so this enumerates it
+/// directly and enriches each entry from the transcript beside it.
+fn list_antigravity_sessions(conversations_dir: &Path, brain_dir: &Path) -> Vec<BackendSession> {
+    let Ok(entries) = fs::read_dir(conversations_dir) else {
+        return Vec::new();
+    };
+    let mut sessions = entries
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            // `.db-wal` and `.db-shm` sit beside the store and are not
+            // conversations; a non-UUID stem is not one either.
+            if path.extension().and_then(|ext| ext.to_str()) != Some("db") {
+                return None;
+            }
+            let id = path.file_stem().and_then(|stem| stem.to_str())?;
+            let session_id = SessionId(id.to_string());
+            if !is_antigravity_native_session_id(&session_id) {
+                return None;
+            }
+            let metadata = entry.metadata().ok();
+            let updated_at_ms = metadata
+                .as_ref()
+                .and_then(|metadata| metadata.modified().ok())
+                .and_then(system_time_to_ms);
+            let opening = antigravity_transcript_opening(brain_dir, id);
+            Some(BackendSession {
+                id: session_id,
+                backend_kind: BackendKind::Antigravity,
+                // Not recoverable. The store records no workspace, and the
+                // transcript mentions directories only inside tool arguments,
+                // which is where a command ran rather than where the
+                // conversation was rooted. Resume takes its roots from the
+                // caller, so this is display-only.
+                workspace_roots: Vec::new(),
+                title: opening.as_ref().and_then(|opening| opening.title.clone()),
+                token_count: None,
+                created_at_ms: opening.as_ref().and_then(|opening| opening.created_at_ms),
+                updated_at_ms,
+                resumable: true,
+            })
+        })
+        .collect::<Vec<_>>();
+    // Most recently touched first, which is the order a resume picker wants.
+    sessions.sort_by_key(|session| std::cmp::Reverse(session.updated_at_ms));
+    sessions
+}
+
+struct AntigravityTranscriptOpening {
+    title: Option<String>,
+    created_at_ms: Option<u64>,
+}
+
+/// The first step of a conversation, which is what names it.
+fn antigravity_transcript_opening(
+    brain_dir: &Path,
+    conversation_id: &str,
+) -> Option<AntigravityTranscriptOpening> {
+    let path = brain_dir
+        .join(conversation_id)
+        .join(".system_generated")
+        .join("logs")
+        .join("transcript_full.jsonl");
+    let text = fs::read_to_string(path).ok()?;
+    let first = text.lines().find(|line| !line.trim().is_empty())?;
+    let value = serde_json::from_str::<Value>(first).ok()?;
+    let created_at_ms = value
+        .get("created_at")
+        .and_then(Value::as_str)
+        .and_then(|stamp| chrono::DateTime::parse_from_rfc3339(stamp).ok())
+        .map(|stamp| stamp.timestamp_millis().max(0) as u64);
+    Some(AntigravityTranscriptOpening {
+        title: value
+            .get("content")
+            .and_then(Value::as_str)
+            .and_then(antigravity_title_from_user_input),
+        created_at_ms,
+    })
+}
+
+/// `agy` wraps the prompt it was given in `<USER_REQUEST>` and appends its own
+/// metadata blocks, none of which belong in a session's name.
+fn antigravity_title_from_user_input(content: &str) -> Option<String> {
+    const OPEN: &str = "<USER_REQUEST>";
+    const CLOSE: &str = "</USER_REQUEST>";
+    let start = content.find(OPEN)? + OPEN.len();
+    let end = content[start..].find(CLOSE)? + start;
+    let request = content[start..end].trim();
+    let first_line = request.lines().find(|line| !line.trim().is_empty())?.trim();
+    if first_line.is_empty() {
+        return None;
+    }
+    Some(first_line.chars().take(120).collect())
+}
+
+fn system_time_to_ms(time: SystemTime) -> Option<u64> {
+    time.duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|elapsed| elapsed.as_millis() as u64)
+}
+
 /// Where `agy` keeps the per-conversation transcript the tool cards are
 /// enriched from. It is the sibling of the conversations directory, so a caller
 /// that redirects one redirects both rather than reading transcripts from a
@@ -1104,6 +1374,8 @@ impl Backend for AntigravityBackend {
             Cap::SessionSettings,
             Cap::StartupMcpServers,
             Cap::AgentControlTools,
+            Cap::CapacityTelemetry,
+            Cap::ListSessions,
             Cap::WorkspaceInstructions,
             Cap::Customization,
             Cap::UserQuestionRequests,
@@ -1191,7 +1463,11 @@ impl Backend for AntigravityBackend {
     }
 
     async fn list_sessions() -> Result<Vec<BackendSession>, String> {
-        Ok(Vec::new())
+        let conversations_dir = resolve_antigravity_conversations_dir(None)?;
+        Ok(list_antigravity_sessions(
+            &conversations_dir,
+            &antigravity_brain_dir(&conversations_dir),
+        ))
     }
 
     fn session_id(&self) -> SessionId {
@@ -1353,6 +1629,7 @@ impl AntigravityBackend {
                 model,
                 turn_active: false,
                 closing: false,
+                subagent_emitter: None,
                 shutdown_complete: None,
             }),
         });
@@ -1382,6 +1659,7 @@ impl AntigravityBackend {
             cumulative: AgyUsage::default(),
             turn_counter: 0,
             pending_questions: Vec::new(),
+            capacity_read_at: None,
             shutdown_complete: shutdown_complete_tx,
         };
         tokio::spawn(async move {

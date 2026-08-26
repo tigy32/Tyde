@@ -588,3 +588,52 @@ pub fn subagent_request_type(subagent: &AgySubagent) -> ToolRequestType {
         execution_mode: AgentExecutionMode::Foreground,
     }
 }
+
+// ── Capacity ────────────────────────────────────────────────────────────────
+
+/// The payload `agy -p "/usage"` answers with.
+///
+/// It runs no turn and spends no quota — measured, `num_turns: 0` and an
+/// all-zero usage object — so it is safe to poll on a cadence.
+#[derive(Debug, Clone, Deserialize)]
+pub struct AgyUsageReport {
+    #[serde(default)]
+    pub groups: Vec<AgyUsageGroup>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AgyUsageGroup {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub buckets: Vec<AgyUsageBucket>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AgyUsageBucket {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+    /// `weekly` or `5h` on agy 1.1.20. Anything else is reported as unknown
+    /// rather than guessed at.
+    #[serde(default)]
+    pub window: String,
+    /// How much of the limit is left, not how much is used.
+    #[serde(default)]
+    pub remaining_fraction: Option<f64>,
+    #[serde(default)]
+    pub reset_time: Option<String>,
+}
+
+/// Pulls the `/usage` payload out of a `command_result` or `result` frame.
+pub fn usage_report_from_frame(frame: &AgyFrame) -> Option<AgyUsageReport> {
+    let command = match frame {
+        AgyFrame::CommandResult(command) => command,
+        _ => return None,
+    };
+    if command.get("name").and_then(Value::as_str) != Some("usage") {
+        return None;
+    }
+    serde_json::from_value::<AgyUsageReport>(command.get("data")?.clone()).ok()
+}

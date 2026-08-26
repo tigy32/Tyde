@@ -2543,7 +2543,10 @@ async fn prepare_backend_handle_for_adoption(
             }
             Ok(backend)
         }
-        crate::backend::PreparedBackendHandle::Antigravity(backend) => Ok(backend),
+        crate::backend::PreparedBackendHandle::Antigravity(backend) => {
+            backend.set_subagent_emitter(emitter()).await;
+            Ok(backend)
+        }
         crate::backend::PreparedBackendHandle::Hermes(backend) => {
             backend.set_subagent_emitter(emitter()).await;
             Ok(backend)
@@ -2609,12 +2612,16 @@ async fn spawn_backend(
                     antigravity_conversations_dir.as_deref(),
                 )?;
             let (b, events) = AntigravityBackend::spawn_with_conversations_dir(
-                workspace_roots,
+                workspace_roots.clone(),
                 config,
                 initial_input,
                 conversations_dir,
             )
             .await?;
+            b.set_subagent_emitter(Arc::new(
+                sub_agent_context.emitter(agent_id.clone(), workspace_roots),
+            ))
+            .await;
             let session_id = Backend::session_id(&b);
             Ok((Box::new(b), events, session_id))
         }
@@ -2674,12 +2681,16 @@ async fn resume_backend(
                     antigravity_conversations_dir.as_deref(),
                 )?;
             let (b, events) = AntigravityBackend::resume_with_conversations_dir(
-                workspace_roots,
+                workspace_roots.clone(),
                 config,
                 session_id,
                 conversations_dir,
             )
             .await?;
+            b.set_subagent_emitter(Arc::new(
+                sub_agent_context.emitter(agent_id.clone(), workspace_roots),
+            ))
+            .await;
             (Box::new(b), events)
         }
         BackendKind::Hermes => {

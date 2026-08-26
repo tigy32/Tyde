@@ -2761,6 +2761,9 @@ pub enum CapacitySource {
     CodexAccountRateLimitsUpdated,
     ClaudeRateLimitEvent,
     ClaudeControlUsage,
+    /// `agy -p "/usage"`, which answers without starting a turn or spending
+    /// quota.
+    AntigravityUsageCommand,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -2790,9 +2793,22 @@ pub struct CapacityBucket {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "vendor", rename_all = "snake_case")]
 pub enum CapacityBucketId {
-    Codex { slot: CodexLimitSlot },
-    Claude { limit: ClaudeLimitType },
-    ClaudeModel { name: String },
+    Codex {
+        slot: CodexLimitSlot,
+    },
+    Claude {
+        limit: ClaudeLimitType,
+    },
+    ClaudeModel {
+        name: String,
+    },
+    /// Antigravity names its own buckets (`gemini-weekly`, `3p-5h`, …) and the
+    /// set differs per account tier, so the vendor's id is carried verbatim
+    /// rather than mapped onto a fixed enum that would silently drop a bucket
+    /// the account actually has.
+    Antigravity {
+        bucket: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

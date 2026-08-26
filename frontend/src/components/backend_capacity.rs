@@ -124,6 +124,7 @@ fn source_label(source: CapacitySource) -> &'static str {
         CapacitySource::ClaudeRateLimitEvent => "Claude",
         CapacitySource::ClaudeControlUsage => "Claude",
         CapacitySource::CodexAccountRateLimitsUpdated => "Codex",
+        CapacitySource::AntigravityUsageCommand => "Antigravity",
     }
 }
 
@@ -228,6 +229,7 @@ fn bucket_vendor_id_text(id: &CapacityBucketId) -> &'static str {
             ClaudeLimitType::Overage => "claude overage",
         },
         CapacityBucketId::ClaudeModel { .. } => "claude model",
+        CapacityBucketId::Antigravity { .. } => "antigravity",
     }
 }
 
