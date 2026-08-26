@@ -1117,6 +1117,10 @@ fn tool_execution_result(
             image_count: 1,
         },
         ToolRequestType::TydeSendAgentMessage { .. } => ToolExecutionResult::TydeSendAgentMessage,
+        // The await card shows which watched agents finished and which are
+        // still thinking, so the verdict has to be read out of the tool's own
+        // JSON rather than left as an opaque blob.
+        ToolRequestType::TydeAwaitAgents { .. } => tyde_await_result(output),
         // Headless `agy` answers its own questions. Saying so is the whole
         // value of the card: the alternative is a question card that looks
         // like it is still waiting for the user who never saw it.
@@ -1241,6 +1245,31 @@ fn antigravity_capacity_bucket(group: &str, bucket: &AgyUsageBucket) -> Capacity
             })
             .unwrap_or(CapacityReset::NotReported),
         status: None,
+    }
+}
+
+/// Parses `tyde_await_agents`'s `{ready, still_thinking}` payload.
+///
+/// A malformed or absent body degrades to the raw output rather than an empty
+/// verdict: reporting "nothing was waiting" when the call did wait would be a
+/// worse card than an unparsed one.
+fn tyde_await_result(output: &str) -> ToolExecutionResult {
+    #[derive(serde::Deserialize)]
+    struct AwaitPayload {
+        #[serde(default)]
+        ready: Vec<protocol::TydeAgentWaitStatus>,
+        #[serde(default)]
+        still_thinking: Vec<protocol::TydeAgentWaitStatus>,
+    }
+
+    match serde_json::from_str::<AwaitPayload>(output.trim()) {
+        Ok(payload) => ToolExecutionResult::TydeAwaitAgents {
+            ready: payload.ready,
+            still_thinking: payload.still_thinking,
+        },
+        Err(_) => ToolExecutionResult::Other {
+            result: json!({ "output": output }),
+        },
     }
 }
 
