@@ -1385,6 +1385,11 @@ fn real_usage_accounting() {
             }
             assert_cumulative_never_shrinks(&turns);
             assert_context_usage_capability_matches_behaviour(&turns, declares_context_usage);
+            assert_context_usage_updates_within_turn(
+                &turns[3],
+                declares_context_usage,
+                declares_request_usage,
+            );
             assert_context_breakdown_capability_matches_behaviour(
                 &turns,
                 declares_context_breakdown,
@@ -4158,6 +4163,47 @@ fn assert_context_usage_capability_matches_behaviour(turns: &[Turn], declared: b
              occupancy across the measured usage conversation, by either route"
         );
     }
+}
+
+fn assert_context_usage_updates_within_turn(
+    turn: &Turn,
+    declares_context_usage: bool,
+    declares_request_usage: bool,
+) {
+    if !declares_context_usage || !declares_request_usage {
+        return;
+    }
+
+    let mut occupancies = BTreeSet::new();
+    for stats in turn.activity_stats() {
+        if let Some(CurrentContextUsage::Known {
+            input_tokens,
+            context_window,
+        }) = stats.current_context_usage.as_ref()
+        {
+            occupancies.insert((*input_tokens, *context_window));
+        }
+    }
+    for message in turn.assistant_messages() {
+        if let Some(breakdown) = message.context_breakdown.as_ref()
+            && breakdown.input_tokens > 0
+        {
+            occupancies.insert((breakdown.input_tokens, breakdown.context_window));
+        }
+    }
+
+    let request_count = turn
+        .reported_usage()
+        .iter()
+        .filter(|usage| usage.request.known_usage().is_some())
+        .count();
+    assert!(
+        occupancies.len() >= request_count,
+        "{}: context occupancy updated only {} time(s) across {request_count} sequential \
+         provider requests; observed {occupancies:?}",
+        turn.label(),
+        occupancies.len()
+    );
 }
 
 fn assert_context_breakdown_capability_matches_behaviour(turns: &[Turn], declared: bool) {

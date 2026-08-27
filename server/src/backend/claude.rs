@@ -1041,6 +1041,7 @@ struct PendingClaudeToolUse {
 
 #[derive(Default)]
 struct ClaudeStdoutSummary {
+    turn_id: Option<u64>,
     streamed_text: String,
     streamed_reasoning: String,
     assistant_text: Option<String>,
@@ -1065,6 +1066,9 @@ struct ClaudeStdoutSummary {
     /// The only place Claude Code reports the real window; without it there is
     /// no denominator and no occupancy may be published.
     result_context_window: Option<u64>,
+    context_window_model: Option<String>,
+    emitted_context_usage: Option<CurrentContextUsage>,
+    context_usage_sequence: u32,
     errors: Vec<String>,
     tool_calls: Vec<ClaudeToolCall>,
     seen_tool_ids: HashSet<String>,
@@ -4980,7 +4984,16 @@ impl ClaudeInner {
         // along -- the categories would have to be invented to fill one.
         if let Some(current) =
             claude_current_context_usage(summary.last_request_usage.as_ref(), known_context_window)
+            && summary.emitted_context_usage.as_ref() != Some(&current)
         {
+            trace_claude_usage_observed(
+                "terminal_context_emission",
+                summary
+                    .last_request_usage
+                    .as_ref()
+                    .expect("usage checked above"),
+                known_context_window,
+            );
             let request = summary
                 .last_request_usage
                 .clone()
@@ -4999,15 +5012,17 @@ impl ClaudeInner {
                 .model_request_token_usage(&protocol::ModelRequestTokenUsage {
                     request_id: protocol::ModelRequestId {
                         turn_id: protocol::ModelTurnId(turn_id.to_string()),
-                        sequence: 0,
+                        sequence: summary.context_usage_sequence,
                     },
                     request,
                     turn,
                     cumulative,
                     model_context_window: known_context_window,
-                    current_context_usage: Some(current),
+                    current_context_usage: Some(current.clone()),
                     estimated_context_breakdown: None,
                 });
+            summary.context_usage_sequence = summary.context_usage_sequence.saturating_add(1);
+            summary.emitted_context_usage = Some(current);
         }
         if let Some(phase) = take_phase_emission(summary) {
             let text = phase.text;
@@ -5588,6 +5603,8 @@ struct PersistentStdoutTurnState {
     active_turn_id: Option<u64>,
     base_message_id: String,
     current_message_id: String,
+    context_window: Option<u64>,
+    context_window_model: Option<String>,
     summary: ClaudeStdoutSummary,
     segment: SegmentState,
 }
@@ -6119,6 +6136,10 @@ async fn read_claude_stdout_persistent(
         if value.get("type").and_then(Value::as_str) == Some("result") {
             flush_pending_tool_uses_with_fallback(&mut turn_state.summary, &mut turn_state.segment);
             flush_ready_workflow_snapshots(&mut workflow_runs, &inner.emitter);
+            if turn_state.summary.result_context_window.is_some() {
+                turn_state.context_window = turn_state.summary.result_context_window;
+                turn_state.context_window_model = turn_state.summary.context_window_model.clone();
+            }
             let summary = std::mem::take(&mut turn_state.summary);
             turn_state.segment = SegmentState::default();
             turn_state.active_turn_id = None;
@@ -6319,7 +6340,13 @@ async fn prepare_persistent_stdout_turn(
         turn_state.active_turn_id = Some(turn_id);
         turn_state.base_message_id = base_message_id.clone();
         turn_state.current_message_id = base_message_id;
-        turn_state.summary = ClaudeStdoutSummary::default();
+        turn_state.summary = ClaudeStdoutSummary {
+            turn_id: Some(turn_id),
+            model: turn_state.context_window_model.clone(),
+            result_context_window: turn_state.context_window,
+            context_window_model: turn_state.context_window_model.clone(),
+            ..ClaudeStdoutSummary::default()
+        };
         turn_state.segment = SegmentState::default();
     }
 
@@ -9181,6 +9208,11 @@ fn consume_claude_stream_value_with_interrupt(
                     .or(summary.model.as_deref());
                 summary.result_context_window =
                     extract_context_window_from_model_usage(model_usage, preferred_model);
+                summary.context_window_model = preferred_model.map(str::to_owned);
+                tracing::info!(
+                    context_window = summary.result_context_window,
+                    "Claude result supplied context window"
+                );
             }
             let is_error = value
                 .get("is_error")
@@ -9366,6 +9398,7 @@ fn consume_assistant_message(
     }
 
     if let Some(model) = next_model {
+        clear_stale_claude_context_window(summary, &model);
         summary.model = Some(model);
     }
     if let Some(message_id) = next_message_id {
@@ -9383,6 +9416,8 @@ fn consume_assistant_message(
     }
 
     if let Some(usage) = next_usage {
+        trace_claude_usage_observed("assistant_message", &usage, summary.result_context_window);
+        emit_live_claude_context_usage(inner, summary, &usage);
         summary.last_request_usage = Some(usage.clone());
         summary.usage = Some(usage);
     }
@@ -9947,6 +9982,7 @@ fn consume_stream_event(
             let next_message_id = event.get("message").and_then(extract_claude_message_id);
 
             if let Some(model) = next_model.clone() {
+                clear_stale_claude_context_window(summary, &model);
                 summary.model = Some(model);
             }
             if let Some(usage) = parse_token_usage(
@@ -9954,6 +9990,12 @@ fn consume_stream_event(
                     .get("message")
                     .and_then(|message| message.get("usage")),
             ) {
+                trace_claude_usage_observed(
+                    "stream_message_start",
+                    &usage,
+                    summary.result_context_window,
+                );
+                emit_live_claude_context_usage(inner, summary, &usage);
                 summary.last_request_usage = Some(usage.clone());
                 summary.usage = Some(usage);
             }
@@ -9971,6 +10013,12 @@ fn consume_stream_event(
         }
         "message_delta" => {
             if let Some(usage) = parse_token_usage(event.get("usage")) {
+                trace_claude_usage_observed(
+                    "stream_message_delta",
+                    &usage,
+                    summary.result_context_window,
+                );
+                emit_live_claude_context_usage(inner, summary, &usage);
                 summary.last_request_usage = Some(usage.clone());
                 summary.usage = Some(usage);
             }
@@ -10463,6 +10511,74 @@ fn parse_token_usage(raw: Option<&Value>) -> Option<Value> {
             .unwrap_or(0),
         "context_window": context_window,
     }))
+}
+
+fn trace_claude_usage_observed(source: &str, usage: &Value, context_window: Option<u64>) {
+    tracing::info!(
+        source,
+        input_tokens = usage_value_u64(usage, "input_tokens"),
+        cached_prompt_tokens = usage_value_u64(usage, "cached_prompt_tokens"),
+        cache_creation_input_tokens = usage_value_u64(usage, "cache_creation_input_tokens"),
+        output_tokens = usage_value_u64(usage, "output_tokens"),
+        context_window,
+        "Claude usage observation"
+    );
+}
+
+fn clear_stale_claude_context_window(summary: &mut ClaudeStdoutSummary, model: &str) {
+    if summary
+        .context_window_model
+        .as_deref()
+        .is_some_and(|known| !known.trim().eq_ignore_ascii_case(model.trim()))
+    {
+        summary.result_context_window = None;
+        summary.context_window_model = None;
+        summary.emitted_context_usage = None;
+    }
+}
+
+fn emit_live_claude_context_usage(
+    inner: &ClaudeInner,
+    summary: &mut ClaudeStdoutSummary,
+    raw_usage: &Value,
+) {
+    let Some(current) =
+        claude_current_context_usage(Some(raw_usage), summary.result_context_window)
+    else {
+        return;
+    };
+    if summary.emitted_context_usage.as_ref() == Some(&current) {
+        return;
+    }
+    let Some(request) = claude_token_usage(raw_usage.clone()) else {
+        return;
+    };
+    trace_claude_usage_observed(
+        "live_context_emission",
+        raw_usage,
+        summary.result_context_window,
+    );
+    inner
+        .emitter
+        .model_request_token_usage(&protocol::ModelRequestTokenUsage {
+            request_id: protocol::ModelRequestId {
+                turn_id: protocol::ModelTurnId(
+                    summary
+                        .turn_id
+                        .map(|turn_id| turn_id.to_string())
+                        .unwrap_or_else(|| "claude-live".to_owned()),
+                ),
+                sequence: summary.context_usage_sequence,
+            },
+            request: request.clone(),
+            turn: request.clone(),
+            cumulative: request,
+            model_context_window: summary.result_context_window,
+            current_context_usage: Some(current.clone()),
+            estimated_context_breakdown: None,
+        });
+    summary.context_usage_sequence = summary.context_usage_sequence.saturating_add(1);
+    summary.emitted_context_usage = Some(current);
 }
 
 fn normalize_model_key_for_context_lookup(model: &str) -> String {
