@@ -1545,6 +1545,7 @@ fn real_mcp_tool_call() {
             assert_mcp_calls_reached_the_server(&called, &journal, before_single, &[&single]);
             assert_mcp_results_came_back(&called, &[&single]);
             assert_final_text_contains(&called, &format!("{MCP_RESULT_PREFIX}{single}"));
+            assert_no_error_message(&called.label(), called.events());
 
             let (first, second) = (unique_payload(), unique_payload());
             let before_twice = mcp_journal(&journal).len();
@@ -1553,6 +1554,7 @@ fn real_mcp_tool_call() {
             assert_mcp_results_came_back(&twice, &[&first, &second]);
             assert_final_text_contains(&twice, &format!("{MCP_RESULT_PREFIX}{first}"));
             assert_final_text_contains(&twice, &format!("{MCP_RESULT_PREFIX}{second}"));
+            assert_no_error_message(&twice.label(), twice.events());
 
             assert_universal_contract(&[launched, called, twice]);
             assert_clean_close(&mut host, &agent).await;

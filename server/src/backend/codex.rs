@@ -2776,6 +2776,7 @@ struct CodexResponseSplitter {
     /// typed item, so retain the declaration until its raw output proves
     /// whether the typed owner actually existed.
     suppressed_raw_tool_requests: IndexMap<String, BufferedCodexToolRequest>,
+    completed_raw_tool_call_ids: HashSet<String>,
     pending_raw_tool_owners: IndexMap<String, BufferedCodexToolRequest>,
     last_token_usage: Option<Value>,
 }
@@ -2810,6 +2811,7 @@ impl CodexResponseSplitter {
             claimed_raw_tool_calls: HashSet::new(),
             typed_owned_call_ids: HashSet::new(),
             suppressed_raw_tool_requests: IndexMap::new(),
+            completed_raw_tool_call_ids: HashSet::new(),
             pending_raw_tool_owners: IndexMap::new(),
             last_token_usage: None,
         }
@@ -3294,8 +3296,12 @@ impl CodexResponseSplitter {
         // leaving the declared card open until the idle sweep cancelled it.
         for request in &tool_requests {
             if !failed && let Some(call_id) = request.provider_call_id.as_ref() {
-                self.pending_raw_tool_owners
-                    .insert(call_id.clone(), request.clone());
+                if !self.completed_raw_tool_call_ids.remove(call_id) {
+                    self.pending_raw_tool_owners
+                        .insert(call_id.clone(), request.clone());
+                }
+            } else if let Some(call_id) = request.provider_call_id.as_ref() {
+                self.completed_raw_tool_call_ids.remove(call_id);
             }
         }
         let mut evicted_tool_requests = Vec::new();
@@ -3418,6 +3424,12 @@ impl CodexResponseSplitter {
             self.claimed_raw_tool_calls.remove(&owner.tool_call_id);
         }
         owner
+    }
+
+    fn complete_raw_tool_call(&mut self, call_id: &str) {
+        if self.remove_raw_tool_owner(call_id).is_none() {
+            self.completed_raw_tool_call_ids.insert(call_id.to_owned());
+        }
     }
 
     fn remove_raw_tool_owner_by_tool_call_id(&mut self, tool_call_id: &str) {
@@ -8649,7 +8661,7 @@ impl CodexInner {
                 .response_splitters
                 .get_mut(&thread_id)
             {
-                splitter.remove_raw_tool_owner(call_id);
+                splitter.complete_raw_tool_call(call_id);
             }
             return true;
         }
@@ -8660,7 +8672,7 @@ impl CodexInner {
                 .contains(&owner.tool_call_id);
             if native_subagent && let Some(splitter) = state.response_splitters.get_mut(&thread_id)
             {
-                splitter.remove_raw_tool_owner(call_id);
+                splitter.complete_raw_tool_call(call_id);
             }
             native_subagent
         };
@@ -8678,7 +8690,7 @@ impl CodexInner {
                         owner_thread_id == &thread_id && command.tool_call_id == owner.tool_call_id
                     });
             if correlated && let Some(splitter) = state.response_splitters.get_mut(&thread_id) {
-                splitter.remove_raw_tool_owner(call_id);
+                splitter.complete_raw_tool_call(call_id);
             }
             correlated
         };
@@ -8704,7 +8716,7 @@ impl CodexInner {
                         })
                 });
                 if correlated && let Some(splitter) = state.response_splitters.get_mut(&thread_id) {
-                    splitter.remove_raw_tool_owner(call_id);
+                    splitter.complete_raw_tool_call(call_id);
                 }
                 correlated
             };
@@ -8739,7 +8751,7 @@ impl CodexInner {
                             .is_none_or(|process_id| !yielded_session_ids.contains(process_id))
                 });
             if let Some(splitter) = state.response_splitters.get_mut(&thread_id) {
-                splitter.remove_raw_tool_owner(call_id);
+                splitter.complete_raw_tool_call(call_id);
             }
             return true;
         }
@@ -8750,6 +8762,15 @@ impl CodexInner {
         // disagreement surfaced as `conflicting_duplicate_completion`. A card a
         // typed item has taken belongs to that item alone.
         if typed_owns_call {
+            if let Some(splitter) = self
+                .state
+                .lock()
+                .await
+                .response_splitters
+                .get_mut(&thread_id)
+            {
+                splitter.complete_raw_tool_call(call_id);
+            }
             return true;
         }
         let output = raw_custom_tool_output_text(item);
@@ -8778,7 +8799,7 @@ impl CodexInner {
             .response_splitters
             .get_mut(&thread_id)
         {
-            splitter.remove_raw_tool_owner(call_id);
+            splitter.complete_raw_tool_call(call_id);
             splitter.remove_suppressed_raw_tool_request(call_id);
         }
         true
@@ -9111,16 +9132,24 @@ impl CodexInner {
             normalize_token_usage_with_envelope(usage, Some(params), Some(&model))
         });
         let turn_id = extract_turn_id(params);
-        let finalized = {
+        let (finalized, retained_raw_owners, claimed_raw_calls) = {
             let mut state = self.state.lock().await;
-            state
-                .response_splitters
-                .get_mut(&thread_id)
-                .and_then(|splitter| splitter.finalize(turn_id.as_deref(), usage, failed))
+            let Some(splitter) = state.response_splitters.get_mut(&thread_id) else {
+                return false;
+            };
+            let finalized = splitter.finalize(turn_id.as_deref(), usage, failed);
+            (
+                finalized,
+                splitter.pending_raw_tool_owners.len(),
+                splitter.claimed_raw_tool_calls.len(),
+            )
         };
         let Some(finalized) = finalized else {
             return false;
         };
+        eprintln!(
+            "TYDE CODEX RAW OWNER RETENTION thread_id={thread_id} retained={retained_raw_owners} claimed={claimed_raw_calls}"
+        );
         tracing::debug!(
             thread_id,
             turn_id = finalized.turn_id,
@@ -9224,6 +9253,25 @@ impl CodexInner {
         // first moment any outcome that outran the declaration can be emitted.
         self.flush_deferred_tool_completions(&thread_id, &emitter)
             .await;
+        let retained_completed_owners = {
+            let state = self.state.lock().await;
+            state
+                .response_splitters
+                .get(&thread_id)
+                .into_iter()
+                .flat_map(|splitter| splitter.pending_raw_tool_owners.values())
+                .filter(|owner| {
+                    emitter.has_known_tool_request(&owner.tool_call_id)
+                        && !emitter.has_pending_tool_request(&owner.tool_call_id)
+                })
+                .map(|owner| owner.tool_call_id.clone())
+                .collect::<Vec<_>>()
+        };
+        for tool_call_id in retained_completed_owners {
+            emitter.backend_error(&format!(
+                "Codex retained the owner for completed tool '{tool_call_id}'"
+            ));
+        }
         tracing::info!(
             thread_id,
             turn_id = finalized.turn_id,
