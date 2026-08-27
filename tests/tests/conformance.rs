@@ -79,8 +79,8 @@ const CLEARED_MARKER: &str = "TYDE_CLEARED";
 const STEERING_BEFORE_COMPACTION: &str = "TYDE_STEERING_BEFORE_COMPACTION";
 const STEERING_AFTER_COMPACTION: &str = "TYDE_STEERING_AFTER_COMPACTION";
 const STEERING_AFTER_RESUME: &str = "TYDE_STEERING_AFTER_RESUME";
-const SKILL_BODY_MARKER: &str = "TYDE_SKILL_BODY_MUST_STAY_ON_DISK";
-const SKILL_CATALOG_REPLY: &str = "TYDE_SKILL_CATALOG_READY";
+const SKILL_INACTIVE_MARKER: &str = "TYDE_SKILL_INACTIVE";
+const SKILL_ACTIVATED_MARKER: &str = "TYDE_SKILL_ACTIVATED_FROM_BODY";
 
 /// The MCP probe server, its one tool, and the prefix it echoes back.
 ///
@@ -254,52 +254,59 @@ fn real_conversation() {
 
 #[test]
 #[ignore = "paid real-backend suite; use --run-ignored all with TYDE_RUN_REAL_AI_TESTS=1"]
-fn real_skill_bodies_stay_out_of_user_turns() {
-    run_scenario(&[], |mut host| async move {
-        let skill_name = "tyde-progressive-disclosure";
+fn real_skills() {
+    run_native_skill_scenario(|mut host| async move {
+        let skill_name = "tyde-conformance-skill";
         install_skill(
             &mut host,
             skill_name,
-            "Use only when the user explicitly asks to activate the progressive-disclosure probe.",
+            "Use only when the user explicitly asks to activate the Tyde conformance skill.",
             &format!(
-                "---\nname: {skill_name}\ndescription: Use only when explicitly activated.\n---\n\nIf this body is activated, reply with {SKILL_BODY_MARKER}."
+                "---\nname: {skill_name}\ndescription: Use only when the user explicitly asks to activate the Tyde conformance skill.\n---\n\nWhen activated, reply with exactly {SKILL_ACTIVATED_MARKER} and nothing else."
             ),
         )
         .await;
 
-        let prompt = format!(
-            "Do not activate any skills. Reply with exactly {SKILL_CATALOG_REPLY} and nothing else."
+        let unrelated_prompt = format!(
+            "Do not activate any skills. Reply with exactly {SKILL_INACTIVE_MARKER} and nothing else."
         );
-        let agent = spawn_agent(&mut host, &prompt).await;
-        let turn = collect_turn(&mut host, &agent, &prompt).await;
-
-        let user_messages = turn
-            .events()
-            .iter()
-            .filter_map(|event| match event {
-                ChatEvent::MessageAdded(message)
-                    if matches!(message.sender, MessageSender::User) =>
-                {
-                    Some(message.content.as_str())
-                }
-                _ => None,
-            })
-            .collect::<Vec<_>>();
+        let agent = spawn_agent(&mut host, &unrelated_prompt).await;
+        let unrelated = collect_turn(&mut host, &agent, &unrelated_prompt).await;
         assert_eq!(
-            user_messages,
-            vec![prompt.as_str()],
+            unrelated
+                .user_messages()
+                .map(|message| message.content.as_str())
+                .collect::<Vec<_>>(),
+            vec![unrelated_prompt.as_str()],
             "{}: the provider-facing customization text leaked into the user's visible turn",
-            turn.label()
+            unrelated.label()
         );
         assert!(
-            turn.events().iter().all(|event| match event {
-                ChatEvent::MessageAdded(message) => !message.content.contains(SKILL_BODY_MARKER),
+            unrelated.events().iter().all(|event| match event {
+                ChatEvent::MessageAdded(message) => {
+                    !message.content.contains(SKILL_ACTIVATED_MARKER)
+                }
                 _ => true,
             }),
-            "{}: the selected skill body appeared in the chat event stream",
-            turn.label()
+            "{}: the unactivated skill body affected the chat event stream",
+            unrelated.label()
         );
-        assert_final_text_contains(&turn, SKILL_CATALOG_REPLY);
+        assert_final_text_contains(&unrelated, SKILL_INACTIVE_MARKER);
+
+        let activation_prompt = format!(
+            "Activate and follow the {skill_name} skill. Do not infer or invent its instructions from this request; read the skill first."
+        );
+        let activated = ask(&mut host, &agent, &activation_prompt).await;
+        assert_eq!(
+            activated
+                .user_messages()
+                .map(|message| message.content.as_str())
+                .collect::<Vec<_>>(),
+            vec![activation_prompt.as_str()],
+            "{}: the skill activation request was not preserved as the user's exact turn",
+            activated.label()
+        );
+        assert_final_text_contains(&activated, SKILL_ACTIVATED_MARKER);
     });
 }
 

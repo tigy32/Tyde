@@ -234,6 +234,15 @@ impl Turn {
         &self.events
     }
 
+    pub fn user_messages(&self) -> impl Iterator<Item = &ChatMessage> {
+        self.events.iter().filter_map(|event| match event {
+            ChatEvent::MessageAdded(message) if matches!(message.sender, MessageSender::User) => {
+                Some(message)
+            }
+            _ => None,
+        })
+    }
+
     /// Prefix for this turn's assertion failures. Not an identity — it names the
     /// turn by what it asked for, which an index into the conversation could not.
     pub fn label(&self) -> String {
@@ -2071,12 +2080,32 @@ where
     F: Fn(Host) -> Fut + Send + 'static,
     Fut: Future<Output = ()> + 'static,
 {
+    run_scenario_where(requires, |_| true, scenario);
+}
+
+pub fn run_native_skill_scenario<F, Fut>(scenario: F)
+where
+    F: Fn(Host) -> Fut + Send + 'static,
+    Fut: Future<Output = ()> + 'static,
+{
+    run_scenario_where(&[], server::backend::discovers_skills_natively, scenario);
+}
+
+fn run_scenario_where<F, Fut>(
+    requires: &[BackendCapability],
+    eligible: impl Fn(BackendKind) -> bool,
+    scenario: F,
+) where
+    F: Fn(Host) -> Fut + Send + 'static,
+    Fut: Future<Output = ()> + 'static,
+{
     init_tracing();
     let (backends, skipped): (Vec<_>, Vec<_>) = enabled_backends().into_iter().partition(|kind| {
         let capabilities = server::backend::capabilities_for_backend_kind(*kind);
-        requires
-            .iter()
-            .all(|requirement| capabilities.contains(*requirement))
+        eligible(*kind)
+            && requires
+                .iter()
+                .all(|requirement| capabilities.contains(*requirement))
     });
     require_locally_built_mcp_bridge(&backends);
     if backends.is_empty() {

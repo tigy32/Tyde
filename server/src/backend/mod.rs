@@ -1144,6 +1144,14 @@ pub fn capabilities_for_backend_kind(kind: BackendKind) -> BackendCapabilities {
 }
 
 #[cfg(feature = "test-support")]
+pub fn discovers_skills_natively(kind: BackendKind) -> bool {
+    matches!(
+        crate::agent::customization::SkillDelivery::for_backend(kind),
+        crate::agent::customization::SkillDelivery::NativeDiscovery
+    )
+}
+
+#[cfg(feature = "test-support")]
 pub fn compaction_capability_is_native(capability: &BackendCompactionCapability) -> bool {
     matches!(
         capability.availability,
