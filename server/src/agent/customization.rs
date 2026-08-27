@@ -12,8 +12,7 @@ use crate::store::mcp_servers::{McpServerStore, RESERVED_MCP_SERVER_NAMES};
 use crate::store::skills::SkillStore;
 use crate::store::steering::SteeringStore;
 
-/// One skill selected for a session: identity and location first, body only
-/// when the backend has no way to read it for itself.
+/// One skill selected for a session: identity and canonical on-disk location.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedSkill {
     pub id: SkillId,
@@ -36,30 +35,11 @@ pub struct ResolvedSkill {
     /// Canonical `<source_dir>/SKILL.md`, proven to be a regular file inside
     /// `source_dir`.
     pub skill_md_path: PathBuf,
-    payload: SkillPayload,
-}
-
-/// What a session was handed for one skill.
-///
-/// Private, and the only way to reach it is [`ResolvedSkill::inline_body`].
-/// That is the whole point: no caller outside this module can put inline text
-/// into a skill its backend is supposed to discover for itself, or add text to
-/// one after the fact, because there is no public constructor that takes a body
-/// and no field to assign.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum SkillPayload {
-    /// The backend opens `skill_md_path` itself when the model invokes the
-    /// skill. No text travels with the session.
-    Path,
-    /// The backend has no discovery seam, so the text travels with the skill.
-    Inline(String),
 }
 
 impl ResolvedSkill {
     /// A skill the backend finds for itself: identity and canonical locations,
-    /// never any text. This is the only public constructor, so a
-    /// `NativeDiscovery` or `NamesOnly` skill carrying inline text is not a
-    /// state a caller can express.
+    /// never any inline text.
     pub fn path_only(skill: protocol::Skill, source_dir: PathBuf, skill_md_path: PathBuf) -> Self {
         Self {
             id: skill.id,
@@ -68,42 +48,14 @@ impl ResolvedSkill {
             description: skill.description,
             source_dir,
             skill_md_path,
-            payload: SkillPayload::Path,
-        }
-    }
-
-    /// The only place a skill is built from the store, so its payload cannot
-    /// disagree with the delivery the session was resolved under.
-    fn resolved(
-        skill: protocol::Skill,
-        paths: crate::store::skills::SkillPaths,
-        delivery: SkillDelivery,
-    ) -> Result<Self, String> {
-        let mut resolved = Self::path_only(skill, paths.source_dir, paths.skill_md);
-        if delivery.loads_bodies() {
-            resolved.payload = SkillPayload::Inline(resolved.load_body()?);
-        }
-        Ok(resolved)
-    }
-
-    /// The inline body, or `None` when this session's delivery never loaded
-    /// one. Absence is a distinct state rather than an empty string, so
-    /// "discovered on demand" cannot be misread as "has no instructions".
-    pub fn inline_body(&self) -> Option<&str> {
-        match &self.payload {
-            SkillPayload::Path => None,
-            SkillPayload::Inline(body) => Some(body.as_str()),
         }
     }
 
     /// Read this skill's `SKILL.md` on demand.
     ///
-    /// Native-discovery sessions never call this: the backend opens the file
-    /// itself when the model invokes the skill, so the body costs nothing until
-    /// then. It exists for backends with no discovery seam, and for Claude over
-    /// SSH, where a locally materialized directory is invisible to the remote
-    /// CLI. Keeping it an explicit call means every prompt that still pays for
-    /// an inline body is greppable from one place.
+    /// Native-discovery adapters use this only while creating the private
+    /// on-disk projection their backend discovers. The text is never rendered
+    /// into spawn instructions or a user message.
     pub fn load_body(&self) -> Result<String, String> {
         std::fs::read_to_string(&self.skill_md_path).map_err(|err| {
             format!(
@@ -128,11 +80,8 @@ pub enum SkillSelection {
 
 /// How a backend receives the skills resolved for a session.
 ///
-/// This is the transport fact. The two policies that follow from it —
-/// whether resolution reads bodies, and whether the shared renderer inlines
-/// them — are separate predicates, because they are not the same question: a
-/// backend can want no bodies in its prompt for reasons that have nothing to do
-/// with whether it can find the skill on disk.
+/// This is the transport fact. Full skill bodies are never a delivery mode:
+/// backends either discover selected skills on demand or receive names only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SkillDelivery {
     /// The adapter exposes `source_dir` through the backend's own on-demand
@@ -143,10 +92,6 @@ pub enum SkillDelivery {
     /// is a real gap when the backend's mechanism looks somewhere other than
     /// Tyde's store, and the adapter owns closing it.
     NamesOnly,
-    /// The backend has no discovery seam, so bodies are rendered into its spawn
-    /// instructions and are loaded during resolution — a read failure surfaces
-    /// at spawn rather than halfway through building a prompt.
-    InlineBodies,
 }
 
 impl SkillDelivery {
@@ -158,27 +103,14 @@ impl SkillDelivery {
             // well put every selected skill's full text in the prompt *and* in
             // the catalog, which is the duplication native discovery exists to
             // avoid.
-            BackendKind::Claude | BackendKind::Codex | BackendKind::Tycode => Self::NativeDiscovery,
-            // Hermes replaces the shared skill block with its own name-only
-            // catalog, so every body it was handed was read and thrown away.
-            BackendKind::Hermes => Self::NamesOnly,
-            BackendKind::Kiro | BackendKind::Antigravity => Self::InlineBodies,
-        }
-    }
-
-    /// Whether resolution must read each selected skill's `SKILL.md`.
-    pub fn loads_bodies(self) -> bool {
-        match self {
-            Self::NativeDiscovery | Self::NamesOnly => false,
-            Self::InlineBodies => true,
-        }
-    }
-
-    /// Whether the shared spawn-instruction renderer inlines skill bodies.
-    pub fn renders_inline_bodies(self) -> bool {
-        match self {
-            Self::NativeDiscovery | Self::NamesOnly => false,
-            Self::InlineBodies => true,
+            BackendKind::Claude
+            | BackendKind::Codex
+            | BackendKind::Tycode
+            | BackendKind::Antigravity => Self::NativeDiscovery,
+            // Hermes provides its own name-only catalog. Kiro has no native
+            // selected-skill projection yet, so its resolved names remain
+            // available to a future adapter without loading any body today.
+            BackendKind::Hermes | BackendKind::Kiro => Self::NamesOnly,
         }
     }
 }
@@ -204,7 +136,7 @@ impl Default for ResolvedSpawnConfig {
             // Explicit is the safe default: an adapter must never advertise
             // skills it was not handed.
             skill_selection: SkillSelection::Explicit,
-            skill_delivery: SkillDelivery::InlineBodies,
+            skill_delivery: SkillDelivery::NamesOnly,
             mcp_servers: Vec::new(),
             tool_policy: ToolPolicy::Unrestricted,
             access_mode: BackendAccessMode::Unrestricted,
@@ -267,11 +199,7 @@ pub(crate) fn resolve_spawn_config(
         if is_default_custom_agent(&custom_agent) {
             skill_selection = SkillSelection::AllInstalled;
             for skill in request.skill_store.list()? {
-                skills.push(resolve_skill(
-                    request.skill_store,
-                    &skill.id,
-                    skill_delivery,
-                )?);
+                skills.push(resolve_skill(request.skill_store, &skill.id)?);
             }
             for mcp_server in request.mcp_server_store.list()? {
                 push_mcp_server(
@@ -283,11 +211,7 @@ pub(crate) fn resolve_spawn_config(
             }
         } else {
             for skill_id in &custom_agent.skill_ids {
-                skills.push(resolve_skill(
-                    request.skill_store,
-                    skill_id,
-                    skill_delivery,
-                )?);
+                skills.push(resolve_skill(request.skill_store, skill_id)?);
             }
 
             for mcp_server_id in &custom_agent.mcp_server_ids {
@@ -440,16 +364,16 @@ fn startup_mcp_server_to_protocol(server: &StartupMcpServer) -> McpServerConfig 
     }
 }
 
-fn resolve_skill(
-    skill_store: &SkillStore,
-    skill_id: &SkillId,
-    delivery: SkillDelivery,
-) -> Result<ResolvedSkill, String> {
+fn resolve_skill(skill_store: &SkillStore, skill_id: &SkillId) -> Result<ResolvedSkill, String> {
     let skill = skill_store
         .get(skill_id)
         .ok_or_else(|| format!("cannot resolve missing skill {}", skill_id))?;
     let paths = skill_store.skill_paths(skill_id)?;
-    ResolvedSkill::resolved(skill, paths, delivery)
+    Ok(ResolvedSkill::path_only(
+        skill,
+        paths.source_dir,
+        paths.skill_md,
+    ))
 }
 
 fn resolve_steering_body(

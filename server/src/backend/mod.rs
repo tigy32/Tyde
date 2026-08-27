@@ -1842,23 +1842,6 @@ pub(crate) fn render_combined_spawn_instructions(config: &ResolvedSpawnConfig) -
     if !config.steering_body.trim().is_empty() {
         sections.push(format!("Steering:\n{}", config.steering_body.trim()));
     }
-    // Only backends with no discovery seam get bodies here; the rest are
-    // pointed at each skill's directory, or name it, from their own adapter.
-    if config.skill_delivery.renders_inline_bodies() {
-        let skill_blocks = config
-            .skills
-            .iter()
-            .filter_map(|skill| {
-                skill
-                    .inline_body()
-                    .map(|body| format!("Skill: {}\n{}", skill.name, body.trim()))
-            })
-            .collect::<Vec<_>>();
-        if !skill_blocks.is_empty() {
-            sections.push(format!("Skills:\n{}", skill_blocks.join("\n\n")));
-        }
-    }
-
     if sections.is_empty() {
         None
     } else {

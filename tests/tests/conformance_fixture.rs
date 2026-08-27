@@ -26,10 +26,10 @@ use protocol::{
     MessageMetadataUpdateData, MessageSender, MessageTokenUsage, NewAgentPayload,
     QueuedMessagesPayload, SendMessagePayload, SendMessageToolResponse, SessionHistoryPayload,
     SessionId, SessionListPayload, SessionSettingValue, SessionSettingsValues, SessionSummary,
-    SpawnAgentParams, SpawnAgentPayload, SpawnCostHint, Steering, SteeringId,
-    SteeringNotifyPayload, SteeringScope, SteeringUpsertPayload, StreamPath, TaskList,
-    ToolExecutionCompletedData, ToolExecutionOutcome, ToolExecutionResult, ToolRequest,
-    ToolUseData,
+    Skill, SkillId, SkillNotifyPayload, SkillRefreshPayload, SpawnAgentParams, SpawnAgentPayload,
+    SpawnCostHint, Steering, SteeringId, SteeringNotifyPayload, SteeringScope,
+    SteeringUpsertPayload, StreamPath, TaskList, ToolExecutionCompletedData, ToolExecutionOutcome,
+    ToolExecutionResult, ToolRequest, ToolUseData,
 };
 use serde_json::json;
 use tyde_agent_adapter::BackendCapability;
@@ -458,6 +458,7 @@ pub struct Host {
     client: client::Connection,
     handle: server::HostHandle,
     backend_kind: BackendKind,
+    store: PathBuf,
     workspace: PathBuf,
 }
 
@@ -583,6 +584,7 @@ impl Host {
             client,
             handle,
             backend_kind,
+            store: store.to_path_buf(),
             workspace: workspace.to_path_buf(),
         }
     }
@@ -621,6 +623,51 @@ impl Host {
                 "{backend_kind:?} timed out after {}s waiting for {context}",
                 timeout.as_secs()
             ),
+        }
+    }
+}
+
+/// Install one host skill and wait until the running host has rescanned it.
+pub async fn install_skill(host: &mut Host, name: &str, description: &str, body: &str) {
+    loop {
+        let envelope = host.next_envelope(CONTROL_TIMEOUT, "HostBootstrap").await;
+        fail_on_client_error(&envelope, "install_skill bootstrap");
+        if envelope.kind == FrameKind::HostBootstrap {
+            break;
+        }
+    }
+    let skill = Skill {
+        id: SkillId(name.to_owned()),
+        name: name.to_owned(),
+        title: None,
+        description: Some(description.to_owned()),
+    };
+    let skill_dir = host.store.join("skills").join(name);
+    std::fs::create_dir_all(&skill_dir).expect("create conformance skill directory");
+    std::fs::write(
+        skill_dir.join("metadata.json"),
+        serde_json::to_vec_pretty(&skill).expect("serialize conformance skill metadata"),
+    )
+    .expect("write conformance skill metadata");
+    std::fs::write(skill_dir.join("SKILL.md"), body).expect("write conformance skill body");
+    host.client
+        .skill_refresh(SkillRefreshPayload::default())
+        .await
+        .expect("skill_refresh failed");
+    loop {
+        let envelope = host.next_envelope(CONTROL_TIMEOUT, "SkillNotify").await;
+        fail_on_client_error(&envelope, "install_skill");
+        if envelope.kind != FrameKind::SkillNotify {
+            continue;
+        }
+        let notify: SkillNotifyPayload =
+            envelope.parse_payload().expect("parse SkillNotifyPayload");
+        if notify
+            == (SkillNotifyPayload::Upsert {
+                skill: skill.clone(),
+            })
+        {
+            break;
         }
     }
 }

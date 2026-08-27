@@ -79,6 +79,8 @@ const CLEARED_MARKER: &str = "TYDE_CLEARED";
 const STEERING_BEFORE_COMPACTION: &str = "TYDE_STEERING_BEFORE_COMPACTION";
 const STEERING_AFTER_COMPACTION: &str = "TYDE_STEERING_AFTER_COMPACTION";
 const STEERING_AFTER_RESUME: &str = "TYDE_STEERING_AFTER_RESUME";
+const SKILL_BODY_MARKER: &str = "TYDE_SKILL_BODY_MUST_STAY_ON_DISK";
+const SKILL_CATALOG_REPLY: &str = "TYDE_SKILL_CATALOG_READY";
 
 /// The MCP probe server, its one tool, and the prefix it echoes back.
 ///
@@ -247,6 +249,57 @@ fn real_conversation() {
         );
 
         assert_clean_close(&mut host, &agent).await;
+    });
+}
+
+#[test]
+#[ignore = "paid real-backend suite; use --run-ignored all with TYDE_RUN_REAL_AI_TESTS=1"]
+fn real_skill_bodies_stay_out_of_user_turns() {
+    run_scenario(&[], |mut host| async move {
+        let skill_name = "tyde-progressive-disclosure";
+        install_skill(
+            &mut host,
+            skill_name,
+            "Use only when the user explicitly asks to activate the progressive-disclosure probe.",
+            &format!(
+                "---\nname: {skill_name}\ndescription: Use only when explicitly activated.\n---\n\nIf this body is activated, reply with {SKILL_BODY_MARKER}."
+            ),
+        )
+        .await;
+
+        let prompt = format!(
+            "Do not activate any skills. Reply with exactly {SKILL_CATALOG_REPLY} and nothing else."
+        );
+        let agent = spawn_agent(&mut host, &prompt).await;
+        let turn = collect_turn(&mut host, &agent, &prompt).await;
+
+        let user_messages = turn
+            .events()
+            .iter()
+            .filter_map(|event| match event {
+                ChatEvent::MessageAdded(message)
+                    if matches!(message.sender, MessageSender::User) =>
+                {
+                    Some(message.content.as_str())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            user_messages,
+            vec![prompt.as_str()],
+            "{}: the provider-facing customization text leaked into the user's visible turn",
+            turn.label()
+        );
+        assert!(
+            turn.events().iter().all(|event| match event {
+                ChatEvent::MessageAdded(message) => !message.content.contains(SKILL_BODY_MARKER),
+                _ => true,
+            }),
+            "{}: the selected skill body appeared in the chat event stream",
+            turn.label()
+        );
+        assert_final_text_contains(&turn, SKILL_CATALOG_REPLY);
     });
 }
 

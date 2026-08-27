@@ -782,14 +782,8 @@ fn summarize_text(text: &str) -> String {
     text.trim().replace('\n', "\\n")
 }
 
-/// Record what the backend was actually handed for a skill: the name alone
-/// under native discovery, and `name=body` when the resolver inlined a body.
-/// Tests read this to tell the two deliveries apart.
 fn summarize_skill(skill: &crate::agent::customization::ResolvedSkill) -> String {
-    match skill.inline_body() {
-        Some(body) => format!("{}={}", skill.name, summarize_text(body)),
-        None => skill.name.clone(),
-    }
+    skill.name.clone()
 }
 
 fn now_ms() -> u64 {

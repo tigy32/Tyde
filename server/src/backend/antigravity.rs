@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -29,6 +29,10 @@ use crate::backend::antigravity_stream::{
     STEP_SYSTEM_MESSAGE, STEP_TOOL, STEP_UNKNOWN, STEP_USER_INPUT, TranscriptReader,
     answers_from_result, exit_code_from_result, mcp_inner_call, parse_frame, subagent_request_type,
     tool_request_type, usage_report_from_frame,
+};
+use crate::backend::skill_projection::{
+    DescriptionPolicy, ProjectionPolicy, SkillRefusal, create_private_dir, create_private_root,
+    discard_wrapper, inspect_skill, write_wrapper,
 };
 use crate::backend::turn_emitter::{AgentName, ResponseHandle, StreamEndPayload, TurnEmitter};
 use crate::backend::{
@@ -65,6 +69,12 @@ const ANTIGRAVITY_PRINT_TIMEOUT: &str = "60m";
 const ANTIGRAVITY_DEFAULT_MODEL: &str = "Gemini 3.7 Flash (Medium)";
 const ANTIGRAVITY_LOW_MODEL: &str = "Gemini 3.7 Flash (Low)";
 const ANTIGRAVITY_HIGH_MODEL: &str = "Gemini 3.1 Pro (High)";
+const ANTIGRAVITY_SKILLS_ROOT_PREFIX: &str = "tyde-antigravity-skills-";
+
+const ANTIGRAVITY_SKILL_PROJECTION: ProjectionPolicy = ProjectionPolicy {
+    refused_resource_names: &[],
+    description: DescriptionPolicy::Required,
+};
 
 /// The one entry Tyde owns in `agy`'s shared MCP config. Shared with the
 /// bridge so the tool-name mapping and the config agree on it.
@@ -116,6 +126,85 @@ struct AgyLaunch {
     /// every `agy` process this session starts — including the ones a restart
     /// after an interrupt creates.
     bridge_env: Option<(String, String)>,
+}
+
+struct AntigravitySkillProjection {
+    root: tempfile::TempDir,
+}
+
+impl AntigravitySkillProjection {
+    fn path(&self) -> &Path {
+        self.root.path()
+    }
+}
+
+#[derive(Default)]
+struct AntigravitySkillSetup {
+    projection: Option<AntigravitySkillProjection>,
+    degraded_notice: Option<String>,
+}
+
+fn prepare_antigravity_skills(
+    skills: &[crate::agent::customization::ResolvedSkill],
+) -> Result<AntigravitySkillSetup, String> {
+    if skills.is_empty() {
+        return Ok(AntigravitySkillSetup::default());
+    }
+
+    let mut inspected = Vec::new();
+    let mut refusals = Vec::new();
+    let mut claimed = BTreeSet::new();
+    for skill in skills {
+        match inspect_skill(skill, &mut claimed, ANTIGRAVITY_SKILL_PROJECTION) {
+            Ok(entry) => inspected.push(entry),
+            Err(reason) => refusals.push(SkillRefusal {
+                name: skill.name.clone(),
+                reason,
+            }),
+        }
+    }
+
+    let mut projection = None;
+    if !inspected.is_empty() {
+        let root = create_private_root(None, ANTIGRAVITY_SKILLS_ROOT_PREFIX)?;
+        let skills_dir = root.path().join(".agents").join("skills");
+        create_private_dir(&skills_dir)?;
+        for entry in inspected {
+            if let Err(reason) = write_wrapper(&skills_dir, &entry) {
+                discard_wrapper(&skills_dir, &entry.projected.name);
+                refusals.push(SkillRefusal {
+                    name: entry.source_name,
+                    reason,
+                });
+            }
+        }
+        if std::fs::read_dir(&skills_dir)
+            .map_err(|err| format!("Failed to inspect Antigravity skill projection: {err}"))?
+            .next()
+            .is_some()
+        {
+            projection = Some(AntigravitySkillProjection { root });
+        }
+    }
+
+    for refusal in &refusals {
+        tracing::warn!("Antigravity skill projection: {}", refusal.describe());
+    }
+    let degraded_notice = (!refusals.is_empty()).then(|| {
+        format!(
+            "Antigravity started without some selected skills:\n{}",
+            refusals
+                .iter()
+                .map(|refusal| format!("- {}", refusal.describe()))
+                .collect::<Vec<_>>()
+                .join("\n")
+        )
+    });
+
+    Ok(AntigravitySkillSetup {
+        projection,
+        degraded_notice,
+    })
 }
 
 impl AgyLaunch {
@@ -751,6 +840,9 @@ struct Supervisor {
     /// Deleted when the supervisor exits, taking this session's credentials
     /// with it.
     descriptor_dir: Option<tempfile::TempDir>,
+    /// Keeps the native `.agents/skills` tree alive across every turn and
+    /// process restart in this session.
+    skill_projection: Option<AntigravitySkillProjection>,
     mapper: Option<TurnMapper>,
     cumulative: AgyUsage,
     turn_counter: u64,
@@ -763,18 +855,29 @@ struct Supervisor {
     shutdown_complete: oneshot::Sender<()>,
 }
 
+struct InitialTurn {
+    provider_message: String,
+    user_message: String,
+}
+
 impl Supervisor {
     async fn run(
         mut self,
         mut process: AgyProcess,
         mut input_rx: mpsc::UnboundedReceiver<AgentInput>,
         mut interrupt_rx: mpsc::UnboundedReceiver<()>,
-        initial_message: Option<String>,
+        initial_turn: Option<InitialTurn>,
     ) {
         let emitter = Arc::clone(&self.inner.emitter);
 
-        if let Some(message) = initial_message
-            && !self.start_turn(&mut process, &message, true).await
+        if let Some(turn) = initial_turn
+            && !self
+                .start_turn(
+                    &mut process,
+                    &turn.provider_message,
+                    Some(&turn.user_message),
+                )
+                .await
         {
             self.shutdown(process).await;
             return;
@@ -873,7 +976,8 @@ impl Supervisor {
                 // A tool response is not a chat message, so it produces no user
                 // bubble — the card the user acted on is the record of it.
                 let echo = payload.tool_response.is_none();
-                self.start_turn(process, &payload.message, echo).await
+                let echoed = echo.then_some(payload.message.as_str());
+                self.start_turn(process, &payload.message, echoed).await
             }
             AgentInput::UpdateSessionSettings(payload) => {
                 match self.apply_settings(process, payload.values).await {
@@ -935,7 +1039,7 @@ impl Supervisor {
         &mut self,
         process: &mut AgyProcess,
         message: &str,
-        echo_user_message: bool,
+        echoed_user_message: Option<&str>,
     ) -> bool {
         self.turn_counter += 1;
         let model = {
@@ -949,8 +1053,8 @@ impl Supervisor {
             TranscriptReader::new(&self.brain_dir, &process.conversation_id),
             self.cumulative,
         ));
-        if echo_user_message {
-            self.inner.emitter.user_message(message, None);
+        if let Some(user_message) = echoed_user_message {
+            self.inner.emitter.user_message(user_message, None);
         }
         self.inner.emitter.typing_status_changed(true);
         if let Err(err) = process.send_turn(message).await {
@@ -1061,12 +1165,13 @@ impl Supervisor {
         Ok(())
     }
 
-    async fn shutdown(self, mut process: AgyProcess) {
+    async fn shutdown(mut self, mut process: AgyProcess) {
         process.terminate().await;
         // Nothing to unregister: the shared config holds only the static,
         // credential-free bridge entry. Dropping the descriptor directory
         // removes this session's endpoints and bearer tokens from disk.
         drop(self.descriptor_dir);
+        drop(self.skill_projection.take());
         let _ = self.shutdown_complete.send(());
     }
 }
@@ -1602,6 +1707,7 @@ impl AntigravityBackend {
         let model = selected_model(&settings)?;
         let combined_instructions =
             render_combined_spawn_instructions(&config.resolved_spawn_config);
+        let mut skill_setup = prepare_antigravity_skills(&config.resolved_spawn_config.skills)?;
 
         // Private to this session and removed with it. The descriptor holds the
         // endpoints and bearer credentials that must never reach the config
@@ -1614,6 +1720,16 @@ impl AntigravityBackend {
             install_antigravity_mcp_config(&config.startup_mcp_servers, descriptor_dir.path())
                 .await?;
 
+        let mut extra_roots = extra_roots;
+        if let Some(projection) = skill_setup.projection.as_ref() {
+            let root = projection.path().to_str().ok_or_else(|| {
+                format!(
+                    "Antigravity skill projection path is not valid UTF-8: {}",
+                    projection.path().display()
+                )
+            })?;
+            extra_roots.push(root.to_string());
+        }
         let launch = AgyLaunch {
             primary_root,
             extra_roots,
@@ -1627,6 +1743,9 @@ impl AntigravityBackend {
             event_tx,
             AgentName(ANTIGRAVITY_AGENT_NAME),
         ));
+        if let Some(notice) = skill_setup.degraded_notice.take() {
+            emitter.warning_message(&notice);
+        }
 
         let process = match AgyProcess::start(
             &launch,
@@ -1654,11 +1773,16 @@ impl AntigravityBackend {
         // Workspace instructions ride the first prompt of a new conversation.
         // A resumed one already has them in its history, and repeating them
         // every turn would pay for them again on every request.
-        let initial_message = initial_input.map(|input| {
-            if resume.is_none() {
-                build_prompt(combined_instructions.as_deref(), &input.message)
+        let initial_turn = initial_input.map(|input| {
+            let user_message = input.message;
+            let provider_message = if resume.is_none() {
+                build_prompt(combined_instructions.as_deref(), &user_message)
             } else {
-                input.message
+                user_message.clone()
+            };
+            InitialTurn {
+                provider_message,
+                user_message,
             }
         });
 
@@ -1672,6 +1796,7 @@ impl AntigravityBackend {
             launch,
             brain_dir: antigravity_brain_dir(conversations_dir),
             descriptor_dir: Some(descriptor_dir),
+            skill_projection: skill_setup.projection,
             mapper: None,
             cumulative: AgyUsage::default(),
             turn_counter: 0,
@@ -1681,7 +1806,7 @@ impl AntigravityBackend {
         };
         tokio::spawn(async move {
             supervisor
-                .run(process, input_rx, interrupt_rx, initial_message)
+                .run(process, input_rx, interrupt_rx, initial_turn)
                 .await;
         });
 

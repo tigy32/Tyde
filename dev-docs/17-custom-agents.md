@@ -389,8 +389,8 @@ native startup surface.
 |---|---|---|---|---|
 | Claude | `.claude/agents/{id}.md` + `--agent {id}` | `--append-system-prompt` | `.claude/skills/{name}/SKILL.md` via `--add-dir` | temp JSON via `--mcp-config` |
 | Codex | prepend to `model_instructions_file` | same file | `.agents/skills/tyde-{name}/` symlink | `-c mcp_servers.{name}.command=...` / `url=...` |
-| ACP | ACP `systemPrompt` | ACP `systemPrompt` append | `.kiro/skills/tyde-{name}/` | ACP `mcpServers` |
-| Antigravity | prepended to prompt | same prompt surface | prompt-embedded skill text | global `~/.gemini/config/mcp_config.json` guarded/restored per turn |
+| ACP | ACP `systemPrompt` | ACP `systemPrompt` append | unavailable until the adapter gains native discovery | ACP `mcpServers` |
+| Antigravity | prepended to prompt | same prompt surface | private `.agents/skills/{name}/` root via `--add-dir` | global `~/.gemini/config/mcp_config.json` guarded/restored per turn |
 | Tycode | one temp workspace root containing `.tycode/tyde_steering.md`, appended to `workspace_roots` | same root | same temp workspace root containing `.tycode/skills/` | `--mcp-servers <json>` |
 
 Notes:
