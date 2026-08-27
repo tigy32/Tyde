@@ -210,6 +210,10 @@ fn real_conversation() {
     run_scenario(&[], |mut host| async move {
         let workspace = host.workspace().to_path_buf();
         let payload = unique_payload();
+        // Keep the real CLI probe inside this flow's contract. Hermes v0.20.6
+        // renamed its reported root from `Project:` to `Install directory:`;
+        // the spawn below must fail before any paid turn if Tyde drifts from
+        // the stock CLI's discovery output again.
         let agent = spawn_agent(&mut host, &launch_prompt()).await;
 
         // Asserted next to the turn that produced it rather than in a block at
@@ -586,6 +590,8 @@ fn real_interruption() {
 
 #[test]
 #[ignore = "paid real-backend suite; use --run-ignored all with TYDE_RUN_REAL_AI_TESTS=1"]
+/// Hermes v0.20.6 made `session.resume.messages` the user-visible transcript;
+/// its live `session.history` projection can omit the persisted user turns.
 fn real_conversation_on_resumed_session() {
     run_scenario(&[BackendCapability::ResumeSession], |mut host| async move {
         let workspace = host.workspace().to_path_buf();
@@ -1274,6 +1280,9 @@ fn real_background_task_cancel() {
     );
 }
 
+/// The simultaneous Hermes delegations also guard its native argument schema.
+/// Hermes v0.20.6 moved goals under `tasks: [{ goal, context }]`; Tyde must
+/// correlate each early child event to the matching delegation card.
 #[test]
 #[ignore = "paid real-backend suite; use --run-ignored all with TYDE_RUN_REAL_AI_TESTS=1"]
 fn real_conversation_in_native_subagent() {

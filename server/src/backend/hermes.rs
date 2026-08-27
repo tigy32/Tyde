@@ -9,11 +9,12 @@ use command_group::{AsyncCommandGroup, AsyncGroupChild};
 use protocol::{
     AgentInput, BackendConfigSnapshotStatus, BackendKind, BackendNativeSettingsSnapshot,
     BackendSetupDiagnosticCode, ChatEvent, ChatMessage, CompactionMethod, CompactionMetrics,
-    CompactionStage, CompactionTrigger, ContextBreakdown, MessageSender, MessageTokenUsage,
-    ModelInfo, OperationCancelledData, ReasoningData, RetryAttemptData, SelectOption,
-    SendMessageToolResponse, SessionId, SessionSettingField, SessionSettingFieldType,
-    SessionSettingValue, SessionSettingsSchema, SessionSettingsValues, StreamEndData,
-    StreamStartData, StreamTextDeltaData, TokenUsage, TokenUsageScope, TokenUsageUnavailableReason,
+    CompactionStage, CompactionTrigger, ContextBreakdown, CurrentContextUsage, MessageSender,
+    MessageTokenUsage, ModelInfo, ModelRequestId, ModelRequestTokenUsage, ModelTurnId,
+    OperationCancelledData, ReasoningData, RetryAttemptData, SelectOption, SendMessageToolResponse,
+    SessionId, SessionSettingField, SessionSettingFieldType, SessionSettingValue,
+    SessionSettingsSchema, SessionSettingsValues, StreamEndData, StreamStartData,
+    StreamTextDeltaData, TokenUsage, TokenUsageScope, TokenUsageUnavailableReason,
     ToolExecutionCompletedData, ToolExecutionMode, ToolExecutionOutcome, ToolExecutionResult,
     ToolProgressData, ToolProgressUpdate, ToolRequest, ToolRequestType, ToolUseData,
 };
@@ -814,6 +815,8 @@ struct HermesEventMapper {
     /// turn into one message per request, so each message's own figure is a
     /// single request and the turn only exists as their sum.
     turn_usage_so_far: Option<TokenUsage>,
+    usage_turn_generation: Option<u64>,
+    usage_request_sequence: u32,
     current_turn_generation: Option<u64>,
     last_turn_generation: Option<u64>,
     interrupted_turn_generations: VecDeque<u64>,
@@ -1115,10 +1118,29 @@ impl Backend for HermesBackend {
         if resumed != session_id.0 {
             tracing::info!(from = %session_id.0, to = %resumed, "Hermes resume resolved continuation session");
         }
-        let history = gateway
-            .request("session.history", json!({ "session_id": live_session_id }))
-            .await?;
-        let replay_events = hermes_history_to_chat_events(&history)?;
+        let replay = if resume.get("messages").and_then(Value::as_array).is_some()
+            && !resume
+                .get("messages_omitted")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        {
+            let messages = resume["messages"].as_array().expect("checked above");
+            let user_messages = messages
+                .iter()
+                .filter(|message| message.get("role").and_then(Value::as_str) == Some("user"))
+                .count();
+            tracing::debug!(
+                messages = messages.len(),
+                user_messages,
+                "replaying Hermes transcript from session.resume"
+            );
+            resume
+        } else {
+            gateway
+                .request("session.history", json!({ "session_id": live_session_id }))
+                .await?
+        };
+        let replay_events = hermes_history_to_chat_events(&replay)?;
         let (command_tx, command_rx) = mpsc::unbounded_channel();
         let (events_tx, events_rx) = mpsc::unbounded_channel();
         // A resumed session that came back without its skills says so, exactly
@@ -2809,11 +2831,36 @@ impl HermesSessionActor {
                         .mapper
                         .completion_belongs_to_interrupted_turn(payload.as_ref())
                         || status.as_deref() == Some("interrupted");
+                    let context_usage = payload
+                        .as_ref()
+                        .and_then(|payload| payload.get("usage"))
+                        .and_then(current_context_usage_from_hermes);
                     if !cancelled_settlement {
                         payload = self.enrich_message_complete_payload(payload).await;
                     }
+                    if let Some(current_context_usage) = context_usage
+                        && let Some(usage) = self.mapper.model_request_usage_from_message_complete(
+                            payload.as_ref(),
+                            current_context_usage,
+                        )
+                    {
+                        let _ = self
+                            .events_tx
+                            .send(BackendEvent::ModelRequestTokenUsage(usage));
+                    }
                 }
+                let provider_request_usage = (event_type == "provider.request.start")
+                    .then(|| {
+                        self.mapper
+                            .model_request_usage_from_provider_request_start(payload.as_ref())
+                    })
+                    .flatten();
                 let mapped = self.mapper.map_event(&event_type, payload);
+                if let Some(usage) = provider_request_usage {
+                    let _ = self
+                        .events_tx
+                        .send(BackendEvent::ModelRequestTokenUsage(usage));
+                }
                 for event in mapped {
                     self.emit(event);
                 }
@@ -4429,7 +4476,7 @@ impl HermesEventMapper {
             // Tyde never rendered. None of them describe anything that
             // happened to the user's session here.
             "voice.status" | "voice.transcript" | "skin.changed" | "moa.aggregating"
-            | "notification.clear" => Ok(Vec::new()),
+            | "notification.clear" | "sessions.changed" | "session.usage" => Ok(Vec::new()),
             event if event.starts_with("pet.") => Ok(Vec::new()),
             other => Ok(vec![ChatEvent::MessageAdded(system_message(format!(
                 "Hermes sent an event Tyde does not recognize: '{other}'"
@@ -5397,6 +5444,85 @@ impl HermesEventMapper {
         (turn_usage, cumulative_usage)
     }
 
+    fn model_request_usage_from_message_complete(
+        &mut self,
+        payload: Option<&Value>,
+        current_context_usage: CurrentContextUsage,
+    ) -> Option<ModelRequestTokenUsage> {
+        let payload = payload?;
+        let request = payload.get("usage").and_then(token_usage_from_value)?;
+        let turn = add_token_usage(self.turn_usage_so_far.as_ref(), &request);
+        let cumulative = payload
+            .get("cumulative_usage")
+            .and_then(token_usage_from_value)
+            .unwrap_or_else(|| turn.clone());
+        let context_window = current_context_usage
+            .known()
+            .map(|(_, context_window)| context_window);
+        let estimated_context_breakdown = payload
+            .get("context_breakdown")
+            .and_then(|value| serde_json::from_value(value.clone()).ok());
+        let generation = payload
+            .get("_tyde_turn_generation")
+            .and_then(Value::as_u64)
+            .or(self.current_turn_generation)
+            .or(self.last_turn_generation)
+            .unwrap_or_default();
+        let request_id = self.next_model_request_id(generation);
+        Some(ModelRequestTokenUsage {
+            request_id,
+            request,
+            turn,
+            cumulative,
+            model_context_window: context_window,
+            current_context_usage: Some(current_context_usage),
+            estimated_context_breakdown,
+        })
+    }
+
+    fn model_request_usage_from_provider_request_start(
+        &mut self,
+        payload: Option<&Value>,
+    ) -> Option<ModelRequestTokenUsage> {
+        let payload = payload?;
+        let session_usage_value = payload.get("usage")?;
+        let current_context_usage = current_context_usage_from_hermes(session_usage_value)?;
+        let session_usage = token_usage_from_value(session_usage_value)?;
+        let (request, _) = token_usage_delta(self.last_session_usage.as_ref(), &session_usage);
+        let turn = add_token_usage(self.turn_usage_so_far.as_ref(), &request);
+        let cumulative = if self.cumulative_usage_incomplete {
+            turn.clone()
+        } else {
+            session_usage
+        };
+        let generation = self.current_turn_generation.unwrap_or_default();
+        let request_id = self.next_model_request_id(generation);
+        let model_context_window = current_context_usage
+            .known()
+            .map(|(_, context_window)| context_window);
+        Some(ModelRequestTokenUsage {
+            request_id,
+            request,
+            turn,
+            cumulative,
+            model_context_window,
+            current_context_usage: Some(current_context_usage),
+            estimated_context_breakdown: None,
+        })
+    }
+
+    fn next_model_request_id(&mut self, generation: u64) -> ModelRequestId {
+        if self.usage_turn_generation != Some(generation) {
+            self.usage_turn_generation = Some(generation);
+            self.usage_request_sequence = 0;
+        }
+        self.usage_request_sequence = self.usage_request_sequence.saturating_add(1);
+        ModelRequestId {
+            turn_id: ModelTurnId(format!("hermes-{generation}")),
+            sequence: self.usage_request_sequence,
+        }
+    }
+
     fn finish_stream_events(
         &mut self,
         final_text: Option<String>,
@@ -5661,6 +5787,20 @@ fn hermes_delegation_goals(arguments: &Value) -> Vec<String> {
                 .map(str::trim)
                 .filter(|goal| !goal.is_empty())
                 .map(|goal| vec![goal.to_owned()])
+        })
+        .or_else(|| {
+            arguments
+                .get("tasks")
+                .and_then(Value::as_array)
+                .map(|tasks| {
+                    tasks
+                        .iter()
+                        .filter_map(|task| task.get("goal").and_then(Value::as_str))
+                        .map(str::trim)
+                        .filter(|goal| !goal.is_empty())
+                        .map(str::to_owned)
+                        .collect()
+                })
         })
         .unwrap_or_default()
 }
@@ -6815,7 +6955,9 @@ pub(crate) async fn probe_hermes_cli_gateway(
     let Some(project_root) = parse_hermes_project_root(&output.stdout, &output.stderr) else {
         return Err(HermesProbeFailure::new(
             BackendSetupDiagnosticCode::MissingProjectRoot,
-            format!("Hermes executable {command} --version did not report a Project: root"),
+            format!(
+                "Hermes executable {command} --version did not report a Project: or Install directory: root"
+            ),
         ));
     };
     let gateway_python =
@@ -7270,7 +7412,11 @@ fn parse_hermes_project_root(stdout: &str, stderr: &str) -> Option<PathBuf> {
         .lines()
         .chain(stderr.lines())
         .map(str::trim)
-        .find_map(|line| line.strip_prefix("Project:").map(str::trim))
+        .find_map(|line| {
+            ["Project:", "Install directory:"]
+                .into_iter()
+                .find_map(|prefix| line.strip_prefix(prefix).map(str::trim))
+        })
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
 }
@@ -7758,6 +7904,18 @@ fn context_breakdown_from_hermes(value: &Value) -> Option<ContextBreakdown> {
         conversation_history_bytes: bytes(conversation_tokens),
         reasoning_bytes: 0,
         context_injection_bytes: bytes(context_injection_tokens),
+        input_tokens,
+        context_window,
+    })
+}
+
+fn current_context_usage_from_hermes(value: &Value) -> Option<CurrentContextUsage> {
+    let input_tokens = value.get("context_used").and_then(Value::as_u64)?;
+    let context_window = value
+        .get("context_max")
+        .and_then(Value::as_u64)
+        .filter(|window| *window > 0)?;
+    (input_tokens > 0 && input_tokens <= context_window).then_some(CurrentContextUsage::Known {
         input_tokens,
         context_window,
     })
