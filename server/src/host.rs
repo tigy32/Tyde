@@ -6612,7 +6612,7 @@ impl HostHandle {
         payload: BackendSettingsRefreshPayload,
     ) -> AppResult<()> {
         const OPERATION: &str = "backend_settings_refresh";
-        if !matches!(payload.backend, BackendKind::Hermes | BackendKind::Tycode) {
+        if payload.backend != BackendKind::Hermes {
             return Err(AppError::invalid(
                 OPERATION,
                 format!(
@@ -7543,17 +7543,6 @@ impl HostHandle {
         const OPERATION: &str = "backend_native_settings_write";
         let _settings_apply_guard = self.settings_apply_lock.lock().await;
         let outcome = match payload.backend {
-            BackendKind::Tycode => {
-                match crate::backend::tycode::persist_native_settings(payload.settings).await {
-                    Ok(()) => {
-                        self.refresh_backend_config_snapshots_after_native_save()
-                            .await;
-                        self.refresh_session_schemas_with_fanout(true).await;
-                        Ok(())
-                    }
-                    Err(error) => Err(error),
-                }
-            }
             BackendKind::Hermes => {
                 let result = match hermes_probe_workspace_root() {
                     Ok(workspace_root) => crate::backend::hermes::persist_native_settings(
@@ -7622,19 +7611,10 @@ impl HostHandle {
     ) -> AppResult<()> {
         const OPERATION: &str = "invoke_settings_action";
         let _settings_apply_guard = self.settings_apply_lock.lock().await;
-        let outcome = match payload.backend {
-            BackendKind::Tycode => {
-                crate::backend::tycode::invoke_settings_action(
-                    &payload.resource,
-                    &payload.action,
-                    payload.arguments,
-                )
-                .await
-            }
-            backend => Err(format!(
-                "{backend:?} does not support settings resource actions"
-            )),
-        };
+        let outcome: Result<Vec<String>, String> = Err(format!(
+            "{:?} does not support settings resource actions",
+            payload.backend
+        ));
 
         if let Ok(tombstones) = &outcome {
             self.refresh_backend_config_snapshots_after_settings_action(tombstones)
@@ -7979,7 +7959,6 @@ impl HostHandle {
             crate::store::settings::normalize_backend_list(candidate.enabled_backends);
         if !current.complexity_tiers_enabled && candidate.complexity_tiers_enabled {
             for kind in [
-                BackendKind::Tycode,
                 BackendKind::Kiro,
                 BackendKind::Claude,
                 BackendKind::Codex,
@@ -8086,17 +8065,12 @@ impl HostHandle {
                 );
             }
         }
-        let mut tycode_config_update: Option<protocol::BackendConfigValues> = None;
         for (backend, values) in &candidate.backend_config {
             if current.backend_config.get(backend) == Some(values) || values.0.is_empty() {
                 continue;
             }
             match crate::backend::validate_backend_config_values(*backend, values) {
-                Ok(validated) => {
-                    if *backend == BackendKind::Tycode {
-                        tycode_config_update = Some(validated);
-                    }
-                }
+                Ok(_) => {}
                 Err(message) => push_error(
                     &mut field_errors,
                     &format!("/backend_config/{}", backend_wire_slug(*backend)),
@@ -8105,14 +8079,6 @@ impl HostHandle {
                 ),
             }
         }
-        if tycode_config_update.is_none()
-            && current.backend_config.contains_key(&BackendKind::Tycode)
-            && !candidate.backend_config.contains_key(&BackendKind::Tycode)
-        {
-            // An explicit clear of the Tycode config still propagates.
-            tycode_config_update = Some(protocol::BackendConfigValues::default());
-        }
-
         if !field_errors.is_empty() {
             drop(store);
             drop(state);
@@ -8152,36 +8118,9 @@ impl HostHandle {
             effects.refresh_session_schemas = true;
             effects.refresh_backend_config_snapshots = true;
         }
-        let mut propagation_errors: Vec<SettingsFieldError> = Vec::new();
-        if let Some(incoming) = tycode_config_update {
-            drop(state);
-            let previous = current
-                .backend_config
-                .get(&BackendKind::Tycode)
-                .map(|values| {
-                    crate::backend::sanitize_backend_config_values(BackendKind::Tycode, values)
-                })
-                .unwrap_or_default();
-            let persistence_values =
-                crate::backend::tycode::tycode_backend_config_persistence_values(
-                    &incoming, &previous,
-                );
-            if let Err(message) =
-                crate::backend::tycode::persist_backend_config(persistence_values).await
-            {
-                propagation_errors.push(SettingsFieldError {
-                    pointer: "/backend_config/tycode".to_owned(),
-                    code: SettingsErrorCode::BackendRejected,
-                    message,
-                });
-            }
-            let state = self.state.lock().await;
-            self.finish_settings_apply(state, committed.clone(), effects)
-                .await;
-        } else {
-            self.finish_settings_apply(state, committed.clone(), effects)
-                .await;
-        }
+        let propagation_errors: Vec<SettingsFieldError> = Vec::new();
+        self.finish_settings_apply(state, committed.clone(), effects)
+            .await;
 
         let new_etag = {
             let store = settings_store.lock().await;
@@ -8508,7 +8447,7 @@ impl HostHandle {
     async fn refresh_backend_config_snapshots_with_fanout_and_tombstones(
         &self,
         force_emit: bool,
-        tombstones: &[String],
+        _tombstones: &[String],
     ) {
         let (settings_store, skip_real_backend_probe) = {
             let state = self.state.lock().await;
@@ -8525,24 +8464,11 @@ impl HostHandle {
                 panic!("failed to load host settings for backend config snapshots: {err}")
             })
             .enabled_backends;
-        let mut snapshots = if skip_real_backend_probe {
+        let snapshots = if skip_real_backend_probe {
             BackendSettingsSnapshots::default()
         } else {
             backend_config_snapshots_for_enabled_backends(&enabled_backends).await
         };
-        if !tombstones.is_empty()
-            && let Some(settings) = snapshots
-                .native_settings
-                .iter_mut()
-                .find(|snapshot| snapshot.backend_kind == BackendKind::Tycode)
-                .and_then(|snapshot| snapshot.settings.as_mut())
-                .and_then(serde_json::Value::as_object_mut)
-        {
-            settings.insert(
-                "tombstones".to_owned(),
-                serde_json::to_value(tombstones).expect("serialize Tycode resource tombstones"),
-            );
-        }
         let mut state = self.state.lock().await;
         state.backend_config_snapshots = snapshots.backend_config;
         state.backend_native_settings_snapshots = snapshots.native_settings;
@@ -17529,9 +17455,7 @@ impl SettingsApplyEffects {
             refresh_hermes_schema: old.hermes_disabled_providers != new.hermes_disabled_providers,
             // EnabledBackends must refresh config snapshots + session
             // schemas (named side-effect requirement (b)).
-            refresh_backend_config_snapshots: enabled_backends_changed
-                || old.backend_config.get(&BackendKind::Tycode)
-                    != new.backend_config.get(&BackendKind::Tycode),
+            refresh_backend_config_snapshots: enabled_backends_changed,
             refresh_voice_capabilities: old.voice.enabled != new.voice.enabled
                 || old.voice.aws_region != new.voice.aws_region,
         }
@@ -17873,12 +17797,8 @@ async fn backend_config_snapshots_for_enabled_backends(
     let mut snapshots = BackendSettingsSnapshots::default();
     for kind in enabled_backends {
         match kind {
-            BackendKind::Tycode => {
-                snapshots
-                    .native_settings
-                    .push(crate::backend::tycode::native_settings_snapshot().await);
-            }
-            BackendKind::Hermes
+            BackendKind::Tycode
+            | BackendKind::Hermes
             | BackendKind::Kiro
             | BackendKind::Claude
             | BackendKind::Codex
@@ -17946,8 +17866,7 @@ async fn fan_out_backend_config_snapshots(state: &mut HostState, force_emit: boo
 }
 
 fn initial_backend_capacity_snapshots() -> HashMap<BackendKind, BackendCapacitySnapshot> {
-    const BACKENDS: [BackendKind; 6] = [
-        BackendKind::Tycode,
+    const BACKENDS: [BackendKind; 5] = [
         BackendKind::Kiro,
         BackendKind::Claude,
         BackendKind::Codex,
@@ -18012,12 +17931,12 @@ fn backend_capacity_snapshots(state: &HostState) -> Vec<BackendCapacitySnapshot>
         })
         .collect::<Vec<_>>();
     snapshots.sort_by_key(|snapshot| match snapshot.backend_kind {
-        BackendKind::Tycode => 0,
-        BackendKind::Kiro => 1,
-        BackendKind::Claude => 2,
-        BackendKind::Codex => 3,
-        BackendKind::Antigravity => 4,
-        BackendKind::Hermes => 5,
+        BackendKind::Kiro => 0,
+        BackendKind::Claude => 1,
+        BackendKind::Codex => 2,
+        BackendKind::Antigravity => 3,
+        BackendKind::Hermes => 4,
+        BackendKind::Tycode => 5,
     });
     snapshots
 }

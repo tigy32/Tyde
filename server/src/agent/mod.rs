@@ -34,7 +34,6 @@ use crate::backend::codex::CodexBackend;
 use crate::backend::hermes::HermesBackend;
 use crate::backend::kiro::KiroBackend;
 use crate::backend::mock::MockBackend;
-use crate::backend::tycode::TycodeBackend;
 use crate::backend::{
     Backend, BackendEvent, BackendExecutionMode, BackendSession, BackendSpawnConfig,
     BackendStartupError, EventStream, SendOutcome, apply_session_settings_update,
@@ -2528,7 +2527,6 @@ async fn prepare_backend_handle_for_adoption(
         )
     };
     match handle {
-        crate::backend::PreparedBackendHandle::Tycode(backend) => Ok(backend),
         crate::backend::PreparedBackendHandle::Acp(backend) => Ok(backend),
         crate::backend::PreparedBackendHandle::Claude(backend) => {
             backend.set_subagent_emitter(emitter()).await;
@@ -2570,11 +2568,7 @@ async fn spawn_backend(
     antigravity_conversations_dir: Option<PathBuf>,
 ) -> BackendSpawnResult {
     match backend_kind {
-        BackendKind::Tycode => {
-            let (b, events) = TycodeBackend::spawn(workspace_roots, config, initial_input).await?;
-            let session_id = Backend::session_id(&b);
-            Ok((Box::new(b), events, session_id))
-        }
+        BackendKind::Tycode => Err("Tycode backend has been removed".to_owned()),
         BackendKind::Kiro => {
             let (b, events) = KiroBackend::spawn(workspace_roots, config, initial_input).await?;
             let session_id = Backend::session_id(&b);
@@ -2648,10 +2642,7 @@ async fn resume_backend(
     antigravity_conversations_dir: Option<PathBuf>,
 ) -> BackendResumeResult {
     let (backend, events): (BackendHandle, EventStream) = match backend_kind {
-        BackendKind::Tycode => {
-            let (b, events) = TycodeBackend::resume(workspace_roots, config, session_id).await?;
-            (Box::new(b), events)
-        }
+        BackendKind::Tycode => return Err("Tycode backend has been removed".to_owned()),
         BackendKind::Kiro => {
             let (b, events) = KiroBackend::resume(workspace_roots, config, session_id).await?;
             (Box::new(b), events)
@@ -2716,13 +2707,9 @@ async fn fork_backend(
     sub_agent_context: HostSubAgentEmitterContext,
 ) -> BackendForkResult {
     match backend_kind {
-        BackendKind::Tycode => {
-            let (b, events) =
-                TycodeBackend::fork(workspace_roots, config, from_session_id, initial_input)
-                    .await?;
-            let session_id = Backend::session_id(&b);
-            Ok((Box::new(b), events, session_id))
-        }
+        BackendKind::Tycode => Err(BackendStartupError::backend_failed(
+            "Tycode backend has been removed",
+        )),
         BackendKind::Kiro => {
             let (b, events) =
                 KiroBackend::fork(workspace_roots, config, from_session_id, initial_input).await?;
@@ -8046,11 +8033,7 @@ fn backend_startup_drop_cancels_workers(backend_kind: BackendKind) -> bool {
     // backend explicitly cancels or reaps work after its returned future drops.
     matches!(
         backend_kind,
-        BackendKind::Claude
-            | BackendKind::Codex
-            | BackendKind::Kiro
-            | BackendKind::Hermes
-            | BackendKind::Tycode
+        BackendKind::Claude | BackendKind::Codex | BackendKind::Kiro | BackendKind::Hermes
     )
 }
 
@@ -9969,12 +9952,13 @@ fn backend_session_is_resumable(
     resolved_spawn_config: &customization::ResolvedSpawnConfig,
 ) -> bool {
     match backend_kind {
+        BackendKind::Tycode => false,
         BackendKind::Antigravity => is_antigravity_native_session_id(session_id),
         BackendKind::Hermes => crate::backend::hermes::session_is_resumable_for_workspace_roots(
             workspace_roots,
             resolved_spawn_config,
         ),
-        BackendKind::Tycode | BackendKind::Kiro | BackendKind::Claude | BackendKind::Codex => true,
+        BackendKind::Kiro | BackendKind::Claude | BackendKind::Codex => true,
     }
 }
 

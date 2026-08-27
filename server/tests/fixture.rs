@@ -144,11 +144,20 @@ impl Fixture {
     }
 
     #[allow(dead_code)]
+    pub async fn new_with_runtime_config_and_real_backend_probe_for_enabled_backends(
+        runtime_config: server::HostRuntimeConfig,
+        enabled_backends: Vec<BackendKind>,
+    ) -> Self {
+        Self::new_with_runtime_config_inner(runtime_config, false, Some(enabled_backends), true)
+            .await
+    }
+
+    #[allow(dead_code)]
     pub async fn new_with_real_tycode_backend() -> Self {
         Self::new_with_runtime_config_inner(
             server::HostRuntimeConfig::default(),
             false,
-            Some(vec![BackendKind::Tycode]),
+            Some(vec![BackendKind::Claude]),
             false,
         )
         .await

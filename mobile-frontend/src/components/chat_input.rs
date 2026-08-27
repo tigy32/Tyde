@@ -438,7 +438,6 @@ fn backend_label(backend: protocol::BackendKind) -> &'static str {
 
 fn parse_backend(value: &str) -> Option<protocol::BackendKind> {
     match value {
-        "tycode" => Some(protocol::BackendKind::Tycode),
         // `acp` is the spelling this value carried before the backend was
         // named for the agent; a persisted selection still parses.
         "kiro" | "acp" => Some(protocol::BackendKind::Kiro),

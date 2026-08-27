@@ -97,16 +97,16 @@ pub enum SkillDelivery {
 impl SkillDelivery {
     pub(crate) fn for_backend(backend_kind: BackendKind) -> Self {
         match backend_kind {
+            BackendKind::Tycode => Self::NamesOnly,
             // Tycode discovers `<workspace root>/.tycode/skills/<name>` itself,
             // lists name and description in its system prompt, and loads a body
             // only when the model calls `invoke_skill`. Inlining bodies here as
             // well put every selected skill's full text in the prompt *and* in
             // the catalog, which is the duplication native discovery exists to
             // avoid.
-            BackendKind::Claude
-            | BackendKind::Codex
-            | BackendKind::Tycode
-            | BackendKind::Antigravity => Self::NativeDiscovery,
+            BackendKind::Claude | BackendKind::Codex | BackendKind::Antigravity => {
+                Self::NativeDiscovery
+            }
             // Hermes provides its own name-only catalog. Kiro has no native
             // selected-skill projection yet, so its resolved names remain
             // available to a future adapter without loading any body today.

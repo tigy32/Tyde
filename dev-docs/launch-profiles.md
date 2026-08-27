@@ -34,7 +34,6 @@ Existing backend-kind launches remain supported by omitting
 
 Every enabled backend gets a default profile:
 
-- `tycode:default`
 - `kiro:default`
 - `claude:default`
 - `codex:default`

@@ -625,6 +625,8 @@ impl fmt::Display for McpServerId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum BackendKind {
+    /// Legacy serialized value retained so stores written by older releases
+    /// remain readable. Tycode is no longer offered or runnable as a backend.
     Tycode,
     /// Kiro. It reaches the agent over the Agent Client Protocol, and the
     /// binary, args and quirks adapter come from the session's launch profile

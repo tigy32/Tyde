@@ -94,9 +94,6 @@ Tyde reports unsupported behavior instead.
   response into typed capabilities, but `session.fork` is not among the ones it
   captures, so there is nothing to gate a fork on. Do not copy an agent's
   session files as a fallback.
-- **Tycode**: unsupported for now. Tycode source lives outside this repo and the
-  currently consumed `tycode-subprocess` protocol exposes `UserInput`, image
-  input, cancel, and resume but no `ForkSession` command in Tyde2's write scope.
 - **Codex**: supported through the Codex app-server `thread/fork` JSON-RPC
   method. Verified against the current Codex CLI schema (`ThreadForkParams`,
   `ThreadForkResponse`, and `Thread.forkedFromId`). Tyde sends the parent

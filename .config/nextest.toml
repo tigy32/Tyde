@@ -19,15 +19,13 @@ command = { command-line = "tools/run-nextest-binary.sh", relative-to = "workspa
 
 # These tests intentionally exercise real CLI probes at tight process timeout
 # boundaries. Reserve the runner while they probe so unrelated process-heavy
-# tests cannot consume the deadline of healthy fake executables. The Tycode
-# integration flows also isolate process-global HOME/PATH while spawning their
-# fake subprocess, so both profiles reserve the runner with the same filter.
+# tests cannot consume the deadline of healthy fake executables.
 [[profile.default.overrides]]
-filter = '(binary_id(server::settings) & test(/(backend_(setup_payload_(uses_sign_in_command_and_versioned_tycode_probe|reports_found_unusable_hermes_cli)|config_snapshots_(expose_tycode_grouped_native_settings|report_tycode_native_settings_probe_failure))|set_setting_backend_native_settings_persists_and_refreshes_tycode_snapshot|tycode_|trusted_tycode_setup)/))'
+filter = 'binary_id(server::settings) & test(backend_setup_payload_reports_found_unusable_hermes_cli)'
 threads-required = "num-test-threads"
 
 [[profile.ci.overrides]]
-filter = '(binary_id(server::settings) & test(/(backend_(setup_payload_(uses_sign_in_command_and_versioned_tycode_probe|reports_found_unusable_hermes_cli)|config_snapshots_(expose_tycode_grouped_native_settings|report_tycode_native_settings_probe_failure))|set_setting_backend_native_settings_persists_and_refreshes_tycode_snapshot|tycode_|trusted_tycode_setup)/))'
+filter = 'binary_id(server::settings) & test(backend_setup_payload_reports_found_unusable_hermes_cli)'
 threads-required = "num-test-threads"
 
 [profile.default]

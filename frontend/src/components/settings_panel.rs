@@ -666,7 +666,6 @@ impl SettingsTab {
                 "The backend to use by default when creating new agents",
                 "Enabled Backends",
                 "Toggle which backends are available for creating agents",
-                "Tycode",
                 "ACP",
                 "Kiro",
                 "Claude",
@@ -824,8 +823,8 @@ impl SettingsPage {
 /// Backends that get their own sidebar page on the selected host, in the
 /// canonical backend order. Derived purely from server-owned state — never
 /// from `enabled_backends`, and never hardcoded per backend. A backend earns a
-/// page if it exposes a typed deep-config schema *or* the server has published
-/// a backend-native settings snapshot for it (e.g. Tycode's grouped settings).
+/// page if it exposes a typed deep-config schema or the server has published
+/// a backend-native settings snapshot for it.
 fn schema_backends(state: &AppState) -> Vec<BackendKind> {
     let Some(host_id) = state.selected_host_id.get() else {
         return Vec::new();
@@ -2291,7 +2290,7 @@ fn BackendsTab() -> impl IntoView {
         </div>
 
         <p class="settings-description settings-panel-intro">
-            "A backend is the coding agent Tyde drives — Claude Code, Codex, Tycode, and the rest. Each one is a separate program with its own account and its own model access; Tyde starts it, feeds it your messages, and renders what it streams back. This page decides which of them Tyde offers on this host. A backend's own configuration lives on its page in the sidebar, and what its account has spent lives on Usage."
+            "A backend is the coding agent Tyde drives — Claude Code, Codex, and the rest. Each one is a separate program with its own account and its own model access; Tyde starts it, feeds it your messages, and renders what it streams back. This page decides which of them Tyde offers on this host. A backend's own configuration lives on its page in the sidebar, and what its account has spent lives on Usage."
         </p>
 
         <div class="settings-field">
@@ -4584,7 +4583,7 @@ fn tycode_profiles_form(
                 active_native_group,
                 Some(&active),
             );
-            let delete_button = (active != protocol::tycode_config::TYCODE_DEFAULT_PROFILE).then(
+            let delete_button = (active != "default").then(
                 || {
                     let state = state.clone();
                     let profile = active.clone();
@@ -6333,7 +6332,7 @@ pub(super) fn send_hermes_disabled_providers(
     }
 }
 
-fn all_backends() -> [BackendKind; 6] {
+fn all_backends() -> [BackendKind; 5] {
     crate::components::agents_panel::BACKENDS_BY_PREFERENCE
 }
 
@@ -6364,7 +6363,6 @@ fn parse_acp_adapter(value: &str) -> Option<AcpAdapterId> {
 
 fn parse_backend_kind(value: &str) -> Option<BackendKind> {
     match value {
-        "tycode" => Some(BackendKind::Tycode),
         // "kiro" is the pre-rename spelling; still accepted so a stale
         // select value cannot silently fail to parse.
         "acp" | "kiro" => Some(BackendKind::Kiro),
@@ -11273,7 +11271,6 @@ mod wasm_tests {
                 "Claude".to_owned(),
                 "Hermes".to_owned(),
                 "Antigravity".to_owned(),
-                "Tycode".to_owned(),
                 "Kiro".to_owned(),
             ],
             "the enable rows follow the preference order and name Kiro, not ACP"
@@ -11381,197 +11378,6 @@ mod wasm_tests {
         assert!(
             list.contains(&"claude"),
             "already-enabled backends must be preserved: {list:?}"
-        );
-    }
-
-    /// Tycode persists `BackendConfig` edits to the native backend right away,
-    /// so a page for a Tycode-like backend that is disabled and not installed
-    /// must lock every config control — no edit frame can reach the wire, even
-    /// from synthetic events — while keeping the Enable action live. Once the
-    /// server reports the backend enabled and installed, the controls unlock
-    /// and edits commit normally.
-    #[wasm_bindgen_test]
-    async fn tycode_page_locks_config_until_enabled_and_installed() {
-        let calls = install_settings_send_stub();
-        let container = make_container();
-        let state = AppState::new();
-        let host_id = "host-tyc".to_owned();
-        state.selected_host_id.set(Some(host_id.clone()));
-        state.host_streams.update(|m| {
-            m.insert(
-                host_id.clone(),
-                protocol::StreamPath(format!("/host/{host_id}")),
-            );
-        });
-        state.connection_statuses.update(|m| {
-            m.insert(host_id.clone(), crate::state::ConnectionStatus::Connected);
-        });
-        state.host_settings_by_host.update(|m| {
-            m.insert(
-                host_id.clone(),
-                settings_model::HostSettings {
-                    enabled_backends: vec![BackendKind::Claude],
-                    default_backend: Some(BackendKind::Claude),
-                    enable_mobile_connections: false,
-                    mobile_broker_url: None,
-                    mobile_broker_auth: Default::default(),
-                    tyde_debug_mcp_enabled: false,
-                    tyde_agent_control_mcp_enabled: true,
-                    tyde_agent_control_max_depth: settings_model::default_agent_control_max_depth(),
-                    complexity_tiers_enabled: false,
-                    backend_tier_configs: std::collections::HashMap::new(),
-                    background_agent_features: Default::default(),
-                    supervisor: Default::default(),
-                    code_intel: Default::default(),
-                    backend_config: std::collections::HashMap::new(),
-                    launch_profiles: Default::default(),
-                    hermes_disabled_providers: Default::default(),
-                    voice: Default::default(),
-                },
-            );
-        });
-        state.backend_config_schemas.update(|m| {
-            m.entry(host_id.clone())
-                .or_default()
-                .insert(BackendKind::Tycode, tycode_config_schema());
-        });
-        state.backend_setup_by_host.update(|m| {
-            m.insert(
-                host_id.clone(),
-                vec![backend_setup_info(
-                    BackendKind::Tycode,
-                    BackendSetupStatus::NotInstalled,
-                )],
-            );
-        });
-        state.settings_open.set(true);
-
-        let state_for_mount = state.clone();
-        let _handle = mount_to(container.clone(), move || {
-            provide_context(state_for_mount.clone());
-            view! { <SettingsPanel /> }
-        });
-        next_tick().await;
-
-        click_tab(&container, "Tycode");
-        next_tick().await;
-
-        let text = container.text_content().unwrap_or_default();
-        assert!(
-            text.contains("disabled on the selected host"),
-            "the locked page must state the disabled condition: {text:?}"
-        );
-        assert!(
-            text.contains("not installed"),
-            "the locked page must state the not-installed condition: {text:?}"
-        );
-        assert!(
-            text.contains("read-only"),
-            "the locked page must say the settings are read-only: {text:?}"
-        );
-
-        let select: HtmlSelectElement = container
-            .query_selector(".settings-backend-config-fields select")
-            .unwrap()
-            .expect("the Tycode provider select must render from the schema")
-            .dyn_into()
-            .unwrap();
-        assert!(
-            select.disabled(),
-            "the select control must be locked while disabled and not installed"
-        );
-        let input: HtmlInputElement = container
-            .query_selector("input.settings-backend-config-input")
-            .unwrap()
-            .expect("the Tycode text field must render from the schema")
-            .dyn_into()
-            .unwrap();
-        assert!(input.disabled(), "the text control must be locked");
-
-        // Locked controls must never reach the wire, even via synthetic events
-        // that bypass the disabled attribute.
-        select.set_value("bedrock");
-        dispatch_event_from_js(&select.clone().unchecked_into(), "change", None);
-        let _ = select.remove_attribute("id");
-        set_and_change(&input, "work");
-        for _ in 0..3 {
-            next_tick().await;
-        }
-        assert!(
-            last_backend_config(&calls).is_none(),
-            "a locked page must not emit any backend_config frame"
-        );
-
-        // The enable path stays live from the locked page.
-        let enable = find_button_by_text(&container, "Enable backend")
-            .expect("the locked page must keep the enable action available");
-        assert!(
-            !enable.has_attribute("disabled"),
-            "the enable action itself must not be locked"
-        );
-        enable.click();
-        for _ in 0..3 {
-            next_tick().await;
-        }
-        assert!(
-            recorded_settings_write_ops(&calls)
-                .iter()
-                .any(|op| replacement_value(op, "/enabled_backends").is_some()),
-            "the enable action must replace enabled_backends"
-        );
-
-        // Server confirms the backend enabled and installed → controls unlock.
-        state.host_settings_by_host.update(|m| {
-            if let Some(settings) = m.get_mut(&host_id) {
-                settings.enabled_backends = vec![BackendKind::Claude, BackendKind::Tycode];
-            }
-        });
-        state.backend_setup_by_host.update(|m| {
-            m.insert(
-                host_id.clone(),
-                vec![backend_setup_info(
-                    BackendKind::Tycode,
-                    BackendSetupStatus::Installed,
-                )],
-            );
-        });
-        for _ in 0..3 {
-            next_tick().await;
-        }
-
-        let select: HtmlSelectElement = container
-            .query_selector(".settings-backend-config-fields select")
-            .unwrap()
-            .expect("the select must re-render after the server state change")
-            .dyn_into()
-            .unwrap();
-        assert!(
-            !select.disabled(),
-            "controls must unlock once the backend is enabled and installed"
-        );
-        select.set_value("bedrock");
-        dispatch_event_from_js(&select.clone().unchecked_into(), "change", None);
-        for _ in 0..3 {
-            next_tick().await;
-        }
-        let setting =
-            last_backend_config(&calls).expect("an unlocked edit must emit a backend_config frame");
-        assert_eq!(
-            setting.get("backend").and_then(|b| b.as_str()),
-            Some("tycode"),
-            "the edit must target Tycode: {setting:?}"
-        );
-        let values = setting
-            .get("values")
-            .and_then(|v| v.as_object())
-            .expect("values object");
-        assert_eq!(
-            values
-                .get("active_provider")
-                .and_then(|v| v.get("string"))
-                .and_then(|s| s.as_str()),
-            Some("bedrock"),
-            "the unlocked edit must carry the typed value: {values:?}"
         );
     }
 
@@ -12481,7 +12287,7 @@ mod wasm_tests {
     }
 
     /// Wrap one profile's settings object into the Tycode profiles document
-    /// shape the server publishes (see `protocol::tycode_config`): version,
+    /// shape the legacy server published: version,
     /// then one `default` profile backed by the shared settings file.
     fn tycode_profiles_doc(settings: serde_json::Value) -> serde_json::Value {
         serde_json::json!({
@@ -12867,51 +12673,6 @@ mod wasm_tests {
                 .then(|| envelope.get("payload").cloned())
                 .flatten()
         })
-    }
-
-    /// When Tycode's native settings probe fails, the Tycode page appears in
-    /// the Backends sidebar and shows the server's own reason verbatim — never
-    /// blank/default value controls.
-    #[wasm_bindgen_test]
-    async fn tycode_native_settings_unavailable_shows_server_message() {
-        let container = make_container();
-        let message = "Tycode native settings probe timed out waiting for SettingsSchema";
-        let _handle = mount_to(container.clone(), move || {
-            let state = AppState::new();
-            install_tycode_native_host(
-                &state,
-                BackendNativeSettingsSnapshot {
-                    backend_kind: BackendKind::Tycode,
-                    status: BackendConfigSnapshotStatus::Unavailable,
-                    settings: None,
-                    groups: Vec::new(),
-                    message: Some(message.to_owned()),
-                    advisories: Vec::new(),
-                },
-            );
-            state.settings_open.set(true);
-            provide_context(state);
-            view! { <SettingsPanel /> }
-        });
-        next_tick().await;
-
-        // The native snapshot alone (no legacy schema) must earn a sidebar page.
-        click_tab(&container, "Tycode");
-        next_tick().await;
-
-        let text = container.text_content().unwrap_or_default();
-        assert!(
-            text.contains(message),
-            "the server's unavailable reason must be surfaced verbatim: {text:?}"
-        );
-        assert_eq!(
-            container
-                .query_selector_all("input.settings-native-input")
-                .unwrap()
-                .length(),
-            0,
-            "unavailable native settings must not render blank/default value controls"
-        );
     }
 
     /// A Ready snapshot renders each server-provided group with its current

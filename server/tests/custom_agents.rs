@@ -966,13 +966,6 @@ async fn tool_policy_rejection_for_non_claude_backends() {
             },
         ),
         (
-            "tycode-deny",
-            BackendKind::Tycode,
-            ToolPolicy::DenyList {
-                tools: vec!["Edit".to_string()],
-            },
-        ),
-        (
             "hermes-allow",
             BackendKind::Hermes,
             ToolPolicy::AllowList {

@@ -531,16 +531,10 @@ async fn fork_outlives_the_agent_it_forked_from() {
     );
 }
 
-/// Forking a backend that has no native fork must fail as a typed
-/// `Unsupported` error and leave the source session record untouched — Tyde
-/// never fakes a fork by copying session files.
-///
-/// This case previously named a dead parent agent and so failed on the
-/// parent-liveness guard before it ever reached the backend, leaving the
-/// unsupported-fork contract in dev-docs/23 unverified. With that guard gone
-/// it now exercises the contract it was written for.
+/// Forking a session from a removed backend must fail as a typed `Unsupported`
+/// error and leave the source session record untouched.
 #[tokio::test]
-async fn unsupported_backend_fork_fails_without_touching_source_session() {
+async fn removed_backend_fork_fails_without_touching_source_session() {
     fixture::init_tracing();
     let dir = tempfile::tempdir().expect("tempdir");
     let session_path = dir.path().join("sessions.json");
@@ -554,7 +548,7 @@ async fn unsupported_backend_fork_fails_without_touching_source_session() {
                 id: source_session_id.clone(),
                 backend_kind: BackendKind::Tycode,
                 workspace_roots: vec!["/tmp".to_owned()],
-                title: Some("Tycode source".to_owned()),
+                title: Some("Removed backend source".to_owned()),
                 token_count: None,
                 created_at_ms: Some(100),
                 updated_at_ms: Some(100),
@@ -602,8 +596,10 @@ async fn unsupported_backend_fork_fails_without_touching_source_session() {
     .await;
     assert_eq!(error.code, AgentErrorCode::Unsupported);
     assert!(
-        error.message.contains("does not support session fork"),
-        "unexpected unsupported-fork message: {}",
+        error
+            .message
+            .contains("cannot fork non-resumable session tycode-source-session"),
+        "unexpected removed-backend message: {}",
         error.message
     );
 

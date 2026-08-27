@@ -122,12 +122,11 @@ pub(crate) fn backend_class(kind: protocol::BackendKind) -> &'static str {
 /// alphabetical. Alphabetical order buried the two backends in daily use under
 /// ones that are rarely picked, on every list the user chooses from. This is
 /// the single source of that order; lists that need one sort by it.
-pub(crate) const BACKENDS_BY_PREFERENCE: [protocol::BackendKind; 6] = [
+pub(crate) const BACKENDS_BY_PREFERENCE: [protocol::BackendKind; 5] = [
     protocol::BackendKind::Codex,
     protocol::BackendKind::Claude,
     protocol::BackendKind::Hermes,
     protocol::BackendKind::Antigravity,
-    protocol::BackendKind::Tycode,
     protocol::BackendKind::Kiro,
 ];
 

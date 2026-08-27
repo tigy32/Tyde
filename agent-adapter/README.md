@@ -27,7 +27,6 @@ The built-in adapter declarations are:
 
 | Backend | Sessions | Input/control | Configuration | Usage | Agents/work |
 | --- | --- | --- | --- | --- | --- |
-| Tycode | list, resume | interrupt | session, MCP, workspace, customization | turn | — |
 | ACP | list, resume | interrupt | MCP, workspace, customization | — | — |
 | Claude | resume, fork | image, interrupt | session, MCP, workspace, customization | turn | subagents, background, initiated turns |
 | Codex | resume, fork | image, interrupt | session, MCP, workspace, customization | turn, request, context | subagents, background, initiated turns |
@@ -74,7 +73,7 @@ real calls and select backends with:
 
 ```sh
 TYDE_RUN_REAL_AI_TESTS=1 \
-TYDE_REAL_BACKENDS=claude,codex,kiro,hermes,tycode \
+TYDE_REAL_BACKENDS=claude,codex,kiro,hermes \
 cargo test -p tests --test backend \
   real_universal_backend_qualification_suite -- --ignored --nocapture
 ```
@@ -87,7 +86,7 @@ cargo test -p tests --test backend \
   real_cert_request_sequence_starts_at_one -- --ignored --nocapture
 ```
 
-`TYDE_REAL_BACKENDS` accepts `claude`, `codex`, `kiro`, `hermes`, and `tycode`. A selected
+`TYDE_REAL_BACKENDS` accepts `claude`, `codex`, `kiro`, and `hermes`. A selected
 backend that is missing or unrunnable is a qualification failure, not a silent
 skip. Claude qualification calls are pinned to Haiku with `low` effort, and
 Codex calls are pinned to `gpt-5.6-luna` with `low` reasoning rather than

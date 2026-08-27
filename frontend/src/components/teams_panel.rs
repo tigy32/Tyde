@@ -2313,7 +2313,6 @@ fn backend_kind_value(kind: BackendKind) -> &'static str {
 
 fn parse_backend_kind(value: &str) -> Option<BackendKind> {
     match value {
-        "tycode" => Some(BackendKind::Tycode),
         "kiro" => Some(BackendKind::Kiro),
         "claude" => Some(BackendKind::Claude),
         "codex" => Some(BackendKind::Codex),

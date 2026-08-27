@@ -19,8 +19,6 @@ pub mod setup;
 pub mod skill_projection;
 pub mod subprocess;
 pub mod turn_emitter;
-pub mod tycode;
-pub mod tycode_config;
 
 use std::{
     collections::{HashMap, VecDeque},
@@ -1134,7 +1132,7 @@ pub trait Backend: Send + Sync + 'static {
 
 pub fn capabilities_for_backend_kind(kind: BackendKind) -> BackendCapabilities {
     match kind {
-        BackendKind::Tycode => tycode::TycodeBackend::capabilities(),
+        BackendKind::Tycode => BackendCapabilities::default(),
         BackendKind::Kiro => kiro::KiroBackend::capabilities(),
         BackendKind::Claude => claude::ClaudeBackend::capabilities(),
         BackendKind::Codex => codex::CodexBackend::capabilities(),
@@ -1164,7 +1162,7 @@ pub async fn list_sessions_for_backend_kind(
     kind: BackendKind,
 ) -> Result<Vec<BackendSession>, String> {
     match kind {
-        BackendKind::Tycode => tycode::TycodeBackend::list_sessions().await,
+        BackendKind::Tycode => Err("Tycode backend has been removed".to_owned()),
         BackendKind::Kiro => kiro::KiroBackend::list_sessions().await,
         BackendKind::Claude => claude::ClaudeBackend::list_sessions().await,
         BackendKind::Codex => codex::CodexBackend::list_sessions().await,
@@ -1174,7 +1172,6 @@ pub async fn list_sessions_for_backend_kind(
 }
 
 pub(crate) enum PreparedBackendHandle {
-    Tycode(Box<tycode::TycodeBackend>),
     Acp(Box<kiro::KiroBackend>),
     Claude(Box<claude::ClaudeBackend>),
     Codex(Box<codex::CodexBackend>),
@@ -1193,7 +1190,6 @@ pub(crate) struct PreparedBackendBinding {
 impl PreparedBackendHandle {
     pub(crate) async fn shutdown(self) {
         match self {
-            Self::Tycode(backend) => Backend::shutdown(*backend).await,
             Self::Acp(backend) => Backend::shutdown(*backend).await,
             Self::Claude(backend) => Backend::shutdown(*backend).await,
             Self::Codex(backend) => Backend::shutdown(*backend).await,
@@ -1210,17 +1206,10 @@ pub(crate) async fn prepare_compacted_backend_binding(
     seed: BackendContextSeed,
 ) -> Result<PreparedBackendBinding, BackendBindingPrepareError> {
     match kind {
-        BackendKind::Tycode => {
-            let (backend, events, provider_session_id, ready) =
-                prepare_concrete_backend_binding::<tycode::TycodeBackend>(kind, spawn, seed)
-                    .await?;
-            Ok(PreparedBackendBinding {
-                backend: PreparedBackendHandle::Tycode(Box::new(backend)),
-                events,
-                provider_session_id,
-                ready,
-            })
-        }
+        BackendKind::Tycode => Err(BackendBindingPrepareError::SpawnFailed {
+            backend_kind: kind,
+            message: "Tycode backend has been removed".to_owned(),
+        }),
         BackendKind::Kiro => {
             let (backend, events, provider_session_id, ready) =
                 prepare_concrete_backend_binding::<kiro::KiroBackend>(kind, spawn, seed).await?;
@@ -1547,7 +1536,7 @@ pub(crate) fn session_settings_schema_for_backend(
     backend_kind: BackendKind,
 ) -> SessionSettingsSchema {
     match backend_kind {
-        BackendKind::Tycode => tycode::TycodeBackend::session_settings_schema(),
+        BackendKind::Tycode => empty_session_settings_schema(backend_kind),
         BackendKind::Kiro => kiro::KiroBackend::session_settings_schema(),
         BackendKind::Claude => claude::ClaudeBackend::session_settings_schema(),
         BackendKind::Codex => codex::CodexBackend::session_settings_schema(),
@@ -1561,7 +1550,7 @@ pub(crate) fn backend_config_schema_for_backend(
     backend_kind: BackendKind,
 ) -> Option<BackendConfigSchema> {
     match backend_kind {
-        BackendKind::Tycode => tycode::TycodeBackend::backend_config_schema(),
+        BackendKind::Tycode => None,
         BackendKind::Kiro => kiro::KiroBackend::backend_config_schema(),
         BackendKind::Claude => claude::ClaudeBackend::backend_config_schema(),
         BackendKind::Codex => codex::CodexBackend::backend_config_schema(),
@@ -1574,7 +1563,6 @@ pub(crate) fn backend_config_schema_for_backend(
 /// backends, not a projection of the current enabled-backend list.
 pub(crate) fn backend_config_schema_catalog() -> Vec<BackendConfigSchema> {
     [
-        BackendKind::Tycode,
         BackendKind::Kiro,
         BackendKind::Claude,
         BackendKind::Codex,
@@ -1696,7 +1684,7 @@ pub(crate) fn resolve_backend_session_settings(
     config: &BackendSpawnConfig,
 ) -> SessionSettingsValues {
     match backend_kind {
-        BackendKind::Tycode => tycode::resolve_session_settings(config),
+        BackendKind::Tycode => SessionSettingsValues::default(),
         BackendKind::Kiro => kiro::resolve_session_settings(config),
         BackendKind::Claude => claude::resolve_session_settings(config),
         BackendKind::Codex => codex::resolve_session_settings(config),
@@ -1716,12 +1704,6 @@ pub(crate) fn validate_session_settings_values(
         .collect::<HashMap<_, _>>();
 
     for (key, value) in &values.0 {
-        if schema.backend_kind == BackendKind::Tycode
-            && key == "tyde_conformance_model"
-            && matches!(value, SessionSettingValue::String(_))
-        {
-            continue;
-        }
         let Some(field) = fields_by_key.get(key.as_str()) else {
             return Err(format!(
                 "unknown session setting '{}' for backend {:?}",
@@ -1740,7 +1722,7 @@ pub(crate) fn validate_runtime_session_settings_update(
     update: &SessionSettingsValues,
 ) -> Result<(), String> {
     match backend_kind {
-        BackendKind::Tycode => tycode::validate_runtime_session_settings_update(update),
+        BackendKind::Tycode => Err("Tycode backend has been removed".to_owned()),
         BackendKind::Hermes => hermes::validate_runtime_session_settings_update(current, update),
         BackendKind::Kiro | BackendKind::Claude | BackendKind::Codex | BackendKind::Antigravity => {
             Ok(())
@@ -1785,7 +1767,7 @@ pub(crate) fn apply_session_settings_update(
 pub(crate) fn builtin_tier_config(kind: BackendKind) -> BackendTierConfig {
     let defaults: fn(SpawnCostHint) -> SessionSettingsValues = match kind {
         BackendKind::Claude => claude::claude_cost_hint_defaults,
-        BackendKind::Codex | BackendKind::Tycode | BackendKind::Hermes => {
+        BackendKind::Codex | BackendKind::Hermes | BackendKind::Tycode => {
             |_| SessionSettingsValues::default()
         }
         BackendKind::Antigravity => antigravity::antigravity_cost_hint_defaults,

@@ -155,7 +155,6 @@ The mental model: server events → `state.rs` signals → reactive view closure
 ## Test Assumptions, Don't Guess
 
 - **Source-level claims demand source-level evidence.** If a fix rests on "X emits Y first" or "Z always does W", open the code that produces Y/W and confirm. Reading a comment, recalling a past message, or reasoning from API shape is not evidence.
-- **Tycode source lives at `~/Tycode`.** When a tyde change depends on tycode-subprocess behavior, read the relevant code there. Invoke the pinned binary directly (e.g. `~/.tyde/tycode/<version>/tycode-subprocess --workspace-roots '[...]' <<< '{"UserInput":{...}}'`) to observe actual event order and shape.
 - **Validate every fix against a live dev instance.** Use the `tyde-debug` MCP (`tyde_dev_instance_start` + `tyde_debug_evaluate`) to exercise the change end-to-end before declaring it done. Type-check only proves types, not behavior.
 
 ## Keep It Simple

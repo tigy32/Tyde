@@ -68,7 +68,6 @@ impl TydeConfigMcpServer {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 enum BackendKindInput {
-    Tycode,
     Kiro,
     Claude,
     Codex,
@@ -79,7 +78,6 @@ enum BackendKindInput {
 impl From<BackendKindInput> for BackendKind {
     fn from(value: BackendKindInput) -> Self {
         match value {
-            BackendKindInput::Tycode => Self::Tycode,
             BackendKindInput::Kiro => Self::Kiro,
             BackendKindInput::Claude => Self::Claude,
             BackendKindInput::Codex => Self::Codex,

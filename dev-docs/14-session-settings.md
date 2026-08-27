@@ -462,9 +462,6 @@ fn collect_session_schemas(enabled: &[BackendKind]) -> Vec<SessionSchemaEntry> {
         BackendKind::Antigravity => SessionSchemaEntry::Ready {
             schema: AntigravityBackend::session_settings_schema(),
         },
-        BackendKind::Tycode => SessionSchemaEntry::Ready {
-            schema: TycodeBackend::session_settings_schema(),
-        },
         BackendKind::Acp => probe_acp_schema_state(profile_id),
         BackendKind::Hermes => probe_hermes_schema_state(),
         // The test-only mock backend uses an empty static schema.
@@ -762,7 +759,7 @@ fallback model lists.
 ### Server crate
 - Add static backend schemas and host-owned dynamic schema refresh for backends
   that need native model discovery.
-- Implement for each backend (Claude, Codex, Antigravity, Mock, Tycode, ACP,
+- Implement for each backend (Claude, Codex, Antigravity, Mock, ACP,
   Hermes).
 - Add `session_settings: SessionSettingsValues` to `BackendSpawnConfig`
   (keep existing `cost_hint`).

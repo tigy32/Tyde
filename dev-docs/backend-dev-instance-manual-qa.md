@@ -16,7 +16,7 @@ model used for every case. A run may use more than one model when the cheapest
 default model does not expose every backend capability.
 
 Run the complete workflow independently for every backend being certified,
-including Claude, Codex, Tycode, and any other enabled backend. Evidence from
+including Claude, Codex, and any other enabled backend. Evidence from
 one backend cannot satisfy a case for another; shared setup evidence is the
 only exception.
 
@@ -74,7 +74,7 @@ test plan.
 
 1. Choose the cheapest reliable model exposed by the backend as its default QA
    model. Current examples include GPT Luna or Haiku for Claude and MiniMax for
-   Tycode; use the cheapest currently available equivalent when catalogs or
+   another backend; use the cheapest currently available equivalent when catalogs or
    prices change.
 2. Run every feature the default model supports on that model, including all
    lifecycle, replay, cancellation, concurrency, and multi-client cases. Do not

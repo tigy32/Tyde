@@ -1116,15 +1116,14 @@ where
     F: Fn(&SessionId) -> bool,
 {
     match record.backend_kind {
+        BackendKind::Tycode => false,
         BackendKind::Antigravity => {
             !antigravity_record_is_permanently_non_resumable(record)
                 && is_antigravity_resumable(&record.id)
         }
-        BackendKind::Tycode
-        | BackendKind::Kiro
-        | BackendKind::Claude
-        | BackendKind::Codex
-        | BackendKind::Hermes => record.resumable,
+        BackendKind::Kiro | BackendKind::Claude | BackendKind::Codex | BackendKind::Hermes => {
+            record.resumable
+        }
     }
 }
 

@@ -700,29 +700,6 @@ native-settings state until a toggle or restart. This refresh is server-owned;
 the frontend does not infer success from terminal text or provide a local
 refresh workaround.
 
-### Tycode installed identity
-
-The child `PATH` supplied to a trusted setup PTY is only its process
-environment. It is not a Tycode runtime-resolution fallback. Tyde runs Tycode
-only from the checksum-pinned installed path:
-
-```text
-~/.tyde/tycode/0.10.0/tycode-subprocess
-```
-
-The installer verifies the platform release checksum before publishing that
-file. Runtime compatibility additionally requires the installed file to be a
-regular file, `--version` to exit successfully with empty stderr, and stdout to
-contain exactly `tycode-subprocess 0.10.0` apart from its conventional final
-line ending. Exact text followed by a non-zero exit is a failure, not a valid
-installation. Tyde does not search the login-shell `PATH`, accept an out-of-tree
-binary, or downgrade to an older version.
-
-A missing installed artifact remains `NotInstalled` where Tyde has a supported
-installer. A present artifact that cannot prove the exact successful identity
-is `Unavailable` with the server diagnostic. Setup and repair remain typed
-backend actions; this does not add executable selection to terminal protocol.
-
 ### Corrective validation status
 
 The trusted-terminal and installed-identity implementation described here is

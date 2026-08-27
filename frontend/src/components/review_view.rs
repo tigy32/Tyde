@@ -1129,7 +1129,6 @@ fn effective_submit_target(
 
 fn parse_backend_kind(s: &str) -> Option<BackendKind> {
     match s {
-        "Tycode" => Some(BackendKind::Tycode),
         // "ACP" is the label this backend carried for one release; still parsed
         // so a persisted review reviewer string keeps resolving.
         "Kiro" | "ACP" => Some(BackendKind::Kiro),

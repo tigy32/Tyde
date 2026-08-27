@@ -123,7 +123,7 @@ impl SubprocessBridge {
         let mut child = if let Some((host, _)) = remote_roots {
             let remote_binary = if subprocess_path.is_empty() {
                 std::env::var("TYDE_REMOTE_SUBPROCESS_PATH")
-                    .unwrap_or_else(|_| "tycode-subprocess".to_string())
+                    .unwrap_or_else(|_| "backend-subprocess".to_string())
             } else {
                 subprocess_path.to_string()
             };

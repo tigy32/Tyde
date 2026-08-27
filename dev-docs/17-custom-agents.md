@@ -391,20 +391,14 @@ native startup surface.
 | Codex | prepend to `model_instructions_file` | same file | `.agents/skills/tyde-{name}/` symlink | `-c mcp_servers.{name}.command=...` / `url=...` |
 | ACP | ACP `systemPrompt` | ACP `systemPrompt` append | unavailable until the adapter gains native discovery | ACP `mcpServers` |
 | Antigravity | prepended to prompt | same prompt surface | private `.agents/skills/{name}/` root via `--add-dir` | global `~/.gemini/config/mcp_config.json` guarded/restored per turn |
-| Tycode | one temp workspace root containing `.tycode/tyde_steering.md`, appended to `workspace_roots` | same root | same temp workspace root containing `.tycode/skills/` | `--mcp-servers <json>` |
 
 Notes:
 
 - For Claude, keep instructions and steering distinct because Claude has a real
   first-class agent identity surface.
-- For Codex, ACP, Antigravity, and Tycode, the adapter may concatenate
+- For Codex, ACP, and Antigravity, the adapter may concatenate
   custom-agent instructions plus steering in that order, but only after the
   resolver has kept them separate.
-- Tycode uses exactly one synthesized extra workspace root per spawn. That root
-  contains both the steering file and the materialized skills tree; do not
-  append one root for steering and another for skills.
-- Tycode should use the same extra-workspace-root pattern the old app already
-  used for steering and skill injection. There is no new frontend logic here.
 
 ---
 
@@ -413,7 +407,7 @@ Notes:
 Tool policy is declared on `CustomAgent.tool_policy`.
 
 - Claude: translate directly to Claude's native allow/deny tool surface.
-- Codex, ACP, Antigravity, Tycode: reject the spawn if the selected custom agent
+- Codex, ACP, Antigravity: reject the spawn if the selected custom agent
   declares `AllowList` or `DenyList`.
 
 This must fail fast. Do not silently drop tool restrictions on backends that do

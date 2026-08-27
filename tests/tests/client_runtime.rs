@@ -94,13 +94,6 @@ async fn passive_capacity_replays_deduplicates_and_stales_over_public_client() {
         (snapshot.backend_kind, &snapshot.state),
         (BackendKind::Codex, BackendCapacityState::Unavailable { .. })
     )));
-    assert!(initial.snapshots.iter().any(|snapshot| matches!(
-        (snapshot.backend_kind, &snapshot.state),
-        (
-            BackendKind::Tycode,
-            BackendCapacityState::Unsupported { .. }
-        )
-    )));
 
     assert!(
         host.ingest_passive_adapter_notification_for_test(

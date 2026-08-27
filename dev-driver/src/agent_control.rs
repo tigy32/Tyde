@@ -1171,7 +1171,6 @@ fn parse_agent_id_from_stream(stream: &StreamPath) -> AgentId {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum BackendKindInput {
-    Tycode,
     /// `acp` is accepted too: it is the spelling this tool took before the
     /// backend was renamed for the agent it runs.
     #[serde(alias = "acp")]
@@ -1185,7 +1184,6 @@ enum BackendKindInput {
 impl From<BackendKindInput> for BackendKind {
     fn from(value: BackendKindInput) -> Self {
         match value {
-            BackendKindInput::Tycode => Self::Tycode,
             BackendKindInput::Kiro => Self::Kiro,
             BackendKindInput::Claude => Self::Claude,
             BackendKindInput::Codex => Self::Codex,

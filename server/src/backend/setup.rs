@@ -18,17 +18,6 @@ use tokio::process::Command;
 use crate::browse_stream::host_platform;
 use crate::process_env;
 
-pub(crate) const TYCODE_VERSION: &str = "0.10.0";
-// Keep the stable grouped-settings adoption floor synchronized in its invariant test.
-const TYCODE_RELEASE_BASE_URL: &str = "https://github.com/tigy32/Tycode/releases/download";
-const TYCODE_SUBPROCESS_SHA256_AARCH64_APPLE_DARWIN: &str =
-    "3a3b4ea1bb74bcf7b9078ba21de954468c944613e0573b6ed03abb81670ca96e";
-const TYCODE_SUBPROCESS_SHA256_X86_64_APPLE_DARWIN: &str =
-    "c1bbfc5b2a64d309d3d1c13a7b9057a5946a8c6e2cb66cc15019b97053eb6c1e";
-const TYCODE_SUBPROCESS_SHA256_AARCH64_UNKNOWN_LINUX_MUSL: &str =
-    "1844c3d98d126dbdf49e661d94930de6feb7c53a3f0806b7b0b797e34ad3481d";
-const TYCODE_SUBPROCESS_SHA256_X86_64_UNKNOWN_LINUX_MUSL: &str =
-    "abfcd6865151ba48d33d582b1fa706460d41b5807d4c194778c757102ff1d6c7";
 const CLAUDE_CLI_CANDIDATES: &[&str] = &["claude"];
 const CODEX_CLI_CANDIDATES: &[&str] = &["codex"];
 const ANTIGRAVITY_CLI_CANDIDATES: &[&str] = &["agy"];
@@ -91,7 +80,6 @@ pub(crate) async fn collect_backend_setup(
     // sequentially made host startup wait for the sum of all probes.
     let backends = futures_util::future::join_all(
         [
-            BackendKind::Tycode,
             BackendKind::Kiro,
             BackendKind::Claude,
             BackendKind::Codex,
@@ -118,7 +106,6 @@ pub(crate) struct ConfiguredAcpAgent {
 pub(crate) fn stub_backend_setup() -> BackendSetupPayload {
     let platform = host_platform();
     let backends = [
-        BackendKind::Tycode,
         BackendKind::Kiro,
         BackendKind::Claude,
         BackendKind::Codex,
@@ -242,38 +229,13 @@ fn stage_backend_setup_command(
     })
 }
 
-pub(crate) fn tycode_versioned_binary_path() -> Result<PathBuf, String> {
-    Ok(tycode_versioned_binary_path_for_home(&home_dir()?))
-}
-
-fn tycode_versioned_binary_path_for_home(home: &Path) -> PathBuf {
-    home.join(".tyde")
-        .join("tycode")
-        .join(TYCODE_VERSION)
-        .join("tycode-subprocess")
-}
-
-pub(crate) fn resolve_tycode_binary_path() -> Option<String> {
-    let home = home_dir().ok()?;
-    resolve_tycode_binary_path_for_home(&home)
-}
-
-fn resolve_tycode_binary_path_for_home(home: &Path) -> Option<String> {
-    let path = tycode_versioned_binary_path_for_home(home);
-    let metadata = std::fs::symlink_metadata(&path).ok()?;
-    metadata
-        .file_type()
-        .is_file()
-        .then(|| path.to_string_lossy().to_string())
-}
-
 async fn probe_backend(
     kind: BackendKind,
     platform: HostPlatform,
     acp_agents: &[ConfiguredAcpAgent],
 ) -> BackendSetupInfo {
     let probe = match kind {
-        BackendKind::Tycode => probe_installed_tycode().await,
+        BackendKind::Tycode => ProbeResult::not_installed(),
         BackendKind::Kiro => probe_acp_agents(acp_agents).await,
         BackendKind::Claude => probe_candidates(&command_candidates(CLAUDE_CLI_CANDIDATES)).await,
         BackendKind::Codex => probe_candidates(&command_candidates(CODEX_CLI_CANDIDATES)).await,
@@ -363,22 +325,6 @@ impl ProbeResult {
     fn with_hermes_executable(mut self, executable: String) -> Self {
         self.hermes_executable = Some(executable);
         self
-    }
-}
-
-async fn probe_installed_tycode() -> ProbeResult {
-    probe_resolved_tycode(resolve_tycode_binary_path()).await
-}
-
-async fn probe_resolved_tycode(command: Option<String>) -> ProbeResult {
-    let Some(command) = command else {
-        return ProbeResult::not_installed();
-    };
-    match validate_tycode_command(&command).await {
-        TycodeCommandValidation::Compatible { version } => ProbeResult::installed(Some(version)),
-        TycodeCommandValidation::Incompatible { diagnostic } => {
-            ProbeResult::unavailable(diagnostic)
-        }
     }
 }
 
@@ -697,12 +643,6 @@ async fn wait_for_version_command_group(
     }
 }
 
-async fn run_version_command(command: &str) -> Result<VersionCommandOutput, VersionCommandFailure> {
-    // The pinned Tycode command is already an explicit path. Resolving a login
-    // shell PATH here would synchronously run outside the probe timeout.
-    run_version_command_with_child_path(command, None).await
-}
-
 fn trace_version_probe_stage(started: Instant, command: &str, stage: &str) {
     let elapsed_ms = started.elapsed().as_millis();
     tracing::debug!(command, stage, elapsed_ms = %elapsed_ms, "version probe stage");
@@ -806,110 +746,6 @@ async fn run_version_command_with_child_path(
     }
     trace_version_probe_stage(started, &command_name, "function_returning_success");
     Ok(VersionCommandOutput { stdout, stderr })
-}
-
-enum TycodeCommandValidation {
-    Compatible { version: String },
-    Incompatible { diagnostic: BackendSetupDiagnostic },
-}
-
-pub(crate) async fn ensure_tycode_command_compatible(command: &str) -> Result<String, String> {
-    let expected_path = tycode_versioned_binary_path()?;
-    if Path::new(command) != expected_path {
-        return Err(format!(
-            "Tyde only runs the installed checksum-pinned Tycode artifact at {}; refusing {command}",
-            expected_path.display()
-        ));
-    }
-    match validate_tycode_command(command).await {
-        TycodeCommandValidation::Compatible { version: _ } => Ok(command.to_string()),
-        TycodeCommandValidation::Incompatible { diagnostic } => Err(diagnostic.message),
-    }
-}
-
-async fn validate_tycode_command(command: &str) -> TycodeCommandValidation {
-    let output = match run_version_command(command).await {
-        Ok(output) => output,
-        Err(failure) => {
-            return TycodeCommandValidation::Incompatible {
-                diagnostic: tycode_version_command_failure(command, failure),
-            };
-        }
-    };
-    let expected = format!("tycode-subprocess {TYCODE_VERSION}");
-    if exact_tycode_version_output(&output, &expected) {
-        return TycodeCommandValidation::Compatible { version: expected };
-    }
-    let Some(version_line) = parse_tycode_version_output(&output.stdout, &output.stderr) else {
-        return TycodeCommandValidation::Incompatible {
-            diagnostic: BackendSetupDiagnostic {
-                code: BackendSetupDiagnosticCode::CommandFailed,
-                message: format!(
-                    "Tycode command {command} did not report the exact expected --version output {expected:?}"
-                ),
-            },
-        };
-    };
-    let Some(version) = parse_tycode_reported_version(&version_line) else {
-        return TycodeCommandValidation::Incompatible {
-            diagnostic: BackendSetupDiagnostic {
-                code: BackendSetupDiagnosticCode::CommandFailed,
-                message: format!(
-                    "Tycode command {command} reported unparseable version line {version_line:?}; Tyde requires tycode-subprocess {TYCODE_VERSION}"
-                ),
-            },
-        };
-    };
-    TycodeCommandValidation::Incompatible {
-        diagnostic: BackendSetupDiagnostic {
-            code: BackendSetupDiagnosticCode::CommandFailed,
-            message: format!(
-                "Tycode command {command} reported {version_line:?} (version {version}), but Tyde requires exact --version output {expected:?} from the pinned installed artifact"
-            ),
-        },
-    }
-}
-
-fn exact_tycode_version_output(output: &VersionCommandOutput, expected: &str) -> bool {
-    output.stderr.is_empty()
-        && (output.stdout == expected
-            || output.stdout == format!("{expected}\n")
-            || output.stdout == format!("{expected}\r\n"))
-}
-
-fn tycode_version_command_failure(
-    command: &str,
-    failure: VersionCommandFailure,
-) -> BackendSetupDiagnostic {
-    let expected = format!("tycode-subprocess {TYCODE_VERSION}");
-    let message = match failure {
-        VersionCommandFailure::Start(error) => {
-            format!("Tycode command {command} could not run its required --version probe: {error}")
-        }
-        VersionCommandFailure::TimedOut => {
-            format!("Tycode command {command} timed out during its required --version probe")
-        }
-        VersionCommandFailure::NonZero {
-            status,
-            stdout,
-            stderr,
-        } => {
-            let output = VersionCommandOutput { stdout, stderr };
-            if exact_tycode_version_output(&output, &expected) {
-                format!(
-                    "Tycode command {command} reported exact expected --version output {expected:?} but exited unsuccessfully with {status}"
-                )
-            } else {
-                format!(
-                    "Tycode command {command} exited unsuccessfully with {status} during --version; Tyde requires exact output {expected:?}"
-                )
-            }
-        }
-    };
-    BackendSetupDiagnostic {
-        code: BackendSetupDiagnosticCode::CommandFailed,
-        message,
-    }
 }
 
 async fn probe_explicit_hermes_python(candidate: &str) -> ProbeResult {
@@ -1027,91 +863,9 @@ fn command_candidates(defaults: &[&str]) -> Vec<String> {
     candidates
 }
 
-fn parse_tycode_version_output(stdout: &str, stderr: &str) -> Option<String> {
-    for line in stdout.lines().chain(stderr.lines()).map(str::trim) {
-        if line.is_empty() {
-            continue;
-        }
-        if let Some(version) = parse_tycode_plain_text_version_line(line) {
-            return Some(version);
-        }
-        if let Some(version) = parse_tycode_version_frame(line) {
-            return Some(version);
-        }
-    }
-    None
-}
-
-fn parse_tycode_plain_text_version_line(line: &str) -> Option<String> {
-    let mut parts = line.split_whitespace();
-    let binary = parts.next()?;
-    let version = parts.next()?;
-    if parts.next().is_some() {
-        return None;
-    }
-    if binary != "tycode-subprocess" && binary != "tycode" {
-        return None;
-    }
-    if !looks_like_semver(version) {
-        return None;
-    }
-    Some(line.to_string())
-}
-
-fn parse_tycode_reported_version(line: &str) -> Option<&str> {
-    let mut parts = line.split_whitespace();
-    let binary = parts.next()?;
-    let version = parts.next()?;
-    if parts.next().is_some() {
-        return None;
-    }
-    if binary != "tycode-subprocess" && binary != "tycode" {
-        return None;
-    }
-    looks_like_semver(version).then_some(version)
-}
-
-fn parse_tycode_version_frame(line: &str) -> Option<String> {
-    let value: serde_json::Value = serde_json::from_str(line).ok()?;
-    let kind = value.get("kind").and_then(serde_json::Value::as_str)?;
-    if !kind.eq_ignore_ascii_case("version") {
-        return None;
-    }
-    let version = value
-        .get("version")
-        .or_else(|| value.get("data").and_then(|data| data.get("version")))
-        .and_then(serde_json::Value::as_str)
-        .map(str::trim)
-        .filter(|raw| !raw.is_empty())?;
-    let binary = value
-        .get("binary")
-        .or_else(|| value.get("data").and_then(|data| data.get("binary")))
-        .and_then(serde_json::Value::as_str)
-        .map(str::trim)
-        .filter(|raw| !raw.is_empty())
-        .unwrap_or("tycode-subprocess");
-    Some(format!("{binary} {version}"))
-}
-
-fn looks_like_semver(value: &str) -> bool {
-    let mut saw_digit = false;
-    let mut saw_dot = false;
-    for byte in value.bytes() {
-        match byte {
-            b'0'..=b'9' => saw_digit = true,
-            b'.' => saw_dot = true,
-            b'-' | b'+' | b'a'..=b'z' | b'A'..=b'Z' => {}
-            _ => return false,
-        }
-    }
-    saw_digit && saw_dot
-}
-
 fn docs_url(kind: BackendKind) -> String {
     match kind {
-        BackendKind::Tycode => {
-            format!("https://github.com/tigy32/Tycode/releases/tag/v{TYCODE_VERSION}")
-        }
+        BackendKind::Tycode => "https://github.com/tigy32/Tycode".to_owned(),
         BackendKind::Kiro => "https://kiro.dev/docs/cli/installation/".to_string(),
         BackendKind::Claude => {
             "https://docs.anthropic.com/en/docs/claude-code/getting-started".to_string()
@@ -1126,7 +880,7 @@ fn docs_url(kind: BackendKind) -> String {
 
 fn install_command(kind: BackendKind, platform: HostPlatform) -> Option<BackendSetupCommand> {
     match kind {
-        BackendKind::Tycode => tycode_install_command(platform),
+        BackendKind::Tycode => None,
         BackendKind::Kiro => Some(BackendSetupCommand {
             title: "Install CLI".to_string(),
             description: "Install Kiro CLI on this host. Kiro opens a browser for authentication after install.".to_string(),
@@ -1220,142 +974,10 @@ fn sign_in_command(
     }
 }
 
-fn shell_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\\''"))
-}
-
-fn tycode_install_command(platform: HostPlatform) -> Option<BackendSetupCommand> {
-    match platform {
-        HostPlatform::Macos | HostPlatform::Linux => Some(BackendSetupCommand {
-            title: "Install release artifact".to_string(),
-            description: format!(
-                "Download the Tycode v{TYCODE_VERSION} release artifact for this host, extract tycode-subprocess, and install it into ~/.tyde/tycode/{TYCODE_VERSION}."
-            ),
-            command: tycode_unix_install_command(),
-            display_command: Some(format!(
-                "/bin/sh <private Tyde v{TYCODE_VERSION} setup script>"
-            )),
-            runnable: true,
-        }),
-        HostPlatform::Windows | HostPlatform::Other => None,
-    }
-}
-
-fn tycode_unix_install_command() -> String {
-    format!(
-        r#"set -eu
-
-VERSION="{version}"
-BASE_URL="{release_base}/v{version}"
-HOME_DIR="${{HOME:-}}"
-[ -n "$HOME_DIR" ] || {{ echo "HOME is empty" >&2; exit 1; }}
-command -v python3 >/dev/null 2>&1 || {{ echo "python3 is required for Tycode install" >&2; exit 1; }}
-OS="$(uname -s)"
-ARCH="$(uname -m)"
-
-sha256_file() {{
-  if command -v shasum >/dev/null 2>&1; then
-    shasum -a 256 "$1" | awk '{{print $1}}'
-    return
-  fi
-  if command -v sha256sum >/dev/null 2>&1; then
-    sha256sum "$1" | awk '{{print $1}}'
-    return
-  fi
-  echo "No SHA256 tool found" >&2
-  exit 1
-}}
-
-fsync_path() {{
-  python3 - "$1" <<'PY'
-import os
-import sys
-
-path = sys.argv[1]
-fd = os.open(path, os.O_RDONLY)
-try:
-    os.fsync(fd)
-finally:
-    os.close(fd)
-PY
-}}
-
-case "$OS" in
-  Darwin)
-    case "$ARCH" in
-      arm64|aarch64)
-        ASSET="tycode-subprocess-aarch64-apple-darwin.tar.xz"
-        EXPECTED_SHA256="{sha_macos_arm64}"
-        ;;
-      x86_64|amd64)
-        ASSET="tycode-subprocess-x86_64-apple-darwin.tar.xz"
-        EXPECTED_SHA256="{sha_macos_x64}"
-        ;;
-      *) echo "Unsupported Tycode architecture: $ARCH" >&2; exit 1 ;;
-    esac
-    ;;
-  Linux)
-    case "$ARCH" in
-      arm64|aarch64)
-        ASSET="tycode-subprocess-aarch64-unknown-linux-musl.tar.xz"
-        EXPECTED_SHA256="{sha_linux_arm64}"
-        ;;
-      x86_64|amd64)
-        ASSET="tycode-subprocess-x86_64-unknown-linux-musl.tar.xz"
-        EXPECTED_SHA256="{sha_linux_x64}"
-        ;;
-      *) echo "Unsupported Tycode architecture: $ARCH" >&2; exit 1 ;;
-    esac
-    ;;
-  *)
-    echo "Unsupported Tycode OS: $OS" >&2
-    exit 1
-    ;;
-esac
-
-URL="${{BASE_URL}}/${{ASSET}}"
-INSTALL_ROOT="${{HOME_DIR}}/.tyde/tycode"
-DEST_DIR="${{INSTALL_ROOT}}/${{VERSION}}"
-TMP_ROOT="$(mktemp -d)"
-ARCHIVE="${{TMP_ROOT}}/${{ASSET}}"
-STAGED_BINARY="${{DEST_DIR}}/tycode-subprocess.tmp.$$"
-FINAL_BINARY="${{DEST_DIR}}/tycode-subprocess"
-cleanup() {{
-  rm -rf "$TMP_ROOT"
-  rm -f "$STAGED_BINARY"
-}}
-trap cleanup EXIT
-
-mkdir -p "$DEST_DIR"
-curl -fL "$URL" -o "$ARCHIVE"
-ACTUAL_SHA256="$(sha256_file "$ARCHIVE")"
-[ "$ACTUAL_SHA256" = "$EXPECTED_SHA256" ] || {{
-  echo "Tycode SHA256 mismatch for $ASSET: expected $EXPECTED_SHA256 got $ACTUAL_SHA256" >&2
-  exit 1
-}}
-tar -xJf "$ARCHIVE" -C "$TMP_ROOT"
-BINARY="$(find "$TMP_ROOT" -type f -name 'tycode-subprocess' | head -n 1)"
-[ -n "$BINARY" ] || {{ echo "Downloaded Tycode asset did not contain tycode-subprocess" >&2; exit 1; }}
-install -m 755 "$BINARY" "$STAGED_BINARY"
-fsync_path "$STAGED_BINARY"
-mv -f "$STAGED_BINARY" "$FINAL_BINARY"
-fsync_path "$DEST_DIR"
-"$FINAL_BINARY" --version
-"#,
-        version = TYCODE_VERSION,
-        release_base = TYCODE_RELEASE_BASE_URL,
-        sha_macos_arm64 = TYCODE_SUBPROCESS_SHA256_AARCH64_APPLE_DARWIN,
-        sha_macos_x64 = TYCODE_SUBPROCESS_SHA256_X86_64_APPLE_DARWIN,
-        sha_linux_arm64 = TYCODE_SUBPROCESS_SHA256_AARCH64_UNKNOWN_LINUX_MUSL,
-        sha_linux_x64 = TYCODE_SUBPROCESS_SHA256_X86_64_UNKNOWN_LINUX_MUSL,
-    )
-}
-
 fn home_dir() -> Result<PathBuf, String> {
     crate::paths::home_dir()
 }
 
-#[allow(dead_code)]
-fn _tycode_release_asset_url(asset_name: &str) -> String {
-    format!("{TYCODE_RELEASE_BASE_URL}/v{TYCODE_VERSION}/{asset_name}")
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
 }

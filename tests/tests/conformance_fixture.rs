@@ -166,7 +166,6 @@ fn enabled_backends() -> Vec<BackendKind> {
             BackendKind::Codex,
             BackendKind::Kiro,
             BackendKind::Hermes,
-            BackendKind::Tycode,
             BackendKind::Antigravity,
         ],
         Ok(configured) => {
@@ -181,7 +180,6 @@ fn enabled_backends() -> Vec<BackendKind> {
                     "codex" => BackendKind::Codex,
                     "kiro" | "acp" => BackendKind::Kiro,
                     "hermes" => BackendKind::Hermes,
-                    "tycode" => BackendKind::Tycode,
                     "antigravity" | "agy" => BackendKind::Antigravity,
                     other => panic!("unknown backend {other:?} in TYDE_REAL_BACKENDS"),
                 };
@@ -1225,11 +1223,11 @@ pub async fn delegate(
 /// rather than something a logging label quietly decides.
 pub fn spawn_tool_backend_name(backend_kind: BackendKind) -> &'static str {
     match backend_kind {
+        BackendKind::Tycode => "tycode-removed",
         BackendKind::Claude => "claude",
         BackendKind::Codex => "codex",
         BackendKind::Kiro => "kiro",
         BackendKind::Hermes => "hermes",
-        BackendKind::Tycode => "tycode",
         BackendKind::Antigravity => "antigravity",
     }
 }
@@ -2006,10 +2004,10 @@ pub async fn history_page(host: &mut Host, agent: &Agent) -> SessionHistoryPaylo
 
 fn backend_label(backend_kind: BackendKind) -> &'static str {
     match backend_kind {
+        BackendKind::Tycode => "tycode-removed",
         BackendKind::Claude => "claude",
         BackendKind::Codex => "codex",
         BackendKind::Antigravity => "antigravity",
-        BackendKind::Tycode => "tycode",
         BackendKind::Kiro => "kiro",
         BackendKind::Hermes => "hermes",
     }

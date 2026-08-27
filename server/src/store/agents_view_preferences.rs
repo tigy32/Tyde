@@ -927,12 +927,12 @@ fn canonicalize_status_filters(mut statuses: Vec<AgentStatusFilter>) -> Vec<Agen
 
 fn canonicalize_backends(mut backends: Vec<BackendKind>) -> Vec<BackendKind> {
     backends.sort_by_key(|backend| match *backend {
-        BackendKind::Tycode => 0,
-        BackendKind::Kiro => 1,
-        BackendKind::Claude => 2,
-        BackendKind::Codex => 3,
-        BackendKind::Antigravity => 4,
-        BackendKind::Hermes => 5,
+        BackendKind::Tycode => 5,
+        BackendKind::Kiro => 0,
+        BackendKind::Claude => 1,
+        BackendKind::Codex => 2,
+        BackendKind::Antigravity => 3,
+        BackendKind::Hermes => 4,
     });
     backends.dedup();
     backends
