@@ -1691,6 +1691,37 @@ mod wasm_tests {
         );
     }
 
+    #[wasm_bindgen_test]
+    async fn terminal_completion_clears_command_when_its_card_is_unavailable() {
+        let (container, state) = mount_tray(|_| {});
+        apply_live(
+            &state,
+            ChatEvent::ToolProgress(background_command_progress()),
+        );
+        next_tick().await;
+        assert_eq!(
+            count(&container, ".inflight-tray-row"),
+            1,
+            "background progress renders a running command"
+        );
+
+        apply_live(
+            &state,
+            command_completion(ToolExecutionResult::RunCommand {
+                exit_code: 0,
+                stdout: "done".to_owned(),
+                stderr: String::new(),
+            }),
+        );
+        next_tick().await;
+
+        assert_eq!(
+            count(&container, ".inflight-tray"),
+            0,
+            "an authoritative terminal event must clear live work even when its historical card is unavailable"
+        );
+    }
+
     /// The stop affordance follows the backend's own claim about the card, not
     /// the mere fact that a command is running. Offering it on a card nothing
     /// can address gives the user a button that silently does nothing.

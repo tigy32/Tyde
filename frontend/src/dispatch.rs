@@ -5661,6 +5661,9 @@ pub fn apply_chat_event_from(
                 data.outcome
             );
             let call_id = data.tool_call_id.clone();
+            state.tool_progress.update(|progress| {
+                progress.remove(&(agent_id.clone(), ToolCallId(call_id.clone())));
+            });
             let streaming = state
                 .streaming_text
                 .with_untracked(|map| map.get(&agent_id).cloned());
