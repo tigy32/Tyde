@@ -1227,6 +1227,12 @@ pub async fn connect_one_host(state: AppState, host_id: String) {
         return;
     }
 
+    // The native router replaces any existing connection for this host
+    // without emitting a disconnect event. Start a fresh protocol epoch here
+    // because the replacement server validators begin every stream at seq 0.
+    crate::send::clear_host_seqs(&host_id);
+    crate::dispatch::reset_inbound_state_for_host(&host_id);
+
     let host_stream = generate_host_stream();
     state.host_streams.update(|streams| {
         streams.insert(host_id.clone(), host_stream.clone());
@@ -1267,4 +1273,83 @@ pub(crate) fn is_managed_remote_host(state: &AppState, host_id: &str) -> bool {
                     }
                 )
         })
+}
+
+#[cfg(all(test, target_arch = "wasm32"))]
+mod wasm_tests {
+    use super::*;
+    use wasm_bindgen_test::*;
+
+    wasm_bindgen_test_configure!(run_in_browser);
+
+    fn install_connection_bridge(host_id: &str) {
+        js_sys::eval(&format!(
+            r#"
+            (function() {{
+                window.__connection_seq_generation = 0;
+                window.__connection_seq_frames = [];
+                window.__TAURI__ = window.__TAURI__ || {{}};
+                window.__TAURI__.core = window.__TAURI__.core || {{}};
+                window.__TAURI__.core.invoke = function(cmd, args) {{
+                    if (cmd === "connect_host" && args.hostId === {host_id}) {{
+                        window.__connection_seq_generation += 1;
+                        return Promise.resolve();
+                    }}
+                    if (cmd === "send_host_line" && args.hostId === {host_id}) {{
+                        const envelope = JSON.parse(args.line);
+                        window.__connection_seq_frames.push({{
+                            generation: window.__connection_seq_generation,
+                            envelope: envelope,
+                        }});
+                        return Promise.resolve();
+                    }}
+                    return Promise.resolve();
+                }};
+            }})();
+            "#,
+            host_id = serde_json::to_string(host_id).expect("encode host id"),
+        ))
+        .expect("install connection bridge");
+    }
+
+    fn project_access_sequences() -> Vec<(u64, u64)> {
+        let raw = js_sys::eval(
+            r#"
+            JSON.stringify(
+                (window.__connection_seq_frames || [])
+                    .filter(frame => frame.envelope.kind === "project_accessed")
+                    .map(frame => [frame.generation, frame.envelope.seq])
+            )
+            "#,
+        )
+        .expect("read project-access frames")
+        .as_string()
+        .expect("project-access frames serialize");
+        serde_json::from_str(&raw).expect("decode project-access frames")
+    }
+
+    #[wasm_bindgen_test]
+    async fn replacing_connection_restarts_project_sequence() {
+        let host_id = "connection-seq-reproduction";
+        let project_stream = StreamPath("/project/connection-seq-reproduction".to_owned());
+        let state = AppState::new();
+        crate::send::clear_host_seqs(host_id);
+        install_connection_bridge(host_id);
+
+        connect_one_host(state.clone(), host_id.to_owned()).await;
+        crate::send::project_accessed(host_id, project_stream.clone())
+            .await
+            .expect("send project access on first connection");
+
+        connect_one_host(state, host_id.to_owned()).await;
+        crate::send::project_accessed(host_id, project_stream)
+            .await
+            .expect("send project access on replacement connection");
+
+        assert_eq!(
+            project_access_sequences(),
+            vec![(1, 0), (2, 0)],
+            "each replacement connection has a fresh server-side validator, so its first project frame must start at sequence zero"
+        );
+    }
 }
