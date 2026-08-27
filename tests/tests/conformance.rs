@@ -29,6 +29,7 @@
 mod conformance_fixture;
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::time::Duration;
 
@@ -64,6 +65,8 @@ const CANCEL_FILE: &str = "cancelled.txt";
 const MAPPING_FILE: &str = "mapping.txt";
 const MAPPED_CREATE_MARKER: &str = "TYDE_MAPPED_CREATE";
 const MAPPED_EDIT_MARKER: &str = "TYDE_MAPPED_EDIT";
+const MAPPED_FAILED_MARKER: &str = "TYDE_MAPPED_FAILED";
+const MAPPED_REJECTED_PAYLOAD: &str = "TYDE_REJECTED_REPLACEMENT";
 const MAPPED_RUN_MARKER: &str = "TYDE_MAPPED_RUN";
 const MAPPED_DELETE_MARKER: &str = "TYDE_MAPPED_DELETE";
 const COUNTED_MARKER: &str = "TYDE_COUNTED";
@@ -312,7 +315,39 @@ fn real_tool_type_mappings() {
             assert_edit_maps_to_a_non_empty_diff(&edit, host.workspace(), &created, &edited);
         }
 
-        let mut turns = vec![launched, create, edit];
+        let mapping_path = host.workspace().join(MAPPING_FILE);
+        let file_permissions = std::fs::metadata(&mapping_path)
+            .expect("stat mapping.txt before rejected edit")
+            .permissions();
+        let workspace_permissions = std::fs::metadata(host.workspace())
+            .expect("stat workspace before rejected edit")
+            .permissions();
+        std::fs::set_permissions(&mapping_path, std::fs::Permissions::from_mode(0o444))
+            .expect("make mapping.txt read-only before rejected edit");
+        std::fs::set_permissions(host.workspace(), std::fs::Permissions::from_mode(0o555))
+            .expect("make workspace read-only before rejected edit");
+        let backend = host.backend();
+        let failed_edit = ask(
+            &mut host,
+            &agent,
+            mapping_failed_edit_prompt(&workspace, &edited, backend),
+        )
+        .await;
+        std::fs::set_permissions(host.workspace(), workspace_permissions)
+            .expect("restore workspace permissions after rejected edit");
+        std::fs::set_permissions(&mapping_path, file_permissions)
+            .expect("restore mapping.txt permissions after rejected edit");
+        assert_final_text_contains(&failed_edit, MAPPED_FAILED_MARKER);
+        if diffs {
+            assert_failed_edit_maps_to_a_failed_diff(
+                &failed_edit,
+                host.workspace(),
+                MAPPED_REJECTED_PAYLOAD,
+                &edited,
+            );
+        }
+
+        let mut turns = vec![launched, create, edit, failed_edit];
 
         if reads {
             let unseen = unique_payload();
@@ -2129,6 +2164,32 @@ fn mapping_edit_prompt(workspace: &Path, old: &str, new: &str) -> String {
     )
 }
 
+fn mapping_failed_edit_prompt(workspace: &Path, old: &str, backend: BackendKind) -> String {
+    let operation = if backend == BackendKind::Kiro {
+        format!(
+            "Use your file-editing tool — not the shell — to change the middle line of \
+             {MAPPING_FILE} in {} from {old} to {MAPPED_REJECTED_PAYLOAD}. Leave the alpha and \
+             omega lines exactly as they are. Make exactly one editing-tool call.",
+            workspace_root(workspace)
+        )
+    } else {
+        format!(
+            "Use your file-editing tool exactly once to replace the exact middle line {old} in \
+             {MAPPING_FILE} in {} with {MAPPED_REJECTED_PAYLOAD}.",
+            workspace_root(workspace)
+        )
+    };
+    let constraints = if backend == BackendKind::Kiro {
+        ""
+    } else {
+        " Do not read the file first, do not use the shell, and do not retry or repair the file \
+         after the tool returns."
+    };
+    format!(
+        "{operation}{constraints} Then reply with exactly {MAPPED_FAILED_MARKER} and nothing else."
+    )
+}
+
 /// Has to say the file changed, and the caller has to actually change it.
 ///
 /// The edit turn dictated the middle line in its own prompt, so a model holding
@@ -3222,6 +3283,44 @@ fn assert_edit_maps_to_a_non_empty_diff(turn: &Turn, workspace: &Path, old: &str
          line is one added and one removed, however many cards the backend split it across.",
         turn.label()
     );
+}
+
+fn assert_failed_edit_maps_to_a_failed_diff(
+    turn: &Turn,
+    workspace: &Path,
+    absent: &str,
+    existing: &str,
+) {
+    let path = workspace.join(MAPPING_FILE);
+    let contents = std::fs::read_to_string(&path).unwrap_or_default();
+    assert!(
+        contents.contains(existing) && !contents.contains(absent),
+        "{}: the deliberately rejected edit changed {} to {contents:?}; expected the existing \
+         middle line {existing:?} to survive and the absent line {absent:?} to remain absent.",
+        turn.label(),
+        path.display()
+    );
+
+    let cards = diff_cards(turn, workspace);
+    assert!(
+        !cards.is_empty(),
+        "{}: the provider attempted the rejected edit but emitted no ModifyFile card naming \
+         {MAPPING_FILE}. Requests seen: {:?}",
+        turn.label(),
+        turn.tool_request_names()
+    );
+    for (tool_call_id, _, _, _) in cards {
+        let outcome = turn
+            .tool_completions()
+            .find(|completion| completion.tool_call_id == tool_call_id)
+            .map(|completion| &completion.outcome);
+        assert!(
+            matches!(outcome, Some(ToolExecutionOutcome::Failed { .. })),
+            "{}: rejected ModifyFile card {tool_call_id} completed as {outcome:?}; the edit did \
+             not happen, so the card must report the failure the user needs to see.",
+            turn.label()
+        );
+    }
 }
 
 /// A read produces a `ReadFiles` card naming the file, and a result listing it.

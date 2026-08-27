@@ -9925,6 +9925,8 @@ impl CodexInner {
             }
             "thread/tokenUsage/updated" => {
                 self.handle_root_token_usage_updated(params).await;
+                let turn_id = extract_turn_id(params);
+                self.flush_raw_modify_failures(turn_id.as_deref()).await;
                 self.finalize_strict_response_at_token_usage(params).await;
             }
             "model/rerouted" => {
@@ -14712,6 +14714,11 @@ impl CodexInner {
         let completed_turn_id = extract_turn_id(params);
         self.flush_raw_modify_failures(completed_turn_id.as_deref())
             .await;
+        // Raw apply-patch failures have no typed fileChange item. Recovering
+        // their cards above opens a response after the pre-routing terminal
+        // sweep has already run, so close that response before this handler
+        // reports the turn idle.
+        self.finalize_strict_response(params, false).await;
         let consumed_terminated_turn = {
             let mut state = self.state.lock().await;
             match completed_turn_id.as_ref() {
