@@ -46,6 +46,7 @@ use conformance_fixture::*;
 
 const READY_MARKER: &str = "TYDE_READY";
 const WROTE_MARKER: &str = "TYDE_WROTE";
+const INTERIM_MARKER: &str = "TYDE_INTERIM_WORKING";
 const MULTI_MARKER: &str = "TYDE_MULTI";
 const BG_MARKER: &str = "TYDE_BG";
 /// Printed on stdout by the background command itself, so the card can be
@@ -224,6 +225,13 @@ fn real_conversation() {
 
         let wrote = ask(&mut host, &agent, write_prompt(&workspace, &payload)).await;
         assert_wrote_file(&wrote, host.workspace(), &payload);
+        assert!(
+            wrote
+                .assistant_messages()
+                .any(|message| message.content.contains(INTERIM_MARKER)),
+            "{}: pre-tool assistant commentary did not reach the user",
+            wrote.label()
+        );
         assert_final_text_contains(&wrote, WROTE_MARKER);
 
         let read_back = ask(&mut host, &agent, read_prompt(&workspace)).await;
@@ -2173,8 +2181,10 @@ fn workflow_prompt(workspace: &Path, backend_kind: BackendKind) -> String {
 
 fn write_prompt(workspace: &Path, payload: &str) -> String {
     format!(
-        "Create a file named {HELLO_FILE} in {} whose entire contents are exactly \
-         {payload} followed by a newline. Then reply with exactly {WROTE_MARKER} and nothing else.",
+        "Before using a tool, write exactly {INTERIM_MARKER} as visible assistant commentary. \
+         Then create a file named {HELLO_FILE} in {} whose entire contents are exactly {payload} \
+         followed by a newline. After the tool finishes, reply with exactly {WROTE_MARKER} and \
+         nothing else.",
         workspace_root(workspace)
     )
 }
@@ -2576,6 +2586,7 @@ fn assert_universal_contract(turns: &[Turn]) {
     assert!(!turns.is_empty(), "conversation produced no turns at all");
     for turn in turns {
         assert_no_error_message(&turn.label(), turn.events());
+        assert_no_unknown_backend_event(turn);
         assert_streams_are_balanced(turn);
         assert_no_empty_response(turn);
         assert_every_request_was_declared(turn);
@@ -2589,6 +2600,25 @@ fn assert_universal_contract(turns: &[Turn]) {
     assert_text_was_streamed(turns);
     assert_tool_call_ids_are_unique(turns);
     assert_reported_model_is_pinned(turns);
+}
+
+fn assert_no_unknown_backend_event(turn: &Turn) {
+    let unknown = turn.events().iter().filter_map(|event| match event {
+        ChatEvent::MessageAdded(message)
+            if message
+                .content
+                .contains("sent an event Tyde does not recognize") =>
+        {
+            Some(message.content.as_str())
+        }
+        _ => None,
+    });
+    let unknown = unknown.collect::<Vec<_>>();
+    assert!(
+        unknown.is_empty(),
+        "{}: exposed backend protocol events as user-visible messages: {unknown:?}",
+        turn.label()
+    );
 }
 
 /// Also the emitter-violation check: `TurnEmitter` aggregates the protocol

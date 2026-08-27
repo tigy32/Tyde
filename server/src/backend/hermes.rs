@@ -4447,6 +4447,7 @@ impl HermesEventMapper {
             "provider.request.start" => self.map_provider_request_start(payload),
             "message.start" => self.map_message_start(payload),
             "message.delta" => self.map_message_delta(payload),
+            "message.interim" => self.map_message_interim(payload),
             "message.complete" => self.map_message_complete(payload),
             "thinking.delta" | "reasoning.delta" => self.map_reasoning_delta(event_type, payload),
             "reasoning.available" => self.map_reasoning_available(payload),
@@ -4753,6 +4754,26 @@ impl HermesEventMapper {
             return Err("Hermes emitted message.delta before message.start".to_string());
         }
         if text.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.current_text.push_str(&text);
+        Ok(vec![ChatEvent::StreamDelta(StreamTextDeltaData { text })])
+    }
+
+    fn map_message_interim(&mut self, payload: Option<Value>) -> Result<Vec<ChatEvent>, String> {
+        let payload = required_payload(payload, "message.interim")?;
+        let text = required_raw_string(&payload, &["text"], "message.interim")?;
+        if text.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+        if self.current_message_id.is_none() {
+            return Err("Hermes emitted message.interim before message.start".to_string());
+        }
+        if payload
+            .get("already_streamed")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
             return Ok(Vec::new());
         }
         self.current_text.push_str(&text);
