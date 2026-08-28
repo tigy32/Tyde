@@ -9,12 +9,12 @@ use command_group::{AsyncCommandGroup, AsyncGroupChild};
 use protocol::{
     AgentInput, BackendConfigSnapshotStatus, BackendKind, BackendNativeSettingsSnapshot,
     BackendSetupDiagnosticCode, ChatEvent, ChatMessage, CompactionMethod, CompactionMetrics,
-    CompactionStage, CompactionTrigger, ContextBreakdown, CurrentContextUsage, MessageSender,
-    MessageTokenUsage, ModelInfo, ModelRequestId, ModelRequestTokenUsage, ModelTurnId,
-    OperationCancelledData, ReasoningData, RetryAttemptData, SelectOption, SendMessageToolResponse,
-    SessionId, SessionSettingField, SessionSettingFieldType, SessionSettingValue,
-    SessionSettingsSchema, SessionSettingsValues, StreamEndData, StreamStartData,
-    StreamTextDeltaData, TokenUsage, TokenUsageScope, TokenUsageUnavailableReason,
+    CompactionStage, CompactionTrigger, ContextBreakdown, CurrentContextUsage, ImageData,
+    MessageSender, MessageTokenUsage, ModelInfo, ModelRequestId, ModelRequestTokenUsage,
+    ModelTurnId, OperationCancelledData, ReasoningData, RetryAttemptData, SelectOption,
+    SendMessageToolResponse, SessionId, SessionSettingField, SessionSettingFieldType,
+    SessionSettingValue, SessionSettingsSchema, SessionSettingsValues, StreamEndData,
+    StreamStartData, StreamTextDeltaData, TokenUsage, TokenUsageScope, TokenUsageUnavailableReason,
     ToolExecutionCompletedData, ToolExecutionMode, ToolExecutionOutcome, ToolExecutionResult,
     ToolProgressData, ToolProgressUpdate, ToolRequest, ToolRequestType, ToolUseData,
 };
@@ -941,6 +941,7 @@ impl Backend for HermesBackend {
         [
             tyde_agent_adapter::BackendCapability::ListSessions,
             tyde_agent_adapter::BackendCapability::ResumeSession,
+            tyde_agent_adapter::BackendCapability::ImageInput,
             tyde_agent_adapter::BackendCapability::Interrupt,
             tyde_agent_adapter::BackendCapability::SessionSettings,
             tyde_agent_adapter::BackendCapability::StartupMcpServers,
@@ -983,7 +984,7 @@ impl Backend for HermesBackend {
         config: BackendSpawnConfig,
         initial_input: protocol::SendMessagePayload,
     ) -> Result<(Self, EventStream), String> {
-        reject_unverified_capabilities(&config, &initial_input)?;
+        reject_unverified_resume_capabilities(&config)?;
         let resolved_settings = resolve_session_settings(&config);
         let profile = resolve_session_profile(&resolved_settings)?;
         let expects_mcp_tools = !config.startup_mcp_servers.is_empty();
@@ -2513,25 +2514,27 @@ impl HermesSessionActor {
     }
 
     async fn handle_send_message(&mut self, payload: protocol::SendMessagePayload) {
-        if payload
-            .images
-            .as_ref()
-            .is_some_and(|images| !images.is_empty())
-        {
-            self.emit_error(
-                "Hermes image input is disabled until the native gateway contract is verified",
-            );
-            return;
-        }
-        if payload.message.trim().is_empty() {
+        let images = payload.images.unwrap_or_default();
+        if payload.message.trim().is_empty() && images.is_empty() {
             self.emit_error("Hermes prompt.submit requires a non-empty message");
             return;
         }
 
+        let attached_paths = match self.attach_images(&images).await {
+            Ok(paths) => paths,
+            Err(err) => {
+                self.emit_error(err);
+                return;
+            }
+        };
+
         // Scope the stderr tail to this turn so a later failure never reports
         // stale output from an earlier one.
         self.recent_stderr.clear();
-        self.emit(ChatEvent::MessageAdded(user_message(&payload.message)));
+        self.emit(ChatEvent::MessageAdded(user_message(
+            &payload.message,
+            (!images.is_empty()).then_some(images),
+        )));
         self.mapper.typing_active = true;
         self.emit(ChatEvent::TypingStatusChanged(true));
         match self
@@ -2553,7 +2556,75 @@ impl HermesSessionActor {
                 Err(err) => self.emit_turn_failure(err),
             },
             Err(err) => {
+                self.detach_images(&attached_paths).await;
                 self.emit_turn_failure(format!("Hermes prompt.submit failed: {err}"));
+            }
+        }
+    }
+
+    async fn attach_images(&self, images: &[ImageData]) -> Result<Vec<String>, String> {
+        let mut attached_paths = Vec::with_capacity(images.len());
+        for (index, image) in images.iter().enumerate() {
+            let extension = match image.media_type.as_str() {
+                "image/png" => "png",
+                "image/jpeg" => "jpg",
+                "image/gif" => "gif",
+                "image/webp" => "webp",
+                media_type => {
+                    self.detach_images(&attached_paths).await;
+                    return Err(format!(
+                        "Hermes cannot attach unsupported image media type '{media_type}'"
+                    ));
+                }
+            };
+            let result = match self
+                .gateway
+                .request(
+                    "image.attach_bytes",
+                    json!({
+                        "session_id": self.live_session_id,
+                        "content_base64": image.data,
+                        "filename": format!("image-{}.{}", index + 1, extension),
+                    }),
+                )
+                .await
+            {
+                Ok(result) => result,
+                Err(err) => {
+                    self.detach_images(&attached_paths).await;
+                    return Err(format!("Hermes image.attach_bytes failed: {err}"));
+                }
+            };
+            if result.get("attached").and_then(Value::as_bool) != Some(true) {
+                self.detach_images(&attached_paths).await;
+                return Err("Hermes image.attach_bytes did not attach the image".to_string());
+            }
+            let path = match required_string(&result, &["path"], "image.attach_bytes") {
+                Ok(path) => path,
+                Err(err) => {
+                    self.detach_images(&attached_paths).await;
+                    return Err(err);
+                }
+            };
+            attached_paths.push(path);
+        }
+        Ok(attached_paths)
+    }
+
+    async fn detach_images(&self, paths: &[String]) {
+        for path in paths {
+            if let Err(err) = self
+                .gateway
+                .request(
+                    "image.detach",
+                    json!({
+                        "session_id": self.live_session_id,
+                        "path": path,
+                    }),
+                )
+                .await
+            {
+                tracing::warn!(path, %err, "failed to detach Hermes image after rejected send");
             }
         }
     }
@@ -6162,7 +6233,10 @@ fn hermes_clarify_answers(
     };
 
     if questions.len() == 1 {
-        return Ok(vec![(None, extract(&questions[0], answer))]);
+        return Ok(vec![(
+            questions[0].id.clone(),
+            extract(&questions[0], answer),
+        )]);
     }
 
     let lines = answer
@@ -6366,24 +6440,6 @@ fn hermes_subagent_progress(
             status,
         }),
     }
-}
-
-fn reject_unverified_capabilities(
-    config: &BackendSpawnConfig,
-    input: &protocol::SendMessagePayload,
-) -> Result<(), String> {
-    reject_unverified_resume_capabilities(config)?;
-    if input
-        .images
-        .as_ref()
-        .is_some_and(|images| !images.is_empty())
-    {
-        return Err(
-            "Hermes image input is disabled until the native gateway contract is verified"
-                .to_string(),
-        );
-    }
-    Ok(())
 }
 
 fn reject_unverified_resume_capabilities(config: &BackendSpawnConfig) -> Result<(), String> {
@@ -8226,7 +8282,7 @@ fn current_context_usage_from_hermes(value: &Value) -> Option<CurrentContextUsag
     })
 }
 
-fn user_message(content: &str) -> ChatMessage {
+fn user_message(content: &str, images: Option<Vec<ImageData>>) -> ChatMessage {
     ChatMessage {
         message_id: None,
         timestamp: unix_now_ms(),
@@ -8237,7 +8293,7 @@ fn user_message(content: &str) -> ChatMessage {
         model_info: None,
         token_usage: None,
         context_breakdown: None,
-        images: None,
+        images,
     }
 }
 
