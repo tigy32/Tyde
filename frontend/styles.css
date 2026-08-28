@@ -1207,19 +1207,28 @@ details summary:focus:not(:focus-visible) {
     display: none;
 }
 
-/* The focused pane differs by weight as well as color, so focus is not
-   conveyed by hue alone. */
-.editor-pane.pane-split.pane-focused > .tab-bar {
-    border-bottom-color: var(--accent-primary);
-    box-shadow: inset 0 2px 0 0 var(--accent-primary);
-}
-
+/* Focus is marked by receding the pane that lacks it, never by painting the
+   one that has it: the accent then lands exactly once in the tab region, under
+   the tab actually receiving input. Marking both sides put three accent lines
+   in one 36px band and read as an error state. Weight and the receded surface
+   both carry focus, so it is still not conveyed by hue alone. */
 .editor-pane.pane-split.pane-focused .tab.active {
     font-weight: 600;
 }
 
 .editor-pane.pane-split:not(.pane-focused) > .tab-bar {
     background: var(--surface-2);
+}
+
+.editor-pane.pane-split:not(.pane-focused) .tab {
+    color: var(--text-tertiary);
+}
+
+/* Still the active tab of its own pane — just stated in the neutral border
+   instead of competing with the focused pane's accent. */
+.editor-pane.pane-split:not(.pane-focused) .tab.active {
+    color: var(--text-secondary);
+    border-bottom-color: var(--border-primary);
 }
 
 .pane-divider {

@@ -3006,6 +3006,96 @@ mod wasm_tests {
         );
     }
 
+    /// Focus in a split is marked by receding the pane that does not have it,
+    /// not by painting the one that does. The accent then appears exactly once
+    /// in the tab region — under the tab receiving input — instead of
+    /// bracketing the focused pane's tab bar top and bottom while the other
+    /// pane's active tab wears the same accent anyway.
+    #[wasm_bindgen_test]
+    async fn only_the_focused_panes_active_tab_wears_the_accent() {
+        let container = make_container();
+        let state = AppState::new();
+        let state_for_mount = state.clone();
+        let _handle = mount_to(container.clone(), move || {
+            provide_context(state_for_mount.clone());
+            install_tab_lru_effect(&state_for_mount);
+            view! { <CenterZone /> }
+        });
+        settle().await;
+
+        open_file_tab(&state, "alpha.rs", "fn alpha() {}");
+        settle().await;
+        open_file_tab_in(&state, PaneId::Secondary, "bravo.rs", "fn bravo() {}");
+        settle().await;
+
+        // Both directions: a rule that merely favors the primary pane would
+        // pass the first pass and fail the second.
+        for (focused, unfocused, focused_label, unfocused_label) in [
+            (PaneId::Primary, PaneId::Secondary, "alpha.rs", "bravo.rs"),
+            (PaneId::Secondary, PaneId::Primary, "bravo.rs", "alpha.rs"),
+        ] {
+            state.focus_pane(focused);
+            settle_styles().await;
+
+            let focused_pane = pane_element(&container, focused);
+            let unfocused_pane = pane_element(&container, unfocused);
+            let focused_bar =
+                query(&focused_pane, ":scope > .tab-bar").expect("the focused pane owns a tab bar");
+            let unfocused_bar = query(&unfocused_pane, ":scope > .tab-bar")
+                .expect("the unfocused pane owns a tab bar");
+            let focused_active = tab_button_named_in(&focused_pane, focused_label);
+            let unfocused_active = tab_button_named_in(&unfocused_pane, unfocused_label);
+
+            // Read the accent off the one element still meant to carry it
+            // rather than hard-coding #007acc, so retheming cannot fail this.
+            let accent = computed(&focused_active, "border-bottom-color");
+            assert_ne!(
+                accent, TRANSPARENT,
+                "the focused pane's active tab keeps the accent marker"
+            );
+
+            assert_eq!(
+                computed(&focused_bar, "box-shadow"),
+                "none",
+                "focus must not draw an accent bar across the top of the tab bar"
+            );
+            assert_ne!(
+                computed(&focused_bar, "border-bottom-color"),
+                accent,
+                "focus must not repaint the tab bar's bottom edge in the accent"
+            );
+            assert_eq!(
+                computed(&focused_bar, "border-bottom-color"),
+                computed(&unfocused_bar, "border-bottom-color"),
+                "both tab bars share one neutral bottom edge"
+            );
+
+            assert_ne!(
+                computed(&unfocused_active, "border-bottom-color"),
+                accent,
+                "the unfocused pane's active tab must not wear the accent too"
+            );
+            assert_ne!(
+                computed(&unfocused_active, "border-bottom-color"),
+                TRANSPARENT,
+                "it still reads as its own pane's active tab, just not in accent"
+            );
+
+            // Dropping the accent cannot leave focus conveyed by hue alone:
+            // the receded background and the heavier active tab both carry it.
+            assert_ne!(
+                computed(&focused_bar, "background-color"),
+                computed(&unfocused_bar, "background-color"),
+                "the unfocused pane's tab bar recedes"
+            );
+            assert_ne!(
+                computed(&focused_active, "font-weight"),
+                computed(&unfocused_active, "font-weight"),
+                "the focused pane's active tab is the heavier of the two"
+            );
+        }
+    }
+
     /// A tab near the right edge — which a half-width split strip makes
     /// ordinary — must not open a menu that hangs off-screen with its items
     /// unreachable.
