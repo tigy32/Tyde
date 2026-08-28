@@ -68,7 +68,6 @@ const HERMES_MODEL_PROVIDER_FLAG: &str = " --provider ";
 const HERMES_TOOLSETS_ENV: &str = "HERMES_TUI_TOOLSETS";
 const HERMES_TOOL_PROGRESS_ENV: &str = "HERMES_TUI_TOOL_PROGRESS";
 const HERMES_MANAGED_DIR_ENV: &str = "HERMES_MANAGED_DIR";
-const HERMES_YOLO_MODE_ENV: &str = "HERMES_YOLO_MODE";
 const TYDE_HERMES_SYSTEM_PROMPT_ENV: &str = "TYDE_HERMES_SYSTEM_PROMPT";
 const HERMES_MANAGED_MCP_TOOLSET: &str = "mcp-tyde";
 /// Hermes's Tool Search bridge tool. When deferral is active the
@@ -816,6 +815,7 @@ struct HermesEventMapper {
     opaque_progress_tools: HashSet<String>,
     background_tasks: HashMap<String, HermesBackgroundTask>,
     pending_approval_tool_id: Option<String>,
+    pending_approval_request_id: Option<String>,
     pending_clarify: Option<HermesPendingClarify>,
     last_session_usage: Option<TokenUsage>,
     cumulative_usage_incomplete: bool,
@@ -2614,15 +2614,17 @@ impl HermesSessionActor {
                     return;
                 }
                 let choice = match decision {
-                    protocol::ExitPlanModeDecision::Approve => "allow",
+                    protocol::ExitPlanModeDecision::Approve => "once",
                     protocol::ExitPlanModeDecision::Reject => "deny",
                 };
+                let request_id = self.mapper.pending_approval_request_id.clone();
                 match self
                     .gateway
                     .request(
                         "approval.respond",
                         json!({
                             "session_id": self.live_session_id,
+                            "request_id": request_id,
                             "choice": choice,
                             "message": message,
                         }),
@@ -2631,14 +2633,22 @@ impl HermesSessionActor {
                 {
                     Ok(result) => {
                         self.mapper.pending_approval_tool_id = None;
+                        self.mapper.pending_approval_request_id = None;
                         self.mapper.pending_tools.remove(&tool_call_id);
                         self.mapper.pending_tool_arguments.remove(&tool_call_id);
+                        let outcome = if result.get("resolved").and_then(Value::as_u64) == Some(0) {
+                            ToolExecutionOutcome::Cancelled {
+                                message: "Hermes approval was no longer pending".to_string(),
+                            }
+                        } else {
+                            ToolExecutionOutcome::Succeeded {
+                                result: ToolExecutionResult::Other { result },
+                            }
+                        };
                         self.emit(ChatEvent::ToolExecutionCompleted(
                             ToolExecutionCompletedData {
                                 tool_call_id,
-                                outcome: ToolExecutionOutcome::Succeeded {
-                                    result: ToolExecutionResult::Other { result },
-                                },
+                                outcome,
                             },
                         ));
                         self.mapper.typing_active = true;
@@ -4437,19 +4447,6 @@ async fn spawn_gateway_child(target: &HermesSpawnTarget) -> Result<AsyncGroupChi
         command.current_dir(cwd);
         command.env("TERMINAL_CWD", cwd);
     }
-    // Hermes is the only backend that stops mid-turn to ask its own user for
-    // permission, which in Tyde means a turn that waits on a prompt the user
-    // never asked for. Its 47 approval patterns cover ordinary agent work —
-    // `rm -r`, `chmod -R`, `find -exec rm`, `git clean -f` — and every other
-    // backend here simply runs them.
-    //
-    // Scoped to the process Tyde spawns rather than set through
-    // `~/.hermes/config.yaml`, so it cannot change the user's own CLI sessions.
-    // Frozen at import (`approval.py:32`), so it has to be here and not sent
-    // later. Hermes checks its hardline set *before* consulting this
-    // (`approval.py:1383`), so `rm -rf /`, `$HOME`, `mkfs`, `dd` to a raw
-    // device, fork bombs and shutdown stay blocked regardless.
-    command.env(HERMES_YOLO_MODE_ENV, "1");
     command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -4743,6 +4740,21 @@ impl HermesEventMapper {
         if self.current_message_id.is_none() {
             return Err("Hermes provider request started before message.start".to_string());
         }
+        let mut events = Vec::new();
+        if let Some(tool_call_id) = self.pending_approval_tool_id.take() {
+            self.pending_tools.remove(&tool_call_id);
+            self.pending_tool_arguments.remove(&tool_call_id);
+            self.pending_approval_request_id = None;
+            events.push(ChatEvent::ToolExecutionCompleted(
+                ToolExecutionCompletedData {
+                    tool_call_id,
+                    outcome: ToolExecutionOutcome::Cancelled {
+                        message: "Hermes continued after the approval was denied, expired, or resolved elsewhere"
+                            .to_string(),
+                    },
+                },
+            ));
+        }
         if !self.pending_tools.is_empty() {
             return Err(format!(
                 "Hermes provider request started with unresolved tool calls: {}",
@@ -4757,8 +4769,7 @@ impl HermesEventMapper {
             .map_or((None, None), |(request, cumulative)| {
                 (Some(request), cumulative)
             });
-        let mut events =
-            self.finish_stream_events(None, None, request_usage, cumulative_usage, None);
+        events.extend(self.finish_stream_events(None, None, request_usage, cumulative_usage, None));
         self.turn_tools.clear();
         self.next_turn_tool_order = 0;
 
@@ -5576,6 +5587,7 @@ impl HermesEventMapper {
             format!("{description}\n\nCommand:\n{command}")
         };
         self.pending_approval_tool_id = Some(tool_call_id.clone());
+        self.pending_approval_request_id = optional_string(&payload, &["request_id"]);
         self.pending_tools
             .insert(tool_call_id.clone(), "approval.request".to_string());
         Ok(vec![ChatEvent::ToolRequest(ToolRequest {
@@ -5868,6 +5880,7 @@ impl HermesEventMapper {
         self.turn_tools.clear();
         self.next_turn_tool_order = 0;
         self.pending_approval_tool_id = None;
+        self.pending_approval_request_id = None;
         self.pending_clarify = None;
     }
 }

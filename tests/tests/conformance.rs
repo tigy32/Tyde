@@ -1149,6 +1149,48 @@ fn real_user_question() {
     );
 }
 
+/// A provider-native approval pauses a live turn, accepts Tyde's typed
+/// response, and lets that same turn continue without corrupting its stream.
+///
+/// Hermes requires the gateway request id and the canonical `once` choice.
+/// Sending the older `allow` spelling leaves the gateway blocked until its
+/// approval timeout, after which the next provider request arrives while Tyde
+/// still believes the synthetic approval tool is open. Claude reaches the same
+/// normalized flow through plan approval, so setup and assertions stay shared.
+#[test]
+#[ignore = "paid real-backend suite; use --run-ignored all with TYDE_RUN_REAL_AI_TESTS=1"]
+fn real_native_approval() {
+    run_scenario(
+        &[BackendCapability::PlanApprovalRequests],
+        |mut host| async move {
+            let workspace = host.workspace().to_path_buf();
+            let prompt = approval_prompt(host.backend(), &workspace);
+            let agent = spawn_agent(&mut host, &launch_prompt()).await;
+            let launched = collect_turn(&mut host, &agent, &launch_prompt()).await;
+            assert_ready_handshake(&launched);
+
+            let approval = ask_for_approval(&mut host, &agent, &prompt).await;
+            assert_no_error_message(
+                &format!("{:?} pending approval", host.backend()),
+                approval.events(),
+            );
+            let approved = approve_request(&mut host, &agent, approval).await;
+            assert_final_text_contains(&approved, DELETED_MARKER);
+            assert!(
+                !workspace.join(SCRATCH_DIR).exists(),
+                "{}: approved action did not remove {}",
+                approved.label(),
+                workspace.join(SCRATCH_DIR).display()
+            );
+            assert_universal_contract(&[launched, approved]);
+
+            let recovered = ask_expecting_delivery(&mut host, &agent, &launch_prompt()).await;
+            assert_ready_handshake(&recovered);
+            assert_clean_close(&mut host, &agent).await;
+        },
+    );
+}
+
 /// A tool still running when the turn ends.
 ///
 /// Deliberately does *not* assert that every request completed — a backgrounded
@@ -2667,27 +2709,38 @@ fn wait_prompt() -> String {
     )
 }
 
-/// Destructive, through a shell command, and *recursive* specifically.
-///
-/// Recursion is what the gates key on. Hermes ships 47 approval patterns and 12
-/// hard blocks (`~/.hermes/hermes-agent/tools/approval.py`); `rm <file>` matches
-/// none of them, while `rm -r` matches "recursive delete". An earlier version of
-/// this prompt deleted a single file, and every backend sailed through it —
-/// a green result that asserted nothing about the gate.
-///
-/// Tyde cannot answer a prompt a provider raises inside its own runtime, so a
-/// backend that gates here does not fail loudly: it goes quiet with the work
-/// undone, which is why the oracle below is the filesystem and not the reply.
-///
 /// The target is a directory this scenario seeded inside its own temporary
 /// workspace, which is the whole of what the agent can reach.
 fn delete_prompt(workspace: &Path) -> String {
     format!(
-        "Delete the directory {SCRATCH_DIR} and everything in it from {}, by \
-         running a single recursive shell command. Then reply with exactly {DELETED_MARKER} and \
-         nothing else.",
+        "Delete the directory {SCRATCH_DIR} and everything in it from {} by running this exact \
+         command: python3 -c \"import shutil; shutil.rmtree('{SCRATCH_DIR}')\". Then reply with \
+         exactly {DELETED_MARKER} and nothing else.",
         workspace_root(workspace)
     )
+}
+
+fn approval_prompt(backend_kind: BackendKind, workspace: &Path) -> String {
+    let root = workspace_root(workspace);
+    match backend_kind {
+        BackendKind::Claude => format!(
+            "Use your native plan mode for this task. Plan to delete the directory {SCRATCH_DIR} \
+             and everything in it from {root} with one recursive shell command, then request my \
+             approval through ExitPlanMode. Do not execute the command before I approve. After I \
+             approve, execute it and reply with exactly {DELETED_MARKER} and nothing else."
+        ),
+        BackendKind::Hermes => {
+            let encoded =
+                "cHl0aG9uMyAtYyAiaW1wb3J0IHNodXRpbDsgc2h1dGlsLnJtdHJlZSgnc2NyYXRjaCcpIg==";
+            format!(
+                "Run this exact command with the terminal tool: echo {encoded} | base64 -d | \
+                 bash. Do not use clarify or any other tool. Hermes's security scanner will \
+                 request my approval; after I approve, reply with exactly {DELETED_MARKER} and \
+                 nothing else."
+            )
+        }
+        other => panic!("{other:?} advertises plan approvals but has no conformance prompt"),
+    }
 }
 
 /// Names a decision the model cannot make for itself, so asking is the only way
@@ -3030,7 +3083,18 @@ fn assert_every_request_was_declared(turn: &Turn) {
         .map(|request| request.tool_call_id.clone())
         .collect();
 
-    let undeclared: Vec<_> = requested.difference(&declared).collect();
+    // Provider-native approval is a host interjection, not a tool the model
+    // declared. Hermes proves the distinction: the terminal call is declared
+    // under its provider id, while approval.request has a synthetic Tyde id.
+    let undeclared: Vec<_> = requested
+        .difference(&declared)
+        .filter(|tool_call_id| {
+            !turn.tool_requests().any(|request| {
+                request.tool_call_id.as_str() == tool_call_id.as_str()
+                    && matches!(request.tool_type, ToolRequestType::ExitPlanMode { .. })
+            })
+        })
+        .collect();
     assert!(
         undeclared.is_empty(),
         "{}: tool request(s) {undeclared:?} were never declared by any assistant response in the \
@@ -4362,18 +4426,14 @@ fn assert_background_task_survived_the_interrupt(
 
 /// The directory is gone, and the model says so.
 ///
-/// The filesystem is the oracle in both directions. A backend that stops to ask
-/// its own user for confirmation leaves a turn that looks entirely reasonable —
-/// tool requested, turn ended, no error — with the work simply not done, and
-/// only the surviving directory tells those apart. The reverse also happens: a
-/// model that reports deleting something it never touched.
+/// The filesystem is the oracle in both directions: it distinguishes a tool
+/// that did the work from a model that only reported deleting the directory.
 fn assert_deleted_directory(turn: &Turn, workspace: &Path) {
     let path = workspace.join(SCRATCH_DIR);
     assert!(
         !path.exists(),
         "{}: {} still exists after a turn that was asked to remove it recursively. The turn \
-         emitted {:?} and {} completion(s), and replied {:?}. A provider that gates recursive \
-         deletes behind its own confirmation ends the turn exactly like this, with the work undone.",
+         emitted {:?} and {} completion(s), and replied {:?}.",
         turn.label(),
         path.display(),
         turn.tool_request_names(),

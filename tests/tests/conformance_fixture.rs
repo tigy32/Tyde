@@ -20,7 +20,7 @@ use protocol::{
     AgentActivityStats, AgentActivityStatsPayload, AgentBootstrapEvent, AgentBootstrapPayload,
     AgentCompactPayload, AgentErrorPayload, AgentId, AgentStartPayload, AskUserQuestion,
     BackendKind, ChatEvent, ChatMessage, ChatMessageId, ClientErrorPayload,
-    ContextCompactionNotifyPayload, ContextCompactionTimelineEvent, Envelope,
+    ContextCompactionNotifyPayload, ContextCompactionTimelineEvent, Envelope, ExitPlanModeDecision,
     FetchSessionHistoryPayload, FrameKind, HistoryPageRequestId, HostBootstrapPayload, ImageData,
     ListSessionsPayload, McpServerConfig, McpServerId, McpServerUpsertPayload, McpTransportConfig,
     MessageMetadataUpdateData, MessageSender, MessageTokenUsage, NewAgentPayload,
@@ -1520,6 +1520,94 @@ pub async fn answer_question(
         .await
         .expect("answer send_message failed");
     collect_until_idle(host, agent, &format!("answer {answer:?}")).await
+}
+
+pub struct Approval {
+    backend: BackendKind,
+    prompt: String,
+    request: ToolRequest,
+    events: Vec<ChatEvent>,
+}
+
+impl Approval {
+    pub fn events(&self) -> &[ChatEvent] {
+        &self.events
+    }
+
+    pub fn tool_call_id(&self) -> &str {
+        &self.request.tool_call_id
+    }
+}
+
+pub async fn ask_for_approval(host: &mut Host, agent: &Agent, prompt: &str) -> Approval {
+    let backend = host.backend_kind;
+    host.client
+        .send_message(&agent.stream, prompt.to_owned())
+        .await
+        .expect("send_message failed");
+
+    let context = format!("{} approval for prompt {prompt:?}", backend_label(backend));
+    let mut events = Vec::new();
+    loop {
+        let envelope = host.next_envelope(Duration::from_secs(240), &context).await;
+        fail_on_agent_error(&envelope, &context);
+        fail_on_client_error(&envelope, &context);
+        if envelope.stream != agent.stream {
+            continue;
+        }
+        for event in chat_events_in(&envelope) {
+            let approval = match &event {
+                ChatEvent::ToolRequest(request)
+                    if matches!(
+                        request.tool_type,
+                        protocol::ToolRequestType::ExitPlanMode { .. }
+                    ) =>
+                {
+                    Some(request.clone())
+                }
+                _ => None,
+            };
+            events.push(event);
+            if let Some(request) = approval {
+                events.extend(drain_events_for(host, Duration::from_secs(2)).await);
+                return Approval {
+                    backend,
+                    prompt: prompt.to_owned(),
+                    request,
+                    events,
+                };
+            }
+        }
+    }
+}
+
+pub async fn approve_request(host: &mut Host, agent: &Agent, approval: Approval) -> Turn {
+    let tool_call_id = approval.tool_call_id().to_owned();
+    host.client
+        .send_message_payload(
+            &agent.stream,
+            SendMessagePayload {
+                message: "Approve".to_owned(),
+                images: None,
+                origin: None,
+                tool_response: Some(SendMessageToolResponse::ExitPlanMode {
+                    tool_call_id,
+                    decision: ExitPlanModeDecision::Approve,
+                    feedback: None,
+                }),
+            },
+        )
+        .await
+        .expect("approval send_message failed");
+    let continued = collect_until_idle(host, agent, "approved request").await;
+    let mut events = approval.events;
+    events.extend(continued.events);
+    Turn {
+        backend: approval.backend,
+        prompt: approval.prompt,
+        events,
+        activity_stats: continued.activity_stats,
+    }
 }
 
 /// Collect to the next idle without waiting for a user echo. A tool response is
