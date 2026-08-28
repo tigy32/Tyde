@@ -1330,7 +1330,7 @@ impl ReviewActor {
 
     fn submit_payload(&self) -> Result<SendMessagePayload, String> {
         let bundle = ReviewFeedbackBundle::from_review(&self.review)?;
-        let message = bundle.render_markdown()?;
+        let message = bundle.render_markdown();
         Ok(SendMessagePayload {
             message,
             images: None,

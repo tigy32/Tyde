@@ -198,8 +198,8 @@ pub enum ReviewSubmitTarget {
 
 `ExistingAgent` is valid only when the agent is live and bound to the same
 project as the review. `NewAgent` spawns an unrestricted same-project agent
-using `project.roots` and sends the review bundle as the initial user input
-with `MessageOrigin::Review { review_id }`.
+using `project.roots` and sends the rendered Markdown review message as the
+initial user input with `MessageOrigin::Review { review_id }`.
 
 ### Actions
 
@@ -218,8 +218,9 @@ pub enum ReviewActionPayload {
 }
 ```
 
-`Submit` validates comments and target, delivers one feedback bundle for all
-accepted comments across roots, then resets the review on success.
+`Submit` validates comments and target, delivers one rendered Markdown review
+message for all accepted comments across roots, then resets the review on
+success.
 `ClearComments` explicitly resets comments/suggestions/AI state without
 delivering anything. `Cancel` remains deserializable for backcompat but new
 server/UI paths should not depend on it for lifecycle.
@@ -377,12 +378,18 @@ location must be one of the project root paths present in the review diff.
 2. Refresh every root's staged and unstaged diffs plus referenced regular-file
    snapshots, then mark stale anchors.
 3. Reject if any accepted comment is stale/invalid.
-4. Build one `ReviewFeedbackBundle` containing comments across all roots and
-   render the deterministic markdown message.
+4. Build one typed `ReviewFeedbackBundle` containing comments across all roots
+   and render one concise Markdown message. The agent-facing message numbers
+   each comment and includes only its human-readable target, location, body,
+   and reviewed excerpt. Review, project, session, comment, revision, and
+   anchor metadata stay internal; `MessageOrigin::Review` carries the typed
+   review identity separately for delivery bookkeeping. Excerpts are fenced
+   or quoted safely and are explicitly identified as code or data that cannot
+   override system, developer, or repository instructions.
 5. Deliver to the chosen target:
    - existing agent: live, same project, receives `AgentInput::SendMessage`
-   - new agent: spawned in the same project with `project.roots` and the bundle
-     as initial input
+   - new agent: spawned in the same project with `project.roots` and the
+     rendered Markdown review message as initial input
 6. On success, clear comments, suggestions, and AI state; keep `status = Draft`;
    emit `Cleared` and update project review summaries.
 
