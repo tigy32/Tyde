@@ -705,6 +705,64 @@ mod wasm_tests {
         );
     }
 
+    /// Project bootstrap supplies the row's initial liveness, then both an
+    /// attached agent's chat events and an unattached agent's host-stream
+    /// notifications update `agent_turn_active`. The visible row must follow
+    /// those live edges without requiring the agent record to be replaced.
+    #[wasm_bindgen_test]
+    async fn agents_row_tracks_live_turn_status_changes() {
+        let host = LocalHostId("host-live-status".to_owned());
+        let agent_ref = AgentRef {
+            local_host_id: host.clone(),
+            agent_id: AgentId("a-live".to_owned()),
+        };
+        let state = AppState::new();
+        state.active_local_host_id.set(Some(host.clone()));
+        state
+            .agents
+            .set(vec![fixture(&host, "a-live", "Live agent", None)]);
+
+        let container = make_container();
+        let state_for_mount = state.clone();
+        let _h = mount_to(container.clone(), move || {
+            provide_context(state_for_mount.clone());
+            view! { <AgentsView /> }
+        });
+        next_tick().await;
+
+        let status_text = || {
+            container
+                .query_selector("[data-mobile-test='agent-row-status-label']")
+                .unwrap()
+                .expect("visible agent status label")
+                .text_content()
+                .unwrap_or_default()
+                .trim()
+                .to_owned()
+        };
+        assert_eq!(status_text(), "Idle", "control: the agent begins idle");
+
+        state.agent_turn_active.update(|turns| {
+            turns.insert(agent_ref.clone(), true);
+        });
+        next_tick().await;
+        assert_eq!(
+            status_text(),
+            "Thinking",
+            "a live turn-start edge must update the visible row"
+        );
+
+        state.agent_turn_active.update(|turns| {
+            turns.remove(&agent_ref);
+        });
+        next_tick().await;
+        assert_eq!(
+            status_text(),
+            "Idle",
+            "a live turn-end edge must settle the visible row back to idle"
+        );
+    }
+
     /// Empty list renders the dedicated empty state with a CTA, not a
     /// bare list.
     #[wasm_bindgen_test]

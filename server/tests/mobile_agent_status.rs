@@ -9,8 +9,8 @@ mod fixture;
 
 use fixture::{Fixture, TestAgent, next_frame_matching_on, send_load_agent_on};
 use protocol::{
-    AgentBootstrapPayload, AgentId, AgentTurnStateNotifyPayload, ChatEvent, Envelope, FrameKind,
-    NewAgentPayload, StreamPath,
+    AgentBootstrapPayload, AgentId, AgentTurnStateNotifyPayload, BackendKind, ChatEvent, Envelope,
+    FrameKind, NewAgentPayload, SpawnAgentParams, SpawnAgentPayload, StreamPath,
 };
 use server::backend::mock::{MockGateHandle, MockScript, MockTurn};
 
@@ -176,14 +176,34 @@ async fn lazy_client_learns_agent_liveness_from_the_host_stream() {
         "idle must be announced idle again after its follow-up turn ends"
     );
 
-    // An agent spawned after connect is described running from the start.
+    // An agent spawned from the phone after connect is described running from
+    // the start, then its auto-opened stream bootstraps with the same state.
     let late_launch = MockGateHandle::new();
-    let late = fixture
-        .spawn_scripted(
+    let late_reservation = fixture
+        .reserve_next_mock_launch(
             "late",
             MockScript::one(MockTurn::gated_text("late launch", &late_launch)),
         )
         .await;
+    mobile
+        .spawn_agent(SpawnAgentPayload {
+            name: Some("late".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::New {
+                workspace_roots: vec!["/tmp/test".to_owned()],
+                prompt: "started from the phone".to_owned(),
+                images: None,
+                backend_kind: BackendKind::Claude,
+                launch_profile_id: None,
+                cost_hint: None,
+                access_mode: Default::default(),
+                session_settings: None,
+            },
+        })
+        .await
+        .expect("spawn late agent from mobile");
     late_launch.wait_until_entered().await;
     let late_new_agent: NewAgentPayload =
         next_frame_matching_on(&mut mobile, "late NewAgent", |env| {
@@ -196,27 +216,39 @@ async fn lazy_client_learns_agent_liveness_from_the_host_stream() {
             env.kind == FrameKind::NewAgent
                 && env
                     .parse_payload::<NewAgentPayload>()
-                    .is_ok_and(|payload| payload.agent_id == late.new_agent.agent_id)
+                    .is_ok_and(|payload| payload.name == "late")
         })
         .await
         .parse_payload()
         .expect("parse late NewAgentPayload");
     assert!(
         late_new_agent.turn_active,
-        "an agent spawned after connect must be described as running"
+        "an agent spawned by the phone must be described as running"
+    );
+    let late_stream = late_new_agent.instance_stream.clone();
+    send_load_agent_on(&mut mobile, &late_stream).await;
+    let late_bootstrap: AgentBootstrapPayload =
+        next_frame_matching_on(&mut mobile, "late AgentBootstrap", |env| {
+            env.kind == FrameKind::AgentBootstrap && env.stream == late_stream
+        })
+        .await
+        .parse_payload()
+        .expect("parse late AgentBootstrapPayload");
+    assert!(
+        late_bootstrap.turn_active,
+        "the phone-opened agent stream must bootstrap as running"
     );
     late_launch.release_one();
-    settle_turn(&mut fixture, &late).await;
-    assert!(
-        !next_turn_state_on(
-            &mut mobile,
-            &late.new_agent.agent_id,
-            &[],
-            "late going idle"
-        )
-        .await,
-        "late must be announced idle after its launch turn ends"
-    );
+    drop(late_reservation);
+    next_frame_matching_on(&mut mobile, "late idle on its own stream", |env| {
+        env.stream == late_stream
+            && env.kind == FrameKind::ChatEvent
+            && matches!(
+                env.parse_payload::<ChatEvent>(),
+                Ok(ChatEvent::TypingStatusChanged(false))
+            )
+    })
+    .await;
 
     // Opening an agent attaches its stream: the AgentBootstrap is
     // authoritative, and from then on its liveness travels on that stream
@@ -235,11 +267,10 @@ async fn lazy_client_learns_agent_liveness_from_the_host_stream() {
     );
     let attached = [mobile_busy_stream.clone()];
 
-    fixture
-        .client
-        .send_message(&busy.stream, "again".to_owned())
+    mobile
+        .send_message(&mobile_busy_stream, "again".to_owned())
         .await
-        .expect("send follow-up to busy");
+        .expect("send follow-up to idle agent from mobile");
     busy_follow_up.wait_until_entered().await;
     let typing_on_stream = |env: &Envelope, expected: bool| {
         env.stream == mobile_busy_stream
