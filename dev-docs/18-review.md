@@ -3,7 +3,8 @@
 Spec for Tyde's inline Review feature.
 
 Reviews are an **always-on, workspace-scoped inline layer** over a project's
-current unstaged git diffs. In this document, **workspace** means the
+unstaged diffs, staged diffs, and regular text files. In this document,
+**workspace** means the
 `Project`, keyed by `ProjectId`, spanning every path in `Project.roots`.
 There is exactly one active draft review per project, even when the project has
 one root. The primary UX is still the project diff surface: comments, AI
@@ -22,20 +23,34 @@ Audience: implementation agents and future maintainers.
 - Active reviews are implicit. Project bootstrap and review summary updates
   surface the active id; clients should not send `ReviewCreate` just to make a
   review appear in the UI.
-- `Review.diffs` contains one `ProjectGitDiffPayload` per project root that can
-  be read as a git repository. Each payload is normalized to
-  `ProjectDiffScope::Unstaged` and `DiffContextMode::FullFile`.
+- `Review.diffs` contains staged and unstaged `ProjectGitDiffPayload` values
+  for every project root that can be read as a git repository. Payloads use
+  `DiffContextMode::FullFile`.
+- Every `ReviewLocation` carries a `ReviewTarget` discriminator. Missing target
+  data in legacy records defaults to `UnstagedDiff`. Staged and unstaged
+  locations for the same path are therefore different identities.
+- Regular-file comments use server-authored immutable text snapshots and a
+  SHA-256 content revision. Clients send only a project-relative location and
+  anchor; the server canonicalizes the selected project root and target,
+  rejects symlink aliases and NUL-containing files, normalizes the stored
+  relative path, and replaces the requested revision with its own value before
+  accepting the comment. File snapshots are retained only while feedback
+  references them and are cleared with the review.
+- Regular-file snapshot reads use descriptor-relative, no-follow traversal on
+  Unix and compare independently opened file identities before reading on all
+  platforms. A path, alias, or file identity change during resolution rejects
+  the operation. AI reviewer locations go through the same server freeze, so
+  reviewer-provided revisions are never authoritative.
 - Submitting feedback does not move the active review into a durable
   submitted/consumed queue. After successful delivery the server clears
   comments, suggestions, and AI reviewer state and keeps the same draft review
   ready for the next unstaged workspace diff.
-- Diff refreshes never silently re-anchor comments. If a stored anchor no
-  longer matches the current unstaged diff for its root, the server marks it
+- Source refreshes never silently re-anchor comments. If a stored anchor no
+  longer matches its staged/unstaged diff, or a regular file's content revision
+  changes, the server marks it
   stale and leaves the original `ReviewLocation` unchanged.
-- Clean reset is workspace-wide: the active review clears only when **all**
-  project roots have clean unstaged state. If one root becomes clean while
-  another root is still dirty, comments in the clean root become stale through
-  normal anchor-status refresh.
+- A clean unstaged worktree never erases staged or regular-file comments.
+  Unstaged-only drafts retain the historical clean-reset behavior.
 - Feedback can be submitted either to an existing open same-project agent or to
   a newly spawned same-project agent.
 
@@ -48,6 +63,10 @@ workspace draft.
 ---
 
 ## 2. Protocol contract
+
+`ReviewTarget` and `Review.file_snapshots` are wire-visible additions in
+protocol version 52. Stored legacy locations remain readable because a missing
+target defaults to `UnstagedDiff` and missing file snapshots default empty.
 
 ### Streams
 
@@ -257,7 +276,8 @@ included review.
 ### Diff files
 
 Review diffs use the normal project diff payload with
-`ProjectDiffScope::Unstaged` and `DiffContextMode::FullFile`.
+`ProjectDiffScope::Unstaged` or `ProjectDiffScope::Staged` and
+`DiffContextMode::FullFile`.
 `Review.diffs` may contain multiple `ProjectGitDiffPayload` values, one for
 each git root in the project. `ProjectGitDiffFile.is_binary` marks binary
 additions/modifications. Binary files carry no hunks, so line and hunk anchors
@@ -288,7 +308,7 @@ per-root drafts into the active workspace review.
 
 ### Diff refresh and stale anchors
 
-Review actors refresh `diffs` from every project root's unstaged diff on full
+Review actors refresh `diffs` from every project root's staged and unstaged diff on full
 subscribe and before mutating/submitting/starting AI review. After each refresh
 the actor checks every comment and suggestion location against the refreshed
 workspace diff:
@@ -299,6 +319,11 @@ workspace diff:
 The server never changes `ReviewLocation` to make an anchor fit. Submitting with
 any stale/invalid accepted comment fails with `InvalidLocation`.
 
+Regular-file targets are read through the same root-relative project path
+validation as normal file reads. Missing, binary, inaccessible, and out-of-root
+targets are rejected. Once accepted, a later content revision mismatch is
+reported as a stale anchor; the original snapshot and location remain frozen.
+
 Untracked binary files are included in refreshed unstaged diffs as
 `is_binary = true` with empty hunks instead of failing review creation or
 refresh. Because binary and metadata-only changes can have no hunks, clean-reset
@@ -307,15 +332,26 @@ no files.
 
 ### Clean reset
 
-A refresh that observes no changed files in any root clears the active workspace
-review. Project-stream git status refreshes also notify the registry only when
+A refresh that observes no changed files in any root clears an unstaged-only
+active workspace review. Project-stream git status refreshes also notify the registry only when
 all project roots have clean unstaged state (`unstaged == None` and not
-untracked). Staged-only changes therefore leave the active unstaged review
-clear.
+untracked). The actor preserves the draft when it contains staged or
+regular-file comments.
 
 If one root becomes clean while another root remains dirty, the review is not
 cleared. Comments in the clean root remain in the review and are marked stale by
 anchor-status refresh because their diff file is no longer present.
+
+### Desktop and mobile surfaces
+
+Desktop diff tabs expose review affordances for explicit staged and unstaged
+scopes. The combined uncommitted scope is intentionally not reviewable because
+it cannot distinguish the two versions of a path. Desktop regular text-file
+tabs expose the same file, line, and drag-range composer. The aggregate comments
+surface labels and navigates each source independently.
+
+Mobile is agent-chat-only for this feature area. It does not expose project
+files, Git status, diffs, review comments, or review navigation.
 
 ### AI review
 
@@ -338,7 +374,8 @@ location must be one of the project root paths present in the review diff.
 
 1. Require draft review, at least one accepted comment, and no running AI
    reviewer.
-2. Refresh all roots' unstaged diffs and mark stale anchors.
+2. Refresh every root's staged and unstaged diffs plus referenced regular-file
+   snapshots, then mark stale anchors.
 3. Reject if any accepted comment is stale/invalid.
 4. Build one `ReviewFeedbackBundle` containing comments across all roots and
    render the deterministic markdown message.

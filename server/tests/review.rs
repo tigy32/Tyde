@@ -509,10 +509,50 @@ fn new_line_location(review: &Review) -> ReviewLocation {
     ReviewLocation {
         root: diff.root.clone(),
         relative_path: file.relative_path.clone(),
+        target: protocol::ReviewTarget::UnstagedDiff,
         anchor: ReviewAnchor::LineRange {
             side: ReviewDiffSide::New,
             start_line: added_line.new_line_number.expect("new line number"),
             end_line: added_line.new_line_number.expect("new line number"),
+        },
+    }
+}
+
+fn new_line_location_for_scope(review: &Review, scope: ProjectDiffScope) -> ReviewLocation {
+    let diff = review
+        .diffs
+        .iter()
+        .find(|diff| {
+            diff.scope == scope
+                && diff
+                    .files
+                    .iter()
+                    .any(|file| file.relative_path == "src/lib.rs")
+        })
+        .unwrap_or_else(|| panic!("review diff for {scope:?}"));
+    let file = diff
+        .files
+        .iter()
+        .find(|file| file.relative_path == "src/lib.rs")
+        .expect("src/lib.rs diff");
+    let line = file
+        .hunks
+        .iter()
+        .flat_map(|hunk| hunk.lines.iter())
+        .find(|line| line.kind == ProjectGitDiffLineKind::Added)
+        .expect("added line");
+    ReviewLocation {
+        root: diff.root.clone(),
+        relative_path: file.relative_path.clone(),
+        target: match scope {
+            ProjectDiffScope::Unstaged => protocol::ReviewTarget::UnstagedDiff,
+            ProjectDiffScope::Staged => protocol::ReviewTarget::StagedDiff,
+            ProjectDiffScope::Uncommitted => panic!("combined diff is not reviewable"),
+        },
+        anchor: ReviewAnchor::LineRange {
+            side: ReviewDiffSide::New,
+            start_line: line.new_line_number.expect("new line number"),
+            end_line: line.new_line_number.expect("new line number"),
         },
     }
 }
@@ -537,6 +577,7 @@ fn new_line_location_for_root(review: &Review, root: &str) -> ReviewLocation {
     ReviewLocation {
         root: diff.root.clone(),
         relative_path: file.relative_path.clone(),
+        target: protocol::ReviewTarget::UnstagedDiff,
         anchor: ReviewAnchor::LineRange {
             side: ReviewDiffSide::New,
             start_line: added_line.new_line_number.expect("new line number"),
@@ -597,6 +638,7 @@ fn sample_stored_review(
             context_mode: DiffContextMode::FullFile,
             files: Vec::new(),
         }],
+        file_snapshots: Vec::new(),
         comments: Vec::new(),
         suggestions: Vec::<ReviewSuggestedComment>::new(),
         ai_reviewer: ReviewAiReviewerState {
@@ -1501,6 +1543,7 @@ async fn create_review_with_untracked_binary_file_allows_file_comment() {
     let location = ReviewLocation {
         root: diff.root.clone(),
         relative_path: "binary.dat".to_owned(),
+        target: protocol::ReviewTarget::UnstagedDiff,
         anchor: ReviewAnchor::File,
     };
     client
@@ -1544,14 +1587,17 @@ async fn submitted_review_sends_rendered_markdown_to_origin() {
             end_line,
             ..
         } if start_line == end_line => {
-            format!("### {}:{} (new)", location.relative_path, start_line)
+            format!(
+                "### {}:{} (new, unstaged)",
+                location.relative_path, start_line
+            )
         }
         ReviewAnchor::LineRange {
             start_line,
             end_line,
             ..
         } => format!(
-            "### {}:{}-{} (new)",
+            "### {}:{}-{} (new, unstaged)",
             location.relative_path, start_line, end_line
         ),
         other => panic!("expected line range anchor, got {other:?}"),
@@ -1758,11 +1804,54 @@ async fn ai_reviewer_propose_tool_accepts_and_rejects_suggestions() {
     let repo = root.path().join("review-root");
     fs::create_dir_all(&repo).expect("create repo");
     seed_repo(&repo);
+    git(&repo, &["checkout", "--", "src/lib.rs"]);
+    let notes = repo.join("notes.txt");
+    fs::write(&notes, "first note\nsecond note\n").expect("write regular review file");
+    git(&repo, &["add", "notes.txt"]);
+    git(&repo, &["commit", "-m", "Add notes"]);
+    fs::write(
+        repo.join("src/lib.rs"),
+        "fn value() -> i32 {\n    1\n}\n\nfn extra() -> i32 {\n    2\n}\n",
+    )
+    .expect("create staged change");
+    git(&repo, &["add", "src/lib.rs"]);
+    fs::write(
+        repo.join("src/lib.rs"),
+        "fn value() -> i32 {\n    1\n}\n\nfn extra() -> i32 {\n    2\n}\n\nfn newest() -> i32 {\n    3\n}\n",
+    )
+    .expect("create unstaged change above staged change");
 
     let project = create_project(&mut client, &repo).await;
     let (agent, _session_id) = spawn_project_agent(&mut client, &project).await;
     let review = create_review(&mut client, &project, &agent).await;
     let location = new_line_location(&review);
+    let staged_location = new_line_location_for_scope(&review, ProjectDiffScope::Staged);
+    let regular_location = ReviewLocation {
+        root: ProjectRootPath(repo.to_string_lossy().to_string()),
+        relative_path: "notes.txt".to_owned(),
+        target: protocol::ReviewTarget::RegularFile {
+            revision: String::new(),
+        },
+        anchor: ReviewAnchor::LineRange {
+            side: ReviewDiffSide::New,
+            start_line: 1,
+            end_line: 1,
+        },
+    };
+    client
+        .review_action(
+            &review.id,
+            ReviewActionPayload::AddComment {
+                location: regular_location,
+                body: "freeze regular source".to_owned(),
+            },
+        )
+        .await
+        .expect("add regular-file comment before AI review");
+    let regular_comment = match expect_review_delta(&mut client, "regular comment upsert").await {
+        ReviewEventPayload::CommentUpsert { comment } => comment,
+        other => panic!("expected regular comment upsert, got {other:?}"),
+    };
 
     let _reservation = fixture
         .reserve_next_mock_launch(
@@ -1931,15 +2020,132 @@ async fn ai_reviewer_propose_tool_accepts_and_rejects_suggestions() {
         other => panic!("expected rejected suggestion, got {other:?}"),
     }
 
+    let expected_regular_revision = match &regular_comment.location.target {
+        protocol::ReviewTarget::RegularFile { revision } => revision.clone(),
+        other => panic!("expected frozen regular target, got {other:?}"),
+    };
+    let mut reviewer_regular_location = regular_comment.location.clone();
+    reviewer_regular_location.target = protocol::ReviewTarget::RegularFile {
+        revision: "reviewer-forged-revision".to_owned(),
+    };
+    let tool_result = call_propose_review_comment_tool(
+        &fixture,
+        &reviewer_agent_id,
+        &review.id,
+        reviewer_regular_location,
+    )
+    .await;
+    assert_eq!(tool_result["status"], "success");
+    let regular_suggestion =
+        match expect_review_delta(&mut client, "regular-file suggestion upsert").await {
+            ReviewEventPayload::SuggestionUpsert { suggestion } => suggestion,
+            other => panic!("expected regular-file suggestion, got {other:?}"),
+        };
+    assert!(matches!(
+        &regular_suggestion.location.target,
+        protocol::ReviewTarget::RegularFile { revision }
+            if revision == &expected_regular_revision
+    ));
+
+    client
+        .review_action(
+            &review.id,
+            ReviewActionPayload::DeleteComment {
+                comment_id: regular_comment.id.clone(),
+            },
+        )
+        .await
+        .expect("delete regular-file seed comment");
+    match expect_review_delta(&mut client, "regular seed comment delete").await {
+        ReviewEventPayload::CommentDelete { comment_id } => {
+            assert_eq!(comment_id, regular_comment.id)
+        }
+        other => panic!("expected regular comment delete, got {other:?}"),
+    }
+
+    fs::write(&notes, "changed after suggestion\n").expect("change suggested regular file");
+    let mut stale_observer = fixture.connect().await;
+    let stale_snapshot = subscribe_review(&mut stale_observer, &review.id).await;
+    assert!(stale_snapshot.suggestions.iter().any(|suggestion| {
+        suggestion.id == regular_suggestion.id
+            && matches!(
+                suggestion.anchor_status,
+                protocol::ReviewAnchorStatus::Stale { .. }
+            )
+    }));
+
+    client
+        .review_action(
+            &review.id,
+            ReviewActionPayload::AcceptSuggestion {
+                suggestion_id: regular_suggestion.id.clone(),
+                edit: None,
+            },
+        )
+        .await
+        .expect("attempt stale regular-file suggestion accept");
+    loop {
+        match expect_review_delta(&mut client, "stale regular suggestion rejection").await {
+            ReviewEventPayload::SuggestionUpsert { suggestion }
+                if suggestion.id == regular_suggestion.id =>
+            {
+                assert!(matches!(
+                    suggestion.anchor_status,
+                    protocol::ReviewAnchorStatus::Stale { .. }
+                ));
+            }
+            ReviewEventPayload::Error { error } => {
+                assert_eq!(error.code, ReviewErrorCode::InvalidLocation);
+                assert!(error.message.contains("stale anchor"));
+                break;
+            }
+            other => panic!("unexpected stale suggestion event: {other:?}"),
+        }
+    }
+
+    let tool_result =
+        call_propose_review_comment_tool(&fixture, &reviewer_agent_id, &review.id, staged_location)
+            .await;
+    assert_eq!(tool_result["status"], "success");
+    let staged_suggestion =
+        match expect_review_delta(&mut client, "staged suggestion before clean refresh").await {
+            ReviewEventPayload::SuggestionUpsert { suggestion } => suggestion,
+            other => panic!("expected staged suggestion, got {other:?}"),
+        };
+    assert!(matches!(
+        staged_suggestion.location.target,
+        protocol::ReviewTarget::StagedDiff
+    ));
+
+    fs::write(&notes, "first note\nsecond note\n").expect("restore regular file");
+    git(&repo, &["checkout", "--", "src/lib.rs"]);
+    let mut clean_observer = fixture.connect().await;
+    let preserved = subscribe_review(&mut clean_observer, &review.id).await;
+    assert!(preserved.suggestions.iter().any(|suggestion| {
+        suggestion.id == staged_suggestion.id
+            && matches!(suggestion.state, ReviewSuggestionState::Pending)
+            && matches!(
+                suggestion.location.target,
+                protocol::ReviewTarget::StagedDiff
+            )
+    }));
+
     client
         .interrupt(&reviewer_stream)
         .await
         .expect("interrupt reviewer");
-    match expect_review_delta(&mut client, "AI reviewer completed delta").await {
-        ReviewEventPayload::AiReviewerChanged { state }
-            if state.status == ReviewAiReviewerStatus::Completed => {}
-        other => {
-            panic!("unexpected event while waiting for reviewer completion: {other:?}");
+    loop {
+        match expect_review_delta(&mut client, "AI reviewer completed delta").await {
+            ReviewEventPayload::AiReviewerChanged { state }
+                if state.status == ReviewAiReviewerStatus::Completed =>
+            {
+                break;
+            }
+            ReviewEventPayload::CommentUpsert { .. }
+            | ReviewEventPayload::SuggestionUpsert { .. } => {}
+            other => {
+                panic!("unexpected event while waiting for reviewer completion: {other:?}");
+            }
         }
     }
     close_agent_and_wait(&mut client, &reviewer_stream).await;
@@ -2367,4 +2573,352 @@ async fn legacy_project_only_drafts_do_not_surface_as_active_summaries() {
     assert_ne!(summary.id, first.id);
     assert_ne!(summary.id, second.id);
     assert!(matches!(summary.status, ReviewStatus::Draft));
+}
+
+#[tokio::test]
+async fn mixed_source_comments_keep_identity_and_file_revision() {
+    let fixture = Fixture::new().await;
+    let gate = MockGateHandle::new();
+    let _reservation = fixture
+        .reserve_next_mock_launch(
+            "Review Origin",
+            MockScript::one(MockTurn::gated_text("mixed source target", &gate)),
+        )
+        .await;
+    let mut client = fixture.connect().await;
+    let root = tempfile::tempdir().expect("temp root");
+    let repo = root.path().join("review-root");
+    fs::create_dir_all(&repo).expect("create repo");
+    seed_repo(&repo);
+    git(&repo, &["add", "src/lib.rs"]);
+    fs::write(
+        repo.join("src/lib.rs"),
+        "fn value() -> i32 {\n    3\n}\n\nfn extra() -> i32 {\n    2\n}\n",
+    )
+    .expect("create unstaged version of staged path");
+    let notes = repo.join("notes.txt");
+    let original_notes = "first note\nsecond note\nthird note\n";
+    fs::write(&notes, original_notes).expect("write review file");
+    fs::write(repo.join("nul.txt"), b"text\0still utf8\n").expect("write NUL file");
+    let outside = root.path().join("outside.txt");
+    fs::write(&outside, "not project content\n").expect("write outside file");
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(&outside, repo.join("escape.txt"))
+            .expect("create escaping symlink");
+        std::os::unix::fs::symlink(&notes, repo.join("notes-link.txt"))
+            .expect("create in-root symlink alias");
+        let output = Command::new("mkfifo")
+            .arg(repo.join(".git/review.fifo"))
+            .output()
+            .expect("create review FIFO");
+        assert!(
+            output.status.success(),
+            "mkfifo failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let project = create_project(&mut client, &repo).await;
+    let bootstrap = expect_project_bootstrap(&mut client, &project).await;
+    let review_id = bootstrap.review_summaries[0].id.clone();
+    let review = subscribe_review(&mut client, &review_id).await;
+    let staged = new_line_location_for_scope(&review, ProjectDiffScope::Staged);
+    let unstaged = new_line_location_for_scope(&review, ProjectDiffScope::Unstaged);
+    assert_eq!(staged.relative_path, unstaged.relative_path);
+    assert!(!staged.target.same_surface(&unstaged.target));
+    client
+        .review_action(
+            &review_id,
+            ReviewActionPayload::AddComment {
+                location: ReviewLocation {
+                    root: ProjectRootPath(root.path().to_string_lossy().to_string()),
+                    relative_path: "outside.txt".to_owned(),
+                    target: protocol::ReviewTarget::RegularFile {
+                        revision: String::new(),
+                    },
+                    anchor: ReviewAnchor::File,
+                },
+                body: "must use an owning project root".to_owned(),
+            },
+        )
+        .await
+        .expect("send mismatched-root regular-file comment");
+    let error = expect_review_error(
+        &mut client,
+        "mismatched-root regular-file comment",
+        ReviewErrorCode::InvalidLocation,
+    )
+    .await;
+    assert!(
+        error.message.contains("does not belong to project"),
+        "a file cannot be associated through a different root: {}",
+        error.message
+    );
+    #[cfg(unix)]
+    {
+        client
+            .review_action(
+                &review_id,
+                ReviewActionPayload::AddComment {
+                    location: ReviewLocation {
+                        root: ProjectRootPath(repo.to_string_lossy().to_string()),
+                        relative_path: "escape.txt".to_owned(),
+                        target: protocol::ReviewTarget::RegularFile {
+                            revision: String::new(),
+                        },
+                        anchor: ReviewAnchor::File,
+                    },
+                    body: "must not read outside root".to_owned(),
+                },
+            )
+            .await
+            .expect("send escaping regular-file comment");
+        let error = expect_review_error(
+            &mut client,
+            "escaping regular-file comment",
+            ReviewErrorCode::InvalidLocation,
+        )
+        .await;
+        assert!(
+            error.message.contains("escapes project root"),
+            "escaping symlink must be rejected by canonical containment: {}",
+            error.message
+        );
+
+        client
+            .review_action(
+                &review_id,
+                ReviewActionPayload::AddComment {
+                    location: ReviewLocation {
+                        root: ProjectRootPath(repo.to_string_lossy().to_string()),
+                        relative_path: "notes-link.txt".to_owned(),
+                        target: protocol::ReviewTarget::RegularFile {
+                            revision: String::new(),
+                        },
+                        anchor: ReviewAnchor::File,
+                    },
+                    body: "must not change logical file identity".to_owned(),
+                },
+            )
+            .await
+            .expect("send aliased regular-file comment");
+        let error = expect_review_error(
+            &mut client,
+            "aliased regular-file comment",
+            ReviewErrorCode::InvalidLocation,
+        )
+        .await;
+        assert!(
+            error.message.contains("symlink alias"),
+            "in-root aliases must be rejected instead of changing identity: {}",
+            error.message
+        );
+
+        client
+            .review_action(
+                &review_id,
+                ReviewActionPayload::AddComment {
+                    location: ReviewLocation {
+                        root: ProjectRootPath(repo.to_string_lossy().to_string()),
+                        relative_path: ".git/review.fifo".to_owned(),
+                        target: protocol::ReviewTarget::RegularFile {
+                            revision: String::new(),
+                        },
+                        anchor: ReviewAnchor::File,
+                    },
+                    body: "must not block on a special file".to_owned(),
+                },
+            )
+            .await
+            .expect("send FIFO regular-file comment");
+        let error = expect_review_error(
+            &mut client,
+            "FIFO regular-file comment",
+            ReviewErrorCode::InvalidLocation,
+        )
+        .await;
+        assert!(
+            error.message.contains("not a regular file"),
+            "special files must be rejected before reading: {}",
+            error.message
+        );
+    }
+
+    client
+        .review_action(
+            &review_id,
+            ReviewActionPayload::AddComment {
+                location: ReviewLocation {
+                    root: ProjectRootPath(repo.to_string_lossy().to_string()),
+                    relative_path: "nul.txt".to_owned(),
+                    target: protocol::ReviewTarget::RegularFile {
+                        revision: String::new(),
+                    },
+                    anchor: ReviewAnchor::File,
+                },
+                body: "must reject NUL text".to_owned(),
+            },
+        )
+        .await
+        .expect("send NUL regular-file comment");
+    let error = expect_review_error(
+        &mut client,
+        "NUL regular-file comment",
+        ReviewErrorCode::InvalidLocation,
+    )
+    .await;
+    assert!(
+        error.message.contains("NUL bytes"),
+        "UTF-8 with NUL must follow binary rejection policy: {}",
+        error.message
+    );
+
+    client
+        .review_action(
+            &review_id,
+            ReviewActionPayload::AddComment {
+                location: ReviewLocation {
+                    root: ProjectRootPath(repo.to_string_lossy().to_string()),
+                    relative_path: "notes.txt".to_owned(),
+                    target: protocol::ReviewTarget::RegularFile {
+                        revision: String::new(),
+                    },
+                    anchor: ReviewAnchor::LineRange {
+                        side: ReviewDiffSide::New,
+                        start_line: 99,
+                        end_line: 99,
+                    },
+                },
+                body: "invalid anchor must not retain source text".to_owned(),
+            },
+        )
+        .await
+        .expect("send invalid regular-file anchor");
+    expect_review_error(
+        &mut client,
+        "invalid regular-file anchor",
+        ReviewErrorCode::InvalidLocation,
+    )
+    .await;
+    let mut leak_observer = fixture.connect().await;
+    let after_invalid = subscribe_review(&mut leak_observer, &review_id).await;
+    assert!(
+        after_invalid.file_snapshots.is_empty(),
+        "rejected anchors must not retain unreferenced file snapshots"
+    );
+    let regular = ReviewLocation {
+        root: ProjectRootPath(repo.to_string_lossy().to_string()),
+        relative_path: "./notes.txt".to_owned(),
+        target: protocol::ReviewTarget::RegularFile {
+            revision: "client-value-is-not-authoritative".to_owned(),
+        },
+        anchor: ReviewAnchor::LineRange {
+            side: ReviewDiffSide::New,
+            start_line: 1,
+            end_line: 2,
+        },
+    };
+
+    let mut accepted = Vec::new();
+    for (location, body) in [
+        (unstaged, "unstaged source"),
+        (staged, "staged source"),
+        (regular, "regular source"),
+    ] {
+        client
+            .review_action(
+                &review_id,
+                ReviewActionPayload::AddComment {
+                    location,
+                    body: body.to_owned(),
+                },
+            )
+            .await
+            .expect("add mixed-source comment");
+        loop {
+            if let ReviewEventPayload::CommentUpsert { comment } =
+                expect_review_delta(&mut client, "mixed comment").await
+                && comment.body == body
+            {
+                accepted.push(comment);
+                break;
+            }
+        }
+    }
+    let file_comment = accepted
+        .iter()
+        .find(|comment| comment.body == "regular source")
+        .expect("regular comment");
+    let protocol::ReviewTarget::RegularFile { revision } = &file_comment.location.target else {
+        panic!("regular target");
+    };
+    assert_ne!(revision, "client-value-is-not-authoritative");
+    assert_eq!(file_comment.location.relative_path, "notes.txt");
+
+    fs::write(&notes, b"changed\0text\n").expect("make reviewed file NUL-binary");
+    let mut observer = fixture.connect().await;
+    let stale = subscribe_review(&mut observer, &review_id).await;
+    assert!(stale.comments.iter().any(|comment| {
+        comment.body == "regular source"
+            && matches!(
+                &comment.anchor_status,
+                protocol::ReviewAnchorStatus::Stale { reason }
+                    if reason.contains("NUL bytes")
+            )
+    }));
+
+    fs::write(&notes, original_notes).expect("restore reviewed file");
+    let (agent, _) =
+        spawn_project_agent_with_prompt(&mut client, &project, "mixed source review target", false)
+            .await;
+    client
+        .review_action(&review_id, submit_to(&agent))
+        .await
+        .expect("submit mixed review");
+    let mut queued_message = None;
+    next_frame_matching_on(&mut client, "mixed bundle", |env| {
+        if env.kind != FrameKind::QueuedMessages || env.stream != agent.instance_stream {
+            return false;
+        }
+        let payload: QueuedMessagesPayload = env.parse_payload().expect("queued messages");
+        queued_message = payload
+            .messages
+            .iter()
+            .find(|entry| {
+                entry.origin
+                    == Some(MessageOrigin::Review {
+                        review_id: review_id.clone(),
+                    })
+            })
+            .map(|entry| entry.message.clone());
+        queued_message.is_some()
+    })
+    .await;
+    let bundle: serde_json::Value = serde_json::from_str(tyde_review_json(
+        queued_message.as_deref().expect("mixed review message"),
+    ))
+    .expect("mixed bundle JSON");
+    let comments = bundle["comments"].as_array().expect("comments");
+    assert_eq!(comments.len(), 3);
+    let kinds = comments
+        .iter()
+        .map(|comment| {
+            comment["location"]["target"]["kind"]
+                .as_str()
+                .expect("target kind")
+        })
+        .collect::<Vec<_>>();
+    assert!(kinds.contains(&"unstaged_diff"));
+    assert!(kinds.contains(&"staged_diff"));
+    assert!(kinds.contains(&"regular_file"));
+    let file_excerpt = comments
+        .iter()
+        .find(|comment| comment["body"] == "regular source")
+        .and_then(|comment| comment["excerpt"].as_array())
+        .expect("regular excerpt");
+    assert_eq!(file_excerpt.len(), 2);
+    let mut cleared_observer = fixture.connect().await;
+    let cleared = subscribe_review(&mut cleared_observer, &review_id).await;
+    assert!(cleared.file_snapshots.is_empty());
 }

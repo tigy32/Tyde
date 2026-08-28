@@ -3483,6 +3483,7 @@ mod wasm_tests {
             selection: ReviewDiffSelection::AllUncommitted,
             status: ReviewStatus::Draft,
             diffs: Vec::new(),
+            file_snapshots: Vec::new(),
             comments: Vec::new(),
             suggestions: Vec::new(),
             ai_reviewer: ReviewAiReviewerState {
@@ -3517,6 +3518,7 @@ mod wasm_tests {
                         location: protocol::ReviewLocation {
                             root: ProjectRootPath("/repo".to_owned()),
                             relative_path: "src/lib.rs".to_owned(),
+                            target: protocol::ReviewTarget::UnstagedDiff,
                             anchor: protocol::ReviewAnchor::File,
                         },
                         anchor_status: protocol::ReviewAnchorStatus::Current,

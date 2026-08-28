@@ -58,6 +58,7 @@ impl LegacyReview {
             selection: self.selection.into_selection(),
             status: self.status,
             diffs: self.diffs,
+            file_snapshots: Vec::new(),
             comments: self.comments,
             suggestions: self.suggestions,
             ai_reviewer: self.ai_reviewer,

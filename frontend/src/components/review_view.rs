@@ -1353,8 +1353,8 @@ pub fn open_changed_diff_for_root(
 /// Open (or focus) the compact review-comments surface for the project's
 /// single workspace draft review: snippets around each human comment,
 /// accepted AI comment, and pending AI suggestion — not the full diff —
-/// grouped by root. The full diff stays one click away via the surface's
-/// per-root "Open full diff" buttons.
+/// grouped by root. Source-aware navigation opens the corresponding staged
+/// diff, unstaged diff, or regular file.
 pub fn open_comments_for_project(
     state: &AppState,
     host_id: &str,
@@ -1397,10 +1397,12 @@ struct SnippetLine {
 const SNIPPET_CONTEXT: u32 = 2;
 const SNIPPET_MAX_LINES: usize = 14;
 
-fn anchor_label(relative_path: &str, anchor: &ReviewAnchor) -> String {
-    match anchor {
-        ReviewAnchor::File => format!("{relative_path} \u{00b7} file"),
-        ReviewAnchor::Hunk { .. } => format!("{relative_path} \u{00b7} hunk"),
+fn anchor_label(location: &ReviewLocation) -> String {
+    let relative_path = &location.relative_path;
+    let source = location.target.label();
+    match &location.anchor {
+        ReviewAnchor::File => format!("{relative_path} \u{00b7} {source} \u{00b7} file"),
+        ReviewAnchor::Hunk { .. } => format!("{relative_path} \u{00b7} {source} \u{00b7} hunk"),
         ReviewAnchor::LineRange {
             side,
             start_line,
@@ -1411,9 +1413,11 @@ fn anchor_label(relative_path: &str, anchor: &ReviewAnchor) -> String {
                 ReviewDiffSide::New => "new",
             };
             if start_line == end_line {
-                format!("{relative_path} \u{00b7} {side} L{start_line}")
+                format!("{relative_path} \u{00b7} {source} \u{00b7} {side} L{start_line}")
             } else {
-                format!("{relative_path} \u{00b7} {side} L{start_line}\u{2013}{end_line}")
+                format!(
+                    "{relative_path} \u{00b7} {source} \u{00b7} {side} L{start_line}\u{2013}{end_line}"
+                )
             }
         }
     }
@@ -1509,6 +1513,113 @@ fn snippet_for_anchor(
     }
 }
 
+fn snippet_for_file_snapshot(review: &Review, location: &ReviewLocation) -> Vec<SnippetLine> {
+    let protocol::ReviewTarget::RegularFile { revision } = &location.target else {
+        return Vec::new();
+    };
+    let Some(snapshot) = review.file_snapshots.iter().find(|snapshot| {
+        snapshot.root == location.root
+            && snapshot.relative_path == location.relative_path
+            && snapshot.revision == *revision
+    }) else {
+        return Vec::new();
+    };
+    let ReviewAnchor::LineRange {
+        start_line,
+        end_line,
+        ..
+    } = &location.anchor
+    else {
+        return Vec::new();
+    };
+    let lo = start_line.saturating_sub(SNIPPET_CONTEXT).max(1);
+    let hi = end_line.saturating_add(SNIPPET_CONTEXT);
+    (lo..=hi)
+        .filter_map(|number| {
+            snapshot
+                .lines
+                .get(number.saturating_sub(1) as usize)
+                .map(|text| SnippetLine {
+                    marker: ' ',
+                    number: Some(number),
+                    text: text.clone(),
+                })
+        })
+        .take(SNIPPET_MAX_LINES)
+        .collect()
+}
+
+fn open_review_location(
+    state: &AppState,
+    host_id: &str,
+    project_id: &ProjectId,
+    location: &ReviewLocation,
+) {
+    if matches!(location.target, protocol::ReviewTarget::RegularFile { .. }) {
+        crate::actions::open_project_path_for(
+            state,
+            host_id.to_owned(),
+            project_id.clone(),
+            protocol::ProjectPath {
+                root: location.root.clone(),
+                relative_path: location.relative_path.clone(),
+            },
+        );
+        return;
+    }
+    let scope = match location.target {
+        protocol::ReviewTarget::UnstagedDiff => ProjectDiffScope::Unstaged,
+        protocol::ReviewTarget::StagedDiff => ProjectDiffScope::Staged,
+        protocol::ReviewTarget::RegularFile { .. } => unreachable!(),
+    };
+    let path = location.relative_path.clone();
+    state.open_tab(
+        TabContent::Diff {
+            host_id: host_id.to_owned(),
+            project_id: project_id.clone(),
+            root: location.root.clone(),
+            scope,
+            path: path.clone(),
+        },
+        format!("{} ({})", path, location.target.label()),
+        true,
+    );
+    let context_mode = state.diff_context_mode.get_untracked();
+    let key = DiffKey::new(
+        host_id,
+        project_id.clone(),
+        location.root.clone(),
+        scope,
+        path.clone(),
+    );
+    state.diff_contents.update(|diffs| {
+        let previous = diffs.get(&key);
+        diffs.insert(
+            key,
+            DiffViewState::for_request(
+                previous,
+                location.root.clone(),
+                scope,
+                Some(path.clone()),
+                context_mode,
+            ),
+        );
+    });
+    let host = host_id.to_owned();
+    let stream = StreamPath(format!("/project/{}", project_id.0));
+    let payload = ProjectReadDiffPayload {
+        root: location.root.clone(),
+        scope,
+        path: Some(path),
+        context_mode,
+    };
+    spawn_local(async move {
+        if let Err(error) = send_frame(&host, stream, FrameKind::ProjectReadDiff, &payload).await {
+            log::error!("failed to open review location: {error}");
+        }
+    });
+}
+
 /// Numeric sort key for a comment-surface entry: group by file, then by
 /// anchor side, then by line range. Avoids the lexicographic ordering of the
 /// Debug-string entry key (which would sort line 10 before line 2).
@@ -1544,24 +1655,19 @@ fn resolve_diff_files(
     project_id: &ProjectId,
     root: &ProjectRootPath,
     relative_path: &str,
+    scope: ProjectDiffScope,
 ) -> Vec<protocol::ProjectGitDiffFile> {
     let per_file = DiffKey::new(
         host_id,
         project_id.clone(),
         root.clone(),
-        ProjectDiffScope::Unstaged,
+        scope,
         relative_path,
     );
     if let Some(entry) = diffs.get(&per_file) {
         return entry.files.clone();
     }
-    let whole_root = DiffKey::new(
-        host_id,
-        project_id.clone(),
-        root.clone(),
-        ProjectDiffScope::Unstaged,
-        "",
-    );
+    let whole_root = DiffKey::new(host_id, project_id.clone(), root.clone(), scope, "");
     diffs
         .get(&whole_root)
         .map(|entry| entry.files.clone())
@@ -1577,21 +1683,16 @@ fn file_diff_cached(
     project_id: &ProjectId,
     root: &ProjectRootPath,
     relative_path: &str,
+    scope: ProjectDiffScope,
 ) -> bool {
     let per_file = DiffKey::new(
         host_id,
         project_id.clone(),
         root.clone(),
-        ProjectDiffScope::Unstaged,
+        scope,
         relative_path,
     );
-    let whole_root = DiffKey::new(
-        host_id,
-        project_id.clone(),
-        root.clone(),
-        ProjectDiffScope::Unstaged,
-        "",
-    );
+    let whole_root = DiffKey::new(host_id, project_id.clone(), root.clone(), scope, "");
     diffs.contains_key(&per_file) || diffs.contains_key(&whole_root)
 }
 
@@ -1601,8 +1702,9 @@ fn file_diff_cached(
 /// Shows only the regions that carry feedback — each human comment, accepted
 /// AI comment, and pending AI suggestion — as a small snippet plus its
 /// thread, instead of the whole diff. One review spans every root, so entries
-/// are grouped under per-root headers; each group has its own "Open full diff"
-/// escape hatch. Rejected suggestions are excluded from the entry list (they
+/// are grouped under per-root headers; global and per-root controls open a
+/// real commented source rather than guessing a diff scope. Rejected
+/// suggestions are excluded from the entry list (they
 /// stay reachable under each thread's existing "N rejected" toggle). An empty
 /// state covers the no-feedback case.
 #[component]
@@ -1646,32 +1748,40 @@ pub fn ReviewCommentsSurface(host_id: String, project_id: ProjectId) -> impl Int
     // Distinct (root, file) pairs that carry feedback (comments or pending
     // suggestions) across all roots. Drives the per-file diff fetch below.
     let files_state = state.clone();
-    let commented_files: Memo<Vec<(ProjectRootPath, String)>> = Memo::new(move |_| {
-        let Some((_, rid)) = draft.get() else {
-            return Vec::new();
-        };
-        files_state.reviews.with(|map| {
-            let Some(review) = map.get(&rid) else {
+    let commented_files: Memo<Vec<(ProjectRootPath, String, protocol::ReviewTarget)>> =
+        Memo::new(move |_| {
+            let Some((_, rid)) = draft.get() else {
                 return Vec::new();
             };
-            let mut seen: std::collections::HashSet<(ProjectRootPath, String)> =
-                std::collections::HashSet::new();
-            let mut files = Vec::new();
-            let comment_files = review.comments.iter().map(|c| &c.location);
-            let suggestion_files = review
-                .suggestions
-                .iter()
-                .filter(|s| matches!(s.state, ReviewSuggestionState::Pending))
-                .map(|s| &s.location);
-            for loc in comment_files.chain(suggestion_files) {
-                let pair = (loc.root.clone(), loc.relative_path.clone());
-                if seen.insert(pair.clone()) {
-                    files.push(pair);
+            files_state.reviews.with(|map| {
+                let Some(review) = map.get(&rid) else {
+                    return Vec::new();
+                };
+                let mut seen: std::collections::HashSet<(
+                    ProjectRootPath,
+                    String,
+                    protocol::ReviewTarget,
+                )> = std::collections::HashSet::new();
+                let mut files = Vec::new();
+                let comment_files = review.comments.iter().map(|c| &c.location);
+                let suggestion_files = review
+                    .suggestions
+                    .iter()
+                    .filter(|s| matches!(s.state, ReviewSuggestionState::Pending))
+                    .map(|s| &s.location);
+                for loc in comment_files.chain(suggestion_files) {
+                    let pair = (
+                        loc.root.clone(),
+                        loc.relative_path.clone(),
+                        loc.target.clone(),
+                    );
+                    if seen.insert(pair.clone()) {
+                        files.push(pair);
+                    }
                 }
-            }
-            files
-        })
-    });
+                files
+            })
+        });
 
     // Fetch the unstaged diff for each commented (root, file) not already in
     // the project diff cache (per-file or shared whole-root). Lightweight:
@@ -1683,15 +1793,20 @@ pub fn ReviewCommentsSurface(host_id: String, project_id: ProjectId) -> impl Int
         let fetch_host = host_id.clone();
         let fetch_pid = project_id.clone();
         let requested: StoredValue<
-            std::collections::HashSet<(ProjectRootPath, String)>,
+            std::collections::HashSet<(ProjectRootPath, String, ProjectDiffScope)>,
             LocalStorage,
         > = StoredValue::new_local(std::collections::HashSet::new());
         Effect::new(move |_| {
-            for (root, path) in commented_files.get() {
+            for (root, path, target) in commented_files.get() {
+                let scope = match target {
+                    protocol::ReviewTarget::UnstagedDiff => ProjectDiffScope::Unstaged,
+                    protocol::ReviewTarget::StagedDiff => ProjectDiffScope::Staged,
+                    protocol::ReviewTarget::RegularFile { .. } => continue,
+                };
                 let cached = fetch_state.diff_contents.with_untracked(|diffs| {
-                    file_diff_cached(diffs, &fetch_host, &fetch_pid, &root, &path)
+                    file_diff_cached(diffs, &fetch_host, &fetch_pid, &root, &path, scope)
                 });
-                let pair = (root.clone(), path.clone());
+                let pair = (root.clone(), path.clone(), scope);
                 if cached || requested.with_value(|set| set.contains(&pair)) {
                     continue;
                 }
@@ -1702,7 +1817,7 @@ pub fn ReviewCommentsSurface(host_id: String, project_id: ProjectId) -> impl Int
                     fetch_host.clone(),
                     fetch_pid.clone(),
                     root.clone(),
-                    ProjectDiffScope::Unstaged,
+                    scope,
                     path.clone(),
                 );
                 fetch_state.diff_contents.update(|diffs| {
@@ -1710,7 +1825,7 @@ pub fn ReviewCommentsSurface(host_id: String, project_id: ProjectId) -> impl Int
                     let next = DiffViewState::for_request(
                         previous,
                         root.clone(),
-                        ProjectDiffScope::Unstaged,
+                        scope,
                         Some(path.clone()),
                         DiffContextMode::Hunks,
                     );
@@ -1720,7 +1835,7 @@ pub fn ReviewCommentsSurface(host_id: String, project_id: ProjectId) -> impl Int
                 let host = fetch_host.clone();
                 let payload = ProjectReadDiffPayload {
                     root: root.clone(),
-                    scope: ProjectDiffScope::Unstaged,
+                    scope,
                     path: Some(path.clone()),
                     context_mode: DiffContextMode::Hunks,
                 };
@@ -1765,12 +1880,12 @@ pub fn ReviewCommentsSurface(host_id: String, project_id: ProjectId) -> impl Int
                 // the same path/anchor in another root, forces a fresh row
                 // rather than reusing one bound to the old review/root.
                 let key = format!(
-                    "{}|{}|{}|{:?}",
-                    rid.0, loc.root.0, loc.relative_path, loc.anchor
+                    "{}|{}|{}|{:?}|{:?}",
+                    rid.0, loc.root.0, loc.relative_path, loc.target, loc.anchor
                 );
                 if seen.insert(key.clone()) {
                     entries.push(CommentSurfaceEntry {
-                        label: anchor_label(&loc.relative_path, &loc.anchor),
+                        label: anchor_label(loc),
                         key,
                         location: loc.clone(),
                     });
@@ -1799,27 +1914,31 @@ pub fn ReviewCommentsSurface(host_id: String, project_id: ProjectId) -> impl Int
 
     let has_entries = Memo::new(move |_| !groups.get().is_empty());
 
-    // Toolbar escape hatch: always available, opens the project's first
-    // reviewable root's full diff (per-root groups offer their own opener).
     let toolbar_state = state.clone();
     let toolbar_host = host_id.clone();
     let toolbar_pid = project_id.clone();
-    let open_full_diff = move |_| {
-        open_changed_diff_for_project(&toolbar_state, &toolbar_host, &toolbar_pid);
-    };
 
     view! {
         <div class="review-comments-surface" data-test="review-comments-surface">
             <div class="review-comments-toolbar">
                 <span class="review-comments-title">"Review comments"</span>
-                <button
-                    class="review-btn review-comments-open-full"
-                    data-test="review-comments-open-full"
-                    title="Open the full diff for the first changed root"
-                    on:click=open_full_diff
-                >
-                    "Open full diff"
-                </button>
+                {move || groups.get().first().and_then(|(_, entries)| entries.first().cloned()).map(|entry| {
+                    let state = toolbar_state.clone();
+                    let host = toolbar_host.clone();
+                    let project = toolbar_pid.clone();
+                    view! {
+                        <button
+                            class="review-btn review-comments-open-full"
+                            data-test="review-comments-open-full"
+                            title="Open the first commented source"
+                            on:click=move |_| open_review_location(
+                                &state, &host, &project, &entry.location,
+                            )
+                        >
+                            "Open first comment"
+                        </button>
+                    }
+                })}
             </div>
             <Show
                 when=move || has_entries.get()
@@ -1847,15 +1966,7 @@ pub fn ReviewCommentsSurface(host_id: String, project_id: ProjectId) -> impl Int
                                 let open_state = state.clone();
                                 let open_host = host_id.clone();
                                 let open_pid = project_id.clone();
-                                let open_root = root.clone();
-                                let open_full_diff = move |_| {
-                                    open_changed_diff_for_root(
-                                        &open_state,
-                                        &open_host,
-                                        &open_pid,
-                                        &open_root,
-                                    );
-                                };
+                                let first_location = entries.first().map(|entry| entry.location.clone());
                                 let row_host = host_id.clone();
                                 let row_pid = project_id.clone();
                                 let row_state = state.clone();
@@ -1880,14 +1991,21 @@ pub fn ReviewCommentsSurface(host_id: String, project_id: ProjectId) -> impl Int
                                             <span class="review-comments-root-name">
                                                 {root_display_name(&root)}
                                             </span>
-                                            <button
-                                                class="review-btn review-comments-open-root"
-                                                data-test="review-comments-open-root"
-                                                title="Open this root's full diff"
-                                                on:click=open_full_diff
-                                            >
-                                                "Open diff"
-                                            </button>
+                                            {first_location.map(|location| view! {
+                                                <button
+                                                    class="review-btn review-comments-open-root"
+                                                    data-test="review-comments-open-root"
+                                                    title="Open this root's first commented source"
+                                                    on:click=move |_| open_review_location(
+                                                        &open_state,
+                                                        &open_host,
+                                                        &open_pid,
+                                                        &location,
+                                                    )
+                                                >
+                                                    "Open source"
+                                                </button>
+                                            })}
                                         </div>
                                         {rows}
                                     </div>
@@ -1927,18 +2045,49 @@ fn review_comment_entry_row(
     let snip_root = entry.location.root.clone();
     let snip_path = entry.location.relative_path.clone();
     let snip_anchor = entry.location.anchor.clone();
+    let snip_target = entry.location.target.clone();
+    let snip_location = entry.location.clone();
+    let snip_review_id = rid.clone();
     let snippet = move || {
+        if matches!(snip_target, protocol::ReviewTarget::RegularFile { .. }) {
+            return snip_state.reviews.with(|reviews| {
+                reviews
+                    .get(&snip_review_id)
+                    .map(|review| snippet_for_file_snapshot(review, &snip_location))
+                    .unwrap_or_default()
+            });
+        }
+        let scope = match snip_target {
+            protocol::ReviewTarget::UnstagedDiff => ProjectDiffScope::Unstaged,
+            protocol::ReviewTarget::StagedDiff => ProjectDiffScope::Staged,
+            protocol::ReviewTarget::RegularFile { .. } => unreachable!(),
+        };
         snip_state.diff_contents.with(|diffs| {
-            let files = resolve_diff_files(diffs, &snip_host, &snip_pid, &snip_root, &snip_path);
+            let files =
+                resolve_diff_files(diffs, &snip_host, &snip_pid, &snip_root, &snip_path, scope);
             snippet_for_anchor(&files, &snip_path, &snip_anchor)
         })
     };
 
     let region_root = entry.location.root.clone();
     let region_host = host_id.to_owned();
+    let region_target = entry.location.target.clone();
+    let open_state = state.clone();
+    let open_host = host_id.to_owned();
+    let open_project = project_id.clone();
+    let open_location = entry.location.clone();
     view! {
         <div class="review-comments-entry" data-test="review-comments-entry">
-            <div class="review-comments-entry-label">{entry.label.clone()}</div>
+            <button
+                class="review-comments-entry-label"
+                title="Open commented source"
+                on:click=move |_| open_review_location(
+                    &open_state,
+                    &open_host,
+                    &open_project,
+                    &open_location,
+                )
+            >{entry.label.clone()}</button>
             {move || {
                 let lines = snippet();
                 (!lines.is_empty()).then(|| view! {
@@ -1967,10 +2116,12 @@ fn review_comment_entry_row(
                 review_id=rid
                 root=region_root
                 relative_path=entry.location.relative_path.clone()
+                target=region_target
                 host_id=region_host
                 composer=composer
                 matcher=matcher
                 is_draft=is_draft
+                strict_target=true
             />
         </div>
     }
@@ -2315,6 +2466,7 @@ mod wasm_tests {
             selection: ReviewDiffSelection::AllUncommitted,
             status: ReviewStatus::Draft,
             diffs: vec![diff_payload()],
+            file_snapshots: Vec::new(),
             comments: vec![],
             suggestions: vec![],
             ai_reviewer: ReviewAiReviewerState {
@@ -2365,6 +2517,7 @@ mod wasm_tests {
             location: ReviewLocation {
                 root: root_path(),
                 relative_path: "src/foo.rs".to_owned(),
+                target: protocol::ReviewTarget::UnstagedDiff,
                 anchor: ReviewAnchor::LineRange {
                     side: ReviewDiffSide::New,
                     start_line: line,
@@ -2385,6 +2538,7 @@ mod wasm_tests {
             location: ReviewLocation {
                 root: root_path(),
                 relative_path: "src/foo.rs".to_owned(),
+                target: protocol::ReviewTarget::UnstagedDiff,
                 anchor: ReviewAnchor::LineRange {
                     side: ReviewDiffSide::New,
                     start_line: line,
@@ -3116,7 +3270,7 @@ mod wasm_tests {
     }
 
     /// Comments surface with no feedback shows the empty state and zero
-    /// entries, while still offering the "Open full diff" escape hatch.
+    /// entries, without inventing a source navigation target.
     #[wasm_bindgen_test]
     async fn comments_surface_shows_empty_state() {
         ensure_styles_loaded();
@@ -3138,8 +3292,110 @@ mod wasm_tests {
             .unwrap();
         assert_eq!(entries.length(), 0, "no entries when there is no feedback");
         assert!(
-            find_button_by_text(&container, "Open full diff").is_some(),
-            "the full-diff escape hatch must always be available"
+            container
+                .query_selector("[data-test=\"review-comments-open-full\"]")
+                .unwrap()
+                .is_none(),
+            "an empty aggregate must not offer a navigation target"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    async fn comments_surface_opens_the_staged_comment_source() {
+        let container = make_container();
+        let mut review = make_review();
+        let mut staged = comment_at_line(2, "staged");
+        staged.location.target = protocol::ReviewTarget::StagedDiff;
+        review.comments.push(staged);
+        let holder = mount_comments_surface(container.clone(), review, false);
+
+        next_tick().await;
+        container
+            .query_selector("[data-test=\"review-comments-open-full\"]")
+            .unwrap()
+            .expect("source navigation renders")
+            .dyn_ref::<HtmlElement>()
+            .unwrap()
+            .click();
+        next_tick().await;
+
+        let state = holder.borrow().clone().unwrap();
+        let opened = state.center_zone.with_untracked(|zone| {
+            zone.all_tabs().any(|(_, tab)| {
+                matches!(
+                    &tab.content,
+                    TabContent::Diff {
+                        host_id,
+                        project_id,
+                        root,
+                        scope: ProjectDiffScope::Staged,
+                        path,
+                    } if host_id == "h1"
+                        && *project_id == ProjectId("proj-1".to_owned())
+                        && *root == root_path()
+                        && path == "src/foo.rs"
+                )
+            })
+        });
+        assert!(opened, "a staged comment must navigate to its staged diff");
+    }
+
+    #[wasm_bindgen_test]
+    async fn comments_surface_file_navigation_uses_its_own_project() {
+        let container = make_container();
+        let mut review = make_review();
+        let mut regular = comment_at_line(2, "regular");
+        regular.location.target = protocol::ReviewTarget::RegularFile {
+            revision: "file-revision".to_owned(),
+        };
+        review.comments.push(regular);
+        let holder = mount_comments_surface(container.clone(), review, false);
+
+        next_tick().await;
+        let state = holder.borrow().clone().unwrap();
+        let expected_key = crate::state::FileResourceKey {
+            host_id: "h1".to_owned(),
+            project_id: ProjectId("proj-1".to_owned()),
+            path: protocol::ProjectPath {
+                root: root_path(),
+                relative_path: "src/foo.rs".to_owned(),
+            },
+        };
+        state.open_files.update(|files| {
+            files.insert(
+                expected_key.clone(),
+                crate::state::OpenFile {
+                    path: expected_key.path.clone(),
+                    version: protocol::ProjectFileVersion(1),
+                    contents: Some("line one\nline two\n".to_owned()),
+                    is_binary: false,
+                    missing: false,
+                },
+            );
+        });
+        state
+            .active_project
+            .set(Some(crate::state::ActiveProjectRef {
+                host_id: "other-host".to_owned(),
+                project_id: ProjectId("other-project".to_owned()),
+            }));
+        container
+            .query_selector("[data-test=\"review-comments-open-full\"]")
+            .unwrap()
+            .expect("file source navigation renders")
+            .dyn_ref::<HtmlElement>()
+            .unwrap()
+            .click();
+        next_tick().await;
+
+        let opened = state.center_zone.with_untracked(|zone| {
+            zone.all_tabs().any(
+                |(_, tab)| matches!(&tab.content, TabContent::File { key } if key == &expected_key),
+            )
+        });
+        assert!(
+            opened,
+            "regular-file navigation must keep the review tab's explicit project"
         );
     }
 
@@ -3189,6 +3445,45 @@ mod wasm_tests {
             !text.contains("bar();"),
             "an unrelated file's diff must not appear in the comments surface; got: {text}"
         );
+    }
+
+    #[wasm_bindgen_test]
+    async fn comments_surface_keeps_regular_file_revisions_in_separate_rows() {
+        let container = make_container();
+        let mut review = make_review();
+        let mut first = comment_at_line(2, "first snapshot comment");
+        first.location.target = protocol::ReviewTarget::RegularFile {
+            revision: "revision-one".to_owned(),
+        };
+        let mut second = comment_at_line(2, "second snapshot comment");
+        second.location.target = protocol::ReviewTarget::RegularFile {
+            revision: "revision-two".to_owned(),
+        };
+        review.comments.extend([first, second]);
+        let _mounted = mount_comments_surface(container.clone(), review, false);
+
+        next_tick().await;
+        next_tick().await;
+
+        let entries = container
+            .query_selector_all("[data-test=\"review-comments-entry\"]")
+            .unwrap();
+        assert_eq!(entries.length(), 2, "each immutable snapshot needs one row");
+        for index in 0..entries.length() {
+            let text = entries
+                .item(index)
+                .expect("entry")
+                .dyn_into::<Element>()
+                .unwrap()
+                .text_content()
+                .unwrap_or_default();
+            let first_visible = text.contains("first snapshot comment");
+            let second_visible = text.contains("second snapshot comment");
+            assert_ne!(
+                first_visible, second_visible,
+                "an aggregate row must render only its exact file revision: {text}"
+            );
+        }
     }
 
     /// NEW: the workspace comments surface groups entries by root — a review
@@ -3553,6 +3848,7 @@ mod wasm_tests {
         let loc = |line: u32| ReviewLocation {
             root: root_path(),
             relative_path: "src/foo.rs".to_owned(),
+            target: protocol::ReviewTarget::UnstagedDiff,
             anchor: ReviewAnchor::LineRange {
                 side: ReviewDiffSide::New,
                 start_line: line,

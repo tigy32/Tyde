@@ -561,6 +561,7 @@ impl ReviewRegistryActor {
             selection: normalize_create_selection(request.selection),
             status: ReviewStatus::Draft,
             diffs: request.diffs,
+            file_snapshots: Vec::new(),
             comments: Vec::new(),
             suggestions: Vec::new(),
             ai_reviewer: protocol::ReviewAiReviewerState {

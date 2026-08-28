@@ -308,7 +308,6 @@ fn ActiveHostShell() -> impl IntoView {
                         MobileTab::Home => view! { <components::HomeView /> }.into_any(),
                         MobileTab::Agents => view! { <components::AgentsView /> }.into_any(),
                         MobileTab::Sessions => view! { <components::SessionsView /> }.into_any(),
-                        MobileTab::Projects => view! { <components::ProjectsView /> }.into_any(),
                         MobileTab::Settings => view! { <components::SettingsView /> }.into_any(),
                     }
                 }

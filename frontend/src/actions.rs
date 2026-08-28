@@ -521,6 +521,54 @@ pub fn open_project_path(state: &AppState, path: ProjectPath) {
     open_project_path_at(state, path, OpenTarget::Focused);
 }
 
+/// Open a file for an explicit owning host/project rather than deriving the
+/// route from the currently active project. Review/comment tabs use this so a
+/// project switch cannot redirect a stored location into another workspace.
+pub fn open_project_path_for(
+    state: &AppState,
+    host_id: String,
+    project_id: ProjectId,
+    path: ProjectPath,
+) -> Option<TabId> {
+    let destination = state
+        .center_zone
+        .with_untracked(|center_zone| center_zone.resolve(OpenTarget::Focused));
+    let key = FileResourceKey {
+        host_id: host_id.clone(),
+        project_id: project_id.clone(),
+        path: path.clone(),
+    };
+    if let Some((_, tab)) = state.resolve_file_occurrence(&key, destination) {
+        state.activate_tab(tab);
+        return Some(tab);
+    }
+    if state
+        .open_files
+        .with_untracked(|files| files.contains_key(&key))
+    {
+        let label = path
+            .relative_path
+            .rsplit('/')
+            .next()
+            .unwrap_or(&path.relative_path)
+            .to_owned();
+        return state.open_tab_in(destination, TabContent::File { key }, label, true);
+    }
+    if state.host_stream_untracked(&host_id).is_none() {
+        log::error!("open_project_path_for: host stream missing");
+        return None;
+    }
+    state.record_pending_file_open(
+        key,
+        PendingFileOpen::Open {
+            destination: PendingOpenDestination::new(destination),
+            navigation: None,
+        },
+    );
+    send_read_and_subscribe(host_id, project_id.0, path);
+    None
+}
+
 pub fn open_project_path_at(state: &AppState, path: ProjectPath, target: OpenTarget) {
     let destination = state
         .center_zone

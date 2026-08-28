@@ -5,7 +5,6 @@ mod chat_input;
 mod chat_message;
 pub mod chat_view;
 mod connection_banner;
-mod diff_viewer;
 mod error_banner;
 mod home_view;
 mod host_browser;
@@ -13,7 +12,6 @@ mod onboarding_view;
 mod paired_hosts_picker;
 mod pairing_flow;
 pub mod pending_submissions;
-mod projects_view;
 mod sessions_view;
 pub mod settings_view;
 mod teams_view;
@@ -35,7 +33,6 @@ pub use pairing_flow::PairingFlow;
 // it reaches `ChatInput` and `ChatMessageView`, and the reason a re-export here was
 // dead.
 pub use pending_submissions::PendingSubmissions;
-pub use projects_view::ProjectsView;
 pub use sessions_view::SessionsView;
 pub use settings_view::SettingsView;
 

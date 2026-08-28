@@ -448,13 +448,10 @@ pub fn ReviewableDiffView(
 ) -> impl IntoView {
     let state = expect_context::<AppState>();
 
-    // Active inline reviews are anchored server-side to `Unstaged`
-    // (index↔worktree). Overlaying comments on any other scope risks
-    // mis-anchoring: a `Staged` tab shows different line numbers, and an
-    // `Uncommitted` tab (HEAD↔worktree) drifts from the review's anchors as
-    // soon as staged changes exist. So only `Unstaged` carries review
-    // decorations; every other scope renders a plain diff.
-    if scope != ProjectDiffScope::Unstaged {
+    // Combined HEAD-to-worktree diffs have no stable identity when staged and
+    // unstaged versions of the same path coexist. The two explicit scopes are
+    // independently reviewable and remain distinct in ReviewLocation.
+    if scope == ProjectDiffScope::Uncommitted {
         return view! {
             <DiffView
                 tab_id=tab_id
@@ -540,6 +537,11 @@ pub fn ReviewableDiffView(
                             review_id,
                             review_host,
                             is_draft,
+                            match scope {
+                                ProjectDiffScope::Unstaged => protocol::ReviewTarget::UnstagedDiff,
+                                ProjectDiffScope::Staged => protocol::ReviewTarget::StagedDiff,
+                                ProjectDiffScope::Uncommitted => unreachable!(),
+                            },
                         );
                         view! {
                             <DiffView
@@ -5604,11 +5606,13 @@ mod wasm_tests {
             selection: ReviewDiffSelection::AllUncommitted,
             status: ReviewStatus::Draft,
             diffs: vec![],
+            file_snapshots: Vec::new(),
             comments: vec![ReviewComment {
                 id: ReviewCommentId("c1".to_owned()),
                 location: ReviewLocation {
                     root: review_root(),
                     relative_path: path.to_owned(),
+                    target: protocol::ReviewTarget::UnstagedDiff,
                     anchor: ReviewAnchor::LineRange {
                         side: ReviewDiffSide::New,
                         start_line: line,
@@ -5942,19 +5946,22 @@ mod wasm_tests {
         );
     }
 
-    /// A `Staged` diff tab gets NO review overlay even when a draft exists —
-    /// staged-only changes are excluded from the active unstaged review.
+    /// Staged tabs are first-class review surfaces, but only staged-targeted
+    /// comments render on them.
     #[wasm_bindgen_test]
-    async fn staged_scope_has_no_review_overlay() {
+    async fn staged_scope_shows_only_staged_review_overlay() {
         ensure_styles_loaded();
         let container = make_container();
         let mut diff = small_foo_diff();
         diff.scope = ProjectDiffScope::Staged;
-        let _mounted = mount_reviewable(
-            container.clone(),
-            diff,
-            Some(draft_review("src/foo.rs", 2, "please fix this")),
-        );
+        let mut review = draft_review("src/foo.rs", 2, "please fix staged");
+        review.comments[0].location.target = protocol::ReviewTarget::StagedDiff;
+        let mut unstaged_comment = review.comments[0].clone();
+        unstaged_comment.id = protocol::ReviewCommentId("unstaged-comment".to_owned());
+        unstaged_comment.body = "unstaged must stay hidden".to_owned();
+        unstaged_comment.location.target = protocol::ReviewTarget::UnstagedDiff;
+        review.comments.push(unstaged_comment);
+        let _mounted = mount_reviewable(container.clone(), diff, Some(review));
         next_tick().await;
         next_tick().await;
 
@@ -5963,7 +5970,7 @@ mod wasm_tests {
             text.contains("let x = 1;"),
             "the diff itself should still render; got: {text}"
         );
-        // Staged scope: no overlay, no banner, no comment gutters.
+        // Staged scope gets its own overlay and comment gutters.
         assert!(
             container
                 .query_selector("[data-test=\"reviewable-diff-banner\"]")
@@ -5975,12 +5982,16 @@ mod wasm_tests {
             container
                 .query_selector(".diff-gutter-clickable")
                 .unwrap()
-                .is_none(),
-            "no comment gutters on a staged diff tab"
+                .is_some(),
+            "staged diff tab must expose comment gutters"
         );
         assert!(
-            !text.contains("please fix this"),
-            "review comments must not overlay a staged diff; got: {text}"
+            text.contains("please fix staged"),
+            "staged comments must overlay a staged diff; got: {text}"
+        );
+        assert!(
+            !text.contains("unstaged must stay hidden"),
+            "unstaged comments must not leak onto staged diffs; got: {text}"
         );
     }
 

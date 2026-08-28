@@ -1006,11 +1006,13 @@ mod wasm_tests {
             },
             status: ReviewStatus::Draft,
             diffs: vec![],
+            file_snapshots: Vec::new(),
             comments: vec![ReviewComment {
                 id: ReviewCommentId("c1".to_owned()),
                 location: ReviewLocation {
                     root: ProjectRootPath("/repo".to_owned()),
                     relative_path: "src/foo.rs".to_owned(),
+                    target: protocol::ReviewTarget::UnstagedDiff,
                     anchor: ReviewAnchor::File,
                 },
                 anchor_status: ReviewAnchorStatus::Current,

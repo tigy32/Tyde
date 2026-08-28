@@ -47,7 +47,6 @@ pub fn BottomNav() -> impl IntoView {
             {make_tab(MobileTab::Home, "Home", "\u{2302}", "nav-tab-home")}
             {make_tab(MobileTab::Agents, "Agents", "\u{25B6}", "nav-tab-agents")}
             {make_tab(MobileTab::Sessions, "Sessions", "\u{2630}", "nav-tab-sessions")}
-            {make_tab(MobileTab::Projects, "Projects", "\u{2261}", "nav-tab-projects")}
             {make_tab(MobileTab::Settings, "Settings", "\u{2699}", "nav-tab-settings")}
         </nav>
     }
@@ -103,6 +102,13 @@ mod wasm_tests {
             .query_selector("[data-mobile-test='nav-tab-home']")
             .unwrap()
             .unwrap();
+        assert!(
+            container
+                .query_selector("[data-mobile-test='nav-tab-projects']")
+                .unwrap()
+                .is_none(),
+            "mobile navigation must not expose projects, files, Git, diffs, or reviews"
+        );
         assert_eq!(
             home.get_attribute("aria-current").as_deref(),
             Some("page"),

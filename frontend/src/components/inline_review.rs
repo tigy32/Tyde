@@ -14,6 +14,7 @@ use wasm_bindgen_futures::spawn_local;
 use protocol::{
     ProjectRootPath, ReviewActionPayload, ReviewAnchor, ReviewAnchorStatus, ReviewComment,
     ReviewCommentId, ReviewCommentSource, ReviewSuggestedComment, ReviewSuggestionState,
+    ReviewTarget,
 };
 
 use crate::components::review_view::{
@@ -21,6 +22,24 @@ use crate::components::review_view::{
     try_claim_review_action,
 };
 use crate::state::{AppState, ReviewActionTarget};
+
+fn same_comment_location(
+    left: &protocol::ReviewLocation,
+    right: &protocol::ReviewLocation,
+) -> bool {
+    left.root == right.root
+        && left.relative_path == right.relative_path
+        && left.target.same_surface(&right.target)
+        && left.anchor == right.anchor
+}
+
+fn target_matches(left: &ReviewTarget, right: &ReviewTarget, strict: bool) -> bool {
+    if strict {
+        left == right
+    } else {
+        left.same_surface(right)
+    }
+}
 
 /// Generic thread region. Renders all comments + pending suggestions (and
 /// the inline composer when its location matches) whose `(root,
@@ -30,10 +49,12 @@ pub(crate) fn ThreadRegionFiltered(
     review_id: protocol::ReviewId,
     root: ProjectRootPath,
     relative_path: String,
+    target: ReviewTarget,
     host_id: String,
     composer: RwSignal<Option<ComposerState>>,
     matcher: std::sync::Arc<dyn Fn(&ReviewAnchor) -> bool + Send + Sync>,
     is_draft: Memo<bool>,
+    #[prop(default = false)] strict_target: bool,
 ) -> impl IntoView {
     let state = expect_context::<AppState>();
 
@@ -41,6 +62,7 @@ pub(crate) fn ThreadRegionFiltered(
     let cm_root = root.clone();
     let cm_path = relative_path.clone();
     let cm_matcher = matcher.clone();
+    let cm_target = target.clone();
     let comments: Memo<Vec<ReviewComment>> = Memo::new(move |_| {
         state.reviews.with(|map| {
             let Some(review) = map.get(&comments_review_id) else {
@@ -52,6 +74,7 @@ pub(crate) fn ThreadRegionFiltered(
                 .filter(|c| {
                     c.location.root == cm_root
                         && c.location.relative_path == cm_path
+                        && target_matches(&c.location.target, &cm_target, strict_target)
                         && cm_matcher(&c.location.anchor)
                 })
                 .cloned()
@@ -63,6 +86,7 @@ pub(crate) fn ThreadRegionFiltered(
     let sg_root = root.clone();
     let sg_path = relative_path.clone();
     let sg_matcher = matcher.clone();
+    let sg_target = target.clone();
     let suggestions: Memo<Vec<ReviewSuggestedComment>> = Memo::new(move |_| {
         state.reviews.with(|map| {
             let Some(review) = map.get(&suggestions_review_id) else {
@@ -74,6 +98,7 @@ pub(crate) fn ThreadRegionFiltered(
                 .filter(|s| {
                     s.location.root == sg_root
                         && s.location.relative_path == sg_path
+                        && target_matches(&s.location.target, &sg_target, strict_target)
                         && sg_matcher(&s.location.anchor)
                 })
                 .cloned()
@@ -86,12 +111,14 @@ pub(crate) fn ThreadRegionFiltered(
     let composer_matcher = matcher.clone();
     let composer_root = root.clone();
     let composer_path = relative_path.clone();
+    let composer_target = target.clone();
     let composer_visible = move || -> bool {
         let Some(c) = composer.get() else {
             return false;
         };
         c.location.root == composer_root
             && c.location.relative_path == composer_path
+            && target_matches(&c.location.target, &composer_target, strict_target)
             && composer_matcher(&c.location.anchor)
     };
 
@@ -108,6 +135,7 @@ pub(crate) fn ThreadRegionFiltered(
     let sg_rejected_review_id = review_id.clone();
     let sg_rejected_root = root.clone();
     let sg_rejected_path = relative_path.clone();
+    let sg_rejected_target = target.clone();
     let sg_rejected_matcher = matcher.clone();
     let rejected_suggestions: Memo<Vec<ReviewSuggestedComment>> = Memo::new(move |_| {
         state.reviews.with(|map| {
@@ -121,6 +149,7 @@ pub(crate) fn ThreadRegionFiltered(
                     matches!(s.state, ReviewSuggestionState::Rejected)
                         && s.location.root == sg_rejected_root
                         && s.location.relative_path == sg_rejected_path
+                        && target_matches(&s.location.target, &sg_rejected_target, strict_target)
                         && sg_rejected_matcher(&s.location.anchor)
                 })
                 .cloned()
@@ -944,7 +973,7 @@ pub(crate) fn Composer(
                     .map(|r| {
                         r.comments.iter().any(|c| {
                             matches!(c.source, ReviewCommentSource::User)
-                                && c.location == target_location
+                                && same_comment_location(&c.location, &target_location)
                                 && !baseline.contains(&c.id)
                         })
                     })
@@ -982,7 +1011,7 @@ pub(crate) fn Composer(
                             .iter()
                             .filter(|c| {
                                 matches!(c.source, ReviewCommentSource::User)
-                                    && c.location == location_for_send
+                                    && same_comment_location(&c.location, &location_for_send)
                             })
                             .map(|c| c.id.clone())
                             .collect()
@@ -1085,8 +1114,10 @@ mod wasm_tests {
     use protocol::{
         AgentId, ProjectId, Review, ReviewAiReviewerState, ReviewAiReviewerStatus, ReviewComment,
         ReviewCommentId, ReviewDiffSelection, ReviewDiffSide, ReviewId, ReviewLocation,
-        ReviewStatus, SessionId,
+        ReviewSeverity, ReviewStatus, ReviewSuggestedComment, ReviewSuggestionId,
+        ReviewSuggestionState, SessionId,
     };
+    use wasm_bindgen::JsCast;
     use wasm_bindgen_test::*;
     use web_sys::HtmlElement;
 
@@ -1113,6 +1144,7 @@ mod wasm_tests {
         ReviewLocation {
             root: ProjectRootPath("/repo".to_owned()),
             relative_path: "src/foo.rs".to_owned(),
+            target: protocol::ReviewTarget::UnstagedDiff,
             anchor: ReviewAnchor::LineRange {
                 side: ReviewDiffSide::New,
                 start_line: 2,
@@ -1142,6 +1174,7 @@ mod wasm_tests {
             selection: ReviewDiffSelection::AllUncommitted,
             status: ReviewStatus::Draft,
             diffs: vec![],
+            file_snapshots: Vec::new(),
             comments,
             suggestions: vec![],
             ai_reviewer: ReviewAiReviewerState {
@@ -1162,6 +1195,15 @@ mod wasm_tests {
         seed_comments: Vec<ReviewComment>,
         baseline: Vec<ReviewCommentId>,
     ) -> Mounted<RwSignal<Option<ComposerState>>> {
+        mount_composer_post_save_at(container, location(), seed_comments, baseline)
+    }
+
+    fn mount_composer_post_save_at(
+        container: HtmlElement,
+        composer_location: ReviewLocation,
+        seed_comments: Vec<ReviewComment>,
+        baseline: Vec<ReviewCommentId>,
+    ) -> Mounted<RwSignal<Option<ComposerState>>> {
         let review = review_with(seed_comments);
         let rid = review.id.clone();
         let composer: RwSignal<Option<ComposerState>> = RwSignal::new(None);
@@ -1172,7 +1214,7 @@ mod wasm_tests {
             });
             provide_context(state.clone());
             let composer_state = ComposerState {
-                location: location(),
+                location: composer_location.clone(),
                 body: RwSignal::new("draft text".to_owned()),
                 submitted_baseline: RwSignal::new(Some(baseline.clone())),
             };
@@ -1237,6 +1279,146 @@ mod wasm_tests {
             composer.get_untracked().is_some(),
             "composer must stay open when no comment outside the baseline \
              appears (e.g. the AddComment failed)"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    async fn regular_file_composer_closes_on_server_revision_echo() {
+        let container = make_container();
+        let mut requested = location();
+        requested.target = protocol::ReviewTarget::RegularFile {
+            revision: String::new(),
+        };
+        let review = review_with(Vec::new());
+        let rid = review.id.clone();
+        let composer: RwSignal<Option<ComposerState>> = RwSignal::new(None);
+        let state_holder: std::rc::Rc<std::cell::RefCell<Option<AppState>>> =
+            std::rc::Rc::new(std::cell::RefCell::new(None));
+        let holder_for_mount = state_holder.clone();
+        let requested_for_mount = requested.clone();
+        let _handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            state.reviews.update(|reviews| {
+                reviews.insert(rid.clone(), review.clone());
+            });
+            *holder_for_mount.borrow_mut() = Some(state.clone());
+            provide_context(state);
+            let composer_state = ComposerState {
+                location: requested_for_mount.clone(),
+                body: RwSignal::new("regular draft".to_owned()),
+                submitted_baseline: RwSignal::new(None),
+            };
+            composer.set(Some(composer_state.clone()));
+            let is_draft = Memo::new(move |_| true);
+            view! {
+                <Composer
+                    composer=composer
+                    composer_state=composer_state
+                    host_id="h1".to_owned()
+                    review_id=rid.clone()
+                    is_draft=is_draft
+                />
+            }
+        });
+
+        next_tick().await;
+        container
+            .query_selector(".review-composer-save")
+            .unwrap()
+            .expect("save button")
+            .dyn_ref::<HtmlElement>()
+            .unwrap()
+            .click();
+        next_tick().await;
+        assert!(
+            composer.get_untracked().is_some(),
+            "saving must wait for the server-authored comment echo"
+        );
+
+        let state = state_holder.borrow().clone().unwrap();
+        let mut echoed = user_comment("regular-echo");
+        echoed.location.target = protocol::ReviewTarget::RegularFile {
+            revision: "server-sha256".to_owned(),
+        };
+        state.reviews.update(|reviews| {
+            reviews
+                .get_mut(&ReviewId("rev-1".to_owned()))
+                .expect("review remains mounted")
+                .comments
+                .push(echoed);
+        });
+        next_tick().await;
+
+        assert!(
+            composer.get_untracked().is_none(),
+            "server-owned regular-file revision must confirm the matching path/anchor composer"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    async fn rejected_suggestions_stay_on_their_diff_surface() {
+        let container = make_container();
+        let _handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            let mut review = review_with(Vec::new());
+            for (id, target, body) in [
+                (
+                    "unstaged-rejected",
+                    protocol::ReviewTarget::UnstagedDiff,
+                    "unstaged rejected body",
+                ),
+                (
+                    "staged-rejected",
+                    protocol::ReviewTarget::StagedDiff,
+                    "staged rejected body",
+                ),
+            ] {
+                let mut target_location = location();
+                target_location.target = target;
+                review.suggestions.push(ReviewSuggestedComment {
+                    id: ReviewSuggestionId(id.to_owned()),
+                    location: target_location,
+                    anchor_status: ReviewAnchorStatus::Current,
+                    body: body.to_owned(),
+                    rationale: None,
+                    severity: ReviewSeverity::Info,
+                    state: ReviewSuggestionState::Rejected,
+                    reviewer_agent_id: AgentId("reviewer".to_owned()),
+                    created_at_ms: 1,
+                });
+            }
+            let rid = review.id.clone();
+            state.reviews.update(|reviews| {
+                reviews.insert(rid.clone(), review);
+            });
+            provide_context(state);
+            let composer = RwSignal::new(None);
+            let matcher: std::sync::Arc<dyn Fn(&ReviewAnchor) -> bool + Send + Sync> =
+                std::sync::Arc::new(|anchor| anchor == &location().anchor);
+            let is_draft = Memo::new(move |_| true);
+            view! {
+                <ThreadRegionFiltered
+                    review_id=rid
+                    root=ProjectRootPath("/repo".to_owned())
+                    relative_path="src/foo.rs".to_owned()
+                    target=protocol::ReviewTarget::UnstagedDiff
+                    host_id="h1".to_owned()
+                    composer=composer
+                    matcher=matcher
+                    is_draft=is_draft
+                />
+            }
+        });
+        next_tick().await;
+
+        let text = container.text_content().unwrap_or_default();
+        assert!(
+            text.contains("1 rejected"),
+            "only one source-matching rejection: {text}"
+        );
+        assert!(
+            !text.contains("2 rejected"),
+            "staged rejection must not leak into unstaged thread: {text}"
         );
     }
 }

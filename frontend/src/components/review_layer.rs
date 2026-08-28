@@ -26,7 +26,9 @@ use crate::components::diff_view::{
 use crate::components::inline_review::ThreadRegionFiltered;
 use crate::state::AppState;
 
-use protocol::{ProjectRootPath, ReviewAnchor, ReviewCommentId, ReviewDiffSide, ReviewLocation};
+use protocol::{
+    ProjectRootPath, ReviewAnchor, ReviewCommentId, ReviewDiffSide, ReviewLocation, ReviewTarget,
+};
 
 /// Inline composer state. `Some` ⇒ the composer is open pinned to the
 /// given location; `None` ⇒ closed. Body text is local UI state — the
@@ -63,6 +65,7 @@ pub(crate) struct ComposerState {
 pub(crate) struct DragSelection {
     root: ProjectRootPath,
     relative_path: String,
+    target: ReviewTarget,
     side: ReviewDiffSide,
     /// Where the user pressed the pointer down. Stays fixed.
     start_line: u32,
@@ -96,19 +99,25 @@ pub(crate) fn build_review_decorations(
     review_id: protocol::ReviewId,
     host_id: String,
     is_draft: Memo<bool>,
+    target: ReviewTarget,
 ) -> ReviewDecorationFns {
     ReviewDecorationFns {
-        gutter_pointer_down: make_gutter_pointer_down(drag_selection, is_draft),
+        gutter_pointer_down: make_gutter_pointer_down(drag_selection, is_draft, target.clone()),
         line_extra_class: make_line_extra_class(drag_selection),
-        gutter_action_for_file_header: make_gutter_action_for_file_header(composer, is_draft),
+        gutter_action_for_file_header: make_gutter_action_for_file_header(
+            composer,
+            is_draft,
+            target.clone(),
+        ),
         decoration_below_line: make_line_decoration(
             composer,
             review_id.clone(),
             host_id.clone(),
             is_draft,
+            target.clone(),
         ),
         decoration_below_file_header: make_file_header_decoration(
-            composer, review_id, host_id, is_draft,
+            composer, review_id, host_id, is_draft, target,
         ),
     }
 }
@@ -125,6 +134,7 @@ pub(crate) fn build_review_decorations(
 pub(crate) fn make_gutter_pointer_down(
     drag_selection: RwSignal<Option<DragSelection>>,
     is_draft: Memo<bool>,
+    target: ReviewTarget,
 ) -> GutterPointerDownFn {
     Arc::new(
         move |root: ProjectRootPath, path: String, side: ReviewDiffSide, line: u32| {
@@ -134,6 +144,7 @@ pub(crate) fn make_gutter_pointer_down(
             drag_selection.set(Some(DragSelection {
                 root,
                 relative_path: path,
+                target: target.clone(),
                 side,
                 start_line: line,
                 end_line: line,
@@ -258,6 +269,7 @@ pub(crate) fn install_drag_listeners(
                 location: ReviewLocation {
                     root: current.root.clone(),
                     relative_path: current.relative_path.clone(),
+                    target: current.target.clone(),
                     anchor: ReviewAnchor::LineRange {
                         side: current.side,
                         start_line: start,
@@ -353,6 +365,7 @@ pub(crate) fn make_line_decoration(
     review_id: protocol::ReviewId,
     host_id: String,
     is_draft: Memo<bool>,
+    target: ReviewTarget,
 ) -> DecorationLineFn {
     let state = expect_context::<AppState>();
     Arc::new(
@@ -364,7 +377,9 @@ pub(crate) fn make_line_decoration(
                     } => *s == side && *end_line == line,
                     _ => false,
                 });
-            if !thread_region_has_content(&state, &review_id, &root, &path, &matcher, composer) {
+            if !thread_region_has_content(
+                &state, &review_id, &root, &path, &target, &matcher, composer,
+            ) {
                 return None;
             }
             let review_id = review_id.clone();
@@ -375,6 +390,7 @@ pub(crate) fn make_line_decoration(
                         review_id=review_id
                         root=root
                         relative_path=path
+                        target=target.clone()
                         host_id=host_id
                         composer=composer
                         matcher=matcher
@@ -392,10 +408,12 @@ pub(crate) fn make_line_decoration(
 pub(crate) fn make_gutter_action_for_file_header(
     composer: RwSignal<Option<ComposerState>>,
     is_draft: Memo<bool>,
+    target: ReviewTarget,
 ) -> GutterActionFileHeaderFn {
     Arc::new(move |root: ProjectRootPath, path: String| {
         let click_root = root.clone();
         let click_path = path.clone();
+        let click_target = target.clone();
         view! {
             <button
                 class="review-add-comment-btn review-file-comment-btn"
@@ -406,6 +424,7 @@ pub(crate) fn make_gutter_action_for_file_header(
                         location: ReviewLocation {
                             root: click_root.clone(),
                             relative_path: click_path.clone(),
+                            target: click_target.clone(),
                             anchor: ReviewAnchor::File,
                         },
                         body: RwSignal::new(String::new()),
@@ -427,12 +446,15 @@ pub(crate) fn make_file_header_decoration(
     review_id: protocol::ReviewId,
     host_id: String,
     is_draft: Memo<bool>,
+    target: ReviewTarget,
 ) -> DecorationFileHeaderFn {
     let state = expect_context::<AppState>();
     Arc::new(move |root: ProjectRootPath, path: String| {
         let matcher: Arc<dyn Fn(&ReviewAnchor) -> bool + Send + Sync> =
             Arc::new(|a: &ReviewAnchor| matches!(a, ReviewAnchor::File));
-        if !thread_region_has_content(&state, &review_id, &root, &path, &matcher, composer) {
+        if !thread_region_has_content(
+            &state, &review_id, &root, &path, &target, &matcher, composer,
+        ) {
             return None;
         }
         let review_id = review_id.clone();
@@ -443,6 +465,7 @@ pub(crate) fn make_file_header_decoration(
                     review_id=review_id
                     root=root
                     relative_path=path
+                    target=target.clone()
                     host_id=host_id
                     composer=composer
                     matcher=matcher
@@ -464,6 +487,7 @@ pub(crate) fn thread_region_has_content(
     review_id: &protocol::ReviewId,
     root: &ProjectRootPath,
     relative_path: &str,
+    target: &ReviewTarget,
     matcher: &Arc<dyn Fn(&ReviewAnchor) -> bool + Send + Sync>,
     composer: RwSignal<Option<ComposerState>>,
 ) -> bool {
@@ -474,6 +498,7 @@ pub(crate) fn thread_region_has_content(
         let comment_match = review.comments.iter().any(|c| {
             c.location.root == *root
                 && c.location.relative_path == relative_path
+                && c.location.target.same_surface(target)
                 && matcher(&c.location.anchor)
         });
         if comment_match {
@@ -482,6 +507,7 @@ pub(crate) fn thread_region_has_content(
         review.suggestions.iter().any(|s| {
             s.location.root == *root
                 && s.location.relative_path == relative_path
+                && s.location.target.same_surface(target)
                 && matcher(&s.location.anchor)
         })
     });
@@ -492,6 +518,7 @@ pub(crate) fn thread_region_has_content(
         c.as_ref().is_some_and(|c| {
             c.location.root == *root
                 && c.location.relative_path == relative_path
+                && c.location.target.same_surface(target)
                 && matcher(&c.location.anchor)
         })
     })

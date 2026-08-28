@@ -13,7 +13,7 @@ use serde_json::Value;
 /// `protocol::TydeReleaseVersion`.
 pub use host_config::{LOCAL_HOST_ID, TydeReleaseVersion};
 
-pub const PROTOCOL_VERSION: u32 = 51;
+pub const PROTOCOL_VERSION: u32 = 52;
 pub const TYDE_VERSION: Version = Version {
     major: 0,
     minor: 8,
@@ -5992,7 +5992,47 @@ impl ReviewDiffSelection {
 pub struct ReviewLocation {
     pub root: ProjectRootPath,
     pub relative_path: String,
+    /// The exact surface whose contents this anchor describes. Older stored
+    /// locations predate this discriminator and therefore remain unstaged.
+    #[serde(default)]
+    pub target: ReviewTarget,
     pub anchor: ReviewAnchor,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ReviewTarget {
+    #[default]
+    UnstagedDiff,
+    StagedDiff,
+    /// A project text file. The revision is filled by the server when the
+    /// comment is accepted; clients never provide canonical file contents.
+    RegularFile {
+        revision: String,
+    },
+}
+
+impl ReviewTarget {
+    pub const fn label(&self) -> &'static str {
+        match self {
+            Self::UnstagedDiff => "unstaged",
+            Self::StagedDiff => "staged",
+            Self::RegularFile { .. } => "file",
+        }
+    }
+
+    /// Whether two targets render on the same live editor/diff surface.
+    /// Regular-file revisions intentionally share that surface so stale
+    /// threads remain visible; use `Eq` when immutable snapshot identity is
+    /// required, such as aggregate review rows.
+    pub const fn same_surface(&self, other: &Self) -> bool {
+        matches!(
+            (self, other),
+            (Self::UnstagedDiff, Self::UnstagedDiff)
+                | (Self::StagedDiff, Self::StagedDiff)
+                | (Self::RegularFile { .. }, Self::RegularFile { .. })
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -6121,11 +6161,24 @@ pub struct Review {
     pub selection: ReviewDiffSelection,
     pub status: ReviewStatus,
     pub diffs: Vec<ProjectGitDiffPayload>,
+    /// Server-authored immutable text snapshots used to validate and render
+    /// regular-file review anchors. Snapshots remain frozen so a later edit
+    /// makes an anchor stale instead of moving it to different text.
+    #[serde(default)]
+    pub file_snapshots: Vec<ReviewFileSnapshot>,
     pub comments: Vec<ReviewComment>,
     pub suggestions: Vec<ReviewSuggestedComment>,
     pub ai_reviewer: ReviewAiReviewerState,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewFileSnapshot {
+    pub root: ProjectRootPath,
+    pub relative_path: String,
+    pub revision: String,
+    pub lines: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -1,18 +1,21 @@
 use std::collections::{BTreeMap, HashMap};
+use std::io::Read;
+use std::path::{Component, Path};
 use std::sync::Arc;
 use std::time::Instant;
 
 use protocol::{
     AgentId, DiffContextMode, FrameKind, MessageOrigin, Project, ProjectDiffScope,
     ProjectGitDiffFile, ProjectGitDiffLine, ProjectGitDiffLineKind, ProjectGitDiffPayload,
-    ProjectReadDiffPayload, ProjectRootPath, Review, ReviewActionPayload, ReviewAiReviewerState,
-    ReviewAiReviewerStatus, ReviewAnchor, ReviewAnchorStatus, ReviewBootstrapPayload,
-    ReviewComment, ReviewCommentId, ReviewCommentSource, ReviewDiffSelection, ReviewDiffSide,
-    ReviewErrorCode, ReviewErrorContext, ReviewErrorPayload, ReviewEventPayload,
-    ReviewFileCommentCount, ReviewId, ReviewLocation, ReviewStatus, ReviewSubmitTarget,
-    ReviewSuggestedComment, ReviewSuggestionId, ReviewSuggestionState, ReviewSummaryScope,
-    SendMessagePayload, StreamPath,
+    ProjectPath, ProjectReadDiffPayload, ProjectRootPath, Review, ReviewActionPayload,
+    ReviewAiReviewerState, ReviewAiReviewerStatus, ReviewAnchor, ReviewAnchorStatus,
+    ReviewBootstrapPayload, ReviewComment, ReviewCommentId, ReviewCommentSource,
+    ReviewDiffSelection, ReviewDiffSide, ReviewErrorCode, ReviewErrorContext, ReviewErrorPayload,
+    ReviewEventPayload, ReviewFileCommentCount, ReviewFileSnapshot, ReviewId, ReviewLocation,
+    ReviewStatus, ReviewSubmitTarget, ReviewSuggestedComment, ReviewSuggestionId,
+    ReviewSuggestionState, ReviewSummaryScope, ReviewTarget, SendMessagePayload, StreamPath,
 };
+use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, mpsc, oneshot};
 use uuid::Uuid;
 
@@ -305,18 +308,38 @@ impl ReviewActor {
         }
     }
 
-    async fn add_comment(&mut self, location: ReviewLocation, body: String, conn: ConnectionId) {
+    async fn add_comment(
+        &mut self,
+        mut location: ReviewLocation,
+        body: String,
+        conn: ConnectionId,
+    ) {
         let context = ReviewErrorContext::AddComment;
         if !self.ensure_draft(&conn, context.clone()).await {
             return;
         }
-        if !self
-            .refresh_diffs_or_error(Some(&conn), context.clone())
-            .await
+        let preserve_clean = !matches!(location.target, ReviewTarget::UnstagedDiff);
+        if let Err(message) = self.refresh_diffs_inner(preserve_clean).await {
+            self.send_error(
+                Some(&conn),
+                ReviewErrorCode::GitFailed,
+                message,
+                false,
+                context.clone(),
+            )
+            .await;
+            return;
+        }
+        let previous = self.review.clone();
+        if matches!(location.target, ReviewTarget::RegularFile { .. })
+            && !self
+                .freeze_regular_file(&mut location, &conn, context.clone())
+                .await
         {
             return;
         }
         if let Err(message) = validate_location(&self.review, &location) {
+            self.review = previous;
             self.send_error(
                 Some(&conn),
                 ReviewErrorCode::InvalidLocation,
@@ -328,7 +351,6 @@ impl ReviewActor {
             return;
         }
 
-        let previous = self.review.clone();
         let now = now_ms();
         let comment = ReviewComment {
             id: ReviewCommentId(Uuid::new_v4().to_string()),
@@ -454,6 +476,7 @@ impl ReviewActor {
 
         let previous = self.review.clone();
         let removed = self.review.comments.remove(index);
+        prune_file_snapshots(&mut self.review);
         self.review.updated_at_ms = now_ms();
         if !self.persist_or_revert(previous, Some(&conn), context).await {
             return;
@@ -507,11 +530,41 @@ impl ReviewActor {
             .await;
             return;
         }
-        let suggestion = self.review.suggestions[index].clone();
         if !self
             .refresh_diffs_or_error(Some(&conn), context.clone())
             .await
         {
+            return;
+        }
+        let Some(index) = self
+            .review
+            .suggestions
+            .iter()
+            .position(|suggestion| suggestion.id == suggestion_id)
+        else {
+            self.send_error(
+                Some(&conn),
+                ReviewErrorCode::UnknownSuggestion,
+                format!("unknown review suggestion {}", suggestion_id),
+                false,
+                context,
+            )
+            .await;
+            return;
+        };
+        let suggestion = self.review.suggestions[index].clone();
+        if let ReviewAnchorStatus::Stale { reason } = &suggestion.anchor_status {
+            self.send_error(
+                Some(&conn),
+                ReviewErrorCode::InvalidLocation,
+                format!(
+                    "review suggestion {} has a stale anchor: {reason}",
+                    suggestion_id
+                ),
+                false,
+                context,
+            )
+            .await;
             return;
         }
         if let Err(message) = validate_location(&self.review, &suggestion.location) {
@@ -1097,7 +1150,39 @@ impl ReviewActor {
             .await;
             return Err(error);
         }
+        let previous = self.review.clone();
+        if matches!(suggestion.location.target, ReviewTarget::RegularFile { .. }) {
+            let project = {
+                let store = self.project_store.lock().await;
+                store.get(&self.review.project_id)
+            };
+            let Some(project) = project else {
+                let error = review_error(
+                    ReviewErrorCode::InvalidLocation,
+                    format!("unknown project {}", self.review.project_id),
+                    false,
+                    context,
+                );
+                self.broadcast(ReviewEventPayload::Error {
+                    error: error.clone(),
+                })
+                .await;
+                return Err(error);
+            };
+            if let Err(message) =
+                freeze_regular_file_in_review(&mut self.review, &project, &mut suggestion.location)
+            {
+                self.review = previous;
+                let error = review_error(ReviewErrorCode::InvalidLocation, message, false, context);
+                self.broadcast(ReviewEventPayload::Error {
+                    error: error.clone(),
+                })
+                .await;
+                return Err(error);
+            }
+        }
         if let Err(message) = validate_location(&self.review, &suggestion.location) {
+            self.review = previous;
             let error = review_error(ReviewErrorCode::InvalidLocation, message, false, context);
             self.broadcast(ReviewEventPayload::Error {
                 error: error.clone(),
@@ -1108,7 +1193,6 @@ impl ReviewActor {
         suggestion.state = ReviewSuggestionState::Pending;
         suggestion.anchor_status = ReviewAnchorStatus::Current;
         let suggestion_id = suggestion.id.clone();
-        let previous = self.review.clone();
         match self
             .review
             .suggestions
@@ -1258,6 +1342,9 @@ impl ReviewActor {
     }
 
     async fn reset_for_clean_working_tree(&mut self, conn: Option<&ConnectionId>) {
+        if review_has_non_unstaged_feedback(&self.review) {
+            return;
+        }
         if !review_has_user_state(&self.review) && self.review.diffs.is_empty() {
             return;
         }
@@ -1280,6 +1367,7 @@ impl ReviewActor {
         self.review.status = ReviewStatus::Draft;
         self.review.comments.clear();
         self.review.suggestions.clear();
+        self.review.file_snapshots.clear();
         self.review.ai_reviewer = ReviewAiReviewerState {
             status: ReviewAiReviewerStatus::Idle,
             agent_id: None,
@@ -1334,6 +1422,10 @@ impl ReviewActor {
     }
 
     async fn refresh_diffs(&mut self) -> Result<(), String> {
+        self.refresh_diffs_inner(false).await
+    }
+
+    async fn refresh_diffs_inner(&mut self, preserve_clean: bool) -> Result<(), String> {
         let started = Instant::now();
         tracing::debug!(
             review_id = %self.review.id,
@@ -1363,14 +1455,26 @@ impl ReviewActor {
                 let stats = diff_stats(&diffs);
                 let previous = self.review.clone();
                 self.review.diffs = diffs;
-                if diff_is_clean(&self.review.diffs) {
+                if !preserve_clean
+                    && unstaged_diff_is_clean(&self.review.diffs)
+                    && !review_has_non_unstaged_feedback(&self.review)
+                {
                     self.reset_for_clean_working_tree(None).await;
                     return Ok(());
                 }
-                let anchor_updates = refresh_anchor_statuses(&mut self.review);
-                if anchor_updates.has_changes() {
+                let mut anchor_updates = refresh_anchor_statuses(&mut self.review);
+                let regular_updates = self.refresh_regular_file_snapshots(&project);
+                anchor_updates.comments.extend(regular_updates.comments);
+                anchor_updates
+                    .suggestions
+                    .extend(regular_updates.suggestions);
+                let pruned_snapshots = prune_file_snapshots(&mut self.review);
+                if anchor_updates.has_changes() || pruned_snapshots {
                     self.review.updated_at_ms = now_ms();
-                    self.store.upsert(self.review.clone())?;
+                    if let Err(error) = self.store.upsert(self.review.clone()) {
+                        self.review = previous;
+                        return Err(error);
+                    }
                     for comment in anchor_updates.comments {
                         self.broadcast(ReviewEventPayload::CommentUpsert { comment })
                             .await;
@@ -1408,6 +1512,66 @@ impl ReviewActor {
             }
         }
         Ok(())
+    }
+
+    async fn freeze_regular_file(
+        &mut self,
+        location: &mut ReviewLocation,
+        conn: &ConnectionId,
+        context: ReviewErrorContext,
+    ) -> bool {
+        let project = {
+            let store = self.project_store.lock().await;
+            store.get(&self.review.project_id)
+        };
+        let Some(project) = project else {
+            self.send_error(
+                Some(conn),
+                ReviewErrorCode::InvalidLocation,
+                format!("unknown project {}", self.review.project_id),
+                false,
+                context,
+            )
+            .await;
+            return false;
+        };
+        if let Err(message) = freeze_regular_file_in_review(&mut self.review, &project, location) {
+            self.send_error(
+                Some(conn),
+                ReviewErrorCode::InvalidLocation,
+                message,
+                false,
+                context,
+            )
+            .await;
+            return false;
+        }
+        true
+    }
+
+    fn refresh_regular_file_snapshots(&mut self, project: &Project) -> AnchorStatusUpdates {
+        let mut updates = AnchorStatusUpdates::default();
+        for comment in &mut self.review.comments {
+            let ReviewTarget::RegularFile { revision } = &comment.location.target else {
+                continue;
+            };
+            let status = regular_file_anchor_status(project, &comment.location, revision);
+            if comment.anchor_status != status {
+                comment.anchor_status = status;
+                updates.comments.push(comment.clone());
+            }
+        }
+        for suggestion in &mut self.review.suggestions {
+            let ReviewTarget::RegularFile { revision } = &suggestion.location.target else {
+                continue;
+            };
+            let status = regular_file_anchor_status(project, &suggestion.location, revision);
+            if suggestion.anchor_status != status {
+                suggestion.anchor_status = status;
+                updates.suggestions.push(suggestion.clone());
+            }
+        }
+        updates
     }
 
     fn validate_comment_locations(&self) -> Result<(), String> {
@@ -1572,6 +1736,300 @@ impl ReviewActor {
     }
 }
 
+struct ResolvedRegularFilePath {
+    path: ProjectPath,
+    canonical_root: std::path::PathBuf,
+    canonical_target: std::path::PathBuf,
+}
+
+enum SecureRegularFileContents {
+    Text(String),
+    Binary,
+}
+
+struct SecureRegularFile {
+    path: ProjectPath,
+    contents: SecureRegularFileContents,
+}
+
+fn resolve_regular_file_path(
+    project: &Project,
+    location: &ReviewLocation,
+) -> Result<ResolvedRegularFilePath, String> {
+    let root = project
+        .root_paths()
+        .into_iter()
+        .find(|root| *root == location.root)
+        .ok_or_else(|| {
+            format!(
+                "Root '{}' does not belong to project {}",
+                location.root, project.id
+            )
+        })?;
+    let relative = Path::new(&location.relative_path);
+    if !relative.is_relative() || location.relative_path.trim().is_empty() {
+        return Err(format!(
+            "project relative path must be relative: {}",
+            location.relative_path
+        ));
+    }
+    let mut logical_relative = std::path::PathBuf::new();
+    for component in relative.components() {
+        match component {
+            Component::Normal(part) => logical_relative.push(part),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(format!(
+                    "project relative path escapes its root: {}",
+                    location.relative_path
+                ));
+            }
+        }
+    }
+
+    let canonical_root = std::fs::canonicalize(&root.0)
+        .map_err(|error| format!("Failed to resolve project root '{}': {error}", root.0))?;
+    let requested = Path::new(&root.0).join(relative);
+    let canonical_target = std::fs::canonicalize(&requested)
+        .map_err(|error| format!("Failed to resolve file '{}': {error}", requested.display()))?;
+    let canonical_relative = canonical_target
+        .strip_prefix(&canonical_root)
+        .map_err(|_| {
+            format!(
+                "review file '{}' escapes project root '{}'",
+                location.relative_path, root.0
+            )
+        })?;
+    if canonical_relative.as_os_str().is_empty() {
+        return Err("review location must name a file within the project root".to_owned());
+    }
+    if canonical_relative != logical_relative {
+        return Err(format!(
+            "review file '{}' is a symlink alias; comment on its canonical project path instead",
+            location.relative_path
+        ));
+    }
+    let relative_path = logical_relative.to_string_lossy().replace('\\', "/");
+    Ok(ResolvedRegularFilePath {
+        path: ProjectPath {
+            root,
+            relative_path,
+        },
+        canonical_root,
+        canonical_target,
+    })
+}
+
+#[cfg(unix)]
+fn open_regular_file_beneath(
+    canonical_root: &Path,
+    relative_path: &Path,
+) -> Result<std::fs::File, String> {
+    use rustix::fs::{Mode, OFlags, open, openat};
+
+    let directory_flags = OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::DIRECTORY;
+    let mut directory = open(Path::new("/"), directory_flags, Mode::empty())
+        .map_err(|error| format!("Failed to open canonical filesystem root: {error}"))?;
+    for component in canonical_root.components() {
+        match component {
+            Component::RootDir => {}
+            Component::Normal(part) => {
+                directory =
+                    openat(&directory, part, directory_flags, Mode::empty()).map_err(|error| {
+                        format!(
+                            "Failed to open canonical project directory '{}': {error}",
+                            canonical_root.display()
+                        )
+                    })?;
+            }
+            Component::CurDir | Component::ParentDir | Component::Prefix(_) => {
+                return Err(format!(
+                    "invalid canonical project root '{}'",
+                    canonical_root.display()
+                ));
+            }
+        }
+    }
+
+    let components = relative_path.components().collect::<Vec<_>>();
+    let Some((last, parents)) = components.split_last() else {
+        return Err("review location must name a file within the project root".to_owned());
+    };
+    for component in parents {
+        let Component::Normal(part) = component else {
+            return Err("regular-file path was not normalized".to_owned());
+        };
+        directory = openat(&directory, *part, directory_flags, Mode::empty()).map_err(|error| {
+            format!(
+                "Failed to open review file parent '{}': {error}",
+                relative_path.display()
+            )
+        })?;
+    }
+    let Component::Normal(file_name) = last else {
+        return Err("regular-file path was not normalized".to_owned());
+    };
+    let file = openat(
+        &directory,
+        *file_name,
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
+        Mode::empty(),
+    )
+    .map_err(|error| {
+        format!(
+            "Failed to securely open review file '{}': {error}",
+            relative_path.display()
+        )
+    })?;
+    let file = std::fs::File::from(file);
+    let metadata = file.metadata().map_err(|error| {
+        format!(
+            "Failed to inspect review file '{}': {error}",
+            relative_path.display()
+        )
+    })?;
+    if !metadata.file_type().is_file() {
+        return Err(format!(
+            "review target '{}' is not a regular file",
+            relative_path.display()
+        ));
+    }
+    Ok(file)
+}
+
+#[cfg(not(unix))]
+fn open_regular_file_beneath(
+    canonical_root: &Path,
+    relative_path: &Path,
+) -> Result<std::fs::File, String> {
+    let file = std::fs::File::open(canonical_root.join(relative_path)).map_err(|error| {
+        format!(
+            "Failed to open review file '{}': {error}",
+            relative_path.display()
+        )
+    })?;
+    let metadata = file.metadata().map_err(|error| {
+        format!(
+            "Failed to inspect review file '{}': {error}",
+            relative_path.display()
+        )
+    })?;
+    if !metadata.file_type().is_file() {
+        return Err(format!(
+            "review target '{}' is not a regular file",
+            relative_path.display()
+        ));
+    }
+    Ok(file)
+}
+
+fn read_regular_file_secure(
+    project: &Project,
+    location: &ReviewLocation,
+) -> Result<SecureRegularFile, String> {
+    let resolved = resolve_regular_file_path(project, location)?;
+    let relative = Path::new(&resolved.path.relative_path);
+    let mut file = open_regular_file_beneath(&resolved.canonical_root, relative)?;
+    let opened_identity = same_file::Handle::from_file(
+        file.try_clone()
+            .map_err(|error| format!("Failed to clone secure review file handle: {error}"))?,
+    )
+    .map_err(|error| format!("Failed to identify secure review file handle: {error}"))?;
+
+    let confirmed = resolve_regular_file_path(project, location)?;
+    if confirmed.path != resolved.path
+        || confirmed.canonical_root != resolved.canonical_root
+        || confirmed.canonical_target != resolved.canonical_target
+    {
+        return Err("review file identity changed while it was being opened".to_owned());
+    }
+    let confirmed_file = open_regular_file_beneath(&confirmed.canonical_root, relative)?;
+    let confirmed_identity = same_file::Handle::from_file(confirmed_file)
+        .map_err(|error| format!("Failed to confirm secure review file identity: {error}"))?;
+    if opened_identity != confirmed_identity {
+        return Err("review file identity changed while it was being opened".to_owned());
+    }
+
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).map_err(|error| {
+        format!(
+            "Failed to read securely opened review file '{}': {error}",
+            resolved.path.relative_path
+        )
+    })?;
+    let contents = match String::from_utf8(bytes) {
+        Ok(contents) => SecureRegularFileContents::Text(contents),
+        Err(_) => SecureRegularFileContents::Binary,
+    };
+    Ok(SecureRegularFile {
+        path: resolved.path,
+        contents,
+    })
+}
+
+fn freeze_regular_file_in_review(
+    review: &mut Review,
+    project: &Project,
+    location: &mut ReviewLocation,
+) -> Result<(), String> {
+    let file = read_regular_file_secure(project, location)?;
+    let contents = match file.contents {
+        SecureRegularFileContents::Text(contents) if contents.contains('\0') => {
+            return Err("files containing NUL bytes cannot have review comments".to_owned());
+        }
+        SecureRegularFileContents::Text(contents) => contents,
+        SecureRegularFileContents::Binary => {
+            return Err("binary files cannot have line comments".to_owned());
+        }
+    };
+    location.root = file.path.root;
+    location.relative_path = file.path.relative_path;
+    let revision = file_revision(&contents);
+    location.target = ReviewTarget::RegularFile {
+        revision: revision.clone(),
+    };
+    if !review.file_snapshots.iter().any(|snapshot| {
+        snapshot.root == location.root
+            && snapshot.relative_path == location.relative_path
+            && snapshot.revision == revision
+    }) {
+        review.file_snapshots.push(ReviewFileSnapshot {
+            root: location.root.clone(),
+            relative_path: location.relative_path.clone(),
+            revision,
+            lines: contents.lines().map(ToOwned::to_owned).collect(),
+        });
+    }
+    Ok(())
+}
+
+fn regular_file_anchor_status(
+    project: &Project,
+    location: &ReviewLocation,
+    revision: &str,
+) -> ReviewAnchorStatus {
+    let file = read_regular_file_secure(project, location);
+    match file {
+        Ok(file) => match file.contents {
+            SecureRegularFileContents::Text(contents) if contents.contains('\0') => {
+                ReviewAnchorStatus::Stale {
+                    reason: "file now contains NUL bytes and is treated as binary".to_owned(),
+                }
+            }
+            SecureRegularFileContents::Text(contents) if file_revision(&contents) == revision => {
+                ReviewAnchorStatus::Current
+            }
+            SecureRegularFileContents::Text(_) => ReviewAnchorStatus::Stale {
+                reason: "file contents changed after this feedback was added".to_owned(),
+            },
+            SecureRegularFileContents::Binary => ReviewAnchorStatus::Stale {
+                reason: "file is now binary".to_owned(),
+            },
+        },
+        Err(reason) => ReviewAnchorStatus::Stale { reason },
+    }
+}
+
 fn read_review_diffs(
     project: &Project,
     selection: &ReviewDiffSelection,
@@ -1580,14 +2038,26 @@ fn read_review_diffs(
         ReviewDiffSelection::AllUncommitted | ReviewDiffSelection::Workspace { .. } => {
             let mut diffs = Vec::new();
             for root in project.root_paths() {
-                let payload = ProjectReadDiffPayload {
-                    root,
+                let unstaged = ProjectReadDiffPayload {
+                    root: root.clone(),
                     scope: ProjectDiffScope::Unstaged,
                     path: None,
                     context_mode: DiffContextMode::FullFile,
                 };
-                match read_diff(project, payload) {
+                match read_diff(project, unstaged) {
                     Ok(diff) => diffs.push(diff),
+                    Err(error) if is_not_git_repository_error(&error) => continue,
+                    Err(error) => return Err(error),
+                }
+                let staged = ProjectReadDiffPayload {
+                    root,
+                    scope: ProjectDiffScope::Staged,
+                    path: None,
+                    context_mode: DiffContextMode::FullFile,
+                };
+                match read_diff(project, staged) {
+                    Ok(diff) if !diff.files.is_empty() => diffs.push(diff),
+                    Ok(_) => {}
                     Err(error) if is_not_git_repository_error(&error) => {}
                     Err(error) => return Err(error),
                 }
@@ -1595,19 +2065,37 @@ fn read_review_diffs(
             Ok(diffs)
         }
         ReviewDiffSelection::Root { root, path, .. } => {
-            let payload = ProjectReadDiffPayload {
+            let mut diffs = Vec::new();
+            let unstaged = ProjectReadDiffPayload {
                 root: root.clone(),
                 scope: ProjectDiffScope::Unstaged,
                 path: path.clone(),
                 context_mode: DiffContextMode::FullFile,
             };
-            match read_diff(project, payload) {
-                Ok(diff) => Ok(vec![diff]),
-                Err(error) if is_not_git_repository_error(&error) => Ok(Vec::new()),
-                Err(error) => Err(error),
+            match read_diff(project, unstaged) {
+                Ok(diff) => diffs.push(diff),
+                Err(error) if is_not_git_repository_error(&error) => return Ok(Vec::new()),
+                Err(error) => return Err(error),
             }
+            let staged = ProjectReadDiffPayload {
+                root: root.clone(),
+                scope: ProjectDiffScope::Staged,
+                path: path.clone(),
+                context_mode: DiffContextMode::FullFile,
+            };
+            match read_diff(project, staged) {
+                Ok(diff) if !diff.files.is_empty() => diffs.push(diff),
+                Ok(_) => {}
+                Err(error) if is_not_git_repository_error(&error) => {}
+                Err(error) => return Err(error),
+            }
+            Ok(diffs)
         }
     }
+}
+
+fn file_revision(contents: &str) -> String {
+    format!("{:x}", Sha256::digest(contents.as_bytes()))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1655,12 +2143,24 @@ fn refresh_anchor_statuses(review: &mut Review) -> AnchorStatusUpdates {
     let comment_statuses = review
         .comments
         .iter()
-        .map(|comment| anchor_status_for_location(review, &comment.location))
+        .map(|comment| {
+            if matches!(comment.location.target, ReviewTarget::RegularFile { .. }) {
+                comment.anchor_status.clone()
+            } else {
+                anchor_status_for_location(review, &comment.location)
+            }
+        })
         .collect::<Vec<_>>();
     let suggestion_statuses = review
         .suggestions
         .iter()
-        .map(|suggestion| anchor_status_for_location(review, &suggestion.location))
+        .map(|suggestion| {
+            if matches!(suggestion.location.target, ReviewTarget::RegularFile { .. }) {
+                suggestion.anchor_status.clone()
+            } else {
+                anchor_status_for_location(review, &suggestion.location)
+            }
+        })
         .collect::<Vec<_>>();
 
     let mut updates = AnchorStatusUpdates::default();
@@ -1690,12 +2190,64 @@ fn diff_is_clean(diffs: &[ProjectGitDiffPayload]) -> bool {
     diffs.iter().all(|diff| diff.files.is_empty())
 }
 
+fn unstaged_diff_is_clean(diffs: &[ProjectGitDiffPayload]) -> bool {
+    diffs
+        .iter()
+        .filter(|diff| diff.scope == ProjectDiffScope::Unstaged)
+        .all(|diff| diff.files.is_empty())
+}
+
 fn review_has_user_state(review: &Review) -> bool {
     !review.comments.is_empty()
         || !review.suggestions.is_empty()
         || !matches!(review.ai_reviewer.status, ReviewAiReviewerStatus::Idle)
         || review.ai_reviewer.agent_id.is_some()
         || review.ai_reviewer.error.is_some()
+}
+
+fn review_has_non_unstaged_feedback(review: &Review) -> bool {
+    review
+        .comments
+        .iter()
+        .map(|comment| &comment.location)
+        .chain(
+            review
+                .suggestions
+                .iter()
+                .map(|suggestion| &suggestion.location),
+        )
+        .any(|location| !matches!(location.target, ReviewTarget::UnstagedDiff))
+}
+
+fn prune_file_snapshots(review: &mut Review) -> bool {
+    let referenced = review
+        .comments
+        .iter()
+        .map(|comment| &comment.location)
+        .chain(
+            review
+                .suggestions
+                .iter()
+                .map(|suggestion| &suggestion.location),
+        )
+        .filter_map(|location| match &location.target {
+            ReviewTarget::RegularFile { revision } => Some((
+                location.root.clone(),
+                location.relative_path.clone(),
+                revision.clone(),
+            )),
+            ReviewTarget::UnstagedDiff | ReviewTarget::StagedDiff => None,
+        })
+        .collect::<std::collections::HashSet<_>>();
+    let before = review.file_snapshots.len();
+    review.file_snapshots.retain(|snapshot| {
+        referenced.contains(&(
+            snapshot.root.clone(),
+            snapshot.relative_path.clone(),
+            snapshot.revision.clone(),
+        ))
+    });
+    review.file_snapshots.len() != before
 }
 
 fn review_error(
@@ -1808,6 +2360,50 @@ pub(crate) fn review_summary_scope(review: &Review) -> ReviewSummaryScope {
 }
 
 pub(crate) fn validate_location(review: &Review, location: &ReviewLocation) -> Result<(), String> {
+    if let ReviewTarget::RegularFile { revision } = &location.target {
+        let snapshot = review
+            .file_snapshots
+            .iter()
+            .find(|snapshot| {
+                snapshot.root == location.root
+                    && snapshot.relative_path == location.relative_path
+                    && snapshot.revision == *revision
+            })
+            .ok_or_else(|| {
+                format!(
+                    "review {} has no server snapshot for file {} in root {}",
+                    review.id, location.relative_path, location.root
+                )
+            })?;
+        return match &location.anchor {
+            ReviewAnchor::File => Ok(()),
+            ReviewAnchor::LineRange {
+                side,
+                start_line,
+                end_line,
+            } => {
+                if *side != ReviewDiffSide::New {
+                    return Err("regular-file comments must use the new side".to_owned());
+                }
+                if start_line == &0 || start_line > end_line {
+                    return Err(format!(
+                        "line range start {} must be between 1 and end {}",
+                        start_line, end_line
+                    ));
+                }
+                if *end_line as usize > snapshot.lines.len() {
+                    return Err(format!(
+                        "line {} is outside regular file {} ({} lines)",
+                        end_line,
+                        location.relative_path,
+                        snapshot.lines.len()
+                    ));
+                }
+                Ok(())
+            }
+            ReviewAnchor::Hunk { .. } => Err("regular files do not have diff hunks".to_owned()),
+        };
+    }
     let file = find_file(review, location).ok_or_else(|| {
         format!(
             "review {} has no file {} in root {}",
@@ -1868,10 +2464,15 @@ pub(crate) fn validate_location(review: &Review, location: &ReviewLocation) -> R
 }
 
 fn find_file<'a>(review: &'a Review, location: &ReviewLocation) -> Option<&'a ProjectGitDiffFile> {
+    let expected_scope = match location.target {
+        ReviewTarget::UnstagedDiff => ProjectDiffScope::Unstaged,
+        ReviewTarget::StagedDiff => ProjectDiffScope::Staged,
+        ReviewTarget::RegularFile { .. } => return None,
+    };
     review
         .diffs
         .iter()
-        .find(|diff| diff.root == location.root)
+        .find(|diff| diff.root == location.root && diff.scope == expected_scope)
         .and_then(|diff| {
             diff.files
                 .iter()

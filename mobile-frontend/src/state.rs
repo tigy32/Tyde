@@ -840,7 +840,6 @@ pub enum MobileTab {
     Home,
     Agents,
     Sessions,
-    Projects,
     Settings,
 }
 

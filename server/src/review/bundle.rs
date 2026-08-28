@@ -1,6 +1,6 @@
 use protocol::{
     ProjectGitDiffLine, ProjectGitDiffLineKind, ProjectId, Review, ReviewAnchor, ReviewCommentId,
-    ReviewCommentSource, ReviewDiffSide, ReviewId, ReviewLocation, SessionId,
+    ReviewCommentSource, ReviewDiffSide, ReviewId, ReviewLocation, ReviewTarget, SessionId,
 };
 use serde::Serialize;
 
@@ -94,10 +94,55 @@ fn excerpt_for_location(
     review: &Review,
     location: &ReviewLocation,
 ) -> Result<Vec<ProjectGitDiffLine>, String> {
+    if let ReviewTarget::RegularFile { revision } = &location.target {
+        let snapshot = review
+            .file_snapshots
+            .iter()
+            .find(|snapshot| {
+                snapshot.root == location.root
+                    && snapshot.relative_path == location.relative_path
+                    && snapshot.revision == *revision
+            })
+            .ok_or_else(|| {
+                format!(
+                    "review {} has no file snapshot {} in root {}",
+                    review.id, location.relative_path, location.root
+                )
+            })?;
+        return match &location.anchor {
+            ReviewAnchor::File => Ok(Vec::new()),
+            ReviewAnchor::LineRange {
+                start_line,
+                end_line,
+                ..
+            } => Ok((*start_line..=*end_line)
+                .filter_map(|line_number| {
+                    snapshot
+                        .lines
+                        .get(line_number.saturating_sub(1) as usize)
+                        .map(|text| ProjectGitDiffLine {
+                            kind: ProjectGitDiffLineKind::Context,
+                            text: text.clone(),
+                            old_line_number: None,
+                            new_line_number: Some(line_number),
+                        })
+                })
+                .collect()),
+            ReviewAnchor::Hunk { .. } => Err("regular files do not have diff hunks".to_owned()),
+        };
+    }
     let Some(file) = review
         .diffs
         .iter()
-        .find(|diff| diff.root == location.root)
+        .find(|diff| {
+            diff.root == location.root
+                && diff.scope
+                    == match location.target {
+                        ReviewTarget::UnstagedDiff => protocol::ProjectDiffScope::Unstaged,
+                        ReviewTarget::StagedDiff => protocol::ProjectDiffScope::Staged,
+                        ReviewTarget::RegularFile { .. } => unreachable!(),
+                    }
+        })
         .and_then(|diff| {
             diff.files
                 .iter()
@@ -154,10 +199,11 @@ fn line_matches_range(
 }
 
 fn location_heading(location: &ReviewLocation) -> String {
+    let target = location.target.label();
     match &location.anchor {
-        ReviewAnchor::File => location.relative_path.clone(),
+        ReviewAnchor::File => format!("{} [{target}]", location.relative_path),
         ReviewAnchor::Hunk { hunk_id, .. } => {
-            format!("{} hunk {}", location.relative_path, hunk_id)
+            format!("{} hunk {} [{target}]", location.relative_path, hunk_id)
         }
         ReviewAnchor::LineRange {
             side,
@@ -169,10 +215,13 @@ fn location_heading(location: &ReviewLocation) -> String {
                 ReviewDiffSide::New => "new",
             };
             if start_line == end_line {
-                format!("{}:{} ({side})", location.relative_path, start_line)
+                format!(
+                    "{}:{} ({side}, {target})",
+                    location.relative_path, start_line
+                )
             } else {
                 format!(
-                    "{}:{}-{} ({side})",
+                    "{}:{}-{} ({side}, {target})",
                     location.relative_path, start_line, end_line
                 )
             }

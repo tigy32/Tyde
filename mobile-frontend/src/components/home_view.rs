@@ -31,19 +31,6 @@ pub fn HomeView() -> impl IntoView {
             .count()
     };
 
-    let s_projects = state.clone();
-    let project_count = move || {
-        let Some(active) = s_projects.active_local_host_id.get() else {
-            return 0;
-        };
-        s_projects
-            .projects
-            .get()
-            .iter()
-            .filter(|p| p.local_host_id == active)
-            .count()
-    };
-
     let s_sessions = state.clone();
     let session_count = move || {
         let Some(active) = s_sessions.active_local_host_id.get() else {
@@ -137,11 +124,6 @@ pub fn HomeView() -> impl IntoView {
     let on_view_sessions = Callback::new(move |_: ()| {
         s_nav_sessions.active_tab.set(MobileTab::Sessions);
     });
-    let s_nav_projects = state.clone();
-    let on_view_projects = Callback::new(move |_: ()| {
-        s_nav_projects.active_tab.set(MobileTab::Projects);
-    });
-
     let s_recent = state.clone();
     let recent_agents = move || -> Vec<AgentInfo> {
         let Some(active) = s_recent.active_local_host_id.get() else {
@@ -206,7 +188,7 @@ pub fn HomeView() -> impl IntoView {
                     view! {
                         <EmptyState
                             title="No host connected"
-                            body="Pair a Tyde desktop to bring chats, projects, and sessions onto your phone."
+                            body="Pair a Tyde desktop to bring agent chats and sessions onto your phone."
                             icon="\u{1F517}"
                             data_mobile_test="home-empty-no-host"
                         />
@@ -236,12 +218,6 @@ pub fn HomeView() -> impl IntoView {
                                 <div class="home-stat-card">
                                     <div class="home-stat-value">{session_count}</div>
                                     <p class="home-stat-label">"Sessions"</p>
-                                </div>
-                            </Card>
-                            <Card data_mobile_test="home-stat-projects" dense=true>
-                                <div class="home-stat-card">
-                                    <div class="home-stat-value">{project_count}</div>
-                                    <p class="home-stat-label">"Projects"</p>
                                 </div>
                             </Card>
                             <Card data_mobile_test="home-stat-host" dense=true>
@@ -283,13 +259,6 @@ pub fn HomeView() -> impl IntoView {
                                     on_click=on_view_sessions
                                 />
                             </div>
-                            <Button
-                                label="Projects"
-                                variant=ButtonVariant::Ghost
-                                full_width=true
-                                data_mobile_test="home-view-projects"
-                                on_click=on_view_projects
-                            />
                         </div>
                     }
                     .into_any()
@@ -441,6 +410,17 @@ mod wasm_tests {
         next_tick().await;
 
         let text = container.text_content().unwrap_or_default();
+        assert!(
+            container
+                .query_selector("[data-mobile-test='home-stat-projects'], [data-mobile-test='home-view-projects']")
+                .unwrap()
+                .is_none(),
+            "mobile home must not expose project, file, Git, diff, or review entry points"
+        );
+        assert!(
+            !text.contains("Projects"),
+            "mobile home must remain agent-chat focused: {text}"
+        );
         assert!(
             text.contains("Agent Alpha") && text.contains("Agent Bravo"),
             "host-a agents should appear: {text}"

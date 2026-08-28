@@ -14,6 +14,9 @@ use crate::components::code_intel_ui::{
     CodeIntelContextMenu, CodeIntelMenuState, CodeIntelMenuTarget,
 };
 use crate::components::find_bar::{FindBar, FindState};
+use crate::components::review_layer::{
+    ComposerState, build_review_decorations, install_drag_listeners,
+};
 use crate::line_source::FileLines;
 use crate::state::{AppState, CodeIntelKey, FileFocus, FileResourceKey, TabId, TabScrollState};
 use crate::syntax_highlight::{LineHighlighter, LineTokens, color_to_css, syntax_for_path};
@@ -176,6 +179,27 @@ fn FileViewLoaded(
     version: ProjectFileVersion,
 ) -> impl IntoView {
     let state = expect_context::<AppState>();
+    let composer = RwSignal::new(None::<ComposerState>);
+    let drag_selection = RwSignal::new(None);
+    install_drag_listeners(drag_selection, composer);
+
+    let draft_state = state.clone();
+    let draft_project = key.project_id.clone();
+    let draft_host = key.host_id.clone();
+    let draft: Memo<Option<(String, protocol::ReviewId)>> = Memo::new(move |_| {
+        let id = draft_state.review_summaries.with(|summaries| {
+            summaries.get(&draft_project).and_then(|summaries| {
+                crate::components::review_view::pick_workspace_draft(summaries)
+                    .map(|summary| summary.id.clone())
+            })
+        })?;
+        Some((draft_host.clone(), id))
+    });
+    let is_draft = Memo::new(move |_| draft.get().is_some());
+    crate::components::review_view::subscribe_review_reactive(&state, draft);
+    let review_target = protocol::ReviewTarget::RegularFile {
+        revision: String::new(),
+    };
     let initial_scroll_state = state.tab_scroll_state_untracked(tab_id);
 
     let f = state
@@ -217,6 +241,14 @@ fn FileViewLoaded(
         });
     }
     let path_display = format!("{}/{}", f.path.root.0, f.path.relative_path);
+    let review_root = f.path.root.clone();
+    let review_path = f.path.relative_path.clone();
+    let header_button_root = review_root.clone();
+    let header_button_path = review_path.clone();
+    let header_button_target = review_target.clone();
+    let header_thread_root = review_root.clone();
+    let header_thread_path = review_path.clone();
+    let header_thread_target = review_target.clone();
     let content = if f.is_binary {
         "(binary file)".to_owned()
     } else {
@@ -888,6 +920,21 @@ fn FileViewLoaded(
     view! {
                             <div class="file-view-header">
                                 <span class="file-view-path">{path_display}</span>
+                                {move || {
+                                    let (host, review_id) = draft.get()?;
+                                    let decorations = build_review_decorations(
+                                        composer,
+                                        drag_selection,
+                                        review_id,
+                                        host,
+                                        is_draft,
+                                        header_button_target.clone(),
+                                    );
+                                    Some((decorations.gutter_action_for_file_header)(
+                                        header_button_root.clone(),
+                                        header_button_path.clone(),
+                                    ))
+                                }}
                                 {
                                     let code_intel_key = code_intel_key.clone();
                                     move || {
@@ -918,6 +965,21 @@ fn FileViewLoaded(
                                 }
                                 <button class="file-view-close" on:click=on_close title="Close">"×"</button>
                             </div>
+                            {move || {
+                                let (host, review_id) = draft.get()?;
+                                let decorations = build_review_decorations(
+                                    composer,
+                                    drag_selection,
+                                    review_id,
+                                    host,
+                                    is_draft,
+                                    header_thread_target.clone(),
+                                );
+                                (decorations.decoration_below_file_header)(
+                                    header_thread_root.clone(),
+                                    header_thread_path.clone(),
+                                )
+                            }}
                             {move || {
                                 deleted_on_disk.get().then(|| view! {
                                     <div
@@ -988,16 +1050,48 @@ fn FileViewLoaded(
                                         let text = lines_for_render.line(i).to_owned();
                                         let highlighted_for_row = highlighted_for_render.clone();
                                         let find_for_class = find_for_render.clone();
+                                        let row_root = review_root.clone();
+                                        let row_path = review_path.clone();
+                                        let pointer_root = row_root.clone();
+                                        let pointer_path = row_path.clone();
+                                        let pointer_target = review_target.clone();
+                                        let thread_target = review_target.clone();
                                         view! {
                                             <div
-                                                class=move || file_line_class_with_diagnostics(
+                                                class=move || format!("{} diff-line", file_line_class_with_diagnostics(
                                                     i, &find_for_class, decorations, flash_line,
-                                                )
+                                                ))
                                                 data-find-idx=i
+                                                data-anchor-new-line={(i + 1).to_string()}
+                                                data-anchor-old-line=""
                                             >
                                                 <span
                                                     class="file-line-num"
                                                     data-line-num={(i + 1).to_string()}
+                                                    on:pointerdown={
+                                                        let row_root = pointer_root.clone();
+                                                        let row_path = pointer_path.clone();
+                                                        move |event: web_sys::PointerEvent| {
+                                                            event.prevent_default();
+                                                            let Some((host, review_id)) = draft.get_untracked() else {
+                                                                return;
+                                                            };
+                                                            let review = build_review_decorations(
+                                                                composer,
+                                                                drag_selection,
+                                                                review_id,
+                                                                host,
+                                                                is_draft,
+                                                                pointer_target.clone(),
+                                                            );
+                                                            (review.gutter_pointer_down)(
+                                                                row_root.clone(),
+                                                                row_path.clone(),
+                                                                protocol::ReviewDiffSide::New,
+                                                                i as u32 + 1,
+                                                            );
+                                                        }
+                                                    }
                                                 ></span>
                                                 {move || {
                                                     // Reactive read: when a
@@ -1018,6 +1112,23 @@ fn FileViewLoaded(
                                                     )
                                                 }}
                                             </div>
+                                            {move || {
+                                                let (host, review_id) = draft.get()?;
+                                                let review = build_review_decorations(
+                                                    composer,
+                                                    drag_selection,
+                                                    review_id,
+                                                    host,
+                                                    is_draft,
+                                                    thread_target.clone(),
+                                                );
+                                                (review.decoration_below_line)(
+                                                    row_root.clone(),
+                                                    row_path.clone(),
+                                                    protocol::ReviewDiffSide::New,
+                                                    i as u32 + 1,
+                                                )
+                                            }}
                                         }
                                     }
                                 </For>
@@ -2094,6 +2205,124 @@ mod wasm_tests {
                  selection / copy: text was {text:?}"
             );
         }
+    }
+
+    #[wasm_bindgen_test]
+    async fn regular_file_renders_review_affordances_and_thread() {
+        ensure_styles_loaded();
+        let path = ProjectPath {
+            root: ProjectRootPath("test-root".to_owned()),
+            relative_path: "hello.rs".to_owned(),
+        };
+        let container = make_container();
+        let mount_path = path.clone();
+        let _handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            let key = file_key(mount_path.clone());
+            state.open_files.update(|files| {
+                files.insert(
+                    key.clone(),
+                    OpenFile {
+                        path: mount_path.clone(),
+                        version: ProjectFileVersion(1),
+                        contents: Some("first\nsecond\nthird".to_owned()),
+                        is_binary: false,
+                        missing: false,
+                    },
+                );
+            });
+            let review_id = protocol::ReviewId("review-file".to_owned());
+            state.review_summaries.update(|summaries| {
+                summaries.insert(
+                    ProjectId("p".to_owned()),
+                    vec![protocol::ReviewSummary {
+                        id: review_id.clone(),
+                        scope: protocol::ReviewSummaryScope::Workspace,
+                        status: protocol::ReviewStatus::Draft,
+                        origin_session_id: protocol::SessionId("session".to_owned()),
+                        origin_agent_id: protocol::AgentId("agent".to_owned()),
+                        created_at_ms: 1,
+                        updated_at_ms: 1,
+                        user_comment_count: 1,
+                        pending_suggestion_count: 0,
+                        file_comment_counts: Vec::new(),
+                    }],
+                );
+            });
+            state.reviews.update(|reviews| {
+                reviews.insert(
+                    review_id.clone(),
+                    protocol::Review {
+                        id: review_id,
+                        project_id: ProjectId("p".to_owned()),
+                        origin_agent_id: protocol::AgentId("agent".to_owned()),
+                        origin_session_id: protocol::SessionId("session".to_owned()),
+                        selection: protocol::ReviewDiffSelection::Workspace {
+                            scope: protocol::ProjectDiffScope::Unstaged,
+                        },
+                        status: protocol::ReviewStatus::Draft,
+                        diffs: Vec::new(),
+                        file_snapshots: vec![protocol::ReviewFileSnapshot {
+                            root: mount_path.root.clone(),
+                            relative_path: mount_path.relative_path.clone(),
+                            revision: "server-revision".to_owned(),
+                            lines: vec![
+                                "first".to_owned(),
+                                "second".to_owned(),
+                                "third".to_owned(),
+                            ],
+                        }],
+                        comments: vec![protocol::ReviewComment {
+                            id: protocol::ReviewCommentId("comment-file".to_owned()),
+                            location: protocol::ReviewLocation {
+                                root: mount_path.root.clone(),
+                                relative_path: mount_path.relative_path.clone(),
+                                target: protocol::ReviewTarget::RegularFile {
+                                    revision: "server-revision".to_owned(),
+                                },
+                                anchor: protocol::ReviewAnchor::LineRange {
+                                    side: protocol::ReviewDiffSide::New,
+                                    start_line: 1,
+                                    end_line: 2,
+                                },
+                            },
+                            anchor_status: protocol::ReviewAnchorStatus::Current,
+                            body: "comment on ordinary file".to_owned(),
+                            source: protocol::ReviewCommentSource::User,
+                            created_at_ms: 1,
+                            updated_at_ms: 1,
+                        }],
+                        suggestions: Vec::new(),
+                        ai_reviewer: protocol::ReviewAiReviewerState {
+                            status: protocol::ReviewAiReviewerStatus::Idle,
+                            agent_id: None,
+                            error: None,
+                        },
+                        created_at_ms: 1,
+                        updated_at_ms: 1,
+                    },
+                );
+            });
+            provide_context(state);
+            view! { <FileView tab_id=TabId(20_099) key=key /> }
+        });
+        next_tick().await;
+        next_tick().await;
+
+        assert!(
+            container
+                .query_selector(".review-file-comment-btn")
+                .unwrap()
+                .is_some(),
+            "ordinary text files must expose file-level review affordance"
+        );
+        assert!(
+            container
+                .text_content()
+                .unwrap_or_default()
+                .contains("comment on ordinary file"),
+            "ordinary-file line range thread must render at its anchored line"
+        );
     }
 
     #[wasm_bindgen_test]
