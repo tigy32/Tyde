@@ -68,6 +68,7 @@ const HERMES_MODEL_PROVIDER_FLAG: &str = " --provider ";
 const HERMES_TOOLSETS_ENV: &str = "HERMES_TUI_TOOLSETS";
 const HERMES_TOOL_PROGRESS_ENV: &str = "HERMES_TUI_TOOL_PROGRESS";
 const HERMES_MANAGED_DIR_ENV: &str = "HERMES_MANAGED_DIR";
+const HERMES_YOLO_MODE_ENV: &str = "HERMES_YOLO_MODE";
 const TYDE_HERMES_SYSTEM_PROMPT_ENV: &str = "TYDE_HERMES_SYSTEM_PROMPT";
 const HERMES_MANAGED_MCP_TOOLSET: &str = "mcp-tyde";
 /// Hermes's Tool Search bridge tool. When deferral is active the
@@ -965,7 +966,6 @@ impl Backend for HermesBackend {
             tyde_agent_adapter::BackendCapability::GenericOtherTool,
             tyde_agent_adapter::BackendCapability::OpaqueToolProgress,
             tyde_agent_adapter::BackendCapability::RetryTelemetry,
-            tyde_agent_adapter::BackendCapability::PlanApprovalRequests,
             tyde_agent_adapter::BackendCapability::UserQuestionRequests,
         ]
         .into()
@@ -4447,6 +4447,11 @@ async fn spawn_gateway_child(target: &HermesSpawnTarget) -> Result<AsyncGroupChi
         command.current_dir(cwd);
         command.env("TERMINAL_CWD", cwd);
     }
+    // Tyde owns the interaction surface, so ordinary Hermes approval gates
+    // would only interrupt work the user already authorized by starting the
+    // agent. Keep Hermes in its process-scoped YOLO mode. Hermes evaluates its
+    // unconditional hardline blocks before this flag.
+    command.env(HERMES_YOLO_MODE_ENV, "1");
     command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

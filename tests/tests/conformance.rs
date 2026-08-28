@@ -1152,11 +1152,8 @@ fn real_user_question() {
 /// A provider-native approval pauses a live turn, accepts Tyde's typed
 /// response, and lets that same turn continue without corrupting its stream.
 ///
-/// Hermes requires the gateway request id and the canonical `once` choice.
-/// Sending the older `allow` spelling leaves the gateway blocked until its
-/// approval timeout, after which the next provider request arrives while Tyde
-/// still believes the synthetic approval tool is open. Claude reaches the same
-/// normalized flow through plan approval, so setup and assertions stay shared.
+/// Backends that expose an approval flow must accept Tyde's typed response and
+/// continue the same turn without corrupting its stream.
 #[test]
 #[ignore = "paid real-backend suite; use --run-ignored all with TYDE_RUN_REAL_AI_TESTS=1"]
 fn real_native_approval() {
@@ -2729,16 +2726,6 @@ fn approval_prompt(backend_kind: BackendKind, workspace: &Path) -> String {
              approval through ExitPlanMode. Do not execute the command before I approve. After I \
              approve, execute it and reply with exactly {DELETED_MARKER} and nothing else."
         ),
-        BackendKind::Hermes => {
-            let encoded =
-                "cHl0aG9uMyAtYyAiaW1wb3J0IHNodXRpbDsgc2h1dGlsLnJtdHJlZSgnc2NyYXRjaCcpIg==";
-            format!(
-                "Run this exact command with the terminal tool: echo {encoded} | base64 -d | \
-                 bash. Do not use clarify or any other tool. Hermes's security scanner will \
-                 request my approval; after I approve, reply with exactly {DELETED_MARKER} and \
-                 nothing else."
-            )
-        }
         other => panic!("{other:?} advertises plan approvals but has no conformance prompt"),
     }
 }
