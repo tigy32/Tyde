@@ -4458,6 +4458,7 @@ impl HermesEventMapper {
             "tool.start" => self.map_tool_start(payload),
             "tool.progress" => self.map_tool_progress(payload),
             "tool.complete" => self.map_tool_complete(payload),
+            "tool.output_risk" => self.map_tool_output_risk(payload),
             "agent.terminal.output" => self.map_agent_terminal_output(payload),
             "background.complete" => self.map_background_complete(payload),
             "terminal.close" => Ok(Vec::new()),
@@ -5057,6 +5058,43 @@ impl HermesEventMapper {
             cancellable: false,
             update: ToolProgressUpdate::Other { payload },
         })])
+    }
+
+    fn map_tool_output_risk(&mut self, payload: Option<Value>) -> Result<Vec<ChatEvent>, String> {
+        let payload = required_payload(payload, "tool.output_risk")?;
+        let tool_name = required_string_any(&payload, &["name", "tool_name"], "tool.output_risk")?;
+        let risk = required_string(&payload, &["risk"], "tool.output_risk")?.to_ascii_lowercase();
+        if risk.eq_ignore_ascii_case("low") {
+            return Ok(Vec::new());
+        }
+
+        let findings = payload
+            .get("findings")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(|finding| finding.replace('_', " "))
+            .collect::<Vec<_>>();
+        let findings = if findings.is_empty() {
+            String::new()
+        } else {
+            format!(" Findings: {}.", findings.join(", "))
+        };
+        let treatment = if payload
+            .get("redacted")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            "Hermes redacted the flagged content and treated the result as untrusted."
+        } else {
+            "Hermes treated the result as untrusted."
+        };
+
+        Ok(vec![ChatEvent::MessageAdded(warning_message(format!(
+            "Hermes detected {risk}-risk content in output from `{tool_name}`.{findings} \
+             {treatment} Review it before relying on or acting on it."
+        )))])
     }
 
     fn map_tool_complete(&mut self, payload: Option<Value>) -> Result<Vec<ChatEvent>, String> {
