@@ -788,6 +788,13 @@ struct HermesTurnTool {
     observed_order: u64,
 }
 
+#[derive(Clone)]
+struct HermesPendingClarify {
+    tool_call_id: String,
+    request_id: String,
+    questions: Vec<protocol::AskUserQuestion>,
+}
+
 #[derive(Default)]
 struct HermesEventMapper {
     current_message_id: Option<String>,
@@ -809,6 +816,7 @@ struct HermesEventMapper {
     opaque_progress_tools: HashSet<String>,
     background_tasks: HashMap<String, HermesBackgroundTask>,
     pending_approval_tool_id: Option<String>,
+    pending_clarify: Option<HermesPendingClarify>,
     last_session_usage: Option<TokenUsage>,
     cumulative_usage_incomplete: bool,
     /// Running total of the current turn's provider requests. Hermes splits a
@@ -958,6 +966,7 @@ impl Backend for HermesBackend {
             tyde_agent_adapter::BackendCapability::OpaqueToolProgress,
             tyde_agent_adapter::BackendCapability::RetryTelemetry,
             tyde_agent_adapter::BackendCapability::PlanApprovalRequests,
+            tyde_agent_adapter::BackendCapability::UserQuestionRequests,
         ]
         .into()
     }
@@ -2551,8 +2560,43 @@ impl HermesSessionActor {
 
     async fn handle_tool_response(&mut self, response: SendMessageToolResponse, message: String) {
         match response {
-            SendMessageToolResponse::AskUserQuestion { .. } => {
-                self.emit_error("Hermes received an unsupported user-question response");
+            SendMessageToolResponse::AskUserQuestion {
+                tool_call_id,
+                answer,
+            } => {
+                let Some(pending) = self.mapper.pending_clarify.clone() else {
+                    self.emit_error("Hermes received a question response with no pending clarify");
+                    return;
+                };
+                if pending.tool_call_id != tool_call_id {
+                    self.emit_error(format!(
+                        "Hermes clarify response tool_call_id mismatch: expected {}, got {tool_call_id}",
+                        pending.tool_call_id
+                    ));
+                    return;
+                }
+                let answers = match hermes_clarify_answers(&pending.questions, &answer) {
+                    Ok(answers) => answers,
+                    Err(err) => {
+                        self.emit_error(err);
+                        return;
+                    }
+                };
+                for (question_id, answer) in answers {
+                    let mut params = json!({
+                        "session_id": self.live_session_id,
+                        "request_id": pending.request_id,
+                        "answer": answer,
+                    });
+                    if let Some(question_id) = question_id {
+                        params["question_id"] = Value::String(question_id);
+                    }
+                    if let Err(err) = self.gateway.request("clarify.respond", params).await {
+                        self.emit_error(format!("Hermes clarify.respond failed: {err}"));
+                        return;
+                    }
+                }
+                self.mapper.pending_clarify = None;
             }
             SendMessageToolResponse::ExitPlanMode {
                 tool_call_id,
@@ -4097,6 +4141,9 @@ fn hermes_selected_toolsets(
     if !selected.iter().any(|name| name == "delegation") {
         selected.push("delegation".to_string());
     }
+    if !selected.iter().any(|name| name == "clarify") {
+        selected.push("clarify".to_string());
+    }
     if !selected.iter().any(|name| name == MANAGED_SERVER_NAME) {
         selected.push(MANAGED_SERVER_NAME.to_string());
     }
@@ -4459,6 +4506,8 @@ impl HermesEventMapper {
             "tool.progress" => self.map_tool_progress(payload),
             "tool.complete" => self.map_tool_complete(payload),
             "tool.output_risk" => self.map_tool_output_risk(payload),
+            "clarify.request" => self.map_clarify_request(payload),
+            "clarify.expire" => self.map_clarify_expire(payload),
             "agent.terminal.output" => self.map_agent_terminal_output(payload),
             "background.complete" => self.map_background_complete(payload),
             "terminal.close" => Ok(Vec::new()),
@@ -5038,6 +5087,9 @@ impl HermesEventMapper {
                 goals: hermes_delegation_goals(&arguments),
             });
         }
+        if normalized_hermes_tool_name(&tool_name) == "clarify" {
+            return Ok(Vec::new());
+        }
         // Agent-control progress is emitted once for every backend in
         // `EventStream::project_tyde_agent_control`.
         Ok(vec![ChatEvent::ToolRequest(ToolRequest {
@@ -5045,6 +5097,54 @@ impl HermesEventMapper {
             tool_name: tool_name.clone(),
             tool_type,
         })])
+    }
+
+    fn map_clarify_request(&mut self, payload: Option<Value>) -> Result<Vec<ChatEvent>, String> {
+        let payload = required_payload(payload, "clarify.request")?;
+        if let Some(pending) = self.pending_clarify.as_ref() {
+            return Err(format!(
+                "Hermes emitted clarify.request while clarify {} is still pending",
+                pending.tool_call_id
+            ));
+        }
+        let request_id = required_string(&payload, &["request_id"], "clarify.request")?;
+        let mut clarify_tools = self
+            .pending_tools
+            .iter()
+            .filter(|(_, name)| normalized_hermes_tool_name(name) == "clarify");
+        let Some((tool_call_id, _)) = clarify_tools.next() else {
+            return Err("Hermes emitted clarify.request with no pending clarify tool".to_string());
+        };
+        if clarify_tools.next().is_some() {
+            return Err(
+                "Hermes emitted clarify.request with multiple pending clarify tools".to_string(),
+            );
+        }
+        let tool_call_id = tool_call_id.clone();
+        let questions = hermes_clarify_questions(&payload)?;
+        self.pending_clarify = Some(HermesPendingClarify {
+            tool_call_id: tool_call_id.clone(),
+            request_id,
+            questions: questions.clone(),
+        });
+        Ok(vec![ChatEvent::ToolRequest(ToolRequest {
+            tool_call_id,
+            tool_name: "clarify".to_string(),
+            tool_type: ToolRequestType::AskUserQuestion { questions },
+        })])
+    }
+
+    fn map_clarify_expire(&mut self, payload: Option<Value>) -> Result<Vec<ChatEvent>, String> {
+        let payload = required_payload(payload, "clarify.expire")?;
+        let request_id = required_string(&payload, &["request_id"], "clarify.expire")?;
+        if self
+            .pending_clarify
+            .as_ref()
+            .is_some_and(|pending| pending.request_id == request_id)
+        {
+            self.pending_clarify = None;
+        }
+        Ok(Vec::new())
     }
 
     fn map_tool_progress(&mut self, payload: Option<Value>) -> Result<Vec<ChatEvent>, String> {
@@ -5115,6 +5215,13 @@ impl HermesEventMapper {
             return Err(format!(
                 "Hermes tool.complete name mismatch for {tool_call_id}: expected {expected_name}, got {tool_name}"
             ));
+        }
+        if self
+            .pending_clarify
+            .as_ref()
+            .is_some_and(|pending| pending.tool_call_id == tool_call_id)
+        {
+            self.pending_clarify = None;
         }
         self.pending_tools.remove(&tool_call_id);
         let arguments = self
@@ -5761,6 +5868,7 @@ impl HermesEventMapper {
         self.turn_tools.clear();
         self.next_turn_tool_order = 0;
         self.pending_approval_tool_id = None;
+        self.pending_clarify = None;
     }
 }
 
@@ -5866,6 +5974,11 @@ fn hermes_delegation_goals(arguments: &Value) -> Vec<String> {
 
 fn hermes_native_tool_request_type(tool_name: &str, arguments: &Value) -> Option<ToolRequestType> {
     let normalized = normalized_hermes_tool_name(tool_name);
+    if normalized == "clarify" {
+        return hermes_clarify_questions(arguments)
+            .ok()
+            .map(|questions| ToolRequestType::AskUserQuestion { questions });
+    }
     if normalized == "terminal" {
         let command = arguments.get("command")?.as_str()?.to_owned();
         return Some(ToolRequestType::RunCommand {
@@ -5941,6 +6054,121 @@ fn hermes_native_tool_request_type(tool_name: &str, arguments: &Value) -> Option
         }
         _ => None,
     }
+}
+
+fn hermes_clarify_questions(payload: &Value) -> Result<Vec<protocol::AskUserQuestion>, String> {
+    let parse = |value: &Value, context: &str| {
+        let question = required_string(value, &["question"], context)?;
+        let options = match value.get("choices") {
+            None | Some(Value::Null) => Vec::new(),
+            Some(Value::Array(choices)) => choices
+                .iter()
+                .enumerate()
+                .map(|(index, choice)| {
+                    choice
+                        .as_str()
+                        .map(str::trim)
+                        .filter(|choice| !choice.is_empty())
+                        .map(|choice| {
+                            const RECOMMENDED: &str = " (recommended)";
+                            let recommended = choice.to_ascii_lowercase().ends_with(RECOMMENDED);
+                            let label = if recommended {
+                                choice[..choice.len() - RECOMMENDED.len()].trim()
+                            } else {
+                                choice
+                            };
+                            protocol::AskUserQuestionOption {
+                                label: label.to_string(),
+                                description: recommended.then(|| "Recommended".to_string()),
+                            }
+                        })
+                        .ok_or_else(|| {
+                            format!(
+                                "Hermes {context} field choices[{index}] must be a non-empty string"
+                            )
+                        })
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+            Some(_) => {
+                return Err(format!("Hermes {context} field choices must be an array"));
+            }
+        };
+        Ok(protocol::AskUserQuestion {
+            id: optional_string(value, &["qid"]),
+            question,
+            header: None,
+            options,
+            multi_select: value
+                .get("multi_select")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        })
+    };
+
+    if let Some(questions) = payload.get("questions") {
+        let questions = questions
+            .as_array()
+            .ok_or_else(|| "Hermes clarify.request field questions must be an array".to_string())?;
+        if questions.is_empty() {
+            return Err("Hermes clarify.request field questions must not be empty".to_string());
+        }
+        return questions
+            .iter()
+            .enumerate()
+            .map(|(index, question)| {
+                parse(question, &format!("clarify.request questions[{index}]"))
+            })
+            .collect();
+    }
+
+    Ok(vec![parse(payload, "clarify.request")?])
+}
+
+fn hermes_clarify_answers(
+    questions: &[protocol::AskUserQuestion],
+    answer: &str,
+) -> Result<Vec<(Option<String>, String)>, String> {
+    let answer = answer.trim();
+    if answer.is_empty() {
+        return Err("Hermes clarify response must not be empty".to_string());
+    }
+    let extract = |question: &protocol::AskUserQuestion, value: &str| {
+        let value = value.trim();
+        let prefix = format!("{}:", question.question.trim());
+        value
+            .strip_prefix(&prefix)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(value)
+            .to_string()
+    };
+
+    if questions.len() == 1 {
+        return Ok(vec![(None, extract(&questions[0], answer))]);
+    }
+
+    let lines = answer
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+    if lines.len() != questions.len() {
+        return Err(format!(
+            "Hermes clarify response contained {} answers for {} questions",
+            lines.len(),
+            questions.len()
+        ));
+    }
+    questions
+        .iter()
+        .zip(lines)
+        .map(|(question, answer)| {
+            let question_id = question.id.clone().ok_or_else(|| {
+                "Hermes batch clarify question is missing its question id".to_string()
+            })?;
+            Ok((Some(question_id), extract(question, answer)))
+        })
+        .collect()
 }
 
 /// The result for a tool whose request Tyde mapped to a Tyde type.

@@ -1,6 +1,6 @@
-//! Interactive renderer for Claude's typed `AskUserQuestion` tool call.
+//! Interactive renderer for a typed `AskUserQuestion` tool call.
 //!
-//! Claude emits `AskUserQuestion` to ask the user one or more multiple-choice
+//! Backends emit `AskUserQuestion` to ask the user one or more multiple-choice
 //! questions (single- or multi-select), each with an optional free-text answer.
 //! Rather than dumping the raw JSON, this card renders the questions as
 //! selectable options plus a custom-text field and a Submit button.
@@ -209,7 +209,7 @@ fn AskUserQuestionCard(
                 </button>
                 <Show when=move || submitted.get()>
                     <span class="ask-question-sent-note" role="status">
-                        "Sent — Claude will continue on the next turn."
+                        "Sent — the agent will continue on the next turn."
                     </span>
                 </Show>
                 <Show when=move || send_error.get().is_some()>
