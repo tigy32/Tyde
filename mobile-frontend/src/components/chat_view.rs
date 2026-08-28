@@ -2846,11 +2846,21 @@ mod wasm_tests {
             "a couple of pixels, not a widget: {}px",
             track.height()
         );
+        // The header is a rounded capsule, so a literally full-width track
+        // would render outside its silhouette at the rounded ends. It is inset
+        // just enough to stay inside them and stays centred, so the fill is
+        // still read as a share of the whole header rather than of a widget.
         assert!(
-            track.width() >= header.width() - 1.0,
-            "the track spans the header edge ({} vs {})",
+            track.width() >= header.width() * 0.9,
+            "the track spans the header ({} vs {})",
             track.width(),
             header.width()
+        );
+        let left_inset = track.left() - header.left();
+        let right_inset = header.right() - track.right();
+        assert!(
+            (left_inset - right_inset).abs() < 1.0,
+            "the track is centred in the header ({left_inset} vs {right_inset})"
         );
         let share = fill.width() / track.width();
         assert!(

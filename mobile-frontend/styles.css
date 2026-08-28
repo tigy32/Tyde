@@ -10,11 +10,15 @@
     --radius-sm: 6px;
     --radius-md: 10px;
     --radius-lg: 16px;
+    --radius-xl: 20px;
     --radius-full: 9999px;
     --font-sans: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", sans-serif;
     --font-mono: "SF Mono", "Cascadia Code", "Fira Code", monospace;
     --header-height: 44px;
     --nav-height: 52px;
+    /* Inset the floating chrome (header capsule, tab dock, composer) keeps
+       from the screen edges. One token so they stay on the same rails. */
+    --chrome-gutter: 12px;
     --safe-area-top: env(safe-area-inset-top, 0px);
     --safe-area-bottom: env(safe-area-inset-bottom, 0px);
     /* The home-indicator inset only needs clearing while it is actually on
@@ -48,6 +52,10 @@ html[data-keyboard-open] {
     --accent-error-bg: #2a1515;
     --shadow-sm: 0 1px 2px rgba(0,0,0,0.3);
     --shadow-md: 0 4px 12px rgba(0,0,0,0.4);
+    --accent-soft: rgba(0, 122, 204, 0.20);
+    --surface-float: #1f1f1f;
+    --rim-float: inset 0 0 0 1px rgba(255, 255, 255, 0.07);
+    --shadow-float: 0 1px 2px rgba(0, 0, 0, 0.4), 0 10px 30px rgba(0, 0, 0, 0.55);
 }
 
 [data-theme="light"] {
@@ -71,6 +79,10 @@ html[data-keyboard-open] {
     --accent-error-bg: #fef2f2;
     --shadow-sm: 0 1px 2px rgba(0,0,0,0.08);
     --shadow-md: 0 4px 12px rgba(0,0,0,0.12);
+    --accent-soft: rgba(37, 99, 235, 0.12);
+    --surface-float: #ffffff;
+    --rim-float: inset 0 0 0 1px rgba(26, 31, 40, 0.08);
+    --shadow-float: 0 1px 2px rgba(23, 20, 31, 0.06), 0 10px 30px rgba(23, 20, 31, 0.14);
 }
 
 /* ── Reset ──────────────────────────────────────────────────────────── */
@@ -206,7 +218,9 @@ html[data-keyboard-open] .mobile-app {
 
 .connection-banner {
     position: fixed;
-    top: calc(var(--safe-area-top) + var(--header-height) + var(--space-2));
+    top: calc(
+        var(--safe-area-top) + var(--space-2) + var(--header-height) + var(--space-2)
+    );
     right: var(--space-3);
     z-index: 90;
     display: flex;
@@ -381,14 +395,22 @@ html[data-keyboard-open] .mobile-app {
 
 /* ── Bottom Navigation ──────────────────────────────────────────────── */
 
+/* The dock stays in the shell's flex column — it floats visually, not in
+   layout, so the keyboard/viewport height math above is untouched. */
 .bottom-nav {
     display: flex;
     align-items: stretch;
-    height: calc(var(--nav-height) + var(--active-safe-area-bottom));
-    padding-bottom: var(--active-safe-area-bottom);
+    gap: var(--space-1);
+    height: var(--nav-height);
     flex-shrink: 0;
-    background: var(--bg-surface);
-    border-top: 1px solid var(--border-default);
+    margin:
+        var(--space-2)
+        var(--chrome-gutter)
+        calc(var(--space-2) + var(--active-safe-area-bottom));
+    padding: var(--space-1);
+    border-radius: var(--radius-full);
+    background: var(--surface-float);
+    box-shadow: var(--rim-float), var(--shadow-float);
 }
 
 .nav-tab {
@@ -399,12 +421,14 @@ html[data-keyboard-open] .mobile-app {
     justify-content: center;
     gap: 2px;
     color: var(--text-tertiary);
-    transition: color 0.15s;
+    border-radius: var(--radius-full);
+    transition: color 0.15s, background 0.15s;
     padding: var(--space-1) 0;
 }
 
 .nav-tab.active {
     color: var(--accent-primary);
+    background: var(--accent-soft);
 }
 
 .nav-icon {
@@ -442,11 +466,21 @@ html[data-keyboard-open] .mobile-app {
     display: flex;
     align-items: center;
     justify-content: space-between;
+    gap: var(--space-2);
     height: var(--header-height);
-    padding: 0 var(--space-4);
-    border-bottom: 1px solid var(--border-default);
-    background: var(--bg-surface);
+    margin: var(--space-2) var(--chrome-gutter);
+    padding: 0 var(--space-1) 0 var(--space-4);
+    border-radius: var(--radius-full);
+    background: var(--surface-float);
+    box-shadow: var(--rim-float), var(--shadow-float);
     flex-shrink: 0;
+}
+
+/* A header action nests inside the capsule, so it takes the capsule's shape
+   rather than the squarer corner the rest of the app's buttons use. */
+.view-header .ui-button,
+.view-header .header-action {
+    border-radius: var(--radius-full);
 }
 
 .view-title {
@@ -476,7 +510,7 @@ html[data-keyboard-open] .mobile-app {
     overflow-y: auto;
     overflow-x: hidden;
     -webkit-overflow-scrolling: touch;
-    padding: var(--space-4);
+    padding: var(--space-2) var(--space-4) var(--space-4);
 }
 
 .view-loading {
@@ -1047,28 +1081,33 @@ html[data-keyboard-open] .mobile-app {
     display: flex;
     align-items: center;
     height: var(--header-height);
-    padding: 0 var(--space-3);
-    border-bottom: 1px solid var(--border-default);
-    background: var(--bg-surface);
+    margin: var(--space-2) var(--chrome-gutter);
+    padding: 0 var(--space-2);
+    border-radius: var(--radius-full);
+    background: var(--surface-float);
+    box-shadow: var(--rim-float), var(--shadow-float);
     flex-shrink: 0;
     gap: var(--space-2);
     position: relative;
 }
 
 /* A couple of pixels of context occupancy along the header's bottom edge:
-   the 1px border becomes a 2px track with the used share filled in. */
+   a 2px track with the used share filled in, inset to stay clear of the
+   capsule's rounded corners. */
 .chat-context-bar {
     position: absolute;
-    left: 0;
-    right: 0;
-    bottom: -1px;
+    left: var(--space-3);
+    right: var(--space-3);
+    bottom: 4px;
     height: 2px;
+    border-radius: var(--radius-full);
     background: var(--border-default);
     overflow: hidden;
 }
 
 .chat-context-bar-fill {
     height: 100%;
+    border-radius: inherit;
     background: var(--accent-primary);
     transition: width var(--motion-slow) var(--ease-standard);
 }
@@ -1157,13 +1196,12 @@ html[data-keyboard-open] .mobile-app {
 .chat-more-button {
     width: var(--button-height-icon);
     height: var(--button-height-icon);
-    border-radius: var(--radius-button);
+    border-radius: var(--radius-full);
     display: flex;
     align-items: center;
     justify-content: center;
     color: var(--accent-primary);
-    background: var(--bg-surface-2);
-    border: 1px solid var(--border-default);
+    background: transparent;
     font-size: 22px;
     font-weight: 700;
     line-height: 1;
@@ -1963,21 +2001,25 @@ html[data-keyboard-open] .mobile-app {
 .chat-input-container {
     position: relative;
     flex-shrink: 0;
-    padding: var(--space-2) var(--space-3) max(var(--space-2), var(--active-safe-area-bottom));
-    border-top: 1px solid var(--border-default);
-    background: var(--bg-surface);
+    padding:
+        var(--space-2)
+        var(--chrome-gutter)
+        max(var(--space-2), var(--active-safe-area-bottom));
+    background: transparent;
 }
 
-/* Desktop's thinking indicator, verbatim (`.chat-input-area.thinking::before`
-   in frontend/styles.css): a blue shimmer along the composer's top edge while
-   the active agent's turn is running. */
+/* Desktop's thinking indicator (`.chat-input-area.thinking::before` in
+   frontend/styles.css): a blue shimmer along the composer's top edge while the
+   active agent's turn is running. Inset here to trace the floating composer
+   capsule rather than a full-bleed bar. */
 .chat-input-container.thinking::before {
     content: "";
     position: absolute;
-    top: 0;
-    left: 0;
-    right: 0;
+    top: var(--space-2);
+    left: calc(var(--chrome-gutter) + var(--space-4));
+    right: calc(var(--chrome-gutter) + var(--space-4));
     height: 1px;
+    border-radius: var(--radius-full);
     background: linear-gradient(
         90deg,
         transparent 0%,
@@ -2005,6 +2047,14 @@ html[data-keyboard-open] .mobile-app {
     display: flex;
     align-items: flex-end;
     gap: var(--space-2);
+    padding: var(--space-1);
+    border-radius: var(--radius-xl);
+    background: var(--surface-float);
+    box-shadow: var(--rim-float), var(--shadow-float);
+}
+
+.chat-input-row:focus-within {
+    box-shadow: inset 0 0 0 1px var(--accent-primary), var(--shadow-float);
 }
 
 .chat-photo-input {
@@ -2073,10 +2123,9 @@ html[data-keyboard-open] .mobile-app {
     display: grid;
     place-items: center;
     padding: 0;
-    border: 1px solid var(--border-default);
-    border-radius: var(--radius-button);
-    background: var(--bg-surface-2);
-    color: var(--text-primary);
+    border-radius: var(--radius-full);
+    background: transparent;
+    color: var(--text-secondary);
     font-size: 24px;
     font-weight: 400;
     line-height: 1;
@@ -2095,18 +2144,13 @@ html[data-keyboard-open] .mobile-app {
     min-height: 36px;
     max-height: 132px;
     padding: var(--space-2) var(--space-3);
-    background: var(--bg-surface-2);
-    border: 1px solid var(--border-default);
-    border-radius: var(--radius-button);
+    background: transparent;
+    border: none;
     resize: none;
     font-size: 16px;
     line-height: 1.4;
     outline: none;
     overflow-y: hidden;
-}
-
-.chat-input-field:focus {
-    border-color: var(--accent-primary);
 }
 
 .chat-input-field:disabled {
@@ -2117,7 +2161,7 @@ html[data-keyboard-open] .mobile-app {
     min-width: var(--button-height);
     height: var(--button-height);
     padding: 0 var(--space-3);
-    border-radius: var(--radius-button);
+    border-radius: var(--radius-lg);
     background: var(--accent-primary);
     color: white;
     font-size: 14px;
@@ -2157,7 +2201,7 @@ html[data-keyboard-open] .mobile-app {
     height: var(--button-height);
     padding: 0 var(--space-2);
     margin-left: -1px;
-    border-radius: 0 var(--radius-button) var(--radius-button) 0;
+    border-radius: 0 var(--radius-lg) var(--radius-lg) 0;
     background: var(--bg-surface-2);
     color: var(--text-primary);
     border: 1px solid var(--border-default);
@@ -2642,7 +2686,7 @@ html[data-keyboard-open] .mobile-app {
     /* Touch targets */
     --hit-area: 44px;
     /* Buttons */
-    --radius-button: 4px;            /* sharp; single source for button corners */
+    --radius-button: 10px;           /* single source for button corners */
     --button-disabled-opacity: 0.5;
     --button-height: 44px;           /* standard tap target (Apple HIG 44pt / Material 48dp) */
     --button-height-compact: 40px;
@@ -3142,23 +3186,23 @@ html[data-keyboard-open] .mobile-app {
 .search-bar {
     position: sticky;
     top: 0;
-    padding: var(--space-3) var(--space-4);
-    background: var(--bg-base);
-    border-bottom: 1px solid var(--border-default);
+    padding: 0 var(--chrome-gutter);
+    background: transparent;
     z-index: 1;
 }
 
 .search-bar input {
     width: 100%;
     min-height: 40px;
-    padding: 0 var(--space-3);
-    background: var(--bg-surface-2);
+    padding: 0 var(--space-4);
+    background: var(--surface-float);
     color: var(--text-primary);
-    border: 1px solid var(--border-default);
-    border-radius: var(--radius-md);
+    border: none;
+    border-radius: var(--radius-full);
+    box-shadow: var(--rim-float), var(--shadow-float);
     font-size: var(--text-base);
     outline: none;
-    transition: border-color var(--motion-fast) var(--ease-standard);
+    transition: box-shadow var(--motion-fast) var(--ease-standard);
 }
 
 .search-bar input::placeholder {
@@ -3166,7 +3210,7 @@ html[data-keyboard-open] .mobile-app {
 }
 
 .search-bar input:focus {
-    border-color: var(--accent-primary);
+    box-shadow: inset 0 0 0 1px var(--accent-primary), var(--shadow-float);
 }
 
 .section-heading {
@@ -3847,23 +3891,25 @@ html[data-keyboard-open] .mobile-app {
 .agents-segmented {
     display: flex;
     gap: var(--space-1);
-    padding: var(--space-2);
-    background: var(--bg-surface);
-    border-bottom: 1px solid var(--border-default);
+    margin: 0 var(--chrome-gutter) var(--space-2);
+    padding: var(--space-1);
+    border-radius: var(--radius-full);
+    background: var(--surface-float);
+    box-shadow: var(--rim-float), var(--shadow-float);
 }
 .agents-segmented-button {
     flex: 1;
     min-height: var(--button-height-compact);
-    background: var(--bg-surface-2);
+    background: transparent;
     color: var(--text-secondary);
     padding: var(--space-2);
-    border-radius: var(--radius-button);
+    border-radius: var(--radius-full);
     font-weight: 600;
     font-size: var(--text-sm);
 }
 .agents-segmented-button.active {
-    background: var(--accent-primary);
-    color: white;
+    background: var(--accent-soft);
+    color: var(--accent-primary);
 }
 
 /* Host browser */
