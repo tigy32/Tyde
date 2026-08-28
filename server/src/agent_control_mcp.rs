@@ -12,10 +12,11 @@ use protocol::{
     AGENT_CONTROL_DEFAULT_READ_LIMIT, AGENT_CONTROL_DEFAULT_READ_MAX_BYTES,
     AGENT_CONTROL_MAX_READ_LIMIT, AGENT_CONTROL_MAX_READ_MAX_BYTES, AgentControlReadDebugResult,
     AgentControlReadResult, AgentControlStatus, AgentId, AgentOrigin, BackendAccessMode,
-    BackendKind, CustomAgentId, GitBranchName, ImageData, ProjectId, ProjectSource,
-    SendMessagePayload, SpawnAgentParams, SpawnAgentPayload, SpawnCostHint, Team, TeamMember,
-    TeamMemberBindingPayload, TeamMemberId, WorkbenchCreatePayload, WorkbenchRemovePayload,
-    WorkflowSaveRequest, WorkflowSaveResponse, WorkflowTargetsResponse, cap_agent_control_events,
+    BackendKind, CustomAgentId, GitBranchName, ImageData, LaunchProfileEntry, LaunchProfileId,
+    ProjectId, ProjectSource, SendMessagePayload, SpawnAgentParams, SpawnAgentPayload,
+    SpawnCostHint, Team, TeamMember, TeamMemberBindingPayload, TeamMemberId,
+    WorkbenchCreatePayload, WorkbenchRemovePayload, WorkflowSaveRequest, WorkflowSaveResponse,
+    WorkflowTargetsResponse, cap_agent_control_events,
 };
 use rmcp::{
     ErrorData as McpError, RoleServer, ServerHandler,
@@ -358,6 +359,7 @@ struct SpawnAgentToolInput {
     #[serde(default)]
     workspace_roots: Vec<String>,
     prompt: String,
+    launch_profile_id: Option<String>,
     backend_kind: Option<BackendKindInput>,
     parent_agent_id: Option<String>,
     project_id: Option<String>,
@@ -502,6 +504,16 @@ struct ListLaunchOptionsResult {
     enabled_backends: Vec<BackendKind>,
     default_backend: Option<BackendKind>,
     complexity_tiers_enabled: bool,
+    launch_profiles: Vec<AgentLaunchProfileOption>,
+    default_launch_profile_id: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct AgentLaunchProfileOption {
+    id: String,
+    label: String,
+    description: Option<String>,
+    backend_kind: BackendKind,
 }
 
 #[derive(Clone)]
@@ -785,7 +797,7 @@ impl TydeAgentControlMcpServer {
     }
 
     #[tool(
-        description = "List enabled backends, the default backend, and whether optional task complexity tiers may be requested."
+        description = "List enabled backends, launch profile IDs, the defaults, and whether optional task complexity tiers may be requested."
     )]
     async fn tyde_list_launch_options(
         &self,
@@ -1269,9 +1281,37 @@ async fn do_spawn_agent(
     }
 
     let host_settings = host.read_settings().await?;
-    let backend_kind = match input.backend_kind.map(BackendKind::from) {
-        Some(explicit) => explicit,
-        None => host_settings.default_backend.ok_or_else(|| {
+    let launch_profile_id = input
+        .launch_profile_id
+        .as_deref()
+        .map(parse_launch_profile_id)
+        .transpose()?;
+    let launch_profile_backend = match launch_profile_id.as_ref() {
+        Some(launch_profile_id) => Some(
+            host.resolve_launch_profile(launch_profile_id)
+                .await?
+                .backend_kind,
+        ),
+        None => None,
+    };
+    let backend_kind = match (
+        input.backend_kind.map(BackendKind::from),
+        launch_profile_backend,
+    ) {
+        (Some(explicit), Some(profile_backend)) if explicit != profile_backend => {
+            return Err(format!(
+                "launch_profile_id {} targets {:?}, but backend_kind is {:?}",
+                launch_profile_id
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .unwrap_or_default(),
+                profile_backend,
+                explicit
+            ));
+        }
+        (Some(explicit), _) => explicit,
+        (None, Some(profile_backend)) => profile_backend,
+        (None, None) => host_settings.default_backend.ok_or_else(|| {
             "backend_kind is required because the host has no default_backend".to_string()
         })?,
     };
@@ -1311,7 +1351,7 @@ async fn do_spawn_agent(
             prompt: input.prompt,
             images: None,
             backend_kind,
-            launch_profile_id: None,
+            launch_profile_id,
             cost_hint: input.cost_hint.map(SpawnCostHint::from),
             access_mode: input
                 .access_mode
@@ -1521,10 +1561,26 @@ async fn do_remove_workbench(
 
 async fn do_list_launch_options(host: &HostHandle) -> Result<ListLaunchOptionsResult, String> {
     let settings = host.read_settings().await?;
+    let catalog = host.read_launch_profile_catalog().await?;
+    let launch_profiles = catalog
+        .entries
+        .into_iter()
+        .filter_map(|entry| match entry {
+            LaunchProfileEntry::Ready { profile } => Some(AgentLaunchProfileOption {
+                id: profile.id.0,
+                label: profile.label,
+                description: profile.description,
+                backend_kind: profile.backend_kind,
+            }),
+            LaunchProfileEntry::Unavailable { .. } => None,
+        })
+        .collect();
     Ok(ListLaunchOptionsResult {
         enabled_backends: settings.enabled_backends,
         default_backend: settings.default_backend,
         complexity_tiers_enabled: settings.complexity_tiers_enabled,
+        launch_profiles,
+        default_launch_profile_id: catalog.default_profile_id.map(|id| id.0),
     })
 }
 
@@ -1960,6 +2016,7 @@ async fn do_read_agent_debug(
 struct SpawnRequestInput {
     workspace_roots: Vec<String>,
     prompt: String,
+    launch_profile_id: Option<String>,
     backend_kind: Option<BackendKindInput>,
     parent_agent_id: Option<String>,
     project_id: Option<String>,
@@ -1973,6 +2030,7 @@ impl From<SpawnAgentToolInput> for SpawnRequestInput {
         Self {
             workspace_roots: v.workspace_roots,
             prompt: v.prompt,
+            launch_profile_id: v.launch_profile_id,
             backend_kind: v.backend_kind,
             parent_agent_id: v.parent_agent_id,
             project_id: v.project_id,
@@ -2003,6 +2061,14 @@ fn parse_agent_ids(inputs: Vec<String>) -> Result<Vec<AgentId>, String> {
 fn parse_project_id(input: &str) -> Result<ProjectId, String> {
     Uuid::parse_str(input).map_err(|err| format!("invalid project_id '{input}': {err}"))?;
     Ok(ProjectId(input.to_string()))
+}
+
+fn parse_launch_profile_id(input: &str) -> Result<LaunchProfileId, String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Err("launch_profile_id must not be empty".to_string());
+    }
+    Ok(LaunchProfileId(trimmed.to_owned()))
 }
 
 fn parse_team_member_id(input: &str) -> Result<TeamMemberId, String> {

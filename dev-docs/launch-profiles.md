@@ -81,11 +81,13 @@ so those launches fail visibly instead of falling back to the remote default.
 
 Agent-control MCP exposes:
 
-- `tyde_list_launch_options`: read-only discovery of enabled backends, the
-  default backend, and whether task complexity tiers are enabled.
-- `tyde_spawn_agent`: accepts a backend and, only when enabled by the host, an
-  optional complexity tier. It does not accept launch profiles or raw session
-  settings, so child agents cannot select a model or reasoning effort.
+- `tyde_list_launch_options`: read-only discovery of enabled backends, ready
+  launch profile IDs, the defaults, and whether task complexity tiers are
+  enabled. Profile summaries omit their raw session settings.
+- `tyde_spawn_agent`: accepts a launch profile ID or backend and, only when
+  enabled by the host, an optional complexity tier. It does not accept raw
+  session settings, so child agents cannot directly select a model or reasoning
+  effort.
 
 Example:
 
@@ -93,7 +95,7 @@ Example:
 {
   "workspace_roots": ["/repo"],
   "prompt": "Investigate failing tests",
-  "backend_kind": "claude",
+  "launch_profile_id": "claude:default",
   "cost_hint": "high"
 }
 ```

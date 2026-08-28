@@ -3671,7 +3671,7 @@ async fn agent_control_end_to_end_flow_uses_full_stack() {
 }
 
 #[tokio::test]
-async fn agent_control_http_limits_spawn_selection_to_backend_and_tier() {
+async fn agent_control_http_limits_spawn_selection_to_profile_backend_and_tier() {
     let mut fixture = Fixture::new().await;
     let write_id = fixture
         .client
@@ -3693,6 +3693,19 @@ async fn agent_control_http_limits_spawn_selection_to_backend_and_tier() {
         .expect("enabled backend list");
     assert_eq!(enabled_backends, &[json!("claude")]);
     assert_eq!(options["complexity_tiers_enabled"], false);
+    assert!(
+        options["launch_profiles"]
+            .as_array()
+            .is_some_and(|profiles| {
+                profiles.iter().any(|profile| {
+                    profile["id"] == "claude:default" && profile["backend_kind"] == "claude"
+                }) && profiles.iter().all(|profile| {
+                    profile.get("session_settings").is_none()
+                        && profile.get("model").is_none()
+                        && profile.get("reasoning_effort").is_none()
+                })
+            })
+    );
     assert!(
         options.get("catalog").is_none(),
         "catalog leaked in {options}"
@@ -3718,38 +3731,35 @@ async fn agent_control_http_limits_spawn_selection_to_backend_and_tier() {
         .as_object()
         .expect("spawn input properties");
     assert!(properties.contains_key("backend_kind"));
-    assert!(!properties.contains_key("launch_profile_id"));
+    assert!(properties.contains_key("launch_profile_id"));
     assert!(!properties.contains_key("session_settings"));
     assert!(!properties.contains_key("cost_hint"));
 
     let agent_ids_before = fixture.agent_ids().await;
-    for forbidden in [
-        json!({ "launch_profile_id": "claude:default" }),
-        json!({ "session_settings": { "model": { "string": "haiku" } } }),
-    ] {
-        let mut arguments = json!({
+    let response = mcp_tool_call_as(
+        &caller,
+        false,
+        "tyde_spawn_agent",
+        json!({
             "workspace_roots": ["/tmp/agent-control-forbidden-selection"],
             "prompt": "must not spawn",
-            "backend_kind": "claude"
-        });
-        arguments
-            .as_object_mut()
-            .expect("spawn arguments")
-            .extend(forbidden.as_object().expect("forbidden argument").clone());
-        let response = mcp_tool_call_as(&caller, false, "tyde_spawn_agent", arguments).await;
-        let rejected = response.get("error").is_some()
-            || response
-                .get("result")
-                .and_then(|result| result.get("isError").or_else(|| result.get("is_error")))
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-        assert!(
-            rejected
-                && (response.to_string().contains("unknown field")
-                    || response.to_string().contains("invalid")),
-            "forbidden spawn selection must be rejected: {response}"
-        );
-    }
+            "backend_kind": "claude",
+            "session_settings": { "model": { "string": "haiku" } }
+        }),
+    )
+    .await;
+    let rejected = response.get("error").is_some()
+        || response
+            .get("result")
+            .and_then(|result| result.get("isError").or_else(|| result.get("is_error")))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+    assert!(
+        rejected
+            && (response.to_string().contains("unknown field")
+                || response.to_string().contains("invalid")),
+        "forbidden spawn selection must be rejected: {response}"
+    );
     assert_eq!(fixture.agent_ids().await, agent_ids_before);
 
     let write_id = fixture
@@ -3789,10 +3799,10 @@ async fn agent_control_http_limits_spawn_selection_to_backend_and_tier() {
         &caller,
         json!({
             "workspace_roots": ["/tmp/agent-control-backend-tier"],
-            "prompt": "agent control backend and tier",
-            "backend_kind": "claude",
+            "prompt": "agent control profile and tier",
+            "launch_profile_id": "claude:default",
             "cost_hint": "low",
-            "name": "backend-tier child"
+            "name": "profile-tier child"
         }),
     )
     .await;
