@@ -81,10 +81,11 @@ so those launches fail visibly instead of falling back to the remote default.
 
 Agent-control MCP exposes:
 
-- `tyde_list_launch_options`: read-only discovery of the server-owned catalog,
-  default backend, and current session schemas.
-- `tyde_spawn_agent`: accepts optional `launch_profile_id` and optional
-  `session_settings`. No Hermes-specific arguments are exposed.
+- `tyde_list_launch_options`: read-only discovery of enabled backends, the
+  default backend, and whether task complexity tiers are enabled.
+- `tyde_spawn_agent`: accepts a backend and, only when enabled by the host, an
+  optional complexity tier. It does not accept launch profiles or raw session
+  settings, so child agents cannot select a model or reasoning effort.
 
 Example:
 
@@ -92,9 +93,7 @@ Example:
 {
   "workspace_roots": ["/repo"],
   "prompt": "Investigate failing tests",
-  "launch_profile_id": "claude:default",
-  "session_settings": {
-    "model": { "string": "haiku" }
-  }
+  "backend_kind": "claude",
+  "cost_hint": "high"
 }
 ```

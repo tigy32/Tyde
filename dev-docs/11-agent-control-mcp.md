@@ -253,7 +253,10 @@ Input:
 - `cost_hint?`
 
 `backend_kind` is optional only if the host has an explicit `default_backend` in
-`HostSettings`. Each injected agent receives a server-signed bearer credential
+`HostSettings`. `cost_hint` is exposed and honored only while task complexity
+tiers are enabled. The tool does not accept launch profiles or raw session
+settings; agents cannot directly choose a model or reasoning effort. Each
+injected agent receives a server-signed bearer credential
 bound to its `AgentId`; that authenticated identity becomes the parent. Header
 and query identities are claims only and must match the credential. Root/admin
 spawns use the separate typed host protocol/dev-driver surface, not bare MCP.

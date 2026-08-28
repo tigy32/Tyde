@@ -9534,24 +9534,6 @@ impl HostHandle {
         Ok(launch_profile_catalog_for_settings(&state, &settings))
     }
 
-    pub(crate) async fn read_launch_options(
-        &self,
-    ) -> Result<
-        (
-            LaunchProfileCatalog,
-            Option<BackendKind>,
-            Vec<SessionSchemaEntry>,
-        ),
-        String,
-    > {
-        let state = self.state.lock().await;
-        let settings = state.settings_store.lock().await.get()?;
-        let catalog = launch_profile_catalog_for_settings(&state, &settings);
-        let session_schemas =
-            session_schemas_for_enabled_backends(&state, &settings.enabled_backends);
-        Ok((catalog, settings.default_backend, session_schemas))
-    }
-
     pub(crate) async fn resolve_launch_profile(
         &self,
         launch_profile_id: &LaunchProfileId,

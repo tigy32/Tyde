@@ -3671,7 +3671,7 @@ async fn agent_control_end_to_end_flow_uses_full_stack() {
 }
 
 #[tokio::test]
-async fn agent_control_http_discovers_and_spawns_launch_profiles() {
+async fn agent_control_http_limits_spawn_selection_to_backend_and_tier() {
     let mut fixture = Fixture::new().await;
     let write_id = fixture
         .client
@@ -3688,26 +3688,111 @@ async fn agent_control_http_discovers_and_spawns_launch_profiles() {
     let caller = fixture.agent_control_caller(&parent.agent_id).await;
     let base_url = fixture.agent_control_http_url().await;
     let options = mcp_list_launch_options(&base_url).await;
-    let entries = options["catalog"]["entries"]
+    let enabled_backends = options["enabled_backends"]
         .as_array()
-        .expect("launch option entries");
+        .expect("enabled backend list");
+    assert_eq!(enabled_backends, &[json!("claude")]);
+    assert_eq!(options["complexity_tiers_enabled"], false);
     assert!(
-        entries
-            .iter()
-            .any(|entry| entry["state"] == "ready" && entry["profile"]["id"] == "claude:default"),
-        "expected claude:default in {options}"
+        options.get("catalog").is_none(),
+        "catalog leaked in {options}"
+    );
+    assert!(
+        options.get("session_schemas").is_none(),
+        "session schemas leaked in {options}"
+    );
+
+    let tools_response = post_json_with_headers(
+        &base_url,
+        &[("Authorization", &caller.authorization)],
+        &json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {} }),
+    )
+    .await;
+    let spawn_tool = tools_response["result"]["tools"]
+        .as_array()
+        .expect("tools/list result")
+        .iter()
+        .find(|tool| tool["name"] == "tyde_spawn_agent")
+        .expect("tyde_spawn_agent tool");
+    let properties = spawn_tool["inputSchema"]["properties"]
+        .as_object()
+        .expect("spawn input properties");
+    assert!(properties.contains_key("backend_kind"));
+    assert!(!properties.contains_key("launch_profile_id"));
+    assert!(!properties.contains_key("session_settings"));
+    assert!(!properties.contains_key("cost_hint"));
+
+    let agent_ids_before = fixture.agent_ids().await;
+    for forbidden in [
+        json!({ "launch_profile_id": "claude:default" }),
+        json!({ "session_settings": { "model": { "string": "haiku" } } }),
+    ] {
+        let mut arguments = json!({
+            "workspace_roots": ["/tmp/agent-control-forbidden-selection"],
+            "prompt": "must not spawn",
+            "backend_kind": "claude"
+        });
+        arguments
+            .as_object_mut()
+            .expect("spawn arguments")
+            .extend(forbidden.as_object().expect("forbidden argument").clone());
+        let response = mcp_tool_call_as(&caller, false, "tyde_spawn_agent", arguments).await;
+        let rejected = response.get("error").is_some()
+            || response
+                .get("result")
+                .and_then(|result| result.get("isError").or_else(|| result.get("is_error")))
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+        assert!(
+            rejected
+                && (response.to_string().contains("unknown field")
+                    || response.to_string().contains("invalid")),
+            "forbidden spawn selection must be rejected: {response}"
+        );
+    }
+    assert_eq!(fixture.agent_ids().await, agent_ids_before);
+
+    let write_id = fixture
+        .client
+        .replace_setting("/complexity_tiers_enabled", true, false)
+        .await
+        .expect("enable complexity tiers");
+    expect_settings_write_applied(
+        &mut fixture.client,
+        &write_id,
+        "enable agent-control complexity tiers",
+    )
+    .await;
+    let tier_options = mcp_list_launch_options(&base_url).await;
+    assert_eq!(tier_options["complexity_tiers_enabled"], true);
+
+    let tier_tools_response = post_json_with_headers(
+        &base_url,
+        &[("Authorization", &caller.authorization)],
+        &json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {} }),
+    )
+    .await;
+    let tier_spawn_tool = tier_tools_response["result"]["tools"]
+        .as_array()
+        .expect("tools/list result")
+        .iter()
+        .find(|tool| tool["name"] == "tyde_spawn_agent")
+        .expect("tyde_spawn_agent tool");
+    assert!(
+        tier_spawn_tool["inputSchema"]["properties"]
+            .as_object()
+            .expect("spawn input properties")
+            .contains_key("cost_hint")
     );
 
     let agent_id = mcp_spawn_agent_as(
         &caller,
         json!({
-            "workspace_roots": ["/tmp/agent-control-launch-profile"],
-            "prompt": "agent control launch profile",
-            "launch_profile_id": "claude:default",
-            "session_settings": {
-                "model": { "string": "haiku" }
-            },
-            "name": "profile child"
+            "workspace_roots": ["/tmp/agent-control-backend-tier"],
+            "prompt": "agent control backend and tier",
+            "backend_kind": "claude",
+            "cost_hint": "low",
+            "name": "backend-tier child"
         }),
     )
     .await;
@@ -3716,11 +3801,9 @@ async fn agent_control_http_discovers_and_spawns_launch_profiles() {
 }
 
 /// An explicitly configured Hermes launch profile becomes Ready after the
-/// schema refresh and both agent-control surfaces can discover and spawn
-/// it: the HTTP MCP surface (catalog listing + spawn + await) and the
-/// dev-driver surface (launch options + spawn + await).
+/// schema refresh and remains available to the typed dev-driver surface.
 #[tokio::test]
-async fn explicit_hermes_launch_profile_spawns_on_http_and_dev_driver_surfaces() {
+async fn explicit_hermes_launch_profile_spawns_on_dev_driver_surface() {
     let mut fixture = Fixture::new().await;
     let profile_write_id = fixture
         .client
@@ -3762,35 +3845,6 @@ async fn explicit_hermes_launch_profile_spawns_on_http_and_dev_driver_surfaces()
         "expected ready hermes:claude in {catalog:?}"
     );
 
-    let parent = spawn_agent_control_parent(&mut fixture, "hermes-profile-parent").await;
-    let caller = fixture.agent_control_caller(&parent.agent_id).await;
-    let base_url = fixture.agent_control_http_url().await;
-    let options = mcp_list_launch_options(&base_url).await;
-    let entries = options["catalog"]["entries"]
-        .as_array()
-        .expect("launch option entries");
-    assert!(
-        entries.iter().any(|entry| {
-            entry["state"] == "ready"
-                && entry["profile"]["id"] == "hermes:claude"
-                && entry["profile"]["backend_kind"] == "hermes"
-        }),
-        "expected ready hermes:claude in {options}"
-    );
-
-    let agent_id = mcp_spawn_agent_as(
-        &caller,
-        json!({
-            "workspace_roots": ["/tmp/agent-control-hermes-launch-profile"],
-            "prompt": "agent control explicit Hermes launch profile",
-            "launch_profile_id": "hermes:claude",
-            "name": "explicit hermes profile"
-        }),
-    )
-    .await;
-    let awaited = mcp_await_agent(&caller, &agent_id).await;
-    assert_await_result_ready(&awaited, &agent_id);
-
     let control = fixture.connect_agent_control().await;
     let options = control.list_launch_options();
     assert!(
@@ -3807,10 +3861,6 @@ async fn explicit_hermes_launch_profile_spawns_on_http_and_dev_driver_surfaces()
         "dev-driver launch options should include ready hermes:claude"
     );
 
-    // The HTTP phase already created agents, so the awaited id must be
-    // proven to be the dev-driver spawn: a new agent id carrying the
-    // requested name and Hermes profile-visible properties, not a reused
-    // pre-existing ready agent.
     let ids_before_dev_driver_spawn = fixture.agent_ids().await;
     let spawned = control
         .spawn_agent(SpawnRequest {
