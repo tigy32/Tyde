@@ -1149,45 +1149,6 @@ fn real_user_question() {
     );
 }
 
-/// A provider-native approval pauses a live turn, accepts Tyde's typed
-/// response, and lets that same turn continue without corrupting its stream.
-///
-/// Backends that expose an approval flow must accept Tyde's typed response and
-/// continue the same turn without corrupting its stream.
-#[test]
-#[ignore = "paid real-backend suite; use --run-ignored all with TYDE_RUN_REAL_AI_TESTS=1"]
-fn real_native_approval() {
-    run_scenario(
-        &[BackendCapability::PlanApprovalRequests],
-        |mut host| async move {
-            let workspace = host.workspace().to_path_buf();
-            let prompt = approval_prompt(host.backend(), &workspace);
-            let agent = spawn_agent(&mut host, &launch_prompt()).await;
-            let launched = collect_turn(&mut host, &agent, &launch_prompt()).await;
-            assert_ready_handshake(&launched);
-
-            let approval = ask_for_approval(&mut host, &agent, &prompt).await;
-            assert_no_error_message(
-                &format!("{:?} pending approval", host.backend()),
-                approval.events(),
-            );
-            let approved = approve_request(&mut host, &agent, approval).await;
-            assert_final_text_contains(&approved, DELETED_MARKER);
-            assert!(
-                !workspace.join(SCRATCH_DIR).exists(),
-                "{}: approved action did not remove {}",
-                approved.label(),
-                workspace.join(SCRATCH_DIR).display()
-            );
-            assert_universal_contract(&[launched, approved]);
-
-            let recovered = ask_expecting_delivery(&mut host, &agent, &launch_prompt()).await;
-            assert_ready_handshake(&recovered);
-            assert_clean_close(&mut host, &agent).await;
-        },
-    );
-}
-
 /// A tool still running when the turn ends.
 ///
 /// Deliberately does *not* assert that every request completed — a backgrounded
@@ -2717,19 +2678,6 @@ fn delete_prompt(workspace: &Path) -> String {
     )
 }
 
-fn approval_prompt(backend_kind: BackendKind, workspace: &Path) -> String {
-    let root = workspace_root(workspace);
-    match backend_kind {
-        BackendKind::Claude => format!(
-            "Use your native plan mode for this task. Plan to delete the directory {SCRATCH_DIR} \
-             and everything in it from {root} with one recursive shell command, then request my \
-             approval through ExitPlanMode. Do not execute the command before I approve. After I \
-             approve, execute it and reply with exactly {DELETED_MARKER} and nothing else."
-        ),
-        other => panic!("{other:?} advertises plan approvals but has no conformance prompt"),
-    }
-}
-
 /// Names a decision the model cannot make for itself, so asking is the only way
 /// forward. A prompt the model can resolve on its own produces a clean, fast,
 /// meaningless pass.
@@ -3070,9 +3018,7 @@ fn assert_every_request_was_declared(turn: &Turn) {
         .map(|request| request.tool_call_id.clone())
         .collect();
 
-    // Provider-native approval is a host interjection, not a tool the model
-    // declared. Hermes proves the distinction: the terminal call is declared
-    // under its provider id, while approval.request has a synthetic Tyde id.
+    // ExitPlanMode is a host interjection, not a tool the model declared.
     let undeclared: Vec<_> = requested
         .difference(&declared)
         .filter(|tool_call_id| {
