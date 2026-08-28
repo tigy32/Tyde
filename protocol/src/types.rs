@@ -658,8 +658,8 @@ impl BackendKind {
     /// than silently dropping it.
     pub const fn supports_image_input(self) -> bool {
         match self {
-            Self::Kiro | Self::Claude | Self::Codex => true,
-            Self::Tycode | Self::Antigravity | Self::Hermes => false,
+            Self::Kiro | Self::Claude | Self::Codex | Self::Hermes => true,
+            Self::Tycode | Self::Antigravity => false,
         }
     }
 }
