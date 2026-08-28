@@ -141,6 +141,12 @@ pub trait AcpAgentAdapter: Send + Sync + 'static {
         ssh_host: Option<&str>,
     ) -> Result<AcpSpawnSpec, String>;
 
+    /// Build a read-only subscription-capacity probe when this specific agent
+    /// exposes one outside ACP. The generic ACP protocol has no usage method.
+    fn capacity_probe_spec(&self, _roots: &AcpSessionRoots) -> Option<AcpSpawnSpec> {
+        None
+    }
+
     /// Client capabilities advertised in `initialize`.
     ///
     /// The default declares filesystem read/write and terminal support, which

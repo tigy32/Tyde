@@ -19,19 +19,19 @@ use futures_util::FutureExt;
 use protocol::{
     AgentActivityStats, AgentActivityStatsPayload, AgentBootstrapEvent, AgentBootstrapPayload,
     AgentCompactPayload, AgentErrorPayload, AgentId, AgentStartPayload, AskUserQuestion,
-    BackendKind, ChatEvent, ChatMessage, ChatMessageId, ClientErrorPayload,
-    ContextCompactionNotifyPayload, ContextCompactionTimelineEvent, Envelope,
-    FetchSessionHistoryPayload, FrameKind, HistoryPageRequestId, HostBootstrapPayload, ImageData,
-    ListSessionsPayload, McpServerConfig, McpServerId, McpServerUpsertPayload, McpTransportConfig,
-    MessageMetadataUpdateData, MessageSender, MessageTokenUsage, NewAgentPayload,
-    QueuedMessagesPayload, SendMessagePayload, SendMessageToolResponse, SessionHistoryPayload,
-    SessionId, SessionListPayload, SessionSchemaEntry, SessionSchemasPayload, SessionSettingValue,
-    SessionSettingsPayload, SessionSettingsSchema, SessionSettingsValues, SessionSummary,
-    SetSessionSettingsPayload, Skill, SkillId, SkillNotifyPayload, SkillRefreshPayload,
-    SpawnAgentParams, SpawnAgentPayload, SpawnCostHint, Steering, SteeringId,
-    SteeringNotifyPayload, SteeringScope, SteeringUpsertPayload, StreamPath, TaskList,
-    ToolExecutionCompletedData, ToolExecutionOutcome, ToolExecutionResult, ToolRequest,
-    ToolUseData,
+    BackendCapacityPayload, BackendCapacitySnapshot, BackendCapacityState, BackendKind, ChatEvent,
+    ChatMessage, ChatMessageId, ClientErrorPayload, ContextCompactionNotifyPayload,
+    ContextCompactionTimelineEvent, Envelope, FetchSessionHistoryPayload, FrameKind,
+    HistoryPageRequestId, HostBootstrapPayload, ImageData, ListSessionsPayload, McpServerConfig,
+    McpServerId, McpServerUpsertPayload, McpTransportConfig, MessageMetadataUpdateData,
+    MessageSender, MessageTokenUsage, NewAgentPayload, QueuedMessagesPayload, SendMessagePayload,
+    SendMessageToolResponse, SessionHistoryPayload, SessionId, SessionListPayload,
+    SessionSchemaEntry, SessionSchemasPayload, SessionSettingValue, SessionSettingsPayload,
+    SessionSettingsSchema, SessionSettingsValues, SessionSummary, SetSessionSettingsPayload, Skill,
+    SkillId, SkillNotifyPayload, SkillRefreshPayload, SpawnAgentParams, SpawnAgentPayload,
+    SpawnCostHint, Steering, SteeringId, SteeringNotifyPayload, SteeringScope,
+    SteeringUpsertPayload, StreamPath, TaskList, ToolExecutionCompletedData, ToolExecutionOutcome,
+    ToolExecutionResult, ToolRequest, ToolUseData,
 };
 use serde_json::json;
 use tyde_agent_adapter::BackendCapability;
@@ -469,6 +469,7 @@ pub struct Host {
     backend_kind: BackendKind,
     store: PathBuf,
     workspace: PathBuf,
+    latest_capacity: HashMap<BackendKind, BackendCapacitySnapshot>,
 }
 
 /// `git worktree add` is the only way to reach the CLI's session relocation, and
@@ -595,6 +596,7 @@ impl Host {
             backend_kind,
             store: store.to_path_buf(),
             workspace: workspace.to_path_buf(),
+            latest_capacity: HashMap::new(),
         }
     }
 
@@ -625,13 +627,42 @@ impl Host {
     async fn next_envelope(&mut self, timeout: Duration, context: &str) -> Envelope {
         let backend_kind = self.backend_kind;
         match tokio::time::timeout(timeout, self.client.next_event()).await {
-            Ok(Ok(Some(envelope))) => envelope,
+            Ok(Ok(Some(envelope))) => {
+                if envelope.kind == FrameKind::BackendCapacity {
+                    let payload: BackendCapacityPayload = envelope
+                        .parse_payload()
+                        .expect("parse BackendCapacityPayload");
+                    for snapshot in payload.snapshots {
+                        self.latest_capacity.insert(snapshot.backend_kind, snapshot);
+                    }
+                }
+                envelope
+            }
             Ok(Ok(None)) => panic!("connection closed while waiting for {context}"),
             Ok(Err(error)) => panic!("next_event failed waiting for {context}: {error:?}"),
             Err(_) => panic!(
                 "{backend_kind:?} timed out after {}s waiting for {context}",
                 timeout.as_secs()
             ),
+        }
+    }
+
+    pub async fn await_known_capacity(&mut self) -> BackendCapacitySnapshot {
+        let deadline = tokio::time::Instant::now() + CONTROL_TIMEOUT;
+        loop {
+            if let Some(snapshot) = self.latest_capacity.get(&self.backend_kind)
+                && matches!(snapshot.state, BackendCapacityState::Known { .. })
+            {
+                return snapshot.clone();
+            }
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "{:?}: timed out waiting for known subscription capacity; latest state: {:?}",
+                self.backend_kind,
+                self.latest_capacity.get(&self.backend_kind)
+            );
+            let _ = self.next_envelope(remaining, "BackendCapacity").await;
         }
     }
 }

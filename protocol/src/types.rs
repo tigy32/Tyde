@@ -2768,6 +2768,9 @@ pub enum CapacitySource {
     /// `agy -p "/usage"`, which answers without starting a turn or spending
     /// quota.
     AntigravityUsageCommand,
+    /// `kiro-cli-chat chat --agent-engine v1 --no-interactive /usage`, which
+    /// reports subscription credits without starting a model turn.
+    KiroUsageCommand,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -2813,6 +2816,9 @@ pub enum CapacityBucketId {
     Antigravity {
         bucket: String,
     },
+    Kiro {
+        bucket: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -2838,6 +2844,13 @@ pub enum ClaudeLimitType {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CapacityMeasure {
     UsedPercent {
+        used_percent: u8,
+        remaining_percent: u8,
+        provenance: ValueProvenance,
+    },
+    CreditUsage {
+        used: String,
+        limit: String,
         used_percent: u8,
         remaining_percent: u8,
         provenance: ValueProvenance,
@@ -2873,13 +2886,18 @@ impl CapacityMeasure {
             Self::UsedPercent { provenance, .. } if provenance.vendor_reported => {
                 Some(PercentValueProvenance::VendorReported)
             }
-            Self::UsedPercent { .. } => Some(PercentValueProvenance::DerivedFromVendorTotals),
+            Self::CreditUsage { provenance, .. } if provenance.vendor_reported => {
+                Some(PercentValueProvenance::VendorReported)
+            }
+            Self::UsedPercent { .. } | Self::CreditUsage { .. } => {
+                Some(PercentValueProvenance::DerivedFromVendorTotals)
+            }
             _ => None,
         }
     }
 
     pub fn remaining_percent_provenance(&self) -> Option<PercentValueProvenance> {
-        matches!(self, Self::UsedPercent { .. })
+        matches!(self, Self::UsedPercent { .. } | Self::CreditUsage { .. })
             .then_some(PercentValueProvenance::DerivedComplement)
     }
 }

@@ -125,6 +125,7 @@ fn source_label(source: CapacitySource) -> &'static str {
         CapacitySource::ClaudeControlUsage => "Claude",
         CapacitySource::CodexAccountRateLimitsUpdated => "Codex",
         CapacitySource::AntigravityUsageCommand => "Antigravity",
+        CapacitySource::KiroUsageCommand => "Kiro",
     }
 }
 
@@ -230,6 +231,7 @@ fn bucket_vendor_id_text(id: &CapacityBucketId) -> &'static str {
         },
         CapacityBucketId::ClaudeModel { .. } => "claude model",
         CapacityBucketId::Antigravity { .. } => "antigravity",
+        CapacityBucketId::Kiro { .. } => "kiro",
     }
 }
 
@@ -404,7 +406,8 @@ fn authoritative_bucket(report: &CapacityReport) -> Option<(&CapacityBucket, u8)
         .buckets
         .iter()
         .filter_map(|bucket| match &bucket.measure {
-            CapacityMeasure::UsedPercent { used_percent, .. } => Some((bucket, *used_percent)),
+            CapacityMeasure::UsedPercent { used_percent, .. }
+            | CapacityMeasure::CreditUsage { used_percent, .. } => Some((bucket, *used_percent)),
             CapacityMeasure::Credits { .. } | CapacityMeasure::ReportedWithoutMagnitude => None,
         })
         .max_by_key(|(_, used_percent)| *used_percent)
@@ -474,6 +477,27 @@ fn measure_view(bucket: &CapacityBucket, with_bar: bool) -> AnyView {
             }
             .into_any()
         }
+        CapacityMeasure::CreditUsage {
+            used,
+            limit,
+            used_percent,
+            ..
+        } => {
+            let percent = *used_percent;
+            let credits = format!("{used} of {limit} plan credits used");
+            view! {
+                <div class="capacity-measure">
+                    {with_bar.then(|| percent_bar(bucket, percent))}
+                    <span class="capacity-figures">
+                        <span class="capacity-figure capacity-figure-used">
+                            <span class="capacity-used">{format!("{percent}% used")}</span>
+                        </span>
+                        <span class="capacity-credit-usage">{credits}</span>
+                    </span>
+                </div>
+            }
+            .into_any()
+        }
         CapacityMeasure::Credits {
             has_credits,
             unlimited,
@@ -512,7 +536,10 @@ fn measure_view(bucket: &CapacityBucket, with_bar: bool) -> AnyView {
 /// as "weekly limit", and a Codex `primary` must never read as a Claude
 /// `five_hour`.
 fn bucket_row(bucket: &CapacityBucket) -> AnyView {
-    let has_percent = matches!(bucket.measure, CapacityMeasure::UsedPercent { .. });
+    let has_percent = matches!(
+        bucket.measure,
+        CapacityMeasure::UsedPercent { .. } | CapacityMeasure::CreditUsage { .. }
+    );
     let reset = match reset_texts(&bucket.reset) {
         Some((absolute, relative)) => format!("resets {absolute} \u{b7} {relative}"),
         None => "reset not reported".to_owned(),
@@ -1035,6 +1062,43 @@ mod wasm_tests {
         }
     }
 
+    fn kiro_known() -> BackendCapacitySnapshot {
+        BackendCapacitySnapshot {
+            backend_kind: BackendKind::Kiro,
+            state: BackendCapacityState::Known {
+                report: CapacityReport {
+                    source: CapacitySource::KiroUsageCommand,
+                    observed_at_ms: None,
+                    plan: Some(protocol::CapacityPlanLabel {
+                        label: "KIRO FREE".to_owned(),
+                    }),
+                    buckets: vec![CapacityBucket {
+                        id: CapacityBucketId::Kiro {
+                            bucket: "credits".to_owned(),
+                        },
+                        label: "plan credits".to_owned(),
+                        measure: CapacityMeasure::CreditUsage {
+                            used: "25.13".to_owned(),
+                            limit: "50".to_owned(),
+                            used_percent: 50,
+                            remaining_percent: 50,
+                            provenance: ValueProvenance {
+                                vendor_reported: true,
+                            },
+                        },
+                        scope: CapacityScope::Account,
+                        window: CapacityWindow::NotReported,
+                        reset: CapacityReset::NotReported,
+                        status: None,
+                    }],
+                    coverage: CapacityCoverage::RepresentativeBucketOnly,
+                },
+            },
+            retrieved_at_ms: now_ms(),
+            freshness: fresh(),
+        }
+    }
+
     /// A Codex window bucket as `map_passive_rate_limits_updated` builds one:
     /// the vendor's `limitName` prefixes the slot label, rolling window, no
     /// status, `Individual` scope (this fixture's `individualLimit` is true).
@@ -1486,8 +1550,8 @@ mod wasm_tests {
 
     /// The page's subject is how much quota you have left, so the backends that
     /// actually report some come first. Alphabetical order alone buried Codex
-    /// and Claude — the only two vendors with a capacity source — under Kiro
-    /// and Antigravity, which can never have anything to say.
+    /// and Claude under silent providers. Kiro's usage probe makes it a third
+    /// reporting backend.
     ///
     /// Order within each group is the shared preference order, so the list is
     /// stable: only a backend gaining or losing its report moves a card.
@@ -1509,7 +1573,7 @@ mod wasm_tests {
             "h-cap-order",
             0,
             vec![
-                silent(BackendKind::Kiro),
+                kiro_known(),
                 silent(BackendKind::Antigravity),
                 claude_known(),
                 codex_known(),
@@ -1537,15 +1601,23 @@ mod wasm_tests {
         };
 
         assert_eq!(title_of(0), "Codex", "a reporting backend leads the list");
-        assert_eq!(title_of(1), "Claude", "then the other reporting backend");
+        assert_eq!(title_of(1), "Claude", "then the next reporting backend");
         assert_eq!(
-            (title_of(2), title_of(3), title_of(4)),
-            (
-                "Hermes".to_owned(),
-                "Antigravity".to_owned(),
-                "Kiro".to_owned()
-            ),
+            title_of(2),
+            "Kiro",
+            "Kiro's usage report stays with reporters"
+        );
+        assert_eq!(
+            (title_of(3), title_of(4)),
+            ("Hermes".to_owned(), "Antigravity".to_owned()),
             "backends with no capacity source fall below, in preference order"
+        );
+        let text = text_of(&container);
+        assert!(
+            text.contains("KIRO FREE")
+                && text.contains("50% used")
+                && text.contains("25.13 of 50 plan credits used"),
+            "Kiro's plan and numeric usage must be visible, got: {text}"
         );
 
         // Vertical geometry, not just DOM order: the reader sees the numbers
@@ -1566,7 +1638,7 @@ mod wasm_tests {
             .top();
         assert!(
             codex_top < kiro_top,
-            "the reporting card must render above the silent one, got {codex_top} vs {kiro_top}"
+            "reporting cards follow preference order, got {codex_top} vs {kiro_top}"
         );
     }
 

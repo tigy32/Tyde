@@ -8,9 +8,11 @@ subscription.
 downgrades, or falls back between backends, accounts, or models. It never makes
 a paid model call. It never guesses a number.
 
-Phase 1 is **passive-only**: both sources report as a side effect of turns the
-user already ran. There is no polling, no background collection, and no refresh
-action — there is nothing to refresh.
+Collection is bounded and backend-native. Claude and Codex use their existing
+provider control channels; Kiro and Antigravity run their documented read-only
+`/usage` commands. The command probes never start a model turn or spend model
+tokens, are rate-limited to once per two minutes, and have hard timeouts. There
+is no free-running polling loop or manual refresh action.
 
 ---
 
@@ -33,15 +35,17 @@ arithmetic.
 
 ## 2. Where the data comes from
 
-| Backend | Phase-1 source | Cost | Coverage |
+| Backend | Source | Cost | Coverage |
 |---|---|---|---|
-| **Claude** | `rate_limit_event` on the existing stream-json pipe | zero | `RepresentativeBucketOnly` |
-| **Codex** | `account/rateLimits/updated` on the existing app-server connection | zero | `AllVendorBuckets` |
-| Antigravity, Hermes, ACP, Tycode | — | — | `Unsupported { BackendHasNoCapacitySource }` |
+| **Claude** | `get_usage` on the existing control channel, with `rate_limit_event` as an early fallback | zero | vendor-dependent |
+| **Codex** | `account/rateLimits/read` on the existing app-server connection | zero | `AllVendorBuckets` |
+| **Kiro** | `kiro-cli-chat chat --agent-engine v1 --no-interactive /usage` | zero model turns | `RepresentativeBucketOnly` |
+| **Antigravity** | `agy -p /usage` | zero model turns | `AllVendorBuckets` |
+| Hermes, custom ACP agents, Tycode | — | — | `Unsupported { BackendHasNoCapacitySource }` |
 
-Both sources are frames Tyde's subprocess pipes **already carry** and previously
-dropped. Consuming them costs no new process, no network call, no credential
-access, and no billing.
+The control-channel sources reuse already-open processes. The command sources
+start short-lived read-only processes and rely on the provider CLI's existing
+login; Tyde does not open credential files or copy credentials onto the wire.
 
 ### Coverage is load-bearing, not a footnote
 
@@ -52,17 +56,22 @@ one-bucket Claude report and a complete Codex report would render identically,
 and a user looking at a healthy Claude row would have no way to know a
 *different* Claude limit sits at 98%.
 
-So **every Phase 1 UI surface renders coverage as text** — Settings and the
+So **every UI surface renders coverage as text** — Settings and the
 popup. Capacity has no MCP or agent-control exposure in this phase.
 It is never a tooltip and never hover-only.
 
 ### Unit scales differ between vendors
 
 Claude's `utilization` is a **fraction 0..1**. Codex's `usedPercent` is already
-**0..100**. The backend adapters convert both to a single 0..=100 scale exactly
+**0..100**, and Kiro prints a percent beside its credit totals. The backend
+adapters convert these to a single 0..=100 scale exactly
 once, at the boundary. This is a lossless unit conversion, not a semantic
 normalization — and getting it wrong ships a 100×-off bar, so it is pinned by
 tests on both the server and the UI side.
+
+Kiro's typed `CreditUsage` measure also preserves the exact `used` and `limit`
+values (`25.13 of 50`, for example). Its reset is date-only with no timezone, so
+Tyde leaves `CapacityReset` as `NotReported` instead of inventing an instant.
 
 ### Provenance is per value, not per measure
 
@@ -77,7 +86,7 @@ same origin:
   supplies it directly. It is the **only** derived value anywhere in the model.
 
 `ValueProvenance.vendor_reported` is the wire-compatible provenance flag for
-`used_percent`, and both Phase-1 adapters set it to `true`. The protocol's
+`used_percent`. The protocol's
 `used_percent_provenance()` and `remaining_percent_provenance()` identify the
 two values independently: vendor-reported used and derived-complement remaining.
 
@@ -140,9 +149,9 @@ credits bucket takes its scope from `rateLimitReachedType`, which reports a
 workspace or organization condition when there is one and `NotReported`
 otherwise.
 
-Both adapters set `provenance.vendor_reported: true`. That is the **only**
-`UsedPercent` shape either one produces, and it is the only shape a UI fixture
-may use.
+The adapters mark a directly printed percentage as vendor-reported. If a source
+reports only exact totals, the percentage may instead be derived from those
+totals and is marked accordingly.
 
 ### Not sources — and why
 
@@ -159,9 +168,9 @@ may use.
   secret-bearing file Tyde has never opened (and on some installs the data is in
   the Keychain instead, so a file read would be silently machine-dependent).
   Claude's plan is therefore reported as **absent**, not guessed.
-- **Codex `account/rateLimits/read`** — an *active* read whose auth, error, and
-  billing behavior is unverified. It is **gated**: not implemented, not called,
-  not polled, until a bounded one-shot verification is explicitly approved.
+- **ACP `/usage`** — Kiro's ACP implementation reduces the response to a plan
+  name and bucket count, discarding the numeric values. The V1 non-interactive
+  CLI command is therefore the numeric source.
 
 ---
 
@@ -189,23 +198,18 @@ report or a false awaiting state.
 failed validation is discarded whole. Its values are not partially trusted and
 no figure is shown.
 
-**`Stale` is the normal steady state, not an error.** With passive-only sources,
-an idle account's data simply ages. That is designed for and labelled, not
-hidden.
+**`Stale` is the normal steady state, not an error.** An idle account's data
+simply ages. That is designed for and labelled, not hidden.
 
 None of `Unavailable`, `Unsupported`, `Stale`, `AuthError`, or `RateLimited` may
 ever render as "has capacity". A hidden row reads as "fine", and an empty
 progress bar reads as "0% used" — both are the exact lie this feature exists to
 prevent.
 
-**`AuthError` and `RateLimited` are not reachable in Phase 1.** They exist in the
-protocol and the UI renders them, but no passive code path produces them; they
-arrive with the gated Codex read. Nothing may fabricate a fixture for them.
-
 ### Freshness is the server's verdict, and only the server's
 
 `CapacityFreshness` is `Fresh { age_ms }` or `Stale { age_ms, threshold_ms }`,
-with a **60-minute** threshold for both backends. Clients render it **verbatim**
+with a **60-minute** threshold for every backend. Clients render it **verbatim**
 and never run a clock against `retrieved_at_ms` to second-guess it. If they did,
 desktop and mobile would disagree about the same snapshot and both could drift
 from the server's verdict.
@@ -226,10 +230,9 @@ render that age and never "just now"; and a report past the threshold, emitted a
 
 Capacity is a property of **(host, backend)** — never global, never per-agent.
 
-There is a subtlety worth stating plainly: both passive sources arrive on a
-**per-agent pipe** (Claude's `rate_limit_event` carries a `session_id`; Codex's
-notification arrives on that agent's app-server connection), but both describe
-**account-wide** state. So the host actor stores the snapshot at (host, backend),
+There is a subtlety worth stating plainly: reports are collected through a
+**per-agent process**, but describe **account-wide** state. So the host actor
+stores the snapshot at (host, backend),
 accepts reports from *any* agent's connection for that backend, and never keys
 it by agent. Closing an agent does not clear the snapshot.
 
@@ -278,7 +281,7 @@ disconnect, and the server replays the current snapshot on the next subscribe.
 ## 6. What the UI must do
 
 The frontends are a pure projection of the server snapshot. They keep no cache,
-run no freshness timer, infer nothing, and (in phase 1) offer no refresh button.
+run no freshness timer, infer nothing, and offer no refresh button.
 
 **Desktop** — `frontend/src/components/backend_capacity.rs`:
 
@@ -358,25 +361,22 @@ if it does.
 
 Stated plainly so none of it is mistaken for a gap to be quietly filled later.
 
-- **Any background polling, for either backend.** Phase 1 is passive-only.
+- **Any free-running background polling.** Command probes run only when a live
+  backend session supplies the host-owned emitter and at bounded turn
+  boundaries.
 - **Any MCP / agent-control / orchestrator exposure.** See §7.
 - **A refresh action.** Nothing to refresh; the UI says so rather than showing a
   dead button.
-- **`AuthError` and `RateLimited` state in practice.** The protocol carries them
-  and the UI renders them, but no passive code path emits them. No fixture may
-  pretend otherwise.
-- **Codex `account/rateLimits/read`** — gated, pending an explicitly approved
-  one-shot verification of its auth/error/billing behavior.
 - **Claude multi-bucket capacity.** Claude reports one binding bucket;
   everything else is `RepresentativeBucketOnly`. `/api/oauth/usage` is out of
   scope — it is undocumented, would require Tyde to hold the user's OAuth token,
   and its `refreshOAuth: true` means a "status read" can *rotate stored
   credentials*.
-- **Claude capacity before the first turn** — no data exists.
-  `AwaitingFirstReport`, not 0%.
+- **Capacity before the first successful provider read** — represented as
+  `AwaitingFirstReport`, never 0%.
 - **Claude plan/limit label** — would require reading a secret-bearing file.
-- **Codex capacity with no Codex agent running** — no app-server connection, no
-  notification.
+- **Fresh capacity with no backend agent running** — there is no provider
+  connection or CLI trigger.
 - **Dollar amounts for Claude** — never reported by these sources.
 - **Cross-vendor comparison, or any merged percentage.**
 - **Org/workspace/seat disambiguation beyond what the vendor states** —

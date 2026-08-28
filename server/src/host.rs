@@ -17859,9 +17859,11 @@ fn initial_backend_capacity_snapshots() -> HashMap<BackendKind, BackendCapacityS
         .into_iter()
         .map(|backend_kind| {
             let state = match backend_kind {
-                BackendKind::Claude | BackendKind::Codex => BackendCapacityState::Unavailable {
-                    reason: protocol::CapacityUnavailableReason::AwaitingFirstReport,
-                },
+                BackendKind::Kiro | BackendKind::Claude | BackendKind::Codex => {
+                    BackendCapacityState::Unavailable {
+                        reason: protocol::CapacityUnavailableReason::AwaitingFirstReport,
+                    }
+                }
                 _ => BackendCapacityState::Unsupported {
                     reason: protocol::CapacityUnsupportedReason::BackendHasNoCapacitySource,
                 },

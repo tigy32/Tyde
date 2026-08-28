@@ -6,12 +6,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::process::Command;
+use tokio::sync::{Mutex, mpsc, oneshot, watch};
 
 use protocol::{
-    ChatMessageId, ContextBreakdown, ImageData, MessageTokenUsage, ModelInfo, ReasoningData,
-    TokenUsage, TokenUsageUnavailableReason, ToolExecutionOutcome, ToolExecutionResult,
-    ToolRequestType, ToolUseData,
+    BackendCapacityState, CapacityBucket, CapacityBucketId, CapacityCoverage, CapacityMeasure,
+    CapacityPlanLabel, CapacityReport, CapacityReset, CapacityScope, CapacitySource,
+    CapacityUnavailableReason, CapacityWindow, ChatMessageId, ContextBreakdown, ImageData,
+    MessageTokenUsage, ModelInfo, ReasoningData, TokenUsage, TokenUsageUnavailableReason,
+    ToolExecutionOutcome, ToolExecutionResult, ToolRequestType, ToolUseData, ValueProvenance,
 };
 
 use crate::acp::adapter::{
@@ -19,8 +22,9 @@ use crate::acp::adapter::{
     AcpSessionKind, adapter_for_spec,
 };
 use crate::acp::{
-    AcpBridge, AcpInbound, acp_mcp_servers_json, extract_message_id, extract_text_from_update,
-    extract_tool_call_id, map_plan_status, parse_tool_call_completion, parse_tool_call_request,
+    AcpBridge, AcpInbound, AcpSpawnSpec, acp_mcp_servers_json, extract_message_id,
+    extract_text_from_update, extract_tool_call_id, map_plan_status, parse_tool_call_completion,
+    parse_tool_call_request,
 };
 use crate::backend::turn_emitter::{
     AgentName, ResponseHandle, RetryAttemptPayload, StreamEndPayload, TurnEmitter,
@@ -30,6 +34,7 @@ use crate::backend::{
     normalize_mcp_call_tool_result, render_combined_spawn_instructions,
 };
 use crate::process_env;
+use crate::sub_agent::SubAgentEmitter;
 use crate::subprocess::ImageAttachment;
 
 pub(crate) const KIRO_AGENT_NAME: &str = "kiro";
@@ -38,6 +43,8 @@ pub(crate) const KIRO_EPHEMERAL_SESSION_SUBDIR: &str = ".tyde/kiro-ephemeral";
 const KIRO_SCHEMA_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 const KIRO_SCHEMA_PROBE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 const KIRO_PROMPT_MAX_RETRIES: u64 = 5;
+const KIRO_CAPACITY_TIMEOUT: Duration = Duration::from_secs(20);
+const KIRO_CAPACITY_REFRESH_INTERVAL: Duration = Duration::from_secs(120);
 
 fn kiro_prompt_error_is_retryable(error: &str) -> bool {
     let error = error.to_ascii_lowercase();
@@ -530,6 +537,9 @@ impl KiroSession {
 
         let (event_tx, event_rx) = mpsc::unbounded_channel();
 
+        let capacity_probe = (!mode.admin_session)
+            .then(|| adapter.capacity_probe_spec(&roots))
+            .flatten();
         let inner = Arc::new(KiroInner {
             adapter,
             capabilities,
@@ -540,6 +550,8 @@ impl KiroSession {
             )),
             shutting_down: AtomicBool::new(false),
             ssh_host: mode.ssh_host,
+            capacity_probe,
+            capacity_state: Mutex::new(KiroCapacityState::default()),
             state: Mutex::new(KiroState {
                 session_id,
                 workspace_root: roots.scope_root,
@@ -590,6 +602,10 @@ impl KiroSession {
         KiroCommandHandle {
             inner: Arc::clone(&self.inner),
         }
+    }
+
+    pub(crate) async fn set_subagent_emitter(&self, emitter: Arc<dyn SubAgentEmitter>) {
+        self.inner.set_capacity_emitter(emitter).await;
     }
 
     pub async fn shutdown(self) {
@@ -678,9 +694,118 @@ struct KiroInner {
     state: Mutex<KiroState>,
     shutting_down: AtomicBool,
     ssh_host: Option<String>,
+    capacity_probe: Option<AcpSpawnSpec>,
+    capacity_state: Mutex<KiroCapacityState>,
+}
+
+#[derive(Default)]
+struct KiroCapacityState {
+    emitter: Option<Arc<dyn SubAgentEmitter>>,
+    read_at: Option<std::time::Instant>,
+    in_flight: bool,
 }
 
 impl KiroInner {
+    async fn set_capacity_emitter(self: &Arc<Self>, emitter: Arc<dyn SubAgentEmitter>) {
+        self.capacity_state.lock().await.emitter = Some(emitter.clone());
+        if self.capacity_probe.is_none() {
+            emitter.on_backend_capacity(
+                protocol::BackendKind::Kiro,
+                BackendCapacityState::Unsupported {
+                    reason: protocol::CapacityUnsupportedReason::ExternalProvider,
+                },
+            );
+            return;
+        }
+        self.spawn_capacity_refresh(false).await;
+    }
+
+    async fn spawn_capacity_refresh(self: &Arc<Self>, force: bool) {
+        let emitter = {
+            let mut state = self.capacity_state.lock().await;
+            if state.in_flight
+                || (!force
+                    && state
+                        .read_at
+                        .is_some_and(|last| last.elapsed() < KIRO_CAPACITY_REFRESH_INTERVAL))
+            {
+                return;
+            }
+            let Some(emitter) = state.emitter.clone() else {
+                return;
+            };
+            state.in_flight = true;
+            state.read_at = Some(std::time::Instant::now());
+            emitter
+        };
+        let inner = Arc::clone(self);
+        tokio::spawn(async move {
+            let capacity = inner.read_kiro_capacity().await;
+            inner.capacity_state.lock().await.in_flight = false;
+            emitter.on_backend_capacity(protocol::BackendKind::Kiro, capacity);
+        });
+    }
+
+    async fn read_kiro_capacity(&self) -> BackendCapacityState {
+        let Some(spec) = self.capacity_probe.as_ref() else {
+            return BackendCapacityState::Unsupported {
+                reason: protocol::CapacityUnsupportedReason::ExternalProvider,
+            };
+        };
+        let output = if let Some(host) = self.ssh_host.as_deref() {
+            let mut parts = Vec::new();
+            if let Some(cwd) = spec.remote_cwd.as_deref() {
+                parts.push(format!("cd {} &&", crate::remote::shell_quote_arg(cwd)));
+            }
+            parts.push(crate::remote::shell_quote_command(&spec.remote_args));
+            tokio::time::timeout(
+                KIRO_CAPACITY_TIMEOUT,
+                crate::remote::run_ssh_raw(host, &parts.join(" ")),
+            )
+            .await
+            .map_err(|_| CapacityUnavailableReason::SourceTimedOut)
+            .and_then(|result| result.map_err(|_| CapacityUnavailableReason::SourceUnreachable))
+        } else {
+            let mut command = Command::new(&spec.local_program);
+            command.args(&spec.local_args);
+            if let Some(cwd) = spec.local_cwd.as_deref() {
+                command.current_dir(cwd);
+            }
+            if let Some(path) = process_env::resolved_child_process_path() {
+                command.env("PATH", path);
+            }
+            command
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped());
+            tokio::time::timeout(KIRO_CAPACITY_TIMEOUT, command.output())
+                .await
+                .map_err(|_| CapacityUnavailableReason::SourceTimedOut)
+                .and_then(|result| result.map_err(|_| CapacityUnavailableReason::SourceUnreachable))
+        };
+        let output = match output {
+            Ok(output) => output,
+            Err(reason) => return BackendCapacityState::Unavailable { reason },
+        };
+        let mut capture = String::from_utf8_lossy(&output.stdout).into_owned();
+        capture.push('\n');
+        capture.push_str(&String::from_utf8_lossy(&output.stderr));
+        tracing::debug!(
+            success = output.status.success(),
+            output_bytes = capture.len(),
+            "Kiro usage probe completed"
+        );
+        if !output.status.success() {
+            return BackendCapacityState::Unavailable {
+                reason: CapacityUnavailableReason::SourceUnreachable,
+            };
+        }
+        match map_kiro_capacity(&capture) {
+            Ok(report) => BackendCapacityState::Known { report },
+            Err(reason) => BackendCapacityState::Unavailable { reason },
+        }
+    }
+
     async fn request_prompt_with_retry(&self, params: Value) -> Result<Value, String> {
         let mut attempt = 0u64;
         loop {
@@ -716,7 +841,7 @@ impl KiroInner {
         }
     }
 
-    async fn execute(&self, command: SessionCommand) -> Result<(), String> {
+    async fn execute(self: &Arc<Self>, command: SessionCommand) -> Result<(), String> {
         match command {
             SessionCommand::CancelBackgroundTask { tool_call_id } => Err(format!(
                 "this backend cannot cancel background command {tool_call_id}"
@@ -863,6 +988,7 @@ impl KiroInner {
 
                 self.finalize_active_stream_if_any(Some(response), true)
                     .await;
+                self.spawn_capacity_refresh(false).await;
                 Ok(())
             }
             SessionCommand::CancelConversation => {
@@ -3629,6 +3755,138 @@ pub(crate) fn unix_now_ms() -> u64 {
         .as_millis() as u64
 }
 
+fn map_kiro_capacity(capture: &str) -> Result<CapacityReport, CapacityUnavailableReason> {
+    let clean = strip_ansi_and_controls(capture);
+    let lines = clean
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+    let plan = lines
+        .iter()
+        .find_map(|line| {
+            let (label, value) = line.split_once(':')?;
+            label.eq_ignore_ascii_case("plan").then(|| value.trim())
+        })
+        .or_else(|| {
+            lines.iter().find_map(|line| {
+                line.to_ascii_lowercase()
+                    .starts_with("estimated usage")
+                    .then(|| line.rsplit('|').next().map(str::trim))
+                    .flatten()
+            })
+        });
+    let plan = match plan {
+        Some(value)
+            if !value.is_empty() && value.len() <= 128 && !value.chars().any(char::is_control) =>
+        {
+            Some(CapacityPlanLabel {
+                label: value.to_string(),
+            })
+        }
+        Some(_) => return Err(CapacityUnavailableReason::MalformedReport),
+        None => None,
+    };
+
+    let reported_percent = lines.iter().find_map(|line| {
+        line.split_whitespace().find_map(|token| {
+            token
+                .trim_matches(|ch: char| !ch.is_ascii_digit() && ch != '.' && ch != '%')
+                .strip_suffix('%')
+                .and_then(|value| value.parse::<f64>().ok())
+                .filter(|value| (0.0..=100.0).contains(value))
+        })
+    });
+    let covered = kiro_covered_credits(&clean);
+    let percent = reported_percent.or_else(|| {
+        covered.and_then(|(used, total)| (total > 0.0).then_some((used / total) * 100.0))
+    });
+    let Some(percent) = percent else {
+        return Err(CapacityUnavailableReason::MalformedReport);
+    };
+    let used_percent = percent.round().clamp(0.0, 100.0) as u8;
+    tracing::debug!(
+        plan_reported = plan.is_some(),
+        exact_percent_reported = reported_percent.is_some(),
+        covered_totals_reported = covered.is_some(),
+        used_percent,
+        "Parsed Kiro subscription capacity"
+    );
+    Ok(CapacityReport {
+        source: CapacitySource::KiroUsageCommand,
+        observed_at_ms: None,
+        plan,
+        buckets: vec![CapacityBucket {
+            id: CapacityBucketId::Kiro {
+                bucket: "credits".to_string(),
+            },
+            label: "plan credits".to_string(),
+            measure: match covered {
+                Some((used, limit)) => CapacityMeasure::CreditUsage {
+                    used: format_capacity_decimal(used),
+                    limit: format_capacity_decimal(limit),
+                    used_percent,
+                    remaining_percent: 100 - used_percent,
+                    provenance: ValueProvenance {
+                        vendor_reported: reported_percent.is_some(),
+                    },
+                },
+                None => CapacityMeasure::UsedPercent {
+                    used_percent,
+                    remaining_percent: 100 - used_percent,
+                    provenance: ValueProvenance {
+                        vendor_reported: true,
+                    },
+                },
+            },
+            scope: CapacityScope::Account,
+            window: CapacityWindow::NotReported,
+            reset: CapacityReset::NotReported,
+            status: None,
+        }],
+        coverage: CapacityCoverage::RepresentativeBucketOnly,
+    })
+}
+
+fn format_capacity_decimal(value: f64) -> String {
+    let formatted = format!("{value:.6}");
+    formatted
+        .trim_end_matches('0')
+        .trim_end_matches('.')
+        .to_string()
+}
+
+fn kiro_covered_credits(input: &str) -> Option<(f64, f64)> {
+    let normalized = input.replace(',', "");
+    let lower = normalized.to_ascii_lowercase();
+    let covered = lower.find("covered in plan")?;
+    let prefix = &normalized[..covered];
+    let separator = prefix.to_ascii_lowercase().rfind(" of ")?;
+    let used = numeric_tokens(&prefix[..separator]).pop()?.parse().ok()?;
+    let total = numeric_tokens(&prefix[separator + 4..])
+        .into_iter()
+        .next()?
+        .parse()
+        .ok()?;
+    Some((used, total))
+}
+
+fn numeric_tokens(input: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    for ch in input.chars() {
+        if ch.is_ascii_digit() || ch == '.' {
+            current.push(ch);
+        } else if !current.is_empty() {
+            tokens.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    tokens
+}
+
 #[cfg(unix)]
 fn is_pid_alive(pid: u32) -> bool {
     std::process::Command::new("kill")
@@ -3874,6 +4132,13 @@ pub struct KiroBackend {
     input_tx: mpsc::UnboundedSender<AgentInput>,
     interrupt_tx: mpsc::UnboundedSender<()>,
     session_id: Arc<std::sync::Mutex<Option<SessionId>>>,
+    subagent_emitter_tx: watch::Sender<Option<Arc<dyn SubAgentEmitter>>>,
+}
+
+impl KiroBackend {
+    pub(crate) async fn set_subagent_emitter(&self, emitter: Arc<dyn SubAgentEmitter>) {
+        let _ = self.subagent_emitter_tx.send(Some(emitter));
+    }
 }
 
 struct KiroStartupTaskGuard(Option<tokio::task::AbortHandle>);
@@ -3949,6 +4214,7 @@ impl Backend for KiroBackend {
             tyde_agent_adapter::BackendCapability::TaskListClear,
             tyde_agent_adapter::BackendCapability::GenericWebSearch,
             tyde_agent_adapter::BackendCapability::GenericViewImage,
+            tyde_agent_adapter::BackendCapability::CapacityTelemetry,
         ]
         .into()
     }
@@ -3994,6 +4260,8 @@ impl Backend for KiroBackend {
         let session_id = Arc::new(std::sync::Mutex::new(None));
         let session_id_task = Arc::clone(&session_id);
         let (ready_tx, ready_rx) = oneshot::channel::<Result<(), String>>();
+        let (subagent_emitter_tx, mut subagent_emitter_rx) =
+            watch::channel::<Option<Arc<dyn SubAgentEmitter>>>(None);
 
         let startup_task = tokio::spawn(async move {
             let mut ready_tx: Option<oneshot::Sender<Result<(), String>>> = Some(ready_tx);
@@ -4074,6 +4342,15 @@ impl Backend for KiroBackend {
 
             loop {
                 tokio::select! {
+                    changed = subagent_emitter_rx.changed() => {
+                        if changed.is_err() {
+                            break;
+                        }
+                        let emitter = { subagent_emitter_rx.borrow().clone() };
+                        if let Some(emitter) = emitter {
+                            session.set_subagent_emitter(emitter).await;
+                        }
+                    }
                     maybe_error = command_error_rx.recv() => {
                         let Some(error) = maybe_error else {
                             break;
@@ -4151,6 +4428,7 @@ impl Backend for KiroBackend {
                 input_tx,
                 interrupt_tx,
                 session_id,
+                subagent_emitter_tx,
             },
             EventStream::new(events_rx),
         ))
@@ -4170,6 +4448,8 @@ impl Backend for KiroBackend {
         let known_session_id = Arc::new(std::sync::Mutex::new(Some(session_id.clone())));
         let known_session_id_task = Arc::clone(&known_session_id);
         let (ready_tx, ready_rx) = oneshot::channel::<Result<(), String>>();
+        let (subagent_emitter_tx, mut subagent_emitter_rx) =
+            watch::channel::<Option<Arc<dyn SubAgentEmitter>>>(None);
 
         let startup_task = tokio::spawn(async move {
             let mut ready_tx: Option<oneshot::Sender<Result<(), String>>> = Some(ready_tx);
@@ -4259,6 +4539,15 @@ impl Backend for KiroBackend {
             let (command_error_tx, mut command_error_rx) = mpsc::unbounded_channel::<String>();
             loop {
                 tokio::select! {
+                    changed = subagent_emitter_rx.changed() => {
+                        if changed.is_err() {
+                            break;
+                        }
+                        let emitter = { subagent_emitter_rx.borrow().clone() };
+                        if let Some(emitter) = emitter {
+                            session.set_subagent_emitter(emitter).await;
+                        }
+                    }
                     maybe_error = command_error_rx.recv() => {
                         let Some(error) = maybe_error else {
                             break;
@@ -4335,6 +4624,7 @@ impl Backend for KiroBackend {
                 input_tx,
                 interrupt_tx,
                 session_id: known_session_id,
+                subagent_emitter_tx,
             },
             EventStream::new_with_resume_replay_barrier(events_rx, resume_replay_complete_rx),
         ))

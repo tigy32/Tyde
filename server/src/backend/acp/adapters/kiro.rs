@@ -142,6 +142,26 @@ impl AcpAgentAdapter for KiroAdapter {
         Ok(spawn)
     }
 
+    fn capacity_probe_spec(&self, roots: &AcpSessionRoots) -> Option<AcpSpawnSpec> {
+        let configured = self.spec.command.trim();
+        let program = if configured.is_empty() {
+            kiro_impl::resolve_kiro_chat_binary()
+        } else {
+            configured.to_string()
+        };
+        let mut spec = AcpSpawnSpec::new(
+            "Kiro usage",
+            program,
+            &["chat", "--agent-engine", "v1", "--no-interactive", "/usage"],
+        )
+        .with_local_cwd(roots.session_cwd.clone())
+        .with_remote_cwd(roots.session_cwd.clone());
+        if configured.is_empty() {
+            spec.remote_args[0] = "kiro-cli-chat".to_string();
+        }
+        Some(spec)
+    }
+
     fn decorate_session_new(&self, params: &mut Value, ctx: &AcpRequestCtx<'_>) {
         // Kiro takes Tyde's combined system/steering instructions as a
         // non-standard `systemPrompt` on session creation.

@@ -128,6 +128,7 @@ fn source_label(source: CapacitySource) -> &'static str {
         CapacitySource::ClaudeControlUsage => "Claude",
         CapacitySource::CodexAccountRateLimitsUpdated => "Codex",
         CapacitySource::AntigravityUsageCommand => "Antigravity",
+        CapacitySource::KiroUsageCommand => "Kiro",
     }
 }
 
@@ -220,6 +221,7 @@ fn bucket_vendor_id_text(id: &CapacityBucketId) -> &'static str {
         },
         CapacityBucketId::ClaudeModel { .. } => "claude model",
         CapacityBucketId::Antigravity { .. } => "antigravity",
+        CapacityBucketId::Kiro { .. } => "kiro",
     }
 }
 
@@ -379,7 +381,8 @@ fn authoritative_bucket(report: &CapacityReport) -> Option<(&CapacityBucket, u8)
         .buckets
         .iter()
         .filter_map(|bucket| match &bucket.measure {
-            CapacityMeasure::UsedPercent { used_percent, .. } => Some((bucket, *used_percent)),
+            CapacityMeasure::UsedPercent { used_percent, .. }
+            | CapacityMeasure::CreditUsage { used_percent, .. } => Some((bucket, *used_percent)),
             CapacityMeasure::Credits { .. } | CapacityMeasure::ReportedWithoutMagnitude => None,
         })
         .max_by_key(|(_, used_percent)| *used_percent)
@@ -425,6 +428,28 @@ fn measure_view(bucket: &CapacityBucket) -> AnyView {
                     <span class="capacity-figures">
                         <span class="capacity-figure capacity-figure-used">
                             <span class="capacity-used">{format!("{used}% used")}</span>
+                        </span>
+                    </span>
+                </div>
+            }
+            .into_any()
+        }
+        CapacityMeasure::CreditUsage {
+            used,
+            limit,
+            used_percent,
+            ..
+        } => {
+            let percent = *used_percent;
+            view! {
+                <div class="capacity-measure">
+                    {percent_bar(bucket, percent)}
+                    <span class="capacity-figures">
+                        <span class="capacity-figure capacity-figure-used">
+                            <span class="capacity-used">{format!("{percent}% used")}</span>
+                        </span>
+                        <span class="capacity-credit-usage">
+                            {format!("{used} of {limit} plan credits used")}
                         </span>
                     </span>
                 </div>
@@ -847,6 +872,43 @@ mod wasm_tests {
         }
     }
 
+    fn kiro_known() -> BackendCapacitySnapshot {
+        BackendCapacitySnapshot {
+            backend_kind: BackendKind::Kiro,
+            state: BackendCapacityState::Known {
+                report: CapacityReport {
+                    source: CapacitySource::KiroUsageCommand,
+                    observed_at_ms: None,
+                    plan: Some(CapacityPlanLabel {
+                        label: "KIRO FREE".to_owned(),
+                    }),
+                    buckets: vec![CapacityBucket {
+                        id: CapacityBucketId::Kiro {
+                            bucket: "credits".to_owned(),
+                        },
+                        label: "plan credits".to_owned(),
+                        measure: CapacityMeasure::CreditUsage {
+                            used: "25.13".to_owned(),
+                            limit: "50".to_owned(),
+                            used_percent: 50,
+                            remaining_percent: 50,
+                            provenance: ValueProvenance {
+                                vendor_reported: true,
+                            },
+                        },
+                        scope: CapacityScope::Account,
+                        window: CapacityWindow::NotReported,
+                        reset: CapacityReset::NotReported,
+                        status: None,
+                    }],
+                    coverage: CapacityCoverage::RepresentativeBucketOnly,
+                },
+            },
+            retrieved_at_ms: now_ms(),
+            freshness: fresh(),
+        }
+    }
+
     fn codex_known() -> BackendCapacitySnapshot {
         BackendCapacitySnapshot {
             backend_kind: BackendKind::Codex,
@@ -930,36 +992,24 @@ mod wasm_tests {
 
     /// Mobile shows the same authoritative meaning as desktop: every vendor
     /// bucket, each with its own unit and window, plus the coverage statement.
-    /// Nothing is dropped for lack of screen width. The ACP snapshot is a
-    /// backend with no capacity source at all — it still renders, and it sorts
-    /// below the two that report, so the numbers lead on the small screen too.
+    /// Nothing is dropped for lack of screen width. Kiro's out-of-band usage
+    /// probe renders alongside the other reporting backends.
     #[wasm_bindgen_test]
     async fn mobile_renders_every_bucket_and_coverage() {
         let container = make_container();
         let _handle = mount_with(
             &container,
             "h-cap-buckets",
-            vec![
-                BackendCapacitySnapshot {
-                    backend_kind: BackendKind::Kiro,
-                    state: BackendCapacityState::Unsupported {
-                        reason: CapacityUnsupportedReason::BackendHasNoCapacitySource,
-                    },
-                    retrieved_at_ms: now_ms(),
-                    freshness: fresh(),
-                },
-                claude_known(),
-                codex_known(),
-            ],
+            vec![kiro_known(), claude_known(), codex_known()],
         );
         for _ in 0..4 {
             next_tick().await;
         }
 
-        // Claude's 1 bucket + Codex's 3; ACP contributes none.
+        // Claude's 1 bucket + Codex's 3 + Kiro's plan-credit bucket.
         assert_eq!(
             count(&container, ".capacity-bucket"),
-            4,
+            5,
             "mobile renders one row per vendor bucket, same as desktop"
         );
         // Name order alone would put ACP first; reporting backends lead.
@@ -990,7 +1040,10 @@ mod wasm_tests {
             "both coverage statements must survive on mobile, got: {text}"
         );
         assert!(
-            text.contains("82% used"),
+            text.contains("82% used")
+                && text.contains("50% used")
+                && text.contains("KIRO FREE")
+                && text.contains("25.13 of 50 plan credits used"),
             "the used figure renders on the 0-100 scale, got: {text}"
         );
         assert!(

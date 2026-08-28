@@ -35,10 +35,10 @@ use std::time::Duration;
 
 use base64::Engine as _;
 use protocol::{
-    AgentId, AgentOrigin, BackendKind, ChatEvent, ContextCompactionStatus, CurrentContextUsage,
-    ImageData, MessageSender, MessageTokenUsage, SessionId, SessionSettingFieldType,
-    SessionSettingsValues, TaskStatus, TokenUsage, ToolExecutionMode, ToolExecutionOutcome,
-    ToolExecutionResult, ToolRequestType,
+    AgentId, AgentOrigin, BackendCapacityState, BackendKind, CapacityMeasure, CapacitySource,
+    ChatEvent, ContextCompactionStatus, CurrentContextUsage, ImageData, MessageSender,
+    MessageTokenUsage, SessionId, SessionSettingFieldType, SessionSettingsValues, TaskStatus,
+    TokenUsage, ToolExecutionMode, ToolExecutionOutcome, ToolExecutionResult, ToolRequestType,
 };
 use serde_json::Value;
 use tyde_agent_adapter::BackendCapability;
@@ -1668,6 +1668,84 @@ fn real_usage_accounting() {
             );
 
             assert_universal_contract(&turns);
+            assert_clean_close(&mut host, &agent).await;
+        },
+    );
+}
+
+/// Subscription capacity is provider account state, not turn token usage. The
+/// capability gate makes the declaration testable: every backend that claims a
+/// source must publish a typed, non-empty report on the host stream after a
+/// real session starts.
+#[test]
+#[ignore = "paid real-backend suite; use --run-ignored all with TYDE_RUN_REAL_AI_TESTS=1"]
+fn real_subscription_capacity() {
+    run_scenario(
+        &[BackendCapability::CapacityTelemetry],
+        |mut host| async move {
+            let agent = spawn_agent(&mut host, &launch_prompt()).await;
+            let launched = collect_turn(&mut host, &agent, &launch_prompt()).await;
+            assert_ready_handshake(&launched);
+
+            let snapshot = host.await_known_capacity().await;
+            assert_eq!(snapshot.backend_kind, host.backend());
+            let BackendCapacityState::Known { report } = snapshot.state else {
+                unreachable!("await_known_capacity returns only Known")
+            };
+            let source_matches_backend = matches!(
+                (host.backend(), report.source),
+                (BackendKind::Kiro, CapacitySource::KiroUsageCommand)
+                    | (
+                        BackendKind::Claude,
+                        CapacitySource::ClaudeControlUsage | CapacitySource::ClaudeRateLimitEvent
+                    )
+                    | (
+                        BackendKind::Codex,
+                        CapacitySource::CodexAccountRateLimitsUpdated
+                    )
+            );
+            assert!(
+                source_matches_backend,
+                "{:?}: capacity came from the wrong provider source: {:?}",
+                host.backend(),
+                report.source
+            );
+            assert!(
+                !report.buckets.is_empty(),
+                "{:?}: Known capacity carried no buckets",
+                host.backend()
+            );
+            assert!(
+                report.buckets.iter().any(|bucket| match &bucket.measure {
+                    CapacityMeasure::UsedPercent {
+                        used_percent,
+                        remaining_percent,
+                        ..
+                    } => u16::from(*used_percent) + u16::from(*remaining_percent) == 100,
+                    CapacityMeasure::CreditUsage {
+                        used,
+                        limit,
+                        used_percent,
+                        remaining_percent,
+                        ..
+                    } => {
+                        !used.is_empty()
+                            && !limit.is_empty()
+                            && u16::from(*used_percent) + u16::from(*remaining_percent) == 100
+                    }
+                    CapacityMeasure::Credits {
+                        has_credits,
+                        unlimited,
+                        balance,
+                    } => *has_credits || *unlimited || balance.is_some(),
+                    CapacityMeasure::ReportedWithoutMagnitude => false,
+                }),
+                "{:?}: Known capacity carried no usable numeric magnitude: {:?}",
+                host.backend(),
+                report.buckets
+            );
+
+            assert_universal_contract(&[launched]);
             assert_clean_close(&mut host, &agent).await;
         },
     );
