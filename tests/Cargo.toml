@@ -12,6 +12,7 @@ tyde-dev-driver = { path = "../dev-driver" }
 tyde-agent-adapter = { path = "../agent-adapter" }
 futures-util = "0.3"
 axum = "0.8"
+base64.workspace = true
 paste = "1"
 rmcp = { version = "0.15.0", default-features = false, features = ["client", "server", "transport-streamable-http-client-reqwest", "transport-streamable-http-server"] }
 serde.workspace = true

@@ -549,6 +549,7 @@ impl KiroSession {
                 model: initial_model,
                 mode: initial_mode,
                 known_models: extract_known_models(&session_started),
+                known_modes: extract_known_modes(&session_started),
                 active_response: None,
                 active_stream_text: String::new(),
                 active_stream_tool_calls: Vec::new(),
@@ -605,6 +606,7 @@ struct KiroState {
     model: Option<String>,
     mode: Option<String>,
     known_models: Vec<Value>,
+    known_modes: Vec<Value>,
     active_response: Option<ResponseHandle>,
     active_stream_text: String,
     active_stream_tool_calls: Vec<ToolUseData>,
@@ -643,10 +645,10 @@ impl KiroReplayMessageIdentity {
 
 #[derive(Clone)]
 struct PendingToolCompletion {
-    tool_name: String,
     tool_result: Value,
     success: bool,
     error: Option<String>,
+    task_update: Option<protocol::TaskList>,
 }
 
 #[derive(Clone)]
@@ -818,6 +820,11 @@ impl KiroInner {
                 if !known_models.is_empty() {
                     let mut state = self.state.lock().await;
                     state.known_models = known_models;
+                }
+                let known_modes = extract_known_modes(&response);
+                if !known_modes.is_empty() {
+                    let mut state = self.state.lock().await;
+                    state.known_modes = known_modes;
                 }
 
                 let stop_reason = response
@@ -1185,6 +1192,10 @@ impl KiroInner {
             if !known_models.is_empty() {
                 state.known_models = known_models;
             }
+            let known_modes = extract_known_modes(&response);
+            if !known_modes.is_empty() {
+                state.known_modes = known_modes;
+            }
             state.replaying_history = false;
 
             // Emit SessionStarted so forward_events sets backend_session_id on resume
@@ -1407,6 +1418,11 @@ impl KiroInner {
                 if !models.is_empty() {
                     let mut state = self.state.lock().await;
                     state.known_models = models;
+                }
+                let modes = extract_known_modes(update);
+                if !modes.is_empty() {
+                    let mut state = self.state.lock().await;
+                    state.known_modes = modes;
                 }
             }
             _ => {}
@@ -1730,6 +1746,9 @@ impl KiroInner {
 
             completion.tool_name = context.tool_name.clone();
             completion.is_mcp_tool = context.is_mcp_tool;
+            let task_update = self
+                .adapter
+                .map_task_update(&completion, Some(&context.tool_type));
             let tool_result = self
                 .adapter
                 .map_tool_result(&completion, Some(&context.tool_type));
@@ -1746,6 +1765,7 @@ impl KiroInner {
                 tool_result,
                 success,
                 error,
+                task_update,
             );
 
             state.active_tool_contexts.remove(&completion.tool_call_id);
@@ -1764,11 +1784,15 @@ impl KiroInner {
             output
         };
 
-        let (tool_call_id, _tool_name, tool_result, success, error) = completion_to_emit;
+        let (tool_call_id, _tool_name, tool_result, success, error, task_update) =
+            completion_to_emit;
         self.emitter.tool_completed(
             &tool_call_id,
             kiro_tool_execution_outcome(tool_result, success, error),
         );
+        if let Some(tasks) = task_update {
+            self.emitter.task_update(&tasks);
+        }
     }
 
     async fn handle_tool_call(&self, params: &Value) {
@@ -1994,7 +2018,7 @@ impl KiroInner {
             None
         };
 
-        let mut emit_completion_now: Option<(String, String, Value, bool, Option<String>)> = None;
+        let mut emit_completion_now: Option<(String, PendingToolCompletion)> = None;
         {
             let mut state = self.state.lock().await;
             if let Some(context) = state.active_tool_contexts.get_mut(&completion.tool_call_id) {
@@ -2015,6 +2039,9 @@ impl KiroInner {
                     completion.tool_name = context.tool_name.clone();
                 }
                 completion.is_mcp_tool = context.is_mcp_tool;
+                let task_update = self
+                    .adapter
+                    .map_task_update(&completion, Some(&context.tool_type));
                 let tool_result = self
                     .adapter
                     .map_tool_result(&completion, Some(&context.tool_type));
@@ -2026,19 +2053,13 @@ impl KiroInner {
                     completion.error.clone(),
                 );
                 let pending = PendingToolCompletion {
-                    tool_name: completion.tool_name.clone(),
                     tool_result,
                     success,
                     error,
+                    task_update,
                 };
                 if context.request_emitted {
-                    emit_completion_now = Some((
-                        completion.tool_call_id.clone(),
-                        pending.tool_name,
-                        pending.tool_result,
-                        pending.success,
-                        pending.error,
-                    ));
+                    emit_completion_now = Some((completion.tool_call_id.clone(), pending));
                 } else {
                     context.pending_completion = Some(pending);
                 }
@@ -2060,11 +2081,18 @@ impl KiroInner {
             }
         }
 
-        if let Some((tool_call_id, _tool_name, tool_result, success, error)) = emit_completion_now {
+        if let Some((tool_call_id, completion)) = emit_completion_now {
             self.emitter.tool_completed(
                 &tool_call_id,
-                kiro_tool_execution_outcome(tool_result, success, error),
+                kiro_tool_execution_outcome(
+                    completion.tool_result,
+                    completion.success,
+                    completion.error,
+                ),
             );
+            if let Some(tasks) = completion.task_update {
+                self.emitter.task_update(&tasks);
+            }
         }
     }
 
@@ -2294,8 +2322,7 @@ impl KiroInner {
     }
 
     async fn flush_tool_events_after_stream_end(&self, tool_calls: &[ToolUseData]) {
-        let mut completions_to_emit: Vec<(String, String, Value, bool, Option<String>)> =
-            Vec::new();
+        let mut completions_to_emit: Vec<(String, PendingToolCompletion)> = Vec::new();
         let mut requests_to_emit: Vec<(String, String, Value)> = Vec::new();
 
         {
@@ -2313,18 +2340,12 @@ impl KiroInner {
                         context.request_emitted = true;
                     }
                     if let Some(completion) = context.pending_completion.take() {
-                        completions_to_emit.push((
-                            tool_call_id.clone(),
-                            completion.tool_name,
-                            completion.tool_result,
-                            completion.success,
-                            completion.error,
-                        ));
+                        completions_to_emit.push((tool_call_id.clone(), completion));
                     }
                 }
             }
 
-            for (tool_call_id, _, _, _, _) in &completions_to_emit {
+            for (tool_call_id, _) in &completions_to_emit {
                 state.active_tool_contexts.remove(tool_call_id);
                 state.completed_tool_call_ids.insert(tool_call_id.clone());
                 remove_tool_call_aliases(&mut state.tool_call_aliases, tool_call_id, None, None);
@@ -2337,11 +2358,18 @@ impl KiroInner {
                 .tool_request(&tool_call_id, kiro_tool_request_type(tool_type));
         }
 
-        for (tool_call_id, _tool_name, tool_result, success, error) in completions_to_emit {
+        for (tool_call_id, completion) in completions_to_emit {
             self.emitter.tool_completed(
                 &tool_call_id,
-                kiro_tool_execution_outcome(tool_result, success, error),
+                kiro_tool_execution_outcome(
+                    completion.tool_result,
+                    completion.success,
+                    completion.error,
+                ),
             );
+            if let Some(tasks) = completion.task_update {
+                self.emitter.task_update(&tasks);
+            }
         }
     }
 
@@ -2732,6 +2760,15 @@ pub(crate) fn map_tool_completion_result(
             "short_message": short_message,
             "detailed_message": detailed_message,
         });
+    }
+
+    match request_payload
+        .and_then(|payload| payload.get("kind"))
+        .and_then(Value::as_str)
+    {
+        Some("WebSearch") => return json!({ "kind": "WebSearch" }),
+        Some("ViewImage") => return json!({ "kind": "ViewImage" }),
+        _ => {}
     }
 
     match completion.kind.as_str() {
@@ -3181,6 +3218,7 @@ fn extract_current_mode(value: &Value) -> Option<String> {
 }
 
 fn extract_known_models(value: &Value) -> Vec<Value> {
+    let current_model = extract_current_model(value);
     let models = value
         .get("models")
         .and_then(|models| {
@@ -3221,7 +3259,8 @@ fn extract_known_models(value: &Value) -> Vec<Value> {
             .get("isDefault")
             .or_else(|| model.get("default"))
             .and_then(Value::as_bool)
-            .unwrap_or(false);
+            .unwrap_or(false)
+            || current_model.as_deref() == Some(id);
         let normalized_id = id.to_ascii_lowercase();
         let preferred_id = id.to_string();
 
@@ -3257,50 +3296,96 @@ fn extract_known_models(value: &Value) -> Vec<Value> {
     deduped
 }
 
-fn session_settings_schema_from_known_models(
-    known_models: &[Value],
-) -> Result<protocol::SessionSettingsSchema, String> {
-    let mut options = Vec::new();
-    let mut default = None;
+fn extract_known_modes(value: &Value) -> Vec<Value> {
+    let current_mode = extract_current_mode(value);
+    let raw_modes = value
+        .get("modes")
+        .and_then(|modes| {
+            modes
+                .get("availableModes")
+                .or_else(|| modes.get("modes"))
+                .or_else(|| modes.get("available"))
+        })
+        .or_else(|| value.get("availableModes"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
 
-    for model in known_models {
-        let id = model
+    let mut deduped = Vec::new();
+    let mut seen = HashSet::new();
+    for mode in &raw_modes {
+        let Some(id) = mode
             .get("id")
-            .or_else(|| model.get("modelId"))
+            .or_else(|| mode.get("modeId"))
+            .or_else(|| mode.get("name"))
             .and_then(Value::as_str)
             .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| "ACP agent model entry missing id".to_string())?;
-        let label = model
-            .get("displayName")
-            .or_else(|| model.get("name"))
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .unwrap_or(id);
-        if model
-            .get("isDefault")
-            .or_else(|| model.get("default"))
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-        {
-            default = Some(id.to_string());
+            .filter(|id| !id.is_empty())
+        else {
+            continue;
+        };
+        if !seen.insert(id.to_ascii_lowercase()) {
+            continue;
         }
-        options.push(protocol::SelectOption {
-            value: id.to_string(),
+        let display_name = mode
+            .get("name")
+            .or_else(|| mode.get("displayName"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .unwrap_or(id);
+        deduped.push(json!({
+            "id": id,
+            "displayName": display_name,
+            "isDefault": current_mode.as_deref() == Some(id),
+        }));
+    }
+    deduped
+}
+
+fn session_settings_schema_from_known_options(
+    known_models: &[Value],
+    known_modes: &[Value],
+) -> Result<protocol::SessionSettingsSchema, String> {
+    fn select_field(
+        key: &str,
+        label: &str,
+        entries: &[Value],
+    ) -> Result<protocol::SessionSettingField, String> {
+        let mut options = Vec::new();
+        let mut default = None;
+        for entry in entries {
+            let id = entry
+                .get("id")
+                .or_else(|| entry.get("modelId"))
+                .or_else(|| entry.get("modeId"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| format!("ACP agent {key} entry missing id"))?;
+            let option_label = entry
+                .get("displayName")
+                .or_else(|| entry.get("name"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or(id);
+            if entry
+                .get("isDefault")
+                .or_else(|| entry.get("default"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                default = Some(id.to_string());
+            }
+            options.push(protocol::SelectOption {
+                value: id.to_string(),
+                label: option_label.to_string(),
+            });
+        }
+        Ok(protocol::SessionSettingField {
+            key: key.to_string(),
             label: label.to_string(),
-        });
-    }
-
-    if options.is_empty() {
-        return Err("ACP agent reported no selectable models".to_string());
-    }
-
-    Ok(protocol::SessionSettingsSchema {
-        backend_kind: protocol::BackendKind::Kiro,
-        fields: vec![protocol::SessionSettingField {
-            key: "model".to_string(),
-            label: "Model".to_string(),
             description: None,
             use_slider: false,
             select_options_by_setting: None,
@@ -3309,7 +3394,22 @@ fn session_settings_schema_from_known_models(
                 default,
                 nullable: true,
             },
-        }],
+        })
+    }
+
+    if known_models.is_empty() && known_modes.is_empty() {
+        return Err("ACP agent reported no selectable models or modes".to_string());
+    }
+    let mut fields = Vec::new();
+    if !known_models.is_empty() {
+        fields.push(select_field("model", "Model", known_models)?);
+    }
+    if !known_modes.is_empty() {
+        fields.push(select_field("mode", "Mode", known_modes)?);
+    }
+    Ok(protocol::SessionSettingsSchema {
+        backend_kind: protocol::BackendKind::Kiro,
+        fields,
     })
 }
 
@@ -3350,7 +3450,8 @@ pub(crate) async fn probe_session_settings_schema(
                 .ok_or_else(|| {
                     "ACP schema probe ModelsList response missing data.models array".to_string()
                 })?;
-            return session_settings_schema_from_known_models(known_models);
+            let known_modes = session.inner.state.lock().await.known_modes.clone();
+            return session_settings_schema_from_known_options(known_models, &known_modes);
         }
     })
     .await;
@@ -3763,7 +3864,7 @@ use protocol::{
 
 use crate::backend::{
     Backend, BackendCompactionCapability, BackendCompactionUnavailableReason, BackendSession,
-    BackendSpawnConfig, EventStream, empty_session_settings_schema, protocol_images_to_attachments,
+    BackendSpawnConfig, EventStream, protocol_images_to_attachments,
     resolve_settings as resolve_backend_settings, session_settings_to_json,
 };
 
@@ -3833,6 +3934,8 @@ impl Backend for KiroBackend {
         [
             tyde_agent_adapter::BackendCapability::ListSessions,
             tyde_agent_adapter::BackendCapability::ResumeSession,
+            tyde_agent_adapter::BackendCapability::ImageInput,
+            tyde_agent_adapter::BackendCapability::SessionSettings,
             tyde_agent_adapter::BackendCapability::StartupMcpServers,
             tyde_agent_adapter::BackendCapability::AgentControlTools,
             tyde_agent_adapter::BackendCapability::WorkspaceInstructions,
@@ -3841,12 +3944,34 @@ impl Backend for KiroBackend {
             tyde_agent_adapter::BackendCapability::GenericReadFiles,
             tyde_agent_adapter::BackendCapability::GenericOtherTool,
             tyde_agent_adapter::BackendCapability::RetryTelemetry,
+            tyde_agent_adapter::BackendCapability::TaskUpdates,
+            tyde_agent_adapter::BackendCapability::TaskListReplacement,
+            tyde_agent_adapter::BackendCapability::TaskListClear,
+            tyde_agent_adapter::BackendCapability::GenericWebSearch,
+            tyde_agent_adapter::BackendCapability::GenericViewImage,
         ]
         .into()
     }
 
     fn session_settings_schema() -> protocol::SessionSettingsSchema {
-        empty_session_settings_schema(BackendKind::Kiro)
+        protocol::SessionSettingsSchema {
+            backend_kind: BackendKind::Kiro,
+            fields: [("model", "Model"), ("mode", "Mode")]
+                .into_iter()
+                .map(|(key, label)| protocol::SessionSettingField {
+                    key: key.to_string(),
+                    label: label.to_string(),
+                    description: None,
+                    use_slider: false,
+                    select_options_by_setting: None,
+                    field_type: protocol::SessionSettingFieldType::Select {
+                        options: Vec::new(),
+                        default: None,
+                        nullable: true,
+                    },
+                })
+                .collect(),
+        }
     }
 
     fn compaction_capability(&self) -> BackendCompactionCapability {
@@ -3901,11 +4026,7 @@ impl Backend for KiroBackend {
 
             let handle = session.command_handle();
             let resolved_settings = resolve_session_settings(&config);
-            let model_override = match resolved_settings.0.get("model") {
-                Some(SessionSettingValue::String(value)) => Some(value.clone()),
-                _ => None,
-            };
-            if model_override.is_some()
+            if !resolved_settings.0.is_empty()
                 && let Err(err) = handle
                     .execute(SessionCommand::UpdateSettings {
                         settings: session_settings_to_json(&resolved_settings),
@@ -4093,11 +4214,7 @@ impl Backend for KiroBackend {
                 .expect("kiro session_id mutex poisoned") = Some(session_id);
 
             let resolved_settings = resolve_session_settings(&config);
-            let model_override = match resolved_settings.0.get("model") {
-                Some(SessionSettingValue::String(value)) => Some(value.clone()),
-                _ => None,
-            };
-            if model_override.is_some()
+            if !resolved_settings.0.is_empty()
                 && let Err(err) = handle
                     .execute(SessionCommand::UpdateSettings {
                         settings: session_settings_to_json(&resolved_settings),

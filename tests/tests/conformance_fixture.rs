@@ -21,15 +21,17 @@ use protocol::{
     AgentCompactPayload, AgentErrorPayload, AgentId, AgentStartPayload, AskUserQuestion,
     BackendKind, ChatEvent, ChatMessage, ChatMessageId, ClientErrorPayload,
     ContextCompactionNotifyPayload, ContextCompactionTimelineEvent, Envelope,
-    FetchSessionHistoryPayload, FrameKind, HistoryPageRequestId, ListSessionsPayload,
-    McpServerConfig, McpServerId, McpServerUpsertPayload, McpTransportConfig,
+    FetchSessionHistoryPayload, FrameKind, HistoryPageRequestId, HostBootstrapPayload, ImageData,
+    ListSessionsPayload, McpServerConfig, McpServerId, McpServerUpsertPayload, McpTransportConfig,
     MessageMetadataUpdateData, MessageSender, MessageTokenUsage, NewAgentPayload,
     QueuedMessagesPayload, SendMessagePayload, SendMessageToolResponse, SessionHistoryPayload,
-    SessionId, SessionListPayload, SessionSettingValue, SessionSettingsValues, SessionSummary,
-    Skill, SkillId, SkillNotifyPayload, SkillRefreshPayload, SpawnAgentParams, SpawnAgentPayload,
-    SpawnCostHint, Steering, SteeringId, SteeringNotifyPayload, SteeringScope,
-    SteeringUpsertPayload, StreamPath, TaskList, ToolExecutionCompletedData, ToolExecutionOutcome,
-    ToolExecutionResult, ToolRequest, ToolUseData,
+    SessionId, SessionListPayload, SessionSchemaEntry, SessionSchemasPayload, SessionSettingValue,
+    SessionSettingsPayload, SessionSettingsSchema, SessionSettingsValues, SessionSummary,
+    SetSessionSettingsPayload, Skill, SkillId, SkillNotifyPayload, SkillRefreshPayload,
+    SpawnAgentParams, SpawnAgentPayload, SpawnCostHint, Steering, SteeringId,
+    SteeringNotifyPayload, SteeringScope, SteeringUpsertPayload, StreamPath, TaskList,
+    ToolExecutionCompletedData, ToolExecutionOutcome, ToolExecutionResult, ToolRequest,
+    ToolUseData,
 };
 use serde_json::json;
 use tyde_agent_adapter::BackendCapability;
@@ -634,6 +636,77 @@ impl Host {
     }
 }
 
+pub async fn await_session_schema(host: &mut Host) -> SessionSettingsSchema {
+    loop {
+        let envelope = host
+            .next_envelope(CONTROL_TIMEOUT, "session settings schema")
+            .await;
+        fail_on_client_error(&envelope, "await_session_schema");
+        let schemas = match envelope.kind {
+            FrameKind::HostBootstrap => {
+                envelope
+                    .parse_payload::<HostBootstrapPayload>()
+                    .expect("parse HostBootstrap")
+                    .session_schemas
+            }
+            FrameKind::SessionSchemas => {
+                envelope
+                    .parse_payload::<SessionSchemasPayload>()
+                    .expect("parse SessionSchemas")
+                    .schemas
+            }
+            _ => continue,
+        };
+        let Some(entry) = schemas
+            .into_iter()
+            .find(|entry| entry.backend_kind() == host.backend_kind)
+        else {
+            continue;
+        };
+        match entry {
+            SessionSchemaEntry::Ready { schema } => return schema,
+            SessionSchemaEntry::Pending { .. } => continue,
+            SessionSchemaEntry::Unavailable { message, .. } => {
+                panic!(
+                    "{:?}: session settings schema unavailable: {message}",
+                    host.backend()
+                )
+            }
+        }
+    }
+}
+
+pub async fn set_session_setting(
+    host: &mut Host,
+    agent: &Agent,
+    key: &str,
+    value: &str,
+) -> SessionSettingsValues {
+    let mut update = SessionSettingsValues::default();
+    update.0.insert(
+        key.to_string(),
+        SessionSettingValue::String(value.to_string()),
+    );
+    host.client
+        .set_session_settings(&agent.stream, SetSessionSettingsPayload { values: update })
+        .await
+        .expect("set_session_settings failed");
+
+    loop {
+        let envelope = host.next_envelope(CONTROL_TIMEOUT, "SessionSettings").await;
+        fail_on_agent_error(&envelope, "set_session_setting");
+        if envelope.stream != agent.stream || envelope.kind != FrameKind::SessionSettings {
+            continue;
+        }
+        let payload: SessionSettingsPayload = envelope
+            .parse_payload()
+            .expect("parse SessionSettingsPayload");
+        if payload.values.0.get(key) == Some(&SessionSettingValue::String(value.to_string())) {
+            return payload.values;
+        }
+    }
+}
+
 /// Install one host skill and wait until the running host has rescanned it.
 pub async fn install_skill(host: &mut Host, name: &str, description: &str, body: &str) {
     loop {
@@ -878,6 +951,27 @@ pub async fn ask(host: &mut Host, agent: &Agent, prompt: impl AsRef<str>) -> Tur
         .send_message(&agent.stream, prompt.to_owned())
         .await
         .expect("send_message failed");
+    collect_turn(host, agent, prompt).await
+}
+
+pub async fn ask_with_images(
+    host: &mut Host,
+    agent: &Agent,
+    prompt: &str,
+    images: Vec<ImageData>,
+) -> Turn {
+    host.client
+        .send_message_payload(
+            &agent.stream,
+            SendMessagePayload {
+                message: prompt.to_owned(),
+                images: Some(images),
+                origin: None,
+                tool_response: None,
+            },
+        )
+        .await
+        .expect("image send_message failed");
     collect_turn(host, agent, prompt).await
 }
 

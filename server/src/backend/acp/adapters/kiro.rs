@@ -23,7 +23,7 @@ use std::collections::HashMap;
 
 use futures_util::future::BoxFuture;
 use protocol::{AcpAdapterId, AcpAgentSpec, BackendKind, SessionId};
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::backend::BackendSession;
 use crate::backend::acp::AcpSpawnSpec;
@@ -268,15 +268,36 @@ impl AcpAgentAdapter for KiroAdapter {
         })
     }
 
-    // `map_tool_request` is deliberately not overridden. Kiro's rawInput uses
-    // the ordinary ACP spellings, so the shared default already reads them —
-    // and reads more of them than the override did. The override named only
-    // `newStr`/`file_text` for an edit's replacement text, while Kiro sends a
-    // create as `{"command":"create","content":…,"path":…}`; `content` is in
-    // the default's key list and was not in the override's, so every file Kiro
-    // wrote produced a diff card empty on both sides. The result mapping below
-    // stays, because parsing `exit_status`/`stdout`/`stderr` out of Kiro's
-    // rawOutput really is Kiro-specific knowledge.
+    fn map_tool_request<'a>(
+        &'a self,
+        kind: &'a str,
+        args: &'a Value,
+        workspace_root: &'a str,
+    ) -> BoxFuture<'a, Value> {
+        Box::pin(async move {
+            if kind == "search"
+                && let Some(query) = args
+                    .get("query")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|query| !query.is_empty())
+            {
+                return json!({
+                    "kind": "WebSearch",
+                    "query": query,
+                });
+            }
+            if kind == "read"
+                && let Some(path) = kiro_single_image_path(args)
+            {
+                return json!({
+                    "kind": "ViewImage",
+                    "path": path,
+                });
+            }
+            super::super::tools::default_map_tool_request(kind, args, workspace_root).await
+        })
+    }
 
     fn map_tool_result(
         &self,
@@ -286,6 +307,14 @@ impl AcpAgentAdapter for KiroAdapter {
         kiro_impl::map_tool_completion_result(completion, request_payload)
     }
 
+    fn map_task_update(
+        &self,
+        completion: &crate::backend::acp::AcpToolCallCompletion,
+        request_payload: Option<&Value>,
+    ) -> Option<protocol::TaskList> {
+        kiro_task_update(completion, request_payload)
+    }
+
     fn extra_env(&self) -> HashMap<String, String> {
         self.spec
             .env
@@ -293,4 +322,94 @@ impl AcpAgentAdapter for KiroAdapter {
             .map(|(name, value)| (name.clone(), value.clone()))
             .collect()
     }
+}
+
+fn kiro_single_image_path(args: &Value) -> Option<&str> {
+    let paths = args
+        .get("operations")?
+        .as_array()?
+        .iter()
+        .filter(|operation| operation.get("mode").and_then(Value::as_str) == Some("Image"))
+        .flat_map(|operation| {
+            operation
+                .get("image_paths")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+        })
+        .filter_map(Value::as_str)
+        .map(str::trim)
+        .filter(|path| !path.is_empty());
+    let paths = paths.collect::<Vec<_>>();
+    match paths.as_slice() {
+        [path] => Some(*path),
+        _ => None,
+    }
+}
+
+fn kiro_task_update(
+    completion: &crate::backend::acp::AcpToolCallCompletion,
+    request_payload: Option<&Value>,
+) -> Option<protocol::TaskList> {
+    if !completion.success {
+        return None;
+    }
+
+    let request_payload = request_payload?;
+    if request_payload.get("kind").and_then(Value::as_str) != Some("Other") {
+        return None;
+    }
+    let args = request_payload.get("args")?;
+    let command = args.get("command").and_then(Value::as_str)?;
+    let is_task_command = match command {
+        "create" => args.get("task_list_description").is_some() && args.get("tasks").is_some(),
+        "complete" => args.get("completed_task_ids").is_some(),
+        "remove" => args.get("remove_task_ids").is_some(),
+        _ => false,
+    };
+    if !is_task_command {
+        return None;
+    }
+
+    let snapshot = completion
+        .tool_result
+        .get("items")?
+        .as_array()?
+        .first()?
+        .get("Json")?;
+    let raw_tasks = snapshot.get("tasks")?.as_array()?;
+    let tasks = raw_tasks
+        .iter()
+        .map(|task| {
+            let id = task
+                .get("id")
+                .and_then(|id| id.as_u64().or_else(|| id.as_str()?.parse().ok()))?;
+            let description = task.get("task_description").and_then(Value::as_str)?.trim();
+            if description.is_empty() {
+                return None;
+            }
+            Some(protocol::Task {
+                id,
+                description: description.to_string(),
+                status: if task
+                    .get("completed")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+                {
+                    protocol::TaskStatus::Completed
+                } else {
+                    protocol::TaskStatus::Pending
+                },
+            })
+        })
+        .collect::<Option<Vec<_>>>()?;
+
+    Some(protocol::TaskList {
+        title: snapshot
+            .get("description")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        tasks,
+    })
 }

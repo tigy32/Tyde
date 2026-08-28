@@ -33,10 +33,12 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::time::Duration;
 
+use base64::Engine as _;
 use protocol::{
     AgentId, AgentOrigin, BackendKind, ChatEvent, ContextCompactionStatus, CurrentContextUsage,
-    MessageSender, MessageTokenUsage, SessionId, TaskStatus, TokenUsage, ToolExecutionMode,
-    ToolExecutionOutcome, ToolExecutionResult, ToolRequestType,
+    ImageData, MessageSender, MessageTokenUsage, SessionId, SessionSettingFieldType,
+    SessionSettingsValues, TaskStatus, TokenUsage, ToolExecutionMode, ToolExecutionOutcome,
+    ToolExecutionResult, ToolRequestType,
 };
 use serde_json::Value;
 use tyde_agent_adapter::BackendCapability;
@@ -70,6 +72,9 @@ const MAPPED_FAILED_MARKER: &str = "TYDE_MAPPED_FAILED";
 const MAPPED_REJECTED_PAYLOAD: &str = "TYDE_REJECTED_REPLACEMENT";
 const MAPPED_RUN_MARKER: &str = "TYDE_MAPPED_RUN";
 const MAPPED_DELETE_MARKER: &str = "TYDE_MAPPED_DELETE";
+const MAPPED_WEB_MARKER: &str = "TYDE_MAPPED_WEB";
+const MAPPED_VIEW_MARKER: &str = "TYDE_MAPPED_VIEW";
+const MAPPING_IMAGE_FILE: &str = "mapping-image.png";
 const COUNTED_MARKER: &str = "TYDE_COUNTED";
 const RAN_MARKER: &str = "TYDE_RAN";
 const INTERRUPT_PROOF_FILE: &str = "interrupt_proof.txt";
@@ -82,6 +87,8 @@ const STEERING_AFTER_COMPACTION: &str = "TYDE_STEERING_AFTER_COMPACTION";
 const STEERING_AFTER_RESUME: &str = "TYDE_STEERING_AFTER_RESUME";
 const SKILL_INACTIVE_MARKER: &str = "TYDE_SKILL_INACTIVE";
 const SKILL_ACTIVATED_MARKER: &str = "TYDE_SKILL_ACTIVATED_FROM_BODY";
+const IMAGE_ANSWER: &str = "magenta:cyan:yellow";
+const VALID_IMAGE_PNG_BASE64: &str = "iVBORw0KGgoAAAANSUhEUgAAAlgAAAEsCAIAAACQX1rBAAAAAXNSR0IArs4c6QAAAERlWElmTU0AKgAAAAgAAYdpAAQAAAABAAAAGgAAAAAAA6ABAAMAAAABAAEAAKACAAQAAAABAAACWKADAAQAAAABAAABLAAAAAAlWrY5AAANVklEQVR4Ae3V0QlEIRRDQd3+e/ZtEecnMBYQLhMh9513PAK1wPWtalJ5f4F3LgcCucAvTxRIgAABAgSGBAzhUFlOJUCAAIFewBD2phIJECBAYEjAEA6V5VQCBAgQ6AUMYW8qkQABAgSGBAzhUFlOJUCAAIFewBD2phIJECBAYEjAEA6V5VQCBAgQ6AUMYW8qkQABAgSGBAzhUFlOJUCAAIFewBD2phIJECBAYEjAEA6V5VQCBAgQ6AUMYW8qkQABAgSGBAzhUFlOJUCAAIFewBD2phIJECBAYEjAEA6V5VQCBAgQ6AUMYW8qkQABAgSGBAzhUFlOJUCAAIFewBD2phIJECBAYEjAEA6V5VQCBAgQ6AUMYW8qkQABAgSGBAzhUFlOJUCAAIFewBD2phIJECBAYEjAEA6V5VQCBAgQ6AUMYW8qkQABAgSGBAzhUFlOJUCAAIFewBD2phIJECBAYEjAEA6V5VQCBAgQ6AUMYW8qkQABAgSGBAzhUFlOJUCAAIFewBD2phIJECBAYEjAEA6V5VQCBAgQ6AUMYW8qkQABAgSGBAzhUFlOJUCAAIFewBD2phIJECBAYEjAEA6V5VQCBAgQ6AUMYW8qkQABAgSGBAzhUFlOJUCAAIFewBD2phIJECBAYEjAEA6V5VQCBAgQ6AUMYW8qkQABAgSGBAzhUFlOJUCAAIFewBD2phIJECBAYEjAEA6V5VQCBAgQ6AUMYW8qkQABAgSGBAzhUFlOJUCAAIFewBD2phIJECBAYEjAEA6V5VQCBAgQ6AUMYW8qkQABAgSGBAzhUFlOJUCAAIFewBD2phIJECBAYEjAEA6V5VQCBAgQ6AUMYW8qkQABAgSGBAzhUFlOJUCAAIFewBD2phIJECBAYEjAEA6V5VQCBAgQ6AUMYW8qkQABAgSGBAzhUFlOJUCAAIFewBD2phIJECBAYEjAEA6V5VQCBAgQ6AUMYW8qkQABAgSGBAzhUFlOJUCAAIFewBD2phIJECBAYEjAEA6V5VQCBAgQ6AUMYW8qkQABAgSGBAzhUFlOJUCAAIFewBD2phIJECBAYEjAEA6V5VQCBAgQ6AUMYW8qkQABAgSGBAzhUFlOJUCAAIFewBD2phIJECBAYEjAEA6V5VQCBAgQ6AUMYW8qkQABAgSGBAzhUFlOJUCAAIFewBD2phIJECBAYEjAEA6V5VQCBAgQ6AUMYW8qkQABAgSGBAzhUFlOJUCAAIFewBD2phIJECBAYEjAEA6V5VQCBAgQ6AUMYW8qkQABAgSGBAzhUFlOJUCAAIFewBD2phIJECBAYEjAEA6V5VQCBAgQ6AUMYW8qkQABAgSGBAzhUFlOJUCAAIFewBD2phIJECBAYEjAEA6V5VQCBAgQ6AUMYW8qkQABAgSGBAzhUFlOJUCAAIFewBD2phIJECBAYEjAEA6V5VQCBAgQ6AUMYW8qkQABAgSGBAzhUFlOJUCAAIFewBD2phIJECBAYEjAEA6V5VQCBAgQ6AUMYW8qkQABAgSGBAzhUFlOJUCAAIFewBD2phIJECBAYEjAEA6V5VQCBAgQ6AUMYW8qkQABAgSGBAzhUFlOJUCAAIFewBD2phIJECBAYEjAEA6V5VQCBAgQ6AUMYW8qkQABAgSGBAzhUFlOJUCAAIFewBD2phIJECBAYEjAEA6V5VQCBAgQ6AUMYW8qkQABAgSGBAzhUFlOJUCAAIFewBD2phIJECBAYEjAEA6V5VQCBAgQ6AUMYW8qkQABAgSGBAzhUFlOJUCAAIFewBD2phIJECBAYEjAEA6V5VQCBAgQ6AUMYW8qkQABAgSGBAzhUFlOJUCAAIFewBD2phIJECBAYEjAEA6V5VQCBAgQ6AUMYW8qkQABAgSGBAzhUFlOJUCAAIFewBD2phIJECBAYEjAEA6V5VQCBAgQ6AUMYW8qkQABAgSGBAzhUFlOJUCAAIFewBD2phIJECBAYEjAEA6V5VQCBAgQ6AUMYW8qkQABAgSGBAzhUFlOJUCAAIFewBD2phIJECBAYEjAEA6V5VQCBAgQ6AUMYW8qkQABAgSGBAzhUFlOJUCAAIFewBD2phIJECBAYEjAEA6V5VQCBAgQ6AUMYW8qkQABAgSGBAzhUFlOJUCAAIFewBD2phIJECBAYEjAEA6V5VQCBAgQ6AUMYW8qkQABAgSGBAzhUFlOJUCAAIFewBD2phIJECBAYEjAEA6V5VQCBAgQ6AUMYW8qkQABAgSGBAzhUFlOJUCAAIFewBD2phIJECBAYEjAEA6V5VQCBAgQ6AUMYW8qkQABAgSGBAzhUFlOJUCAAIFewBD2phIJECBAYEjAEA6V5VQCBAgQ6AUMYW8qkQABAgSGBAzhUFlOJUCAAIFewBD2phIJECBAYEjAEA6V5VQCBAgQ6AUMYW8qkQABAgSGBAzhUFlOJUCAAIFewBD2phIJECBAYEjAEA6V5VQCBAgQ6AUMYW8qkQABAgSGBAzhUFlOJUCAAIFewBD2phIJECBAYEjAEA6V5VQCBAgQ6AUMYW8qkQABAgSGBAzhUFlOJUCAAIFewBD2phIJECBAYEjAEA6V5VQCBAgQ6AUMYW8qkQABAgSGBAzhUFlOJUCAAIFewBD2phIJECBAYEjAEA6V5VQCBAgQ6AUMYW8qkQABAgSGBAzhUFlOJUCAAIFewBD2phIJECBAYEjAEA6V5VQCBAgQ6AUMYW8qkQABAgSGBAzhUFlOJUCAAIFewBD2phIJECBAYEjAEA6V5VQCBAgQ6AUMYW8qkQABAgSGBAzhUFlOJUCAAIFewBD2phIJECBAYEjAEA6V5VQCBAgQ6AUMYW8qkQABAgSGBAzhUFlOJUCAAIFewBD2phIJECBAYEjAEA6V5VQCBAgQ6AUMYW8qkQABAgSGBAzhUFlOJUCAAIFewBD2phIJECBAYEjAEA6V5VQCBAgQ6AUMYW8qkQABAgSGBAzhUFlOJUCAAIFewBD2phIJECBAYEjAEA6V5VQCBAgQ6AUMYW8qkQABAgSGBAzhUFlOJUCAAIFewBD2phIJECBAYEjAEA6V5VQCBAgQ6AUMYW8qkQABAgSGBAzhUFlOJUCAAIFewBD2phIJECBAYEjAEA6V5VQCBAgQ6AUMYW8qkQABAgSGBAzhUFlOJUCAAIFewBD2phIJECBAYEjAEA6V5VQCBAgQ6AUMYW8qkQABAgSGBAzhUFlOJUCAAIFewBD2phIJECBAYEjAEA6V5VQCBAgQ6AUMYW8qkQABAgSGBAzhUFlOJUCAAIFewBD2phIJECBAYEjAEA6V5VQCBAgQ6AUMYW8qkQABAgSGBAzhUFlOJUCAAIFewBD2phIJECBAYEjAEA6V5VQCBAgQ6AUMYW8qkQABAgSGBAzhUFlOJUCAAIFewBD2phIJECBAYEjAEA6V5VQCBAgQ6AUMYW8qkQABAgSGBAzhUFlOJUCAAIFewBD2phIJECBAYEjAEA6V5VQCBAgQ6AUMYW8qkQABAgSGBAzhUFlOJUCAAIFewBD2phIJECBAYEjAEA6V5VQCBAgQ6AUMYW8qkQABAgSGBAzhUFlOJUCAAIFewBD2phIJECBAYEjAEA6V5VQCBAgQ6AUMYW8qkQABAgSGBAzhUFlOJUCAAIFewBD2phIJECBAYEjAEA6V5VQCBAgQ6AUMYW8qkQABAgSGBAzhUFlOJUCAAIFewBD2phIJECBAYEjAEA6V5VQCBAgQ6AUMYW8qkQABAgSGBAzhUFlOJUCAAIFewBD2phIJECBAYEjAEA6V5VQCBAgQ6AUMYW8qkQABAgSGBAzhUFlOJUCAAIFewBD2phIJECBAYEjAEA6V5VQCBAgQ6AUMYW8qkQABAgSGBAzhUFlOJUCAAIFewBD2phIJECBAYEjAEA6V5VQCBAgQ6AUMYW8qkQABAgSGBAzhUFlOJUCAAIFewBD2phIJECBAYEjAEA6V5VQCBAgQ6AUMYW8qkQABAgSGBAzhUFlOJUCAAIFewBD2phIJECBAYEjAEA6V5VQCBAgQ6AUMYW8qkQABAgSGBAzhUFlOJUCAAIFewBD2phIJECBAYEjAEA6V5VQCBAgQ6AUMYW8qkQABAgSGBAzhUFlOJUCAAIFewBD2phIJECBAYEjAEA6V5VQCBAgQ6AUMYW8qkQABAgSGBAzhUFlOJUCAAIFewBD2phIJECBAYEjAEA6V5VQCBAgQ6AUMYW8qkQABAgSGBAzhUFlOJUCAAIFewBD2phIJECBAYEjAEA6V5VQCBAgQ6AUMYW8qkQABAgSGBAzhUFlOJUCAAIFewBD2phIJECBAYEjAEA6V5VQCBAgQ6AUMYW8qkQABAgSGBAzhUFlOJUCAAIFewBD2phIJECBAYEjAEA6V5VQCBAgQ6AUMYW8qkQABAgSGBAzhUFlOJUCAAIFewBD2phIJECBAYEjAEA6V5VQCBAgQ6AUMYW8qkQABAgSGBAzhUFlOJUCAAIFewBD2phIJECBAYEjAEA6V5VQCBAgQ6AUMYW8qkQABAgSGBAzhUFlOJUCAAIFewBD2phIJECBAYEjgA61RBlazp+FwAAAAAElFTkSuQmCC";
 
 /// The MCP probe server, its one tool, and the prefix it echoes back.
 ///
@@ -322,6 +329,118 @@ fn real_skills() {
     });
 }
 
+#[test]
+#[ignore = "paid real-backend suite; use --run-ignored all with TYDE_RUN_REAL_AI_TESTS=1"]
+fn real_image_input() {
+    run_scenario(&[BackendCapability::ImageInput], |mut host| async move {
+        let agent = spawn_agent(&mut host, &launch_prompt()).await;
+        let launched = collect_turn(&mut host, &agent, &launch_prompt()).await;
+        assert_ready_handshake(&launched);
+
+        let prompt = "The attached image contains three equal vertical solid-color bands. Reply \
+                      with exactly their lowercase CSS color names from left to right, separated \
+                      by colons, and nothing else.";
+        let image = ImageData {
+            media_type: "image/png".to_string(),
+            data: VALID_IMAGE_PNG_BASE64.to_string(),
+        };
+        let viewed = ask_with_images(&mut host, &agent, prompt, vec![image.clone()]).await;
+
+        let echoed = viewed.events().iter().find_map(|event| match event {
+            ChatEvent::MessageAdded(message) if matches!(message.sender, MessageSender::User) => {
+                message.images.as_ref()
+            }
+            _ => None,
+        });
+        assert_eq!(
+            echoed.cloned(),
+            Some(vec![image]),
+            "{}: the user-visible message did not retain the submitted image",
+            viewed.label()
+        );
+        assert_eq!(
+            viewed.final_text().trim().to_ascii_lowercase(),
+            IMAGE_ANSWER,
+            "{}: the provider did not identify the pixels in the submitted image",
+            viewed.label()
+        );
+
+        let turns = [launched, viewed];
+        assert_universal_contract(&turns);
+        assert_clean_close(&mut host, &agent).await;
+    });
+}
+
+#[test]
+#[ignore = "paid real-backend suite; use --run-ignored all with TYDE_RUN_REAL_AI_TESTS=1"]
+fn real_session_settings() {
+    run_scenario(
+        &[BackendCapability::SessionSettings],
+        |mut host| async move {
+            let schema = await_session_schema(&mut host).await;
+            assert!(
+                !schema.fields.is_empty(),
+                "{:?}: declared SessionSettings but published an empty schema",
+                host.backend()
+            );
+
+            let agent = spawn_agent(&mut host, &launch_prompt()).await;
+            let launched = collect_turn(&mut host, &agent, &launch_prompt()).await;
+            assert_ready_handshake(&launched);
+
+            let mut current = SessionSettingsValues::default();
+            let selectable = |field: &&protocol::SessionSettingField| {
+                matches!(field.field_type, SessionSettingFieldType::Select { .. })
+                    && field
+                        .select_options(&current)
+                        .is_some_and(|options| options.len() >= 2)
+            };
+            // Hermes publishes `profile` in the schema but rejects changing it
+            // after launch. Model and mode are the shared live settings contract.
+            let field = ["mode", "model"]
+                .into_iter()
+                .find_map(|key| {
+                    schema
+                        .fields
+                        .iter()
+                        .find(|field| field.key == key && selectable(field))
+                })
+                .or_else(|| schema.fields.iter().find(selectable))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{:?}: session settings schema offered no selectable setting with two values",
+                        host.backend()
+                    )
+                });
+            let options = field
+                .select_options(&current)
+                .expect("selected field has options")
+                .iter()
+                .map(|option| option.value.clone())
+                .collect::<Vec<_>>();
+            current = set_session_setting(&mut host, &agent, &field.key, &options[0]).await;
+            assert_eq!(
+                current.0.get(&field.key),
+                Some(&protocol::SessionSettingValue::String(options[0].clone())),
+                "{:?}: session setting {:?} did not retain its first selected value",
+                host.backend(),
+                field.key
+            );
+            current = set_session_setting(&mut host, &agent, &field.key, &options[1]).await;
+            assert_eq!(
+                current.0.get(&field.key),
+                Some(&protocol::SessionSettingValue::String(options[1].clone())),
+                "{:?}: session setting {:?} did not retain its second selected value",
+                host.backend(),
+                field.key
+            );
+
+            assert_universal_contract(&[launched]);
+            assert_clean_close(&mut host, &agent).await;
+        },
+    );
+}
+
 /// What the tool cards are made of, not just that they exist.
 ///
 /// Every other scenario in this suite counts tool requests and consults the
@@ -347,6 +466,8 @@ fn real_tool_type_mappings() {
         let token = unique_payload();
         let diffs = host.declares(BackendCapability::GenericModifyFile);
         let reads = host.declares(BackendCapability::GenericReadFiles);
+        let web_search = host.declares(BackendCapability::GenericWebSearch);
+        let view_image = host.declares(BackendCapability::GenericViewImage);
 
         let agent = spawn_agent(&mut host, &launch_prompt()).await;
         let launched = collect_turn(&mut host, &agent, &launch_prompt()).await;
@@ -453,6 +574,43 @@ fn real_tool_type_mappings() {
         assert_delete_is_not_an_opaque_card(&deleted, host.workspace());
         assert_final_text_contains(&deleted, MAPPED_DELETE_MARKER);
         turns.push(deleted);
+
+        if web_search {
+            let searched = ask(&mut host, &agent, &mapping_web_search_prompt(backend)).await;
+            assert_web_search_maps_to_web_search(&searched);
+            assert_final_text_contains(&searched, MAPPED_WEB_MARKER);
+            turns.push(searched);
+        } else {
+            eprintln!(
+                "COVERAGE: {:?} does not declare GenericWebSearch, so this run asserts nothing \
+                 about web-search cards",
+                host.backend()
+            );
+        }
+
+        if view_image {
+            let image = base64::engine::general_purpose::STANDARD
+                .decode(VALID_IMAGE_PNG_BASE64)
+                .expect("decode conformance image fixture");
+            std::fs::write(host.workspace().join(MAPPING_IMAGE_FILE), image)
+                .expect("write image-view fixture");
+            let viewed = ask(
+                &mut host,
+                &agent,
+                &mapping_view_image_prompt(backend, &workspace),
+            )
+            .await;
+            assert_view_image_maps_to_view_image(&viewed, host.workspace());
+            assert_final_text_contains(&viewed, IMAGE_ANSWER);
+            assert_final_text_contains(&viewed, MAPPED_VIEW_MARKER);
+            turns.push(viewed);
+        } else {
+            eprintln!(
+                "COVERAGE: {:?} does not declare GenericViewImage, so this run asserts nothing \
+                 about image-view cards",
+                host.backend()
+            );
+        }
 
         assert_universal_contract(&turns);
         assert_clean_close(&mut host, &agent).await;
@@ -2319,6 +2477,33 @@ fn mapping_delete_prompt(workspace: &Path) -> String {
     )
 }
 
+fn mapping_web_search_prompt(backend: BackendKind) -> String {
+    let tool = match backend {
+        BackendKind::Antigravity => "native search_web tool",
+        BackendKind::Kiro => "native web_search tool",
+        _ => "native web-search tool",
+    };
+    format!(
+        "Use your {tool} exactly once to search for the official Rust programming language \
+         website. Do not fetch a result or use any other tool. Then reply with exactly \
+         {MAPPED_WEB_MARKER} and nothing else."
+    )
+}
+
+fn mapping_view_image_prompt(backend: BackendKind, workspace: &Path) -> String {
+    let tool = if backend == BackendKind::Kiro {
+        "native read tool in Image mode"
+    } else {
+        "native image-viewing tool"
+    };
+    format!(
+        "Use your {tool} exactly once to inspect {MAPPING_IMAGE_FILE} in {}. The image contains \
+         three equal vertical solid-color bands. Do not use any other tool. Then reply with \
+         exactly {IMAGE_ANSWER} followed by a space and {MAPPED_VIEW_MARKER}, and nothing else.",
+        workspace_root(workspace)
+    )
+}
+
 /// Deliberately un-writable. A codeword held only in the conversation is the one
 /// thing a model that has lost its context cannot answer; every file-backed
 /// oracle in this suite it still answers correctly.
@@ -3617,6 +3802,66 @@ fn assert_delete_is_not_an_opaque_card(turn: &Turn, workspace: &Path) {
             );
         }
     }
+}
+
+fn assert_web_search_maps_to_web_search(turn: &Turn) {
+    let searches = turn
+        .tool_requests()
+        .filter_map(|request| match &request.tool_type {
+            ToolRequestType::WebSearch { query } => {
+                Some((request.tool_call_id.as_str(), query.as_str()))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let [(tool_call_id, query)] = searches.as_slice() else {
+        panic!(
+            "{}: expected exactly one WebSearch card, saw {searches:?}; requests: {:?}",
+            turn.label(),
+            turn.tool_request_names()
+        );
+    };
+    assert!(
+        query.to_ascii_lowercase().contains("rust"),
+        "{}: WebSearch card lost the requested Rust query: {query:?}",
+        turn.label()
+    );
+    let result = result_for(turn, tool_call_id);
+    assert!(
+        matches!(result, Some(ToolExecutionResult::WebSearch)),
+        "{}: completed web search reported {result:?}, not WebSearch",
+        turn.label()
+    );
+}
+
+fn assert_view_image_maps_to_view_image(turn: &Turn, workspace: &Path) {
+    let views = turn
+        .tool_requests()
+        .filter_map(|request| match &request.tool_type {
+            ToolRequestType::ViewImage { path } => {
+                Some((request.tool_call_id.as_str(), path.as_str()))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let [(tool_call_id, path)] = views.as_slice() else {
+        panic!(
+            "{}: expected exactly one ViewImage card, saw {views:?}; requests: {:?}",
+            turn.label(),
+            turn.tool_request_names()
+        );
+    };
+    assert!(
+        resolves_to(path, workspace, MAPPING_IMAGE_FILE),
+        "{}: ViewImage card names {path:?}, not {MAPPING_IMAGE_FILE}",
+        turn.label()
+    );
+    let result = result_for(turn, tool_call_id);
+    assert!(
+        matches!(result, Some(ToolExecutionResult::ViewImage)),
+        "{}: completed image view reported {result:?}, not ViewImage",
+        turn.label()
+    );
 }
 
 /// Longer than any cancellation observed today, short enough that a user would

@@ -3418,6 +3418,16 @@ impl CodexResponseSplitter {
         self.suppressed_raw_tool_requests.shift_remove(call_id)
     }
 
+    fn suppressed_web_search_query(&self) -> Option<String> {
+        let mut queries = self
+            .suppressed_raw_tool_requests
+            .values()
+            .filter_map(|request| request.arguments.as_str())
+            .filter_map(codex_web_search_query_from_source);
+        let query = queries.next()?;
+        queries.next().is_none().then_some(query)
+    }
+
     fn remove_raw_tool_owner(&mut self, call_id: &str) -> Option<BufferedCodexToolRequest> {
         let owner = self.pending_raw_tool_owners.shift_remove(call_id);
         if let Some(owner) = owner.as_ref() {
@@ -13354,8 +13364,21 @@ impl CodexInner {
                 let query = item
                     .get("query")
                     .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_owned();
+                    .filter(|query| !query.trim().is_empty())
+                    .map(str::to_owned);
+                let query = match query {
+                    Some(query) => query,
+                    None => {
+                        // Code-mode emits an empty typed webSearch item after a
+                        // raw web__run request whose JavaScript source owns the query.
+                        let state = self.state.lock().await;
+                        notification_thread_id
+                            .as_deref()
+                            .and_then(|thread_id| state.response_splitters.get(thread_id))
+                            .and_then(CodexResponseSplitter::suppressed_web_search_query)
+                            .unwrap_or_default()
+                    }
+                };
                 self.emit_tool_request(
                     &item_id,
                     "web_search",
@@ -16193,6 +16216,21 @@ fn codex_image_generation_prompt(item: &Value) -> Option<String> {
         .and_then(Value::as_str)
         .filter(|prompt| !prompt.trim().is_empty())
         .map(str::to_owned)
+}
+
+fn codex_web_search_query_from_source(source: &str) -> Option<String> {
+    let source = source.split_once("tools.web__run")?.1;
+    let search = source.split_once("search_query")?.1;
+    let encoded = search
+        .split_once("\"q\":")
+        .or_else(|| search.split_once("q:"))?
+        .1
+        .trim_start();
+    serde_json::Deserializer::from_str(encoded)
+        .into_iter::<String>()
+        .next()?
+        .ok()
+        .filter(|query| !query.trim().is_empty())
 }
 
 fn codex_native_tool_completion(item_type: &str) -> Option<(&'static str, Value)> {

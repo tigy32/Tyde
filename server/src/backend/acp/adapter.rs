@@ -249,6 +249,19 @@ pub trait AcpAgentAdapter: Send + Sync + 'static {
         super::tools::default_map_tool_result(completion, request_payload)
     }
 
+    /// Map a completed native task tool onto an authoritative task snapshot.
+    ///
+    /// ACP does not standardize task tools, so the default recognizes none.
+    /// An adapter may return a snapshot only when the provider result carries
+    /// the complete list; the generic backend emits it after the tool result.
+    fn map_task_update(
+        &self,
+        _completion: &super::AcpToolCallCompletion,
+        _request_payload: Option<&Value>,
+    ) -> Option<protocol::TaskList> {
+        None
+    }
+
     /// Interpret whatever usage numbers the agent reported.
     ///
     /// Tyde accounts per provider request. An agent that reports only
