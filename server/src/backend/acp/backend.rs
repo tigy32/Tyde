@@ -863,6 +863,9 @@ impl KiroInner {
                 state.cancelled = true;
                 let session_id = state.session_id.clone();
                 drop(state);
+                self.bridge
+                    .trace_terminal_state("cancelling ACP conversation")
+                    .await;
                 let result = self
                     .bridge
                     .notify("session/cancel", json!({ "sessionId": session_id }))
@@ -3825,10 +3828,11 @@ pub(crate) fn resolve_session_settings(
 
 impl Backend for KiroBackend {
     fn capabilities() -> tyde_agent_adapter::BackendCapabilities {
+        // Kiro 2.20.1 acknowledges session/cancel but lets an active shell
+        // command finish, so it does not satisfy the interrupt contract.
         [
             tyde_agent_adapter::BackendCapability::ListSessions,
             tyde_agent_adapter::BackendCapability::ResumeSession,
-            tyde_agent_adapter::BackendCapability::Interrupt,
             tyde_agent_adapter::BackendCapability::StartupMcpServers,
             tyde_agent_adapter::BackendCapability::AgentControlTools,
             tyde_agent_adapter::BackendCapability::WorkspaceInstructions,

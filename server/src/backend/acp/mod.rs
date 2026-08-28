@@ -150,6 +150,24 @@ impl AcpBridge {
             .map_err(|_| "ACP inbound barrier dropped".to_string())
     }
 
+    pub async fn trace_terminal_state(&self, reason: &str) {
+        let terminals = self.terminals.lock().await;
+        eprintln!(
+            "TYDE ACP TERMINAL STATE reason={reason:?} terminal_count={}",
+            terminals.len()
+        );
+        for (terminal_id, terminal) in terminals.iter() {
+            let terminal = terminal.lock().await;
+            eprintln!(
+                "TYDE ACP TERMINAL STATE terminal_id={terminal_id} reason={reason:?} \
+                 child_available={} exit_code={:?} exit_signal={:?}",
+                terminal.child.is_some(),
+                terminal.exit_code,
+                terminal.exit_signal,
+            );
+        }
+    }
+
     pub async fn handle_server_request(
         &self,
         id: Value,
