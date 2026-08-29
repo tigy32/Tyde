@@ -4553,10 +4553,7 @@ impl ClaudeInner {
                 .lock()
                 .expect("Claude native subagent task mutex poisoned")
                 .insert(tool_call.id.clone());
-            eprintln!(
-                "TYDE CLAUDE NATIVE TASK TRACK request={} inserted={inserted}",
-                tool_call.id
-            );
+            eprintln!("TYDE CLAUDE NATIVE TASK TRACK inserted={inserted}");
         }
         self.adopt_background_task_awaiting_tool_request(tool_call);
         true
@@ -4677,13 +4674,12 @@ impl ClaudeInner {
         let outcome = claude_tool_execution_outcome(success, tool_result, error);
         let pending_before_completion = self.emitter.has_pending_tool_request(tool_call_id);
         eprintln!(
-            "TYDE CLAUDE TOOL COMPLETION id={tool_call_id} name={tool_name} pending={pending_before_completion} known={}",
+            "TYDE CLAUDE TOOL COMPLETION name={tool_name} pending={pending_before_completion} known={}",
             self.emitter.has_known_tool_request(tool_call_id)
         );
         let emitted =
             emit_tool_completion_for_known_request(&self.emitter, tool_call_id, tool_name, outcome);
         tracing::info!(
-            tool_call_id,
             tool_name,
             pending_before_completion,
             emitted,

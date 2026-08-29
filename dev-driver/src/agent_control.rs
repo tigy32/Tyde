@@ -874,8 +874,8 @@ fn correlate_compaction_session(
     match agent.logical_session_id.as_ref() {
         Some(bound_session) => assert_eq!(
             bound_session, logical_session_id,
-            "{frame} logical session {} must match agent {} session {}",
-            logical_session_id.0, agent_id.0, bound_session.0,
+            "{frame} logical session must match agent {} session",
+            agent_id.0,
         ),
         None => {
             agent.logical_session_id = Some(logical_session_id.clone());
@@ -963,8 +963,8 @@ fn apply_envelope(snapshot: &mut SnapshotState, envelope: &protocol::Envelope) {
                 match agent.logical_session_id.as_ref() {
                     Some(bound_session) => assert_eq!(
                         bound_session, session_id,
-                        "AgentStart logical session {} must match agent {} session {}",
-                        session_id.0, payload.agent_id.0, bound_session.0,
+                        "AgentStart logical session must match agent {} session",
+                        payload.agent_id.0,
                     ),
                     None => agent.logical_session_id = Some(session_id.clone()),
                 }

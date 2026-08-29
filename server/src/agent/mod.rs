@@ -5206,7 +5206,6 @@ pub(crate) fn spawn_agent_actor(
                                                 session_store: &session_store,
                                                 status_handle: &status_handle,
                                                 review_registry: &review_registry,
-                                                session_id: current_session_id.as_ref(),
                                                 },
                                             )
                                             .await
@@ -5932,11 +5931,7 @@ pub(crate) fn spawn_agent_actor(
                                             )
                                             .await;
                                             eprintln!(
-                                                "TYDE TOOL RESPONSE COMMIT session={} tool_call_id={} event_log_len={}",
-                                                current_session_id
-                                                    .as_ref()
-                                                    .expect("live agent must have session_id")
-                                                    .0,
+                                                "TYDE TOOL RESPONSE COMMIT tool_call_id={} event_log_len={}",
                                                 tool_call_id,
                                                 event_log.len(),
                                             );
@@ -7007,7 +7002,6 @@ pub(crate) fn spawn_agent_actor(
                                 &session_store,
                                 &status_handle,
                                 &review_registry,
-                                current_session_id.as_ref(),
                             )
                             .await;
                             if dispatch == QueuedMessageDispatchOutcome::Closed {
@@ -7174,7 +7168,6 @@ pub(crate) fn spawn_agent_actor(
                                                 &session_store,
                                                 &status_handle,
                                                 &review_registry,
-                                                current_session_id.as_ref(),
                                             )
                                             .await;
                                             if dispatch
@@ -7354,7 +7347,6 @@ pub(crate) fn spawn_agent_actor(
                                     &session_store,
                                     &status_handle,
                                     &review_registry,
-                                    current_session_id.as_ref(),
                                 )
                                 .await;
                                 if dispatch == QueuedMessageDispatchOutcome::Closed {
@@ -11601,7 +11593,6 @@ async fn release_context_compaction_barrier(
     session_store: &Arc<Mutex<SessionStore>>,
     status_handle: &registry::AgentStatusHandle,
     review_registry: &ReviewRegistryHandle,
-    session_id: Option<&SessionId>,
 ) -> QueuedMessageDispatchOutcome {
     if *in_turn {
         return QueuedMessageDispatchOutcome::Empty;
@@ -11618,7 +11609,6 @@ async fn release_context_compaction_barrier(
         session_store,
         status_handle,
         review_registry,
-        session_id,
     })
     .await
 }
@@ -11643,7 +11633,6 @@ struct QueuedMessageDispatchContext<'a> {
     session_store: &'a Arc<Mutex<SessionStore>>,
     status_handle: &'a registry::AgentStatusHandle,
     review_registry: &'a ReviewRegistryHandle,
-    session_id: Option<&'a SessionId>,
 }
 
 async fn dispatch_queued_message(
@@ -11674,12 +11663,8 @@ async fn dispatch_queued_message(
     {
         SendOutcome::Accepted => {
             eprintln!(
-                "TYDE RESUME QUEUE DISPATCH agent={} session={} queued_message_id={}",
-                context.agent_id,
-                context
-                    .session_id
-                    .map_or("<none>", |session_id| session_id.0.as_str()),
-                queued.id,
+                "TYDE RESUME QUEUE DISPATCH agent={} queued_message_id={}",
+                context.agent_id, queued.id,
             );
             mark_agent_turn_active(context.status_handle).await;
             if let Some(review_id) = review_id {
@@ -11690,12 +11675,8 @@ async fn dispatch_queued_message(
         }
         SendOutcome::Busy(_) => {
             eprintln!(
-                "TYDE RESUME QUEUE BUSY agent={} session={} queued_message_id={}",
-                context.agent_id,
-                context
-                    .session_id
-                    .map_or("<none>", |session_id| session_id.0.as_str()),
-                queued.id,
+                "TYDE RESUME QUEUE BUSY agent={} queued_message_id={}",
+                context.agent_id, queued.id,
             );
             context.queue.push_front(queued);
             update_queued_messages_snapshot(
@@ -11713,12 +11694,8 @@ async fn dispatch_queued_message(
         SendOutcome::Closed => {
             *context.in_turn = false;
             eprintln!(
-                "TYDE RESUME QUEUE CLOSED agent={} session={} queued_message_id={}",
-                context.agent_id,
-                context
-                    .session_id
-                    .map_or("<none>", |session_id| session_id.0.as_str()),
-                queued.id,
+                "TYDE RESUME QUEUE CLOSED agent={} queued_message_id={}",
+                context.agent_id, queued.id,
             );
             QueuedMessageDispatchOutcome::Closed
         }

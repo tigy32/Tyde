@@ -921,7 +921,7 @@ async fn assert_a_session_cannot_move_out_from_under_tyde(host: &mut Host, sessi
     assert!(
         recalled.final_text().contains(&secret),
         "{backend:?}: resuming after the worktree attempt came back without the conversation — \
-         the model answered {:?} instead of the codeword {secret}.",
+         the model did not recall the expected codeword and answered {:?}.",
         recalled.final_text()
     );
     assert_clean_close(host, &after).await;

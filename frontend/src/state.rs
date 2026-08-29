@@ -4635,10 +4635,8 @@ impl AppState {
             && bound_session != snapshot.logical_session_id
         {
             log::warn!(
-                "context_compaction_capability for agent {} names session {} but the agent is bound to {}; dropping",
+                "context_compaction_capability for agent {} names a different session than the bound agent; dropping",
                 agent_id.0,
-                snapshot.logical_session_id.0,
-                bound_session.0,
             );
             self.compaction_capability.update(|map| {
                 map.remove(agent_id);

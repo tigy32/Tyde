@@ -1677,24 +1677,18 @@ fn context_compaction_session_matches(
 ) -> bool {
     let mut matches = true;
     state.agents.update(|agents| {
-        let Some(agent) = agents
-            .iter_mut()
-            .find(|agent| {
-                agent.local_host_id == agent_ref.local_host_id
-                    && agent.agent_id == agent_ref.agent_id
-            })
-        else {
+        let Some(agent) = agents.iter_mut().find(|agent| {
+            agent.local_host_id == agent_ref.local_host_id && agent.agent_id == agent_ref.agent_id
+        }) else {
             matches = false;
             return;
         };
         match agent.session_id.as_ref() {
             Some(bound_session) if bound_session != logical_session_id => {
                 log::warn!(
-                    "{} for agent {} names session {} but the mobile agent is bound to {}; dropping",
+                    "{} for agent {} names a different session than the mobile agent; dropping",
                     frame,
                     agent_ref.agent_id,
-                    logical_session_id.0,
-                    bound_session.0,
                 );
                 matches = false;
             }
@@ -1737,12 +1731,10 @@ fn apply_agent_start(
             && bound_session != announced_session
         {
             log::error!(
-                "ignoring AgentStart with conflicting logical session host={} agent_id={} stream={} bound={} announced={}",
+                "ignoring AgentStart with conflicting logical session host={} agent_id={} stream={}",
                 host,
                 payload.agent_id,
                 stream,
-                bound_session.0,
-                announced_session.0,
             );
             return;
         }
@@ -1770,11 +1762,9 @@ fn reduce_context_compaction_notify(
         &payload.operation_id,
     ) {
         log::debug!(
-            "ignoring delayed context compaction progress host={} agent_id={} session={} operation={}",
+            "ignoring delayed context compaction progress host={} agent_id={}",
             agent_ref.local_host_id,
             agent_ref.agent_id,
-            payload.logical_session_id.0,
-            payload.operation_id.0,
         );
         return;
     }
@@ -2836,11 +2826,9 @@ fn apply_agent_bootstrap(
             && current != candidate
         {
             log::error!(
-                "agent bootstrap carried conflicting compaction sessions host={} stream={} first={} next={}",
+                "agent bootstrap carried conflicting compaction sessions host={} stream={}",
                 host,
                 stream,
-                current.0,
-                candidate.0,
             );
             compaction_session_conflict = true;
             break;

@@ -4644,10 +4644,7 @@ impl HostHandle {
                             .clone()
                             .or(record.alias.clone())
                             .unwrap_or_else(|| {
-                                panic!(
-                                    "cannot resume session {} without a stored effective name",
-                                    session_id
-                                )
+                                panic!("cannot resume session without a stored effective name")
                             });
                         (effective, None)
                     }

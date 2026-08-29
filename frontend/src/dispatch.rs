@@ -4074,20 +4074,16 @@ fn apply_context_compaction_notify(
         && bound_session != payload.logical_session_id
     {
         log::warn!(
-            "context_compaction_notify for agent {} names session {} but the agent is bound to {}; dropping",
+            "context_compaction_notify for agent {} names a different session than the bound agent; dropping",
             payload.agent_id.0,
-            payload.logical_session_id.0,
-            bound_session.0,
         );
         return;
     }
 
     log::info!(
-        "dispatch context_compaction_notify host={} agent_id={} session={} operation_id={} status={:?} method={:?} source={:?}",
+        "dispatch context_compaction_notify host={} agent_id={} status={:?} method={:?} source={:?}",
         host_id,
         payload.agent_id,
-        payload.logical_session_id.0,
-        payload.operation_id.0,
         payload.status,
         payload.method,
         source
@@ -4172,10 +4168,9 @@ fn apply_context_compaction_capability(
         }
     }
     log::debug!(
-        "dispatch context_compaction_capability host={} agent_id={} session={} availability={:?}",
+        "dispatch context_compaction_capability host={} agent_id={} availability={:?}",
         host_id,
         payload.agent_id,
-        payload.logical_session_id.0,
         payload.availability
     );
     // The logical session travels with the snapshot: capability describes a
@@ -4249,10 +4244,8 @@ fn apply_team_context_compaction_notify(
             && *bound_session != member.logical_session_id
         {
             log::warn!(
-                "team_context_compaction_notify member {} names session {} but the agent is bound to {}; skipping member result",
+                "team_context_compaction_notify member {} names a different session than the bound agent; skipping member result",
                 member.agent_id.0,
-                member.logical_session_id.0,
-                bound_session.0,
             );
             continue;
         }

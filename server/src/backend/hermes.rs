@@ -2936,19 +2936,13 @@ impl HermesSessionActor {
                     "mapping Hermes gateway event"
                 );
                 if event_type.starts_with("subagent.") {
-                    eprintln!(
-                        "TYDE HERMES SUBAGENT RAW type={event_type} session={} payload={payload:?}",
-                        self.live_session_id
-                    );
+                    eprintln!("TYDE HERMES SUBAGENT EVENT type={event_type}");
                     self.handle_native_subagent_event(&event_type, payload)
                         .await;
                     return true;
                 }
                 if event_type == "message.complete" {
-                    eprintln!(
-                        "TYDE HERMES MESSAGE COMPLETE RAW session={} payload={payload:?}",
-                        self.live_session_id
-                    );
+                    eprintln!("TYDE HERMES MESSAGE COMPLETE EVENT");
                     let status = payload
                         .as_ref()
                         .and_then(|value| optional_string(value, &["status"]));
