@@ -13,6 +13,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use futures_util::FutureExt;
@@ -40,6 +41,8 @@ use uuid::Uuid;
 /// Control-plane replies do not wait on a model. Kept named because three call
 /// sites share it; the per-turn waits are inline at their one use each.
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(60);
+static CONFORMANCE_RUN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static LEGACY_CODEX_DYNAMIC_AWAIT_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 /// Seeded here and asserted in `conformance.rs`; shared so the two cannot drift.
 pub const SCRATCH_DIR: &str = "scratch";
@@ -57,7 +60,13 @@ pub fn pinned_models(backend: BackendKind) -> Vec<String> {
         BackendKind::Claude => vec!["haiku".to_owned(), "claude-haiku-4-5-20251001".to_owned()],
         // `codex.rs` documents this variable: pinning a different model without
         // a rebuild is how you tell model-specific drift from a real defect.
-        BackendKind::Codex => vec![env_or("TYDE_CODEX_TEST_MODEL", "gpt-5.6-luna")],
+        BackendKind::Codex => vec![
+            if LEGACY_CODEX_DYNAMIC_AWAIT_ACTIVE.load(Ordering::Relaxed) {
+                "gpt-5.6-sol".to_owned()
+            } else {
+                env_or("TYDE_CODEX_TEST_MODEL", "gpt-5.6-luna")
+            },
+        ],
         _ => Vec::new(),
     }
 }
@@ -2179,6 +2188,7 @@ fn host_settings(backend_kind: BackendKind) -> serde_json::Value {
 /// guard before reaching a Tyde assertion. `/tmp` resolves to `/private/tmp`,
 /// which is not on that list, and is closer to where a real workspace lives.
 const SCRATCH_ROOT: &str = "/tmp";
+const CODEX_LEGACY_DYNAMIC_AWAIT_MARKER: &str = ".tyde-conformance-legacy-dynamic-await";
 
 /// A scratch directory under [`SCRATCH_ROOT`] that a backend's file tools will
 /// actually write to.
@@ -2203,7 +2213,20 @@ where
     F: Fn(Host) -> Fut + Send + 'static,
     Fut: Future<Output = ()> + 'static,
 {
-    run_scenario_where(requires, |_| true, scenario);
+    run_scenario_where(requires, |_| true, false, scenario);
+}
+
+pub fn run_legacy_codex_dynamic_await_scenario<F, Fut>(requires: &[BackendCapability], scenario: F)
+where
+    F: Fn(Host) -> Fut + Send + 'static,
+    Fut: Future<Output = ()> + 'static,
+{
+    run_scenario_where(
+        requires,
+        |backend| backend == BackendKind::Codex,
+        true,
+        scenario,
+    );
 }
 
 pub fn run_native_skill_scenario<F, Fut>(scenario: F)
@@ -2211,17 +2234,34 @@ where
     F: Fn(Host) -> Fut + Send + 'static,
     Fut: Future<Output = ()> + 'static,
 {
-    run_scenario_where(&[], server::backend::discovers_skills_natively, scenario);
+    run_scenario_where(
+        &[],
+        server::backend::discovers_skills_natively,
+        false,
+        scenario,
+    );
 }
 
 fn run_scenario_where<F, Fut>(
     requires: &[BackendCapability],
     eligible: impl Fn(BackendKind) -> bool,
+    legacy_codex_dynamic_await: bool,
     scenario: F,
 ) where
     F: Fn(Host) -> Fut + Send + 'static,
     Fut: Future<Output = ()> + 'static,
 {
+    let _run = CONFORMANCE_RUN_LOCK
+        .lock()
+        .expect("conformance run lock poisoned");
+    struct LegacyCodexModelGuard;
+    impl Drop for LegacyCodexModelGuard {
+        fn drop(&mut self) {
+            LEGACY_CODEX_DYNAMIC_AWAIT_ACTIVE.store(false, Ordering::Relaxed);
+        }
+    }
+    LEGACY_CODEX_DYNAMIC_AWAIT_ACTIVE.store(legacy_codex_dynamic_await, Ordering::Relaxed);
+    let _model_guard = LegacyCodexModelGuard;
     init_tracing();
     let (backends, skipped): (Vec<_>, Vec<_>) = enabled_backends().into_iter().partition(|kind| {
         let capabilities = server::backend::capabilities_for_backend_kind(*kind);
@@ -2249,6 +2289,13 @@ fn run_scenario_where<F, Fut>(
                     for backend_kind in backends {
                         let store = scratch_dir("store");
                         let workspace = scratch_dir("workspace");
+                        if legacy_codex_dynamic_await && backend_kind == BackendKind::Codex {
+                            std::fs::write(
+                                workspace.path().join(CODEX_LEGACY_DYNAMIC_AWAIT_MARKER),
+                                "pre-beta.76 Codex thread",
+                            )
+                            .expect("mark legacy Codex dynamic-await conformance workspace");
+                        }
                         let host = Host::new(backend_kind, store.path(), workspace.path()).await;
                         let handle = host.handle.clone();
 

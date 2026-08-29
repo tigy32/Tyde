@@ -85,6 +85,8 @@ The partial output above was kept and the turn continued.";
 const CODEX_SKILLS_ROOT_PREFIX: &str = "tyde-codex-skills-";
 const CODEX_SKILL_MANIFEST_MAX_ENTRIES: usize = 100_000;
 const CODEX_SKILL_MANIFEST_MAX_BYTES: u64 = 1024 * 1024 * 1024;
+#[cfg(feature = "test-support")]
+const CODEX_LEGACY_DYNAMIC_AWAIT_MARKER: &str = ".tyde-conformance-legacy-dynamic-await";
 const CODEX_RAW_EVENTS_UNAVAILABLE_WARNING: &str = "This resumed or forked Codex thread cannot expose per-response raw boundaries with the installed app-server. Tyde is retaining the legacy tool-container projection for this thread; start a new Codex session for strict provider-response message identity.";
 
 fn emit_codex_raw_events_warning_if_needed(emitter: &TurnEmitter, strict: bool) {
@@ -1626,6 +1628,24 @@ impl CodexSession {
             }
             _ => None,
         };
+        #[cfg(feature = "test-support")]
+        let legacy_dynamic_await = workspace_roots.iter().any(|root| {
+            Path::new(root)
+                .join(CODEX_LEGACY_DYNAMIC_AWAIT_MARKER)
+                .is_file()
+        });
+        #[cfg(feature = "test-support")]
+        let conformance_mcp_servers = legacy_dynamic_await.then(|| {
+            startup_mcp_servers
+                .iter()
+                .filter(|server| server.name != AGENT_CONTROL_AWAIT_MCP_SERVER_NAME)
+                .cloned()
+                .collect::<Vec<_>>()
+        });
+        #[cfg(feature = "test-support")]
+        let startup_mcp_servers = conformance_mcp_servers
+            .as_deref()
+            .unwrap_or(startup_mcp_servers);
         let (rpc, inbound_rx) = match CodexRpc::spawn(
             ssh_host.as_deref(),
             startup_mcp_servers,
@@ -1720,6 +1740,27 @@ impl CodexSession {
             "experimentalRawEvents": CODEX_ENABLE_EXPERIMENTAL_RAW_EVENTS,
             "persistExtendedHistory": false
         });
+        #[cfg(feature = "test-support")]
+        if legacy_dynamic_await {
+            thread_start_params["dynamicTools"] = json!([{
+                "type": "function",
+                "name": "tyde_await_agents",
+                "description": "Wait until any supplied direct child Tyde agent becomes idle or failed.",
+                "inputSchema": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "agent_ids": {
+                            "type": "array",
+                            "minItems": 1,
+                            "items": { "type": "string", "minLength": 1 }
+                        }
+                    },
+                    "required": ["agent_ids"]
+                }
+            }]);
+            tracing::info!("Projected the legacy Codex dynamic await tool for conformance");
+        }
         if execution_mode == BackendExecutionMode::InferenceOnly {
             match codex_inference_thread_config(&rpc, &cwd).await {
                 Ok(config) => thread_start_params["config"] = config,
@@ -13135,17 +13176,11 @@ impl CodexInner {
                     .and_then(Value::as_str)
                     .map(|call_id| codex_scoped_tool_call_id(params, call_id))
                     .unwrap_or_else(|| codex_scoped_tool_call_id(params, "dynamic-tool-call"));
-                self.track_tool_requests(std::iter::once(call_id.clone()))
-                    .await;
-                self.emit_tool_request(
-                    &call_id,
+                tracing::info!(
+                    tool_call_id = call_id,
                     tool_name,
-                    CodexToolRequest::other(json!(
-                        params.get("arguments").cloned().unwrap_or(Value::Null)
-                    )),
-                )
-                .await;
-
+                    "Rejecting unsupported Codex dynamic client tool request"
+                );
                 let response_payload = json!({
                     "success": false,
                     "contentItems": [
@@ -13156,18 +13191,6 @@ impl CodexInner {
                     ]
                 });
                 let _ = self.rpc.respond(id, response_payload).await;
-                self.emit_tool_execution_completed(
-                    &call_id,
-                    tool_name,
-                    false,
-                    json!({
-                        "kind": "Error",
-                        "short_message": "Dynamic client tool calls are not yet supported in Tyde.",
-                        "detailed_message": "Codex requested a client-side dynamic tool call that Tyde has not implemented yet."
-                    }),
-                    Some("Dynamic client tool calls are not yet supported in Tyde.".to_string()),
-                )
-                .await;
             }
             _ => {
                 let _ = self
@@ -14076,6 +14099,14 @@ impl CodexInner {
                 let error = normalized_mcp
                     .and_then(|normalized| normalized.error)
                     .or_else(|| (!success).then(|| format!("{tool_name} failed")));
+                if item_type == "dynamicToolCall" {
+                    tracing::info!(
+                        tool_call_id = item_id,
+                        tool_name,
+                        provider_success,
+                        "Completing Codex dynamic tool from its provider item"
+                    );
+                }
                 self.emit_agent_control_await_progress_if_needed(
                     &item_id,
                     tool_name,

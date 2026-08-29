@@ -2128,6 +2128,64 @@ fn real_agent_await_survives_a_resumed_session() {
             assert_clean_close(&mut host, &resumed).await;
         },
     );
+
+    // A thread created before beta.76 retains the obsolete default-namespace
+    // dynamic await after an upgrade. Codex reports its rejected client call
+    // both as the RPC Tyde answers and as a terminal dynamicToolCall item. The
+    // RPC is transport, not a second UI completion: one failed card is valid;
+    // completing it twice produces the user-visible malformed-event Error bar.
+    run_legacy_codex_dynamic_await_scenario(
+        &[BackendCapability::ResumeSession],
+        |mut host| async move {
+            let workspace = host.workspace().to_path_buf();
+            let agent = spawn_agent(&mut host, &launch_prompt()).await;
+            let launched = collect_turn(&mut host, &agent, &launch_prompt()).await;
+            assert_ready_handshake(&launched);
+            assert_clean_close(&mut host, &agent).await;
+
+            let session = stored_session(&mut host).await;
+            let resumed = resume_agent(&mut host, &session.id).await;
+
+            let payload = unique_payload();
+            let child_prompt = child_prompt(&workspace, &payload);
+            let spawn_prompt =
+                spawn_child_prompt(host.backend(), &host.workspace_roots(), &child_prompt);
+            let delegation = delegate(&mut host, &resumed, &spawn_prompt, &child_prompt).await;
+            let child_id = delegation.child_agent().agent_id.clone();
+            let [spawned, child] = delegation.into_turns();
+
+            let prompt = await_child_prompt(&child_id);
+            let rejected = ask(&mut host, &resumed, &prompt).await;
+
+            let completions = rejected.tool_completions().collect::<Vec<_>>();
+            assert!(
+                !completions.is_empty(),
+                "{}: legacy dynamic await did not complete: {:?}",
+                rejected.label(),
+                rejected.completion_summaries(),
+            );
+            for completion in completions {
+                let ToolExecutionOutcome::Failed { details, .. } = &completion.outcome else {
+                    panic!(
+                        "{}: obsolete dynamic await unexpectedly succeeded: {:?}",
+                        rejected.label(),
+                        completion.outcome
+                    )
+                };
+                assert!(
+                    details
+                        .as_deref()
+                        .is_some_and(|details| details.contains("dynamicToolCall")),
+                    "{}: did not exercise Codex's legacy dynamic-tool completion: {:?}",
+                    rejected.label(),
+                    completion.outcome
+                );
+            }
+            assert_final_text_contains(&rejected, AWAITED_MARKER);
+            assert_universal_contract(&[launched, spawned, child, rejected]);
+            assert_clean_close(&mut host, &resumed).await;
+        },
+    );
 }
 
 /// Names the tool, for the same reason [`spawn_child_prompt`] does: every
