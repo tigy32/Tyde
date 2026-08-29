@@ -4672,19 +4672,9 @@ impl ClaudeInner {
             error
         };
         let outcome = claude_tool_execution_outcome(success, tool_result, error);
-        let pending_before_completion = self.emitter.has_pending_tool_request(tool_call_id);
-        eprintln!(
-            "TYDE CLAUDE TOOL COMPLETION name={tool_name} pending={pending_before_completion} known={}",
-            self.emitter.has_known_tool_request(tool_call_id)
-        );
-        let emitted =
-            emit_tool_completion_for_known_request(&self.emitter, tool_call_id, tool_name, outcome);
-        tracing::info!(
-            tool_name,
-            pending_before_completion,
-            emitted,
-            "Claude tool completion emission"
-        );
+        eprintln!("TYDE CLAUDE TOOL COMPLETION");
+        emit_tool_completion_for_known_request(&self.emitter, tool_call_id, tool_name, outcome);
+        tracing::info!("Claude tool completion emission");
         if let Some(tasks) = task_update {
             self.emitter.task_update(&tasks);
         }
