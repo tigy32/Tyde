@@ -15149,7 +15149,19 @@ impl CodexInner {
         let agents = {
             let state = self.state.lock().await;
             if thread_ids.is_empty() {
-                thread_ids.extend(state.subagent_streams.keys().cloned());
+                thread_ids.extend(
+                    state
+                        .subagent_streams
+                        .iter()
+                        .filter(|(_, stream)| {
+                            self.emitter.has_pending_tool_request(&stream.spawn_item_id)
+                                || self.emitter.has_pending_tool_request(&format!(
+                                    "codex-native-spawn:{}",
+                                    stream.spawn_item_id
+                                ))
+                        })
+                        .map(|(thread_id, _)| thread_id.clone()),
+                );
                 thread_ids.sort();
             }
             thread_ids
@@ -19631,6 +19643,7 @@ impl Backend for CodexBackend {
             tyde_agent_adapter::BackendCapability::ContextUsageReported,
             tyde_agent_adapter::BackendCapability::CompactionReported,
             tyde_agent_adapter::BackendCapability::Subagents,
+            tyde_agent_adapter::BackendCapability::NativeSubagentWaitProgress,
             tyde_agent_adapter::BackendCapability::BackgroundSubagents,
             tyde_agent_adapter::BackendCapability::BackgroundTasks,
             tyde_agent_adapter::BackendCapability::CancelsBackgroundTasks,

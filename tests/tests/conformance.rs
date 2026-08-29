@@ -35,10 +35,12 @@ use std::time::Duration;
 
 use base64::Engine as _;
 use protocol::{
-    AgentId, AgentOrigin, BackendCapacityState, BackendKind, CapacityMeasure, CapacitySource,
-    ChatEvent, ContextCompactionStatus, CurrentContextUsage, ImageData, MessageSender,
-    MessageTokenUsage, SessionId, SessionSettingFieldType, SessionSettingsValues, TaskStatus,
-    TokenUsage, ToolExecutionMode, ToolExecutionOutcome, ToolExecutionResult, ToolRequestType,
+    AgentControlProgressKind, AgentControlProgressStatus, AgentId, AgentOrigin,
+    BackendCapacityState, BackendKind, CapacityMeasure, CapacitySource, ChatEvent,
+    ContextCompactionStatus, CurrentContextUsage, ImageData, MessageSender, MessageTokenUsage,
+    SessionId, SessionSettingFieldType, SessionSettingsValues, TaskStatus, TokenUsage,
+    ToolExecutionMode, ToolExecutionOutcome, ToolExecutionResult, ToolProgressUpdate,
+    ToolRequestType,
 };
 use serde_json::Value;
 use tyde_agent_adapter::BackendCapability;
@@ -1525,6 +1527,79 @@ fn real_conversation_in_native_subagent() {
     });
 }
 
+/// Codex retains completed native child sessions so a later follow-up can still
+/// address them. An untargeted native wait is different: it waits for current
+/// child activity, so its receipt must not count retained terminal sessions as
+/// if they were still running.
+#[test]
+#[ignore = "paid real-backend suite; use --run-ignored all with TYDE_RUN_REAL_AI_TESTS=1"]
+fn real_native_wait_excludes_completed_children() {
+    run_scenario(
+        &[BackendCapability::NativeSubagentWaitProgress],
+        |mut host| async move {
+            let workspace = host.workspace().to_path_buf();
+            let first_payload = unique_payload();
+            let first_prompt = codex_single_subagent_wait_prompt(
+                &workspace,
+                "wait-history-first.txt",
+                &first_payload,
+                0,
+            );
+            let agent = spawn_agent(&mut host, &first_prompt).await;
+            let first = collect_turn(&mut host, &agent, &first_prompt).await;
+            eprintln!("native wait regression: collected first turn");
+            assert_final_text_contains(&first, &first_payload);
+            assert_universal_contract(std::slice::from_ref(&first));
+            eprintln!("native wait regression: validated first turn");
+            let first_children = native_subagent_ids(&first);
+            assert_eq!(
+                first_children.len(),
+                1,
+                "{}: expected one completed native child, got {first_children:?}",
+                first.label()
+            );
+
+            let second_payload = unique_payload();
+            let second_prompt = codex_single_subagent_wait_prompt(
+                &workspace,
+                "wait-history-second.txt",
+                &second_payload,
+                8,
+            );
+            eprintln!("native wait regression: sending second turn");
+            let second = ask(&mut host, &agent, &second_prompt).await;
+            assert_final_text_contains(&second, &second_payload);
+            assert_universal_contract(std::slice::from_ref(&second));
+            let second_children = native_subagent_ids(&second);
+            assert_eq!(
+                second_children.len(),
+                1,
+                "{}: expected one newly running native child, got {second_children:?}",
+                second.label()
+            );
+
+            let waits = running_native_wait_agent_ids(&second);
+            assert_eq!(
+                waits.len(),
+                1,
+                "{}: expected exactly one running native wait receipt, got {waits:?}",
+                second.label()
+            );
+            assert_eq!(
+                waits[0],
+                second_children,
+                "{}: native wait counted retained completed children; completed {:?}, new {:?}, \
+                 wait {:?}",
+                second.label(),
+                first_children,
+                second_children,
+                waits[0]
+            );
+            assert_clean_close(&mut host, &agent).await;
+        },
+    );
+}
+
 /// Everything about a native workflow, in one conversation.
 ///
 /// A workflow is the second thing in Tyde that is *supposed* to outlive its own
@@ -2836,6 +2911,62 @@ fn subagent_prompt(backend: BackendKind, workspace: &Path, first: &str, second: 
         ),
         _ => behavior,
     }
+}
+
+fn codex_single_subagent_wait_prompt(
+    workspace: &Path,
+    file: &str,
+    payload: &str,
+    delay_seconds: u64,
+) -> String {
+    format!(
+        "Use Codex's native collaboration spawn_agent tool directly exactly once with the \
+         delegated task below. Then immediately call Codex's native untargeted wait tool \
+         directly exactly once and wait for the live child to finish. The wait takes no child \
+         ids. Do not use programmatic exec, functions.exec, any mcp__tyde tool, apply_patch, or \
+         any file/terminal tool in the parent. The delegated message must require the child to \
+         use exec_command exactly \
+         once to run `sleep {delay_seconds}; printf '{payload}\\n' > {}/{file} && cat \
+         {}/{file}`. After the child finishes, reply with exactly {payload} and nothing else.",
+        workspace.display(),
+        workspace.display(),
+    )
+}
+
+fn native_subagent_ids(turn: &Turn) -> Vec<AgentId> {
+    let mut ids = Vec::new();
+    for event in turn.events() {
+        if let ChatEvent::ToolProgress(progress) = event
+            && let ToolProgressUpdate::SubAgent(subagent) = &progress.update
+            && !subagent.completed
+            && !ids.contains(&subagent.agent_id)
+        {
+            ids.push(subagent.agent_id.clone());
+        }
+    }
+    ids
+}
+
+fn running_native_wait_agent_ids(turn: &Turn) -> Vec<Vec<AgentId>> {
+    turn.events()
+        .iter()
+        .filter_map(|event| {
+            let ChatEvent::ToolProgress(progress) = event else {
+                return None;
+            };
+            let ToolProgressUpdate::AgentControl(wait) = &progress.update else {
+                return None;
+            };
+            (wait.progress_kind == AgentControlProgressKind::Await
+                && wait.status == AgentControlProgressStatus::Running)
+                .then(|| {
+                    wait.agents
+                        .iter()
+                        .map(|agent| agent.agent_id.clone())
+                        .collect()
+                })
+        })
+        .collect()
 }
 
 /// A nonce, so a stale file from an earlier run can never satisfy the oracle.

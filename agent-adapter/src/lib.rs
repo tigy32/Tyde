@@ -105,6 +105,7 @@ exhaustive_capabilities! {
     ContextBreakdownReported,
     CompactionReported,
     Subagents,
+    NativeSubagentWaitProgress,
     ForegroundSubagents,
     BackgroundSubagents,
     BackgroundTasks,
