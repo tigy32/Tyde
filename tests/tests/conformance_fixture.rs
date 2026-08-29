@@ -43,6 +43,7 @@ use uuid::Uuid;
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(60);
 static CONFORMANCE_RUN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 static LEGACY_CODEX_DYNAMIC_AWAIT_ACTIVE: AtomicBool = AtomicBool::new(false);
+static CODEX_NESTED_SUBAGENT_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 /// Seeded here and asserted in `conformance.rs`; shared so the two cannot drift.
 pub const SCRATCH_DIR: &str = "scratch";
@@ -60,13 +61,13 @@ pub fn pinned_models(backend: BackendKind) -> Vec<String> {
         BackendKind::Claude => vec!["haiku".to_owned(), "claude-haiku-4-5-20251001".to_owned()],
         // `codex.rs` documents this variable: pinning a different model without
         // a rebuild is how you tell model-specific drift from a real defect.
-        BackendKind::Codex => vec![
-            if LEGACY_CODEX_DYNAMIC_AWAIT_ACTIVE.load(Ordering::Relaxed) {
-                "gpt-5.6-sol".to_owned()
-            } else {
-                env_or("TYDE_CODEX_TEST_MODEL", "gpt-5.6-luna")
-            },
-        ],
+        BackendKind::Codex => vec![if LEGACY_CODEX_DYNAMIC_AWAIT_ACTIVE.load(Ordering::Relaxed)
+            || CODEX_NESTED_SUBAGENT_ACTIVE.load(Ordering::Relaxed)
+        {
+            "gpt-5.6-sol".to_owned()
+        } else {
+            env_or("TYDE_CODEX_TEST_MODEL", "gpt-5.6-luna")
+        }],
         _ => Vec::new(),
     }
 }
@@ -2171,8 +2172,12 @@ fn host_settings(backend_kind: BackendKind) -> serde_json::Value {
             settings["settings"]["backend_tier_configs"] =
                 json!({"codex": {"low": tier, "high": tier}});
         }
-        // Hermes pins through per-spawn session settings instead; see
-        // `hermes_session_settings`.
+        BackendKind::Hermes => {
+            let tier = serde_json::to_value(hermes_session_settings())
+                .expect("serialize Hermes conformance tier");
+            settings["settings"]["backend_tier_configs"] =
+                json!({"hermes": {"low": tier, "high": tier}});
+        }
         _ => {}
     }
     settings
@@ -2213,7 +2218,15 @@ where
     F: Fn(Host) -> Fut + Send + 'static,
     Fut: Future<Output = ()> + 'static,
 {
-    run_scenario_where(requires, |_| true, false, scenario);
+    run_scenario_where(requires, |_| true, false, false, scenario);
+}
+
+pub fn run_nested_subagent_scenario<F, Fut>(requires: &[BackendCapability], scenario: F)
+where
+    F: Fn(Host) -> Fut + Send + 'static,
+    Fut: Future<Output = ()> + 'static,
+{
+    run_scenario_where(requires, |_| true, false, true, scenario);
 }
 
 pub fn run_legacy_codex_dynamic_await_scenario<F, Fut>(requires: &[BackendCapability], scenario: F)
@@ -2225,6 +2238,7 @@ where
         requires,
         |backend| backend == BackendKind::Codex,
         true,
+        false,
         scenario,
     );
 }
@@ -2238,6 +2252,7 @@ where
         &[],
         server::backend::discovers_skills_natively,
         false,
+        false,
         scenario,
     );
 }
@@ -2246,6 +2261,7 @@ fn run_scenario_where<F, Fut>(
     requires: &[BackendCapability],
     eligible: impl Fn(BackendKind) -> bool,
     legacy_codex_dynamic_await: bool,
+    codex_nested_subagent: bool,
     scenario: F,
 ) where
     F: Fn(Host) -> Fut + Send + 'static,
@@ -2258,9 +2274,11 @@ fn run_scenario_where<F, Fut>(
     impl Drop for LegacyCodexModelGuard {
         fn drop(&mut self) {
             LEGACY_CODEX_DYNAMIC_AWAIT_ACTIVE.store(false, Ordering::Relaxed);
+            CODEX_NESTED_SUBAGENT_ACTIVE.store(false, Ordering::Relaxed);
         }
     }
     LEGACY_CODEX_DYNAMIC_AWAIT_ACTIVE.store(legacy_codex_dynamic_await, Ordering::Relaxed);
+    CODEX_NESTED_SUBAGENT_ACTIVE.store(codex_nested_subagent, Ordering::Relaxed);
     let _model_guard = LegacyCodexModelGuard;
     init_tracing();
     let (backends, skipped): (Vec<_>, Vec<_>) = enabled_backends().into_iter().partition(|kind| {

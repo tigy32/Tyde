@@ -4019,10 +4019,22 @@ impl CodexBackgroundCommand {
 }
 
 enum CodexNotificationOwner {
-    Parent { thread_id: String },
-    LiveChild { thread_id: String },
-    CompletedChild { thread_id: String },
-    Unknown { thread_id: Option<String> },
+    Parent {
+        thread_id: String,
+    },
+    LiveChild {
+        thread_id: String,
+    },
+    CompletedChild {
+        thread_id: String,
+    },
+    Descendant {
+        thread_id: String,
+        ancestor_thread_id: String,
+    },
+    Unknown {
+        thread_id: Option<String>,
+    },
 }
 
 struct CodexState {
@@ -4098,6 +4110,7 @@ struct CodexState {
     conflicting_subagent_threads: HashMap<String, String>,
     registering_subagent_threads: HashSet<String>,
     unknown_owner_notifications: HashSet<String>,
+    descendant_owner_threads: HashMap<String, String>,
     subagent_streams: HashMap<String, CodexSubAgentStream>,
     completed_subagent_streams: HashMap<String, CompletedCodexSubAgentStream>,
 }
@@ -4177,6 +4190,7 @@ fn initial_codex_state(
         conflicting_subagent_threads: HashMap::new(),
         registering_subagent_threads: HashSet::new(),
         unknown_owner_notifications: HashSet::new(),
+        descendant_owner_threads: HashMap::new(),
         subagent_streams: HashMap::new(),
         completed_subagent_streams: HashMap::new(),
     }
@@ -10259,6 +10273,8 @@ impl CodexInner {
                 false
             }
             CodexNotificationOwner::LiveChild { thread_id } => {
+                self.register_codex_descendant_from_notification(&thread_id, params)
+                    .await;
                 let model = self
                     .state
                     .lock()
@@ -10276,6 +10292,8 @@ impl CodexInner {
                 true
             }
             CodexNotificationOwner::CompletedChild { thread_id } => {
+                self.register_codex_descendant_from_notification(&thread_id, params)
+                    .await;
                 let model = self
                     .state
                     .lock()
@@ -10290,6 +10308,20 @@ impl CodexInner {
                 );
                 self.handle_completed_subagent_notification(method, params, &thread_id, &model)
                     .await;
+                true
+            }
+            CodexNotificationOwner::Descendant {
+                thread_id,
+                ancestor_thread_id,
+            } => {
+                self.register_codex_descendant_from_notification(&ancestor_thread_id, params)
+                    .await;
+                tracing::info!(
+                    method,
+                    thread_id,
+                    ancestor_thread_id,
+                    "Codex notification ownership: nested descendant"
+                );
                 true
             }
             CodexNotificationOwner::Unknown { thread_id } => {
@@ -10316,6 +10348,51 @@ impl CodexInner {
                     );
                 }
                 true
+            }
+        }
+    }
+
+    async fn register_codex_descendant_from_notification(
+        &self,
+        ancestor_thread_id: &str,
+        params: &Value,
+    ) {
+        let Some(item) = params.get("item") else {
+            return;
+        };
+        let Some(activity) = parse_codex_subagent_activity(item) else {
+            return;
+        };
+        if activity.kind != "started" {
+            return;
+        }
+        let descendant_thread_id = activity.agent_thread_id;
+        let mut state = self.state.lock().await;
+        match state.descendant_owner_threads.get(&descendant_thread_id) {
+            Some(existing) if existing != ancestor_thread_id => {
+                let message = format!(
+                    "Codex ownership invariant failed: descendant thread '{descendant_thread_id}' names both '{existing}' and '{ancestor_thread_id}' as its direct-child ancestor"
+                );
+                tracing::error!(
+                    descendant_thread_id,
+                    existing_ancestor_thread_id = existing,
+                    ancestor_thread_id,
+                    "{message}"
+                );
+                drop(state);
+                self.emitter.backend_error(&message);
+            }
+            Some(_) => {}
+            None => {
+                tracing::info!(
+                    descendant_thread_id,
+                    ancestor_thread_id,
+                    agent_path = activity.agent_path,
+                    "Registered Codex nested descendant ownership"
+                );
+                state
+                    .descendant_owner_threads
+                    .insert(descendant_thread_id, ancestor_thread_id.to_owned());
             }
         }
     }
@@ -11071,6 +11148,19 @@ impl CodexInner {
         stream_key: &str,
         model: &str,
     ) {
+        if matches!(method, "item/started" | "item/completed")
+            && params
+                .pointer("/item/type")
+                .and_then(Value::as_str)
+                .is_some_and(|item_type| item_type.eq_ignore_ascii_case("subAgentActivity"))
+        {
+            tracing::info!(
+                child_thread_id = stream_key,
+                codex_method = method,
+                "Accepted nested activity from completed Codex child"
+            );
+            return;
+        }
         if self
             .state
             .lock()
@@ -15461,6 +15551,12 @@ fn classify_codex_notification_owner(state: &CodexState, params: &Value) -> Code
     }
     if state.completed_subagent_streams.contains_key(&thread_id) {
         return CodexNotificationOwner::CompletedChild { thread_id };
+    }
+    if let Some(ancestor_thread_id) = state.descendant_owner_threads.get(&thread_id) {
+        return CodexNotificationOwner::Descendant {
+            thread_id,
+            ancestor_thread_id: ancestor_thread_id.clone(),
+        };
     }
     CodexNotificationOwner::Unknown {
         thread_id: Some(thread_id),

@@ -1600,6 +1600,40 @@ fn real_native_wait_excludes_completed_children() {
     );
 }
 
+/// A child can delegate again. Codex descendant notifications still share the
+/// root app-server connection, so their turns must remain owned instead of
+/// becoming unregistered-thread Error cards.
+#[test]
+#[ignore = "paid real-backend suite; use --run-ignored all with TYDE_RUN_REAL_AI_TESTS=1"]
+fn real_nested_subagent_ownership() {
+    run_nested_subagent_scenario(&[BackendCapability::Subagents], |mut host| async move {
+        let workspace = host.workspace().to_path_buf();
+        let payload = unique_payload();
+        let agent = spawn_agent(&mut host, &launch_prompt()).await;
+        let launched = collect_turn(&mut host, &agent, &launch_prompt()).await;
+        let child_prompt = nested_native_subagent_prompt(host.backend(), &workspace, &payload);
+        let prompt = native_relay_child_prompt(host.backend(), &child_prompt, &payload);
+        let delegation = delegate(&mut host, &agent, &prompt, &child_prompt).await;
+        let [spawned, delegated] = delegation.into_turns();
+        assert_final_text_contains(&launched, READY_MARKER);
+        assert_no_ownership_error(&spawned.label(), spawned.events());
+        assert_no_ownership_error(&delegated.label(), delegated.events());
+        assert_final_text_contains(&spawned, &payload);
+        assert_final_text_contains(&delegated, &payload);
+        let proof = workspace.join("nested-native.txt");
+        let contents = std::fs::read_to_string(&proof).ok();
+        assert!(
+            contents
+                .as_deref()
+                .is_some_and(|contents| contents.contains(&payload)),
+            "{}: {} does not contain {payload:?} (contents: {contents:?})",
+            delegated.label(),
+            proof.display()
+        );
+        assert_clean_close(&mut host, &agent).await;
+    });
+}
+
 /// Everything about a native workflow, in one conversation.
 ///
 /// A workflow is the second thing in Tyde that is *supposed* to outlive its own
@@ -2989,6 +3023,78 @@ fn codex_single_subagent_wait_prompt(
         workspace.display(),
         workspace.display(),
     )
+}
+
+fn nested_native_subagent_prompt(backend: BackendKind, workspace: &Path, payload: &str) -> String {
+    let provider = match backend {
+        BackendKind::Codex => {
+            "Use Codex's native collaboration spawn_agent tool directly exactly once with the \
+             task below, then use its native wait tool until that grandchild finishes. Do not use \
+             functions.exec or any mcp__tyde_agent_control tool."
+                .to_owned()
+        }
+        BackendKind::Claude => {
+            "Use the native Agent and TaskOutput collaboration tools.".to_owned()
+        }
+        BackendKind::Hermes => format!(
+            "Use mcp__tyde__tyde_spawn_agent exactly once, then use \
+             mcp__tyde__tyde_await_agents with the returned agent id until it finishes. Pass \
+             backend_kind `hermes`, cost_hint `low`, and workspace_roots [`{}`] to the spawn.",
+            workspace.display()
+        ),
+        BackendKind::Antigravity => format!(
+            "Use mcp__tyde__tyde_spawn_agent exactly once, then use \
+             mcp__tyde__tyde_await_agents with the returned agent id until it finishes. Pass \
+             backend_kind `antigravity`, cost_hint `low`, and workspace_roots [`{}`] to the \
+             spawn.",
+            workspace.display()
+        ),
+        BackendKind::Tycode | BackendKind::Kiro => {
+            "Use the backend's native spawn-agent and wait collaboration tools.".to_owned()
+        }
+    };
+    format!(
+        "{provider} Spawn exactly one grandchild whose task is to use a shell exactly once to run \
+         `printf '{payload}\\n' > {}/nested-native.txt && cat {}/nested-native.txt`. Do not use \
+         any shell or file tool yourself. Wait for the grandchild, then reply with exactly \
+         {payload} and nothing else.",
+        workspace.display(),
+        workspace.display(),
+    )
+}
+
+fn native_relay_child_prompt(
+    backend: BackendKind,
+    child_prompt: &str,
+    final_payload: &str,
+) -> String {
+    match backend {
+        BackendKind::Codex => format!(
+            "Use Codex's native collaboration spawn_agent tool directly exactly once. Its child \
+             message must be the entire block between BEGIN CHILD TASK and END CHILD TASK copied \
+             verbatim; do not interpret or perform that block in this agent. Then use the native \
+             wait tool until the child finishes and reply with exactly {final_payload}. Do not \
+             use any mcp__tyde tool. BEGIN CHILD TASK\n{child_prompt}\nEND CHILD TASK"
+        ),
+        _ => format!(
+            "Use the backend's native subagent tool exactly once with this delegated task: \
+             {child_prompt} Wait for it and reply with exactly {final_payload}."
+        ),
+    }
+}
+
+fn assert_no_ownership_error(label: &str, events: &[ChatEvent]) {
+    for event in events {
+        if let ChatEvent::MessageAdded(message) = event
+            && matches!(message.sender, MessageSender::Error)
+            && message.content.contains("ownership invariant failed")
+        {
+            panic!(
+                "{label}: emitted an ownership Error message: {:?}",
+                message.content
+            );
+        }
+    }
 }
 
 fn native_subagent_ids(turn: &Turn) -> Vec<AgentId> {
