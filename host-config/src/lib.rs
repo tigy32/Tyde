@@ -48,6 +48,11 @@ impl TydeReleaseVersion {
     pub fn github_tag(&self) -> String {
         format!("v{}", self.0)
     }
+
+    /// Whether this identifies a prerelease build such as a Tyde beta.
+    pub fn is_prerelease(&self) -> bool {
+        self.0.contains('-')
+    }
 }
 
 impl fmt::Display for TydeReleaseVersion {

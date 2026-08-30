@@ -32,6 +32,7 @@ pub struct TurnEmitter {
 struct TurnEmitterState {
     tx: mpsc::UnboundedSender<Value>,
     agent: String,
+    surface_protocol_violations: bool,
     typing_active: bool,
     current_response: Option<OpenResponse>,
     declared_tools: HashMap<String, DeclaredTool>,
@@ -122,10 +123,21 @@ impl TurnEmitter {
     }
 
     pub fn new_for_agent(tx: mpsc::UnboundedSender<Value>, agent: AgentName<'_>) -> Self {
+        let surface_protocol_violations =
+            crate::host_release_version().is_some_and(|version| version.is_prerelease());
+        Self::new_for_agent_with_protocol_violation_policy(tx, agent, surface_protocol_violations)
+    }
+
+    fn new_for_agent_with_protocol_violation_policy(
+        tx: mpsc::UnboundedSender<Value>,
+        agent: AgentName<'_>,
+        surface_protocol_violations: bool,
+    ) -> Self {
         Self {
             inner: std::sync::Mutex::new(TurnEmitterState {
                 tx,
                 agent: agent.0.to_owned(),
+                surface_protocol_violations,
                 typing_active: false,
                 current_response: None,
                 declared_tools: HashMap::new(),
@@ -597,6 +609,13 @@ impl TurnEmitterState {
             return;
         }
         let violations = std::mem::take(&mut self.violations);
+        if !self.surface_protocol_violations {
+            tracing::debug!(
+                count = violations.len(),
+                "Suppressing user-facing protocol violation report for a stable build"
+            );
+            return;
+        }
         let total = violations.len();
         // A wedged response repeats one violation per delta — 71 identical lines
         // in a real report. The count is the information; the repetition only
@@ -1241,8 +1260,21 @@ mod tests {
     use super::*;
 
     fn emitter() -> (TurnEmitter, mpsc::UnboundedReceiver<Value>) {
+        emitter_with_protocol_violation_policy(true)
+    }
+
+    fn emitter_with_protocol_violation_policy(
+        surface_protocol_violations: bool,
+    ) -> (TurnEmitter, mpsc::UnboundedReceiver<Value>) {
         let (tx, rx) = mpsc::unbounded_channel();
-        (TurnEmitter::new(tx), rx)
+        (
+            TurnEmitter::new_for_agent_with_protocol_violation_policy(
+                tx,
+                AgentName("assistant"),
+                surface_protocol_violations,
+            ),
+            rx,
+        )
     }
 
     /// The violation report the user actually sees, drained from the wire.
