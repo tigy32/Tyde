@@ -1835,6 +1835,12 @@ html[data-keyboard-open] .mobile-app {
     overflow-wrap: anywhere;
 }
 
+.tool-native-detail {
+    min-width: 0;
+    overflow-wrap: anywhere;
+    word-break: break-word;
+}
+
 .tool-result summary {
     font-size: 12px;
     color: var(--text-tertiary);

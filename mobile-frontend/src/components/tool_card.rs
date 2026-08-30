@@ -4496,6 +4496,46 @@ mod wasm_tests {
             })
     }
 
+    #[wasm_bindgen_test]
+    async fn view_image_path_stays_inside_phone_width() {
+        crate::components::test_styles::ensure_styles_loaded();
+        let path = format!(
+            "/Users/mike/Tyggs/Ascendra/test-results/assets/cottage/{}/diagnostic/contact-sheet.png",
+            "54d0d5e382013e6420772e6b01dc102".repeat(4)
+        );
+        let container = mount_card(ToolRequestEntry {
+            tool_name: "view_image".to_owned(),
+            request: ToolRequest {
+                tool_call_id: "toolu_view_image".to_owned(),
+                tool_name: "view_image".to_owned(),
+                tool_type: ToolRequestType::ViewImage { path },
+            },
+            result: None,
+        });
+        container.style().set_property("width", "320px").unwrap();
+        next_tick().await;
+
+        let detail: HtmlElement = container
+            .query_selector(".tool-native-detail")
+            .unwrap()
+            .expect("image path")
+            .dyn_into()
+            .unwrap();
+        assert!(detail.client_width() > 0, "the path must have layout width");
+        assert!(
+            detail.scroll_width() <= detail.client_width() + 1,
+            "the image path must wrap inside the phone-width card: scroll_width {} vs client_width {}",
+            detail.scroll_width(),
+            detail.client_width()
+        );
+        assert!(
+            container.scroll_width() <= container.client_width() + 1,
+            "the image tool card must not make the transcript scroll sideways: scroll_width {} vs client_width {}",
+            container.scroll_width(),
+            container.client_width()
+        );
+    }
+
     /// A shell card previews what was run — whatever the provider calls the
     /// tool — on the card face, not behind the Result disclosure.
     #[wasm_bindgen_test]
