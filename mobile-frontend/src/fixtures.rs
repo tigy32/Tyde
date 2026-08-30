@@ -166,7 +166,22 @@ pub fn seed_state(state: &AppState) {
         loaded.insert(agent_ref.clone());
     });
     state.chat_messages.update(|messages| {
-        messages.insert(agent_ref, fixture_messages());
+        messages.insert(agent_ref.clone(), fixture_messages());
+    });
+    // Puts the header's context bar on screen. The fixtures are how this
+    // chrome gets reviewed, and a bar that only ever appears against a live
+    // agent never gets looked at.
+    state.agent_activity_stats.update(|stats| {
+        stats.insert(
+            agent_ref,
+            protocol::AgentActivityStats {
+                current_context_usage: Some(protocol::CurrentContextUsage::Known {
+                    input_tokens: 84_000,
+                    context_window: 200_000,
+                }),
+                ..Default::default()
+            },
+        );
     });
 
     match name.as_str() {

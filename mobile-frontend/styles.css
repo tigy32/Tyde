@@ -16,15 +16,28 @@
     --font-mono: "SF Mono", "Cascadia Code", "Fira Code", monospace;
     --header-height: 44px;
     --nav-height: 52px;
+    --search-bar-height: 40px;
     /* Inset the floating chrome (header capsule, tab dock, composer) keeps
        from the screen edges. One token so they stay on the same rails. */
     --chrome-gutter: 12px;
+    /* The layout height a floating top capsule occupies: the gap above it, the
+       capsule, and the gap below. Scrollers cancel it with a negative margin so
+       their content runs underneath, and add it back as padding so nothing
+       starts life hidden. */
+    --top-chrome-height: calc(var(--space-2) + var(--header-height) + var(--space-2));
     --safe-area-top: env(safe-area-inset-top, 0px);
     --safe-area-bottom: env(safe-area-inset-bottom, 0px);
     /* The home-indicator inset only needs clearing while it is actually on
        screen. With the keyboard up the keyboard covers it, so reserving it
        again would float the composer above a dead band. */
     --active-safe-area-bottom: var(--safe-area-bottom);
+    /* How far the bottom capsules ride above the screen edge. The home
+       indicator has to stay clear, but reserving the whole inset under a
+       capsule that is already floating reads as a dead band, so the capsule
+       sits just inside it. */
+    --bottom-chrome-inset: max(var(--space-2), calc(var(--active-safe-area-bottom) - var(--space-2)));
+    /* The tab dock's full layout height, including the gaps it floats in. */
+    --bottom-nav-height: calc(var(--space-2) + var(--nav-height) + var(--bottom-chrome-inset));
 }
 
 html[data-keyboard-open] {
@@ -54,6 +67,7 @@ html[data-keyboard-open] {
     --shadow-md: 0 4px 12px rgba(0,0,0,0.4);
     --accent-soft: rgba(0, 122, 204, 0.20);
     --surface-float: #1f1f1f;
+    --surface-float-translucent: rgba(52, 52, 52, 0.78);
     --rim-float: inset 0 0 0 1px rgba(255, 255, 255, 0.07);
     --shadow-float: 0 1px 2px rgba(0, 0, 0, 0.4), 0 10px 30px rgba(0, 0, 0, 0.55);
 }
@@ -81,6 +95,7 @@ html[data-keyboard-open] {
     --shadow-md: 0 4px 12px rgba(0,0,0,0.12);
     --accent-soft: rgba(37, 99, 235, 0.12);
     --surface-float: #ffffff;
+    --surface-float-translucent: rgba(255, 255, 255, 0.82);
     --rim-float: inset 0 0 0 1px rgba(26, 31, 40, 0.08);
     --shadow-float: 0 1px 2px rgba(23, 20, 31, 0.06), 0 10px 30px rgba(23, 20, 31, 0.14);
 }
@@ -91,6 +106,33 @@ html[data-keyboard-open] {
     box-sizing: border-box;
     margin: 0;
     padding: 0;
+}
+
+/* iOS paints the root element's background across the whole window — the
+   safe-area bands, and any strip a viewport that measured short leaves below
+   the shell. Without this the page underneath shows through at the edges in a
+   colour that is not the app's: in production the loader's page, in the bundle
+   its inline boot styles.
+   Written against `[data-theme]`, which `app.rs` mirrors onto <html> at mount:
+   it both resolves the palette (the host page carries no theme of its own) and
+   outranks whichever of those two pages is underneath, while leaving the boot
+   screen its own colour until the app is actually up. */
+html[data-theme] {
+    background: var(--bg-base);
+}
+
+html[data-theme] body,
+html[data-theme] #app-root {
+    background: var(--bg-base);
+}
+
+/* Same reason for the text colour: the host page sets a light-on-dark default
+   for its own boot screen, and `body { color: var(--text-primary) }` alone
+   cannot beat it — nor could it even resolve, since the palette used to live
+   only on the app shell. Without this the light theme renders its transcript
+   in the dark theme's near-white. */
+html[data-theme] body {
+    color: var(--text-primary);
 }
 
 html, body {
@@ -143,6 +185,12 @@ input, textarea, select {
     min-height: 0;
     overflow: hidden;
     padding-top: var(--safe-area-top);
+    background: var(--bg-base);
+    /* The shell states its own colour rather than inheriting one from the page
+       it was mounted into: the theme lives on this element, so anything the
+       host page set (the bundle's boot screen carries a hard-coded dark
+       `data-theme`) would otherwise win for every element that only inherits. */
+    color: var(--text-primary);
 }
 
 /* Software keyboard up. iOS WebKit ignores interactive-widget=resizes-content
@@ -159,6 +207,103 @@ input, textarea, select {
    never mistaken for a keyboard and still takes the max() path above. */
 html[data-keyboard-open] .mobile-app {
     height: var(--app-height, 100dvh);
+}
+
+/* ── Floating chrome ────────────────────────────────────────────────── */
+
+/* The header capsules, the tab dock and the composer are lifted off the
+   content rather than bolted to the screen edges, and the content scrolls
+   *under* them (see the negative margins on each scroller below). Because
+   something is moving behind the glass they are translucent and blurred; where
+   a browser cannot blur, the surface stays solid so text never lands on text.
+   Every capsule also lifts itself out of source order: with negative margins
+   the scroller is the later sibling and would otherwise paint over it. */
+.chat-header,
+.view-header,
+.agents-segmented,
+.bottom-nav,
+.chat-bottom-dock {
+    position: relative;
+    z-index: 3;
+}
+
+.chat-header,
+.view-header,
+.agents-segmented,
+.bottom-nav,
+.chat-input-row,
+.search-bar input {
+    background: var(--surface-float);
+}
+
+@supports ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
+    .chat-header,
+    .view-header,
+    .agents-segmented,
+    .bottom-nav,
+    .chat-input-row,
+    .search-bar input {
+        background: var(--surface-float-translucent);
+        backdrop-filter: saturate(180%) blur(20px);
+        -webkit-backdrop-filter: saturate(180%) blur(20px);
+    }
+}
+
+/* The iOS "scroll edge" fade: content dissolves into the base colour as it
+   passes behind a capsule instead of sliding out from under it mid-glyph.
+   It belongs to the surface the chrome floats over, not to the capsule — a
+   pseudo-element inside a capsule paints over that capsule's own background,
+   which would erase the glass it is there to protect. Sits at z-index 2:
+   above the scroller, below the capsules at 3. */
+.view,
+.mobile-content {
+    position: relative;
+}
+
+.view:has(> .view-header)::before,
+.chat-view::before,
+.mobile-content:has(~ .bottom-nav)::after,
+.chat-view::after {
+    content: "";
+    position: absolute;
+    left: 0;
+    right: 0;
+    z-index: 2;
+    pointer-events: none;
+}
+
+.view:has(> .view-header)::before,
+.chat-view::before {
+    top: 0;
+    height: calc(var(--view-top-chrome) + var(--space-4));
+    background: linear-gradient(
+        to bottom,
+        var(--bg-base) 0%,
+        var(--bg-base) 70%,
+        transparent 100%
+    );
+}
+
+.mobile-content:has(~ .bottom-nav)::after {
+    bottom: 0;
+    height: calc(var(--bottom-nav-height) + var(--space-4));
+    background: linear-gradient(
+        to top,
+        var(--bg-base) 0%,
+        var(--bg-base) 70%,
+        transparent 100%
+    );
+}
+
+.chat-view::after {
+    bottom: 0;
+    height: calc(var(--chat-dock-height, 0px) + var(--space-4));
+    background: linear-gradient(
+        to top,
+        var(--bg-base) 0%,
+        var(--bg-base) 70%,
+        transparent 100%
+    );
 }
 
 /* ── Mobile Shell Error Banner ──────────────────────────────────────── */
@@ -395,8 +540,11 @@ html[data-keyboard-open] .mobile-app {
 
 /* ── Bottom Navigation ──────────────────────────────────────────────── */
 
-/* The dock stays in the shell's flex column — it floats visually, not in
-   layout, so the keyboard/viewport height math above is untouched. */
+/* The dock stays in the shell's flex column — so the keyboard/viewport height
+   math above is untouched — but hands back every pixel it occupies through a
+   negative top margin. The content above it therefore grows to the full shell
+   and the dock floats over its last rows; `.view-body` pads itself by
+   --bottom-nav-height so no list ends underneath it. */
 .bottom-nav {
     display: flex;
     align-items: stretch;
@@ -404,12 +552,11 @@ html[data-keyboard-open] .mobile-app {
     height: var(--nav-height);
     flex-shrink: 0;
     margin:
-        var(--space-2)
+        calc(-1 * (var(--nav-height) + var(--bottom-chrome-inset)))
         var(--chrome-gutter)
-        calc(var(--space-2) + var(--active-safe-area-bottom));
+        var(--bottom-chrome-inset);
     padding: var(--space-1);
     border-radius: var(--radius-full);
-    background: var(--surface-float);
     box-shadow: var(--rim-float), var(--shadow-float);
 }
 
@@ -471,7 +618,6 @@ html[data-keyboard-open] .mobile-app {
     margin: var(--space-2) var(--chrome-gutter);
     padding: 0 var(--space-1) 0 var(--space-4);
     border-radius: var(--radius-full);
-    background: var(--surface-float);
     box-shadow: var(--rim-float), var(--shadow-float);
     flex-shrink: 0;
 }
@@ -511,6 +657,36 @@ html[data-keyboard-open] .mobile-app {
     overflow-x: hidden;
     -webkit-overflow-scrolling: touch;
     padding: var(--space-2) var(--space-4) var(--space-4);
+    /* Clears the tab dock, which floats over the bottom of every tab view.
+       Views reached without the dock (pairing, onboarding) simply end with
+       more room under their last row. */
+    padding-bottom: calc(var(--space-4) + var(--bottom-nav-height));
+    scroll-padding-bottom: var(--bottom-nav-height);
+}
+
+/* Each view names the top chrome its body has to clear: the header capsule,
+   plus whatever second row the view floats beneath it. */
+.view {
+    --view-top-chrome: var(--top-chrome-height);
+}
+
+.agents-view {
+    --view-top-chrome: calc(
+        var(--top-chrome-height) + var(--button-height-compact) + var(--space-2) + var(--space-2)
+    );
+}
+
+.sessions-view {
+    --view-top-chrome: calc(var(--top-chrome-height) + var(--search-bar-height));
+}
+
+/* The scroller reclaims the space the top chrome took in the flex column so
+   its content passes behind the capsules, then pads the same amount back so
+   the first row still starts below them. */
+.view:has(> .view-header) > .view-body {
+    margin-top: calc(-1 * var(--view-top-chrome));
+    padding-top: calc(var(--view-top-chrome) + var(--space-2));
+    scroll-padding-top: var(--view-top-chrome);
 }
 
 .view-loading {
@@ -1084,40 +1260,48 @@ html[data-keyboard-open] .mobile-app {
     margin: var(--space-2) var(--chrome-gutter);
     padding: 0 var(--space-2);
     border-radius: var(--radius-full);
-    background: var(--surface-float);
     box-shadow: var(--rim-float), var(--shadow-float);
     flex-shrink: 0;
     gap: var(--space-2);
-    position: relative;
 }
 
-/* A couple of pixels of context occupancy along the header's bottom edge:
-   a 2px track with the used share filled in, inset to stay clear of the
-   capsule's rounded corners. */
+/* Context occupancy along the header's bottom edge, drawn like the composer's
+   thinking indicator below: a light line rather than a widget. The empty track
+   is a faint hairline, the used share is a lit line that glows and fades out at
+   its leading edge, and it is inset to stay inside the capsule's rounded
+   corners while still reading as a share of the whole header. */
 .chat-context-bar {
     position: absolute;
-    left: var(--space-3);
-    right: var(--space-3);
-    bottom: 4px;
-    height: 2px;
+    left: var(--space-4);
+    right: var(--space-4);
+    bottom: 5px;
+    height: 1px;
     border-radius: var(--radius-full);
-    background: var(--border-default);
-    overflow: hidden;
+    background: color-mix(in srgb, var(--text-tertiary) 35%, transparent);
+    overflow: visible;
 }
 
 .chat-context-bar-fill {
     height: 100%;
     border-radius: inherit;
-    background: var(--accent-primary);
+    /* A background-COLOR, not a gradient: the tone is the signal (calm, amber,
+       red) and the taper is a mask, so the level stays readable to anything
+       that inspects the computed colour. */
+    background-color: var(--accent-primary);
+    box-shadow: 0 0 6px color-mix(in srgb, var(--accent-primary) 70%, transparent);
+    -webkit-mask-image: linear-gradient(90deg, transparent 0%, #000 12%, #000 100%);
+    mask-image: linear-gradient(90deg, transparent 0%, #000 12%, #000 100%);
     transition: width var(--motion-slow) var(--ease-standard);
 }
 
 .chat-context-bar[data-context-level="warning"] .chat-context-bar-fill {
-    background: var(--accent-warning);
+    background-color: var(--accent-warning);
+    box-shadow: 0 0 6px color-mix(in srgb, var(--accent-warning) 70%, transparent);
 }
 
 .chat-context-bar[data-context-level="danger"] .chat-context-bar-fill {
-    background: var(--accent-error);
+    background-color: var(--accent-error);
+    box-shadow: 0 0 8px color-mix(in srgb, var(--accent-error) 80%, transparent);
 }
 
 .chat-back-button {
@@ -1254,13 +1438,33 @@ html[data-keyboard-open] .mobile-app {
     gap: var(--space-1);
 }
 
+/* The transcript is the only scroller in a chat, and it runs the full height
+   of the view: it reclaims the header's row with a negative margin and clears
+   the floating dock at the other end with padding. --chat-dock-height is
+   published by `chat_view.rs` (the dock grows with attachments, queued
+   messages and the new-chat options, so its height cannot be a constant). */
 .chat-messages {
     flex: 1;
     min-height: 0;
     overflow-y: auto;
     overscroll-behavior-y: contain;
     -webkit-overflow-scrolling: touch;
-    padding: var(--space-2) var(--space-2);
+    margin-top: calc(-1 * var(--top-chrome-height));
+    padding:
+        calc(var(--top-chrome-height) + var(--space-2))
+        var(--space-2)
+        calc(var(--chat-dock-height, 0px) + var(--space-2));
+    scroll-padding-top: var(--top-chrome-height);
+    scroll-padding-bottom: var(--chat-dock-height, 0px);
+}
+
+/* The pending-submission surface and the composer travel together: one dock,
+   floating over the end of the transcript. The negative margin is its own
+   measured height, so the flex column hands the whole shell to the transcript
+   and the dock overlays the bottom of it. */
+.chat-bottom-dock {
+    flex-shrink: 0;
+    margin-top: calc(-1 * var(--chat-dock-height, 0px));
 }
 
 .chat-transcript {
@@ -2001,10 +2205,7 @@ html[data-keyboard-open] .mobile-app {
 .chat-input-container {
     position: relative;
     flex-shrink: 0;
-    padding:
-        var(--space-2)
-        var(--chrome-gutter)
-        max(var(--space-2), var(--active-safe-area-bottom));
+    padding: var(--space-2) var(--chrome-gutter) var(--bottom-chrome-inset);
     background: transparent;
 }
 
@@ -2049,7 +2250,6 @@ html[data-keyboard-open] .mobile-app {
     gap: var(--space-2);
     padding: var(--space-1);
     border-radius: var(--radius-xl);
-    background: var(--surface-float);
     box-shadow: var(--rim-float), var(--shadow-float);
 }
 
@@ -3184,16 +3384,15 @@ html[data-keyboard-open] .mobile-app {
 }
 
 .search-bar {
-    position: sticky;
-    top: 0;
+    position: relative;
     padding: 0 var(--chrome-gutter);
     background: transparent;
-    z-index: 1;
+    z-index: 3;
 }
 
 .search-bar input {
     width: 100%;
-    min-height: 40px;
+    min-height: var(--search-bar-height);
     padding: 0 var(--space-4);
     background: var(--surface-float);
     color: var(--text-primary);
@@ -3894,7 +4093,6 @@ html[data-keyboard-open] .mobile-app {
     margin: 0 var(--chrome-gutter) var(--space-2);
     padding: var(--space-1);
     border-radius: var(--radius-full);
-    background: var(--surface-float);
     box-shadow: var(--rim-float), var(--shadow-float);
 }
 .agents-segmented-button {

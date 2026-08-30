@@ -2,6 +2,8 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use leptos::prelude::*;
+use wasm_bindgen::JsCast;
+use wasm_bindgen::closure::Closure;
 use wasm_bindgen_futures::spawn_local;
 
 use crate::bridge;
@@ -592,6 +594,8 @@ pub fn ChatView() -> impl IntoView {
     let s_pending = state.clone();
     let s_body = state.clone();
     let scroll_ref = NodeRef::<leptos::html::Div>::new();
+    let dock_ref = NodeRef::<leptos::html::Div>::new();
+    publish_dock_height(dock_ref);
     let user_scrolled_up = RwSignal::new(false);
     let auto_scroll_pending = Rc::new(Cell::new(false));
     let last_active_agent: Rc<RefCell<Option<AgentRef>>> = Rc::new(RefCell::new(None));
@@ -1247,17 +1251,69 @@ pub fn ChatView() -> impl IntoView {
             // surface. Directly above the composer, so they stay reachable with
             // the keyboard open. New-chat records never appear here: they have
             // no agent, and the client does not guess one.
-            {move || {
-                s_pending
-                    .active_agent
-                    .get()
-                    .map(|active| view! {
-                        <AgentPendingSubmissions agent_ref=active.as_agent_ref() />
-                    })
-            }}
-            <ChatInput />
+            <div class="chat-bottom-dock" node_ref=dock_ref data-mobile-test="chat-bottom-dock">
+                {move || {
+                    s_pending
+                        .active_agent
+                        .get()
+                        .map(|active| view! {
+                            <AgentPendingSubmissions agent_ref=active.as_agent_ref() />
+                        })
+                }}
+                <ChatInput />
+            </div>
         </div>
     }
+}
+
+/// Publishes the bottom dock's height as `--chat-dock-height`.
+///
+/// The dock floats over the end of the transcript (see `.chat-bottom-dock` in
+/// styles.css), so the transcript has to pad itself by exactly the dock's
+/// height or its last message is stranded underneath. That height is not a
+/// constant: the composer grows with the text, the photo tray, the queued-
+/// message list, the new-chat backend/agent pickers and the pending-submission
+/// surface. A ResizeObserver is the only measurement that survives all of them,
+/// including the ones that change without any signal this component can see
+/// (the textarea auto-growing as the user types).
+fn publish_dock_height(dock_ref: NodeRef<leptos::html::Div>) {
+    Effect::new(move |_| {
+        let Some(dock) = dock_ref.get() else {
+            return;
+        };
+        // Published on the chat view rather than the document: two chats can
+        // be mounted at once (a team's split view), and each transcript has to
+        // pad for its own dock, not for whichever mounted last.
+        let Some(view) = dock
+            .parent_element()
+            .and_then(|element| element.dyn_into::<web_sys::HtmlElement>().ok())
+        else {
+            return;
+        };
+        let measured = dock.clone();
+        let publish = move || {
+            let height = measured.get_bounding_client_rect().height();
+            let _ = view
+                .style()
+                .set_property("--chat-dock-height", &format!("{height}px"));
+        };
+        publish();
+        let on_resize = Closure::<dyn FnMut()>::new(publish);
+        let Ok(observer) = web_sys::ResizeObserver::new(on_resize.as_ref().unchecked_ref()) else {
+            return;
+        };
+        observer.observe(&dock);
+        // `on_cleanup` wants a Send + Sync closure and neither the observer nor
+        // its JS callback is either; on wasm there is only ever the one thread,
+        // which is what SendWrapper asserts. Leaving them alive instead would
+        // keep an observer per visited chat.
+        let held = send_wrapper::SendWrapper::new((observer, on_resize));
+        on_cleanup(move || {
+            let (observer, on_resize) = held.take();
+            observer.disconnect();
+            drop(on_resize);
+        });
+    });
 }
 
 fn track_active_chat_content(state: &AppState, key: &AgentRef) {
@@ -2784,7 +2840,7 @@ mod wasm_tests {
         }
     }
 
-    /// The header carries a couple of pixels of context occupancy for the
+    /// The header carries a hairline of context occupancy for the
     /// active agent: filled in proportion to the latest reported figure,
     /// following the server's activity stats when they speak and the last
     /// assistant row's breakdown otherwise, and absent — never stale or
@@ -2842,8 +2898,8 @@ mod wasm_tests {
             .expect("fill")
             .get_bounding_client_rect();
         assert!(
-            (1.5..=3.0).contains(&track.height()),
-            "a couple of pixels, not a widget: {}px",
+            (0.5..=2.0).contains(&track.height()),
+            "a hairline, like the composer's thinking line, not a widget: {}px",
             track.height()
         );
         // The header is a rounded capsule, so a literally full-width track

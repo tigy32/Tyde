@@ -123,6 +123,75 @@ fn keyboard_is_open(baseline: f64, height: f64) -> bool {
     baseline - height > KEYBOARD_MIN_INSET_PX
 }
 
+/// The largest viewport shortfall we are willing to blame on the standalone
+/// launch defect. The insets iOS can lose this way are a status bar (~59px)
+/// and a home indicator (~34px); a bigger gap is a real one — browser chrome,
+/// a split screen, an in-app banner — and has to be believed, or the shell
+/// would run its bottom chrome underneath whatever owns that space.
+const MAX_STANDALONE_SHORTFALL_PX: f64 = 120.0;
+
+/// The screen edge the viewport should reach. iOS has reported `screen.width`
+/// and `screen.height` orientation-independently across versions, so the axis
+/// is chosen by the viewport's own orientation rather than by which field is
+/// which.
+fn screen_height_for(portrait: bool, screen_width: f64, screen_height: f64) -> f64 {
+    if portrait {
+        screen_width.max(screen_height)
+    } else {
+        screen_width.min(screen_height)
+    }
+}
+
+/// A standalone (home-screen) launch can lay out BOTH `100dvh` and the visual
+/// viewport short of the screen the app actually fills — `env(safe-area-inset-*)`
+/// still reports the true insets, so the shell pads for a status bar it was
+/// never given room for and every bottom-anchored capsule floats that far above
+/// the screen edge, over a dead band of page background.
+///
+/// The screen is the only measurement left that is not short, so a shortfall
+/// small enough to be an inset is recovered from it. Everything else — a
+/// browser with chrome, a keyboard, a genuinely small window — keeps the
+/// measurement, which is why the caller applies this only in standalone mode
+/// with the keyboard closed.
+fn recovered_standalone_height(
+    measured: f64,
+    viewport_width: f64,
+    screen_width: f64,
+    screen_height: f64,
+) -> f64 {
+    let expected = screen_height_for(viewport_width <= measured, screen_width, screen_height);
+    let shortfall = expected - measured;
+    if shortfall > 0.5 && shortfall <= MAX_STANDALONE_SHORTFALL_PX {
+        expected
+    } else {
+        measured
+    }
+}
+
+/// Whether the app is running as an installed app rather than in a browser tab.
+/// iOS exposes the legacy `navigator.standalone`; everyone else answers the
+/// `display-mode` media query, which iOS 26 also honours.
+fn is_standalone_display(window: &web_sys::Window) -> bool {
+    let ios_standalone = js_sys::Reflect::get(window.navigator().as_ref(), &"standalone".into())
+        .ok()
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    ios_standalone
+        || window
+            .match_media("(display-mode: standalone)")
+            .ok()
+            .flatten()
+            .is_some_and(|query| query.matches())
+}
+
+/// The screen size in CSS pixels, when the browser reports a usable one.
+fn screen_size(window: &web_sys::Window) -> Option<(f64, f64)> {
+    let screen = window.screen().ok()?;
+    let width = f64::from(screen.width().ok()?);
+    let height = f64::from(screen.height().ok()?);
+    (usable(&width) && usable(&height)).then_some((width, height))
+}
+
 fn usable(value: &f64) -> bool {
     value.is_finite() && *value > 0.0
 }
@@ -171,10 +240,21 @@ fn apply_app_height(window: &web_sys::Window) {
     else {
         return;
     };
+    let keyboard = keyboard_is_open(baseline, height);
+    // Only an installed app with the keyboard closed can be short for the
+    // standalone reason; in a browser the missing height belongs to chrome the
+    // app must stay clear of, and with the keyboard up the measurement is the
+    // whole point of this probe.
+    let published = match screen_size(window) {
+        Some((screen_width, screen_height)) if !keyboard && is_standalone_display(window) => {
+            recovered_standalone_height(height, width, screen_width, screen_height)
+        }
+        _ => height,
+    };
     let _ = root
         .style()
-        .set_property("--app-height", &format!("{height}px"));
-    if keyboard_is_open(baseline, height) {
+        .set_property("--app-height", &format!("{published}px"));
+    if keyboard {
         let _ = root.set_attribute("data-keyboard-open", "");
     } else {
         let _ = root.remove_attribute("data-keyboard-open");
@@ -224,12 +304,18 @@ fn viewport_metrics() -> String {
         .ok()
         .and_then(|screen| screen.height().ok())
         .unwrap_or(-1);
-    let standalone = js_sys::Reflect::get(window.navigator().as_ref(), &"standalone".into())
-        .ok()
-        .and_then(|value| value.as_bool())
-        .unwrap_or(false);
+    let standalone = is_standalone_display(&window);
+    // What the shell was actually sized to, so a report from a phone says
+    // whether the standalone recovery above fired and by how much.
+    let app_height = window
+        .document()
+        .and_then(|document| document.document_element())
+        .and_then(|element| element.dyn_into::<web_sys::HtmlElement>().ok())
+        .and_then(|root| root.style().get_property_value("--app-height").ok())
+        .unwrap_or_default();
     format!(
-        "viewport: inner_h={inner_height} visual_h={visual_height} screen_h={screen_height} standalone={standalone}"
+        "viewport: inner_h={inner_height} visual_h={visual_height} screen_h={screen_height} \
+         standalone={standalone} app_height={app_height}"
     )
 }
 
@@ -341,6 +427,56 @@ mod wasm_tests {
         assert!(
             !keyboard_is_open(portrait, TALL),
             "rotating must not leave the shell believing a keyboard is open"
+        );
+    }
+
+    /// The defect this recovery exists for: a standalone launch lays out short
+    /// by the insets it still reports through `env()`, so the shell pads for a
+    /// status bar it was not given and every bottom capsule floats that far
+    /// above the screen edge. The screen is the measurement that is not short.
+    #[wasm_bindgen_test]
+    fn a_standalone_shortfall_is_recovered_from_the_screen() {
+        let short = TALL - 59.0;
+        assert_eq!(
+            recovered_standalone_height(short, WIDTH, WIDTH, TALL),
+            TALL,
+            "a status-bar-sized shortfall must be recovered to the screen height"
+        );
+        assert_eq!(
+            recovered_standalone_height(TALL, WIDTH, WIDTH, TALL),
+            TALL,
+            "a viewport that already reaches the screen must be left alone"
+        );
+    }
+
+    /// Anything bigger than the insets is a real reason for a short viewport,
+    /// and expanding into it would run the composer under whatever owns that
+    /// space (browser chrome, a split screen).
+    #[wasm_bindgen_test]
+    fn a_large_shortfall_is_believed() {
+        let with_chrome = TALL - 140.0;
+        assert_eq!(
+            recovered_standalone_height(with_chrome, WIDTH, WIDTH, TALL),
+            with_chrome,
+            "a 140px gap is chrome, not a lost inset"
+        );
+    }
+
+    /// iOS has reported the screen orientation-independently, so the axis has
+    /// to be chosen by the viewport's orientation — otherwise a landscape app
+    /// would "recover" to the portrait height and run off the screen.
+    #[wasm_bindgen_test]
+    fn the_screen_axis_follows_the_viewport_orientation() {
+        let landscape_short = WIDTH - 20.0;
+        assert_eq!(
+            recovered_standalone_height(landscape_short, TALL, WIDTH, TALL),
+            WIDTH,
+            "a landscape viewport recovers to the screen's short axis"
+        );
+        assert_eq!(
+            recovered_standalone_height(landscape_short, TALL, TALL, WIDTH),
+            WIDTH,
+            "which field holds which dimension must not matter"
         );
     }
 

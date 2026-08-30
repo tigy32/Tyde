@@ -64,6 +64,7 @@ pub fn FixtureApp() -> impl IntoView {
 #[component]
 fn AppSurface() -> impl IntoView {
     let state = use_context::<AppState>().unwrap();
+    mirror_theme_to_document(state.clone());
     view! {
         <div
             class="mobile-app"
@@ -317,6 +318,28 @@ fn ActiveHostShell() -> impl IntoView {
             <components::BottomNav />
         </Show>
     }
+}
+
+/// Mirrors the theme onto `<html>` so the palette exists on the document
+/// element as well as on the app shell.
+///
+/// The shell cannot cover every pixel: iOS paints the canvas (the root
+/// element's background) across the whole window, including the safe-area
+/// bands and any strip a mis-measured viewport leaves below the shell. In
+/// production the app mounts into the loader's page, which carries no
+/// `data-theme`, so a rule on `html` would otherwise resolve `var(--bg-base)`
+/// to nothing and leave the loader's own colour showing at the edges.
+fn mirror_theme_to_document(state: AppState) {
+    Effect::new(move |_| {
+        let theme = state.theme.get();
+        let Some(root) = web_sys::window()
+            .and_then(|window| window.document())
+            .and_then(|document| document.document_element())
+        else {
+            return;
+        };
+        let _ = root.set_attribute("data-theme", &theme);
+    });
 }
 
 /// Keeps `app_mode` aligned with the `paired_hosts` and pairing-flow signals.
