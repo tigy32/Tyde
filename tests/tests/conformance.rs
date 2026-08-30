@@ -2140,22 +2140,29 @@ fn real_agent_await_survives_a_resumed_session() {
             let child_id = delegation.child_agent().agent_id.clone();
             let [spawned, child] = delegation.into_turns();
 
-            // `delegate` already waited for the child to go idle, so a working
-            // await returns immediately. A missing one cannot: the tool is
-            // simply not there to call.
-            let await_prompt = await_child_prompt(&child_id);
+            // Make the resumed session exercise the real long-poll boundary,
+            // not only an await that returns from an already-idle child. Codex
+            // runs MCP calls inside a code-mode cell; after 31 seconds that
+            // outer call yields while the nested `mcpToolCall` remains open.
+            // Leaving the yielded cell uncollected reproduced a production
+            // turn that reached idle with the foreground card still open.
+            let await_prompt = busy_child_await_prompt(host.backend(), &child_id);
             let awaited = ask(&mut host, &resumed, &await_prompt).await;
-            assert!(
-                awaited
-                    .tool_request_names()
-                    .iter()
-                    .any(|name| name.contains("tyde_await_agents")),
-                "{}: a resumed session could not call tyde_await_agents. Requested instead: {:?}",
-                awaited.label(),
-                awaited.tool_request_names()
-            );
+            assert_orphaned_await_shape(&awaited);
             assert_final_text_contains(&awaited, AWAITED_MARKER);
+            // Report the emitter violation itself before downstream result
+            // assertions diagnose the cancelled await as an empty status set.
+            assert_no_error_message(&awaited.label(), awaited.events());
             assert_the_await_reported_the_child(&awaited, &child_id);
+            assert_await_completion_precedes_the_only_idle(&awaited);
+
+            // If finishing the abandoned code-mode cell wakes Codex, that
+            // continuation must have been incorporated before the one idle
+            // boundary above. Catch the inverse race too: stale idle from the
+            // completed turn followed by a newly-started provider turn.
+            let after_idle =
+                drain_agent_events_for(&mut host, &resumed, Duration::from_secs(3)).await;
+            assert_no_provider_continuation_after_idle(&awaited.label(), &after_idle);
             assert_no_await_unavailable_warning(&[&launched, &spawned, &awaited]);
 
             assert_universal_contract(&[launched, spawned, child, awaited]);
@@ -2231,6 +2238,145 @@ fn await_child_prompt(child_id: &protocol::AgentId) -> String {
          passing agent_ids [\"{child_id}\"]. Do not use any other tool. After it returns, reply \
          with exactly {AWAITED_MARKER} and nothing else."
     )
+}
+
+/// A resumed parent makes its existing child busy, then leaves its await cell.
+///
+/// Codex's await is deliberately left behind in the yielded code-mode cell. The
+/// universal contract still requires that request to receive exactly one
+/// terminal event before the turn goes idle. Only the provider-specific
+/// spelling needed to create that lifecycle differs.
+fn busy_child_await_prompt(backend: BackendKind, child_id: &protocol::AgentId) -> String {
+    let child_task = "Run this exact foreground shell command and wait for it to finish: \
+        python3 -c \"import time; time.sleep(75); print('CHILD_READY')\". Then reply with exactly \
+        CHILD_READY and nothing else.";
+    let common = format!(
+        "Use the Tyde agent-control tool whose name ends in `tyde_send_agent_message`, exactly \
+         once, passing agent_id \"{child_id}\" and this exact message: `{child_task}`. Then use \
+         the Tyde agent-control tool whose name ends in `tyde_await_agents` exactly once, passing \
+         agent_ids [\"{child_id}\"]. Do not use any other tool. After the await returns, reply \
+         with exactly {AWAITED_MARKER} and nothing else."
+    );
+    match backend {
+        BackendKind::Codex => format!(
+            "{common} For the await, call the MCP tool from a functions.exec code-mode cell. When \
+             that execution yields `Script running with cell ID ...`, leave that \
+             cell uncollected: do not call functions.wait for it. Treat the yield as the await \
+             returning and immediately give the required final reply."
+        ),
+        _ => common,
+    }
+}
+
+/// The malformed-event regression is vacuous unless the provider actually
+/// created the await card. The send count also proves the child was made busy
+/// through Tyde rather than the model merely waiting on an already-idle agent.
+fn assert_orphaned_await_shape(turn: &Turn) {
+    let names = turn.tool_request_names();
+    let sends = names
+        .iter()
+        .filter(|name| name.contains("tyde_send_agent_message"))
+        .count();
+    let awaits = names
+        .iter()
+        .filter(|name| name.contains("tyde_await_agents"))
+        .count();
+    assert_eq!(
+        sends,
+        1,
+        "{}: busy-await turn issued {sends} send-agent requests, expected exactly 1; tools: \
+         {names:?}",
+        turn.label()
+    );
+    assert_eq!(
+        awaits,
+        1,
+        "{}: busy-await turn issued {awaits} await requests, expected exactly 1; tools: \
+         {names:?}",
+        turn.label()
+    );
+}
+
+/// The foreground await owns the presentation through its real completion.
+///
+/// Exactly one idle also covers the provider-resume race: if completion wakes
+/// Codex before its `turn/started` notification is handled, the older turn may
+/// not emit an idle that the resumed turn later has to reverse.
+fn assert_await_completion_precedes_the_only_idle(turn: &Turn) {
+    let await_call_id = turn
+        .tool_declarations()
+        .find(|call| call.name.contains("tyde_await_agents"))
+        .map(|call| call.tool_call_id.as_str())
+        .unwrap_or_else(|| panic!("{}: no declared await call", turn.label()));
+    let completion_positions = turn
+        .events()
+        .iter()
+        .enumerate()
+        .filter_map(|(position, event)| match event {
+            ChatEvent::ToolExecutionCompleted(completion)
+                if completion.tool_call_id == await_call_id =>
+            {
+                Some(position)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        completion_positions.len(),
+        1,
+        "{}: await {await_call_id:?} completed {} times, expected exactly once",
+        turn.label(),
+        completion_positions.len()
+    );
+    let idle_positions = event_positions(turn, |event| {
+        matches!(event, ChatEvent::TypingStatusChanged(false))
+    });
+    assert_eq!(
+        idle_positions.len(),
+        1,
+        "{}: busy-await lifecycle emitted {} idle boundaries at {idle_positions:?}, expected one",
+        turn.label(),
+        idle_positions.len()
+    );
+    assert!(
+        completion_positions[0] < idle_positions[0],
+        "{}: went idle at event {} while foreground await {await_call_id:?} remained open until \
+         event {}",
+        turn.label(),
+        idle_positions[0],
+        completion_positions[0]
+    );
+    assert_eq!(
+        idle_positions[0] + 1,
+        turn.events().len(),
+        "{}: emitted more turn events after its only idle boundary: {:?}",
+        turn.label(),
+        turn.events()[idle_positions[0] + 1..]
+            .iter()
+            .map(describe_event)
+            .collect::<Vec<_>>()
+    );
+}
+
+/// A tool completion may cause Codex to resume generation. That work either
+/// starts before the collected idle boundary or it is a stale-idle ordering
+/// bug; it must never appear immediately afterwards.
+fn assert_no_provider_continuation_after_idle(label: &str, events: &[ChatEvent]) {
+    let continuation = events.iter().find(|event| {
+        matches!(
+            event,
+            ChatEvent::TypingStatusChanged(true)
+                | ChatEvent::StreamStart(_)
+                | ChatEvent::StreamDelta(_)
+                | ChatEvent::StreamReasoningDelta(_)
+                | ChatEvent::StreamEnd(_)
+        )
+    });
+    assert!(
+        continuation.is_none(),
+        "{label}: Codex resumed provider work after the turn had already reported idle: {:?}",
+        events.iter().map(describe_event).collect::<Vec<_>>()
+    );
 }
 
 /// The await has to have actually waited on the child, not merely been called.

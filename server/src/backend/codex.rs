@@ -4095,6 +4095,10 @@ struct CodexState {
     raw_contract_drift_warned: bool,
     tool_container_images: Vec<protocol::ImageData>,
     cancelled_tool_call_ids: HashSet<String>,
+    /// A provider turn reached `turn/completed` while explicitly foreground
+    /// tool requests were still open. The presentation remains active until
+    /// those real requests complete, unless another turn starts first and
+    /// assumes ownership of the active presentation.
     close_active_stream_when_tools_idle: bool,
     pending_message_metadata: Option<PendingCodexMessageMetadata>,
     completed_message_metadata_by_turn: HashMap<String, PendingCodexMessageMetadata>,
@@ -7469,7 +7473,7 @@ impl CodexInner {
         tool_call_id: &str,
         images: Vec<protocol::ImageData>,
     ) {
-        {
+        let emit_deferred_idle = {
             let mut state = self.state.lock().await;
             state.tool_container_images.extend(images);
             state.pending_tool_call_ids.remove(tool_call_id);
@@ -7495,6 +7499,24 @@ impl CodexInner {
                         .extend(images);
                 }
             }
+            let emit_deferred_idle = state.pending_tool_call_ids.is_empty()
+                && state.close_active_stream_when_tools_idle
+                && state.active_turn_id.is_none()
+                && !state.awaiting_root_turn_start;
+            if emit_deferred_idle {
+                // Keep the state transition and event emission atomic with
+                // `turn/started`: a completion from the previous turn must not
+                // publish stale idle after a newer turn has become active.
+                state.close_active_stream_when_tools_idle = false;
+                self.emitter.typing_status_changed(false);
+            }
+            emit_deferred_idle
+        };
+        if emit_deferred_idle {
+            tracing::debug!(
+                tool_call_id,
+                "Codex foreground tools completed after their provider turn"
+            );
         }
     }
 
@@ -9984,6 +10006,10 @@ impl CodexInner {
                     "PROBE typed item event"
                 );
                 self.handle_item_completed(params).await;
+                // A foreground completion can be the event that releases a
+                // deferred idle boundary. Only after that boundary may queued
+                // background results start their provider wake turn.
+                self.spawn_pending_background_wake();
             }
             "turn/plan/updated" => {
                 self.handle_plan_update(params);
@@ -14926,6 +14952,11 @@ impl CodexInner {
         };
         let turn_usage = extract_turn_token_usage(params, model_hint.as_deref());
         let model_usage = extract_model_request_token_usage(params, model_hint.as_deref());
+        let open_foreground_tool_ids = self
+            .emitter
+            .open_foreground_tool_ids()
+            .into_iter()
+            .collect::<HashSet<_>>();
 
         let (
             open_item_without_completion,
@@ -14935,6 +14966,7 @@ impl CodexInner {
             metadata_update,
             model_usage,
             terminated_background_commands,
+            defer_idle_until_foreground_tools_complete,
         ) = {
             let mut state = self.state.lock().await;
             if let Some((turn_id, token_usage)) = turn_usage {
@@ -15066,10 +15098,18 @@ impl CodexInner {
                 state
                     .cancelled_tool_call_ids
                     .extend(interrupted_tool_call_ids);
+                state.pending_tool_call_ids.clear();
+                state.close_active_stream_when_tools_idle = false;
+            } else {
+                // The emitter's execution mode is the explicit protocol
+                // ownership signal. Background requests may outlive an idle
+                // turn; foreground requests keep the presentation active.
+                state.pending_tool_call_ids = open_foreground_tool_ids;
+                state.close_active_stream_when_tools_idle = !state.pending_tool_call_ids.is_empty();
             }
-            state.pending_tool_call_ids.clear();
             state.tool_container_images.clear();
-            state.close_active_stream_when_tools_idle = false;
+            let defer_idle_until_foreground_tools_complete =
+                state.close_active_stream_when_tools_idle;
             (
                 open_item_without_completion,
                 open_item_published,
@@ -15078,6 +15118,7 @@ impl CodexInner {
                 metadata_update,
                 model_usage,
                 terminated_background_commands,
+                defer_idle_until_foreground_tools_complete,
             )
         };
 
@@ -15153,6 +15194,25 @@ impl CodexInner {
             // emitter.operation_cancelled runs the full cancel tail:
             // flush pending tools → OperationCancelled → TypingStatusChanged(false).
             self.emitter.operation_cancelled("Operation cancelled");
+            return;
+        }
+
+        if defer_idle_until_foreground_tools_complete {
+            tracing::debug!(
+                pending_foreground_tools = self.emitter.open_foreground_tool_ids().len(),
+                "Deferring Codex idle until foreground tools complete"
+            );
+            if turn_status == "failed" {
+                let message = params
+                    .get("turn")
+                    .and_then(|v| v.get("error"))
+                    .and_then(|v| v.get("message"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("Codex turn failed")
+                    .to_string();
+                self.complete_all_codex_subagents().await;
+                self.emitter.backend_error(&message);
+            }
             return;
         }
 

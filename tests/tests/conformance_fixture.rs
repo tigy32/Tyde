@@ -1429,6 +1429,38 @@ pub async fn drain_events_for(host: &mut Host, window: Duration) -> Vec<ChatEven
     events
 }
 
+/// Collect over `window`, restricted to one agent instance stream.
+///
+/// A parent and its child intentionally remain active at the same time. Tests
+/// looking for work after a parent boundary must not mistake legitimate child
+/// events for the parent resuming.
+pub async fn drain_agent_events_for(
+    host: &mut Host,
+    agent: &Agent,
+    window: Duration,
+) -> Vec<ChatEvent> {
+    let deadline = tokio::time::Instant::now() + window;
+    let mut events = Vec::new();
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(remaining, host.client.next_event()).await {
+            Ok(Ok(Some(envelope))) => {
+                fail_on_agent_error(&envelope, "agent settle");
+                if envelope.stream == agent.stream {
+                    events.extend(chat_events_in(&envelope));
+                }
+            }
+            Ok(Ok(None)) => break,
+            Ok(Err(error)) => panic!("agent settle next_event failed: {error:?}"),
+            Err(_) => break,
+        }
+    }
+    events
+}
+
 /// Returns what arrives during shutdown, which is the emitter's last chance to
 /// report violations it recorded after the final turn ended.
 pub async fn close_agent(host: &mut Host, agent: &Agent) -> Vec<ChatEvent> {
