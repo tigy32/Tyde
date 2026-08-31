@@ -629,6 +629,9 @@ impl TurnMapper {
                 self.close_tool(emitter, step_index, &step);
             }
             "CANCELLED" | "CANCELED" => {
+                if !self.open_tools.contains_key(&step_index) {
+                    self.open_tool(emitter, step_index, &tool_name, &step);
+                }
                 if let Some(open) = self.open_tools.remove(&step_index) {
                     emitter.tool_completed(
                         &open.tool_call_id,

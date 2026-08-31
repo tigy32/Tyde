@@ -3494,6 +3494,59 @@ fn assert_streams_are_balanced(turn: &Turn) {
     );
 }
 
+/// Stream invariant check for an interrupted/cancelled turn.
+///
+/// Unlike `assert_streams_are_balanced`, `OperationCancelled` is permitted to abort
+/// at most one in-flight response without emitting a `StreamEnd`. This assertion
+/// verifies that:
+/// 1. No nested `StreamStart`s occur (at most one open stream at any point).
+/// 2. Every `StreamEnd` closes a previously opened `StreamStart`.
+/// 3. `OperationCancelled` aborts at most one in-flight response.
+/// 4. When the turn finishes (at idle), no open response remains.
+fn assert_streams_are_balanced_for_cancellation(turn: &Turn) {
+    let mut open = false;
+    let mut starts = 0usize;
+    let mut ends = 0usize;
+    let mut aborted = 0usize;
+    for event in turn.events() {
+        match event {
+            ChatEvent::StreamStart(_) => {
+                assert!(
+                    !open,
+                    "{}: StreamStart arrived while another assistant response was still open",
+                    turn.label()
+                );
+                open = true;
+                starts += 1;
+            }
+            ChatEvent::StreamEnd(_) => {
+                assert!(
+                    open,
+                    "{}: StreamEnd closed a response that was never started",
+                    turn.label()
+                );
+                open = false;
+                ends += 1;
+            }
+            ChatEvent::OperationCancelled(_) if open => {
+                open = false;
+                aborted += 1;
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        !open,
+        "{}: ended with an assistant response still open ({starts} StreamStart, {ends} StreamEnd, {aborted} aborted)",
+        turn.label()
+    );
+    assert!(
+        aborted <= 1,
+        "{}: OperationCancelled aborted {aborted} responses; expected at most 1",
+        turn.label()
+    );
+}
+
 /// Set equality, not ordering. `TurnEmitter` does treat declaration as a hard
 /// precondition, but it is constructed only in `claude.rs`, `codex.rs` and
 /// `acp/backend.rs` — Hermes builds `ChatEvent::ToolRequest` directly
@@ -4429,6 +4482,7 @@ fn assert_cancellation_contract(interrupted: &Interrupted) {
     let turn = interrupted.turn();
     assert_no_error_message(&turn.label(), turn.events());
     assert_no_unknown_backend_event(turn);
+    assert_streams_are_balanced_for_cancellation(turn);
     assert_no_completion_without_request(turn);
 
     let Some(settled_in) = interrupted.settled_in() else {
