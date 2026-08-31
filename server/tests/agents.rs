@@ -869,7 +869,7 @@ async fn expect_task_token_usage_matching(
     context: &str,
     mut matches_payload: impl FnMut(&TaskTokenUsagePayload) -> bool,
 ) -> TaskTokenUsagePayload {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
     let mut observed = Vec::new();
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());

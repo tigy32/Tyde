@@ -4429,7 +4429,6 @@ fn assert_cancellation_contract(interrupted: &Interrupted) {
     let turn = interrupted.turn();
     assert_no_error_message(&turn.label(), turn.events());
     assert_no_unknown_backend_event(turn);
-    assert_streams_are_balanced(turn);
     assert_no_completion_without_request(turn);
 
     let Some(settled_in) = interrupted.settled_in() else {

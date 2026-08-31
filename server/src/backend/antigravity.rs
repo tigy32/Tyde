@@ -65,7 +65,7 @@ const ANTIGRAVITY_MCP_LOCK_POLL: Duration = Duration::from_millis(250);
 const ANTIGRAVITY_GRACEFUL_EXIT_TIMEOUT: Duration = Duration::from_secs(15);
 /// `agy` ends a turn on its own after this long. It is a provider-side cap on a
 /// single turn, not a Tyde timeout over local state, so it stays generous.
-const ANTIGRAVITY_PRINT_TIMEOUT: &str = "60m";
+const ANTIGRAVITY_PRINT_TIMEOUT: &str = "720h";
 const ANTIGRAVITY_DEFAULT_MODEL: &str = "Gemini 3.7 Flash (Medium)";
 const ANTIGRAVITY_LOW_MODEL: &str = "Gemini 3.7 Flash (Low)";
 const ANTIGRAVITY_HIGH_MODEL: &str = "Gemini 3.1 Pro (High)";
@@ -628,6 +628,16 @@ impl TurnMapper {
                 }
                 self.close_tool(emitter, step_index, &step);
             }
+            "CANCELLED" | "CANCELED" => {
+                if let Some(open) = self.open_tools.remove(&step_index) {
+                    emitter.tool_completed(
+                        &open.tool_call_id,
+                        ToolExecutionOutcome::Cancelled {
+                            message: "Tool execution was cancelled".to_string(),
+                        },
+                    );
+                }
+            }
             other => {
                 tracing::debug!("Antigravity tool step state {other:?} has no Tyde mapping");
             }
@@ -816,6 +826,17 @@ impl TurnMapper {
 
     fn take_pending_questions(&mut self) -> Vec<String> {
         std::mem::take(&mut self.pending_questions)
+    }
+
+    fn close_open_tools_as_cancelled(&mut self, emitter: &TurnEmitter, message: &str) {
+        for (_, open) in self.open_tools.drain() {
+            emitter.tool_completed(
+                &open.tool_call_id,
+                ToolExecutionOutcome::Cancelled {
+                    message: message.to_string(),
+                },
+            );
+        }
     }
 
     /// Drops the mapper's own bookkeeping for an interrupted turn.
@@ -1101,6 +1122,10 @@ impl Supervisor {
     async fn finish_turn(&mut self) {
         if let Some(mut mapper) = self.mapper.take() {
             mapper.close_response(&self.inner.emitter);
+            mapper.close_open_tools_as_cancelled(
+                &self.inner.emitter,
+                "Antigravity turn ended before tool execution completed",
+            );
             self.pending_questions
                 .extend(mapper.take_pending_questions());
         }
