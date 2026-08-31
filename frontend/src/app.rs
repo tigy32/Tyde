@@ -609,25 +609,17 @@ fn is_external_href(href: &str) -> bool {
         || scheme.eq_ignore_ascii_case("mailto")
 }
 
-fn drag_type_is_files(value: &str) -> bool {
-    value == "Files"
-}
-
-fn data_transfer_types_include_files(types: &js_sys::Array) -> bool {
-    types
-        .iter()
-        .any(|value| value.as_string().as_deref().is_some_and(drag_type_is_files))
-}
-
-fn event_has_dragged_files(ev: &web_sys::Event) -> bool {
-    let Some(drag_event) = ev.dyn_ref::<web_sys::DragEvent>() else {
-        return false;
-    };
-    let Some(data_transfer) = drag_event.data_transfer() else {
+pub(crate) fn drag_event_offers_external_files(ev: &web_sys::DragEvent) -> bool {
+    let Some(data_transfer) = ev.data_transfer() else {
         return false;
     };
 
-    if data_transfer_types_include_files(&data_transfer.types()) {
+    if data_transfer.types().iter().any(|value| {
+        value.as_string().is_some_and(|offered_type| {
+            offered_type.eq_ignore_ascii_case("Files")
+                || offered_type.eq_ignore_ascii_case("text/uri-list")
+        })
+    }) {
         return true;
     }
 
@@ -636,7 +628,7 @@ fn event_has_dragged_files(ev: &web_sys::Event) -> bool {
         .is_some_and(|files| files.length() > 0)
 }
 
-fn install_file_drop_navigation_guard() {
+pub(crate) fn install_file_drop_navigation_guard() {
     FILE_DROP_LISTENER_HANDLES.with(|handles| {
         for handle in handles.borrow_mut().drain(..) {
             handle.remove();
@@ -647,7 +639,10 @@ fn install_file_drop_navigation_guard() {
     let mut handles = Vec::new();
     for event in ["dragover", "drop"] {
         let callback = Closure::<dyn Fn(web_sys::Event)>::new(move |ev: web_sys::Event| {
-            if event_has_dragged_files(&ev) {
+            if ev
+                .dyn_ref::<web_sys::DragEvent>()
+                .is_some_and(drag_event_offers_external_files)
+            {
                 ev.prevent_default();
             }
         });

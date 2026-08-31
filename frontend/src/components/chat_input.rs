@@ -1,7 +1,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use js_sys::{Array, Promise};
+use js_sys::Promise;
 use leptos::prelude::*;
 use wasm_bindgen::{JsCast, JsValue, closure::Closure};
 use wasm_bindgen_futures::{JsFuture, spawn_local};
@@ -656,17 +656,6 @@ fn clipboard_image_files(data_transfer: &web_sys::DataTransfer) -> Vec<web_sys::
     images
 }
 
-fn data_transfer_has_files(ev: &web_sys::DragEvent) -> bool {
-    let Some(data_transfer) = ev.data_transfer() else {
-        return false;
-    };
-
-    let types: Array = data_transfer.types();
-    types
-        .iter()
-        .any(|value| value.as_string().as_deref() == Some("Files"))
-}
-
 fn parse_data_url(data_url: &str) -> Result<(String, String), String> {
     let rest = data_url
         .strip_prefix("data:")
@@ -1139,7 +1128,7 @@ pub fn ChatInput(
     let on_dragenter_error = attachment_error;
     let on_dragenter_depth = drag_depth;
     let on_dragenter = move |ev: web_sys::DragEvent| {
-        if !data_transfer_has_files(&ev) {
+        if !crate::app::drag_event_offers_external_files(&ev) {
             return;
         }
         ev.prevent_default();
@@ -1149,7 +1138,7 @@ pub fn ChatInput(
 
     let on_dragover_depth = drag_depth;
     let on_dragover = move |ev: web_sys::DragEvent| {
-        if !data_transfer_has_files(&ev) {
+        if !crate::app::drag_event_offers_external_files(&ev) {
             return;
         }
         ev.prevent_default();
@@ -1759,6 +1748,34 @@ mod wasm_tests {
             .count()
     }
 
+    fn drag_event(event: &str, offered_type: &str, with_image: bool) -> web_sys::DragEvent {
+        js_sys::eval(&format!(
+            r#"
+            (function() {{
+                const transfer = new DataTransfer();
+                transfer.setData({offered_type}, "file:///tmp/ubuntu-drop.png");
+                if ({with_image}) {{
+                    transfer.items.add(new File(
+                        [new Uint8Array([137, 80, 78, 71])],
+                        "ubuntu-drop.png",
+                        {{ type: "image/png" }}
+                    ));
+                }}
+                return new DragEvent({event}, {{
+                    bubbles: true,
+                    cancelable: true,
+                    dataTransfer: transfer
+                }});
+            }})()
+            "#,
+            event = serde_json::to_string(event).expect("encode event type"),
+            offered_type = serde_json::to_string(offered_type).expect("encode offered type"),
+        ))
+        .expect("construct drag event")
+        .dyn_into::<web_sys::DragEvent>()
+        .expect("drag event")
+    }
+
     /// R-03: the disabled attribute is reactive and may not be applied when a
     /// second click arrives, so single-submit has to hold in the commit path.
     /// Two clicks must produce one Interrupt frame.
@@ -2347,6 +2364,112 @@ mod wasm_tests {
             c.is_some(),
             "caret toggle must always be present in the DOM, even when disabled"
         );
+    }
+
+    // Linux WebKitGTK advertises a file-manager drag as `text/uri-list`
+    // before exposing its FileList. Exercise the complete user-visible flow
+    // from that offer through an image-only send.
+    #[wasm_bindgen_test]
+    async fn uri_list_image_drop_attaches_and_sends_without_text() {
+        let container = make_container();
+        let state = AppState::new();
+        configure(&state, false, false, "");
+        let calls = stub_send_recording();
+        let state_for_mount = state.clone();
+        let _h = mount_to(container.clone(), move || {
+            provide_context(state_for_mount.clone());
+            view! { <ChatInput /> }
+        });
+        crate::app::install_file_drop_navigation_guard();
+        next_tick().await;
+
+        let composer = query(&container, ".chat-input-area").expect("composer");
+        let offer = drag_event("dragenter", "text/uri-list", false);
+        composer.dispatch_event(&offer).expect("dispatch dragenter");
+        assert!(
+            offer.default_prevented(),
+            "the composer must accept a URI-list file offer before a FileList is available"
+        );
+        next_tick().await;
+        assert_eq!(
+            query(&container, ".chat-input-drop-copy")
+                .and_then(|node| node.text_content())
+                .unwrap_or_default(),
+            "Drop images to attach",
+            "accepting the external offer must show the intended composer's overlay"
+        );
+
+        let outside = web_sys::window()
+            .unwrap()
+            .document()
+            .unwrap()
+            .create_element("div")
+            .unwrap();
+        web_sys::window()
+            .unwrap()
+            .document()
+            .unwrap()
+            .body()
+            .unwrap()
+            .append_child(&outside)
+            .unwrap();
+        let outside_offer = drag_event("dragover", "text/uri-list", false);
+        outside
+            .dispatch_event(&outside_offer)
+            .expect("dispatch outside dragover");
+        assert!(
+            outside_offer.default_prevented(),
+            "an external file offer outside a composer must not navigate the webview"
+        );
+        let internal_drag = drag_event("dragover", "text/plain", false);
+        outside
+            .dispatch_event(&internal_drag)
+            .expect("dispatch internal dragover");
+        assert!(
+            !internal_drag.default_prevented(),
+            "the external-file guard must leave internal plain-text drag/drop intact"
+        );
+
+        let drop = drag_event("drop", "text/uri-list", true);
+        composer.dispatch_event(&drop).expect("dispatch image drop");
+        for _ in 0..8 {
+            next_tick().await;
+            if query(&container, ".chat-attachment-thumb").is_some() {
+                break;
+            }
+        }
+        let attachment = query(&container, ".chat-attachment-thumb")
+            .expect("the dropped image must render as an attachment");
+        assert_eq!(
+            attachment.get_attribute("alt").as_deref(),
+            Some("ubuntu-drop.png")
+        );
+        assert!(
+            !primary(&container).has_attribute("disabled"),
+            "an image-only draft must enable Send"
+        );
+
+        primary(&container)
+            .dyn_into::<HtmlElement>()
+            .unwrap()
+            .click();
+        next_tick().await;
+        let payloads = send_message_payloads(&calls);
+        assert_eq!(payloads.len(), 1, "image-only send must emit one message");
+        assert_eq!(
+            payloads[0]
+                .get("images")
+                .and_then(JsonValue::as_array)
+                .map(Vec::len),
+            Some(1),
+            "sending the image-only draft must emit its attachment"
+        );
+        assert!(
+            query(&container, ".chat-attachment-bar").is_none(),
+            "the sent attachment must clear from the composer"
+        );
+
+        outside.remove();
     }
 
     #[wasm_bindgen_test]
