@@ -617,10 +617,7 @@ fn steer_chat_input(
     });
 }
 
-fn data_transfer_files(ev: &web_sys::DragEvent) -> Vec<web_sys::File> {
-    let Some(data_transfer) = ev.data_transfer() else {
-        return Vec::new();
-    };
+fn data_transfer_files(data_transfer: &web_sys::DataTransfer) -> Vec<web_sys::File> {
     let Some(files) = data_transfer.files() else {
         return Vec::new();
     };
@@ -632,6 +629,31 @@ fn data_transfer_files(ev: &web_sys::DragEvent) -> Vec<web_sys::File> {
         }
     }
     out
+}
+
+fn clipboard_image_files(data_transfer: &web_sys::DataTransfer) -> Vec<web_sys::File> {
+    let files = data_transfer_files(data_transfer)
+        .into_iter()
+        .filter(|file| file.type_().starts_with("image/"))
+        .collect::<Vec<_>>();
+    if !files.is_empty() {
+        return files;
+    }
+
+    let items = data_transfer.items();
+    let mut images = Vec::new();
+    for idx in 0..items.length() {
+        let Some(item) = items.get(idx) else {
+            continue;
+        };
+        if item.kind() == "file"
+            && item.type_().starts_with("image/")
+            && let Ok(Some(file)) = item.get_as_file()
+        {
+            images.push(file);
+        }
+    }
+    images
 }
 
 fn data_transfer_has_files(ev: &web_sys::DragEvent) -> bool {
@@ -665,7 +687,11 @@ fn js_error_to_string(err: JsValue) -> String {
 }
 
 async fn read_image_file(file: web_sys::File) -> Result<PendingImage, String> {
-    let name = file.name();
+    let name = if file.name().is_empty() {
+        "Pasted image".to_string()
+    } else {
+        file.name()
+    };
     let media_type = file.type_();
     if !media_type.starts_with("image/") {
         return Err(format!("{name} is not an image file"));
@@ -713,7 +739,7 @@ async fn read_image_file(file: web_sys::File) -> Result<PendingImage, String> {
         let onerror = Closure::wrap(Box::new(move |_ev: web_sys::ProgressEvent| {
             reader_for_error.set_onload(None);
             reader_for_error.set_onerror(None);
-            let err = JsValue::from_str("Failed to read dropped image");
+            let err = JsValue::from_str("Failed to read attached image");
             let _ = reject_for_error.call1(&JsValue::UNDEFINED, &err);
             onload_slot_for_error.borrow_mut().take();
             onerror_slot_for_error.borrow_mut().take();
@@ -737,7 +763,7 @@ async fn read_image_file(file: web_sys::File) -> Result<PendingImage, String> {
         .await
         .map_err(js_error_to_string)?
         .as_string()
-        .ok_or_else(|| format!("Failed to decode dropped image {name}"))?;
+        .ok_or_else(|| format!("Failed to decode attached image {name}"))?;
     let (parsed_media_type, data) = parse_data_url(&data_url)?;
 
     Ok(PendingImage {
@@ -749,6 +775,48 @@ async fn read_image_file(file: web_sys::File) -> Result<PendingImage, String> {
         },
         data,
     })
+}
+
+fn attach_image_files(
+    files: Vec<web_sys::File>,
+    state: AppState,
+    composer: ComposerHandle,
+    agent_ref: Signal<Option<ActiveAgentRef>>,
+    pending_images: RwSignal<Vec<PendingImage>>,
+    attachment_error: RwSignal<Option<String>>,
+) {
+    if !selected_backend_kind(&state, &composer, agent_ref)
+        .map(BackendKind::supports_image_input)
+        .unwrap_or(false)
+    {
+        let backend_name = selected_backend_kind(&state, &composer, agent_ref)
+            .map(|backend| format!("{backend:?}"))
+            .unwrap_or_else(|| "selected backend".to_string());
+        attachment_error.set(Some(format!("{backend_name} does not support image input")));
+        return;
+    }
+
+    attachment_error.set(None);
+    spawn_local(async move {
+        let mut added_images = Vec::new();
+        let mut errors = Vec::new();
+        for file in files {
+            match read_image_file(file).await {
+                Ok(image) => added_images.push(image),
+                Err(err) => errors.push(err),
+            }
+        }
+
+        if !added_images.is_empty() {
+            pending_images.update(|images| images.extend(added_images));
+        }
+
+        if errors.is_empty() {
+            attachment_error.set(None);
+        } else {
+            attachment_error.set(Some(errors.join(" ")));
+        }
+    });
 }
 
 #[component]
@@ -1106,46 +1174,48 @@ pub fn ChatInput(
         ev.prevent_default();
         on_drop_depth.set(0);
 
-        let files = data_transfer_files(&ev);
+        let Some(data_transfer) = ev.data_transfer() else {
+            return;
+        };
+        let files = data_transfer_files(&data_transfer);
+        if files.is_empty() {
+            return;
+        }
+        attach_image_files(
+            files,
+            on_drop_state.clone(),
+            on_drop_composer.clone(),
+            agent_ref,
+            on_drop_images,
+            on_drop_error,
+        );
+    };
+
+    let textarea_ref = NodeRef::<leptos::html::Textarea>::new();
+
+    let on_paste_state = state.clone();
+    let on_paste_composer = composer.clone();
+    let on_paste_images = pending_images;
+    let on_paste_error = attachment_error;
+    let on_paste = move |ev: web_sys::ClipboardEvent| {
+        let Some(data_transfer) = ev.clipboard_data() else {
+            return;
+        };
+        let files = clipboard_image_files(&data_transfer);
         if files.is_empty() {
             return;
         }
 
-        if !selected_backend_kind(&on_drop_state, &on_drop_composer, agent_ref)
-            .map(BackendKind::supports_image_input)
-            .unwrap_or(false)
-        {
-            let backend_name = selected_backend_kind(&on_drop_state, &on_drop_composer, agent_ref)
-                .map(|backend| format!("{backend:?}"))
-                .unwrap_or_else(|| "selected backend".to_string());
-            on_drop_error.set(Some(format!("{backend_name} does not support image input")));
-            return;
-        }
-
-        on_drop_error.set(None);
-        spawn_local(async move {
-            let mut added_images = Vec::new();
-            let mut errors = Vec::new();
-            for file in files {
-                match read_image_file(file).await {
-                    Ok(image) => added_images.push(image),
-                    Err(err) => errors.push(err),
-                }
-            }
-
-            if !added_images.is_empty() {
-                on_drop_images.update(|images| images.extend(added_images));
-            }
-
-            if errors.is_empty() {
-                on_drop_error.set(None);
-            } else {
-                on_drop_error.set(Some(errors.join(" ")));
-            }
-        });
+        ev.prevent_default();
+        attach_image_files(
+            files,
+            on_paste_state.clone(),
+            on_paste_composer.clone(),
+            agent_ref,
+            on_paste_images,
+            on_paste_error,
+        );
     };
-
-    let textarea_ref = NodeRef::<leptos::html::Textarea>::new();
 
     // Synchronise the textarea's `value` property *only* when the
     // signal diverges from what the DOM already has — the common case
@@ -1330,6 +1400,7 @@ pub fn ChatInput(
                     prop:disabled=move || is_readonly.get()
                     on:input=on_input
                     on:keydown=on_keydown
+                    on:paste=on_paste
                     rows="1"
                     node_ref=textarea_ref
                     spellcheck="false"
@@ -1841,6 +1912,56 @@ mod wasm_tests {
         target.dispatch_event(&event).unwrap();
     }
 
+    fn dispatch_paste(
+        target: &web_sys::Element,
+        files: &[(&str, &str, &[u8])],
+        text: Option<&str>,
+    ) -> bool {
+        let data_transfer = web_sys::DataTransfer::new().expect("construct clipboard data");
+        for (name, media_type, bytes) in files {
+            let parts = js_sys::Array::of1(&js_sys::Uint8Array::from(*bytes));
+            let options = js_sys::Object::new();
+            js_sys::Reflect::set(&options, &"type".into(), &(*media_type).into()).unwrap();
+            let file_ctor = js_sys::Reflect::get(&js_sys::global(), &"File".into()).unwrap();
+            let file_ctor: js_sys::Function = file_ctor.unchecked_into();
+            let args = js_sys::Array::of3(&parts, &(*name).into(), &options);
+            let file = js_sys::Reflect::construct(&file_ctor, &args).unwrap();
+            let file: web_sys::File = file.unchecked_into();
+            data_transfer.items().add_with_file(&file).unwrap();
+        }
+        if let Some(text) = text {
+            data_transfer.set_data("text/plain", text).unwrap();
+        }
+
+        let init = js_sys::Object::new();
+        js_sys::Reflect::set(&init, &"clipboardData".into(), &data_transfer).unwrap();
+        js_sys::Reflect::set(&init, &"bubbles".into(), &JsValue::TRUE).unwrap();
+        js_sys::Reflect::set(&init, &"cancelable".into(), &JsValue::TRUE).unwrap();
+        let ctor = js_sys::Reflect::get(&js_sys::global(), &"ClipboardEvent".into()).unwrap();
+        let ctor: js_sys::Function = ctor.unchecked_into();
+        let args = js_sys::Array::of2(&"paste".into(), &init);
+        let event = js_sys::Reflect::construct(&ctor, &args).unwrap();
+        let event: web_sys::Event = event.unchecked_into();
+        target.dispatch_event(&event).unwrap()
+    }
+
+    fn send_message_payloads(calls: &js_sys::Array) -> Vec<JsonValue> {
+        calls
+            .iter()
+            .filter_map(|entry| entry.as_string())
+            .filter_map(|args| serde_json::from_str::<JsonValue>(&args).ok())
+            .filter_map(|args| {
+                args.get("line")
+                    .and_then(|line| line.as_str())
+                    .and_then(|line| serde_json::from_str::<JsonValue>(line).ok())
+            })
+            .filter(|envelope| {
+                envelope.get("kind").and_then(|kind| kind.as_str()) == Some("send_message")
+            })
+            .filter_map(|envelope| envelope.get("payload").cloned())
+            .collect()
+    }
+
     // ── State matrix row 1: Idle + empty ──────────────────────────────────────
     // Primary "Send" disabled; caret visible but disabled; no dropdown items.
     #[wasm_bindgen_test]
@@ -2228,24 +2349,149 @@ mod wasm_tests {
         );
     }
 
-    // ── Image-only input coverage note ────────────────────────────────────────
-    // The matrix says desktop input = "text/images". Full image-only tests
-    // (e.g. idle image+session → Send enabled/caret enabled/Fork + send) are not
-    // feasible from this wasm test module because:
-    //   1. `pending_images` is a component-local RwSignal<Vec<PendingImage>>
-    //      not exposed via AppState or any injectable context — there is no
-    //      external setter.
-    //   2. Simulating a file-drop via DragEvent requires a real FileList, which
-    //      web-sys provides no constructor for in test scope.
-    // The `has_input = has_text || has_images` gate in ui_mode uses a single
-    // branch: both text and images set the same boolean, so behaviour is
-    // identical — the text-only matrix rows above already exercise every
-    // reachable code path gated on `has_input`. The attachment UI (thumbnails,
-    // drop overlay, error banner) is rendered independently of the split-button
-    // state machine and is not covered here.
-    //
-    // To add image-only tests in the future: move `pending_images` into
-    // AppState or provide it via a Leptos context, then seed it in `configure`.
+    #[wasm_bindgen_test]
+    async fn pasted_images_attach_in_order_and_send_image_only() {
+        let state = AppState::new();
+        configure(&state, false, false, "");
+        let calls = stub_send_recording();
+        let mount_state = state.clone();
+        let container = make_container();
+        let _h = mount_to(container.clone(), move || {
+            provide_context(mount_state.clone());
+            view! { <ChatInput /> }
+        });
+        next_tick().await;
+
+        let allowed = dispatch_paste(
+            &textarea(&container),
+            &[
+                ("first.png", "image/png", &[1, 2, 3]),
+                ("", "image/jpeg", &[4, 5, 6]),
+            ],
+            Some("unwanted image representation"),
+        );
+        assert!(
+            !allowed,
+            "image paste must suppress its text representation"
+        );
+        for _ in 0..4 {
+            next_tick().await;
+        }
+
+        let cards = container
+            .query_selector_all(".chat-attachment-card")
+            .unwrap();
+        assert_eq!(cards.length(), 2, "both pasted images must be visible");
+        let names = (0..cards.length())
+            .map(|index| {
+                let card: web_sys::Element = cards.item(index).unwrap().dyn_into().unwrap();
+                card.query_selector(".chat-attachment-name")
+                    .unwrap()
+                    .unwrap()
+                    .text_content()
+                    .unwrap_or_default()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            vec!["first.png", "Pasted image"],
+            "pasted images must retain clipboard order and unnamed images need a useful label"
+        );
+        assert_eq!(
+            state.composer_untracked().text.get_untracked(),
+            "",
+            "the clipboard's accompanying text must not enter the composer"
+        );
+        assert!(
+            !primary(&container).has_attribute("disabled"),
+            "an image-only draft must be sendable"
+        );
+
+        let send: HtmlElement = primary(&container).dyn_into().unwrap();
+        send.click();
+        for _ in 0..3 {
+            next_tick().await;
+        }
+        let payloads = send_message_payloads(&calls);
+        assert_eq!(payloads.len(), 1, "image-only send must emit one message");
+        assert_eq!(
+            payloads[0].get("message").and_then(JsonValue::as_str),
+            Some("")
+        );
+        let images = payloads[0]
+            .get("images")
+            .and_then(JsonValue::as_array)
+            .expect("send payload must contain images");
+        assert_eq!(images.len(), 2);
+        assert_eq!(
+            images[0].get("media_type").and_then(JsonValue::as_str),
+            Some("image/png")
+        );
+        assert_eq!(
+            images[0].get("data").and_then(JsonValue::as_str),
+            Some("AQID")
+        );
+        assert_eq!(
+            images[1].get("media_type").and_then(JsonValue::as_str),
+            Some("image/jpeg")
+        );
+        assert_eq!(
+            images[1].get("data").and_then(JsonValue::as_str),
+            Some("BAUG")
+        );
+    }
+
+    #[wasm_bindgen_test]
+    async fn text_paste_is_not_intercepted() {
+        let container = make_container();
+        let _h = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            configure(&state, false, false, "");
+            provide_context(state);
+            view! { <ChatInput /> }
+        });
+        next_tick().await;
+
+        assert!(
+            dispatch_paste(&textarea(&container), &[], Some("ordinary text")),
+            "plain-text paste must retain the browser's native default action"
+        );
+        assert!(query(&container, ".chat-attachment-bar").is_none());
+    }
+
+    #[wasm_bindgen_test]
+    async fn unsupported_backend_rejects_pasted_image_explicitly() {
+        let state = AppState::new();
+        configure(&state, false, false, "");
+        state
+            .agents
+            .update(|agents| agents[0].backend_kind = BackendKind::Tycode);
+        let mount_state = state.clone();
+        let container = make_container();
+        let _h = mount_to(container.clone(), move || {
+            provide_context(mount_state.clone());
+            view! { <ChatInput /> }
+        });
+        next_tick().await;
+
+        assert!(
+            !dispatch_paste(
+                &textarea(&container),
+                &[("screen.png", "image/png", &[1])],
+                None,
+            ),
+            "recognized image content must be consumed even when the backend rejects it"
+        );
+        next_tick().await;
+        assert!(query(&container, ".chat-attachment-bar").is_none());
+        assert_eq!(
+            query(&container, ".chat-input-error")
+                .and_then(|error| error.text_content())
+                .unwrap_or_default()
+                .trim(),
+            "Tycode does not support image input"
+        );
+    }
 
     /// Attachment error banner is absent in the baseline state so it does not
     /// pollute the split-button matrix rows above.
