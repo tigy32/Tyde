@@ -1105,7 +1105,7 @@ mod wasm_tests {
         assert_eq!(current_seq(host_id, &stream), 0);
         settle().await;
         let visible_error = container
-            .query_selector(".user-error-banner-message")
+            .query_selector(".user-notice-banner-message")
             .unwrap()
             .and_then(|message| message.text_content())
             .expect("transport rejection must produce visible feedback");
@@ -1131,7 +1131,7 @@ mod wasm_tests {
         assert_eq!(envelopes[1].seq, 0);
         assert_eq!(current_seq(host_id, &stream), 1);
         container
-            .query_selector(".user-error-banner-dismiss")
+            .query_selector(".user-notice-banner-dismiss")
             .unwrap()
             .expect("reported transport error must be dismissible")
             .dyn_into::<web_sys::HtmlElement>()

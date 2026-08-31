@@ -1048,7 +1048,7 @@ fn reported_host_error_message(label: Option<&str>, error: &str) -> String {
 }
 
 async fn install_host_listeners(state: AppState) -> Result<Vec<bridge::UnlistenHandle>, String> {
-    let mut handles = Vec::with_capacity(4);
+    let mut handles = Vec::with_capacity(5);
 
     let line_state = state.clone();
     handles.push(
@@ -1126,6 +1126,20 @@ async fn install_host_listeners(state: AppState) -> Result<Vec<bridge::UnlistenH
             error_state.connection_statuses.update(|statuses| {
                 statuses.insert(event.host_id, ConnectionStatus::Error(event.message));
             });
+        })
+        .await?,
+    );
+
+    let warning_state = state.clone();
+    handles.push(
+        bridge::listen_host_warning(move |event| {
+            log::warn!("host {} warning: {}", event.host_id, event.message);
+            let label = configured_host_label(&warning_state, &event.host_id);
+            let message = match label {
+                Some(label) => format!("Host “{label}” reported: {}", event.message),
+                None => format!("A host reported: {}", event.message),
+            };
+            crate::components::header::report_user_warning(message);
         })
         .await?,
     );

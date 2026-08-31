@@ -1,21 +1,26 @@
 use std::collections::HashMap;
+use std::process::ExitStatus;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use tauri::{AppHandle, Emitter, Manager};
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 
 use crate::bridge::{
-    HOST_DISCONNECTED_EVENT, HOST_ERROR_EVENT, HOST_LINE_EVENT, HostDisconnectedEvent,
-    HostErrorEvent, HostLineEvent,
+    HOST_DISCONNECTED_EVENT, HOST_ERROR_EVENT, HOST_LINE_EVENT, HOST_WARNING_EVENT,
+    HostDisconnectedEvent, HostErrorEvent, HostLineEvent, HostWarningEvent,
 };
 use crate::host_store::{HostTransportConfig, RemoteHostLifecycleConfig};
 use crate::remote_bootstrap::{current_app_release_version, shell_quote};
 use host_config::TydeReleaseVersion;
 
 const DEFAULT_REMOTE_HOST_COMMAND: &str = "tyde host --bridge-uds";
+const SSH_STDERR_CAPTURE_LIMIT: usize = 64 * 1024;
+const SSH_EXIT_WAIT: Duration = Duration::from_secs(2);
 pub const HOST_VOICE_FRAME_EVENT: &str = "tyde://host-voice-frame";
 
 #[derive(Clone, serde::Serialize)]
@@ -72,7 +77,7 @@ struct Connection {
     outbound_tx: mpsc::UnboundedSender<Outbound>,
     /// SSH child process, owned here so teardown can reap it. `None` for the
     /// in-process embedded transport.
-    child: Option<Child>,
+    child: Option<SshChild>,
     /// Liveness flag shared with this connection's reader/stderr tasks. Cleared
     /// (non-blocking, no lock) the instant the entry is removed or superseded,
     /// so a stale reader/stderr task that is still draining stops emitting
@@ -80,6 +85,44 @@ struct Connection {
     /// reused the same host id.
     live: Arc<AtomicBool>,
     audio_pending: Arc<AtomicUsize>,
+}
+
+struct SshChild {
+    process: Child,
+    stderr_capture: Arc<Mutex<StderrCapture>>,
+    stderr_task: JoinHandle<Result<(), String>>,
+}
+
+#[derive(Default)]
+struct StderrCapture {
+    bytes: Vec<u8>,
+    truncated: bool,
+}
+
+impl StderrCapture {
+    fn push(&mut self, chunk: &[u8]) {
+        let remaining = SSH_STDERR_CAPTURE_LIMIT.saturating_sub(self.bytes.len());
+        self.bytes
+            .extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+        self.truncated |= chunk.len() > remaining;
+    }
+
+    fn text(&self) -> String {
+        let mut text = String::from_utf8_lossy(&self.bytes).trim().to_owned();
+        if self.truncated {
+            if !text.is_empty() {
+                text.push('\n');
+            }
+            text.push_str("[SSH diagnostic truncated]");
+        }
+        text
+    }
+}
+
+#[derive(Clone, Copy)]
+enum CloseCause {
+    NaturalEof,
+    Abort,
 }
 
 impl ProxyRouterHandle {
@@ -121,7 +164,7 @@ impl ProxyRouterHandle {
             {
                 let _ = emit_error(&app, &host_id, error);
             }
-            reap_child(existing.child).await;
+            abort_child(existing.child).await;
         }
 
         let connection_id = {
@@ -193,7 +236,7 @@ impl ProxyRouterHandle {
         // already gone, so no `HOST_DISCONNECTED_EVENT` is emitted for an
         // explicit disconnect.
         connection.live.store(false, Ordering::Relaxed);
-        reap_child(connection.child).await;
+        abort_child(connection.child).await;
         Ok(())
     }
 
@@ -271,9 +314,13 @@ async fn reader_task(
     live: Arc<AtomicBool>,
 ) {
     let mut reader = protocol::FrameReader::new(reader);
+    let mut close_cause = CloseCause::Abort;
     loop {
         match reader.read_frame().await {
-            Ok(None) => break,
+            Ok(None) => {
+                close_cause = CloseCause::NaturalEof;
+                break;
+            }
             Ok(Some(frame)) => {
                 // Non-blocking liveness check (no lock, no await): if this
                 // connection was superseded/torn down while we were parked in
@@ -401,7 +448,7 @@ async fn reader_task(
         }
     }
 
-    close_connection(&state, &app, &host_id, connection_id).await;
+    close_connection(&state, &app, &host_id, connection_id, close_cause).await;
 }
 
 /// Outbound half: solely owns the transport writer and drains the unbounded
@@ -443,7 +490,7 @@ async fn writer_task(
             if live.load(Ordering::Relaxed) {
                 let _ = emit_error(&app, &host_id, error);
             }
-            close_connection(&state, &app, &host_id, connection_id).await;
+            close_connection(&state, &app, &host_id, connection_id, CloseCause::Abort).await;
             return;
         }
     }
@@ -458,6 +505,7 @@ async fn close_connection(
     app: &AppHandle,
     host_id: &str,
     connection_id: u64,
+    cause: CloseCause,
 ) {
     let connection = {
         let mut guard = state.lock().expect("router state poisoned");
@@ -481,7 +529,9 @@ async fn close_connection(
     {
         let _ = emit_error(app, host_id, error);
     }
-    reap_child(connection.child).await;
+    if let Some(error) = finish_child(connection.child, cause).await {
+        let _ = emit_error(app, host_id, error);
+    }
     tracing::info!(host_id, connection_id, "connection closed");
     let _ = app.emit(
         HOST_DISCONNECTED_EVENT,
@@ -491,12 +541,12 @@ async fn close_connection(
     );
 }
 
-async fn reap_child(child: Option<Child>) {
+async fn abort_child(child: Option<SshChild>) {
     let Some(mut child) = child else {
         return;
     };
-    let _ = child.kill().await;
-    match child.wait().await {
+    let _ = child.process.kill().await;
+    match child.process.wait().await {
         Ok(status) => {
             tracing::info!(%status, "ssh transport exited");
         }
@@ -504,12 +554,67 @@ async fn reap_child(child: Option<Child>) {
             tracing::warn!(%error, "failed to wait for ssh transport exit");
         }
     }
+    let _ = child.stderr_task.await;
+}
+
+async fn finish_child(child: Option<SshChild>, cause: CloseCause) -> Option<String> {
+    let mut child = child?;
+    if matches!(cause, CloseCause::Abort) {
+        abort_child(Some(child)).await;
+        return None;
+    }
+
+    let status = match tokio::time::timeout(SSH_EXIT_WAIT, child.process.wait()).await {
+        Ok(Ok(status)) => Some(status),
+        Ok(Err(error)) => {
+            let _ = child.stderr_task.await;
+            return Some(format!("failed to wait for ssh transport exit: {error}"));
+        }
+        Err(_) => {
+            let _ = child.process.kill().await;
+            let _ = child.process.wait().await;
+            None
+        }
+    };
+    let stderr_result = child.stderr_task.await;
+    let diagnostic = child
+        .stderr_capture
+        .lock()
+        .expect("ssh stderr capture poisoned")
+        .text();
+
+    match stderr_result {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => return Some(error),
+        Err(error) => return Some(format!("failed to join ssh stderr capture: {error}")),
+    }
+    match status {
+        Some(status) if status.success() => None,
+        Some(status) => Some(ssh_exit_failure_message(status, &diagnostic)),
+        None => Some(ssh_exit_timeout_message(&diagnostic)),
+    }
+}
+
+fn ssh_exit_failure_message(status: ExitStatus, diagnostic: &str) -> String {
+    if diagnostic.is_empty() {
+        format!("ssh transport exited with {status}")
+    } else {
+        format!("ssh transport exited with {status}:\n{diagnostic}")
+    }
+}
+
+fn ssh_exit_timeout_message(diagnostic: &str) -> String {
+    if diagnostic.is_empty() {
+        "ssh transport closed its output without exiting".to_owned()
+    } else {
+        format!("ssh transport closed its output without exiting:\n{diagnostic}")
+    }
 }
 
 struct ConnectionSetup {
     reader: Box<dyn AsyncBufRead + Unpin + Send>,
     writer: Box<dyn AsyncWrite + Unpin + Send>,
-    child: Option<Child>,
+    child: Option<SshChild>,
 }
 
 async fn write_line<W: AsyncWriteExt + Unpin>(writer: &mut W, line: String) -> Result<(), String> {
@@ -532,11 +637,43 @@ fn emit_error(app: &AppHandle, host_id: &str, message: String) -> tauri::Result<
     )
 }
 
-fn trim_line_ending(mut line: String) -> String {
-    while line.ends_with('\n') || line.ends_with('\r') {
-        line.pop();
+fn emit_warning(app: &AppHandle, host_id: &str, message: String) -> tauri::Result<()> {
+    app.emit(
+        HOST_WARNING_EVENT,
+        HostWarningEvent {
+            host_id: host_id.to_owned(),
+            message,
+        },
+    )
+}
+
+async fn capture_stderr<R, F>(
+    mut stderr: R,
+    capture: Arc<Mutex<StderrCapture>>,
+    mut on_diagnostic: F,
+) -> Result<(), String>
+where
+    R: AsyncRead + Unpin + Send,
+    F: FnMut(String) + Send,
+{
+    let mut chunk = [0_u8; 4096];
+    loop {
+        let read = stderr
+            .read(&mut chunk)
+            .await
+            .map_err(|error| format!("failed to read ssh stderr: {error}"))?;
+        if read == 0 {
+            return Ok(());
+        }
+        let diagnostic = {
+            let mut capture = capture.lock().expect("ssh stderr capture poisoned");
+            capture.push(&chunk[..read]);
+            capture.text()
+        };
+        if !diagnostic.is_empty() {
+            on_diagnostic(diagnostic);
+        }
     }
-    line
 }
 
 async fn setup_connection_transport(
@@ -609,51 +746,41 @@ async fn setup_connection_transport(
                 .take()
                 .ok_or_else(|| format!("ssh transport for host {host_id} has no stdin"))?;
 
-            if let Some(stderr) = child.stderr.take() {
-                let app = app.clone();
-                let host_id = host_id.to_string();
-                let live = live.clone();
-                tokio::spawn(async move {
-                    let mut stderr = BufReader::new(stderr);
-                    loop {
-                        // Stop emitting the moment this connection is superseded
-                        // so late stderr lines can't surface as errors on the
-                        // connection that replaced us (non-blocking, no lock).
-                        if !live.load(Ordering::Relaxed) {
-                            break;
-                        }
-                        let mut line = String::new();
-                        match stderr.read_line(&mut line).await {
-                            Ok(0) => break,
-                            Ok(_) => {
-                                if !live.load(Ordering::Relaxed) {
-                                    break;
-                                }
-                                let line = trim_line_ending(line);
-                                if line.is_empty() {
-                                    continue;
-                                }
-                                let _ = emit_error(&app, &host_id, format!("ssh: {line}"));
-                            }
-                            Err(error) => {
-                                if live.load(Ordering::Relaxed) {
-                                    let _ = emit_error(
-                                        &app,
-                                        &host_id,
-                                        format!("failed to read ssh stderr: {error}"),
-                                    );
-                                }
-                                break;
-                            }
-                        }
+            let stderr = child
+                .stderr
+                .take()
+                .ok_or_else(|| format!("ssh transport for host {host_id} has no stderr"))?;
+            let stderr_capture = Arc::new(Mutex::new(StderrCapture::default()));
+            let stderr_capture_for_task = stderr_capture.clone();
+            let app_for_stderr = app.clone();
+            let host_id_for_stderr = host_id.to_string();
+            let live_for_stderr = live.clone();
+            let stderr_task = tokio::spawn(async move {
+                capture_stderr(stderr, stderr_capture_for_task, move |diagnostic| {
+                    tracing::warn!(
+                        host_id = %host_id_for_stderr,
+                        %diagnostic,
+                        "ssh transport diagnostic"
+                    );
+                    if live_for_stderr.load(Ordering::Relaxed) {
+                        let _ = emit_warning(
+                            &app_for_stderr,
+                            &host_id_for_stderr,
+                            format!("ssh: {diagnostic}"),
+                        );
                     }
-                });
-            }
+                })
+                .await
+            });
 
             Ok(ConnectionSetup {
                 reader: Box::new(BufReader::new(stdout)),
                 writer: Box::new(stdin),
-                child: Some(child),
+                child: Some(SshChild {
+                    process: child,
+                    stderr_capture,
+                    stderr_task,
+                }),
             })
         }
     }
@@ -679,4 +806,80 @@ export TYDE_SOCKET_PATH="$HOME/.tyde/tyde.sock"
 exec "$bin" host --bridge-uds 2>> "$HOME/.tyde/logs/tyde-host-bridge-uds.log"
 "#
     )
+}
+
+#[cfg(all(test, not(target_os = "windows")))]
+mod tests {
+    use super::*;
+
+    async fn diagnostic_process(script: &str) -> (SshChild, Arc<Mutex<Vec<String>>>) {
+        let mut process = Command::new("/bin/sh");
+        process
+            .arg("-c")
+            .arg(script)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped());
+        let mut process = process.spawn().expect("spawn diagnostic process");
+        let stderr = process.stderr.take().expect("capture process stderr");
+        let stderr_capture = Arc::new(Mutex::new(StderrCapture::default()));
+        let capture_for_task = stderr_capture.clone();
+        let updates = Arc::new(Mutex::new(Vec::new()));
+        let updates_for_task = updates.clone();
+        let stderr_task = tokio::spawn(async move {
+            capture_stderr(stderr, capture_for_task, move |diagnostic| {
+                updates_for_task
+                    .lock()
+                    .expect("diagnostic updates poisoned")
+                    .push(diagnostic);
+            })
+            .await
+        });
+        (
+            SshChild {
+                process,
+                stderr_capture,
+                stderr_task,
+            },
+            updates,
+        )
+    }
+
+    #[tokio::test]
+    async fn ssh_diagnostics_follow_the_real_process_exit_status() {
+        let (successful, successful_updates) = diagnostic_process(
+            "printf '%s\\n' '** WARNING: connection is not using a post-quantum key exchange algorithm.' '**' >&2; exit 0",
+        )
+        .await;
+        let success_error = finish_child(Some(successful), CloseCause::NaturalEof).await;
+        assert_eq!(
+            success_error, None,
+            "stderr from a successful SSH process is diagnostic, not fatal"
+        );
+        let successful_diagnostic = successful_updates
+            .lock()
+            .expect("successful diagnostic updates poisoned")
+            .last()
+            .cloned()
+            .expect("successful process must surface its warning");
+        assert!(
+            successful_diagnostic.contains("WARNING: connection is not using a post-quantum")
+                && successful_diagnostic.ends_with("**"),
+            "the cumulative warning must preserve every stderr line: {successful_diagnostic}"
+        );
+
+        let (failed, _) = diagnostic_process(
+            "printf '%s\\n' 'Permission denied (publickey).' 'Connection closed by remote host.' >&2; exit 23",
+        )
+        .await;
+        let failure = finish_child(Some(failed), CloseCause::NaturalEof)
+            .await
+            .expect("a nonzero SSH exit must be fatal");
+        assert!(
+            failure.contains("exit status: 23")
+                && failure.contains("Permission denied (publickey).")
+                && failure.contains("Connection closed by remote host."),
+            "one failure must retain the exit status and complete stderr: {failure}"
+        );
+    }
 }

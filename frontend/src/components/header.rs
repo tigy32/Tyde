@@ -5,38 +5,55 @@ use leptos::prelude::*;
 use crate::state::{AppState, ConnectionStatus, DockVisibility};
 
 #[derive(Clone, PartialEq, Eq)]
-struct UserFacingError {
+enum UserNoticeKind {
+    Error,
+    Warning,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct UserNotice {
     id: u64,
+    kind: UserNoticeKind,
     message: String,
 }
 
 thread_local! {
-    static USER_FACING_ERROR: ArcRwSignal<Option<UserFacingError>> =
+    static USER_NOTICE: ArcRwSignal<Option<UserNotice>> =
         ArcRwSignal::new(None);
-    static NEXT_USER_FACING_ERROR_ID: Cell<u64> = const { Cell::new(0) };
+    static NEXT_USER_NOTICE_ID: Cell<u64> = const { Cell::new(0) };
 }
 
 pub(crate) fn report_user_error(message: impl Into<String>) {
     let message = message.into();
     log::error!("user-visible error: {message}");
-    let id = NEXT_USER_FACING_ERROR_ID.with(|next| {
+    report_user_notice(UserNoticeKind::Error, message);
+}
+
+pub(crate) fn report_user_warning(message: impl Into<String>) {
+    let message = message.into();
+    log::warn!("user-visible warning: {message}");
+    report_user_notice(UserNoticeKind::Warning, message);
+}
+
+fn report_user_notice(kind: UserNoticeKind, message: String) {
+    let id = NEXT_USER_NOTICE_ID.with(|next| {
         let id = next.get();
         next.set(id.wrapping_add(1));
         id
     });
-    USER_FACING_ERROR.with(|error| {
-        error.set(Some(UserFacingError { id, message }));
+    USER_NOTICE.with(|notice| {
+        notice.set(Some(UserNotice { id, kind, message }));
     });
 }
 
-fn user_facing_error_signal() -> ArcRwSignal<Option<UserFacingError>> {
-    USER_FACING_ERROR.with(Clone::clone)
+fn user_notice_signal() -> ArcRwSignal<Option<UserNotice>> {
+    USER_NOTICE.with(Clone::clone)
 }
 
 #[component]
 pub fn Header() -> impl IntoView {
     let state = expect_context::<AppState>();
-    let user_error = user_facing_error_signal();
+    let user_notice = user_notice_signal();
 
     let status_text_state = state.clone();
     let status_text = Memo::new(move |_| {
@@ -107,14 +124,38 @@ pub fn Header() -> impl IntoView {
         });
     };
 
-    let user_error_for_show = user_error.clone();
-    let user_error_for_message = user_error;
-    let user_error_message = Memo::new(move |_| {
-        user_error_for_message
+    let user_notice_for_show = user_notice.clone();
+    let user_notice_for_kind = user_notice.clone();
+    let user_notice_for_role = user_notice.clone();
+    let user_notice_for_label = user_notice.clone();
+    let user_notice_for_message = user_notice;
+    let user_notice_message = Memo::new(move |_| {
+        user_notice_for_message
             .get()
-            .map(|error| error.message)
+            .map(|notice| notice.message)
             .unwrap_or_default()
     });
+    let user_notice_class =
+        Memo::new(
+            move |_| match user_notice_for_kind.get().map(|notice| notice.kind) {
+                Some(UserNoticeKind::Warning) => "user-notice-banner warning",
+                _ => "user-notice-banner error",
+            },
+        );
+    let user_notice_label =
+        Memo::new(
+            move |_| match user_notice_for_label.get().map(|notice| notice.kind) {
+                Some(UserNoticeKind::Warning) => "SSH warning",
+                _ => "Action failed",
+            },
+        );
+    let user_notice_role =
+        Memo::new(
+            move |_| match user_notice_for_role.get().map(|notice| notice.kind) {
+                Some(UserNoticeKind::Warning) => "status",
+                _ => "alert",
+            },
+        );
 
     view! {
         <>
@@ -132,18 +173,18 @@ pub fn Header() -> impl IntoView {
                     <button class="header-btn" title="Toggle Right Dock" on:click=toggle_right>"Right"</button>
                 </div>
             </header>
-            <Show when=move || user_error_for_show.get().is_some()>
-                <div class="user-error-banner" role="alert" aria-atomic="true">
-                    <span class="user-error-banner-label">"Action failed"</span>
-                    <span class="user-error-banner-message">
-                        {move || user_error_message.get()}
+            <Show when=move || user_notice_for_show.get().is_some()>
+                <div class={user_notice_class} role={user_notice_role} aria-live="polite" aria-atomic="true">
+                    <span class="user-notice-banner-label">{user_notice_label}</span>
+                    <span class="user-notice-banner-message">
+                        {move || user_notice_message.get()}
                     </span>
                     <button
-                        class="user-error-banner-dismiss"
-                        title="Dismiss error"
-                        aria-label="Dismiss error"
+                        class="user-notice-banner-dismiss"
+                        title="Dismiss notice"
+                        aria-label="Dismiss notice"
                         on:click=move |_| {
-                            USER_FACING_ERROR.with(|error| error.set(None));
+                            USER_NOTICE.with(|notice| notice.set(None));
                         }
                     >
                         "×"
@@ -183,7 +224,7 @@ mod wasm_tests {
 
     #[wasm_bindgen_test]
     async fn reported_error_is_visible_and_dismissible() {
-        USER_FACING_ERROR.with(|error| error.set(None));
+        USER_NOTICE.with(|notice| notice.set(None));
         let container = make_container();
         let _handle = mount_to(container.clone(), move || {
             provide_context(AppState::new());
@@ -193,7 +234,7 @@ mod wasm_tests {
         report_user_error("Tyde could not open a terminal because the host is offline.");
         next_tick().await;
         let banner = container
-            .query_selector(".user-error-banner")
+            .query_selector(".user-notice-banner.error")
             .unwrap()
             .expect("reported failures must render visibly");
         assert_eq!(banner.get_attribute("role").as_deref(), Some("alert"));
@@ -205,7 +246,7 @@ mod wasm_tests {
         );
 
         container
-            .query_selector(".user-error-banner-dismiss")
+            .query_selector(".user-notice-banner-dismiss")
             .unwrap()
             .expect("error banner must be dismissible")
             .dyn_into::<HtmlElement>()
@@ -214,9 +255,69 @@ mod wasm_tests {
         next_tick().await;
         assert!(
             container
-                .query_selector(".user-error-banner")
+                .query_selector(".user-notice-banner")
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    #[wasm_bindgen_test]
+    async fn reported_warning_is_visible_without_changing_connection_status() {
+        USER_NOTICE.with(|notice| notice.set(None));
+        let container = make_container();
+        let state = AppState::new();
+        state
+            .configured_hosts
+            .set(vec![crate::bridge::ConfiguredHost {
+                id: "remote".to_owned(),
+                label: "Remote".to_owned(),
+                transport: crate::bridge::HostTransportConfig::LocalEmbedded,
+                auto_connect: false,
+            }]);
+        state.selected_host_id.set(Some("remote".to_owned()));
+        state.connection_statuses.update(|statuses| {
+            statuses.insert("remote".to_owned(), ConnectionStatus::Connected);
+        });
+        let state_for_view = state.clone();
+        let _handle = mount_to(container.clone(), move || {
+            provide_context(state_for_view);
+            view! { <Header /> }
+        });
+
+        report_user_warning(
+            "ssh: ** WARNING: connection is not using a post-quantum key exchange algorithm.",
+        );
+        next_tick().await;
+
+        let warning = container
+            .query_selector(".user-notice-banner.warning")
+            .unwrap()
+            .expect("SSH diagnostics must render as a warning");
+        assert!(
+            warning
+                .text_content()
+                .unwrap_or_default()
+                .contains("not using a post-quantum key exchange")
+        );
+        assert_eq!(
+            container
+                .query_selector(".status-text")
+                .unwrap()
+                .expect("host status must remain visible")
+                .text_content()
+                .as_deref(),
+            Some("1/1 hosts connected · Remote")
+        );
+        assert!(
+            container
+                .query_selector(".status-dot.connected")
+                .unwrap()
+                .is_some(),
+            "a warning must not apply error styling to the host"
+        );
+        assert_eq!(
+            state.connection_statuses.get_untracked().get("remote"),
+            Some(&ConnectionStatus::Connected)
         );
     }
 }

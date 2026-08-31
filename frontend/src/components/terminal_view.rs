@@ -654,7 +654,7 @@ mod wasm_tests {
         next_tick().await;
 
         let banner = container
-            .query_selector(".user-error-banner")
+            .query_selector(".user-notice-banner.error")
             .unwrap()
             .expect("terminal refusal must render a visible explanation");
         let text = banner.text_content().unwrap_or_default();

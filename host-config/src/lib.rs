@@ -264,6 +264,14 @@ pub struct HostErrorEvent {
     pub message: String,
 }
 
+/// Tauri event payload: a host connection produced a non-fatal diagnostic.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostWarningEvent {
+    pub host_id: String,
+    pub message: String,
+}
+
 /// The remote operating system/architecture pair probed over SSH.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

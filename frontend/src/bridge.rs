@@ -8,9 +8,9 @@ use wasm_bindgen_futures::JsFuture;
 // verbatim with the Tauri shell. Re-export them for downstream modules.
 pub use host_config::{
     ConfiguredHost, ConfiguredHostStore, HostDisconnectedEvent, HostErrorEvent, HostIdRequest,
-    HostLifecycleEvent, HostLineEvent, HostTransportConfig, RemoteHostLifecycleConfig,
-    RemoteHostLifecycleSnapshot, RemoteHostLifecycleStatus, RemoteHostLifecycleStep,
-    RemoteTydeRunningState, SendHostLineRequest, SetSelectedHostRequest,
+    HostLifecycleEvent, HostLineEvent, HostTransportConfig, HostWarningEvent,
+    RemoteHostLifecycleConfig, RemoteHostLifecycleSnapshot, RemoteHostLifecycleStatus,
+    RemoteHostLifecycleStep, RemoteTydeRunningState, SendHostLineRequest, SetSelectedHostRequest,
     UpsertConfiguredHostRequest,
 };
 
@@ -515,6 +515,21 @@ pub async fn listen_host_error(
         {
             Ok(event) => callback(event.payload),
             Err(error) => log::error!("failed to parse host-error event: {error}"),
+        },
+    )
+    .await
+}
+
+pub async fn listen_host_warning(
+    callback: impl Fn(HostWarningEvent) + 'static,
+) -> Result<UnlistenHandle, String> {
+    listen_event(
+        "tyde://host-warning",
+        move |val: JsValue| match serde_wasm_bindgen::from_value::<TauriEvent<HostWarningEvent>>(
+            val,
+        ) {
+            Ok(event) => callback(event.payload),
+            Err(error) => log::error!("failed to parse host-warning event: {error}"),
         },
     )
     .await

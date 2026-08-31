@@ -271,31 +271,46 @@ details summary:focus:not(:focus-visible) {
     color: var(--text-primary);
 }
 
-.user-error-banner {
+.user-notice-banner {
     display: flex;
     align-items: center;
     gap: var(--space-2);
     min-height: 38px;
     padding: 7px var(--space-3);
     color: var(--text-primary);
+}
+
+.user-notice-banner.error {
     background: color-mix(in srgb, var(--error) 14%, var(--surface-1));
     border-bottom: 1px solid color-mix(in srgb, var(--error) 55%, var(--border-primary));
 }
 
-.user-error-banner-label {
+.user-notice-banner.warning {
+    background: color-mix(in srgb, var(--warning) 14%, var(--surface-1));
+    border-bottom: 1px solid color-mix(in srgb, var(--warning) 55%, var(--border-primary));
+}
+
+.user-notice-banner-label {
     flex: 0 0 auto;
     font-weight: 700;
+}
+
+.user-notice-banner.error .user-notice-banner-label {
     color: var(--error);
 }
 
-.user-error-banner-message {
+.user-notice-banner.warning .user-notice-banner-label {
+    color: var(--warning);
+}
+
+.user-notice-banner-message {
     flex: 1 1 auto;
     min-width: 0;
     line-height: 1.35;
     overflow-wrap: anywhere;
 }
 
-.user-error-banner-dismiss {
+.user-notice-banner-dismiss {
     flex: 0 0 auto;
     width: 28px;
     height: 28px;
@@ -305,7 +320,7 @@ details summary:focus:not(:focus-visible) {
     line-height: 1;
 }
 
-.user-error-banner-dismiss:hover {
+.user-notice-banner-dismiss:hover {
     color: var(--text-primary);
     background: var(--surface-hover);
 }
