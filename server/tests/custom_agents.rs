@@ -109,12 +109,24 @@ fn assert_orchestrator_uses_tyde_agent_control(orchestrator: &CustomAgent) {
         normalized.contains("Await returns status only")
             && normalized.contains("read each ready result")
             && normalized.contains("message only idle agents")
-            && normalized.contains("Repeat await/read while work remains")
-            && normalized.contains("including after revisions and re-reviews")
-            && normalized.contains("Never final-answer or end your turn")
-            && normalized.contains("After an interim update, continue the cycle")
-            && normalized.contains("pending or running"),
+            && normalized.contains(
+                "Repeat `tyde_await_agents` and `tyde_read_agent` until no delegated work remains"
+            )
+            && normalized.contains("Do not end your turn before then")
+            && normalized.contains("except if blocked or stopped by the user"),
         "Orchestrator should require repeated await/read cycles through completion: {instructions}"
+    );
+    assert!(
+        normalized.contains("Use Claude and Codex for paired roles when available")
+            && normalized.contains("unless the user overrides that preference")
+            && normalized
+                .contains("otherwise use independent sessions and disclose reduced diversity")
+            && normalized.contains("Present the plan before implementation if requested")
+            && !normalized.contains("Present the plan before implementation only if requested")
+            && normalized.contains(
+                "Prefer Codex for the Implementer unless the user overrides that preference"
+            ),
+        "Orchestrator should state backend, planning, and implementation preferences: {instructions}"
     );
 }
 
@@ -480,6 +492,51 @@ async fn superseded_orchestrator_v6_upgrades_on_restart() {
     assert_eq!(
         upgraded, active,
         "an unedited published V6 record should upgrade to the active prompt"
+    );
+    assert_orchestrator_uses_tyde_agent_control(&upgraded);
+}
+
+#[tokio::test(start_paused = true)]
+async fn superseded_orchestrator_v7_upgrades_on_restart() {
+    let mut fixture = Fixture::new().await;
+    let orchestrator_id = CustomAgentId("tyde-team-lead".to_owned());
+    let active = collect_builtin_team_custom_agents_from_bootstrap(&fixture.bootstrap)
+        .remove(&orchestrator_id)
+        .expect("built-in Orchestrator should be seeded");
+
+    let mut v7 = active.clone();
+    v7.instructions = Some(
+        server::store::custom_agents::SUPERSEDED_ORCHESTRATOR_V7_INSTRUCTIONS
+            .trim()
+            .to_owned(),
+    );
+    fixture
+        .client
+        .custom_agent_upsert(CustomAgentUpsertPayload { custom_agent: v7 })
+        .await
+        .expect("install superseded Orchestrator V7 failed");
+    fixture
+        .next_frame_matching("superseded Orchestrator V7 upsert", |env| {
+            env.kind == FrameKind::CustomAgentNotify
+                && env
+                    .parse_payload::<CustomAgentNotifyPayload>()
+                    .is_ok_and(|payload| {
+                        matches!(
+                            payload,
+                            CustomAgentNotifyPayload::Upsert { custom_agent }
+                                if custom_agent.id == orchestrator_id
+                        )
+                    })
+        })
+        .await;
+
+    let (_fresh, bootstrap) = fixture.connect_fresh_host_with_bootstrap().await;
+    let upgraded = collect_builtin_team_custom_agents_from_bootstrap(&bootstrap)
+        .remove(&orchestrator_id)
+        .expect("upgraded Orchestrator should be replayed");
+    assert_eq!(
+        upgraded, active,
+        "an unedited published V7 record should upgrade to the active prompt"
     );
     assert_orchestrator_uses_tyde_agent_control(&upgraded);
 }
