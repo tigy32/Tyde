@@ -64,6 +64,55 @@ fn collect_builtin_team_custom_agents_from_bootstrap(
         .collect()
 }
 
+fn assert_orchestrator_uses_tyde_agent_control(orchestrator: &CustomAgent) {
+    let instructions = orchestrator
+        .instructions
+        .as_deref()
+        .expect("Orchestrator should have instructions");
+    let normalized = instructions
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    for suffix in [
+        "tyde_list_launch_options",
+        "tyde_spawn_agent",
+        "tyde_await_agents",
+        "tyde_read_agent",
+        "tyde_send_agent_message",
+    ] {
+        assert!(
+            instructions.contains(&format!("`{suffix}`")),
+            "Orchestrator should name the Tyde tool suffix {suffix}: {instructions}"
+        );
+    }
+    for native_tool in [
+        "`spawn_agent`",
+        "`wait`",
+        "`wait_agent`",
+        "`send_message`",
+        "`followup_task`",
+    ] {
+        assert!(
+            instructions.contains(native_tool),
+            "Orchestrator should prohibit native tool {native_tool}: {instructions}"
+        );
+    }
+    assert!(
+        normalized.contains("Claude Agent or Task tools")
+            && normalized.contains("Hermes delegation tools")
+            && normalized.contains("never fall back to native tools"),
+        "Orchestrator should prohibit backend-native fallback: {instructions}"
+    );
+    assert!(
+        normalized.contains("Await returns status only, not findings")
+            && normalized.contains("send follow-up work only to idle agents")
+            && normalized.contains("Call the tool ending in `tyde_await_agents` again")
+            && normalized.contains("Do not emit a final answer or end your turn")
+            && normalized.contains("pending or running"),
+        "Orchestrator should require repeated await/read cycles through completion: {instructions}"
+    );
+}
+
 async fn expect_command_error(
     client: &mut client::Connection,
     context: &str,
@@ -266,6 +315,7 @@ async fn builtin_team_custom_agents_seed_and_preserve_user_edits() {
             .is_some_and(|instructions| instructions.contains("Feature Owner workflow")),
         "Orchestrator should describe the feature-owner workflow: {orchestrator:?}"
     );
+    assert_orchestrator_uses_tyde_agent_control(orchestrator);
     let help = builtins
         .get(&CustomAgentId("tyde-help".to_owned()))
         .expect("built-in Help should be seeded");
@@ -337,6 +387,51 @@ async fn builtin_team_custom_agents_seed_and_preserve_user_edits() {
         Some(&edited),
         "built-in seeding must not overwrite user edits"
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn superseded_orchestrator_v5_upgrades_on_restart() {
+    let mut fixture = Fixture::new().await;
+    let orchestrator_id = CustomAgentId("tyde-team-lead".to_owned());
+    let active = collect_builtin_team_custom_agents_from_bootstrap(&fixture.bootstrap)
+        .remove(&orchestrator_id)
+        .expect("built-in Orchestrator should be seeded");
+
+    let mut v5 = active.clone();
+    v5.instructions = Some(
+        server::store::custom_agents::SUPERSEDED_ORCHESTRATOR_V5_INSTRUCTIONS
+            .trim()
+            .to_owned(),
+    );
+    fixture
+        .client
+        .custom_agent_upsert(CustomAgentUpsertPayload { custom_agent: v5 })
+        .await
+        .expect("install superseded Orchestrator V5 failed");
+    fixture
+        .next_frame_matching("superseded Orchestrator V5 upsert", |env| {
+            env.kind == FrameKind::CustomAgentNotify
+                && env
+                    .parse_payload::<CustomAgentNotifyPayload>()
+                    .is_ok_and(|payload| {
+                        matches!(
+                            payload,
+                            CustomAgentNotifyPayload::Upsert { custom_agent }
+                                if custom_agent.id == orchestrator_id
+                        )
+                    })
+        })
+        .await;
+
+    let (_fresh, bootstrap) = fixture.connect_fresh_host_with_bootstrap().await;
+    let upgraded = collect_builtin_team_custom_agents_from_bootstrap(&bootstrap)
+        .remove(&orchestrator_id)
+        .expect("upgraded Orchestrator should be replayed");
+    assert_eq!(
+        upgraded, active,
+        "an unedited published V5 record should upgrade to the active prompt"
+    );
+    assert_orchestrator_uses_tyde_agent_control(&upgraded);
 }
 
 #[tokio::test(start_paused = true)]
