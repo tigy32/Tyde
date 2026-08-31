@@ -7267,13 +7267,6 @@ pub(crate) fn hermes_executable_candidates() -> Vec<String> {
         candidates.push(explicit);
     }
 
-    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
-        let local = home.join(".local").join("bin").join(HERMES_CLI_BINARY);
-        if local.is_file() {
-            push_unique_candidate(&mut candidates, local.to_string_lossy().to_string());
-        }
-    }
-
     if let Some(path) = process_env::find_executable_in_path(HERMES_CLI_BINARY) {
         push_unique_candidate(&mut candidates, path.to_string_lossy().to_string());
     }
@@ -7685,7 +7678,7 @@ async fn run_hermes_version_command(
             format!("Failed to capture Hermes {command} --version stderr"),
         )
     })?;
-    let status = match tokio::time::timeout(Duration::from_secs(2), child.wait()).await {
+    let status = match tokio::time::timeout(Duration::from_secs(60), child.wait()).await {
         Ok(Ok(status)) => status,
         Ok(Err(err)) => {
             return Err(HermesProbeFailure::new(
@@ -7865,7 +7858,7 @@ pub(crate) async fn probe_hermes_python_gateway_import(
             format!("Failed to capture Hermes gateway import probe stderr from {command}"),
         )
     })?;
-    let status = match tokio::time::timeout(Duration::from_secs(2), child.wait()).await {
+    let status = match tokio::time::timeout(Duration::from_secs(60), child.wait()).await {
         Ok(Ok(status)) => status,
         Ok(Err(err)) => {
             return Err(HermesProbeFailure::new(

@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 static RESOLVED_CHILD_PROCESS_PATH: OnceLock<Option<OsString>> = OnceLock::new();
 #[cfg(unix)]
-const LOGIN_SHELL_TIMEOUT: Duration = Duration::from_secs(3);
+const LOGIN_SHELL_TIMEOUT: Duration = Duration::from_secs(60);
 #[cfg(unix)]
 const PROBE_SENTINEL_BEGIN: &str = "TYDE_SHELL_PROBE_BEGIN_7f3c9a2e=";
 #[cfg(unix)]
@@ -45,13 +45,10 @@ pub(crate) fn find_executable_in_path(binary: &str) -> Option<PathBuf> {
 
 fn compute_resolved_child_process_path() -> Option<OsString> {
     let mut segments = Vec::<PathBuf>::new();
-    extend_from_path_value(&mut segments, std::env::var_os("PATH"));
-    #[cfg(target_os = "macos")]
-    extend_path_helper_path(&mut segments);
     #[cfg(unix)]
     extend_login_shell_path(&mut segments);
-    extend_common_user_bin_dirs(&mut segments);
-    extend_common_system_bin_dirs(&mut segments);
+    #[cfg(not(unix))]
+    extend_from_path_value(&mut segments, std::env::var_os("PATH"));
 
     let mut seen = HashSet::<PathBuf>::new();
     let mut deduped = Vec::<PathBuf>::new();
@@ -65,14 +62,14 @@ fn compute_resolved_child_process_path() -> Option<OsString> {
     }
 
     if deduped.is_empty() {
-        return std::env::var_os("PATH");
+        return None;
     }
 
     match std::env::join_paths(deduped) {
         Ok(path) => Some(path),
         Err(err) => {
-            tracing::warn!("failed to build resolved child process PATH: {err}");
-            std::env::var_os("PATH")
+            tracing::error!("failed to build resolved child process PATH: {err}");
+            None
         }
     }
 }
@@ -84,42 +81,10 @@ fn extend_from_path_value(segments: &mut Vec<PathBuf>, path_value: Option<OsStri
     segments.extend(std::env::split_paths(&path_value));
 }
 
-#[cfg(target_os = "macos")]
-fn extend_path_helper_path(segments: &mut Vec<PathBuf>) {
-    let output = Command::new("/usr/libexec/path_helper")
-        .arg("-s")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output();
-    let Ok(output) = output else {
-        return;
-    };
-    if !output.status.success() {
-        return;
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    if let Some(path_value) = parse_exported_path(stdout.trim()) {
-        extend_from_path_value(segments, Some(OsString::from(path_value)));
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn parse_exported_path(shell_output: &str) -> Option<String> {
-    let start = shell_output.find("PATH=")? + "PATH=".len();
-    let rest = shell_output.get(start..)?.trim_start();
-    if let Some(rest) = rest.strip_prefix('"') {
-        let end = rest.find('"')?;
-        return Some(rest[..end].to_string());
-    }
-    let end = rest.find(';').unwrap_or(rest.len());
-    let value = rest[..end].trim();
-    (!value.is_empty()).then(|| value.to_string())
-}
-
 #[cfg(unix)]
 fn extend_login_shell_path(segments: &mut Vec<PathBuf>) {
     let Some(shell) = default_login_shell() else {
+        tracing::error!("failed to determine default login shell for PATH query");
         return;
     };
 
@@ -138,7 +103,7 @@ fn extend_login_shell_path(segments: &mut Vec<PathBuf>) {
     {
         Ok(child) => child,
         Err(err) => {
-            tracing::debug!("failed to query login-shell PATH via {}: {err}", shell);
+            tracing::error!("failed to query login-shell PATH via {}: {err}", shell);
             return;
         }
     };
@@ -149,6 +114,11 @@ fn extend_login_shell_path(segments: &mut Vec<PathBuf>) {
         match child.try_wait() {
             Ok(Some(status)) => {
                 if !status.success() {
+                    tracing::error!(
+                        "login-shell PATH query via {} exited with status {}",
+                        shell,
+                        status
+                    );
                     return;
                 }
                 let stdout = match read_child_stdout(child, "login-shell PATH query") {
@@ -157,7 +127,7 @@ fn extend_login_shell_path(segments: &mut Vec<PathBuf>) {
                 };
                 let text = String::from_utf8_lossy(&stdout);
                 let Some(value) = extract_probe_value(&text) else {
-                    tracing::debug!(
+                    tracing::error!(
                         "login-shell PATH probe output missing sentinels via {}",
                         shell
                     );
@@ -173,13 +143,16 @@ fn extend_login_shell_path(segments: &mut Vec<PathBuf>) {
                 if started.elapsed() >= timeout {
                     let _ = child.kill();
                     let _ = child.wait();
-                    tracing::debug!("timed out querying login-shell PATH via {}", shell);
+                    tracing::error!(
+                        "timed out querying login-shell PATH via {} (deadline 60s)",
+                        shell
+                    );
                     return;
                 }
                 std::thread::sleep(Duration::from_millis(10));
             }
             Err(err) => {
-                tracing::debug!(
+                tracing::error!(
                     "failed to wait for login-shell PATH query via {}: {err}",
                     shell
                 );
@@ -222,27 +195,6 @@ fn read_child_stdout(mut child: std::process::Child, context: &str) -> Option<Ve
         return None;
     }
     Some(stdout)
-}
-
-fn extend_common_user_bin_dirs(segments: &mut Vec<PathBuf>) {
-    let home = std::env::var_os("HOME").map(PathBuf::from);
-    if let Some(home) = home {
-        segments.push(home.join(".cargo").join("bin"));
-        segments.push(home.join(".local").join("bin"));
-        segments.push(home.join(".npm-global").join("bin"));
-    }
-}
-
-fn extend_common_system_bin_dirs(segments: &mut Vec<PathBuf>) {
-    #[cfg(target_os = "macos")]
-    {
-        segments.push(PathBuf::from("/opt/homebrew/bin"));
-    }
-    segments.push(PathBuf::from("/usr/local/bin"));
-    segments.push(PathBuf::from("/usr/bin"));
-    segments.push(PathBuf::from("/bin"));
-    segments.push(PathBuf::from("/usr/sbin"));
-    segments.push(PathBuf::from("/sbin"));
 }
 
 fn find_matching_executable_in_dir(dir: &Path, binary: &str) -> Option<PathBuf> {

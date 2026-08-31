@@ -239,7 +239,9 @@ async fn probe_backend(
         BackendKind::Kiro => probe_acp_agents(acp_agents).await,
         BackendKind::Claude => probe_candidates(&command_candidates(CLAUDE_CLI_CANDIDATES)).await,
         BackendKind::Codex => probe_candidates(&command_candidates(CODEX_CLI_CANDIDATES)).await,
-        BackendKind::Antigravity => probe_candidates(&antigravity_command_candidates()).await,
+        BackendKind::Antigravity => {
+            probe_candidates(&command_candidates(ANTIGRAVITY_CLI_CANDIDATES)).await
+        }
         BackendKind::Hermes => probe_hermes_gateway().await,
     };
 
@@ -601,7 +603,7 @@ fn version_command_failure(
         VersionCommandFailure::TimedOut => BackendSetupDiagnostic {
             code: BackendSetupDiagnosticCode::CommandTimedOut,
             message: format!(
-                "Tyde found {command}, but its --version check did not finish within 2 seconds"
+                "Tyde found {command}, but its --version check did not finish within 60 seconds"
             ),
         },
         VersionCommandFailure::NonZero {
@@ -682,7 +684,7 @@ async fn run_version_command_with_child_path(
 
     let mut stdout_bytes = Vec::new();
     let mut stderr_bytes = Vec::new();
-    let probe = tokio::time::timeout(Duration::from_secs(2), async {
+    let probe = tokio::time::timeout(Duration::from_secs(60), async {
         tokio::join!(
             wait_for_version_command_group(&mut child, started, &command_name),
             async {
@@ -829,22 +831,6 @@ fn hermes_failure_diagnostic(
     }
 }
 
-fn antigravity_command_candidates() -> Vec<String> {
-    let mut candidates = Vec::new();
-    if let Ok(home) = home_dir() {
-        let local = home.join(".local").join("bin").join("agy");
-        if local.is_file() {
-            candidates.push(local.to_string_lossy().to_string());
-        }
-    }
-    for candidate in command_candidates(ANTIGRAVITY_CLI_CANDIDATES) {
-        if !candidates.contains(&candidate) {
-            candidates.push(candidate);
-        }
-    }
-    candidates
-}
-
 fn command_candidates(defaults: &[&str]) -> Vec<String> {
     let mut candidates = Vec::<String>::new();
     for default in defaults {
@@ -972,10 +958,6 @@ fn sign_in_command(
             })
         }
     }
-}
-
-fn home_dir() -> Result<PathBuf, String> {
-    crate::paths::home_dir()
 }
 
 fn shell_quote(value: &str) -> String {

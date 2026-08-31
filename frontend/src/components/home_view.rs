@@ -588,7 +588,7 @@ mod wasm_tests {
                     diagnostic: Some(protocol::BackendSetupDiagnostic {
                         code: protocol::BackendSetupDiagnosticCode::CommandTimedOut,
                         message:
-                            "Tyde found claude, but its --version check did not finish within 2 seconds"
+                            "Tyde found claude, but its --version check did not finish within 60 seconds"
                                 .to_owned(),
                     }),
                     sign_in_command: None,
@@ -613,7 +613,7 @@ mod wasm_tests {
             .expect("broken enabled backend must be explained on Home");
         let text = warning.text_content().unwrap_or_default();
         assert!(
-            text.contains("found claude") && text.contains("within 2 seconds"),
+            text.contains("found claude") && text.contains("within 60 seconds"),
             "Home must show the backend probe's real diagnostic: {text}"
         );
     }

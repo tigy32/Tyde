@@ -453,7 +453,7 @@ impl LspClient {
     /// wedged server can never hang teardown.
     pub(crate) async fn shutdown(self) {
         let _ = tokio::time::timeout(
-            Duration::from_secs(2),
+            Duration::from_secs(60),
             self.request("shutdown", Value::Null),
         )
         .await;
@@ -461,7 +461,7 @@ impl LspClient {
         if let Some(child) = &self.child {
             let mut guard = child.lock().await;
             if let Some(mut c) = guard.take() {
-                match tokio::time::timeout(Duration::from_secs(2), c.wait()).await {
+                match tokio::time::timeout(Duration::from_secs(60), c.wait()).await {
                     Ok(_) => {}
                     Err(_) => {
                         let _ = c.kill().await;

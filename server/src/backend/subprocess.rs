@@ -260,7 +260,7 @@ impl SubprocessBridge {
         let mut child = self.child.lock().await;
         let Some(mut c) = child.take() else { return };
 
-        match tokio::time::timeout(Duration::from_secs(2), c.wait()).await {
+        match tokio::time::timeout(Duration::from_secs(60), c.wait()).await {
             Ok(_) => {}
             Err(_) => {
                 let _ = c.kill().await;
