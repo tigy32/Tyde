@@ -693,7 +693,16 @@ fn real_interruption() {
         let after_tool = ask_expecting_delivery(&mut host, &agent, &launch_prompt()).await;
         assert_ready_handshake(&after_tool);
 
-        let mut turns = vec![after_stream, after_tool];
+        let follow_up_payload = unique_payload();
+        let follow_up_tool = ask(
+            &mut host,
+            &agent,
+            write_prompt(&workspace, &follow_up_payload),
+        )
+        .await;
+        assert_wrote_file(&follow_up_tool, host.workspace(), &follow_up_payload);
+
+        let mut turns = vec![after_stream, after_tool, follow_up_tool];
 
         if host.declares(BackendCapability::BackgroundTasks) {
             let bg_prompt = background_prompt(
@@ -4419,6 +4428,9 @@ const INTERRUPT_BUDGET: Duration = Duration::from_secs(20);
 fn assert_cancellation_contract(interrupted: &Interrupted) {
     let turn = interrupted.turn();
     assert_no_error_message(&turn.label(), turn.events());
+    assert_no_unknown_backend_event(turn);
+    assert_streams_are_balanced(turn);
+    assert_no_completion_without_request(turn);
 
     let Some(settled_in) = interrupted.settled_in() else {
         panic!(
