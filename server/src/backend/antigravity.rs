@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -25,8 +25,8 @@ use uuid::Uuid;
 
 use crate::backend::antigravity_stream::{
     AgyFrame, AgyResult, AgyStep, AgyUsage, AgyUsageBucket, AgyUsageReport, MCP_DISPATCH_TOOL,
-    STATE_ACTIVE, STATE_DONE, STATE_ERROR, STEP_AGENT_RESPONSE, STEP_CHECKPOINT, STEP_SUBAGENT,
-    STEP_SYSTEM_MESSAGE, STEP_TOOL, STEP_UNKNOWN, STEP_USER_INPUT, TranscriptReader,
+    STATE_ACTIVE, STATE_CANCELLED, STATE_DONE, STATE_ERROR, STEP_AGENT_RESPONSE, STEP_CHECKPOINT,
+    STEP_SUBAGENT, STEP_SYSTEM_MESSAGE, STEP_TOOL, STEP_UNKNOWN, STEP_USER_INPUT, TranscriptReader,
     answers_from_result, exit_code_from_result, mcp_inner_call, parse_frame, subagent_request_type,
     tool_request_type, usage_report_from_frame,
 };
@@ -63,8 +63,10 @@ const ANTIGRAVITY_MCP_LOCK_POLL: Duration = Duration::from_millis(250);
 /// How long `agy` gets to finalize its conversation after `SIGTERM`. Measured
 /// at well under a second; the margin is for a loaded machine.
 const ANTIGRAVITY_GRACEFUL_EXIT_TIMEOUT: Duration = Duration::from_secs(15);
-/// `agy` ends a turn on its own after this long. It is a provider-side cap on a
-/// single turn, not a Tyde timeout over local state, so it stays generous.
+/// `agy` ends a turn on its own after this long (`--print-timeout`). It is set to
+/// 720 hours (1 month) so long-running release commands, compilation, and subagent
+/// tasks are not aborted by arbitrary provider-side turn deadlines. Unresponsive or
+/// wedged provider processes are recovered via user manual interrupt or session shutdown.
 const ANTIGRAVITY_PRINT_TIMEOUT: &str = "720h";
 const ANTIGRAVITY_DEFAULT_MODEL: &str = "Gemini 3.7 Flash (Medium)";
 const ANTIGRAVITY_LOW_MODEL: &str = "Gemini 3.7 Flash (Low)";
@@ -470,7 +472,8 @@ struct TurnMapper {
     turn_id: ModelTurnId,
     model: String,
     response: Option<OpenResponse>,
-    open_tools: HashMap<u64, OpenTool>,
+    open_tools: BTreeMap<u64, OpenTool>,
+    completed_steps: BTreeSet<u64>,
     turn_usage: AgyUsage,
     cumulative_usage: AgyUsage,
     /// Question cards this turn opened and deliberately did not close.
@@ -511,7 +514,8 @@ impl TurnMapper {
             turn_id: ModelTurnId(turn_id),
             model,
             response: None,
-            open_tools: HashMap::new(),
+            open_tools: BTreeMap::new(),
+            completed_steps: BTreeSet::new(),
             turn_usage: AgyUsage::default(),
             cumulative_usage: cumulative,
             pending_questions: Vec::new(),
@@ -627,24 +631,36 @@ impl TurnMapper {
                     self.open_tool(emitter, step_index, &tool_name, &step);
                 }
                 self.close_tool(emitter, step_index, &step);
+                self.completed_steps.insert(step_index);
             }
-            "CANCELLED" | "CANCELED" => {
+            STATE_CANCELLED => {
                 if !self.open_tools.contains_key(&step_index) {
                     self.open_tool(emitter, step_index, &tool_name, &step);
                 }
-                if let Some(open) = self.open_tools.remove(&step_index) {
-                    emitter.tool_completed(
-                        &open.tool_call_id,
-                        ToolExecutionOutcome::Cancelled {
-                            message: "Tool execution was cancelled".to_string(),
-                        },
-                    );
-                }
+                self.cancel_tool(emitter, step_index);
+                self.completed_steps.insert(step_index);
             }
             other => {
                 tracing::debug!("Antigravity tool step state {other:?} has no Tyde mapping");
             }
         }
+    }
+
+    fn cancel_tool(&mut self, emitter: &TurnEmitter, step_index: u64) {
+        let Some(open) = self.open_tools.remove(&step_index) else {
+            return;
+        };
+        // A question card outlives its turn so the user can answer it.
+        if matches!(open.tool_type, ToolRequestType::AskUserQuestion { .. }) {
+            self.pending_questions.push(open.tool_call_id);
+            return;
+        }
+        emitter.tool_completed(
+            &open.tool_call_id,
+            ToolExecutionOutcome::Cancelled {
+                message: "Tool execution was cancelled".to_string(),
+            },
+        );
     }
 
     fn open_tool(
@@ -832,13 +848,19 @@ impl TurnMapper {
     }
 
     fn close_open_tools_as_cancelled(&mut self, emitter: &TurnEmitter, message: &str) {
-        for (_, open) in self.open_tools.drain() {
-            emitter.tool_completed(
-                &open.tool_call_id,
-                ToolExecutionOutcome::Cancelled {
-                    message: message.to_string(),
-                },
-            );
+        for (step_index, open) in std::mem::take(&mut self.open_tools) {
+            self.completed_steps.insert(step_index);
+            // Question cards outlive their turn so the user can act on them.
+            if matches!(open.tool_type, ToolRequestType::AskUserQuestion { .. }) {
+                self.pending_questions.push(open.tool_call_id);
+            } else {
+                emitter.tool_completed(
+                    &open.tool_call_id,
+                    ToolExecutionOutcome::Cancelled {
+                        message: message.to_string(),
+                    },
+                );
+            }
         }
     }
 
@@ -849,6 +871,7 @@ impl TurnMapper {
     /// cancelled. Doing it here as well would report each card twice.
     fn abandon_open_work(&mut self) {
         self.open_tools.clear();
+        self.completed_steps.clear();
         self.response = None;
     }
 }

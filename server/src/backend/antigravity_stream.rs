@@ -163,6 +163,7 @@ impl AgyUsage {
 pub const STATE_ACTIVE: &str = "ACTIVE";
 pub const STATE_DONE: &str = "DONE";
 pub const STATE_ERROR: &str = "ERROR";
+pub const STATE_CANCELLED: &str = "CANCELLED";
 
 pub const STEP_AGENT_RESPONSE: &str = "agent_response";
 pub const STEP_TOOL: &str = "tool";

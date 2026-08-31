@@ -3545,6 +3545,11 @@ fn assert_streams_are_balanced_for_cancellation(turn: &Turn) {
         "{}: OperationCancelled aborted {aborted} responses; expected at most 1",
         turn.label()
     );
+    assert!(
+        starts > 0,
+        "{}: produced no assistant response at all",
+        turn.label()
+    );
 }
 
 /// Set equality, not ordering. `TurnEmitter` does treat declaration as a hard
