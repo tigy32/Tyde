@@ -70,12 +70,14 @@ async fn refreshed_voice_capability(
                     let payload: settings_model::HostSettingsPayload =
                         frame.envelope.parse_payload().unwrap();
                     settings_received = payload.settings.voice.enabled
-                        && payload.settings.voice.aws_region.as_deref() == Some("us-east-1");
+                        && payload.settings.voice.aws_region.as_deref() == Some("us-east-1")
+                        && payload.settings.voice.dictation_enabled
+                        && payload.settings.voice.dictation_region.as_deref() == Some("us-west-2");
                 }
                 FrameKind::VoiceCapabilities => {
                     let payload: protocol::VoiceCapabilitiesPayload =
                         frame.envelope.parse_payload().unwrap();
-                    if payload.nova_available {
+                    if payload.nova_available && payload.dictation_available {
                         capability = Some(payload);
                     }
                 }
@@ -133,8 +135,10 @@ async fn voice_settings_refresh_capabilities_for_every_live_connection() {
     let writer_initial = initial_voice_capability(&mut writer).await;
     let observer_initial = initial_voice_capability(&mut observer).await;
     assert!(!writer_initial.nova_available);
+    assert!(!writer_initial.dictation_available);
     assert!(writer_initial.native_capture);
     assert!(!observer_initial.nova_available);
+    assert!(!observer_initial.dictation_available);
     assert!(observer_initial.browser_capture);
 
     writer
@@ -149,13 +153,27 @@ async fn voice_settings_refresh_capabilities_for_every_live_connection() {
         .replace_setting("/voice/enabled", true, false)
         .await
         .unwrap();
+    writer
+        .replace_setting(
+            "/voice/dictation_region",
+            Some("us-west-2"),
+            Option::<String>::None,
+        )
+        .await
+        .unwrap();
+    writer
+        .replace_setting("/voice/dictation_enabled", true, false)
+        .await
+        .unwrap();
 
     let writer_refreshed = refreshed_voice_capability(&mut writer).await;
     let observer_refreshed = refreshed_voice_capability(&mut observer).await;
     assert!(writer_refreshed.nova_available);
+    assert!(writer_refreshed.dictation_available);
     assert!(writer_refreshed.native_capture);
     assert!(!writer_refreshed.browser_capture);
     assert!(observer_refreshed.nova_available);
+    assert!(observer_refreshed.dictation_available);
     assert!(!observer_refreshed.native_capture);
     assert!(observer_refreshed.browser_capture);
 
@@ -243,8 +261,10 @@ async fn synthetic_voice_full_lifecycle_over_production_session_path() {
     }];
     let start = protocol::VoiceStartPayload {
         generation: 1,
-        target: target.clone(),
-        formats: formats.clone(),
+        request: protocol::VoiceRequest::Conversation {
+            target: target.clone(),
+            formats: formats.clone(),
+        },
     };
     let start = Envelope::from_payload(
         StreamPath("/voice".into()),
@@ -452,8 +472,10 @@ async fn synthetic_voice_full_lifecycle_over_production_session_path() {
     assert_eq!(stopped.generation, 1);
     let restart = protocol::VoiceStartPayload {
         generation: 2,
-        target: target.clone(),
-        formats: formats.clone(),
+        request: protocol::VoiceRequest::Conversation {
+            target: target.clone(),
+            formats: formats.clone(),
+        },
     };
     protocol::write_envelope(
         &mut client.writer,
@@ -544,8 +566,10 @@ async fn synthetic_voice_full_lifecycle_over_production_session_path() {
     );
     let third = protocol::VoiceStartPayload {
         generation: 3,
-        target: target.clone(),
-        formats,
+        request: protocol::VoiceRequest::Conversation {
+            target: target.clone(),
+            formats,
+        },
     };
     protocol::write_envelope(
         &mut client.writer,
@@ -602,14 +626,16 @@ async fn synthetic_voice_full_lifecycle_over_production_session_path() {
         .unwrap();
     let fourth = protocol::VoiceStartPayload {
         generation: 4,
-        target: protocol::VoiceTarget {
-            agent_id: transport_agent.agent_id,
-            instance_stream: transport_agent.instance_stream,
+        request: protocol::VoiceRequest::Conversation {
+            target: protocol::VoiceTarget {
+                agent_id: transport_agent.agent_id,
+                instance_stream: transport_agent.instance_stream,
+            },
+            formats: vec![protocol::VoiceFormatPair {
+                uplink: protocol::VoiceAudioFormat::opus(48_000),
+                downlink: protocol::VoiceAudioFormat::opus(24_000),
+            }],
         },
-        formats: vec![protocol::VoiceFormatPair {
-            uplink: protocol::VoiceAudioFormat::opus(48_000),
-            downlink: protocol::VoiceAudioFormat::opus(24_000),
-        }],
     };
     protocol::write_envelope(
         &mut client.writer,
@@ -649,6 +675,497 @@ async fn synthetic_voice_full_lifecycle_over_production_session_path() {
         );
         assert!(!String::from_utf8_lossy(&bytes).contains("voice_audio"));
     }
+}
+
+#[tokio::test]
+async fn synthetic_dictation_is_input_only_and_flushes_final_text() {
+    let store = tempfile::tempdir().unwrap();
+    let host = server::spawn_host_with_mock_backend(
+        store.path().join("sessions.json"),
+        store.path().join("projects.json"),
+        store.path().join("settings.json"),
+    )
+    .unwrap();
+    let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+    let server_task = tokio::spawn(async move {
+        let connection = server::accept(&server::ServerConfig::current(), server_io)
+            .await
+            .unwrap();
+        server::run_connection_with_synthetic_voice(connection, host)
+            .await
+            .unwrap();
+    });
+    let mut client = client::connect(&client::ClientConfig::current(), client_io)
+        .await
+        .unwrap();
+    let _ = next_kind(&mut client, FrameKind::HostBootstrap).await;
+    client
+        .replace_setting(
+            "/voice/dictation_region",
+            Some("us-west-2"),
+            Option::<String>::None,
+        )
+        .await
+        .unwrap();
+    client
+        .replace_setting("/voice/dictation_enabled", true, false)
+        .await
+        .unwrap();
+
+    let dictation_request = || protocol::VoiceRequest::Dictation {
+        formats: vec![protocol::VoiceAudioFormat::opus(48_000)],
+    };
+    let start = protocol::VoiceStartPayload {
+        generation: 1,
+        request: dictation_request(),
+    };
+    protocol::write_envelope(
+        &mut client.writer,
+        &Envelope::from_payload(
+            StreamPath("/voice".into()),
+            FrameKind::VoiceStart,
+            0,
+            &start,
+        )
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    let accepted: protocol::VoiceAcceptedPayload = next_kind(&mut client, FrameKind::VoiceAccepted)
+        .await
+        .envelope
+        .parse_payload()
+        .unwrap();
+    assert_eq!(accepted.request.mode(), protocol::VoiceMode::Dictation);
+    assert!(matches!(
+        accepted.request,
+        protocol::VoiceAcceptedRequest::Dictation { .. }
+    ));
+
+    let mut encoder =
+        opus::Encoder::new(48_000, opus::Channels::Mono, opus::Application::Voip).unwrap();
+    let mut packet = vec![0; 1275];
+    let len = encoder.encode(&[0i16; 960], &mut packet).unwrap();
+    packet.truncate(len);
+    for media_seq in 0..2 {
+        let audio = VoiceAudioPayload {
+            session_id: accepted.session_id.clone(),
+            generation: 1,
+            direction: VoiceDirection::Input,
+            first_media_seq: media_seq,
+            timestamp_samples_48k: media_seq * 960,
+            packet_lengths: vec![packet.len() as u16],
+        };
+        protocol::write_frame(
+            &mut client.writer,
+            &protocol::ProtocolFrame {
+                envelope: Envelope::from_payload(
+                    StreamPath(format!("/voice/{}", accepted.session_id.0)),
+                    FrameKind::VoiceAudio,
+                    media_seq,
+                    &audio,
+                )
+                .unwrap(),
+                binary: packet.clone(),
+            },
+        )
+        .await
+        .unwrap();
+    }
+    for expected in ["synthetic", "synthetic dictation"] {
+        let transcript: protocol::VoiceTranscriptPayload =
+            next_dictation_kind(&mut client, FrameKind::VoiceTranscript)
+                .await
+                .envelope
+                .parse_payload()
+                .unwrap();
+        assert_eq!(transcript.text, expected);
+        assert!(!transcript.is_final);
+        assert_eq!(transcript.speaker, protocol::VoiceTranscriptSpeaker::User);
+        assert!(transcript.message_id.is_none());
+    }
+
+    protocol::write_envelope(
+        &mut client.writer,
+        &Envelope::from_payload(
+            StreamPath(format!("/voice/{}", accepted.session_id.0)),
+            FrameKind::VoiceInputEnd,
+            2,
+            &protocol::VoiceSessionPayload {
+                session_id: accepted.session_id.clone(),
+                generation: 1,
+            },
+        )
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    let final_transcript: protocol::VoiceTranscriptPayload =
+        next_dictation_kind(&mut client, FrameKind::VoiceTranscript)
+            .await
+            .envelope
+            .parse_payload()
+            .unwrap();
+    assert_eq!(final_transcript.text, "synthetic dictation");
+    assert!(final_transcript.is_final);
+    let completed: protocol::VoiceStopPayload =
+        next_dictation_kind(&mut client, FrameKind::VoiceStop)
+            .await
+            .envelope
+            .parse_payload()
+            .unwrap();
+    assert_eq!(
+        completed.reason,
+        protocol::VoiceStopReason::ProviderCompleted
+    );
+
+    let cancel_start = protocol::VoiceStartPayload {
+        generation: 2,
+        request: dictation_request(),
+    };
+    protocol::write_envelope(
+        &mut client.writer,
+        &Envelope::from_payload(
+            StreamPath("/voice".into()),
+            FrameKind::VoiceStart,
+            1,
+            &cancel_start,
+        )
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    let cancelled: protocol::VoiceAcceptedPayload =
+        next_kind(&mut client, FrameKind::VoiceAccepted)
+            .await
+            .envelope
+            .parse_payload()
+            .unwrap();
+    protocol::write_envelope(
+        &mut client.writer,
+        &Envelope::from_payload(
+            StreamPath(format!("/voice/{}", cancelled.session_id.0)),
+            FrameKind::VoiceStop,
+            0,
+            &protocol::VoiceStopPayload {
+                session_id: cancelled.session_id.clone(),
+                generation: 2,
+                reason: protocol::VoiceStopReason::UserExited,
+                stats: Default::default(),
+            },
+        )
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    let cancelled_stop: protocol::VoiceStopPayload =
+        next_dictation_kind(&mut client, FrameKind::VoiceStop)
+            .await
+            .envelope
+            .parse_payload()
+            .unwrap();
+    assert_eq!(cancelled_stop.reason, protocol::VoiceStopReason::UserExited);
+
+    client
+        .replace_setting("/voice/dictation_language_code", "en-ZZ", "en-US")
+        .await
+        .unwrap();
+    protocol::write_envelope(
+        &mut client.writer,
+        &Envelope::from_payload(
+            StreamPath("/voice".into()),
+            FrameKind::VoiceStart,
+            2,
+            &protocol::VoiceStartPayload {
+                generation: 3,
+                request: dictation_request(),
+            },
+        )
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    let failure: protocol::VoiceErrorPayload = next_kind(&mut client, FrameKind::VoiceError)
+        .await
+        .envelope
+        .parse_payload()
+        .unwrap();
+    assert_eq!(failure.code, protocol::VoiceErrorCode::InvalidConfiguration);
+    assert!(!failure.retryable);
+    assert!(failure.detail.is_none());
+
+    client
+        .replace_setting("/voice/dictation_language_code", "en-US", "en-ZZ")
+        .await
+        .unwrap();
+    protocol::write_envelope(
+        &mut client.writer,
+        &Envelope::from_payload(
+            StreamPath("/voice".into()),
+            FrameKind::VoiceStart,
+            3,
+            &protocol::VoiceStartPayload {
+                generation: 4,
+                request: dictation_request(),
+            },
+        )
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    let restarted: protocol::VoiceAcceptedPayload =
+        next_kind(&mut client, FrameKind::VoiceAccepted)
+            .await
+            .envelope
+            .parse_payload()
+            .unwrap();
+    assert_eq!(restarted.generation, 4);
+    drop(client);
+    tokio::time::timeout(Duration::from_secs(2), server_task)
+        .await
+        .expect("dictation transport teardown")
+        .expect("server task");
+    for path in std::fs::read_dir(store.path())
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.is_file())
+    {
+        let bytes = std::fs::read(path).unwrap();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(!text.contains("synthetic dictation"));
+        assert!(!bytes.windows(packet.len()).any(|window| window == packet));
+    }
+}
+
+async fn next_dictation_kind(
+    client: &mut client::Connection,
+    expected: FrameKind,
+) -> protocol::ProtocolFrame {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let frame = client
+                .next_frame()
+                .await
+                .expect("synthetic dictation frame")
+                .expect("open connection");
+            assert!(
+                !matches!(
+                    frame.envelope.kind,
+                    FrameKind::VoiceAudio | FrameKind::VoiceOutput | FrameKind::ChatEvent
+                ),
+                "dictation must not emit output audio, VoiceOutput, or tool traffic"
+            );
+            if frame.envelope.kind == expected {
+                return frame;
+            }
+        }
+    })
+    .await
+    .expect("expected synthetic dictation frame")
+}
+
+#[tokio::test]
+#[ignore = "paid Amazon Transcribe stream; set TYDE_RUN_REAL_TRANSCRIBE_TESTS=1 and fixture variables"]
+async fn real_amazon_transcribe_streams_prerecorded_dictation() {
+    assert_eq!(
+        std::env::var("TYDE_RUN_REAL_TRANSCRIBE_TESTS")
+            .ok()
+            .as_deref(),
+        Some("1"),
+        "set TYDE_RUN_REAL_TRANSCRIBE_TESTS=1 to authorize paid Transcribe coverage"
+    );
+    let region = std::env::var("TYDE_REAL_TRANSCRIBE_REGION")
+        .expect("set TYDE_REAL_TRANSCRIBE_REGION to the explicit AWS region");
+    let fixture_path = std::env::var("TYDE_REAL_TRANSCRIBE_PCM")
+        .expect("set TYDE_REAL_TRANSCRIBE_PCM to deterministic 48 kHz mono signed-LE PCM");
+    let expected = std::env::var("TYDE_REAL_TRANSCRIBE_EXPECTED")
+        .expect("set TYDE_REAL_TRANSCRIBE_EXPECTED to text contained in the final transcript")
+        .to_ascii_lowercase();
+    let bytes = std::fs::read(&fixture_path).expect("read deterministic speech fixture");
+    assert!(bytes.len() >= 48_000);
+    let (sample_bytes, remainder) = bytes.as_chunks::<2>();
+    assert!(remainder.is_empty());
+    let samples: Vec<i16> = sample_bytes
+        .iter()
+        .map(|sample| i16::from_le_bytes(*sample))
+        .collect();
+
+    let store = tempfile::tempdir().unwrap();
+    let host = server::spawn_host_with_mock_backend(
+        store.path().join("sessions.json"),
+        store.path().join("projects.json"),
+        store.path().join("settings.json"),
+    )
+    .unwrap();
+    let (client_io, server_io) = tokio::io::duplex(256 * 1024);
+    let server_task = tokio::spawn(async move {
+        let connection = server::accept(&server::ServerConfig::current(), server_io)
+            .await
+            .unwrap();
+        server::run_connection(connection, host).await.unwrap();
+    });
+    let mut client = client::connect(&client::ClientConfig::current(), client_io)
+        .await
+        .unwrap();
+    let _ = next_kind(&mut client, FrameKind::HostBootstrap).await;
+    if let Ok(profile) = std::env::var("TYDE_REAL_TRANSCRIBE_AWS_PROFILE") {
+        client
+            .replace_setting("/voice/aws_profile", Some(profile), Option::<String>::None)
+            .await
+            .unwrap();
+    }
+    client
+        .replace_setting(
+            "/voice/dictation_region",
+            Some(region),
+            Option::<String>::None,
+        )
+        .await
+        .unwrap();
+    client
+        .replace_setting("/voice/dictation_enabled", true, false)
+        .await
+        .unwrap();
+    protocol::write_envelope(
+        &mut client.writer,
+        &Envelope::from_payload(
+            StreamPath("/voice".into()),
+            FrameKind::VoiceStart,
+            0,
+            &protocol::VoiceStartPayload {
+                generation: 1,
+                request: protocol::VoiceRequest::Dictation {
+                    formats: vec![protocol::VoiceAudioFormat::opus(48_000)],
+                },
+            },
+        )
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    let accepted = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let frame = client.next_frame().await.unwrap().unwrap();
+            match frame.envelope.kind {
+                FrameKind::VoiceAccepted => {
+                    break frame
+                        .envelope
+                        .parse_payload::<protocol::VoiceAcceptedPayload>()
+                        .unwrap();
+                }
+                FrameKind::VoiceError => {
+                    let error: protocol::VoiceErrorPayload =
+                        frame.envelope.parse_payload().unwrap();
+                    panic!("real Transcribe startup failed: {error:?}");
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("real Transcribe startup bound");
+
+    let mut encoder =
+        opus::Encoder::new(48_000, opus::Channels::Mono, opus::Application::Voip).unwrap();
+    let mut media_seq = 0_u64;
+    for frame_samples in samples.chunks(960) {
+        let mut padded = [0_i16; 960];
+        padded[..frame_samples.len()].copy_from_slice(frame_samples);
+        let mut opus_packet = vec![0; 1275];
+        let len = encoder.encode(&padded, &mut opus_packet).unwrap();
+        opus_packet.truncate(len);
+        let audio = VoiceAudioPayload {
+            session_id: accepted.session_id.clone(),
+            generation: 1,
+            direction: VoiceDirection::Input,
+            first_media_seq: media_seq,
+            timestamp_samples_48k: media_seq * 960,
+            packet_lengths: vec![len as u16],
+        };
+        protocol::write_frame(
+            &mut client.writer,
+            &protocol::ProtocolFrame {
+                envelope: Envelope::from_payload(
+                    StreamPath(format!("/voice/{}", accepted.session_id.0)),
+                    FrameKind::VoiceAudio,
+                    media_seq,
+                    &audio,
+                )
+                .unwrap(),
+                binary: opus_packet,
+            },
+        )
+        .await
+        .unwrap();
+        media_seq += 1;
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    protocol::write_envelope(
+        &mut client.writer,
+        &Envelope::from_payload(
+            StreamPath(format!("/voice/{}", accepted.session_id.0)),
+            FrameKind::VoiceInputEnd,
+            media_seq,
+            &protocol::VoiceSessionPayload {
+                session_id: accepted.session_id.clone(),
+                generation: 1,
+            },
+        )
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+
+    let finalized = tokio::time::timeout(Duration::from_secs(30), async {
+        let mut finalized = String::new();
+        loop {
+            let frame = client.next_frame().await.unwrap().unwrap();
+            assert!(
+                !matches!(
+                    frame.envelope.kind,
+                    FrameKind::VoiceAudio | FrameKind::VoiceOutput
+                ),
+                "real dictation must remain input-only"
+            );
+            match frame.envelope.kind {
+                FrameKind::VoiceTranscript => {
+                    let transcript: protocol::VoiceTranscriptPayload =
+                        frame.envelope.parse_payload().unwrap();
+                    assert_eq!(transcript.speaker, protocol::VoiceTranscriptSpeaker::User);
+                    assert!(transcript.message_id.is_none());
+                    if transcript.is_final {
+                        if !finalized.is_empty() {
+                            finalized.push(' ');
+                        }
+                        finalized.push_str(&transcript.text);
+                    }
+                }
+                FrameKind::VoiceStop => {
+                    let stop: protocol::VoiceStopPayload = frame.envelope.parse_payload().unwrap();
+                    assert_eq!(stop.reason, protocol::VoiceStopReason::ProviderCompleted);
+                    break finalized;
+                }
+                FrameKind::VoiceError => {
+                    let error: protocol::VoiceErrorPayload =
+                        frame.envelope.parse_payload().unwrap();
+                    panic!("real Transcribe stream failed: {error:?}");
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("real Transcribe final flush bound");
+    assert!(
+        finalized.to_ascii_lowercase().contains(&expected),
+        "final transcript {finalized:?} did not contain {expected:?}"
+    );
+    drop(client);
+    tokio::time::timeout(Duration::from_secs(2), server_task)
+        .await
+        .expect("real Transcribe connection teardown")
+        .expect("server task");
 }
 
 fn mqtt_config(

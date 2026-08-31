@@ -61,9 +61,15 @@ async fn runtime_surfaces_typed_server_voice_capabilities() {
     assert_eq!(capabilities.protocol, protocol::VOICE_PROTOCOL_VERSION);
     assert!(
         capabilities
-            .formats
+            .conversation_formats
             .iter()
             .all(|pair| pair.uplink.valid() && pair.downlink.valid())
+    );
+    assert!(
+        capabilities
+            .dictation_formats
+            .iter()
+            .all(protocol::VoiceAudioFormat::valid)
     );
 }
 

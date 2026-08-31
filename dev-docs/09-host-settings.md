@@ -40,7 +40,9 @@ The persisted host-settings document covers:
 
 - `enabled_backends`
 - `default_backend`
-- native voice enablement, AWS profile/region selectors, and exact Nova model
+- independent Nova conversation and Amazon Transcribe dictation enablement,
+  the host-only AWS profile, explicit per-service regions, dictation language,
+  and exact Nova model
 
 These are host-level settings, not per-session settings or frontend
 preferences. Backend-native settings are also exposed on the host stream, but

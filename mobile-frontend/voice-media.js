@@ -67,7 +67,6 @@
       new AudioContext({ sampleRate: 48000, latencyHint: "interactive" });
     await context.resume();
     await context.audioWorklet.addModule(assetUrl("voice-capture-worklet.js"));
-    await context.audioWorklet.addModule(assetUrl("voice-playback-worklet.js"));
     installWorker();
     probeWait = deferred();
     worker.postMessage({ type: "probe" });
@@ -83,11 +82,12 @@
     return true;
   }
 
-  async function start(nextGeneration) {
+  async function start(options) {
     try {
       await prepare();
       await stopTracks();
-      generation = nextGeneration;
+      generation = options.generation;
+      const inputOnly = options.inputOnly === true;
       startWait = deferred();
       worker.postMessage({ type: "start", generation });
       await Promise.race([
@@ -98,7 +98,7 @@
       ]);
       const constraints = {
         audio: {
-          echoCancellation: true,
+          echoCancellation: !inputOnly,
           noiseSuppression: true,
           autoGainControl: true,
           channelCount: 1,
@@ -109,18 +109,23 @@
       stream = await navigator.mediaDevices.getUserMedia(constraints);
       const source = context.createMediaStreamSource(stream);
       capture = new AudioWorkletNode(context, "tyde-capture");
-      playback = new AudioWorkletNode(context, "tyde-playback", {
-        outputChannelCount: [1],
-      });
-      playback.port.onmessage = (event) => {
-        if (event.data?.type === "drop") {
-          dispatch("tyde-mobile-voice-playback-drop", {
-            generation,
-            packets: event.data.packets,
-          });
-        }
-      };
-      playback.connect(context.destination);
+      if (!inputOnly) {
+        await context.audioWorklet.addModule(
+          assetUrl("voice-playback-worklet.js"),
+        );
+        playback = new AudioWorkletNode(context, "tyde-playback", {
+          outputChannelCount: [1],
+        });
+        playback.port.onmessage = (event) => {
+          if (event.data?.type === "drop") {
+            dispatch("tyde-mobile-voice-playback-drop", {
+              generation,
+              packets: event.data.packets,
+            });
+          }
+        };
+        playback.connect(context.destination);
+      }
       let timestamp = 0;
       capture.port.onmessage = (event) => {
         const block = new Float32Array(event.data);

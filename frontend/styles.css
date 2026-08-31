@@ -13858,6 +13858,17 @@ pre.tool-error-pre {
     min-width: 56px;
 }
 
+.voice-mode-select {
+    min-width: 0;
+    max-width: 150px;
+    align-self: center;
+    color: var(--text-secondary);
+    background: var(--surface-2);
+    border: 1px solid var(--border-secondary);
+    border-radius: 4px;
+    padding: 5px 6px;
+}
+
 .voice-pulse {
     color: var(--accent-primary);
     font-weight: 600;

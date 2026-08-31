@@ -67,6 +67,7 @@ pub struct ProtocolValidator {
 struct VoiceStreamState {
     generation: u64,
     session_id: Option<crate::VoiceSessionId>,
+    mode: Option<crate::VoiceMode>,
     last_input_media_seq: Option<u64>,
     last_output_media_seq: Option<u64>,
     stopped: bool,
@@ -200,11 +201,30 @@ impl ProtocolValidator {
                         "voice generation did not advance".into(),
                     ));
                 }
+                let request_valid = match &payload.request {
+                    crate::VoiceRequest::Conversation { formats, .. } => {
+                        !formats.is_empty()
+                            && formats
+                                .iter()
+                                .all(|pair| pair.uplink.valid() && pair.downlink.valid())
+                    }
+                    crate::VoiceRequest::Dictation { formats } => {
+                        !formats.is_empty() && formats.iter().all(crate::VoiceAudioFormat::valid)
+                    }
+                };
+                if !request_valid {
+                    return Err(self.violation(
+                        envelope,
+                        None,
+                        "invalid requested voice format".into(),
+                    ));
+                }
                 self.voice_streams.insert(
                     envelope.stream.clone(),
                     VoiceStreamState {
                         generation: payload.generation,
                         session_id: None,
+                        mode: Some(payload.request.mode()),
                         last_input_media_seq: None,
                         last_output_media_seq: None,
                         stopped: false,
@@ -224,16 +244,24 @@ impl ProtocolValidator {
                     envelope.parse_payload().map_err(|e| {
                         self.violation(envelope, None, format!("invalid VoiceAccepted: {e}"))
                     })?;
-                if !payload.uplink.valid() || !payload.downlink.valid() {
+                if !payload.request.valid() {
                     return Err(self.violation(
                         envelope,
                         None,
                         "invalid accepted voice format".into(),
                     ));
                 }
+                if current.mode.is_some() && current.mode != Some(payload.request.mode()) {
+                    return Err(self.violation(
+                        envelope,
+                        None,
+                        "VoiceAccepted changed the requested mode".into(),
+                    ));
+                }
                 let state = VoiceStreamState {
                     generation: payload.generation,
                     session_id: Some(payload.session_id.clone()),
+                    mode: Some(payload.request.mode()),
                     last_input_media_seq: None,
                     last_output_media_seq: None,
                     stopped: false,
@@ -257,6 +285,11 @@ impl ProtocolValidator {
                     &payload.session_id,
                     payload.generation,
                 )?;
+                if current.mode == Some(crate::VoiceMode::Dictation)
+                    && payload.direction != crate::VoiceDirection::Input
+                {
+                    return Err(self.violation(envelope, None, "dictation is input-only".into()));
+                }
                 let last = match payload.direction {
                     crate::VoiceDirection::Input => current.last_input_media_seq,
                     crate::VoiceDirection::Output => current.last_output_media_seq,
@@ -288,7 +321,17 @@ impl ProtocolValidator {
                     &current,
                     &payload.session_id,
                     payload.generation,
-                )
+                )?;
+                if current.mode == Some(crate::VoiceMode::Dictation)
+                    && envelope.kind != FrameKind::VoiceInputEnd
+                {
+                    return Err(self.violation(
+                        envelope,
+                        None,
+                        "dictation forbids interrupt and output controls".into(),
+                    ));
+                }
+                Ok(())
             }
             FrameKind::VoiceTranscript => {
                 let payload: crate::VoiceTranscriptPayload =
@@ -301,7 +344,18 @@ impl ProtocolValidator {
                     &current,
                     &payload.session_id,
                     payload.generation,
-                )
+                )?;
+                if current.mode == Some(crate::VoiceMode::Dictation)
+                    && (payload.speaker != crate::VoiceTranscriptSpeaker::User
+                        || payload.message_id.is_some())
+                {
+                    return Err(self.violation(
+                        envelope,
+                        None,
+                        "dictation transcripts must be provider text only".into(),
+                    ));
+                }
+                Ok(())
             }
             FrameKind::VoiceState => {
                 let payload: crate::VoiceStatePayload = envelope.parse_payload().map_err(|e| {
@@ -313,7 +367,23 @@ impl ProtocolValidator {
                     &current,
                     &payload.session_id,
                     payload.generation,
-                )
+                )?;
+                if current.mode == Some(crate::VoiceMode::Dictation)
+                    && !matches!(
+                        payload.state,
+                        crate::VoiceSessionState::Starting
+                            | crate::VoiceSessionState::Listening
+                            | crate::VoiceSessionState::Ending
+                            | crate::VoiceSessionState::Ended
+                    )
+                {
+                    return Err(self.violation(
+                        envelope,
+                        None,
+                        "dictation emitted a conversation-only state".into(),
+                    ));
+                }
+                Ok(())
             }
             FrameKind::VoiceStop => {
                 let payload: crate::VoiceStopPayload = envelope.parse_payload().map_err(|e| {

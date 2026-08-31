@@ -5,22 +5,29 @@ It does not introduce WebRTC networking, UDP, ICE, STUN, TURN, or mDNS.
 
 ## Capability and ownership
 
-The server emits `voice_capabilities` after connection setup. The UI shows the
-voice affordance only when the host setting is enabled, Nova is available, and
-the selected agent has a live `instance_stream`. A session owns the exact
-`VoiceTarget { agent_id, instance_stream }`; changing agents ends it and never
-auto-starts another session.
+The server emits `voice_capabilities` after connection setup and advertises
+Nova conversation and Transcribe dictation availability independently. The UI
+offers **Talk with Nova** only when conversation is enabled and the selected
+agent has a live `instance_stream`. It offers **Dictate to composer** when
+dictation is enabled on the active host, including new-chat composers that do
+not have an agent yet. A conversation session owns the exact
+`VoiceTarget { agent_id, instance_stream }`; dictation deliberately has no
+agent target.
 
-`voice_start` proposes Opus formats and a strictly increasing generation.
-`voice_accepted` is sent only after the provider stream is live and fixes the
-session id, generation, target, and formats. Desktop and mobile must not open a
-microphone before this acceptance. All later frames use
+`voice_start` carries a strongly typed request: `conversation` contains its
+target and bidirectional formats, while `dictation` contains only input
+formats. `voice_accepted` echoes the selected request shape after the relevant
+provider stream is live. Desktop and mobile must not open a microphone before
+this acceptance. All later frames use
 `/voice/<session-id>` and repeat session id and generation.
 
 States are `starting`, `listening`, `agent_working`, `speaking`,
 `interrupting`, `ending`, and `ended`. Controls are `voice_input_end`,
 `voice_interrupt`, and `voice_stop`. Server output includes typed transcripts,
-state/progress, output-start, audio, stop statistics, and errors. Any foreign
+state/progress, output-start, audio, stop statistics, and errors. Dictation is
+restricted to listening/ending states, user partial/final transcripts,
+`voice_input_end`, and stop/error: output audio, `voice_output`, assistant or
+progress transcripts, and interrupts are protocol violations. Any foreign
 target, future/unknown generation or session, wrong direction, invalid format,
 or malformed packet table is rejected. Frames from a completed older
 generation are discarded without affecting the current generation; duplicate
@@ -35,9 +42,11 @@ media is counted as dropped.
 - one to three `u16` Opus packet lengths whose exact sum is the body length
 - Opus, mono, 20 ms packets; 48 kHz client capture and 24 kHz provider output
 
-The server decodes capture directly to 16 kHz with libopus at the Nova
-boundary and encodes Nova's 24 kHz PCM directly with libopus. There is no
-standalone resampler. Provider PCM exists only inside the server adapter.
+The server decodes capture directly to 16 kHz with libopus at the provider
+boundary. Nova's 24 kHz PCM is encoded directly with libopus. Dictation sends
+16 kHz mono signed little-endian PCM to Amazon Transcribe Streaming in roughly
+100 ms chunks and has no encoder or downlink. There is no standalone
+resampler. Provider PCM exists only inside the server adapter.
 
 The connection writer has separate bounded control (64), chat (256), bulk
 (256), and audio lanes. Control is highest priority; after eight consecutive
@@ -57,8 +66,10 @@ and queue high-water information.
 The Tauri shell starts a dedicated native-audio control thread. That thread,
 not Tauri managed state, owns every CPAL device/stream, AEC processor, Opus
 encoder/decoder, and active-session identity. Tauri retains only bounded
-`Send + Sync` command/event handles. The thread creates a fresh capture/output
-pair only after it acknowledges the exact server acceptance authorization.
+`Send + Sync` command/event handles. The thread creates media only after it
+acknowledges the exact server acceptance authorization. Conversation opens
+capture and output; dictation opens capture only and therefore works without
+an output device.
 The WebView sees small Opus packets and controls only, never raw PCM. Stop,
 target switch, transport loss, and shell exit wait for an explicit
 acknowledgement sent only after both streams have been dropped. Every wait is
@@ -121,12 +132,55 @@ content block per prompt and the tool protocol has no partial-result event.
 The backend agent remains voice-unaware and is not cancelled by a voice
 interruption.
 
+## Dictation with Amazon Transcribe Streaming
+
+Dictation is separately disabled by default. Configure its explicit AWS
+region and language code (default `en-US`), then enable it in Voice settings.
+It reuses the host-only AWS profile configuration and requires
+`transcribe:StartStreamTranscription`. An empty region makes the capability
+unavailable; Tyde never silently substitutes a region or provider.
+
+The Transcribe adapter requests 16 kHz mono PCM and low partial-result
+stabilization. Each partial replaces the previous provisional text. Only final
+provider text is buffered for insertion, with no LLM call or semantic rewrite.
+**Finish** closes input, boundedly waits for trailing finals, then appends the
+exact finalized text to the current editable draft without sending it.
+**Cancel** discards all dictation output. Concurrent composer edits are
+preserved because the final text is appended only at successful completion.
+No dictation transcript becomes a chat event, diagnostic-history entry, or
+persistent host record.
+
+Amazon Transcribe can mishear speech and normalize spelling or punctuation;
+users must review the editable result. AWS pricing varies by region and
+account. Operators should also review AWS Transcribe content-use terms and,
+where applicable, the AWS Organizations AI-services opt-out policy.
+
+Startup, flush, and close are bounded. Missing/expired credentials, missing
+permission, quota/concurrency exhaustion, invalid region/language, and
+provider failures remain typed and visible. There is no fallback to Nova or
+another speech service.
+
 ## Validation
 
 The synthetic suite uses the real `TYD2` reader/writer, production scheduler,
-real rumqttd encrypted byte stream, mock Nova/provider events, normal agent
-tool bridge, and desktop/mobile lifecycle adapters. The M7 case moves a real
+real rumqttd encrypted byte stream, synthetic events above the provider
+boundary, normal Nova agent tool bridge, and desktop/mobile lifecycle adapters.
+The dictation flow proves acceptance precedes capture, partial replacement,
+final flush, cancellation, stale-generation isolation, restart, typed failure,
+and the absence of audio/tool/chat output. The M7 case moves a real
 4 MiB bulk envelope while admitting audio and control and requires both to
 arrive before complete bulk reassembly with local latency at or below 100 ms.
-Real AWS coverage remains ignored and is
-enabled only by the repository's explicit paid-live-test gate.
+Real AWS coverage remains ignored and is enabled only by its explicit paid
+live-test gate. The fixture is raw 48 kHz mono signed little-endian PCM with a
+known spoken phrase. Run only with a profile that has
+`transcribe:StartStreamTranscription`:
+
+```bash
+TYDE_RUN_REAL_TRANSCRIBE_TESTS=1 \
+TYDE_REAL_TRANSCRIBE_REGION=us-east-1 \
+TYDE_REAL_TRANSCRIBE_AWS_PROFILE=default \
+TYDE_REAL_TRANSCRIBE_PCM=/absolute/path/known-speech-48k-s16le.pcm \
+TYDE_REAL_TRANSCRIBE_EXPECTED='known spoken phrase' \
+cargo nextest run -p tests --test native_voice --run-ignored ignored-only \
+  -E 'test(real_amazon_transcribe_streams_prerecorded_dictation)'
+```

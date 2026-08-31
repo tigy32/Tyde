@@ -169,11 +169,12 @@ pub use types::{
 };
 pub use types::{
     BrowserAecStatus, MAX_VOICE_AUDIO_BYTES, MAX_VOICE_PACKETS_PER_FRAME, VOICE_PROTOCOL_VERSION,
-    VOICE_SESSION_MAX_SECONDS, VoiceAcceptedPayload, VoiceAudioCodec, VoiceAudioFormat,
-    VoiceAudioPayload, VoiceAvailability, VoiceCapabilitiesPayload, VoiceDirection, VoiceErrorCode,
-    VoiceErrorPayload, VoiceFlowStats, VoiceFormatPair, VoiceSessionId, VoiceSessionPayload,
-    VoiceSessionState, VoiceStartPayload, VoiceStatePayload, VoiceStopPayload, VoiceStopReason,
-    VoiceTarget, VoiceTranscriptPayload, VoiceTranscriptSpeaker, VoiceUnavailableReason,
+    VOICE_SESSION_MAX_SECONDS, VoiceAcceptedPayload, VoiceAcceptedRequest, VoiceAudioCodec,
+    VoiceAudioFormat, VoiceAudioPayload, VoiceAvailability, VoiceCapabilitiesPayload,
+    VoiceDirection, VoiceErrorCode, VoiceErrorPayload, VoiceFlowStats, VoiceFormatPair, VoiceMode,
+    VoiceRequest, VoiceSessionId, VoiceSessionPayload, VoiceSessionState, VoiceStartPayload,
+    VoiceStatePayload, VoiceStopPayload, VoiceStopReason, VoiceTarget, VoiceTranscriptPayload,
+    VoiceTranscriptSpeaker, VoiceUnavailableReason,
 };
 // Re-exported from host-config via types.rs; the bundle-key type for the
 // web/PWA client (see WelcomePayload::release_version).

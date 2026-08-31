@@ -128,6 +128,7 @@ struct ServerVoiceState {
 struct ServerVoiceSession {
     session_id: protocol::VoiceSessionId,
     generation: u64,
+    mode: protocol::VoiceMode,
     next_output_media_seq: u64,
 }
 
@@ -242,8 +243,7 @@ fn accept_server_voice_frame(
                 parse_voice_payload(frame, "VoiceAccepted")?;
             if payload.session_id.0.is_empty()
                 || payload.generation <= state.last_generation
-                || !payload.uplink.valid()
-                || !payload.downlink.valid()
+                || !payload.request.valid()
             {
                 return Err(reject_voice("invalid server VoiceAccepted session"));
             }
@@ -251,6 +251,7 @@ fn accept_server_voice_frame(
             state.active = Some(ServerVoiceSession {
                 session_id: payload.session_id.clone(),
                 generation: payload.generation,
+                mode: payload.request.mode(),
                 next_output_media_seq: 0,
             });
             Ok(Some(VoiceEvent::Accepted(payload)))
@@ -279,6 +280,9 @@ fn accept_server_voice_frame(
                 payload.generation,
                 StreamPath(format!("/voice/{}/audio", payload.session_id.0)),
             )?;
+            if active.mode == protocol::VoiceMode::Dictation {
+                return Err(reject_voice("dictation received output audio"));
+            }
             if payload.first_media_seq < active.next_output_media_seq {
                 return Err(reject_voice("server voice media sequence moved backwards"));
             }
@@ -297,19 +301,42 @@ fn accept_server_voice_frame(
             require_empty_voice_body(frame)?;
             let payload: protocol::VoiceTranscriptPayload =
                 parse_voice_payload(frame, "VoiceTranscript")?;
-            require_active_voice(state, frame, &payload.session_id, payload.generation)?;
+            let active =
+                require_active_voice(state, frame, &payload.session_id, payload.generation)?;
+            if active.mode == protocol::VoiceMode::Dictation
+                && (payload.speaker != protocol::VoiceTranscriptSpeaker::User
+                    || payload.message_id.is_some())
+            {
+                return Err(reject_voice("dictation received non-provider transcript"));
+            }
             Ok(Some(VoiceEvent::Transcript(payload)))
         }
         FrameKind::VoiceState => {
             require_empty_voice_body(frame)?;
             let payload: protocol::VoiceStatePayload = parse_voice_payload(frame, "VoiceState")?;
-            require_active_voice(state, frame, &payload.session_id, payload.generation)?;
+            let active =
+                require_active_voice(state, frame, &payload.session_id, payload.generation)?;
+            if active.mode == protocol::VoiceMode::Dictation
+                && !matches!(
+                    payload.state,
+                    protocol::VoiceSessionState::Starting
+                        | protocol::VoiceSessionState::Listening
+                        | protocol::VoiceSessionState::Ending
+                        | protocol::VoiceSessionState::Ended
+                )
+            {
+                return Err(reject_voice("dictation received conversation state"));
+            }
             Ok(Some(VoiceEvent::State(payload)))
         }
         FrameKind::VoiceOutput => {
             require_empty_voice_body(frame)?;
             let payload: protocol::VoiceSessionPayload = parse_voice_payload(frame, "VoiceOutput")?;
-            require_active_voice(state, frame, &payload.session_id, payload.generation)?;
+            let active =
+                require_active_voice(state, frame, &payload.session_id, payload.generation)?;
+            if active.mode == protocol::VoiceMode::Dictation {
+                return Err(reject_voice("dictation received VoiceOutput"));
+            }
             Ok(Some(VoiceEvent::Output(payload)))
         }
         FrameKind::VoiceStop => {

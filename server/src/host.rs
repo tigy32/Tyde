@@ -17437,7 +17437,10 @@ impl SettingsApplyEffects {
             // schemas (named side-effect requirement (b)).
             refresh_backend_config_snapshots: enabled_backends_changed,
             refresh_voice_capabilities: old.voice.enabled != new.voice.enabled
-                || old.voice.aws_region != new.voice.aws_region,
+                || old.voice.aws_region != new.voice.aws_region
+                || old.voice.dictation_enabled != new.voice.dictation_enabled
+                || old.voice.dictation_region != new.voice.dictation_region
+                || old.voice.dictation_language_code != new.voice.dictation_language_code,
         }
     }
 }
@@ -18274,9 +18277,13 @@ fn emit_voice_capabilities_for_subscriber(
     let Some(desktop) = subscriber.voice_desktop else {
         return Ok(());
     };
-    let available = settings.voice.enabled && settings.voice.aws_region.is_some();
+    let nova_available = settings.voice.enabled && settings.voice.aws_region.is_some();
+    let dictation_available =
+        settings.voice.dictation_enabled && settings.voice.dictation_region.is_some();
     let payload = serde_json::to_value(protocol::VoiceCapabilitiesPayload::for_connection(
-        available, desktop,
+        nova_available,
+        dictation_available,
+        desktop,
     ))
     .expect("failed to serialize VoiceCapabilities payload for host stream fanout");
     emit_or_queue_host_frame(subscriber, FrameKind::VoiceCapabilities, payload)

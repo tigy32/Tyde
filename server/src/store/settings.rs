@@ -759,6 +759,10 @@ fn validate_settings(settings: HostSettings) -> Result<HostSettings, String> {
     let mut voice = settings.voice;
     voice.aws_profile = normalize_optional_voice_setting(voice.aws_profile, "AWS profile")?;
     voice.aws_region = normalize_optional_voice_setting(voice.aws_region, "AWS region")?;
+    voice.dictation_region =
+        normalize_optional_voice_setting(voice.dictation_region, "AWS Transcribe region")?;
+    voice.dictation_language_code =
+        validate_dictation_language_code(&voice.dictation_language_code)?.to_owned();
     voice.nova_model = validate_voice_model(&voice.nova_model)?.to_owned();
     // Availability is runtime-derived and must never be trusted from disk.
     voice.availability = if !voice.enabled {
@@ -766,6 +770,17 @@ fn validate_settings(settings: HostSettings) -> Result<HostSettings, String> {
             reason: protocol::VoiceUnavailableReason::NotEnabled,
         }
     } else if voice.aws_region.is_none() {
+        protocol::VoiceAvailability::Unavailable {
+            reason: protocol::VoiceUnavailableReason::RegionNotConfigured,
+        }
+    } else {
+        protocol::VoiceAvailability::Available
+    };
+    voice.dictation_availability = if !voice.dictation_enabled {
+        protocol::VoiceAvailability::Unavailable {
+            reason: protocol::VoiceUnavailableReason::NotEnabled,
+        }
+    } else if voice.dictation_region.is_none() {
         protocol::VoiceAvailability::Unavailable {
             reason: protocol::VoiceUnavailableReason::RegionNotConfigured,
         }
@@ -813,6 +828,20 @@ fn validate_voice_model(model: &str) -> Result<&str, String> {
     match model.trim() {
         "amazon.nova-2-sonic-v1:0" | "amazon.nova-sonic-v1:0" => Ok(model.trim()),
         _ => Err("unsupported Nova Sonic model".to_owned()),
+    }
+}
+
+fn validate_dictation_language_code(code: &str) -> Result<&str, String> {
+    let code = code.trim();
+    let bytes = code.as_bytes();
+    if bytes.len() == 5
+        && bytes[0..2].iter().all(u8::is_ascii_lowercase)
+        && bytes[2] == b'-'
+        && bytes[3..5].iter().all(u8::is_ascii_uppercase)
+    {
+        Ok(code)
+    } else {
+        Err("AWS Transcribe language code must use a value such as en-US".to_owned())
     }
 }
 

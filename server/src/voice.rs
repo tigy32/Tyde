@@ -4,10 +4,10 @@ use std::time::{Duration, Instant};
 
 use protocol::{
     FrameKind, ProtocolFrame, SendMessagePayload, StreamPath, VoiceAcceptedPayload,
-    VoiceAudioFormat, VoiceAudioPayload, VoiceDirection, VoiceErrorCode, VoiceErrorPayload,
-    VoiceFlowStats, VoiceFormatPair, VoiceSessionId, VoiceSessionPayload, VoiceSessionState,
-    VoiceStartPayload, VoiceStatePayload, VoiceStopPayload, VoiceStopReason,
-    VoiceTranscriptPayload,
+    VoiceAcceptedRequest, VoiceAudioFormat, VoiceAudioPayload, VoiceDirection, VoiceErrorCode,
+    VoiceErrorPayload, VoiceFlowStats, VoiceMode, VoiceRequest, VoiceSessionId,
+    VoiceSessionPayload, VoiceSessionState, VoiceStartPayload, VoiceStatePayload, VoiceStopPayload,
+    VoiceStopReason, VoiceTranscriptPayload,
 };
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -142,6 +142,106 @@ pub(crate) trait NovaProvider: Send + Sync {
     ) -> ProviderFuture<'a, Box<dyn NovaSession>>;
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum DictationInput {
+    Audio16Khz(Vec<i16>),
+    InputEnd,
+    Stop,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum DictationOutput {
+    Transcript {
+        text: String,
+        is_final: bool,
+    },
+    ProviderError {
+        code: VoiceErrorCode,
+        retryable: bool,
+        detail: Option<String>,
+    },
+    End {
+        clean: bool,
+    },
+}
+
+pub(crate) trait DictationSession: Send {
+    fn send(&mut self, input: DictationInput) -> Result<NovaSend, ProviderFailure>;
+    fn output(&mut self) -> &mut mpsc::Receiver<DictationOutput>;
+    fn close(&mut self);
+}
+
+pub(crate) trait DictationProvider: Send + Sync {
+    fn open<'a>(
+        &'a self,
+        settings: &'a settings_model::VoiceSettings,
+        session: &'a VoiceSessionId,
+    ) -> ProviderFuture<'a, Box<dyn DictationSession>>;
+}
+
+pub(crate) struct VoiceProviders {
+    pub nova: std::sync::Arc<dyn NovaProvider>,
+    pub dictation: std::sync::Arc<dyn DictationProvider>,
+}
+
+enum ProviderSession {
+    Nova(Box<dyn NovaSession>),
+    Dictation(Box<dyn DictationSession>),
+}
+
+enum ProviderOutput {
+    Nova(NovaOutput),
+    Dictation(DictationOutput),
+}
+
+impl ProviderSession {
+    fn send_audio(&mut self, pcm: Vec<i16>) -> Result<NovaSend, ProviderFailure> {
+        match self {
+            Self::Nova(session) => session.send(NovaInput::Audio16Khz(pcm)),
+            Self::Dictation(session) => session.send(DictationInput::Audio16Khz(pcm)),
+        }
+    }
+
+    fn input_end(&mut self) -> Result<NovaSend, ProviderFailure> {
+        match self {
+            Self::Nova(session) => session.send(NovaInput::InputEnd),
+            Self::Dictation(session) => session.send(DictationInput::InputEnd),
+        }
+    }
+
+    fn stop(&mut self) -> Result<NovaSend, ProviderFailure> {
+        match self {
+            Self::Nova(session) => session.send(NovaInput::Stop),
+            Self::Dictation(session) => session.send(DictationInput::Stop),
+        }
+    }
+
+    fn close(&mut self) {
+        match self {
+            Self::Nova(session) => session.close(),
+            Self::Dictation(session) => session.close(),
+        }
+    }
+
+    fn try_output(&mut self) -> Result<ProviderOutput, mpsc::error::TryRecvError> {
+        match self {
+            Self::Nova(session) => session.output().try_recv().map(ProviderOutput::Nova),
+            Self::Dictation(session) => session.output().try_recv().map(ProviderOutput::Dictation),
+        }
+    }
+
+    fn send_nova(&mut self, input: NovaInput) -> Result<NovaSend, ProviderFailure> {
+        match self {
+            Self::Nova(session) => session.send(input),
+            Self::Dictation(_) => Err(ProviderFailure {
+                code: VoiceErrorCode::InvalidRequest,
+                retryable: false,
+                category: "dictation_conversation_input",
+            }),
+        }
+    }
+}
+
 async fn open_provider(
     provider: std::sync::Arc<dyn NovaProvider>,
     settings: settings_model::VoiceSettings,
@@ -150,8 +250,111 @@ async fn open_provider(
     provider.open(&settings, &session).await
 }
 
+async fn open_dictation_provider(
+    provider: std::sync::Arc<dyn DictationProvider>,
+    settings: settings_model::VoiceSettings,
+    session: VoiceSessionId,
+) -> Result<Box<dyn DictationSession>, ProviderFailure> {
+    provider.open(&settings, &session).await
+}
+
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) struct SyntheticNovaProvider;
+
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) struct SyntheticDictationProvider;
+
+#[cfg(any(test, feature = "test-support"))]
+impl DictationProvider for SyntheticDictationProvider {
+    fn open<'a>(
+        &'a self,
+        settings: &'a settings_model::VoiceSettings,
+        _: &'a VoiceSessionId,
+    ) -> ProviderFuture<'a, Box<dyn DictationSession>> {
+        Box::pin(async move {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            if settings.dictation_language_code == "en-ZZ" {
+                return Err(ProviderFailure {
+                    code: VoiceErrorCode::InvalidConfiguration,
+                    retryable: false,
+                    category: "synthetic_invalid_language",
+                });
+            }
+            let (input_tx, mut input_rx) = mpsc::channel(16);
+            let (output_tx, output_rx) = mpsc::channel(16);
+            tokio::spawn(async move {
+                let mut chunks = 0usize;
+                while let Some(input) = input_rx.recv().await {
+                    match input {
+                        DictationInput::Audio16Khz(_) => {
+                            chunks += 1;
+                            let text = if chunks == 1 {
+                                "synthetic"
+                            } else {
+                                "synthetic dictation"
+                            };
+                            let _ = output_tx
+                                .send(DictationOutput::Transcript {
+                                    text: text.into(),
+                                    is_final: false,
+                                })
+                                .await;
+                        }
+                        DictationInput::InputEnd => {
+                            let _ = output_tx
+                                .send(DictationOutput::Transcript {
+                                    text: "synthetic dictation".into(),
+                                    is_final: true,
+                                })
+                                .await;
+                            let _ = output_tx.send(DictationOutput::End { clean: true }).await;
+                            break;
+                        }
+                        DictationInput::Stop => break,
+                    }
+                }
+            });
+            Ok(Box::new(SyntheticDictationSession {
+                input_tx: Some(input_tx),
+                output_rx,
+            }) as Box<dyn DictationSession>)
+        })
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+struct SyntheticDictationSession {
+    input_tx: Option<mpsc::Sender<DictationInput>>,
+    output_rx: mpsc::Receiver<DictationOutput>,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl DictationSession for SyntheticDictationSession {
+    fn send(&mut self, input: DictationInput) -> Result<NovaSend, ProviderFailure> {
+        self.input_tx
+            .as_ref()
+            .ok_or(ProviderFailure {
+                code: VoiceErrorCode::ProviderUnavailable,
+                retryable: false,
+                category: "synthetic_dictation_closed",
+            })?
+            .try_send(input)
+            .map(|_| NovaSend::Sent)
+            .map_err(|_| ProviderFailure {
+                code: VoiceErrorCode::ProviderUnavailable,
+                retryable: true,
+                category: "synthetic_dictation_backpressure",
+            })
+    }
+
+    fn output(&mut self) -> &mut mpsc::Receiver<DictationOutput> {
+        &mut self.output_rx
+    }
+
+    fn close(&mut self) {
+        self.input_tx.take();
+    }
+}
 
 #[cfg(any(test, feature = "test-support"))]
 impl NovaProvider for SyntheticNovaProvider {
@@ -308,10 +511,10 @@ impl NovaSession for SyntheticNovaSession {
 struct ActiveVoice {
     id: VoiceSessionId,
     generation: u64,
-    target: protocol::VoiceTarget,
+    request: VoiceAcceptedRequest,
     decoder: opus::Decoder,
-    encoder: opus::Encoder,
-    provider: Box<dyn NovaSession>,
+    encoder: Option<opus::Encoder>,
+    provider: ProviderSession,
     next_input_seq: u64,
     next_output_seq: u64,
     output_timestamp_48k: u64,
@@ -332,9 +535,8 @@ struct ActiveVoice {
 struct PendingVoice {
     id: VoiceSessionId,
     generation: u64,
-    target: protocol::VoiceTarget,
-    pair: VoiceFormatPair,
-    open: tokio::task::JoinHandle<Result<Box<dyn NovaSession>, ProviderFailure>>,
+    request: VoiceAcceptedRequest,
+    open: tokio::task::JoinHandle<Result<ProviderSession, ProviderFailure>>,
     last_target_check: Instant,
 }
 
@@ -342,7 +544,7 @@ pub(crate) struct VoiceConnection {
     host: HostHandle,
     connection_host_stream: StreamPath,
     output: Stream,
-    provider: std::sync::Arc<dyn NovaProvider>,
+    providers: VoiceProviders,
     pending: Option<PendingVoice>,
     active: Option<ActiveVoice>,
     last_generation: u64,
@@ -355,17 +557,13 @@ impl Drop for VoiceConnection {
 }
 
 impl VoiceConnection {
-    pub fn new(
-        host: HostHandle,
-        output: Stream,
-        provider: std::sync::Arc<dyn NovaProvider>,
-    ) -> Self {
+    pub fn new(host: HostHandle, output: Stream, providers: VoiceProviders) -> Self {
         let connection_host_stream = output.path().clone();
         Self {
             host,
             connection_host_stream,
             output,
-            provider,
+            providers,
             pending: None,
             active: None,
             last_generation: 0,
@@ -427,64 +625,112 @@ impl VoiceConnection {
                 true,
             );
         }
-        let Some(pair) = start
-            .formats
-            .iter()
-            .find(|pair| {
-                pair.uplink.valid()
-                    && pair.downlink.valid()
-                    && pair.uplink == VoiceAudioFormat::opus(48_000)
-                    && pair.downlink == VoiceAudioFormat::opus(24_000)
-            })
-            .cloned()
-        else {
-            return self.emit_error(
-                None,
-                start.generation,
-                VoiceErrorCode::InvalidRequest,
-                false,
-                true,
-            );
-        };
-        if self
-            .host
-            .agent_handle_for_instance(&self.connection_host_stream, &start.target)
-            .await
-            .is_none()
-        {
-            return self.emit_error(
-                None,
-                start.generation,
-                VoiceErrorCode::WrongTarget,
-                false,
-                true,
-            );
-        }
         let settings = self
             .host
             .read_settings()
             .await
             .map_err(|_| "settings unavailable")?;
-        if !settings.voice.enabled {
-            return self.emit_error(
-                None,
-                start.generation,
-                VoiceErrorCode::NotAvailable,
-                false,
-                true,
-            );
-        }
         let id = VoiceSessionId(Uuid::new_v4().to_string());
+        let voice_settings = settings.voice;
+        let (request, open) = match start.request {
+            VoiceRequest::Conversation { target, formats } => {
+                let Some(pair) = formats
+                    .iter()
+                    .find(|pair| {
+                        pair.uplink.valid()
+                            && pair.downlink.valid()
+                            && pair.uplink == VoiceAudioFormat::opus(48_000)
+                            && pair.downlink == VoiceAudioFormat::opus(24_000)
+                    })
+                    .cloned()
+                else {
+                    return self.emit_error(
+                        None,
+                        start.generation,
+                        VoiceErrorCode::InvalidRequest,
+                        false,
+                        true,
+                    );
+                };
+                if self
+                    .host
+                    .agent_handle_for_instance(&self.connection_host_stream, &target)
+                    .await
+                    .is_none()
+                {
+                    return self.emit_error(
+                        None,
+                        start.generation,
+                        VoiceErrorCode::WrongTarget,
+                        false,
+                        true,
+                    );
+                }
+                if !voice_settings.enabled || voice_settings.aws_region.is_none() {
+                    return self.emit_error(
+                        None,
+                        start.generation,
+                        VoiceErrorCode::NotAvailable,
+                        false,
+                        true,
+                    );
+                }
+                let provider = self.providers.nova.clone();
+                let provider_settings = voice_settings.clone();
+                let provider_id = id.clone();
+                let open = tokio::spawn(async move {
+                    open_provider(provider, provider_settings, provider_id)
+                        .await
+                        .map(ProviderSession::Nova)
+                });
+                (
+                    VoiceAcceptedRequest::Conversation {
+                        target,
+                        uplink: pair.uplink,
+                        downlink: pair.downlink,
+                    },
+                    open,
+                )
+            }
+            VoiceRequest::Dictation { formats } => {
+                let Some(uplink) = formats
+                    .iter()
+                    .find(|format| format.valid() && **format == VoiceAudioFormat::opus(48_000))
+                    .cloned()
+                else {
+                    return self.emit_error(
+                        None,
+                        start.generation,
+                        VoiceErrorCode::InvalidRequest,
+                        false,
+                        true,
+                    );
+                };
+                if !voice_settings.dictation_enabled || voice_settings.dictation_region.is_none() {
+                    return self.emit_error(
+                        None,
+                        start.generation,
+                        VoiceErrorCode::NotAvailable,
+                        false,
+                        true,
+                    );
+                }
+                let provider = self.providers.dictation.clone();
+                let provider_settings = voice_settings.clone();
+                let provider_id = id.clone();
+                let open = tokio::spawn(async move {
+                    open_dictation_provider(provider, provider_settings, provider_id)
+                        .await
+                        .map(ProviderSession::Dictation)
+                });
+                (VoiceAcceptedRequest::Dictation { uplink }, open)
+            }
+        };
         self.last_generation = start.generation;
-        let provider = self.provider.clone();
-        let voice_settings = settings.voice.clone();
-        let open_id = id.clone();
-        let open = tokio::spawn(open_provider(provider, voice_settings, open_id));
         self.pending = Some(PendingVoice {
             id,
             generation: start.generation,
-            target: start.target,
-            pair,
+            request,
             open,
             last_target_check: Instant::now(),
         });
@@ -532,7 +778,7 @@ impl VoiceConnection {
             let mut plc = vec![0i16; 320];
             if let Ok(samples) = active.decoder.decode(&[], &mut plc, true) {
                 plc.truncate(samples);
-                let _ = active.provider.send(NovaInput::Audio16Khz(plc));
+                let _ = active.provider.send_audio(plc);
             }
         }
         let mut offset = 0;
@@ -548,7 +794,7 @@ impl VoiceConnection {
             pcm.truncate(decoded);
             match active
                 .provider
-                .send(NovaInput::Audio16Khz(pcm))
+                .send_audio(pcm)
                 .map_err(|_| "provider input closed")?
             {
                 NovaSend::Sent => {
@@ -578,7 +824,11 @@ impl VoiceConnection {
             .parse_payload()
             .map_err(|_| "invalid VoiceInterrupt")?;
         let active = self.active.as_ref().ok_or("no active voice session")?;
-        validate_session(active, &payload.session_id, payload.generation)
+        validate_session(active, &payload.session_id, payload.generation)?;
+        if active.request.mode() == VoiceMode::Dictation {
+            return Err("dictation cannot be interrupted".into());
+        }
+        Ok(())
     }
 
     fn apply_interrupt(&mut self, provider_reported: bool) -> Result<(), String> {
@@ -599,7 +849,7 @@ impl VoiceConnection {
             active.output_generation = active.output_generation.wrapping_add(1);
             active
                 .provider
-                .send(NovaInput::Interrupt {
+                .send_nova(NovaInput::Interrupt {
                     output_generation: active.output_generation,
                 })
                 .map_err(|_| "provider interrupt failed")?;
@@ -641,7 +891,7 @@ impl VoiceConnection {
         active.input_ended = true;
         active
             .provider
-            .send(NovaInput::InputEnd)
+            .input_end()
             .map(|_| ())
             .map_err(|_| "provider input closed".into())
     }
@@ -693,9 +943,9 @@ impl VoiceConnection {
         // ValidationException ("All contents must be closed before ending
         // prompt") on every teardown.
         if !active.input_ended {
-            let _ = active.provider.send(NovaInput::InputEnd);
+            let _ = active.provider.input_end();
         }
-        let _ = active.provider.send(NovaInput::Stop);
+        let _ = active.provider.stop();
         active.provider.close();
         let (packets, bytes) = self
             .output
@@ -832,12 +1082,17 @@ impl VoiceConnection {
 
     pub async fn drain_output(&mut self) -> Result<(), String> {
         if self.pending.as_ref().is_some_and(|pending| {
-            pending.last_target_check.elapsed() >= Duration::from_millis(250)
+            pending.request.mode() == VoiceMode::Conversation
+                && pending.last_target_check.elapsed() >= Duration::from_millis(250)
         }) {
-            let target = self.pending.as_ref().expect("pending voice").target.clone();
+            let VoiceAcceptedRequest::Conversation { target, .. } =
+                &self.pending.as_ref().expect("pending voice").request
+            else {
+                unreachable!("mode checked above")
+            };
             if self
                 .host
-                .agent_handle_for_instance(&self.connection_host_stream, &target)
+                .agent_handle_for_instance(&self.connection_host_stream, target)
                 .await
                 .is_none()
             {
@@ -862,13 +1117,18 @@ impl VoiceConnection {
             .is_some_and(|pending| pending.open.is_finished())
         {
             let pending = self.pending.take().expect("finished pending voice");
-            match pending.open.await.map_err(|_| "Nova startup task failed")? {
+            match pending
+                .open
+                .await
+                .map_err(|_| "voice provider startup task failed")?
+            {
                 Ok(mut provider) => {
-                    if self
-                        .host
-                        .agent_handle_for_instance(&self.connection_host_stream, &pending.target)
-                        .await
-                        .is_none()
+                    if let VoiceAcceptedRequest::Conversation { target, .. } = &pending.request
+                        && self
+                            .host
+                            .agent_handle_for_instance(&self.connection_host_stream, target)
+                            .await
+                            .is_none()
                     {
                         provider.close();
                         self.emit_error(
@@ -882,15 +1142,24 @@ impl VoiceConnection {
                     }
                     let decoder = opus::Decoder::new(16_000, opus::Channels::Mono)
                         .map_err(|_| "Opus decoder unavailable")?;
-                    let encoder =
-                        opus::Encoder::new(24_000, opus::Channels::Mono, opus::Application::Voip)
-                            .map_err(|_| "Opus encoder unavailable")?;
+                    let encoder = if pending.request.mode() == VoiceMode::Conversation {
+                        Some(
+                            opus::Encoder::new(
+                                24_000,
+                                opus::Channels::Mono,
+                                opus::Application::Voip,
+                            )
+                            .map_err(|_| "Opus encoder unavailable")?,
+                        )
+                    } else {
+                        None
+                    };
                     let (tool_tx, tool_rx) = mpsc::channel(16);
                     let queue_metrics = self.output.audio_metrics();
                     self.active = Some(ActiveVoice {
                         id: pending.id.clone(),
                         generation: pending.generation,
-                        target: pending.target.clone(),
+                        request: pending.request.clone(),
                         decoder,
                         encoder,
                         provider,
@@ -913,9 +1182,7 @@ impl VoiceConnection {
                     let accepted = VoiceAcceptedPayload {
                         session_id: pending.id,
                         generation: pending.generation,
-                        target: pending.target,
-                        uplink: pending.pair.uplink,
-                        downlink: pending.pair.downlink,
+                        request: pending.request,
                     };
                     self.output
                         .with_path(StreamPath("/voice".into()))
@@ -931,7 +1198,7 @@ impl VoiceConnection {
                 Err(failure) => {
                     tracing::warn!(
                         category = failure.category,
-                        "Nova voice session was not accepted"
+                        "voice provider session was not accepted"
                     );
                     self.emit_error(
                         None,
@@ -949,15 +1216,18 @@ impl VoiceConnection {
             self.finish(VoiceStopReason::Inactivity);
             return Ok(());
         }
-        if self
-            .active
-            .as_ref()
-            .is_some_and(|active| active.last_target_check.elapsed() >= Duration::from_millis(250))
-        {
-            let target = self.active.as_ref().unwrap().target.clone();
+        if self.active.as_ref().is_some_and(|active| {
+            active.request.mode() == VoiceMode::Conversation
+                && active.last_target_check.elapsed() >= Duration::from_millis(250)
+        }) {
+            let VoiceAcceptedRequest::Conversation { target, .. } =
+                &self.active.as_ref().expect("active voice").request
+            else {
+                unreachable!("mode checked above")
+            };
             let still_owned = self
                 .host
-                .agent_handle_for_instance(&self.connection_host_stream, &target)
+                .agent_handle_for_instance(&self.connection_host_stream, target)
                 .await
                 .is_some();
             if !still_owned {
@@ -1000,20 +1270,16 @@ impl VoiceConnection {
                 }
                 active
                     .provider
-                    .send(input)
+                    .send_nova(input)
                     .map_err(|_| "provider tool channel closed")?;
             }
-            while let Ok(output) = active.provider.output().try_recv() {
+            while let Ok(output) = active.provider.try_output() {
                 match output {
-                    NovaOutput::Transcript {
-                        speaker,
-                        text,
-                        is_final,
-                    } => {
+                    ProviderOutput::Dictation(DictationOutput::Transcript { text, is_final }) => {
                         let payload = VoiceTranscriptPayload {
                             session_id: active.id.clone(),
                             generation: active.generation,
-                            speaker,
+                            speaker: protocol::VoiceTranscriptSpeaker::User,
                             text,
                             is_final,
                             message_id: None,
@@ -1022,164 +1288,12 @@ impl VoiceConnection {
                             .with_path(StreamPath(format!("/voice/{}", active.id.0)))
                             .send_value(
                                 FrameKind::VoiceTranscript,
-                                serde_json::to_value(payload).map_err(|_| "encode transcript")?,
+                                serde_json::to_value(payload)
+                                    .map_err(|_| "encode dictation transcript")?,
                             )
                             .map_err(|_| "output closed")?;
                     }
-                    NovaOutput::Audio24Khz {
-                        output_generation,
-                        samples,
-                    } => {
-                        if output_generation != active.output_generation {
-                            // Stale tail of a client-interrupted response.
-                            // Count it: an uncounted `continue` here is how
-                            // "only the first response is audible" hid from
-                            // the flow stats for three betas.
-                            active.stale_output_chunks += 1;
-                            active.stale_output_samples += samples.len() as u64;
-                            tracing::debug!(
-                                session = %active.id.0,
-                                output_generation,
-                                expected = active.output_generation,
-                                samples = samples.len(),
-                                "discarded stale voice output"
-                            );
-                            continue;
-                        }
-                        if !active.output_active {
-                            active.output_active = true;
-                            let state = VoiceStatePayload {
-                                session_id: active.id.clone(),
-                                generation: active.generation,
-                                state: VoiceSessionState::Speaking,
-                                model_turn_id: None,
-                            };
-                            self.output
-                                .with_path(StreamPath(format!("/voice/{}", active.id.0)))
-                                .send_value(
-                                    FrameKind::VoiceState,
-                                    serde_json::to_value(state).unwrap_or_default(),
-                                )
-                                .map_err(|_| "output closed")?;
-                            let payload = VoiceSessionPayload {
-                                session_id: active.id.clone(),
-                                generation: active.generation,
-                            };
-                            self.output
-                                .with_path(StreamPath(format!("/voice/{}", active.id.0)))
-                                .send_value(
-                                    FrameKind::VoiceOutput,
-                                    serde_json::to_value(payload).unwrap_or_default(),
-                                )
-                                .map_err(|_| "output closed")?;
-                        }
-                        for pcm in samples.chunks(480) {
-                            if pcm.len() != 480 {
-                                break;
-                            }
-                            let mut packet = vec![0; 1275];
-                            let len = active
-                                .encoder
-                                .encode(pcm, &mut packet)
-                                .map_err(|_| "Opus output encode failed")?;
-                            packet.truncate(len);
-                            let payload = VoiceAudioPayload {
-                                session_id: active.id.clone(),
-                                generation: active.generation,
-                                direction: VoiceDirection::Output,
-                                first_media_seq: active.next_output_seq,
-                                timestamp_samples_48k: active.output_timestamp_48k,
-                                packet_lengths: vec![len as u16],
-                            };
-                            // Downlink audio rides its own sub-stream with its
-                            // own sequence counter. The shell consumes these
-                            // frames natively, so if they shared the JSON
-                            // envelope stream's counter the frontend validator
-                            // (a partial observer) would desync at Nova's
-                            // first spoken word and gray out the connection.
-                            self.output
-                                .with_path(StreamPath(format!("/voice/{}/audio", active.id.0)))
-                                .send_binary(
-                                    FrameKind::VoiceAudio,
-                                    serde_json::to_value(payload).unwrap_or_default(),
-                                    packet,
-                                )
-                                .map_err(|_| "output closed")?;
-                            active.next_output_seq += 1;
-                            active.output_timestamp_48k += 960;
-                            active.stats.admitted_packets += 1;
-                            active.stats.admitted_bytes += len as u64;
-                        }
-                    }
-                    NovaOutput::State(VoiceSessionState::Interrupting) => {
-                        provider_interrupt = true;
-                        break;
-                    }
-                    NovaOutput::State(state) => {
-                        let payload = VoiceStatePayload {
-                            session_id: active.id.clone(),
-                            generation: active.generation,
-                            state,
-                            model_turn_id: None,
-                        };
-                        self.output
-                            .with_path(StreamPath(format!("/voice/{}", active.id.0)))
-                            .send_value(
-                                FrameKind::VoiceState,
-                                serde_json::to_value(payload).unwrap_or_default(),
-                            )
-                            .map_err(|_| "output closed")?;
-                    }
-                    NovaOutput::ToolUse {
-                        tool_use_id,
-                        model_turn_id,
-                        message,
-                    } => {
-                        let state = VoiceStatePayload {
-                            session_id: active.id.clone(),
-                            generation: active.generation,
-                            state: VoiceSessionState::AgentWorking,
-                            model_turn_id: Some(model_turn_id),
-                        };
-                        self.output
-                            .with_path(StreamPath(format!("/voice/{}", active.id.0)))
-                            .send_value(
-                                FrameKind::VoiceState,
-                                serde_json::to_value(state)
-                                    .map_err(|_| "encode agent-working state")?,
-                            )
-                            .map_err(|_| "output closed")?;
-                        let host = self.host.clone();
-                        let connection_host_stream = self.connection_host_stream.clone();
-                        let target = active.target.clone();
-                        let tx = active.tool_tx.clone();
-                        let cancel = active.cancel.clone();
-                        tokio::spawn(async move {
-                            let failure_tx = tx.clone();
-                            let failed_tool_id = tool_use_id.clone();
-                            let result = run_agent_tool(
-                                host,
-                                connection_host_stream,
-                                target,
-                                message,
-                                tx,
-                                tool_use_id,
-                                cancel.clone(),
-                            )
-                            .await;
-                            if result.is_err() && !cancel.is_cancelled() {
-                                let _ = failure_tx
-                                    .send(NovaInput::ToolResult {
-                                        tool_use_id: failed_tool_id,
-                                        message_id: "tool-delivery-failed".into(),
-                                        result: "The focused Tyde agent could not complete this tool request."
-                                            .into(),
-                                    })
-                                    .await;
-                            }
-                        });
-                    }
-                    NovaOutput::End { clean } => {
+                    ProviderOutput::Dictation(DictationOutput::End { clean }) => {
                         if clean {
                             provider_completed = true;
                         } else {
@@ -1187,11 +1301,11 @@ impl VoiceConnection {
                         }
                         break;
                     }
-                    NovaOutput::ProviderError {
+                    ProviderOutput::Dictation(DictationOutput::ProviderError {
                         code,
                         retryable,
                         detail,
-                    } => {
+                    }) => {
                         provider_error = Some((
                             active.id.clone(),
                             active.generation,
@@ -1202,6 +1316,212 @@ impl VoiceConnection {
                         provider_ended = true;
                         break;
                     }
+                    ProviderOutput::Nova(output) => match output {
+                        NovaOutput::Transcript {
+                            speaker,
+                            text,
+                            is_final,
+                        } => {
+                            let payload = VoiceTranscriptPayload {
+                                session_id: active.id.clone(),
+                                generation: active.generation,
+                                speaker,
+                                text,
+                                is_final,
+                                message_id: None,
+                            };
+                            self.output
+                                .with_path(StreamPath(format!("/voice/{}", active.id.0)))
+                                .send_value(
+                                    FrameKind::VoiceTranscript,
+                                    serde_json::to_value(payload)
+                                        .map_err(|_| "encode transcript")?,
+                                )
+                                .map_err(|_| "output closed")?;
+                        }
+                        NovaOutput::Audio24Khz {
+                            output_generation,
+                            samples,
+                        } => {
+                            if output_generation != active.output_generation {
+                                // Stale tail of a client-interrupted response.
+                                // Count it: an uncounted `continue` here is how
+                                // "only the first response is audible" hid from
+                                // the flow stats for three betas.
+                                active.stale_output_chunks += 1;
+                                active.stale_output_samples += samples.len() as u64;
+                                tracing::debug!(
+                                    session = %active.id.0,
+                                    output_generation,
+                                    expected = active.output_generation,
+                                    samples = samples.len(),
+                                    "discarded stale voice output"
+                                );
+                                continue;
+                            }
+                            if !active.output_active {
+                                active.output_active = true;
+                                let state = VoiceStatePayload {
+                                    session_id: active.id.clone(),
+                                    generation: active.generation,
+                                    state: VoiceSessionState::Speaking,
+                                    model_turn_id: None,
+                                };
+                                self.output
+                                    .with_path(StreamPath(format!("/voice/{}", active.id.0)))
+                                    .send_value(
+                                        FrameKind::VoiceState,
+                                        serde_json::to_value(state).unwrap_or_default(),
+                                    )
+                                    .map_err(|_| "output closed")?;
+                                let payload = VoiceSessionPayload {
+                                    session_id: active.id.clone(),
+                                    generation: active.generation,
+                                };
+                                self.output
+                                    .with_path(StreamPath(format!("/voice/{}", active.id.0)))
+                                    .send_value(
+                                        FrameKind::VoiceOutput,
+                                        serde_json::to_value(payload).unwrap_or_default(),
+                                    )
+                                    .map_err(|_| "output closed")?;
+                            }
+                            for pcm in samples.chunks(480) {
+                                if pcm.len() != 480 {
+                                    break;
+                                }
+                                let mut packet = vec![0; 1275];
+                                let len = active
+                                    .encoder
+                                    .as_mut()
+                                    .ok_or("dictation cannot encode output")?
+                                    .encode(pcm, &mut packet)
+                                    .map_err(|_| "Opus output encode failed")?;
+                                packet.truncate(len);
+                                let payload = VoiceAudioPayload {
+                                    session_id: active.id.clone(),
+                                    generation: active.generation,
+                                    direction: VoiceDirection::Output,
+                                    first_media_seq: active.next_output_seq,
+                                    timestamp_samples_48k: active.output_timestamp_48k,
+                                    packet_lengths: vec![len as u16],
+                                };
+                                // Downlink audio rides its own sub-stream with its
+                                // own sequence counter. The shell consumes these
+                                // frames natively, so if they shared the JSON
+                                // envelope stream's counter the frontend validator
+                                // (a partial observer) would desync at Nova's
+                                // first spoken word and gray out the connection.
+                                self.output
+                                    .with_path(StreamPath(format!("/voice/{}/audio", active.id.0)))
+                                    .send_binary(
+                                        FrameKind::VoiceAudio,
+                                        serde_json::to_value(payload).unwrap_or_default(),
+                                        packet,
+                                    )
+                                    .map_err(|_| "output closed")?;
+                                active.next_output_seq += 1;
+                                active.output_timestamp_48k += 960;
+                                active.stats.admitted_packets += 1;
+                                active.stats.admitted_bytes += len as u64;
+                            }
+                        }
+                        NovaOutput::State(VoiceSessionState::Interrupting) => {
+                            provider_interrupt = true;
+                            break;
+                        }
+                        NovaOutput::State(state) => {
+                            let payload = VoiceStatePayload {
+                                session_id: active.id.clone(),
+                                generation: active.generation,
+                                state,
+                                model_turn_id: None,
+                            };
+                            self.output
+                                .with_path(StreamPath(format!("/voice/{}", active.id.0)))
+                                .send_value(
+                                    FrameKind::VoiceState,
+                                    serde_json::to_value(payload).unwrap_or_default(),
+                                )
+                                .map_err(|_| "output closed")?;
+                        }
+                        NovaOutput::ToolUse {
+                            tool_use_id,
+                            model_turn_id,
+                            message,
+                        } => {
+                            let state = VoiceStatePayload {
+                                session_id: active.id.clone(),
+                                generation: active.generation,
+                                state: VoiceSessionState::AgentWorking,
+                                model_turn_id: Some(model_turn_id),
+                            };
+                            self.output
+                                .with_path(StreamPath(format!("/voice/{}", active.id.0)))
+                                .send_value(
+                                    FrameKind::VoiceState,
+                                    serde_json::to_value(state)
+                                        .map_err(|_| "encode agent-working state")?,
+                                )
+                                .map_err(|_| "output closed")?;
+                            let host = self.host.clone();
+                            let connection_host_stream = self.connection_host_stream.clone();
+                            let VoiceAcceptedRequest::Conversation { target, .. } = &active.request
+                            else {
+                                return Err("dictation emitted a tool request".into());
+                            };
+                            let target = target.clone();
+                            let tx = active.tool_tx.clone();
+                            let cancel = active.cancel.clone();
+                            tokio::spawn(async move {
+                                let failure_tx = tx.clone();
+                                let failed_tool_id = tool_use_id.clone();
+                                let result = run_agent_tool(
+                                    host,
+                                    connection_host_stream,
+                                    target,
+                                    message,
+                                    tx,
+                                    tool_use_id,
+                                    cancel.clone(),
+                                )
+                                .await;
+                                if result.is_err() && !cancel.is_cancelled() {
+                                    let _ = failure_tx
+                                    .send(NovaInput::ToolResult {
+                                        tool_use_id: failed_tool_id,
+                                        message_id: "tool-delivery-failed".into(),
+                                        result: "The focused Tyde agent could not complete this tool request."
+                                            .into(),
+                                    })
+                                    .await;
+                                }
+                            });
+                        }
+                        NovaOutput::End { clean } => {
+                            if clean {
+                                provider_completed = true;
+                            } else {
+                                provider_ended = true;
+                            }
+                            break;
+                        }
+                        NovaOutput::ProviderError {
+                            code,
+                            retryable,
+                            detail,
+                        } => {
+                            provider_error = Some((
+                                active.id.clone(),
+                                active.generation,
+                                code,
+                                retryable,
+                                detail,
+                            ));
+                            provider_ended = true;
+                            break;
+                        }
+                    },
                 }
             }
         }

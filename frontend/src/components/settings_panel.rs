@@ -5284,7 +5284,7 @@ fn DebugTab() -> impl IntoView {
 
 /// Server-side speech settings. Lifted out of the Mobile tab, where it was the
 /// first thing on a page otherwise entirely about pairing: voice runs on the
-/// host against Bedrock and is equally available to the desktop app, so it was
+/// host against AWS speech services and is equally available to the desktop app, so it was
 /// only ever adjacent to mobile by accident of when it shipped.
 #[component]
 fn VoiceTab() -> impl IntoView {
@@ -5295,7 +5295,7 @@ fn VoiceTab() -> impl IntoView {
         <h2 class="settings-panel-title">"Voice"</h2>
 
         <p class="settings-description settings-panel-intro">
-            "Talk to an agent instead of typing. Speech is transcribed and spoken by Amazon Nova Sonic, which runs through the host's own AWS credentials — audio goes from the client to this host and from the host to Bedrock. Tyde never sends AWS credentials to a desktop or mobile client, and never quietly falls back to a different model or provider if the configured one is unavailable."
+            "Choose conversational voice with Amazon Nova Sonic or direct dictation with Amazon Transcribe Streaming. Both run through the host's own AWS credentials. Tyde never sends AWS credentials to a desktop or mobile client and never falls back to another model or provider."
         </p>
 
         <Show
@@ -5318,34 +5318,41 @@ fn NativeVoiceSettings(state: AppState) -> impl IntoView {
     let state_for_voice_region = state.clone();
     let state_for_voice_model = state.clone();
     let state_for_voice_endpointing = state.clone();
+    let state_for_dictation_enabled = state.clone();
+    let state_for_dictation_region = state.clone();
+    let state_for_dictation_language = state.clone();
     let state_for_voice_enabled_commit = state.clone();
     let state_for_voice_profile_commit = state.clone();
     let state_for_voice_region_commit = state.clone();
     let state_for_voice_model_commit = state.clone();
     let state_for_voice_endpointing_commit = state.clone();
+    let state_for_dictation_enabled_commit = state.clone();
+    let state_for_dictation_region_commit = state.clone();
+    let state_for_dictation_language_commit = state.clone();
+    let state_for_dictation_disabled = state.clone();
     let state_for_voice_disabled = state;
 
     view! {
         <div class="settings-field" data-testid="native-voice-settings">
             <div class="settings-toggle-row">
                 <div>
-                    <label class="settings-label">"Native voice with Amazon Nova Sonic"</label>
-                    <p class="settings-description">"Turn on speech input and output for chats on this host. When enabled, a microphone control appears in the composer on both desktop and mobile. Audio is streamed to Nova Sonic using the AWS profile and region below; if those credentials do not work, voice reports the failure rather than silently downgrading to another model."</p>
+                    <label class="settings-label">"Conversation with Amazon Nova Sonic"</label>
+                    <p class="settings-description">"Turn on speech input and output for existing agent chats on desktop and mobile. Nova can invoke the focused Tyde agent and speaks its response."</p>
                 </div>
                 <label class="settings-toggle"><input type="checkbox"
                     prop:checked=move || state_for_voice_enabled.selected_host_settings().is_some_and(|settings| settings.voice.enabled)
-                    disabled=move || state_for_voice_disabled.selected_host_settings().is_none()
+                    disabled=move || state_for_dictation_disabled.selected_host_settings().is_none()
                     on:change=move |ev| { let input:web_sys::HtmlInputElement=ev.target().unwrap().unchecked_into(); send_host_replace(&state_for_voice_enabled_commit,"/voice/enabled",input.checked()); }
                 /><span class="settings-toggle-slider"></span></label>
             </div>
             <label class="settings-label" for="voice-aws-profile">"AWS profile"</label>
-            <p class="settings-description">"Which named profile from the host's AWS credentials file to use for Bedrock. Leave empty to use the profile named \"default\". The profile is read on the host, so it has to exist there — not on the device you are reading this on."</p>
+            <p class="settings-description">"Which named profile from the host's AWS credentials file to use for Bedrock and Transcribe. Leave empty to use the AWS SDK's normal host credential chain. The profile is read only on the host."</p>
             <input id="voice-aws-profile" class="settings-input" type="text" placeholder="default"
                 prop:value=move || state_for_voice_profile.selected_host_settings().and_then(|settings|settings.voice.aws_profile).unwrap_or_default()
                 on:change=move |ev| { let input:web_sys::HtmlInputElement=ev.target().unwrap().unchecked_into();let value=input.value().trim().to_owned();send_host_replace(&state_for_voice_profile_commit,"/voice/aws_profile",(!value.is_empty()).then_some(value)); }
             />
             <label class="settings-label" for="voice-aws-region">"AWS region"</label>
-            <p class="settings-description">"The AWS region to call Bedrock in. Nova Sonic is not offered in every region, and picking a region far from the host adds audible delay to a conversation, so prefer the nearest region that carries the model. Leave empty to use us-east-1."</p>
+            <p class="settings-description">"The explicit AWS region to call Bedrock in. Nova Sonic is not offered in every region. Leaving this empty makes conversation mode unavailable; Tyde does not silently choose us-east-1."</p>
             <input id="voice-aws-region" class="settings-input" type="text" placeholder="us-east-1"
                 prop:value=move || state_for_voice_region.selected_host_settings().and_then(|settings|settings.voice.aws_region).unwrap_or_default()
                 on:change=move |ev| { let input:web_sys::HtmlInputElement=ev.target().unwrap().unchecked_into();let value=input.value().trim().to_owned();send_host_replace(&state_for_voice_region_commit,"/voice/aws_region",(!value.is_empty()).then_some(value)); }
@@ -5370,6 +5377,46 @@ fn NativeVoiceSettings(state: AppState) -> impl IntoView {
                     send_host_replace(&state_for_voice_endpointing_commit,"/voice/endpointing_sensitivity",sensitivity);
                 }
             ><option value="LOW">"Patient (~2 seconds)"</option><option value="MEDIUM">"Balanced (~1.75 seconds)"</option><option value="HIGH">"Fast (~1.5 seconds)"</option></select>
+
+            <div class="settings-toggle-row">
+                <div>
+                    <label class="settings-label">"Dictation with Amazon Transcribe Streaming"</label>
+                    <p class="settings-description">"Turn on input-only dictation for new-chat and existing-agent composers. Final provider text is appended to the editable draft and is never sent automatically. Dictation does not invoke Nova, an LLM, or a Tyde agent, and it never produces spoken output."</p>
+                </div>
+                <label class="settings-toggle"><input type="checkbox"
+                    prop:checked=move || state_for_dictation_enabled.selected_host_settings().is_some_and(|settings| settings.voice.dictation_enabled)
+                    disabled=move || state_for_voice_disabled.selected_host_settings().is_none()
+                    on:change=move |ev| { let input:web_sys::HtmlInputElement=ev.target().unwrap().unchecked_into(); send_host_replace(&state_for_dictation_enabled_commit,"/voice/dictation_enabled",input.checked()); }
+                /><span class="settings-toggle-slider"></span></label>
+            </div>
+            <label class="settings-label" for="voice-dictation-region">"Transcribe region"</label>
+            <p class="settings-description">"The explicit AWS region for Transcribe Streaming. Leaving it empty makes dictation unavailable; it does not inherit the Nova region or choose a default."</p>
+            <input id="voice-dictation-region" class="settings-input" type="text" placeholder="us-east-1"
+                prop:value=move || state_for_dictation_region.selected_host_settings().and_then(|settings|settings.voice.dictation_region).unwrap_or_default()
+                on:change=move |ev| { let input:web_sys::HtmlInputElement=ev.target().unwrap().unchecked_into();let value=input.value().trim().to_owned();send_host_replace(&state_for_dictation_region_commit,"/voice/dictation_region",(!value.is_empty()).then_some(value)); }
+            />
+            <label class="settings-label" for="voice-dictation-language">"Dictation language"</label>
+            <p class="settings-description">"The fixed language code sent to Amazon Transcribe. Tyde inserts Transcribe's finalized text as returned: no LLM rewriting occurs, though ASR can mishear speech or normalize spelling, punctuation, and numbers."</p>
+            <select id="voice-dictation-language" class="settings-select"
+                prop:value=move || state_for_dictation_language.selected_host_settings().map(|settings|settings.voice.dictation_language_code).unwrap_or_else(||"en-US".into())
+                on:change=move |ev| { let input:web_sys::HtmlSelectElement=ev.target().unwrap().unchecked_into();send_host_replace(&state_for_dictation_language_commit,"/voice/dictation_language_code",input.value()); }
+            >
+                <option value="en-US">"English (United States)"</option>
+                <option value="en-GB">"English (United Kingdom)"</option>
+                <option value="en-AU">"English (Australia)"</option>
+                <option value="es-US">"Spanish (United States)"</option>
+                <option value="es-ES">"Spanish (Spain)"</option>
+                <option value="fr-FR">"French (France)"</option>
+                <option value="fr-CA">"French (Canada)"</option>
+                <option value="de-DE">"German"</option>
+                <option value="it-IT">"Italian"</option>
+                <option value="pt-BR">"Portuguese (Brazil)"</option>
+                <option value="ja-JP">"Japanese"</option>
+                <option value="ko-KR">"Korean"</option>
+                <option value="zh-CN">"Chinese (Mainland)"</option>
+                <option value="hi-IN">"Hindi"</option>
+            </select>
+            <p class="settings-description">"The host AWS identity needs transcribe:StartStreamTranscription. Amazon Transcribe pricing and regional availability vary. Audio and transcript processing is subject to AWS Transcribe service terms and content-use policies; organizations that require an AWS Organizations AI-services opt-out should configure that policy before enabling dictation."</p>
         </div>
     }
 }
@@ -8858,7 +8905,7 @@ mod wasm_tests {
         click_tab(&container, "Voice");
         next_tick().await;
 
-        let toggle = toggle_for_label(&container, "Native voice with Amazon Nova Sonic");
+        let toggle = toggle_for_label(&container, "Conversation with Amazon Nova Sonic");
         assert!(
             !toggle.checked(),
             "native voice starts disabled in this fixture"

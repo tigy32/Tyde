@@ -53,7 +53,7 @@ struct AppLoopResources {
     cancel: CancellationToken,
     origin: ConnectionOrigin,
     first_request: Arc<Notify>,
-    voice_provider: Arc<dyn crate::voice::NovaProvider>,
+    voice_providers: crate::voice::VoiceProviders,
 }
 
 #[derive(Default)]
@@ -126,7 +126,10 @@ pub async fn run_connection(connection: Connection, host: HostHandle) -> Result<
         connection,
         host,
         ConnectionOrigin::Desktop,
-        Arc::new(crate::voice_aws::AwsNovaProvider),
+        crate::voice::VoiceProviders {
+            nova: Arc::new(crate::voice_aws::AwsNovaProvider),
+            dictation: Arc::new(crate::voice_aws::AwsTranscribeProvider),
+        },
     )
     .await
 }
@@ -140,7 +143,10 @@ pub async fn run_mobile_connection(
         connection,
         host,
         ConnectionOrigin::Mobile { device_id },
-        Arc::new(crate::voice_aws::AwsNovaProvider),
+        crate::voice::VoiceProviders {
+            nova: Arc::new(crate::voice_aws::AwsNovaProvider),
+            dictation: Arc::new(crate::voice_aws::AwsTranscribeProvider),
+        },
     )
     .await
 }
@@ -154,7 +160,10 @@ pub async fn run_connection_with_synthetic_voice(
         connection,
         host,
         ConnectionOrigin::Desktop,
-        Arc::new(crate::voice::SyntheticNovaProvider),
+        crate::voice::VoiceProviders {
+            nova: Arc::new(crate::voice::SyntheticNovaProvider),
+            dictation: Arc::new(crate::voice::SyntheticDictationProvider),
+        },
     )
     .await
 }
@@ -163,7 +172,7 @@ async fn run_connection_with_origin(
     connection: Connection,
     host: HostHandle,
     origin: ConnectionOrigin,
-    voice_provider: Arc<dyn crate::voice::NovaProvider>,
+    voice_providers: crate::voice::VoiceProviders,
 ) -> Result<(), FrameError> {
     let host_stream = connection
         .outgoing_seq
@@ -245,7 +254,7 @@ async fn run_connection_with_origin(
                 cancel,
                 origin,
                 first_request: app_first_request,
-                voice_provider,
+                voice_providers,
             })
             .await
         })
@@ -600,7 +609,7 @@ async fn app_loop(resources: AppLoopResources) -> Result<(), FrameError> {
         cancel,
         origin,
         first_request,
-        voice_provider,
+        voice_providers,
     } = resources;
     let (voice_tx, mut voice_rx) = mpsc::channel::<ProtocolFrame>(32);
     let voice_host = host.clone();
@@ -608,7 +617,7 @@ async fn app_loop(resources: AppLoopResources) -> Result<(), FrameError> {
     let voice_cancel = cancel.clone();
     tokio::spawn(async move {
         let mut voice =
-            crate::voice::VoiceConnection::new(voice_host, voice_output, voice_provider);
+            crate::voice::VoiceConnection::new(voice_host, voice_output, voice_providers);
         let mut tick = tokio::time::interval(std::time::Duration::from_millis(10));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {

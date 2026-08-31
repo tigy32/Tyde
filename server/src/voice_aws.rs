@@ -14,7 +14,8 @@ use futures_util::Stream as FuturesStream;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::voice::{
-    NovaInput, NovaOutput, NovaProvider, NovaSend, NovaSession, ProviderFailure, ProviderFuture,
+    DictationInput, DictationOutput, DictationProvider, DictationSession, NovaInput, NovaOutput,
+    NovaProvider, NovaSend, NovaSession, ProviderFailure, ProviderFuture,
 };
 
 const INPUT_CAPACITY: usize = 100;
@@ -594,5 +595,367 @@ fn failure(
         code,
         retryable,
         category,
+    }
+}
+
+const TRANSCRIBE_INPUT_CAPACITY: usize = 64;
+const TRANSCRIBE_OUTPUT_CAPACITY: usize = 32;
+const TRANSCRIBE_CHUNK_SAMPLES: usize = 1_600;
+
+pub(crate) struct AwsTranscribeProvider;
+
+impl DictationProvider for AwsTranscribeProvider {
+    fn open<'a>(
+        &'a self,
+        settings: &'a settings_model::VoiceSettings,
+        _: &'a protocol::VoiceSessionId,
+    ) -> ProviderFuture<'a, Box<dyn DictationSession>> {
+        Box::pin(async move {
+            let region = settings
+                .dictation_region
+                .as_ref()
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| {
+                    failure(
+                        protocol::VoiceErrorCode::InvalidConfiguration,
+                        false,
+                        "transcribe_region_missing",
+                    )
+                })?;
+            let mut loader = aws_config::defaults(aws_config::BehaviorVersion::latest())
+                .region(aws_config::Region::new(region.clone()));
+            if let Some(profile) = settings
+                .aws_profile
+                .as_ref()
+                .filter(|value| !value.trim().is_empty())
+            {
+                loader = loader.profile_name(profile);
+            }
+            let config = loader.load().await;
+            let client = aws_sdk_transcribestreaming::Client::new(&config);
+            let (input_tx, input_rx) = mpsc::channel(TRANSCRIBE_INPUT_CAPACITY);
+            let (output_tx, output_rx) = mpsc::channel(TRANSCRIBE_OUTPUT_CAPACITY);
+            let input_ended = Arc::new(AtomicBool::new(false));
+            let closing = Arc::new(AtomicBool::new(false));
+            let cancel = tokio_util::sync::CancellationToken::new();
+            let (ready_tx, ready_rx) = oneshot::channel();
+            let language_code = settings.dictation_language_code.clone();
+            let stream_cancel = cancel.clone();
+            let stream_input_ended = input_ended.clone();
+            let stream_closing = closing.clone();
+            tokio::spawn(async move {
+                tokio::select! {
+                    _ = stream_cancel.cancelled() => {}
+                    _ = run_transcribe_stream(
+                        client,
+                        language_code,
+                        input_rx,
+                        output_tx,
+                        stream_input_ended,
+                        stream_closing,
+                        ready_tx,
+                    ) => {}
+                }
+            });
+            match tokio::time::timeout(std::time::Duration::from_secs(20), ready_rx).await {
+                Ok(Ok(Ok(()))) => {}
+                Ok(Ok(Err(provider_failure))) => return Err(provider_failure),
+                Ok(Err(_)) => {
+                    return Err(failure(
+                        protocol::VoiceErrorCode::ProviderUnavailable,
+                        true,
+                        "transcribe_startup_channel_closed",
+                    ));
+                }
+                Err(_) => {
+                    cancel.cancel();
+                    return Err(failure(
+                        protocol::VoiceErrorCode::ProviderUnavailable,
+                        true,
+                        "transcribe_startup_timeout",
+                    ));
+                }
+            }
+            Ok(Box::new(AwsTranscribeSession {
+                input_tx: Some(input_tx),
+                output_rx,
+                input_ended,
+                closing,
+                cancel,
+            }) as Box<dyn DictationSession>)
+        })
+    }
+}
+
+struct AwsTranscribeSession {
+    input_tx: Option<mpsc::Sender<DictationInput>>,
+    output_rx: mpsc::Receiver<DictationOutput>,
+    input_ended: Arc<AtomicBool>,
+    closing: Arc<AtomicBool>,
+    cancel: tokio_util::sync::CancellationToken,
+}
+
+impl DictationSession for AwsTranscribeSession {
+    fn send(&mut self, input: DictationInput) -> Result<NovaSend, ProviderFailure> {
+        if matches!(input, DictationInput::InputEnd) {
+            self.input_ended.store(true, Ordering::Release);
+        }
+        let sender = self.input_tx.as_ref().ok_or_else(|| {
+            failure(
+                protocol::VoiceErrorCode::ProviderUnavailable,
+                true,
+                "transcribe_closed",
+            )
+        })?;
+        match sender.try_send(input) {
+            Ok(()) => Ok(NovaSend::Sent),
+            Err(mpsc::error::TrySendError::Full(DictationInput::Audio16Khz(_))) => {
+                Ok(NovaSend::DroppedAudio)
+            }
+            Err(mpsc::error::TrySendError::Full(_)) => Err(failure(
+                protocol::VoiceErrorCode::ProviderUnavailable,
+                true,
+                "transcribe_control_backpressure",
+            )),
+            Err(mpsc::error::TrySendError::Closed(_)) => Err(failure(
+                protocol::VoiceErrorCode::ProviderUnavailable,
+                true,
+                "transcribe_closed",
+            )),
+        }
+    }
+
+    fn output(&mut self) -> &mut mpsc::Receiver<DictationOutput> {
+        &mut self.output_rx
+    }
+
+    fn close(&mut self) {
+        self.closing.store(true, Ordering::Release);
+        self.input_tx.take();
+        self.cancel.cancel();
+    }
+}
+
+struct TranscribeInputStream {
+    rx: Mutex<mpsc::Receiver<DictationInput>>,
+    buffered: Vec<i16>,
+    ending: bool,
+}
+
+impl FuturesStream for TranscribeInputStream {
+    type Item = Result<
+        aws_sdk_transcribestreaming::types::AudioStream,
+        aws_sdk_transcribestreaming::types::error::AudioStreamError,
+    >;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        loop {
+            if this.buffered.len() >= TRANSCRIBE_CHUNK_SAMPLES
+                || (this.ending && !this.buffered.is_empty())
+            {
+                let count = this.buffered.len().min(TRANSCRIBE_CHUNK_SAMPLES);
+                let samples: Vec<i16> = this.buffered.drain(..count).collect();
+                let mut bytes = Vec::with_capacity(samples.len() * 2);
+                for sample in samples {
+                    bytes.extend_from_slice(&sample.to_le_bytes());
+                }
+                let event = aws_sdk_transcribestreaming::types::AudioEvent::builder()
+                    .audio_chunk(Blob::new(bytes))
+                    .build();
+                return Poll::Ready(Some(Ok(
+                    aws_sdk_transcribestreaming::types::AudioStream::AudioEvent(event),
+                )));
+            }
+            if this.ending {
+                return Poll::Ready(None);
+            }
+            match this.rx.lock().expect("Transcribe input lock").poll_recv(cx) {
+                Poll::Ready(Some(DictationInput::Audio16Khz(samples))) => {
+                    this.buffered.extend(samples);
+                }
+                Poll::Ready(Some(DictationInput::InputEnd | DictationInput::Stop))
+                | Poll::Ready(None) => this.ending = true,
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+    }
+}
+
+async fn run_transcribe_stream(
+    client: aws_sdk_transcribestreaming::Client,
+    language_code: String,
+    input_rx: mpsc::Receiver<DictationInput>,
+    output_tx: mpsc::Sender<DictationOutput>,
+    input_ended: Arc<AtomicBool>,
+    closing: Arc<AtomicBool>,
+    ready: oneshot::Sender<Result<(), ProviderFailure>>,
+) {
+    use aws_sdk_transcribestreaming::primitives::event_stream::EventStreamSender;
+    use aws_sdk_transcribestreaming::types::{
+        LanguageCode, MediaEncoding, PartialResultsStability, TranscriptResultStream,
+    };
+
+    let input = TranscribeInputStream {
+        rx: Mutex::new(input_rx),
+        buffered: Vec::with_capacity(TRANSCRIBE_CHUNK_SAMPLES * 2),
+        ending: false,
+    };
+    let response = client
+        .start_stream_transcription()
+        .language_code(LanguageCode::from(language_code.as_str()))
+        .media_encoding(MediaEncoding::Pcm)
+        .media_sample_rate_hertz(16_000)
+        .enable_partial_results_stabilization(true)
+        .partial_results_stability(PartialResultsStability::Low)
+        .audio_stream(EventStreamSender::from(input))
+        .send()
+        .await;
+    let mut response = match response {
+        Ok(response) => {
+            let _ = ready.send(Ok(()));
+            response
+        }
+        Err(error) => {
+            let raw = format!("{error:?}");
+            let provider_failure = categorize_transcribe_failure(&raw);
+            let _ = ready.send(Err(provider_failure.clone()));
+            if !closing.load(Ordering::Acquire) {
+                tracing::warn!(
+                    category = provider_failure.category,
+                    provider_error = %raw,
+                    "Amazon Transcribe stream failed before acceptance"
+                );
+            }
+            return;
+        }
+    };
+    let mut final_result_ids = std::collections::HashSet::new();
+    loop {
+        let received = if input_ended.load(Ordering::Acquire) {
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                response.transcript_result_stream.recv(),
+            )
+            .await
+            {
+                Ok(value) => value,
+                Err(_) => {
+                    let _ = output_tx.send(DictationOutput::End { clean: true }).await;
+                    return;
+                }
+            }
+        } else {
+            response.transcript_result_stream.recv().await
+        };
+        let event = match received {
+            Ok(Some(event)) => event,
+            Ok(None) => break,
+            Err(error) => {
+                let raw = format!("{error:?}");
+                let provider_failure = categorize_transcribe_failure(&raw);
+                let detail = match provider_failure.code {
+                    protocol::VoiceErrorCode::CredentialsExpired
+                    | protocol::VoiceErrorCode::MissingCredentials => None,
+                    _ => extract_service_message(&raw),
+                };
+                if !closing.load(Ordering::Acquire) {
+                    tracing::warn!(
+                        category = provider_failure.category,
+                        provider_error = %raw,
+                        "Amazon Transcribe stream failed"
+                    );
+                }
+                let _ = output_tx
+                    .send(DictationOutput::ProviderError {
+                        code: provider_failure.code,
+                        retryable: provider_failure.retryable,
+                        detail,
+                    })
+                    .await;
+                return;
+            }
+        };
+        let TranscriptResultStream::TranscriptEvent(event) = event else {
+            continue;
+        };
+        let Some(transcript) = event.transcript() else {
+            continue;
+        };
+        for result in transcript.results() {
+            let Some(text) = result
+                .alternatives()
+                .first()
+                .and_then(|alternative| alternative.transcript())
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+            else {
+                continue;
+            };
+            let is_final = !result.is_partial();
+            if is_final
+                && result
+                    .result_id()
+                    .is_some_and(|id| !final_result_ids.insert(id.to_owned()))
+            {
+                continue;
+            }
+            if output_tx
+                .send(DictationOutput::Transcript {
+                    text: text.to_owned(),
+                    is_final,
+                })
+                .await
+                .is_err()
+            {
+                return;
+            }
+        }
+    }
+    let _ = output_tx.send(DictationOutput::End { clean: true }).await;
+}
+
+fn categorize_transcribe_failure(debug: &str) -> ProviderFailure {
+    let text = debug.to_ascii_lowercase();
+    if text.contains("expiredtoken") || text.contains("expired token") {
+        failure(
+            protocol::VoiceErrorCode::CredentialsExpired,
+            true,
+            "transcribe_credentials_expired",
+        )
+    } else if text.contains("credentials") || text.contains("no providers") {
+        failure(
+            protocol::VoiceErrorCode::MissingCredentials,
+            false,
+            "transcribe_credentials_missing",
+        )
+    } else if text.contains("accessdenied") || text.contains("unauthorized") {
+        failure(
+            protocol::VoiceErrorCode::PermissionDenied,
+            false,
+            "transcribe_permission_denied",
+        )
+    } else if text.contains("limitexceeded") || text.contains("throttl") || text.contains("quota") {
+        failure(
+            protocol::VoiceErrorCode::QuotaExceeded,
+            true,
+            "transcribe_quota_exceeded",
+        )
+    } else if text.contains("badrequest")
+        || text.contains("validation")
+        || text.contains("language")
+        || text.contains("region")
+    {
+        failure(
+            protocol::VoiceErrorCode::InvalidConfiguration,
+            false,
+            "transcribe_configuration_rejected",
+        )
+    } else {
+        failure(
+            protocol::VoiceErrorCode::ProviderUnavailable,
+            true,
+            "transcribe_provider_failed",
+        )
     }
 }

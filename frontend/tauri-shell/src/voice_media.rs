@@ -60,6 +60,7 @@ enum ControlCommand {
         app: Option<AppHandle>,
         host_id: String,
         generation: u64,
+        input_only: bool,
         acknowledgement: Acknowledgement,
     },
     Flush {
@@ -126,12 +127,19 @@ impl NativeVoiceMedia {
         })
     }
 
-    pub fn start(&self, app: AppHandle, host_id: String, generation: u64) -> CommandResult {
+    pub fn start(
+        &self,
+        app: AppHandle,
+        host_id: String,
+        generation: u64,
+        input_only: bool,
+    ) -> CommandResult {
         self.control_request(
             |acknowledgement| ControlCommand::Start {
                 app: Some(app),
                 host_id,
                 generation,
+                input_only,
                 acknowledgement,
             },
             START_TIMEOUT,
@@ -277,15 +285,19 @@ impl Drop for AudioControl {
 
 struct Session {
     input: cpal::Stream,
-    output: cpal::Stream,
-    output_tx: mpsc::SyncSender<Vec<u8>>,
-    playback_epoch: Arc<AtomicU64>,
+    output: Option<cpal::Stream>,
+    output_tx: Option<mpsc::SyncSender<Vec<u8>>>,
+    playback_epoch: Option<Arc<AtomicU64>>,
 }
+
+type OutputSession = (cpal::Stream, mpsc::SyncSender<Vec<u8>>, Arc<AtomicU64>);
 
 impl Drop for Session {
     fn drop(&mut self) {
         let _ = self.input.pause();
-        let _ = self.output.pause();
+        if let Some(output) = &self.output {
+            let _ = output.pause();
+        }
     }
 }
 
@@ -298,6 +310,7 @@ struct ActiveSession {
     generation: u64,
     app: Option<AppHandle>,
     media: LiveSession,
+    native_aec: bool,
 }
 
 #[derive(Default)]
@@ -359,6 +372,8 @@ impl AudioThreadState {
         match &mut session.media {
             LiveSession::Device(session) => session
                 .output_tx
+                .as_ref()
+                .ok_or_else(|| "dictation has no output device".to_owned())?
                 .try_send(opus)
                 .map_err(|_| "voice output queue full".into()),
         }
@@ -372,7 +387,11 @@ impl AudioThreadState {
             .ok_or("stale voice media generation")?;
         match &mut session.media {
             LiveSession::Device(session) => {
-                advance_playback_epoch(&session.playback_epoch);
+                let playback_epoch = session
+                    .playback_epoch
+                    .as_ref()
+                    .ok_or("dictation has no output device")?;
+                advance_playback_epoch(playback_epoch);
                 Ok(())
             }
         }
@@ -448,13 +467,15 @@ fn handle_control_command(
             app,
             host_id,
             generation,
+            input_only,
             acknowledgement,
         } => {
             let result = state
                 .consume_acceptance(&host_id, generation)
                 .and_then(|()| {
                     state.stop_active();
-                    open_device_session(generation, event_tx.clone()).map(LiveSession::Device)
+                    open_device_session(generation, event_tx.clone(), input_only)
+                        .map(LiveSession::Device)
                 })
                 .map(|media| {
                     state.active = Some(ActiveSession {
@@ -462,6 +483,7 @@ fn handle_control_command(
                         generation,
                         app: app.clone(),
                         media,
+                        native_aec: !input_only,
                     });
                     if let Some(app) = app {
                         let _ = app.emit(
@@ -469,7 +491,7 @@ fn handle_control_command(
                             VoiceMediaStateEvent {
                                 generation,
                                 state: "active",
-                                native_aec: true,
+                                native_aec: !input_only,
                             },
                         );
                     }
@@ -521,12 +543,7 @@ fn handle_audio_event(event: AudioEvent, state: &mut AudioThreadState) {
                 .active
                 .as_ref()
                 .filter(|active| active.generation == generation)
-                .and_then(|active| {
-                    active.app.clone().map(|app| {
-                        let native_aec = matches!(&active.media, LiveSession::Device(_));
-                        (app, native_aec)
-                    })
-                });
+                .and_then(|active| active.app.clone().map(|app| (app, active.native_aec)));
             if let Some((app, native_aec)) = failure {
                 let _ = app.emit(
                     VOICE_MEDIA_EVENT,
@@ -549,28 +566,24 @@ fn advance_playback_epoch(epoch: &AtomicU64) {
 fn open_device_session(
     generation: u64,
     event_tx: mpsc::SyncSender<AudioEvent>,
+    input_only: bool,
 ) -> Result<Session, String> {
     let host = cpal::default_host();
     let input_device = host
         .default_input_device()
         .ok_or("No microphone is available")?;
-    let output_device = host
-        .default_output_device()
-        .ok_or("No audio output is available")?;
     let (input_config, input_rate) = device_f32_config(&input_device, true)?;
-    let (output_config, output_rate) = device_f32_config(&output_device, false)?;
-    if input_rate != 48_000 || output_rate != 48_000 {
+    if input_rate != 48_000 {
         tracing::info!(
             input_rate,
-            output_rate,
-            "voice devices run off 48 kHz; resampling engaged"
+            "voice input runs off 48 kHz; resampling engaged"
         );
     }
     let processor = Arc::new(
         Processor::new(48_000).map_err(|error| format!("AEC initialization failed: {error}"))?,
     );
     processor.set_config(Config {
-        echo_canceller: Some(EchoCanceller::Full {
+        echo_canceller: (!input_only).then_some(EchoCanceller::Full {
             stream_delay_ms: None,
         }),
         high_pass_filter: Some(Default::default()),
@@ -579,84 +592,16 @@ fn open_device_session(
         ..Default::default()
     });
 
-    // Bedrock streams a response's audio several times faster than real-time,
-    // so this queue must absorb the burst between IPC pushes and the output
-    // callback's drain — at 8 slots (160ms) it overflowed on every response
-    // and dropped packets mid-word. 1024 packets ≈ 20s of 20ms Opus frames
-    // (~60KB), beyond any single response burst, while still bounded so a
-    // wedged callback fails visibly instead of accumulating forever.
-    let (output_tx, output_rx) = mpsc::sync_channel::<Vec<u8>>(1024);
-    let output_rx = Arc::new(Mutex::new(output_rx));
-    let playback_epoch = Arc::new(AtomicU64::new(0));
-    let callback_epoch = playback_epoch.clone();
-    let mut seen_epoch = 0;
-    let output_processor = processor.clone();
-    let output_error_tx = event_tx.clone();
-    let mut decoder = opus::Decoder::new(48_000, opus::Channels::Mono)
-        .map_err(|error| format!("Opus decoder failed: {error}"))?;
-    let mut playback = VecDeque::<f32>::new();
-    let mut render_frame = Vec::with_capacity(480);
-    let mut output_resampler = Resampler::new(48_000, output_rate);
-    let mut device_ready = VecDeque::<f32>::new();
-    let mut jitter_gate = JitterGate::new(JITTER_TARGET_SAMPLES);
-    let output_channels = usize::from(output_config.channels);
-    let output = output_device
-        .build_output_stream(
-            &output_config,
-            move |data: &mut [f32], _| {
-                let epoch = callback_epoch.load(Ordering::Acquire);
-                if epoch != seen_epoch {
-                    seen_epoch = epoch;
-                    playback.clear();
-                    while output_rx
-                        .lock()
-                        .expect("voice output lock")
-                        .try_recv()
-                        .is_ok()
-                    {}
-                    render_frame.clear();
-                    output_resampler.reset();
-                    device_ready.clear();
-                    jitter_gate.reset();
-                }
-                while let Ok(packet) = output_rx.lock().expect("voice output lock").try_recv() {
-                    let mut pcm = vec![0i16; 960];
-                    if let Ok(samples) = decoder.decode(&packet, &mut pcm, false) {
-                        playback.extend(
-                            pcm[..samples]
-                                .iter()
-                                .map(|sample| f32::from(*sample) / 32768.0),
-                        );
-                    }
-                }
-                // The playback clock and AEC render reference stay in the
-                // 48 kHz domain even when the device runs at another rate;
-                // an underrun renders silence, exactly as it did at 48 kHz.
-                let frames_needed = data.len() / output_channels.max(1);
-                while device_ready.len() < frames_needed {
-                    let sample = jitter_gate.next(&mut playback);
-                    render_frame.push(sample);
-                    if render_frame.len() == 480 {
-                        let mut channels = vec![std::mem::take(&mut render_frame)];
-                        let _ = output_processor.process_render_frame(&mut channels);
-                        render_frame = Vec::with_capacity(480);
-                    }
-                    output_resampler.push(sample, &mut device_ready);
-                }
-                for frame in data.chunks_mut(output_channels) {
-                    let sample = device_ready.pop_front().unwrap_or(0.0);
-                    for channel in frame {
-                        *channel = sample;
-                    }
-                }
-            },
-            move |error| {
-                tracing::warn!(code = "voice_output_device", %error, "native voice output failed");
-                let _ = output_error_tx.try_send(AudioEvent::Failed { generation });
-            },
-            None,
-        )
-        .map_err(|error| format!("Could not open audio output: {error}"))?;
+    let output_session = if input_only {
+        None
+    } else {
+        Some(open_output_session(
+            &host,
+            generation,
+            event_tx.clone(),
+            processor.clone(),
+        )?)
+    };
 
     let input_processor = processor;
     let input_packet_tx = event_tx.clone();
@@ -717,18 +662,110 @@ fn open_device_session(
             None,
         )
         .map_err(|error| format!("Could not open microphone: {error}"))?;
-    output
-        .play()
-        .map_err(|error| format!("Could not start output: {error}"))?;
+    if let Some((output, _, _)) = &output_session {
+        output
+            .play()
+            .map_err(|error| format!("Could not start output: {error}"))?;
+    }
     input
         .play()
         .map_err(|error| format!("Could not start microphone: {error}"))?;
+    let (output, output_tx, playback_epoch) = output_session
+        .map(|(output, tx, epoch)| (Some(output), Some(tx), Some(epoch)))
+        .unwrap_or((None, None, None));
     Ok(Session {
         input,
         output,
         output_tx,
         playback_epoch,
     })
+}
+
+fn open_output_session(
+    host: &cpal::Host,
+    generation: u64,
+    event_tx: mpsc::SyncSender<AudioEvent>,
+    processor: Arc<Processor>,
+) -> Result<OutputSession, String> {
+    let output_device = host
+        .default_output_device()
+        .ok_or("No audio output is available")?;
+    let (output_config, output_rate) = device_f32_config(&output_device, false)?;
+    if output_rate != 48_000 {
+        tracing::info!(
+            output_rate,
+            "voice output runs off 48 kHz; resampling engaged"
+        );
+    }
+    let (output_tx, output_rx) = mpsc::sync_channel::<Vec<u8>>(1024);
+    let output_rx = Arc::new(Mutex::new(output_rx));
+    let playback_epoch = Arc::new(AtomicU64::new(0));
+    let callback_epoch = playback_epoch.clone();
+    let mut seen_epoch = 0;
+    let output_error_tx = event_tx;
+    let mut decoder = opus::Decoder::new(48_000, opus::Channels::Mono)
+        .map_err(|error| format!("Opus decoder failed: {error}"))?;
+    let mut playback = VecDeque::<f32>::new();
+    let mut render_frame = Vec::with_capacity(480);
+    let mut output_resampler = Resampler::new(48_000, output_rate);
+    let mut device_ready = VecDeque::<f32>::new();
+    let mut jitter_gate = JitterGate::new(JITTER_TARGET_SAMPLES);
+    let output_channels = usize::from(output_config.channels);
+    let output = output_device
+        .build_output_stream(
+            &output_config,
+            move |data: &mut [f32], _| {
+                let epoch = callback_epoch.load(Ordering::Acquire);
+                if epoch != seen_epoch {
+                    seen_epoch = epoch;
+                    playback.clear();
+                    while output_rx
+                        .lock()
+                        .expect("voice output lock")
+                        .try_recv()
+                        .is_ok()
+                    {}
+                    render_frame.clear();
+                    output_resampler.reset();
+                    device_ready.clear();
+                    jitter_gate.reset();
+                }
+                while let Ok(packet) = output_rx.lock().expect("voice output lock").try_recv() {
+                    let mut pcm = vec![0i16; 960];
+                    if let Ok(samples) = decoder.decode(&packet, &mut pcm, false) {
+                        playback.extend(
+                            pcm[..samples]
+                                .iter()
+                                .map(|sample| f32::from(*sample) / 32768.0),
+                        );
+                    }
+                }
+                let frames_needed = data.len() / output_channels.max(1);
+                while device_ready.len() < frames_needed {
+                    let sample = jitter_gate.next(&mut playback);
+                    render_frame.push(sample);
+                    if render_frame.len() == 480 {
+                        let mut channels = vec![std::mem::take(&mut render_frame)];
+                        let _ = processor.process_render_frame(&mut channels);
+                        render_frame = Vec::with_capacity(480);
+                    }
+                    output_resampler.push(sample, &mut device_ready);
+                }
+                for frame in data.chunks_mut(output_channels) {
+                    let sample = device_ready.pop_front().unwrap_or(0.0);
+                    for channel in frame {
+                        *channel = sample;
+                    }
+                }
+            },
+            move |error| {
+                tracing::warn!(code = "voice_output_device", %error, "native voice output failed");
+                let _ = output_error_tx.try_send(AudioEvent::Failed { generation });
+            },
+            None,
+        )
+        .map_err(|error| format!("Could not open audio output: {error}"))?;
+    Ok((output, output_tx, playback_epoch))
 }
 
 /// AEC and Opus run at a fixed 48 kHz, but the default devices may not:

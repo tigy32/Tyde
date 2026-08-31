@@ -13,7 +13,7 @@ use serde_json::Value;
 /// `protocol::TydeReleaseVersion`.
 pub use host_config::{LOCAL_HOST_ID, TydeReleaseVersion};
 
-pub const PROTOCOL_VERSION: u32 = 52;
+pub const PROTOCOL_VERSION: u32 = 53;
 pub const TYDE_VERSION: Version = Version {
     major: 0,
     minor: 8,
@@ -6647,7 +6647,7 @@ pub struct TerminalErrorPayload {
     pub fatal: bool,
 }
 
-pub const VOICE_PROTOCOL_VERSION: u16 = 1;
+pub const VOICE_PROTOCOL_VERSION: u16 = 2;
 pub const MAX_VOICE_PACKETS_PER_FRAME: usize = 3;
 pub const MAX_VOICE_AUDIO_BYTES: usize = 8 * 1024;
 pub const VOICE_SESSION_MAX_SECONDS: u64 = 450;
@@ -6722,13 +6722,74 @@ pub struct VoiceFormatPair {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum VoiceRequest {
+    Conversation {
+        target: VoiceTarget,
+        formats: Vec<VoiceFormatPair>,
+    },
+    Dictation {
+        formats: Vec<VoiceAudioFormat>,
+    },
+}
+
+impl VoiceRequest {
+    pub fn mode(&self) -> VoiceMode {
+        match self {
+            Self::Conversation { .. } => VoiceMode::Conversation,
+            Self::Dictation { .. } => VoiceMode::Dictation,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VoiceMode {
+    Conversation,
+    Dictation,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum VoiceAcceptedRequest {
+    Conversation {
+        target: VoiceTarget,
+        uplink: VoiceAudioFormat,
+        downlink: VoiceAudioFormat,
+    },
+    Dictation {
+        uplink: VoiceAudioFormat,
+    },
+}
+
+impl VoiceAcceptedRequest {
+    pub fn mode(&self) -> VoiceMode {
+        match self {
+            Self::Conversation { .. } => VoiceMode::Conversation,
+            Self::Dictation { .. } => VoiceMode::Dictation,
+        }
+    }
+
+    pub fn valid(&self) -> bool {
+        match self {
+            Self::Conversation {
+                uplink, downlink, ..
+            } => uplink.valid() && downlink.valid(),
+            Self::Dictation { uplink } => uplink.valid(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct VoiceCapabilitiesPayload {
     pub protocol: u16,
-    pub formats: Vec<VoiceFormatPair>,
+    pub conversation_formats: Vec<VoiceFormatPair>,
+    pub dictation_formats: Vec<VoiceAudioFormat>,
     pub max_batch_packets: u8,
     pub max_sessions_per_connection: u8,
     pub nova_available: bool,
+    pub dictation_available: bool,
     pub native_capture: bool,
     pub native_aec: bool,
     pub browser_capture: bool,
@@ -6737,16 +6798,18 @@ pub struct VoiceCapabilitiesPayload {
 }
 
 impl VoiceCapabilitiesPayload {
-    pub fn for_connection(available: bool, desktop: bool) -> Self {
+    pub fn for_connection(nova_available: bool, dictation_available: bool, desktop: bool) -> Self {
         Self {
             protocol: VOICE_PROTOCOL_VERSION,
-            formats: vec![VoiceFormatPair {
+            conversation_formats: vec![VoiceFormatPair {
                 uplink: VoiceAudioFormat::opus(48_000),
                 downlink: VoiceAudioFormat::opus(24_000),
             }],
+            dictation_formats: vec![VoiceAudioFormat::opus(48_000)],
             max_batch_packets: 1,
             max_sessions_per_connection: 1,
-            nova_available: available,
+            nova_available,
+            dictation_available,
             native_capture: desktop,
             native_aec: desktop,
             browser_capture: !desktop,
@@ -6761,11 +6824,13 @@ impl VoiceCapabilitiesPayload {
 
     pub fn valid(&self) -> bool {
         self.protocol == VOICE_PROTOCOL_VERSION
-            && !self.formats.is_empty()
+            && !self.conversation_formats.is_empty()
             && self
-                .formats
+                .conversation_formats
                 .iter()
                 .all(|pair| pair.uplink.valid() && pair.downlink.valid())
+            && !self.dictation_formats.is_empty()
+            && self.dictation_formats.iter().all(VoiceAudioFormat::valid)
             && (1..=MAX_VOICE_PACKETS_PER_FRAME as u8).contains(&self.max_batch_packets)
             && self.max_sessions_per_connection == 1
     }
@@ -6775,8 +6840,7 @@ impl VoiceCapabilitiesPayload {
 #[serde(deny_unknown_fields)]
 pub struct VoiceStartPayload {
     pub generation: u64,
-    pub target: VoiceTarget,
-    pub formats: Vec<VoiceFormatPair>,
+    pub request: VoiceRequest,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -6784,9 +6848,7 @@ pub struct VoiceStartPayload {
 pub struct VoiceAcceptedPayload {
     pub session_id: VoiceSessionId,
     pub generation: u64,
-    pub target: VoiceTarget,
-    pub uplink: VoiceAudioFormat,
-    pub downlink: VoiceAudioFormat,
+    pub request: VoiceAcceptedRequest,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -6950,6 +7012,10 @@ pub enum VoiceErrorCode {
     InvalidAudio,
     ProviderUnavailable,
     CredentialsExpired,
+    MissingCredentials,
+    PermissionDenied,
+    QuotaExceeded,
+    InvalidConfiguration,
     ToolBusy,
     ToolDeliveryFailed,
     Inactivity,

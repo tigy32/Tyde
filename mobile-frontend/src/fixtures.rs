@@ -121,7 +121,7 @@ pub fn seed_state(state: &AppState) {
         state.voice_capabilities_by_host.update(|capabilities| {
             capabilities.insert(
                 host.clone(),
-                protocol::VoiceCapabilitiesPayload::for_connection(true, false),
+                protocol::VoiceCapabilitiesPayload::for_connection(true, false, false),
             );
         });
     }

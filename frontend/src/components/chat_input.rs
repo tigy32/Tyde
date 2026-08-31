@@ -1374,7 +1374,7 @@ pub fn ChatInput(
                 </div>
             </Show>
 
-            <crate::voice::VoiceComposerBar agent_ref=agent_ref />
+            <crate::voice::VoiceComposerBar agent_ref=agent_ref composer=composer.clone() />
 
             <div class="chat-input-row">
                 <textarea
@@ -1397,7 +1397,7 @@ pub fn ChatInput(
                     autocapitalize="none"
                     autocomplete="off"
                 />
-                <crate::voice::VoiceComposerButton agent_ref=agent_ref />
+                <crate::voice::VoiceComposerButton agent_ref=agent_ref composer=composer.clone() />
                 <div
                     class="chat-send-split"
                     role="group"
@@ -2850,7 +2850,7 @@ mod wasm_tests {
         state.voice_capabilities_by_host.update(|capabilities| {
             capabilities.insert(
                 HOST.to_owned(),
-                protocol::VoiceCapabilitiesPayload::for_connection(true, true),
+                protocol::VoiceCapabilitiesPayload::for_connection(true, false, true),
             );
         });
     }

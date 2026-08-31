@@ -4731,4 +4731,5 @@ html[data-keyboard-open] .mobile-app {
 /* Idle voice UI: a compact floating pill instead of the full-width bar, so a
    voice-capable host does not cover chat content until the user enters voice
    mode. */
-.mobile-voice-toggle{position:fixed;z-index:90;right:12px;bottom:calc(76px + env(safe-area-inset-bottom));border-radius:999px;padding:10px 16px;background:var(--surface-raised,#20232b);box-shadow:0 10px 30px rgba(0,0,0,.3)}
+.mobile-voice-toggle{position:fixed;z-index:90;right:12px;bottom:calc(76px + env(safe-area-inset-bottom));display:flex;align-items:center;gap:8px;border-radius:999px;padding:8px 10px;background:var(--surface-raised,#20232b);box-shadow:0 10px 30px rgba(0,0,0,.3)}
+.mobile-voice-toggle select{max-width:160px;color:inherit;background:transparent;border:0}.mobile-voice-toggle button{border-radius:999px;padding:8px 12px}

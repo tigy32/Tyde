@@ -871,6 +871,7 @@ pub struct AppState {
         RwSignal<HashMap<LocalHostId, protocol::VoiceCapabilitiesPayload>>,
     pub voice_ui: RwSignal<crate::voice::MobileVoiceState>,
     pub voice_generation: RwSignal<u64>,
+    pub voice_mode_choice: RwSignal<protocol::VoiceMode>,
     pub backend_setup_by_host: RwSignal<HashMap<LocalHostId, Vec<BackendSetupInfo>>>,
     /// Server-owned subscription-capacity snapshots, keyed by host then backend.
     /// The same `BackendCapacity` event desktop consumes: replayed on subscribe,
@@ -1052,6 +1053,7 @@ impl AppState {
             voice_capabilities_by_host: RwSignal::new(HashMap::new()),
             voice_ui: RwSignal::new(crate::voice::MobileVoiceState::Idle),
             voice_generation: RwSignal::new(0),
+            voice_mode_choice: RwSignal::new(crate::voice::initial_voice_mode()),
             backend_setup_by_host: RwSignal::new(HashMap::new()),
             backend_capacity_by_host: RwSignal::new(HashMap::new()),
             session_schemas_by_host: RwSignal::new(HashMap::new()),

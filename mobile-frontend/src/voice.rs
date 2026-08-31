@@ -13,15 +13,17 @@ pub enum MobileVoiceState {
     Starting {
         generation: u64,
         host: LocalHostId,
-        target: protocol::VoiceTarget,
+        request: protocol::VoiceRequest,
     },
     Active {
         generation: u64,
         host: LocalHostId,
-        target: protocol::VoiceTarget,
+        request: protocol::VoiceAcceptedRequest,
         session: protocol::VoiceSessionId,
         phase: protocol::VoiceSessionState,
-        transcript: String,
+        partial: String,
+        finalized: String,
+        finishing: bool,
         dropped_output_packets: u64,
         next_output_media_seq: u64,
     },
@@ -179,9 +181,97 @@ fn active_target(state: &AppState) -> Option<(LocalHostId, protocol::VoiceTarget
     ))
 }
 
+pub fn initial_voice_mode() -> protocol::VoiceMode {
+    if let Some(storage) =
+        web_sys::window().and_then(|window| window.local_storage().ok().flatten())
+        && storage
+            .get_item("tyde.voice.mode")
+            .ok()
+            .flatten()
+            .as_deref()
+            == Some("dictation")
+    {
+        protocol::VoiceMode::Dictation
+    } else {
+        protocol::VoiceMode::Conversation
+    }
+}
+
+fn remember_voice_mode(mode: protocol::VoiceMode) {
+    if let Some(storage) =
+        web_sys::window().and_then(|window| window.local_storage().ok().flatten())
+    {
+        let value = match mode {
+            protocol::VoiceMode::Conversation => "conversation",
+            protocol::VoiceMode::Dictation => "dictation",
+        };
+        let _ = storage.set_item("tyde.voice.mode", value);
+    }
+}
+
+fn mode_availability(state: &AppState) -> (Option<LocalHostId>, bool, bool) {
+    let host = state.active_local_host_id.get_untracked();
+    let Some(host) = host else {
+        return (None, false, false);
+    };
+    let settings = state
+        .host_settings_by_host
+        .with_untracked(|values| values.get(&host).cloned());
+    let capabilities = state
+        .voice_capabilities_by_host
+        .with_untracked(|values| values.get(&host).cloned());
+    let conversation = active_target(state).is_some()
+        && settings.as_ref().is_some_and(|value| value.voice.enabled)
+        && capabilities
+            .as_ref()
+            .is_some_and(|value| value.nova_available);
+    let dictation = settings
+        .as_ref()
+        .is_some_and(|value| value.voice.dictation_enabled)
+        && capabilities
+            .as_ref()
+            .is_some_and(|value| value.dictation_available);
+    (Some(host), conversation, dictation)
+}
+
 fn start(state: AppState) {
-    let Some((host, target)) = active_target(&state) else {
+    let (host, conversation, dictation) = mode_availability(&state);
+    let Some(host) = host else {
         return;
+    };
+    let requested_mode = state.voice_mode_choice.get_untracked();
+    let request = match requested_mode {
+        protocol::VoiceMode::Dictation if dictation => protocol::VoiceRequest::Dictation {
+            formats: vec![protocol::VoiceAudioFormat::opus(48_000)],
+        },
+        protocol::VoiceMode::Conversation if conversation => {
+            let Some((_, target)) = active_target(&state) else {
+                return;
+            };
+            protocol::VoiceRequest::Conversation {
+                target,
+                formats: vec![protocol::VoiceFormatPair {
+                    uplink: protocol::VoiceAudioFormat::opus(48_000),
+                    downlink: protocol::VoiceAudioFormat::opus(24_000),
+                }],
+            }
+        }
+        _ if dictation => protocol::VoiceRequest::Dictation {
+            formats: vec![protocol::VoiceAudioFormat::opus(48_000)],
+        },
+        _ if conversation => {
+            let Some((_, target)) = active_target(&state) else {
+                return;
+            };
+            protocol::VoiceRequest::Conversation {
+                target,
+                formats: vec![protocol::VoiceFormatPair {
+                    uplink: protocol::VoiceAudioFormat::opus(48_000),
+                    downlink: protocol::VoiceAudioFormat::opus(24_000),
+                }],
+            }
+        }
+        _ => return,
     };
     let generation = state
         .voice_generation
@@ -193,7 +283,7 @@ fn start(state: AppState) {
     state.voice_ui.set(MobileVoiceState::Starting {
         generation,
         host: host.clone(),
-        target: target.clone(),
+        request: request.clone(),
     });
     spawn_local(async move {
         if let Err(error) = ensure_media_installed().await {
@@ -207,11 +297,7 @@ fn start(state: AppState) {
         }
         let payload = protocol::VoiceStartPayload {
             generation,
-            target,
-            formats: vec![protocol::VoiceFormatPair {
-                uplink: protocol::VoiceAudioFormat::opus(48_000),
-                downlink: protocol::VoiceAudioFormat::opus(24_000),
-            }],
+            request,
         };
         if let Err(error) = send(
             &host,
@@ -263,11 +349,69 @@ fn stop(state: AppState, reason: protocol::VoiceStopReason) {
     })
 }
 
+fn finish_dictation(state: AppState) {
+    let MobileVoiceState::Active {
+        generation,
+        host,
+        session,
+        request: protocol::VoiceAcceptedRequest::Dictation { .. },
+        ..
+    } = state.voice_ui.get_untracked()
+    else {
+        return;
+    };
+    state.voice_ui.update(|current| {
+        if let MobileVoiceState::Active {
+            phase,
+            partial,
+            finishing,
+            ..
+        } = current
+        {
+            *phase = protocol::VoiceSessionState::Ending;
+            partial.clear();
+            *finishing = true;
+        }
+    });
+    spawn_local(async move {
+        let _ = media_call("stop", JsValue::NULL).await;
+        let payload = protocol::VoiceSessionPayload {
+            session_id: session.clone(),
+            generation,
+        };
+        if let Err(error) = send(
+            &host,
+            StreamPath(format!("/voice/{}", session.0)),
+            FrameKind::VoiceInputEnd,
+            &payload,
+            Vec::new(),
+        )
+        .await
+        {
+            state.voice_ui.set(MobileVoiceState::Failed(error));
+        }
+    });
+}
+
+fn append_provider_text(destination: &mut String, text: &str) {
+    if text.is_empty() {
+        return;
+    }
+    if !destination.is_empty()
+        && !destination.chars().last().is_some_and(char::is_whitespace)
+        && !text.chars().next().is_some_and(char::is_whitespace)
+    {
+        destination.push(' ');
+    }
+    destination.push_str(text);
+}
+
 fn interrupt(state: AppState) {
     let MobileVoiceState::Active {
         generation,
         host,
         session,
+        request: protocol::VoiceAcceptedRequest::Conversation { .. },
         ..
     } = state.voice_ui.get_untracked()
     else {
@@ -304,15 +448,37 @@ pub fn handle_control(state: &AppState, host: &LocalHostId, envelope: &Envelope)
     match envelope.kind {
         FrameKind::VoiceAccepted => {
             if let Ok(payload) = envelope.parse_payload::<protocol::VoiceAcceptedPayload>() {
-                let pending = matches!(
-                    state.voice_ui.get_untracked(),
-                    MobileVoiceState::Starting { generation, host: ref pending_host, ref target }
-                        if generation == payload.generation && pending_host == host && target == &payload.target
-                );
-                let owns_target = active_target(state).is_some_and(|(active_host, target)| {
-                    active_host == *host && target == payload.target
-                });
-                if !pending || !owns_target {
+                let pending = match state.voice_ui.get_untracked() {
+                    MobileVoiceState::Starting {
+                        generation,
+                        host: pending_host,
+                        request,
+                    } if generation == payload.generation && pending_host == *host => {
+                        match (&request, &payload.request) {
+                            (
+                                protocol::VoiceRequest::Conversation { target, .. },
+                                protocol::VoiceAcceptedRequest::Conversation {
+                                    target: accepted,
+                                    ..
+                                },
+                            ) => {
+                                target == accepted
+                                    && active_target(state).is_some_and(
+                                        |(active_host, active_target)| {
+                                            active_host == *host && active_target == *target
+                                        },
+                                    )
+                            }
+                            (
+                                protocol::VoiceRequest::Dictation { .. },
+                                protocol::VoiceAcceptedRequest::Dictation { .. },
+                            ) => true,
+                            _ => false,
+                        }
+                    }
+                    _ => false,
+                };
+                if !pending {
                     let host = host.clone();
                     spawn_local(async move {
                         let stop = protocol::VoiceStopPayload {
@@ -335,18 +501,32 @@ pub fn handle_control(state: &AppState, host: &LocalHostId, envelope: &Envelope)
                 state.voice_ui.set(MobileVoiceState::Active {
                     generation: payload.generation,
                     host: host.clone(),
-                    target: payload.target,
+                    request: payload.request.clone(),
                     session: payload.session_id,
                     phase: protocol::VoiceSessionState::Listening,
-                    transcript: String::new(),
+                    partial: String::new(),
+                    finalized: String::new(),
+                    finishing: false,
                     dropped_output_packets: 0,
                     next_output_media_seq: 0,
                 });
                 let media_state = state.clone();
                 spawn_local(async move {
-                    if let Err(error) =
-                        media_call("start", JsValue::from_f64(payload.generation as f64)).await
-                    {
+                    let options = js_sys::Object::new();
+                    let _ = js_sys::Reflect::set(
+                        &options,
+                        &"generation".into(),
+                        &JsValue::from_f64(payload.generation as f64),
+                    );
+                    let _ = js_sys::Reflect::set(
+                        &options,
+                        &"inputOnly".into(),
+                        &JsValue::from_bool(matches!(
+                            payload.request,
+                            protocol::VoiceAcceptedRequest::Dictation { .. }
+                        )),
+                    );
+                    if let Err(error) = media_call("start", options.into()).await {
                         stop(media_state.clone(), protocol::VoiceStopReason::MediaFailed);
                         media_state.voice_ui.set(MobileVoiceState::Failed(error));
                     }
@@ -360,28 +540,53 @@ pub fn handle_control(state: &AppState, host: &LocalHostId, envelope: &Envelope)
                         generation,
                         host: active_host,
                         session,
-                        target,
+                        request,
                         ..
                     } if generation == payload.generation
                         && active_host == *host
                         && session == payload.session_id =>
                     {
-                        Some((target.agent_id, payload.clone()))
+                        Some((request, payload.clone()))
                     }
                     _ => None,
                 };
-                let Some((agent_id, payload)) = identity else {
+                let Some((request, payload)) = identity else {
                     return;
                 };
+                if matches!(&request, protocol::VoiceAcceptedRequest::Dictation { .. }) {
+                    if payload.speaker != protocol::VoiceTranscriptSpeaker::User
+                        || payload.message_id.is_some()
+                    {
+                        return;
+                    }
+                    state.voice_ui.update(|value| {
+                        if let MobileVoiceState::Active {
+                            partial, finalized, ..
+                        } = value
+                        {
+                            if payload.is_final {
+                                append_provider_text(finalized, &payload.text);
+                                partial.clear();
+                            } else {
+                                *partial = payload.text.clone();
+                            }
+                        }
+                    });
+                    return;
+                }
                 state.voice_ui.update(|value| {
-                    if let MobileVoiceState::Active { transcript, .. } = value {
-                        *transcript = payload.text.clone();
+                    if let MobileVoiceState::Active { partial, .. } = value {
+                        *partial = payload.text.clone();
                     }
                 });
                 if payload.is_final {
+                    let protocol::VoiceAcceptedRequest::Conversation { target, .. } = request
+                    else {
+                        return;
+                    };
                     let agent_ref = crate::state::AgentRef {
                         local_host_id: host.clone(),
-                        agent_id,
+                        agent_id: target.agent_id,
                     };
                     state.push_chat_message_entry(
                         &agent_ref,
@@ -446,7 +651,22 @@ pub fn handle_control(state: &AppState, host: &LocalHostId, envelope: &Envelope)
             if let Ok(payload) = envelope.parse_payload::<protocol::VoiceStopPayload>()
                 && matches!(state.voice_ui.get_untracked(), MobileVoiceState::Active { generation, ref session, .. } if generation == payload.generation && session == &payload.session_id)
             {
-                stop(state.clone(), protocol::VoiceStopReason::ProviderFailed);
+                if payload.reason == protocol::VoiceStopReason::ProviderCompleted
+                    && let MobileVoiceState::Active {
+                        request: protocol::VoiceAcceptedRequest::Dictation { .. },
+                        finalized,
+                        finishing: true,
+                        ..
+                    } = state.voice_ui.get_untracked()
+                {
+                    state
+                        .chat_input
+                        .update(|draft| append_provider_text(draft, &finalized));
+                }
+                state.voice_ui.set(MobileVoiceState::Idle);
+                spawn_local(async {
+                    let _ = media_call("stop", JsValue::NULL).await;
+                });
             }
         }
         FrameKind::VoiceError => {
@@ -466,11 +686,32 @@ pub fn handle_control(state: &AppState, host: &LocalHostId, envelope: &Envelope)
                     _ => false,
                 };
                 if applies {
+                    let message = mobile_voice_error_message(
+                        payload.code,
+                        payload.detail.as_deref().unwrap_or_default(),
+                    );
                     stop(state.clone(), protocol::VoiceStopReason::ProviderFailed);
+                    state.voice_ui.set(MobileVoiceState::Failed(message));
                 }
             }
         }
         _ => {}
+    }
+}
+
+fn mobile_voice_error_message(code: protocol::VoiceErrorCode, detail: &str) -> String {
+    let prefix = match code {
+        protocol::VoiceErrorCode::MissingCredentials => "AWS credentials are unavailable",
+        protocol::VoiceErrorCode::PermissionDenied => "AWS permission was denied",
+        protocol::VoiceErrorCode::QuotaExceeded => "AWS Transcribe quota was exceeded",
+        protocol::VoiceErrorCode::InvalidConfiguration => "Voice configuration is invalid",
+        protocol::VoiceErrorCode::ProviderUnavailable => "The voice provider is unavailable",
+        _ => "Voice failed",
+    };
+    if detail.is_empty() {
+        prefix.to_owned()
+    } else {
+        format!("{prefix}: {detail}")
     }
 }
 
@@ -499,6 +740,7 @@ pub fn handle_binary_frame(frame: ProtocolFrame) -> Result<(), String> {
             if let MobileVoiceState::Active {
                 generation,
                 session,
+                request: protocol::VoiceAcceptedRequest::Conversation { .. },
                 next_output_media_seq,
                 dropped_output_packets,
                 ..
@@ -664,21 +906,65 @@ fn MobileVoiceControls(state: AppState) -> impl IntoView {
         let start_state = state.clone();
         let stop_state = state.clone();
         let interrupt_state = state.clone();
+        let finish_state = state.clone();
         let cancel_state = state.clone();
         let dismiss_state = state.clone();
         match state.voice_ui.get() {
-            MobileVoiceState::Idle => view! {
-                <button
-                    class="mobile-voice-toggle"
-                    on:click=move |_| start(start_state.clone())
-                    aria-label="Start voice"
-                >
-                    "Voice"
-                </button>
+            MobileVoiceState::Idle => {
+                let (_, conversation, dictation) = mode_availability(&state);
+                let selected = state.voice_mode_choice.get_untracked();
+                if (selected == protocol::VoiceMode::Conversation && !conversation)
+                    || (selected == protocol::VoiceMode::Dictation && !dictation)
+                {
+                    let fallback = if dictation {
+                        protocol::VoiceMode::Dictation
+                    } else {
+                        protocol::VoiceMode::Conversation
+                    };
+                    state.voice_mode_choice.set(fallback);
+                }
+                let choice_state = state.clone();
+                view! {
+                    <div class="mobile-voice-toggle">
+                        <select
+                            aria-label="Voice mode"
+                            prop:value=move || match state.voice_mode_choice.get() {
+                                protocol::VoiceMode::Conversation => "conversation",
+                                protocol::VoiceMode::Dictation => "dictation",
+                            }
+                            on:change=move |event| {
+                                let mode = if event_target_value(&event) == "dictation" {
+                                    protocol::VoiceMode::Dictation
+                                } else {
+                                    protocol::VoiceMode::Conversation
+                                };
+                                choice_state.voice_mode_choice.set(mode);
+                                remember_voice_mode(mode);
+                            }
+                        >
+                            <option value="conversation" disabled=!conversation>
+                                "Talk with Nova"
+                            </option>
+                            <option value="dictation" disabled=!dictation>
+                                "Dictate to composer"
+                            </option>
+                        </select>
+                        <button
+                            on:click=move |_| start(start_state.clone())
+                            aria-label="Start voice"
+                        >
+                            "Voice"
+                        </button>
+                    </div>
+                }
+                .into_any()
             }
-            .into_any(),
-            MobileVoiceState::Starting { .. } => view! {
-                <span>"Connecting…"</span>
+            MobileVoiceState::Starting { request, .. } => view! {
+                <span>{if request.mode() == protocol::VoiceMode::Dictation {
+                    "Connecting dictation…"
+                } else {
+                    "Connecting to Nova…"
+                }}</span>
                 <button
                     aria-label="Cancel voice"
                     on:click=move |_| {
@@ -690,10 +976,13 @@ fn MobileVoiceControls(state: AppState) -> impl IntoView {
             }
             .into_any(),
             MobileVoiceState::Active {
-                phase, transcript, ..
+                request: protocol::VoiceAcceptedRequest::Conversation { .. },
+                phase,
+                partial,
+                ..
             } => view! {
                 <span>{format!("{phase:?}")}</span>
-                <span>{transcript}</span>
+                <span>{partial}</span>
                 <button on:click=move |_| interrupt(interrupt_state.clone())>
                     "Interrupt"
                 </button>
@@ -704,6 +993,27 @@ fn MobileVoiceControls(state: AppState) -> impl IntoView {
                     )
                 }>
                     "Done"
+                </button>
+            }
+            .into_any(),
+            MobileVoiceState::Active {
+                request: protocol::VoiceAcceptedRequest::Dictation { .. },
+                partial,
+                finishing,
+                ..
+            } => view! {
+                <span>{if finishing { "Finishing…" } else { "Listening…" }}</span>
+                <span aria-live="polite">{partial}</span>
+                <button
+                    disabled=finishing
+                    on:click=move |_| finish_dictation(finish_state.clone())
+                >
+                    "Finish"
+                </button>
+                <button on:click=move |_| {
+                    stop(cancel_state.clone(), protocol::VoiceStopReason::UserExited)
+                }>
+                    "Cancel"
                 </button>
             }
             .into_any(),
@@ -727,11 +1037,15 @@ fn MobileVoiceControls(state: AppState) -> impl IntoView {
 pub fn MobileVoiceBar() -> impl IntoView {
     let state = expect_context::<AppState>();
     install(state.clone());
-    let old = StoredValue::new(None);
+    let old = StoredValue::new((None, None));
     let switch = state.clone();
     Effect::new(move |_| {
-        let current = switch.active_agent.get();
-        if old.get_value().is_some() && old.get_value() != current {
+        let current = (switch.active_local_host_id.get(), switch.active_agent.get());
+        let session_active = matches!(
+            switch.voice_ui.get_untracked(),
+            MobileVoiceState::Starting { .. } | MobileVoiceState::Active { .. }
+        );
+        if session_active && old.get_value() != current {
             stop(switch.clone(), protocol::VoiceStopReason::TargetChanged)
         }
         old.set_value(current);
@@ -742,24 +1056,36 @@ pub fn MobileVoiceBar() -> impl IntoView {
         // event handlers), so a memo built on it computes once — with no
         // active chat at mount time that is `false` with zero subscriptions,
         // and the bar can never appear afterwards.
-        let Some(active) = visible_state.active_agent.get() else {
+        let Some(host) = visible_state.active_local_host_id.get() else {
             return false;
         };
-        let known_agent = visible_state.agents.with(|agents| {
-            agents.iter().any(|agent| {
-                agent.local_host_id == active.local_host_id && agent.agent_id == active.agent_id
-            })
+        let has_conversation_target = visible_state.active_agent.get().is_some_and(|active| {
+            active.local_host_id == host
+                && visible_state.agents.with(|agents| {
+                    agents.iter().any(|agent| {
+                        agent.local_host_id == active.local_host_id
+                            && agent.agent_id == active.agent_id
+                    })
+                })
         });
-        if !known_agent {
-            return false;
-        }
-        let host = active.local_host_id;
-        visible_state
+        let settings = visible_state
             .host_settings_by_host
-            .with(|v| v.get(&host).is_some_and(|s| s.voice.enabled))
-            && visible_state
-                .voice_capabilities_by_host
-                .with(|v| v.get(&host).is_some_and(|c| c.nova_available))
+            .with(|values| values.get(&host).cloned());
+        let capabilities = visible_state
+            .voice_capabilities_by_host
+            .with(|values| values.get(&host).cloned());
+        let conversation = has_conversation_target
+            && settings.as_ref().is_some_and(|value| value.voice.enabled)
+            && capabilities
+                .as_ref()
+                .is_some_and(|value| value.nova_available);
+        let dictation = settings
+            .as_ref()
+            .is_some_and(|value| value.voice.dictation_enabled)
+            && capabilities
+                .as_ref()
+                .is_some_and(|value| value.dictation_available);
+        conversation || dictation
     });
     let mode_state = state.clone();
     // Voice mode = any non-idle session state. Idle renders only the compact
@@ -896,7 +1222,7 @@ mod wasm_tests {
         state.voice_capabilities_by_host.update(|caps| {
             caps.insert(
                 host.clone(),
-                protocol::VoiceCapabilitiesPayload::for_connection(true, false),
+                protocol::VoiceCapabilitiesPayload::for_connection(true, false, false),
             );
         });
         let mut settings = settings_model::HostSettings::default();
@@ -920,6 +1246,7 @@ mod wasm_tests {
             started: true,
             fatal_error: None,
         }]);
+        state.active_local_host_id.set(Some(host.clone()));
         state.active_agent.set(Some(crate::state::ActiveAgentRef {
             local_host_id: host,
             agent_id,
@@ -959,7 +1286,7 @@ mod wasm_tests {
         state.voice_capabilities_by_host.update(|caps| {
             caps.insert(
                 host.clone(),
-                protocol::VoiceCapabilitiesPayload::for_connection(true, false),
+                protocol::VoiceCapabilitiesPayload::for_connection(true, false, false),
             );
         });
         let mut settings = settings_model::HostSettings::default();
@@ -983,6 +1310,7 @@ mod wasm_tests {
             started: true,
             fatal_error: None,
         }]);
+        state.active_local_host_id.set(Some(host.clone()));
         state.active_agent.set(Some(crate::state::ActiveAgentRef {
             local_host_id: host,
             agent_id,
@@ -1056,6 +1384,104 @@ mod wasm_tests {
                 .is_some(),
             "Dismiss must return to the compact toggle"
         );
+
+        drop(mount);
+        container.remove();
+    }
+
+    #[wasm_bindgen_test]
+    async fn dictation_replaces_partials_and_appends_only_after_finish() {
+        let container = container();
+        let state = AppState::new();
+        state.chat_input.set("existing draft".to_owned());
+        state.voice_ui.set(MobileVoiceState::Active {
+            generation: 7,
+            host: LocalHostId("dictation-host".to_owned()),
+            request: protocol::VoiceAcceptedRequest::Dictation {
+                uplink: protocol::VoiceAudioFormat::opus(48_000),
+            },
+            session: protocol::VoiceSessionId("dictation-session".to_owned()),
+            phase: protocol::VoiceSessionState::Listening,
+            partial: String::new(),
+            finalized: String::new(),
+            finishing: true,
+            dropped_output_packets: 0,
+            next_output_media_seq: 0,
+        });
+        let render_state = state.clone();
+        let mount = mount_to(container.clone(), move || {
+            view! { <MobileVoiceControls state=render_state.clone() /> }
+        });
+        let host = LocalHostId("dictation-host".to_owned());
+        let transcript = |text: &str, is_final| {
+            Envelope::from_payload(
+                StreamPath("/voice/dictation-session".to_owned()),
+                FrameKind::VoiceTranscript,
+                0,
+                &protocol::VoiceTranscriptPayload {
+                    session_id: protocol::VoiceSessionId("dictation-session".to_owned()),
+                    generation: 7,
+                    speaker: protocol::VoiceTranscriptSpeaker::User,
+                    text: text.to_owned(),
+                    is_final,
+                    message_id: None,
+                },
+            )
+            .unwrap()
+        };
+
+        handle_control(&state, &host, &transcript("provisional", false));
+        handle_control(&state, &host, &transcript("replacement", false));
+        next_tick().await;
+        let visible = container.text_content().unwrap();
+        assert!(visible.contains("replacement"));
+        assert!(!visible.contains("provisional"));
+        assert_eq!(state.chat_input.get_untracked(), "existing draft");
+
+        handle_control(&state, &host, &transcript("provider final", true));
+        state.chat_input.set("concurrent edit".to_owned());
+        let stop_envelope = Envelope::from_payload(
+            StreamPath("/voice/dictation-session".to_owned()),
+            FrameKind::VoiceStop,
+            1,
+            &protocol::VoiceStopPayload {
+                session_id: protocol::VoiceSessionId("dictation-session".to_owned()),
+                generation: 7,
+                reason: protocol::VoiceStopReason::ProviderCompleted,
+                stats: Default::default(),
+            },
+        )
+        .unwrap();
+        handle_control(&state, &host, &stop_envelope);
+        next_tick().await;
+        assert_eq!(
+            state.chat_input.get_untracked(),
+            "concurrent edit provider final"
+        );
+        assert!(
+            state
+                .chat_messages
+                .with_untracked(|messages| messages.is_empty())
+        );
+
+        state.chat_input.set("cancelled draft".to_owned());
+        state.voice_ui.set(MobileVoiceState::Active {
+            generation: 8,
+            host,
+            request: protocol::VoiceAcceptedRequest::Dictation {
+                uplink: protocol::VoiceAudioFormat::opus(48_000),
+            },
+            session: protocol::VoiceSessionId("cancel-session".to_owned()),
+            phase: protocol::VoiceSessionState::Listening,
+            partial: "discard me".to_owned(),
+            finalized: "also discard".to_owned(),
+            finishing: false,
+            dropped_output_packets: 0,
+            next_output_media_seq: 0,
+        });
+        stop(state.clone(), protocol::VoiceStopReason::UserExited);
+        next_tick().await;
+        assert_eq!(state.chat_input.get_untracked(), "cancelled draft");
 
         drop(mount);
         container.remove();

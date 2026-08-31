@@ -184,12 +184,20 @@ pub struct VoiceSettings {
     pub aws_profile: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub aws_region: Option<String>,
+    #[serde(default)]
+    pub dictation_enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dictation_region: Option<String>,
+    #[serde(default = "default_dictation_language_code")]
+    pub dictation_language_code: String,
     #[serde(default = "default_voice_nova_model")]
     pub nova_model: String,
     #[serde(default)]
     pub endpointing_sensitivity: VoiceEndpointingSensitivity,
     #[serde(default)]
     pub availability: VoiceAvailability,
+    #[serde(default)]
+    pub dictation_availability: VoiceAvailability,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -215,15 +223,23 @@ fn default_voice_nova_model() -> String {
     "amazon.nova-2-sonic-v1:0".into()
 }
 
+fn default_dictation_language_code() -> String {
+    "en-US".into()
+}
+
 impl Default for VoiceSettings {
     fn default() -> Self {
         Self {
             enabled: false,
             aws_profile: None,
             aws_region: None,
+            dictation_enabled: false,
+            dictation_region: None,
+            dictation_language_code: default_dictation_language_code(),
             nova_model: default_voice_nova_model(),
             endpointing_sensitivity: VoiceEndpointingSensitivity::default(),
             availability: VoiceAvailability::default(),
+            dictation_availability: VoiceAvailability::default(),
         }
     }
 }

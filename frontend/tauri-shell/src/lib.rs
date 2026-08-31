@@ -811,8 +811,11 @@ async fn voice_media_start(
     state: tauri::State<'_, ShellState>,
     host_id: String,
     generation: u64,
+    input_only: bool,
 ) -> Result<(), String> {
-    state.voice_media.start(app, host_id, generation)
+    state
+        .voice_media
+        .start(app, host_id, generation, input_only)
 }
 
 #[cfg(not(target_os = "windows"))]
