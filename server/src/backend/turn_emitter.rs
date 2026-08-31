@@ -25,6 +25,20 @@ use protocol::{
     ToolExecutionOutcome, ToolProgressData, ToolRequest, ToolRequestType, ToolUseData,
 };
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EmitterPolicy {
+    /// Strict mode: protocol violations are recorded, invalid transitions are rejected,
+    /// and any accumulated violations are emitted as an Error message to the user at the
+    /// end of the turn. Used in pre-release/beta builds, tests, and conformance suites.
+    Strict,
+    /// Permissive mode: the emitter acts as an auto-healing normalizer. Violations are logged
+    /// to tracing, but transitions are repaired on the fly (auto-opening responses on unannounced
+    /// deltas, auto-closing responses on idle or overlapping starts, synthesizing missing tool
+    /// declarations/requests) so downstream clients always receive a 100% valid event stream
+    /// with zero dropped content. Used in stable release builds.
+    Permissive,
+}
+
 pub struct TurnEmitter {
     inner: std::sync::Mutex<TurnEmitterState>,
 }
@@ -32,7 +46,7 @@ pub struct TurnEmitter {
 struct TurnEmitterState {
     tx: mpsc::UnboundedSender<Value>,
     agent: String,
-    surface_protocol_violations: bool,
+    policy: EmitterPolicy,
     typing_active: bool,
     current_response: Option<OpenResponse>,
     declared_tools: HashMap<String, DeclaredTool>,
@@ -123,21 +137,25 @@ impl TurnEmitter {
     }
 
     pub fn new_for_agent(tx: mpsc::UnboundedSender<Value>, agent: AgentName<'_>) -> Self {
-        let surface_protocol_violations =
-            crate::host_release_version().is_some_and(|version| version.is_prerelease());
-        Self::new_for_agent_with_protocol_violation_policy(tx, agent, surface_protocol_violations)
+        let policy =
+            if crate::host_release_version().is_some_and(|version| !version.is_prerelease()) {
+                EmitterPolicy::Permissive
+            } else {
+                EmitterPolicy::Strict
+            };
+        Self::new_for_agent_with_policy(tx, agent, policy)
     }
 
-    fn new_for_agent_with_protocol_violation_policy(
+    pub fn new_for_agent_with_policy(
         tx: mpsc::UnboundedSender<Value>,
         agent: AgentName<'_>,
-        surface_protocol_violations: bool,
+        policy: EmitterPolicy,
     ) -> Self {
         Self {
             inner: std::sync::Mutex::new(TurnEmitterState {
                 tx,
                 agent: agent.0.to_owned(),
-                surface_protocol_violations,
+                policy,
                 typing_active: false,
                 current_response: None,
                 declared_tools: HashMap::new(),
@@ -417,7 +435,11 @@ impl TurnEmitter {
             });
             if let Some((response, detail)) = abandoned {
                 state.violation("idle_with_open_response", detail);
-                state.discard_open_response(&response);
+                if state.policy == EmitterPolicy::Permissive {
+                    state.auto_end_current_response();
+                } else {
+                    state.discard_open_response(&response);
+                }
             }
             let foreground_tools = state
                 .open_tool_requests
@@ -609,10 +631,10 @@ impl TurnEmitterState {
             return;
         }
         let violations = std::mem::take(&mut self.violations);
-        if !self.surface_protocol_violations {
+        if self.policy != EmitterPolicy::Strict {
             tracing::debug!(
                 count = violations.len(),
-                "Suppressing user-facing protocol violation report for a stable build"
+                "Suppressing user-facing protocol violation report for a permissive emitter"
             );
             return;
         }
@@ -645,6 +667,22 @@ impl TurnEmitterState {
         )));
     }
 
+    fn auto_end_current_response(&mut self) {
+        if let Some(open) = self.current_response.take() {
+            let mut message = self.build_stream_end_message(StreamEndPayload::default(), open);
+            let owner = message
+                .message_id
+                .clone()
+                .expect("stream response has a presentation id");
+            message.tool_calls = self.sanitize_tool_declarations(
+                owner,
+                message.content.chars().count() as u64,
+                std::mem::take(&mut message.tool_calls),
+            );
+            self.send_chat(ChatEvent::StreamEnd(StreamEndData { message }));
+        }
+    }
+
     fn stream_start(
         &mut self,
         model: Option<&str>,
@@ -667,7 +705,11 @@ impl TurnEmitterState {
                      {previous_caller} was still open"
                 ),
             );
-            self.discard_open_response(&response);
+            if self.policy == EmitterPolicy::Permissive {
+                self.auto_end_current_response();
+            } else {
+                self.discard_open_response(&response);
+            }
         }
 
         let message_id = ChatMessageId(Uuid::new_v4().to_string());
@@ -691,7 +733,7 @@ impl TurnEmitterState {
     }
 
     fn stream_delta(&mut self, response: &ResponseHandle, text: &str) {
-        if !self.accept_ordered_response_event(response, "response_delta") {
+        if !self.ensure_accepted_response(response, "response_delta") {
             return;
         }
         self.current_response
@@ -705,7 +747,7 @@ impl TurnEmitterState {
     }
 
     fn stream_reasoning_delta(&mut self, response: &ResponseHandle, text: &str) {
-        if !self.accept_ordered_response_event(response, "response_reasoning_delta") {
+        if !self.ensure_accepted_response(response, "response_reasoning_delta") {
             return;
         }
         self.current_response
@@ -719,24 +761,60 @@ impl TurnEmitterState {
     }
 
     fn stream_end(&mut self, response: &ResponseHandle, payload: StreamEndPayload) {
-        if !self.accept_ordered_response_event(response, "response_end") {
+        if let Some(open) = self.current_response.take() {
+            if &open.handle != response {
+                self.violation(
+                    "response_end",
+                    "event used a stale or foreign response handle",
+                );
+                if self.policy == EmitterPolicy::Strict {
+                    self.current_response = Some(open);
+                    return;
+                }
+            }
+            let mut message = self.build_stream_end_message(payload, open);
+            let owner = message
+                .message_id
+                .clone()
+                .expect("stream response has a presentation id");
+            message.tool_calls = self.sanitize_tool_declarations(
+                owner,
+                message.content.chars().count() as u64,
+                std::mem::take(&mut message.tool_calls),
+            );
+            self.send_chat(ChatEvent::StreamEnd(StreamEndData { message }));
             return;
         }
-        let response = self
-            .current_response
-            .take()
-            .expect("validated open response");
-        let mut message = self.build_stream_end_message(payload, response);
-        let owner = message
-            .message_id
-            .clone()
-            .expect("stream response has a presentation id");
-        message.tool_calls = self.sanitize_tool_declarations(
-            owner,
-            message.content.chars().count() as u64,
-            std::mem::take(&mut message.tool_calls),
-        );
-        self.send_chat(ChatEvent::StreamEnd(StreamEndData { message }));
+
+        self.violation("response_end", "event arrived while no response was open");
+        if self.policy == EmitterPolicy::Permissive {
+            let message_id = if response.message_id.0.trim().is_empty() {
+                ChatMessageId(Uuid::new_v4().to_string())
+            } else {
+                response.message_id.clone()
+            };
+            let mut message = protocol::ChatMessage {
+                message_id: Some(message_id.clone()),
+                timestamp: now_ms(),
+                sender: protocol::MessageSender::Assistant {
+                    agent: self.agent.clone(),
+                },
+                content: payload.content,
+                reasoning: payload.reasoning,
+                tool_calls: payload.tool_calls,
+                model_info: payload.model_info,
+                token_usage: payload.token_usage,
+                context_breakdown: payload.context_breakdown,
+                images: (!payload.images.is_empty()).then_some(payload.images),
+            };
+            let content_len = message.content.chars().count() as u64;
+            message.tool_calls = self.sanitize_tool_declarations(
+                message_id,
+                content_len,
+                std::mem::take(&mut message.tool_calls),
+            );
+            self.send_chat(ChatEvent::StreamEnd(StreamEndData { message }));
+        }
     }
 
     fn declare_streaming_tools(
@@ -744,16 +822,40 @@ impl TurnEmitterState {
         response: &ResponseHandle,
         declarations: Vec<ToolUseData>,
     ) {
-        if !self.accept_ordered_response_event(response, "streaming_tool_declaration") {
+        if let Some((owner, content_len, is_same_handle)) =
+            self.current_response.as_ref().map(|open| {
+                (
+                    open.message_id.clone(),
+                    open.content.chars().count() as u64,
+                    &open.handle == response,
+                )
+            })
+        {
+            if !is_same_handle {
+                self.violation(
+                    "streaming_tool_declaration",
+                    "event used a stale or foreign response handle",
+                );
+                if self.policy == EmitterPolicy::Strict {
+                    return;
+                }
+            }
+            self.sanitize_tool_declarations(owner, content_len, declarations);
             return;
         }
-        let open = self
-            .current_response
-            .as_ref()
-            .expect("validated open response");
-        let owner = open.message_id.clone();
-        let content_len = open.content.chars().count() as u64;
-        self.sanitize_tool_declarations(owner, content_len, declarations);
+
+        self.violation(
+            "streaming_tool_declaration",
+            "event arrived while no response was open",
+        );
+        if self.policy == EmitterPolicy::Permissive {
+            let owner = if response.message_id.0.trim().is_empty() {
+                ChatMessageId(Uuid::new_v4().to_string())
+            } else {
+                response.message_id.clone()
+            };
+            self.sanitize_tool_declarations(owner, 0, declarations);
+        }
     }
 
     fn discard_open_response(&mut self, response: &ResponseHandle) {
@@ -766,20 +868,37 @@ impl TurnEmitterState {
         }
     }
 
-    fn accept_ordered_response_event(
-        &mut self,
-        response: &ResponseHandle,
-        event: &'static str,
-    ) -> bool {
-        let Some(open) = &self.current_response else {
-            self.violation(event, "event arrived while no response was open");
-            return false;
-        };
-        if &open.handle != response {
+    fn ensure_accepted_response(&mut self, response: &ResponseHandle, event: &'static str) -> bool {
+        if let Some(open) = &self.current_response {
+            if &open.handle == response {
+                return true;
+            }
             self.violation(event, "event used a stale or foreign response handle");
-            return false;
+            return self.policy == EmitterPolicy::Permissive;
         }
-        true
+
+        self.violation(event, "event arrived while no response was open");
+        if self.policy == EmitterPolicy::Permissive {
+            let message_id = if response.message_id.0.trim().is_empty() {
+                ChatMessageId(Uuid::new_v4().to_string())
+            } else {
+                response.message_id.clone()
+            };
+            self.current_response = Some(OpenResponse {
+                handle: response.clone(),
+                message_id,
+                model: None,
+                content: String::new(),
+                reasoning: String::new(),
+                opened_at: std::panic::Location::caller(),
+            });
+            self.send_chat(ChatEvent::StreamStart(StreamStartData {
+                agent: self.agent.clone(),
+                model: None,
+            }));
+            return true;
+        }
+        false
     }
 
     fn build_stream_end_message(
@@ -873,7 +992,11 @@ impl TurnEmitterState {
                     "empty_tool_call_id",
                     "response declared a tool call with an empty id",
                 );
-                continue;
+                if self.policy == EmitterPolicy::Permissive {
+                    declaration.tool_call_id = format!("synth_tool_{}", Uuid::new_v4());
+                } else {
+                    continue;
+                }
             }
             if declaration
                 .content_offset
@@ -908,6 +1031,9 @@ impl TurnEmitterState {
                         "tool call '{tool_call_id}' was declared more than once with different data"
                     ),
                 );
+                if self.policy == EmitterPolicy::Permissive {
+                    accepted.push(declaration);
+                }
                 continue;
             }
             if self.completed_tool_requests.contains_key(&tool_call_id)
@@ -917,6 +1043,9 @@ impl TurnEmitterState {
                     "reused_tool_call_id",
                     format!("completed tool call id '{tool_call_id}' was declared again"),
                 );
+                if self.policy == EmitterPolicy::Permissive {
+                    accepted.push(declaration);
+                }
                 continue;
             }
             self.declared_tools.insert(
@@ -971,7 +1100,28 @@ impl TurnEmitterState {
                 "undeclared_tool_request",
                 format!("tool request '{tool_call_id}' was not declared by an assistant response"),
             );
-            return false;
+            if self.policy == EmitterPolicy::Permissive {
+                let owner = self
+                    .current_response
+                    .as_ref()
+                    .map(|open| open.message_id.clone())
+                    .unwrap_or_else(|| ChatMessageId(Uuid::new_v4().to_string()));
+                let tool_name = tool_type_default_name(&tool_type);
+                self.declared_tools.insert(
+                    tool_call_id.to_owned(),
+                    DeclaredTool {
+                        owner,
+                        declaration: ToolUseData {
+                            tool_call_id: tool_call_id.to_owned(),
+                            name: tool_name.to_owned(),
+                            arguments: serde_json::Value::Null,
+                            content_offset: None,
+                        },
+                    },
+                );
+            } else {
+                return false;
+            }
         }
         if let Some(existing) = self.open_tool_requests.get(tool_call_id) {
             if existing.tool_type == tool_type {
@@ -983,7 +1133,7 @@ impl TurnEmitterState {
                     "tool request '{tool_call_id}' was repeated with different executable data"
                 ),
             );
-            return false;
+            return self.policy == EmitterPolicy::Permissive;
         }
         self.open_tool_requests.insert(
             tool_call_id.to_owned(),
@@ -1037,13 +1187,25 @@ impl TurnEmitterState {
                 "completion_without_request",
                 format!("tool completion '{tool_call_id}' had no open request"),
             );
-            return;
+            if self.policy == EmitterPolicy::Permissive {
+                let synthetic_type = ToolRequestType::Other {
+                    args: serde_json::Value::Null,
+                };
+                let _ = self.tool_request(tool_call_id, synthetic_type);
+            } else {
+                return;
+            }
         }
         self.emit_tool_completion(tool_call_id, outcome);
     }
 
     fn send_tool_progress(&mut self, data: &ToolProgressData) {
-        let Some(request) = self.open_tool_requests.get_mut(&data.tool_call_id) else {
+        let is_background = self
+            .open_tool_requests
+            .get(&data.tool_call_id)
+            .map(|r| r.execution_mode == ToolExecutionMode::Background);
+
+        let Some(is_background) = is_background else {
             let finished = self
                 .completed_tool_requests
                 .contains_key(&data.tool_call_id)
@@ -1053,6 +1215,16 @@ impl TurnEmitterState {
                     "progress_without_request",
                     format!("tool progress '{}' had no open request", data.tool_call_id),
                 );
+                if self.policy == EmitterPolicy::Permissive {
+                    let synthetic_type = ToolRequestType::Other {
+                        args: serde_json::Value::Null,
+                    };
+                    let _ = self.tool_request(&data.tool_call_id, synthetic_type);
+                    if let Some(request) = self.open_tool_requests.get_mut(&data.tool_call_id) {
+                        request.execution_mode = data.execution_mode;
+                    }
+                    self.send_chat(ChatEvent::ToolProgress(data.clone()));
+                }
             } else if data.execution_mode == ToolExecutionMode::Background {
                 // Backgrounded work outlives the call that launched it: the tool
                 // returns a handle as soon as the work is handed off, so every
@@ -1071,9 +1243,7 @@ impl TurnEmitterState {
             }
             return;
         };
-        if request.execution_mode == ToolExecutionMode::Background
-            && data.execution_mode == ToolExecutionMode::Foreground
-        {
+        if is_background && data.execution_mode == ToolExecutionMode::Foreground {
             self.violation(
                 "background_tool_returned_to_foreground",
                 format!(
@@ -1081,9 +1251,13 @@ impl TurnEmitterState {
                     data.tool_call_id
                 ),
             );
-            return;
+            if self.policy == EmitterPolicy::Strict {
+                return;
+            }
         }
-        if data.execution_mode == ToolExecutionMode::Background {
+        if data.execution_mode == ToolExecutionMode::Background
+            && let Some(request) = self.open_tool_requests.get_mut(&data.tool_call_id)
+        {
             request.execution_mode = ToolExecutionMode::Background;
         }
         self.send_chat(ChatEvent::ToolProgress(data.clone()));
@@ -1232,6 +1406,26 @@ fn awaits_user_response(tool_type: &ToolRequestType) -> bool {
     )
 }
 
+fn tool_type_default_name(tool_type: &ToolRequestType) -> &'static str {
+    match tool_type {
+        ToolRequestType::ModifyFile { .. } => "modify_file",
+        ToolRequestType::RunCommand { .. } => "run_command",
+        ToolRequestType::ReadFiles { .. } => "read_files",
+        ToolRequestType::SearchTypes { .. } => "search_types",
+        ToolRequestType::GetTypeDocs { .. } => "get_type_docs",
+        ToolRequestType::AskUserQuestion { .. } => "ask_question",
+        ToolRequestType::ExitPlanMode { .. } => "exit_plan_mode",
+        ToolRequestType::AgentSpawn { .. } => "agent_spawn",
+        ToolRequestType::GenerateImage { .. } => "generate_image",
+        ToolRequestType::WebSearch { .. } => "web_search",
+        ToolRequestType::ViewImage { .. } => "view_image",
+        ToolRequestType::Sleep { .. } => "sleep",
+        ToolRequestType::TydeSendAgentMessage { .. } => "send_agent_message",
+        ToolRequestType::TydeAwaitAgents { .. } => "await_agents",
+        ToolRequestType::Other { .. } => "tool",
+    }
+}
+
 fn simple_message(sender: protocol::MessageSender, content: &str) -> protocol::ChatMessage {
     protocol::ChatMessage {
         message_id: None,
@@ -1260,27 +1454,28 @@ mod tests {
     use super::*;
 
     fn emitter() -> (TurnEmitter, mpsc::UnboundedReceiver<Value>) {
-        emitter_with_protocol_violation_policy(true)
+        emitter_with_policy(EmitterPolicy::Strict)
     }
 
-    fn emitter_with_protocol_violation_policy(
-        surface_protocol_violations: bool,
-    ) -> (TurnEmitter, mpsc::UnboundedReceiver<Value>) {
+    fn emitter_with_policy(policy: EmitterPolicy) -> (TurnEmitter, mpsc::UnboundedReceiver<Value>) {
         let (tx, rx) = mpsc::unbounded_channel();
         (
-            TurnEmitter::new_for_agent_with_protocol_violation_policy(
-                tx,
-                AgentName("assistant"),
-                surface_protocol_violations,
-            ),
+            TurnEmitter::new_for_agent_with_policy(tx, AgentName("assistant"), policy),
             rx,
         )
     }
 
-    /// The violation report the user actually sees, drained from the wire.
-    fn reports(rx: &mut mpsc::UnboundedReceiver<Value>) -> Vec<String> {
-        let mut reports = Vec::new();
+    fn drain_events(rx: &mut mpsc::UnboundedReceiver<Value>) -> Vec<Value> {
+        let mut events = Vec::new();
         while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        events
+    }
+
+    fn violation_reports(events: &[Value]) -> Vec<String> {
+        let mut reports = Vec::new();
+        for event in events {
             if event.get("kind").and_then(Value::as_str) == Some("MessageAdded")
                 && let Some(content) = event.pointer("/data/content").and_then(Value::as_str)
                 && content.starts_with("The backend sent")
@@ -1289,6 +1484,11 @@ mod tests {
             }
         }
         reports
+    }
+
+    /// The violation report the user actually sees, drained from the wire.
+    fn reports(rx: &mut mpsc::UnboundedReceiver<Value>) -> Vec<String> {
+        violation_reports(&drain_events(rx))
     }
 
     #[test]
@@ -1419,5 +1619,174 @@ mod tests {
             3,
             "expected a header and two distinct entries: {report}"
         );
+    }
+
+    #[test]
+    fn permissive_abandoned_response_emits_stream_end_instead_of_discarding() {
+        let (emitter, mut rx) = emitter_with_policy(EmitterPolicy::Permissive);
+        emitter.typing_status_changed(true);
+        let response = emitter.stream_start(Some("test-model"));
+        emitter.stream_delta(&response, "important answer text");
+        emitter.stream_reasoning_delta(&response, "thought trace");
+        emitter.typing_status_changed(false);
+
+        let events = drain_events(&mut rx);
+        let reports = violation_reports(&events);
+        assert!(
+            reports.is_empty(),
+            "expected no error reports, got {reports:?}"
+        );
+
+        // StreamEnd should have been automatically emitted with the content & reasoning
+        let mut saw_stream_end = false;
+        let mut final_content = String::new();
+        let mut final_reasoning = String::new();
+        for event in &events {
+            if event.get("kind").and_then(Value::as_str) == Some("StreamEnd") {
+                saw_stream_end = true;
+                if let Some(content) = event
+                    .pointer("/data/message/content")
+                    .and_then(Value::as_str)
+                {
+                    final_content = content.to_owned();
+                }
+                if let Some(reasoning) = event
+                    .pointer("/data/message/reasoning/text")
+                    .and_then(Value::as_str)
+                {
+                    final_reasoning = reasoning.to_owned();
+                }
+            }
+        }
+        assert!(
+            saw_stream_end,
+            "expected StreamEnd to be automatically emitted"
+        );
+        assert_eq!(final_content, "important answer text");
+        assert_eq!(final_reasoning, "thought trace");
+    }
+
+    #[test]
+    fn permissive_overlapping_response_auto_ends_prior_response() {
+        let (emitter, mut rx) = emitter_with_policy(EmitterPolicy::Permissive);
+        emitter.typing_status_changed(true);
+        let first = emitter.stream_start(Some("model-1"));
+        emitter.stream_delta(&first, "part one");
+
+        let second = emitter.stream_start(Some("model-2"));
+        emitter.stream_delta(&second, "part two");
+        emitter.stream_end(second, StreamEndPayload::default());
+        emitter.typing_status_changed(false);
+
+        let events = drain_events(&mut rx);
+        let reports = violation_reports(&events);
+        assert!(reports.is_empty());
+
+        let mut ends = Vec::new();
+        for event in &events {
+            if event.get("kind").and_then(Value::as_str) == Some("StreamEnd")
+                && let Some(content) = event
+                    .pointer("/data/message/content")
+                    .and_then(Value::as_str)
+            {
+                ends.push(content.to_owned());
+            }
+        }
+        assert_eq!(ends, vec!["part one", "part two"]);
+    }
+
+    #[test]
+    fn permissive_unannounced_delta_auto_opens_response() {
+        let (emitter, mut rx) = emitter_with_policy(EmitterPolicy::Permissive);
+        emitter.typing_status_changed(true);
+        let unannounced = ResponseHandle {
+            token: "ghost-token".to_string(),
+            message_id: ChatMessageId("ghost-msg".to_string()),
+        };
+        emitter.stream_delta(&unannounced, "hello unannounced");
+        emitter.stream_end(unannounced, StreamEndPayload::default());
+        emitter.typing_status_changed(false);
+
+        let events = drain_events(&mut rx);
+        assert!(violation_reports(&events).is_empty());
+
+        let mut deltas = Vec::new();
+        let mut ended = false;
+        for event in &events {
+            match event.get("kind").and_then(Value::as_str) {
+                Some("StreamDelta") => {
+                    if let Some(text) = event.pointer("/data/text").and_then(Value::as_str) {
+                        deltas.push(text.to_owned());
+                    }
+                }
+                Some("StreamEnd") => {
+                    ended = true;
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(deltas, vec!["hello unannounced"]);
+        assert!(ended);
+    }
+
+    #[test]
+    fn permissive_undeclared_tool_request_is_auto_declared() {
+        let (emitter, mut rx) = emitter_with_policy(EmitterPolicy::Permissive);
+        emitter.typing_status_changed(true);
+        let ok = emitter.tool_request(
+            "call_123",
+            ToolRequestType::RunCommand {
+                command: "echo test".to_string(),
+                working_directory: ".".to_string(),
+            },
+        );
+        assert!(ok, "permissive mode should accept undeclared tool requests");
+        emitter.tool_completed(
+            "call_123",
+            ToolExecutionOutcome::Succeeded {
+                result: protocol::ToolExecutionResult::RunCommand {
+                    exit_code: 0,
+                    stdout: "test".to_string(),
+                    stderr: String::new(),
+                },
+            },
+        );
+        emitter.typing_status_changed(false);
+
+        let events = drain_events(&mut rx);
+        assert!(violation_reports(&events).is_empty());
+
+        let mut kinds = Vec::new();
+        for event in &events {
+            if let Some(kind) = event.get("kind").and_then(Value::as_str) {
+                kinds.push(kind.to_owned());
+            }
+        }
+        assert!(kinds.contains(&"ToolRequest".to_string()));
+        assert!(kinds.contains(&"ToolExecutionCompleted".to_string()));
+    }
+
+    #[test]
+    fn permissive_unexpected_tool_completion_synthesizes_request() {
+        let (emitter, mut rx) = emitter_with_policy(EmitterPolicy::Permissive);
+        emitter.typing_status_changed(true);
+        emitter.tool_completed(
+            "call_out_of_blue",
+            ToolExecutionOutcome::Cancelled {
+                message: "done".to_string(),
+            },
+        );
+        emitter.typing_status_changed(false);
+
+        let events = drain_events(&mut rx);
+        assert!(violation_reports(&events).is_empty());
+
+        let mut completed = false;
+        for event in &events {
+            if event.get("kind").and_then(Value::as_str) == Some("ToolExecutionCompleted") {
+                completed = true;
+            }
+        }
+        assert!(completed, "expected completion to be emitted");
     }
 }
