@@ -723,6 +723,11 @@ async fn app_loop(resources: AppLoopResources) -> Result<(), FrameError> {
 
                 let request_stream = envelope.stream.clone();
                 let request_kind = envelope.kind;
+                let request_id = envelope
+                    .payload
+                    .get("request_id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(ToOwned::to_owned);
                 if origin.is_mobile() && is_terminal_control_command(request_kind)
                 {
                     let error = AppError::invalid(
@@ -733,6 +738,7 @@ async fn app_loop(resources: AppLoopResources) -> Result<(), FrameError> {
                         &host_output_stream,
                         request_stream,
                         request_kind,
+                        request_id,
                         &error,
                     );
                     first_request.notify_one();
@@ -753,6 +759,7 @@ async fn app_loop(resources: AppLoopResources) -> Result<(), FrameError> {
                         &host_output_stream,
                         request_stream,
                         request_kind,
+                        request_id,
                         &error,
                     );
 
@@ -801,6 +808,7 @@ pub(crate) fn emit_command_error(
     host_output_stream: &Stream,
     request_stream: protocol::StreamPath,
     request_kind: FrameKind,
+    request_id: Option<String>,
     error: &AppError,
 ) {
     if let Some(source) = error.source.as_ref() {
@@ -826,7 +834,8 @@ pub(crate) fn emit_command_error(
         );
     }
 
-    let payload = error.to_payload(request_stream, request_kind);
+    let mut payload = error.to_payload(request_stream, request_kind);
+    payload.request_id = request_id;
     let payload = match serde_json::to_value(&payload) {
         Ok(value) => value,
         Err(err) => {

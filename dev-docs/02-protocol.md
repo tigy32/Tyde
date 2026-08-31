@@ -5,6 +5,15 @@ multiplexing, connection handshake, and version negotiation.
 
 See `01-philosophy.md` for the design decisions that shaped this spec.
 
+Protocol version 54 adds explicit working-tree versus committed-range revision
+identity to project diff requests/responses, first-parent recent-commit metadata
+and repository-native empty-tree identity to per-root git status, and exact
+committed-range review selections, targets, and summary scopes. Full revision
+endpoints participate in client/server cache keys so two historical ranges
+cannot collide. Optional client request IDs are echoed by diff responses and
+command errors so a rejected historical diff or review create can terminate the
+exact pending UI operation.
+
 ---
 
 ## 1. Transport Assumptions
@@ -408,8 +417,10 @@ The protocol is **events in, events out** — not request/response.
 - The server sends events to the client (e.g. "stream delta", "typing status
   changed", "agent registered"). The UI subscribes and renders based on what
   it receives.
-- There are no request IDs and no response correlation. Streams are the
-  correlation mechanism — events on the same stream are related.
+- Streams remain the primary correlation mechanism. A small set of operations
+  whose UI must terminate one exact pending action may carry an optional
+  request ID; historical diff and committed-review creation errors are the
+  current examples.
 - Both sides can send events on a stream at any time. There is no
   request→response pairing.
 

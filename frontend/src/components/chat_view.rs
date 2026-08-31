@@ -1814,6 +1814,7 @@ fn create_review_for_agent(state: &AppState, agent_ref: ActiveAgentRef) {
     let host_id = agent_ref.host_id;
     let stream = StreamPath(format!("/project/{}", project_id.0));
     let payload = ReviewCreatePayload {
+        request_id: None,
         selection: ReviewDiffSelection::Workspace {
             scope: ProjectDiffScope::Unstaged,
         },
@@ -2825,6 +2826,8 @@ mod wasm_tests {
                     vec![ProjectRootGitStatus {
                         root: ProjectRootPath("/repo-a".to_owned()),
                         branch: Some("main".to_owned()),
+                        head_oid: None,
+                        empty_tree_oid: None,
                         ahead: 0,
                         behind: 0,
                         clean: false,
@@ -2834,6 +2837,8 @@ mod wasm_tests {
                             unstaged: Some(ProjectGitChangeKind::Modified),
                             untracked: false,
                         }],
+                        recent_commits: Vec::new(),
+                        history_has_more: false,
                     }],
                 );
             });

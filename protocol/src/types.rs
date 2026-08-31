@@ -13,7 +13,7 @@ use serde_json::Value;
 /// `protocol::TydeReleaseVersion`.
 pub use host_config::{LOCAL_HOST_ID, TydeReleaseVersion};
 
-pub const PROTOCOL_VERSION: u32 = 53;
+pub const PROTOCOL_VERSION: u32 = 54;
 pub const TYDE_VERSION: Version = Version {
     major: 0,
     minor: 8,
@@ -5216,6 +5216,17 @@ pub enum ProjectDiffScope {
     Uncommitted,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ProjectDiffRevision {
+    #[default]
+    WorkingTree,
+    CommittedRange {
+        base_oid: String,
+        tip_oid: String,
+    },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DiffContextMode {
@@ -5225,8 +5236,12 @@ pub enum DiffContextMode {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectReadDiffPayload {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
     pub root: ProjectRootPath,
     pub scope: ProjectDiffScope,
+    #[serde(default)]
+    pub revision: ProjectDiffRevision,
     pub path: Option<String>,
     pub context_mode: DiffContextMode,
 }
@@ -5315,10 +5330,29 @@ pub struct ProjectGitStatusPayload {
 pub struct ProjectRootGitStatus {
     pub root: ProjectRootPath,
     pub branch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head_oid: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub empty_tree_oid: Option<String>,
     pub ahead: u32,
     pub behind: u32,
     pub clean: bool,
     pub files: Vec<ProjectGitFileStatus>,
+    #[serde(default)]
+    pub recent_commits: Vec<ProjectGitCommitSummary>,
+    #[serde(default)]
+    pub history_has_more: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectGitCommitSummary {
+    pub oid: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_parent_oid: Option<String>,
+    pub subject: String,
+    pub author: String,
+    pub authored_at_seconds: i64,
+    pub is_merge: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -5888,8 +5922,12 @@ pub struct CodeIntelErrorPayload {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProjectGitDiffPayload {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
     pub root: ProjectRootPath,
     pub scope: ProjectDiffScope,
+    #[serde(default)]
+    pub revision: ProjectDiffRevision,
     pub path: Option<String>,
     pub context_mode: DiffContextMode,
     pub files: Vec<ProjectGitDiffFile>,
@@ -5898,6 +5936,8 @@ pub struct ProjectGitDiffPayload {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProjectGitDiffFile {
     pub relative_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub change_kind: Option<ProjectGitChangeKind>,
     #[serde(default)]
     pub is_binary: bool,
     #[serde(default)]
@@ -5976,6 +6016,14 @@ pub enum ReviewDiffSelection {
         scope: ProjectDiffScope,
         path: Option<String>,
     },
+    CommittedRange {
+        root: ProjectRootPath,
+        base_oid: String,
+        tip_oid: String,
+        /// Client hint only. The server derives and stores the authoritative
+        /// count by walking `tip_oid`'s first-parent chain to `base_oid`.
+        commit_count: u32,
+    },
 }
 
 impl ReviewDiffSelection {
@@ -5984,6 +6032,7 @@ impl ReviewDiffSelection {
             Self::AllUncommitted => "all_uncommitted",
             Self::Workspace { .. } => "workspace",
             Self::Root { .. } => "root",
+            Self::CommittedRange { .. } => "committed_range",
         }
     }
 }
@@ -6005,6 +6054,10 @@ pub enum ReviewTarget {
     #[default]
     UnstagedDiff,
     StagedDiff,
+    CommittedDiff {
+        base_oid: String,
+        tip_oid: String,
+    },
     /// A project text file. The revision is filled by the server when the
     /// comment is accepted; clients never provide canonical file contents.
     RegularFile {
@@ -6017,6 +6070,7 @@ impl ReviewTarget {
         match self {
             Self::UnstagedDiff => "unstaged",
             Self::StagedDiff => "staged",
+            Self::CommittedDiff { .. } => "committed",
             Self::RegularFile { .. } => "file",
         }
     }
@@ -6025,13 +6079,23 @@ impl ReviewTarget {
     /// Regular-file revisions intentionally share that surface so stale
     /// threads remain visible; use `Eq` when immutable snapshot identity is
     /// required, such as aggregate review rows.
-    pub const fn same_surface(&self, other: &Self) -> bool {
-        matches!(
-            (self, other),
+    pub fn same_surface(&self, other: &Self) -> bool {
+        match (self, other) {
             (Self::UnstagedDiff, Self::UnstagedDiff)
-                | (Self::StagedDiff, Self::StagedDiff)
-                | (Self::RegularFile { .. }, Self::RegularFile { .. })
-        )
+            | (Self::StagedDiff, Self::StagedDiff)
+            | (Self::RegularFile { .. }, Self::RegularFile { .. }) => true,
+            (
+                Self::CommittedDiff {
+                    base_oid: left_base,
+                    tip_oid: left_tip,
+                },
+                Self::CommittedDiff {
+                    base_oid: right_base,
+                    tip_oid: right_tip,
+                },
+            ) => left_base == right_base && left_tip == right_tip,
+            _ => false,
+        }
     }
 }
 
@@ -6210,6 +6274,8 @@ impl ReviewAiReviewerStatus {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReviewCreatePayload {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
     pub selection: ReviewDiffSelection,
 }
 
@@ -6432,6 +6498,12 @@ pub enum ReviewSummaryScope {
     Workspace,
     Root {
         root: ProjectRootPath,
+    },
+    CommittedRange {
+        root: ProjectRootPath,
+        base_oid: String,
+        tip_oid: String,
+        commit_count: u32,
     },
 }
 
@@ -7050,6 +7122,8 @@ pub enum CommandErrorCode {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CommandErrorPayload {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
     pub stream: StreamPath,
     pub request_kind: FrameKind,
     pub operation: String,

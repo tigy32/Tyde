@@ -1468,6 +1468,7 @@ mod wasm_tests {
             pending: false,
             files: vec![ProjectGitDiffFile {
                 relative_path: "src/main.rs".to_owned(),
+                change_kind: None,
                 is_binary: false,
                 unmerged: false,
                 hunks: vec![ProjectGitDiffHunk {
@@ -1913,6 +1914,7 @@ mod wasm_tests {
             pending: false,
             files: vec![ProjectGitDiffFile {
                 relative_path: "assets/logo.png".to_owned(),
+                change_kind: None,
                 is_binary: true,
                 unmerged: false,
                 hunks: vec![],
@@ -1929,6 +1931,7 @@ mod wasm_tests {
             pending: false,
             files: vec![ProjectGitDiffFile {
                 relative_path: "src/conflicted.rs".to_owned(),
+                change_kind: None,
                 is_binary: false,
                 unmerged: true,
                 hunks: vec![],

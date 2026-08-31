@@ -904,12 +904,14 @@ fn TabMount(tab_id: TabId, pane: PaneId) -> impl IntoView {
                     project_id,
                     root,
                     scope,
+                    revision,
                     path,
-                }) => TabRenderKey::Diff(DiffKey::new(
+                }) => TabRenderKey::Diff(DiffKey::with_revision(
                     host_id.clone(),
                     project_id.clone(),
                     root.clone(),
                     *scope,
+                    revision.clone(),
                     path.clone(),
                 )),
                 Some(TabContent::Comments {
@@ -989,6 +991,7 @@ fn TabMount(tab_id: TabId, pane: PaneId) -> impl IntoView {
                                 project_id=key.project_id.clone()
                                 root=key.root.clone()
                                 scope=key.scope
+                                revision=key.revision.clone()
                                 path=key.path.clone()
                             />
                         }.into_any()

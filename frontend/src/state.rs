@@ -1,5 +1,6 @@
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::bridge::{ConfiguredHost, RemoteHostLifecycleStatus};
@@ -1218,6 +1219,7 @@ pub enum TabContent {
         project_id: ProjectId,
         root: ProjectRootPath,
         scope: ProjectDiffScope,
+        revision: protocol::ProjectDiffRevision,
         path: String,
     },
     /// Compact review-comments surface for the project's single workspace
@@ -1284,12 +1286,14 @@ impl Tab {
                 project_id,
                 root,
                 scope,
+                revision,
                 path,
-            } => Some(BackingResource::Diff(DiffKey::new(
+            } => Some(BackingResource::Diff(DiffKey::with_revision(
                 host_id.clone(),
                 project_id.clone(),
                 root.clone(),
                 *scope,
+                revision.clone(),
                 path.clone(),
             ))),
             _ => None,
@@ -2877,6 +2881,7 @@ pub struct DiffKey {
     pub project_id: ProjectId,
     pub root: ProjectRootPath,
     pub scope: ProjectDiffScope,
+    pub revision: protocol::ProjectDiffRevision,
     pub path: String,
 }
 
@@ -2893,6 +2898,25 @@ impl DiffKey {
             project_id,
             root,
             scope,
+            revision: protocol::ProjectDiffRevision::WorkingTree,
+            path: path.into(),
+        }
+    }
+
+    pub fn with_revision(
+        host_id: impl Into<String>,
+        project_id: ProjectId,
+        root: ProjectRootPath,
+        scope: ProjectDiffScope,
+        revision: protocol::ProjectDiffRevision,
+        path: impl Into<String>,
+    ) -> Self {
+        Self {
+            host_id: host_id.into(),
+            project_id,
+            root,
+            scope,
+            revision,
             path: path.into(),
         }
     }
@@ -3359,6 +3383,15 @@ pub fn now_ms() -> u64 {
     }
 }
 
+pub fn next_client_request_id(prefix: &str) -> String {
+    static SEQUENCE: AtomicU64 = AtomicU64::new(1);
+    format!(
+        "{prefix}-{}-{}",
+        now_ms(),
+        SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
 /// A pending request to run a workflow that declares inputs. The Workflows
 /// panel Run button and the command palette both populate this; a global modal
 /// renders one field per declared input and triggers the run on submit. A
@@ -3454,6 +3487,7 @@ pub struct AppState {
     pub connection_statuses: RwSignal<HashMap<String, ConnectionStatus>>,
     pub host_lifecycle_statuses: RwSignal<HashMap<String, RemoteHostLifecycleStatus>>,
     pub command_errors_by_host: RwSignal<HashMap<String, String>>,
+    pub command_errors_by_request: RwSignal<HashMap<String, String>>,
     pub native_voice_supported: RwSignal<bool>,
     pub voice_capabilities_by_host: RwSignal<HashMap<String, protocol::VoiceCapabilitiesPayload>>,
     pub voice_ui: RwSignal<crate::voice::VoiceUiState>,
@@ -3612,6 +3646,8 @@ pub struct AppState {
     /// server. Both directions consult this set before tearing anything down.
     pub diff_code_intel_holds: RwSignal<HashMap<CodeIntelKey, HashSet<TabId>>>,
     pub diff_contents: RwSignal<HashMap<DiffKey, DiffViewState>>,
+    pub diff_request_ids: RwSignal<HashMap<DiffKey, String>>,
+    pub diff_request_errors: RwSignal<HashMap<DiffKey, String>>,
     pub terminals: RwSignal<Vec<TerminalInfo>>,
     pub active_terminal: RwSignal<Option<ActiveTerminalRef>>,
     /// Agents whose interrupt has been sent but not yet acknowledged by a
@@ -4045,6 +4081,7 @@ impl AppState {
             connection_statuses: RwSignal::new(HashMap::new()),
             host_lifecycle_statuses: RwSignal::new(HashMap::new()),
             command_errors_by_host: RwSignal::new(HashMap::new()),
+            command_errors_by_request: RwSignal::new(HashMap::new()),
             native_voice_supported: RwSignal::new(true),
             voice_capabilities_by_host: RwSignal::new(HashMap::new()),
             voice_ui: RwSignal::new(crate::voice::VoiceUiState::Idle),
@@ -4103,6 +4140,8 @@ impl AppState {
             code_intel: RwSignal::new(HashMap::new()),
             diff_code_intel_holds: RwSignal::new(HashMap::new()),
             diff_contents: RwSignal::new(HashMap::new()),
+            diff_request_ids: RwSignal::new(HashMap::new()),
+            diff_request_errors: RwSignal::new(HashMap::new()),
             terminals: RwSignal::new(Vec::new()),
             active_terminal: RwSignal::new(None),
             interrupt_pending: RwSignal::new(HashSet::new()),

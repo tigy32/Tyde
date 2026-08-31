@@ -2,8 +2,9 @@
 //!
 //! The standalone three-pane workbench has been retired: reviews are now an
 //! always-on, workspace-scoped layer over the normal git diff surfaces
-//! (`ReviewableDiffView` in `diff_view.rs`). There is one active review per
-//! project spanning every root; each per-root diff tab renders its own slice.
+//! (`ReviewableDiffView` in `diff_view.rs`). There is one active workspace
+//! review per project spanning every root plus exact committed-range drafts;
+//! each per-root diff tab renders its own slice.
 //! What remains here is the shared action sidebar (`ReviewSidebar` — live
 //! counts, AI-reviewer form, submit-target picker, Clear) that the single
 //! git-panel workspace hub mounts, plus the subscribe/diff-open/feedback
@@ -1318,6 +1319,7 @@ pub fn open_changed_diff_for_root(
             project_id: project_id.clone(),
             root: root.clone(),
             scope,
+            revision: protocol::ProjectDiffRevision::WorkingTree,
             path: path.clone(),
         },
         label,
@@ -1339,8 +1341,10 @@ pub fn open_changed_diff_for_root(
     let root = root.clone();
     spawn_local(async move {
         let payload = ProjectReadDiffPayload {
+            request_id: None,
             root,
             scope,
+            revision: protocol::ProjectDiffRevision::WorkingTree,
             path: None,
             context_mode,
         };
@@ -1570,7 +1574,17 @@ fn open_review_location(
     let scope = match location.target {
         protocol::ReviewTarget::UnstagedDiff => ProjectDiffScope::Unstaged,
         protocol::ReviewTarget::StagedDiff => ProjectDiffScope::Staged,
+        protocol::ReviewTarget::CommittedDiff { .. } => ProjectDiffScope::Uncommitted,
         protocol::ReviewTarget::RegularFile { .. } => unreachable!(),
+    };
+    let revision = match &location.target {
+        protocol::ReviewTarget::CommittedDiff { base_oid, tip_oid } => {
+            protocol::ProjectDiffRevision::CommittedRange {
+                base_oid: base_oid.clone(),
+                tip_oid: tip_oid.clone(),
+            }
+        }
+        _ => protocol::ProjectDiffRevision::WorkingTree,
     };
     let path = location.relative_path.clone();
     state.open_tab(
@@ -1579,17 +1593,19 @@ fn open_review_location(
             project_id: project_id.clone(),
             root: location.root.clone(),
             scope,
+            revision: revision.clone(),
             path: path.clone(),
         },
         format!("{} ({})", path, location.target.label()),
         true,
     );
     let context_mode = state.diff_context_mode.get_untracked();
-    let key = DiffKey::new(
+    let key = DiffKey::with_revision(
         host_id,
         project_id.clone(),
         location.root.clone(),
         scope,
+        revision.clone(),
         path.clone(),
     );
     state.diff_contents.update(|diffs| {
@@ -1608,8 +1624,10 @@ fn open_review_location(
     let host = host_id.to_owned();
     let stream = StreamPath(format!("/project/{}", project_id.0));
     let payload = ProjectReadDiffPayload {
+        request_id: None,
         root: location.root.clone(),
         scope,
+        revision,
         path: Some(path),
         context_mode,
     };
@@ -1801,6 +1819,7 @@ pub fn ReviewCommentsSurface(host_id: String, project_id: ProjectId) -> impl Int
                 let scope = match target {
                     protocol::ReviewTarget::UnstagedDiff => ProjectDiffScope::Unstaged,
                     protocol::ReviewTarget::StagedDiff => ProjectDiffScope::Staged,
+                    protocol::ReviewTarget::CommittedDiff { .. } => continue,
                     protocol::ReviewTarget::RegularFile { .. } => continue,
                 };
                 let cached = fetch_state.diff_contents.with_untracked(|diffs| {
@@ -1834,8 +1853,10 @@ pub fn ReviewCommentsSurface(host_id: String, project_id: ProjectId) -> impl Int
                 let stream = StreamPath(format!("/project/{}", fetch_pid.0));
                 let host = fetch_host.clone();
                 let payload = ProjectReadDiffPayload {
+                    request_id: None,
                     root: root.clone(),
                     scope,
+                    revision: protocol::ProjectDiffRevision::WorkingTree,
                     path: Some(path.clone()),
                     context_mode: DiffContextMode::Hunks,
                 };
@@ -2060,6 +2081,7 @@ fn review_comment_entry_row(
         let scope = match snip_target {
             protocol::ReviewTarget::UnstagedDiff => ProjectDiffScope::Unstaged,
             protocol::ReviewTarget::StagedDiff => ProjectDiffScope::Staged,
+            protocol::ReviewTarget::CommittedDiff { .. } => return Vec::new(),
             protocol::ReviewTarget::RegularFile { .. } => unreachable!(),
         };
         snip_state.diff_contents.with(|diffs| {
@@ -2378,13 +2400,16 @@ mod wasm_tests {
 
     fn diff_payload() -> ProjectGitDiffPayload {
         ProjectGitDiffPayload {
+            request_id: None,
             root: root_path(),
             scope: ProjectDiffScope::Uncommitted,
+            revision: protocol::ProjectDiffRevision::WorkingTree,
             path: None,
             context_mode: DiffContextMode::FullFile,
             files: vec![
                 ProjectGitDiffFile {
                     relative_path: "src/foo.rs".to_owned(),
+                    change_kind: None,
                     is_binary: false,
                     unmerged: false,
                     hunks: vec![ProjectGitDiffHunk {
@@ -2429,6 +2454,7 @@ mod wasm_tests {
                 },
                 ProjectGitDiffFile {
                     relative_path: "src/bar.rs".to_owned(),
+                    change_kind: None,
                     is_binary: false,
                     unmerged: false,
                     hunks: vec![ProjectGitDiffHunk {
@@ -2889,6 +2915,8 @@ mod wasm_tests {
                     vec![protocol::ProjectRootGitStatus {
                         root: root_path(),
                         branch: Some("main".to_owned()),
+                        head_oid: None,
+                        empty_tree_oid: None,
                         ahead: 0,
                         behind: 0,
                         clean: false,
@@ -2898,6 +2926,8 @@ mod wasm_tests {
                             unstaged: Some(protocol::ProjectGitChangeKind::Modified),
                             untracked: false,
                         }],
+                        recent_commits: Vec::new(),
+                        history_has_more: false,
                     }],
                 );
             });
@@ -3036,6 +3066,8 @@ mod wasm_tests {
         protocol::ProjectRootGitStatus {
             root: ProjectRootPath(path.to_owned()),
             branch: Some("main".to_owned()),
+            head_oid: None,
+            empty_tree_oid: None,
             ahead: 0,
             behind: 0,
             clean: staged.is_none() && unstaged.is_none() && !untracked,
@@ -3045,6 +3077,8 @@ mod wasm_tests {
                 unstaged,
                 untracked,
             }],
+            recent_commits: Vec::new(),
+            history_has_more: false,
         }
     }
 
@@ -3330,6 +3364,7 @@ mod wasm_tests {
                         root,
                         scope: ProjectDiffScope::Staged,
                         path,
+                        ..
                     } if host_id == "h1"
                         && *project_id == ProjectId("proj-1".to_owned())
                         && *root == root_path()
@@ -3741,6 +3776,7 @@ mod wasm_tests {
     fn snippet_keeps_removed_line_at_hunk_top() {
         let files = vec![protocol::ProjectGitDiffFile {
             relative_path: "src/foo.rs".to_owned(),
+            change_kind: None,
             is_binary: false,
             unmerged: false,
             hunks: vec![protocol::ProjectGitDiffHunk {
@@ -3793,6 +3829,7 @@ mod wasm_tests {
     fn snippet_keeps_removed_lines_around_new_anchor() {
         let files = vec![protocol::ProjectGitDiffFile {
             relative_path: "src/foo.rs".to_owned(),
+            change_kind: None,
             is_binary: false,
             unmerged: false,
             hunks: vec![protocol::ProjectGitDiffHunk {

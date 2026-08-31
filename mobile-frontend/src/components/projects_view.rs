@@ -456,6 +456,8 @@ mod wasm_tests {
                     vec![ProjectRootGitStatus {
                         root: ProjectRootPath("/x/dirty".to_owned()),
                         branch: Some("main".to_owned()),
+                        head_oid: None,
+                        empty_tree_oid: None,
                         ahead: 0,
                         behind: 0,
                         clean: false,
@@ -465,6 +467,8 @@ mod wasm_tests {
                             unstaged: Some(protocol::ProjectGitChangeKind::Modified),
                             untracked: false,
                         }],
+                        recent_commits: Vec::new(),
+                        history_has_more: false,
                     }],
                 );
                 m.insert(
@@ -472,10 +476,14 @@ mod wasm_tests {
                     vec![ProjectRootGitStatus {
                         root: ProjectRootPath("/x/clean".to_owned()),
                         branch: Some("develop".to_owned()),
+                        head_oid: None,
+                        empty_tree_oid: None,
                         ahead: 0,
                         behind: 0,
                         clean: true,
                         files: Vec::new(),
+                        recent_commits: Vec::new(),
+                        history_has_more: false,
                     }],
                 );
             });

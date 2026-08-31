@@ -22,10 +22,10 @@ use crate::syntax_highlight::{
 };
 
 use protocol::{
-    DiffContextMode, FrameKind, ProjectDiffScope, ProjectFileVersion, ProjectGitDiffFile,
-    ProjectGitDiffHunk, ProjectGitDiffLine, ProjectGitDiffLineKind, ProjectGitDiffPayload,
-    ProjectId, ProjectPath, ProjectReadDiffPayload, ProjectRootPath, ProjectStageHunkPayload,
-    ReviewDiffSide, StreamPath,
+    DiffContextMode, FrameKind, ProjectDiffRevision, ProjectDiffScope, ProjectFileVersion,
+    ProjectGitDiffFile, ProjectGitDiffHunk, ProjectGitDiffLine, ProjectGitDiffLineKind,
+    ProjectGitDiffPayload, ProjectId, ProjectPath, ProjectReadDiffPayload, ProjectRootPath,
+    ProjectStageHunkPayload, ReviewDiffSide, StreamPath,
 };
 
 /// Map a path's extension to a syntect language token (`"rs"`, `"ts"`,
@@ -245,6 +245,7 @@ pub fn DiffView(
     #[prop(optional)] project_id: Option<protocol::ProjectId>,
     root: ProjectRootPath,
     scope: ProjectDiffScope,
+    #[prop(optional)] revision: ProjectDiffRevision,
     path: String,
     /// When `Some`, drives the diff from a frozen payload Memo instead of
     /// `state.diff_contents` and skips refetches on context-mode change.
@@ -277,11 +278,12 @@ pub fn DiffView(
     // scope, path). `None` only in frozen-payload mode, which reads the
     // snapshot memo instead of `diff_contents`.
     let diff_key: Option<crate::state::DiffKey> = match (host_id.clone(), project_id.clone()) {
-        (Some(h), Some(p)) => Some(crate::state::DiffKey::new(
+        (Some(h), Some(p)) => Some(crate::state::DiffKey::with_revision(
             h,
             p,
             root.clone(),
             scope,
+            revision.clone(),
             path.clone(),
         )),
         _ => None,
@@ -355,7 +357,15 @@ pub fn DiffView(
         let stream = StreamPath(format!("/project/{}", project_id.0));
         let root = current.root.clone();
         let scope = current.scope;
+        let revision = key.revision.clone();
         let path = current.path.clone();
+        let request_id = crate::state::next_client_request_id("project-diff");
+        effect_state.diff_request_ids.update(|requests| {
+            requests.insert(key.clone(), request_id.clone());
+        });
+        effect_state.diff_request_errors.update(|errors| {
+            errors.remove(&key);
+        });
 
         let path_for_update = path.clone();
         let root_for_update = root.clone();
@@ -372,26 +382,63 @@ pub fn DiffView(
         });
 
         let payload = ProjectReadDiffPayload {
+            request_id: Some(request_id.clone()),
             root,
             scope,
+            revision,
             path,
             context_mode: signal_mode,
         };
+        let failure_state = effect_state.clone();
+        let failure_key = key.clone();
         spawn_local(async move {
             if let Err(e) = send_frame(&host_id, stream, FrameKind::ProjectReadDiff, &payload).await
             {
                 log::error!("failed to send ProjectReadDiff on context-mode change: {e}");
+                let is_current = failure_state
+                    .diff_request_ids
+                    .with_untracked(|requests| requests.get(&failure_key) == Some(&request_id));
+                if is_current {
+                    failure_state.diff_request_ids.update(|requests| {
+                        requests.remove(&failure_key);
+                    });
+                    failure_state.diff_request_errors.update(|errors| {
+                        errors.insert(failure_key.clone(), e.clone());
+                    });
+                    failure_state.diff_contents.update(|diffs| {
+                        if let Some(diff) = diffs.get_mut(&failure_key) {
+                            diff.pending = false;
+                        }
+                    });
+                }
             }
         });
     });
 
-    let content_host_id = host_id.clone();
-    let content_project_id = project_id.clone();
+    let historical = !matches!(revision, ProjectDiffRevision::WorkingTree);
+    let content_host_id = (!historical).then(|| host_id.clone()).flatten();
+    let content_project_id = (!historical).then(|| project_id.clone()).flatten();
+    let error_state = state.clone();
+    let error_key = diff_key.clone();
+    let diff_error = move || {
+        let key = error_key.as_ref()?;
+        error_state
+            .diff_request_errors
+            .with(|errors| errors.get(key).cloned())
+    };
+    let content_revision = revision.clone();
     view! {
         <div class="diff-view">
             {(!review_mode).then(|| view! { <DiffToolbar /> })}
             {move || {
                 let decorations = decorations.clone();
+                if let Some(message) = diff_error() {
+                    return view! {
+                        <div class="diff-empty" role="alert" data-test="diff-request-error">
+                            <p class="placeholder-text">{format!("Could not load diff: {message}")}</p>
+                        </div>
+                    }.into_any();
+                }
                 match diff() {
                     Some(dv) if dv.pending && dv.files.is_empty() => view! {
                         <div class="diff-empty">
@@ -405,6 +452,7 @@ pub fn DiffView(
                             decorations=decorations
                             host_id=content_host_id.clone()
                             project_id=content_project_id.clone()
+                            revision=content_revision.clone()
                             review_mode=review_mode
                         />
                     }.into_any(),
@@ -444,6 +492,7 @@ pub fn ReviewableDiffView(
     project_id: protocol::ProjectId,
     root: ProjectRootPath,
     scope: ProjectDiffScope,
+    #[prop(optional)] revision: ProjectDiffRevision,
     path: String,
 ) -> impl IntoView {
     let state = expect_context::<AppState>();
@@ -451,7 +500,9 @@ pub fn ReviewableDiffView(
     // Combined HEAD-to-worktree diffs have no stable identity when staged and
     // unstaged versions of the same path coexist. The two explicit scopes are
     // independently reviewable and remain distinct in ReviewLocation.
-    if scope == ProjectDiffScope::Uncommitted {
+    if scope == ProjectDiffScope::Uncommitted
+        && matches!(revision, ProjectDiffRevision::WorkingTree)
+    {
         return view! {
             <DiffView
                 tab_id=tab_id
@@ -459,6 +510,7 @@ pub fn ReviewableDiffView(
                 project_id=project_id
                 root=root
                 scope=scope
+                revision=revision
                 path=path
             />
         }
@@ -490,10 +542,34 @@ pub fn ReviewableDiffView(
     let draft_state = state.clone();
     let draft_host = host_id.clone();
     let draft_project = project_id.clone();
+    let draft_revision = revision.clone();
+    let draft_root = root.clone();
     let draft: Memo<Option<(String, protocol::ReviewId)>> = Memo::new(move |_| {
         let id = draft_state.review_summaries.with(|m| {
             m.get(&draft_project).and_then(|sums| {
-                crate::components::review_view::pick_workspace_draft(sums).map(|s| s.id.clone())
+                match &draft_revision {
+                    ProjectDiffRevision::WorkingTree => {
+                        crate::components::review_view::pick_workspace_draft(sums)
+                    }
+                    ProjectDiffRevision::CommittedRange { base_oid, tip_oid } => sums
+                        .iter()
+                        .filter(|summary| {
+                            matches!(summary.status, protocol::ReviewStatus::Draft)
+                                && matches!(
+                                    &summary.scope,
+                                    protocol::ReviewSummaryScope::CommittedRange {
+                                        root,
+                                        base_oid: summary_base,
+                                        tip_oid: summary_tip,
+                                        ..
+                                    } if root == &draft_root
+                                        && summary_base == base_oid
+                                        && summary_tip == tip_oid
+                                )
+                        })
+                        .max_by_key(|summary| summary.updated_at_ms),
+                }
+                .map(|summary| summary.id.clone())
             })
         })?;
         let live_non_draft = draft_state.reviews.with(|r| {
@@ -519,6 +595,7 @@ pub fn ReviewableDiffView(
     // host, and not the active project).
     let dv_host = host_id.clone();
     let dv_project = project_id.clone();
+    let dv_revision = revision.clone();
     view! {
         <div class="reviewable-diff">
             {move || {
@@ -526,6 +603,7 @@ pub fn ReviewableDiffView(
                 let path = path.clone();
                 let dv_host = dv_host.clone();
                 let dv_project = dv_project.clone();
+                let revision = dv_revision.clone();
                 match draft.get() {
                     // `review_host` is the *review's* host (used for comment
                     // actions); the DiffView still keys off the *tab's*
@@ -540,7 +618,15 @@ pub fn ReviewableDiffView(
                             match scope {
                                 ProjectDiffScope::Unstaged => protocol::ReviewTarget::UnstagedDiff,
                                 ProjectDiffScope::Staged => protocol::ReviewTarget::StagedDiff,
-                                ProjectDiffScope::Uncommitted => unreachable!(),
+                                ProjectDiffScope::Uncommitted => match &revision {
+                                    ProjectDiffRevision::CommittedRange { base_oid, tip_oid } => {
+                                        protocol::ReviewTarget::CommittedDiff {
+                                            base_oid: base_oid.clone(),
+                                            tip_oid: tip_oid.clone(),
+                                        }
+                                    }
+                                    ProjectDiffRevision::WorkingTree => unreachable!(),
+                                },
                             },
                         );
                         view! {
@@ -550,6 +636,7 @@ pub fn ReviewableDiffView(
                                 project_id=dv_project
                                 root=root
                                 scope=scope
+                                revision=revision
                                 path=path
                                 on_gutter_pointer_down=decorations.gutter_pointer_down
                                 line_extra_class=decorations.line_extra_class
@@ -567,6 +654,7 @@ pub fn ReviewableDiffView(
                             project_id=dv_project
                             root=root
                             scope=scope
+                            revision=revision
                             path=path
                         />
                     }
@@ -1204,14 +1292,22 @@ fn DiffContent(
     decorations: DiffDecorations,
     #[prop(optional_no_strip)] host_id: Option<String>,
     #[prop(optional_no_strip)] project_id: Option<ProjectId>,
+    #[prop(optional)] revision: ProjectDiffRevision,
     #[prop(optional)] review_mode: bool,
 ) -> impl IntoView {
     let state = expect_context::<AppState>();
     let initial_scroll_state = tab_id.and_then(|id| state.tab_scroll_state_untracked(id));
-    let scope_label = match diff.scope {
-        ProjectDiffScope::Staged => "staged",
-        ProjectDiffScope::Unstaged => "unstaged",
-        ProjectDiffScope::Uncommitted => "uncommitted",
+    let scope_label = match &revision {
+        ProjectDiffRevision::CommittedRange { base_oid, tip_oid } => format!(
+            "committed {}…{}",
+            base_oid.chars().take(8).collect::<String>(),
+            tip_oid.chars().take(8).collect::<String>()
+        ),
+        ProjectDiffRevision::WorkingTree => match diff.scope {
+            ProjectDiffScope::Staged => "staged".to_owned(),
+            ProjectDiffScope::Unstaged => "unstaged".to_owned(),
+            ProjectDiffScope::Uncommitted => "uncommitted".to_owned(),
+        },
     };
     let perf_key = format!(
         "diff:{}:{}",
@@ -1655,7 +1751,7 @@ fn DiffContent(
                     let root = diff.root.clone();
                     let rendered_offset = file_rendered_offsets[fi];
                     let decorations = decorations.clone();
-                    view! { <DiffFileView file=file scope_label=scope_label scope=diff.scope root=root context_mode=diff.context_mode hunk_offsets=hunk_offsets rendered_offset=rendered_offset decorations=decorations review_mode=review_mode /> }
+                    view! { <DiffFileView file=file scope_label=scope_label.clone() scope=diff.scope root=root context_mode=diff.context_mode hunk_offsets=hunk_offsets rendered_offset=rendered_offset decorations=decorations review_mode=review_mode /> }
                 }).collect::<Vec<_>>()}
             </div>
             {move || {
@@ -1710,7 +1806,7 @@ fn rendered_rows_for_file(file: &ProjectGitDiffFile, context_mode: DiffContextMo
 #[component]
 fn DiffFileView(
     file: ProjectGitDiffFile,
-    scope_label: &'static str,
+    scope_label: String,
     scope: ProjectDiffScope,
     root: ProjectRootPath,
     context_mode: DiffContextMode,
@@ -4187,6 +4283,7 @@ mod wasm_tests {
         };
         let file = ProjectGitDiffFile {
             relative_path: "big.rs".to_owned(),
+            change_kind: None,
             is_binary: false,
             unmerged: false,
             hunks: vec![hunk],
@@ -4362,6 +4459,7 @@ mod wasm_tests {
             pending: false,
             files: vec![ProjectGitDiffFile {
                 relative_path: relative_path.to_owned(),
+                change_kind: None,
                 is_binary: false,
                 unmerged: false,
                 hunks: vec![hunk],
@@ -4471,6 +4569,7 @@ mod wasm_tests {
                         project_id: ProjectId(CODE_INTEL_PROJECT.to_owned()),
                         root: code_intel_root(),
                         scope: ProjectDiffScope::Unstaged,
+                        revision: ProjectDiffRevision::WorkingTree,
                         path: relative_path.to_owned(),
                     },
                     "diff".to_owned(),
@@ -5382,6 +5481,7 @@ mod wasm_tests {
         };
         let file = ProjectGitDiffFile {
             relative_path: path.clone(),
+            change_kind: None,
             is_binary: false,
             unmerged: false,
             hunks: vec![mk_hunk(431, 431, "h1"), mk_hunk(459, 458, "h2")],
@@ -5512,6 +5612,7 @@ mod wasm_tests {
             pending: false,
             files: vec![ProjectGitDiffFile {
                 relative_path: "src/foo.rs".to_owned(),
+                change_kind: None,
                 is_binary: false,
                 unmerged: false,
                 hunks: vec![hunk],
@@ -5528,6 +5629,7 @@ mod wasm_tests {
             pending: false,
             files: vec![ProjectGitDiffFile {
                 relative_path: path.to_owned(),
+                change_kind: None,
                 is_binary: true,
                 unmerged: false,
                 hunks: vec![],
@@ -5544,6 +5646,7 @@ mod wasm_tests {
             pending: false,
             files: vec![ProjectGitDiffFile {
                 relative_path: path.to_owned(),
+                change_kind: None,
                 is_binary: false,
                 unmerged: true,
                 hunks: vec![],
@@ -5554,6 +5657,7 @@ mod wasm_tests {
     fn one_added_line_file(path: &str, text: &str) -> ProjectGitDiffFile {
         ProjectGitDiffFile {
             relative_path: path.to_owned(),
+            change_kind: None,
             is_binary: false,
             unmerged: false,
             hunks: vec![ProjectGitDiffHunk {
@@ -6397,6 +6501,57 @@ mod wasm_tests {
             pending: false,
             files: vec![one_added_line_file(file_name, "    let z = 0;")],
         }
+    }
+
+    #[wasm_bindgen_test]
+    async fn committed_diff_shows_revision_in_visible_badge() {
+        ensure_styles_loaded();
+        let container = make_container();
+        let revision = ProjectDiffRevision::CommittedRange {
+            base_oid: "1111111111111111111111111111111111111111".to_owned(),
+            tip_oid: "2222222222222222222222222222222222222222".to_owned(),
+        };
+        let revision_for_mount = revision.clone();
+        let handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            state.diff_contents.update(|diffs| {
+                diffs.insert(
+                    crate::state::DiffKey::with_revision(
+                        "hostA",
+                        protocol::ProjectId("projA".to_owned()),
+                        review_root(),
+                        ProjectDiffScope::Uncommitted,
+                        revision_for_mount.clone(),
+                        "src/committed.rs",
+                    ),
+                    diff_state_with_file("src/committed.rs"),
+                );
+            });
+            provide_context(state);
+            view! {
+                <DiffView
+                    host_id="hostA".to_owned()
+                    project_id=protocol::ProjectId("projA".to_owned())
+                    root=review_root()
+                    scope=ProjectDiffScope::Uncommitted
+                    revision=revision_for_mount.clone()
+                    path="src/committed.rs".to_owned()
+                />
+            }
+        });
+        let _mounted = Mounted::new(handle, ());
+        next_tick().await;
+        next_tick().await;
+
+        let text = container.text_content().unwrap_or_default();
+        assert!(
+            text.contains("committed 11111111…22222222"),
+            "historical diffs must visibly identify their pinned revision; got: {text}"
+        );
+        assert!(
+            !text.contains("uncommitted"),
+            "a historical diff must never be labeled as an uncommitted change; got: {text}"
+        );
     }
 
     /// Two projects/hosts that share the same root path string must keep

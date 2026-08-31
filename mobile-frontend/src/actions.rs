@@ -414,8 +414,10 @@ pub async fn request_project_diff(
         project_stream(&project.project_id),
         protocol::FrameKind::ProjectReadDiff,
         &protocol::ProjectReadDiffPayload {
+            request_id: None,
             root,
             scope,
+            revision: protocol::ProjectDiffRevision::WorkingTree,
             path,
             context_mode,
         },

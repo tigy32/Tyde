@@ -9,14 +9,14 @@ use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watche
 use protocol::{
     CodeIntelOverviewHeadline, CodeIntelOverviewPayload, CodeIntelOverviewSummary,
     CodeIntelProviderStatus, CodeIntelRootOverview, CodeIntelState, CommandErrorCode,
-    CommandErrorPayload, DiffContextMode, FileEntryOp, FrameKind, Project, ProjectDiffScope,
-    ProjectEventPayload, ProjectFileContentsPayload, ProjectFileEntry, ProjectFileKind,
-    ProjectFileListPayload, ProjectFileVersion, ProjectFileVersionChange, ProjectGitChangeKind,
-    ProjectGitDiffFile, ProjectGitDiffHunk, ProjectGitDiffLine, ProjectGitDiffLineKind,
-    ProjectGitDiffPayload, ProjectGitFileStatus, ProjectGitStatusPayload, ProjectId, ProjectPath,
-    ProjectReadDiffPayload, ProjectReadFilePayload, ProjectRootGitStatus, ProjectRootListing,
-    ProjectRootPath, ProjectSearchFileResult, ProjectSearchMatch, ProjectSearchPayload,
-    ReviewSummary, StreamPath,
+    CommandErrorPayload, DiffContextMode, FileEntryOp, FrameKind, Project, ProjectDiffRevision,
+    ProjectDiffScope, ProjectEventPayload, ProjectFileContentsPayload, ProjectFileEntry,
+    ProjectFileKind, ProjectFileListPayload, ProjectFileVersion, ProjectFileVersionChange,
+    ProjectGitChangeKind, ProjectGitCommitSummary, ProjectGitDiffFile, ProjectGitDiffHunk,
+    ProjectGitDiffLine, ProjectGitDiffLineKind, ProjectGitDiffPayload, ProjectGitFileStatus,
+    ProjectGitStatusPayload, ProjectId, ProjectPath, ProjectReadDiffPayload,
+    ProjectReadFilePayload, ProjectRootGitStatus, ProjectRootListing, ProjectRootPath,
+    ProjectSearchFileResult, ProjectSearchMatch, ProjectSearchPayload, ReviewSummary, StreamPath,
 };
 use serde_json::Value;
 use tokio::sync::{Mutex, mpsc, oneshot};
@@ -29,6 +29,7 @@ use crate::stream::Stream;
 
 const PROJECT_REFRESH_DEBOUNCE: Duration = Duration::from_millis(250);
 const GIT_STATUS_POLL_INTERVAL: Duration = Duration::from_secs(5);
+const RECENT_HISTORY_LIMIT: usize = 100;
 
 struct ProjectWatcher {
     inner: Option<RecommendedWatcher>,
@@ -80,6 +81,7 @@ pub(crate) struct ProjectSnapshotState {
 pub(crate) struct ProjectDiffRequestKey {
     pub root: ProjectRootPath,
     pub scope: ProjectDiffScope,
+    pub revision: ProjectDiffRevision,
     pub path: Option<String>,
 }
 
@@ -1573,8 +1575,10 @@ async fn refresh_remembered_diffs(
             continue;
         };
         let payload = ProjectReadDiffPayload {
+            request_id: None,
             root: key.root.clone(),
             scope: key.scope,
+            revision: key.revision.clone(),
             path: key.path.clone(),
             context_mode,
         };
@@ -1646,6 +1650,7 @@ async fn emit_project_command_error(
     fatal: bool,
 ) {
     let payload = CommandErrorPayload {
+        request_id: None,
         stream: stream.path().clone(),
         request_kind,
         operation: operation.to_owned(),
@@ -1770,16 +1775,21 @@ where
                 roots.push(ProjectRootGitStatus {
                     root,
                     branch: None,
+                    head_oid: None,
+                    empty_tree_oid: None,
                     ahead: 0,
                     behind: 0,
                     clean: true,
                     files: Vec::new(),
+                    recent_commits: Vec::new(),
+                    history_has_more: false,
                 });
                 continue;
             }
             Err(err) => return Err(err),
         };
         let mut branch = None;
+        let mut head_oid = None;
         let mut ahead = 0;
         let mut behind = 0;
         let mut files = BTreeMap::<String, ProjectGitFileStatus>::new();
@@ -1788,6 +1798,13 @@ where
             if let Some(head) = line.strip_prefix("# branch.head ") {
                 if head != "(detached)" {
                     branch = Some(head.to_owned());
+                }
+                continue;
+            }
+
+            if let Some(oid) = line.strip_prefix("# branch.oid ") {
+                if oid != "(initial)" {
+                    head_oid = Some(oid.to_owned());
                 }
                 continue;
             }
@@ -1850,17 +1867,111 @@ where
             }
         }
 
+        let history = load_empty_tree_oid(&root.0).and_then(|empty_tree_oid| {
+            let (recent_commits, history_has_more) = if head_oid.is_some() {
+                load_recent_commits(&root.0)?
+            } else {
+                (Vec::new(), false)
+            };
+            Ok((recent_commits, history_has_more, empty_tree_oid))
+        });
+        let (recent_commits, history_has_more, empty_tree_oid) = match history {
+            Ok((recent_commits, history_has_more, empty_tree_oid)) => {
+                (recent_commits, history_has_more, Some(empty_tree_oid))
+            }
+            Err(error) => {
+                tracing::warn!(
+                    root = %root.0,
+                    %error,
+                    "git history metadata is unavailable; continuing without recent history"
+                );
+                (Vec::new(), false, None)
+            }
+        };
         roots.push(ProjectRootGitStatus {
             root,
             branch,
+            head_oid,
+            empty_tree_oid,
             ahead,
             behind,
             clean: files.is_empty(),
             files: files.into_values().collect(),
+            recent_commits,
+            history_has_more,
         });
     }
 
     Ok(ProjectGitStatusPayload { roots })
+}
+
+fn load_recent_commits(root: &str) -> Result<(Vec<ProjectGitCommitSummary>, bool), String> {
+    let fetch_count = (RECENT_HISTORY_LIMIT + 1).to_string();
+    let raw = run_git_lossy_mode(
+        root,
+        &[
+            "log",
+            "--first-parent",
+            "-n",
+            &fetch_count,
+            "--format=%H%x1f%P%x1f%s%x1f%an%x1f%at%x1e",
+        ],
+        GitAccessMode::ReadOnly,
+    )?;
+    let mut commits = Vec::new();
+    for record in raw.split('\u{1e}') {
+        let record = record.trim_matches(['\r', '\n']);
+        if record.is_empty() {
+            continue;
+        }
+        let mut fields = record.split('\u{1f}');
+        let oid = fields.next().unwrap_or_default();
+        let parents = fields.next().unwrap_or_default();
+        let subject = fields.next().unwrap_or_default();
+        let author = fields.next().unwrap_or_default();
+        let authored_at_seconds = fields
+            .next()
+            .unwrap_or_default()
+            .parse::<i64>()
+            .unwrap_or_default();
+        validate_pinned_oid(oid)
+            .map_err(|error| format!("git history returned an invalid commit identity: {error}"))?;
+        if parents
+            .split_whitespace()
+            .any(|parent| validate_pinned_oid(parent).is_err())
+        {
+            return Err("git history returned an invalid parent commit identity".to_owned());
+        }
+        let parent_oids = parents.split_whitespace().collect::<Vec<_>>();
+        commits.push(ProjectGitCommitSummary {
+            oid: oid.to_owned(),
+            first_parent_oid: parent_oids.first().map(|oid| (*oid).to_owned()),
+            subject: if subject.is_empty() {
+                "(no commit message)".to_owned()
+            } else {
+                subject.to_owned()
+            },
+            author: author.to_owned(),
+            authored_at_seconds,
+            is_merge: parent_oids.len() > 1,
+        });
+    }
+    let history_has_more = commits.len() > RECENT_HISTORY_LIMIT;
+    commits.truncate(RECENT_HISTORY_LIMIT);
+    Ok((commits, history_has_more))
+}
+
+fn load_empty_tree_oid(root: &str) -> Result<String, String> {
+    let oid = run_git_with_stdin_mode(
+        root,
+        &["hash-object", "-t", "tree", "--stdin"],
+        "",
+        GitAccessMode::ReadOnly,
+    )?;
+    let oid = oid.trim();
+    validate_pinned_oid(oid)
+        .map_err(|error| format!("git returned an invalid empty-tree identity: {error}"))?;
+    Ok(oid.to_owned())
 }
 
 fn parse_unmerged_status_line(line: &str) -> Result<ProjectGitFileStatus, String> {
@@ -2234,10 +2345,18 @@ where
         "--relative",
         git_diff_context_arg(payload.context_mode),
     ];
-    match payload.scope {
-        ProjectDiffScope::Staged => args.push("--cached"),
-        ProjectDiffScope::Unstaged => {}
-        ProjectDiffScope::Uncommitted => args.push("HEAD"),
+    match &payload.revision {
+        ProjectDiffRevision::WorkingTree => match payload.scope {
+            ProjectDiffScope::Staged => args.push("--cached"),
+            ProjectDiffScope::Unstaged => {}
+            ProjectDiffScope::Uncommitted => args.push("HEAD"),
+        },
+        ProjectDiffRevision::CommittedRange { base_oid, tip_oid } => {
+            validate_pinned_oid(base_oid)?;
+            validate_pinned_oid(tip_oid)?;
+            args.push(base_oid);
+            args.push(tip_oid);
+        }
     }
     if let Some(path) = &payload.path {
         args.push("--");
@@ -2246,10 +2365,12 @@ where
 
     let raw = run_git(&payload.root.0, &args, GitAccessMode::ReadOnly)?;
     let mut files = parse_git_diff(&raw)?;
-    if matches!(
-        payload.scope,
-        ProjectDiffScope::Unstaged | ProjectDiffScope::Uncommitted
-    ) {
+    if matches!(payload.revision, ProjectDiffRevision::WorkingTree)
+        && matches!(
+            payload.scope,
+            ProjectDiffScope::Unstaged | ProjectDiffScope::Uncommitted
+        )
+    {
         let untracked_paths = list_untracked_paths_with_runner(
             &payload.root.0,
             payload.path.as_deref(),
@@ -2262,12 +2383,101 @@ where
     }
 
     Ok(ProjectGitDiffPayload {
+        request_id: payload.request_id,
         root: payload.root,
         scope: payload.scope,
+        revision: payload.revision,
         path: payload.path,
         context_mode: payload.context_mode,
         files,
     })
+}
+
+fn validate_pinned_oid(oid: &str) -> Result<(), String> {
+    if matches!(oid.len(), 40 | 64) && oid.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        Ok(())
+    } else {
+        Err("committed diff endpoints must be full hexadecimal object IDs".to_owned())
+    }
+}
+
+pub(crate) fn committed_range_commit_count(
+    project: &Project,
+    root: &ProjectRootPath,
+    base_oid: &str,
+    tip_oid: &str,
+) -> Result<u32, String> {
+    validate_root(project, root)?;
+    validate_pinned_oid(base_oid)?;
+    validate_pinned_oid(tip_oid)?;
+    if base_oid == tip_oid {
+        return Err("committed review range must contain at least one commit".to_owned());
+    }
+
+    let max_count = format!("--max-count={RECENT_HISTORY_LIMIT}");
+    let raw = run_git_mode(
+        &root.0,
+        &[
+            "rev-list",
+            "--first-parent",
+            "--parents",
+            &max_count,
+            tip_oid,
+        ],
+        GitAccessMode::ReadOnly,
+    )?;
+    let mut expected_oid = tip_oid;
+    let mut commit_count = 0_usize;
+    let mut boundary_beyond_limit = false;
+    for line in raw.lines() {
+        let mut fields = line.split_whitespace();
+        let oid = fields
+            .next()
+            .ok_or_else(|| "git returned an empty first-parent history row".to_owned())?;
+        validate_pinned_oid(oid).map_err(|error| {
+            format!("git returned an invalid first-parent commit identity: {error}")
+        })?;
+        if oid != expected_oid {
+            return Err(format!(
+                "git first-parent history skipped expected commit {expected_oid}"
+            ));
+        }
+        commit_count += 1;
+
+        let first_parent = fields.next();
+        if first_parent == Some(base_oid) {
+            return u32::try_from(commit_count)
+                .map_err(|_| "committed review range is too large".to_owned());
+        }
+        match first_parent {
+            Some(parent_oid) => {
+                validate_pinned_oid(parent_oid).map_err(|error| {
+                    format!("git returned an invalid first-parent identity: {error}")
+                })?;
+                expected_oid = parent_oid;
+                boundary_beyond_limit = commit_count == RECENT_HISTORY_LIMIT;
+            }
+            None => {
+                let empty_tree_oid = load_empty_tree_oid(&root.0)?;
+                if base_oid == empty_tree_oid {
+                    return u32::try_from(commit_count)
+                        .map_err(|_| "committed review range is too large".to_owned());
+                }
+                break;
+            }
+        }
+    }
+
+    if boundary_beyond_limit {
+        return Err(format!(
+            "committed review base {base_oid} was not reached within the \
+             {RECENT_HISTORY_LIMIT}-commit recent-history limit from tip {tip_oid}"
+        ));
+    }
+
+    Err(format!(
+        "committed review base {base_oid} is not the first-parent boundary of tip {tip_oid}"
+    ))
 }
 
 fn git_diff_context_arg(context_mode: DiffContextMode) -> &'static str {
@@ -2323,6 +2533,7 @@ fn build_untracked_diff_file(
         Ok(_) | Err(_) => {
             return Ok(ProjectGitDiffFile {
                 relative_path: relative_path.to_owned(),
+                change_kind: Some(ProjectGitChangeKind::Added),
                 is_binary: true,
                 unmerged: false,
                 hunks: Vec::new(),
@@ -2355,6 +2566,7 @@ fn build_untracked_diff_file(
 
     Ok(ProjectGitDiffFile {
         relative_path: relative_path.to_owned(),
+        change_kind: Some(ProjectGitChangeKind::Added),
         is_binary: false,
         unmerged: false,
         hunks,
@@ -2699,6 +2911,25 @@ fn run_git_mode(root: &str, args: &[&str], access_mode: GitAccessMode) -> Result
     run_git_mode_with_binary("git", root, args, access_mode)
 }
 
+fn run_git_lossy_mode(
+    root: &str,
+    args: &[&str],
+    access_mode: GitAccessMode,
+) -> Result<String, String> {
+    let output = git_command("git", root, args, access_mode)
+        .output()
+        .map_err(|err| format!("Failed to run git in '{}': {err}", root))?;
+    if !output.status.success() {
+        return Err(format!(
+            "git {:?} failed in '{}': {}",
+            args,
+            root,
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
 fn run_git_mode_with_binary(
     git_binary: impl AsRef<std::ffi::OsStr>,
     root: &str,
@@ -2819,8 +3050,10 @@ fn parse_git_diff(raw: &str) -> Result<Vec<ProjectGitDiffFile>, String> {
         .into_iter()
         .map(|file| {
             let relative_path = file.relative_path.clone();
+            let change_kind = parsed_git_diff_file_change_kind(&file);
             Ok(ProjectGitDiffFile {
                 relative_path: relative_path.clone(),
+                change_kind: Some(change_kind),
                 is_binary: parsed_git_diff_file_is_binary(&file),
                 unmerged: file.unmerged,
                 hunks: file
@@ -2842,6 +3075,41 @@ fn parse_git_diff(raw: &str) -> Result<Vec<ProjectGitDiffFile>, String> {
             })
         })
         .collect()
+}
+
+fn parsed_git_diff_file_change_kind(file: &ParsedGitDiffFile) -> ProjectGitChangeKind {
+    if file.unmerged {
+        return ProjectGitChangeKind::Unmerged;
+    }
+    if file
+        .header_lines
+        .iter()
+        .any(|line| line.starts_with("new file mode "))
+    {
+        return ProjectGitChangeKind::Added;
+    }
+    if file
+        .header_lines
+        .iter()
+        .any(|line| line.starts_with("deleted file mode "))
+    {
+        return ProjectGitChangeKind::Deleted;
+    }
+    if file
+        .header_lines
+        .iter()
+        .any(|line| line.starts_with("rename from "))
+    {
+        return ProjectGitChangeKind::Renamed;
+    }
+    if file
+        .header_lines
+        .iter()
+        .any(|line| line.starts_with("copy from "))
+    {
+        return ProjectGitChangeKind::Copied;
+    }
+    ProjectGitChangeKind::Modified
 }
 
 fn parsed_git_diff_file_is_binary(file: &ParsedGitDiffFile) -> bool {

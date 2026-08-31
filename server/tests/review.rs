@@ -473,6 +473,25 @@ fn git(root: &Path, args: &[&str]) {
     );
 }
 
+fn git_stdout(root: &Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .output()
+        .unwrap_or_else(|err| panic!("git {:?} failed to spawn: {err}", args));
+    assert!(
+        output.status.success(),
+        "git {:?} failed: {}",
+        args,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout)
+        .expect("git stdout utf-8")
+        .trim()
+        .to_owned()
+}
+
 fn seed_repo(root: &Path) {
     git(root, &["init"]);
     git(root, &["config", "user.email", "review@example.com"]);
@@ -632,8 +651,10 @@ fn sample_stored_review(
         },
         status,
         diffs: vec![ProjectGitDiffPayload {
+            request_id: None,
             root: ProjectRootPath(root.to_string_lossy().to_string()),
             scope: ProjectDiffScope::Unstaged,
+            revision: protocol::ProjectDiffRevision::WorkingTree,
             path: None,
             context_mode: DiffContextMode::FullFile,
             files: Vec::new(),
@@ -662,6 +683,7 @@ async fn create_review(
         .review_create(
             &project.id,
             ReviewCreatePayload {
+                request_id: None,
                 selection: ReviewDiffSelection::Workspace {
                     scope: ProjectDiffScope::Unstaged,
                 },
@@ -681,6 +703,7 @@ async fn create_review_for_root(
         .review_create(
             &project.id,
             ReviewCreatePayload {
+                request_id: None,
                 selection: ReviewDiffSelection::Root {
                     root: ProjectRootPath(root.to_owned()),
                     scope: ProjectDiffScope::Unstaged,
@@ -691,6 +714,41 @@ async fn create_review_for_root(
         .await
         .expect("review create");
     expect_review_bootstrap(client, "review bootstrap").await
+}
+
+async fn create_committed_review(
+    client: &mut client::Connection,
+    project: &Project,
+    root: &Path,
+    base_oid: &str,
+    tip_oid: &str,
+    commit_count: u32,
+) -> Review {
+    client
+        .review_create(
+            &project.id,
+            ReviewCreatePayload {
+                request_id: None,
+                selection: ReviewDiffSelection::CommittedRange {
+                    root: ProjectRootPath(root.to_string_lossy().to_string()),
+                    base_oid: base_oid.to_owned(),
+                    tip_oid: tip_oid.to_owned(),
+                    commit_count,
+                },
+            },
+        )
+        .await
+        .expect("committed review create");
+    expect_review_bootstrap(client, "committed review bootstrap").await
+}
+
+fn committed_line_location(review: &Review, base_oid: &str, tip_oid: &str) -> ReviewLocation {
+    let mut location = new_line_location(review);
+    location.target = protocol::ReviewTarget::CommittedDiff {
+        base_oid: base_oid.to_owned(),
+        tip_oid: tip_oid.to_owned(),
+    };
+    location
 }
 
 fn submit_to(agent: &NewAgentPayload) -> ReviewActionPayload {
@@ -983,6 +1041,94 @@ async fn start_ai_review_on_clean_workspace_errors_without_spawning_agent() {
     let snapshot = subscribe_review(&mut client, &review.id).await;
     assert_ne!(snapshot.ai_reviewer.status, ReviewAiReviewerStatus::Running);
     assert_eq!(snapshot.ai_reviewer.agent_id, None);
+}
+
+#[tokio::test]
+async fn committed_ai_review_rejects_oversized_frozen_context_before_spawn() {
+    let fixture = Fixture::new().await;
+    let mut client = fixture.client;
+    set_default_backend(&mut client, BackendKind::Claude).await;
+    let root = tempfile::tempdir().expect("temp root");
+    let repo = root.path().join("review-root");
+    fs::create_dir_all(&repo).expect("create repo");
+    seed_repo(&repo);
+    git(&repo, &["checkout", "--", "src/lib.rs"]);
+    let base_oid = git_stdout(&repo, &["rev-parse", "HEAD"]);
+    fs::write(repo.join("src/large.rs"), "x".repeat(600 * 1024))
+        .expect("write oversized changed line");
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-m", "Add oversized review fixture"]);
+    let tip_oid = git_stdout(&repo, &["rev-parse", "HEAD"]);
+
+    let project = create_project(&mut client, &repo).await;
+    expect_project_bootstrap(&mut client, &project).await;
+    let review =
+        create_committed_review(&mut client, &project, &repo, &base_oid, &tip_oid, 1).await;
+    assert!(
+        serde_json::to_vec(&review.diffs)
+            .expect("serialize frozen oversized diff")
+            .len()
+            > 512 * 1024,
+        "fixture must cross the reviewer prompt hard bound"
+    );
+
+    client
+        .review_action(
+            &review.id,
+            ReviewActionPayload::StartAiReview {
+                backend_kind: None,
+                cost_hint: None,
+                instructions: Some("Review this committed range.".to_owned()),
+            },
+        )
+        .await
+        .expect("start oversized committed AI review");
+
+    let mut failed_state = None;
+    let mut visible_error = None;
+    next_frame_matching_on(&mut client, "oversized committed AI review error", |env| {
+        match env.kind {
+            FrameKind::NewAgent => {
+                let payload: NewAgentPayload = env.parse_payload().expect("new agent payload");
+                assert_ne!(
+                    payload.name, "AI Review",
+                    "oversized frozen context must fail before an AI reviewer is spawned"
+                );
+            }
+            FrameKind::ReviewEvent => match env.parse_payload().expect("review event payload") {
+                ReviewEventPayload::AiReviewerChanged { state }
+                    if state.status == ReviewAiReviewerStatus::Failed =>
+                {
+                    failed_state = state.error;
+                }
+                ReviewEventPayload::Error { error } => {
+                    assert!(matches!(
+                        error.context,
+                        protocol::ReviewErrorContext::StartAiReview
+                    ));
+                    visible_error = Some(error.message);
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+        failed_state.is_some() && visible_error.is_some()
+    })
+    .await;
+    for message in [
+        failed_state.expect("failed AI state error"),
+        visible_error.expect("visible review error"),
+    ] {
+        assert!(
+            message.contains("512 KiB"),
+            "unexpected bound error: {message}"
+        );
+        assert!(
+            message.contains("smaller committed range"),
+            "bound error must offer an actionable recovery: {message}"
+        );
+    }
+    assert_no_ai_review_spawned(&mut client, "oversized committed prompt").await;
 }
 
 #[tokio::test]
@@ -1299,6 +1445,426 @@ async fn workspace_review_counts_submit_and_clean_reset_across_roots() {
 }
 
 #[tokio::test]
+async fn committed_range_review_isolated_immutable_and_fix_forward() {
+    let fixture = Fixture::new().await;
+    let mut client = fixture.connect().await;
+    set_default_backend(&mut client, BackendKind::Claude).await;
+    let root = tempfile::tempdir().expect("temp root");
+    let repo = root.path().join("review-root");
+    fs::create_dir_all(&repo).expect("create repo");
+    seed_repo(&repo);
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-m", "Historical change"]);
+    let tip_oid = git_stdout(&repo, &["rev-parse", "HEAD"]);
+    let base_oid = git_stdout(&repo, &["rev-parse", "HEAD^"]);
+    let main_branch = git_stdout(&repo, &["symbolic-ref", "--short", "HEAD"]);
+    git(&repo, &["checkout", "-b", "out-of-window", &tip_oid]);
+    for index in 0..=100 {
+        let message = format!("Out-of-window history {index}");
+        git(&repo, &["commit", "--allow-empty", "-m", &message]);
+    }
+    let out_of_window_tip = git_stdout(&repo, &["rev-parse", "HEAD"]);
+    git(&repo, &["checkout", &main_branch]);
+    git(&repo, &["checkout", "-b", "unrelated-range", &base_oid]);
+    fs::write(repo.join("src/unrelated.rs"), "fn unrelated() {}\n")
+        .expect("write unrelated branch change");
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-m", "Unrelated range boundary"]);
+    let unrelated_oid = git_stdout(&repo, &["rev-parse", "HEAD"]);
+    git(&repo, &["checkout", &main_branch]);
+    fs::write(
+        repo.join("src/lib.rs"),
+        "fn value() -> i32 {\n    3\n}\n\nfn working() -> i32 {\n    4\n}\n",
+    )
+    .expect("write working-tree change");
+
+    let project = create_project(&mut client, &repo).await;
+    let project_bootstrap = expect_project_bootstrap(&mut client, &project).await;
+    let root_status = project_bootstrap
+        .git_status
+        .roots
+        .iter()
+        .find(|status| status.root.0 == repo.to_string_lossy())
+        .expect("git root status");
+    let empty_tree_oid = root_status
+        .empty_tree_oid
+        .clone()
+        .expect("repository empty tree oid");
+    let workspace_id = project_bootstrap
+        .review_summaries
+        .iter()
+        .find(|summary| summary.scope == ReviewSummaryScope::Workspace)
+        .expect("working-tree draft summary")
+        .id
+        .clone();
+    let workspace = subscribe_review(&mut client, &workspace_id).await;
+    add_comment(&mut client, &workspace, "Working-tree only comment.").await;
+
+    client
+        .review_create(
+            &project.id,
+            ReviewCreatePayload {
+                request_id: Some("rewritten-committed-review".to_owned()),
+                selection: ReviewDiffSelection::CommittedRange {
+                    root: ProjectRootPath(repo.to_string_lossy().to_string()),
+                    base_oid: base_oid.clone(),
+                    tip_oid: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+                    commit_count: 1,
+                },
+            },
+        )
+        .await
+        .expect("send rewritten committed review create");
+    let create_error = next_frame_matching_on(
+        &mut client,
+        "rewritten committed review create error",
+        |env| env.kind == FrameKind::CommandError,
+    )
+    .await
+    .parse_payload::<CommandErrorPayload>()
+    .expect("rewritten committed review create command error");
+    assert_eq!(
+        create_error.request_id.as_deref(),
+        Some("rewritten-committed-review")
+    );
+    assert_eq!(create_error.request_kind, FrameKind::ReviewCreate);
+    assert!(create_error.message.contains("failed"));
+
+    client
+        .review_create(
+            &project.id,
+            ReviewCreatePayload {
+                request_id: Some("noncontiguous-committed-review".to_owned()),
+                selection: ReviewDiffSelection::CommittedRange {
+                    root: ProjectRootPath(repo.to_string_lossy().to_string()),
+                    base_oid: unrelated_oid,
+                    tip_oid: tip_oid.clone(),
+                    commit_count: 1,
+                },
+            },
+        )
+        .await
+        .expect("send noncontiguous committed review create");
+    let range_error = next_frame_matching_on(
+        &mut client,
+        "noncontiguous committed review create error",
+        |env| env.kind == FrameKind::CommandError,
+    )
+    .await
+    .parse_payload::<CommandErrorPayload>()
+    .expect("noncontiguous committed review create command error");
+    assert_eq!(
+        range_error.request_id.as_deref(),
+        Some("noncontiguous-committed-review")
+    );
+    assert_eq!(range_error.request_kind, FrameKind::ReviewCreate);
+    assert!(range_error.message.contains("first-parent boundary"));
+
+    client
+        .review_create(
+            &project.id,
+            ReviewCreatePayload {
+                request_id: Some("out-of-window-committed-review".to_owned()),
+                selection: ReviewDiffSelection::CommittedRange {
+                    root: ProjectRootPath(repo.to_string_lossy().to_string()),
+                    base_oid: tip_oid.clone(),
+                    tip_oid: out_of_window_tip,
+                    commit_count: 101,
+                },
+            },
+        )
+        .await
+        .expect("send out-of-window committed review create");
+    let range_error = next_frame_matching_on(
+        &mut client,
+        "out-of-window committed review create error",
+        |env| env.kind == FrameKind::CommandError,
+    )
+    .await
+    .parse_payload::<CommandErrorPayload>()
+    .expect("out-of-window committed review create command error");
+    assert_eq!(
+        range_error.request_id.as_deref(),
+        Some("out-of-window-committed-review")
+    );
+    assert_eq!(range_error.request_kind, FrameKind::ReviewCreate);
+    assert!(
+        range_error
+            .message
+            .contains("100-commit recent-history limit")
+    );
+
+    let committed =
+        create_committed_review(&mut client, &project, &repo, &base_oid, &tip_oid, 99).await;
+    let ReviewDiffSelection::CommittedRange { commit_count, .. } = &committed.selection else {
+        panic!("expected committed range selection");
+    };
+    assert_eq!(*commit_count, 1, "the server must derive the range count");
+    let committed_location = committed_line_location(&committed, &base_oid, &tip_oid);
+    let mut regular_location = committed_location.clone();
+    regular_location.target = protocol::ReviewTarget::RegularFile {
+        revision: "client-forged-worktree-revision".to_owned(),
+    };
+    client
+        .review_action(
+            &committed.id,
+            ReviewActionPayload::AddComment {
+                location: regular_location,
+                body: "Must not freeze the current worktree.".to_owned(),
+            },
+        )
+        .await
+        .expect("send regular-file target to committed review");
+    let regular_error = expect_review_error(
+        &mut client,
+        "regular-file target on committed review",
+        ReviewErrorCode::InvalidLocation,
+    )
+    .await;
+    assert!(regular_error.message.contains("only committed-diff"));
+    let after_regular_target = subscribe_review(&mut client, &committed.id).await;
+    assert!(after_regular_target.comments.is_empty());
+    assert!(
+        after_regular_target.file_snapshots.is_empty(),
+        "a committed review must reject regular files before freezing worktree content"
+    );
+
+    let _reviewer_reservation = fixture
+        .reserve_next_mock_launch(
+            "AI Review",
+            MockScript::one(MockTurn::held_text(
+                "committed reviewer waits for interrupt",
+            )),
+        )
+        .await;
+    client
+        .review_action(
+            &committed.id,
+            ReviewActionPayload::StartAiReview {
+                backend_kind: None,
+                cost_hint: None,
+                instructions: Some("Review the selected committed range.".to_owned()),
+            },
+        )
+        .await
+        .expect("start committed AI review");
+    let mut reviewer = None;
+    let mut reviewer_agent_id = None;
+    next_frame_matching_on(&mut client, "committed AI reviewer start", |env| {
+        match env.kind {
+            FrameKind::NewAgent => {
+                let agent: NewAgentPayload = env.parse_payload().expect("new AI reviewer");
+                if agent.name == "AI Review" {
+                    reviewer = Some(agent);
+                }
+            }
+            FrameKind::ReviewEvent => {
+                if let ReviewEventPayload::AiReviewerChanged { state } =
+                    env.parse_payload().expect("review event")
+                    && state.status == ReviewAiReviewerStatus::Running
+                {
+                    reviewer_agent_id = state.agent_id;
+                }
+            }
+            _ => {}
+        }
+        reviewer.is_some() && reviewer_agent_id.is_some()
+    })
+    .await;
+    let reviewer = reviewer.expect("committed AI reviewer agent");
+    let reviewer_agent_id = reviewer_agent_id.expect("committed AI reviewer agent id");
+    assert_eq!(reviewer.agent_id, reviewer_agent_id);
+    let tool_result = call_propose_review_comment_tool(
+        &fixture,
+        &reviewer_agent_id,
+        &committed.id,
+        committed_location.clone(),
+    )
+    .await;
+    assert_eq!(tool_result["status"], "success");
+    let suggestion = match expect_review_delta(&mut client, "committed AI suggestion").await {
+        ReviewEventPayload::SuggestionUpsert { suggestion } => suggestion,
+        other => panic!("expected committed suggestion upsert, got {other:?}"),
+    };
+    assert_eq!(suggestion.location, committed_location);
+    assert!(matches!(suggestion.state, ReviewSuggestionState::Pending));
+    client
+        .interrupt(&reviewer.instance_stream)
+        .await
+        .expect("interrupt committed AI reviewer");
+    loop {
+        if let ReviewEventPayload::AiReviewerChanged { state } =
+            expect_review_delta(&mut client, "committed AI reviewer completion").await
+            && state.status == ReviewAiReviewerStatus::Completed
+        {
+            break;
+        }
+    }
+    close_agent_and_wait(&mut client, &reviewer.instance_stream).await;
+
+    client
+        .review_action(
+            &committed.id,
+            ReviewActionPayload::AddComment {
+                location: committed_location.clone(),
+                body: "Committed-range only comment.".to_owned(),
+            },
+        )
+        .await
+        .expect("add committed comment");
+    match expect_review_delta(&mut client, "committed comment upsert").await {
+        ReviewEventPayload::CommentUpsert { comment } => {
+            assert_eq!(comment.body, "Committed-range only comment.")
+        }
+        other => panic!("expected committed comment upsert, got {other:?}"),
+    }
+    let committed_before_clean = subscribe_review(&mut client, &committed.id).await;
+    let committed_diff_bytes =
+        serde_json::to_vec(&committed_before_clean.diffs).expect("serialize committed diffs");
+
+    let mut observer = fixture.connect().await;
+    let summaries = expect_project_bootstrap(&mut observer, &project)
+        .await
+        .review_summaries;
+    let workspace_summary = summaries
+        .iter()
+        .find(|summary| summary.id == workspace.id)
+        .expect("workspace summary");
+    let committed_summary = summaries
+        .iter()
+        .find(|summary| summary.id == committed.id)
+        .expect("committed summary");
+    assert_eq!(workspace_summary.scope, ReviewSummaryScope::Workspace);
+    assert_eq!(workspace_summary.user_comment_count, 1);
+    assert_eq!(committed_summary.user_comment_count, 1);
+    assert_eq!(
+        committed_summary.scope,
+        ReviewSummaryScope::CommittedRange {
+            root: ProjectRootPath(repo.to_string_lossy().to_string()),
+            base_oid: base_oid.clone(),
+            tip_oid: tip_oid.clone(),
+            commit_count: 1,
+        }
+    );
+    let observed_workspace = subscribe_review(&mut observer, &workspace.id).await;
+    let observed_committed = subscribe_review(&mut observer, &committed.id).await;
+    assert_eq!(observed_workspace.comments.len(), 1);
+    assert_eq!(
+        observed_workspace.comments[0].body,
+        "Working-tree only comment."
+    );
+    assert_eq!(observed_committed.comments.len(), 1);
+    assert_eq!(
+        observed_committed.comments[0].body,
+        "Committed-range only comment."
+    );
+
+    let mut mismatched = committed_location;
+    mismatched.target = protocol::ReviewTarget::CommittedDiff {
+        base_oid: base_oid.clone(),
+        tip_oid: base_oid.clone(),
+    };
+    client
+        .review_action(
+            &committed.id,
+            ReviewActionPayload::AddComment {
+                location: mismatched,
+                body: "Must be rejected.".to_owned(),
+            },
+        )
+        .await
+        .expect("send mismatched committed comment");
+    let mismatch = expect_review_error(
+        &mut client,
+        "mismatched committed target",
+        ReviewErrorCode::InvalidLocation,
+    )
+    .await;
+    assert!(!mismatch.fatal);
+    let after_mismatch = subscribe_review(&mut client, &committed.id).await;
+    assert_eq!(after_mismatch.comments.len(), 1);
+    assert_eq!(
+        after_mismatch.comments[0].body, "Committed-range only comment.",
+        "a mismatched range target must not mutate the committed draft"
+    );
+
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-m", "Clean working tree"]);
+    let workspace_after_clean = subscribe_review(&mut client, &workspace.id).await;
+    assert!(workspace_after_clean.comments.is_empty());
+    assert!(workspace_after_clean.diffs.is_empty());
+    let committed_after_clean = subscribe_review(&mut client, &committed.id).await;
+    assert_eq!(committed_after_clean.comments.len(), 1);
+    assert_eq!(
+        serde_json::to_vec(&committed_after_clean.diffs).expect("serialize refreshed diffs"),
+        committed_diff_bytes,
+        "clean-tree refresh must not mutate the frozen committed diff"
+    );
+
+    let same_range =
+        create_committed_review(&mut client, &project, &repo, &base_oid, &tip_oid, 1).await;
+    assert_eq!(same_range.id, committed.id);
+    assert_eq!(same_range.comments.len(), 1);
+    let different_range =
+        create_committed_review(&mut client, &project, &repo, &empty_tree_oid, &base_oid, 1).await;
+    assert_ne!(different_range.id, committed.id);
+
+    let submit_gate = MockGateHandle::new();
+    let _submit_reservation = fixture
+        .reserve_next_mock_launch(
+            "Review Origin",
+            MockScript::one(MockTurn::gated_text(
+                "mock backend response to: committed review target",
+                &submit_gate,
+            )),
+        )
+        .await;
+    let (target, _session_id) =
+        spawn_project_agent_with_prompt(&mut client, &project, "committed review target", false)
+            .await;
+    client
+        .review_action(&committed.id, submit_to(&target))
+        .await
+        .expect("submit committed review");
+    let mut cleared = false;
+    let mut bundled = None;
+    next_frame_matching_on(&mut client, "committed fix-forward submission", |env| {
+        match env.kind {
+            FrameKind::ReviewEvent => {
+                if let ReviewEventPayload::Cleared { review } = env
+                    .parse_payload::<ReviewEventPayload>()
+                    .expect("review event")
+                    && review.id == committed.id
+                {
+                    cleared = true;
+                }
+            }
+            FrameKind::QueuedMessages if env.stream == target.instance_stream => {
+                let payload: QueuedMessagesPayload =
+                    env.parse_payload().expect("queued messages payload");
+                bundled = payload.messages.into_iter().find_map(|entry| {
+                    (entry.origin
+                        == Some(MessageOrigin::Review {
+                            review_id: committed.id.clone(),
+                        }))
+                    .then_some(entry.message)
+                });
+            }
+            _ => {}
+        }
+        cleared && bundled.is_some()
+    })
+    .await;
+    let bundle = bundled.expect("committed review bundle");
+    assert!(bundle.contains(&format!(
+        "committed changes from `{base_oid}` through `{tip_oid}`"
+    )));
+    assert!(bundle.contains("immutable"));
+    assert!(bundle.contains("fix-forward"));
+    assert!(bundle.contains("Committed-range only comment."));
+}
+
+#[tokio::test]
 async fn review_subscribe_include_diffs_controls_bootstrap_and_cleared_payloads() {
     let fixture = Fixture::new().await;
     let mut client = fixture.connect().await;
@@ -1532,6 +2098,7 @@ async fn create_review_does_not_require_origin_agent() {
         .review_create(
             &project.id,
             ReviewCreatePayload {
+                request_id: None,
                 selection: ReviewDiffSelection::Workspace {
                     scope: ProjectDiffScope::Unstaged,
                 },
@@ -1567,6 +2134,7 @@ async fn create_review_with_untracked_binary_file_allows_file_comment() {
         .review_create(
             &project.id,
             ReviewCreatePayload {
+                request_id: None,
                 selection: ReviewDiffSelection::Workspace {
                     scope: ProjectDiffScope::Unstaged,
                 },
@@ -2355,6 +2923,7 @@ async fn second_review_create_attaches_to_existing_singleton() {
         .review_create(
             &project.id,
             ReviewCreatePayload {
+                request_id: None,
                 selection: ReviewDiffSelection::Workspace {
                     scope: ProjectDiffScope::Unstaged,
                 },
@@ -2401,6 +2970,7 @@ async fn fallback_review_create_for_existing_draft_echoes_review_list() {
         .review_create(
             &project.id,
             ReviewCreatePayload {
+                request_id: None,
                 selection: ReviewDiffSelection::Workspace {
                     scope: ProjectDiffScope::Unstaged,
                 },
@@ -2985,6 +3555,7 @@ async fn mixed_source_comments_keep_identity_and_file_revision() {
         let target = match &comment.location.target {
             protocol::ReviewTarget::UnstagedDiff => "unstaged diff",
             protocol::ReviewTarget::StagedDiff => "staged diff",
+            protocol::ReviewTarget::CommittedDiff { .. } => "committed diff",
             protocol::ReviewTarget::RegularFile { .. } => {
                 panic!("expected Git target before regular-file comment")
             }

@@ -318,6 +318,17 @@ impl ReviewActor {
         if !self.ensure_draft(&conn, context.clone()).await {
             return;
         }
+        if let Err(message) = validate_selection_target(&self.review, &location) {
+            self.send_error(
+                Some(&conn),
+                ReviewErrorCode::InvalidLocation,
+                message,
+                false,
+                context,
+            )
+            .await;
+            return;
+        }
         let preserve_clean = !matches!(location.target, ReviewTarget::UnstagedDiff);
         if let Err(message) = self.refresh_diffs_inner(preserve_clean).await {
             self.send_error(
@@ -1142,6 +1153,14 @@ impl ReviewActor {
             .await;
             return Err(error);
         }
+        if let Err(message) = validate_selection_target(&self.review, &suggestion.location) {
+            let error = review_error(ReviewErrorCode::InvalidLocation, message, false, context);
+            self.broadcast(ReviewEventPayload::Error {
+                error: error.clone(),
+            })
+            .await;
+            return Err(error);
+        }
         if let Err(message) = self.refresh_diffs().await {
             let error = review_error(ReviewErrorCode::GitFailed, message, false, context);
             self.broadcast(ReviewEventPayload::Error {
@@ -1455,7 +1474,12 @@ impl ReviewActor {
                 let stats = diff_stats(&diffs);
                 let previous = self.review.clone();
                 self.review.diffs = diffs;
-                if !preserve_clean
+                if matches!(
+                    self.review.selection,
+                    ReviewDiffSelection::AllUncommitted
+                        | ReviewDiffSelection::Workspace { .. }
+                        | ReviewDiffSelection::Root { .. }
+                ) && !preserve_clean
                     && unstaged_diff_is_clean(&self.review.diffs)
                     && !review_has_non_unstaged_feedback(&self.review)
                 {
@@ -2039,8 +2063,10 @@ fn read_review_diffs(
             let mut diffs = Vec::new();
             for root in project.root_paths() {
                 let unstaged = ProjectReadDiffPayload {
+                    request_id: None,
                     root: root.clone(),
                     scope: ProjectDiffScope::Unstaged,
+                    revision: protocol::ProjectDiffRevision::WorkingTree,
                     path: None,
                     context_mode: DiffContextMode::FullFile,
                 };
@@ -2050,8 +2076,10 @@ fn read_review_diffs(
                     Err(error) => return Err(error),
                 }
                 let staged = ProjectReadDiffPayload {
+                    request_id: None,
                     root,
                     scope: ProjectDiffScope::Staged,
+                    revision: protocol::ProjectDiffRevision::WorkingTree,
                     path: None,
                     context_mode: DiffContextMode::FullFile,
                 };
@@ -2067,8 +2095,10 @@ fn read_review_diffs(
         ReviewDiffSelection::Root { root, path, .. } => {
             let mut diffs = Vec::new();
             let unstaged = ProjectReadDiffPayload {
+                request_id: None,
                 root: root.clone(),
                 scope: ProjectDiffScope::Unstaged,
+                revision: protocol::ProjectDiffRevision::WorkingTree,
                 path: path.clone(),
                 context_mode: DiffContextMode::FullFile,
             };
@@ -2078,8 +2108,10 @@ fn read_review_diffs(
                 Err(error) => return Err(error),
             }
             let staged = ProjectReadDiffPayload {
+                request_id: None,
                 root: root.clone(),
                 scope: ProjectDiffScope::Staged,
+                revision: protocol::ProjectDiffRevision::WorkingTree,
                 path: path.clone(),
                 context_mode: DiffContextMode::FullFile,
             };
@@ -2091,6 +2123,26 @@ fn read_review_diffs(
             }
             Ok(diffs)
         }
+        ReviewDiffSelection::CommittedRange {
+            root,
+            base_oid,
+            tip_oid,
+            ..
+        } => read_diff(
+            project,
+            ProjectReadDiffPayload {
+                request_id: None,
+                root: root.clone(),
+                scope: ProjectDiffScope::Uncommitted,
+                revision: protocol::ProjectDiffRevision::CommittedRange {
+                    base_oid: base_oid.clone(),
+                    tip_oid: tip_oid.clone(),
+                },
+                path: None,
+                context_mode: DiffContextMode::FullFile,
+            },
+        )
+        .map(|diff| vec![diff]),
     }
 }
 
@@ -2236,7 +2288,9 @@ fn prune_file_snapshots(review: &mut Review) -> bool {
                 location.relative_path.clone(),
                 revision.clone(),
             )),
-            ReviewTarget::UnstagedDiff | ReviewTarget::StagedDiff => None,
+            ReviewTarget::UnstagedDiff
+            | ReviewTarget::StagedDiff
+            | ReviewTarget::CommittedDiff { .. } => None,
         })
         .collect::<std::collections::HashSet<_>>();
     let before = review.file_snapshots.len();
@@ -2355,11 +2409,23 @@ pub(crate) fn review_summary_scope(review: &Review) -> ReviewSummaryScope {
     match &review.selection {
         ReviewDiffSelection::Workspace { .. } => ReviewSummaryScope::Workspace,
         ReviewDiffSelection::Root { root, .. } => ReviewSummaryScope::Root { root: root.clone() },
+        ReviewDiffSelection::CommittedRange {
+            root,
+            base_oid,
+            tip_oid,
+            commit_count,
+        } => ReviewSummaryScope::CommittedRange {
+            root: root.clone(),
+            base_oid: base_oid.clone(),
+            tip_oid: tip_oid.clone(),
+            commit_count: *commit_count,
+        },
         ReviewDiffSelection::AllUncommitted => ReviewSummaryScope::Workspace,
     }
 }
 
 pub(crate) fn validate_location(review: &Review, location: &ReviewLocation) -> Result<(), String> {
+    validate_selection_target(review, location)?;
     if let ReviewTarget::RegularFile { revision } = &location.target {
         let snapshot = review
             .file_snapshots
@@ -2463,16 +2529,58 @@ pub(crate) fn validate_location(review: &Review, location: &ReviewLocation) -> R
     }
 }
 
+fn validate_selection_target(review: &Review, location: &ReviewLocation) -> Result<(), String> {
+    let ReviewDiffSelection::CommittedRange {
+        root,
+        base_oid,
+        tip_oid,
+        ..
+    } = &review.selection
+    else {
+        return Ok(());
+    };
+    if &location.root != root {
+        return Err(format!(
+            "committed review locations must use selected root {root}"
+        ));
+    }
+    match &location.target {
+        ReviewTarget::CommittedDiff {
+            base_oid: target_base,
+            tip_oid: target_tip,
+        } if target_base == base_oid && target_tip == tip_oid => Ok(()),
+        ReviewTarget::CommittedDiff { .. } => {
+            Err("committed review location endpoints do not match the selected range".to_owned())
+        }
+        _ => Err("committed reviews accept only committed-diff locations".to_owned()),
+    }
+}
+
 fn find_file<'a>(review: &'a Review, location: &ReviewLocation) -> Option<&'a ProjectGitDiffFile> {
     let expected_scope = match location.target {
         ReviewTarget::UnstagedDiff => ProjectDiffScope::Unstaged,
         ReviewTarget::StagedDiff => ProjectDiffScope::Staged,
+        ReviewTarget::CommittedDiff { .. } => ProjectDiffScope::Uncommitted,
         ReviewTarget::RegularFile { .. } => return None,
     };
     review
         .diffs
         .iter()
-        .find(|diff| diff.root == location.root && diff.scope == expected_scope)
+        .find(|diff| {
+            diff.root == location.root
+                && diff.scope == expected_scope
+                && match (&location.target, &diff.revision) {
+                    (
+                        ReviewTarget::CommittedDiff { base_oid, tip_oid },
+                        protocol::ProjectDiffRevision::CommittedRange {
+                            base_oid: diff_base,
+                            tip_oid: diff_tip,
+                        },
+                    ) => base_oid == diff_base && tip_oid == diff_tip,
+                    (ReviewTarget::CommittedDiff { .. }, _) => false,
+                    (_, _) => true,
+                }
+        })
         .and_then(|diff| {
             diff.files
                 .iter()

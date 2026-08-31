@@ -86,6 +86,7 @@ impl AppError {
         request_kind: FrameKind,
     ) -> CommandErrorPayload {
         CommandErrorPayload {
+            request_id: None,
             stream: request_stream,
             request_kind,
             operation: self.operation.to_owned(),

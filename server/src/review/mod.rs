@@ -17,6 +17,7 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 use uuid::Uuid;
 
 use crate::agent::now_ms;
+use crate::project_stream::committed_range_commit_count;
 use crate::review::actor::{ReviewAiSpawnRequest, ReviewDeliveryRequest};
 use crate::store::project::ProjectStore;
 use crate::store::review::ReviewStore;
@@ -540,6 +541,20 @@ impl ReviewRegistryActor {
                     self.draft_review_for_project_root(&request.project_id, root)
                         .await?
                 }
+                ReviewDiffSelection::CommittedRange {
+                    root,
+                    base_oid,
+                    tip_oid,
+                    ..
+                } => {
+                    self.draft_review_for_committed_range(
+                        &request.project_id,
+                        root,
+                        base_oid,
+                        tip_oid,
+                    )
+                    .await?
+                }
                 ReviewDiffSelection::AllUncommitted | ReviewDiffSelection::Workspace { .. } => None,
             }
         };
@@ -582,9 +597,7 @@ impl ReviewRegistryActor {
             self.project_update_tx.clone(),
         );
         self.handles.insert(review_id.clone(), handle);
-        if is_active_workspace {
-            let _ = self.project_update_tx.send(request.project_id);
-        }
+        let _ = self.project_update_tx.send(request.project_id);
         Ok(review_id)
     }
 
@@ -619,6 +632,36 @@ impl ReviewRegistryActor {
             if snapshot.project_id == *project_id
                 && matches!(snapshot.status, ReviewStatus::Draft)
                 && active_review_root(&snapshot).as_ref() == Some(root)
+            {
+                drafts.push(snapshot);
+            }
+        }
+        drafts.sort_by(active_review_sort);
+        Ok(drafts.into_iter().next().map(|review| review.id))
+    }
+
+    async fn draft_review_for_committed_range(
+        &self,
+        project_id: &ProjectId,
+        root: &ProjectRootPath,
+        base_oid: &str,
+        tip_oid: &str,
+    ) -> Result<Option<ReviewId>, String> {
+        let handles = self.handles.values().cloned().collect::<Vec<_>>();
+        let mut drafts = Vec::new();
+        for handle in handles {
+            let snapshot = handle.snapshot().await?;
+            if snapshot.project_id == *project_id
+                && matches!(snapshot.status, ReviewStatus::Draft)
+                && matches!(
+                    &snapshot.selection,
+                    ReviewDiffSelection::CommittedRange {
+                        root: selected_root,
+                        base_oid: selected_base,
+                        tip_oid: selected_tip,
+                        ..
+                    } if selected_root == root && selected_base == base_oid && selected_tip == tip_oid
+                )
             {
                 drafts.push(snapshot);
             }
@@ -662,21 +705,33 @@ impl ReviewRegistryActor {
 
         let handles = self.handles.values().cloned().collect::<Vec<_>>();
         let mut drafts = Vec::new();
+        let mut committed_drafts = Vec::new();
         for handle in &handles {
             let snapshot = handle.snapshot().await?;
-            if snapshot.project_id == project_id
-                && matches!(snapshot.status, ReviewStatus::Draft)
-                && active_review_selection(&snapshot.selection)
-            {
-                drafts.push(snapshot);
+            if snapshot.project_id == project_id && matches!(snapshot.status, ReviewStatus::Draft) {
+                if active_review_selection(&snapshot.selection) {
+                    drafts.push(snapshot);
+                } else if matches!(
+                    snapshot.selection,
+                    ReviewDiffSelection::CommittedRange { .. }
+                ) {
+                    committed_drafts.push(snapshot);
+                }
             }
         }
         drafts.sort_by(active_review_sort);
-        Ok(drafts
+        committed_drafts.sort_by(active_review_sort);
+        let mut summaries = drafts
             .into_iter()
             .next()
             .map(|review| vec![actor::summary_for_review(&review)])
-            .unwrap_or_default())
+            .unwrap_or_default();
+        summaries.extend(
+            committed_drafts
+                .into_iter()
+                .map(|review| actor::summary_for_review(&review)),
+        );
+        Ok(summaries)
     }
 
     async fn reset_project_roots_for_clean_unstaged(
@@ -813,6 +868,30 @@ pub(crate) fn review_create_selection(
                 ))
             }
         }
+        ReviewDiffSelection::CommittedRange {
+            root,
+            base_oid,
+            tip_oid,
+            ..
+        } => {
+            if !project
+                .root_paths()
+                .iter()
+                .any(|candidate| candidate == root)
+            {
+                return Err(format!(
+                    "project {} does not contain review root {}",
+                    project.id, root
+                ));
+            }
+            let commit_count = committed_range_commit_count(project, root, base_oid, tip_oid)?;
+            Ok(ReviewDiffSelection::CommittedRange {
+                root: root.clone(),
+                base_oid: base_oid.clone(),
+                tip_oid: tip_oid.clone(),
+                commit_count,
+            })
+        }
         ReviewDiffSelection::AllUncommitted | ReviewDiffSelection::Workspace { .. } => {
             if project.root_paths().is_empty() {
                 Err(format!("project {} has no review roots", project.id))
@@ -833,6 +912,7 @@ fn normalize_create_selection(selection: ReviewDiffSelection) -> ReviewDiffSelec
             scope: ProjectDiffScope::Unstaged,
             path: None,
         },
+        ReviewDiffSelection::CommittedRange { .. } => selection,
     }
 }
 
@@ -857,13 +937,16 @@ fn active_review_root(review: &Review) -> Option<ProjectRootPath> {
             root, path: None, ..
         } => Some(root.clone()),
         ReviewDiffSelection::Root { .. } => None,
+        ReviewDiffSelection::CommittedRange { .. } => None,
         ReviewDiffSelection::AllUncommitted | ReviewDiffSelection::Workspace { .. } => None,
     }
 }
 
 fn normalize_diff_payloads(mut diffs: Vec<ProjectGitDiffPayload>) -> Vec<ProjectGitDiffPayload> {
     for diff in &mut diffs {
-        diff.scope = ProjectDiffScope::Unstaged;
+        if matches!(diff.revision, protocol::ProjectDiffRevision::WorkingTree) {
+            diff.scope = ProjectDiffScope::Unstaged;
+        }
         diff.context_mode = DiffContextMode::FullFile;
     }
     diffs

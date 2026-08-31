@@ -3286,6 +3286,7 @@ mod wasm_tests {
                 FrameKind::CommandError,
                 0,
                 &protocol::CommandErrorPayload {
+                    request_id: None,
                     stream: StreamPath("/host/mobile-session-list-error".to_owned()),
                     request_kind: FrameKind::ListSessions,
                     operation: "list_sessions".to_owned(),
@@ -3431,8 +3432,10 @@ mod wasm_tests {
                 FrameKind::ProjectGitDiff,
                 2,
                 &ProjectGitDiffPayload {
+                    request_id: None,
                     root: root.clone(),
                     scope: ProjectDiffScope::Uncommitted,
+                    revision: protocol::ProjectDiffRevision::WorkingTree,
                     path: Some("src/lib.rs".to_owned()),
                     context_mode: DiffContextMode::Hunks,
                     files: Vec::new(),
@@ -4204,6 +4207,7 @@ mod wasm_tests {
                 FrameKind::CommandError,
                 1,
                 &CommandErrorPayload {
+                    request_id: None,
                     stream: instance_stream.clone(),
                     request_kind: FrameKind::LoadAgent,
                     operation: "load_agent".to_owned(),
@@ -4259,6 +4263,7 @@ mod wasm_tests {
                 FrameKind::CommandError,
                 2,
                 &CommandErrorPayload {
+                    request_id: None,
                     stream: instance_stream.clone(),
                     request_kind: FrameKind::LoadAgent,
                     operation: "load_agent".to_owned(),
@@ -4316,6 +4321,7 @@ mod wasm_tests {
                 FrameKind::CommandError,
                 1,
                 &CommandErrorPayload {
+                    request_id: None,
                     stream: instance_stream.clone(),
                     request_kind: FrameKind::FetchSessionHistory,
                     operation: "fetch_session_history".to_owned(),

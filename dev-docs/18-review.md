@@ -2,12 +2,13 @@
 
 Spec for Tyde's inline Review feature.
 
-Reviews are an **always-on, workspace-scoped inline layer** over a project's
-unstaged diffs, staged diffs, and regular text files. In this document,
+Reviews are an **always-on inline layer** over a project's unstaged diffs,
+staged diffs, regular text files, and explicitly selected committed ranges. In this document,
 **workspace** means the
 `Project`, keyed by `ProjectId`, spanning every path in `Project.roots`.
-There is exactly one active draft review per project, even when the project has
-one root. The primary UX is still the project diff surface: comments, AI
+There is exactly one active workspace draft review per project, even when the
+project has one root, plus zero or more drafts keyed to exact committed ranges.
+The primary UX is still the project diff surface: comments, AI
 suggestions, stale-anchor badges, and submit controls render inline with the
 changed files from any root in the project.
 
@@ -17,7 +18,10 @@ Audience: implementation agents and future maintainers.
 
 ## 1. Current model
 
-- Exactly one active draft review exists for each `ProjectId`.
+- Exactly one active workspace draft review exists for each `ProjectId`.
+- Committed-range drafts are additional and keyed by exact
+  `(project_id, root, base_oid, tip_oid)`. Browsing history does not create one;
+  an explicit review action does.
 - The active review scope is `ReviewDiffSelection::Workspace { scope:
   ProjectDiffScope::Unstaged }`.
 - Active reviews are implicit. Project bootstrap and review summary updates
@@ -65,7 +69,7 @@ workspace draft.
 ## 2. Protocol contract
 
 `ReviewTarget` and `Review.file_snapshots` are wire-visible additions in
-protocol version 52. Stored legacy locations remain readable because a missing
+protocol version 54. Stored legacy locations remain readable because a missing
 target defaults to `UnstagedDiff` and missing file snapshots default empty.
 
 ### Streams
@@ -81,8 +85,8 @@ target defaults to `UnstagedDiff` and missing file snapshots default empty.
 
 `ProjectBootstrapPayload.review_summaries` and
 `ProjectEventPayload::ReviewListChanged` are the source of active review ids.
-For each project they contain exactly one active draft summary with workspace
-scope:
+For each project they contain the active workspace draft plus any committed
+range drafts:
 
 ```rust
 pub struct ReviewSummary {
@@ -99,6 +103,7 @@ pub struct ReviewSummary {
 pub enum ReviewSummaryScope {
     Workspace,
     Root { root: ProjectRootPath }, // legacy/direct reviews only
+    CommittedRange { root: ProjectRootPath, base_oid: String, tip_oid: String, commit_count: u32 },
 }
 
 pub struct ReviewFileCommentCount {
@@ -111,7 +116,8 @@ pub struct ReviewFileCommentCount {
 ```
 
 For a project with multiple roots, the summary list still contains one active
-summary, not one summary per root. Clients bind active inline review state by
+workspace summary, not one workspace summary per root; committed-range
+summaries are additional. Clients bind active inline workspace review state by
 `(project_id, ReviewSummaryScope::Workspace)`.
 
 `file_comment_counts` lets the normal git file list show comment badges without
@@ -147,6 +153,7 @@ subscribe cannot downgrade full diff payloads.
 
 ```rust
 pub struct ReviewCreatePayload {
+    pub request_id: Option<String>,
     pub selection: ReviewDiffSelection,
 }
 
@@ -155,8 +162,31 @@ pub enum ReviewDiffSelection {
     AllUncommitted, // legacy; active create normalizes to Workspace/Unstaged
     Workspace { scope: ProjectDiffScope },
     Root { root: ProjectRootPath, scope: ProjectDiffScope, path: Option<String> },
+    CommittedRange { root: ProjectRootPath, base_oid: String, tip_oid: String, commit_count: u32 },
 }
 ```
+
+Committed selections are never normalized to workspace scope. Their frozen
+aggregate diff uses first-parent semantics and remains immutable across
+working-tree refresh and clean-tree reset logic. The server walks at most the
+100-commit recent-history window backward from `tip_oid` through first
+parents, requires `base_oid` to be the exact predecessor boundary (or the
+repository-native empty tree at the root), and replaces the client's
+`commit_count` with the derived count. Unrelated, noncontiguous, and
+out-of-window endpoints are rejected. If an endpoint disappears,
+the server returns a request-correlated command error and the client preserves
+the pinned identity rather than silently retargeting it. AI reviewer
+instructions and location examples identify the exact endpoints, treat the
+frozen diff as authoritative over current files, and describe submitted
+feedback as fix-forward because the changes are committed. Locations in a
+committed-range review must use that review's exact root and a `CommittedDiff`
+target with the exact stored endpoints. Regular-file snapshots and working-tree
+targets are rejected before any current file is read.
+
+Committed drafts currently accumulate for the lifetime of their stored review
+records. Exact range identity restores the same draft and a different range
+creates a different draft; there is not yet an archival or retention lifecycle
+for old committed-range drafts.
 
 New UI paths should prefer the active id from project bootstrap/summaries.
 When `ReviewCreate` is used with `Workspace` or legacy `AllUncommitted`, the
@@ -290,9 +320,10 @@ are impossible, but file-level `ReviewAnchor::File` comments are valid.
 
 ### Registry
 
-`ReviewRegistry` owns review actors and enforces active singleton semantics per
-`ProjectId`. Project summaries first ensure the implicit active workspace draft
-exists for the project, then return exactly one workspace summary.
+`ReviewRegistry` owns review actors and enforces workspace singleton semantics
+per `ProjectId`. Project summaries first ensure the implicit active workspace
+draft exists for the project, then return exactly one workspace summary plus
+the exact committed-range draft summaries.
 
 When legacy records are loaded:
 
@@ -342,6 +373,9 @@ regular-file comments.
 If one root becomes clean while another root remains dirty, the review is not
 cleared. Comments in the clean root remain in the review and are marked stale by
 anchor-status refresh because their diff file is no longer present.
+Committed-range reviews are outside this reset path: their endpoints, comments,
+and frozen full-file diffs remain unchanged when the current worktree becomes
+clean.
 
 ### Desktop and mobile surfaces
 
@@ -356,18 +390,22 @@ files, Git status, diffs, review comments, or review navigation.
 
 ### AI review
 
-`StartAiReview` spawns one agent named `AI Review` for the workspace review.
+`StartAiReview` spawns one agent named `AI Review` for the active review scope.
 The spawn request uses:
 
 - `project_id = Some(review.project_id)`
 - `workspace_roots = project.roots`
 - read-only access mode
-- one reviewer prompt containing all refreshed review diffs
+- a reviewer prompt containing exact hunk-local changed-line context, bounded
+  to 512 KiB while the immutable full-file diff remains stored for anchoring
 - the review-feedback MCP server so the reviewer can call
   `propose_review_comment`
 
 The reviewer proposes typed `ReviewLocation` values. The `root` in each
 location must be one of the project root paths present in the review diff.
+If the hunk-local context cannot fit the hard bound, no agent is spawned; the
+review enters failed AI state and surfaces an actionable error asking the user
+to select a smaller committed range.
 
 ### Submit
 

@@ -2209,8 +2209,7 @@ async fn browse_and_terminal_streams_start_with_bootstraps() {
         })
         .await
         .expect("start browse");
-    let browse = next_env(&mut client, "browse bootstrap").await;
-    assert_eq!(browse.kind, FrameKind::BrowseBootstrap);
+    let browse = next_kind(&mut client, FrameKind::BrowseBootstrap, "browse bootstrap").await;
     assert_eq!(browse.stream, browse_stream);
     assert_eq!(browse.seq, 0);
 
@@ -2225,8 +2224,12 @@ async fn browse_and_terminal_streams_start_with_bootstraps() {
     let terminal = next_kind(&mut client, FrameKind::NewTerminal, "new terminal").await;
     let new_terminal: protocol::NewTerminalPayload =
         terminal.parse_payload().expect("new terminal");
-    let terminal_bootstrap = next_env(&mut client, "terminal bootstrap").await;
-    assert_eq!(terminal_bootstrap.kind, FrameKind::TerminalBootstrap);
+    let terminal_bootstrap = next_kind(
+        &mut client,
+        FrameKind::TerminalBootstrap,
+        "terminal bootstrap",
+    )
+    .await;
     assert_eq!(terminal_bootstrap.stream, new_terminal.stream);
     assert_eq!(terminal_bootstrap.seq, 0);
 }

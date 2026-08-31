@@ -22,6 +22,7 @@ The stream must provide enough typed state to build:
 - file open / read
 - git status per root
 - staged and unstaged diff views
+- pinned first-parent committed-range diff views
 - stage-file and stage-hunk actions
 
 This is explicitly server-owned behavior:
@@ -122,7 +123,9 @@ The project stream is event-driven like the rest of Tyde.
 The client may send user intent events on `/project/<project_id>`.
 The server emits output events on `/project/<project_id>`.
 
-There are no request IDs and no request/response pairing.
+Most project state remains snapshot-driven rather than request/response paired.
+Historical diff reads are the exception: they may carry a client request ID so
+success and command-error frames can complete the exact pending range.
 
 Instead:
 
@@ -175,21 +178,41 @@ pub enum ProjectDiffScope {
 }
 
 pub struct ProjectReadDiffPayload {
+    pub request_id: Option<String>,
     pub root: ProjectRootPath,
     pub scope: ProjectDiffScope,
+    pub revision: ProjectDiffRevision,
     pub path: Option<String>,
 }
 ```
+
+`ProjectDiffRevision` defaults to `WorkingTree`. `CommittedRange` carries full
+`base_oid` and `tip_oid` strings. The server passes those exact object IDs to
+`git diff`; it never substitutes `HEAD`. The base is the first parent of the
+oldest selected commit, or Git's empty-tree object for a root commit. Historical
+reads never inject untracked working-tree files and are not registered for
+working-tree refresh pushes.
 
 Rules:
 
 - `path: None` means read the full diff for that root+scope.
 - `path: Some(relative_path)` means read the diff only for that file.
 
+`project_git_status` includes each root's current full `head_oid`, its
+repository-native `empty_tree_oid`, and up to 100 newest-first
+`recent_commits`. Entries are current-root first-parent history and carry full
+OID, first-parent OID, subject, author, timestamp, and merge state. A legal
+empty subject is surfaced as `(no commit message)` and an unusable timestamp is
+degraded for that row without terminating the project stream. Author and
+subject bytes are decoded lossily. Recent history and empty-tree lookup are
+optional metadata: if either Git operation fails, the root still streams file,
+status, and diff state with no recent commits or empty-tree identity. The
+desktop initially renders 20 and reveals additional pages on demand.
+
 Expected output:
 
 - `project_git_diff`
-- `project_error` on failure
+- `command_error` on failure, echoing `request_id` when supplied
 
 ### 5.3 `project_stage_file`
 

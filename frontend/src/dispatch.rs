@@ -508,6 +508,31 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                 state.command_errors_by_host.update(|errors| {
                     errors.insert(host_id.to_string(), message);
                 });
+                if let Some(request_id) = payload.request_id.clone() {
+                    state.command_errors_by_request.update(|errors| {
+                        errors.insert(request_id.clone(), payload.message.clone());
+                    });
+                    let failed_keys = state.diff_request_ids.with_untracked(|requests| {
+                        requests
+                            .iter()
+                            .filter(|(_, pending_id)| *pending_id == &request_id)
+                            .map(|(key, _)| key.clone())
+                            .collect::<Vec<_>>()
+                    });
+                    for key in failed_keys {
+                        state.diff_request_ids.update(|requests| {
+                            requests.remove(&key);
+                        });
+                        state.diff_request_errors.update(|errors| {
+                            errors.insert(key.clone(), payload.message.clone());
+                        });
+                        state.diff_contents.update(|diffs| {
+                            if let Some(diff) = diffs.get_mut(&key) {
+                                diff.pending = false;
+                            }
+                        });
+                    }
+                }
                 clear_session_history_loading_on_error(state, host_id, &payload);
                 clear_session_list_refresh_on_error(state, host_id, &payload);
                 // Release any review-side pending gate the rejected
@@ -1715,14 +1740,31 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                     return;
                 };
                 let payload_path = payload.path.clone().unwrap_or_default();
-                let key = crate::state::DiffKey::new(
+                let key = crate::state::DiffKey::with_revision(
                     host_id,
                     project_id,
                     payload.root.clone(),
                     payload.scope,
+                    payload.revision.clone(),
                     payload_path.clone(),
                 );
                 let perf_key = format!("diff:{}:{payload_path}", payload.root.0);
+                let pending_request_id = state
+                    .diff_request_ids
+                    .with_untracked(|requests| requests.get(&key).cloned());
+                let response_matches = match (&payload.request_id, &pending_request_id) {
+                    (Some(response), Some(pending)) => response == pending,
+                    (None, None) => true,
+                    _ => false,
+                };
+                if !response_matches {
+                    log::debug!(
+                        "ignoring unmatched ProjectGitDiff request {:?} for {:?}",
+                        payload.request_id,
+                        key,
+                    );
+                    return;
+                }
                 let total_lines: usize = payload
                     .files
                     .iter()
@@ -1744,6 +1786,12 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                     .with_untracked(|diffs| diffs.get(&key).cloned());
                 match reduce_diff_response(current.as_ref(), payload) {
                     Some(next) => {
+                        state.diff_request_ids.update(|requests| {
+                            requests.remove(&key);
+                        });
+                        state.diff_request_errors.update(|errors| {
+                            errors.remove(&key);
+                        });
                         state.diff_contents.update(|diffs| {
                             diffs.insert(key, next);
                         });
@@ -8431,6 +8479,7 @@ mod wasm_tests {
             FrameKind::CommandError,
             0,
             &CommandErrorPayload {
+                request_id: None,
                 stream: StreamPath("/host/local".to_owned()),
                 request_kind: FrameKind::WorkbenchRemove,
                 operation: "workbench_remove".to_owned(),
@@ -8474,6 +8523,7 @@ mod wasm_tests {
             FrameKind::CommandError,
             0,
             &CommandErrorPayload {
+                request_id: None,
                 stream: StreamPath("/host/local".to_owned()),
                 request_kind: FrameKind::ListSessions,
                 operation: "list_sessions".to_owned(),
@@ -8512,6 +8562,7 @@ mod wasm_tests {
             FrameKind::CommandError,
             0,
             &CommandErrorPayload {
+                request_id: None,
                 stream: StreamPath("/host/local".to_owned()),
                 request_kind: FrameKind::DeleteSession,
                 operation: "delete_session".to_owned(),

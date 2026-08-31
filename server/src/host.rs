@@ -11942,18 +11942,21 @@ impl HostHandle {
         let project = load_project(&project_store, &project_id, OPERATION).await?;
         let diff = read_diff(&project, payload)
             .map_err(|error| project_command_error(OPERATION, error))?;
-        handle
-            .remember_diff_context_mode(
-                connection_host_stream.clone(),
-                ProjectDiffRequestKey {
-                    root: diff.root.clone(),
-                    scope: diff.scope,
-                    path: diff.path.clone(),
-                },
-                diff.context_mode,
-            )
-            .await
-            .map_err(|error| project_command_error(OPERATION, error))?;
+        if matches!(diff.revision, protocol::ProjectDiffRevision::WorkingTree) {
+            handle
+                .remember_diff_context_mode(
+                    connection_host_stream.clone(),
+                    ProjectDiffRequestKey {
+                        root: diff.root.clone(),
+                        scope: diff.scope,
+                        revision: diff.revision.clone(),
+                        path: diff.path.clone(),
+                    },
+                    diff.context_mode,
+                )
+                .await
+                .map_err(|error| project_command_error(OPERATION, error))?;
+        }
         let payload = serde_json::to_value(&diff).map_err(|error| {
             AppError::internal_message(
                 OPERATION,
@@ -12134,6 +12137,7 @@ impl HostHandle {
             .map_err(|error| AppError::invalid(OPERATION, error))?;
         let selection_root = match &normalized_selection {
             ReviewDiffSelection::Root { root, .. } => Some(root),
+            ReviewDiffSelection::CommittedRange { root, .. } => Some(root),
             ReviewDiffSelection::AllUncommitted | ReviewDiffSelection::Workspace { .. } => None,
         };
 
@@ -12187,6 +12191,7 @@ impl HostHandle {
             review_id.clone(),
             project_id.clone(),
             ReviewCreatePayload {
+                request_id: None,
                 selection: normalized_selection,
             },
             diffs,
@@ -12706,7 +12711,10 @@ impl HostHandle {
             );
         }
         let reviewer_system_prompt =
-            build_reviewer_system_prompt(&request.review, request.instructions);
+            match build_reviewer_system_prompt(&request.review, request.instructions) {
+                Ok(prompt) => prompt,
+                Err(message) => return (reply, Err(message)),
+            };
         let reviewer_system_prompt_len = reviewer_system_prompt.len();
         let reviewer_spawn_config = ResolvedSpawnConfig {
             instructions: Some(reviewer_system_prompt),
@@ -12841,8 +12849,10 @@ fn read_review_diffs(
             let mut diffs = Vec::new();
             for root in project.root_paths() {
                 let payload = ProjectReadDiffPayload {
+                    request_id: None,
                     root,
                     scope: protocol::ProjectDiffScope::Unstaged,
+                    revision: protocol::ProjectDiffRevision::WorkingTree,
                     path: None,
                     context_mode: protocol::DiffContextMode::FullFile,
                 };
@@ -12856,8 +12866,10 @@ fn read_review_diffs(
         }
         ReviewDiffSelection::Root { root, path, .. } => {
             let payload = ProjectReadDiffPayload {
+                request_id: None,
                 root: root.clone(),
                 scope: protocol::ProjectDiffScope::Unstaged,
+                revision: protocol::ProjectDiffRevision::WorkingTree,
                 path: path.clone(),
                 context_mode: protocol::DiffContextMode::FullFile,
             };
@@ -12866,6 +12878,25 @@ fn read_review_diffs(
                 Err(error) if is_not_git_repository_error(&error) => Ok(Vec::new()),
                 Err(error) => Err(error),
             }
+        }
+        ReviewDiffSelection::CommittedRange {
+            root,
+            base_oid,
+            tip_oid,
+            ..
+        } => {
+            let payload = ProjectReadDiffPayload {
+                request_id: None,
+                root: root.clone(),
+                scope: protocol::ProjectDiffScope::Uncommitted,
+                revision: protocol::ProjectDiffRevision::CommittedRange {
+                    base_oid: base_oid.clone(),
+                    tip_oid: tip_oid.clone(),
+                },
+                path: None,
+                context_mode: protocol::DiffContextMode::FullFile,
+            };
+            read_diff(project, payload).map(|diff| vec![diff])
         }
     }
 }
@@ -15003,6 +15034,7 @@ fn emit_spawn_operation_error(terminal: &SpawnOperationTerminal, error: &AppErro
         &terminal.output_stream,
         terminal.request_stream.clone(),
         FrameKind::SpawnAgent,
+        None,
         error,
     );
 }

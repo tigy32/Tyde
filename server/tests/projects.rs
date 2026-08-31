@@ -15,8 +15,9 @@ use protocol::{
     SteeringUpsertPayload, StreamPath, WorkbenchCreatePayload,
 };
 use std::fs;
+use std::io::Write;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::Duration;
 
 fn is_control_plane_noise(env: &Envelope) -> bool {
@@ -252,7 +253,9 @@ async fn request_project_diff(
         // Project streams can also push remembered live diff refreshes; wait
         // for the response that echoes the command payload under test.
         if diff.root == expected.root
+            && diff.request_id == expected.request_id
             && diff.scope == expected.scope
+            && diff.revision == expected.revision
             && diff.path == expected.path
             && diff.context_mode == expected.context_mode
         {
@@ -344,6 +347,48 @@ fn git(root: &Path, args: &[&str]) {
         args,
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+fn git_stdout(root: &Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .output()
+        .unwrap_or_else(|err| panic!("failed to run git {:?}: {}", args, err));
+    assert!(
+        output.status.success(),
+        "git {:?} failed: {}",
+        args,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout)
+        .expect("git output was not UTF-8")
+        .trim()
+        .to_owned()
+}
+
+fn git_with_stdin(root: &Path, args: &[&str], stdin: &[u8]) -> Vec<u8> {
+    let mut child = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|err| panic!("git {:?} failed to spawn: {err}", args));
+    let mut stdin_pipe = child.stdin.take().expect("git stdin");
+    stdin_pipe.write_all(stdin).expect("write git stdin");
+    drop(stdin_pipe);
+    let output = child.wait_with_output().expect("wait for git");
+    assert!(
+        output.status.success(),
+        "git {:?} failed: {}",
+        args,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output.stdout
 }
 
 fn git_expect_failure(root: &Path, args: &[&str]) {
@@ -1213,8 +1258,10 @@ async fn project_read_diff_returns_unstaged_diff() {
         &mut fixture.client,
         &project.id,
         ProjectReadDiffPayload {
+            request_id: None,
             root: protocol::ProjectRootPath(project_root(&project, 0)),
             scope: ProjectDiffScope::Unstaged,
+            revision: protocol::ProjectDiffRevision::WorkingTree,
             path: Some("src/main.rs".to_owned()),
             context_mode: DiffContextMode::Hunks,
         },
@@ -1257,8 +1304,10 @@ async fn project_read_diff_returns_typed_unmerged_file() {
     .await;
     let root = protocol::ProjectRootPath(project_root(&project, 0));
     let request = ProjectReadDiffPayload {
+        request_id: None,
         root: root.clone(),
         scope: ProjectDiffScope::Unstaged,
+        revision: protocol::ProjectDiffRevision::WorkingTree,
         path: Some("src/lib.rs".to_owned()),
         context_mode: DiffContextMode::Hunks,
     };
@@ -1308,8 +1357,10 @@ async fn project_read_diff_untracked_file_appears_as_all_added() {
         &mut fixture.client,
         &project.id,
         ProjectReadDiffPayload {
+            request_id: None,
             root: protocol::ProjectRootPath(project_root(&project, 0)),
             scope: ProjectDiffScope::Unstaged,
+            revision: protocol::ProjectDiffRevision::WorkingTree,
             path: Some("src/new.rs".to_owned()),
             context_mode: DiffContextMode::Hunks,
         },
@@ -1362,8 +1413,10 @@ async fn project_read_diff_unstaged_includes_both_modified_and_untracked() {
         &mut fixture.client,
         &project.id,
         ProjectReadDiffPayload {
+            request_id: None,
             root: protocol::ProjectRootPath(project_root(&project, 0)),
             scope: ProjectDiffScope::Unstaged,
+            revision: protocol::ProjectDiffRevision::WorkingTree,
             path: None,
             context_mode: DiffContextMode::Hunks,
         },
@@ -1430,8 +1483,10 @@ async fn project_read_diff_unstaged_includes_both_modified_and_untracked() {
         &mut fixture.client,
         &project.id,
         ProjectReadDiffPayload {
+            request_id: None,
             root: protocol::ProjectRootPath(project_root(&project, 0)),
             scope: ProjectDiffScope::Unstaged,
+            revision: protocol::ProjectDiffRevision::WorkingTree,
             path: Some("src/new.rs".to_owned()),
             context_mode: DiffContextMode::Hunks,
         },
@@ -1474,8 +1529,10 @@ async fn project_read_diff_staged_scope_excludes_untracked() {
         &mut fixture.client,
         &project.id,
         ProjectReadDiffPayload {
+            request_id: None,
             root: protocol::ProjectRootPath(project_root(&project, 0)),
             scope: ProjectDiffScope::Staged,
+            revision: protocol::ProjectDiffRevision::WorkingTree,
             path: None,
             context_mode: DiffContextMode::Hunks,
         },
@@ -1513,8 +1570,10 @@ async fn project_read_diff_hunks_mode_returns_typed_line_numbers() {
         &mut fixture.client,
         &project.id,
         ProjectReadDiffPayload {
+            request_id: None,
             root: protocol::ProjectRootPath(project_root(&project, 0)),
             scope: ProjectDiffScope::Unstaged,
+            revision: protocol::ProjectDiffRevision::WorkingTree,
             path: Some("src/main.rs".to_owned()),
             context_mode: DiffContextMode::Hunks,
         },
@@ -1606,8 +1665,10 @@ async fn project_read_diff_full_file_mode_returns_single_hunk_spanning_file() {
         &mut fixture.client,
         &project.id,
         ProjectReadDiffPayload {
+            request_id: None,
             root: protocol::ProjectRootPath(project_root(&project, 0)),
             scope: ProjectDiffScope::Unstaged,
+            revision: protocol::ProjectDiffRevision::WorkingTree,
             path: Some("src/main.rs".to_owned()),
             context_mode: DiffContextMode::FullFile,
         },
@@ -1653,8 +1714,10 @@ async fn project_read_diff_payload_echoes_context_mode() {
         &mut fixture.client,
         &project.id,
         ProjectReadDiffPayload {
+            request_id: None,
             root: protocol::ProjectRootPath(project_root(&project, 0)),
             scope: ProjectDiffScope::Unstaged,
+            revision: protocol::ProjectDiffRevision::WorkingTree,
             path: Some("src/main.rs".to_owned()),
             context_mode: DiffContextMode::Hunks,
         },
@@ -1691,8 +1754,10 @@ async fn project_read_diff_payload_echoes_context_mode() {
         &mut fixture.client,
         &project.id,
         ProjectReadDiffPayload {
+            request_id: None,
             root: protocol::ProjectRootPath(project_root(&project, 0)),
             scope: ProjectDiffScope::Unstaged,
+            revision: protocol::ProjectDiffRevision::WorkingTree,
             path: Some("src/main.rs".to_owned()),
             context_mode: DiffContextMode::FullFile,
         },
@@ -1775,8 +1840,10 @@ async fn project_stage_file_updates_git_status_and_diffs() {
         &mut fixture.client,
         &project.id,
         ProjectReadDiffPayload {
+            request_id: None,
             root: protocol::ProjectRootPath(project_root(&project, 0)),
             scope: ProjectDiffScope::Staged,
+            revision: protocol::ProjectDiffRevision::WorkingTree,
             path: Some("src/main.rs".to_owned()),
             context_mode: DiffContextMode::Hunks,
         },
@@ -1790,8 +1857,10 @@ async fn project_stage_file_updates_git_status_and_diffs() {
         &mut fixture.client,
         &project.id,
         ProjectReadDiffPayload {
+            request_id: None,
             root: protocol::ProjectRootPath(project_root(&project, 0)),
             scope: ProjectDiffScope::Unstaged,
+            revision: protocol::ProjectDiffRevision::WorkingTree,
             path: Some("src/main.rs".to_owned()),
             context_mode: DiffContextMode::Hunks,
         },
@@ -1828,8 +1897,10 @@ async fn project_stage_hunk_stages_only_one_hunk() {
         &mut fixture.client,
         &project.id,
         ProjectReadDiffPayload {
+            request_id: None,
             root: protocol::ProjectRootPath(project_root(&project, 0)),
             scope: ProjectDiffScope::Unstaged,
+            revision: protocol::ProjectDiffRevision::WorkingTree,
             path: Some("src/main.rs".to_owned()),
             context_mode: DiffContextMode::Hunks,
         },
@@ -1843,8 +1914,10 @@ async fn project_stage_hunk_stages_only_one_hunk() {
         &mut fixture.client,
         &project.id,
         ProjectReadDiffPayload {
+            request_id: None,
             root: protocol::ProjectRootPath(project_root(&project, 0)),
             scope: ProjectDiffScope::Staged,
+            revision: protocol::ProjectDiffRevision::WorkingTree,
             path: Some("src/main.rs".to_owned()),
             context_mode: DiffContextMode::Hunks,
         },
@@ -2111,4 +2184,251 @@ async fn server_pushed_snapshots_send_all_add_ops() {
             .any(|e| e.relative_path == "lib.rs"),
         "lib.rs should be present in server-pushed listing"
     );
+}
+
+#[tokio::test]
+async fn recent_history_reads_exact_committed_ranges() {
+    let mut fixture = Fixture::new().await;
+    let repo = init_git_repo("initial", &[("src/lib.rs", "pub fn value() -> u8 { 1 }\n")]);
+    let initial_oid = git_stdout(repo.path(), &["rev-parse", "HEAD"]);
+
+    write_file(
+        &repo.path().join("src/lib.rs"),
+        "pub fn value() -> u8 { 2 }\n",
+    );
+    write_file(
+        &repo.path().join("src/added.rs"),
+        "pub const ADDED: bool = true;\n",
+    );
+    git(repo.path(), &["add", "."]);
+    git(repo.path(), &["commit", "-m", "Add committed changes"]);
+    let tip_oid = git_stdout(repo.path(), &["rev-parse", "HEAD"]);
+    git(
+        repo.path(),
+        &["commit", "--allow-empty", "--allow-empty-message", "-m", ""],
+    );
+    let empty_subject_oid = git_stdout(repo.path(), &["rev-parse", "HEAD"]);
+    write_file(&repo.path().join("untracked.txt"), "working tree only\n");
+
+    let project = create_project(
+        &mut fixture.client,
+        "Committed history",
+        vec![repo.path().to_string_lossy().to_string()],
+    )
+    .await;
+    let bootstrap = expect_project_bootstrap(&mut fixture.client, "history bootstrap").await;
+    let root_status = &bootstrap.git_status.roots[0];
+    assert_eq!(
+        root_status.head_oid.as_deref(),
+        Some(empty_subject_oid.as_str())
+    );
+    assert_eq!(root_status.recent_commits[0].oid, empty_subject_oid);
+    assert_eq!(root_status.recent_commits[0].subject, "(no commit message)");
+    assert_eq!(root_status.recent_commits[1].oid, tip_oid);
+    assert_eq!(
+        root_status.recent_commits[1].first_parent_oid.as_deref(),
+        Some(initial_oid.as_str())
+    );
+    assert_eq!(
+        root_status.recent_commits[1].subject,
+        "Add committed changes"
+    );
+    assert_eq!(root_status.recent_commits[2].subject, "initial");
+    let empty_tree_oid = root_status
+        .empty_tree_oid
+        .clone()
+        .expect("repository-native empty tree oid");
+
+    let root = ProjectRootPath(project_root(&project, 0));
+    let revision = protocol::ProjectDiffRevision::CommittedRange {
+        base_oid: initial_oid.clone(),
+        tip_oid: tip_oid.clone(),
+    };
+    let diff = request_project_diff(
+        &mut fixture.client,
+        &project.id,
+        ProjectReadDiffPayload {
+            request_id: None,
+            root: root.clone(),
+            scope: ProjectDiffScope::Uncommitted,
+            revision: revision.clone(),
+            path: None,
+            context_mode: DiffContextMode::Hunks,
+        },
+        "exact committed range",
+    )
+    .await;
+    assert_eq!(diff.revision, revision);
+    let paths = diff
+        .files
+        .iter()
+        .map(|file| file.relative_path.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(paths, vec!["src/added.rs", "src/lib.rs"]);
+    assert!(!paths.contains(&"untracked.txt"));
+    assert_eq!(
+        diff.files
+            .iter()
+            .find(|file| file.relative_path == "src/added.rs")
+            .and_then(|file| file.change_kind),
+        Some(protocol::ProjectGitChangeKind::Added)
+    );
+    assert_eq!(
+        diff.files
+            .iter()
+            .find(|file| file.relative_path == "src/lib.rs")
+            .and_then(|file| file.change_kind),
+        Some(protocol::ProjectGitChangeKind::Modified)
+    );
+
+    fixture
+        .client
+        .project_read_diff(
+            &project.id,
+            ProjectReadDiffPayload {
+                request_id: Some("rewritten-range".to_owned()),
+                root: root.clone(),
+                scope: ProjectDiffScope::Uncommitted,
+                revision: protocol::ProjectDiffRevision::CommittedRange {
+                    base_oid: initial_oid.clone(),
+                    tip_oid: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+                },
+                path: None,
+                context_mode: DiffContextMode::Hunks,
+            },
+        )
+        .await
+        .expect("send rewritten range diff");
+    let error = expect_command_error(&mut fixture.client, "rewritten range error").await;
+    assert_eq!(error.request_id.as_deref(), Some("rewritten-range"));
+    assert_eq!(error.request_kind, FrameKind::ProjectReadDiff);
+    assert!(error.message.contains("failed"));
+
+    let root_diff = request_project_diff(
+        &mut fixture.client,
+        &project.id,
+        ProjectReadDiffPayload {
+            request_id: None,
+            root,
+            scope: ProjectDiffScope::Uncommitted,
+            revision: protocol::ProjectDiffRevision::CommittedRange {
+                base_oid: empty_tree_oid,
+                tip_oid: initial_oid,
+            },
+            path: None,
+            context_mode: DiffContextMode::Hunks,
+        },
+        "root commit range",
+    )
+    .await;
+    assert_eq!(root_diff.files.len(), 1);
+    assert_eq!(root_diff.files[0].relative_path, "src/lib.rs");
+    assert_eq!(
+        root_diff.files[0].change_kind,
+        Some(protocol::ProjectGitChangeKind::Added)
+    );
+}
+
+#[tokio::test]
+async fn non_utf8_commit_metadata_keeps_project_bootstrap_usable() {
+    let mut fixture = Fixture::new().await;
+    let repo = init_git_repo(
+        "non-utf8-history",
+        &[("src/lib.rs", "pub fn history_survives() {}\n")],
+    );
+    let parent_oid = git_stdout(repo.path(), &["rev-parse", "HEAD"]);
+    let tree_oid = git_stdout(repo.path(), &["rev-parse", "HEAD^{tree}"]);
+    let mut raw_commit =
+        format!("tree {tree_oid}\nparent {parent_oid}\nauthor Invalid ").into_bytes();
+    raw_commit.push(0xff);
+    raw_commit.extend_from_slice(
+        b" Author <author@example.com> 1 +0000\ncommitter Test Committer <committer@example.com> 1 +0000\n\nInvalid ",
+    );
+    raw_commit.push(0xfe);
+    raw_commit.extend_from_slice(b" subject\n");
+    let commit_oid = String::from_utf8(git_with_stdin(
+        repo.path(),
+        &["hash-object", "-t", "commit", "-w", "--stdin"],
+        &raw_commit,
+    ))
+    .expect("commit oid utf-8")
+    .trim()
+    .to_owned();
+    git(repo.path(), &["update-ref", "HEAD", &commit_oid]);
+
+    let project = create_project(
+        &mut fixture.client,
+        "Non UTF-8 history",
+        vec![repo.path().to_string_lossy().to_string()],
+    )
+    .await;
+    let bootstrap =
+        expect_project_bootstrap(&mut fixture.client, "non-utf8 history bootstrap").await;
+    assert!(
+        bootstrap.file_list.roots[0]
+            .entries
+            .iter()
+            .any(|entry| entry.relative_path == "src/lib.rs"),
+        "non-UTF-8 history metadata must not suppress the project file tree"
+    );
+    let root_status = &bootstrap.git_status.roots[0];
+    assert_eq!(root_status.head_oid.as_deref(), Some(commit_oid.as_str()));
+    assert!(root_status.clean);
+    assert_eq!(root_status.recent_commits[0].oid, commit_oid);
+    assert!(root_status.recent_commits[0].author.contains('\u{fffd}'));
+    assert!(root_status.recent_commits[0].subject.contains('\u{fffd}'));
+    assert!(root_status.empty_tree_oid.is_some());
+    assert_eq!(
+        project_root(&project, 0),
+        repo.path().to_string_lossy().to_string()
+    );
+}
+
+#[tokio::test]
+async fn sha256_root_history_uses_repository_empty_tree() {
+    let mut fixture = Fixture::new().await;
+    let repo = tempfile::tempdir().expect("sha256 repo");
+    git(repo.path(), &["init", "--object-format=sha256"]);
+    git(repo.path(), &["config", "user.email", "tests@example.com"]);
+    git(repo.path(), &["config", "user.name", "Tests"]);
+    write_file(&repo.path().join("root.txt"), "sha256 root\n");
+    git(repo.path(), &["add", "."]);
+    git(repo.path(), &["commit", "-m", "SHA-256 root"]);
+    let tip_oid = git_stdout(repo.path(), &["rev-parse", "HEAD"]);
+    assert_eq!(tip_oid.len(), 64);
+
+    let project = create_project(
+        &mut fixture.client,
+        "SHA-256 history",
+        vec![repo.path().to_string_lossy().to_string()],
+    )
+    .await;
+    let bootstrap = expect_project_bootstrap(&mut fixture.client, "sha256 bootstrap").await;
+    let root_status = &bootstrap.git_status.roots[0];
+    let empty_tree_oid = root_status
+        .empty_tree_oid
+        .clone()
+        .expect("sha256 empty tree oid");
+    assert_eq!(empty_tree_oid.len(), 64);
+
+    let diff = request_project_diff(
+        &mut fixture.client,
+        &project.id,
+        ProjectReadDiffPayload {
+            request_id: Some("sha256-root-diff".to_owned()),
+            root: ProjectRootPath(project_root(&project, 0)),
+            scope: ProjectDiffScope::Uncommitted,
+            revision: protocol::ProjectDiffRevision::CommittedRange {
+                base_oid: empty_tree_oid,
+                tip_oid,
+            },
+            path: None,
+            context_mode: DiffContextMode::Hunks,
+        },
+        "sha256 root diff",
+    )
+    .await;
+    assert_eq!(diff.request_id.as_deref(), Some("sha256-root-diff"));
+    assert_eq!(diff.files.len(), 1);
+    assert_eq!(diff.files[0].relative_path, "root.txt");
 }
