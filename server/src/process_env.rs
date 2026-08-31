@@ -17,10 +17,35 @@ const PROBE_SENTINEL_BEGIN: &str = "TYDE_SHELL_PROBE_BEGIN_7f3c9a2e=";
 #[cfg(unix)]
 const PROBE_SENTINEL_END: &str = "=TYDE_SHELL_PROBE_END_7f3c9a2e";
 
+pub fn init_process_env() -> Result<(), String> {
+    initialize_process_env().map(|_| ())
+}
+
+pub(crate) fn initialize_process_env() -> Result<&'static OsStr, String> {
+    if let Some(cached) = RESOLVED_CHILD_PROCESS_PATH.get() {
+        return match cached {
+            Some(path) => Ok(path.as_os_str()),
+            None => Err("login-shell PATH initialization previously failed".to_string()),
+        };
+    }
+
+    match compute_resolved_child_process_path() {
+        Ok(path) => {
+            let _ = RESOLVED_CHILD_PROCESS_PATH.set(Some(path));
+            Ok(RESOLVED_CHILD_PROCESS_PATH
+                .get()
+                .and_then(Option::as_deref)
+                .expect("initialized above"))
+        }
+        Err(err) => {
+            let _ = RESOLVED_CHILD_PROCESS_PATH.set(None);
+            Err(err)
+        }
+    }
+}
+
 pub(crate) fn resolved_child_process_path() -> Option<&'static OsStr> {
-    RESOLVED_CHILD_PROCESS_PATH
-        .get_or_init(compute_resolved_child_process_path)
-        .as_deref()
+    initialize_process_env().ok()
 }
 
 pub(crate) fn find_executable_in_path(binary: &str) -> Option<PathBuf> {
@@ -43,10 +68,10 @@ pub(crate) fn find_executable_in_path(binary: &str) -> Option<PathBuf> {
     None
 }
 
-fn compute_resolved_child_process_path() -> Option<OsString> {
+fn compute_resolved_child_process_path() -> Result<OsString, String> {
     let mut segments = Vec::<PathBuf>::new();
     #[cfg(unix)]
-    extend_login_shell_path(&mut segments);
+    extend_login_shell_path(&mut segments)?;
     #[cfg(not(unix))]
     extend_from_path_value(&mut segments, std::env::var_os("PATH"));
 
@@ -62,16 +87,11 @@ fn compute_resolved_child_process_path() -> Option<OsString> {
     }
 
     if deduped.is_empty() {
-        return None;
+        return Err("resolved child process PATH contains no valid directory entries".to_string());
     }
 
-    match std::env::join_paths(deduped) {
-        Ok(path) => Some(path),
-        Err(err) => {
-            tracing::error!("failed to build resolved child process PATH: {err}");
-            None
-        }
-    }
+    std::env::join_paths(deduped)
+        .map_err(|err| format!("failed to build resolved child process PATH: {err}"))
 }
 
 fn extend_from_path_value(segments: &mut Vec<PathBuf>, path_value: Option<OsString>) {
@@ -82,10 +102,11 @@ fn extend_from_path_value(segments: &mut Vec<PathBuf>, path_value: Option<OsStri
 }
 
 #[cfg(unix)]
-fn extend_login_shell_path(segments: &mut Vec<PathBuf>) {
+fn extend_login_shell_path(segments: &mut Vec<PathBuf>) -> Result<(), String> {
     let Some(shell) = default_login_shell() else {
-        tracing::error!("failed to determine default login shell for PATH query");
-        return;
+        let err = "failed to determine default login shell for PATH query".to_string();
+        tracing::error!("{err}");
+        return Err(err);
     };
 
     let script = format!(
@@ -103,8 +124,9 @@ fn extend_login_shell_path(segments: &mut Vec<PathBuf>) {
     {
         Ok(child) => child,
         Err(err) => {
-            tracing::error!("failed to query login-shell PATH via {}: {err}", shell);
-            return;
+            let message = format!("failed to query login-shell PATH via {shell}: {err}");
+            tracing::error!("{message}");
+            return Err(message);
         }
     };
 
@@ -114,49 +136,50 @@ fn extend_login_shell_path(segments: &mut Vec<PathBuf>) {
         match child.try_wait() {
             Ok(Some(status)) => {
                 if !status.success() {
-                    tracing::error!(
-                        "login-shell PATH query via {} exited with status {}",
-                        shell,
-                        status
-                    );
-                    return;
+                    let message =
+                        format!("login-shell PATH query via {shell} exited with status {status}");
+                    tracing::error!("{message}");
+                    return Err(message);
                 }
                 let stdout = match read_child_stdout(child, "login-shell PATH query") {
                     Some(stdout) => stdout,
-                    None => return,
+                    None => {
+                        let message = format!("failed to read stdout from login shell {shell}");
+                        tracing::error!("{message}");
+                        return Err(message);
+                    }
                 };
                 let text = String::from_utf8_lossy(&stdout);
                 let Some(value) = extract_probe_value(&text) else {
-                    tracing::error!(
-                        "login-shell PATH probe output missing sentinels via {}",
-                        shell
-                    );
-                    return;
+                    let message =
+                        format!("login-shell PATH probe output missing sentinels via {shell}");
+                    tracing::error!("{message}");
+                    return Err(message);
                 };
                 if value.is_empty() {
-                    return;
+                    let message = format!("login-shell PATH via {shell} was empty");
+                    tracing::error!("{message}");
+                    return Err(message);
                 }
                 extend_from_path_value(segments, Some(OsString::from(value)));
-                return;
+                return Ok(());
             }
             Ok(None) => {
                 if started.elapsed() >= timeout {
                     let _ = child.kill();
                     let _ = child.wait();
-                    tracing::error!(
-                        "timed out querying login-shell PATH via {} (deadline 60s)",
-                        shell
-                    );
-                    return;
+                    let message =
+                        format!("timed out querying login-shell PATH via {shell} (deadline 60s)");
+                    tracing::error!("{message}");
+                    return Err(message);
                 }
                 std::thread::sleep(Duration::from_millis(10));
             }
             Err(err) => {
-                tracing::error!(
-                    "failed to wait for login-shell PATH query via {}: {err}",
-                    shell
-                );
-                return;
+                let message =
+                    format!("failed to wait for login-shell PATH query via {shell}: {err}");
+                tracing::error!("{message}");
+                return Err(message);
             }
         }
     }

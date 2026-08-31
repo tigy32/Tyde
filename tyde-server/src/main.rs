@@ -154,6 +154,7 @@ fn print_usage() {
 }
 
 fn run_mcp_bridge() -> Result<(), String> {
+    server::init_process_env()?;
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -178,6 +179,7 @@ fn init_logging() -> Result<(), String> {
 
 fn run_host_stdio() -> Result<(), String> {
     init_logging()?;
+    server::init_process_env()?;
     tracing::info!("starting tyde-server stdio mode");
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -227,6 +229,7 @@ fn run_host_uds() -> Result<(), String> {
     #[cfg(unix)]
     {
         init_logging()?;
+        server::init_process_env()?;
         let socket_path = resolve_socket_path()?;
         tracing::info!("starting tyde-server UDS mode at {}", socket_path.display());
 

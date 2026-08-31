@@ -13695,6 +13695,7 @@ fn spawn_host_inner(
     use_mock_backend: bool,
     runtime_config: HostRuntimeConfig,
 ) -> Result<HostHandle, String> {
+    crate::process_env::initialize_process_env()?;
     let transcript_root =
         if std::env::var("TYDE_TRANSCRIPT_STORE_DIR").is_ok_and(|path| !path.trim().is_empty()) {
             TranscriptStore::default_root()?

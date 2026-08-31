@@ -50,6 +50,7 @@ pub use host::{
     InstalledAgentNameGate, InstalledSpawnOperationTestGate, InstalledWorkbenchRemoveHook,
     MockLaunchReservation,
 };
+pub use process_env::init_process_env;
 
 use std::collections::HashMap;
 
