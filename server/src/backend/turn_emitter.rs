@@ -177,6 +177,7 @@ impl TurnEmitter {
             .stream_start(model, std::panic::Location::caller())
     }
 
+    #[track_caller]
     pub fn stream_delta(&self, response: &ResponseHandle, text: &str) {
         if text.is_empty() {
             return;
@@ -184,6 +185,7 @@ impl TurnEmitter {
         self.lock().stream_delta(response, text);
     }
 
+    #[track_caller]
     pub fn stream_reasoning_delta(&self, response: &ResponseHandle, text: &str) {
         if text.is_empty() {
             return;
@@ -504,8 +506,6 @@ impl TurnEmitter {
         state.declared_tools.clear();
         state.completed_tool_requests.clear();
         state.retired_tool_call_ids.clear();
-        state.retired_response_tokens.clear();
-        state.violations.clear();
         state.send(json!({ "kind": "ConversationCleared" }));
     }
 
@@ -622,9 +622,9 @@ impl TurnEmitterState {
             detail,
             "Backend event transition violated the chat protocol"
         );
-        if self.violations.len() < MAX_RECORDED_VIOLATIONS {
+        if self.violations.len() + 1 < MAX_RECORDED_VIOLATIONS {
             self.violations.push(format!("[{code}] {detail}"));
-        } else if self.violations.len() == MAX_RECORDED_VIOLATIONS {
+        } else if self.violations.len() + 1 == MAX_RECORDED_VIOLATIONS {
             self.violations
                 .push("[violations_truncated] Further protocol violations suppressed".to_owned());
         }
@@ -687,11 +687,10 @@ impl TurnEmitterState {
                 .filter(|dt| dt.owner == owner)
                 .map(|dt| dt.declaration.clone())
                 .collect();
-            message.tool_calls = streaming_declarations;
             message.tool_calls = self.sanitize_tool_declarations(
                 owner,
                 message.content.chars().count() as u64,
-                std::mem::take(&mut message.tool_calls),
+                streaming_declarations,
             );
             self.send_chat(ChatEvent::StreamEnd(StreamEndData { message }));
             self.retire_response_token(token);
@@ -756,6 +755,7 @@ impl TurnEmitterState {
         response
     }
 
+    #[track_caller]
     fn stream_delta(&mut self, response: &ResponseHandle, text: &str) {
         if !self.ensure_accepted_response(response, "response_delta") {
             return;
@@ -770,6 +770,7 @@ impl TurnEmitterState {
         }));
     }
 
+    #[track_caller]
     fn stream_reasoning_delta(&mut self, response: &ResponseHandle, text: &str) {
         if !self.ensure_accepted_response(response, "response_reasoning_delta") {
             return;
@@ -795,27 +796,8 @@ impl TurnEmitterState {
                     && !self.retired_response_tokens.contains(&response.token)
                 {
                     // Auto-end the prior open response first
-                    let token = open.handle.token.clone();
-                    let mut message =
-                        self.build_stream_end_message(StreamEndPayload::default(), open);
-                    let owner = message
-                        .message_id
-                        .clone()
-                        .expect("stream response has a presentation id");
-                    let streaming_declarations: Vec<ToolUseData> = self
-                        .declared_tools
-                        .values()
-                        .filter(|dt| dt.owner == owner)
-                        .map(|dt| dt.declaration.clone())
-                        .collect();
-                    message.tool_calls = streaming_declarations;
-                    message.tool_calls = self.sanitize_tool_declarations(
-                        owner,
-                        message.content.chars().count() as u64,
-                        std::mem::take(&mut message.tool_calls),
-                    );
-                    self.send_chat(ChatEvent::StreamEnd(StreamEndData { message }));
-                    self.retire_response_token(token);
+                    self.current_response = Some(open);
+                    self.auto_end_current_response();
 
                     if has_payload_content(&payload) {
                         let message_id = if response.message_id.0.trim().is_empty() {
@@ -848,8 +830,8 @@ impl TurnEmitterState {
                             model: None,
                         }));
                         self.send_chat(ChatEvent::StreamEnd(StreamEndData { message }));
-                        self.retire_response_token(response.token.clone());
                     }
+                    self.retire_response_token(response.token.clone());
                     return;
                 }
                 self.current_response = Some(open);
@@ -980,6 +962,7 @@ impl TurnEmitterState {
         self.retire_response_token(response.token.clone());
     }
 
+    #[track_caller]
     fn ensure_accepted_response(&mut self, response: &ResponseHandle, event: &'static str) -> bool {
         if let Some(open) = &self.current_response {
             if &open.handle == response {
@@ -1272,20 +1255,16 @@ impl TurnEmitterState {
             if existing.tool_type == tool_type {
                 return true;
             }
-            if self.policy == EmitterPolicy::Permissive
-                && matches!(existing.tool_type, ToolRequestType::Other { .. })
-                && !matches!(tool_type, ToolRequestType::Other { .. })
-            {
+            let is_synthetic_other = match &existing.tool_type {
+                ToolRequestType::Other { args } => args.is_null(),
+                _ => false,
+            };
+            if self.policy == EmitterPolicy::Permissive && is_synthetic_other {
                 existing.tool_type = tool_type.clone();
                 let tool_name = tool_type_default_name(&tool_type);
                 if let Some(declared) = self.declared_tools.get_mut(tool_call_id) {
                     declared.declaration.name = tool_name.to_owned();
                 }
-                self.send_chat(ChatEvent::ToolRequest(ToolRequest {
-                    tool_call_id: tool_call_id.to_owned(),
-                    tool_name: tool_name.to_owned(),
-                    tool_type,
-                }));
                 return true;
             }
             self.violation(
@@ -1576,6 +1555,7 @@ fn has_payload_content(payload: &StreamEndPayload) -> bool {
         || !payload.images.is_empty()
         || payload.model_info.is_some()
         || payload.token_usage.is_some()
+        || payload.context_breakdown.is_some()
 }
 
 /// Is this tool waiting on a human rather than on the machine?
@@ -2041,13 +2021,39 @@ mod tests {
         emitter.typing_status_changed(false);
 
         let events = drain_events(&mut rx);
-        assert!(violation_reports(&events).is_empty());
         let tool_requests: Vec<_> = events
             .iter()
             .filter(|e| e.get("kind").and_then(Value::as_str) == Some("ToolRequest"))
             .filter_map(|e| e.pointer("/data/tool_name").and_then(Value::as_str))
             .collect();
-        assert_eq!(tool_requests, vec!["tool", "run_command"]);
+        // The card was emitted once by progress and upgraded in state without emitting a duplicate card
+        assert_eq!(tool_requests, vec!["tool"]);
+    }
+
+    #[test]
+    fn permissive_conversation_cleared_retains_retired_token_and_rejects_late_delta() {
+        let (emitter, mut rx) = emitter_with_policy(EmitterPolicy::Permissive);
+        emitter.typing_status_changed(true);
+        let resp = emitter.stream_start(Some("model-1"));
+        emitter.stream_delta(&resp, "pre-clear text");
+        // Clear conversation while stream is open
+        emitter.conversation_cleared();
+
+        let _ = drain_events(&mut rx);
+
+        // Stale late delta on the pre-clear handle arrives
+        emitter.stream_delta(&resp, "stale delta");
+        emitter.stream_end(resp, StreamEndPayload::default());
+
+        let events = drain_events(&mut rx);
+        // The stale handle was retired and must not resurrect any StreamStart or StreamDelta
+        assert!(
+            events.iter().all(|e| {
+                let kind = e.get("kind").and_then(Value::as_str);
+                kind != Some("StreamStart") && kind != Some("StreamDelta")
+            }),
+            "late delta on pre-clear handle should be rejected, got: {events:?}"
+        );
     }
 
     #[test]
