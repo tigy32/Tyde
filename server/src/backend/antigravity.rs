@@ -606,6 +606,10 @@ impl TurnMapper {
 
     fn handle_tool_like(&mut self, emitter: &TurnEmitter, step: AgyStep) {
         let step_index = step.step_index;
+        if self.completed_steps.contains(&step_index) {
+            return;
+        }
+
         // An `unknown` step carries no `tool_name` and no `tool_info`, so the
         // transcript is the only place its identity exists.
         if step.step_type == STEP_UNKNOWN {
@@ -623,7 +627,11 @@ impl TurnMapper {
             .unwrap_or_else(|| step.step_type.clone());
 
         match step.state.as_str() {
-            STATE_ACTIVE => self.open_tool(emitter, step_index, &tool_name, &step),
+            STATE_ACTIVE => {
+                if !self.open_tools.contains_key(&step_index) {
+                    self.open_tool(emitter, step_index, &tool_name, &step);
+                }
+            }
             STATE_DONE | STATE_ERROR => {
                 // A tool whose ACTIVE never arrived still gets a card, so the
                 // work shows up rather than vanishing.
