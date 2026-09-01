@@ -1587,7 +1587,6 @@ pub fn ChatInput() -> impl IntoView {
     view! {
         <div
             class="chat-input-container"
-            class:thinking=move || is_running.get()
             data-mobile-test="chat-input-container"
         >
             // The composer emptying itself is visible feedback for a sighted
@@ -1687,7 +1686,23 @@ pub fn ChatInput() -> impl IntoView {
                     {move || attachment_error.get().unwrap_or_default()}
                 </div>
             </Show>
-            <div class="chat-input-row">
+            <div class="chat-input-row" data-mobile-test="chat-input-capsule">
+                <Show when=move || is_running.get()>
+                    <svg
+                        class="chat-thinking-ring"
+                        data-mobile-test="chat-thinking-ring"
+                        aria-hidden="true"
+                    >
+                        <rect
+                            class="chat-thinking-ring-tail"
+                            {..leptos::attr::custom::custom_attribute("pathLength", "100")}
+                        />
+                        <rect
+                            class="chat-thinking-ring-head"
+                            {..leptos::attr::custom::custom_attribute("pathLength", "100")}
+                        />
+                    </svg>
+                </Show>
                 <button
                     type="button"
                     class="chat-photo-button"
@@ -3999,12 +4014,12 @@ mod wasm_tests {
         );
     }
 
-    /// The composer carries desktop's thinking indicator — a blue shimmer along
-    /// its top edge while the active agent's turn is running — and puts it out
-    /// the moment the turn ends. Read from the rendered pseudo-element, which is
-    /// the only place the indicator exists.
+    /// The composer carries desktop's thinking indicator, grown from a line
+    /// along its top edge into a lit segment that orbits the whole composer
+    /// capsule while the active agent's turn is running, and drops it the
+    /// moment the turn ends.
     #[wasm_bindgen_test]
-    async fn a_running_turn_lights_the_composer_edge_and_idle_puts_it_out() {
+    async fn a_running_turn_lights_the_composer_rim_and_idle_puts_it_out() {
         crate::components::test_styles::ensure_styles_loaded();
         let host = LocalHostId("host-1".to_owned());
         let agent_ref = AgentRef {
@@ -4020,6 +4035,7 @@ mod wasm_tests {
             m.insert(agent_ref.clone(), true);
         });
         let container = make_container();
+        container.style().set_property("width", "390px").unwrap();
         let mount_state = state.clone();
         let _h = mount_to(container.clone(), move || {
             provide_context(mount_state);
@@ -4027,39 +4043,88 @@ mod wasm_tests {
         });
         next_tick().await;
 
-        let composer = container
-            .query_selector("[data-mobile-test='chat-input-container']")
-            .unwrap()
-            .expect("composer");
-        let edge = |composer: &web_sys::Element| {
-            let style = web_sys::window()
+        let ring = |container: &HtmlElement| {
+            container
+                .query_selector("[data-mobile-test='chat-thinking-ring']")
                 .unwrap()
-                .get_computed_style_with_pseudo_elt(composer, "::before")
-                .unwrap()
-                .expect("computed style for the composer edge");
-            (
-                style.get_property_value("content").unwrap(),
-                style.get_property_value("height").unwrap(),
-                style.get_property_value("background-image").unwrap(),
-            )
         };
+        let capsule = container
+            .query_selector("[data-mobile-test='chat-input-capsule']")
+            .unwrap()
+            .expect("composer capsule");
+        let ring_el = ring(&container).expect("a running turn draws the ring");
 
-        let (content, height, background) = edge(&composer);
-        assert_eq!(content, "\"\"", "a running turn draws the indicator");
-        assert_eq!(
-            height, "1px",
-            "the indicator is desktop's one-pixel edge line"
-        );
-        assert!(
-            background.contains("linear-gradient"),
-            "the indicator is the blue shimmer gradient, got {background}"
-        );
+        // The ring traces the whole capsule, not one of its edges.
+        let capsule_box = capsule.get_bounding_client_rect();
+        let ring_box = ring_el.get_bounding_client_rect();
+        for (edge, ring_edge, capsule_edge) in [
+            ("left", ring_box.left(), capsule_box.left()),
+            ("right", ring_box.right(), capsule_box.right()),
+            ("top", ring_box.top(), capsule_box.top()),
+            ("bottom", ring_box.bottom(), capsule_box.bottom()),
+        ] {
+            assert!(
+                (ring_edge - capsule_edge).abs() < 1.0,
+                "the ring hugs the capsule's {edge} edge ({ring_edge} vs {capsule_edge})"
+            );
+        }
+
+        let window = web_sys::window().unwrap();
+        let capsule_radius = window
+            .get_computed_style(&capsule)
+            .unwrap()
+            .expect("capsule style")
+            .get_property_value("border-top-left-radius")
+            .unwrap();
+        let capsule_radius: f64 = capsule_radius
+            .trim_end_matches("px")
+            .parse()
+            .expect("capsule radius in px");
+        let strokes = ring_el.query_selector_all("rect").unwrap();
+        assert!(strokes.length() > 0, "the ring is stroked outlines");
+        for i in 0..strokes.length() {
+            let stroke: web_sys::Element = strokes.get(i).unwrap().dyn_into().unwrap();
+            let style = window
+                .get_computed_style(&stroke)
+                .unwrap()
+                .expect("stroke style");
+            let prop = |name: &str| style.get_property_value(name).unwrap();
+            assert_eq!(prop("fill"), "none", "an outline, not a filled shape");
+            let width: f64 = prop("stroke-width")
+                .trim_end_matches("px")
+                .parse()
+                .expect("stroke width in px");
+            assert!(
+                (0.5..=2.0).contains(&width),
+                "a hairline, like desktop's one-pixel edge line: {width}px"
+            );
+            let radius: f64 = prop("rx").trim_end_matches("px").parse().expect("rx in px");
+            assert!(
+                (radius - (capsule_radius - 1.0)).abs() < 1.0,
+                "the outline follows the capsule's corner radius ({radius} vs {capsule_radius})"
+            );
+            let dashes = prop("stroke-dasharray");
+            let lit: f64 = dashes
+                .split([',', ' '])
+                .filter(|part| !part.is_empty())
+                .map(|part| {
+                    part.trim_end_matches("px")
+                        .parse::<f64>()
+                        .expect("dash length")
+                })
+                .step_by(2)
+                .sum();
+            assert!(
+                lit > 0.0 && lit < 50.0,
+                "a lit segment that leaves most of the rim dark, got {dashes}"
+            );
+            assert_ne!(prop("animation-name"), "none", "the segment orbits the rim");
+        }
 
         state.agent_turn_active.update(|m| {
             m.remove(&agent_ref);
         });
         next_tick().await;
-        let (content, _, _) = edge(&composer);
-        assert_eq!(content, "none", "an idle agent shows no indicator");
+        assert!(ring(&container).is_none(), "an idle agent shows no ring");
     }
 }

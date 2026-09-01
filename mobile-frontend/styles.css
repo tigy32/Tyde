@@ -1265,43 +1265,53 @@ html[data-keyboard-open] .mobile-app {
     gap: var(--space-2);
 }
 
-/* Context occupancy along the header's bottom edge, drawn like the composer's
-   thinking indicator below: a light line rather than a widget. The empty track
-   is a faint hairline, the used share is a lit line that glows and fades out at
-   its leading edge, and it is inset to stay inside the capsule's rounded
-   corners while still reading as a share of the whole header. */
+/* Context occupancy as a ring around the header capsule, drawn like the
+   composer's thinking ring below: a faint hairline track traces the whole
+   silhouette and the used share is a lit stroke that grows clockwise from the
+   top-left corner, so a full window closes the loop. `pathLength` normalises
+   the outline to 100 units, which makes the dash a share of the perimeter; a
+   conic gradient would make it a share of an angle, which a wide pill skews. */
 .chat-context-bar {
     position: absolute;
-    left: var(--space-4);
-    right: var(--space-4);
-    bottom: 5px;
-    height: 1px;
-    border-radius: var(--radius-full);
-    background: color-mix(in srgb, var(--text-tertiary) 35%, transparent);
+    inset: 0;
+    width: 100%;
+    height: 100%;
     overflow: visible;
+    pointer-events: none;
+    --ring-colour: var(--accent-primary);
+}
+
+.chat-context-bar rect {
+    x: 1px;
+    y: 1px;
+    width: calc(100% - 2px);
+    height: calc(100% - 2px);
+    rx: calc(var(--header-height) / 2 - 1px);
+    fill: none;
+    stroke-width: 1.5px;
+    stroke-linecap: round;
+}
+
+.chat-context-bar-track {
+    stroke: color-mix(in srgb, var(--text-tertiary) 35%, transparent);
 }
 
 .chat-context-bar-fill {
-    height: 100%;
-    border-radius: inherit;
-    /* A background-COLOR, not a gradient: the tone is the signal (calm, amber,
-       red) and the taper is a mask, so the level stays readable to anything
-       that inspects the computed colour. */
-    background-color: var(--accent-primary);
-    box-shadow: 0 0 6px color-mix(in srgb, var(--accent-primary) 70%, transparent);
-    -webkit-mask-image: linear-gradient(90deg, transparent 0%, #000 12%, #000 100%);
-    mask-image: linear-gradient(90deg, transparent 0%, #000 12%, #000 100%);
-    transition: width var(--motion-slow) var(--ease-standard);
+    /* A stroke COLOUR, not a gradient: the tone is the signal (calm, amber,
+       red), so the level stays readable to anything that inspects the
+       computed colour. */
+    stroke: var(--ring-colour);
+    stroke-dasharray: var(--context-fill) 100;
+    filter: drop-shadow(0 0 3px color-mix(in srgb, var(--ring-colour) 70%, transparent));
+    transition: stroke-dasharray var(--motion-slow) var(--ease-standard);
 }
 
-.chat-context-bar[data-context-level="warning"] .chat-context-bar-fill {
-    background-color: var(--accent-warning);
-    box-shadow: 0 0 6px color-mix(in srgb, var(--accent-warning) 70%, transparent);
+.chat-context-bar[data-context-level="warning"] {
+    --ring-colour: var(--accent-warning);
 }
 
-.chat-context-bar[data-context-level="danger"] .chat-context-bar-fill {
-    background-color: var(--accent-error);
-    box-shadow: 0 0 8px color-mix(in srgb, var(--accent-error) 80%, transparent);
+.chat-context-bar[data-context-level="danger"] {
+    --ring-colour: var(--accent-error);
 }
 
 .chat-back-button {
@@ -2216,41 +2226,61 @@ html[data-keyboard-open] .mobile-app {
 }
 
 /* Desktop's thinking indicator (`.chat-input-area.thinking::before` in
-   frontend/styles.css): a blue shimmer along the composer's top edge while the
-   active agent's turn is running. Inset here to trace the floating composer
-   capsule rather than a full-bleed bar. */
-.chat-input-container.thinking::before {
-    content: "";
+   frontend/styles.css) is a blue shimmer along the composer's top edge. Here
+   it is a lit segment that orbits the whole composer capsule while the active
+   agent's turn is running: a dim tail and a bright head stroked on the same
+   rounded rect, carried round the perimeter by one dash-offset animation. */
+.chat-thinking-ring {
     position: absolute;
-    top: var(--space-2);
-    left: calc(var(--chrome-gutter) + var(--space-4));
-    right: calc(var(--chrome-gutter) + var(--space-4));
-    height: 1px;
-    border-radius: var(--radius-full);
-    background: linear-gradient(
-        90deg,
-        transparent 0%,
-        #4a9eff 40%,
-        #6cb4ff 60%,
-        transparent 100%
-    );
-    background-size: 200% 100%;
-    animation: thinking-shimmer 1.5s ease-in-out infinite;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    overflow: visible;
+    pointer-events: none;
+    filter: drop-shadow(0 0 4px rgba(74, 158, 255, 0.7));
 }
 
-@keyframes thinking-shimmer {
-    0% { background-position: 100% 0; }
-    100% { background-position: -100% 0; }
+.chat-thinking-ring rect {
+    x: 1px;
+    y: 1px;
+    width: calc(100% - 2px);
+    height: calc(100% - 2px);
+    rx: calc(var(--radius-xl) - 1px);
+    fill: none;
+    stroke-width: 1.5px;
+    animation: thinking-orbit 2.4s linear infinite;
+}
+
+.chat-thinking-ring-tail {
+    stroke: #4a9eff;
+    stroke-linecap: round;
+    stroke-dasharray: 22 78;
+    opacity: 0.55;
+}
+
+/* The head sits at the leading end of the tail: a zero-length first dash
+   and a 14-unit gap place its 8 units at 14–22 of the same pattern. Butt caps
+   keep the zero-length dash from drawing a dot. */
+.chat-thinking-ring-head {
+    stroke: #6cb4ff;
+    stroke-linecap: butt;
+    stroke-dasharray: 0 14 8 78;
+}
+
+@keyframes thinking-orbit {
+    from { stroke-dashoffset: 100; }
+    to { stroke-dashoffset: 0; }
 }
 
 @media (prefers-reduced-motion: reduce) {
-    .chat-input-container.thinking::before {
+    .chat-thinking-ring rect {
         animation: none;
-        background: #4a9eff;
+        stroke-dashoffset: 0;
     }
 }
 
 .chat-input-row {
+    position: relative;
     display: flex;
     align-items: flex-end;
     gap: var(--space-2);

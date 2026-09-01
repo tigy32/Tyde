@@ -858,7 +858,7 @@ pub fn ChatView() -> impl IntoView {
                     }
                     .to_owned();
                     view! {
-                        <div
+                        <svg
                             class="chat-context-bar"
                             data-mobile-test="chat-context-bar"
                             data-context-level=level
@@ -873,8 +873,16 @@ pub fn ChatView() -> impl IntoView {
                                 format_token_count(window),
                             )
                         >
-                            <div class="chat-context-bar-fill" style:width=format!("{pct:.1}%")></div>
-                        </div>
+                            <rect
+                                class="chat-context-bar-track"
+                                {..leptos::attr::custom::custom_attribute("pathLength", "100")}
+                            />
+                            <rect
+                                class="chat-context-bar-fill"
+                                {..leptos::attr::custom::custom_attribute("pathLength", "100")}
+                                style=format!("--context-fill: {pct:.1}")
+                            />
+                        </svg>
                     }
                 })}
             </div>
@@ -2819,18 +2827,29 @@ mod wasm_tests {
         context_bar(container).and_then(|bar| bar.get_attribute("aria-valuenow"))
     }
 
-    fn context_bar_fill_colour(container: &HtmlElement) -> String {
-        let fill = context_bar(container)
+    fn context_bar_fill(container: &HtmlElement) -> web_sys::Element {
+        context_bar(container)
             .expect("bar")
-            .first_element_child()
-            .expect("fill");
+            .last_element_child()
+            .expect("fill")
+    }
+
+    fn context_bar_fill_style(container: &HtmlElement, name: &str) -> String {
         web_sys::window()
             .unwrap()
-            .get_computed_style(&fill)
+            .get_computed_style(&context_bar_fill(container))
             .unwrap()
             .expect("computed style")
-            .get_property_value("background-color")
+            .get_property_value(name)
             .unwrap()
+    }
+
+    fn context_bar_fill_colour(container: &HtmlElement) -> String {
+        context_bar_fill_style(container, "stroke")
+    }
+
+    fn px(value: &str) -> f64 {
+        value.trim_end_matches("px").parse().expect("a px length")
     }
 
     fn reported_stats(usage: protocol::CurrentContextUsage) -> protocol::AgentActivityStats {
@@ -2840,8 +2859,8 @@ mod wasm_tests {
         }
     }
 
-    /// The header carries a hairline of context occupancy for the
-    /// active agent: filled in proportion to the latest reported figure,
+    /// The header carries a hairline ring of context occupancy for the
+    /// active agent: lit around its rim in proportion to the latest reported figure,
     /// following the server's activity stats when they speak and the last
     /// assistant row's breakdown otherwise, and absent — never stale or
     /// invented — when nothing has reported.
@@ -2888,40 +2907,47 @@ mod wasm_tests {
         let bar =
             context_bar(&container).expect("an assistant row with a breakdown puts the bar up");
         assert_eq!(context_bar_value(&container).as_deref(), Some("60"));
-        let track = bar.get_bounding_client_rect();
+        // The header is a rounded capsule and the ring traces its whole
+        // silhouette, so the fill reads as a share of the header's perimeter
+        // rather than of a widget inside it.
+        let ring = bar.get_bounding_client_rect();
         let header = bar
             .parent_element()
             .expect("header")
             .get_bounding_client_rect();
-        let fill = bar
-            .first_element_child()
-            .expect("fill")
-            .get_bounding_client_rect();
+        for (edge, ring_edge, header_edge) in [
+            ("left", ring.left(), header.left()),
+            ("right", ring.right(), header.right()),
+            ("top", ring.top(), header.top()),
+            ("bottom", ring.bottom(), header.bottom()),
+        ] {
+            assert!(
+                (ring_edge - header_edge).abs() < 1.0,
+                "the ring hugs the header's {edge} edge ({ring_edge} vs {header_edge})"
+            );
+        }
+        let stroke_width = px(&context_bar_fill_style(&container, "stroke-width"));
         assert!(
-            (0.5..=2.0).contains(&track.height()),
-            "a hairline, like the composer's thinking line, not a widget: {}px",
-            track.height()
+            (0.5..=2.0).contains(&stroke_width),
+            "a hairline, like the composer's thinking ring, not a widget: {stroke_width}px"
         );
-        // The header is a rounded capsule, so a literally full-width track
-        // would render outside its silhouette at the rounded ends. It is inset
-        // just enough to stay inside them and stays centred, so the fill is
-        // still read as a share of the whole header rather than of a widget.
+        let corner = px(&context_bar_fill_style(&container, "rx"));
         assert!(
-            track.width() >= header.width() * 0.9,
-            "the track spans the header ({} vs {})",
-            track.width(),
-            header.width()
+            (corner - (header.height() / 2.0 - 1.0)).abs() < 1.0,
+            "the ring follows the capsule's rounded ends ({corner} vs {})",
+            header.height()
         );
-        let left_inset = track.left() - header.left();
-        let right_inset = header.right() - track.right();
-        assert!(
-            (left_inset - right_inset).abs() < 1.0,
-            "the track is centred in the header ({left_inset} vs {right_inset})"
-        );
-        let share = fill.width() / track.width();
+        let dashes = context_bar_fill_style(&container, "stroke-dasharray");
+        let mut lengths = dashes
+            .split([',', ' '])
+            .filter(|part| !part.is_empty())
+            .map(px);
+        let lit = lengths.next().expect("lit length");
+        let whole = lengths.next().expect("perimeter length");
+        let share = lit / whole;
         assert!(
             (share - 0.60).abs() < 0.02,
-            "the fill is the used share of the window, got {share}"
+            "the lit arc is the used share of the window, got {share} from {dashes}"
         );
         let calm = context_bar_fill_colour(&container);
 
