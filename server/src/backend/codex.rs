@@ -11133,6 +11133,7 @@ impl CodexInner {
             "thread/tokenUsage/updated" => {
                 self.handle_subagent_token_usage_updated(params, stream_key, model)
                     .await;
+                self.finalize_strict_response_at_token_usage(params).await;
             }
             "turn/completed" => {
                 self.handle_subagent_turn_completed(params, stream_key, model)

@@ -362,10 +362,16 @@ fn real_image_input() {
             "{}: the user-visible message did not retain the submitted image",
             viewed.label()
         );
+        let identified = viewed
+            .final_text()
+            .trim()
+            .to_ascii_lowercase()
+            .replace("fuchsia", "magenta");
         assert_eq!(
-            viewed.final_text().trim().to_ascii_lowercase(),
+            identified,
             IMAGE_ANSWER,
-            "{}: the provider did not identify the pixels in the submitted image",
+            "{}: the provider did not identify the pixels in the submitted image; CSS fuchsia \
+             and magenta are canonicalized because both name #ff00ff",
             viewed.label()
         );
 
@@ -1629,6 +1635,31 @@ fn real_nested_subagent_ownership() {
         let child_prompt = nested_native_subagent_prompt(host.backend(), &workspace, &payload);
         let prompt = native_relay_child_prompt(host.backend(), &child_prompt, &payload);
         let delegation = delegate(&mut host, &agent, &prompt, &child_prompt).await;
+        let child_responses = delegation.child().assistant_messages().collect::<Vec<_>>();
+        let final_response = child_responses
+            .iter()
+            .position(|message| message.content.contains(&payload))
+            .unwrap_or_else(|| {
+                panic!(
+                    "{}: no assistant response contained {payload:?}",
+                    delegation.child().label()
+                )
+            });
+        assert!(
+            final_response > 0 && child_responses[final_response].tool_calls.is_empty(),
+            "{}: the final response was response {} of {} and inherited tool calls {:?}; the \
+             child had to complete its earlier delegation before it could produce the final \
+             payload, so those are distinct provider responses",
+            delegation.child().label(),
+            final_response + 1,
+            child_responses.len(),
+            child_responses[final_response]
+                .tool_calls
+                .iter()
+                .map(|call| call.name.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert_no_error_message(&delegation.child().label(), delegation.child().events());
         let [spawned, delegated] = delegation.into_turns();
         assert_final_text_contains(&launched, READY_MARKER);
         assert_no_ownership_error(&spawned.label(), spawned.events());
