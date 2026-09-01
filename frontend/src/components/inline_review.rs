@@ -1140,6 +1140,39 @@ mod wasm_tests {
         let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
     }
 
+    struct TauriBridgeGuard {
+        existed: bool,
+        value: wasm_bindgen::JsValue,
+    }
+
+    impl TauriBridgeGuard {
+        fn install() -> Self {
+            let window = web_sys::window().expect("window");
+            let key = wasm_bindgen::JsValue::from_str("__TAURI__");
+            let existed = js_sys::Reflect::has(&window, &key).unwrap_or(false);
+            let value =
+                js_sys::Reflect::get(&window, &key).unwrap_or(wasm_bindgen::JsValue::UNDEFINED);
+            js_sys::eval(
+                "window.__TAURI__ = { core: { invoke: function() { return Promise.resolve(null); } } };",
+            )
+            .expect("install Tauri command bridge");
+            Self { existed, value }
+        }
+    }
+
+    impl Drop for TauriBridgeGuard {
+        fn drop(&mut self) {
+            let window = web_sys::window().expect("window");
+            let key = wasm_bindgen::JsValue::from_str("__TAURI__");
+            if self.existed {
+                let _ = js_sys::Reflect::set(&window, &key, &self.value);
+            } else {
+                let target: &js_sys::Object = window.unchecked_ref();
+                let _ = js_sys::Reflect::delete_property(target, &key);
+            }
+        }
+    }
+
     fn location() -> ReviewLocation {
         ReviewLocation {
             root: ProjectRootPath("/repo".to_owned()),
@@ -1284,6 +1317,7 @@ mod wasm_tests {
 
     #[wasm_bindgen_test]
     async fn regular_file_composer_closes_on_server_revision_echo() {
+        let _bridge = TauriBridgeGuard::install();
         let container = make_container();
         let mut requested = location();
         requested.target = protocol::ReviewTarget::RegularFile {

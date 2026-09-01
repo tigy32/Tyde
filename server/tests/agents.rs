@@ -2210,6 +2210,7 @@ async fn missing_backend_usage_is_unavailable_not_zero_then_task_usage_stays_par
     )
     .await;
     assert_unavailable_turn_usage(&first.message.token_usage);
+    let (mut usage_client, _) = fixture.connect_with_bootstrap().await;
 
     fixture
         .client
@@ -2228,7 +2229,7 @@ async fn missing_backend_usage_is_unavailable_not_zero_then_task_usage_stays_par
     );
 
     let payload = expect_task_token_usage_matching(
-        &mut fixture.client,
+        &mut usage_client,
         &agent.new_agent.agent_id,
         "mixed known and missing self usage",
         |payload| {

@@ -2035,6 +2035,15 @@ mod wasm_tests {
         let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
     }
 
+    async fn wait_for_workspace_width(expected: f64) {
+        for _ in 0..8 {
+            if workspace_width().get_untracked() == Some(expected) {
+                return;
+            }
+            next_animation_frame().await;
+        }
+    }
+
     /// Let the reactive runtime flush the activation → LRU Effect → `<For>`
     /// re-render chain before asserting on the DOM.
     async fn settle() {
@@ -3707,7 +3716,7 @@ mod wasm_tests {
             .style()
             .set_property("width", "400px")
             .expect("shrink test container");
-        next_animation_frame().await;
+        wait_for_workspace_width(400.0).await;
         settle().await;
         assert_eq!(
             width.get_untracked(),
