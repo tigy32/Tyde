@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use leptos::prelude::*;
 use wasm_bindgen::JsCast;
@@ -36,12 +36,39 @@ struct HistoryScope {
     root: ProjectRootPath,
 }
 
+impl HistoryScope {
+    fn owns(&self, selection: &HistoricalSelection) -> bool {
+        selection.host_id == self.host_id
+            && selection.project_id == self.project_id
+            && selection.root == self.root
+    }
+}
+
 struct HistoricalCommitSource<'a> {
     host_id: &'a str,
     project_id: &'a protocol::ProjectId,
     root: &'a ProjectRootPath,
     empty_tree_oid: Option<&'a str>,
     commits: &'a [ProjectGitCommitSummary],
+}
+
+#[derive(Clone)]
+struct HistoricalCommitList {
+    scope: HistoryScope,
+    empty_tree_oid: Option<String>,
+    commits: Vec<ProjectGitCommitSummary>,
+}
+
+impl HistoricalCommitList {
+    fn source(&self) -> HistoricalCommitSource<'_> {
+        HistoricalCommitSource {
+            host_id: &self.scope.host_id,
+            project_id: &self.scope.project_id,
+            root: &self.scope.root,
+            empty_tree_oid: self.empty_tree_oid.as_deref(),
+            commits: &self.commits,
+        }
+    }
 }
 
 impl HistoricalSelection {
@@ -53,11 +80,26 @@ impl HistoricalSelection {
     }
 }
 
+/// Panel-wide interaction state shared by every root section. Keyed by
+/// `HistoryScope` so a status refresh, which rebuilds the root sections from
+/// new `ProjectRootGitStatus` values, never loses what the user opened.
+#[derive(Clone, Copy)]
+struct PanelSignals {
+    historical_selection: RwSignal<Option<HistoricalSelection>>,
+    history_visible_limits: RwSignal<HashMap<HistoryScope, usize>>,
+    history_roots: RwSignal<HashSet<HistoryScope>>,
+    root_expansion: RwSignal<HashMap<HistoryScope, bool>>,
+}
+
 #[component]
 pub fn GitPanel() -> impl IntoView {
     let state = expect_context::<AppState>();
-    let historical_selection = RwSignal::new(None::<HistoricalSelection>);
-    let history_visible_limits = RwSignal::new(HashMap::<HistoryScope, usize>::new());
+    let signals = PanelSignals {
+        historical_selection: RwSignal::new(None),
+        history_visible_limits: RwSignal::new(HashMap::new()),
+        history_roots: RwSignal::new(HashSet::new()),
+        root_expansion: RwSignal::new(HashMap::new()),
+    };
 
     let git_roots = Memo::new(move |_| {
         let project = state.active_project.get()?;
@@ -69,54 +111,24 @@ pub fn GitPanel() -> impl IntoView {
 
     view! {
         <div class="git-panel">
-            <div class="gp-header">
-                <span class="gp-branch">
-                    <svg
-                        class="gp-branch-icon"
-                        width="14"
-                        height="14"
-                        viewBox="0 0 16 16"
-                        fill="currentColor"
-                        aria-hidden="true"
-                    >
-                        <path d="M9.5 3.25a2.25 2.25 0 1 1 3 2.122V6A2.5 2.5 0 0 1 10 8.5H6a1 1 0 0 0-1 1v1.128a2.251 2.251 0 1 1-1.5 0V5.372a2.25 2.25 0 1 1 1.5 0v1.836A2.493 2.493 0 0 1 6 7h4a1 1 0 0 0 1-1v-.628A2.25 2.25 0 0 1 9.5 3.25Zm-6 0a.75.75 0 1 0 1.5 0 .75.75 0 0 0-1.5 0Zm8.25-.75a.75.75 0 1 0 0 1.5.75.75 0 0 0 0-1.5ZM4.25 12a.75.75 0 1 0 0 1.5.75.75 0 0 0 0-1.5Z" />
-                    </svg>
-                    <span class="gp-branch-name">
-                        {move || {
-                            git_roots.get()
-                                .map(|(_, roots)| {
-                                    if roots.len() == 1 {
-                                        roots
-                                            .first()
-                                            .and_then(|r| r.branch.clone())
-                                            .unwrap_or_else(|| "--".to_owned())
-                                    } else {
-                                        format!("{} roots", roots.len())
-                                    }
-                                })
-                            .unwrap_or_else(|| "--".to_owned())
-                        }}
-                    </span>
-                </span>
-            </div>
             <div class="gp-content">
-                // One workspace-level review hub for the whole project,
-                // rendered once (not per root). Renders nothing when there is
-                // no active workspace draft for the project.
-                <WorkspaceReviewHub historical_selection=historical_selection />
+                <ReviewStatusRow />
                 {move || {
                     match git_roots.get() {
-                        Some((project, roots)) => roots.into_iter().map(|root| {
-                            view! {
-                                <GitRootSection
-                                    host_id=project.host_id.clone()
-                                    project_id=project.project_id.clone()
-                                    root=root
-                                    historical_selection=historical_selection
-                                    history_visible_limits=history_visible_limits
-                                />
-                            }.into_any()
-                        }).collect(),
+                        Some((project, roots)) => {
+                            let multi_root = roots.len() > 1;
+                            roots.into_iter().map(|root| {
+                                view! {
+                                    <GitRootSection
+                                        host_id=project.host_id.clone()
+                                        project_id=project.project_id.clone()
+                                        root=root
+                                        multi_root=multi_root
+                                        signals=signals
+                                    />
+                                }.into_any()
+                            }).collect()
+                        }
                         None => vec![view! {
                             <div class="panel-empty">"No git status"</div>
                         }.into_any()],
@@ -127,65 +139,136 @@ pub fn GitPanel() -> impl IntoView {
     }
 }
 
-/// The single workspace-level review hub for the active project. One review
-/// spans every root, so this renders exactly once (not per root). It finds
-/// the project's one active workspace Draft review, subscribes to it, and
-/// renders the compact review summary plus the shared `ReviewSidebar`.
-/// Renders nothing when the project has no active workspace draft. A draft can
-/// exist with no reviewable changes (e.g. staged-only edits), so AI review is
-/// independently gated on there being a dirty file in some root.
+/// One-line summary of the project's workspace review: live counts, whether
+/// the AI reviewer is running, and the way into the full review surface. The
+/// review controls themselves (AI reviewer form, submit, clear) live on that
+/// surface, not in the git panel. Hidden while there is nothing to review and
+/// nothing reviewed, so a clean project pays no vertical cost.
 #[component]
-fn WorkspaceReviewHub(
-    historical_selection: RwSignal<Option<HistoricalSelection>>,
-) -> impl IntoView {
+fn ReviewStatusRow() -> impl IntoView {
     let state = expect_context::<AppState>();
 
-    // Resolve the project's single workspace Draft review id, reactively.
     let target_state = state.clone();
     let target: Memo<Option<(String, ReviewId)>> = Memo::new(move |_| {
         let ap = target_state.active_project.get()?;
-        let selected = historical_selection.get().filter(|selection| {
-            selection.host_id == ap.host_id && selection.project_id == ap.project_id
-        });
         target_state.review_summaries.with(|map| {
-            map.get(&ap.project_id).and_then(|sums| {
-                let summary = match selected.as_ref() {
-                    Some(selection) => pick_committed_range_draft(sums, selection),
-                    None => crate::components::review_view::pick_workspace_draft(sums),
-                }?;
-                Some((ap.host_id.clone(), summary.id.clone()))
+            map.get(&ap.project_id).and_then(|summaries| {
+                crate::components::review_view::pick_workspace_draft(summaries)
+                    .map(|summary| (ap.host_id.clone(), summary.id.clone()))
+            })
+        })
+    });
+    crate::components::review_view::subscribe_review_reactive(&state, target);
+
+    let counts_state = state.clone();
+    let counts: Memo<Option<(u32, u32, bool)>> = Memo::new(move |_| {
+        let (_, rid) = target.get()?;
+        let from_record = counts_state.reviews.with(|map| {
+            map.get(&rid).map(|review| {
+                (
+                    review.comments.len() as u32,
+                    review
+                        .suggestions
+                        .iter()
+                        .filter(|s| matches!(s.state, protocol::ReviewSuggestionState::Pending))
+                        .count() as u32,
+                    matches!(
+                        review.ai_reviewer.status,
+                        protocol::ReviewAiReviewerStatus::Running
+                    ),
+                )
+            })
+        });
+        if from_record.is_some() {
+            return from_record;
+        }
+        counts_state.review_summaries.with(|map| {
+            map.values().find_map(|summaries| {
+                summaries
+                    .iter()
+                    .find(|summary| summary.id == rid)
+                    .map(|summary| {
+                        (
+                            summary.user_comment_count,
+                            summary.pending_suggestion_count,
+                            false,
+                        )
+                    })
             })
         })
     });
 
-    // Keep the review subscribed so `ReviewSidebar` can mount with the full
-    // record. The shared helper retries on send failure / record loss /
-    // reconnect, and resubscribes when the draft id changes.
-    crate::components::review_view::subscribe_review_reactive(&state, target);
+    let dirty_state = state.clone();
+    let has_dirty_root = Memo::new(move |_| {
+        let Some(ap) = dirty_state.active_project.get() else {
+            return false;
+        };
+        dirty_state.git_status.with(|map| {
+            map.get(&ap.project_id)
+                .is_some_and(|roots| roots.iter().any(|root| !root.clean))
+        })
+    });
+    let visible = Memo::new(move |_| {
+        counts
+            .get()
+            .is_some_and(|(comments, suggestions, running)| {
+                comments > 0 || suggestions > 0 || running || has_dirty_root.get()
+            })
+    });
+
+    let open_state = state.clone();
+    let on_open = move |_| {
+        let Some((host, _)) = target.get_untracked() else {
+            return;
+        };
+        let Some(ap) = open_state.active_project.get_untracked() else {
+            return;
+        };
+        crate::components::review_view::open_comments_for_project(
+            &open_state,
+            &host,
+            &ap.project_id,
+        );
+    };
 
     view! {
-        {move || {
-            let active = state.active_project.get();
-            let selected = historical_selection.get().filter(|selection| {
-                active.as_ref().is_some_and(|project| {
-                    selection.host_id == project.host_id
-                        && selection.project_id == project.project_id
-                })
-            });
-            match (target.get(), selected) {
-            (Some((host, rid)), selected) => view! {
-                <WorkspaceReviewHubInner
-                    host_id=host
-                    review_id=rid
-                    historical_selection=selected
-                />
-            }.into_any(),
-            (None, Some(selected)) => view! {
-                <CommittedReviewStarter selection=selected />
-            }.into_any(),
-            (None, None) => view! { <div></div> }.into_any(),
-            }
-        }}
+        <Show when=move || visible.get()>
+            <div class="gp-review-status" data-test="gp-review-status">
+                <span class="gp-review-status-title">"Review"</span>
+                <span class="gp-review-counts" data-test="gp-review-counts">
+                    {move || {
+                        counts
+                            .get()
+                            .map(|(comments, suggestions, _)| {
+                                format!(
+                                    "{comments} comment{} \u{00b7} {suggestions} AI",
+                                    if comments == 1 { "" } else { "s" },
+                                )
+                            })
+                            .unwrap_or_default()
+                    }}
+                </span>
+                {move || {
+                    counts.get().is_some_and(|(_, _, running)| running).then(|| view! {
+                        <span
+                            class="gp-review-ai"
+                            data-test="gp-review-ai"
+                            title="The AI reviewer is running"
+                        >
+                            "reviewing\u{2026}"
+                        </span>
+                    })
+                }}
+                <button
+                    class="gp-review-open-btn"
+                    data-test="gp-review-open"
+                    title="Open the review: comments, AI reviewer, and submit"
+                    on:click=on_open.clone()
+                >
+                    "Open"
+                </button>
+            </div>
+        </Show>
     }
 }
 
@@ -212,12 +295,41 @@ fn pick_committed_range_draft<'a>(
         .max_by_key(|summary| summary.updated_at_ms)
 }
 
+/// Review affordance for the expanded commit block: a starter while the
+/// range has no draft, and the draft's counts plus the shared review
+/// controls once one exists.
+#[component]
+fn CommittedReviewControls(selection: HistoricalSelection) -> impl IntoView {
+    let state = expect_context::<AppState>();
+    let target_state = state.clone();
+    let target_selection = selection.clone();
+    let target: Memo<Option<(String, ReviewId)>> = Memo::new(move |_| {
+        target_state.review_summaries.with(|map| {
+            map.get(&target_selection.project_id).and_then(|summaries| {
+                pick_committed_range_draft(summaries, &target_selection)
+                    .map(|summary| (target_selection.host_id.clone(), summary.id.clone()))
+            })
+        })
+    });
+    crate::components::review_view::subscribe_review_reactive(&state, target);
+
+    view! {
+        {move || match target.get() {
+            Some((host, rid)) => view! {
+                <CommittedReviewHub host_id=host review_id=rid selection=selection.clone() />
+            }.into_any(),
+            None => view! {
+                <CommittedReviewStarter selection=selection.clone() />
+            }.into_any(),
+        }}
+    }
+}
+
 #[component]
 fn CommittedReviewStarter(selection: HistoricalSelection) -> impl IntoView {
     let state = expect_context::<AppState>();
     let pending_request_id = RwSignal::new(None::<String>);
     let send_error = RwSignal::new(None::<String>);
-    let subtitle = historical_scope_label(&selection);
     let create_selection = selection.clone();
     let on_start = move |_| {
         let selection = create_selection.clone();
@@ -263,16 +375,10 @@ fn CommittedReviewStarter(selection: HistoricalSelection) -> impl IntoView {
         })
     });
     view! {
-        <div class="gp-review-hub committed" data-test="gp-committed-review-starter">
-            <div class="gp-review-hub-header">
-                <span class="gp-review-hub-title">"Review"</span>
-                <span class="gp-review-scope">{subtitle}</span>
-            </div>
-            <p class="gp-review-hint">
-                "Review this frozen committed range. Feedback is fix-forward."
-            </p>
+        <div class="gp-commit-review-row" data-test="gp-committed-review-starter">
             <button
                 class="gp-review-open-btn"
+                title="Review these committed changes. They are immutable, so feedback is fix-forward."
                 disabled=move || pending_request_id.get().is_some() && request_error.get().is_none()
                 on:click=on_start
             >
@@ -287,29 +393,14 @@ fn CommittedReviewStarter(selection: HistoricalSelection) -> impl IntoView {
     }
 }
 
-fn historical_scope_label(selection: &HistoricalSelection) -> String {
-    if selection.commit_count == 1 {
-        format!("{} · 1 commit", short_oid(&selection.tip_oid))
-    } else {
-        format!(
-            "{}…{} · {} commits",
-            short_oid(&selection.base_oid),
-            short_oid(&selection.tip_oid),
-            selection.commit_count,
-        )
-    }
-}
-
-/// Hub body, mounted once a workspace draft id is resolved.
 #[component]
-fn WorkspaceReviewHubInner(
+fn CommittedReviewHub(
     host_id: String,
     review_id: ReviewId,
-    historical_selection: Option<HistoricalSelection>,
+    selection: HistoricalSelection,
 ) -> impl IntoView {
     let state = expect_context::<AppState>();
 
-    // Live workspace counts: prefer the full record, fall back to the summary.
     let counts_state = state.clone();
     let counts_rid = review_id.clone();
     let counts: Memo<(u32, u32)> = Memo::new(move |_| {
@@ -353,72 +444,30 @@ fn WorkspaceReviewHubInner(
         })
     });
 
-    // Whether the workspace has any reviewable (unstaged or untracked) change
-    // in any root, read straight from the git status the panel already
-    // renders. Reviews track unstaged state, so staged-only files don't count
-    // — they'd give the AI reviewer an empty diff. Reactive: enables/disables
-    // as git status changes. No cache; pure projection of `git_status`.
+    // The frozen range is reviewable as long as it produced any file diff.
     let changes_state = state.clone();
-    let changes_selection = historical_selection.clone();
     let has_reviewable_changes: Memo<bool> = Memo::new(move |_| {
-        if let Some(selection) = changes_selection.as_ref() {
-            let Some(ap) = changes_state.active_project.get() else {
-                return false;
-            };
-            let key = DiffKey::with_revision(
-                ap.host_id,
-                ap.project_id,
-                selection.root.clone(),
-                ProjectDiffScope::Uncommitted,
-                selection.revision(),
-                "",
-            );
-            return changes_state
-                .diff_contents
-                .with(|diffs| diffs.get(&key).is_some_and(|diff| !diff.files.is_empty()));
-        }
-        let Some(ap) = changes_state.active_project.get() else {
-            return false;
-        };
-        changes_state.git_status.with(|m| {
-            m.get(&ap.project_id)
-                .map(|roots| {
-                    roots
-                        .iter()
-                        .any(|r| r.files.iter().any(|f| f.unstaged.is_some() || f.untracked))
-                })
-                .unwrap_or(false)
-        })
-    });
-
-    let comments_state = state.clone();
-    let comments_host = host_id.clone();
-    let on_comments = move |_| {
-        let Some(ap) = comments_state.active_project.get_untracked() else {
-            return;
-        };
-        crate::components::review_view::open_comments_for_project(
-            &comments_state,
-            &comments_host,
-            &ap.project_id,
+        let key = DiffKey::with_revision(
+            selection.host_id.clone(),
+            selection.project_id.clone(),
+            selection.root.clone(),
+            ProjectDiffScope::Uncommitted,
+            selection.revision(),
+            "",
         );
-    };
+        changes_state
+            .diff_contents
+            .with(|diffs| diffs.get(&key).is_some_and(|diff| !diff.files.is_empty()))
+    });
 
     let sidebar_state = state.clone();
     let sidebar_host = host_id.clone();
     let sidebar_rid = review_id.clone();
-    let scope_label = historical_selection
-        .as_ref()
-        .map(historical_scope_label)
-        .unwrap_or_else(|| "Working tree".to_owned());
-    let committed = historical_selection.is_some();
-
     view! {
-        <div class="gp-review-hub" data-test="gp-workspace-review-hub">
-            <div class="gp-review-hub-header">
-                <span class="gp-review-hub-title">"Review"</span>
-                <span class="gp-review-scope">{scope_label}</span>
-                <span class="gp-review-counts" data-test="gp-workspace-review-counts">
+        <div class="gp-committed-review" data-test="gp-committed-review-hub">
+            <div class="gp-commit-review-row">
+                <span class="gp-review-status-title">"Review"</span>
+                <span class="gp-review-counts" data-test="gp-committed-review-counts">
                     {move || {
                         let (c, s) = counts.get();
                         format!(
@@ -427,20 +476,7 @@ fn WorkspaceReviewHubInner(
                         )
                     }}
                 </span>
-                {(!committed).then(|| view! {
-                    <button
-                        class="gp-review-open-btn"
-                        data-test="gp-workspace-review-comments"
-                        title="Open the workspace review comments"
-                        on:click=on_comments
-                    >
-                        "Comments"
-                    </button>
-                })}
             </div>
-            {committed.then(|| view! {
-                <div class="gp-review-hint">"Committed changes · feedback is fix-forward"</div>
-            })}
             {move || {
                 if !loaded.get() {
                     return view! {
@@ -467,34 +503,21 @@ fn WorkspaceReviewHubInner(
 
 #[component]
 fn RecentCommits(
-    host_id: String,
-    project_id: protocol::ProjectId,
-    root: ProjectRootPath,
-    empty_tree_oid: Option<String>,
-    commits: Vec<ProjectGitCommitSummary>,
+    list: StoredValue<HistoricalCommitList>,
     history_has_more: bool,
-    working_count: usize,
-    historical_selection: RwSignal<Option<HistoricalSelection>>,
-    history_visible_limits: RwSignal<HashMap<HistoryScope, usize>>,
+    signals: PanelSignals,
 ) -> impl IntoView {
-    let expanded = RwSignal::new(true);
-    let history_scope = HistoryScope {
-        host_id: host_id.clone(),
-        project_id: project_id.clone(),
-        root: root.clone(),
-    };
-    let root_for_working_class = root.0.clone();
-    let root_for_working_selected = root.0.clone();
-    let host_for_working_class = host_id.clone();
-    let project_for_working_class = project_id.clone();
-    let host_for_working_selected = host_id.clone();
-    let project_for_working_selected = project_id.clone();
-    let root_for_rows = root.clone();
-    let row_commits = commits.clone();
-    let history_len = commits.len();
-    let limit_scope = history_scope.clone();
+    let (scope, root_label, history_len, row_commits) = list.with_value(|list| {
+        (
+            list.scope.clone(),
+            list.scope.root.0.clone(),
+            list.commits.len(),
+            list.commits.clone(),
+        )
+    });
+    let limit_scope = scope.clone();
     let visible_limit = Memo::new(move |_| {
-        history_visible_limits.with(|limits| {
+        signals.history_visible_limits.with(|limits| {
             limits
                 .get(&limit_scope)
                 .copied()
@@ -502,207 +525,178 @@ fn RecentCommits(
                 .min(history_len)
         })
     });
-    let load_scope = StoredValue::new(history_scope);
+    let selection_scope = scope.clone();
+    let selection: Memo<Option<HistoricalSelection>> = Memo::new(move |_| {
+        signals
+            .historical_selection
+            .get()
+            .filter(|selected| selection_scope.owns(selected))
+    });
+    let load_scope = StoredValue::new(scope);
+    let historical_selection = signals.historical_selection;
 
     view! {
-        <div class="gp-history">
-            <button
-                class="gp-history-header"
-                aria-expanded=move || expanded.get().to_string()
-                on:click=move |_| expanded.update(|value| *value = !*value)
-            >
-                <span aria-hidden="true">{move || if expanded.get() { "▾" } else { "▸" }}</span>
-                <span>"Recent commits"</span>
-            </button>
-            <div
-                class="gp-history-list"
-                role="listbox"
-                aria-label=format!("Change source for {}", root.0)
-                aria-multiselectable="true"
-                style=move || if expanded.get() { "" } else { "display: none;" }
-            >
+        <div
+            class="gp-history"
+            role="listbox"
+            aria-label=format!("Recent commits for {root_label}")
+            aria-multiselectable="true"
+            data-test="gp-history"
+        >
+            {(history_len == 0).then(|| view! {
+                <div class="gp-history-note" role="status">"No commits yet"</div>
+            })}
+            {row_commits.into_iter().enumerate().map(|(index, commit)| {
+                let oid = commit.oid.clone();
+                let oid_for_anchor = commit.oid.clone();
+                let selected = Memo::new(move |_| {
+                    selection.get().is_some_and(|selected| selected.selected_oids.contains(&oid))
+                });
+                let is_anchor = Memo::new(move |_| {
+                    selection.get().is_some_and(|selected| {
+                        selected.selected_oids.last() == Some(&oid_for_anchor)
+                    })
+                });
+                let aria_label = commit_aria_label(&commit);
+                let age = commit_age(commit.authored_at_seconds);
+                let age_title = format!("{} · {}", commit.author, short_oid(&commit.oid));
+                view! {
                     <button
+                        style=move || if index < visible_limit.get() { "" } else { "display: none;" }
+                        tabindex=move || if index < visible_limit.get() { "0" } else { "-1" }
                         class=move || {
-                            if historical_selection
-                                .get()
-                                .is_none_or(|selection| {
-                                    selection.host_id != host_for_working_class
-                                        || selection.project_id != project_for_working_class
-                                        || selection.root.0.as_str() != root_for_working_class.as_str()
-                                })
-                            {
-                                "gp-history-row selected"
-                            } else {
-                                "gp-history-row"
-                            }
+                            if selected.get() { "gp-commit-row selected" } else { "gp-commit-row" }
                         }
                         role="option"
-                        aria-selected=move || historical_selection
-                            .get()
-                            .is_none_or(|selection| {
-                                selection.host_id != host_for_working_selected
-                                    || selection.project_id != project_for_working_selected
-                                    || selection.root.0.as_str() != root_for_working_selected.as_str()
-                            })
-                            .to_string()
-                        aria-label=format!("Working tree, {working_count} changed files")
-                        on:click=move |_| historical_selection.set(None)
+                        aria-selected=move || selected.get().to_string()
+                        aria-label=aria_label
+                        data-test="gp-commit-row"
+                        on:click=move |event| {
+                            list.with_value(|list| {
+                                select_commit_range(
+                                    historical_selection,
+                                    list.source(),
+                                    index,
+                                    event.shift_key(),
+                                );
+                            });
+                        }
                         on:keydown=move |event| {
                             match event.key().as_str() {
-                                "Enter" | " " | "Escape" => {
+                                "Enter" | " " => {
+                                    event.prevent_default();
+                                    list.with_value(|list| {
+                                        select_commit_range(
+                                            historical_selection,
+                                            list.source(),
+                                            index,
+                                            event.shift_key(),
+                                        );
+                                    });
+                                }
+                                "Escape" => {
                                     event.prevent_default();
                                     historical_selection.set(None);
                                 }
-                                "ArrowDown" => {
+                                "ArrowUp" | "ArrowDown" => {
                                     event.prevent_default();
-                                    focus_history_option(&event, 1);
+                                    let offset = if event.key() == "ArrowUp" { -1 } else { 1 };
+                                    focus_history_option(&event, offset);
+                                    if event.shift_key() {
+                                        list.with_value(|list| {
+                                            let target = if offset < 0 {
+                                                index.saturating_sub(1)
+                                            } else {
+                                                (index + 1).min(list.commits.len().saturating_sub(1))
+                                            };
+                                            select_commit_range(
+                                                historical_selection,
+                                                list.source(),
+                                                target,
+                                                true,
+                                            );
+                                        });
+                                    }
                                 }
                                 _ => {}
                             }
                         }
                     >
-                        <span class="gp-history-marker" aria-hidden="true">"✓"</span>
-                        <span class="gp-history-subject">"Working tree"</span>
-                        <span class="gp-history-count">{working_count}</span>
+                        <span class="gp-commit-subject">{commit.subject.clone()}</span>
+                        {commit.is_merge.then(|| view! {
+                            <span class="gp-merge-badge">"merge"</span>
+                        })}
+                        <span class="gp-commit-age" title=age_title>{age}</span>
                     </button>
-                    {row_commits.into_iter().enumerate().map(|(index, commit)| {
-                        let oid = commit.oid.clone();
-                        let oid_for_selected = oid.clone();
-                        let oid_for_aria = oid.clone();
-                        let root_for_selected = root_for_rows.0.clone();
-                        let root_for_aria = root_for_rows.0.clone();
-                        let host_for_selected = host_id.clone();
-                        let project_for_selected = project_id.clone();
-                        let host_for_aria = host_id.clone();
-                        let project_for_aria = project_id.clone();
-                        let root_for_click = root_for_rows.clone();
-                        let root_for_key = root_for_rows.clone();
-                        let host_for_click = host_id.clone();
-                        let project_for_click = project_id.clone();
-                        let empty_tree_for_click = empty_tree_oid.clone();
-                        let host_for_key = host_id.clone();
-                        let project_for_key = project_id.clone();
-                        let empty_tree_for_key = empty_tree_oid.clone();
-                        let commits_for_click = commits.clone();
-                        let commits_for_key = commits.clone();
-                        let commit_for_label = commit.clone();
-                        view! {
-                                <button
-                                    style=move || if index < visible_limit.get() { "" } else { "display: none;" }
-                                    tabindex=move || if index < visible_limit.get() { "0" } else { "-1" }
-                                    class=move || {
-                                        if historical_selection.get().is_some_and(|selection| {
-                                            selection.host_id == host_for_selected
-                                                && selection.project_id == project_for_selected
-                                                && selection.root.0.as_str() == root_for_selected.as_str()
-                                                && selection.selected_oids.contains(&oid_for_selected)
-                                        }) {
-                                            "gp-history-row selected"
-                                        } else {
-                                            "gp-history-row"
-                                        }
-                                    }
-                                    role="option"
-                                    aria-selected=move || historical_selection.get().is_some_and(|selection| {
-                                        selection.host_id == host_for_aria
-                                            && selection.project_id == project_for_aria
-                                            && selection.root.0.as_str() == root_for_aria.as_str()
-                                            && selection.selected_oids.contains(&oid_for_aria)
-                                    }).to_string()
-                                    aria-label=commit_aria_label(&commit_for_label)
-                                    on:click=move |event| {
-                                        select_commit_range(
-                                            historical_selection,
-                                            HistoricalCommitSource {
-                                                host_id: &host_for_click,
-                                                project_id: &project_for_click,
-                                                root: &root_for_click,
-                                                empty_tree_oid: empty_tree_for_click.as_deref(),
-                                                commits: &commits_for_click,
-                                            },
-                                            index,
-                                            event.shift_key(),
-                                        );
-                                    }
-                                    on:keydown=move |event| {
-                                        match event.key().as_str() {
-                                            "Enter" | " " => {
-                                                event.prevent_default();
-                                                select_commit_range(
-                                                    historical_selection,
-                                                    HistoricalCommitSource {
-                                                        host_id: &host_for_key,
-                                                        project_id: &project_for_key,
-                                                        root: &root_for_key,
-                                                        empty_tree_oid: empty_tree_for_key.as_deref(),
-                                                        commits: &commits_for_key,
-                                                    },
-                                                    index,
-                                                    event.shift_key(),
-                                                );
-                                            }
-                                            "Escape" => {
-                                                event.prevent_default();
-                                                historical_selection.set(None);
-                                            }
-                                            "ArrowUp" | "ArrowDown" => {
-                                                event.prevent_default();
-                                                let offset = if event.key() == "ArrowUp" { -1 } else { 1 };
-                                                focus_history_option(&event, offset);
-                                                if event.shift_key() {
-                                                    let target = if offset < 0 {
-                                                        index.saturating_sub(1)
-                                                    } else {
-                                                        (index + 1).min(commits_for_key.len().saturating_sub(1))
-                                                    };
-                                                    select_commit_range(
-                                                        historical_selection,
-                                                        HistoricalCommitSource {
-                                                            host_id: &host_for_key,
-                                                            project_id: &project_for_key,
-                                                            root: &root_for_key,
-                                                            empty_tree_oid: empty_tree_for_key.as_deref(),
-                                                            commits: &commits_for_key,
-                                                        },
-                                                        target,
-                                                        true,
-                                                    );
-                                                }
-                                            }
-                                            _ => {}
-                                        }
-                                    }
-                                >
-                                    <span class="gp-history-marker" aria-hidden="true">"✓"</span>
-                                    <span class="gp-history-subject">{commit.subject.clone()}</span>
-                                    <span class="gp-history-meta">
-                                        <span class="gp-history-sha">{short_oid(&commit.oid)}</span>
-                                        {commit.is_merge.then(|| view! {
-                                            <span class="gp-merge-badge">"merge"</span>
-                                        })}
-                                        <span class="gp-history-author">{commit.author.clone()}</span>
-                                        <span class="gp-history-time">{commit_age(commit.authored_at_seconds)}</span>
-                                    </span>
-                                </button>
-                        }
-                    }).collect::<Vec<_>>()}
-                    <Show when=move || visible_limit.get() < history_len>
-                        <button
-                            class="gp-history-older"
-                            on:click=move |_| history_visible_limits.update(|limits| {
-                                let limit = limits
-                                    .entry(load_scope.get_value())
-                                    .or_insert(HISTORY_PAGE_SIZE);
-                                *limit = (*limit + HISTORY_PAGE_SIZE).min(history_len);
-                            })
-                        >
-                            "Load older commits"
-                        </button>
+                    <Show when=move || is_anchor.get()>
+                        <CommitDetail selection=selection list=list />
                     </Show>
-                    <Show when=move || { history_has_more && visible_limit.get() >= history_len }>
-                        <div class="gp-history-note">"Older history is not loaded"</div>
-                    </Show>
-            </div>
+                }
+            }).collect::<Vec<_>>()}
+            <Show when=move || visible_limit.get() < history_len>
+                <button
+                    class="gp-history-older"
+                    on:click=move |_| signals.history_visible_limits.update(|limits| {
+                        let limit = limits
+                            .entry(load_scope.get_value())
+                            .or_insert(HISTORY_PAGE_SIZE);
+                        *limit = (*limit + HISTORY_PAGE_SIZE).min(history_len);
+                    })
+                >
+                    "Older\u{2026}"
+                </button>
+            </Show>
+            <Show when=move || { history_has_more && visible_limit.get() >= history_len }>
+                <div class="gp-history-note">"Older history is not loaded"</div>
+            </Show>
+        </div>
+    }
+}
+
+/// The accordion body under the selected commit (or the oldest commit of a
+/// selected range): identity line, review affordance, and the range's
+/// changed files. Rendered adjacent to the row that produced it so the cause
+/// and its effect never drift apart.
+#[component]
+fn CommitDetail(
+    selection: Memo<Option<HistoricalSelection>>,
+    list: StoredValue<HistoricalCommitList>,
+) -> impl IntoView {
+    view! {
+        <div class="gp-commit-detail" data-test="gp-commit-detail">
+            {move || selection.get().map(|selected| {
+                let single = selected.commit_count == 1;
+                let sha = if single {
+                    short_oid(&selected.tip_oid)
+                } else {
+                    format!("{}\u{2026}{}", short_oid(&selected.base_oid), short_oid(&selected.tip_oid))
+                };
+                let author = single.then(|| list.with_value(|list| {
+                    list.commits
+                        .iter()
+                        .find(|commit| commit.oid == selected.tip_oid)
+                        .map(|commit| commit.author.clone())
+                })).flatten();
+                let count = format!(
+                    "{} commit{}",
+                    selected.commit_count,
+                    if single { "" } else { "s" },
+                );
+                view! {
+                    <div class="gp-commit-meta" data-test="gp-commit-meta">
+                        <span class="gp-commit-sha" title=selected.tip_oid.clone()>{sha}</span>
+                        {author.map(|author| view! {
+                            <span class="gp-commit-author">{author}</span>
+                        })}
+                        <span class="gp-commit-count">{count}</span>
+                    </div>
+                    <CommittedReviewControls selection=selected />
+                }
+            })}
+            <HistoricalChangedFiles
+                selection=selection
+                commits=list.with_value(|list| list.commits.clone())
+            />
         </div>
     }
 }
@@ -832,13 +826,20 @@ fn GitRootSection(
     host_id: String,
     project_id: protocol::ProjectId,
     root: ProjectRootGitStatus,
-    historical_selection: RwSignal<Option<HistoricalSelection>>,
-    history_visible_limits: RwSignal<HashMap<HistoryScope, usize>>,
+    multi_root: bool,
+    signals: PanelSignals,
 ) -> impl IntoView {
-    let history_commits = root.recent_commits.clone();
+    let scope = HistoryScope {
+        host_id: host_id.clone(),
+        project_id: project_id.clone(),
+        root: root.root.clone(),
+    };
+    let list = HistoricalCommitList {
+        scope: scope.clone(),
+        empty_tree_oid: root.empty_tree_oid.clone(),
+        commits: root.recent_commits.clone(),
+    };
     let history_has_more = root.history_has_more;
-    let empty_tree_oid = root.empty_tree_oid.clone();
-    let working_count = root.files.len();
     let conflicts: Vec<_> = root
         .files
         .iter()
@@ -871,38 +872,31 @@ fn GitRootSection(
         .collect();
     let untracked: Vec<_> = root.files.iter().filter(|f| f.untracked).cloned().collect();
 
+    let list = StoredValue::new(list);
+    let conflicts = StoredValue::new(conflicts);
+    let staged = StoredValue::new(staged);
+    let unstaged = StoredValue::new(unstaged);
+    let untracked = StoredValue::new(untracked);
     let root_path = root.root.clone();
+    let root_handle = StoredValue::new(root.root.clone());
     let conflicts_expanded = RwSignal::new(true);
     let staged_expanded = RwSignal::new(true);
     let unstaged_expanded = RwSignal::new(true);
     let untracked_expanded = RwSignal::new(true);
+    let commit_open = RwSignal::new(false);
 
-    let conflicts_count = conflicts.len();
-    let staged_count = staged.len();
-    let unstaged_count = unstaged.len();
-    let untracked_count = untracked.len();
+    let conflicts_count = conflicts.with_value(Vec::len);
+    let staged_count = staged.with_value(Vec::len);
+    let unstaged_count = unstaged.with_value(Vec::len);
+    let untracked_count = untracked.with_value(Vec::len);
+    let changed_count = root.files.len();
 
     let has_conflicts = conflicts_count != 0;
     let has_staged = staged_count != 0;
     let has_unstaged = unstaged_count != 0;
     let has_untracked = untracked_count != 0;
+    let clean = root.clean;
 
-    let root_for_conflicts = root_path.clone();
-    let root_for_staged = root_path.clone();
-    let root_for_unstaged = root_path.clone();
-    let root_for_untracked = root_path.clone();
-    let root_for_commit = root_path.clone();
-    let root_for_history = root_path.clone();
-    let mode_root = root_path.clone();
-    let mode_host = host_id.clone();
-    let mode_project = project_id.clone();
-    let historical_for_root = Memo::new(move |_| {
-        historical_selection.get().filter(|selection| {
-            selection.host_id == mode_host
-                && selection.project_id == mode_project
-                && selection.root == mode_root
-        })
-    });
     let root_label = root_display_name(&root.root);
     let root_title = root.root.0.clone();
     let branch_label = root.branch.unwrap_or_else(|| "--".to_owned());
@@ -918,6 +912,54 @@ fn GitRootSection(
         Some(parts.join(" "))
     } else {
         None
+    };
+
+    // A lone root is always open. With several, dirty roots open and clean
+    // ones collapse to their header line, so a project with many clean
+    // roots stays one line per root. An explicit toggle wins over the
+    // default and survives status refreshes.
+    let default_expanded = !multi_root || !clean;
+    let expansion_scope = scope.clone();
+    let expanded = Memo::new(move |_| {
+        signals
+            .root_expansion
+            .with(|map| map.get(&expansion_scope).copied())
+            .unwrap_or(default_expanded)
+    });
+    let history_scope = scope.clone();
+    let history_on = Memo::new(move |_| {
+        signals
+            .history_roots
+            .with(|roots| roots.contains(&history_scope))
+    });
+    let toggle_scope = scope.clone();
+    let on_toggle = move |_| {
+        let next = !expanded.get_untracked();
+        signals.root_expansion.update(|map| {
+            map.insert(toggle_scope.clone(), next);
+        });
+    };
+    let history_toggle_scope = scope.clone();
+    let on_toggle_history = move |_| {
+        let turning_on = !history_on.get_untracked();
+        signals.history_roots.update(|roots| {
+            if turning_on {
+                roots.insert(history_toggle_scope.clone());
+            } else {
+                roots.remove(&history_toggle_scope);
+            }
+        });
+        if turning_on {
+            signals.root_expansion.update(|map| {
+                map.insert(history_toggle_scope.clone(), true);
+            });
+        } else if signals
+            .historical_selection
+            .get_untracked()
+            .is_some_and(|selected| history_toggle_scope.owns(&selected))
+        {
+            signals.historical_selection.set(None);
+        }
     };
 
     let commit_message = RwSignal::new(String::new());
@@ -955,9 +997,6 @@ fn GitRootSection(
                 .map(|f| (f.relative_path.clone(), f.total_count()))
                 .collect();
         }
-        // Summary carries no per-file counts for this root (older server, or
-        // counts not yet populated) — fall back to the loaded review record,
-        // filtered to this root.
         counts_state.reviews.with(|m| {
             m.get(&rid)
                 .map(|r| per_file_comment_counts(r, &counts_root))
@@ -965,119 +1004,165 @@ fn GitRootSection(
         })
     });
 
+    let state_label = if clean {
+        (
+            "gp-root-state clean",
+            "\u{2713}".to_owned(),
+            "Working tree clean".to_owned(),
+        )
+    } else if has_conflicts {
+        (
+            "gp-root-state conflicts",
+            format!(
+                "{conflicts_count} conflict{}",
+                if conflicts_count == 1 { "" } else { "s" }
+            ),
+            format!("{changed_count} changed files, {conflicts_count} unmerged"),
+        )
+    } else {
+        (
+            "gp-root-state",
+            changed_count.to_string(),
+            format!(
+                "{changed_count} changed file{}",
+                if changed_count == 1 { "" } else { "s" }
+            ),
+        )
+    };
+
     view! {
-        <div class="gp-root-section">
-            <div class="gp-root-header" title=root_title>
-                <span class="gp-root-name">{root_label}</span>
-                <span class="gp-root-branch">{branch_label}</span>
-                {ahead_behind.map(|ab| view! {
-                    <span class="gp-root-ahead-behind">{ab}</span>
-                })}
+        <section class="gp-root" data-test="gp-root" data-root=root_title.clone()>
+            <div class="gp-root-header" title=root_title.clone()>
+                <button
+                    class="gp-root-toggle"
+                    data-test="gp-root-toggle"
+                    aria-expanded=move || expanded.get().to_string()
+                    on:click=on_toggle
+                >
+                    <span class="fe-chevron">
+                        {move || if expanded.get() { "\u{25be}" } else { "\u{25b8}" }}
+                    </span>
+                    <span class="gp-root-name">{root_label}</span>
+                    <span class="gp-root-branch">{branch_label}</span>
+                    {ahead_behind.map(|ab| view! {
+                        <span class="gp-root-ahead-behind">{ab}</span>
+                    })}
+                </button>
+                <span class=state_label.0 data-test="gp-root-state" title=state_label.2>
+                    {state_label.1}
+                </span>
+                <button
+                    class="gp-root-history-toggle"
+                    data-test="gp-root-history-toggle"
+                    aria-pressed=move || history_on.get().to_string()
+                    title=move || if history_on.get() { "Back to the working tree" } else { "Recent commits" }
+                    on:click=on_toggle_history
+                >
+                    <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
+                        <path d="M1.643 3.143 .427 1.927A.25.25 0 0 0 0 2.104V5.75c0 .138.112.25.25.25h3.646a.25.25 0 0 0 .177-.427L2.715 4.215a6.5 6.5 0 1 1-1.18 4.458.75.75 0 1 0-1.493.154 8.001 8.001 0 1 0 3.601-5.684ZM7.75 4a.75.75 0 0 1 .75.75v2.992l2.028.812a.75.75 0 0 1-.557 1.392l-2.5-1A.751.751 0 0 1 7 8.25v-3.5A.75.75 0 0 1 7.75 4Z" />
+                    </svg>
+                </button>
             </div>
-            <RecentCommits
-                host_id=host_id
-                project_id=project_id
-                root=root_for_history
-                empty_tree_oid=empty_tree_oid
-                commits=history_commits.clone()
-                history_has_more=history_has_more
-                working_count=working_count
-                historical_selection=historical_selection
-                history_visible_limits=history_visible_limits
-            />
-            <Show when=move || historical_for_root.get().is_some()>
-                <HistoricalChangedFiles
-                    selection=historical_for_root
-                    commits=history_commits.clone()
-                />
-            </Show>
-            <Show when=move || historical_for_root.get().is_none() && root.clean>
-                <div class="gp-clean">"✓ Working tree clean"</div>
-            </Show>
-            <Show when=move || historical_for_root.get().is_none() && has_conflicts>
-                <GitFileSection
-                    title="Conflicts"
-                    count=conflicts_count
-                    files=conflicts.clone()
-                    expanded=conflicts_expanded
-                    scope=ProjectDiffScope::Unstaged
-                    root_path=root_for_conflicts.clone()
-                    show_stage_btn=true
-                    show_unstage_btn=false
-                    show_discard_btn=false
-                    file_counts=file_counts
-                />
-            </Show>
-            <Show when=move || historical_for_root.get().is_none() && has_staged>
-                <div class="gp-commit-area">
-                    <textarea
-                        class="gp-commit-input"
-                        placeholder="Commit message"
-                        rows="3"
-                        prop:value=move || commit_message.get()
-                        on:input=move |ev| {
-                            commit_message.set(event_target_value(&ev));
-                        }
+            <Show when=move || expanded.get()>
+                <Show
+                    when=move || history_on.get()
+                    fallback=move || view! {
+                            <Show when=move || clean>
+                                <div class="gp-clean">"\u{2713} Working tree clean"</div>
+                            </Show>
+                            <Show when=move || has_conflicts>
+                                <GitFileSection
+                                    title="Conflicts"
+                                    count=conflicts_count
+                                    files=conflicts.get_value()
+                                    expanded=conflicts_expanded
+                                    scope=ProjectDiffScope::Unstaged
+                                    root_path=root_handle.get_value()
+                                    show_stage_btn=true
+                                    show_unstage_btn=false
+                                    show_discard_btn=false
+                                    file_counts=file_counts
+                                />
+                            </Show>
+                            <Show when=move || has_staged>
+                                <GitFileSection
+                                    title="Staged"
+                                    count=staged_count
+                                    files=staged.get_value()
+                                    expanded=staged_expanded
+                                    scope=ProjectDiffScope::Staged
+                                    root_path=root_handle.get_value()
+                                    show_stage_btn=false
+                                    show_unstage_btn=true
+                                    show_discard_btn=false
+                                    file_counts=file_counts
+                                    commit_toggle=commit_open
+                                />
+                                <Show when=move || commit_open.get()>
+                                    <div class="gp-commit-area" data-test="gp-commit-area">
+                                        <textarea
+                                            class="gp-commit-input"
+                                            placeholder="Commit message"
+                                            rows="3"
+                                            prop:value=move || commit_message.get()
+                                            on:input=move |ev| {
+                                                commit_message.set(event_target_value(&ev));
+                                            }
+                                        />
+                                        <button
+                                            class="gp-commit-btn"
+                                            disabled=move || commit_message.get().trim().is_empty()
+                                            on:click=move |_| {
+                                                let msg = commit_message.get();
+                                                if !msg.trim().is_empty() {
+                                                    send_commit(root_handle.get_value(), msg);
+                                                    commit_message.set(String::new());
+                                                }
+                                            }
+                                        >
+                                            "Commit"
+                                        </button>
+                                    </div>
+                                </Show>
+                            </Show>
+                            <Show when=move || has_unstaged>
+                                <GitFileSection
+                                    title="Changes"
+                                    count=unstaged_count
+                                    files=unstaged.get_value()
+                                    expanded=unstaged_expanded
+                                    scope=ProjectDiffScope::Unstaged
+                                    root_path=root_handle.get_value()
+                                    show_stage_btn=true
+                                    show_unstage_btn=false
+                                    show_discard_btn=true
+                                    file_counts=file_counts
+                                />
+                            </Show>
+                            <Show when=move || has_untracked>
+                                <GitFileSection
+                                    title="Untracked"
+                                    count=untracked_count
+                                    files=untracked.get_value()
+                                    expanded=untracked_expanded
+                                    scope=ProjectDiffScope::Unstaged
+                                    root_path=root_handle.get_value()
+                                    show_stage_btn=true
+                                    show_unstage_btn=false
+                                    show_discard_btn=true
+                                    file_counts=file_counts
+                                />
+                            </Show>
+                    }
+                >
+                    <RecentCommits
+                        list=list
+                        history_has_more=history_has_more
+                        signals=signals
                     />
-                    <button
-                        class="gp-commit-btn"
-                        disabled=move || commit_message.get().trim().is_empty()
-                        on:click={
-                            let root = root_for_commit.clone();
-                            move |_| {
-                                let msg = commit_message.get();
-                                if !msg.trim().is_empty() {
-                                    send_commit(root.clone(), msg);
-                                    commit_message.set(String::new());
-                                }
-                            }
-                        }
-                    >
-                        "Commit"
-                    </button>
-                </div>
-                <GitFileSection
-                    title="Staged"
-                    count=staged_count
-                    files=staged.clone()
-                    expanded=staged_expanded
-                    scope=ProjectDiffScope::Staged
-                    root_path=root_for_staged.clone()
-                    show_stage_btn=false
-                    show_unstage_btn=true
-                    show_discard_btn=false
-                    file_counts=file_counts
-                />
+                </Show>
             </Show>
-            <Show when=move || historical_for_root.get().is_none() && has_unstaged>
-                <GitFileSection
-                    title="Changes"
-                    count=unstaged_count
-                    files=unstaged.clone()
-                    expanded=unstaged_expanded
-                    scope=ProjectDiffScope::Unstaged
-                    root_path=root_for_unstaged.clone()
-                    show_stage_btn=true
-                    show_unstage_btn=false
-                    show_discard_btn=true
-                    file_counts=file_counts
-                />
-            </Show>
-            <Show when=move || historical_for_root.get().is_none() && has_untracked>
-                <GitFileSection
-                    title="Untracked"
-                    count=untracked_count
-                    files=untracked.clone()
-                    expanded=untracked_expanded
-                    scope=ProjectDiffScope::Unstaged
-                    root_path=root_for_untracked.clone()
-                    show_stage_btn=true
-                    show_unstage_btn=false
-                    show_discard_btn=true
-                    file_counts=file_counts
-                />
-            </Show>
-        </div>
+        </section>
     }
 }
 
@@ -1152,16 +1237,6 @@ fn HistoricalChangedFiles(
                         </div>
                     }.into_any();
                 }
-                let subtitle = if selected.commit_count == 1 {
-                    format!("{} · 1 commit", short_oid(&selected.tip_oid))
-                } else {
-                    format!(
-                        "{}…{} · {} commits",
-                        short_oid(&selected.base_oid),
-                        short_oid(&selected.tip_oid),
-                        selected.commit_count,
-                    )
-                };
                 match diff.get() {
                     Some(diff) if diff.pending => view! {
                         <div class="gp-range-state" role="status">"Loading committed changes…"</div>
@@ -1174,7 +1249,6 @@ fn HistoricalChangedFiles(
                                     <span class="gp-section-count">"0"</span>
                                 </div>
                             </div>
-                            <div class="gp-range-subtitle">{subtitle}</div>
                             <div class="gp-range-state" role="status">"No net file changes in this range"</div>
                         </div>
                     }.into_any(),
@@ -1188,7 +1262,6 @@ fn HistoricalChangedFiles(
                                         <span class="gp-section-count">{count}</span>
                                     </div>
                                 </div>
-                                <div class="gp-range-subtitle">{subtitle}</div>
                                 <div class="gp-section-files">
                                     {diff.files.into_iter().map(|file| {
                                         let path = file.relative_path.clone();
@@ -1321,6 +1394,10 @@ fn GitFileSection(
     show_unstage_btn: bool,
     show_discard_btn: bool,
     file_counts: Memo<HashMap<String, u32>>,
+    /// When present, the header offers a "Commit…" action that toggles the
+    /// signal; the owner renders the commit form wherever it belongs.
+    #[prop(optional)]
+    commit_toggle: Option<RwSignal<bool>>,
 ) -> impl IntoView {
     let toggle = move |_| expanded.update(|v| *v = !*v);
 
@@ -1337,6 +1414,17 @@ fn GitFileSection(
                     <span class="gp-section-count">{count}</span>
                 </button>
                 <div class="gp-section-actions">
+                    {commit_toggle.map(|open| view! {
+                        <button
+                            class="gp-section-action gp-commit-toggle"
+                            data-test="gp-commit-toggle"
+                            aria-expanded=move || open.get().to_string()
+                            title="Write a commit message for the staged files"
+                            on:click=move |_| open.update(|value| *value = !*value)
+                        >
+                            "Commit\u{2026}"
+                        </button>
+                    })}
                     {show_stage_btn.then(|| {
                         let root = bulk_root.clone();
                         let paths = bulk_paths.clone();
@@ -1789,6 +1877,18 @@ mod wasm_tests {
 
     wasm_bindgen_test_configure!(run_in_browser);
 
+    const PROD_STYLES: &str = include_str!("../../styles.css");
+
+    fn ensure_styles_loaded() {
+        let document = web_sys::window().unwrap().document().unwrap();
+        if document.get_element_by_id("test-prod-styles-app").is_none() {
+            let style = document.create_element("style").unwrap();
+            style.set_id("test-prod-styles-app");
+            style.set_text_content(Some(PROD_STYLES));
+            document.head().unwrap().append_child(&style).unwrap();
+        }
+    }
+
     fn make_container() -> HtmlElement {
         let document = web_sys::window().unwrap().document().unwrap();
         let container = document.create_element("div").unwrap();
@@ -1830,6 +1930,26 @@ mod wasm_tests {
         }
     }
 
+    fn root_with_staged(path: &str) -> ProjectRootGitStatus {
+        ProjectRootGitStatus {
+            root: ProjectRootPath(path.to_owned()),
+            branch: Some("main".to_owned()),
+            head_oid: None,
+            empty_tree_oid: None,
+            ahead: 0,
+            behind: 0,
+            clean: false,
+            files: vec![ProjectGitFileStatus {
+                relative_path: "src/staged.rs".to_owned(),
+                staged: Some(ProjectGitChangeKind::Modified),
+                unstaged: None,
+                untracked: false,
+            }],
+            recent_commits: Vec::new(),
+            history_has_more: false,
+        }
+    }
+
     fn conflicted_root() -> ProjectRootGitStatus {
         ProjectRootGitStatus {
             root: ProjectRootPath("/repo".to_owned()),
@@ -1851,10 +1971,14 @@ mod wasm_tests {
     }
 
     fn clean_root_with_history() -> ProjectRootGitStatus {
+        clean_root_with_history_at("/repo")
+    }
+
+    fn clean_root_with_history_at(path: &str) -> ProjectRootGitStatus {
         let oldest = "1111111111111111111111111111111111111111".to_owned();
         let newest = "2222222222222222222222222222222222222222".to_owned();
         ProjectRootGitStatus {
-            root: ProjectRootPath("/repo".to_owned()),
+            root: ProjectRootPath(path.to_owned()),
             branch: Some("main".to_owned()),
             head_oid: Some(newest.clone()),
             empty_tree_oid: Some("4b825dc642cb6eb9a060e54bf8d69288fbee4904".to_owned()),
@@ -1970,13 +2094,21 @@ mod wasm_tests {
         container: HtmlElement,
         with_draft: bool,
     ) -> Mounted<Rc<RefCell<Option<AppState>>>> {
-        mount_git_panel_with_root(container, with_draft, changed_root())
+        mount_git_panel_with_roots(container, with_draft, vec![changed_root()])
     }
 
     fn mount_git_panel_with_root(
         container: HtmlElement,
         with_draft: bool,
         root: ProjectRootGitStatus,
+    ) -> Mounted<Rc<RefCell<Option<AppState>>>> {
+        mount_git_panel_with_roots(container, with_draft, vec![root])
+    }
+
+    fn mount_git_panel_with_roots(
+        container: HtmlElement,
+        with_draft: bool,
+        roots: Vec<ProjectRootGitStatus>,
     ) -> Mounted<Rc<RefCell<Option<AppState>>>> {
         let holder: Rc<RefCell<Option<AppState>>> = Rc::new(RefCell::new(None));
         let holder_for_mount = holder.clone();
@@ -1987,14 +2119,14 @@ mod wasm_tests {
                 project_id: ProjectId("proj-1".to_owned()),
             }));
             state.git_status.update(|m| {
-                m.insert(ProjectId("proj-1".to_owned()), vec![root]);
+                m.insert(ProjectId("proj-1".to_owned()), roots);
             });
             if with_draft {
                 state.review_summaries.update(|m| {
                     m.insert(ProjectId("proj-1".to_owned()), vec![draft_summary()]);
                 });
-                // Seed the full record so the hub does not fire a network
-                // subscribe (which the headless bridge can't satisfy).
+                // Seed the full record so the status row does not fire a
+                // network subscribe (which the headless bridge can't satisfy).
                 state.reviews.update(|m| {
                     m.insert(ReviewId("rev-1".to_owned()), full_review());
                 });
@@ -2068,8 +2200,49 @@ mod wasm_tests {
             .unwrap()
     }
 
+    fn query(container: &HtmlElement, selector: &str) -> Option<HtmlElement> {
+        container
+            .query_selector(selector)
+            .unwrap()
+            .map(|element| element.dyn_into::<HtmlElement>().unwrap())
+    }
+
+    fn query_all(container: &HtmlElement, selector: &str) -> Vec<HtmlElement> {
+        let nodes = container.query_selector_all(selector).unwrap();
+        (0..nodes.length())
+            .map(|index| {
+                nodes
+                    .item(index)
+                    .unwrap()
+                    .dyn_into::<HtmlElement>()
+                    .unwrap()
+            })
+            .collect()
+    }
+
+    fn click(element: &HtmlElement) {
+        element.click();
+    }
+
+    fn history_toggle(container: &HtmlElement, index: usize) -> HtmlElement {
+        query_all(container, "[data-test=gp-root-history-toggle]")
+            .into_iter()
+            .nth(index)
+            .expect("history toggle for root")
+    }
+
+    fn commit_rows(container: &HtmlElement) -> Vec<HtmlElement> {
+        query_all(container, "[role=option]")
+    }
+
+    /// The working tree is the panel's default: recent commits stay behind
+    /// the root's history toggle. Once open, choosing a commit expands its
+    /// detail directly beneath the row that was clicked (never at the far
+    /// end of the panel), a range moves that detail under the oldest
+    /// selected commit, and Escape or the toggle put the working tree back.
     #[wasm_bindgen_test]
-    async fn clean_root_history_supports_accessible_range_selection() {
+    async fn history_is_opt_in_and_the_selected_commit_expands_in_place() {
+        ensure_styles_loaded();
         let container = make_container();
         stub_recording_bridge();
         crate::dispatch::clear_host_seqs("h1");
@@ -2079,47 +2252,83 @@ mod wasm_tests {
 
         let text = container.text_content().unwrap_or_default();
         assert!(text.contains("Working tree clean"));
-        assert!(text.contains("Recent commits"));
-        assert!(text.contains("Merge reviewed work"));
         assert!(
-            container
-                .query_selector(".gp-merge-badge")
-                .unwrap()
-                .is_some()
+            commit_rows(&container).is_empty(),
+            "history must not render until the user asks for it"
         );
-
-        let options = container.query_selector_all("[role=option]").unwrap();
-        assert_eq!(options.length(), 3);
-        let working: HtmlElement = options.item(0).unwrap().dyn_into().unwrap();
-        let newest: HtmlElement = options.item(1).unwrap().dyn_into().unwrap();
-        let oldest: HtmlElement = options.item(2).unwrap().dyn_into().unwrap();
-        assert_eq!(
-            working.get_attribute("aria-selected").as_deref(),
-            Some("true")
+        assert!(
+            !text.contains("Merge reviewed work"),
+            "commit subjects must stay hidden while history is off"
         );
-
-        newest.click();
-        next_tick().await;
+        let toggle = history_toggle(&container, 0);
         assert_eq!(
-            working.get_attribute("aria-selected").as_deref(),
+            toggle.get_attribute("aria-pressed").as_deref(),
             Some("false")
         );
+
+        click(&toggle);
+        next_tick().await;
+        assert_eq!(
+            toggle.get_attribute("aria-pressed").as_deref(),
+            Some("true")
+        );
+        let text = container.text_content().unwrap_or_default();
+        assert!(text.contains("Merge reviewed work"));
+        assert!(
+            !text.contains("Working tree clean"),
+            "history replaces the working tree view for that root"
+        );
+        assert!(query(&container, ".gp-merge-badge").is_some());
+        let rows = commit_rows(&container);
+        assert_eq!(rows.len(), 2, "one option per commit and no synthetic rows");
+        let newest = rows[0].clone();
+        let oldest = rows[1].clone();
+        assert!(
+            !newest.text_content().unwrap_or_default().contains("Ada"),
+            "collapsed rows show the subject, not the author"
+        );
+        let row_height = newest.get_bounding_client_rect().height();
+        assert!(
+            row_height > 0.0 && row_height <= 28.0,
+            "a collapsed commit row must stay a single compact line; got {row_height}px"
+        );
+        assert!(
+            query(&container, "[data-test=gp-commit-detail]").is_none(),
+            "nothing is expanded before a commit is chosen"
+        );
+
+        click(&newest);
+        next_tick().await;
         assert_eq!(
             newest.get_attribute("aria-selected").as_deref(),
             Some("true")
         );
+        assert_eq!(
+            oldest.get_attribute("aria-selected").as_deref(),
+            Some("false")
+        );
+        let detail = newest
+            .next_element_sibling()
+            .expect("detail block follows the selected row");
+        assert_eq!(
+            detail.get_attribute("data-test").as_deref(),
+            Some("gp-commit-detail"),
+            "the selected commit expands directly beneath its own row"
+        );
+        let meta = detail.text_content().unwrap_or_default();
         assert!(
-            container
-                .query_selector("[data-test=gp-historical-files]")
-                .unwrap()
-                .is_some()
+            meta.contains("22222222"),
+            "expanded meta shows the sha: {meta}"
         );
         assert!(
-            container
-                .query_selector("[data-test=gp-committed-review-starter]")
-                .unwrap()
-                .is_some()
+            meta.contains("Ada"),
+            "expanded meta shows the author: {meta}"
         );
+        assert!(
+            meta.contains("1 commit"),
+            "expanded meta shows the count: {meta}"
+        );
+        assert!(query(&container, "[data-test=gp-committed-review-starter]").is_some());
         let state = mounted.borrow().clone().unwrap();
         assert!(
             state.center_zone.with_untracked(|zone| {
@@ -2166,26 +2375,16 @@ mod wasm_tests {
         assert!(range_text.contains("Changed files"));
         assert!(range_text.contains("reviewed.rs"));
         assert!(
-            container
-                .query_selector(".gp-file-row.readonly")
-                .unwrap()
-                .is_some(),
+            query(&container, ".gp-file-row.readonly").is_some(),
             "committed files render as read-only rows"
         );
         assert!(
-            container
-                .query_selector(".gp-file-action")
-                .unwrap()
-                .is_none(),
+            query(&container, ".gp-file-action").is_none(),
             "committed files expose no staging or discard action"
         );
-        container
-            .query_selector(".gp-file-row.readonly .gp-file-btn")
-            .unwrap()
-            .expect("committed file row")
-            .dyn_into::<HtmlElement>()
-            .unwrap()
-            .click();
+        click(
+            &query(&container, ".gp-file-row.readonly .gp-file-btn").expect("committed file row"),
+        );
         next_tick().await;
         let historical_tab_label = state.center_zone.with_untracked(|zone| {
             zone.all_tabs()
@@ -2221,11 +2420,23 @@ mod wasm_tests {
             oldest.get_attribute("aria-selected").as_deref(),
             Some("true")
         );
+        let details = query_all(&container, "[data-test=gp-commit-detail]");
+        assert_eq!(details.len(), 1, "a range expands exactly one detail block");
+        let detail = oldest
+            .next_element_sibling()
+            .expect("range detail follows the oldest selected row");
+        assert_eq!(
+            detail.get_attribute("data-test").as_deref(),
+            Some("gp-commit-detail")
+        );
+        let meta = detail.text_content().unwrap_or_default();
         assert!(
-            container
-                .text_content()
-                .unwrap_or_default()
-                .contains("2 commits")
+            meta.contains("2 commits"),
+            "range meta shows the count: {meta}"
+        );
+        assert!(
+            !meta.contains("Ada") && !meta.contains("Lin"),
+            "a range has no single author line: {meta}"
         );
 
         let escape_init = web_sys::KeyboardEventInit::new();
@@ -2236,14 +2447,36 @@ mod wasm_tests {
         oldest.dispatch_event(&escape).unwrap();
         next_tick().await;
         assert_eq!(
-            working.get_attribute("aria-selected").as_deref(),
-            Some("true")
+            newest.get_attribute("aria-selected").as_deref(),
+            Some("false")
         );
+        assert_eq!(
+            oldest.get_attribute("aria-selected").as_deref(),
+            Some("false")
+        );
+        assert!(
+            query(&container, "[data-test=gp-commit-detail]").is_none(),
+            "Escape collapses the expanded commit"
+        );
+
+        click(&newest);
+        next_tick().await;
+        assert!(query(&container, "[data-test=gp-commit-detail]").is_some());
+        click(&history_toggle(&container, 0));
+        next_tick().await;
         assert!(
             container
                 .text_content()
                 .unwrap_or_default()
-                .contains("Working tree clean")
+                .contains("Working tree clean"),
+            "toggling history off restores the working tree"
+        );
+        assert!(commit_rows(&container).is_empty());
+        click(&history_toggle(&container, 0));
+        next_tick().await;
+        assert!(
+            query(&container, "[data-test=gp-commit-detail]").is_none(),
+            "leaving history drops the selection so nothing stays expanded on return"
         );
     }
 
@@ -2254,14 +2487,11 @@ mod wasm_tests {
         let mounted =
             mount_git_panel_with_root(container.clone(), false, clean_root_with_history());
         next_tick().await;
-        let options = container.query_selector_all("[role=option]").unwrap();
-        options
-            .item(1)
-            .unwrap()
-            .dyn_into::<HtmlElement>()
-            .unwrap()
-            .click();
+        click(&history_toggle(&container, 0));
         next_tick().await;
+        click(&commit_rows(&container)[0]);
+        next_tick().await;
+        assert!(query(&container, "[data-test=gp-commit-detail]").is_some());
 
         let state = mounted.borrow().clone().unwrap();
         state.git_status.update(|statuses| {
@@ -2276,26 +2506,25 @@ mod wasm_tests {
         }));
         next_tick().await;
 
-        let switched_options = container.query_selector_all("[role=option]").unwrap();
-        let working: HtmlElement = switched_options.item(0).unwrap().dyn_into().unwrap();
-        assert_eq!(
-            working.get_attribute("aria-selected").as_deref(),
-            Some("true")
+        assert!(
+            commit_rows(&container).is_empty(),
+            "another project's root starts on its working tree"
         );
         assert!(
-            container
-                .query_selector("[data-test=gp-committed-review-starter]")
-                .unwrap()
-                .is_none(),
+            query(&container, "[data-test=gp-commit-detail]").is_none(),
             "the previous project's range must not decorate the new project"
         );
+        click(&history_toggle(&container, 0));
+        next_tick().await;
+        let switched_rows = commit_rows(&container);
+        assert_eq!(switched_rows.len(), 2);
+        assert_eq!(
+            switched_rows[0].get_attribute("aria-selected").as_deref(),
+            Some("false"),
+            "the same oid in another project is not selected"
+        );
 
-        switched_options
-            .item(1)
-            .unwrap()
-            .dyn_into::<HtmlElement>()
-            .unwrap()
-            .click();
+        click(&switched_rows[0]);
         next_tick().await;
         assert!(state.diff_request_ids.with_untracked(|requests| {
             requests
@@ -2310,29 +2539,19 @@ mod wasm_tests {
         stub_recording_bridge();
         let mounted = mount_git_panel_with_root(container.clone(), false, long_clean_history(25));
         next_tick().await;
+        click(&history_toggle(&container, 0));
+        next_tick().await;
 
         assert_eq!(
-            container
-                .query_selector_all("[role=option]:not([tabindex='-1'])")
-                .unwrap()
-                .length(),
-            21,
-            "only Working tree plus the first history page may take keyboard focus"
+            query_all(&container, "[role=option]:not([tabindex='-1'])").len(),
+            20,
+            "only the first history page may take keyboard focus"
         );
-        container
-            .query_selector(".gp-history-older")
-            .unwrap()
-            .expect("load older history button")
-            .dyn_into::<HtmlElement>()
-            .unwrap()
-            .click();
+        click(&query(&container, ".gp-history-older").expect("load older history button"));
         next_tick().await;
         assert_eq!(
-            container
-                .query_selector_all("[role=option]:not([tabindex='-1'])")
-                .unwrap()
-                .length(),
-            26
+            query_all(&container, "[role=option]:not([tabindex='-1'])").len(),
+            25
         );
 
         let state = mounted.borrow().clone().unwrap();
@@ -2343,18 +2562,17 @@ mod wasm_tests {
         });
         next_tick().await;
         assert_eq!(
-            container
-                .query_selector_all("[role=option]:not([tabindex='-1'])")
-                .unwrap()
-                .length(),
-            26,
+            query_all(&container, "[role=option]:not([tabindex='-1'])").len(),
+            25,
             "an unrelated status refresh must preserve the loaded history page"
         );
-        assert!(
-            container
-                .query_selector(".gp-history-older")
-                .unwrap()
-                .is_none()
+        assert!(query(&container, ".gp-history-older").is_none());
+        assert_eq!(
+            history_toggle(&container, 0)
+                .get_attribute("aria-pressed")
+                .as_deref(),
+            Some("true"),
+            "a status refresh must not flip the root back to the working tree"
         );
     }
 
@@ -2366,14 +2584,9 @@ mod wasm_tests {
         let mounted =
             mount_git_panel_with_root(container.clone(), false, clean_root_with_history());
         next_tick().await;
-        container
-            .query_selector_all("[role=option]")
-            .unwrap()
-            .item(1)
-            .unwrap()
-            .dyn_into::<HtmlElement>()
-            .unwrap()
-            .click();
+        click(&history_toggle(&container, 0));
+        next_tick().await;
+        click(&commit_rows(&container)[0]);
         next_tick().await;
 
         let state = mounted.borrow().clone().unwrap();
@@ -2401,12 +2614,7 @@ mod wasm_tests {
         .unwrap();
         crate::dispatch::dispatch_envelope(&state, "h1", error);
         next_tick().await;
-        assert!(
-            container
-                .query_selector("[data-test=gp-historical-diff-error]")
-                .unwrap()
-                .is_some()
-        );
+        assert!(query(&container, "[data-test=gp-historical-diff-error]").is_some());
         assert!(
             !container
                 .text_content()
@@ -2419,13 +2627,7 @@ mod wasm_tests {
                 .with_untracked(|diffs| { diffs.get(&key).is_some_and(|diff| diff.pending) })
         );
 
-        container
-            .query_selector("[data-test=gp-historical-diff-error] button")
-            .unwrap()
-            .expect("retry button")
-            .dyn_into::<HtmlElement>()
-            .unwrap()
-            .click();
+        click(&query(&container, "[data-test=gp-historical-diff-error] button").expect("retry"));
         next_tick().await;
         let retry_id = state
             .diff_request_ids
@@ -2433,13 +2635,10 @@ mod wasm_tests {
             .expect("retry request id");
         assert_ne!(retry_id, request_id);
 
-        container
-            .query_selector("[data-test=gp-committed-review-starter] button")
-            .unwrap()
-            .expect("start review button")
-            .dyn_into::<HtmlElement>()
-            .unwrap()
-            .click();
+        click(
+            &query(&container, "[data-test=gp-committed-review-starter] button")
+                .expect("start review button"),
+        );
         next_tick().await;
         let create_request_id = sent_lines_joined()
             .lines()
@@ -2470,19 +2669,192 @@ mod wasm_tests {
         .unwrap();
         crate::dispatch::dispatch_envelope(&state, "h1", create_error);
         next_tick().await;
+        assert!(query(&container, "[data-test=gp-review-create-error]").is_some());
+        let start_button =
+            query(&container, "[data-test=gp-committed-review-starter] button").unwrap();
+        assert!(!start_button.has_attribute("disabled"));
+    }
+
+    /// A project with several roots keeps the panel to one header line per
+    /// root that has nothing to show: dirty roots open, clean roots collapse.
+    /// The user's own toggle wins over that default and outlives a status
+    /// refresh, and a lone root never collapses.
+    #[wasm_bindgen_test]
+    async fn multi_root_collapses_clean_roots_and_remembers_toggles() {
+        ensure_styles_loaded();
+        let container = make_container();
+        stub_recording_bridge();
+        let mounted = mount_git_panel_with_roots(
+            container.clone(),
+            false,
+            vec![
+                root_with_unstaged("/repo-a"),
+                clean_root_with_history_at("/repo-b"),
+                clean_root_with_history_at("/repo-c"),
+            ],
+        );
+        next_tick().await;
+
+        let toggles = query_all(&container, "[data-test=gp-root-toggle]");
+        assert_eq!(toggles.len(), 3);
+        assert_eq!(
+            toggles[0].get_attribute("aria-expanded").as_deref(),
+            Some("true")
+        );
+        assert_eq!(
+            toggles[1].get_attribute("aria-expanded").as_deref(),
+            Some("false")
+        );
+        assert_eq!(
+            toggles[2].get_attribute("aria-expanded").as_deref(),
+            Some("false")
+        );
+        assert_eq!(query_all(&container, ".gp-file-name").len(), 1);
+        let text = container.text_content().unwrap_or_default();
+        assert!(
+            !text.contains("Working tree clean"),
+            "collapsed clean roots must not spend a body line on their state"
+        );
+        let states = query_all(&container, "[data-test=gp-root-state]");
+        assert_eq!(states[0].text_content().as_deref(), Some("1"));
+        assert_eq!(states[1].text_content().as_deref(), Some("\u{2713}"));
+        let header_height = query(&container, ".gp-root-header")
+            .unwrap()
+            .get_bounding_client_rect()
+            .height();
+        assert!(
+            header_height > 0.0 && header_height <= 32.0,
+            "a root header is one compact line; got {header_height}px"
+        );
+        assert!(
+            query(&container, ".gp-header").is_none() && query(&container, ".gp-branch").is_none(),
+            "there is no panel-level header repeating the branch"
+        );
+
+        click(&toggles[1]);
+        next_tick().await;
+        assert_eq!(
+            toggles[1].get_attribute("aria-expanded").as_deref(),
+            Some("true")
+        );
         assert!(
             container
-                .query_selector("[data-test=gp-review-create-error]")
-                .unwrap()
-                .is_some()
+                .text_content()
+                .unwrap_or_default()
+                .contains("Working tree clean")
         );
-        let start_button: HtmlElement = container
-            .query_selector("[data-test=gp-committed-review-starter] button")
-            .unwrap()
-            .unwrap()
+
+        let state = mounted.borrow().clone().unwrap();
+        let mut refreshed_b = clean_root_with_history_at("/repo-b");
+        refreshed_b.ahead = 1;
+        state.git_status.update(|statuses| {
+            statuses.insert(
+                ProjectId("proj-1".to_owned()),
+                vec![
+                    root_with_unstaged("/repo-a"),
+                    refreshed_b,
+                    clean_root_with_history_at("/repo-c"),
+                ],
+            );
+        });
+        next_tick().await;
+        let toggles = query_all(&container, "[data-test=gp-root-toggle]");
+        assert_eq!(
+            toggles[1].get_attribute("aria-expanded").as_deref(),
+            Some("true"),
+            "an explicit expand must survive a status refresh"
+        );
+        assert_eq!(
+            toggles[2].get_attribute("aria-expanded").as_deref(),
+            Some("false")
+        );
+        assert!(
+            toggles[1]
+                .text_content()
+                .unwrap_or_default()
+                .contains("\u{2191}1")
+        );
+
+        click(&history_toggle(&container, 2));
+        next_tick().await;
+        let toggles = query_all(&container, "[data-test=gp-root-toggle]");
+        assert_eq!(
+            toggles[2].get_attribute("aria-expanded").as_deref(),
+            Some("true"),
+            "asking for a collapsed root's history opens that root"
+        );
+        assert_eq!(commit_rows(&container).len(), 2);
+
+        let single = make_container();
+        let _single = mount_git_panel_with_root(single.clone(), false, clean_root_with_history());
+        next_tick().await;
+        assert_eq!(
+            query(&single, "[data-test=gp-root-toggle]")
+                .unwrap()
+                .get_attribute("aria-expanded")
+                .as_deref(),
+            Some("true"),
+            "a lone root is always open, clean or not"
+        );
+        assert!(
+            single
+                .text_content()
+                .unwrap_or_default()
+                .contains("Working tree clean")
+        );
+    }
+
+    /// The commit message box is behind the Staged section's "Commit…"
+    /// action, so a root with staged files does not permanently spend the
+    /// space, and committing sends the typed message for that root.
+    #[wasm_bindgen_test]
+    async fn commit_form_is_behind_the_staged_commit_action() {
+        record_bridge();
+        let container = make_container();
+        let _mounted =
+            mount_git_panel_with_root(container.clone(), false, root_with_staged("/repo"));
+        next_tick().await;
+
+        assert!(
+            query(&container, ".gp-commit-input").is_none(),
+            "the commit box must not render until asked for"
+        );
+        let toggle = query(&container, "[data-test=gp-commit-toggle]").expect("commit action");
+        assert_eq!(
+            toggle.get_attribute("aria-expanded").as_deref(),
+            Some("false")
+        );
+        click(&toggle);
+        next_tick().await;
+        assert_eq!(
+            toggle.get_attribute("aria-expanded").as_deref(),
+            Some("true")
+        );
+        let input: web_sys::HtmlTextAreaElement = query(&container, ".gp-commit-input")
+            .expect("commit box")
             .dyn_into()
             .unwrap();
-        assert!(!start_button.has_attribute("disabled"));
+        let commit_button = query(&container, ".gp-commit-btn").expect("commit button");
+        assert!(commit_button.has_attribute("disabled"));
+
+        input.set_value("Fix staged thing");
+        input
+            .dispatch_event(&web_sys::Event::new("input").unwrap())
+            .unwrap();
+        next_tick().await;
+        assert!(!commit_button.has_attribute("disabled"));
+        click(&commit_button);
+        next_tick().await;
+        let sent = sent_lines_joined();
+        assert!(
+            sent.contains("project_git_commit") && sent.contains("Fix staged thing"),
+            "committing must send the typed message; sent: {sent}"
+        );
+        assert!(
+            sent.contains("/repo"),
+            "the commit targets its root; sent: {sent}"
+        );
+        assert_eq!(input.value(), "", "the box clears after committing");
     }
 
     /// Splits are created by dragging tabs: a git diff row is a plain
@@ -2498,25 +2870,14 @@ mod wasm_tests {
                 .query_selector("[data-test=\"gp-diff-open-side\"]")
                 .unwrap()
                 .is_none(),
-            "no side-open action renders on a git diff row"
+            "git diff rows must not expose a side-open control"
         );
-        let row = row_button(&container);
-        assert_eq!(
-            row.get_attribute("aria-keyshortcuts").as_deref(),
-            Some("Enter"),
-            "the row advertises only its ordinary Enter activation"
-        );
-
-        // Right-clicking must not surface a side-open context menu.
-        row.dispatch_event(&web_sys::MouseEvent::new("contextmenu").unwrap())
-            .unwrap();
-        next_tick().await;
         assert!(
             container
-                .query_selector("[data-test=\"gp-diff-open-side-menu\"]")
+                .query_selector("[data-test=\"gp-diff-open-menu\"]")
                 .unwrap()
                 .is_none(),
-            "no side-open context menu opens from a git diff row"
+            "git diff rows must not expose an open menu"
         );
     }
 
@@ -2564,6 +2925,14 @@ mod wasm_tests {
                 .unwrap()
                 .is_none()
         );
+        let root_state = query(&container, "[data-test=gp-root-state]").unwrap();
+        assert!(
+            root_state
+                .text_content()
+                .unwrap_or_default()
+                .contains("1 conflict"),
+            "the root header calls out conflicts"
+        );
 
         row_button(&container).click();
         next_tick().await;
@@ -2602,57 +2971,50 @@ mod wasm_tests {
         assert!(!state.center_zone.with_untracked(CenterZoneState::is_split));
     }
 
-    /// No draft review + uncommitted changes ⇒ the git panel does NOT show the
-    /// workspace review hub (there is no active workspace draft to bind to).
+    /// No draft review ⇒ the git panel shows no review status row: there is
+    /// no active workspace draft to summarize.
     #[wasm_bindgen_test]
-    async fn no_draft_shows_review_changes_control() {
+    async fn no_draft_shows_no_review_status_row() {
         let container = make_container();
         let _mounted = mount_git_panel(container.clone(), false);
         next_tick().await;
 
         assert!(
-            container
-                .query_selector("[data-test=\"gp-workspace-review-hub\"]")
-                .unwrap()
-                .is_none(),
-            "workspace review hub must not show without an active draft review"
+            query(&container, "[data-test=gp-review-status]").is_none(),
+            "the review status row must not show without an active draft review"
         );
     }
 
-    /// REWRITTEN for the workspace model (behavior change approved): a Draft
-    /// review ⇒ the git panel shows exactly ONE workspace review hub (not one
-    /// per root) with the workspace-wide comment count.
+    /// A Draft review ⇒ exactly one compact status row for the project with
+    /// the workspace-wide counts and a way into the review surface. The
+    /// review controls themselves are not in the panel.
     #[wasm_bindgen_test]
-    async fn draft_shows_review_hub_with_counts() {
+    async fn draft_shows_one_review_status_row_with_counts() {
+        ensure_styles_loaded();
         let container = make_container();
         let _mounted = mount_git_panel(container.clone(), true);
         next_tick().await;
 
-        // Exactly one workspace hub for the project.
-        let hubs = container
-            .query_selector_all("[data-test=\"gp-workspace-review-hub\"]")
-            .unwrap();
-        assert_eq!(
-            hubs.length(),
-            1,
-            "exactly one workspace review hub must render for the project"
-        );
-        let counts = container
-            .query_selector("[data-test=\"gp-workspace-review-counts\"]")
-            .unwrap()
-            .expect("workspace counts element present");
-        let text = counts.text_content().unwrap_or_default();
+        let rows = query_all(&container, "[data-test=gp-review-status]");
+        assert_eq!(rows.len(), 1, "exactly one review status row must render");
+        let text = query(&container, "[data-test=gp-review-counts]")
+            .expect("counts element present")
+            .text_content()
+            .unwrap_or_default();
         assert!(
             text.contains("1 comment"),
-            "expected the workspace comment count in the hub; got: {text}"
+            "expected the workspace comment count in the row; got: {text}"
         );
-        // The primary "Review all changes across the workspace" action exists.
+        assert!(query(&container, "[data-test=gp-review-open]").is_some());
         assert!(
-            container
-                .query_selector("[data-test=\"gp-workspace-review-all\"]")
-                .unwrap()
-                .is_some(),
-            "the workspace hub must offer the Review-all primary action"
+            query(&container, "[data-test=review-run-ai]").is_none()
+                && query(&container, ".review-submit-btn").is_none(),
+            "AI reviewer and submit controls live on the review surface, not the panel"
+        );
+        let height = rows[0].get_bounding_client_rect().height();
+        assert!(
+            height > 0.0 && height <= 32.0,
+            "the status row is one line; got {height}px"
         );
     }
 
@@ -2695,274 +3057,41 @@ mod wasm_tests {
         );
     }
 
-    /// REWRITTEN for the workspace model (behavior change approved): a
-    /// multi-root project renders exactly ONE workspace review hub (not one
-    /// per root), and clicking its "Comments" button opens the project-level
-    /// (workspace) comments surface — there is no longer a per-root opener.
+    /// A multi-root project renders exactly ONE review status row (not one
+    /// per root), and its Open button opens the project-level (workspace)
+    /// comments surface.
     #[wasm_bindgen_test]
-    async fn workspace_hub_comments_opens_project_comments() {
+    async fn review_status_open_opens_project_comments() {
         stub_recording_bridge();
         let container = make_container();
-        let holder: Rc<RefCell<Option<AppState>>> = Rc::new(RefCell::new(None));
-        let holder_for_mount = holder.clone();
-        let handle = mount_to(container.clone(), move || {
-            let state = AppState::new();
-            state.active_project.set(Some(ActiveProjectRef {
-                host_id: "h1".to_owned(),
-                project_id: ProjectId("proj-1".to_owned()),
-            }));
-            // Two dirty roots in the project.
-            state.git_status.update(|m| {
-                m.insert(
-                    ProjectId("proj-1".to_owned()),
-                    vec![root_with_unstaged("/repo-a"), root_with_unstaged("/repo-b")],
-                );
-            });
-            // One active workspace draft spanning both roots.
-            state.review_summaries.update(|m| {
-                m.insert(ProjectId("proj-1".to_owned()), vec![draft_summary()]);
-            });
-            state.reviews.update(|m| {
-                m.insert(ReviewId("rev-1".to_owned()), full_review());
-            });
-            *holder_for_mount.borrow_mut() = Some(state.clone());
-            provide_context(state);
-            view! { <GitPanel /> }
-        });
-        let _mounted = Mounted::new(handle, ());
+        let mounted = mount_git_panel_with_roots(
+            container.clone(),
+            true,
+            vec![root_with_unstaged("/repo-a"), root_with_unstaged("/repo-b")],
+        );
         next_tick().await;
 
-        // Exactly one workspace hub even with two roots.
-        let hubs = container
-            .query_selector_all("[data-test=\"gp-workspace-review-hub\"]")
-            .unwrap();
         assert_eq!(
-            hubs.length(),
+            query_all(&container, "[data-test=gp-review-status]").len(),
             1,
-            "a multi-root project must render exactly one workspace review hub"
+            "a multi-root project must render exactly one review status row"
         );
 
-        let open_btn = container
-            .query_selector("[data-test=\"gp-workspace-review-comments\"]")
-            .unwrap()
-            .expect("the workspace hub's Comments button must render");
-        open_btn.dyn_ref::<HtmlElement>().unwrap().click();
+        click(&query(&container, "[data-test=gp-review-open]").expect("Open button"));
         next_tick().await;
 
-        let state = holder.borrow().clone().unwrap();
+        let state = mounted.borrow().clone().unwrap();
         let opened = state.center_zone.with_untracked(|cz| {
             cz.all_tabs().find_map(|(_, t)| match &t.content {
                 TabContent::Comments { project_id, .. } => Some(project_id.clone()),
                 _ => None,
             })
         });
-        let pid = opened.expect("a workspace comments tab must open on Comments");
+        let pid = opened.expect("a workspace comments tab must open on Open");
         assert_eq!(
             pid,
             ProjectId("proj-1".to_owned()),
-            "Comments must open the project's workspace comments surface"
-        );
-    }
-
-    /// NEW: the workspace hub's primary "Review all changes across the
-    /// workspace" action targets the single workspace review id (sends
-    /// `StartAiReview` on `/review/<workspace_id>`), regardless of how many
-    /// roots the project has.
-    #[wasm_bindgen_test]
-    async fn review_all_targets_workspace_review() {
-        record_bridge();
-        let container = make_container();
-        let handle = mount_to(container.clone(), move || {
-            let state = AppState::new();
-            state.active_project.set(Some(ActiveProjectRef {
-                host_id: "h1".to_owned(),
-                project_id: ProjectId("proj-1".to_owned()),
-            }));
-            state.connection_statuses.update(|m| {
-                m.insert("h1".to_owned(), crate::state::ConnectionStatus::Connected);
-            });
-            // Multi-root project, one workspace draft, a backend available so
-            // the Review-all action is enabled.
-            state.git_status.update(|m| {
-                m.insert(
-                    ProjectId("proj-1".to_owned()),
-                    vec![root_with_unstaged("/repo-a"), root_with_unstaged("/repo-b")],
-                );
-            });
-            state.review_summaries.update(|m| {
-                m.insert(ProjectId("proj-1".to_owned()), vec![draft_summary()]);
-            });
-            state.reviews.update(|m| {
-                m.insert(ReviewId("rev-1".to_owned()), full_review());
-            });
-            state.host_settings_by_host.update(|m| {
-                m.insert(
-                    "h1".to_owned(),
-                    settings_model::HostSettings {
-                        enabled_backends: vec![protocol::BackendKind::Codex],
-                        default_backend: Some(protocol::BackendKind::Codex),
-                        enable_mobile_connections: false,
-                        mobile_broker_url: None,
-                        mobile_broker_auth: Default::default(),
-                        tyde_debug_mcp_enabled: false,
-                        tyde_agent_control_mcp_enabled: false,
-                        tyde_agent_control_max_depth:
-                            settings_model::default_agent_control_max_depth(),
-                        complexity_tiers_enabled: false,
-                        backend_tier_configs: std::collections::HashMap::new(),
-                        background_agent_features: Default::default(),
-                        supervisor: Default::default(),
-                        code_intel: Default::default(),
-                        backend_config: std::collections::HashMap::new(),
-                        launch_profiles: Default::default(),
-                        hermes_disabled_providers: Default::default(),
-                        voice: Default::default(),
-                    },
-                );
-            });
-            provide_context(state);
-            view! { <GitPanel /> }
-        });
-        let _mounted = Mounted::new(handle, ());
-        next_tick().await;
-        next_tick().await;
-
-        let btn = container
-            .query_selector("[data-test=\"gp-workspace-review-all\"]")
-            .unwrap()
-            .expect("Review-all button must render");
-        let btn: HtmlElement = btn.dyn_into().unwrap();
-        assert!(
-            !btn.has_attribute("disabled"),
-            "Review-all must enable with a draft review and an available backend"
-        );
-        btn.click();
-        next_tick().await;
-
-        let sent = sent_lines_joined();
-        assert!(
-            sent.contains("start_ai_review"),
-            "Review-all must send a StartAiReview action; sent: {sent}"
-        );
-        assert!(
-            sent.contains("/review/rev-1"),
-            "StartAiReview must target the workspace review stream; sent: {sent}"
-        );
-    }
-
-    fn clean_root(path: &str) -> ProjectRootGitStatus {
-        ProjectRootGitStatus {
-            root: ProjectRootPath(path.to_owned()),
-            branch: Some("main".to_owned()),
-            head_oid: None,
-            empty_tree_oid: None,
-            ahead: 0,
-            behind: 0,
-            clean: true,
-            files: vec![],
-            recent_commits: Vec::new(),
-            history_has_more: false,
-        }
-    }
-
-    /// NEW (blocker): with an active workspace draft but NO reviewable changes
-    /// (clean tree), the "Review all" action is DISABLED and cannot dispatch
-    /// `StartAiReview` — an empty-diff reviewer must not be spawnable. It then
-    /// enables reactively once a root gains a changed file (pure projection of
-    /// git status).
-    #[wasm_bindgen_test]
-    async fn review_all_disabled_without_reviewable_changes() {
-        record_bridge();
-        let container = make_container();
-        let holder: Rc<RefCell<Option<AppState>>> = Rc::new(RefCell::new(None));
-        let holder_for_mount = holder.clone();
-        let handle = mount_to(container.clone(), move || {
-            let state = AppState::new();
-            state.active_project.set(Some(ActiveProjectRef {
-                host_id: "h1".to_owned(),
-                project_id: ProjectId("proj-1".to_owned()),
-            }));
-            state.connection_statuses.update(|m| {
-                m.insert("h1".to_owned(), crate::state::ConnectionStatus::Connected);
-            });
-            // A draft exists, but the tree is clean (no reviewable changes).
-            state.git_status.update(|m| {
-                m.insert(ProjectId("proj-1".to_owned()), vec![clean_root("/repo")]);
-            });
-            state.review_summaries.update(|m| {
-                m.insert(ProjectId("proj-1".to_owned()), vec![draft_summary()]);
-            });
-            state.reviews.update(|m| {
-                m.insert(ReviewId("rev-1".to_owned()), full_review());
-            });
-            state.host_settings_by_host.update(|m| {
-                m.insert(
-                    "h1".to_owned(),
-                    settings_model::HostSettings {
-                        enabled_backends: vec![protocol::BackendKind::Codex],
-                        default_backend: Some(protocol::BackendKind::Codex),
-                        enable_mobile_connections: false,
-                        mobile_broker_url: None,
-                        mobile_broker_auth: Default::default(),
-                        tyde_debug_mcp_enabled: false,
-                        tyde_agent_control_mcp_enabled: false,
-                        tyde_agent_control_max_depth:
-                            settings_model::default_agent_control_max_depth(),
-                        complexity_tiers_enabled: false,
-                        backend_tier_configs: std::collections::HashMap::new(),
-                        background_agent_features: Default::default(),
-                        supervisor: Default::default(),
-                        code_intel: Default::default(),
-                        backend_config: std::collections::HashMap::new(),
-                        launch_profiles: Default::default(),
-                        hermes_disabled_providers: Default::default(),
-                        voice: Default::default(),
-                    },
-                );
-            });
-            *holder_for_mount.borrow_mut() = Some(state.clone());
-            provide_context(state);
-            view! { <GitPanel /> }
-        });
-        let _mounted = Mounted::new(handle, ());
-        next_tick().await;
-        next_tick().await;
-
-        // The hub still renders (a draft exists), but Review-all is disabled.
-        let btn = container
-            .query_selector("[data-test=\"gp-workspace-review-all\"]")
-            .unwrap()
-            .expect("Review-all button must render while a draft exists");
-        let btn: HtmlElement = btn.dyn_into().unwrap();
-        assert!(
-            btn.has_attribute("disabled"),
-            "Review-all must be disabled with no reviewable changes"
-        );
-        // Clicking the disabled action must not dispatch StartAiReview.
-        btn.click();
-        next_tick().await;
-        assert!(
-            !sent_lines_joined().contains("start_ai_review"),
-            "a clean workspace must not be able to dispatch StartAiReview"
-        );
-
-        // A root gains a changed file ⇒ Review-all enables reactively.
-        let state = holder.borrow().clone().unwrap();
-        state.git_status.update(|m| {
-            m.insert(
-                ProjectId("proj-1".to_owned()),
-                vec![root_with_unstaged("/repo")],
-            );
-        });
-        next_tick().await;
-        let btn = container
-            .query_selector("[data-test=\"gp-workspace-review-all\"]")
-            .unwrap()
-            .expect("Review-all button still present");
-        let btn: HtmlElement = btn.dyn_into().unwrap();
-        assert!(
-            !btn.has_attribute("disabled"),
-            "Review-all must enable once a root has a reviewable change"
+            "Open must show the project's workspace comments surface"
         );
     }
 
@@ -3179,9 +3308,7 @@ mod wasm_tests {
 
     /// `subscribe_review_reactive` must retry reactively: it subscribes when
     /// the record is absent, stays quiet while it's present, and
-    /// **resubscribes when the record is later lost**. (Previously driven via
-    /// the per-root review hub; now exercised directly since the hub is
-    /// workspace-scoped and resolves its id from summaries.)
+    /// **resubscribes when the record is later lost**.
     #[wasm_bindgen_test]
     async fn hub_resubscribes_when_record_lost() {
         stub_recording_bridge();

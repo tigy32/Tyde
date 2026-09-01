@@ -383,7 +383,17 @@ Desktop diff tabs expose review affordances for explicit staged and unstaged
 scopes. The combined uncommitted scope is intentionally not reviewable because
 it cannot distinguish the two versions of a path. Desktop regular text-file
 tabs expose the same file, line, and drag-range composer. The aggregate comments
-surface labels and navigates each source independently.
+surface labels and navigates each source independently, and it hosts the
+workspace draft's controls: the AI reviewer form, the submit target, and Clear.
+
+The desktop git panel shows one compact review status row per project (live
+counts, an AI-running marker, and an Open action into the comments surface);
+it never hosts the review controls. Each git root is a collapsible section
+whose header carries the root name, branch, ahead/behind, working-tree state,
+and a history toggle. Recent commits stay behind that toggle; selecting a
+commit (or a shift-click range) expands its changed files directly beneath the
+selected row, and the committed-range review starter or draft controls render
+inside that expanded block.
 
 Mobile is agent-chat-only for this feature area. It does not expose project
 files, Git status, diffs, review comments, or review navigation.

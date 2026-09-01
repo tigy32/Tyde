@@ -5,10 +5,12 @@
 //! (`ReviewableDiffView` in `diff_view.rs`). There is one active workspace
 //! review per project spanning every root plus exact committed-range drafts;
 //! each per-root diff tab renders its own slice.
-//! What remains here is the shared action sidebar (`ReviewSidebar` — live
-//! counts, AI-reviewer form, submit-target picker, Clear) that the single
-//! git-panel workspace hub mounts, plus the subscribe/diff-open/feedback
-//! helpers used across the integrated flow.
+//! What remains here is the shared action sidebar (`ReviewSidebar` — the
+//! AI-reviewer form, submit-target picker, Clear) that the review comments
+//! surface hosts for the workspace draft and the git panel's expanded commit
+//! block hosts for a committed-range draft, plus the subscribe/diff-open/
+//! feedback helpers used across the integrated flow. The git panel itself
+//! only shows a one-line review status row.
 //!
 //! Reactivity rules (`dev-docs/01-philosophy.md`):
 //! * No optimistic UI: action buttons disable on click and re-enable when
@@ -789,7 +791,7 @@ pub(crate) fn ReviewSidebar(
                 <div class="review-ai-row">
                     <button
                         class="review-btn primary review-run-ai-btn"
-                        data-test="gp-workspace-review-all"
+                        data-test="review-run-ai"
                         disabled=ai_disabled
                         title=ai_reason
                         on:click=move |ev| {
@@ -1759,6 +1761,32 @@ pub fn ReviewCommentsSurface(host_id: String, project_id: ProjectId) -> impl Int
 
     let is_draft: Memo<bool> = Memo::new(move |_| draft.get().is_some());
 
+    // The review controls (AI reviewer, submit, clear) mount here once the
+    // full record is available. Reviews track unstaged state, so the AI
+    // reviewer is gated on some root having an unstaged or untracked change;
+    // staged-only edits would hand it an empty diff.
+    let loaded_state = state.clone();
+    let loaded: Memo<bool> = Memo::new(move |_| {
+        let Some((_, rid)) = draft.get() else {
+            return false;
+        };
+        loaded_state.reviews.with(|map| map.contains_key(&rid))
+    });
+    let changes_state = state.clone();
+    let changes_project = project_id.clone();
+    let has_reviewable_changes: Memo<bool> = Memo::new(move |_| {
+        changes_state.git_status.with(|map| {
+            map.get(&changes_project).is_some_and(|roots| {
+                roots.iter().any(|root| {
+                    root.files
+                        .iter()
+                        .any(|f| f.unstaged.is_some() || f.untracked)
+                })
+            })
+        })
+    });
+    let actions_state = state.clone();
+
     // A composer signal is required by `ThreadRegionFiltered`, but this
     // surface has no drag-to-comment gutter, so it never opens.
     let composer: RwSignal<Option<ComposerState>> = RwSignal::new(None);
@@ -1961,6 +1989,28 @@ pub fn ReviewCommentsSurface(host_id: String, project_id: ProjectId) -> impl Int
                     }
                 })}
             </div>
+            <Show when=move || loaded.get()>
+                <div class="review-comments-actions" data-test="review-comments-actions">
+                    {
+                        let actions_state = actions_state.clone();
+                        move || {
+                            let (host, rid) = draft.get()?;
+                            let seed = actions_state
+                                .reviews
+                                .with_untracked(|map| map.get(&rid).cloned())?;
+                            Some(view! {
+                                <ReviewSidebar
+                                    review=seed
+                                    host_id=host
+                                    review_id=rid
+                                    is_draft=is_draft
+                                    can_run_ai=has_reviewable_changes
+                                />
+                            })
+                        }
+                    }
+                </div>
+            </Show>
             <Show
                 when=move || has_entries.get()
                 fallback=move || view! {
@@ -2883,12 +2933,10 @@ mod wasm_tests {
     }
 
     /// Live review counts derive reactively from the comments/suggestions
-    /// signal. UPDATED (panel density redesign, flagged): the sidebar's
-    /// two-line COUNTS block was removed; the surviving compact indicator is
-    /// the workspace hub's top-right `gp-workspace-review-counts`
-    /// ("{c} comments · {s} AI"). This mounts the real hub (`GitPanel`) and
-    /// asserts that single indicator reflects live counts — same reactive
-    /// guarantee, repointed at the compact element.
+    /// signal. The surviving compact indicator is the git panel's review
+    /// status row (`gp-review-counts`, "{c} comments · {s} AI"). This mounts
+    /// the real panel (`GitPanel`) and asserts that single indicator
+    /// reflects live counts.
     #[wasm_bindgen_test]
     async fn sidebar_counts_derive_reactively() {
         ensure_styles_loaded();
@@ -2962,7 +3010,7 @@ mod wasm_tests {
         next_tick().await;
 
         let counts = container
-            .query_selector("[data-test=\"gp-workspace-review-counts\"]")
+            .query_selector("[data-test=\"gp-review-counts\"]")
             .unwrap()
             .expect("workspace counts indicator mounted");
         let counts_el: HtmlElement = counts.dyn_into().unwrap();
@@ -2986,7 +3034,7 @@ mod wasm_tests {
         next_tick().await;
 
         let counts = container
-            .query_selector("[data-test=\"gp-workspace-review-counts\"]")
+            .query_selector("[data-test=\"gp-review-counts\"]")
             .unwrap()
             .expect("workspace counts indicator mounted");
         let counts_el: HtmlElement = counts.dyn_into().unwrap();
@@ -3988,5 +4036,155 @@ mod wasm_tests {
             }
         }
         None
+    }
+
+    fn mount_comments_surface_with_roots(
+        container: HtmlElement,
+        roots: Vec<protocol::ProjectRootGitStatus>,
+    ) -> Mounted<std::rc::Rc<std::cell::RefCell<Option<AppState>>>> {
+        let holder: std::rc::Rc<std::cell::RefCell<Option<AppState>>> =
+            std::rc::Rc::new(std::cell::RefCell::new(None));
+        let holder_for_mount = holder.clone();
+        let handle = mount_to(container, move || {
+            let state = AppState::new();
+            let review = make_review();
+            let rid = review.id.clone();
+            let pid = review.project_id.clone();
+            state
+                .active_project
+                .set(Some(crate::state::ActiveProjectRef {
+                    host_id: "h1".to_owned(),
+                    project_id: pid.clone(),
+                }));
+            state.connection_statuses.update(|m| {
+                m.insert("h1".to_owned(), crate::state::ConnectionStatus::Connected);
+            });
+            state.git_status.update(|m| {
+                m.insert(pid.clone(), roots.clone());
+            });
+            state.review_summaries.update(|m| {
+                m.insert(
+                    pid.clone(),
+                    vec![protocol::ReviewSummary {
+                        id: rid.clone(),
+                        scope: protocol::ReviewSummaryScope::Workspace,
+                        status: ReviewStatus::Draft,
+                        origin_session_id: SessionId("s".to_owned()),
+                        origin_agent_id: AgentId("a".to_owned()),
+                        created_at_ms: 0,
+                        updated_at_ms: 1,
+                        user_comment_count: 0,
+                        pending_suggestion_count: 0,
+                        file_comment_counts: vec![],
+                    }],
+                );
+            });
+            state.reviews.update(|m| {
+                m.insert(rid.clone(), review.clone());
+            });
+            seed_host_settings(&state, Some(BackendKind::Codex), vec![BackendKind::Codex]);
+            *holder_for_mount.borrow_mut() = Some(state.clone());
+            provide_context(state.clone());
+            view! {
+                <ReviewCommentsSurface
+                    host_id="h1".to_owned()
+                    project_id=pid.clone()
+                />
+            }
+        });
+        Mounted::new(handle, holder)
+    }
+
+    fn dirty_root(path: &str) -> protocol::ProjectRootGitStatus {
+        root_status(
+            path,
+            None,
+            Some(protocol::ProjectGitChangeKind::Modified),
+            false,
+        )
+    }
+
+    /// The review surface hosts the AI reviewer: with a draft, a backend, and
+    /// a reviewable change in any root, Run sends `StartAiReview` on the
+    /// single workspace review stream regardless of how many roots there are.
+    #[wasm_bindgen_test]
+    async fn comments_surface_run_ai_targets_workspace_review() {
+        record_bridge();
+        let container = make_container();
+        let _mounted = mount_comments_surface_with_roots(
+            container.clone(),
+            vec![dirty_root("/repo-a"), dirty_root("/repo-b")],
+        );
+        next_tick().await;
+        next_tick().await;
+
+        let btn = container
+            .query_selector("[data-test=\"review-run-ai\"]")
+            .unwrap()
+            .expect("Run AI button must render on the review surface");
+        let btn: HtmlElement = btn.dyn_into().unwrap();
+        assert!(
+            !btn.has_attribute("disabled"),
+            "Run AI must enable with a draft review, a backend, and a reviewable change"
+        );
+        btn.click();
+        next_tick().await;
+
+        let sent = sent_lines_joined();
+        assert!(
+            sent.contains("start_ai_review"),
+            "Run AI must send a StartAiReview action; sent: {sent}"
+        );
+        let expected_stream = format!("/review/{}", make_review().id.0);
+        assert!(
+            sent.contains(&expected_stream),
+            "StartAiReview must target the workspace review stream {expected_stream}; sent: {sent}"
+        );
+    }
+
+    /// With a draft but a clean tree there is nothing for the reviewer to
+    /// read, so Run is disabled and a click sends nothing; it enables
+    /// reactively once a root gains an unstaged change.
+    #[wasm_bindgen_test]
+    async fn comments_surface_run_ai_disabled_without_reviewable_changes() {
+        record_bridge();
+        let container = make_container();
+        let holder = mount_comments_surface_with_roots(
+            container.clone(),
+            vec![root_status("/repo", None, None, false)],
+        );
+        next_tick().await;
+        next_tick().await;
+
+        let btn = container
+            .query_selector("[data-test=\"review-run-ai\"]")
+            .unwrap()
+            .expect("Run AI button must render while a draft exists");
+        let btn: HtmlElement = btn.dyn_into().unwrap();
+        assert!(
+            btn.has_attribute("disabled"),
+            "Run AI must be disabled with no reviewable changes"
+        );
+        btn.click();
+        next_tick().await;
+        assert!(
+            !sent_lines_joined().contains("start_ai_review"),
+            "a clean workspace must not be able to dispatch StartAiReview"
+        );
+
+        let state = holder.borrow().clone().unwrap();
+        state.git_status.update(|m| {
+            m.insert(make_review().project_id.clone(), vec![dirty_root("/repo")]);
+        });
+        next_tick().await;
+        let btn = container
+            .query_selector("[data-test=\"review-run-ai\"]")
+            .unwrap()
+            .expect("Run AI button still present");
+        let btn: HtmlElement = btn.dyn_into().unwrap();
+        assert!(
+            !btn.has_attribute("disabled"),
+            "Run AI must enable once a root has a reviewable change"
+        );
     }
 }
