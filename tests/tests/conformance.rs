@@ -1532,6 +1532,12 @@ fn real_conversation_in_native_subagent() {
                 completion.outcome
             );
         }
+        assert_eq!(
+            server::take_duplicate_tool_completion_count(agent.id()),
+            0,
+            "{}: the backend emitted more than one completion for the same native delegation",
+            delegated.label()
+        );
         assert_clean_close(&mut host, &agent).await;
     });
 }
@@ -3142,10 +3148,11 @@ fn subagent_prompt(backend: BackendKind, workspace: &Path, first: &str, second: 
             workspace_root(workspace),
         ),
         BackendKind::Hermes => format!(
-            "{behavior} You must use Hermes's native delegate_task tool twice, once for each \
-             task. Do not use any mcp_tyde tool, terminal tool, or file tool in the parent. Each \
-             delegate_task call returns immediately and runs in the background, so issue both \
-             calls and let their automatic completion messages resume you. In each delegated \
+            "{behavior} You must use Hermes's native delegate_task tool exactly once, passing \
+             both tasks together in that call's tasks list. Do not use any mcp_tyde tool, \
+             terminal tool, or file tool in the parent. The delegate_task call returns \
+             immediately and runs both children in the background, so let their automatic \
+             completion messages resume you. In each delegated \
              goal, require the child to use its terminal tool exactly once: the first child must \
              run `printf '{first}\\n' > {}/{HELLO_FILE} && cat {}/{HELLO_FILE}`, and the second \
              must run `printf '{second}\\n' > {}/{BG_FILE} && cat {}/{BG_FILE}`. Once both \

@@ -874,6 +874,12 @@ pub struct Agent {
     pub replayed_history: Vec<ChatEvent>,
 }
 
+impl Agent {
+    pub fn id(&self) -> &AgentId {
+        &self.agent_id
+    }
+}
+
 pub async fn spawn_agent(host: &mut Host, prompt: &str) -> Agent {
     let backend_kind = host.backend_kind;
     let workspace_roots = host.workspace_roots();

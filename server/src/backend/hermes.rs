@@ -758,6 +758,7 @@ struct HermesSessionActor {
     gateway_events_rx: mpsc::UnboundedReceiver<HermesGatewayEvent>,
     subagent_emitter: Option<Arc<dyn SubAgentEmitter>>,
     native_subagents: HashMap<String, HermesNativeSubagent>,
+    native_delegations: HashMap<String, HermesNativeDelegation>,
     /// Base synthetic id → (current issued id, generation) for id-less native
     /// children, so a reissued base never hands a new child a finished
     /// child's identity.
@@ -778,6 +779,62 @@ struct HermesNativeSubagent {
     /// tool's card.
     parent_anchor: Option<HermesDelegationAnchor>,
     tool_calls: u64,
+}
+
+struct HermesNativeDelegation {
+    expected_children: usize,
+    settled_children: usize,
+    child_results: Vec<Value>,
+    first_failure: Option<String>,
+    stopped: bool,
+}
+
+impl HermesNativeDelegation {
+    fn new(expected_children: usize) -> Self {
+        Self {
+            expected_children,
+            settled_children: 0,
+            child_results: Vec::with_capacity(expected_children),
+            first_failure: None,
+            stopped: false,
+        }
+    }
+
+    fn settle(&mut self, status: protocol::SubAgentProgressStatus, payload: Value) -> bool {
+        if status == protocol::SubAgentProgressStatus::Failed && self.first_failure.is_none() {
+            self.first_failure = Some(
+                optional_string_any(&payload, &["error", "summary", "text"])
+                    .unwrap_or_else(|| "Hermes native subagent failed".to_owned()),
+            );
+        }
+        self.stopped |= status == protocol::SubAgentProgressStatus::Stopped;
+        self.child_results.push(payload);
+        self.settled_children = self.settled_children.saturating_add(1);
+        self.settled_children >= self.expected_children
+    }
+
+    fn outcome(self) -> ToolExecutionOutcome {
+        let result = if self.child_results.len() == 1 {
+            self.child_results.into_iter().next().unwrap_or(Value::Null)
+        } else {
+            json!({ "children": self.child_results })
+        };
+        if let Some(message) = self.first_failure {
+            ToolExecutionOutcome::Failed {
+                message,
+                details: Some(result.to_string()),
+                normalization_failure: None,
+            }
+        } else if self.stopped {
+            ToolExecutionOutcome::Cancelled {
+                message: "A Hermes native subagent was stopped".to_owned(),
+            }
+        } else {
+            ToolExecutionOutcome::Succeeded {
+                result: ToolExecutionResult::Other { result },
+            }
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -848,6 +905,7 @@ impl HermesDelegationTool {
     fn anchor(&self) -> HermesDelegationAnchor {
         HermesDelegationAnchor {
             tool_call_id: self.tool_call_id.clone(),
+            expected_children: self.goals.len().max(1),
         }
     }
 }
@@ -855,6 +913,7 @@ impl HermesDelegationTool {
 #[derive(Clone)]
 struct HermesDelegationAnchor {
     tool_call_id: String,
+    expected_children: usize,
 }
 
 #[derive(Clone)]
@@ -1058,6 +1117,7 @@ impl Backend for HermesBackend {
             gateway_events_rx,
             subagent_emitter: None,
             native_subagents: HashMap::new(),
+            native_delegations: HashMap::new(),
             synthetic_subagent_ids: HashMap::new(),
             recent_stderr: VecDeque::new(),
         };
@@ -1182,6 +1242,7 @@ impl Backend for HermesBackend {
             gateway_events_rx,
             subagent_emitter: None,
             native_subagents: HashMap::new(),
+            native_delegations: HashMap::new(),
             synthetic_subagent_ids: HashMap::new(),
             recent_stderr: VecDeque::new(),
         };
@@ -2401,6 +2462,7 @@ impl HermesSessionActor {
         }
         let mut children = self.native_subagents.drain().collect::<Vec<_>>();
         children.sort_by(|(left, _), (right, _)| left.cmp(right));
+        let mut cancelled_delegations = HashSet::new();
         for (_, child) in children {
             let _ = child
                 .handle
@@ -2415,16 +2477,20 @@ impl HermesSessionActor {
                     true,
                     protocol::SubAgentProgressStatus::Stopped,
                 )));
-                self.emit(ChatEvent::ToolExecutionCompleted(
-                    ToolExecutionCompletedData {
-                        tool_call_id: anchor.tool_call_id.clone(),
-                        outcome: ToolExecutionOutcome::Cancelled {
-                            message: "Hermes gateway owner exited before the native subagent reported completion"
-                                .to_owned(),
-                        },
-                    },
-                ));
+                cancelled_delegations.insert(anchor.tool_call_id.clone());
             }
+        }
+        self.native_delegations.clear();
+        for tool_call_id in cancelled_delegations {
+            self.emit(ChatEvent::ToolExecutionCompleted(
+                ToolExecutionCompletedData {
+                    tool_call_id,
+                    outcome: ToolExecutionOutcome::Cancelled {
+                        message: "Hermes gateway owner exited before the native subagent reported completion"
+                            .to_owned(),
+                    },
+                },
+            ));
         }
     }
 
@@ -3104,6 +3170,9 @@ impl HermesSessionActor {
                     return;
                 }
             };
+            self.native_delegations
+                .entry(parent_anchor.tool_call_id.clone())
+                .or_insert_with(|| HermesNativeDelegation::new(parent_anchor.expected_children));
             self.native_subagents.insert(
                 subagent_id.clone(),
                 HermesNativeSubagent {
@@ -3117,7 +3186,7 @@ impl HermesSessionActor {
 
         let mut child_event = None;
         let mut parent_progress = None;
-        let mut parent_completion = None;
+        let mut settled_child = None;
         if let Some(child) = self.native_subagents.get_mut(&subagent_id) {
             if event_type == "subagent.tool" {
                 child.tool_calls = child.tool_calls.saturating_add(1);
@@ -3186,34 +3255,8 @@ impl HermesSessionActor {
                     context_breakdown: None,
                     images: None,
                 }));
-                let outcome = match status {
-                    protocol::SubAgentProgressStatus::Completed => {
-                        ToolExecutionOutcome::Succeeded {
-                            result: ToolExecutionResult::Other {
-                                result: payload.clone(),
-                            },
-                        }
-                    }
-                    protocol::SubAgentProgressStatus::Stopped => ToolExecutionOutcome::Cancelled {
-                        message: "Hermes native subagent was stopped".to_owned(),
-                    },
-                    _ => {
-                        let message = optional_string_any(&payload, &["error", "summary", "text"])
-                            .unwrap_or_else(|| "Hermes native subagent failed".to_owned());
-                        ToolExecutionOutcome::Failed {
-                            message,
-                            details: Some(payload.to_string()),
-                            normalization_failure: None,
-                        }
-                    }
-                };
                 if let Some(anchor) = child.parent_anchor.as_ref() {
-                    parent_completion = Some(ChatEvent::ToolExecutionCompleted(
-                        ToolExecutionCompletedData {
-                            tool_call_id: anchor.tool_call_id.clone(),
-                            outcome,
-                        },
-                    ));
+                    settled_child = Some((anchor.clone(), status, payload.clone()));
                 }
             }
         }
@@ -3225,8 +3268,21 @@ impl HermesSessionActor {
         {
             let _ = child.handle.event_tx.send(event);
         }
-        if let Some(completion) = parent_completion {
-            self.emit(completion);
+        if let Some((anchor, status, payload)) = settled_child {
+            let delegation = self
+                .native_delegations
+                .entry(anchor.tool_call_id.clone())
+                .or_insert_with(|| HermesNativeDelegation::new(anchor.expected_children));
+            if delegation.settle(status, payload)
+                && let Some(delegation) = self.native_delegations.remove(&anchor.tool_call_id)
+            {
+                self.emit(ChatEvent::ToolExecutionCompleted(
+                    ToolExecutionCompletedData {
+                        tool_call_id: anchor.tool_call_id,
+                        outcome: delegation.outcome(),
+                    },
+                ));
+            }
         }
         if event_type == "subagent.complete" {
             self.native_subagents.remove(&subagent_id);

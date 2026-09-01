@@ -61,6 +61,31 @@ use self::registry::{
     AgentStartupFailure, InitialAgentAlias, InitialAgentAliasPersistence, ResolvedSpawnRequest,
 };
 
+#[cfg(feature = "test-support")]
+fn duplicate_tool_completion_counts() -> &'static std::sync::Mutex<HashMap<String, u64>> {
+    static COUNTS: std::sync::OnceLock<std::sync::Mutex<HashMap<String, u64>>> =
+        std::sync::OnceLock::new();
+    COUNTS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+#[cfg(feature = "test-support")]
+fn record_duplicate_tool_completion(agent_id: &AgentId) {
+    let mut counts = duplicate_tool_completion_counts()
+        .lock()
+        .expect("duplicate tool completion counter mutex poisoned");
+    let count = counts.entry(agent_id.0.clone()).or_default();
+    *count = count.saturating_add(1);
+}
+
+#[cfg(feature = "test-support")]
+pub fn take_duplicate_tool_completion_count(agent_id: &AgentId) -> u64 {
+    duplicate_tool_completion_counts()
+        .lock()
+        .expect("duplicate tool completion counter mutex poisoned")
+        .remove(&agent_id.0)
+        .unwrap_or_default()
+}
+
 const IMAGE_ONLY_AGENT_NAME: &str = "Image Review Task";
 const RESUME_REPLAY_BARRIER_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long a close waits for an interrupted turn to reach idle before it
@@ -4545,6 +4570,8 @@ pub(crate) fn spawn_agent_actor(
                         }
                         ChatEvent::ToolExecutionCompleted(completion) => {
                             if completed_tool_call_ids.contains(&completion.tool_call_id) {
+                                #[cfg(feature = "test-support")]
+                                record_duplicate_tool_completion(&current_start.agent_id);
                                 eprintln!(
                                     "TYDE DUPLICATE TOOL COMPLETION DROPPED agent={} tool_call_id={}",
                                     current_start.agent_id,
