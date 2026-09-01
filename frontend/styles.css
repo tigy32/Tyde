@@ -3958,7 +3958,8 @@ kbd {
     100% { background-position: -100% 0; }
 }
 
-.chat-textarea {
+.chat-textarea,
+.chat-textarea-measure {
     flex: 1;
     min-height: 32px;
     max-height: calc(1.077rem * 1.45 * 5 + 16px);
@@ -3982,6 +3983,20 @@ kbd {
 
 .chat-textarea::placeholder {
     color: var(--text-tertiary);
+}
+
+.chat-textarea-measure {
+    position: absolute;
+    top: 0;
+    left: 0;
+    visibility: hidden;
+    pointer-events: none;
+    min-height: 0;
+    max-height: none;
+    height: auto;
+    overflow: hidden;
+    white-space: pre-wrap;
+    overflow-wrap: break-word;
 }
 
 .chat-input-row {

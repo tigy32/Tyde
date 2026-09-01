@@ -39,6 +39,39 @@ fn target_instance_stream(
         .map(|a| a.instance_stream.clone())
 }
 
+fn resize_composer(textarea: &web_sys::HtmlTextAreaElement, measure: &web_sys::HtmlElement) {
+    let textarea_element: &web_sys::Element = textarea.unchecked_ref();
+    let scroller = textarea_element
+        .closest(".chat-view-main")
+        .ok()
+        .flatten()
+        .and_then(|main| main.query_selector(".chat-messages").ok().flatten());
+    let was_at_bottom = scroller
+        .as_ref()
+        .is_some_and(|el| el.scroll_height() - el.scroll_top() - el.client_height() <= 1);
+
+    measure.set_text_content(Some(&format!("{}\u{200b}", textarea.value())));
+    let measure_style = measure.style();
+    let _ = measure_style.set_property("width", &format!("{}px", textarea.offset_width()));
+    let scroll_height = measure.scroll_height();
+    let border_height = textarea.offset_height() - textarea.client_height();
+    let desired_height = format!("{}px", scroll_height + border_height);
+    let style = web_sys::HtmlElement::from(textarea.clone()).style();
+    if style.get_property_value("height").ok().as_deref() != Some(desired_height.as_str()) {
+        let _ = style.set_property("height", &desired_height);
+    }
+    let overflow = if textarea.scroll_height() > textarea.client_height() {
+        "auto"
+    } else {
+        "hidden"
+    };
+    let _ = style.set_property("overflow-y", overflow);
+
+    if let Some(scroller) = scroller.filter(|_| was_at_bottom) {
+        scroller.set_scroll_top(scroller.scroll_height());
+    }
+}
+
 fn target_instance_stream_tracked(
     state: &AppState,
     agent_ref: Signal<Option<ActiveAgentRef>>,
@@ -1084,6 +1117,8 @@ pub fn ChatInput(
         }
     };
 
+    let textarea_ref = NodeRef::<leptos::html::Textarea>::new();
+    let textarea_measure_ref = NodeRef::<leptos::html::Div>::new();
     let on_input_composer = composer.clone();
     // Throttle textarea autosize to one update per animation frame.
     // The previous code ran height="auto" → read scrollHeight →
@@ -1105,23 +1140,14 @@ pub fn ChatInput(
         };
         autosize_pending.set(true);
         let pending = autosize_pending.clone();
+        let measure_ref = textarea_measure_ref;
         leptos::prelude::request_animation_frame(move || {
             pending.set(false);
-            let style = web_sys::HtmlElement::from(textarea.clone()).style();
-            // Hide overflow before measuring so a scrollbar doesn't inflate scrollHeight.
-            let _ = style.set_property("overflow-y", "hidden");
-            let _ = style.set_property("height", "auto");
-            let scroll_h = textarea.scroll_height();
-            // Account for border-box: borders aren't in scrollHeight but are in offsetHeight.
-            let border_h = textarea.offset_height() - textarea.client_height();
-            let _ = style.set_property("height", &format!("{}px", scroll_h + border_h));
-            // Re-enable scrollbar only if CSS max-height is now capping the element.
-            let overflow = if textarea.scroll_height() > textarea.client_height() {
-                "auto"
-            } else {
-                "hidden"
+            let Some(measure) = measure_ref.get() else {
+                return;
             };
-            let _ = style.set_property("overflow-y", overflow);
+            let measure: web_sys::HtmlElement = (*measure).clone().unchecked_into();
+            resize_composer(&textarea, &measure);
         });
     };
 
@@ -1180,8 +1206,6 @@ pub fn ChatInput(
         );
     };
 
-    let textarea_ref = NodeRef::<leptos::html::Textarea>::new();
-
     let on_paste_state = state.clone();
     let on_paste_composer = composer.clone();
     let on_paste_images = pending_images;
@@ -1232,12 +1256,12 @@ pub fn ChatInput(
             let val = reset_composer.text.get_untracked();
             textarea.set_value(&val);
         }
-        let is_empty = reset_composer.text.with(|val| val.is_empty());
-        if is_empty {
-            let html_el: web_sys::HtmlElement = el.into();
-            let style = html_el.style();
-            let _ = style.set_property("height", "auto");
-            let _ = style.set_property("overflow-y", "hidden");
+        if needs_set || reset_composer.text.with(|val| val.is_empty()) {
+            let Some(measure) = textarea_measure_ref.get() else {
+                return;
+            };
+            let measure: web_sys::HtmlElement = (*measure).clone().unchecked_into();
+            resize_composer(&textarea, &measure);
         }
     });
 
@@ -1397,6 +1421,11 @@ pub fn ChatInput(
                     autocapitalize="none"
                     autocomplete="off"
                 />
+                <div
+                    class="chat-textarea-measure"
+                    aria-hidden="true"
+                    node_ref=textarea_measure_ref
+                ></div>
                 <crate::voice::VoiceComposerButton agent_ref=agent_ref composer=composer.clone() />
                 <div
                     class="chat-send-split"

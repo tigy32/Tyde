@@ -1965,6 +1965,16 @@ mod wasm_tests {
         let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
     }
 
+    async fn next_animation_frame() {
+        let promise = js_sys::Promise::new(&mut |resolve, _reject| {
+            web_sys::window()
+                .unwrap()
+                .request_animation_frame(&resolve)
+                .unwrap();
+        });
+        let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+    }
+
     fn mk_user_msg(text: &str) -> ChatMessageEntry {
         ChatMessageEntry {
             message: ChatMessage {
@@ -2333,6 +2343,125 @@ mod wasm_tests {
             distance_from_bottom > 500,
             "restored user-scrolled tab should not auto-scroll back to bottom"
         );
+    }
+
+    #[wasm_bindgen_test]
+    async fn typing_in_multiline_composer_keeps_transcript_at_bottom() {
+        ensure_styles_loaded();
+
+        let agent_id = AgentId("agent-composer-scroll".to_owned());
+        let host_id = "host-composer-scroll".to_owned();
+        let container = make_container();
+        let agent_id_for_mount = agent_id.clone();
+        let handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            state.agents.set(vec![make_target_agent(
+                &host_id,
+                &agent_id_for_mount.0,
+                None,
+            )]);
+            let rows: Vec<ChatRowHandle> = (0..80)
+                .map(|i| ChatRowHandle::new(mk_user_msg(&format!("message {i}"))))
+                .collect();
+            state.chat_rows.update(|by_agent| {
+                by_agent.insert(agent_id_for_mount.clone(), rows);
+            });
+            provide_context(state);
+            let bound = ActiveAgentRef {
+                host_id: host_id.clone(),
+                agent_id: agent_id_for_mount.clone(),
+            };
+            let agent_ref = Signal::derive(move || Some(bound.clone()));
+            let visible: Signal<bool> = Signal::derive(|| true);
+            view! {
+                <ChatView
+                    tab_id=TabId(10_004)
+                    agent_ref=agent_ref
+                    is_active=visible
+                />
+            }
+        });
+        next_tick().await;
+        next_tick().await;
+
+        let scroller: HtmlElement = container
+            .query_selector(".chat-messages")
+            .unwrap()
+            .expect("chat scroller present")
+            .dyn_into()
+            .unwrap();
+        let textarea: web_sys::HtmlTextAreaElement = container
+            .query_selector(".chat-textarea")
+            .unwrap()
+            .expect("composer textarea present")
+            .dyn_into()
+            .unwrap();
+        textarea.set_id("composer-scroll-regression-textarea");
+        let input = web_sys::Event::new("input").unwrap();
+
+        textarea.set_value("alpha\nbeta\ngamma");
+        textarea.dispatch_event(&input).unwrap();
+        next_animation_frame().await;
+        next_tick().await;
+        assert!(
+            textarea.get_bounding_client_rect().height() > 50.0,
+            "precondition: multiline draft must expand the composer"
+        );
+        assert!(
+            scroller.scroll_height() > scroller.client_height(),
+            "precondition: transcript must be scrollable"
+        );
+        scroller.set_scroll_top(scroller.scroll_height());
+        let bottom_before = scroller.scroll_height() - scroller.client_height();
+        assert_eq!(scroller.scroll_top(), bottom_before);
+
+        js_sys::eval(
+            r#"
+            window.__composerScrollStyleHistory = [];
+            window.__composerScrollObserver = new MutationObserver((records) => {
+                for (const record of records) {
+                    window.__composerScrollStyleHistory.push(record.oldValue || "");
+                }
+            });
+            window.__composerScrollObserver.observe(
+                document.getElementById("composer-scroll-regression-textarea"),
+                { attributes: true, attributeOldValue: true, attributeFilter: ["style"] }
+            );
+            "#,
+        )
+        .unwrap();
+
+        textarea.set_value("alpha\nbeta\ngammax");
+        textarea
+            .dispatch_event(&web_sys::Event::new("input").unwrap())
+            .unwrap();
+        next_animation_frame().await;
+
+        let distance_from_bottom =
+            scroller.scroll_height() - scroller.client_height() - scroller.scroll_top();
+        assert!(
+            distance_from_bottom.abs() <= 1,
+            "typing without changing composer height must keep the transcript at bottom; \
+             it moved {distance_from_bottom}px away"
+        );
+        let style_history = js_sys::eval(
+            r#"
+            window.__composerScrollObserver.disconnect();
+            JSON.stringify(window.__composerScrollStyleHistory);
+            "#,
+        )
+        .unwrap()
+        .as_string()
+        .unwrap();
+        assert!(
+            !style_history.contains("height: auto"),
+            "typing must not collapse the visible multiline composer to its minimum height; \
+             observed style history: {style_history}"
+        );
+
+        drop(handle);
+        container.remove();
+        next_tick().await;
     }
 
     #[wasm_bindgen_test]
