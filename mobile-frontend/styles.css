@@ -2485,7 +2485,7 @@ html[data-keyboard-open] .mobile-app {
 
 .chat-input-queued-row {
     display: flex;
-    align-items: center;
+    align-items: flex-start;
     gap: var(--space-1);
 }
 
@@ -2499,8 +2499,22 @@ html[data-keyboard-open] .mobile-app {
     text-overflow: ellipsis;
 }
 
+.chat-input-queued-display {
+    display: flex;
+    align-items: center;
+    flex: 1;
+    min-width: 0;
+    gap: var(--space-1);
+}
+
+.chat-input-queued-display[hidden],
+.chat-input-queued-editor[hidden],
+.chat-input-queued-edit[hidden] {
+    display: none;
+}
+
 .chat-input-queued-action {
-    min-height: 32px;
+    min-height: 44px;
     padding: 0 var(--space-2);
     border-radius: var(--radius-button);
     border: 1px solid var(--border-default);
@@ -2517,6 +2531,74 @@ html[data-keyboard-open] .mobile-app {
 
 .chat-input-queued-delete {
     color: var(--accent-error);
+}
+
+.chat-input-queued-edit,
+.chat-input-queued-save {
+    color: var(--accent-primary);
+}
+
+.chat-input-queued-editor {
+    display: flex;
+    flex: 1;
+    min-width: 0;
+    flex-direction: column;
+    gap: var(--space-2);
+}
+
+.chat-input-queued-textarea {
+    box-sizing: border-box;
+    width: 100%;
+    min-height: 39px;
+    max-height: 240px;
+    padding: 7px var(--space-2);
+    resize: none;
+    overflow-y: hidden;
+    color: var(--text-primary);
+    background: var(--bg-surface);
+    border: 1px solid var(--border-default);
+    border-radius: var(--radius-button);
+    font-family: inherit;
+    font-size: 16px;
+    line-height: 1.4;
+}
+
+.chat-input-queued-textarea:focus {
+    border-color: var(--accent-primary);
+    outline: none;
+}
+
+.chat-input-queued-edit-actions,
+.chat-input-queued-recovery {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+}
+
+.chat-input-queued-edit-actions {
+    justify-content: flex-end;
+}
+
+.chat-input-queued-recovery {
+    flex-wrap: wrap;
+    justify-content: space-between;
+    color: var(--accent-warning);
+    font-size: var(--text-xs);
+}
+
+.chat-input-queued-error {
+    color: var(--accent-error);
+    font-size: var(--text-xs);
+}
+
+@media (max-width: 420px) {
+    .chat-input-queued-display {
+        flex-wrap: wrap;
+    }
+
+    .chat-input-queued-preview {
+        flex-basis: 100%;
+    }
 }
 
 /* ── Session Cards ──────────────────────────────────────────────────── */

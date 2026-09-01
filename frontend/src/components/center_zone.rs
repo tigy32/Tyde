@@ -2025,6 +2025,16 @@ mod wasm_tests {
         let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
     }
 
+    async fn next_animation_frame() {
+        let promise = js_sys::Promise::new(&mut |resolve, _reject| {
+            web_sys::window()
+                .unwrap()
+                .request_animation_frame(&resolve)
+                .unwrap();
+        });
+        let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+    }
+
     /// Let the reactive runtime flush the activation → LRU Effect → `<For>`
     /// re-render chain before asserting on the DOM.
     async fn settle() {
@@ -3697,6 +3707,7 @@ mod wasm_tests {
             .style()
             .set_property("width", "400px")
             .expect("shrink test container");
+        next_animation_frame().await;
         settle().await;
         assert_eq!(
             width.get_untracked(),

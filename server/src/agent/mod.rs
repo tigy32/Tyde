@@ -5985,8 +5985,8 @@ pub(crate) fn spawn_agent_actor(
                                     }
                                 }
                                 AgentInput::EditQueuedMessage(payload) => {
-                                    let Some(entry) =
-                                        queue.iter_mut().find(|entry| entry.id == payload.id)
+                                    let Some(index) =
+                                        queue.iter().position(|entry| entry.id == payload.id)
                                     else {
                                         emit_unknown_queued_message_error(
                                             &canonical_stream,
@@ -5998,6 +5998,21 @@ pub(crate) fn spawn_agent_actor(
                                         .await;
                                         continue;
                                     };
+                                    if matches!(
+                                        queue[index].origin.as_ref(),
+                                        Some(MessageOrigin::Supervisor)
+                                    ) {
+                                        emit_uneditable_queued_message_error(
+                                            &canonical_stream,
+                                            &mut event_log,
+                                            &mut subscribers,
+                                            &current_start.agent_id,
+                                            &payload.id,
+                                        )
+                                        .await;
+                                        continue;
+                                    }
+                                    let entry = &mut queue[index];
                                     entry.message = payload.message;
                                     entry.images = payload.images;
                                     update_queued_messages_snapshot(
@@ -9886,6 +9901,32 @@ async fn emit_unknown_queued_message_error(
         agent_id: agent_id.clone(),
         code: AgentErrorCode::Internal,
         message: format!("unknown queued message id {}", queued_message_id),
+        fatal: false,
+    };
+    append_event(
+        canonical_stream,
+        event_log,
+        subscribers,
+        FrameKind::AgentError,
+        &payload,
+    )
+    .await;
+}
+
+async fn emit_uneditable_queued_message_error(
+    canonical_stream: &str,
+    event_log: &mut Vec<Envelope>,
+    subscribers: &mut Vec<Stream>,
+    agent_id: &AgentId,
+    queued_message_id: &QueuedMessageId,
+) {
+    let payload = AgentErrorPayload {
+        agent_id: agent_id.clone(),
+        code: AgentErrorCode::Unsupported,
+        message: format!(
+            "supervisor-origin queued message {} cannot be edited",
+            queued_message_id
+        ),
         fatal: false,
     };
     append_event(

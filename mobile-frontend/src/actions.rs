@@ -284,6 +284,21 @@ pub async fn cancel_queued_message(
     .await
 }
 
+pub async fn edit_queued_message(
+    state: &AppState,
+    agent_ref: &AgentRef,
+    payload: protocol::EditQueuedMessagePayload,
+) -> Result<(), String> {
+    let stream = agent_instance_stream(state, agent_ref).ok_or("agent not found")?;
+    send_action(
+        &agent_ref.local_host_id,
+        stream,
+        protocol::FrameKind::EditQueuedMessage,
+        &payload,
+    )
+    .await
+}
+
 pub async fn send_queued_message_now(
     state: &AppState,
     agent_ref: &AgentRef,

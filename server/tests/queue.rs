@@ -2,9 +2,9 @@ mod fixture;
 
 use fixture::Fixture;
 use protocol::{
-    AgentErrorPayload, CancelQueuedMessagePayload, ChatEvent, FrameKind, QueuedMessageId,
-    QueuedMessagesPayload, SendMessagePayload, SendMessageToolResponse,
-    SendQueuedMessageNowPayload, StreamPath,
+    AgentErrorPayload, CancelQueuedMessagePayload, ChatEvent, EditQueuedMessagePayload, FrameKind,
+    ImageData, MessageOrigin, QueuedMessageId, QueuedMessagesPayload, SendMessagePayload,
+    SendMessageToolResponse, SendQueuedMessageNowPayload, StreamPath,
 };
 use server::backend::mock::{MockGateHandle, MockScript, MockTurn};
 
@@ -345,6 +345,144 @@ async fn cancel_queued_message_removes_entry() {
         empty.messages.is_empty(),
         "queue must be empty after cancel"
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn edit_queued_message_preserves_identity_order_and_origin() {
+    let mut fixture = Fixture::new().await;
+    let gate = MockGateHandle::new();
+    let agent = fixture
+        .spawn_scripted(
+            "queue-edit",
+            MockScript::one(MockTurn::gated_text("edit-test response", &gate)),
+        )
+        .await;
+
+    fixture
+        .next_chat_event_matching(&agent, "TypingStatusChanged(true)", |event| {
+            matches!(event, ChatEvent::TypingStatusChanged(true))
+        })
+        .await;
+
+    let original_images = vec![ImageData {
+        media_type: "image/png".to_owned(),
+        data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=".to_owned(),
+    }];
+    fixture
+        .client
+        .send_message_payload(
+            &agent.stream,
+            SendMessagePayload {
+                message: "edit A".to_owned(),
+                images: Some(original_images.clone()),
+                origin: Some(MessageOrigin::User),
+                tool_response: None,
+            },
+        )
+        .await
+        .expect("send editable message");
+    fixture
+        .client
+        .send_message(&agent.stream, "order B".to_owned())
+        .await
+        .expect("send second queued message");
+
+    let before = fixture.expect_queued_messages(&agent, 2).await;
+    let edited_id = before.messages[0].id.clone();
+    let second_id = before.messages[1].id.clone();
+    fixture
+        .client
+        .edit_queued_message(
+            &agent.stream,
+            EditQueuedMessagePayload {
+                id: edited_id.clone(),
+                message: "edited A\nwith detail".to_owned(),
+                images: original_images.clone(),
+            },
+        )
+        .await
+        .expect("edit queued message");
+
+    let after = fixture.expect_queued_messages(&agent, 2).await;
+    assert_eq!(after.messages[0].id, edited_id);
+    assert_eq!(after.messages[1].id, second_id);
+    assert_eq!(after.messages[0].message, "edited A\nwith detail");
+    assert_eq!(after.messages[0].images, original_images);
+    assert_eq!(after.messages[0].origin, Some(MessageOrigin::User));
+}
+
+#[tokio::test(start_paused = true)]
+async fn edit_queued_message_rejects_supervisor_origin_without_mutation() {
+    let mut fixture = Fixture::new().await;
+    let gate = MockGateHandle::new();
+    let agent = fixture
+        .spawn_scripted(
+            "queue-edit-supervisor",
+            MockScript::one(MockTurn::gated_text("edit-test response", &gate)),
+        )
+        .await;
+
+    fixture
+        .next_chat_event_matching(&agent, "TypingStatusChanged(true)", |event| {
+            matches!(event, ChatEvent::TypingStatusChanged(true))
+        })
+        .await;
+
+    fixture
+        .client
+        .send_message_payload(
+            &agent.stream,
+            SendMessagePayload {
+                message: "supervisor-owned".to_owned(),
+                images: None,
+                origin: Some(MessageOrigin::Supervisor),
+                tool_response: None,
+            },
+        )
+        .await
+        .expect("queue supervisor message");
+    fixture
+        .client
+        .send_message(&agent.stream, "user-owned".to_owned())
+        .await
+        .expect("queue user message");
+
+    let before = fixture.expect_queued_messages(&agent, 2).await;
+    let supervisor_id = before.messages[0].id.clone();
+    let user_id = before.messages[1].id.clone();
+    fixture
+        .client
+        .edit_queued_message(
+            &agent.stream,
+            EditQueuedMessagePayload {
+                id: supervisor_id.clone(),
+                message: "client tried to overwrite supervisor".to_owned(),
+                images: Vec::new(),
+            },
+        )
+        .await
+        .expect("submit forbidden edit");
+
+    let env = fixture
+        .next_frame_matching("supervisor edit rejection", |env| {
+            env.kind == FrameKind::AgentError && env.stream == agent.stream
+        })
+        .await;
+    let error: AgentErrorPayload = env.parse_payload().expect("parse AgentErrorPayload");
+    assert!(!error.fatal);
+    assert!(error.message.contains("supervisor-origin"));
+
+    fixture
+        .client
+        .send_message(&agent.stream, "snapshot trigger".to_owned())
+        .await
+        .expect("queue snapshot trigger");
+    let after = fixture.expect_queued_messages(&agent, 3).await;
+    assert_eq!(after.messages[0].id, supervisor_id);
+    assert_eq!(after.messages[0].message, "supervisor-owned");
+    assert_eq!(after.messages[0].origin, Some(MessageOrigin::Supervisor));
+    assert_eq!(after.messages[1].id, user_id);
+    assert_eq!(after.messages[1].message, "user-owned");
 }
 
 #[tokio::test(start_paused = true)]

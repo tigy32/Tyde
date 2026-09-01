@@ -4233,7 +4233,7 @@ kbd {
 
 .queued-message-item {
     display: flex;
-    align-items: center;
+    align-items: flex-start;
     gap: var(--space-2);
     padding: 5px 8px;
     background: var(--surface-2);
@@ -4249,6 +4249,20 @@ kbd {
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
+}
+
+.queued-message-display {
+    display: flex;
+    align-items: center;
+    flex: 1;
+    min-width: 0;
+    gap: var(--space-2);
+}
+
+.queued-message-display[hidden],
+.queued-message-editor[hidden],
+.queued-message-edit[hidden] {
+    display: none;
 }
 
 .queued-message-btn {
@@ -4272,9 +4286,67 @@ kbd {
     border-color: var(--border-primary);
 }
 
-.queued-message-cancel:hover {
+.queued-message-btn:disabled {
+    cursor: not-allowed;
+    opacity: 0.5;
+}
+
+.queued-message-delete:hover {
     color: var(--error);
     border-color: var(--error);
+}
+
+.queued-message-editor {
+    display: flex;
+    flex: 1;
+    min-width: 0;
+    flex-direction: column;
+    gap: var(--space-2);
+}
+
+.queued-message-textarea {
+    box-sizing: border-box;
+    width: 100%;
+    min-height: calc(1em * 1.4 + 14px);
+    max-height: calc(1em * 1.4 * 10 + 14px);
+    padding: 6px 8px;
+    resize: none;
+    overflow-y: hidden;
+    color: var(--text-primary);
+    background: var(--surface-base);
+    border: 1px solid var(--border-primary);
+    border-radius: 4px;
+    font: inherit;
+    line-height: 1.4;
+}
+
+.queued-message-textarea:focus {
+    border-color: var(--accent-primary);
+    outline: none;
+}
+
+.queued-message-edit-actions,
+.queued-message-recovery {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+}
+
+.queued-message-edit-actions {
+    justify-content: flex-end;
+}
+
+.queued-message-recovery {
+    justify-content: space-between;
+    color: var(--warning);
+}
+
+.queued-message-error {
+    color: var(--error);
+}
+
+.queued-message-save {
+    color: var(--accent-primary);
 }
 
 .chat-send-btn {

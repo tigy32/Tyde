@@ -2599,7 +2599,7 @@ fn apply_host_bootstrap(
     {
         let state = state.clone();
         let host = host.clone();
-        leptos::task::spawn_local(async move {
+        wasm_bindgen_futures::spawn_local(async move {
             crate::actions::deliver_push_subscription(&state, host).await;
         });
     }

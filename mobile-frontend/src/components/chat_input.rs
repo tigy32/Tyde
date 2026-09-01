@@ -1,6 +1,7 @@
 use base64::Engine;
 use leptos::prelude::*;
 use wasm_bindgen::JsCast;
+use wasm_bindgen::closure::Closure;
 use wasm_bindgen_futures::{JsFuture, spawn_local};
 
 use crate::bridge::Accepted;
@@ -11,6 +12,8 @@ use crate::state::{
 
 const CHAT_INPUT_MIN_HEIGHT_PX: i32 = 36;
 const CHAT_INPUT_MAX_HEIGHT_PX: i32 = 132;
+const QUEUED_EDIT_MIN_HEIGHT_PX: i32 = 39;
+const QUEUED_EDIT_MAX_HEIGHT_PX: i32 = 240;
 
 /// Visible recovery copy shown once the composer target has died. Kept
 /// character-identical to the desktop composer
@@ -51,6 +54,142 @@ const QUEUED_ANNOUNCEMENT: &str = "Message queued to send.";
 struct QueuedRowRef {
     agent_ref: AgentRef,
     id: protocol::QueuedMessageId,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct QueuedEditSubmission {
+    message: String,
+    images: Vec<protocol::ImageData>,
+    baseline_message: String,
+    baseline_images: Vec<protocol::ImageData>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct QueuedEditDraft {
+    owner: AgentRef,
+    id: protocol::QueuedMessageId,
+    original_message: String,
+    message: String,
+    images: Vec<protocol::ImageData>,
+    saving: bool,
+    admitted: bool,
+    submitted: Option<QueuedEditSubmission>,
+    missing: bool,
+    error: Option<String>,
+}
+
+fn queued_entry_is_user_editable(origin: Option<&protocol::MessageOrigin>) -> bool {
+    !matches!(origin, Some(protocol::MessageOrigin::Supervisor))
+}
+
+fn close_queued_edit(
+    queued_edit: RwSignal<Option<QueuedEditDraft>>,
+    focus_return: RwSignal<Option<QueuedRowRef>>,
+) {
+    if let Some(draft) = queued_edit.get_untracked() {
+        let target = QueuedRowRef {
+            agent_ref: draft.owner,
+            id: draft.id,
+        };
+        queued_edit.set(None);
+        focus_return.set(Some(target));
+    }
+}
+
+fn schedule_queued_edit_focus(
+    focus_return: RwSignal<Option<QueuedRowRef>>,
+    target: QueuedRowRef,
+    edit_button_ref: NodeRef<leptos::html::Button>,
+) {
+    let callback_target = target.clone();
+    let callback = Closure::once_into_js(move || {
+        if focus_return.get_untracked().as_ref() != Some(&callback_target) {
+            return;
+        }
+        let Some(button) = edit_button_ref.get_untracked() else {
+            log::warn!("queued edit focus target disappeared before restoration");
+            return;
+        };
+        if button.focus().is_err() {
+            log::warn!("queued edit focus restoration was rejected by the webview");
+            return;
+        }
+        let restored = web_sys::window()
+            .and_then(|window| window.document())
+            .and_then(|document| document.active_element())
+            .is_some_and(|active| active.is_same_node(Some(&button)));
+        if restored {
+            focus_return.set(None);
+        } else {
+            log::warn!("queued edit focus restoration did not change the active element");
+        }
+    });
+    let Some(window) = web_sys::window() else {
+        log::warn!("queued edit focus restoration has no window");
+        return;
+    };
+    if window
+        .set_timeout_with_callback_and_timeout_and_arguments_0(callback.unchecked_ref(), 0)
+        .is_err()
+    {
+        log::warn!("queued edit focus restoration could not schedule a task");
+    }
+}
+
+fn schedule_queued_editor_focus(
+    queued_edit: RwSignal<Option<QueuedEditDraft>>,
+    target: QueuedRowRef,
+    editor_ref: NodeRef<leptos::html::Textarea>,
+) {
+    let callback = Closure::once_into_js(move || {
+        let still_editing = queued_edit.with_untracked(|draft| {
+            draft
+                .as_ref()
+                .is_some_and(|draft| draft.owner == target.agent_ref && draft.id == target.id)
+        });
+        if !still_editing {
+            return;
+        }
+        let Some(textarea) = editor_ref.get_untracked() else {
+            log::warn!("queued editor focus target disappeared before autofocus");
+            return;
+        };
+        resize_queued_editor(&textarea);
+        if textarea.focus().is_err() {
+            log::warn!("queued editor autofocus was rejected by the webview");
+            return;
+        }
+        let focused = web_sys::window()
+            .and_then(|window| window.document())
+            .and_then(|document| document.active_element())
+            .is_some_and(|active| active.is_same_node(Some(&textarea)));
+        if !focused {
+            log::warn!("queued editor autofocus did not change the active element");
+        }
+    });
+    let Some(window) = web_sys::window() else {
+        log::warn!("queued editor autofocus has no window");
+        return;
+    };
+    if window
+        .set_timeout_with_callback_and_timeout_and_arguments_0(callback.unchecked_ref(), 0)
+        .is_err()
+    {
+        log::warn!("queued editor autofocus could not schedule a task");
+    }
+}
+
+fn copy_queued_draft(text: String, status: RwSignal<&'static str>) {
+    spawn_local(async move {
+        let copied = if let Some(window) = web_sys::window() {
+            JsFuture::from(window.navigator().clipboard().write_text(&text))
+                .await
+                .is_ok()
+        } else {
+            false
+        };
+        status.set(if copied { "Copied" } else { "Copy failed" });
+    });
 }
 
 /// One outbound user submission as the composer sees it: where it is going, and
@@ -319,13 +458,124 @@ fn active_agent_has_session_id_tracked(state: &AppState) -> bool {
     })
 }
 
+fn save_queued_edit(
+    state: &AppState,
+    row: &QueuedRowRef,
+    queued_edit: RwSignal<Option<QueuedEditDraft>>,
+    focus_return: RwSignal<Option<QueuedRowRef>>,
+) {
+    let Some(draft) = queued_edit.get_untracked() else {
+        return;
+    };
+    if draft.id != row.id || draft.owner != row.agent_ref || draft.saving || draft.missing {
+        return;
+    }
+    if draft.message.trim().is_empty() && draft.images.is_empty() {
+        queued_edit.update(|current| {
+            if let Some(current) = current {
+                current.error =
+                    Some("Add text or keep at least one image before saving.".to_owned());
+            }
+        });
+        return;
+    }
+    if draft.message == draft.original_message {
+        close_queued_edit(queued_edit, focus_return);
+        return;
+    }
+
+    let current_entry = state.agent_message_queue.with_untracked(|queues| {
+        queues
+            .get(&row.agent_ref)
+            .and_then(|entries| entries.iter().find(|entry| entry.id == row.id))
+            .cloned()
+    });
+    let Some(current_entry) = current_entry else {
+        queued_edit.update(|current| {
+            if let Some(current) = current {
+                current.missing = true;
+                current.error = None;
+            }
+        });
+        return;
+    };
+    if !queued_entry_is_user_editable(current_entry.origin.as_ref()) {
+        queued_edit.update(|current| {
+            if let Some(current) = current {
+                current.error = Some("This queued message can no longer be edited.".to_owned());
+            }
+        });
+        return;
+    }
+    if agent_ref_is_fatal(state, &row.agent_ref) {
+        queued_edit.update(|current| {
+            if let Some(current) = current {
+                current.missing = true;
+                current.error = None;
+            }
+        });
+        return;
+    }
+
+    queued_edit.update(|current| {
+        if let Some(current) = current {
+            current.saving = true;
+            current.admitted = false;
+            current.submitted = Some(QueuedEditSubmission {
+                message: draft.message.clone(),
+                images: draft.images.clone(),
+                baseline_message: current_entry.message.clone(),
+                baseline_images: current_entry.images.clone(),
+            });
+            current.error = None;
+        }
+    });
+    let state = state.clone();
+    let agent_ref = row.agent_ref.clone();
+    let payload = protocol::EditQueuedMessagePayload {
+        id: draft.id,
+        message: draft.message,
+        images: draft.images,
+    };
+    spawn_local(async move {
+        match crate::actions::edit_queued_message(&state, &agent_ref, payload.clone()).await {
+            Ok(()) => queued_edit.update(|current| {
+                if let Some(current) = current
+                    && current.owner == agent_ref
+                    && current.id == payload.id
+                {
+                    current.admitted = true;
+                }
+            }),
+            Err(error) => queued_edit.update(|current| {
+                if let Some(current) = current
+                    && current.owner == agent_ref
+                    && current.id == payload.id
+                {
+                    current.saving = false;
+                    current.admitted = false;
+                    current.submitted = None;
+                    current.error = Some(format!("Could not save this edit: {error}"));
+                }
+            }),
+        }
+    });
+}
+
 #[component]
-fn QueuedMessageControlRow(row: QueuedRowRef) -> impl IntoView {
+fn QueuedMessageControlRow(
+    row: QueuedRowRef,
+    queued_edit: RwSignal<Option<QueuedEditDraft>>,
+    focus_return: RwSignal<Option<QueuedRowRef>>,
+) -> impl IntoView {
     let state = use_context::<AppState>().unwrap();
 
     let preview_agent = row.agent_ref.clone();
     let preview_id = row.id.clone();
     let preview_state = state.clone();
+    let editor_ref: NodeRef<leptos::html::Textarea> = NodeRef::new();
+    let edit_button_ref: NodeRef<leptos::html::Button> = NodeRef::new();
+    let editor_focus_requested = RwSignal::new(false);
     let preview = move || {
         preview_state.agent_message_queue.with(|queues| {
             queues
@@ -336,6 +586,62 @@ fn QueuedMessageControlRow(row: QueuedRowRef) -> impl IntoView {
         })
     };
 
+    let editable_agent = row.agent_ref.clone();
+    let editable_id = row.id.clone();
+    let editable_state = state.clone();
+    let editable = Signal::derive(move || {
+        editable_state.agent_message_queue.with(|queues| {
+            queues
+                .get(&editable_agent)
+                .and_then(|entries| entries.iter().find(|entry| entry.id == editable_id))
+                .is_some_and(|entry| queued_entry_is_user_editable(entry.origin.as_ref()))
+        })
+    });
+
+    let editing_agent = row.agent_ref.clone();
+    let editing_id = row.id.clone();
+    let is_editing = Signal::derive(move || {
+        queued_edit.with(|draft| {
+            draft
+                .as_ref()
+                .is_some_and(|draft| draft.owner == editing_agent && draft.id == editing_id)
+        })
+    });
+
+    let edit_agent = row.agent_ref.clone();
+    let edit_id = row.id.clone();
+    let edit_state = state.clone();
+    let on_edit = move |_| {
+        if queued_edit.get_untracked().is_some() {
+            return;
+        }
+        let entry = edit_state.agent_message_queue.with_untracked(|queues| {
+            queues
+                .get(&edit_agent)
+                .and_then(|entries| entries.iter().find(|entry| entry.id == edit_id))
+                .cloned()
+        });
+        let Some(entry) = entry else {
+            return;
+        };
+        if !queued_entry_is_user_editable(entry.origin.as_ref()) {
+            return;
+        }
+        focus_return.set(None);
+        queued_edit.set(Some(QueuedEditDraft {
+            owner: edit_agent.clone(),
+            id: entry.id,
+            original_message: entry.message.clone(),
+            message: entry.message,
+            images: entry.images,
+            saving: false,
+            admitted: false,
+            submitted: None,
+            missing: false,
+            error: None,
+        }));
+    };
+
     let send_now_agent = row.agent_ref.clone();
     let send_now_id = row.id.clone();
     let send_now_state = state.clone();
@@ -343,7 +649,7 @@ fn QueuedMessageControlRow(row: QueuedRowRef) -> impl IntoView {
         let state = send_now_state.clone();
         let agent_ref = send_now_agent.clone();
         let id = send_now_id.clone();
-        // "Send Now" is a same-actor send. The row is already hidden for a dead
+        // "Send next" is a same-actor send. The row is already hidden for a dead
         // owner, so this only catches a click that was already in flight when
         // the fatal error landed — but a hidden control is not a guard.
         if agent_ref_is_fatal(&state, &agent_ref) {
@@ -361,8 +667,8 @@ fn QueuedMessageControlRow(row: QueuedRowRef) -> impl IntoView {
         });
     };
 
-    let delete_agent = row.agent_ref;
-    let delete_id = row.id;
+    let delete_agent = row.agent_ref.clone();
+    let delete_id = row.id.clone();
     let delete_state = state.clone();
     let on_delete = move |_| {
         let state = delete_state.clone();
@@ -389,27 +695,170 @@ fn QueuedMessageControlRow(row: QueuedRowRef) -> impl IntoView {
         });
     };
 
+    let focus_row = row.clone();
+    Effect::new(move |_| {
+        let editing = queued_edit.with(|draft| {
+            draft
+                .as_ref()
+                .is_some_and(|draft| draft.owner == focus_row.agent_ref && draft.id == focus_row.id)
+        });
+        if editing {
+            if !editor_focus_requested.get() {
+                editor_focus_requested.set(true);
+                schedule_queued_editor_focus(queued_edit, focus_row.clone(), editor_ref);
+            }
+        } else {
+            editor_focus_requested.set(false);
+        }
+    });
+
+    let return_focus_row = row.clone();
+    Effect::new(move |_| {
+        if is_editing.get()
+            || focus_return.get().as_ref() != Some(&return_focus_row)
+            || !editable.get()
+        {
+            return;
+        }
+        schedule_queued_edit_focus(focus_return, return_focus_row.clone(), edit_button_ref);
+    });
+
+    let save_row = row.clone();
+    let save_state = state.clone();
+    let on_save = move |_| save_queued_edit(&save_state, &save_row, queued_edit, focus_return);
+    let key_row = row.clone();
+    let key_state = state.clone();
+    let on_keydown = move |event: leptos::ev::KeyboardEvent| {
+        if event.key() == "Escape" {
+            event.prevent_default();
+            close_queued_edit(queued_edit, focus_return);
+        } else if event.key() == "Enter" && (event.meta_key() || event.ctrl_key()) {
+            event.prevent_default();
+            save_queued_edit(&key_state, &key_row, queued_edit, focus_return);
+        }
+    };
+    let copy_status = RwSignal::new("Copy draft");
+    let value_id = row.id.clone();
+    let value_owner = row.agent_ref.clone();
+    let input_id = row.id.clone();
+    let input_owner = row.agent_ref.clone();
+    let notice_id = row.id;
+    let notice_owner = row.agent_ref;
+
     view! {
         <div class="chat-input-queued-row" data-mobile-test="chat-input-queued-row">
-            <span class="chat-input-queued-preview">{preview}</span>
-            <button
-                type="button"
-                class="chat-input-queued-action chat-input-queued-send-now"
-                aria-label="Send queued message now"
-                data-mobile-test="chat-input-queued-send-now"
-                on:click=on_send_now
-            >
-                "Send Now"
-            </button>
-            <button
-                type="button"
-                class="chat-input-queued-action chat-input-queued-delete"
-                aria-label="Delete queued message"
-                data-mobile-test="chat-input-queued-delete"
-                on:click=on_delete
-            >
-                "Delete"
-            </button>
+            <div class="chat-input-queued-display" hidden=move || is_editing.get()>
+                <span class="chat-input-queued-preview">{preview}</span>
+                <button
+                    type="button"
+                    class="chat-input-queued-action chat-input-queued-edit"
+                    node_ref=edit_button_ref
+                    aria-label="Edit queued message"
+                    data-mobile-test="chat-input-queued-edit"
+                    hidden=move || !editable.get()
+                    disabled=move || queued_edit.get().is_some()
+                    on:click=on_edit
+                >
+                    "Edit"
+                </button>
+                <button
+                    type="button"
+                    class="chat-input-queued-action chat-input-queued-send-now"
+                    aria-label="Send queued message next"
+                    data-mobile-test="chat-input-queued-send-now"
+                    on:click=on_send_now
+                >
+                    "Send next"
+                </button>
+                <button
+                    type="button"
+                    class="chat-input-queued-action chat-input-queued-delete"
+                    aria-label="Delete queued message"
+                    data-mobile-test="chat-input-queued-delete"
+                    on:click=on_delete
+                >
+                    "Delete"
+                </button>
+            </div>
+            <div class="chat-input-queued-editor" hidden=move || !is_editing.get()>
+                    <textarea
+                        class="chat-input-queued-textarea"
+                        rows=1
+                        aria-label="Edit queued message"
+                        data-mobile-test="chat-input-queued-editor"
+                        node_ref=editor_ref
+                        prop:value=move || queued_edit.with(|draft| {
+                            draft.as_ref().filter(|draft| {
+                                draft.owner == value_owner && draft.id == value_id
+                            })
+                                .map(|draft| draft.message.clone()).unwrap_or_default()
+                        })
+                        on:input=move |event| {
+                            let textarea = event_target::<web_sys::HtmlTextAreaElement>(&event);
+                            let value = textarea.value();
+                            queued_edit.update(|draft| {
+                                if let Some(draft) = draft
+                                    && draft.owner == input_owner
+                                    && draft.id == input_id
+                                {
+                                    draft.message = value;
+                                    draft.error = None;
+                                }
+                            });
+                            resize_queued_editor(&textarea);
+                        }
+                        on:keydown=on_keydown
+                    />
+                    {move || queued_edit.with(|draft| {
+                        let Some(draft) = draft.as_ref().filter(|draft| {
+                            draft.owner == notice_owner && draft.id == notice_id
+                        }) else {
+                            return view! { <span></span> }.into_any();
+                        };
+                        if draft.missing {
+                            view! {
+                                <div class="chat-input-queued-recovery" role="status" data-mobile-test="chat-input-queued-recovery">
+                                    <span>"This message left the queue. Your edit is still here; copy it before closing."</span>
+                                    <button
+                                        type="button"
+                                        class="chat-input-queued-action"
+                                        on:click=move |_| {
+                                            let text = queued_edit.with_untracked(|draft| {
+                                                draft.as_ref().map(|draft| draft.message.clone()).unwrap_or_default()
+                                            });
+                                            copy_queued_draft(text, copy_status);
+                                        }
+                                    >
+                                        {move || copy_status.get()}
+                                    </button>
+                                </div>
+                            }.into_any()
+                        } else if let Some(error) = &draft.error {
+                            view! { <div class="chat-input-queued-error" role="alert">{error.clone()}</div> }.into_any()
+                        } else {
+                            view! { <span></span> }.into_any()
+                        }
+                    })}
+                    <div class="chat-input-queued-edit-actions">
+                        <button
+                            type="button"
+                            class="chat-input-queued-action chat-input-queued-save"
+                            data-mobile-test="chat-input-queued-save"
+                            disabled=move || queued_edit.with(|draft| draft.as_ref().is_none_or(|draft| draft.saving || draft.missing))
+                            on:click=on_save
+                        >
+                            {move || if queued_edit.with(|draft| draft.as_ref().is_some_and(|draft| draft.saving)) { "Saving…" } else { "Save" }}
+                        </button>
+                        <button
+                            type="button"
+                            class="chat-input-queued-action"
+                            data-mobile-test="chat-input-queued-cancel"
+                            on:click=move |_| close_queued_edit(queued_edit, focus_return)
+                        >
+                            "Cancel"
+                        </button>
+                    </div>
+            </div>
         </div>
     }
 }
@@ -578,6 +1027,8 @@ pub fn ChatInput() -> impl IntoView {
     let attachment_error = composer.attachment_error;
     let loading_photos = RwSignal::new(false);
     let submitting = composer.submitting;
+    let queued_edit = RwSignal::new(None::<QueuedEditDraft>);
+    let queued_edit_focus_return = RwSignal::new(None::<QueuedRowRef>);
 
     let do_send = {
         let state = state.clone();
@@ -1001,6 +1452,138 @@ pub fn ChatInput() -> impl IntoView {
         })
     });
 
+    let queued_render_state = state.clone();
+    let queued_rows_for_render = Signal::derive(move || {
+        let mut rows = queued_rows.get();
+        let active = queued_render_state
+            .active_agent
+            .get()
+            .map(|active| active.as_agent_ref());
+        if let Some(draft) = queued_edit.get()
+            && active.as_ref() == Some(&draft.owner)
+            && !rows
+                .iter()
+                .any(|row| row.agent_ref == draft.owner && row.id == draft.id)
+        {
+            rows.push(QueuedRowRef {
+                agent_ref: draft.owner,
+                id: draft.id,
+            });
+        }
+        rows
+    });
+
+    let confirmation_state = state.clone();
+    Effect::new(move |_| {
+        let Some(draft) = queued_edit.get() else {
+            return;
+        };
+        let fatal = agent_ref_is_fatal(&confirmation_state, &draft.owner);
+        let entry = confirmation_state.agent_message_queue.with(|queues| {
+            queues
+                .get(&draft.owner)
+                .and_then(|entries| entries.iter().find(|entry| entry.id == draft.id))
+                .cloned()
+        });
+        match entry {
+            Some(entry) if draft.saving && draft.admitted => {
+                let Some(submitted) = draft.submitted.as_ref() else {
+                    queued_edit.update(|current| {
+                        if let Some(current) = current
+                            && current.owner == draft.owner
+                            && current.id == draft.id
+                        {
+                            current.saving = false;
+                            current.admitted = false;
+                            current.error = Some(
+                                "The save could not be confirmed. Your draft is preserved."
+                                    .to_owned(),
+                            );
+                        }
+                    });
+                    return;
+                };
+                if entry.message == submitted.message && entry.images == submitted.images {
+                    if draft.message == submitted.message && draft.images == submitted.images {
+                        close_queued_edit(queued_edit, queued_edit_focus_return);
+                    } else {
+                        queued_edit.update(|current| {
+                            if let Some(current) = current
+                                && current.owner == draft.owner
+                                && current.id == draft.id
+                            {
+                                current.original_message = submitted.message.clone();
+                                current.saving = false;
+                                current.admitted = false;
+                                current.submitted = None;
+                                current.missing = false;
+                                current.error = Some(
+                                    "The saved version is in the queue. Your newer edits are still here."
+                                        .to_owned(),
+                                );
+                            }
+                        });
+                    }
+                } else if entry.message != submitted.baseline_message
+                    || entry.images != submitted.baseline_images
+                {
+                    queued_edit.update(|current| {
+                        if let Some(current) = current
+                            && current.owner == draft.owner
+                            && current.id == draft.id
+                        {
+                            current.saving = false;
+                            current.admitted = false;
+                            current.submitted = None;
+                            current.missing = false;
+                            current.error = Some(
+                                "The queued message changed before this save was confirmed. Your draft is preserved."
+                                    .to_owned(),
+                            );
+                        }
+                    });
+                }
+            }
+            None if !draft.missing => queued_edit.update(|current| {
+                if let Some(current) = current
+                    && current.owner == draft.owner
+                    && current.id == draft.id
+                {
+                    current.missing = true;
+                    current.saving = false;
+                    current.admitted = false;
+                    current.submitted = None;
+                    current.error = None;
+                }
+            }),
+            Some(_) if draft.missing && !fatal => queued_edit.update(|current| {
+                if let Some(current) = current
+                    && current.owner == draft.owner
+                    && current.id == draft.id
+                {
+                    current.missing = false;
+                    current.error = Some(
+                        "This message returned to the queue. Review your preserved draft before saving."
+                            .to_owned(),
+                    );
+                }
+            }),
+            Some(_) if fatal && !draft.missing => queued_edit.update(|current| {
+                if let Some(current) = current
+                    && current.owner == draft.owner
+                    && current.id == draft.id
+                {
+                    current.missing = true;
+                    current.saving = false;
+                    current.admitted = false;
+                    current.submitted = None;
+                    current.error = None;
+                }
+            }),
+            _ => {}
+        }
+    });
+
     view! {
         <div
             class="chat-input-container"
@@ -1021,27 +1604,27 @@ pub fn ChatInput() -> impl IntoView {
             <Show when=move || state.active_agent.get().is_none()>
                 <NewChatOptions />
             </Show>
-            {move || {
-                let rows = queued_rows.get();
-                if rows.is_empty() {
-                    return view! { <div></div> }.into_any();
-                }
-                let n = rows.len();
-                view! {
-                    <div class="chat-input-queued-list" data-mobile-test="chat-input-queued-list" aria-live="polite">
-                        <div class="chat-input-queued-title">
-                            {format!("{n} message{} queued", if n == 1 { "" } else { "s" })}
-                        </div>
-                        <For
-                            each=move || queued_rows.get()
-                            key=|row| format!("{}:{}:{}", row.agent_ref.local_host_id, row.agent_ref.agent_id, row.id)
-                            let:row
-                        >
-                            <QueuedMessageControlRow row=row />
-                        </For>
+            <Show when=move || !queued_rows_for_render.get().is_empty()>
+                <div class="chat-input-queued-list" data-mobile-test="chat-input-queued-list" aria-live="polite">
+                    <div class="chat-input-queued-title">
+                        {move || {
+                            let n = queued_rows_for_render.get().len();
+                            format!("{n} message{} queued", if n == 1 { "" } else { "s" })
+                        }}
                     </div>
-                }.into_any()
-            }}
+                    <For
+                        each=move || queued_rows_for_render.get()
+                        key=|row| format!("{}:{}:{}", row.agent_ref.local_host_id, row.agent_ref.agent_id, row.id)
+                        let:row
+                    >
+                        <QueuedMessageControlRow
+                            row=row
+                            queued_edit=queued_edit
+                            focus_return=queued_edit_focus_return
+                        />
+                    </For>
+                </div>
+            </Show>
             <input
                 class="chat-photo-input"
                 type="file"
@@ -1280,6 +1863,24 @@ fn resize_chat_input(textarea: &web_sys::HtmlTextAreaElement) {
     let scroll_height = html_el.scroll_height();
     let target_height = scroll_height.clamp(CHAT_INPUT_MIN_HEIGHT_PX, CHAT_INPUT_MAX_HEIGHT_PX);
     let overflow = if scroll_height > CHAT_INPUT_MAX_HEIGHT_PX {
+        "auto"
+    } else {
+        "hidden"
+    };
+    let _ = textarea.set_attribute(
+        "style",
+        &format!("height: {target_height}px; overflow-y: {overflow};"),
+    );
+}
+
+fn resize_queued_editor(textarea: &web_sys::HtmlTextAreaElement) {
+    let html_el: web_sys::HtmlElement = textarea.clone().unchecked_into();
+    let _ = textarea.set_attribute("style", "height: auto; overflow-y: hidden;");
+    let scroll_height = html_el.scroll_height();
+    let border_height = html_el.offset_height() - html_el.client_height();
+    let content_height = scroll_height + border_height;
+    let target_height = content_height.clamp(QUEUED_EDIT_MIN_HEIGHT_PX, QUEUED_EDIT_MAX_HEIGHT_PX);
+    let overflow = if content_height > QUEUED_EDIT_MAX_HEIGHT_PX {
         "auto"
     } else {
         "hidden"
@@ -1563,6 +2164,62 @@ mod wasm_tests {
         container.dyn_into::<HtmlElement>().unwrap()
     }
 
+    fn is_perceivably_visible(element: &web_sys::Element) -> bool {
+        let rect = element.get_bounding_client_rect();
+        let display = web_sys::window()
+            .unwrap()
+            .get_computed_style(element)
+            .unwrap()
+            .unwrap()
+            .get_property_value("display")
+            .unwrap();
+        display != "none" && rect.width() > 0.0 && rect.height() > 0.0
+    }
+
+    struct StalledAnimationFrames {
+        original: wasm_bindgen::JsValue,
+    }
+
+    impl Drop for StalledAnimationFrames {
+        fn drop(&mut self) {
+            let window = web_sys::window().unwrap();
+            js_sys::Reflect::set(
+                window.as_ref(),
+                &wasm_bindgen::JsValue::from_str("requestAnimationFrame"),
+                &self.original,
+            )
+            .unwrap();
+        }
+    }
+
+    fn stall_animation_frames() -> StalledAnimationFrames {
+        let window = web_sys::window().unwrap();
+        let property = wasm_bindgen::JsValue::from_str("requestAnimationFrame");
+        let original = js_sys::Reflect::get(window.as_ref(), &property).unwrap();
+        let stalled = js_sys::Function::new_with_args("_callback", "return 1;");
+        js_sys::Reflect::set(window.as_ref(), &property, stalled.as_ref()).unwrap();
+        StalledAnimationFrames { original }
+    }
+
+    fn reveal_editor_on_next_task(editor: &HtmlElement) {
+        editor.style().set_property("display", "none").unwrap();
+        let editor = editor.clone();
+        let callback = Closure::once_into_js(move || {
+            editor.style().remove_property("display").unwrap();
+        });
+        web_sys::window()
+            .unwrap()
+            .set_timeout_with_callback_and_timeout_and_arguments_0(callback.unchecked_ref(), 0)
+            .unwrap();
+    }
+
+    fn set_queued_editor_value(editor: &web_sys::HtmlTextAreaElement, value: &str) {
+        editor.set_value(value);
+        editor
+            .dispatch_event(&web_sys::Event::new("input").unwrap())
+            .unwrap();
+    }
+
     async fn next_tick() {
         let promise = js_sys::Promise::new(&mut |resolve, _reject| {
             web_sys::window()
@@ -1610,7 +2267,7 @@ mod wasm_tests {
     /// Dispatch a real `keydown` on `target`. The composer's Cmd/Ctrl+Enter send
     /// runs off this event and is not gated by the button's `disabled`
     /// attribute, so it is the send path a fatal guard actually has to stop.
-    fn dispatch_keydown(target: &web_sys::Element, key: &str, meta: bool, ctrl: bool) {
+    fn dispatch_keydown(target: &web_sys::Element, key: &str, meta: bool, ctrl: bool) -> bool {
         // Constructed through `Reflect` rather than `KeyboardEventInit`, mirroring
         // the desktop composer's helper: it does not depend on which init-dict
         // setters the pinned web-sys exposes.
@@ -1635,7 +2292,7 @@ mod wasm_tests {
         let args = js_sys::Array::of2(&"keydown".into(), &init);
         let event = js_sys::Reflect::construct(&ctor, &args).unwrap();
         let event: web_sys::Event = event.unchecked_into();
-        target.dispatch_event(&event).unwrap();
+        target.dispatch_event(&event).unwrap()
     }
 
     fn type_text(container: &HtmlElement, text: &str) {
@@ -1955,10 +2612,12 @@ mod wasm_tests {
     }
 
     /// When there are queued messages, the composer surfaces per-row
-    /// controls so a phone can do the same send-now/delete operations as
+    /// controls so a phone can edit, send-next, and delete without borrowing
+    /// the main composer.
     /// desktop — without disabling the input.
     #[wasm_bindgen_test]
     async fn queued_controls_appear_when_messages_are_queued() {
+        crate::components::test_styles::ensure_styles_loaded();
         let host = LocalHostId("host-1".to_owned());
         let host_clone = host.clone();
         let container = make_container();
@@ -1972,15 +2631,32 @@ mod wasm_tests {
                 local_host_id: host_clone.clone(),
                 agent_id: AgentId("agent-1".to_owned()),
             }));
+            state.chat_input.set("composer draft stays here".to_owned());
             state.agent_message_queue.update(|m| {
                 m.insert(
                     agent_ref,
-                    vec![QueuedMessageEntry {
-                        id: QueuedMessageId("q-1".to_owned()),
-                        message: "later".to_owned(),
-                        images: Vec::new(),
-                        origin: None,
-                    }],
+                    vec![
+                        QueuedMessageEntry {
+                            id: QueuedMessageId("q-1".to_owned()),
+                            message: "later".to_owned(),
+                            images: Vec::new(),
+                            origin: Some(protocol::MessageOrigin::User),
+                        },
+                        QueuedMessageEntry {
+                            id: QueuedMessageId("q-supervisor".to_owned()),
+                            message: "supervisor kick".to_owned(),
+                            images: Vec::new(),
+                            origin: Some(protocol::MessageOrigin::Supervisor),
+                        },
+                        QueuedMessageEntry {
+                            id: QueuedMessageId("q-review".to_owned()),
+                            message: "review follow-up".to_owned(),
+                            images: Vec::new(),
+                            origin: Some(protocol::MessageOrigin::Review {
+                                review_id: protocol::ReviewId("review-1".to_owned()),
+                            }),
+                        },
+                    ],
                 );
             });
             provide_context(state);
@@ -1993,14 +2669,14 @@ mod wasm_tests {
             .expect("queued controls must render when at least one message is queued");
         let text = list.text_content().unwrap_or_default();
         assert!(
-            text.contains("1 message"),
+            text.contains("3 messages"),
             "queued controls must mention count: {text}"
         );
         assert!(
             list.query_selector("[data-mobile-test='chat-input-queued-send-now']")
                 .unwrap()
                 .is_some(),
-            "queued row must expose Send Now"
+            "queued row must expose Send next"
         );
         assert!(
             list.query_selector("[data-mobile-test='chat-input-queued-delete']")
@@ -2008,15 +2684,586 @@ mod wasm_tests {
                 .is_some(),
             "queued row must expose Delete"
         );
-        // Composer must remain enabled for queueing more messages.
-        let input = container
-            .query_selector("[data-mobile-test='chat-input']")
+        let edits = list
+            .query_selector_all("[data-mobile-test='chat-input-queued-edit']")
+            .unwrap();
+        assert_eq!(edits.length(), 3);
+        let user_edit = edits.item(0).unwrap().dyn_into::<HtmlElement>().unwrap();
+        let supervisor_edit = edits
+            .item(1)
+            .unwrap()
+            .dyn_into::<web_sys::Element>()
+            .unwrap();
+        let review_edit = edits
+            .item(2)
+            .unwrap()
+            .dyn_into::<web_sys::Element>()
+            .unwrap();
+        assert!(supervisor_edit.has_attribute("hidden"));
+        assert!(
+            !is_perceivably_visible(&supervisor_edit),
+            "the Supervisor edit action occupies no visible mobile geometry"
+        );
+        assert!(
+            is_perceivably_visible(&review_edit),
+            "Review-origin queued entries remain editable"
+        );
+
+        user_edit.focus().unwrap();
+        assert!(
+            web_sys::window()
+                .unwrap()
+                .document()
+                .unwrap()
+                .active_element()
+                .unwrap()
+                .is_same_node(Some(&user_edit)),
+            "mobile keyboard activation starts from the visible Edit button"
+        );
+        user_edit.click();
+        next_tick().await;
+        next_tick().await;
+        let editor: web_sys::HtmlTextAreaElement = list
+            .query_selector("[data-mobile-test='chat-input-queued-editor']")
+            .unwrap()
+            .expect("Edit must expand inside its queued row")
+            .dyn_into()
+            .unwrap();
+        assert_eq!(editor.value(), "later");
+        assert_eq!(editor.rows(), 1);
+        let active = web_sys::window()
+            .unwrap()
+            .document()
+            .unwrap()
+            .active_element()
+            .expect("Edit focuses the mobile textarea");
+        assert!(active.is_same_node(Some(&editor)));
+        let row = editor.closest(".chat-input-queued-row").unwrap().unwrap();
+        assert!(
+            !is_perceivably_visible(
+                &row.query_selector(".chat-input-queued-display")
+                    .unwrap()
+                    .unwrap()
+            ),
+            "the mobile queued display occupies no geometry during editing"
+        );
+        assert!(
+            is_perceivably_visible(
+                &row.query_selector(".chat-input-queued-editor")
+                    .unwrap()
+                    .unwrap()
+            ),
+            "the mobile inline editor is visibly expanded"
+        );
+        let computed = web_sys::window()
+            .unwrap()
+            .get_computed_style(&editor)
             .unwrap()
             .unwrap();
+        assert_eq!(computed.get_property_value("font-size").unwrap(), "16px");
+        let one_line_height = editor.get_bounding_client_rect().height();
+        assert!(one_line_height >= 38.0);
         assert!(
-            !input.has_attribute("disabled"),
+            editor.scroll_height() <= editor.client_height(),
+            "the one-line mobile editor is not clipped"
+        );
+        set_queued_editor_value(
+            &editor,
+            &format!(
+                "wrapped content {}\nexplicit second line",
+                "word ".repeat(45)
+            ),
+        );
+        let grown_height = editor.get_bounding_client_rect().height();
+        assert!(grown_height > one_line_height);
+        set_queued_editor_value(
+            &editor,
+            &(1..=10)
+                .map(|n| format!("line {n}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+        let ten_line_height = editor.get_bounding_client_rect().height();
+        assert!(ten_line_height > grown_height);
+        assert!((ten_line_height - 240.0).abs() < 1.1);
+        set_queued_editor_value(
+            &editor,
+            &(1..=14)
+                .map(|n| format!("line {n}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+        let overflow_height = editor.get_bounding_client_rect().height();
+        assert!((overflow_height - ten_line_height).abs() < 1.1);
+        assert!(editor.scroll_height() > editor.client_height());
+        assert_eq!(
+            web_sys::window()
+                .unwrap()
+                .get_computed_style(&editor)
+                .unwrap()
+                .unwrap()
+                .get_property_value("overflow-y")
+                .unwrap(),
+            "auto"
+        );
+
+        let _stalled_animation_frames = stall_animation_frames();
+        set_queued_editor_value(&editor, "changed\nwith a plain newline");
+        let editor_element: web_sys::Element = editor.clone().unchecked_into();
+        assert!(
+            dispatch_keydown(&editor_element, "Enter", false, false),
+            "plain Enter must not be prevented so it inserts a newline"
+        );
+        assert!(
+            !dispatch_keydown(&editor_element, "Enter", false, true),
+            "Ctrl+Enter must be consumed by Save"
+        );
+        dispatch_keydown(&editor_element, "Escape", false, false);
+        next_tick().await;
+        next_tick().await;
+        let closed_editor = list
+            .query_selector(".chat-input-queued-editor")
+            .unwrap()
+            .unwrap();
+        assert!(closed_editor.has_attribute("hidden"));
+        assert!(
+            !is_perceivably_visible(&closed_editor),
+            "Escape removes the mobile editor's flex geometry"
+        );
+        let active = web_sys::window()
+            .unwrap()
+            .document()
+            .unwrap()
+            .active_element()
+            .expect("Escape returns focus to the row Edit action");
+        let returned_edit: HtmlElement = list
+            .query_selector("[data-mobile-test='chat-input-queued-edit']")
+            .unwrap()
+            .unwrap()
+            .dyn_into()
+            .unwrap();
+        assert!(active.is_same_node(Some(&returned_edit)));
+
+        let editor_shell: HtmlElement = list
+            .query_selector(".chat-input-queued-editor")
+            .unwrap()
+            .unwrap()
+            .dyn_into()
+            .unwrap();
+        reveal_editor_on_next_task(&editor_shell);
+        returned_edit.click();
+        next_tick().await;
+        next_tick().await;
+        let reopened_editor: web_sys::HtmlTextAreaElement = list
+            .query_selector("[data-mobile-test='chat-input-queued-editor']")
+            .unwrap()
+            .unwrap()
+            .dyn_into()
+            .unwrap();
+        let active = web_sys::window()
+            .unwrap()
+            .document()
+            .unwrap()
+            .active_element()
+            .expect("reopening after mobile Escape focuses the textarea");
+        assert!(active.is_same_node(Some(&reopened_editor)));
+
+        let composer: web_sys::HtmlTextAreaElement = container
+            .query_selector("[data-mobile-test='chat-input']")
+            .unwrap()
+            .unwrap()
+            .dyn_into()
+            .unwrap();
+        assert_eq!(composer.value(), "composer draft stays here");
+
+        let editor: web_sys::HtmlTextAreaElement = list
+            .query_selector("[data-mobile-test='chat-input-queued-editor']")
+            .unwrap()
+            .unwrap()
+            .dyn_into()
+            .unwrap();
+        set_queued_editor_value(&editor, "");
+        list.query_selector("[data-mobile-test='chat-input-queued-save']")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap()
+            .click();
+        next_tick().await;
+        assert!(
+            list.text_content()
+                .unwrap_or_default()
+                .contains("Add text or keep at least one image"),
+            "empty attachment-free edits show an in-row error"
+        );
+        // Composer must remain enabled for queueing more messages.
+        assert!(
+            !composer.has_attribute("disabled"),
             "composer must stay enabled so users can queue more"
         );
+        list.query_selector("[data-mobile-test='chat-input-queued-cancel']")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap()
+            .click();
+        next_tick().await;
+        next_tick().await;
+        let active = web_sys::window()
+            .unwrap()
+            .document()
+            .unwrap()
+            .active_element()
+            .expect("Cancel returns focus to the row Edit action");
+        let returned_edit: HtmlElement = list
+            .query_selector("[data-mobile-test='chat-input-queued-edit']")
+            .unwrap()
+            .unwrap()
+            .dyn_into()
+            .unwrap();
+        assert!(active.is_same_node(Some(&returned_edit)));
+        reveal_editor_on_next_task(&editor_shell);
+        returned_edit.click();
+        next_tick().await;
+        next_tick().await;
+        let editor: web_sys::HtmlTextAreaElement = list
+            .query_selector("[data-mobile-test='chat-input-queued-editor']")
+            .unwrap()
+            .unwrap()
+            .dyn_into()
+            .unwrap();
+        let active = web_sys::window()
+            .unwrap()
+            .document()
+            .unwrap()
+            .active_element()
+            .expect("reopening after mobile Cancel focuses the textarea");
+        assert!(active.is_same_node(Some(&editor)));
+    }
+
+    #[wasm_bindgen_test]
+    async fn queued_edit_survives_its_server_row_disappearing() {
+        let container = make_container();
+        let state_slot = std::rc::Rc::new(std::cell::RefCell::new(None::<AppState>));
+        let mount_slot = state_slot.clone();
+        let _h = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            let host = LocalHostId("host-1".to_owned());
+            let agent_ref = AgentRef {
+                local_host_id: host.clone(),
+                agent_id: AgentId("agent-1".to_owned()),
+            };
+            state.active_agent.set(Some(crate::state::ActiveAgentRef {
+                local_host_id: host,
+                agent_id: agent_ref.agent_id.clone(),
+            }));
+            state.agent_message_queue.update(|queues| {
+                queues.insert(
+                    agent_ref,
+                    vec![QueuedMessageEntry {
+                        id: QueuedMessageId("q-drain".to_owned()),
+                        message: "original".to_owned(),
+                        images: Vec::new(),
+                        origin: Some(protocol::MessageOrigin::User),
+                    }],
+                );
+            });
+            *mount_slot.borrow_mut() = Some(state.clone());
+            provide_context(state);
+            view! { <ChatInput /> }
+        });
+        next_tick().await;
+
+        container
+            .query_selector("[data-mobile-test='chat-input-queued-edit']")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap()
+            .click();
+        next_tick().await;
+        let editor: web_sys::HtmlTextAreaElement = container
+            .query_selector("[data-mobile-test='chat-input-queued-editor']")
+            .unwrap()
+            .unwrap()
+            .dyn_into()
+            .unwrap();
+        editor.set_value("recover this dirty edit");
+        editor
+            .dispatch_event(&web_sys::Event::new("input").unwrap())
+            .unwrap();
+
+        state_slot
+            .borrow()
+            .as_ref()
+            .unwrap()
+            .agent_message_queue
+            .update(|queues| queues.clear());
+        next_tick().await;
+
+        let recovered: web_sys::HtmlTextAreaElement = container
+            .query_selector("[data-mobile-test='chat-input-queued-editor']")
+            .unwrap()
+            .expect("dirty edit remains mounted after the queue snapshot drains")
+            .dyn_into()
+            .unwrap();
+        assert_eq!(recovered.value(), "recover this dirty edit");
+        assert!(
+            container
+                .query_selector("[data-mobile-test='chat-input-queued-recovery']")
+                .unwrap()
+                .is_some(),
+            "the retained draft explains the drain and offers recovery"
+        );
+
+        state_slot
+            .borrow()
+            .as_ref()
+            .unwrap()
+            .agent_message_queue
+            .update(|queues| {
+                queues.insert(
+                    AgentRef {
+                        local_host_id: LocalHostId("host-1".to_owned()),
+                        agent_id: AgentId("agent-1".to_owned()),
+                    },
+                    vec![QueuedMessageEntry {
+                        id: QueuedMessageId("q-drain".to_owned()),
+                        message: "server row returned".to_owned(),
+                        images: Vec::new(),
+                        origin: Some(protocol::MessageOrigin::User),
+                    }],
+                );
+            });
+        next_tick().await;
+        assert_eq!(recovered.value(), "recover this dirty edit");
+        assert!(
+            container
+                .text_content()
+                .unwrap_or_default()
+                .contains("returned to the queue")
+        );
+        assert!(
+            container
+                .query_selector("[data-mobile-test='chat-input-queued-recovery']")
+                .unwrap()
+                .is_none(),
+            "a matching reappearing row clears the mobile missing state"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    async fn queued_save_confirmation_preserves_newer_mobile_typing() {
+        let _guard = crate::bridge::test_capture_sends();
+        let container = make_container();
+        let state_slot = std::rc::Rc::new(std::cell::RefCell::new(None::<AppState>));
+        let mount_slot = state_slot.clone();
+        let _h = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            let host = LocalHostId("host-race".to_owned());
+            let agent_id = AgentId("agent-race".to_owned());
+            let agent_ref = AgentRef {
+                local_host_id: host.clone(),
+                agent_id: agent_id.clone(),
+            };
+            state.active_agent.set(Some(crate::state::ActiveAgentRef {
+                local_host_id: host.clone(),
+                agent_id: agent_id.clone(),
+            }));
+            state.agents.set(vec![AgentInfo {
+                local_host_id: host,
+                agent_id,
+                name: "Agent".to_owned(),
+                origin: AgentOrigin::User,
+                backend_kind: BackendKind::Claude,
+                workspace_roots: Vec::new(),
+                project_id: None,
+                parent_agent_id: None,
+                session_id: Some(SessionId("session-race".to_owned())),
+                custom_agent_id: None,
+                created_at_ms: 0,
+                instance_stream: StreamPath("/agent/race/inst".to_owned()),
+                started: true,
+                fatal_error: None,
+            }]);
+            state.agent_message_queue.update(|queues| {
+                queues.insert(
+                    agent_ref,
+                    vec![QueuedMessageEntry {
+                        id: QueuedMessageId("q-race".to_owned()),
+                        message: "original".to_owned(),
+                        images: Vec::new(),
+                        origin: Some(protocol::MessageOrigin::User),
+                    }],
+                );
+            });
+            *mount_slot.borrow_mut() = Some(state.clone());
+            provide_context(state);
+            view! { <ChatInput /> }
+        });
+        next_tick().await;
+
+        let edit: HtmlElement = container
+            .query_selector("[data-mobile-test='chat-input-queued-edit']")
+            .unwrap()
+            .unwrap()
+            .dyn_into()
+            .unwrap();
+        edit.focus().unwrap();
+        edit.click();
+        next_tick().await;
+        next_tick().await;
+        let editor: web_sys::HtmlTextAreaElement = container
+            .query_selector("[data-mobile-test='chat-input-queued-editor']")
+            .unwrap()
+            .unwrap()
+            .dyn_into()
+            .unwrap();
+        set_queued_editor_value(&editor, "submitted version");
+        container
+            .query_selector("[data-mobile-test='chat-input-queued-save']")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap()
+            .click();
+        set_queued_editor_value(&editor, "newer mobile typing");
+        next_tick().await;
+
+        let row_ref = AgentRef {
+            local_host_id: LocalHostId("host-race".to_owned()),
+            agent_id: AgentId("agent-race".to_owned()),
+        };
+        state_slot
+            .borrow()
+            .as_ref()
+            .unwrap()
+            .agent_message_queue
+            .update(|queues| {
+                queues.get_mut(&row_ref).unwrap()[0].message = "submitted version".to_owned();
+            });
+        next_tick().await;
+        let editor: web_sys::HtmlTextAreaElement = container
+            .query_selector("[data-mobile-test='chat-input-queued-editor']")
+            .unwrap()
+            .unwrap()
+            .dyn_into()
+            .unwrap();
+        assert_eq!(editor.value(), "newer mobile typing");
+        assert!(
+            container
+                .text_content()
+                .unwrap_or_default()
+                .contains("newer edits are still here")
+        );
+        assert_eq!(
+            container
+                .query_selector("[data-mobile-test='chat-input-queued-save']")
+                .unwrap()
+                .unwrap()
+                .text_content()
+                .unwrap_or_default()
+                .trim(),
+            "Save"
+        );
+
+        container
+            .query_selector("[data-mobile-test='chat-input-queued-save']")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap()
+            .click();
+        next_tick().await;
+        state_slot
+            .borrow()
+            .as_ref()
+            .unwrap()
+            .agent_message_queue
+            .update(|queues| {
+                queues.get_mut(&row_ref).unwrap()[0].message =
+                    "external concurrent version".to_owned();
+            });
+        next_tick().await;
+        let editor: web_sys::HtmlTextAreaElement = container
+            .query_selector("[data-mobile-test='chat-input-queued-editor']")
+            .unwrap()
+            .unwrap()
+            .dyn_into()
+            .unwrap();
+        assert_eq!(editor.value(), "newer mobile typing");
+        assert!(
+            container
+                .text_content()
+                .unwrap_or_default()
+                .contains("changed before this save was confirmed")
+        );
+        assert_eq!(
+            container
+                .query_selector("[data-mobile-test='chat-input-queued-save']")
+                .unwrap()
+                .unwrap()
+                .text_content()
+                .unwrap_or_default()
+                .trim(),
+            "Save"
+        );
+
+        container
+            .query_selector("[data-mobile-test='chat-input-queued-save']")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap()
+            .click();
+        next_tick().await;
+        state_slot
+            .borrow()
+            .as_ref()
+            .unwrap()
+            .agent_message_queue
+            .update(|queues| {
+                queues.get_mut(&row_ref).unwrap()[0].message = "newer mobile typing".to_owned();
+            });
+        let _stalled_animation_frames = stall_animation_frames();
+        next_tick().await;
+        next_tick().await;
+        let active = web_sys::window()
+            .unwrap()
+            .document()
+            .unwrap()
+            .active_element()
+            .expect("successful mobile save returns focus to Edit");
+        let returned_edit: HtmlElement = container
+            .query_selector("[data-mobile-test='chat-input-queued-edit']")
+            .unwrap()
+            .unwrap()
+            .dyn_into()
+            .unwrap();
+        assert!(active.is_same_node(Some(&returned_edit)));
+        let editor_shell: HtmlElement = container
+            .query_selector(".chat-input-queued-editor")
+            .unwrap()
+            .unwrap()
+            .dyn_into()
+            .unwrap();
+        reveal_editor_on_next_task(&editor_shell);
+        returned_edit.click();
+        next_tick().await;
+        next_tick().await;
+        let editor: web_sys::HtmlTextAreaElement = container
+            .query_selector("[data-mobile-test='chat-input-queued-editor']")
+            .unwrap()
+            .unwrap()
+            .dyn_into()
+            .unwrap();
+        let active = web_sys::window()
+            .unwrap()
+            .document()
+            .unwrap()
+            .active_element()
+            .expect("reopening after confirmed mobile save focuses the textarea");
+        assert!(active.is_same_node(Some(&editor)));
     }
 
     // ── State matrix row 4: Thinking + empty ─────────────────────────────────
@@ -2665,7 +3912,15 @@ mod wasm_tests {
             });
             *handle_for_mount.borrow_mut() = Some(state.clone());
             provide_context(state);
-            view! { <QueuedMessageControlRow row=row_for_mount.clone() /> }
+            let queued_edit = RwSignal::new(None::<QueuedEditDraft>);
+            let focus_return = RwSignal::new(None::<QueuedRowRef>);
+            view! {
+                <QueuedMessageControlRow
+                    row=row_for_mount.clone()
+                    queued_edit=queued_edit
+                    focus_return=focus_return
+                />
+            }
         });
         std::mem::forget(h);
         next_tick().await;
