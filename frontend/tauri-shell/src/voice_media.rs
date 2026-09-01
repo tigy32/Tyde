@@ -61,6 +61,9 @@ enum ControlCommand {
         host_id: String,
         generation: u64,
         input_only: bool,
+        /// Open the capture device on the user's gesture, before the host has
+        /// accepted the session. Restricted to input-only sessions.
+        pending_acceptance: bool,
         acknowledgement: Acknowledgement,
     },
     Flush {
@@ -133,6 +136,7 @@ impl NativeVoiceMedia {
         host_id: String,
         generation: u64,
         input_only: bool,
+        pending_acceptance: bool,
     ) -> CommandResult {
         self.control_request(
             |acknowledgement| ControlCommand::Start {
@@ -140,6 +144,7 @@ impl NativeVoiceMedia {
                 host_id,
                 generation,
                 input_only,
+                pending_acceptance,
                 acknowledgement,
             },
             START_TIMEOUT,
@@ -460,7 +465,16 @@ fn handle_control_command(
             generation,
             acknowledgement,
         } => {
-            state.accepted = Some((host_id, generation));
+            // A capture-first session is already live by the time acceptance
+            // arrives. Recording a token it will never consume would leave one
+            // behind that authorizes some later, unrelated start.
+            let already_live = state
+                .active
+                .as_ref()
+                .is_some_and(|active| active.host_id == host_id && active.generation == generation);
+            if !already_live {
+                state.accepted = Some((host_id, generation));
+            }
             let _ = acknowledgement.send(Ok(()));
         }
         ControlCommand::Start {
@@ -468,10 +482,25 @@ fn handle_control_command(
             host_id,
             generation,
             input_only,
+            pending_acceptance,
             acknowledgement,
         } => {
-            let result = state
-                .consume_acceptance(&host_id, generation)
+            let authorized = if pending_acceptance {
+                // The user's press is the authorization. Audio captured before
+                // the host accepts is held by the frontend and discarded if the
+                // session never starts, so nothing reaches a provider early.
+                // Only an input-only session may do this: a conversation also
+                // opens playback, which has no meaning before acceptance.
+                if input_only {
+                    state.accepted = None;
+                    Ok(())
+                } else {
+                    Err("pre-acceptance capture is limited to input-only sessions".to_owned())
+                }
+            } else {
+                state.consume_acceptance(&host_id, generation)
+            };
+            let result = authorized
                 .and_then(|()| {
                     state.stop_active();
                     open_device_session(generation, event_tx.clone(), input_only)

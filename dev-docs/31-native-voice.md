@@ -25,9 +25,19 @@ radio group.
 `voice_start` carries a strongly typed request: `conversation` contains its
 target and bidirectional formats, while `dictation` contains only input
 formats. `voice_accepted` echoes the selected request shape after the relevant
-provider stream is live. Desktop and mobile must not open a microphone before
-this acceptance. All later frames use
+provider stream is live. All later frames use
 `/voice/<session-id>` and repeat session id and generation.
+
+A microphone opens only on a user gesture. A conversation additionally waits
+for `voice_accepted`, because it opens playback too, and the native audio
+thread refuses a non-input-only start that has not been authorized by an
+accepted session. Desktop dictation is input-only and starts capture on the
+gesture itself: credential resolution and the provider stream open sit between
+the press and acceptance, and audio spoken in that window would otherwise never
+be captured. That audio is held client-side and is only ever sent after
+acceptance; if the session fails or is abandoned the queue is discarded and the
+microphone closed, so nothing captured early reaches a provider. Mobile
+dictation still waits for acceptance.
 
 States are `starting`, `listening`, `agent_working`, `speaking`,
 `interrupting`, `ending`, and `ended`. Controls are `voice_input_end`,

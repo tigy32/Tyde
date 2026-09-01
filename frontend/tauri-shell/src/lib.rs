@@ -812,10 +812,11 @@ async fn voice_media_start(
     host_id: String,
     generation: u64,
     input_only: bool,
+    pending_acceptance: bool,
 ) -> Result<(), String> {
     state
         .voice_media
-        .start(app, host_id, generation, input_only)
+        .start(app, host_id, generation, input_only, pending_acceptance)
 }
 
 #[cfg(not(target_os = "windows"))]

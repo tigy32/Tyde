@@ -176,6 +176,7 @@ pub async fn voice_media_start(
     host_id: &str,
     generation: u64,
     input_only: bool,
+    pending_acceptance: bool,
 ) -> Result<(), String> {
     #[derive(Serialize)]
     #[serde(rename_all = "camelCase")]
@@ -183,11 +184,13 @@ pub async fn voice_media_start(
         host_id: &'a str,
         generation: u64,
         input_only: bool,
+        pending_acceptance: bool,
     }
     let args = serde_wasm_bindgen::to_value(&Args {
         host_id,
         generation,
         input_only,
+        pending_acceptance,
     })
     .map_err(|error| error.to_string())?;
     tauri_invoke("voice_media_start", args)

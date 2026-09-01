@@ -57,6 +57,30 @@ fn prepare_voice_uplink(
     })
 }
 
+enum VoiceUplinkRouting {
+    Send(PreparedVoiceUplink),
+    /// Captured before the host accepted the session. The packet waits in the
+    /// queue rather than being dropped, which is the whole point of opening the
+    /// microphone on the press.
+    Hold(bridge::VoiceOpusPacketEvent),
+    Drop,
+}
+
+fn route_voice_uplink(
+    state: &VoiceUiState,
+    event: bridge::VoiceOpusPacketEvent,
+) -> VoiceUplinkRouting {
+    if let VoiceUiState::Starting { generation, .. } = state
+        && *generation == event.generation
+    {
+        return VoiceUplinkRouting::Hold(event);
+    }
+    match prepare_voice_uplink(state, event) {
+        Ok(prepared) => VoiceUplinkRouting::Send(prepared),
+        Err(_) => VoiceUplinkRouting::Drop,
+    }
+}
+
 async fn send_prepared_voice_uplink_with<F, Fut>(
     prepared: PreparedVoiceUplink,
     send: F,
@@ -277,12 +301,36 @@ fn start(
             *value
         })
         .unwrap_or(1);
+    clear_voice_uplink_queue();
+    let capture_first = request.mode() == protocol::VoiceMode::Dictation;
     state.voice_ui.set(VoiceUiState::Starting {
         generation,
         host_id: host_id.clone(),
         request: request.clone(),
         dictation,
     });
+    if capture_first {
+        // Open the microphone on the user's gesture instead of waiting for the
+        // host to accept. Credential resolution and the Transcribe stream open
+        // sit between the press and acceptance, and anything said in that
+        // window was previously never captured at all. What is recorded before
+        // acceptance waits in the uplink queue, and is discarded with it if the
+        // session never starts.
+        let capture_state = state.clone();
+        let capture_host = host_id.clone();
+        spawn_local(async move {
+            if let Err(error) =
+                bridge::voice_media_start(&capture_host, generation, true, true).await
+            {
+                let failed = failed_voice_state(&capture_state.voice_ui.get_untracked(), error);
+                stop(
+                    capture_state.clone(),
+                    protocol::VoiceStopReason::MediaFailed,
+                );
+                capture_state.voice_ui.set(failed);
+            }
+        });
+    }
     spawn_local(async move {
         let payload = protocol::VoiceStartPayload {
             generation,
@@ -304,6 +352,7 @@ fn start(
 
 pub fn stop(state: AppState, reason: protocol::VoiceStopReason) {
     let current = state.voice_ui.get_untracked();
+    clear_voice_uplink_queue();
     let VoiceUiState::Active {
         generation,
         host_id,
@@ -313,6 +362,12 @@ pub fn stop(state: AppState, reason: protocol::VoiceStopReason) {
     } = current
     else {
         state.voice_ui.set(VoiceUiState::Idle);
+        // A session abandoned before acceptance still has a live microphone,
+        // because capture-first opens it on the press. Leaving without this
+        // would keep it recording with nowhere to send the audio.
+        spawn_local(async {
+            let _ = bridge::voice_media_stop().await;
+        });
         return;
     };
     state.voice_ui.set(VoiceUiState::Idle);
@@ -501,18 +556,26 @@ pub fn handle_control(state: &AppState, host_id: &str, envelope: &protocol::Enve
                     next_output_media_seq: 0,
                     dropped_output_packets: 0,
                 });
-                let media_state = state.clone();
-                let media_host = host_id.to_owned();
-                spawn_local(async move {
-                    if let Err(error) =
-                        bridge::voice_media_start(&media_host, generation, input_only).await
-                    {
-                        let failed =
-                            failed_voice_state(&media_state.voice_ui.get_untracked(), error);
-                        stop(media_state.clone(), protocol::VoiceStopReason::MediaFailed);
-                        media_state.voice_ui.set(failed);
-                    }
-                });
+                if input_only {
+                    // Capture-first already opened the microphone on the press.
+                    // Everything recorded while connecting is queued, and now
+                    // flushes in capture order ahead of anything since.
+                    drain_voice_uplink_queue(state);
+                } else {
+                    let media_state = state.clone();
+                    let media_host = host_id.to_owned();
+                    spawn_local(async move {
+                        if let Err(error) =
+                            bridge::voice_media_start(&media_host, generation, input_only, false)
+                                .await
+                        {
+                            let failed =
+                                failed_voice_state(&media_state.voice_ui.get_untracked(), error);
+                            stop(media_state.clone(), protocol::VoiceStopReason::MediaFailed);
+                            media_state.voice_ui.set(failed);
+                        }
+                    });
+                }
             }
         }
         FrameKind::VoiceTranscript => {
@@ -650,6 +713,7 @@ pub fn handle_control(state: &AppState, host_id: &str, envelope: &protocol::Enve
                 }
                 state.voice_ui.set(VoiceUiState::Idle);
                 clear_media_push_queue();
+                clear_voice_uplink_queue();
                 spawn_local(async {
                     let _ = bridge::voice_media_stop().await;
                 });
@@ -678,6 +742,7 @@ pub fn handle_control(state: &AppState, host_id: &str, envelope: &protocol::Enve
                     );
                     state.voice_ui.set(failed);
                     clear_media_push_queue();
+                    clear_voice_uplink_queue();
                     spawn_local(async {
                         let _ = bridge::voice_media_stop().await;
                     });
@@ -739,20 +804,85 @@ fn voice_error_message(payload: &protocol::VoiceErrorPayload) -> String {
     message
 }
 
-fn handle_voice_opus_packet(packet_state: &AppState, event: bridge::VoiceOpusPacketEvent) {
-    let prepared = match prepare_voice_uplink(&packet_state.voice_ui.get_untracked(), event) {
-        Ok(prepared) => prepared,
-        Err(_) => return,
-    };
-    spawn_local(async move {
-        let _ = send_prepared_voice_uplink_with(
-            prepared,
-            |host_id, stream, payload, opus| async move {
-                send_binary_frame(&host_id, stream, FrameKind::VoiceAudio, &payload, &opus).await
-            },
-        )
-        .await;
+/// Roughly fifteen seconds of 20ms Opus packets. The cap bounds a session that
+/// never reaches acceptance. It drops the newest packet rather than the oldest
+/// because the head of the queue holds the words spoken first, which is exactly
+/// what capture-first exists to keep.
+const VOICE_UPLINK_QUEUE_LIMIT: usize = 750;
+
+thread_local! {
+    static VOICE_UPLINK_QUEUE: RefCell<VecDeque<bridge::VoiceOpusPacketEvent>> =
+        const { RefCell::new(VecDeque::new()) };
+    static VOICE_UPLINK_PUMP_RUNNING: Cell<bool> = const { Cell::new(false) };
+}
+
+fn clear_voice_uplink_queue() {
+    VOICE_UPLINK_QUEUE.with(|queue| queue.borrow_mut().clear());
+}
+
+/// Captured input goes through one FIFO drained by a single task. The server
+/// treats any packet whose `first_media_seq` is below what it has already seen
+/// as a duplicate and discards it, so a flush that raced live capture would
+/// silently lose the buffered opening words. One drain is what makes the order
+/// on the wire the order the microphone produced.
+fn enqueue_voice_uplink(state: &AppState, event: bridge::VoiceOpusPacketEvent) {
+    let queued = VOICE_UPLINK_QUEUE.with(|queue| {
+        let mut queue = queue.borrow_mut();
+        if queue.len() >= VOICE_UPLINK_QUEUE_LIMIT {
+            return false;
+        }
+        queue.push_back(event);
+        true
     });
+    if !queued {
+        log::warn!("voice uplink queue is full; dropping a captured packet");
+        return;
+    }
+    drain_voice_uplink_queue(state);
+}
+
+fn drain_voice_uplink_queue(state: &AppState) {
+    if VOICE_UPLINK_PUMP_RUNNING.with(|running| running.replace(true)) {
+        return;
+    }
+    let state = state.clone();
+    spawn_local(async move {
+        loop {
+            let Some(event) = VOICE_UPLINK_QUEUE.with(|queue| queue.borrow_mut().pop_front())
+            else {
+                VOICE_UPLINK_PUMP_RUNNING.with(|running| running.set(false));
+                return;
+            };
+            match route_voice_uplink(&state.voice_ui.get_untracked(), event) {
+                VoiceUplinkRouting::Send(prepared) => {
+                    let _ = send_prepared_voice_uplink_with(
+                        prepared,
+                        |host_id, stream, payload, opus| async move {
+                            send_binary_frame(
+                                &host_id,
+                                stream,
+                                FrameKind::VoiceAudio,
+                                &payload,
+                                &opus,
+                            )
+                            .await
+                        },
+                    )
+                    .await;
+                }
+                VoiceUplinkRouting::Hold(event) => {
+                    VOICE_UPLINK_QUEUE.with(|queue| queue.borrow_mut().push_front(event));
+                    VOICE_UPLINK_PUMP_RUNNING.with(|running| running.set(false));
+                    return;
+                }
+                VoiceUplinkRouting::Drop => {}
+            }
+        }
+    });
+}
+
+fn handle_voice_opus_packet(packet_state: &AppState, event: bridge::VoiceOpusPacketEvent) {
+    enqueue_voice_uplink(packet_state, event);
 }
 
 async fn register_voice_opus_listener(state: AppState) -> Result<bridge::UnlistenHandle, String> {
@@ -1742,6 +1872,7 @@ mod wasm_tests {
             "__tyde_voice_test_packet_dispatch",
             "__tyde_voice_test_host_frame_dispatch",
             "__tyde_voice_test_send_host_frame_args",
+            "__tyde_voice_test_send_host_frame_log",
             "__tyde_voice_test_push_output_args",
             "__tyde_voice_test_listen_attempts",
             "__tyde_voice_test_unlisten_calls",
@@ -1758,6 +1889,7 @@ mod wasm_tests {
             window.__tyde_voice_test_packet_dispatch = undefined;
             window.__tyde_voice_test_host_frame_dispatch = undefined;
             window.__tyde_voice_test_send_host_frame_args = undefined;
+            window.__tyde_voice_test_send_host_frame_log = [];
             window.__tyde_voice_test_push_output_args = undefined;
             window.__tyde_voice_test_listen_attempts = 0;
             window.__tyde_voice_test_unlisten_calls = 0;
@@ -1810,6 +1942,7 @@ mod wasm_tests {
                     invoke: function(command, args) {
                         if (command === "send_host_frame") {
                             window.__tyde_voice_test_send_host_frame_args = args;
+                            window.__tyde_voice_test_send_host_frame_log.push(args);
                             return Promise.resolve(null);
                         }
                         if (command === "voice_media_push_output") {
@@ -2170,6 +2303,146 @@ mod wasm_tests {
         assert_eq!(downlink.media_seq, 9);
         assert_eq!(downlink.timestamp_samples_48k, 8_640);
         assert_eq!(downlink.opus, vec![4, 5]);
+
+        drop(mount);
+        container.remove();
+    }
+
+    fn uplink_log() -> Vec<protocol::VoiceAudioPayload> {
+        let log = js_sys::Array::from(&captured_invoke("__tyde_voice_test_send_host_frame_log"));
+        (0..log.length())
+            .map(|index| {
+                #[derive(serde::Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct Invocation {
+                    envelope: String,
+                }
+                let invocation: Invocation = serde_wasm_bindgen::from_value(log.get(index))
+                    .expect("decode send_host_frame invocation");
+                let envelope: protocol::Envelope =
+                    serde_json::from_str(&invocation.envelope).expect("decode envelope");
+                assert_eq!(envelope.kind, FrameKind::VoiceAudio);
+                envelope.parse_payload().expect("decode audio payload")
+            })
+            .collect()
+    }
+
+    async fn wait_for_uplinks(expected: usize) -> Vec<protocol::VoiceAudioPayload> {
+        for _ in 0..16 {
+            let sent = uplink_log();
+            if sent.len() >= expected {
+                return sent;
+            }
+            next_tick().await;
+        }
+        uplink_log()
+    }
+
+    /// **Words spoken while the provider stream is still opening must survive.**
+    ///
+    /// The microphone now opens on the press rather than on acceptance, so
+    /// audio exists before there is a session to send it to. It has to be held
+    /// and then replayed in capture order: the server discards any packet whose
+    /// sequence it has already passed, so a flush that arrived after live
+    /// capture would drop precisely the opening words this exists to keep.
+    #[wasm_bindgen_test]
+    async fn dictation_captured_before_acceptance_flushes_in_capture_order() {
+        #[derive(serde::Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct UplinkEvent {
+            generation: u64,
+            media_seq: u64,
+            timestamp_samples_48k: u64,
+            opus: Vec<u8>,
+        }
+
+        let _stub = install_voice_listener_stub(None, None);
+        let container = container();
+        let state = AppState::new();
+        let composer = state.composer();
+        state.voice_ui.set(VoiceUiState::Starting {
+            generation: 5,
+            host_id: "local".to_owned(),
+            request: protocol::VoiceRequest::Dictation {
+                formats: vec![protocol::VoiceAudioFormat::opus(48_000)],
+            },
+            dictation: Some(DictationCapture {
+                composer_text: composer.text.clone(),
+                finalized: String::new(),
+                partial: None,
+                finishing: false,
+            }),
+        });
+        let render_state = state.clone();
+        let mount = mount_to(container.clone(), move || {
+            provide_context(render_state.clone());
+            view! { <VoiceRuntime /> }
+        });
+        wait_for_voice_listener_attempts(4).await;
+        next_tick().await;
+
+        for seq in 0..3u64 {
+            dispatch_tauri_voice_event(
+                "__tyde_voice_test_packet_dispatch",
+                "tyde://voice-opus-packet",
+                UplinkEvent {
+                    generation: 5,
+                    media_seq: seq,
+                    timestamp_samples_48k: seq * 960,
+                    opus: vec![seq as u8 + 1],
+                },
+            );
+        }
+        next_tick().await;
+        next_tick().await;
+        assert!(
+            uplink_log().is_empty(),
+            "audio captured before acceptance must not reach the host early"
+        );
+
+        let accepted = protocol::Envelope::from_payload(
+            StreamPath("/voice/dictation-session".to_owned()),
+            FrameKind::VoiceAccepted,
+            0,
+            &protocol::VoiceAcceptedPayload {
+                session_id: protocol::VoiceSessionId("dictation-session".to_owned()),
+                generation: 5,
+                request: protocol::VoiceAcceptedRequest::Dictation {
+                    uplink: protocol::VoiceAudioFormat::opus(48_000),
+                },
+            },
+        )
+        .expect("build acceptance envelope");
+        handle_control(&state, "local", &accepted);
+
+        let flushed = wait_for_uplinks(3).await;
+        assert_eq!(
+            flushed
+                .iter()
+                .map(|p| p.first_media_seq)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2],
+            "the held audio must replay in capture order"
+        );
+
+        // Audio captured after acceptance queues behind the flush rather than
+        // overtaking it, which is what keeps the server from discarding the
+        // earlier sequences as duplicates.
+        dispatch_tauri_voice_event(
+            "__tyde_voice_test_packet_dispatch",
+            "tyde://voice-opus-packet",
+            UplinkEvent {
+                generation: 5,
+                media_seq: 3,
+                timestamp_samples_48k: 3 * 960,
+                opus: vec![9],
+            },
+        );
+        let live = wait_for_uplinks(4).await;
+        assert_eq!(
+            live.iter().map(|p| p.first_media_seq).collect::<Vec<_>>(),
+            vec![0, 1, 2, 3]
+        );
 
         drop(mount);
         container.remove();
