@@ -1256,11 +1256,74 @@ fn VoiceSessionControls(state: AppState) -> impl IntoView {
     }
 }
 
+const VOICE_OFFER_UNAVAILABLE: &str = "Speech is unavailable in this chat";
+
+/// Whether each speech mode can start for one composer. A mode holds `None`
+/// when it is startable and `Some(reason)` when it is not, so the mode menu can
+/// say *why* a mode is out rather than offering a dead entry the way the old
+/// disabled `<option>` did.
+#[derive(Clone, PartialEq, Eq, Debug)]
+struct ComposerVoiceOffer {
+    host: Option<String>,
+    conversation_block: Option<&'static str>,
+    dictation_block: Option<&'static str>,
+}
+
+impl ComposerVoiceOffer {
+    fn blocked() -> Self {
+        Self {
+            host: None,
+            conversation_block: Some(VOICE_OFFER_UNAVAILABLE),
+            dictation_block: Some(VOICE_OFFER_UNAVAILABLE),
+        }
+    }
+
+    fn conversation(&self) -> bool {
+        self.conversation_block.is_none()
+    }
+
+    fn dictation(&self) -> bool {
+        self.dictation_block.is_none()
+    }
+
+    fn allows(&self, mode: protocol::VoiceMode) -> bool {
+        match mode {
+            protocol::VoiceMode::Conversation => self.conversation(),
+            protocol::VoiceMode::Dictation => self.dictation(),
+        }
+    }
+
+    fn any(&self) -> bool {
+        self.conversation() || self.dictation()
+    }
+
+    fn block(&self, mode: protocol::VoiceMode) -> Option<&'static str> {
+        match mode {
+            protocol::VoiceMode::Conversation => self.conversation_block,
+            protocol::VoiceMode::Dictation => self.dictation_block,
+        }
+    }
+
+    /// The mode the mic actually starts: the remembered choice when it can run,
+    /// otherwise whichever mode can. `None` when neither is startable.
+    fn effective(&self, chosen: protocol::VoiceMode) -> Option<protocol::VoiceMode> {
+        if self.allows(chosen) {
+            return Some(chosen);
+        }
+        [
+            protocol::VoiceMode::Dictation,
+            protocol::VoiceMode::Conversation,
+        ]
+        .into_iter()
+        .find(|mode| self.allows(*mode))
+    }
+}
+
 fn composer_voice_availability(
     state: &AppState,
     agent_ref: Signal<Option<ActiveAgentRef>>,
     composer: ComposerHandle,
-) -> Memo<(Option<String>, bool, bool)> {
+) -> Memo<ComposerVoiceOffer> {
     let state = state.clone();
     Memo::new(move |_| {
         #[cfg(target_arch = "wasm32")]
@@ -1268,19 +1331,19 @@ fn composer_voice_availability(
         #[cfg(not(target_arch = "wasm32"))]
         let owns_active_composer = state.composer_untracked().text == composer.text;
         if !owns_active_composer || !state.native_voice_supported.get() {
-            return (None, false, false);
+            return ComposerVoiceOffer::blocked();
         }
         let active = state.active_agent.get();
         let requested_agent = agent_ref.get();
         if requested_agent != active {
-            return (None, false, false);
+            return ComposerVoiceOffer::blocked();
         }
         let host = requested_agent
             .as_ref()
             .map(|agent| agent.host_id.clone())
             .or_else(|| state.chat_context_host_id());
         let Some(host) = host else {
-            return (None, false, false);
+            return ComposerVoiceOffer::blocked();
         };
         let settings = state
             .host_settings_by_host
@@ -1288,22 +1351,44 @@ fn composer_voice_availability(
         let capabilities = state
             .voice_capabilities_by_host
             .with(|capabilities| capabilities.get(&host).cloned());
-        let conversation = requested_agent.is_some()
-            && target_with_resolution_tracked(&state).0.target_resolvable
-            && settings.as_ref().is_some_and(|value| value.voice.enabled)
-            && capabilities
-                .as_ref()
-                .is_some_and(|value| value.nova_available);
-        let dictation = settings
+        let conversation_block = if !settings.as_ref().is_some_and(|value| value.voice.enabled) {
+            Some("Voice is turned off for this host")
+        } else if !capabilities
+            .as_ref()
+            .is_some_and(|value| value.nova_available)
+        {
+            Some("Nova is not configured for this host")
+        } else if requested_agent.is_none()
+            || !target_with_resolution_tracked(&state).0.target_resolvable
+        {
+            Some("Open a running agent to talk with Nova")
+        } else {
+            None
+        };
+        let dictation_block = if !settings
             .as_ref()
             .is_some_and(|value| value.voice.dictation_enabled)
-            && capabilities
-                .as_ref()
-                .is_some_and(|value| value.dictation_available);
-        (Some(host), conversation, dictation)
+        {
+            Some("Dictation is turned off for this host")
+        } else if !capabilities
+            .as_ref()
+            .is_some_and(|value| value.dictation_available)
+        {
+            Some("Amazon Transcribe is not configured for this host")
+        } else {
+            None
+        };
+        ComposerVoiceOffer {
+            host: Some(host),
+            conversation_block,
+            dictation_block,
+        }
     })
 }
 
+/// Dictation is the default because it is the mode that can nearly always run
+/// (it needs no agent and no resolvable target) and the one that cannot act on
+/// your behalf — it only fills the composer, which you still read and send.
 pub fn initial_voice_mode() -> protocol::VoiceMode {
     #[cfg(target_arch = "wasm32")]
     if let Some(storage) =
@@ -1313,11 +1398,69 @@ pub fn initial_voice_mode() -> protocol::VoiceMode {
             .ok()
             .flatten()
             .as_deref()
-            == Some("dictation")
+            == Some("conversation")
     {
-        return protocol::VoiceMode::Dictation;
+        return protocol::VoiceMode::Conversation;
     }
-    protocol::VoiceMode::Conversation
+    protocol::VoiceMode::Dictation
+}
+
+pub fn voice_mode_value(mode: protocol::VoiceMode) -> &'static str {
+    match mode {
+        protocol::VoiceMode::Conversation => "conversation",
+        protocol::VoiceMode::Dictation => "dictation",
+    }
+}
+
+pub fn voice_mode_label(mode: protocol::VoiceMode) -> &'static str {
+    match mode {
+        protocol::VoiceMode::Conversation => "Talk with Nova",
+        protocol::VoiceMode::Dictation => "Dictate to composer",
+    }
+}
+
+fn voice_mode_hint(mode: protocol::VoiceMode) -> &'static str {
+    match mode {
+        protocol::VoiceMode::Conversation => "Hold a spoken conversation with Nova",
+        protocol::VoiceMode::Dictation => "Speak to fill the composer, then edit before sending",
+    }
+}
+
+/// A distinct glyph per mode so the button reads as its current mode at a
+/// glance — a headset for the conversation, a mic for dictation — without the
+/// text label the mode select used to spend composer width on.
+fn voice_mode_icon(mode: protocol::VoiceMode) -> AnyView {
+    match mode {
+        protocol::VoiceMode::Dictation => view! {
+            <svg
+                class="voice-mic-icon"
+                viewBox="0 0 24 24"
+                width="16"
+                height="16"
+                fill="currentColor"
+                aria-hidden="true"
+            >
+                <path d="M12 14a3 3 0 0 0 3-3V5a3 3 0 0 0-6 0v6a3 3 0 0 0 3 3z" />
+                <path d="M19 11a1 1 0 1 0-2 0 5 5 0 0 1-10 0 1 1 0 1 0-2 0 7 7 0 0 0 6 6.92V20H8.5a1 1 0 1 0 0 2h7a1 1 0 1 0 0-2H13v-2.08A7 7 0 0 0 19 11z" />
+            </svg>
+        }
+        .into_any(),
+        protocol::VoiceMode::Conversation => view! {
+            <svg
+                class="voice-mic-icon"
+                viewBox="0 0 24 24"
+                width="16"
+                height="16"
+                fill="currentColor"
+                aria-hidden="true"
+            >
+                <path d="M12 3a8 8 0 0 0-8 8v1a1 1 0 0 0 2 0v-1a6 6 0 0 1 12 0v1a1 1 0 0 0 2 0v-1a8 8 0 0 0-8-8z" />
+                <path d="M4 13a2 2 0 0 1 2 2v3a2 2 0 1 1-4 0v-3a2 2 0 0 1 2-2z" />
+                <path d="M20 13a2 2 0 0 1 2 2v3a2 2 0 1 1-4 0v-3a2 2 0 0 1 2-2z" />
+            </svg>
+        }
+        .into_any(),
+    }
 }
 
 fn remember_voice_mode(mode: protocol::VoiceMode) {
@@ -1327,11 +1470,7 @@ fn remember_voice_mode(mode: protocol::VoiceMode) {
     if let Some(storage) =
         web_sys::window().and_then(|window| window.local_storage().ok().flatten())
     {
-        let value = match mode {
-            protocol::VoiceMode::Conversation => "conversation",
-            protocol::VoiceMode::Dictation => "dictation",
-        };
-        let _ = storage.set_item("tyde.voice.mode", value);
+        let _ = storage.set_item("tyde.voice.mode", voice_mode_value(mode));
     }
 }
 
@@ -1341,84 +1480,115 @@ fn remember_voice_mode(mode: protocol::VoiceMode) {
 /// `position: fixed` at the bottom-centre of the viewport — exactly where the
 /// composer sits — so it painted on top of the textarea and read as a button
 /// inside the text input.
+///
+/// It is a split button rather than a mode `<select>` plus a mic: the mode is a
+/// sticky preference you set once, so it belongs behind the caret with the
+/// other composer menus, not in 150px of permanent composer width. The caret
+/// lists both modes always — a mode that cannot start stays visible but
+/// disabled and says why, which a disabled `<option>` could not.
 #[component]
 pub fn VoiceComposerButton(
     agent_ref: Signal<Option<ActiveAgentRef>>,
     composer: ComposerHandle,
 ) -> impl IntoView {
     let state = expect_context::<AppState>();
-    let available = composer_voice_availability(&state, agent_ref, composer.clone());
+    let offer = composer_voice_availability(&state, agent_ref, composer.clone());
     let idle_state = state.clone();
     let show = Memo::new(move |_| {
-        let (_, conversation, dictation) = available.get();
-        (conversation || dictation) && matches!(idle_state.voice_ui.get(), VoiceUiState::Idle)
+        offer.get().any() && matches!(idle_state.voice_ui.get(), VoiceUiState::Idle)
     });
-    let select_state = state.clone();
+    let mode_state = state.clone();
+    let effective_mode =
+        Memo::new(move |_| offer.get().effective(mode_state.voice_mode_choice.get()));
+    let menu_open = RwSignal::new(false);
+    let choice_state = StoredValue::new(state.clone());
     let start_state = StoredValue::new((state, composer));
-    view! {
-        <Show when=move || show.get()>
-            <select
-                class="voice-mode-select"
-                data-testid="voice-mode-select"
-                aria-label="Speech mode"
-                prop:value=move || match select_state.voice_mode_choice.get() {
-                    protocol::VoiceMode::Conversation => "conversation",
-                    protocol::VoiceMode::Dictation => "dictation",
+    let start_effective = move || {
+        let Some(mode) = effective_mode.get_untracked() else {
+            return;
+        };
+        start_state.with_value(|(state, composer)| match mode {
+            protocol::VoiceMode::Dictation => {
+                if let Some(host) = offer.get_untracked().host {
+                    start_dictation(state.clone(), host, composer.text.clone());
                 }
-                on:change=move |event| {
-                    let mode = if event_target_value(&event) == "dictation" {
-                        protocol::VoiceMode::Dictation
-                    } else {
-                        protocol::VoiceMode::Conversation
-                    };
-                    select_state.voice_mode_choice.set(mode);
-                    remember_voice_mode(mode);
-                }
-            >
-                <option value="conversation" disabled=move || !available.get().1>"Talk with Nova"</option>
-                <option value="dictation" disabled=move || !available.get().2>"Dictate to composer"</option>
-            </select>
+            }
+            protocol::VoiceMode::Conversation => start_conversation(state.clone()),
+        })
+    };
+    let mode_item = move |mode: protocol::VoiceMode| {
+        let block = Memo::new(move |_| offer.get().block(mode));
+        let selected = Memo::new(move |_| effective_mode.get() == Some(mode));
+        view! {
             <button
                 type="button"
-                class="chat-send-btn chat-voice-btn"
-                data-test="chat-voice-start"
-                aria-label="Start selected speech mode"
-                title="Start selected speech mode"
+                class="chat-send-menu-item"
+                role="menuitemradio"
+                aria-checked=move || if selected.get() { "true" } else { "false" }
+                data-test=format!("chat-voice-mode-{}", voice_mode_value(mode))
+                disabled=move || block.get().is_some()
+                title=move || block.get().unwrap_or(voice_mode_hint(mode))
                 on:click=move |_| {
-                    start_state.with_value(|(state, composer)| {
-                        let (host, conversation, dictation) = available.get_untracked();
-                        match state.voice_mode_choice.get_untracked() {
-                            protocol::VoiceMode::Dictation if dictation => {
-                                if let Some(host) = host {
-                                    start_dictation(state.clone(), host, composer.text.clone());
-                                }
-                            }
-                            protocol::VoiceMode::Conversation if conversation => {
-                                start_conversation(state.clone())
-                            }
-                            _ if dictation => {
-                                if let Some(host) = host {
-                                    start_dictation(state.clone(), host, composer.text.clone());
-                                }
-                            }
-                            _ if conversation => start_conversation(state.clone()),
-                            _ => {}
-                        }
-                    })
+                    choice_state.with_value(|state| state.voice_mode_choice.set(mode));
+                    remember_voice_mode(mode);
+                    menu_open.set(false);
                 }
             >
-                <svg
-                    class="voice-mic-icon"
-                    viewBox="0 0 24 24"
-                    width="16"
-                    height="16"
-                    fill="currentColor"
-                    aria-hidden="true"
-                >
-                    <path d="M12 14a3 3 0 0 0 3-3V5a3 3 0 0 0-6 0v6a3 3 0 0 0 3 3z" />
-                    <path d="M19 11a1 1 0 1 0-2 0 5 5 0 0 1-10 0 1 1 0 1 0-2 0 7 7 0 0 0 6 6.92V20H8.5a1 1 0 1 0 0 2h7a1 1 0 1 0 0-2H13v-2.08A7 7 0 0 0 19 11z" />
-                </svg>
+                <span class="chat-send-menu-label">{voice_mode_label(mode)}</span>
+                <span class="chat-send-menu-check" aria-hidden="true">
+                    {move || if selected.get() { "✓" } else { "" }}
+                </span>
             </button>
+        }
+    };
+    view! {
+        <Show when=move || show.get()>
+            <div class="chat-send-split chat-voice-split" role="group" aria-label="Speech actions">
+                <button
+                    type="button"
+                    class="chat-send-btn chat-voice-btn chat-send-split-primary"
+                    data-test="chat-voice-start"
+                    data-voice-mode=move || {
+                        effective_mode.get().map(voice_mode_value).unwrap_or("none")
+                    }
+                    aria-label=move || {
+                        effective_mode.get().map(voice_mode_label).unwrap_or("Start speech")
+                    }
+                    title=move || {
+                        effective_mode.get().map(voice_mode_label).unwrap_or("Start speech")
+                    }
+                    on:click=move |_| start_effective()
+                >
+                    {move || effective_mode.get().map(voice_mode_icon)}
+                </button>
+                <button
+                    type="button"
+                    class="chat-send-btn chat-send-split-toggle"
+                    data-test="chat-voice-mode-toggle"
+                    aria-haspopup="menu"
+                    aria-expanded=move || if menu_open.get() { "true" } else { "false" }
+                    aria-label="Choose speech mode"
+                    title="Choose speech mode"
+                    on:click=move |_| menu_open.update(|open| *open = !*open)
+                >
+                    <span aria-hidden="true">"⌄"</span>
+                </button>
+                <Show when=move || menu_open.get()>
+                    <div
+                        class="chat-send-menu-backdrop"
+                        on:click=move |_| menu_open.set(false)
+                    ></div>
+                    <div
+                        class="chat-send-menu"
+                        role="menu"
+                        aria-label="Speech mode"
+                        data-test="chat-voice-mode-menu"
+                    >
+                        {mode_item(protocol::VoiceMode::Dictation)}
+                        {mode_item(protocol::VoiceMode::Conversation)}
+                    </div>
+                </Show>
+            </div>
         </Show>
     }
 }
@@ -1432,7 +1602,7 @@ pub fn VoiceComposerBar(
     composer: ComposerHandle,
 ) -> impl IntoView {
     let state = expect_context::<AppState>();
-    let available = composer_voice_availability(&state, agent_ref, composer.clone());
+    let offer = composer_voice_availability(&state, agent_ref, composer.clone());
     let session_state = state.clone();
     let in_session = Memo::new(move |_| match session_state.voice_ui.get() {
         VoiceUiState::Starting {
@@ -1448,7 +1618,7 @@ pub fn VoiceComposerBar(
             ..
         } => origin == composer.text,
         VoiceUiState::Idle => false,
-        _ => available.get().1,
+        _ => offer.get().conversation(),
     });
     let render_state = StoredValue::new(state);
     view! {
@@ -2303,6 +2473,39 @@ mod wasm_tests {
             start_button(&container).is_some(),
             "dictation availability must offer speech in a new-chat composer"
         );
+        // Only dictation can run here, so the mic must commit to it rather than
+        // making the user consult a separate mode control.
+        assert_eq!(
+            start_button(&container)
+                .unwrap()
+                .get_attribute("data-voice-mode")
+                .as_deref(),
+            Some("dictation")
+        );
+        let toggle: HtmlElement = container
+            .query_selector("[data-test='chat-voice-mode-toggle']")
+            .unwrap()
+            .expect("mode caret must be offered")
+            .dyn_into()
+            .unwrap();
+        toggle.click();
+        next_tick().await;
+        let blocked = container
+            .query_selector("[data-test='chat-voice-mode-conversation']")
+            .unwrap()
+            .expect("an unavailable mode stays listed rather than vanishing");
+        assert!(
+            blocked.has_attribute("disabled"),
+            "a mode that cannot start must not be selectable"
+        );
+        // The whole reason for replacing the disabled `<option>`: the menu now
+        // says why the mode is out instead of offering a dead entry.
+        assert_eq!(
+            blocked.get_attribute("title").as_deref(),
+            Some("Voice is turned off for this host")
+        );
+        toggle.click();
+        next_tick().await;
 
         state.voice_ui.set(VoiceUiState::Active {
             generation: 7,
@@ -2661,14 +2864,50 @@ mod wasm_tests {
             }
         });
         next_tick().await;
-        let modes = container
-            .query_selector("[data-testid='voice-mode-select']")
+        // The mic announces the mode it will start, so a user knows what the
+        // press does without reading a separate control.
+        assert_eq!(
+            start_button(&container)
+                .expect("mic must be offered")
+                .get_attribute("aria-label")
+                .as_deref(),
+            Some("Dictate to composer")
+        );
+        assert!(
+            container
+                .query_selector("[data-test='chat-voice-mode-menu']")
+                .unwrap()
+                .is_none(),
+            "the mode menu must stay closed until its caret is used"
+        );
+        let toggle: HtmlElement = container
+            .query_selector("[data-test='chat-voice-mode-toggle']")
             .unwrap()
-            .expect("both speech modes must be selectable")
-            .text_content()
+            .expect("mode caret must be offered")
+            .dyn_into()
             .unwrap();
-        assert!(modes.contains("Talk with Nova"));
-        assert!(modes.contains("Dictate to composer"));
+        toggle.click();
+        next_tick().await;
+        for (selector, label, checked) in [
+            ("chat-voice-mode-dictation", "Dictate to composer", "true"),
+            ("chat-voice-mode-conversation", "Talk with Nova", "false"),
+        ] {
+            let item = container
+                .query_selector(&format!("[data-test='{selector}']"))
+                .unwrap()
+                .expect("both speech modes must stay listed");
+            assert!(
+                item.text_content().unwrap_or_default().contains(label),
+                "the menu must name {label}"
+            );
+            assert_eq!(
+                item.get_attribute("aria-checked").as_deref(),
+                Some(checked),
+                "the tick must mark the mode the mic would start"
+            );
+        }
+        toggle.click();
+        next_tick().await;
 
         state.voice_ui.set(VoiceUiState::Active {
             generation: 9,

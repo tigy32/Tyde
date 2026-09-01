@@ -14,6 +14,14 @@ not have an agent yet. A conversation session owns the exact
 `VoiceTarget { agent_id, instance_stream }`; dictation deliberately has no
 agent target.
 
+The composer presents these as one split button: the mic starts the remembered
+mode and the caret picks between them. Dictation is the default because it is
+the mode that needs neither an agent nor a resolvable target and cannot act on
+the user's behalf. A mode that cannot start stays listed in the caret menu but
+is disabled and carries the reason, so an unavailable capability is explained
+rather than silently dropped. Mobile shows the same choice as a two-segment
+radio group.
+
 `voice_start` carries a strongly typed request: `conversation` contains its
 target and bidirectional formats, while `dictation` contains only input
 formats. `voice_accepted` echoes the selected request shape after the relevant

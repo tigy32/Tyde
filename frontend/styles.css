@@ -4458,9 +4458,16 @@ kbd {
     white-space: nowrap;
 }
 
-.chat-send-menu-item:hover {
+.chat-send-menu-item:hover:not(:disabled) {
     background: var(--surface-hover);
     color: var(--text-bright);
+}
+
+/* A mode that cannot start stays listed and explains itself through its
+   title, so the menu never silently hides a capability. */
+.chat-send-menu-item:disabled {
+    color: var(--text-tertiary);
+    cursor: not-allowed;
 }
 
 .chat-send-menu-shortcut {
@@ -14099,19 +14106,23 @@ pre.tool-error-pre {
     z-index: 1;
 }
 
+/* Icon-width, not the 56px slab it used to be: the mode now lives behind the
+   caret, so the mic only ever has to hold a 16px glyph. */
 .chat-voice-btn {
-    min-width: 56px;
+    min-width: 32px;
+    padding: 0 8px;
 }
 
-.voice-mode-select {
-    min-width: 0;
-    max-width: 150px;
-    align-self: center;
-    color: var(--text-secondary);
-    background: var(--surface-2);
-    border: 1px solid var(--border-secondary);
-    border-radius: 4px;
-    padding: 5px 6px;
+.chat-voice-split {
+    margin-right: var(--space-1);
+}
+
+/* Reserved width so a row does not shift sideways when its tick appears. */
+.chat-send-menu-check {
+    flex-shrink: 0;
+    min-width: 10px;
+    color: var(--accent-primary);
+    font-size: 0.8rem;
 }
 
 .voice-pulse {

@@ -181,6 +181,9 @@ fn active_target(state: &AppState) -> Option<(LocalHostId, protocol::VoiceTarget
     ))
 }
 
+/// Dictation is the default for the same reason as on desktop: it runs without
+/// an agent or a resolvable target, and it only fills the composer rather than
+/// acting on the user's behalf.
 pub fn initial_voice_mode() -> protocol::VoiceMode {
     if let Some(storage) =
         web_sys::window().and_then(|window| window.local_storage().ok().flatten())
@@ -189,23 +192,62 @@ pub fn initial_voice_mode() -> protocol::VoiceMode {
             .ok()
             .flatten()
             .as_deref()
-            == Some("dictation")
+            == Some("conversation")
     {
-        protocol::VoiceMode::Dictation
-    } else {
         protocol::VoiceMode::Conversation
+    } else {
+        protocol::VoiceMode::Dictation
     }
+}
+
+fn voice_mode_value(mode: protocol::VoiceMode) -> &'static str {
+    match mode {
+        protocol::VoiceMode::Conversation => "conversation",
+        protocol::VoiceMode::Dictation => "dictation",
+    }
+}
+
+fn voice_mode_label(mode: protocol::VoiceMode) -> &'static str {
+    match mode {
+        protocol::VoiceMode::Conversation => "Talk with Nova",
+        protocol::VoiceMode::Dictation => "Dictate to composer",
+    }
+}
+
+fn voice_mode_short_label(mode: protocol::VoiceMode) -> &'static str {
+    match mode {
+        protocol::VoiceMode::Conversation => "Nova",
+        protocol::VoiceMode::Dictation => "Dictate",
+    }
+}
+
+/// The mode the start button will actually use: the remembered choice when it
+/// can run, otherwise whichever mode can.
+fn effective_mode(
+    conversation: bool,
+    dictation: bool,
+    chosen: protocol::VoiceMode,
+) -> Option<protocol::VoiceMode> {
+    let allows = |mode| match mode {
+        protocol::VoiceMode::Conversation => conversation,
+        protocol::VoiceMode::Dictation => dictation,
+    };
+    if allows(chosen) {
+        return Some(chosen);
+    }
+    [
+        protocol::VoiceMode::Dictation,
+        protocol::VoiceMode::Conversation,
+    ]
+    .into_iter()
+    .find(|mode| allows(*mode))
 }
 
 fn remember_voice_mode(mode: protocol::VoiceMode) {
     if let Some(storage) =
         web_sys::window().and_then(|window| window.local_storage().ok().flatten())
     {
-        let value = match mode {
-            protocol::VoiceMode::Conversation => "conversation",
-            protocol::VoiceMode::Dictation => "dictation",
-        };
-        let _ = storage.set_item("tyde.voice.mode", value);
+        let _ = storage.set_item("tyde.voice.mode", voice_mode_value(mode));
     }
 }
 
@@ -239,12 +281,18 @@ fn start(state: AppState) {
     let Some(host) = host else {
         return;
     };
-    let requested_mode = state.voice_mode_choice.get_untracked();
-    let request = match requested_mode {
-        protocol::VoiceMode::Dictation if dictation => protocol::VoiceRequest::Dictation {
+    let Some(mode) = effective_mode(
+        conversation,
+        dictation,
+        state.voice_mode_choice.get_untracked(),
+    ) else {
+        return;
+    };
+    let request = match mode {
+        protocol::VoiceMode::Dictation => protocol::VoiceRequest::Dictation {
             formats: vec![protocol::VoiceAudioFormat::opus(48_000)],
         },
-        protocol::VoiceMode::Conversation if conversation => {
+        protocol::VoiceMode::Conversation => {
             let Some((_, target)) = active_target(&state) else {
                 return;
             };
@@ -256,22 +304,6 @@ fn start(state: AppState) {
                 }],
             }
         }
-        _ if dictation => protocol::VoiceRequest::Dictation {
-            formats: vec![protocol::VoiceAudioFormat::opus(48_000)],
-        },
-        _ if conversation => {
-            let Some((_, target)) = active_target(&state) else {
-                return;
-            };
-            protocol::VoiceRequest::Conversation {
-                target,
-                formats: vec![protocol::VoiceFormatPair {
-                    uplink: protocol::VoiceAudioFormat::opus(48_000),
-                    downlink: protocol::VoiceAudioFormat::opus(24_000),
-                }],
-            }
-        }
-        _ => return,
     };
     let generation = state
         .voice_generation
@@ -903,58 +935,45 @@ fn install(state: AppState) {
 #[component]
 fn MobileVoiceControls(state: AppState) -> impl IntoView {
     move || {
-        let start_state = state.clone();
         let stop_state = state.clone();
         let interrupt_state = state.clone();
         let finish_state = state.clone();
         let cancel_state = state.clone();
         let dismiss_state = state.clone();
         match state.voice_ui.get() {
+            // One button per mode instead of a `<select>` plus a start button:
+            // with exactly two modes, tapping the one you want is a single tap
+            // and needs no popup, and the pill stays inside the compact width
+            // the idle surface is held to. Tapping also remembers the mode, so
+            // the desktop composer opens on the same choice.
+            //
+            // This replaces a write-during-render that rewrote
+            // `voice_mode_choice` whenever the remembered mode was
+            // unavailable; the choice is now left alone and resolved at use.
             MobileVoiceState::Idle => {
                 let (_, conversation, dictation) = mode_availability(&state);
-                let selected = state.voice_mode_choice.get_untracked();
-                if (selected == protocol::VoiceMode::Conversation && !conversation)
-                    || (selected == protocol::VoiceMode::Dictation && !dictation)
-                {
-                    let fallback = if dictation {
-                        protocol::VoiceMode::Dictation
-                    } else {
-                        protocol::VoiceMode::Conversation
-                    };
-                    state.voice_mode_choice.set(fallback);
-                }
-                let choice_state = state.clone();
-                view! {
-                    <div class="mobile-voice-toggle">
-                        <select
-                            aria-label="Voice mode"
-                            prop:value=move || match state.voice_mode_choice.get() {
-                                protocol::VoiceMode::Conversation => "conversation",
-                                protocol::VoiceMode::Dictation => "dictation",
-                            }
-                            on:change=move |event| {
-                                let mode = if event_target_value(&event) == "dictation" {
-                                    protocol::VoiceMode::Dictation
-                                } else {
-                                    protocol::VoiceMode::Conversation
-                                };
-                                choice_state.voice_mode_choice.set(mode);
-                                remember_voice_mode(mode);
-                            }
-                        >
-                            <option value="conversation" disabled=!conversation>
-                                "Talk with Nova"
-                            </option>
-                            <option value="dictation" disabled=!dictation>
-                                "Dictate to composer"
-                            </option>
-                        </select>
+                let mode_button = |mode: protocol::VoiceMode, available: bool| {
+                    let mode_state = state.clone();
+                    view! {
                         <button
-                            on:click=move |_| start(start_state.clone())
-                            aria-label="Start voice"
+                            class="mobile-voice-mode"
+                            aria-label=voice_mode_label(mode)
+                            data-test=format!("mobile-voice-start-{}", voice_mode_value(mode))
+                            disabled=!available
+                            on:click=move |_| {
+                                mode_state.voice_mode_choice.set(mode);
+                                remember_voice_mode(mode);
+                                start(mode_state.clone());
+                            }
                         >
-                            "Voice"
+                            {voice_mode_short_label(mode)}
                         </button>
+                    }
+                };
+                view! {
+                    <div class="mobile-voice-toggle" role="group" aria-label="Speech mode">
+                        {mode_button(protocol::VoiceMode::Dictation, dictation)}
+                        {mode_button(protocol::VoiceMode::Conversation, conversation)}
                     </div>
                 }
                 .into_any()
@@ -1161,12 +1180,18 @@ mod wasm_tests {
             view! { <MobileVoiceControls state=render_state.clone() /> }
         });
         next_tick().await;
-        assert!(
-            container
-                .query_selector("button[aria-label='Start voice']")
-                .unwrap()
-                .is_some()
-        );
+        // No host is selected, so both modes render but neither can start —
+        // the single button this replaces rendered enabled and did nothing.
+        for mode in ["dictation", "conversation"] {
+            assert!(
+                container
+                    .query_selector(&format!("[data-test='mobile-voice-start-{mode}']"))
+                    .unwrap()
+                    .expect("both speech modes must be listed")
+                    .has_attribute("disabled"),
+                "{mode} must not be startable without a voice-capable host"
+            );
+        }
 
         state
             .voice_ui
@@ -1181,12 +1206,18 @@ mod wasm_tests {
 
         state.voice_ui.set(MobileVoiceState::Idle);
         next_tick().await;
-        assert!(
-            container
-                .query_selector("button[aria-label='Start voice']")
-                .unwrap()
-                .is_some()
-        );
+        // No host is selected, so both modes render but neither can start —
+        // the single button this replaces rendered enabled and did nothing.
+        for mode in ["dictation", "conversation"] {
+            assert!(
+                container
+                    .query_selector(&format!("[data-test='mobile-voice-start-{mode}']"))
+                    .unwrap()
+                    .expect("both speech modes must be listed")
+                    .has_attribute("disabled"),
+                "{mode} must not be startable without a voice-capable host"
+            );
+        }
         drop(mount);
         container.remove();
     }
@@ -1211,7 +1242,7 @@ mod wasm_tests {
         next_tick().await;
         assert!(
             container
-                .query_selector("button[aria-label='Start voice']")
+                .query_selector("[data-test^='mobile-voice-start-']")
                 .unwrap()
                 .is_none(),
             "no voice button may show before a chat is active"
@@ -1253,13 +1284,26 @@ mod wasm_tests {
         }));
         next_tick().await;
 
+        let conversation = container
+            .query_selector("[data-test='mobile-voice-start-conversation']")
+            .unwrap()
+            .expect(
+                "the Nova button must appear once a chat is active on a \
+                 voice-capable host",
+            );
+        assert!(
+            !conversation.has_attribute("disabled"),
+            "the configured mode must be startable"
+        );
+        // Transcribe is not configured on this host, so its button stays
+        // listed but unusable instead of silently starting the other mode.
         assert!(
             container
-                .query_selector("button[aria-label='Start voice']")
+                .query_selector("[data-test='mobile-voice-start-dictation']")
                 .unwrap()
-                .is_some(),
-            "the Voice button must appear once a chat is active on a \
-             voice-capable host"
+                .expect("an unconfigured mode stays listed")
+                .has_attribute("disabled"),
+            "dictation must not be startable without Transcribe"
         );
         drop(mount);
         container.remove();
@@ -1325,11 +1369,13 @@ mod wasm_tests {
             .as_f64()
             .unwrap();
 
-        // Idle: the only voice surface is the compact toggle.
+        // Idle: the only voice surface is the compact pill. Measuring the
+        // pill rather than one button keeps the compactness contract honest
+        // now that the pill holds a button per speech mode.
         let toggle = document
-            .query_selector("button[aria-label='Start voice']")
+            .query_selector("[role='group'][aria-label='Speech mode']")
             .unwrap()
-            .expect("idle voice UI must render the Start voice toggle");
+            .expect("idle voice UI must render the speech pill");
         let toggle_width = toggle.get_bounding_client_rect().width();
         assert!(
             toggle_width > 0.0 && toggle_width < viewport_width * 0.4,
@@ -1379,7 +1425,7 @@ mod wasm_tests {
         );
         assert!(
             document
-                .query_selector("button[aria-label='Start voice']")
+                .query_selector("[data-test^='mobile-voice-start-']")
                 .unwrap()
                 .is_some(),
             "Dismiss must return to the compact toggle"
