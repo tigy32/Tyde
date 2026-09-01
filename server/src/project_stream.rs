@@ -31,6 +31,30 @@ const PROJECT_REFRESH_DEBOUNCE: Duration = Duration::from_millis(250);
 const GIT_STATUS_POLL_INTERVAL: Duration = Duration::from_secs(5);
 const RECENT_HISTORY_LIMIT: usize = 100;
 
+struct ProjectWatcherFailure {
+    message: String,
+    limit_reached: bool,
+}
+
+impl ProjectWatcherFailure {
+    fn from_notify(context: String, error: notify::Error) -> Self {
+        Self {
+            message: format!("{context}: {error}"),
+            limit_reached: matches!(error.kind, notify::ErrorKind::MaxFilesWatch),
+        }
+    }
+
+    fn forced_limit(root: &ProjectRootPath) -> Self {
+        Self {
+            message: format!(
+                "failed to watch project root '{}': OS file watch limit reached.",
+                root
+            ),
+            limit_reached: true,
+        }
+    }
+}
+
 struct ProjectWatcher {
     inner: Option<RecommendedWatcher>,
 }
@@ -373,6 +397,7 @@ pub(crate) async fn spawn_project_subscription(
     project_store: Arc<Mutex<ProjectStore>>,
     project_id: ProjectId,
     review_registry: ReviewRegistryHandle,
+    force_watch_limit: bool,
 ) -> Result<ProjectStreamSubscription, String> {
     let project = load_subscription_project(&project_store, &project_id).await?;
     let (watch_tx, watch_rx) = mpsc::unbounded_channel();
@@ -386,13 +411,14 @@ pub(crate) async fn spawn_project_subscription(
         if let Err(error) = std::thread::Builder::new()
             .name("tyde-project-watch-init".to_owned())
             .spawn(move || {
-                let result = create_project_watcher(&project, watch_tx);
+                let result = create_project_watcher(&project, watch_tx, force_watch_limit);
                 let _ = tx.send(result);
             })
         {
-            let _ = watcher_ready_tx.send(Err(format!(
-                "failed to spawn project watcher initialization thread: {error}"
-            )));
+            let _ = watcher_ready_tx.send(Err(ProjectWatcherFailure {
+                message: format!("failed to spawn project watcher initialization thread: {error}"),
+                limit_reached: false,
+            }));
         }
     }
     let (command_tx, command_rx) = mpsc::unbounded_channel();
@@ -436,19 +462,33 @@ async fn load_subscription_project(
 fn create_project_watcher(
     project: &Project,
     watch_tx: mpsc::UnboundedSender<notify::Result<Event>>,
-) -> Result<ProjectWatcher, String> {
+    force_watch_limit: bool,
+) -> Result<ProjectWatcher, ProjectWatcherFailure> {
     let mut watcher = RecommendedWatcher::new(
         move |result| {
             let _ = watch_tx.send(result);
         },
         Config::default(),
     )
-    .map_err(|error| format!("failed to create project filesystem watcher: {error}"))?;
+    .map_err(|error| {
+        ProjectWatcherFailure::from_notify(
+            "failed to create project filesystem watcher".to_owned(),
+            error,
+        )
+    })?;
 
     for root in project.root_paths() {
+        if force_watch_limit {
+            return Err(ProjectWatcherFailure::forced_limit(&root));
+        }
         watcher
             .watch(Path::new(&root.0), RecursiveMode::Recursive)
-            .map_err(|error| format!("failed to watch project root '{}': {error}", root))?;
+            .map_err(|error| {
+                ProjectWatcherFailure::from_notify(
+                    format!("failed to watch project root '{}'", root),
+                    error,
+                )
+            })?;
     }
 
     Ok(ProjectWatcher::new(watcher))
@@ -476,7 +516,7 @@ async fn run_project_subscription(
     mut watched_roots: Vec<ProjectRootPath>,
     watch_tx: mpsc::UnboundedSender<notify::Result<Event>>,
     mut watch_rx: mpsc::UnboundedReceiver<notify::Result<Event>>,
-    mut watcher_ready_rx: mpsc::UnboundedReceiver<Result<ProjectWatcher, String>>,
+    mut watcher_ready_rx: mpsc::UnboundedReceiver<Result<ProjectWatcher, ProjectWatcherFailure>>,
     mut command_rx: mpsc::UnboundedReceiver<ProjectStreamCommand>,
     review_registry: ReviewRegistryHandle,
 ) {
@@ -498,6 +538,8 @@ async fn run_project_subscription(
     // on every event.
     let mut watcher_roots = WatcherRootPaths::new(project.root_paths());
     let mut pending_update = PendingProjectUpdate::default();
+    let mut watcher_initializing = watcher.is_none();
+    let mut watcher_warning = None::<String>;
     let mut debounce_active = false;
     let mut debounce_sleep = Box::pin(sleep(Duration::from_secs(60 * 60 * 24 * 365)));
     let mut git_poll = interval_at(
@@ -529,6 +571,14 @@ async fn run_project_subscription(
                         if result.is_err() {
                             subscribers.remove(&host_path);
                             snapshot.diff_context_modes.retain(|(subscriber, _), _| subscriber != &host_path);
+                        } else if let Some(message) = watcher_warning.as_ref() {
+                            emit_project_command_error(
+                                &stream,
+                                FrameKind::ProjectFileList,
+                                "project_watch",
+                                message.clone(),
+                                false,
+                            ).await;
                         }
                         let _ = reply.send(result);
                     }
@@ -642,7 +692,8 @@ async fn run_project_subscription(
                     }
                 }
             }
-            maybe_watcher = watcher_ready_rx.recv(), if watcher.is_none() => {
+            maybe_watcher = watcher_ready_rx.recv(), if watcher_initializing => {
+                watcher_initializing = false;
                 match maybe_watcher {
                     Some(Ok(ready_watcher)) => {
                         watcher = Some(ready_watcher);
@@ -664,9 +715,15 @@ async fn run_project_subscription(
                             return;
                         }
                     }
+                    Some(Err(error)) if error.limit_reached => {
+                        let message = project_watch_limit_guidance(&error.message);
+                        tracing::warn!(project_id = %project_id, error = %message, "continuing project subscription without filesystem watching");
+                        emit_project_stream_warning(&mut subscribers, "project_watch", message.clone()).await;
+                        watcher_warning = Some(message);
+                    }
                     Some(Err(error)) => {
-                        tracing::warn!(project_id = %project_id, error = %error, "stopping project subscription after watcher initialization failure");
-                        emit_fatal_project_stream_error(&mut subscribers, "project_watch", error).await;
+                        tracing::warn!(project_id = %project_id, error = %error.message, "stopping project subscription after watcher initialization failure");
+                        emit_fatal_project_stream_error(&mut subscribers, "project_watch", error.message).await;
                         return;
                     }
                     None => {
@@ -680,7 +737,7 @@ async fn run_project_subscription(
                     }
                 }
             }
-            maybe_event = watch_rx.recv() => {
+            maybe_event = watch_rx.recv(), if watcher.is_some() => {
                 let Some(event_result) = maybe_event else {
                     emit_fatal_project_stream_error(
                         &mut subscribers,
@@ -715,6 +772,13 @@ async fn run_project_subscription(
                             debounce_active = true;
                             debounce_sleep.as_mut().reset(Instant::now() + PROJECT_REFRESH_DEBOUNCE);
                         }
+                    }
+                    Err(error) if matches!(error.kind, notify::ErrorKind::MaxFilesWatch) => {
+                        let message = project_watch_limit_guidance(&format!("project filesystem watcher failed: {error}"));
+                        tracing::warn!(project_id = %project_id, error = %message, "continuing project subscription without filesystem watching");
+                        watcher = None;
+                        emit_project_stream_warning(&mut subscribers, "project_watch", message.clone()).await;
+                        watcher_warning = Some(message);
                     }
                     Err(error) => {
                         let message = format!("project filesystem watcher failed: {error}");
@@ -801,7 +865,7 @@ async fn run_project_subscription(
                         true,
                     ).await
                 } else {
-                    refresh_full_unwatched(
+                    refresh_git_status_unwatched(
                         &project_store,
                         &project_id,
                         &mut project,
@@ -896,6 +960,40 @@ async fn refresh_full_unwatched(
     Ok(())
 }
 
+async fn refresh_git_status_unwatched(
+    project_store: &Arc<Mutex<ProjectStore>>,
+    project_id: &ProjectId,
+    project: &mut Project,
+    snapshot: &mut ProjectSnapshotState,
+    subscribers: &mut HashMap<StreamPath, ProjectSubscriber>,
+    review_registry: &ReviewRegistryHandle,
+) -> Result<(), String> {
+    let latest_project = load_subscription_project(project_store, project_id).await?;
+    let git_status = build_git_status(&latest_project)?;
+    let git_json = serialize_git_status(&git_status)?;
+    let git_changed = snapshot.git_status.as_ref() != Some(&git_json);
+
+    *project = latest_project;
+    let code_intel_roots_changed =
+        sync_code_intel_overview_roots(&mut snapshot.code_intel_overview, project.root_paths());
+
+    if git_changed {
+        snapshot.git_status = Some(git_json);
+        fan_out_payload(subscribers, FrameKind::ProjectGitStatus, &git_status).await?;
+        reset_reviews_for_clean_unstaged_roots(review_registry, project_id, &git_status).await;
+        refresh_remembered_diffs(project, snapshot, subscribers).await;
+    }
+    if code_intel_roots_changed {
+        fan_out_payload(
+            subscribers,
+            FrameKind::CodeIntelOverview,
+            &snapshot.code_intel_overview,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn refresh_incremental(
     project_store: &Arc<Mutex<ProjectStore>>,
@@ -963,7 +1061,7 @@ fn ensure_watched_roots(
         return Ok(());
     }
 
-    *watcher = create_project_watcher(project, watch_tx)?;
+    *watcher = create_project_watcher(project, watch_tx, false).map_err(|error| error.message)?;
     *watched_roots = roots;
     Ok(())
 }
@@ -1640,6 +1738,33 @@ async fn emit_fatal_project_stream_error(
         .await;
     }
     subscribers.clear();
+}
+
+fn project_watch_limit_guidance(error: &str) -> String {
+    format!(
+        "{error} Live project file updates are disabled, but the project remains available. For best results, configure each project root as the root of its Git repository instead of a broader parent directory. On Linux, you can also increase fs.inotify.max_user_watches. Reopen the project after correcting the root or system limit."
+    )
+}
+
+async fn emit_project_stream_warning(
+    subscribers: &mut HashMap<StreamPath, ProjectSubscriber>,
+    operation: &str,
+    message: String,
+) {
+    let streams = subscribers
+        .values()
+        .map(|subscriber| subscriber.stream.clone())
+        .collect::<Vec<_>>();
+    for stream in streams {
+        emit_project_command_error(
+            &stream,
+            FrameKind::ProjectFileList,
+            operation,
+            message.clone(),
+            false,
+        )
+        .await;
+    }
 }
 
 async fn emit_project_command_error(

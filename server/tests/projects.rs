@@ -1135,6 +1135,90 @@ async fn project_read_file_returns_file_contents() {
 }
 
 #[tokio::test]
+async fn watch_limit_warns_without_stopping_project_or_polling_files() {
+    let runtime_config = server::HostRuntimeConfig {
+        force_project_watch_limit: true,
+        ..server::HostRuntimeConfig::default()
+    };
+    let mut fixture = Fixture::new_with_runtime_config(runtime_config).await;
+    let repo = init_git_repo(
+        "watch-limit",
+        &[("src/main.rs", "fn main() { println!(\"before\"); }\n")],
+    );
+    let project = create_project(
+        &mut fixture.client,
+        "Watch Limit",
+        vec![repo.path().to_string_lossy().to_string()],
+    )
+    .await;
+
+    let _ = expect_project_bootstrap(&mut fixture.client, "watch limit project bootstrap").await;
+    let error = expect_command_error(&mut fixture.client, "watch limit warning").await;
+    assert_eq!(error.operation, "project_watch");
+    assert_eq!(error.code, CommandErrorCode::Internal);
+    assert!(!error.fatal);
+    assert!(
+        error
+            .message
+            .contains("Live project file updates are disabled")
+    );
+    assert!(
+        error
+            .message
+            .contains("configure each project root as the root of its Git repository")
+    );
+    assert!(error.message.contains("fs.inotify.max_user_watches"));
+
+    fs::write(
+        repo.path().join("src/main.rs"),
+        "fn main() { println!(\"after\"); }\n",
+    )
+    .expect("update file while project watching is unavailable");
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(5_500);
+    while let Ok(Ok(Some(env))) =
+        tokio::time::timeout_at(deadline, fixture.client.next_event()).await
+    {
+        assert_ne!(
+            env.kind,
+            FrameKind::ProjectFileList,
+            "degraded project must not poll the file tree"
+        );
+        if env.kind == FrameKind::ProjectEvent {
+            let event: protocol::ProjectEventPayload = env
+                .parse_payload()
+                .expect("parse project event while degraded");
+            assert!(
+                !matches!(event, protocol::ProjectEventPayload::FilesChanged { .. }),
+                "degraded project must not synthesize watched file changes"
+            );
+        }
+    }
+
+    fixture
+        .client
+        .project_read_file(
+            &project.id,
+            ProjectReadFilePayload {
+                path: ProjectPath {
+                    root: protocol::ProjectRootPath(project_root(&project, 0)),
+                    relative_path: "src/main.rs".to_owned(),
+                },
+            },
+        )
+        .await
+        .expect("project_read_file should remain available");
+    let contents = expect_project_file_contents(
+        &mut fixture.client,
+        "project file contents after watch limit",
+    )
+    .await;
+    assert_eq!(
+        contents.contents.as_deref(),
+        Some("fn main() { println!(\"after\"); }\n")
+    );
+}
+
+#[tokio::test]
 async fn project_read_file_accepts_absolute_path_with_line_suffix() {
     let mut fixture = Fixture::new().await;
     let repo = init_git_repo(

@@ -377,6 +377,8 @@ pub struct HostRuntimeConfig {
     pub start_agent_supervisor_worker: bool,
     #[cfg(any(test, feature = "test-support"))]
     pub enable_actor_transcript_io: bool,
+    #[cfg(any(test, feature = "test-support"))]
+    pub force_project_watch_limit: bool,
 }
 
 impl Default for HostRuntimeConfig {
@@ -398,6 +400,8 @@ impl Default for HostRuntimeConfig {
             start_agent_supervisor_worker: true,
             #[cfg(any(test, feature = "test-support"))]
             enable_actor_transcript_io: false,
+            #[cfg(any(test, feature = "test-support"))]
+            force_project_watch_limit: false,
         }
     }
 }
@@ -741,6 +745,7 @@ pub(crate) struct HostState {
     kiro_probe_program: Option<String>,
     kiro_probe_workspace_root: Option<PathBuf>,
     skip_real_backend_probe: bool,
+    force_project_watch_limit: bool,
     host_streams: HashMap<StreamPath, HostSubscriber>,
     project_streams: HashMap<ProjectId, ProjectStreamSubscription>,
     terminal_streams: HashMap<(StreamPath, TerminalId), TerminalHandle>,
@@ -13917,6 +13922,16 @@ fn spawn_host_inner(
             kiro_probe_program: runtime_config.kiro_probe_program.clone(),
             kiro_probe_workspace_root: runtime_config.kiro_probe_workspace_root.clone(),
             skip_real_backend_probe: runtime_config.skip_real_backend_probe,
+            force_project_watch_limit: {
+                #[cfg(any(test, feature = "test-support"))]
+                {
+                    runtime_config.force_project_watch_limit
+                }
+                #[cfg(not(any(test, feature = "test-support")))]
+                {
+                    false
+                }
+            },
             host_streams: HashMap::new(),
             project_streams: HashMap::new(),
             terminal_streams: HashMap::new(),
@@ -17402,6 +17417,7 @@ async fn ensure_project_actor(
         Arc::clone(&state.project_store),
         project_id.clone(),
         state.review_registry.clone(),
+        state.force_project_watch_limit,
     )
     .await?;
     let handle = subscription.handle.clone();
