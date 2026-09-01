@@ -4,7 +4,6 @@ use leptos::prelude::*;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::spawn_local;
 
-use crate::components::review_view::ReviewSidebar;
 use crate::send::send_frame;
 use crate::state::{AppState, DiffKey, DiffViewState, next_client_request_id, root_display_name};
 
@@ -272,232 +271,136 @@ fn ReviewStatusRow() -> impl IntoView {
     }
 }
 
-fn pick_committed_range_draft<'a>(
-    summaries: &'a [protocol::ReviewSummary],
-    selection: &HistoricalSelection,
-) -> Option<&'a protocol::ReviewSummary> {
-    summaries
-        .iter()
-        .filter(|summary| {
-            matches!(summary.status, protocol::ReviewStatus::Draft)
-                && matches!(
-                    &summary.scope,
-                    protocol::ReviewSummaryScope::CommittedRange {
-                        root,
-                        base_oid,
-                        tip_oid,
-                        ..
-                    } if root == &selection.root
-                        && base_oid == &selection.base_oid
-                        && tip_oid == &selection.tip_oid
-                )
-        })
-        .max_by_key(|summary| summary.updated_at_ms)
-}
-
-/// Review affordance for the expanded commit block: a starter while the
-/// range has no draft, and the draft's counts plus the shared review
-/// controls once one exists.
+/// Ask the AI reviewer to read one committed range. Its suggestions land in
+/// the project's single workspace review like any other feedback.
 #[component]
-fn CommittedReviewControls(selection: HistoricalSelection) -> impl IntoView {
+fn CommittedAiReviewButton(selection: HistoricalSelection) -> impl IntoView {
     let state = expect_context::<AppState>();
     let target_state = state.clone();
-    let target_selection = selection.clone();
+    let target_project = selection.project_id.clone();
+    let target_host = selection.host_id.clone();
     let target: Memo<Option<(String, ReviewId)>> = Memo::new(move |_| {
         target_state.review_summaries.with(|map| {
-            map.get(&target_selection.project_id).and_then(|summaries| {
-                pick_committed_range_draft(summaries, &target_selection)
-                    .map(|summary| (target_selection.host_id.clone(), summary.id.clone()))
+            map.get(&target_project)
+                .and_then(|summaries| {
+                    crate::components::review_view::pick_workspace_draft(summaries)
+                })
+                .map(|summary| (target_host.clone(), summary.id.clone()))
+        })
+    });
+    let backend_state = state.clone();
+    let backend_host = selection.host_id.clone();
+    let has_backend = Memo::new(move |_| {
+        backend_state.host_settings_by_host.with(|map| {
+            map.get(&backend_host).is_some_and(|settings| {
+                settings.default_backend.is_some() || !settings.enabled_backends.is_empty()
             })
         })
     });
-    crate::components::review_view::subscribe_review_reactive(&state, target);
-
-    view! {
-        {move || match target.get() {
-            Some((host, rid)) => view! {
-                <CommittedReviewHub host_id=host review_id=rid selection=selection.clone() />
-            }.into_any(),
-            None => view! {
-                <CommittedReviewStarter selection=selection.clone() />
-            }.into_any(),
-        }}
-    }
-}
-
-#[component]
-fn CommittedReviewStarter(selection: HistoricalSelection) -> impl IntoView {
-    let state = expect_context::<AppState>();
-    let pending_request_id = RwSignal::new(None::<String>);
-    let send_error = RwSignal::new(None::<String>);
-    let create_selection = selection.clone();
-    let on_start = move |_| {
-        let selection = create_selection.clone();
-        let request_id = next_client_request_id("committed-review-create");
-        state.command_errors_by_request.update(|errors| {
-            errors.remove(&request_id);
-        });
-        send_error.set(None);
-        pending_request_id.set(Some(request_id.clone()));
-        let payload = protocol::ReviewCreatePayload {
-            request_id: Some(request_id.clone()),
-            selection: protocol::ReviewDiffSelection::CommittedRange {
-                root: selection.root.clone(),
-                base_oid: selection.base_oid.clone(),
-                tip_oid: selection.tip_oid.clone(),
-                commit_count: selection.commit_count,
-            },
+    let running_state = state.clone();
+    let running = Memo::new(move |_| {
+        let Some((_, rid)) = target.get() else {
+            return false;
         };
-        let host_id = selection.host_id.clone();
-        let project_id = selection.project_id.clone();
+        running_state.reviews.with(|map| {
+            map.get(&rid).is_some_and(|review| {
+                matches!(
+                    review.ai_reviewer.status,
+                    protocol::ReviewAiReviewerStatus::Running
+                )
+            })
+        })
+    });
+    let pending_state = state.clone();
+    let pending = Memo::new(move |_| {
+        let Some((_, rid)) = target.get() else {
+            return false;
+        };
+        pending_state
+            .review_action_pending
+            .with(|map| map.get(&rid).is_some_and(|gate| gate.start_ai))
+    });
+    let reason = move || -> &'static str {
+        if target.get().is_none() {
+            "No review is open for this project"
+        } else if !has_backend.get() {
+            "No AI backend available"
+        } else if pending.get() {
+            "AI reviewer starting\u{2026}"
+        } else if running.get() {
+            "AI reviewer is already running"
+        } else {
+            ""
+        }
+    };
+    let scope = protocol::ReviewAiScope::CommittedRange {
+        root: selection.root.clone(),
+        base_oid: selection.base_oid.clone(),
+        tip_oid: selection.tip_oid.clone(),
+    };
+    let click_state = state.clone();
+    let on_click = move |_| {
+        if !reason().is_empty() {
+            return;
+        }
+        let Some((host, rid)) = target.get_untracked() else {
+            return;
+        };
+        let mut claimed = false;
+        click_state.review_action_pending.update(|map| {
+            let gate = map.entry(rid.clone()).or_default();
+            if !gate.start_ai {
+                gate.start_ai = true;
+                claimed = true;
+            }
+        });
+        if !claimed {
+            return;
+        }
+        let payload = protocol::ReviewActionPayload::StartAiReview {
+            backend_kind: None,
+            cost_hint: None,
+            instructions: None,
+            scope: scope.clone(),
+        };
+        let failure_state = click_state.clone();
         spawn_local(async move {
-            if let Err(error) = send_frame(
-                &host_id,
-                StreamPath(format!("/project/{}", project_id.0)),
-                FrameKind::ReviewCreate,
-                &payload,
+            if let Err(error) = crate::components::review_view::send_review_action_inner(
+                &host,
+                rid.clone(),
+                payload,
             )
             .await
             {
-                log::error!("failed to create committed range review: {error}");
-                send_error.set(Some(error));
-                pending_request_id.set(None);
+                log::error!("review.start_ai.send_err review={rid} error={error}");
+                failure_state.review_action_pending.update(|map| {
+                    if let Some(gate) = map.get_mut(&rid) {
+                        gate.start_ai = false;
+                        if gate.is_idle() {
+                            map.remove(&rid);
+                        }
+                    }
+                });
             }
         });
     };
-    let error_state = state.clone();
-    let request_error = Memo::new(move |_| {
-        send_error.get().or_else(|| {
-            let request_id = pending_request_id.get()?;
-            error_state
-                .command_errors_by_request
-                .with(|errors| errors.get(&request_id).cloned())
-        })
-    });
     view! {
-        <div class="gp-commit-review-row" data-test="gp-committed-review-starter">
-            <button
-                class="gp-review-open-btn"
-                title="Review these committed changes. They are immutable, so feedback is fix-forward."
-                disabled=move || pending_request_id.get().is_some() && request_error.get().is_none()
-                on:click=on_start
-            >
-                {move || if pending_request_id.get().is_some() && request_error.get().is_none() { "Starting…" } else { "Start review" }}
-            </button>
-            {move || request_error.get().map(|message| view! {
-                <div class="gp-range-state error" role="alert" data-test="gp-review-create-error">
-                    {format!("Could not start review: {message}. Retry after refreshing history.")}
-                </div>
-            })}
-        </div>
-    }
-}
-
-#[component]
-fn CommittedReviewHub(
-    host_id: String,
-    review_id: ReviewId,
-    selection: HistoricalSelection,
-) -> impl IntoView {
-    let state = expect_context::<AppState>();
-
-    let counts_state = state.clone();
-    let counts_rid = review_id.clone();
-    let counts: Memo<(u32, u32)> = Memo::new(move |_| {
-        if let Some((c, s)) = counts_state.reviews.with(|m| {
-            m.get(&counts_rid).map(|r| {
-                (
-                    r.comments.len() as u32,
-                    r.suggestions
-                        .iter()
-                        .filter(|s| matches!(s.state, protocol::ReviewSuggestionState::Pending))
-                        .count() as u32,
-                )
-            })
-        }) {
-            return (c, s);
-        }
-        counts_state
-            .review_summaries
-            .with(|m| {
-                m.values().find_map(|sums| {
-                    sums.iter()
-                        .find(|s| s.id == counts_rid)
-                        .map(|s| (s.user_comment_count, s.pending_suggestion_count))
-                })
-            })
-            .unwrap_or((0, 0))
-    });
-
-    let loaded_state = state.clone();
-    let loaded_rid = review_id.clone();
-    let loaded: Memo<bool> =
-        Memo::new(move |_| loaded_state.reviews.with(|m| m.contains_key(&loaded_rid)));
-
-    let isdraft_state = state.clone();
-    let isdraft_rid = review_id.clone();
-    let is_draft: Memo<bool> = Memo::new(move |_| {
-        isdraft_state.reviews.with(|m| {
-            m.get(&isdraft_rid)
-                .map(|r| matches!(r.status, protocol::ReviewStatus::Draft))
-                .unwrap_or(true)
-        })
-    });
-
-    // The frozen range is reviewable as long as it produced any file diff.
-    let changes_state = state.clone();
-    let has_reviewable_changes: Memo<bool> = Memo::new(move |_| {
-        let key = DiffKey::with_revision(
-            selection.host_id.clone(),
-            selection.project_id.clone(),
-            selection.root.clone(),
-            ProjectDiffScope::Uncommitted,
-            selection.revision(),
-            "",
-        );
-        changes_state
-            .diff_contents
-            .with(|diffs| diffs.get(&key).is_some_and(|diff| !diff.files.is_empty()))
-    });
-
-    let sidebar_state = state.clone();
-    let sidebar_host = host_id.clone();
-    let sidebar_rid = review_id.clone();
-    view! {
-        <div class="gp-committed-review" data-test="gp-committed-review-hub">
-            <div class="gp-commit-review-row">
-                <span class="gp-review-status-title">"Review"</span>
-                <span class="gp-review-counts" data-test="gp-committed-review-counts">
-                    {move || {
-                        let (c, s) = counts.get();
-                        format!(
-                            "{c} comment{} \u{00b7} {s} AI",
-                            if c == 1 { "" } else { "s" },
-                        )
-                    }}
-                </span>
-            </div>
-            {move || {
-                if !loaded.get() {
-                    return view! {
-                        <div class="gp-review-loading">"Loading review\u{2026}"</div>
-                    }.into_any();
+        <button
+            class="gp-review-open-btn gp-commit-ai-review"
+            data-test="gp-commit-ai-review"
+            disabled=move || !reason().is_empty()
+            title=move || {
+                let reason = reason();
+                if reason.is_empty() {
+                    "Ask the AI reviewer to read these committed changes"
+                } else {
+                    reason
                 }
-                let seed = sidebar_state.reviews.with_untracked(|m| m.get(&sidebar_rid).cloned());
-                match seed {
-                    Some(review) => view! {
-                        <ReviewSidebar
-                            review=review
-                            host_id=sidebar_host.clone()
-                            review_id=sidebar_rid.clone()
-                            is_draft=is_draft
-                            can_run_ai=has_reviewable_changes
-                        />
-                    }.into_any(),
-                    None => view! { <div></div> }.into_any(),
-                }
-            }}
-        </div>
+            }
+            on:click=on_click
+        >
+            "AI review"
+        </button>
     }
 }
 
@@ -662,6 +565,44 @@ fn CommitDetail(
     selection: Memo<Option<HistoricalSelection>>,
     list: StoredValue<HistoricalCommitList>,
 ) -> impl IntoView {
+    // Badges for the range's files count only feedback anchored to this exact
+    // range; the same path's working-tree comments stay on the working tree.
+    let counts_state = expect_context::<AppState>();
+    let file_counts: Memo<HashMap<String, u32>> = Memo::new(move |_| {
+        let Some(selected) = selection.get() else {
+            return HashMap::new();
+        };
+        let target = protocol::ReviewTarget::CommittedDiff {
+            base_oid: selected.base_oid.clone(),
+            tip_oid: selected.tip_oid.clone(),
+        };
+        let summary = counts_state.review_summaries.with(|map| {
+            map.get(&selected.project_id).and_then(|summaries| {
+                crate::components::review_view::pick_workspace_draft(summaries)
+                    .map(|s| (s.id.clone(), s.file_comment_counts.clone()))
+            })
+        });
+        let Some((rid, file_comment_counts)) = summary else {
+            return HashMap::new();
+        };
+        let from_summary: HashMap<String, u32> = file_comment_counts
+            .iter()
+            .filter(|f| f.root == selected.root && f.target == target)
+            .map(|f| (f.relative_path.clone(), f.total_count()))
+            .collect();
+        if !from_summary.is_empty() {
+            return from_summary;
+        }
+        counts_state.reviews.with(|map| {
+            map.get(&rid)
+                .map(|review| {
+                    per_file_comment_counts(review, &selected.root, |candidate| {
+                        *candidate == target
+                    })
+                })
+                .unwrap_or_default()
+        })
+    });
     view! {
         <div class="gp-commit-detail" data-test="gp-commit-detail">
             {move || selection.get().map(|selected| {
@@ -689,13 +630,14 @@ fn CommitDetail(
                             <span class="gp-commit-author">{author}</span>
                         })}
                         <span class="gp-commit-count">{count}</span>
+                        <CommittedAiReviewButton selection=selected />
                     </div>
-                    <CommittedReviewControls selection=selected />
                 }
             })}
             <HistoricalChangedFiles
                 selection=selection
                 commits=list.with_value(|list| list.commits.clone())
+                file_counts=file_counts
             />
         </div>
     }
@@ -989,7 +931,10 @@ fn GitRootSection(
         };
         let this_root: Vec<_> = file_comment_counts
             .iter()
-            .filter(|f| f.root == counts_root)
+            .filter(|f| {
+                f.root == counts_root
+                    && !matches!(f.target, protocol::ReviewTarget::CommittedDiff { .. })
+            })
             .collect();
         if !this_root.is_empty() {
             return this_root
@@ -999,7 +944,11 @@ fn GitRootSection(
         }
         counts_state.reviews.with(|m| {
             m.get(&rid)
-                .map(|r| per_file_comment_counts(r, &counts_root))
+                .map(|r| {
+                    per_file_comment_counts(r, &counts_root, |target| {
+                        !matches!(target, protocol::ReviewTarget::CommittedDiff { .. })
+                    })
+                })
                 .unwrap_or_default()
         })
     });
@@ -1170,6 +1119,7 @@ fn GitRootSection(
 fn HistoricalChangedFiles(
     selection: Memo<Option<HistoricalSelection>>,
     commits: Vec<ProjectGitCommitSummary>,
+    file_counts: Memo<HashMap<String, u32>>,
 ) -> impl IntoView {
     let state = expect_context::<AppState>();
     let diff_state = state.clone();
@@ -1278,6 +1228,7 @@ fn HistoricalChangedFiles(
                                         let icon_class = change_kind_class(Some(kind));
                                         let selected_for_click = selected.clone();
                                         let title = format!("Open committed diff for {path}");
+                                        let path_for_badge = path.clone();
                                         view! {
                                             <div class="gp-file-row readonly">
                                                 <button
@@ -1299,6 +1250,22 @@ fn HistoricalChangedFiles(
                                                             <span class="gp-file-dir">{directory}</span>
                                                         })}
                                                     </span>
+                                                    {move || {
+                                                        let n = file_counts
+                                                            .get()
+                                                            .get(&path_for_badge)
+                                                            .copied()
+                                                            .unwrap_or(0);
+                                                        (n > 0).then(|| view! {
+                                                            <span
+                                                                class="gp-file-comment-count"
+                                                                data-test="gp-file-comment-count"
+                                                                title="Review comments"
+                                                            >
+                                                                {format!("({n})")}
+                                                            </span>
+                                                        })
+                                                    }}
                                                 </button>
                                             </div>
                                         }
@@ -1605,15 +1572,19 @@ fn GitFileSection(
 fn per_file_comment_counts(
     review: &protocol::Review,
     root: &ProjectRootPath,
+    include: impl Fn(&protocol::ReviewTarget) -> bool,
 ) -> HashMap<String, u32> {
     let mut counts: HashMap<String, u32> = HashMap::new();
     for c in &review.comments {
-        if c.location.root == *root {
+        if c.location.root == *root && include(&c.location.target) {
             *counts.entry(c.location.relative_path.clone()).or_insert(0) += 1;
         }
     }
     for s in &review.suggestions {
-        if matches!(s.state, protocol::ReviewSuggestionState::Pending) && s.location.root == *root {
+        if matches!(s.state, protocol::ReviewSuggestionState::Pending)
+            && s.location.root == *root
+            && include(&s.location.target)
+        {
             *counts.entry(s.location.relative_path.clone()).or_insert(0) += 1;
         }
     }
@@ -2084,6 +2055,7 @@ mod wasm_tests {
                 status: ReviewAiReviewerStatus::Idle,
                 agent_id: None,
                 error: None,
+                scope: Default::default(),
             },
             created_at_ms: 0,
             updated_at_ms: 0,
@@ -2328,7 +2300,16 @@ mod wasm_tests {
             meta.contains("1 commit"),
             "expanded meta shows the count: {meta}"
         );
-        assert!(query(&container, "[data-test=gp-committed-review-starter]").is_some());
+        let ai_review = query(&container, "[data-test=gp-commit-ai-review]")
+            .expect("the expanded commit offers an AI review of exactly this range");
+        assert!(
+            ai_review.has_attribute("disabled"),
+            "without a project review there is nothing for the AI to write into"
+        );
+        assert!(
+            query(&container, "[data-test=gp-committed-review-starter]").is_none(),
+            "a committed range never starts a separate review"
+        );
         let state = mounted.borrow().clone().unwrap();
         assert!(
             state.center_zone.with_untracked(|zone| {
@@ -2635,44 +2616,182 @@ mod wasm_tests {
             .expect("retry request id");
         assert_ne!(retry_id, request_id);
 
-        click(
-            &query(&container, "[data-test=gp-committed-review-starter] button")
-                .expect("start review button"),
-        );
+        // Once the project has its review and a backend, the block's AI
+        // review reads exactly this range inside that one review.
+        state.review_summaries.update(|m| {
+            m.insert(ProjectId("proj-1".to_owned()), vec![draft_summary()]);
+        });
+        state.reviews.update(|m| {
+            m.insert(ReviewId("rev-1".to_owned()), full_review());
+        });
+        seed_host_settings(&state);
         next_tick().await;
-        let create_request_id = sent_lines_joined()
-            .lines()
-            .filter_map(|line| serde_json::from_str::<Envelope>(line).ok())
-            .filter(|envelope| envelope.kind == FrameKind::ReviewCreate)
-            .filter_map(|envelope| {
-                envelope
-                    .parse_payload::<protocol::ReviewCreatePayload>()
-                    .ok()
-            })
-            .filter_map(|payload| payload.request_id)
-            .last()
-            .expect("committed review create request id");
-        let create_error = Envelope::from_payload(
-            StreamPath("/host/h1".to_owned()),
-            FrameKind::CommandError,
-            1,
-            &CommandErrorPayload {
-                request_id: Some(create_request_id),
-                stream: StreamPath("/project/proj-1".to_owned()),
-                request_kind: FrameKind::ReviewCreate,
-                operation: "review_create".to_owned(),
-                code: CommandErrorCode::NotFound,
-                message: "the selected range was rewritten".to_owned(),
-                fatal: false,
+        let ai_review = query(&container, "[data-test=gp-commit-ai-review]").expect("AI review");
+        assert!(!ai_review.has_attribute("disabled"));
+        click(&ai_review);
+        next_tick().await;
+        let sent = sent_lines_joined();
+        assert!(
+            sent.contains("start_ai_review") && sent.contains("/review/rev-1"),
+            "AI review must start on the workspace review stream; sent: {sent}"
+        );
+        assert!(
+            sent.contains("\"kind\":\"committed_range\"")
+                && sent.contains("2222222222222222222222222222222222222222")
+                && sent.contains("1111111111111111111111111111111111111111"),
+            "the reviewer is scoped to the selected range; sent: {sent}"
+        );
+        assert!(
+            !sent.contains("review_create"),
+            "no separate review is created for a committed range; sent: {sent}"
+        );
+        assert!(
+            ai_review.has_attribute("disabled"),
+            "the action gates itself until the server answers"
+        );
+    }
+
+    fn seed_host_settings(state: &AppState) {
+        state.host_settings_by_host.update(|m| {
+            m.insert(
+                "h1".to_owned(),
+                settings_model::HostSettings {
+                    enabled_backends: vec![protocol::BackendKind::Codex],
+                    default_backend: Some(protocol::BackendKind::Codex),
+                    enable_mobile_connections: false,
+                    mobile_broker_url: None,
+                    mobile_broker_auth: Default::default(),
+                    tyde_debug_mcp_enabled: false,
+                    tyde_agent_control_mcp_enabled: false,
+                    tyde_agent_control_max_depth: settings_model::default_agent_control_max_depth(),
+                    complexity_tiers_enabled: false,
+                    backend_tier_configs: std::collections::HashMap::new(),
+                    background_agent_features: Default::default(),
+                    supervisor: Default::default(),
+                    code_intel: Default::default(),
+                    backend_config: std::collections::HashMap::new(),
+                    launch_profiles: Default::default(),
+                    hermes_disabled_providers: Default::default(),
+                    voice: Default::default(),
+                },
+            );
+        });
+    }
+
+    /// A committed comment on a path badges that path inside the expanded
+    /// range that was commented on, and nowhere else: not on the same path in
+    /// another range, and not on the working-tree row.
+    #[wasm_bindgen_test]
+    async fn committed_file_rows_badge_only_that_ranges_comments() {
+        stub_recording_bridge();
+        crate::dispatch::clear_host_seqs("h1");
+        let container = make_container();
+        let mut root = clean_root_with_history();
+        root.clean = false;
+        root.files = vec![ProjectGitFileStatus {
+            relative_path: "src/reviewed.rs".to_owned(),
+            staged: None,
+            unstaged: Some(ProjectGitChangeKind::Modified),
+            untracked: false,
+        }];
+        let mounted = mount_git_panel_with_root(container.clone(), false, root);
+        next_tick().await;
+        let state = mounted.borrow().clone().unwrap();
+        let count = |target: protocol::ReviewTarget, user: u32| protocol::ReviewFileCommentCount {
+            root: ProjectRootPath("/repo".to_owned()),
+            relative_path: "src/reviewed.rs".to_owned(),
+            target,
+            user_comment_count: user,
+            ai_comment_count: 0,
+            pending_suggestion_count: 0,
+        };
+        let mut summary = draft_summary();
+        summary.file_comment_counts = vec![
+            count(
+                protocol::ReviewTarget::CommittedDiff {
+                    base_oid: "1111111111111111111111111111111111111111".to_owned(),
+                    tip_oid: "2222222222222222222222222222222222222222".to_owned(),
+                },
+                1,
+            ),
+            count(
+                protocol::ReviewTarget::CommittedDiff {
+                    base_oid: "4b825dc642cb6eb9a060e54bf8d69288fbee4904".to_owned(),
+                    tip_oid: "1111111111111111111111111111111111111111".to_owned(),
+                },
+                5,
+            ),
+            count(protocol::ReviewTarget::UnstagedDiff, 3),
+        ];
+        state.review_summaries.update(|m| {
+            m.insert(ProjectId("proj-1".to_owned()), vec![summary]);
+        });
+        state.reviews.update(|m| {
+            m.insert(ReviewId("rev-1".to_owned()), full_review());
+        });
+        next_tick().await;
+        let working_badge = query(&container, "[data-test=gp-file-comment-count]")
+            .expect("the working-tree row badges its own comments");
+        assert_eq!(working_badge.text_content().as_deref(), Some("(3)"));
+
+        click(&history_toggle(&container, 0));
+        next_tick().await;
+        click(&commit_rows(&container)[0]);
+        next_tick().await;
+        let (key, request_id) = state.diff_request_ids.with_untracked(|requests| {
+            requests
+                .iter()
+                .find(|(key, _)| matches!(key.revision, ProjectDiffRevision::CommittedRange { .. }))
+                .map(|(key, request_id)| (key.clone(), request_id.clone()))
+                .expect("historical diff request")
+        });
+        let response = Envelope::from_payload(
+            StreamPath("/project/proj-1".to_owned()),
+            FrameKind::ProjectGitDiff,
+            0,
+            &ProjectGitDiffPayload {
+                request_id: Some(request_id),
+                root: key.root.clone(),
+                scope: key.scope,
+                revision: key.revision.clone(),
+                path: None,
+                context_mode: state.diff_context_mode.get_untracked(),
+                files: vec![
+                    ProjectGitDiffFile {
+                        relative_path: "src/reviewed.rs".to_owned(),
+                        change_kind: Some(ProjectGitChangeKind::Modified),
+                        is_binary: false,
+                        unmerged: false,
+                        hunks: Vec::new(),
+                    },
+                    ProjectGitDiffFile {
+                        relative_path: "src/other.rs".to_owned(),
+                        change_kind: Some(ProjectGitChangeKind::Added),
+                        is_binary: false,
+                        unmerged: false,
+                        hunks: Vec::new(),
+                    },
+                ],
             },
         )
         .unwrap();
-        crate::dispatch::dispatch_envelope(&state, "h1", create_error);
+        crate::dispatch::dispatch_envelope(&state, "h1", response);
         next_tick().await;
-        assert!(query(&container, "[data-test=gp-review-create-error]").is_some());
-        let start_button =
-            query(&container, "[data-test=gp-committed-review-starter] button").unwrap();
-        assert!(!start_button.has_attribute("disabled"));
+
+        let badges = query_all(
+            &container,
+            ".gp-file-row.readonly [data-test=gp-file-comment-count]",
+        );
+        assert_eq!(
+            badges.len(),
+            1,
+            "only the commented file in this range is badged"
+        );
+        assert_eq!(
+            badges[0].text_content().as_deref(),
+            Some("(1)"),
+            "the badge counts this range's comments only, not another range's or the working tree's"
+        );
     }
 
     /// A project with several roots keeps the panel to one header line per

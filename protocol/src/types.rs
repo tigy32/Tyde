@@ -13,7 +13,7 @@ use serde_json::Value;
 /// `protocol::TydeReleaseVersion`.
 pub use host_config::{LOCAL_HOST_ID, TydeReleaseVersion};
 
-pub const PROTOCOL_VERSION: u32 = 54;
+pub const PROTOCOL_VERSION: u32 = 55;
 pub const TYDE_VERSION: Version = Version {
     major: 0,
     minor: 8,
@@ -6016,12 +6016,13 @@ pub enum ReviewDiffSelection {
         scope: ProjectDiffScope,
         path: Option<String>,
     },
+    /// Legacy: stored records only. Committed changes are reviewed inside
+    /// the workspace draft through `ReviewTarget::CommittedDiff` locations;
+    /// creating a review with this selection is rejected.
     CommittedRange {
         root: ProjectRootPath,
         base_oid: String,
         tip_oid: String,
-        /// Client hint only. The server derives and stores the authoritative
-        /// count by walking `tip_oid`'s first-parent chain to `base_oid`.
         commit_count: u32,
     },
 }
@@ -6250,6 +6251,23 @@ pub struct ReviewAiReviewerState {
     pub status: ReviewAiReviewerStatus,
     pub agent_id: Option<AgentId>,
     pub error: Option<String>,
+    /// What the most recent AI reviewer was asked to read.
+    #[serde(default)]
+    pub scope: ReviewAiScope,
+}
+
+/// Which diff an AI reviewer reads. The review itself spans every target;
+/// the reviewer needs one frozen diff to work from.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ReviewAiScope {
+    #[default]
+    WorkingTree,
+    CommittedRange {
+        root: ProjectRootPath,
+        base_oid: String,
+        tip_oid: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -6349,6 +6367,8 @@ pub enum ReviewActionPayload {
         backend_kind: Option<BackendKind>,
         cost_hint: Option<SpawnCostHint>,
         instructions: Option<String>,
+        #[serde(default)]
+        scope: ReviewAiScope,
     },
     Submit {
         target: ReviewSubmitTarget,
@@ -6499,12 +6519,6 @@ pub enum ReviewSummaryScope {
     Root {
         root: ProjectRootPath,
     },
-    CommittedRange {
-        root: ProjectRootPath,
-        base_oid: String,
-        tip_oid: String,
-        commit_count: u32,
-    },
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -6512,6 +6526,10 @@ pub struct ReviewFileCommentCount {
     #[serde(default)]
     pub root: ProjectRootPath,
     pub relative_path: String,
+    /// The surface the counted feedback anchors to, so a committed-range
+    /// comment on a path never badges that path's working-tree row.
+    #[serde(default)]
+    pub target: ReviewTarget,
     #[serde(default)]
     pub user_comment_count: u32,
     #[serde(default)]

@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::io::Read;
 use std::path::{Component, Path};
 use std::sync::Arc;
@@ -20,7 +20,7 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 use uuid::Uuid;
 
 use crate::agent::now_ms;
-use crate::project_stream::{is_not_git_repository_error, read_diff};
+use crate::project_stream::{committed_range_commit_count, is_not_git_repository_error, read_diff};
 use crate::review::bundle::ReviewFeedbackBundle;
 use crate::store::project::ProjectStore;
 use crate::store::review::ReviewStore;
@@ -55,7 +55,10 @@ pub(crate) struct ReviewDeliveryRequest {
 
 pub(crate) struct ReviewAiSpawnRequest {
     pub review_id: ReviewId,
+    /// The review with `diffs` narrowed to `scope`, so the reviewer prompt
+    /// and its size bound only see what the reviewer is asked to read.
     pub review: Review,
+    pub scope: protocol::ReviewAiScope,
     pub backend_kind: Option<protocol::BackendKind>,
     pub cost_hint: Option<protocol::SpawnCostHint>,
     pub instructions: Option<String>,
@@ -292,8 +295,9 @@ impl ReviewActor {
                 backend_kind,
                 cost_hint,
                 instructions,
+                scope,
             } => {
-                self.start_ai_review(backend_kind, cost_hint, instructions, conn)
+                self.start_ai_review(backend_kind, cost_hint, instructions, scope, conn)
                     .await;
             }
             ReviewActionPayload::Submit { target } => {
@@ -337,6 +341,21 @@ impl ReviewActor {
                 message,
                 false,
                 context.clone(),
+            )
+            .await;
+            return;
+        }
+        if let ReviewTarget::CommittedDiff { base_oid, tip_oid } = &location.target
+            && let Err(message) = self
+                .ensure_committed_diff(&location.root, base_oid, tip_oid)
+                .await
+        {
+            self.send_error(
+                Some(&conn),
+                ReviewErrorCode::InvalidLocation,
+                message,
+                false,
+                context,
             )
             .await;
             return;
@@ -685,9 +704,24 @@ impl ReviewActor {
         backend_kind: Option<protocol::BackendKind>,
         cost_hint: Option<protocol::SpawnCostHint>,
         instructions: Option<String>,
+        scope: protocol::ReviewAiScope,
         conn: ConnectionId,
     ) {
         let context = ReviewErrorContext::StartAiReview;
+        // A legacy committed-range record can only ever read its own range.
+        let scope = match &self.review.selection {
+            ReviewDiffSelection::CommittedRange {
+                root,
+                base_oid,
+                tip_oid,
+                ..
+            } => protocol::ReviewAiScope::CommittedRange {
+                root: root.clone(),
+                base_oid: base_oid.clone(),
+                tip_oid: tip_oid.clone(),
+            },
+            _ => scope,
+        };
         let instructions_len = instructions.as_ref().map_or(0, String::len);
         tracing::info!(
             review_id = %self.review.id,
@@ -724,27 +758,71 @@ impl ReviewActor {
         {
             return;
         }
-        if diff_is_clean(&self.review.diffs) {
+        let prompt_diffs = match &scope {
+            protocol::ReviewAiScope::WorkingTree => self
+                .review
+                .diffs
+                .iter()
+                .filter(|diff| matches!(diff.revision, protocol::ProjectDiffRevision::WorkingTree))
+                .cloned()
+                .collect::<Vec<_>>(),
+            protocol::ReviewAiScope::CommittedRange {
+                root,
+                base_oid,
+                tip_oid,
+            } => {
+                if let Err(message) = self.ensure_committed_diff(root, base_oid, tip_oid).await {
+                    self.send_error(
+                        Some(&conn),
+                        ReviewErrorCode::InvalidLocation,
+                        message,
+                        false,
+                        context,
+                    )
+                    .await;
+                    return;
+                }
+                self.review
+                    .diffs
+                    .iter()
+                    .filter(|diff| committed_payload_matches(diff, root, base_oid, tip_oid))
+                    .cloned()
+                    .collect::<Vec<_>>()
+            }
+        };
+        if diff_is_clean(&prompt_diffs) {
+            let message = match &scope {
+                protocol::ReviewAiScope::WorkingTree => {
+                    "nothing to review: workspace has no unstaged changes"
+                }
+                protocol::ReviewAiScope::CommittedRange { .. } => {
+                    "nothing to review: the committed range has no file changes"
+                }
+            };
             tracing::info!(
                 review_id = %self.review.id,
                 conn = %conn,
-                "AI review skipped because workspace has no changed files"
+                scope = ?scope,
+                "AI review skipped because the scope has no changed files"
             );
             self.send_error(
                 Some(&conn),
                 ReviewErrorCode::InvalidStatus,
-                "nothing to review: workspace has no unstaged changes".to_owned(),
+                message.to_owned(),
                 false,
                 context,
             )
             .await;
             return;
         }
+        let mut review_for_prompt = self.review.clone();
+        review_for_prompt.diffs = prompt_diffs;
 
         let (reply, response) = oneshot::channel();
         let request = ReviewAiSpawnRequest {
             review_id: self.review.id.clone(),
-            review: self.review.clone(),
+            review: review_for_prompt,
+            scope: scope.clone(),
             backend_kind,
             cost_hint,
             instructions,
@@ -787,6 +865,7 @@ impl ReviewActor {
                     status: ReviewAiReviewerStatus::Running,
                     agent_id: Some(agent_id),
                     error: None,
+                    scope: scope.clone(),
                 };
                 self.review.updated_at_ms = now_ms();
                 if !self.persist_or_revert(previous, Some(&conn), context).await {
@@ -810,6 +889,7 @@ impl ReviewActor {
                     status: ReviewAiReviewerStatus::Failed,
                     agent_id: None,
                     error: Some(message.clone()),
+                    scope: scope.clone(),
                 };
                 self.review.updated_at_ms = now_ms();
                 if self
@@ -1169,6 +1249,18 @@ impl ReviewActor {
             .await;
             return Err(error);
         }
+        if let ReviewTarget::CommittedDiff { base_oid, tip_oid } = &suggestion.location.target
+            && let Err(message) = self
+                .ensure_committed_diff(&suggestion.location.root, base_oid, tip_oid)
+                .await
+        {
+            let error = review_error(ReviewErrorCode::InvalidLocation, message, false, context);
+            self.broadcast(ReviewEventPayload::Error {
+                error: error.clone(),
+            })
+            .await;
+            return Err(error);
+        }
         let previous = self.review.clone();
         if matches!(suggestion.location.target, ReviewTarget::RegularFile { .. }) {
             let project = {
@@ -1391,6 +1483,7 @@ impl ReviewActor {
             status: ReviewAiReviewerStatus::Idle,
             agent_id: None,
             error: None,
+            scope: protocol::ReviewAiScope::WorkingTree,
         };
         if clear_diffs {
             self.review.diffs.clear();
@@ -1470,7 +1563,13 @@ impl ReviewActor {
             }
         };
         match read_review_diffs(&project, &self.review.selection) {
-            Ok(diffs) => {
+            Ok(mut diffs) => {
+                if !matches!(
+                    self.review.selection,
+                    ReviewDiffSelection::CommittedRange { .. }
+                ) {
+                    diffs.extend(referenced_committed_diffs(&self.review));
+                }
                 let stats = diff_stats(&diffs);
                 let previous = self.review.clone();
                 self.review.diffs = diffs;
@@ -1596,6 +1695,57 @@ impl ReviewActor {
             }
         }
         updates
+    }
+
+    /// Freeze the diff of one committed range into the review so locations
+    /// targeting it validate like any other diff target. Ranges must be a
+    /// contiguous first-parent run inside the recent-history window of the
+    /// root, exactly as the git panel offers them. Idempotent.
+    async fn ensure_committed_diff(
+        &mut self,
+        root: &ProjectRootPath,
+        base_oid: &str,
+        tip_oid: &str,
+    ) -> Result<(), String> {
+        if self
+            .review
+            .diffs
+            .iter()
+            .any(|diff| committed_payload_matches(diff, root, base_oid, tip_oid))
+        {
+            return Ok(());
+        }
+        let project = {
+            let store = self.project_store.lock().await;
+            store
+                .get(&self.review.project_id)
+                .ok_or_else(|| format!("unknown project {}", self.review.project_id))?
+        };
+        committed_range_commit_count(&project, root, base_oid, tip_oid)?;
+        let diff = read_diff(
+            &project,
+            ProjectReadDiffPayload {
+                request_id: None,
+                root: root.clone(),
+                scope: ProjectDiffScope::Uncommitted,
+                revision: protocol::ProjectDiffRevision::CommittedRange {
+                    base_oid: base_oid.to_owned(),
+                    tip_oid: tip_oid.to_owned(),
+                },
+                path: None,
+                context_mode: DiffContextMode::FullFile,
+            },
+        )?;
+        tracing::info!(
+            review_id = %self.review.id,
+            root = %root,
+            base_oid,
+            tip_oid,
+            file_count = diff.files.len(),
+            "froze committed range diff into workspace review"
+        );
+        self.review.diffs.push(diff);
+        Ok(())
     }
 
     fn validate_comment_locations(&self) -> Result<(), String> {
@@ -2238,6 +2388,64 @@ fn anchor_status_for_location(review: &Review, location: &ReviewLocation) -> Rev
     }
 }
 
+fn committed_payload_matches(
+    diff: &ProjectGitDiffPayload,
+    root: &ProjectRootPath,
+    base_oid: &str,
+    tip_oid: &str,
+) -> bool {
+    diff.root == *root
+        && matches!(
+            &diff.revision,
+            protocol::ProjectDiffRevision::CommittedRange {
+                base_oid: diff_base,
+                tip_oid: diff_tip,
+            } if diff_base == base_oid && diff_tip == tip_oid
+        )
+}
+
+/// Frozen committed diffs still referenced by a comment, a suggestion, or a
+/// running AI reviewer. Anything else is dropped on refresh so the record
+/// does not accumulate ranges nobody commented on.
+fn referenced_committed_diffs(review: &Review) -> Vec<ProjectGitDiffPayload> {
+    let mut referenced = review
+        .comments
+        .iter()
+        .map(|comment| &comment.location)
+        .chain(
+            review
+                .suggestions
+                .iter()
+                .map(|suggestion| &suggestion.location),
+        )
+        .filter_map(|location| match &location.target {
+            ReviewTarget::CommittedDiff { base_oid, tip_oid } => {
+                Some((location.root.clone(), base_oid.clone(), tip_oid.clone()))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if matches!(review.ai_reviewer.status, ReviewAiReviewerStatus::Running)
+        && let protocol::ReviewAiScope::CommittedRange {
+            root,
+            base_oid,
+            tip_oid,
+        } = &review.ai_reviewer.scope
+    {
+        referenced.push((root.clone(), base_oid.clone(), tip_oid.clone()));
+    }
+    review
+        .diffs
+        .iter()
+        .filter(|diff| {
+            referenced.iter().any(|(root, base_oid, tip_oid)| {
+                committed_payload_matches(diff, root, base_oid, tip_oid)
+            })
+        })
+        .cloned()
+        .collect()
+}
+
 fn diff_is_clean(diffs: &[ProjectGitDiffPayload]) -> bool {
     diffs.iter().all(|diff| diff.files.is_empty())
 }
@@ -2365,18 +2573,31 @@ pub(crate) fn summary_for_review(review: &Review) -> protocol::ReviewSummary {
 }
 
 pub(crate) fn review_file_comment_counts(review: &Review) -> Vec<ReviewFileCommentCount> {
-    let mut counts = BTreeMap::<(ProjectRootPath, String), ReviewFileCommentCount>::new();
-    for comment in &review.comments {
-        let count = counts
-            .entry((
-                comment.location.root.clone(),
-                comment.location.relative_path.clone(),
-            ))
-            .or_insert_with(|| ReviewFileCommentCount {
-                root: comment.location.root.clone(),
-                relative_path: comment.location.relative_path.clone(),
-                ..ReviewFileCommentCount::default()
+    let mut counts = Vec::<ReviewFileCommentCount>::new();
+    fn entry<'a>(
+        counts: &'a mut Vec<ReviewFileCommentCount>,
+        location: &ReviewLocation,
+    ) -> &'a mut ReviewFileCommentCount {
+        let index = counts
+            .iter()
+            .position(|count| {
+                count.root == location.root
+                    && count.relative_path == location.relative_path
+                    && count.target == location.target
+            })
+            .unwrap_or_else(|| {
+                counts.push(ReviewFileCommentCount {
+                    root: location.root.clone(),
+                    relative_path: location.relative_path.clone(),
+                    target: location.target.clone(),
+                    ..ReviewFileCommentCount::default()
+                });
+                counts.len() - 1
             });
+        &mut counts[index]
+    }
+    for comment in &review.comments {
+        let count = entry(&mut counts, &comment.location);
         match &comment.source {
             ReviewCommentSource::User => {
                 count.user_comment_count = count.user_comment_count.saturating_add(1);
@@ -2390,36 +2611,27 @@ pub(crate) fn review_file_comment_counts(review: &Review) -> Vec<ReviewFileComme
         if !matches!(suggestion.state, ReviewSuggestionState::Pending) {
             continue;
         }
-        let count = counts
-            .entry((
-                suggestion.location.root.clone(),
-                suggestion.location.relative_path.clone(),
-            ))
-            .or_insert_with(|| ReviewFileCommentCount {
-                root: suggestion.location.root.clone(),
-                relative_path: suggestion.location.relative_path.clone(),
-                ..ReviewFileCommentCount::default()
-            });
+        let count = entry(&mut counts, &suggestion.location);
         count.pending_suggestion_count = count.pending_suggestion_count.saturating_add(1);
     }
-    counts.into_values().collect()
+    counts.sort_by(|left, right| {
+        left.root
+            .0
+            .cmp(&right.root.0)
+            .then_with(|| left.relative_path.cmp(&right.relative_path))
+            .then_with(|| left.target.label().cmp(right.target.label()))
+    });
+    counts
 }
 
 pub(crate) fn review_summary_scope(review: &Review) -> ReviewSummaryScope {
     match &review.selection {
         ReviewDiffSelection::Workspace { .. } => ReviewSummaryScope::Workspace,
         ReviewDiffSelection::Root { root, .. } => ReviewSummaryScope::Root { root: root.clone() },
-        ReviewDiffSelection::CommittedRange {
-            root,
-            base_oid,
-            tip_oid,
-            commit_count,
-        } => ReviewSummaryScope::CommittedRange {
-            root: root.clone(),
-            base_oid: base_oid.clone(),
-            tip_oid: tip_oid.clone(),
-            commit_count: *commit_count,
-        },
+        // Legacy committed-range records are never emitted as summaries.
+        ReviewDiffSelection::CommittedRange { root, .. } => {
+            ReviewSummaryScope::Root { root: root.clone() }
+        }
         ReviewDiffSelection::AllUncommitted => ReviewSummaryScope::Workspace,
     }
 }

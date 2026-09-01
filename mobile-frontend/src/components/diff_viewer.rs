@@ -1159,6 +1159,7 @@ fn ReviewControls(project: ActiveProjectRef, ctx: Option<ReviewCtx>) -> impl Int
                     backend_kind: None,
                     cost_hint: None,
                     instructions: None,
+                    scope: protocol::ReviewAiScope::WorkingTree,
                 },
             )
             .await
@@ -1534,6 +1535,7 @@ mod wasm_tests {
                 status: ReviewAiReviewerStatus::Idle,
                 agent_id: None,
                 error: None,
+                scope: Default::default(),
             },
             created_at_ms: 0,
             updated_at_ms: 0,

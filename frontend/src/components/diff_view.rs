@@ -542,34 +542,11 @@ pub fn ReviewableDiffView(
     let draft_state = state.clone();
     let draft_host = host_id.clone();
     let draft_project = project_id.clone();
-    let draft_revision = revision.clone();
-    let draft_root = root.clone();
     let draft: Memo<Option<(String, protocol::ReviewId)>> = Memo::new(move |_| {
         let id = draft_state.review_summaries.with(|m| {
             m.get(&draft_project).and_then(|sums| {
-                match &draft_revision {
-                    ProjectDiffRevision::WorkingTree => {
-                        crate::components::review_view::pick_workspace_draft(sums)
-                    }
-                    ProjectDiffRevision::CommittedRange { base_oid, tip_oid } => sums
-                        .iter()
-                        .filter(|summary| {
-                            matches!(summary.status, protocol::ReviewStatus::Draft)
-                                && matches!(
-                                    &summary.scope,
-                                    protocol::ReviewSummaryScope::CommittedRange {
-                                        root,
-                                        base_oid: summary_base,
-                                        tip_oid: summary_tip,
-                                        ..
-                                    } if root == &draft_root
-                                        && summary_base == base_oid
-                                        && summary_tip == tip_oid
-                                )
-                        })
-                        .max_by_key(|summary| summary.updated_at_ms),
-                }
-                .map(|summary| summary.id.clone())
+                crate::components::review_view::pick_workspace_draft(sums)
+                    .map(|summary| summary.id.clone())
             })
         })?;
         let live_non_draft = draft_state.reviews.with(|r| {
@@ -5734,6 +5711,7 @@ mod wasm_tests {
                 status: ReviewAiReviewerStatus::Idle,
                 agent_id: None,
                 error: None,
+                scope: Default::default(),
             },
             created_at_ms: 0,
             updated_at_ms: 0,
@@ -6712,6 +6690,94 @@ mod wasm_tests {
         assert!(
             sends.contains("hostA"),
             "refetch must go to the tab's host (hostA); sends: {sends}"
+        );
+    }
+
+    /// A committed-range diff tab is reviewed inside the project's one
+    /// workspace draft: its committed comments render inline, and the
+    /// working-tree comment on the same path stays off this surface.
+    #[wasm_bindgen_test]
+    async fn committed_diff_binds_to_workspace_draft() {
+        ensure_styles_loaded();
+        let container = make_container();
+        let revision = ProjectDiffRevision::CommittedRange {
+            base_oid: "1111111111111111111111111111111111111111".to_owned(),
+            tip_oid: "2222222222222222222222222222222222222222".to_owned(),
+        };
+        let mut review = draft_review("src/foo.rs", 2, "working tree only");
+        let mut committed = review.comments[0].clone();
+        committed.id = protocol::ReviewCommentId("c-committed".to_owned());
+        committed.location.target = protocol::ReviewTarget::CommittedDiff {
+            base_oid: "1111111111111111111111111111111111111111".to_owned(),
+            tip_oid: "2222222222222222222222222222222222222222".to_owned(),
+        };
+        committed.body = "committed comment".to_owned();
+        review.comments.push(committed);
+        let mut diff = small_foo_diff();
+        diff.scope = ProjectDiffScope::Uncommitted;
+        let revision_for_mount = revision.clone();
+        let handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            state
+                .active_project
+                .set(Some(crate::state::ActiveProjectRef {
+                    host_id: "h1".to_owned(),
+                    project_id: protocol::ProjectId("proj-1".to_owned()),
+                }));
+            state.diff_contents.update(|d| {
+                d.insert(
+                    crate::state::DiffKey::with_revision(
+                        "h1",
+                        protocol::ProjectId("proj-1".to_owned()),
+                        review_root(),
+                        ProjectDiffScope::Uncommitted,
+                        revision_for_mount.clone(),
+                        "src/foo.rs",
+                    ),
+                    diff.clone(),
+                );
+            });
+            state.review_summaries.update(|m| {
+                m.insert(
+                    protocol::ProjectId("proj-1".to_owned()),
+                    vec![summary_for(&review)],
+                );
+            });
+            state.reviews.update(|m| {
+                m.insert(review.id.clone(), review.clone());
+            });
+            provide_context(state);
+            view! {
+                <ReviewableDiffView
+                    tab_id=crate::state::TabId(1)
+                    host_id="h1".to_owned()
+                    project_id=protocol::ProjectId("proj-1".to_owned())
+                    root=review_root()
+                    scope=ProjectDiffScope::Uncommitted
+                    revision=revision_for_mount.clone()
+                    path="src/foo.rs".to_owned()
+                />
+            }
+        });
+        let _mounted = Mounted::new(handle, ());
+        next_tick().await;
+        next_tick().await;
+
+        let text = container.text_content().unwrap_or_default();
+        assert!(
+            text.contains("committed comment"),
+            "the workspace draft's committed comment renders on the committed diff; got: {text}"
+        );
+        assert!(
+            !text.contains("working tree only"),
+            "a working-tree comment must not leak onto the committed diff; got: {text}"
+        );
+        assert!(
+            container
+                .query_selector(".diff-gutter-clickable")
+                .unwrap()
+                .is_some(),
+            "a committed diff is commentable inside the workspace draft"
         );
     }
 }

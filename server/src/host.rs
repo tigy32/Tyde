@@ -12715,11 +12715,14 @@ impl HostHandle {
                 Err("review feedback MCP server is unavailable for AI review".to_owned()),
             );
         }
-        let reviewer_system_prompt =
-            match build_reviewer_system_prompt(&request.review, request.instructions) {
-                Ok(prompt) => prompt,
-                Err(message) => return (reply, Err(message)),
-            };
+        let reviewer_system_prompt = match build_reviewer_system_prompt(
+            &request.review,
+            &request.scope,
+            request.instructions,
+        ) {
+            Ok(prompt) => prompt,
+            Err(message) => return (reply, Err(message)),
+        };
         let reviewer_system_prompt_len = reviewer_system_prompt.len();
         let reviewer_spawn_config = ResolvedSpawnConfig {
             instructions: Some(reviewer_system_prompt),

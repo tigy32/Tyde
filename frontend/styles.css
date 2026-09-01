@@ -7060,28 +7060,12 @@ math merror {
     font-weight: 500;
 }
 
-.gp-commit-review-row {
-    display: flex;
-    align-items: center;
-    flex-wrap: wrap;
-    gap: var(--space-2);
-    padding: 2px var(--space-2);
+.gp-commit-meta .gp-commit-ai-review {
+    margin-left: auto;
 }
 
-.gp-committed-review {
-    display: flex;
-    flex-direction: column;
-    gap: var(--space-2);
-    margin: var(--space-1) var(--space-2);
-    padding: var(--space-2);
-    border: 1px solid var(--border-primary);
-    border-radius: 6px;
-    background: var(--surface-2);
-}
-
-/* `ReviewSidebar` is built for a docked pane; drop that chrome wherever it
- * is embedded so it reads as a section of its host. */
-.gp-committed-review .review-sidebar,
+/* `ReviewSidebar` is built for a docked pane; drop that chrome where the
+ * comments surface embeds it so it reads as a section of its host. */
 .review-comments-actions .review-sidebar {
     border-left: 0;
     background: transparent;
@@ -7090,7 +7074,6 @@ math merror {
     gap: var(--space-3);
 }
 
-.gp-committed-review .review-sidebar-section + .review-sidebar-section,
 .review-comments-actions .review-sidebar-section + .review-sidebar-section {
     border-top: 1px solid var(--border-primary);
     padding-top: var(--space-3);

@@ -3481,6 +3481,7 @@ mod wasm_tests {
                 status: ReviewAiReviewerStatus::Idle,
                 agent_id: None,
                 error: None,
+                scope: Default::default(),
             },
             created_at_ms: 1,
             updated_at_ms: 1,

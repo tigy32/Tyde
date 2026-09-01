@@ -561,6 +561,7 @@ pub(crate) fn ReviewSidebar(
                 backend_kind: backend_override,
                 cost_hint: cost,
                 instructions: inst,
+                scope: protocol::ReviewAiScope::WorkingTree,
             };
             match send_review_action_inner(&host, target_rid.clone(), payload).await {
                 Ok(()) => {
@@ -1152,7 +1153,7 @@ fn parse_cost_hint(s: &str) -> Option<protocol::SpawnCostHint> {
     }
 }
 
-async fn send_review_action_inner(
+pub(crate) async fn send_review_action_inner(
     host_id: &str,
     review_id: protocol::ReviewId,
     payload: ReviewActionPayload,
@@ -1669,6 +1670,31 @@ fn anchor_sort_key(location: &ReviewLocation) -> (String, u8, u32, u32) {
 /// Resolve the project diff files that cover `relative_path` from the project
 /// diff cache: prefer a per-file entry, else fall back to the whole-root entry
 /// (which the full diff view shares). Empty when neither is loaded yet.
+/// The project diff surface a review target renders on: its scope and the
+/// revision it is pinned to. Regular files have no diff surface.
+pub(crate) fn diff_surface_for_target(
+    target: &protocol::ReviewTarget,
+) -> Option<(ProjectDiffScope, protocol::ProjectDiffRevision)> {
+    match target {
+        protocol::ReviewTarget::UnstagedDiff => Some((
+            ProjectDiffScope::Unstaged,
+            protocol::ProjectDiffRevision::WorkingTree,
+        )),
+        protocol::ReviewTarget::StagedDiff => Some((
+            ProjectDiffScope::Staged,
+            protocol::ProjectDiffRevision::WorkingTree,
+        )),
+        protocol::ReviewTarget::CommittedDiff { base_oid, tip_oid } => Some((
+            ProjectDiffScope::Uncommitted,
+            protocol::ProjectDiffRevision::CommittedRange {
+                base_oid: base_oid.clone(),
+                tip_oid: tip_oid.clone(),
+            },
+        )),
+        protocol::ReviewTarget::RegularFile { .. } => None,
+    }
+}
+
 fn resolve_diff_files(
     diffs: &std::collections::HashMap<DiffKey, DiffViewState>,
     host_id: &str,
@@ -1676,18 +1702,27 @@ fn resolve_diff_files(
     root: &ProjectRootPath,
     relative_path: &str,
     scope: ProjectDiffScope,
+    revision: &protocol::ProjectDiffRevision,
 ) -> Vec<protocol::ProjectGitDiffFile> {
-    let per_file = DiffKey::new(
+    let per_file = DiffKey::with_revision(
         host_id,
         project_id.clone(),
         root.clone(),
         scope,
+        revision.clone(),
         relative_path,
     );
     if let Some(entry) = diffs.get(&per_file) {
         return entry.files.clone();
     }
-    let whole_root = DiffKey::new(host_id, project_id.clone(), root.clone(), scope, "");
+    let whole_root = DiffKey::with_revision(
+        host_id,
+        project_id.clone(),
+        root.clone(),
+        scope,
+        revision.clone(),
+        "",
+    );
     diffs
         .get(&whole_root)
         .map(|entry| entry.files.clone())
@@ -1704,15 +1739,24 @@ fn file_diff_cached(
     root: &ProjectRootPath,
     relative_path: &str,
     scope: ProjectDiffScope,
+    revision: &protocol::ProjectDiffRevision,
 ) -> bool {
-    let per_file = DiffKey::new(
+    let per_file = DiffKey::with_revision(
         host_id,
         project_id.clone(),
         root.clone(),
         scope,
+        revision.clone(),
         relative_path,
     );
-    let whole_root = DiffKey::new(host_id, project_id.clone(), root.clone(), scope, "");
+    let whole_root = DiffKey::with_revision(
+        host_id,
+        project_id.clone(),
+        root.clone(),
+        scope,
+        revision.clone(),
+        "",
+    );
     diffs.contains_key(&per_file) || diffs.contains_key(&whole_root)
 }
 
@@ -1839,32 +1883,43 @@ pub fn ReviewCommentsSurface(host_id: String, project_id: ProjectId) -> impl Int
         let fetch_host = host_id.clone();
         let fetch_pid = project_id.clone();
         let requested: StoredValue<
-            std::collections::HashSet<(ProjectRootPath, String, ProjectDiffScope)>,
+            std::collections::HashSet<(
+                ProjectRootPath,
+                String,
+                ProjectDiffScope,
+                protocol::ProjectDiffRevision,
+            )>,
             LocalStorage,
         > = StoredValue::new_local(std::collections::HashSet::new());
         Effect::new(move |_| {
             for (root, path, target) in commented_files.get() {
-                let scope = match target {
-                    protocol::ReviewTarget::UnstagedDiff => ProjectDiffScope::Unstaged,
-                    protocol::ReviewTarget::StagedDiff => ProjectDiffScope::Staged,
-                    protocol::ReviewTarget::CommittedDiff { .. } => continue,
-                    protocol::ReviewTarget::RegularFile { .. } => continue,
+                let Some((scope, revision)) = diff_surface_for_target(&target) else {
+                    continue;
                 };
                 let cached = fetch_state.diff_contents.with_untracked(|diffs| {
-                    file_diff_cached(diffs, &fetch_host, &fetch_pid, &root, &path, scope)
+                    file_diff_cached(
+                        diffs,
+                        &fetch_host,
+                        &fetch_pid,
+                        &root,
+                        &path,
+                        scope,
+                        &revision,
+                    )
                 });
-                let pair = (root.clone(), path.clone(), scope);
+                let pair = (root.clone(), path.clone(), scope, revision.clone());
                 if cached || requested.with_value(|set| set.contains(&pair)) {
                     continue;
                 }
                 requested.update_value(|set| {
                     set.insert(pair.clone());
                 });
-                let key = DiffKey::new(
+                let key = DiffKey::with_revision(
                     fetch_host.clone(),
                     fetch_pid.clone(),
                     root.clone(),
                     scope,
+                    revision.clone(),
                     path.clone(),
                 );
                 fetch_state.diff_contents.update(|diffs| {
@@ -1884,7 +1939,7 @@ pub fn ReviewCommentsSurface(host_id: String, project_id: ProjectId) -> impl Int
                     request_id: None,
                     root: root.clone(),
                     scope,
-                    revision: protocol::ProjectDiffRevision::WorkingTree,
+                    revision,
                     path: Some(path.clone()),
                     context_mode: DiffContextMode::Hunks,
                 };
@@ -2128,15 +2183,13 @@ fn review_comment_entry_row(
                     .unwrap_or_default()
             });
         }
-        let scope = match snip_target {
-            protocol::ReviewTarget::UnstagedDiff => ProjectDiffScope::Unstaged,
-            protocol::ReviewTarget::StagedDiff => ProjectDiffScope::Staged,
-            protocol::ReviewTarget::CommittedDiff { .. } => return Vec::new(),
-            protocol::ReviewTarget::RegularFile { .. } => unreachable!(),
+        let Some((scope, revision)) = diff_surface_for_target(&snip_target) else {
+            unreachable!("regular files snippet from their snapshot");
         };
         snip_state.diff_contents.with(|diffs| {
-            let files =
-                resolve_diff_files(diffs, &snip_host, &snip_pid, &snip_root, &snip_path, scope);
+            let files = resolve_diff_files(
+                diffs, &snip_host, &snip_pid, &snip_root, &snip_path, scope, &revision,
+            );
             snippet_for_anchor(&files, &snip_path, &snip_anchor)
         })
     };
@@ -2549,6 +2602,7 @@ mod wasm_tests {
                 status: ReviewAiReviewerStatus::Idle,
                 agent_id: None,
                 error: None,
+                scope: Default::default(),
             },
             created_at_ms: 0,
             updated_at_ms: 0,
@@ -4185,6 +4239,78 @@ mod wasm_tests {
         assert!(
             !btn.has_attribute("disabled"),
             "Run AI must enable once a root has a reviewable change"
+        );
+    }
+
+    /// A comment on a committed range fetches that range's diff (not the
+    /// working tree's) for its snippet, and renders the snippet once the
+    /// committed response lands under the revision-pinned cache key.
+    #[wasm_bindgen_test]
+    async fn comments_surface_fetches_committed_diff_for_committed_comment() {
+        ensure_styles_loaded();
+        record_bridge();
+        let container = make_container();
+        let mut review = make_review();
+        let mut comment = comment_at_line(2, "committed note");
+        comment.location.target = protocol::ReviewTarget::CommittedDiff {
+            base_oid: "1111111111111111111111111111111111111111".to_owned(),
+            tip_oid: "2222222222222222222222222222222222222222".to_owned(),
+        };
+        review.comments.push(comment);
+        let holder = mount_comments_surface(container.clone(), review, false);
+        next_tick().await;
+        next_tick().await;
+
+        let sent = sent_lines_joined();
+        assert!(
+            sent.contains("\"kind\":\"committed_range\"")
+                && sent.contains("2222222222222222222222222222222222222222")
+                && sent.contains("\"path\":\"src/foo.rs\""),
+            "the committed comment must fetch its range's path diff; sent: {sent}"
+        );
+        let labels = container.text_content().unwrap_or_default();
+        assert!(
+            labels.contains("committed"),
+            "the entry names its committed source; got: {labels}"
+        );
+        assert!(
+            container
+                .query_selector(".review-comments-snippet")
+                .unwrap()
+                .is_none(),
+            "no snippet before the committed diff lands"
+        );
+
+        let state = holder.borrow().clone().unwrap();
+        let key = DiffKey::with_revision(
+            "h1",
+            ProjectId("proj-1".to_owned()),
+            root_path(),
+            ProjectDiffScope::Uncommitted,
+            protocol::ProjectDiffRevision::CommittedRange {
+                base_oid: "1111111111111111111111111111111111111111".to_owned(),
+                tip_oid: "2222222222222222222222222222222222222222".to_owned(),
+            },
+            "src/foo.rs",
+        );
+        state.diff_contents.update(|m| {
+            m.insert(
+                key,
+                DiffViewState {
+                    root: root_path(),
+                    scope: ProjectDiffScope::Uncommitted,
+                    path: Some("src/foo.rs".to_owned()),
+                    context_mode: DiffContextMode::Hunks,
+                    pending: false,
+                    files: diff_payload().files,
+                },
+            );
+        });
+        next_tick().await;
+        let text = container.text_content().unwrap_or_default();
+        assert!(
+            text.contains("let x = 1;"),
+            "the committed snippet renders from the revision-pinned diff; got: {text}"
         );
     }
 }

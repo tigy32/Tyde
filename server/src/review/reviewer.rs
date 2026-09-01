@@ -193,12 +193,10 @@ impl ReviewerToolBridge {
 
 pub(crate) fn build_reviewer_system_prompt(
     review: &protocol::Review,
+    scope: &protocol::ReviewAiScope,
     instructions: Option<String>,
 ) -> Result<String, String> {
-    let committed = matches!(
-        &review.selection,
-        protocol::ReviewDiffSelection::CommittedRange { .. }
-    );
+    let committed = matches!(scope, protocol::ReviewAiScope::CommittedRange { .. });
     let too_large_error = reviewer_prompt_too_large_error(committed);
     let mut prompt = String::new();
     prompt.push_str("You are the AI reviewer for a frozen Tyde code review. ");
@@ -236,8 +234,8 @@ pub(crate) fn build_reviewer_system_prompt(
         }
     }
 
-    let location_target = match &review.selection {
-        protocol::ReviewDiffSelection::CommittedRange {
+    let location_target = match scope {
+        protocol::ReviewAiScope::CommittedRange {
             base_oid, tip_oid, ..
         } => format!(
             r#","target":{{"kind":"committed_diff","base_oid":"{base_oid}","tip_oid":"{tip_oid}"}}"#
@@ -252,9 +250,9 @@ pub(crate) fn build_reviewer_system_prompt(
     ));
     prompt.push_str("Use severity values `info`, `warn`, or `bug`.\n");
     ensure_reviewer_prompt_fits(&prompt, &too_large_error)?;
-    if let protocol::ReviewDiffSelection::CommittedRange {
+    if let protocol::ReviewAiScope::CommittedRange {
         base_oid, tip_oid, ..
-    } = &review.selection
+    } = scope
     {
         prompt.push_str("\nThis review is restricted to the frozen committed diff ");
         prompt.push_str(base_oid);

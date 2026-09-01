@@ -5,6 +5,12 @@ multiplexing, connection handshake, and version negotiation.
 
 See `01-philosophy.md` for the design decisions that shaped this spec.
 
+Protocol version 55 folds committed-range review into the single workspace
+review: `ReviewSummaryScope::CommittedRange` is gone, `StartAiReview` and
+`ReviewAiReviewerState` carry a `ReviewAiScope`, and `ReviewFileCommentCount`
+carries the `ReviewTarget` it counts. `ReviewDiffSelection::CommittedRange`
+remains readable for stored records only and is rejected on create.
+
 Protocol version 54 adds explicit working-tree versus committed-range revision
 identity to project diff requests/responses, first-parent recent-commit metadata
 and repository-native empty-tree identity to per-root git status, and exact
