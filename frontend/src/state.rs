@@ -3493,6 +3493,9 @@ pub struct AppState {
     pub voice_ui: RwSignal<crate::voice::VoiceUiState>,
     pub voice_generation: RwSignal<u64>,
     pub voice_mode_choice: RwSignal<protocol::VoiceMode>,
+    /// A released hold that must end the dictation turn once everything it
+    /// captured has reached the host.
+    pub voice_finish_pending: RwSignal<bool>,
     /// Sticky user choice between the expanded voice band and the one-line
     /// strip. Never changed by session state — a view the user chose must
     /// not move on its own.
@@ -4087,6 +4090,7 @@ impl AppState {
             voice_ui: RwSignal::new(crate::voice::VoiceUiState::Idle),
             voice_generation: RwSignal::new(0),
             voice_mode_choice: RwSignal::new(crate::voice::initial_voice_mode()),
+            voice_finish_pending: RwSignal::new(false),
             voice_band_collapsed: RwSignal::new(false),
             voice_transcript_in_chat: RwSignal::new(false),
             projects: RwSignal::new(Vec::new()),

@@ -22,6 +22,13 @@ is disabled and carries the reason, so an unavailable capability is explained
 rather than silently dropped. Mobile shows the same choice as a two-segment
 radio group.
 
+On desktop the mic is a press-and-hold control for dictation: holding it
+records and releasing ends the turn, while a press shorter than the hold
+threshold latches the session open to be ended from the session bar. Keyboard
+activation always latches, since there is no press to hold. A release only
+sends `voice_input_end` once the audio it captured has been sent, because the
+server rejects input that arrives after the end of input.
+
 `voice_start` carries a strongly typed request: `conversation` contains its
 target and bidirectional formats, while `dictation` contains only input
 formats. `voice_accepted` echoes the selected request shape after the relevant

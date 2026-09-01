@@ -4,6 +4,7 @@ use std::{
 };
 
 use leptos::prelude::*;
+use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::spawn_local;
 
 use crate::{
@@ -302,6 +303,7 @@ fn start(
         })
         .unwrap_or(1);
     clear_voice_uplink_queue();
+    state.voice_finish_pending.set(false);
     let capture_first = request.mode() == protocol::VoiceMode::Dictation;
     state.voice_ui.set(VoiceUiState::Starting {
         generation,
@@ -353,6 +355,7 @@ fn start(
 pub fn stop(state: AppState, reason: protocol::VoiceStopReason) {
     let current = state.voice_ui.get_untracked();
     clear_voice_uplink_queue();
+    state.voice_finish_pending.set(false);
     let VoiceUiState::Active {
         generation,
         host_id,
@@ -391,6 +394,22 @@ pub fn stop(state: AppState, reason: protocol::VoiceStopReason) {
         )
         .await;
     });
+}
+
+/// Release of a hold-to-talk press. Capture stops immediately, because the user
+/// let go, but the turn only ends once everything already captured has been
+/// sent — including audio recorded before the host accepted the session.
+pub fn request_dictation_finish(state: AppState) {
+    if matches!(state.voice_ui.get_untracked(), VoiceUiState::Idle) {
+        return;
+    }
+    state.voice_finish_pending.set(true);
+    let media_state = state.clone();
+    spawn_local(async move {
+        let _ = bridge::voice_media_stop().await;
+        drain_voice_uplink_queue(&media_state);
+    });
+    drain_voice_uplink_queue(&state);
 }
 
 pub fn finish_dictation(state: AppState) {
@@ -851,6 +870,15 @@ fn drain_voice_uplink_queue(state: &AppState) {
             let Some(event) = VOICE_UPLINK_QUEUE.with(|queue| queue.borrow_mut().pop_front())
             else {
                 VOICE_UPLINK_PUMP_RUNNING.with(|running| running.set(false));
+                // A released hold ends the turn here rather than at the release
+                // itself: `voice_input_end` ahead of the audio it follows makes
+                // the server reject that audio outright.
+                if state.voice_finish_pending.get_untracked()
+                    && matches!(state.voice_ui.get_untracked(), VoiceUiState::Active { .. })
+                {
+                    state.voice_finish_pending.set(false);
+                    finish_dictation(state.clone());
+                }
                 return;
             };
             match route_voice_uplink(&state.voice_ui.get_untracked(), event) {
@@ -1386,6 +1414,12 @@ fn VoiceSessionControls(state: AppState) -> impl IntoView {
     }
 }
 
+/// Below this, a press is a tap that latches the session open; at or above it
+/// the press is a hold whose release ends the turn. Set by feel: long enough
+/// that an ordinary click never starts a hold, short enough that a deliberate
+/// press-and-speak always does.
+const VOICE_HOLD_THRESHOLD_MS: f64 = 350.0;
+
 const VOICE_OFFER_UNAVAILABLE: &str = "Speech is unavailable in this chat";
 
 /// Whether each speech mode can start for one composer. A mode holds `None`
@@ -1623,15 +1657,22 @@ pub fn VoiceComposerButton(
 ) -> impl IntoView {
     let state = expect_context::<AppState>();
     let offer = composer_voice_availability(&state, agent_ref, composer.clone());
+    // A press is held while the pointer is still down. The button has to stay
+    // mounted for that whole time or the release would land on nothing, so the
+    // idle-only rule below is relaxed for the duration of a hold.
+    let holding = RwSignal::new(false);
+    let hold_started_at = StoredValue::new(0.0_f64);
     let idle_state = state.clone();
     let show = Memo::new(move |_| {
-        offer.get().any() && matches!(idle_state.voice_ui.get(), VoiceUiState::Idle)
+        offer.get().any()
+            && (matches!(idle_state.voice_ui.get(), VoiceUiState::Idle) || holding.get())
     });
     let mode_state = state.clone();
     let effective_mode =
         Memo::new(move |_| offer.get().effective(mode_state.voice_mode_choice.get()));
     let menu_open = RwSignal::new(false);
     let choice_state = StoredValue::new(state.clone());
+    let gesture_state = StoredValue::new(state.clone());
     let start_state = StoredValue::new((state, composer));
     let start_effective = move || {
         let Some(mode) = effective_mode.get_untracked() else {
@@ -1645,6 +1686,44 @@ pub fn VoiceComposerButton(
             }
             protocol::VoiceMode::Conversation => start_conversation(state.clone()),
         })
+    };
+    // Hold-to-talk belongs to dictation, which is a burst: one utterance into
+    // the composer, with the release marking its end. A conversation is a
+    // session you enter and stay in, so it keeps plain click-to-start.
+    let hold_applies =
+        move || effective_mode.get_untracked() == Some(protocol::VoiceMode::Dictation);
+    let on_press = move |event: web_sys::PointerEvent| {
+        if !hold_applies()
+            || !gesture_state
+                .with_value(|state| matches!(state.voice_ui.get_untracked(), VoiceUiState::Idle))
+        {
+            return;
+        }
+        // Keeps the release on this button even if the pointer drifts off it
+        // while the user is talking.
+        if let Some(target) = event
+            .target()
+            .and_then(|target| target.dyn_into::<web_sys::Element>().ok())
+        {
+            let _ = target.set_pointer_capture(event.pointer_id());
+        }
+        hold_started_at.set_value(js_sys::Date::now());
+        holding.set(true);
+        start_effective();
+    };
+    let on_release = move |_: web_sys::PointerEvent| {
+        if !holding.get_untracked() {
+            return;
+        }
+        holding.set(false);
+        // Anything shorter than a deliberate hold is a tap, which latches the
+        // session open so it can be ended from the session bar. Keyboard users
+        // reach the same latch through the click handler, which never sees a
+        // pointer sequence at all.
+        if js_sys::Date::now() - hold_started_at.get_value() < VOICE_HOLD_THRESHOLD_MS {
+            return;
+        }
+        gesture_state.with_value(|state| request_dictation_finish(state.clone()));
     };
     let mode_item = move |mode: protocol::VoiceMode| {
         let block = Memo::new(move |_| offer.get().block(mode));
@@ -1681,13 +1760,31 @@ pub fn VoiceComposerButton(
                     data-voice-mode=move || {
                         effective_mode.get().map(voice_mode_value).unwrap_or("none")
                     }
+                    class:chat-voice-btn--holding=move || holding.get()
+                    data-holding=move || if holding.get() { "true" } else { "false" }
                     aria-label=move || {
                         effective_mode.get().map(voice_mode_label).unwrap_or("Start speech")
                     }
-                    title=move || {
-                        effective_mode.get().map(voice_mode_label).unwrap_or("Start speech")
+                    title=move || match effective_mode.get() {
+                        Some(protocol::VoiceMode::Dictation) => {
+                            "Hold to dictate, or tap to keep dictating"
+                        }
+                        Some(mode) => voice_mode_label(mode),
+                        None => "Start speech",
                     }
-                    on:click=move |_| start_effective()
+                    on:pointerdown=on_press
+                    on:pointerup=on_release
+                    on:pointercancel=on_release
+                    on:click=move |_| {
+                        // A pointer press has already started the session, so
+                        // the click that follows it must not start a second
+                        // one. Only a keyboard activation reaches this idle.
+                        if gesture_state.with_value(|state| {
+                            matches!(state.voice_ui.get_untracked(), VoiceUiState::Idle)
+                        }) {
+                            start_effective();
+                        }
+                    }
                 >
                     {move || effective_mode.get().map(voice_mode_icon)}
                 </button>
@@ -1874,6 +1971,7 @@ mod wasm_tests {
             "__tyde_voice_test_send_host_frame_args",
             "__tyde_voice_test_send_host_frame_log",
             "__tyde_voice_test_push_output_args",
+            "__tyde_voice_test_media_start_args",
             "__tyde_voice_test_listen_attempts",
             "__tyde_voice_test_unlisten_calls",
             "__tyde_voice_test_active_listeners",
@@ -1891,6 +1989,7 @@ mod wasm_tests {
             window.__tyde_voice_test_send_host_frame_args = undefined;
             window.__tyde_voice_test_send_host_frame_log = [];
             window.__tyde_voice_test_push_output_args = undefined;
+            window.__tyde_voice_test_media_start_args = undefined;
             window.__tyde_voice_test_listen_attempts = 0;
             window.__tyde_voice_test_unlisten_calls = 0;
             window.__tyde_voice_test_active_listeners = 0;
@@ -1940,9 +2039,22 @@ mod wasm_tests {
                 },
                 core: {
                     invoke: function(command, args) {
+                        if (command === "voice_media_start") {
+                            window.__tyde_voice_test_media_start_args = args;
+                            return Promise.resolve(null);
+                        }
                         if (command === "send_host_frame") {
                             window.__tyde_voice_test_send_host_frame_args = args;
                             window.__tyde_voice_test_send_host_frame_log.push(args);
+                            return Promise.resolve(null);
+                        }
+                        if (command === "send_host_line") {
+                            // Control frames travel on a different command from
+                            // binary audio. Both land in one ordered log so a
+                            // test can assert how they interleave.
+                            window.__tyde_voice_test_send_host_frame_log.push({
+                                envelope: args.line
+                            });
                             return Promise.resolve(null);
                         }
                         if (command === "voice_media_push_output") {
@@ -2308,7 +2420,7 @@ mod wasm_tests {
         container.remove();
     }
 
-    fn uplink_log() -> Vec<protocol::VoiceAudioPayload> {
+    fn logged_envelopes() -> Vec<protocol::Envelope> {
         let log = js_sys::Array::from(&captured_invoke("__tyde_voice_test_send_host_frame_log"));
         (0..log.length())
             .map(|index| {
@@ -2319,12 +2431,38 @@ mod wasm_tests {
                 }
                 let invocation: Invocation = serde_wasm_bindgen::from_value(log.get(index))
                     .expect("decode send_host_frame invocation");
-                let envelope: protocol::Envelope =
-                    serde_json::from_str(&invocation.envelope).expect("decode envelope");
-                assert_eq!(envelope.kind, FrameKind::VoiceAudio);
-                envelope.parse_payload().expect("decode audio payload")
+                serde_json::from_str(&invocation.envelope).expect("decode envelope")
             })
             .collect()
+    }
+
+    fn uplink_log() -> Vec<protocol::VoiceAudioPayload> {
+        logged_envelopes()
+            .into_iter()
+            .filter(|envelope| envelope.kind == FrameKind::VoiceAudio)
+            .map(|envelope| envelope.parse_payload().expect("decode audio payload"))
+            .collect()
+    }
+
+    async fn sleep_ms(ms: i32) {
+        let promise = js_sys::Promise::new(&mut |resolve, _| {
+            web_sys::window()
+                .expect("window")
+                .set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, ms)
+                .expect("schedule timeout");
+        });
+        let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+    }
+
+    fn dispatch_pointer(element: &web_sys::Element, kind: &str) {
+        let init = web_sys::PointerEventInit::new();
+        init.set_bubbles(true);
+        init.set_pointer_id(1);
+        let event = web_sys::PointerEvent::new_with_event_init_dict(kind, &init)
+            .expect("construct pointer event");
+        element
+            .dispatch_event(&event)
+            .expect("dispatch pointer event");
     }
 
     async fn wait_for_uplinks(expected: usize) -> Vec<protocol::VoiceAudioPayload> {
@@ -2336,6 +2474,169 @@ mod wasm_tests {
             next_tick().await;
         }
         uplink_log()
+    }
+
+    /// **A held press dictates, and its release ends the turn behind its audio.**
+    ///
+    /// The gesture has to hold together across the whole session: the press
+    /// opens the microphone before the host has accepted anything, and the
+    /// release must not send `voice_input_end` until the audio it captured has
+    /// gone out, because the server rejects input that arrives after the end.
+    #[wasm_bindgen_test]
+    async fn holding_the_mic_dictates_and_release_ends_the_turn_behind_its_audio() {
+        #[derive(serde::Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct UplinkEvent {
+            generation: u64,
+            media_seq: u64,
+            timestamp_samples_48k: u64,
+            opus: Vec<u8>,
+        }
+
+        let _stub = install_voice_listener_stub(None, None);
+        let container = container();
+        let state = AppState::new();
+        open_voice_gate(&state);
+        state.host_settings_by_host.update(|settings| {
+            settings.get_mut("local").unwrap().voice.dictation_enabled = true;
+            settings.get_mut("local").unwrap().voice.dictation_region =
+                Some("us-west-2".to_owned());
+        });
+        state.voice_capabilities_by_host.update(|capabilities| {
+            capabilities.insert(
+                "local".to_owned(),
+                protocol::VoiceCapabilitiesPayload::for_connection(true, true, true),
+            );
+        });
+        state.voice_mode_choice.set(protocol::VoiceMode::Dictation);
+        let render_state = state.clone();
+        let mount = mount_to(container.clone(), move || {
+            let state = render_state.clone();
+            provide_context(state.clone());
+            let agent_ref = Signal::derive(move || state.active_agent.get());
+            let composer = render_state.composer();
+            view! {
+                <VoiceRuntime />
+                <VoiceComposerButton agent_ref=agent_ref composer=composer />
+            }
+        });
+        wait_for_voice_listener_attempts(4).await;
+        next_tick().await;
+
+        let mic = start_button(&container).expect("the mic must be offered");
+        dispatch_pointer(&mic, "pointerdown");
+        next_tick().await;
+        next_tick().await;
+
+        // The press alone opens the microphone: capture must not wait for the
+        // host, which is the whole point of holding to talk.
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct MediaStart {
+            input_only: bool,
+            pending_acceptance: bool,
+        }
+        let media_start: MediaStart =
+            serde_wasm_bindgen::from_value(captured_invoke("__tyde_voice_test_media_start_args"))
+                .expect("the press must start capture");
+        assert!(media_start.input_only);
+        assert!(
+            media_start.pending_acceptance,
+            "a held press captures before the host accepts"
+        );
+        assert!(
+            mic.get_attribute("data-holding").as_deref() == Some("true"),
+            "the mic must show that it is recording for the length of the press"
+        );
+
+        let generation = state.voice_generation.get_untracked();
+        // Speak while the provider stream is still opening — the realistic
+        // hold: the press is over long before a Transcribe stream is live.
+        for seq in 0..2u64 {
+            dispatch_tauri_voice_event(
+                "__tyde_voice_test_packet_dispatch",
+                "tyde://voice-opus-packet",
+                UplinkEvent {
+                    generation,
+                    media_seq: seq,
+                    timestamp_samples_48k: seq * 960,
+                    opus: vec![seq as u8 + 1],
+                },
+            );
+        }
+
+        // Past the tap threshold, so letting go ends the turn rather than
+        // latching the session open.
+        sleep_ms(450).await;
+        dispatch_pointer(&mic, "pointerup");
+        next_tick().await;
+        next_tick().await;
+        assert!(
+            logged_envelopes()
+                .iter()
+                .all(|envelope| envelope.kind != FrameKind::VoiceInputEnd),
+            "a release cannot end a turn the host has not accepted yet"
+        );
+        assert!(
+            uplink_log().is_empty(),
+            "audio held from before acceptance must not have been sent yet"
+        );
+
+        let session = protocol::VoiceSessionId("hold-session".to_owned());
+        let accepted = protocol::Envelope::from_payload(
+            StreamPath(format!("/voice/{}", session.0)),
+            FrameKind::VoiceAccepted,
+            0,
+            &protocol::VoiceAcceptedPayload {
+                session_id: session.clone(),
+                generation,
+                request: protocol::VoiceAcceptedRequest::Dictation {
+                    uplink: protocol::VoiceAudioFormat::opus(48_000),
+                },
+            },
+        )
+        .expect("build acceptance envelope");
+        handle_control(&state, "local", &accepted);
+        for _ in 0..24 {
+            if logged_envelopes()
+                .iter()
+                .any(|envelope| envelope.kind == FrameKind::VoiceInputEnd)
+            {
+                break;
+            }
+            next_tick().await;
+        }
+
+        // Everything the hold captured reaches the host, and the turn ends
+        // behind it: `voice_input_end` sent first would make the server reject
+        // exactly the audio the hold existed to capture.
+        assert_eq!(
+            uplink_log()
+                .iter()
+                .map(|payload| payload.first_media_seq)
+                .collect::<Vec<_>>(),
+            vec![0, 1],
+            "the held audio must flush in capture order once accepted"
+        );
+        let kinds: Vec<FrameKind> = logged_envelopes()
+            .into_iter()
+            .map(|envelope| envelope.kind)
+            .collect();
+        let last_audio = kinds
+            .iter()
+            .rposition(|kind| *kind == FrameKind::VoiceAudio)
+            .expect("the held audio must be sent");
+        let input_end = kinds
+            .iter()
+            .position(|kind| *kind == FrameKind::VoiceInputEnd)
+            .expect("releasing a held press must end the turn");
+        assert!(
+            last_audio < input_end,
+            "voice_input_end must follow every packet it ends, got {kinds:?}"
+        );
+
+        drop(mount);
+        container.remove();
     }
 
     /// **Words spoken while the provider stream is still opening must survive.**

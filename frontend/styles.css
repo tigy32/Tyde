@@ -14117,6 +14117,18 @@ pre.tool-error-pre {
     margin-right: var(--space-1);
 }
 
+/* Held down: the button is the recording indicator for the duration of the
+   press, so the state has to read at a glance without moving anything. */
+.chat-voice-btn--holding,
+.chat-voice-btn--holding:hover:not(:disabled) {
+    background: var(--accent-primary);
+    color: var(--surface-1);
+}
+
+.chat-voice-btn--holding:active:not(:disabled) {
+    transform: none;
+}
+
 /* Reserved width so a row does not shift sideways when its tick appears. */
 .chat-send-menu-check {
     flex-shrink: 0;
