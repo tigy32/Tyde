@@ -13,7 +13,7 @@
 
 use std::collections::HashMap;
 
-use indexmap::{IndexMap, IndexSet};
+use indexmap::IndexMap;
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 use uuid::Uuid;
@@ -25,20 +25,6 @@ use protocol::{
     ToolExecutionOutcome, ToolProgressData, ToolRequest, ToolRequestType, ToolUseData,
 };
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum EmitterPolicy {
-    /// Strict mode: protocol violations are recorded, invalid transitions are rejected,
-    /// and any accumulated violations are emitted as an Error message to the user at the
-    /// end of the turn. Used in pre-release/beta builds, tests, and conformance suites.
-    Strict,
-    /// Permissive mode: the emitter acts as an auto-healing normalizer. Violations are logged
-    /// to tracing, but transitions are repaired on the fly (auto-opening responses on unannounced
-    /// deltas, auto-closing responses on idle or overlapping starts, synthesizing missing tool
-    /// declarations/requests) so downstream clients always receive a 100% valid event stream
-    /// with zero dropped content. Used in stable release builds.
-    Permissive,
-}
-
 pub struct TurnEmitter {
     inner: std::sync::Mutex<TurnEmitterState>,
 }
@@ -46,20 +32,17 @@ pub struct TurnEmitter {
 struct TurnEmitterState {
     tx: mpsc::UnboundedSender<Value>,
     agent: String,
-    policy: EmitterPolicy,
+    surface_protocol_violations: bool,
     typing_active: bool,
     current_response: Option<OpenResponse>,
     declared_tools: HashMap<String, DeclaredTool>,
     open_tool_requests: IndexMap<String, EmittedToolRequest>,
     completed_tool_requests: HashMap<String, CompletedToolRequest>,
     retired_tool_call_ids: IndexMap<String, CompletedToolRequest>,
-    retired_response_tokens: IndexSet<String>,
     violations: Vec<String>,
 }
 
 const RETIRED_TOOL_CALL_LEDGER_CAP: usize = 1024;
-const RETIRED_RESPONSE_LEDGER_CAP: usize = 512;
-const MAX_RECORDED_VIOLATIONS: usize = 256;
 
 struct EmittedToolRequest {
     tool_type: ToolRequestType,
@@ -140,32 +123,27 @@ impl TurnEmitter {
     }
 
     pub fn new_for_agent(tx: mpsc::UnboundedSender<Value>, agent: AgentName<'_>) -> Self {
-        let policy =
-            if crate::host_release_version().is_some_and(|version| !version.is_prerelease()) {
-                EmitterPolicy::Permissive
-            } else {
-                EmitterPolicy::Strict
-            };
-        Self::new_for_agent_with_policy(tx, agent, policy)
+        let surface_protocol_violations =
+            crate::host_release_version().is_some_and(|version| version.is_prerelease());
+        Self::new_for_agent_with_protocol_violation_policy(tx, agent, surface_protocol_violations)
     }
 
-    pub fn new_for_agent_with_policy(
+    fn new_for_agent_with_protocol_violation_policy(
         tx: mpsc::UnboundedSender<Value>,
         agent: AgentName<'_>,
-        policy: EmitterPolicy,
+        surface_protocol_violations: bool,
     ) -> Self {
         Self {
             inner: std::sync::Mutex::new(TurnEmitterState {
                 tx,
                 agent: agent.0.to_owned(),
-                policy,
+                surface_protocol_violations,
                 typing_active: false,
                 current_response: None,
                 declared_tools: HashMap::new(),
                 open_tool_requests: IndexMap::new(),
                 completed_tool_requests: HashMap::new(),
                 retired_tool_call_ids: IndexMap::new(),
-                retired_response_tokens: IndexSet::new(),
                 violations: Vec::new(),
             }),
         }
@@ -177,7 +155,6 @@ impl TurnEmitter {
             .stream_start(model, std::panic::Location::caller())
     }
 
-    #[track_caller]
     pub fn stream_delta(&self, response: &ResponseHandle, text: &str) {
         if text.is_empty() {
             return;
@@ -185,7 +162,6 @@ impl TurnEmitter {
         self.lock().stream_delta(response, text);
     }
 
-    #[track_caller]
     pub fn stream_reasoning_delta(&self, response: &ResponseHandle, text: &str) {
         if text.is_empty() {
             return;
@@ -320,6 +296,11 @@ impl TurnEmitter {
     }
 
     pub fn tool_progress(&self, data: &protocol::ToolProgressData) {
+        if data.tool_call_id.trim().is_empty() {
+            self.lock()
+                .violation("empty_tool_call_id", "tool progress carried an empty id");
+            return;
+        }
         self.lock().send_tool_progress(data);
     }
 
@@ -420,27 +401,11 @@ impl TurnEmitter {
         if !typing {
             // Both ends of the report matter: which terminal path declared the
             // turn over, and which `stream_start` opened the response it walked
-            // away from. The volume says whether the user lost real output or
+            // away from. The volume says whether real output was at stake or
             // only an empty shell.
-            let abandoned = state.current_response.as_ref().map(|open| {
-                (
-                    open.handle.clone(),
-                    format!(
-                        "typing ended at {idle_caller} before the response opened at {} reached \
-                         StreamEnd, discarding {} characters of content and {} of reasoning",
-                        open.opened_at,
-                        open.content.chars().count(),
-                        open.reasoning.chars().count(),
-                    ),
-                )
-            });
-            if let Some((response, detail)) = abandoned {
+            if let Some(open) = state.current_response.take() {
+                let detail = state.end_open_response_at_idle(open, idle_caller);
                 state.violation("idle_with_open_response", detail);
-                if state.policy == EmitterPolicy::Permissive {
-                    state.auto_end_current_response();
-                } else {
-                    state.discard_open_response(&response);
-                }
             }
             let foreground_tools = state
                 .open_tool_requests
@@ -622,12 +587,7 @@ impl TurnEmitterState {
             detail,
             "Backend event transition violated the chat protocol"
         );
-        if self.violations.len() + 1 < MAX_RECORDED_VIOLATIONS {
-            self.violations.push(format!("[{code}] {detail}"));
-        } else if self.violations.len() + 1 == MAX_RECORDED_VIOLATIONS {
-            self.violations
-                .push("[violations_truncated] Further protocol violations suppressed".to_owned());
-        }
+        self.violations.push(format!("[{code}] {detail}"));
     }
 
     /// Emitted before the turn's `TypingStatusChanged(false)` so it lands inside
@@ -637,10 +597,10 @@ impl TurnEmitterState {
             return;
         }
         let violations = std::mem::take(&mut self.violations);
-        if self.policy != EmitterPolicy::Strict {
+        if !self.surface_protocol_violations {
             tracing::debug!(
                 count = violations.len(),
-                "Suppressing user-facing protocol violation report for a permissive emitter"
+                "Suppressing user-facing protocol violation report for a stable build"
             );
             return;
         }
@@ -673,39 +633,6 @@ impl TurnEmitterState {
         )));
     }
 
-    fn auto_end_current_response(&mut self) {
-        if let Some(open) = self.current_response.take() {
-            let token = open.handle.token.clone();
-            let mut message = self.build_stream_end_message(StreamEndPayload::default(), open);
-            let owner = message
-                .message_id
-                .clone()
-                .expect("stream response has a presentation id");
-            let streaming_declarations: Vec<ToolUseData> = self
-                .declared_tools
-                .values()
-                .filter(|dt| dt.owner == owner)
-                .map(|dt| dt.declaration.clone())
-                .collect();
-            message.tool_calls = self.sanitize_tool_declarations(
-                owner,
-                message.content.chars().count() as u64,
-                streaming_declarations,
-            );
-            self.send_chat(ChatEvent::StreamEnd(StreamEndData { message }));
-            self.retire_response_token(token);
-        }
-    }
-
-    fn retire_response_token(&mut self, token: String) {
-        if !token.is_empty() {
-            self.retired_response_tokens.insert(token);
-            while self.retired_response_tokens.len() > RETIRED_RESPONSE_LEDGER_CAP {
-                self.retired_response_tokens.shift_remove_index(0);
-            }
-        }
-    }
-
     fn stream_start(
         &mut self,
         model: Option<&str>,
@@ -728,11 +655,7 @@ impl TurnEmitterState {
                      {previous_caller} was still open"
                 ),
             );
-            if self.policy == EmitterPolicy::Permissive {
-                self.auto_end_current_response();
-            } else {
-                self.discard_open_response(&response);
-            }
+            self.discard_open_response(&response);
         }
 
         let message_id = ChatMessageId(Uuid::new_v4().to_string());
@@ -755,9 +678,8 @@ impl TurnEmitterState {
         response
     }
 
-    #[track_caller]
     fn stream_delta(&mut self, response: &ResponseHandle, text: &str) {
-        if !self.ensure_accepted_response(response, "response_delta") {
+        if !self.accept_ordered_response_event(response, "response_delta") {
             return;
         }
         self.current_response
@@ -770,9 +692,8 @@ impl TurnEmitterState {
         }));
     }
 
-    #[track_caller]
     fn stream_reasoning_delta(&mut self, response: &ResponseHandle, text: &str) {
-        if !self.ensure_accepted_response(response, "response_reasoning_delta") {
+        if !self.accept_ordered_response_event(response, "response_reasoning_delta") {
             return;
         }
         self.current_response
@@ -786,115 +707,24 @@ impl TurnEmitterState {
     }
 
     fn stream_end(&mut self, response: &ResponseHandle, payload: StreamEndPayload) {
-        if let Some(open) = self.current_response.take() {
-            if &open.handle != response {
-                self.violation(
-                    "response_end",
-                    "event used a stale or foreign response handle",
-                );
-                if self.policy == EmitterPolicy::Permissive
-                    && !self.retired_response_tokens.contains(&response.token)
-                {
-                    // Auto-end the prior open response first
-                    self.current_response = Some(open);
-                    self.auto_end_current_response();
-
-                    if has_payload_content(&payload) {
-                        let message_id = if response.message_id.0.trim().is_empty() {
-                            ChatMessageId(Uuid::new_v4().to_string())
-                        } else {
-                            response.message_id.clone()
-                        };
-                        let mut message = protocol::ChatMessage {
-                            message_id: Some(message_id.clone()),
-                            timestamp: now_ms(),
-                            sender: protocol::MessageSender::Assistant {
-                                agent: self.agent.clone(),
-                            },
-                            content: payload.content,
-                            reasoning: payload.reasoning,
-                            tool_calls: payload.tool_calls,
-                            model_info: payload.model_info,
-                            token_usage: payload.token_usage,
-                            context_breakdown: payload.context_breakdown,
-                            images: (!payload.images.is_empty()).then_some(payload.images),
-                        };
-                        let content_len = message.content.chars().count() as u64;
-                        message.tool_calls = self.sanitize_tool_declarations(
-                            message_id,
-                            content_len,
-                            std::mem::take(&mut message.tool_calls),
-                        );
-                        self.send_chat(ChatEvent::StreamStart(StreamStartData {
-                            agent: self.agent.clone(),
-                            model: None,
-                        }));
-                        self.send_chat(ChatEvent::StreamEnd(StreamEndData { message }));
-                    }
-                    self.retire_response_token(response.token.clone());
-                    return;
-                }
-                self.current_response = Some(open);
-                return;
-            }
-            let token = response.token.clone();
-            let mut message = self.build_stream_end_message(payload, open);
-            let owner = message
-                .message_id
-                .clone()
-                .expect("stream response has a presentation id");
-            message.tool_calls = self.sanitize_tool_declarations(
-                owner,
-                message.content.chars().count() as u64,
-                std::mem::take(&mut message.tool_calls),
-            );
-            self.send_chat(ChatEvent::StreamEnd(StreamEndData { message }));
-            self.retire_response_token(token);
+        if !self.accept_ordered_response_event(response, "response_end") {
             return;
         }
-
-        self.violation("response_end", "event arrived while no response was open");
-        if self.retired_response_tokens.contains(&response.token) {
-            // Late StreamEnd for an already-completed response; drop safely
-            return;
-        }
-
-        if self.policy == EmitterPolicy::Permissive {
-            if has_payload_content(&payload) {
-                let message_id = if response.message_id.0.trim().is_empty() {
-                    ChatMessageId(Uuid::new_v4().to_string())
-                } else {
-                    response.message_id.clone()
-                };
-                let mut message = protocol::ChatMessage {
-                    message_id: Some(message_id.clone()),
-                    timestamp: now_ms(),
-                    sender: protocol::MessageSender::Assistant {
-                        agent: self.agent.clone(),
-                    },
-                    content: payload.content,
-                    reasoning: payload.reasoning,
-                    tool_calls: payload.tool_calls,
-                    model_info: payload.model_info,
-                    token_usage: payload.token_usage,
-                    context_breakdown: payload.context_breakdown,
-                    images: (!payload.images.is_empty()).then_some(payload.images),
-                };
-                let content_len = message.content.chars().count() as u64;
-                message.tool_calls = self.sanitize_tool_declarations(
-                    message_id,
-                    content_len,
-                    std::mem::take(&mut message.tool_calls),
-                );
-                // In permissive mode, synthesize StreamStart before StreamEnd so start/end pairing invariant holds
-                self.send_chat(ChatEvent::StreamStart(StreamStartData {
-                    agent: self.agent.clone(),
-                    model: None,
-                }));
-                self.send_chat(ChatEvent::StreamEnd(StreamEndData { message }));
-            }
-            self.retire_response_token(response.token.clone());
-        }
+        let response = self
+            .current_response
+            .take()
+            .expect("validated open response");
+        let mut message = self.build_stream_end_message(payload, response);
+        let owner = message
+            .message_id
+            .clone()
+            .expect("stream response has a presentation id");
+        message.tool_calls = self.sanitize_tool_declarations(
+            owner,
+            message.content.chars().count() as u64,
+            std::mem::take(&mut message.tool_calls),
+        );
+        self.send_chat(ChatEvent::StreamEnd(StreamEndData { message }));
     }
 
     fn declare_streaming_tools(
@@ -902,53 +732,52 @@ impl TurnEmitterState {
         response: &ResponseHandle,
         declarations: Vec<ToolUseData>,
     ) {
-        if let Some((owner, content_len, is_same_handle)) =
-            self.current_response.as_ref().map(|open| {
-                (
-                    open.message_id.clone(),
-                    open.content.chars().count() as u64,
-                    &open.handle == response,
-                )
-            })
-        {
-            if !is_same_handle {
-                self.violation(
-                    "streaming_tool_declaration",
-                    "event used a stale or foreign response handle",
-                );
-                if self.policy == EmitterPolicy::Strict
-                    || self.retired_response_tokens.contains(&response.token)
-                {
-                    return;
-                }
-                self.auto_end_current_response();
-                let owner = if response.message_id.0.trim().is_empty() {
-                    ChatMessageId(Uuid::new_v4().to_string())
-                } else {
-                    response.message_id.clone()
-                };
-                self.sanitize_tool_declarations(owner, 0, declarations);
-                return;
-            }
-            self.sanitize_tool_declarations(owner, content_len, declarations);
+        if !self.accept_ordered_response_event(response, "streaming_tool_declaration") {
             return;
         }
+        let open = self
+            .current_response
+            .as_ref()
+            .expect("validated open response");
+        let owner = open.message_id.clone();
+        let content_len = open.content.chars().count() as u64;
+        self.sanitize_tool_declarations(owner, content_len, declarations);
+    }
 
-        self.violation(
-            "streaming_tool_declaration",
-            "event arrived while no response was open",
-        );
-        if self.policy == EmitterPolicy::Permissive {
-            if self.retired_response_tokens.contains(&response.token) {
-                return;
-            }
-            let owner = if response.message_id.0.trim().is_empty() {
-                ChatMessageId(Uuid::new_v4().to_string())
-            } else {
-                response.message_id.clone()
-            };
-            self.sanitize_tool_declarations(owner, 0, declarations);
+    /// The client drops the live bubble on idle and history holds one message
+    /// per `StreamEnd`, so a response left open when the turn ends would be
+    /// text the user watched arrive and then lost. Publish what streamed; only
+    /// an empty shell is dropped, because an empty bubble is its own defect.
+    fn end_open_response_at_idle(
+        &mut self,
+        open: OpenResponse,
+        idle_caller: &'static std::panic::Location<'static>,
+    ) -> String {
+        let opened_at = open.opened_at;
+        let owner = open.message_id.clone();
+        let declared = self
+            .declared_tools
+            .values()
+            .filter(|tool| tool.owner == owner)
+            .map(|tool| tool.declaration.clone())
+            .collect::<Vec<_>>();
+        let content_len = open.content.chars().count();
+        let reasoning_len = open.reasoning.chars().count();
+        if content_len == 0 && reasoning_len == 0 && declared.is_empty() {
+            return format!(
+                "typing ended at {idle_caller} before the response opened at {opened_at} reached \
+                 StreamEnd, discarding the empty shell"
+            );
         }
+        let mut message = self.build_stream_end_message(StreamEndPayload::default(), open);
+        message.tool_calls = self.sanitize_tool_declarations(owner, content_len as u64, declared);
+        let declared_len = message.tool_calls.len();
+        self.send_chat(ChatEvent::StreamEnd(StreamEndData { message }));
+        format!(
+            "typing ended at {idle_caller} before the response opened at {opened_at} reached \
+             StreamEnd, publishing {content_len} characters of content, {reasoning_len} of \
+             reasoning and {declared_len} declared tool calls as-is"
+        )
     }
 
     fn discard_open_response(&mut self, response: &ResponseHandle) {
@@ -959,70 +788,22 @@ impl TurnEmitterState {
         {
             self.current_response = None;
         }
-        self.retire_response_token(response.token.clone());
     }
 
-    #[track_caller]
-    fn ensure_accepted_response(&mut self, response: &ResponseHandle, event: &'static str) -> bool {
-        if let Some(open) = &self.current_response {
-            if &open.handle == response {
-                return true;
-            }
+    fn accept_ordered_response_event(
+        &mut self,
+        response: &ResponseHandle,
+        event: &'static str,
+    ) -> bool {
+        let Some(open) = &self.current_response else {
+            self.violation(event, "event arrived while no response was open");
+            return false;
+        };
+        if &open.handle != response {
             self.violation(event, "event used a stale or foreign response handle");
-            if self.policy == EmitterPolicy::Permissive
-                && !self.retired_response_tokens.contains(&response.token)
-            {
-                // In permissive mode, transition cleanly from prior response to this new incoming response
-                self.auto_end_current_response();
-                let message_id = if response.message_id.0.trim().is_empty() {
-                    ChatMessageId(Uuid::new_v4().to_string())
-                } else {
-                    response.message_id.clone()
-                };
-                self.current_response = Some(OpenResponse {
-                    handle: response.clone(),
-                    message_id,
-                    model: None,
-                    content: String::new(),
-                    reasoning: String::new(),
-                    opened_at: std::panic::Location::caller(),
-                });
-                self.send_chat(ChatEvent::StreamStart(StreamStartData {
-                    agent: self.agent.clone(),
-                    model: None,
-                }));
-                return true;
-            }
             return false;
         }
-
-        self.violation(event, "event arrived while no response was open");
-        if self.retired_response_tokens.contains(&response.token) {
-            // Late delta for an already closed / auto-ended response
-            return false;
-        }
-
-        if self.policy == EmitterPolicy::Permissive {
-            let message_id = if response.message_id.0.trim().is_empty() {
-                ChatMessageId(Uuid::new_v4().to_string())
-            } else {
-                response.message_id.clone()
-            };
-            self.current_response = Some(OpenResponse {
-                handle: response.clone(),
-                message_id,
-                model: None,
-                content: String::new(),
-                reasoning: String::new(),
-                opened_at: std::panic::Location::caller(),
-            });
-            self.send_chat(ChatEvent::StreamStart(StreamStartData {
-                agent: self.agent.clone(),
-                model: None,
-            }));
-            return true;
-        }
-        false
+        true
     }
 
     fn build_stream_end_message(
@@ -1116,11 +897,7 @@ impl TurnEmitterState {
                     "empty_tool_call_id",
                     "response declared a tool call with an empty id",
                 );
-                if self.policy == EmitterPolicy::Permissive {
-                    declaration.tool_call_id = format!("synth_tool_{}", Uuid::new_v4());
-                } else {
-                    continue;
-                }
+                continue;
             }
             if declaration
                 .content_offset
@@ -1135,7 +912,7 @@ impl TurnEmitterState {
                 );
                 declaration.content_offset = None;
             }
-            let mut tool_call_id = declaration.tool_call_id.clone();
+            let tool_call_id = declaration.tool_call_id.clone();
             if let Some(existing) = self.declared_tools.get(&tool_call_id) {
                 if existing.owner == owner
                     && existing.declaration.name == declaration.name
@@ -1155,12 +932,7 @@ impl TurnEmitterState {
                         "tool call '{tool_call_id}' was declared more than once with different data"
                     ),
                 );
-                if self.policy == EmitterPolicy::Permissive {
-                    tool_call_id = format!("{}_synth_{}", declaration.tool_call_id, Uuid::new_v4());
-                    declaration.tool_call_id = tool_call_id.clone();
-                } else {
-                    continue;
-                }
+                continue;
             }
             if self.completed_tool_requests.contains_key(&tool_call_id)
                 || self.retired_tool_call_ids.contains_key(&tool_call_id)
@@ -1169,12 +941,7 @@ impl TurnEmitterState {
                     "reused_tool_call_id",
                     format!("completed tool call id '{tool_call_id}' was declared again"),
                 );
-                if self.policy == EmitterPolicy::Permissive {
-                    tool_call_id = format!("{}_synth_{}", declaration.tool_call_id, Uuid::new_v4());
-                    declaration.tool_call_id = tool_call_id.clone();
-                } else {
-                    continue;
-                }
+                continue;
             }
             self.declared_tools.insert(
                 tool_call_id,
@@ -1228,43 +995,10 @@ impl TurnEmitterState {
                 "undeclared_tool_request",
                 format!("tool request '{tool_call_id}' was not declared by an assistant response"),
             );
-            if self.policy == EmitterPolicy::Permissive {
-                let owner = self
-                    .current_response
-                    .as_ref()
-                    .map(|open| open.message_id.clone())
-                    .unwrap_or_else(|| ChatMessageId(Uuid::new_v4().to_string()));
-                let tool_name = tool_type_default_name(&tool_type);
-                self.declared_tools.insert(
-                    tool_call_id.to_owned(),
-                    DeclaredTool {
-                        owner,
-                        declaration: ToolUseData {
-                            tool_call_id: tool_call_id.to_owned(),
-                            name: tool_name.to_owned(),
-                            arguments: serde_json::Value::Null,
-                            content_offset: None,
-                        },
-                    },
-                );
-            } else {
-                return false;
-            }
+            return false;
         }
-        if let Some(existing) = self.open_tool_requests.get_mut(tool_call_id) {
+        if let Some(existing) = self.open_tool_requests.get(tool_call_id) {
             if existing.tool_type == tool_type {
-                return true;
-            }
-            let is_synthetic_other = match &existing.tool_type {
-                ToolRequestType::Other { args } => args.is_null(),
-                _ => false,
-            };
-            if self.policy == EmitterPolicy::Permissive && is_synthetic_other {
-                existing.tool_type = tool_type.clone();
-                let tool_name = tool_type_default_name(&tool_type);
-                if let Some(declared) = self.declared_tools.get_mut(tool_call_id) {
-                    declared.declaration.name = tool_name.to_owned();
-                }
                 return true;
             }
             self.violation(
@@ -1298,10 +1032,6 @@ impl TurnEmitterState {
     }
 
     fn tool_completed(&mut self, tool_call_id: &str, outcome: ToolExecutionOutcome) {
-        if tool_call_id.trim().is_empty() {
-            self.violation("empty_tool_call_id", "tool completion carried an empty id");
-            return;
-        }
         if let Some(existing) = self.completed_tool_requests.get(tool_call_id) {
             if existing.outcome != outcome {
                 self.violation(
@@ -1331,33 +1061,13 @@ impl TurnEmitterState {
                 "completion_without_request",
                 format!("tool completion '{tool_call_id}' had no open request"),
             );
-            if self.policy == EmitterPolicy::Permissive {
-                let synthetic_type = ToolRequestType::Other {
-                    args: serde_json::Value::Null,
-                };
-                if !self.tool_request(tool_call_id, synthetic_type) {
-                    return;
-                }
-            } else {
-                return;
-            }
+            return;
         }
-        if self.open_tool_requests.contains_key(tool_call_id) {
-            self.emit_tool_completion(tool_call_id, outcome);
-        }
+        self.emit_tool_completion(tool_call_id, outcome);
     }
 
     fn send_tool_progress(&mut self, data: &ToolProgressData) {
-        if data.tool_call_id.trim().is_empty() {
-            self.violation("empty_tool_call_id", "tool progress carried an empty id");
-            return;
-        }
-        let is_background = self
-            .open_tool_requests
-            .get(&data.tool_call_id)
-            .map(|r| r.execution_mode == ToolExecutionMode::Background);
-
-        let Some(is_background) = is_background else {
+        let Some(request) = self.open_tool_requests.get_mut(&data.tool_call_id) else {
             let finished = self
                 .completed_tool_requests
                 .contains_key(&data.tool_call_id)
@@ -1367,17 +1077,6 @@ impl TurnEmitterState {
                     "progress_without_request",
                     format!("tool progress '{}' had no open request", data.tool_call_id),
                 );
-                if self.policy == EmitterPolicy::Permissive {
-                    let synthetic_type = ToolRequestType::Other {
-                        args: serde_json::Value::Null,
-                    };
-                    if self.tool_request(&data.tool_call_id, synthetic_type) {
-                        if let Some(request) = self.open_tool_requests.get_mut(&data.tool_call_id) {
-                            request.execution_mode = data.execution_mode;
-                        }
-                        self.send_chat(ChatEvent::ToolProgress(data.clone()));
-                    }
-                }
             } else if data.execution_mode == ToolExecutionMode::Background {
                 // Backgrounded work outlives the call that launched it: the tool
                 // returns a handle as soon as the work is handed off, so every
@@ -1396,8 +1095,9 @@ impl TurnEmitterState {
             }
             return;
         };
-        let mut emitted_data = data.clone();
-        if is_background && data.execution_mode == ToolExecutionMode::Foreground {
+        if request.execution_mode == ToolExecutionMode::Background
+            && data.execution_mode == ToolExecutionMode::Foreground
+        {
             self.violation(
                 "background_tool_returned_to_foreground",
                 format!(
@@ -1405,17 +1105,12 @@ impl TurnEmitterState {
                     data.tool_call_id
                 ),
             );
-            if self.policy == EmitterPolicy::Strict {
-                return;
-            }
-            emitted_data.execution_mode = ToolExecutionMode::Background;
+            return;
         }
-        if emitted_data.execution_mode == ToolExecutionMode::Background
-            && let Some(request) = self.open_tool_requests.get_mut(&data.tool_call_id)
-        {
+        if data.execution_mode == ToolExecutionMode::Background {
             request.execution_mode = ToolExecutionMode::Background;
         }
-        self.send_chat(ChatEvent::ToolProgress(emitted_data));
+        self.send_chat(ChatEvent::ToolProgress(data.clone()));
     }
 
     fn emit_tool_completion(&mut self, tool_call_id: &str, outcome: ToolExecutionOutcome) {
@@ -1529,9 +1224,7 @@ impl TurnEmitterState {
     }
 
     fn reset_turn_state(&mut self) {
-        if let Some(open) = self.current_response.take() {
-            self.retire_response_token(open.handle.token);
-        }
+        self.current_response = None;
         self.retire_completed_tools();
         self.declared_tools
             .retain(|tool_call_id, _| self.open_tool_requests.contains_key(tool_call_id));
@@ -1548,16 +1241,6 @@ impl TurnEmitterState {
     }
 }
 
-fn has_payload_content(payload: &StreamEndPayload) -> bool {
-    !payload.content.is_empty()
-        || payload.reasoning.is_some()
-        || !payload.tool_calls.is_empty()
-        || !payload.images.is_empty()
-        || payload.model_info.is_some()
-        || payload.token_usage.is_some()
-        || payload.context_breakdown.is_some()
-}
-
 /// Is this tool waiting on a human rather than on the machine?
 ///
 /// A question or a plan approval is the one kind of foreground tool that is
@@ -1571,26 +1254,6 @@ fn awaits_user_response(tool_type: &ToolRequestType) -> bool {
         tool_type,
         ToolRequestType::AskUserQuestion { .. } | ToolRequestType::ExitPlanMode { .. }
     )
-}
-
-fn tool_type_default_name(tool_type: &ToolRequestType) -> &'static str {
-    match tool_type {
-        ToolRequestType::ModifyFile { .. } => "modify_file",
-        ToolRequestType::RunCommand { .. } => "run_command",
-        ToolRequestType::ReadFiles { .. } => "read_files",
-        ToolRequestType::SearchTypes { .. } => "search_types",
-        ToolRequestType::GetTypeDocs { .. } => "get_type_docs",
-        ToolRequestType::AskUserQuestion { .. } => "ask_question",
-        ToolRequestType::ExitPlanMode { .. } => "exit_plan_mode",
-        ToolRequestType::AgentSpawn { .. } => "agent_spawn",
-        ToolRequestType::GenerateImage { .. } => "generate_image",
-        ToolRequestType::WebSearch { .. } => "web_search",
-        ToolRequestType::ViewImage { .. } => "view_image",
-        ToolRequestType::Sleep { .. } => "sleep",
-        ToolRequestType::TydeSendAgentMessage { .. } => "send_agent_message",
-        ToolRequestType::TydeAwaitAgents { .. } => "await_agents",
-        ToolRequestType::Other { .. } => "tool",
-    }
 }
 
 fn simple_message(sender: protocol::MessageSender, content: &str) -> protocol::ChatMessage {
@@ -1621,18 +1284,25 @@ mod tests {
     use super::*;
 
     fn emitter() -> (TurnEmitter, mpsc::UnboundedReceiver<Value>) {
-        emitter_with_policy(EmitterPolicy::Strict)
+        emitter_with_protocol_violation_policy(true)
     }
 
-    fn emitter_with_policy(policy: EmitterPolicy) -> (TurnEmitter, mpsc::UnboundedReceiver<Value>) {
+    fn emitter_with_protocol_violation_policy(
+        surface_protocol_violations: bool,
+    ) -> (TurnEmitter, mpsc::UnboundedReceiver<Value>) {
         let (tx, rx) = mpsc::unbounded_channel();
         (
-            TurnEmitter::new_for_agent_with_policy(tx, AgentName("assistant"), policy),
+            TurnEmitter::new_for_agent_with_protocol_violation_policy(
+                tx,
+                AgentName("assistant"),
+                surface_protocol_violations,
+            ),
             rx,
         )
     }
 
-    fn drain_events(rx: &mut mpsc::UnboundedReceiver<Value>) -> Vec<Value> {
+    /// Everything the emitter put on the wire, in order.
+    fn drain(rx: &mut mpsc::UnboundedReceiver<Value>) -> Vec<Value> {
         let mut events = Vec::new();
         while let Ok(event) = rx.try_recv() {
             events.push(event);
@@ -1640,26 +1310,26 @@ mod tests {
         events
     }
 
-    fn violation_reports(events: &[Value]) -> Vec<String> {
-        let mut reports = Vec::new();
-        for event in events {
-            if event.get("kind").and_then(Value::as_str) == Some("MessageAdded")
-                && let Some(content) = event.pointer("/data/content").and_then(Value::as_str)
-                && content.starts_with("The backend sent")
-            {
-                reports.push(content.to_owned());
-            }
-        }
-        reports
-    }
-
     /// The violation report the user actually sees, drained from the wire.
     fn reports(rx: &mut mpsc::UnboundedReceiver<Value>) -> Vec<String> {
-        violation_reports(&drain_events(rx))
+        reports_in(&drain(rx))
+    }
+
+    fn reports_in(events: &[Value]) -> Vec<String> {
+        events
+            .iter()
+            .filter_map(|event| {
+                (event.get("kind").and_then(Value::as_str) == Some("MessageAdded"))
+                    .then(|| event.pointer("/data/content").and_then(Value::as_str))
+                    .flatten()
+                    .filter(|content| content.starts_with("The backend sent"))
+                    .map(str::to_owned)
+            })
+            .collect()
     }
 
     #[test]
-    fn an_abandoned_response_names_where_it_opened_where_it_ended_and_what_was_lost() {
+    fn an_abandoned_response_names_where_it_opened_where_it_ended_and_keeps_what_streamed() {
         let (emitter, mut rx) = emitter();
         emitter.typing_status_changed(true);
         let opened_at = line!() + 1;
@@ -1669,7 +1339,8 @@ mod tests {
         let ended_at = line!() + 1;
         emitter.typing_status_changed(false);
 
-        let reports = reports(&mut rx);
+        let events = drain(&mut rx);
+        let reports = reports_in(&events);
         assert_eq!(reports.len(), 1, "expected one report, got {reports:?}");
         let report = &reports[0];
         assert!(
@@ -1685,8 +1356,60 @@ mod tests {
             "report does not name the terminal call site: {report}"
         );
         assert!(
-            report.contains("discarding 12 characters of content and 3 of reasoning"),
-            "report does not say how much was thrown away: {report}"
+            report.contains(
+                "publishing 12 characters of content, 3 of reasoning and 0 declared tool calls as-is"
+            ),
+            "report does not say what was kept: {report}"
+        );
+
+        // The text the user watched stream in must reach the transcript: one
+        // StreamEnd carrying it, closed before the turn is declared idle.
+        let kinds = events
+            .iter()
+            .filter_map(|event| event.get("kind").and_then(Value::as_str))
+            .collect::<Vec<_>>();
+        let ends = kinds.iter().filter(|kind| **kind == "StreamEnd").count();
+        assert_eq!(ends, 1, "expected exactly one StreamEnd: {kinds:?}");
+        let end_index = kinds.iter().position(|kind| *kind == "StreamEnd").unwrap();
+        let idle_index = kinds
+            .iter()
+            .rposition(|kind| *kind == "TypingStatusChanged")
+            .unwrap();
+        assert!(
+            end_index < idle_index,
+            "the response must close before the turn goes idle: {kinds:?}"
+        );
+        let end = &events[end_index];
+        assert_eq!(
+            end.pointer("/data/message/content").and_then(Value::as_str),
+            Some("twelve chars"),
+            "StreamEnd lost the streamed content: {end}"
+        );
+        assert_eq!(
+            end.pointer("/data/message/reasoning/text")
+                .and_then(Value::as_str),
+            Some("abc"),
+            "StreamEnd lost the streamed reasoning: {end}"
+        );
+
+        // An open response with nothing in it is an empty bubble, not content
+        // to keep: the shell is dropped and the report says so.
+        emitter.typing_status_changed(true);
+        let _empty = emitter.stream_start(Some("test-model"));
+        emitter.typing_status_changed(false);
+        let events = drain(&mut rx);
+        let reports = reports_in(&events);
+        assert_eq!(reports.len(), 1, "expected one report, got {reports:?}");
+        assert!(
+            reports[0].contains("discarding the empty shell"),
+            "report does not say the shell was dropped: {}",
+            reports[0]
+        );
+        assert!(
+            events
+                .iter()
+                .all(|event| event.get("kind").and_then(Value::as_str) != Some("StreamEnd")),
+            "an empty shell must not publish a message: {events:?}"
         );
     }
 
@@ -1786,386 +1509,5 @@ mod tests {
             3,
             "expected a header and two distinct entries: {report}"
         );
-    }
-
-    #[test]
-    fn permissive_abandoned_response_emits_stream_end_instead_of_discarding() {
-        let (emitter, mut rx) = emitter_with_policy(EmitterPolicy::Permissive);
-        emitter.typing_status_changed(true);
-        let response = emitter.stream_start(Some("test-model"));
-        emitter.stream_delta(&response, "important answer text");
-        emitter.stream_reasoning_delta(&response, "thought trace");
-        emitter.typing_status_changed(false);
-
-        let events = drain_events(&mut rx);
-        let reports = violation_reports(&events);
-        assert!(
-            reports.is_empty(),
-            "expected no error reports, got {reports:?}"
-        );
-
-        // StreamEnd should have been automatically emitted with the content & reasoning
-        let mut saw_stream_end = false;
-        let mut final_content = String::new();
-        let mut final_reasoning = String::new();
-        for event in &events {
-            if event.get("kind").and_then(Value::as_str) == Some("StreamEnd") {
-                saw_stream_end = true;
-                if let Some(content) = event
-                    .pointer("/data/message/content")
-                    .and_then(Value::as_str)
-                {
-                    final_content = content.to_owned();
-                }
-                if let Some(reasoning) = event
-                    .pointer("/data/message/reasoning/text")
-                    .and_then(Value::as_str)
-                {
-                    final_reasoning = reasoning.to_owned();
-                }
-            }
-        }
-        assert!(
-            saw_stream_end,
-            "expected StreamEnd to be automatically emitted"
-        );
-        assert_eq!(final_content, "important answer text");
-        assert_eq!(final_reasoning, "thought trace");
-    }
-
-    #[test]
-    fn permissive_overlapping_response_auto_ends_prior_response() {
-        let (emitter, mut rx) = emitter_with_policy(EmitterPolicy::Permissive);
-        emitter.typing_status_changed(true);
-        let first = emitter.stream_start(Some("model-1"));
-        emitter.stream_delta(&first, "part one");
-
-        let second = emitter.stream_start(Some("model-2"));
-        emitter.stream_delta(&second, "part two");
-        emitter.stream_end(second, StreamEndPayload::default());
-        emitter.typing_status_changed(false);
-
-        let events = drain_events(&mut rx);
-        let reports = violation_reports(&events);
-        assert!(reports.is_empty());
-
-        let mut ends = Vec::new();
-        for event in &events {
-            if event.get("kind").and_then(Value::as_str) == Some("StreamEnd")
-                && let Some(content) = event
-                    .pointer("/data/message/content")
-                    .and_then(Value::as_str)
-            {
-                ends.push(content.to_owned());
-            }
-        }
-        assert_eq!(ends, vec!["part one", "part two"]);
-    }
-
-    #[test]
-    fn permissive_unannounced_delta_auto_opens_response() {
-        let (emitter, mut rx) = emitter_with_policy(EmitterPolicy::Permissive);
-        emitter.typing_status_changed(true);
-        let unannounced = ResponseHandle {
-            token: "ghost-token".to_string(),
-            message_id: ChatMessageId("ghost-msg".to_string()),
-        };
-        emitter.stream_delta(&unannounced, "hello unannounced");
-        emitter.stream_end(unannounced, StreamEndPayload::default());
-        emitter.typing_status_changed(false);
-
-        let events = drain_events(&mut rx);
-        assert!(violation_reports(&events).is_empty());
-
-        let mut deltas = Vec::new();
-        let mut ended = false;
-        for event in &events {
-            match event.get("kind").and_then(Value::as_str) {
-                Some("StreamDelta") => {
-                    if let Some(text) = event.pointer("/data/text").and_then(Value::as_str) {
-                        deltas.push(text.to_owned());
-                    }
-                }
-                Some("StreamEnd") => {
-                    ended = true;
-                }
-                _ => {}
-            }
-        }
-        assert_eq!(deltas, vec!["hello unannounced"]);
-        assert!(ended);
-    }
-
-    #[test]
-    fn permissive_undeclared_tool_request_is_auto_declared() {
-        let (emitter, mut rx) = emitter_with_policy(EmitterPolicy::Permissive);
-        emitter.typing_status_changed(true);
-        let ok = emitter.tool_request(
-            "call_123",
-            ToolRequestType::RunCommand {
-                command: "echo test".to_string(),
-                working_directory: ".".to_string(),
-            },
-        );
-        assert!(ok, "permissive mode should accept undeclared tool requests");
-        emitter.tool_completed(
-            "call_123",
-            ToolExecutionOutcome::Succeeded {
-                result: protocol::ToolExecutionResult::RunCommand {
-                    exit_code: 0,
-                    stdout: "test".to_string(),
-                    stderr: String::new(),
-                },
-            },
-        );
-        emitter.typing_status_changed(false);
-
-        let events = drain_events(&mut rx);
-        assert!(violation_reports(&events).is_empty());
-
-        let mut kinds = Vec::new();
-        for event in &events {
-            if let Some(kind) = event.get("kind").and_then(Value::as_str) {
-                kinds.push(kind.to_owned());
-            }
-        }
-        assert!(kinds.contains(&"ToolRequest".to_string()));
-        assert!(kinds.contains(&"ToolExecutionCompleted".to_string()));
-    }
-
-    #[test]
-    fn permissive_unexpected_tool_completion_synthesizes_request() {
-        let (emitter, mut rx) = emitter_with_policy(EmitterPolicy::Permissive);
-        emitter.typing_status_changed(true);
-        emitter.tool_completed(
-            "call_out_of_blue",
-            ToolExecutionOutcome::Cancelled {
-                message: "done".to_string(),
-            },
-        );
-        emitter.typing_status_changed(false);
-
-        let events = drain_events(&mut rx);
-        assert!(violation_reports(&events).is_empty());
-
-        let mut completed = false;
-        for event in &events {
-            if event.get("kind").and_then(Value::as_str) == Some("ToolExecutionCompleted") {
-                completed = true;
-            }
-        }
-        assert!(completed, "expected completion to be emitted");
-    }
-
-    #[test]
-    fn permissive_foreign_handle_delta_auto_ends_prior_and_streams_new() {
-        let (emitter, mut rx) = emitter_with_policy(EmitterPolicy::Permissive);
-        emitter.typing_status_changed(true);
-        let first = emitter.stream_start(Some("model-1"));
-        emitter.stream_delta(&first, "first content");
-
-        let foreign = ResponseHandle {
-            token: "foreign-token".to_string(),
-            message_id: ChatMessageId("foreign-msg".to_string()),
-        };
-        emitter.stream_delta(&foreign, "foreign content");
-        emitter.stream_end(foreign, StreamEndPayload::default());
-        emitter.typing_status_changed(false);
-
-        let events = drain_events(&mut rx);
-        let mut ends = Vec::new();
-        for event in &events {
-            if event.get("kind").and_then(Value::as_str) == Some("StreamEnd")
-                && let Some(content) = event
-                    .pointer("/data/message/content")
-                    .and_then(Value::as_str)
-            {
-                ends.push(content.to_owned());
-            }
-        }
-        assert_eq!(ends, vec!["first content", "foreign content"]);
-    }
-
-    #[test]
-    fn permissive_progress_before_request_upgrades_cleanly() {
-        let (emitter, mut rx) = emitter_with_policy(EmitterPolicy::Permissive);
-        emitter.typing_status_changed(true);
-        // Progress arrives before tool request
-        emitter.tool_progress(&ToolProgressData {
-            tool_call_id: "tool_prog_first".to_string(),
-            execution_mode: ToolExecutionMode::Foreground,
-            cancellable: false,
-            update: protocol::ToolProgressUpdate::Other {
-                payload: serde_json::Value::Null,
-            },
-        });
-        // Genuine tool request arrives later
-        let ok = emitter.tool_request(
-            "tool_prog_first",
-            ToolRequestType::RunCommand {
-                command: "echo upgraded".to_string(),
-                working_directory: ".".to_string(),
-            },
-        );
-        assert!(ok, "permissive mode should upgrade synthetic Other request");
-        emitter.tool_completed(
-            "tool_prog_first",
-            ToolExecutionOutcome::Succeeded {
-                result: protocol::ToolExecutionResult::RunCommand {
-                    exit_code: 0,
-                    stdout: "upgraded".to_string(),
-                    stderr: String::new(),
-                },
-            },
-        );
-        emitter.typing_status_changed(false);
-
-        let events = drain_events(&mut rx);
-        let tool_requests: Vec<_> = events
-            .iter()
-            .filter(|e| e.get("kind").and_then(Value::as_str) == Some("ToolRequest"))
-            .filter_map(|e| e.pointer("/data/tool_name").and_then(Value::as_str))
-            .collect();
-        // The card was emitted once by progress and upgraded in state without emitting a duplicate card
-        assert_eq!(tool_requests, vec!["tool"]);
-    }
-
-    #[test]
-    fn permissive_conversation_cleared_retains_retired_token_and_rejects_late_delta() {
-        let (emitter, mut rx) = emitter_with_policy(EmitterPolicy::Permissive);
-        emitter.typing_status_changed(true);
-        let resp = emitter.stream_start(Some("model-1"));
-        emitter.stream_delta(&resp, "pre-clear text");
-        // Clear conversation while stream is open
-        emitter.conversation_cleared();
-
-        let _ = drain_events(&mut rx);
-
-        // Stale late delta on the pre-clear handle arrives
-        emitter.stream_delta(&resp, "stale delta");
-        emitter.stream_end(resp, StreamEndPayload::default());
-
-        let events = drain_events(&mut rx);
-        // The stale handle was retired and must not resurrect any StreamStart or StreamDelta
-        assert!(
-            events.iter().all(|e| {
-                let kind = e.get("kind").and_then(Value::as_str);
-                kind != Some("StreamStart") && kind != Some("StreamDelta")
-            }),
-            "late delta on pre-clear handle should be rejected, got: {events:?}"
-        );
-    }
-
-    #[test]
-    fn permissive_auto_end_preserves_streaming_tool_declarations() {
-        let (emitter, mut rx) = emitter_with_policy(EmitterPolicy::Permissive);
-        emitter.typing_status_changed(true);
-        let resp = emitter.stream_start(Some("model-1"));
-        emitter.stream_delta(&resp, "let me run a command");
-        emitter.declare_streaming_tools(
-            &resp,
-            vec![ToolUseData {
-                tool_call_id: "call_str_1".to_string(),
-                name: "run_command".to_string(),
-                arguments: serde_json::json!({ "command": "ls" }),
-                content_offset: Some(21),
-            }],
-        );
-        // Turn goes idle before stream_end
-        emitter.typing_status_changed(false);
-
-        let events = drain_events(&mut rx);
-        let mut declared_in_end = Vec::new();
-        for event in &events {
-            if event.get("kind").and_then(Value::as_str) == Some("StreamEnd")
-                && let Some(tools) = event
-                    .pointer("/data/message/tool_calls")
-                    .and_then(Value::as_array)
-            {
-                for tool in tools {
-                    if let Some(id) = tool.get("tool_call_id").and_then(Value::as_str) {
-                        declared_in_end.push(id.to_owned());
-                    }
-                }
-            }
-        }
-        assert_eq!(declared_in_end, vec!["call_str_1"]);
-    }
-
-    #[test]
-    fn permissive_late_stream_end_after_idle_does_not_emit_duplicate_end() {
-        let (emitter, mut rx) = emitter_with_policy(EmitterPolicy::Permissive);
-        emitter.typing_status_changed(true);
-        let response = emitter.stream_start(Some("model-1"));
-        emitter.stream_delta(&response, "some text");
-        // Turn goes idle, auto-flushing response
-        emitter.typing_status_changed(false);
-
-        // Later, late stream_end arrives for the already auto-ended response
-        emitter.stream_end(response, StreamEndPayload::default());
-
-        let events = drain_events(&mut rx);
-        let stream_ends = events
-            .iter()
-            .filter(|event| event.get("kind").and_then(Value::as_str) == Some("StreamEnd"))
-            .count();
-        assert_eq!(
-            stream_ends, 1,
-            "expected exactly 1 StreamEnd, not duplicate"
-        );
-    }
-
-    #[test]
-    fn permissive_empty_id_tool_completion_does_not_panic() {
-        let (emitter, _rx) = emitter_with_policy(EmitterPolicy::Permissive);
-        emitter.typing_status_changed(true);
-        // Empty id should not panic
-        emitter.tool_completed(
-            "",
-            ToolExecutionOutcome::Cancelled {
-                message: "cancelled".to_string(),
-            },
-        );
-        emitter.typing_status_changed(false);
-    }
-
-    #[test]
-    fn permissive_background_progress_normalization() {
-        let (emitter, mut rx) = emitter_with_policy(EmitterPolicy::Permissive);
-        emitter.typing_status_changed(true);
-        let _ = emitter.tool_request(
-            "call_bg",
-            ToolRequestType::RunCommand {
-                command: "echo test".to_string(),
-                working_directory: ".".to_string(),
-            },
-        );
-        // Move to background
-        emitter.tool_progress(&ToolProgressData {
-            tool_call_id: "call_bg".to_string(),
-            execution_mode: ToolExecutionMode::Background,
-            cancellable: false,
-            update: protocol::ToolProgressUpdate::Other {
-                payload: serde_json::Value::Null,
-            },
-        });
-        // Try invalid foreground progress
-        emitter.tool_progress(&ToolProgressData {
-            tool_call_id: "call_bg".to_string(),
-            execution_mode: ToolExecutionMode::Foreground,
-            cancellable: false,
-            update: protocol::ToolProgressUpdate::Other {
-                payload: serde_json::Value::Null,
-            },
-        });
-        emitter.typing_status_changed(false);
-
-        let events = drain_events(&mut rx);
-        let progress_modes: Vec<_> = events
-            .iter()
-            .filter(|e| e.get("kind").and_then(Value::as_str) == Some("ToolProgress"))
-            .filter_map(|e| e.pointer("/data/execution_mode").and_then(Value::as_str))
-            .collect();
-        assert_eq!(progress_modes, vec!["background", "background"]);
     }
 }
