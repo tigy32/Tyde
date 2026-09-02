@@ -3050,17 +3050,27 @@ fn delegation_preference_rows(state: &AppState) -> Vec<AnyView> {
         .iter()
         .enumerate()
         .map(|(index, id)| {
-            let (label, availability) = match catalog.entries.iter().find(|entry| entry.id() == id)
-            {
-                Some(LaunchProfileEntry::Ready { profile }) => (
-                    profile.label.clone(),
-                    format!("{} · available", backend_label(profile.backend_kind)),
-                ),
-                Some(LaunchProfileEntry::Unavailable { message, .. }) => {
-                    (id.0.clone(), format!("Unavailable: {message}"))
-                }
-                None => (id.0.clone(), "Missing from this host".to_owned()),
-            };
+            let (label, status, row_class, title) =
+                match catalog.entries.iter().find(|entry| entry.id() == id) {
+                    Some(LaunchProfileEntry::Ready { profile }) => (
+                        Some(profile.label.clone()),
+                        None,
+                        "delegation-preference-row",
+                        None,
+                    ),
+                    Some(LaunchProfileEntry::Unavailable { label, message, .. }) => (
+                        Some(label.clone()),
+                        Some("Unavailable"),
+                        "delegation-preference-row delegation-preference-row-unavailable",
+                        Some(message.clone()),
+                    ),
+                    None => (
+                        None,
+                        Some("Missing"),
+                        "delegation-preference-row delegation-preference-row-missing",
+                        None,
+                    ),
+                };
             let move_up_state = state.clone();
             let move_up_order = order.clone();
             let move_down_state = state.clone();
@@ -3071,11 +3081,15 @@ fn delegation_preference_rows(state: &AppState) -> Vec<AnyView> {
             let id_for_down = id.0.clone();
             let id_for_remove = id.0.clone();
             view! {
-                <li class="delegation-preference-row">
+                <li class=row_class title=title>
                     <div class="delegation-preference-copy">
-                        <span class="delegation-preference-label">{label}</span>
+                        {label.map(|label| view! {
+                            <span class="delegation-preference-label">{label}</span>
+                        })}
                         <span class="delegation-preference-id">{id.0.clone()}</span>
-                        <span class="delegation-preference-status">{availability}</span>
+                        {status.map(|status| view! {
+                            <span class="delegation-preference-status">{status}</span>
+                        })}
                     </div>
                     <div class="delegation-preference-actions">
                         <button
@@ -11281,7 +11295,7 @@ mod wasm_tests {
     }
 
     #[wasm_bindgen_test]
-    async fn delegation_preference_preserves_missing_ids_and_has_accessible_order_controls() {
+    async fn delegation_preference_rows_show_clear_states_and_accessible_actions() {
         let calls = install_settings_send_stub();
         let container = make_container();
         let _handle = mount_to(container.clone(), move || {
@@ -11294,6 +11308,7 @@ mod wasm_tests {
                     .delegation_launch_profile_order = vec![
                     LaunchProfileId("missing:saved".to_owned()),
                     LaunchProfileId("claude:default".to_owned()),
+                    LaunchProfileId("hermes:review".to_owned()),
                 ];
             });
             state.launch_profile_catalog.update(|catalogs| {
@@ -11321,6 +11336,13 @@ mod wasm_tests {
                                     session_settings: SessionSettingsValues::default(),
                                 },
                             },
+                            protocol::LaunchProfileEntry::Unavailable {
+                                id: LaunchProfileId("hermes:review".to_owned()),
+                                kind: protocol::LaunchProfileKind::Custom,
+                                backend_kind: BackendKind::Hermes,
+                                label: "Hermes review".to_owned(),
+                                message: "Hermes CLI did not answer its readiness probe".to_owned(),
+                            },
                         ],
                         default_profile_id: None,
                     },
@@ -11331,14 +11353,50 @@ mod wasm_tests {
         });
         next_tick().await;
 
-        let text = container.text_content().unwrap_or_default();
+        let rows = container.query_selector_all("ol > li").unwrap();
+        assert_eq!(rows.length(), 3, "every saved preference must render");
+        let missing_text = rows
+            .item(0)
+            .expect("missing row")
+            .text_content()
+            .unwrap_or_default();
+        let ready_text = rows
+            .item(1)
+            .expect("ready row")
+            .text_content()
+            .unwrap_or_default();
+        let unavailable = rows.item(2).expect("unavailable row");
+        let unavailable_text = unavailable.text_content().unwrap_or_default();
         assert!(
-            text.contains("missing:saved"),
-            "saved missing id must render: {text:?}"
+            ready_text.contains("Claude") && ready_text.contains("claude:default"),
+            "ready row must show its friendly label and id: {ready_text:?}"
         );
         assert!(
-            text.contains("Missing from this host"),
-            "missing state must be explicit: {text:?}"
+            !ready_text.to_ascii_lowercase().contains("available"),
+            "ready row must not repeat availability: {ready_text:?}"
+        );
+        assert!(
+            unavailable_text.contains("Hermes review")
+                && unavailable_text.contains("hermes:review")
+                && unavailable_text.contains("Unavailable"),
+            "unavailable row must show its friendly label, id, and concise marker: {unavailable_text:?}"
+        );
+        assert_eq!(
+            unavailable
+                .dyn_ref::<HtmlElement>()
+                .expect("unavailable row element")
+                .title(),
+            "Hermes CLI did not answer its readiness probe",
+            "the detailed diagnostic remains supplemental"
+        );
+        assert!(
+            missing_text.contains("Missing"),
+            "missing state must have a concise visible marker: {missing_text:?}"
+        );
+        assert_eq!(
+            missing_text.matches("missing:saved").count(),
+            1,
+            "missing row must render its raw id only once: {missing_text:?}"
         );
         assert!(
             container
@@ -11348,6 +11406,22 @@ mod wasm_tests {
                 .unwrap()
                 .is_some(),
             "a missing saved id must remain removable"
+        );
+        assert!(
+            container
+                .query_selector(
+                    "button[aria-label='Remove hermes:review from delegation preference']"
+                )
+                .unwrap()
+                .is_some(),
+            "an unavailable saved profile must remain removable"
+        );
+        assert!(
+            container
+                .query_selector("button[aria-label='Move hermes:review up']")
+                .unwrap()
+                .is_some(),
+            "an unavailable saved profile must retain reorder controls"
         );
 
         let move_up: HtmlElement = container
@@ -11368,7 +11442,7 @@ mod wasm_tests {
             .expect("reorder settings write");
         assert_eq!(
             reorder["value"],
-            serde_json::json!(["claude:default", "missing:saved"])
+            serde_json::json!(["claude:default", "missing:saved", "hermes:review"])
         );
 
         let add: web_sys::HtmlSelectElement = container
@@ -11386,7 +11460,12 @@ mod wasm_tests {
         let added = writes.last().expect("add settings write");
         assert_eq!(
             added["value"],
-            serde_json::json!(["missing:saved", "claude:default", "codex:default"])
+            serde_json::json!([
+                "missing:saved",
+                "claude:default",
+                "hermes:review",
+                "codex:default"
+            ])
         );
 
         let remove: HtmlElement = container
@@ -11401,7 +11480,10 @@ mod wasm_tests {
         }
         let writes = recorded_settings_write_ops(&calls);
         let removed = writes.last().expect("remove settings write");
-        assert_eq!(removed["value"], serde_json::json!(["claude:default"]));
+        assert_eq!(
+            removed["value"],
+            serde_json::json!(["claude:default", "hermes:review"])
+        );
     }
 
     /// The sidebar has a dedicated Backends group: a stable Overview entry, a

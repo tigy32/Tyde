@@ -9067,6 +9067,12 @@ math merror {
     border-radius: 8px;
 }
 
+.delegation-preference-row-unavailable,
+.delegation-preference-row-missing {
+    background: color-mix(in srgb, var(--error) 5%, transparent);
+    border-color: color-mix(in srgb, var(--error) 28%, var(--border-primary));
+}
+
 .delegation-preference-copy {
     display: grid;
     min-width: 0;
@@ -9077,11 +9083,21 @@ math merror {
     font-weight: 600;
 }
 
-.delegation-preference-id,
-.delegation-preference-status {
-    color: var(--text-muted);
+.delegation-preference-id {
+    color: var(--text-secondary);
     font-size: 12px;
     overflow-wrap: anywhere;
+}
+
+.delegation-preference-status {
+    width: fit-content;
+    padding: 1px 6px;
+    color: var(--error);
+    background: color-mix(in srgb, var(--error) 9%, transparent);
+    border: 1px solid color-mix(in srgb, var(--error) 30%, transparent);
+    border-radius: 999px;
+    font-size: 11px;
+    font-weight: 600;
 }
 
 .delegation-preference-actions {
