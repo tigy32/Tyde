@@ -55,6 +55,11 @@ pub struct HostSettings {
     pub tyde_agent_control_mcp_enabled: bool,
     #[serde(default = "default_agent_control_max_depth")]
     pub tyde_agent_control_max_depth: u8,
+    /// Advisory order for agent-control callers choosing a launch profile.
+    /// IDs remain stored even while their catalog entry is unavailable so a
+    /// temporarily missing backend does not erase the user's preference.
+    #[serde(default = "default_delegation_launch_profile_order")]
+    pub delegation_launch_profile_order: Vec<LaunchProfileId>,
     /// When false (default), spawn cost hints are ignored: every spawn uses
     /// the backend's own default model/effort and the hint is hidden from
     /// spawn UIs and the agent-control MCP tool schema.
@@ -104,6 +109,7 @@ impl Default for HostSettings {
             tyde_debug_mcp_enabled: false,
             tyde_agent_control_mcp_enabled: true,
             tyde_agent_control_max_depth: default_agent_control_max_depth(),
+            delegation_launch_profile_order: default_delegation_launch_profile_order(),
             complexity_tiers_enabled: false,
             backend_tier_configs: HashMap::new(),
             background_agent_features: default_background_agent_features(),
@@ -115,6 +121,18 @@ impl Default for HostSettings {
             voice: VoiceSettings::default(),
         }
     }
+}
+
+pub fn default_delegation_launch_profile_order() -> Vec<LaunchProfileId> {
+    [
+        "codex:default",
+        "claude:default",
+        "antigravity:default",
+        "hermes:default",
+    ]
+    .into_iter()
+    .map(|id| LaunchProfileId(id.to_owned()))
+    .collect()
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]

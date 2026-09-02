@@ -372,7 +372,7 @@ delegated work is pending or running. Report remaining risks and non-blocking
 notes concisely.
 "#;
 
-const ORCHESTRATOR_INSTRUCTIONS: &str = r#"
+pub const SUPERSEDED_ORCHESTRATOR_V8_INSTRUCTIONS: &str = r#"
 You are Tyde's Orchestrator. Coordinate through agents; never edit project
 files or implement changes yourself. User instructions and applicable repository
 instructions, including AGENTS.md, override this workflow and apply to delegates.
@@ -458,6 +458,23 @@ validation passes, repository-required commit and landing are complete, and no
 delegated work is pending or running. Report remaining risks and non-blocking
 notes concisely.
 "#;
+
+fn orchestrator_instructions() -> String {
+    SUPERSEDED_ORCHESTRATOR_V8_INSTRUCTIONS
+        .trim()
+        .replace(
+            "Use two independent read-only Planners, one Implementer, and two fresh\nindependent read-only Reviewers. Use Claude and Codex for paired roles when\navailable, unless the user overrides that preference; otherwise use independent\nsessions and disclose reduced diversity.",
+            "Use two independent read-only Planners, one Implementer, and two fresh\nindependent read-only Reviewers. Call `tyde_list_launch_options` first and choose\nprofiles in its returned preference order, considering only factual limits it\nactually reports. User-selected backends or profiles remain authoritative. Use\nindependent sessions and disclose reduced diversity when needed.",
+        )
+        .replace(
+            "Prefer Codex for the Implementer unless the user overrides that preference.\nGive one Implementer the task, acceptance criteria, plan, scope, and repository",
+            "Choose the Implementer from the returned launch-profile preference unless the\nuser selected a backend or profile. Give one Implementer the task, acceptance\ncriteria, plan, scope, and repository",
+        )
+        .replace(
+            "Honor the user's requested backends above all else. Discover availability and do\nnot silently substitute an unavailable requested backend. Without a user\nselection, choose one to three available backends according to complexity: your\nown backend plus up to two strong backends from different model families. One is\nenough for trivial work; substantive or non-obvious work benefits from diverse\nindependent perspectives. If diversity is unavailable, say so rather than\npresenting single-backend agreement as consensus.",
+            "Honor the user's requested backends above all else. Discover availability and do\nnot silently substitute an unavailable requested backend. Without a user\nselection, choose one to three available profiles in the order returned by\n`tyde_list_launch_options`, using its factual known limits only as advisory\ncontext. One is enough for trivial work; substantive or non-obvious work benefits\nfrom diverse independent perspectives. If diversity is unavailable, say so\nrather than presenting single-backend agreement as consensus.",
+        )
+}
 
 const SUPERSEDED_ORCHESTRATOR_V4_INSTRUCTIONS: &str = r#"
 You are Tyde's Orchestrator: a project manager, not the primary investigator or
@@ -1522,7 +1539,7 @@ pub fn builtin_custom_agents() -> Vec<CustomAgent> {
             description:
                 "Coordinates multi-backend plan, implement, and review workflows across agents."
                     .to_owned(),
-            instructions: Some(ORCHESTRATOR_INSTRUCTIONS.trim().to_owned()),
+            instructions: Some(orchestrator_instructions()),
             skill_ids: Vec::new(),
             mcp_server_ids: Vec::new(),
             tool_policy: ToolPolicy::Unrestricted,
@@ -1627,6 +1644,17 @@ fn superseded_builtin_custom_agents() -> Vec<CustomAgent> {
                 "Coordinates multi-backend plan, implement, and review workflows across agents."
                     .to_owned(),
             instructions: Some(SUPERSEDED_ORCHESTRATOR_V7_INSTRUCTIONS.trim().to_owned()),
+            skill_ids: Vec::new(),
+            mcp_server_ids: Vec::new(),
+            tool_policy: ToolPolicy::Unrestricted,
+        },
+        CustomAgent {
+            id: CustomAgentId(TEAM_LEAD_CUSTOM_AGENT_ID.to_owned()),
+            name: "Orchestrator".to_owned(),
+            description:
+                "Coordinates multi-backend plan, implement, and review workflows across agents."
+                    .to_owned(),
+            instructions: Some(SUPERSEDED_ORCHESTRATOR_V8_INSTRUCTIONS.trim().to_owned()),
             skill_ids: Vec::new(),
             mcp_server_ids: Vec::new(),
             tool_policy: ToolPolicy::Unrestricted,

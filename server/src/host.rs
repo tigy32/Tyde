@@ -1754,6 +1754,15 @@ impl HostHandle {
         }
     }
 
+    #[cfg(feature = "test-support")]
+    pub async fn record_backend_capacity_for_test(
+        &self,
+        backend_kind: BackendKind,
+        state: BackendCapacityState,
+    ) {
+        self.record_backend_capacity(backend_kind, state).await;
+    }
+
     pub async fn age_backend_capacity_for_test(&self, backend_kind: BackendKind, age_ms: u64) {
         let mut state = self.state.lock().await;
         let now = capacity_now_ms();
@@ -9534,6 +9543,11 @@ impl HostHandle {
         let state = self.state.lock().await;
         let settings = state.settings_store.lock().await.get()?;
         Ok(launch_profile_catalog_for_settings(&state, &settings))
+    }
+
+    pub(crate) async fn read_backend_capacity_snapshots(&self) -> Vec<BackendCapacitySnapshot> {
+        let state = self.state.lock().await;
+        backend_capacity_snapshots(&state)
     }
 
     pub(crate) async fn resolve_launch_profile(

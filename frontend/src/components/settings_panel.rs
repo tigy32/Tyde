@@ -15,13 +15,13 @@ use protocol::{
     BackendNativeSettingsAdvisory, BackendNativeSettingsGroup, BackendNativeSettingsGroupKind,
     BackendNativeSettingsSnapshot, BackendNativeSettingsWritePayload, BackendSetupAction,
     BackendSetupInfo, BackendSetupStatus, BrokerUrl, CodeIntelProviderId, CustomAgent,
-    CustomAgentId, DiffContextMode, FrameKind, InvokeSettingsActionPayload, LaunchProfileId,
-    McpServerConfig, McpServerId, McpTransportConfig, MobileAccessStatePayload, MobileBrokerStatus,
-    MobileDeviceState, MobilePairingOfferId, MobilePairingOfferPayload, MobilePairingState,
-    MobilePushState, ProjectId, RunBackendSetupPayload, SessionSchemaEntry, SessionSettingField,
-    SessionSettingFieldType, SessionSettingValue, SessionSettingsSchema, SessionSettingsValues,
-    SettingExpectation, SettingOp, SettingsWriteId, SettingsWritePayload, Skill, SkillId, Steering,
-    SteeringId, SteeringScope, ToolPolicy,
+    CustomAgentId, DiffContextMode, FrameKind, InvokeSettingsActionPayload, LaunchProfileEntry,
+    LaunchProfileId, McpServerConfig, McpServerId, McpTransportConfig, MobileAccessStatePayload,
+    MobileBrokerStatus, MobileDeviceState, MobilePairingOfferId, MobilePairingOfferPayload,
+    MobilePairingState, MobilePushState, ProjectId, RunBackendSetupPayload, SessionSchemaEntry,
+    SessionSettingField, SessionSettingFieldType, SessionSettingValue, SessionSettingsSchema,
+    SessionSettingsValues, SettingExpectation, SettingOp, SettingsWriteId, SettingsWritePayload,
+    Skill, SkillId, Steering, SteeringId, SteeringScope, ToolPolicy,
 };
 use settings_model::{HostExecutablePath, HostLaunchProfileConfig};
 
@@ -2975,11 +2975,184 @@ fn SubagentsTab() -> impl IntoView {
             {move || host_schema_section(&fields_state, "subagents")}
         </div>
 
+        <DelegationPreference />
+
         <h3 class="settings-section-title">"How sub-agents are configured"</h3>
         <div class="settings-field">
             {move || complexity_tier_rows(&rows_state)}
         </div>
     }
+}
+
+#[component]
+fn DelegationPreference() -> impl IntoView {
+    let state = expect_context::<AppState>();
+    let rows_state = state.clone();
+    let add_state = state.clone();
+
+    view! {
+        <section class="settings-field delegation-preference" aria-labelledby="delegation-preference-title">
+            <h3 id="delegation-preference-title" class="settings-section-title">
+                "Delegation preference"
+            </h3>
+            <p class="settings-description">
+                "Agents use this order as advice when choosing how to launch a child. An explicit backend or launch profile always wins. Profiles that are temporarily unavailable stay in the list."
+            </p>
+            <ol class="delegation-preference-list">
+                {move || delegation_preference_rows(&rows_state)}
+            </ol>
+            <label class="settings-form-label delegation-preference-add">
+                <span>"Add launch profile"</span>
+                <select
+                    class="settings-select"
+                    aria-label="Add launch profile to delegation preference"
+                    on:change=move |ev: web_sys::Event| {
+                        let target = ev.target().expect("delegation preference select target");
+                        let select: web_sys::HtmlSelectElement = target.unchecked_into();
+                        let id = select.value();
+                        if id.is_empty() {
+                            return;
+                        }
+                        if let Some(settings) = add_state.selected_host_settings_untracked() {
+                            let mut order = settings.delegation_launch_profile_order;
+                            let id = LaunchProfileId(id);
+                            if !order.contains(&id) {
+                                order.push(id);
+                                send_host_replace(
+                                    &add_state,
+                                    "/delegation_launch_profile_order",
+                                    order,
+                                );
+                            }
+                        }
+                        select.set_value("");
+                    }
+                >
+                    <option value="">"Choose a profile…"</option>
+                    {move || delegation_preference_add_options(&state)}
+                </select>
+            </label>
+        </section>
+    }
+}
+
+fn delegation_preference_rows(state: &AppState) -> Vec<AnyView> {
+    let Some(settings) = state.selected_host_settings() else {
+        return Vec::new();
+    };
+    let catalog = state
+        .selected_host_id
+        .get()
+        .and_then(|host_id| state.launch_profile_catalog.get().get(&host_id).cloned())
+        .unwrap_or_default();
+    let order = settings.delegation_launch_profile_order;
+    order
+        .iter()
+        .enumerate()
+        .map(|(index, id)| {
+            let (label, availability) = match catalog.entries.iter().find(|entry| entry.id() == id)
+            {
+                Some(LaunchProfileEntry::Ready { profile }) => (
+                    profile.label.clone(),
+                    format!("{} · available", backend_label(profile.backend_kind)),
+                ),
+                Some(LaunchProfileEntry::Unavailable { message, .. }) => {
+                    (id.0.clone(), format!("Unavailable: {message}"))
+                }
+                None => (id.0.clone(), "Missing from this host".to_owned()),
+            };
+            let move_up_state = state.clone();
+            let move_up_order = order.clone();
+            let move_down_state = state.clone();
+            let move_down_order = order.clone();
+            let remove_state = state.clone();
+            let remove_order = order.clone();
+            let id_for_up = id.0.clone();
+            let id_for_down = id.0.clone();
+            let id_for_remove = id.0.clone();
+            view! {
+                <li class="delegation-preference-row">
+                    <div class="delegation-preference-copy">
+                        <span class="delegation-preference-label">{label}</span>
+                        <span class="delegation-preference-id">{id.0.clone()}</span>
+                        <span class="delegation-preference-status">{availability}</span>
+                    </div>
+                    <div class="delegation-preference-actions">
+                        <button
+                            class="settings-btn"
+                            aria-label=format!("Move {id_for_up} up")
+                            disabled=index == 0
+                            on:click=move |_| {
+                                let mut next = move_up_order.clone();
+                                next.swap(index, index - 1);
+                                send_host_replace(
+                                    &move_up_state,
+                                    "/delegation_launch_profile_order",
+                                    next,
+                                );
+                            }
+                        >"↑"</button>
+                        <button
+                            class="settings-btn"
+                            aria-label=format!("Move {id_for_down} down")
+                            disabled=index + 1 == move_down_order.len()
+                            on:click=move |_| {
+                                let mut next = move_down_order.clone();
+                                next.swap(index, index + 1);
+                                send_host_replace(
+                                    &move_down_state,
+                                    "/delegation_launch_profile_order",
+                                    next,
+                                );
+                            }
+                        >"↓"</button>
+                        <button
+                            class="settings-btn settings-btn-danger"
+                            aria-label=format!("Remove {id_for_remove} from delegation preference")
+                            on:click=move |_| {
+                                let mut next = remove_order.clone();
+                                next.remove(index);
+                                send_host_replace(
+                                    &remove_state,
+                                    "/delegation_launch_profile_order",
+                                    next,
+                                );
+                            }
+                        >"Remove"</button>
+                    </div>
+                </li>
+            }
+            .into_any()
+        })
+        .collect()
+}
+
+fn delegation_preference_add_options(state: &AppState) -> Vec<AnyView> {
+    let selected = state
+        .selected_host_settings()
+        .map(|settings| settings.delegation_launch_profile_order)
+        .unwrap_or_default();
+    state
+        .selected_host_id
+        .get()
+        .and_then(|host_id| state.launch_profile_catalog.get().get(&host_id).cloned())
+        .unwrap_or_default()
+        .entries
+        .into_iter()
+        .filter(|entry| !selected.contains(entry.id()))
+        .map(|entry| {
+            let id = entry.id().0.clone();
+            let label = match entry {
+                LaunchProfileEntry::Ready { profile } => {
+                    format!("{} ({})", profile.label, profile.id.0)
+                }
+                LaunchProfileEntry::Unavailable { message, .. } => {
+                    format!("{id} — unavailable: {message}")
+                }
+            };
+            view! { <option value=id>{label}</option> }.into_any()
+        })
+        .collect()
 }
 
 fn complexity_tier_rows(state: &AppState) -> Option<AnyView> {
@@ -8351,6 +8524,8 @@ mod wasm_tests {
                     tyde_debug_mcp_enabled: false,
                     tyde_agent_control_mcp_enabled: true,
                     tyde_agent_control_max_depth: settings_model::default_agent_control_max_depth(),
+                    delegation_launch_profile_order:
+                        settings_model::default_delegation_launch_profile_order(),
                     complexity_tiers_enabled: false,
                     backend_tier_configs: std::collections::HashMap::new(),
                     background_agent_features: Default::default(),
@@ -9785,6 +9960,8 @@ mod wasm_tests {
                     tyde_debug_mcp_enabled: false,
                     tyde_agent_control_mcp_enabled: true,
                     tyde_agent_control_max_depth: settings_model::default_agent_control_max_depth(),
+                    delegation_launch_profile_order:
+                        settings_model::default_delegation_launch_profile_order(),
                     complexity_tiers_enabled: false,
                     backend_tier_configs: std::collections::HashMap::new(),
                     background_agent_features: settings_model::BackgroundAgentFeaturesSettings {
@@ -10479,6 +10656,8 @@ mod wasm_tests {
             tyde_debug_mcp_enabled: false,
             tyde_agent_control_mcp_enabled: true,
             tyde_agent_control_max_depth: settings_model::default_agent_control_max_depth(),
+            delegation_launch_profile_order:
+                settings_model::default_delegation_launch_profile_order(),
             complexity_tiers_enabled: false,
             backend_tier_configs: std::collections::HashMap::new(),
             background_agent_features: Default::default(),
@@ -11099,6 +11278,130 @@ mod wasm_tests {
             .find(|op| replacement_value(op, "/tyde_agent_control_max_depth").is_some())
             .expect("the depth input must commit its settings path");
         assert_eq!(depth_frame.get("value").and_then(Value::as_u64), Some(4));
+    }
+
+    #[wasm_bindgen_test]
+    async fn delegation_preference_preserves_missing_ids_and_has_accessible_order_controls() {
+        let calls = install_settings_send_stub();
+        let container = make_container();
+        let _handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            install_launch_profile_host(&state, Vec::new());
+            state.host_settings_by_host.update(|hosts| {
+                hosts
+                    .get_mut("host-lp")
+                    .expect("launch-profile fixture settings")
+                    .delegation_launch_profile_order = vec![
+                    LaunchProfileId("missing:saved".to_owned()),
+                    LaunchProfileId("claude:default".to_owned()),
+                ];
+            });
+            state.launch_profile_catalog.update(|catalogs| {
+                catalogs.insert(
+                    "host-lp".to_owned(),
+                    protocol::LaunchProfileCatalog {
+                        entries: vec![
+                            protocol::LaunchProfileEntry::Ready {
+                                profile: protocol::LaunchProfile {
+                                    id: LaunchProfileId("claude:default".to_owned()),
+                                    kind: protocol::LaunchProfileKind::BackendDefault,
+                                    label: "Claude".to_owned(),
+                                    description: None,
+                                    backend_kind: BackendKind::Claude,
+                                    session_settings: SessionSettingsValues::default(),
+                                },
+                            },
+                            protocol::LaunchProfileEntry::Ready {
+                                profile: protocol::LaunchProfile {
+                                    id: LaunchProfileId("codex:default".to_owned()),
+                                    kind: protocol::LaunchProfileKind::BackendDefault,
+                                    label: "Codex".to_owned(),
+                                    description: None,
+                                    backend_kind: BackendKind::Codex,
+                                    session_settings: SessionSettingsValues::default(),
+                                },
+                            },
+                        ],
+                        default_profile_id: None,
+                    },
+                );
+            });
+            provide_context(state);
+            view! { <DelegationPreference /> }
+        });
+        next_tick().await;
+
+        let text = container.text_content().unwrap_or_default();
+        assert!(
+            text.contains("missing:saved"),
+            "saved missing id must render: {text:?}"
+        );
+        assert!(
+            text.contains("Missing from this host"),
+            "missing state must be explicit: {text:?}"
+        );
+        assert!(
+            container
+                .query_selector(
+                    "button[aria-label='Remove missing:saved from delegation preference']"
+                )
+                .unwrap()
+                .is_some(),
+            "a missing saved id must remain removable"
+        );
+
+        let move_up: HtmlElement = container
+            .query_selector("button[aria-label='Move claude:default up']")
+            .unwrap()
+            .expect("accessible move-up control")
+            .dyn_into()
+            .unwrap();
+        move_up.click();
+        for _ in 0..3 {
+            next_tick().await;
+        }
+        let reorder = recorded_settings_write_ops(&calls)
+            .into_iter()
+            .find(|op| {
+                op.get("path").and_then(Value::as_str) == Some("/delegation_launch_profile_order")
+            })
+            .expect("reorder settings write");
+        assert_eq!(
+            reorder["value"],
+            serde_json::json!(["claude:default", "missing:saved"])
+        );
+
+        let add: web_sys::HtmlSelectElement = container
+            .query_selector("select[aria-label='Add launch profile to delegation preference']")
+            .unwrap()
+            .expect("accessible add control")
+            .dyn_into()
+            .unwrap();
+        add.set_value("codex:default");
+        dispatch_event_from_js(&add.clone().unchecked_into(), "change", None);
+        for _ in 0..3 {
+            next_tick().await;
+        }
+        let writes = recorded_settings_write_ops(&calls);
+        let added = writes.last().expect("add settings write");
+        assert_eq!(
+            added["value"],
+            serde_json::json!(["missing:saved", "claude:default", "codex:default"])
+        );
+
+        let remove: HtmlElement = container
+            .query_selector("button[aria-label='Remove missing:saved from delegation preference']")
+            .unwrap()
+            .expect("accessible remove control")
+            .dyn_into()
+            .unwrap();
+        remove.click();
+        for _ in 0..3 {
+            next_tick().await;
+        }
+        let writes = recorded_settings_write_ops(&calls);
+        let removed = writes.last().expect("remove settings write");
+        assert_eq!(removed["value"], serde_json::json!(["claude:default"]));
     }
 
     /// The sidebar has a dedicated Backends group: a stable Overview entry, a
@@ -11919,6 +12222,8 @@ mod wasm_tests {
                     tyde_debug_mcp_enabled: false,
                     tyde_agent_control_mcp_enabled: true,
                     tyde_agent_control_max_depth: settings_model::default_agent_control_max_depth(),
+                    delegation_launch_profile_order:
+                        settings_model::default_delegation_launch_profile_order(),
                     complexity_tiers_enabled: false,
                     backend_tier_configs: std::collections::HashMap::new(),
                     background_agent_features: Default::default(),

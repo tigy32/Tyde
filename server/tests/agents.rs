@@ -513,20 +513,8 @@ fn mcp_success_json(response: &Value) -> Value {
     serde_json::from_str(mcp_result_text(response)).expect("parse MCP success payload JSON")
 }
 
-async fn mcp_list_launch_options(url: &str) -> Value {
-    let response = post_json(
-        url,
-        &json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "tools/call",
-            "params": {
-                "name": "tyde_list_launch_options",
-                "arguments": {}
-            }
-        }),
-    )
-    .await;
+async fn mcp_list_launch_options(caller: &server::AgentControlMcpCaller) -> Value {
+    let response = mcp_tool_call_as(caller, false, "tyde_list_launch_options", json!({})).await;
     let result = response
         .get("result")
         .unwrap_or_else(|| panic!("MCP response missing result: {response}"));
@@ -3609,6 +3597,71 @@ async fn agent_control_end_to_end_flow_uses_full_stack() {
         }),
         "dev-driver launch options should include claude:default"
     );
+    assert_eq!(
+        options.launch_profile_preference,
+        settings_model::default_delegation_launch_profile_order()
+    );
+    assert!(options.backend_limits.is_empty());
+
+    let live_preference = vec![
+        LaunchProfileId("missing:dev-driver".to_owned()),
+        LaunchProfileId("claude:default".to_owned()),
+    ];
+    let write_id = fixture
+        .client
+        .replace_setting(
+            "/delegation_launch_profile_order",
+            live_preference.clone(),
+            settings_model::default_delegation_launch_profile_order(),
+        )
+        .await
+        .expect("update live dev-driver preference");
+    expect_settings_write_applied(
+        &mut fixture.client,
+        &write_id,
+        "update live dev-driver preference",
+    )
+    .await;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if control.list_launch_options().launch_profile_preference == live_preference {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("connected dev driver should observe HostSettings update");
+
+    fixture
+        .host_for_test()
+        .record_backend_capacity_for_test(
+            BackendKind::Claude,
+            protocol::BackendCapacityState::Known {
+                report: protocol::CapacityReport {
+                    source: protocol::CapacitySource::ClaudeRateLimitEvent,
+                    observed_at_ms: Some(789),
+                    plan: None,
+                    buckets: Vec::new(),
+                    coverage: protocol::CapacityCoverage::RepresentativeBucketOnly,
+                },
+            },
+        )
+        .await;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let options = control.list_launch_options();
+            if options.backend_limits.iter().any(|limits| {
+                limits.backend_kind == BackendKind::Claude
+                    && limits.report.observed_at_ms == Some(789)
+            }) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("connected dev driver should observe factual BackendCapacity update");
 
     let spawned = control
         .spawn_agent(SpawnRequest {
@@ -3688,12 +3741,22 @@ async fn agent_control_http_limits_spawn_selection_to_profile_backend_and_tier()
     let parent = spawn_agent_control_parent(&mut fixture, "launch-profile-parent").await;
     let caller = fixture.agent_control_caller(&parent.agent_id).await;
     let base_url = fixture.agent_control_http_url().await;
-    let options = mcp_list_launch_options(&base_url).await;
+    let options = mcp_list_launch_options(&caller).await;
     let enabled_backends = options["enabled_backends"]
         .as_array()
         .expect("enabled backend list");
     assert_eq!(enabled_backends, &[json!("claude")]);
     assert_eq!(options["complexity_tiers_enabled"], false);
+    assert_eq!(
+        options["launch_profile_preference"],
+        json!([
+            "codex:default",
+            "claude:default",
+            "antigravity:default",
+            "hermes:default"
+        ])
+    );
+    assert_eq!(options["backend_limits"], json!([]));
     assert!(
         options["launch_profiles"]
             .as_array()
@@ -3715,6 +3778,97 @@ async fn agent_control_http_limits_spawn_selection_to_profile_backend_and_tier()
         options.get("session_schemas").is_none(),
         "session schemas leaked in {options}"
     );
+
+    let anonymous = post_json(
+        &base_url,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 9,
+            "method": "tools/call",
+            "params": { "name": "tyde_list_launch_options", "arguments": {} }
+        }),
+    )
+    .await;
+    assert!(mcp_result_is_error(&anonymous));
+    assert!(mcp_result_text(&anonymous).contains("bearer credential"));
+
+    let preference_write_id = fixture
+        .client
+        .replace_setting(
+            "/delegation_launch_profile_order",
+            vec![
+                LaunchProfileId("missing:saved".to_owned()),
+                LaunchProfileId("claude:default".to_owned()),
+            ],
+            settings_model::default_delegation_launch_profile_order(),
+        )
+        .await
+        .expect("replace delegation preference");
+    expect_settings_write_applied(
+        &mut fixture.client,
+        &preference_write_id,
+        "replace delegation preference",
+    )
+    .await;
+    fixture
+        .host_for_test()
+        .record_backend_capacity_for_test(
+            BackendKind::Claude,
+            protocol::BackendCapacityState::Known {
+                report: protocol::CapacityReport {
+                    source: protocol::CapacitySource::ClaudeRateLimitEvent,
+                    observed_at_ms: Some(123_456),
+                    plan: None,
+                    buckets: vec![protocol::CapacityBucket {
+                        id: protocol::CapacityBucketId::Claude {
+                            limit: protocol::ClaudeLimitType::FiveHour,
+                        },
+                        label: "session limit".to_owned(),
+                        measure: protocol::CapacityMeasure::UsedPercent {
+                            used_percent: 25,
+                            remaining_percent: 75,
+                            provenance: protocol::ValueProvenance {
+                                vendor_reported: true,
+                            },
+                        },
+                        scope: protocol::CapacityScope::NotReported,
+                        window: protocol::CapacityWindow::NotReported,
+                        reset: protocol::CapacityReset::NotReported,
+                        status: Some(protocol::CapacityBucketStatus::Allowed),
+                    }],
+                    coverage: protocol::CapacityCoverage::RepresentativeBucketOnly,
+                },
+            },
+        )
+        .await;
+    let live_options = mcp_list_launch_options(&caller).await;
+    assert_eq!(
+        live_options["launch_profile_preference"],
+        json!(["missing:saved", "claude:default"]),
+        "the already-running caller must see the saved order, including a missing id"
+    );
+    assert_eq!(live_options["backend_limits"].as_array().unwrap().len(), 1);
+    let limits = &live_options["backend_limits"][0];
+    assert_eq!(limits["backend_kind"], "claude");
+    assert_eq!(limits["report"]["observed_at_ms"], 123_456);
+    assert_eq!(
+        limits["report"]["buckets"][0]["measure"]["remaining_percent"],
+        75
+    );
+    assert!(limits.get("state").is_none());
+    assert!(limits.get("freshness").is_none());
+    assert!(limits.get("stale_since_ms").is_none());
+
+    fixture
+        .host_for_test()
+        .mark_backend_capacity_stale_for_test(BackendKind::Claude)
+        .await;
+    let stale_options = mcp_list_launch_options(&caller).await;
+    assert_eq!(
+        stale_options["backend_limits"][0]["report"],
+        limits["report"]
+    );
+    assert!(stale_options["backend_limits"][0].get("stale").is_none());
 
     let tools_response = post_json_with_headers(
         &base_url,
@@ -3774,7 +3928,7 @@ async fn agent_control_http_limits_spawn_selection_to_profile_backend_and_tier()
         "enable agent-control complexity tiers",
     )
     .await;
-    let tier_options = mcp_list_launch_options(&base_url).await;
+    let tier_options = mcp_list_launch_options(&caller).await;
     assert_eq!(tier_options["complexity_tiers_enabled"], true);
 
     let tier_tools_response = post_json_with_headers(

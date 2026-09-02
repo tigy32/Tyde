@@ -81,13 +81,18 @@ so those launches fail visibly instead of falling back to the remote default.
 
 Agent-control MCP exposes:
 
-- `tyde_list_launch_options`: read-only discovery of enabled backends, ready
-  launch profile IDs, the defaults, and whether task complexity tiers are
-  enabled. Profile summaries omit their raw session settings.
+- `tyde_list_launch_options`: authenticated, read-only discovery of enabled
+  backends, ready launch profile IDs, the defaults, the live ordered delegation
+  preference, factual backend-scoped `CapacityReport` projections when present,
+  and whether task complexity tiers are enabled. Profile summaries omit their
+  raw session settings. Saved missing preference IDs remain visible in the
+  order rather than being deleted.
 - `tyde_spawn_agent`: accepts a launch profile ID or backend and, only when
   enabled by the host, an optional complexity tier. It does not accept raw
   session settings, so child agents cannot directly select a model or reasoning
-  effort.
+  effort. Callers consult list-options first; explicit user/backend/profile
+  choices remain authoritative, and omitted selection retains its existing
+  default-backend behavior.
 
 Example:
 

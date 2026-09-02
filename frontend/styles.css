@@ -9049,6 +9049,58 @@ math merror {
     margin-top: var(--space-3);
 }
 
+.delegation-preference-list {
+    display: grid;
+    gap: 8px;
+    margin: 12px 0;
+    padding: 0;
+    list-style: none;
+}
+
+.delegation-preference-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 10px 12px;
+    border: 1px solid var(--border-subtle);
+    border-radius: 8px;
+}
+
+.delegation-preference-copy {
+    display: grid;
+    min-width: 0;
+    gap: 2px;
+}
+
+.delegation-preference-label {
+    font-weight: 600;
+}
+
+.delegation-preference-id,
+.delegation-preference-status {
+    color: var(--text-muted);
+    font-size: 12px;
+    overflow-wrap: anywhere;
+}
+
+.delegation-preference-actions {
+    display: flex;
+    flex-shrink: 0;
+    gap: 6px;
+}
+
+.delegation-preference-add {
+    max-width: 520px;
+}
+
+@media (max-width: 640px) {
+    .delegation-preference-row {
+        align-items: stretch;
+        flex-direction: column;
+    }
+}
+
 .settings-tier-backend {
     padding: var(--space-3);
     background: var(--surface-2);

@@ -10,7 +10,8 @@ use protocol::{
     AGENT_CONTROL_MAX_READ_LIMIT, AGENT_CONTROL_MAX_READ_MAX_BYTES, AgentBootstrapEvent,
     AgentBootstrapPayload, AgentControlLatestOutput, AgentControlReadDebugResult,
     AgentControlReadResult, AgentControlStatus, AgentErrorPayload, AgentId, AgentRenamedPayload,
-    AgentStartPayload, BackendAccessMode, BackendConfigSchemasPayload, BackendKind, ChatEvent,
+    AgentStartPayload, BackendAccessMode, BackendCapacityPayload, BackendCapacitySnapshot,
+    BackendCapacityState, BackendConfigSchemasPayload, BackendKind, CapacityReport, ChatEvent,
     ContextCompactionCapabilityPayload, ContextCompactionNotifyPayload, Envelope, FrameKind,
     LaunchProfileCatalog, LaunchProfileCatalogPayload, LaunchProfileEntry, LaunchProfileId,
     MessageSender, NewAgentPayload, ProjectId, SendMessagePayload, SessionId, SessionSchemaEntry,
@@ -82,6 +83,7 @@ struct SnapshotState {
     host_settings: Option<HostSettings>,
     launch_profile_catalog: LaunchProfileCatalog,
     session_schemas: Vec<SessionSchemaEntry>,
+    backend_capacity: HashMap<BackendKind, BackendCapacitySnapshot>,
     agents: HashMap<AgentId, AgentState>,
     direct_agent_ids: HashSet<AgentId>,
     connection_error: Option<String>,
@@ -313,6 +315,30 @@ impl AgentControlHandle {
 
     pub fn list_launch_options(&self) -> ListLaunchOptionsResult {
         let snapshot = self.snapshot();
+        let mut backend_limits = snapshot
+            .backend_capacity
+            .into_values()
+            .filter_map(|snapshot| {
+                let report = match snapshot.state {
+                    BackendCapacityState::Known { report }
+                    | BackendCapacityState::Stale { report, .. } => report,
+                    _ => return None,
+                };
+                Some(BackendKnownLimits {
+                    backend_kind: snapshot.backend_kind,
+                    report,
+                    retrieved_at_ms: snapshot.retrieved_at_ms,
+                })
+            })
+            .collect::<Vec<_>>();
+        backend_limits.sort_by_key(|limits| match limits.backend_kind {
+            BackendKind::Kiro => 0,
+            BackendKind::Claude => 1,
+            BackendKind::Codex => 2,
+            BackendKind::Antigravity => 3,
+            BackendKind::Hermes => 4,
+            BackendKind::Tycode => 5,
+        });
         ListLaunchOptionsResult {
             catalog: snapshot.launch_profile_catalog,
             default_backend: snapshot
@@ -320,6 +346,12 @@ impl AgentControlHandle {
                 .as_ref()
                 .and_then(|settings| settings.default_backend),
             session_schemas: snapshot.session_schemas,
+            launch_profile_preference: snapshot
+                .host_settings
+                .as_ref()
+                .map(|settings| settings.delegation_launch_profile_order.clone())
+                .unwrap_or_default(),
+            backend_limits,
         }
     }
 
@@ -472,6 +504,15 @@ pub struct ListLaunchOptionsResult {
     pub catalog: LaunchProfileCatalog,
     pub default_backend: Option<BackendKind>,
     pub session_schemas: Vec<SessionSchemaEntry>,
+    pub launch_profile_preference: Vec<LaunchProfileId>,
+    pub backend_limits: Vec<BackendKnownLimits>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BackendKnownLimits {
+    pub backend_kind: BackendKind,
+    pub report: CapacityReport,
+    pub retrieved_at_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -918,6 +959,16 @@ fn apply_envelope(snapshot: &mut SnapshotState, envelope: &protocol::Envelope) {
             let _: BackendConfigSchemasPayload = envelope
                 .parse_payload()
                 .expect("validated BackendConfigSchemas payload should parse");
+        }
+        FrameKind::BackendCapacity => {
+            let payload: BackendCapacityPayload = envelope
+                .parse_payload()
+                .expect("validated BackendCapacity payload should parse");
+            snapshot.backend_capacity = payload
+                .snapshots
+                .into_iter()
+                .map(|entry| (entry.backend_kind, entry))
+                .collect();
         }
         FrameKind::NewAgent => {
             let payload: NewAgentPayload = envelope
@@ -1532,7 +1583,7 @@ fn tool_definitions() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition {
             name: "tyde_spawn_agent",
-            description: "Spawn a Tyde agent and return immediately with its agent_id. Use tyde_await_agents to wait and tyde_read_agent to read output.",
+            description: "Spawn a Tyde agent and return immediately with its agent_id. Call tyde_list_launch_options first and follow its preference and factual known limits unless the user explicitly selected a backend or profile. Use tyde_await_agents to wait and tyde_read_agent to read output.",
             input_schema: spawn_agent_schema(),
         },
         ToolDefinition {
@@ -1566,7 +1617,7 @@ fn tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "tyde_list_launch_options",
-            description: "List server-owned Launch Profiles and backend launch metadata.",
+            description: "List server-owned Launch Profiles, the live ordered delegation preference, and factual last-known backend limits when Tyde has an actual report.",
             input_schema: json!({
                 "type": "object",
                 "properties": {},

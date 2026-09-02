@@ -40,6 +40,8 @@ The persisted host-settings document covers:
 
 - `enabled_backends`
 - `default_backend`
+- `delegation_launch_profile_order`, an advisory ordered list whose missing
+  launch-profile IDs are retained across backend/catalog availability changes
 - independent Nova conversation and Amazon Transcribe dictation enablement,
   the host-only AWS profile, explicit per-service regions, dictation language,
   and exact Nova model

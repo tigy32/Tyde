@@ -121,6 +121,8 @@ pub fn prime_host_for_tests(state: &AppState, host: &LocalHostId) {
             tyde_debug_mcp_enabled: false,
             tyde_agent_control_mcp_enabled: true,
             tyde_agent_control_max_depth: settings_model::default_agent_control_max_depth(),
+            delegation_launch_profile_order:
+                settings_model::default_delegation_launch_profile_order(),
             complexity_tiers_enabled: false,
             backend_tier_configs: std::collections::HashMap::new(),
             background_agent_features: Default::default(),
@@ -3864,6 +3866,8 @@ mod wasm_tests {
                 tyde_debug_mcp_enabled: false,
                 tyde_agent_control_mcp_enabled: true,
                 tyde_agent_control_max_depth: settings_model::default_agent_control_max_depth(),
+                delegation_launch_profile_order:
+                    settings_model::default_delegation_launch_profile_order(),
                 complexity_tiers_enabled: false,
                 backend_tier_configs: std::collections::HashMap::new(),
                 background_agent_features: Default::default(),

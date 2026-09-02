@@ -12,11 +12,11 @@ use protocol::{
     AGENT_CONTROL_DEFAULT_READ_LIMIT, AGENT_CONTROL_DEFAULT_READ_MAX_BYTES,
     AGENT_CONTROL_MAX_READ_LIMIT, AGENT_CONTROL_MAX_READ_MAX_BYTES, AgentControlReadDebugResult,
     AgentControlReadResult, AgentControlStatus, AgentId, AgentOrigin, BackendAccessMode,
-    BackendKind, CustomAgentId, GitBranchName, ImageData, LaunchProfileEntry, LaunchProfileId,
-    ProjectId, ProjectSource, SendMessagePayload, SpawnAgentParams, SpawnAgentPayload,
-    SpawnCostHint, Team, TeamMember, TeamMemberBindingPayload, TeamMemberId,
-    WorkbenchCreatePayload, WorkbenchRemovePayload, WorkflowSaveRequest, WorkflowSaveResponse,
-    WorkflowTargetsResponse, cap_agent_control_events,
+    BackendCapacityState, BackendKind, CapacityReport, CustomAgentId, GitBranchName, ImageData,
+    LaunchProfileEntry, LaunchProfileId, ProjectId, ProjectSource, SendMessagePayload,
+    SpawnAgentParams, SpawnAgentPayload, SpawnCostHint, Team, TeamMember, TeamMemberBindingPayload,
+    TeamMemberId, WorkbenchCreatePayload, WorkbenchRemovePayload, WorkflowSaveRequest,
+    WorkflowSaveResponse, WorkflowTargetsResponse, cap_agent_control_events,
 };
 use rmcp::{
     ErrorData as McpError, RoleServer, ServerHandler,
@@ -506,6 +506,15 @@ struct ListLaunchOptionsResult {
     complexity_tiers_enabled: bool,
     launch_profiles: Vec<AgentLaunchProfileOption>,
     default_launch_profile_id: Option<String>,
+    launch_profile_preference: Vec<String>,
+    backend_limits: Vec<BackendKnownLimits>,
+}
+
+#[derive(Debug, Serialize)]
+struct BackendKnownLimits {
+    backend_kind: BackendKind,
+    report: CapacityReport,
+    retrieved_at_ms: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -721,7 +730,7 @@ async fn authorize_direct_children(
 #[tool_router]
 impl TydeAgentControlMcpServer {
     #[tool(
-        description = "Spawn a direct child of the authenticated caller and return immediately with its agent_id."
+        description = "Spawn a direct child of the authenticated caller and return immediately with its agent_id. Call tyde_list_launch_options first, then follow its ordered launch-profile preference and factual backend limits unless the user explicitly selected a backend or profile."
     )]
     async fn tyde_spawn_agent(
         &self,
@@ -797,12 +806,18 @@ impl TydeAgentControlMcpServer {
     }
 
     #[tool(
-        description = "List enabled backends, launch profile IDs, the defaults, and whether optional task complexity tiers may be requested."
+        description = "List enabled backends, launch profiles, the user's ordered advisory preference, factual last-known backend limits when Tyde has an actual report, defaults, and whether optional task complexity tiers may be requested. Requires the calling agent's bearer credential."
     )]
     async fn tyde_list_launch_options(
         &self,
         Parameters(_input): Parameters<EmptyToolInput>,
+        Extension(parts): Extension<axum::http::request::Parts>,
     ) -> Result<CallToolResult, McpError> {
+        if let Err(error) =
+            require_authenticated_caller(self, &parts, "tyde_list_launch_options").await
+        {
+            return Ok(err_text(error));
+        }
         match do_list_launch_options(&self.host).await {
             Ok(result) => ok_json(result),
             Err(err) => Ok(err_text(err)),
@@ -1562,6 +1577,26 @@ async fn do_remove_workbench(
 async fn do_list_launch_options(host: &HostHandle) -> Result<ListLaunchOptionsResult, String> {
     let settings = host.read_settings().await?;
     let catalog = host.read_launch_profile_catalog().await?;
+    let backend_limits = host
+        .read_backend_capacity_snapshots()
+        .await
+        .into_iter()
+        .filter_map(|snapshot| {
+            let report = match snapshot.state {
+                BackendCapacityState::Known { report }
+                | BackendCapacityState::Stale { report, .. } => report,
+                BackendCapacityState::Unavailable { .. }
+                | BackendCapacityState::Unsupported { .. }
+                | BackendCapacityState::AuthError { .. }
+                | BackendCapacityState::RateLimited { .. } => return None,
+            };
+            Some(BackendKnownLimits {
+                backend_kind: snapshot.backend_kind,
+                report,
+                retrieved_at_ms: snapshot.retrieved_at_ms,
+            })
+        })
+        .collect();
     let launch_profiles = catalog
         .entries
         .into_iter()
@@ -1581,6 +1616,12 @@ async fn do_list_launch_options(host: &HostHandle) -> Result<ListLaunchOptionsRe
         complexity_tiers_enabled: settings.complexity_tiers_enabled,
         launch_profiles,
         default_launch_profile_id: catalog.default_profile_id.map(|id| id.0),
+        launch_profile_preference: settings
+            .delegation_launch_profile_order
+            .into_iter()
+            .map(|id| id.0)
+            .collect(),
+        backend_limits,
     })
 }
 

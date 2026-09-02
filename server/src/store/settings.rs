@@ -651,6 +651,7 @@ fn empty_settings() -> HostSettings {
         tyde_debug_mcp_enabled: false,
         tyde_agent_control_mcp_enabled: true,
         tyde_agent_control_max_depth: settings_model::default_agent_control_max_depth(),
+        delegation_launch_profile_order: settings_model::default_delegation_launch_profile_order(),
         complexity_tiers_enabled: false,
         backend_tier_configs: std::collections::HashMap::new(),
         background_agent_features: Default::default(),
@@ -720,6 +721,8 @@ fn validate_settings(settings: HostSettings) -> Result<HostSettings, String> {
     }
 
     let code_intel = validate_code_intel_settings(settings.code_intel)?;
+    let delegation_launch_profile_order =
+        normalize_delegation_launch_profile_order(settings.delegation_launch_profile_order);
     let launch_profiles = validate_launch_profile_configs(settings.launch_profiles)?;
     // Normalize on load exactly as `apply_setting` does on write, so a
     // hand-edited store file cannot leave blank slugs or an empty list behind
@@ -797,6 +800,7 @@ fn validate_settings(settings: HostSettings) -> Result<HostSettings, String> {
         tyde_debug_mcp_enabled: settings.tyde_debug_mcp_enabled,
         tyde_agent_control_mcp_enabled: settings.tyde_agent_control_mcp_enabled,
         tyde_agent_control_max_depth: settings.tyde_agent_control_max_depth,
+        delegation_launch_profile_order,
         complexity_tiers_enabled: settings.complexity_tiers_enabled,
         backend_tier_configs: settings.backend_tier_configs,
         background_agent_features: settings.background_agent_features,
@@ -807,6 +811,26 @@ fn validate_settings(settings: HostSettings) -> Result<HostSettings, String> {
         hermes_disabled_providers,
         voice,
     })
+}
+
+fn normalize_delegation_launch_profile_order(
+    profile_ids: Vec<LaunchProfileId>,
+) -> Vec<LaunchProfileId> {
+    let mut seen = std::collections::HashSet::new();
+    profile_ids
+        .into_iter()
+        .filter_map(|profile_id| {
+            let normalized = profile_id.0.trim();
+            if normalized.is_empty()
+                || normalized.len() > 256
+                || normalized.chars().any(char::is_control)
+                || !seen.insert(normalized.to_owned())
+            {
+                return None;
+            }
+            Some(LaunchProfileId(normalized.to_owned()))
+        })
+        .collect()
 }
 
 fn normalize_optional_voice_setting(

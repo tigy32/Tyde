@@ -216,6 +216,7 @@ Tools:
 - `tyde_send_agent_message`
 - `tyde_read_agent`
 - `tyde_read_agent_debug`
+- `tyde_list_launch_options`
 
 There is no `run` convenience tool and no MCP `cancel` tool in this surface.
 Clients compose the primitives explicitly: spawn, await status, then read output.
@@ -263,6 +264,30 @@ receives a server-signed bearer credential
 bound to its `AgentId`; that authenticated identity becomes the parent. Header
 and query identities are claims only and must match the credential. Root/admin
 spawns use the separate typed host protocol/dev-driver surface, not bare MCP.
+
+Call `tyde_list_launch_options` before spawning unless the user already made an
+explicit backend or launch-profile choice. Its `launch_profile_preference` is
+ordered, host-persistent advice; it does not change omitted-selection semantics
+and never overrides explicit input.
+
+#### `tyde_list_launch_options`
+
+Returns the live host settings and catalog projection on every call, so a
+running agent observes preference changes without relaunch. The response
+contains enabled backends, ready launch profiles, defaults, complexity-tier
+availability, and the saved ordered preference. Saved IDs remain in the
+preference even when absent from the current catalog.
+
+`backend_limits` is backend-scoped and contains an entry only when the host has
+an actual `CapacityReport`. Each entry reuses the canonical report, including
+its buckets, coverage, source, and optional observation time, plus the host's
+retrieval timestamp. Retained reports remain factual after aging; the MCP
+projection does not add freshness labels, health classifications, predictions,
+or interpretations. Unavailable, unsupported, authentication-error, and
+rate-limited states are omitted.
+
+Because quota is account-sensitive, this otherwise read-only tool requires the
+same server-signed agent bearer credential as the other caller-bound tools.
 
 #### `tyde_list_agents`
 

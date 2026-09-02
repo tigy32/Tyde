@@ -339,21 +339,23 @@ mobile-only freshness maths.
 
 ---
 
-## 7. Orchestrator exposure — none in Phase 1
+## 7. Factual agent-control projection
 
-Capacity has **no MCP or agent-control surface at all** in Phase 1. It is not
-returned by `tyde_list_launch_options`, not exposed by any new tool, and not
-readable by an agent. The only consumers are the desktop and mobile UIs, from the
-`BackendCapacity` host-stream event.
+The authenticated `tyde_list_launch_options` call projects a backend only when
+Tyde holds an actual `CapacityReport` for it. The projection reuses the
+canonical report, including factual buckets, coverage, source, and observation
+time, and adds the host retrieval timestamp. Limits remain backend-scoped;
+launch profiles map to that backend through the existing catalog rather than
+duplicating quota per profile.
+
+Known and retained stale reports use the same factual shape. The projection
+does not expose or invent `Known`, `Stale`, `Unavailable`, `Unsupported`,
+`AuthError`, or `RateLimited` classifications, health states, predictions, or
+guesses. With no actual report, the backend is omitted. The agent bearer
+credential is required so anonymous loopback callers cannot read account quota.
 
 `tyde_spawn_agent` behavior is **unchanged**: no capacity input, no automatic
 backend or model selection, no fallback, no downgrade, no reroute.
-
-If capacity is later surfaced to orchestrators, it must return the same typed
-states as the UI — including `coverage` — and must be scoped to the caller's own
-host. `Unavailable`, `Unsupported`, and `Stale` may never be returned as
-"available capacity". None of that exists yet, and nothing should be written as
-if it does.
 
 ---
 
@@ -364,7 +366,8 @@ Stated plainly so none of it is mistaken for a gap to be quietly filled later.
 - **Any free-running background polling.** Command probes run only when a live
   backend session supplies the host-owned emitter and at bounded turn
   boundaries.
-- **Any MCP / agent-control / orchestrator exposure.** See §7.
+- **A separate capacity MCP tool or routing policy.** See §7; list-options is a
+  factual advisory projection only.
 - **A refresh action.** Nothing to refresh; the UI says so rather than showing a
   dead button.
 - **Claude multi-bucket capacity.** Claude reports one binding bucket;

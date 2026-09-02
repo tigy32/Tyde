@@ -142,6 +142,7 @@ fn expected_empty_settings() -> HostSettings {
         tyde_debug_mcp_enabled: false,
         tyde_agent_control_mcp_enabled: true,
         tyde_agent_control_max_depth: settings_model::default_agent_control_max_depth(),
+        delegation_launch_profile_order: settings_model::default_delegation_launch_profile_order(),
         complexity_tiers_enabled: false,
         backend_tier_configs: std::collections::HashMap::new(),
         background_agent_features: Default::default(),
@@ -386,6 +387,8 @@ fn persisted_backend_lists_are_canonicalized_but_not_defaulted() {
             tyde_debug_mcp_enabled: false,
             tyde_agent_control_mcp_enabled: true,
             tyde_agent_control_max_depth: settings_model::default_agent_control_max_depth(),
+            delegation_launch_profile_order:
+                settings_model::default_delegation_launch_profile_order(),
             complexity_tiers_enabled: false,
             backend_tier_configs: std::collections::HashMap::new(),
             background_agent_features: Default::default(),
@@ -1744,4 +1747,51 @@ async fn sequential_settings_writes_preserve_prior_fields() {
         expect_settings_write_result(&mut fixture.client, "w-alongside", "alongside result").await;
     assert!(result.applied, "{:?}", result.field_errors);
     assert_eq!(result.current_etag, fanout.etag);
+}
+
+#[tokio::test]
+async fn delegation_preference_normalizes_only_invalid_and_duplicate_ids() {
+    let mut fixture = Fixture::new().await;
+    let defaults = settings_model::default_delegation_launch_profile_order();
+    send_settings_write(
+        &mut fixture.client,
+        "w-delegation-order",
+        vec![replace_op(
+            "/delegation_launch_profile_order",
+            serde_json::json!([
+                " missing:saved ",
+                "claude:default",
+                "missing:saved",
+                "",
+                "bad\nprofile",
+                "codex:default"
+            ]),
+            serde_json::to_value(defaults).expect("serialize default preference"),
+        )],
+    )
+    .await;
+    let fanout = expect_host_settings_frame(&mut fixture.client, "delegation order fanout").await;
+    assert_eq!(
+        fanout.settings.delegation_launch_profile_order,
+        vec![
+            protocol::LaunchProfileId("missing:saved".to_owned()),
+            protocol::LaunchProfileId("claude:default".to_owned()),
+            protocol::LaunchProfileId("codex:default".to_owned()),
+        ],
+        "missing profile ids survive while whitespace, invalid ids, and later duplicates normalize"
+    );
+    let result = expect_settings_write_result(
+        &mut fixture.client,
+        "w-delegation-order",
+        "delegation order result",
+    )
+    .await;
+    assert!(result.applied, "{:?}", result.field_errors);
+
+    let (_, replay) = fixture.connect_fresh_host_with_bootstrap().await;
+    assert_eq!(
+        replay.settings.delegation_launch_profile_order,
+        fanout.settings.delegation_launch_profile_order,
+        "the normalized order must persist across a real host restart"
+    );
 }

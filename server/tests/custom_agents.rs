@@ -85,6 +85,15 @@ fn assert_orchestrator_uses_tyde_agent_control(orchestrator: &CustomAgent) {
             "Orchestrator should name the Tyde tool suffix {suffix}: {instructions}"
         );
     }
+    assert!(
+        normalized.contains("profiles in its returned preference order"),
+        "Orchestrator should follow the live list-options preference: {instructions}"
+    );
+    assert!(
+        !normalized.contains("Prefer Codex for the Implementer")
+            && !normalized.contains("Use Claude and Codex for paired roles"),
+        "Orchestrator must not retain hard-coded backend preferences: {instructions}"
+    );
     for native_tool in [
         "`spawn_agent`",
         "`wait`",
@@ -117,15 +126,14 @@ fn assert_orchestrator_uses_tyde_agent_control(orchestrator: &CustomAgent) {
         "Orchestrator should require repeated await/read cycles through completion: {instructions}"
     );
     assert!(
-        normalized.contains("Use Claude and Codex for paired roles when available")
-            && normalized.contains("unless the user overrides that preference")
-            && normalized
-                .contains("otherwise use independent sessions and disclose reduced diversity")
+        normalized.contains("Call `tyde_list_launch_options` first")
+            && normalized.contains("User-selected backends or profiles remain authoritative")
+            && normalized.contains("independent sessions and disclose reduced diversity")
             && normalized.contains("Present the plan before implementation if requested")
             && !normalized.contains("Present the plan before implementation only if requested")
-            && normalized.contains(
-                "Prefer Codex for the Implementer unless the user overrides that preference"
-            ),
+            && normalized
+                .contains("Choose the Implementer from the returned launch-profile preference")
+            && normalized.contains("unless the user selected a backend or profile"),
         "Orchestrator should state backend, planning, and implementation preferences: {instructions}"
     );
 }
@@ -537,6 +545,51 @@ async fn superseded_orchestrator_v7_upgrades_on_restart() {
     assert_eq!(
         upgraded, active,
         "an unedited published V7 record should upgrade to the active prompt"
+    );
+    assert_orchestrator_uses_tyde_agent_control(&upgraded);
+}
+
+#[tokio::test(start_paused = true)]
+async fn superseded_orchestrator_v8_upgrades_on_restart() {
+    let mut fixture = Fixture::new().await;
+    let orchestrator_id = CustomAgentId("tyde-team-lead".to_owned());
+    let active = collect_builtin_team_custom_agents_from_bootstrap(&fixture.bootstrap)
+        .remove(&orchestrator_id)
+        .expect("built-in Orchestrator should be seeded");
+
+    let mut v8 = active.clone();
+    v8.instructions = Some(
+        server::store::custom_agents::SUPERSEDED_ORCHESTRATOR_V8_INSTRUCTIONS
+            .trim()
+            .to_owned(),
+    );
+    fixture
+        .client
+        .custom_agent_upsert(CustomAgentUpsertPayload { custom_agent: v8 })
+        .await
+        .expect("install superseded Orchestrator V8 failed");
+    fixture
+        .next_frame_matching("superseded Orchestrator V8 upsert", |env| {
+            env.kind == FrameKind::CustomAgentNotify
+                && env
+                    .parse_payload::<CustomAgentNotifyPayload>()
+                    .is_ok_and(|payload| {
+                        matches!(
+                            payload,
+                            CustomAgentNotifyPayload::Upsert { custom_agent }
+                                if custom_agent.id == orchestrator_id
+                        )
+                    })
+        })
+        .await;
+
+    let (_fresh, bootstrap) = fixture.connect_fresh_host_with_bootstrap().await;
+    let upgraded = collect_builtin_team_custom_agents_from_bootstrap(&bootstrap)
+        .remove(&orchestrator_id)
+        .expect("upgraded Orchestrator should be replayed");
+    assert_eq!(
+        upgraded, active,
+        "an unedited published V8 record should upgrade to the active prompt"
     );
     assert_orchestrator_uses_tyde_agent_control(&upgraded);
 }
