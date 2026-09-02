@@ -114,7 +114,7 @@ test("handlePairingUri does NOT stash when the URI is not a pairing code", async
 
 test("handlePairingUri does NOT stash unsupported pairing URI versions", async () => {
   delete sessionStore[PAIR_URI_KEY];
-  const unsupported = REAL_MANAGED_V2.replace("tyde-pair://v2?", "tyde-pair://v3?");
+  const unsupported = REAL_MANAGED_V2.replace("tyde-pair://v2?", "tyde-pair://v4?");
   await handlePairingUri(unsupported, manifestWithStableProtocol(37));
   assert.equal(sessionStore[PAIR_URI_KEY], undefined);
 });

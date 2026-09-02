@@ -579,7 +579,10 @@ impl ConnectionManager {
             .get(&local_host_id)
             .await?
             .ok_or_else(|| format!("paired host {local_host_id} was not found"))?;
-        let psk = IndexedDbPskStore.load(&record.psk_keychain_key_id).await?;
+        let psk = match record.psk_keychain_key_id.as_ref() {
+            Some(key_id) => Some(IndexedDbPskStore.load(key_id).await?),
+            None => None,
+        };
 
         let actor_instance_id = {
             let mut inner = self.inner.borrow_mut();
@@ -926,14 +929,14 @@ enum ConnectedOutcome {
 }
 
 enum ConnectWaitOutcome {
-    Connected(Result<mqtt_transport::EnvelopeStream, ConnectErr>),
+    Connected(Result<BoxedTransport, ConnectErr>),
     Control(ConnectionControl),
 }
 
 async fn run_connection_actor(
     manager: ConnectionManager,
     record: WebPairedHostRecord,
-    psk: PreSharedKey,
+    psk: Option<PreSharedKey>,
     actor_instance_id: u64,
     mut rx: mpsc::Receiver<ConnectionCommand>,
     control_tx: watch::Sender<ConnectionControl>,
@@ -950,7 +953,7 @@ async fn run_connection_actor(
         let connect_outcome = tokio::select! {
             biased;
             control = next_control(&mut control_rx) => ConnectWaitOutcome::Control(control),
-            result = connect_once(&record, &psk) => ConnectWaitOutcome::Connected(result),
+            result = connect_once(&record, psk.as_ref()) => ConnectWaitOutcome::Connected(result),
         };
 
         let stream = match connect_outcome {
@@ -1124,14 +1127,51 @@ fn handle_retryable_connect_failure(
 
 async fn connect_once(
     record: &WebPairedHostRecord,
-    psk: &PreSharedKey,
-) -> Result<mqtt_transport::EnvelopeStream, ConnectErr> {
-    match &record.managed {
-        Some(_) => connect_managed_once(record, psk).await,
-        None => Err(ConnectErr::NeedsRepair(format!(
+    psk: Option<&PreSharedKey>,
+) -> Result<BoxedTransport, ConnectErr> {
+    // Direct first: a host that serves this bundle itself is reached over the
+    // origin the bundle came from, with no broker and no credentials to mint.
+    if let Some(direct) = record.direct.as_ref() {
+        return connect_direct_once(record, direct).await;
+    }
+    match (&record.managed, psk) {
+        (Some(_), Some(psk)) => connect_managed_once(record, psk)
+            .await
+            .map(|stream| Box::new(stream) as BoxedTransport),
+        _ => Err(ConnectErr::NeedsRepair(format!(
             "\"{}\" was paired before managed mobile access and can't connect anymore. Re-pair from the host's current QR code in the Mobile tab under Settings (Settings → Mobile) to move it to managed access, or forget it.",
             record.host_label
         ))),
+    }
+}
+
+/// Any byte stream the connection loop can run the protocol over.
+pub(crate) trait ClientTransport: tokio::io::AsyncRead + tokio::io::AsyncWrite {}
+
+impl<T> ClientTransport for T where T: tokio::io::AsyncRead + tokio::io::AsyncWrite {}
+
+pub(crate) type BoxedTransport = Box<dyn ClientTransport + Unpin>;
+
+async fn connect_direct_once(
+    record: &WebPairedHostRecord,
+    direct: &super::store::DirectPairingRecord,
+) -> Result<BoxedTransport, ConnectErr> {
+    let origin = super::direct::document_origin().map_err(ConnectErr::NeedsRepair)?;
+    let token = super::store::load_device_token(&direct.device_token_key_id)
+        .await
+        .map_err(ConnectErr::NeedsRepair)?;
+    match timeout(
+        CONNECT_ATTEMPT_TIMEOUT,
+        super::direct::DirectWebSocketStream::connect(&origin, &token),
+    )
+    .await
+    {
+        Ok(Ok(stream)) => Ok(Box::new(stream) as BoxedTransport),
+        Ok(Err(message)) => Err(ConnectErr::NeedsRepair(format!(
+            "\"{}\": {message}",
+            record.host_label
+        ))),
+        Err(_) => Err(ConnectErr::Timeout),
     }
 }
 
@@ -1144,7 +1184,12 @@ async fn connect_managed_once(
     let config = ManagedMqttConnectConfig {
         broker,
         credentials,
-        room: record.room,
+        room: record.room.ok_or_else(|| {
+            ConnectErr::NeedsRepair(format!(
+                "\"{}\" has no rendezvous room; re-pair from the host's QR code.",
+                record.host_label
+            ))
+        })?,
         psk: psk.clone(),
         role: ParticipantRole::Client,
     };

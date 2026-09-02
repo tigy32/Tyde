@@ -228,6 +228,7 @@ fn write_host_settings_with_launch_profiles(
         mobile_broker_auth: Default::default(),
         mobile_direct_hosting_enabled: false,
         mobile_direct_bind_addr: None,
+        mobile_direct_public_origin: None,
         mobile_direct_bundle_dir: None,
         tyde_debug_mcp_enabled: false,
         tyde_agent_control_mcp_enabled: true,

@@ -63,12 +63,17 @@ pub const MQTT_TRANSPORT_PROTOCOL_VERSION: u32 = 6;
 pub const LEGACY_MOBILE_QR_VERSION: u32 = 2;
 pub const MOBILE_QR_VERSION: u32 = LEGACY_MOBILE_QR_VERSION;
 pub const MOBILE_MANAGED_QR_VERSION: u32 = 3;
+/// Pairing with a host that serves the mobile web app itself. Lives beside the
+/// MQTT payloads because the QR dispatcher has to decide between all three from
+/// one string; it carries no MQTT coordinates of its own.
+pub const MOBILE_DIRECT_QR_VERSION: u32 = 4;
 pub const MQTT_VERSION: u8 = 5;
 pub const MQTT_QOS_AT_LEAST_ONCE: u8 = 1;
 pub const MQTT_RETAIN: bool = false;
 pub const MQTT_CLEAN_START: bool = true;
 const LEGACY_PAIRING_URI_PREFIX: &str = "tyde-pair://v1?";
 const MANAGED_PAIRING_URI_PREFIX: &str = "tyde-pair://v2?";
+const DIRECT_PAIRING_URI_PREFIX: &str = "tyde-pair://v3?";
 const PAIRING_URI_PREFIX: &str = LEGACY_PAIRING_URI_PREFIX;
 /// Origin-root web loader that turns the host's pairing QR into a generic
 /// HTTPS link the native iOS/Android Camera can open. The PSK-bearing
@@ -446,9 +451,190 @@ impl ManagedMobilePairingQrPayload {
     }
 }
 
+/// A pairing offer for a host that serves the mobile web app itself.
+///
+/// Unlike the managed and legacy payloads this carries no transport
+/// coordinates and, deliberately, no origin. By the time a phone parses this it
+/// has already been loaded from the host's own origin, so `location.origin` is
+/// the authoritative address; an origin named inside the payload would just be
+/// a redirect target the host cannot vouch for.
+///
+/// The secret is single use and short lived. It buys exactly one exchange at
+/// the host for a durable device token, so a photographed QR stops being a
+/// credential the moment it is redeemed or expires.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DirectMobilePairingQrPayload {
+    pub v: u32,
+    pub protocol_version: u32,
+    pub tyde_version: protocol::Version,
+    pub release_version: protocol::TydeReleaseVersion,
+    pub offer_id: MobilePairingOfferId,
+    pub offer_secret: String,
+    pub host_label: String,
+    pub expires_at_ms: u64,
+}
+
+impl fmt::Debug for DirectMobilePairingQrPayload {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DirectMobilePairingQrPayload")
+            .field("v", &self.v)
+            .field("protocol_version", &self.protocol_version)
+            .field("tyde_version", &self.tyde_version)
+            .field("release_version", &self.release_version)
+            .field("offer_id", &self.offer_id)
+            .field("offer_secret", &"<redacted>")
+            .field("host_label", &self.host_label)
+            .field("expires_at_ms", &self.expires_at_ms)
+            .finish()
+    }
+}
+
+impl DirectMobilePairingQrPayload {
+    pub fn new(
+        protocol_version: u32,
+        release_version: protocol::TydeReleaseVersion,
+        offer_id: MobilePairingOfferId,
+        offer_secret: String,
+        host_label: String,
+        expires_at_ms: u64,
+    ) -> Self {
+        Self {
+            v: MOBILE_DIRECT_QR_VERSION,
+            protocol_version,
+            tyde_version: TYDE_VERSION,
+            release_version,
+            offer_id,
+            offer_secret,
+            host_label,
+            expires_at_ms,
+        }
+    }
+
+    pub fn encode_cbor(&self) -> Result<Vec<u8>, TransportTypeError> {
+        encode_cbor("DirectMobilePairingQrPayload", self)
+    }
+
+    pub fn decode_cbor(bytes: &[u8]) -> Result<Self, TransportTypeError> {
+        let payload: Self = decode_cbor("DirectMobilePairingQrPayload", bytes)?;
+        payload.validate()?;
+        Ok(payload)
+    }
+
+    pub fn validate(&self) -> Result<(), TransportTypeError> {
+        if self.v != MOBILE_DIRECT_QR_VERSION {
+            return Err(TransportTypeError::PairingQrVersionMismatch {
+                actual: self.v,
+                expected: MOBILE_DIRECT_QR_VERSION,
+            });
+        }
+        if self.offer_secret.trim().is_empty() {
+            return Err(TransportTypeError::InvalidPairingUri {
+                message: "direct pairing offer secret must not be empty".to_owned(),
+            });
+        }
+        if self.host_label.trim().is_empty() {
+            return Err(TransportTypeError::InvalidPairingUri {
+                message: "direct pairing host label must not be empty".to_owned(),
+            });
+        }
+        if self.expires_at_ms == 0 {
+            return Err(TransportTypeError::InvalidPairingUri {
+                message: "direct pairing expiry must not be zero".to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    pub fn to_uri(&self) -> Result<String, TransportTypeError> {
+        self.validate()?;
+        let cbor = self.encode_cbor()?;
+        let encoded = URL_SAFE_NO_PAD.encode(cbor);
+        Ok(format!("{DIRECT_PAIRING_URI_PREFIX}{encoded}"))
+    }
+
+    pub fn from_uri(uri: &str) -> Result<Self, TransportTypeError> {
+        let encoded = uri.strip_prefix(DIRECT_PAIRING_URI_PREFIX).ok_or_else(|| {
+            TransportTypeError::InvalidPairingUri {
+                message: format!("URI must start with {DIRECT_PAIRING_URI_PREFIX}"),
+            }
+        })?;
+        if encoded.is_empty() {
+            return Err(TransportTypeError::InvalidPairingUri {
+                message: "URI payload must not be empty".to_owned(),
+            });
+        }
+        let cbor =
+            URL_SAFE_NO_PAD
+                .decode(encoded)
+                .map_err(|err| TransportTypeError::InvalidBase64 {
+                    type_name: "DirectMobilePairingQrPayload URI payload",
+                    message: err.to_string(),
+                })?;
+        Self::decode_cbor(&cbor)
+    }
+
+    /// Builds the HTTPS link encoded into the host's QR, pointing at the
+    /// operator-declared origin rather than `tycode.dev`. The secret rides in
+    /// the FRAGMENT, which browsers never send to the server, so it stays out
+    /// of the reverse proxy's access log on the way in.
+    pub fn to_pairing_url(&self, origin: &str) -> Result<String, TransportTypeError> {
+        let origin = validate_direct_origin(origin)?;
+        Ok(format!("{origin}/tyde/#{}", self.to_uri()?))
+    }
+}
+
+/// Checks an operator-configured public origin. The host sits behind a proxy
+/// and cannot discover its own external name, so this value is declared rather
+/// than detected; a wrong one produces QR codes that pair to nothing, which is
+/// worth catching where it is typed.
+pub fn validate_direct_origin(origin: &str) -> Result<String, TransportTypeError> {
+    let trimmed = origin.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return Err(TransportTypeError::InvalidPairingUri {
+            message: "direct hosting public origin must not be empty".to_owned(),
+        });
+    }
+    let parsed = url::Url::parse(trimmed).map_err(|err| TransportTypeError::InvalidPairingUri {
+        message: format!("direct hosting public origin {trimmed:?} is invalid: {err}"),
+    })?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(TransportTypeError::InvalidPairingUri {
+            message: format!(
+                "direct hosting public origin scheme {:?} is unsupported; expected http:// or https://",
+                parsed.scheme()
+            ),
+        });
+    }
+    if parsed.host_str().is_none() {
+        return Err(TransportTypeError::InvalidPairingUri {
+            message: "direct hosting public origin is missing a host".to_owned(),
+        });
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(TransportTypeError::InvalidPairingUri {
+            message: "direct hosting public origin must not embed credentials".to_owned(),
+        });
+    }
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        return Err(TransportTypeError::InvalidPairingUri {
+            message: "direct hosting public origin must not carry a query or fragment".to_owned(),
+        });
+    }
+    if parsed.path() != "/" && !parsed.path().is_empty() {
+        return Err(TransportTypeError::InvalidPairingUri {
+            message: format!(
+                "direct hosting public origin must be a bare origin, got path {:?}",
+                parsed.path()
+            ),
+        });
+    }
+    Ok(trimmed.to_owned())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MobilePairingQrOffer {
     ManagedService(ManagedMobilePairingQrPayload),
+    Direct(DirectMobilePairingQrPayload),
     LegacyPublicBrokerRepairRequired(MobilePairingQrPayload),
 }
 
@@ -460,32 +646,38 @@ impl MobilePairingQrOffer {
         if uri.starts_with(MANAGED_PAIRING_URI_PREFIX) {
             return ManagedMobilePairingQrPayload::from_uri(uri).map(Self::ManagedService);
         }
+        if uri.starts_with(DIRECT_PAIRING_URI_PREFIX) {
+            return DirectMobilePairingQrPayload::from_uri(uri).map(Self::Direct);
+        }
         if uri.starts_with(LEGACY_PAIRING_URI_PREFIX) {
             return MobilePairingQrPayload::from_uri(uri)
                 .map(Self::LegacyPublicBrokerRepairRequired);
         }
         Err(TransportTypeError::InvalidPairingUri {
             message: format!(
-                "URI must start with {MANAGED_PAIRING_URI_PREFIX} or {LEGACY_PAIRING_URI_PREFIX}"
+                "URI must start with {MANAGED_PAIRING_URI_PREFIX}, {DIRECT_PAIRING_URI_PREFIX} or {LEGACY_PAIRING_URI_PREFIX}"
             ),
         })
     }
 
     pub fn from_any(input: &str) -> Result<Self, TransportTypeError> {
         let trimmed = input.trim();
-        if trimmed.starts_with(MANAGED_PAIRING_URI_PREFIX)
-            || trimmed.starts_with(LEGACY_PAIRING_URI_PREFIX)
-        {
+        if is_pairing_uri(trimmed) {
             return Self::from_uri(trimmed);
         }
         if let Some((_, fragment)) = trimmed.split_once('#')
-            && (fragment.starts_with(MANAGED_PAIRING_URI_PREFIX)
-                || fragment.starts_with(LEGACY_PAIRING_URI_PREFIX))
+            && is_pairing_uri(fragment)
         {
             return Self::from_uri(fragment);
         }
         Self::from_uri(trimmed)
     }
+}
+
+fn is_pairing_uri(value: &str) -> bool {
+    value.starts_with(MANAGED_PAIRING_URI_PREFIX)
+        || value.starts_with(DIRECT_PAIRING_URI_PREFIX)
+        || value.starts_with(LEGACY_PAIRING_URI_PREFIX)
 }
 
 pub fn parse_mobile_pairing_qr_offer(

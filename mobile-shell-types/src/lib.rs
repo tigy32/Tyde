@@ -68,8 +68,12 @@ pub struct MobilePairingPreview {
 pub struct PairedHostSummary {
     pub local_host_id: LocalHostId,
     pub host_label: String,
-    pub broker: BrokerEndpointSummary,
-    pub room: RoomIdSummary,
+    /// MQTT rendezvous. Absent for a host paired over its own HTTP origin,
+    /// which has no broker and no room to report.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub broker: Option<BrokerEndpointSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub room: Option<RoomIdSummary>,
     pub credential_fingerprint: String,
     pub auto_connect: bool,
     pub last_connected_at_ms: Option<u64>,

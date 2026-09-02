@@ -2997,7 +2997,13 @@ pub struct HeartbeatPayload {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MobilePairingStartPayload {}
+pub struct MobilePairingStartPayload {
+    /// Pair against the host's own HTTP origin instead of the managed broker.
+    /// Defaulted so a client built before direct hosting still asks for the
+    /// managed flow it knows.
+    #[serde(default)]
+    pub direct: bool,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MobilePairingCancelPayload {
@@ -3134,6 +3140,44 @@ pub struct MobileAccessStatePayload {
     pub paired_devices: Vec<MobileDeviceSummary>,
     #[serde(default)]
     pub direct_hosting: MobileDirectHostingStatus,
+}
+
+/// Durable per-device credential minted when a direct-hosting pairing offer is
+/// redeemed. Presented on every later WebSocket connection.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MobileDeviceToken(pub String);
+
+impl fmt::Debug for MobileDeviceToken {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("MobileDeviceToken(<redacted>)")
+    }
+}
+
+/// Redeems a direct-hosting pairing offer. The secret comes from the QR the
+/// host displayed, so holding it is the proof that the user had access to an
+/// authenticated desktop session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MobileDirectPairRequest {
+    pub offer_id: MobilePairingOfferId,
+    pub offer_secret: String,
+    pub device_label: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MobileDirectPairResponse {
+    pub device_id: MobileDeviceId,
+    pub device_token: MobileDeviceToken,
+    pub host_label: String,
+    pub protocol_version: u32,
+}
+
+/// Error body returned by the direct-hosting HTTP endpoints. Deliberately the
+/// same code vocabulary the protocol uses, so a client reports one failure
+/// language whichever transport it paired over.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MobileDirectErrorResponse {
+    pub code: MobileAccessErrorCode,
+    pub message: String,
 }
 
 /// State of the host's own mobile web server, which serves the loader shell and

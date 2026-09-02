@@ -13,9 +13,16 @@ import { MAX_CBOR_BYTES } from "./cbor.js";
 
 export const PAIRING_V1_PREFIX = "tyde-pair://v1?";
 export const PAIRING_V2_PREFIX = "tyde-pair://v2?";
+// Pairing with a host that serves this loader itself. The loader still only
+// reads `release_version` from it; the app does the authoritative parse.
+export const PAIRING_V3_PREFIX = "tyde-pair://v3?";
 export const PAIRING_PREFIX = PAIRING_V1_PREFIX;
 
-const SUPPORTED_PAIRING_PREFIXES = [PAIRING_V1_PREFIX, PAIRING_V2_PREFIX];
+const SUPPORTED_PAIRING_PREFIXES = [
+  PAIRING_V1_PREFIX,
+  PAIRING_V2_PREFIX,
+  PAIRING_V3_PREFIX,
+];
 
 // Pulls the inner `tyde-pair://…` pairing URI out of whatever was scanned or
 // pasted. The host's QR is now a generic HTTPS link

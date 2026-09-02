@@ -52,12 +52,14 @@ pub use stream::EnvelopeStream;
 #[cfg(feature = "test-support")]
 pub use stream::{ProductionBoundaryProbe, production_boundary_probe};
 pub use types::{
-    BrokerAuth, BrokerEndpoint, DEFAULT_MOBILE_MQTT_BROKER_URL, LEGACY_MOBILE_QR_VERSION,
-    MOBILE_MANAGED_QR_VERSION, MOBILE_QR_VERSION, MQTT_CLEAN_START, MQTT_QOS_AT_LEAST_ONCE,
-    MQTT_RETAIN, MQTT_TRANSPORT_PROTOCOL_VERSION, MQTT_VERSION, ManagedMobilePairingQrPayload,
+    BrokerAuth, BrokerEndpoint, DEFAULT_MOBILE_MQTT_BROKER_URL, DirectMobilePairingQrPayload,
+    LEGACY_MOBILE_QR_VERSION, MOBILE_DIRECT_QR_VERSION, MOBILE_MANAGED_QR_VERSION,
+    MOBILE_QR_VERSION, MQTT_CLEAN_START, MQTT_QOS_AT_LEAST_ONCE, MQTT_RETAIN,
+    MQTT_TRANSPORT_PROTOCOL_VERSION, MQTT_VERSION, ManagedMobilePairingQrPayload,
     ManagedMobilePairingQrPayloadParams, MobilePairingQrOffer, MobilePairingQrPayload,
     MqttTransportPolicy, PreSharedKey, RoomId, TransportTypeError, default_mobile_broker_endpoint,
     is_legacy_public_broker_endpoint, parse_mobile_pairing_qr_offer, validate_broker_url,
+    validate_direct_origin,
 };
 
 pub use topic::{

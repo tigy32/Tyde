@@ -489,12 +489,16 @@ pub async fn team_compact(
 /// replies on the host stream with `MobilePairingOffer` (carrying the
 /// `qr_uri`) and an updated `MobileAccessState` snapshot whose
 /// pairing phase transitions to `Active`.
-pub async fn mobile_pairing_start(host_id: &str, host_stream: StreamPath) -> Result<(), String> {
+pub async fn mobile_pairing_start(
+    host_id: &str,
+    host_stream: StreamPath,
+    direct: bool,
+) -> Result<(), String> {
     send_frame(
         host_id,
         host_stream,
         FrameKind::MobilePairingStart,
-        &MobilePairingStartPayload {},
+        &MobilePairingStartPayload { direct },
     )
     .await
 }

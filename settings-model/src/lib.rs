@@ -60,6 +60,12 @@ pub struct HostSettings {
     /// `127.0.0.1:8730`.
     #[serde(default)]
     pub mobile_direct_bind_addr: Option<String>,
+    /// Externally reachable origin of the direct mobile web server, e.g.
+    /// `https://tyde.corp.internal`. Required to build a pairing QR: the host
+    /// sits behind a reverse proxy and cannot discover the name clients use to
+    /// reach it.
+    #[serde(default)]
+    pub mobile_direct_public_origin: Option<String>,
     /// Directory holding the built mobile web assets, laid out exactly like the
     /// deployed `tyde/` prefix: the loader shell at the root, `manifest.json`
     /// beside it, and each bundle under `v<version>/`. Required while direct
@@ -125,6 +131,7 @@ impl Default for HostSettings {
             mobile_broker_auth: MobileBrokerAuthSettings::default(),
             mobile_direct_hosting_enabled: false,
             mobile_direct_bind_addr: None,
+            mobile_direct_public_origin: None,
             mobile_direct_bundle_dir: None,
             tyde_debug_mcp_enabled: false,
             tyde_agent_control_mcp_enabled: true,
@@ -520,6 +527,7 @@ fn decorate_host_settings_schema(schema: &mut Value) {
         ("mobile_broker_url", "mobile", 20, "text"),
         ("mobile_direct_hosting_enabled", "mobile", 50, "toggle"),
         ("mobile_direct_bind_addr", "mobile", 60, "text"),
+        ("mobile_direct_public_origin", "mobile", 65, "text"),
         ("mobile_direct_bundle_dir", "mobile", 70, "text"),
     ] {
         annotate_property(schema, "HostSettings", field, section, order, widget);
@@ -574,6 +582,11 @@ fn decorate_host_settings_schema(schema: &mut Value) {
             "mobile_direct_bind_addr",
             "Direct hosting address",
             "Address the direct mobile web server listens on. Defaults to 127.0.0.1:8730, which only accepts connections from a proxy running on this machine.",
+        ),
+        (
+            "mobile_direct_public_origin",
+            "Direct hosting public URL",
+            "The URL phones use to reach this host, e.g. https://tyde.corp.internal. Required to generate a pairing code, because the host cannot see the name your proxy publishes it under.",
         ),
         (
             "mobile_direct_bundle_dir",

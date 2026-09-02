@@ -426,6 +426,9 @@ fn boot_pairing_screen(
         },
         PairingOffer::RepairRequired { message } => PairingScreen::RepairRequired { message },
         PairingOffer::DirectPairing { preview } => PairingScreen::Confirm { qr_uri, preview },
+        PairingOffer::SelfHosted { host_label } => {
+            PairingScreen::SelfHostedConfirm { qr_uri, host_label }
+        }
     }
 }
 
@@ -1223,6 +1226,7 @@ mod wasm_tests {
             mobile_broker_auth: Default::default(),
             mobile_direct_hosting_enabled: false,
             mobile_direct_bind_addr: None,
+            mobile_direct_public_origin: None,
             mobile_direct_bundle_dir: None,
             tyde_debug_mcp_enabled: false,
             tyde_agent_control_mcp_enabled: true,
@@ -1245,11 +1249,11 @@ mod wasm_tests {
         PairedHostSummary {
             local_host_id: LocalHostId(id.to_owned()),
             host_label: label.to_owned(),
-            broker: BrokerEndpoint {
+            broker: Some(BrokerEndpoint {
                 url: BrokerUrl::new("wss://broker.example.test/mqtt").unwrap(),
                 auth: BrokerAuth::Anonymous,
-            },
-            room: RoomId("AQEBAQEBAQEBAQEBAQEBAQ".to_owned()),
+            }),
+            room: Some(RoomId("AQEBAQEBAQEBAQEBAQEBAQ".to_owned())),
             credential_fingerprint: "fp".to_owned(),
             auto_connect: false,
             last_connected_at_ms: None,

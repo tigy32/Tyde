@@ -24,6 +24,67 @@ pub struct MobilePairings {
     pub pending_handoff_ack: Option<PendingManagedMobileHandoffAck>,
     #[serde(default)]
     pub devices: Vec<MobilePairingRecord>,
+    /// Devices paired against the host's own HTTP origin. Kept in their own
+    /// list because they share none of an MQTT pairing's coordinates — no
+    /// broker, no room, no pre-shared key — and because everything the two
+    /// kinds do share is reachable through [`MobilePairings::device_mut`].
+    #[serde(default)]
+    pub direct_devices: Vec<DirectMobilePairingRecord>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_direct_pairing: Option<ActiveDirectMobilePairing>,
+}
+
+/// An outstanding direct-hosting pairing offer. Only the secret's hash is
+/// stored: the plaintext exists in the QR on screen and nowhere else, so a
+/// stolen pairings file cannot redeem an offer it did not watch being made.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActiveDirectMobilePairing {
+    pub offer_id: MobilePairingOfferId,
+    pub secret_hash: String,
+    pub created_at_ms: u64,
+    pub expires_at_ms: u64,
+}
+
+/// A device paired over direct hosting. It authenticates with a bearer token
+/// whose hash is all the host keeps, so the durable credential cannot be
+/// recovered from the store either.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DirectMobilePairingRecord {
+    pub device_id: MobileDeviceId,
+    pub token_hash: String,
+    pub label: String,
+    pub created_at_ms: u64,
+    pub last_seen_at_ms: Option<u64>,
+    pub state: MobileDeviceState,
+    pub key_fingerprint: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub push: Option<DevicePushRegistration>,
+}
+
+impl fmt::Debug for DirectMobilePairingRecord {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DirectMobilePairingRecord")
+            .field("device_id", &self.device_id)
+            .field("token_hash", &"<redacted>")
+            .field("label", &self.label)
+            .field("created_at_ms", &self.created_at_ms)
+            .field("last_seen_at_ms", &self.last_seen_at_ms)
+            .field("state", &self.state)
+            .field("key_fingerprint", &self.key_fingerprint)
+            .field("push", &self.push)
+            .finish()
+    }
+}
+
+/// The fields every paired device has, whichever transport it uses. Lets the
+/// transport-agnostic paths — rename, push registration, connection bookkeeping
+/// — stay unaware that there are two lists behind them.
+pub struct DeviceMut<'a> {
+    pub label: &'a mut String,
+    pub state: &'a mut MobileDeviceState,
+    pub last_seen_at_ms: &'a mut Option<u64>,
+    pub push: &'a mut Option<DevicePushRegistration>,
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -230,11 +291,26 @@ impl MobilePairings {
             active_pairing: None,
             pending_handoff_ack: None,
             devices: Vec::new(),
+            direct_devices: Vec::new(),
+            active_direct_pairing: None,
         }
     }
 
     pub fn summaries(&self) -> Vec<MobileDeviceSummary> {
-        self.devices
+        let managed = self.devices.iter().map(|record| MobileDeviceSummary {
+            device_id: record.device_id.clone(),
+            label: record.label.clone(),
+            key_fingerprint: record.key_fingerprint.clone(),
+            created_at_ms: record.created_at_ms,
+            last_seen_at_ms: record.last_seen_at_ms,
+            state: record.state,
+            push: record
+                .push
+                .as_ref()
+                .map_or(MobilePushState::Disabled, DevicePushRegistration::state),
+        });
+        let direct = self
+            .direct_devices
             .iter()
             .map(|record| MobileDeviceSummary {
                 device_id: record.device_id.clone(),
@@ -247,8 +323,73 @@ impl MobilePairings {
                     .push
                     .as_ref()
                     .map_or(MobilePushState::Disabled, DevicePushRegistration::state),
+            });
+        managed.chain(direct).collect()
+    }
+
+    pub fn device_mut(&mut self, device_id: &MobileDeviceId) -> Option<DeviceMut<'_>> {
+        if let Some(record) = self
+            .devices
+            .iter_mut()
+            .find(|record| &record.device_id == device_id)
+        {
+            return Some(DeviceMut {
+                label: &mut record.label,
+                state: &mut record.state,
+                last_seen_at_ms: &mut record.last_seen_at_ms,
+                push: &mut record.push,
+            });
+        }
+        let record = self
+            .direct_devices
+            .iter_mut()
+            .find(|record| &record.device_id == device_id)?;
+        Some(DeviceMut {
+            label: &mut record.label,
+            state: &mut record.state,
+            last_seen_at_ms: &mut record.last_seen_at_ms,
+            push: &mut record.push,
+        })
+    }
+
+    /// Removes a device from whichever list holds it. Returns false when no
+    /// list did.
+    pub fn remove_device(&mut self, device_id: &MobileDeviceId) -> bool {
+        let before = self.devices.len() + self.direct_devices.len();
+        self.devices.retain(|record| &record.device_id != device_id);
+        self.direct_devices
+            .retain(|record| &record.device_id != device_id);
+        before != self.devices.len() + self.direct_devices.len()
+    }
+
+    /// Every device that could receive a push notification, whichever
+    /// transport paired it.
+    pub fn push_targets(&self) -> Vec<(MobileDeviceId, MobilePushSubscription, MobileDeviceState)> {
+        let managed = self
+            .devices
+            .iter()
+            .map(|record| (&record.device_id, &record.push, record.state));
+        let direct = self
+            .direct_devices
+            .iter()
+            .map(|record| (&record.device_id, &record.push, record.state));
+        managed
+            .chain(direct)
+            .filter_map(|(device_id, push, state)| {
+                let push = push.as_ref()?;
+                (!push.expired).then(|| (device_id.clone(), push.subscription.clone(), state))
             })
             .collect()
+    }
+
+    /// Finds the direct device a bearer token authenticates, comparing in
+    /// constant time so a token cannot be recovered one byte at a time.
+    pub fn direct_device_for_token(&self, token: &str) -> Option<&DirectMobilePairingRecord> {
+        let candidate = token_hash(token);
+        self.direct_devices.iter().find(|record| {
+            record.state != MobileDeviceState::Revoked
+                && constant_time_eq(record.token_hash.as_bytes(), candidate.as_bytes())
+        })
     }
 
     pub fn normalize_startup_runtime_state(&mut self) -> bool {
@@ -262,6 +403,12 @@ impl MobilePairings {
             changed = true;
         }
         for device in &mut self.devices {
+            if device.state == MobileDeviceState::Connected {
+                device.state = MobileDeviceState::Paired;
+                changed = true;
+            }
+        }
+        for device in &mut self.direct_devices {
             if device.state == MobileDeviceState::Connected {
                 device.state = MobileDeviceState::Paired;
                 changed = true;
@@ -441,6 +588,34 @@ fn mobile_pairings_path_override() -> Option<PathBuf> {
     } else {
         Some(PathBuf::from(trimmed))
     }
+}
+
+/// Blake2s of a pairing secret or device token. The host stores only this, so
+/// neither credential can be read back out of the pairings file.
+pub fn token_hash(secret: &str) -> String {
+    let digest = Blake2s256::digest(secret.as_bytes());
+    let mut output = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        push_lower_hex(&mut output, byte);
+    }
+    output
+}
+
+/// Short, stable identifier shown next to a direct device in the UI, playing
+/// the same role the PSK fingerprint plays for an MQTT pairing.
+pub fn direct_key_fingerprint(token: &str) -> String {
+    token_hash(token).chars().take(16).collect()
+}
+
+pub fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    let mut difference = 0u8;
+    for (left, right) in left.iter().zip(right) {
+        difference |= left ^ right;
+    }
+    difference == 0
 }
 
 pub fn key_fingerprint(psk: &PreSharedKey) -> String {

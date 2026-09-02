@@ -5800,7 +5800,7 @@ fn MobileTab() -> impl IntoView {
             });
         let state_for_async = state_for_start_click.clone();
         spawn_local(async move {
-            if let Err(err) = mobile_pairing_start(&host_id, host_stream).await {
+            if let Err(err) = mobile_pairing_start(&host_id, host_stream, false).await {
                 log::error!("mobile_pairing_start send failed: {err}");
                 let host_id_for_clear = host_id.clone();
                 state_for_async.mobile_pairing_start_pending.update(|set| {
@@ -8537,6 +8537,7 @@ mod wasm_tests {
                     mobile_broker_auth: Default::default(),
                     mobile_direct_hosting_enabled: false,
                     mobile_direct_bind_addr: None,
+                    mobile_direct_public_origin: None,
                     mobile_direct_bundle_dir: None,
                     tyde_debug_mcp_enabled: false,
                     tyde_agent_control_mcp_enabled: true,
@@ -9984,6 +9985,7 @@ mod wasm_tests {
                     mobile_broker_auth: Default::default(),
                     mobile_direct_hosting_enabled: false,
                     mobile_direct_bind_addr: None,
+                    mobile_direct_public_origin: None,
                     mobile_direct_bundle_dir: None,
                     tyde_debug_mcp_enabled: false,
                     tyde_agent_control_mcp_enabled: true,
@@ -10683,6 +10685,7 @@ mod wasm_tests {
             mobile_broker_auth: Default::default(),
             mobile_direct_hosting_enabled: false,
             mobile_direct_bind_addr: None,
+            mobile_direct_public_origin: None,
             mobile_direct_bundle_dir: None,
             tyde_debug_mcp_enabled: false,
             tyde_agent_control_mcp_enabled: true,
@@ -12320,6 +12323,7 @@ mod wasm_tests {
                     mobile_broker_auth: Default::default(),
                     mobile_direct_hosting_enabled: false,
                     mobile_direct_bind_addr: None,
+                    mobile_direct_public_origin: None,
                     mobile_direct_bundle_dir: None,
                     tyde_debug_mcp_enabled: false,
                     tyde_agent_control_mcp_enabled: true,

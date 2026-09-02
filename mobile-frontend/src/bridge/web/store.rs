@@ -66,15 +66,37 @@ pub struct ManagedPairingRecord {
 pub struct WebPairedHostRecord {
     pub local_host_id: LocalHostId,
     pub host_label: String,
-    pub broker: BrokerEndpoint,
-    pub room: RoomId,
-    pub psk_keychain_key_id: KeychainSecretId,
+    /// MQTT rendezvous. Absent for direct-hosting pairings, which reach the
+    /// host over its own origin and have no broker, room, or pre-shared key.
+    /// Present-or-absent rather than defaulted: a synthetic broker would make
+    /// a direct record look connectable over a transport it cannot use.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub broker: Option<BrokerEndpoint>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub room: Option<RoomId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub psk_keychain_key_id: Option<KeychainSecretId>,
     pub credential_fingerprint: String,
     pub auto_connect: bool,
     pub last_connected_at_ms: Option<u64>,
     /// `Some` for managed (`tyde-pair://v2`) pairings; `None` for legacy ones.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub managed: Option<ManagedPairingRecord>,
+    /// `Some` for direct (`tyde-pair://v3`) pairings against a self-hosting
+    /// host.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub direct: Option<DirectPairingRecord>,
+}
+
+/// Identity of a device paired against a host that serves the app itself.
+///
+/// The durable bearer token lives in IndexedDB behind a key id, exactly as the
+/// PSK does for an MQTT pairing, rather than inline in this record.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DirectPairingRecord {
+    pub device_id: String,
+    pub device_token_key_id: KeychainSecretId,
 }
 
 impl WebPairedHostRecord {
@@ -82,9 +104,9 @@ impl WebPairedHostRecord {
         PairedHostSummary {
             local_host_id: self.local_host_id.clone(),
             host_label: self.host_label.clone(),
-            broker: BrokerEndpointSummary {
-                url: self.broker.url.clone(),
-                auth: match &self.broker.auth {
+            broker: self.broker.as_ref().map(|broker| BrokerEndpointSummary {
+                url: broker.url.clone(),
+                auth: match &broker.auth {
                     BrokerAuth::Anonymous => BrokerAuthSummary::Anonymous,
                     BrokerAuth::UsernamePassword { username, password } => {
                         BrokerAuthSummary::UsernamePassword {
@@ -93,13 +115,28 @@ impl WebPairedHostRecord {
                         }
                     }
                 },
-            },
-            room: RoomIdSummary(self.room.to_string()),
+            }),
+            room: self.room.map(|room| RoomIdSummary(room.to_string())),
             credential_fingerprint: self.credential_fingerprint.clone(),
             auto_connect: self.auto_connect,
             last_connected_at_ms: self.last_connected_at_ms,
         }
     }
+}
+
+/// Fingerprint for a direct pairing, playing the same identifying role the
+/// PSK-derived one plays for MQTT. Derived from the origin and device id
+/// because those, not a shared key, are what identify this pairing.
+pub fn direct_credential_fingerprint(origin: &str, device_id: &protocol::MobileDeviceId) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(origin.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(device_id.0.as_bytes());
+    let digest = hasher.finalize();
+    digest[..8]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 /// Stable, traversal-safe 16-char credential fingerprint. Byte-for-byte port of
@@ -266,6 +303,20 @@ pub async fn delete_device_secret(key_id: &KeychainSecretId) -> Result<(), Strin
     idb::delete(idb::STORE_PSK, &key_id.0).await
 }
 
+/// Persists a direct-hosting device token alongside the other durable secrets,
+/// so it never sits in the JSON-serialized paired-host list.
+pub async fn store_device_token(token: &str) -> Result<KeychainSecretId, String> {
+    let key_id = KeychainSecretId(format!("tyde-web-device-token-{}", uuid::Uuid::new_v4()));
+    idb::put(idb::STORE_PSK, &key_id.0, token).await?;
+    Ok(key_id)
+}
+
+pub async fn load_device_token(key_id: &KeychainSecretId) -> Result<String, String> {
+    idb::get(idb::STORE_PSK, &key_id.0)
+        .await?
+        .ok_or_else(|| format!("no device token stored for {key_id}"))
+}
+
 // ── PSK store (seam for later WebCrypto hardening) ───────────────────────
 
 /// Storage seam for the long-term PSK. See the module docs: the only place
@@ -327,13 +378,14 @@ mod wasm_tests {
         WebPairedHostRecord {
             local_host_id: LocalHostId(format!("host-{tag}-{}", uuid::Uuid::new_v4())),
             host_label: "Round Trip".to_owned(),
-            broker: broker.clone(),
-            room,
-            psk_keychain_key_id: KeychainSecretId(format!("psk-{tag}")),
+            broker: Some(broker.clone()),
+            room: Some(room),
+            psk_keychain_key_id: Some(KeychainSecretId(format!("psk-{tag}"))),
             credential_fingerprint: credential_fingerprint(&broker, &room, &psk),
             auto_connect: true,
             last_connected_at_ms: None,
             managed: None,
+            direct: None,
         }
     }
 
@@ -368,7 +420,7 @@ mod wasm_tests {
         // Pair: store the PSK, then a record that references it.
         let key_id = psk_store.store(&psk).await.expect("store psk");
         let mut record = unique_record("race");
-        record.psk_keychain_key_id = key_id.clone();
+        record.psk_keychain_key_id = Some(key_id.clone());
         let id = record.local_host_id.clone();
         store.insert(record).await.expect("insert");
 

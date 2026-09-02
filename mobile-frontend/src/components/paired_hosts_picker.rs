@@ -440,11 +440,11 @@ mod wasm_tests {
         PairedHostSummary {
             local_host_id: LocalHostId(id.to_owned()),
             host_label: label.to_owned(),
-            broker: BrokerEndpoint {
+            broker: Some(BrokerEndpoint {
                 url: BrokerUrl::new("wss://broker.example.test/mqtt").unwrap(),
                 auth: BrokerAuth::Anonymous,
-            },
-            room: RoomId("AQEBAQEBAQEBAQEBAQEBAQ".to_owned()),
+            }),
+            room: Some(RoomId("AQEBAQEBAQEBAQEBAQEBAQ".to_owned())),
             credential_fingerprint: "fp".to_owned(),
             auto_connect: false,
             last_connected_at_ms: None,

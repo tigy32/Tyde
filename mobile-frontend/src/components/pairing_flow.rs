@@ -3,7 +3,7 @@ use wasm_bindgen_futures::spawn_local;
 
 use crate::bridge;
 use crate::bridge::{AuthProvider, RedeemOutcome};
-use crate::components::ui::{Button, ButtonVariant};
+use crate::components::ui::{Button, ButtonVariant, Spinner};
 use crate::state::{AppMode, AppState, MobileServiceAuthState, PairingOffer, PairingScreen};
 
 /// Top-level dispatcher for the pairing experience. The current step lives in
@@ -34,6 +34,14 @@ pub fn PairingFlow(screen: PairingScreen) -> impl IntoView {
             <ServiceAuthStatusScreen initial_auth=auth />
         }
         .into_any(),
+        PairingScreen::SelfHostedConfirm { qr_uri, host_label } => view! {
+            <SelfHostedConfirmScreen qr_uri=qr_uri host_label=host_label />
+        }
+        .into_any(),
+        PairingScreen::SelfHostedPairing { host_label } => view! {
+            <SelfHostedPairingScreen host_label=host_label />
+        }
+        .into_any(),
         PairingScreen::RepairRequired { message } => view! {
             <RepairRequiredScreen message=message />
         }
@@ -56,6 +64,9 @@ fn route_offer(state: &AppState, qr_uri: String, offer: PairingOffer) {
         },
         PairingOffer::RepairRequired { message } => PairingScreen::RepairRequired { message },
         PairingOffer::DirectPairing { preview } => PairingScreen::Confirm { qr_uri, preview },
+        PairingOffer::SelfHosted { host_label } => {
+            PairingScreen::SelfHostedConfirm { qr_uri, host_label }
+        }
     };
     state.app_mode.set(AppMode::Pairing(screen));
 }
@@ -679,6 +690,80 @@ fn ServiceWorking(message: String) -> impl IntoView {
 /// Terminal screen for a legacy public-broker QR or stored record. Explains why
 /// it can't connect and points the user at a fresh re-pair — never a spinner or
 /// a silent public-broker connect.
+#[component]
+fn SelfHostedConfirmScreen(qr_uri: String, host_label: String) -> impl IntoView {
+    let state = use_context::<AppState>().expect("AppState context");
+    let state_for_pair = state.clone();
+    let state_for_cancel = state.clone();
+    let label_for_pair = host_label.clone();
+    let on_pair = Callback::new(move |_: ()| {
+        let state = state_for_pair.clone();
+        let qr_uri = qr_uri.clone();
+        let host_label = label_for_pair.clone();
+        state
+            .app_mode
+            .set(AppMode::Pairing(PairingScreen::SelfHostedPairing {
+                host_label,
+            }));
+        leptos::task::spawn_local(async move {
+            match crate::bridge::redeem_self_hosted_and_connect(&qr_uri).await {
+                Ok(()) => state.app_mode.set(AppMode::Workspace),
+                Err(message) => state
+                    .app_mode
+                    .set(AppMode::Pairing(PairingScreen::Failed { message })),
+            }
+        });
+    });
+    let on_cancel = Callback::new(move |_: ()| state_for_cancel.app_mode.set(AppMode::Workspace));
+
+    view! {
+        <div class="view pairing-view">
+            <div class="view-header">
+                <h1 class="view-title">"Pair with this Tyde"</h1>
+            </div>
+            <div class="view-body">
+                <div class="pairing-card" data-mobile-test="pairing-self-hosted-confirm">
+                    <p class="pairing-card-title">{host_label}</p>
+                    <p class="pairing-card-body">
+                        "This Tyde is hosting the app itself, so your phone talks to it directly."
+                    </p>
+                </div>
+                <Button
+                    label="Pair"
+                    variant=ButtonVariant::Primary
+                    on_click=on_pair
+                />
+                <Button
+                    label="Cancel"
+                    variant=ButtonVariant::Secondary
+                    on_click=on_cancel
+                />
+            </div>
+        </div>
+    }
+}
+
+#[component]
+fn SelfHostedPairingScreen(host_label: String) -> impl IntoView {
+    view! {
+        <div class="view pairing-view">
+            <div class="view-header">
+                <h1 class="view-title">"Pairing"</h1>
+            </div>
+            <div class="view-body">
+                <div
+                    class="pairing-card"
+                    role="status"
+                    data-mobile-test="pairing-self-hosted-progress"
+                >
+                    <Spinner />
+                    <p class="pairing-card-body">{format!("Connecting to {host_label}…")}</p>
+                </div>
+            </div>
+        </div>
+    }
+}
+
 #[component]
 fn RepairRequiredScreen(message: String) -> impl IntoView {
     let state = use_context::<AppState>().expect("AppState context");

@@ -5,6 +5,7 @@
 //! event hub ([`events`]).
 
 mod connection;
+mod direct;
 mod events;
 pub(crate) mod idb;
 mod qr;
@@ -107,12 +108,86 @@ pub async fn classify_pairing_offer(qr_uri: &str) -> Result<PairingOffer, String
             let host_label = normalize_host_label(payload.host_label.clone())?;
             Ok(PairingOffer::ManagedService { host_label })
         }
+        MobilePairingQrOffer::Direct(payload) => {
+            if payload.protocol_version != PROTOCOL_VERSION {
+                request_loader_repair(qr_uri);
+                return Err(format!(
+                    "unsupported Tyde protocol version {}, expected {}",
+                    payload.protocol_version, PROTOCOL_VERSION
+                ));
+            }
+            let host_label = normalize_host_label(payload.host_label.clone())?;
+            Ok(PairingOffer::SelfHosted { host_label })
+        }
         MobilePairingQrOffer::LegacyPublicBrokerRepairRequired(_) => {
             Ok(PairingOffer::RepairRequired {
                 message: LEGACY_QR_REPAIR_MESSAGE.to_owned(),
             })
         }
     }
+}
+
+/// Redeems a self-hosted offer against the origin this bundle was served from
+/// and connects over it.
+///
+/// The offer's origin is deliberately not taken from the QR: the page is
+/// already loaded from the host, so `location.origin` is the address the user
+/// actually reached, and trusting the payload instead would let a forged QR
+/// point the redemption somewhere else.
+pub async fn redeem_self_hosted_and_connect(qr_uri: &str) -> Result<(), String> {
+    let offer = parse_mobile_pairing_qr_offer(qr_uri)
+        .map_err(|error| format!("invalid mobile pairing URI: {error}"))?;
+    let MobilePairingQrOffer::Direct(payload) = offer else {
+        return Err("this pairing code is not for a self-hosted Tyde".to_owned());
+    };
+    let host_label = normalize_host_label(payload.host_label.clone())?;
+    let origin = direct::document_origin()?;
+
+    let grant = direct::redeem_direct_offer(
+        &origin,
+        &protocol::MobileDirectPairRequest {
+            offer_id: payload.offer_id.clone(),
+            offer_secret: payload.offer_secret.clone(),
+            device_label: default_device_label(),
+        },
+    )
+    .await?;
+
+    let token_key_id = store::store_device_token(&grant.device_token.0).await?;
+    let record = WebPairedHostRecord {
+        local_host_id: LocalHostId(uuid::Uuid::new_v4().to_string()),
+        host_label,
+        broker: None,
+        room: None,
+        psk_keychain_key_id: None,
+        credential_fingerprint: store::direct_credential_fingerprint(&origin, &grant.device_id),
+        auto_connect: true,
+        last_connected_at_ms: None,
+        managed: None,
+        direct: Some(store::DirectPairingRecord {
+            device_id: grant.device_id.0.clone(),
+            device_token_key_id: token_key_id.clone(),
+        }),
+    };
+    let local_host_id = record.local_host_id.clone();
+
+    if let Err(message) = IndexedDbHostStore.insert(record).await {
+        let _ = store::delete_device_secret(&token_key_id).await;
+        return Err(message);
+    }
+
+    emit_paired_hosts_changed().await;
+    connection::manager().connect(local_host_id).await
+}
+
+/// Label a freshly paired phone shows up as in the host's device list until the
+/// user renames it.
+fn default_device_label() -> String {
+    web_sys::window()
+        .and_then(|window| window.navigator().platform().ok())
+        .map(|platform| platform.trim().to_owned())
+        .filter(|platform| !platform.is_empty())
+        .unwrap_or_else(|| "Phone".to_owned())
 }
 
 /// Redeems a managed offer with `tycode.dev` and connects to the managed broker.
@@ -135,13 +210,14 @@ pub async fn start_pairing(qr_uri: &str) -> Result<(), String> {
     let record = WebPairedHostRecord {
         local_host_id: LocalHostId(uuid::Uuid::new_v4().to_string()),
         host_label: normalize_host_label(payload.host_label.clone())?,
-        broker: payload.broker.clone(),
-        room: payload.room,
-        psk_keychain_key_id: key_id.clone(),
+        broker: Some(payload.broker.clone()),
+        room: Some(payload.room),
+        psk_keychain_key_id: Some(key_id.clone()),
         credential_fingerprint: fingerprint,
         auto_connect: true,
         last_connected_at_ms: None,
         managed: None,
+        direct: None,
     };
     let local_host_id = record.local_host_id.clone();
 
@@ -187,8 +263,18 @@ pub async fn forget_paired_host(local_host_id: &LocalHostId) -> Result<(), Strin
     // (finding #8). The PSK and the managed device pairing secret both live in
     // the secret store; the record itself lives in the host store.
     let mut failures: Vec<String> = Vec::new();
-    if let Err(error) = IndexedDbPskStore.delete(&record.psk_keychain_key_id).await {
-        failures.push(format!("PSK ({}): {error}", record.psk_keychain_key_id));
+    if let Some(key_id) = record.psk_keychain_key_id.as_ref()
+        && let Err(error) = IndexedDbPskStore.delete(key_id).await
+    {
+        failures.push(format!("PSK ({key_id}): {error}"));
+    }
+    if let Some(direct) = record.direct.as_ref()
+        && let Err(error) = store::delete_device_secret(&direct.device_token_key_id).await
+    {
+        failures.push(format!(
+            "device token ({}): {error}",
+            direct.device_token_key_id
+        ));
     }
     if let Some(managed) = record.managed.as_ref()
         && let Err(error) = store::delete_device_secret(&managed.device_secret_key_id).await

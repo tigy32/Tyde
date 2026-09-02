@@ -122,9 +122,10 @@ pub(crate) async fn route_client_envelope(
                 host.set_agent_groups(payload).await?;
             }
             FrameKind::MobilePairingStart => {
-                let _: MobilePairingStartPayload =
+                let payload: MobilePairingStartPayload =
                     parse_payload(&envelope, "mobile_pairing_start")?;
-                host.start_mobile_pairing(envelope.stream.clone()).await?;
+                host.start_mobile_pairing(envelope.stream.clone(), payload.direct)
+                    .await?;
             }
             FrameKind::MobilePairingCancel => {
                 let payload: MobilePairingCancelPayload =

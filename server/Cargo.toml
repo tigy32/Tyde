@@ -21,7 +21,7 @@ devtools-protocol = { path = "../devtools-protocol" }
 protocol = { path = "../protocol" }
 settings-model = { path = "../settings-model" }
 mqtt-transport = { path = "../mqtt-transport" }
-axum = "0.8"
+axum = { version = "0.8", features = ["ws"] }
 base64 = "0.22"
 command-group = { version = "5", features = ["with-tokio"] }
 chrono = { version = "0.4", default-features = false, features = ["std"] }

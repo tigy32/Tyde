@@ -21,6 +21,7 @@ serde_json.workspace = true
 tempfile = "3"
 thiserror.workspace = true
 tokio.workspace = true
+tokio-tungstenite = "0.29"
 uuid.workspace = true
 rumqttd = "0.20.0"
 opus = "0.3.1"

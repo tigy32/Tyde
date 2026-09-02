@@ -228,7 +228,7 @@ async fn send_mobile_pairing_start(client: &mut client::Connection) {
     send_host_payload(
         client,
         FrameKind::MobilePairingStart,
-        &MobilePairingStartPayload {},
+        &MobilePairingStartPayload { direct: false },
     )
     .await;
 }

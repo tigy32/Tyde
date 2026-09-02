@@ -164,6 +164,7 @@ dispatch!(list_paired_host_connection_statuses() -> Result<Vec<PairedHostConnect
 dispatch!(list_pending_host_lines() -> Result<Vec<HostLineEvent>, String>);
 dispatch!(classify_pairing_offer(qr_uri: &str) -> Result<PairingOffer, String>);
 dispatch!(start_pairing(qr_uri: &str) -> Result<(), String>);
+dispatch!(redeem_self_hosted_and_connect(qr_uri: &str) -> Result<(), String>);
 dispatch!(connect_paired_host(local_host_id: &LocalHostId) -> Result<(), String>);
 dispatch!(disconnect_paired_host(local_host_id: &LocalHostId) -> Result<(), String>);
 dispatch!(forget_paired_host(local_host_id: &LocalHostId) -> Result<(), String>);

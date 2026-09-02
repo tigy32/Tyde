@@ -923,9 +923,9 @@ async fn finish_redeem(
     let record = WebPairedHostRecord {
         local_host_id: LocalHostId(uuid::Uuid::new_v4().to_string()),
         host_label: offer.host_label.trim().to_owned(),
-        broker: broker_endpoint,
-        room: offer.room,
-        psk_keychain_key_id: psk_key_id.clone(),
+        broker: Some(broker_endpoint),
+        room: Some(offer.room),
+        psk_keychain_key_id: Some(psk_key_id.clone()),
         credential_fingerprint: fingerprint,
         auto_connect: true,
         last_connected_at_ms: None,
@@ -935,6 +935,7 @@ async fn finish_redeem(
             broker: result.broker,
             device_secret_key_id: device_secret_key_id.clone(),
         }),
+        direct: None,
     };
     let local_host_id = record.local_host_id.clone();
 
@@ -997,7 +998,14 @@ async fn mint_managed_credentials(
         protocol_version: PROTOCOL_VERSION,
         transport_protocol_version: MQTT_TRANSPORT_PROTOCOL_VERSION,
         requested_rooms: vec![RequestedRoom {
-            room_id: record.room.to_string(),
+            room_id: record
+                .room
+                .ok_or_else(|| ManagedCredentialError {
+                    code: MobileAccessErrorCode::RepairRequired,
+                    message: "paired host has no rendezvous room".to_owned(),
+                    retryable: false,
+                })?
+                .to_string(),
             purpose: "rendezvous",
         }],
     };
@@ -1127,7 +1135,7 @@ fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
 // ── HTTP plumbing ─────────────────────────────────────────────────────────────
 
 #[derive(Clone, Copy)]
-enum HttpMethod {
+pub(super) enum HttpMethod {
     Get,
     Post,
 }
@@ -1141,15 +1149,15 @@ impl HttpMethod {
     }
 }
 
-struct HttpJson {
-    status: u16,
-    body: String,
+pub(super) struct HttpJson {
+    pub status: u16,
+    pub body: String,
 }
 
 /// Issues a `tycode.dev` request with the session cookie attached
 /// (`credentials: "include"`). No auth secret is ever taken from a JS global or
 /// added as a bearer header — the cookie is the sole session credential.
-async fn send(
+pub(super) async fn send(
     method: HttpMethod,
     url: &str,
     body: Option<&[u8]>,
@@ -2032,12 +2040,12 @@ mod wasm_tests {
         WebPairedHostRecord {
             local_host_id: LocalHostId(local_host_id.to_owned()),
             host_label: "Living Room".to_owned(),
-            broker: mqtt_transport::BrokerEndpoint {
+            broker: Some(mqtt_transport::BrokerEndpoint {
                 url: managed_broker.endpoint.clone(),
                 auth: mqtt_transport::BrokerAuth::Anonymous,
-            },
-            room: mqtt_transport::RoomId([7_u8; 16]),
-            psk_keychain_key_id: mobile_shell_types::KeychainSecretId("psk-test".to_owned()),
+            }),
+            room: Some(mqtt_transport::RoomId([7_u8; 16])),
+            psk_keychain_key_id: Some(mobile_shell_types::KeychainSecretId("psk-test".to_owned())),
             credential_fingerprint: "fingerprint".to_owned(),
             auto_connect: true,
             last_connected_at_ms: None,
@@ -2047,6 +2055,7 @@ mod wasm_tests {
                 broker: managed_broker,
                 device_secret_key_id,
             }),
+            direct: None,
         }
     }
 
@@ -2202,9 +2211,18 @@ mod wasm_tests {
             })
             .expect("a managed record must be stored");
         // The scanned room + PSK are preserved for the rendezvous.
-        assert_eq!(record.room, payload.room, "stored room must match the QR");
+        assert_eq!(
+            record.room,
+            Some(payload.room),
+            "stored room must match the QR"
+        );
         let psk = IndexedDbPskStore
-            .load(&record.psk_keychain_key_id)
+            .load(
+                record
+                    .psk_keychain_key_id
+                    .as_ref()
+                    .expect("a managed pairing stores a PSK"),
+            )
             .await
             .expect("psk stored");
         assert_eq!(psk, payload.psk, "stored PSK must match the QR");

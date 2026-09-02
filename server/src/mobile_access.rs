@@ -14,9 +14,9 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use fs2::FileExt;
 use hmac::{Hmac, Mac};
 use mqtt_transport::{
-    BrokerAuth, BrokerEndpoint, EnvelopeStream, ManagedMobilePairingQrPayload,
-    ManagedMobilePairingQrPayloadParams, MobilePairingQrPayload, MqttConnectConfig,
-    ParticipantRole, PreSharedKey, RoomId, validate_broker_url,
+    BrokerAuth, BrokerEndpoint, DirectMobilePairingQrPayload, EnvelopeStream,
+    ManagedMobilePairingQrPayload, ManagedMobilePairingQrPayloadParams, MobilePairingQrPayload,
+    MqttConnectConfig, ParticipantRole, PreSharedKey, RoomId, validate_broker_url,
 };
 use protocol::{
     AgentControlStatus, AgentOrigin, BrokerUrl, FrameKind, ManagedBrokerAuthorizerName,
@@ -45,10 +45,11 @@ use crate::host::HostHandle;
 use crate::mobile_http::{MobileHttpServer, MobileWebAssets, resolve_bind_addr};
 use crate::mobile_push::{PushSendError, send_push};
 use crate::store::mobile_pairings::{
-    ActiveManagedMobilePairingCredential, ActiveMobilePairingCredential, DevicePushRegistration,
-    ManagedMobilePairingCredential, ManagedMobilePairingHandoff, ManagedMobilePairingRecordInsert,
-    MobilePairingRecord, MobilePairings, MobilePairingsStore, PendingManagedMobileHandoffAck,
-    key_fingerprint,
+    ActiveDirectMobilePairing, ActiveManagedMobilePairingCredential, ActiveMobilePairingCredential,
+    DevicePushRegistration, DirectMobilePairingRecord, ManagedMobilePairingCredential,
+    ManagedMobilePairingHandoff, ManagedMobilePairingRecordInsert, MobilePairingRecord,
+    MobilePairings, MobilePairingsStore, PendingManagedMobileHandoffAck, constant_time_eq,
+    direct_key_fingerprint, key_fingerprint, token_hash,
 };
 use crate::stream::{Stream, StreamClosed};
 
@@ -114,9 +115,9 @@ impl MobileAccessHandle {
         let _ = self.tx.send(MobileAccessCommand::Shutdown);
     }
 
-    pub(crate) fn start_pairing(&self, requester: StreamPath) -> AppResult<()> {
+    pub(crate) fn start_pairing(&self, requester: StreamPath, direct: bool) -> AppResult<()> {
         self.tx
-            .send(MobileAccessCommand::StartPairing { requester })
+            .send(MobileAccessCommand::StartPairing { requester, direct })
             .map_err(|_| {
                 AppError::internal(
                     "mobile_pairing_start",
@@ -261,6 +262,18 @@ pub(crate) fn spawn_mobile_access_actor(
     Ok(())
 }
 
+/// Anything the mobile bridge can run the Tyde protocol over. `accept` has
+/// always been generic over the byte stream; this names that requirement so the
+/// actor can carry either transport without knowing which it has.
+pub(crate) trait MobileTransport:
+    tokio::io::AsyncRead + tokio::io::AsyncWrite + Send
+{
+}
+
+impl<T> MobileTransport for T where T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send {}
+
+pub(crate) type BoxedMobileTransport = Box<dyn MobileTransport + Unpin>;
+
 pub(crate) enum MobileAccessCommand {
     Shutdown,
     RegisterBootstrapSubscriber {
@@ -278,6 +291,19 @@ pub(crate) enum MobileAccessCommand {
     },
     StartPairing {
         requester: StreamPath,
+        /// Pair against the host's own HTTP origin rather than the broker.
+        direct: bool,
+    },
+    /// A phone is redeeming a direct-hosting pairing offer over HTTP.
+    RedeemDirectPairing {
+        request: Box<protocol::MobileDirectPairRequest>,
+        reply:
+            oneshot::Sender<Result<protocol::MobileDirectPairResponse, MobileAccessCommandFailure>>,
+    },
+    /// A direct-hosting WebSocket is presenting a device token.
+    AuthenticateDirectDevice {
+        token: String,
+        reply: oneshot::Sender<Option<MobileDeviceId>>,
     },
     CancelPairing {
         offer_id: MobilePairingOfferId,
@@ -315,7 +341,7 @@ pub(crate) enum MobileAccessCommand {
     },
     DeviceTransportConnected {
         device_id: MobileDeviceId,
-        stream: EnvelopeStream,
+        stream: BoxedMobileTransport,
     },
     PairingOfferRedeemed {
         offer_id: MobilePairingOfferId,
@@ -371,6 +397,10 @@ impl MobileAccessCommandFailure {
             code,
             message: message.into(),
         }
+    }
+
+    pub(crate) fn into_parts(self) -> (MobileAccessErrorCode, String) {
+        (self.code, self.message)
     }
 
     fn into_app_error(self, operation: &'static str) -> AppError {
@@ -1396,8 +1426,15 @@ impl MobileAccessActor {
                 MobileAccessCommand::SettingsChanged { settings } => {
                     self.apply_settings(*settings).await;
                 }
-                MobileAccessCommand::StartPairing { requester } => {
-                    self.start_pairing(requester).await;
+                MobileAccessCommand::StartPairing { requester, direct } => {
+                    self.start_pairing(requester, direct).await;
+                }
+                MobileAccessCommand::RedeemDirectPairing { request, reply } => {
+                    let result = self.redeem_direct_pairing(*request).await;
+                    let _ = reply.send(result);
+                }
+                MobileAccessCommand::AuthenticateDirectDevice { token, reply } => {
+                    let _ = reply.send(self.authenticate_direct_device(&token));
                 }
                 MobileAccessCommand::CancelPairing { offer_id } => {
                     self.cancel_pairing(&offer_id).await;
@@ -1612,7 +1649,7 @@ impl MobileAccessActor {
         // Release the running listener before binding, so restarting on the
         // same address does not fail against the socket we are replacing.
         self.direct_hosting = DirectHostingState::Disabled;
-        self.direct_hosting = match start_direct_hosting(desired.0, desired.1) {
+        self.direct_hosting = match start_direct_hosting(desired.0, desired.1, self.tx.clone()) {
             Ok(running) => {
                 tracing::info!(
                     bind_addr = %running.server.local_addr(),
@@ -1725,7 +1762,7 @@ impl MobileAccessActor {
         let _ = self.pairings_store.save(&self.pairings);
     }
 
-    async fn start_pairing(&mut self, requester: StreamPath) {
+    async fn start_pairing(&mut self, requester: StreamPath, direct: bool) {
         let offer_id = match new_offer_id() {
             Ok(offer_id) => offer_id,
             Err(message) => {
@@ -1733,6 +1770,14 @@ impl MobileAccessActor {
                 return;
             }
         };
+
+        // Direct pairing does not touch the broker, so it deliberately skips
+        // every managed precondition below — including the mobile-connections
+        // switch, which governs the broker path only.
+        if direct {
+            self.start_direct_pairing(requester, offer_id).await;
+            return;
+        }
 
         if !self.settings.enable_mobile_connections {
             self.pairing = MobilePairingState::Failed {
@@ -1877,6 +1922,239 @@ impl MobileAccessActor {
         if send_mobile_pairing_offer(&stream, &offer).await.is_err() {
             self.subscribers.remove(&requester);
         }
+    }
+
+    /// Publishes a single-use, short-lived offer for a phone that will reach
+    /// this host over its own HTTP origin.
+    ///
+    /// The QR carries only the offer secret. Redeeming it at the host exchanges
+    /// that secret for a durable device token, so a QR photographed off a
+    /// screen stops being a credential the moment it is used or expires —
+    /// unlike a QR that simply contained the long-lived key.
+    async fn start_direct_pairing(
+        &mut self,
+        requester: StreamPath,
+        offer_id: MobilePairingOfferId,
+    ) {
+        if !self.settings.mobile_direct_hosting_enabled {
+            self.fail_pairing(
+                offer_id,
+                MobileAccessErrorCode::InvalidConfig,
+                "direct hosting is turned off".to_owned(),
+            )
+            .await;
+            return;
+        }
+        let origin = match self
+            .settings
+            .mobile_direct_public_origin
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            Some(origin) => origin.to_owned(),
+            None => {
+                self.fail_pairing(
+                    offer_id,
+                    MobileAccessErrorCode::InvalidConfig,
+                    "set the direct hosting public URL before pairing; the host cannot see the address your proxy publishes it under".to_owned(),
+                )
+                .await;
+                return;
+            }
+        };
+        let created_at_ms = match now_ms() {
+            Ok(now) => now,
+            Err(message) => {
+                self.fail_pairing(offer_id, MobileAccessErrorCode::Internal, message)
+                    .await;
+                return;
+            }
+        };
+        let release_version = match host_release_version_for_qr() {
+            Ok(version) => version,
+            Err(message) => {
+                self.fail_pairing(offer_id, MobileAccessErrorCode::Internal, message)
+                    .await;
+                return;
+            }
+        };
+
+        let expires_at_ms = created_at_ms.saturating_add(self.pairing_ttl.as_millis() as u64);
+        let secret = new_shared_secret();
+        let payload = DirectMobilePairingQrPayload::new(
+            PROTOCOL_VERSION,
+            release_version,
+            offer_id.clone(),
+            secret.clone(),
+            "Tyde Host".to_owned(),
+            expires_at_ms,
+        );
+        let qr_uri = match payload.to_pairing_url(&origin) {
+            Ok(uri) => MobilePairingQrUri(uri),
+            Err(err) => {
+                self.fail_pairing(
+                    offer_id,
+                    MobileAccessErrorCode::InvalidConfig,
+                    format!("failed to encode direct pairing QR: {err}"),
+                )
+                .await;
+                return;
+            }
+        };
+
+        // One outstanding offer at a time, whichever transport asked for it.
+        self.cancel_active_pairing_without_state();
+        self.pairings.active_direct_pairing = Some(ActiveDirectMobilePairing {
+            offer_id: offer_id.clone(),
+            secret_hash: token_hash(&secret),
+            created_at_ms,
+            expires_at_ms,
+        });
+        if let Err(message) = self.pairings_store.save(&self.pairings) {
+            self.fail_pairing(offer_id, MobileAccessErrorCode::StoreLoadFailed, message)
+                .await;
+            return;
+        }
+
+        self.active_requester = Some(requester.clone());
+        self.pairing = MobilePairingState::Active {
+            offer_id: offer_id.clone(),
+            expires_at_ms,
+        };
+        self.schedule_pairing_ttl(offer_id.clone(), expires_at_ms);
+        self.fan_out_state().await;
+
+        let Some(stream) = self.subscribers.get(&requester).cloned() else {
+            return;
+        };
+        let offer = MobilePairingOfferPayload {
+            offer_id,
+            qr_uri,
+            expires_at_ms,
+        };
+        if send_mobile_pairing_offer(&stream, &offer).await.is_err() {
+            self.subscribers.remove(&requester);
+        }
+    }
+
+    async fn fail_pairing(
+        &mut self,
+        offer_id: MobilePairingOfferId,
+        code: MobileAccessErrorCode,
+        message: String,
+    ) {
+        self.pairing = MobilePairingState::Failed {
+            offer_id,
+            code,
+            message,
+        };
+        self.fan_out_state().await;
+    }
+
+    /// Exchanges a pairing offer secret for a durable device token.
+    ///
+    /// The offer is consumed whether or not this succeeds past the secret
+    /// check, so a leaked QR cannot be retried against.
+    async fn redeem_direct_pairing(
+        &mut self,
+        request: protocol::MobileDirectPairRequest,
+    ) -> Result<protocol::MobileDirectPairResponse, MobileAccessCommandFailure> {
+        if !self.settings.mobile_direct_hosting_enabled {
+            return Err(MobileAccessCommandFailure::new(
+                MobileAccessErrorCode::InvalidConfig,
+                "direct hosting is turned off",
+            ));
+        }
+        let now = now_ms().map_err(|message| {
+            MobileAccessCommandFailure::new(MobileAccessErrorCode::Internal, message)
+        })?;
+        let Some(active) = self.pairings.active_direct_pairing.clone() else {
+            return Err(MobileAccessCommandFailure::new(
+                MobileAccessErrorCode::PairingRejected,
+                "no pairing code is waiting to be used",
+            ));
+        };
+        if active.offer_id != request.offer_id {
+            return Err(MobileAccessCommandFailure::new(
+                MobileAccessErrorCode::PairingRejected,
+                "this pairing code is no longer the current one",
+            ));
+        }
+        if now >= active.expires_at_ms {
+            self.pairings.active_direct_pairing = None;
+            let _ = self.pairings_store.save(&self.pairings);
+            self.pairing = MobilePairingState::Expired {
+                offer_id: active.offer_id,
+            };
+            self.fan_out_state().await;
+            return Err(MobileAccessCommandFailure::new(
+                MobileAccessErrorCode::PairingRejected,
+                "this pairing code has expired; show a new one",
+            ));
+        }
+        if !constant_time_eq(
+            active.secret_hash.as_bytes(),
+            token_hash(&request.offer_secret).as_bytes(),
+        ) {
+            return Err(MobileAccessCommandFailure::new(
+                MobileAccessErrorCode::PairingRejected,
+                "this pairing code is not valid",
+            ));
+        }
+
+        let label = request.device_label.trim();
+        let label = if label.is_empty() {
+            "Phone".to_owned()
+        } else {
+            label.chars().take(64).collect()
+        };
+        let device_id = new_device_id().map_err(|message| {
+            MobileAccessCommandFailure::new(MobileAccessErrorCode::Internal, message)
+        })?;
+        let token = new_shared_secret();
+
+        self.pairings
+            .direct_devices
+            .push(DirectMobilePairingRecord {
+                device_id: device_id.clone(),
+                token_hash: token_hash(&token),
+                label,
+                created_at_ms: now,
+                last_seen_at_ms: None,
+                state: MobileDeviceState::Paired,
+                key_fingerprint: direct_key_fingerprint(&token),
+                push: None,
+            });
+        // Single use: the offer is spent even though the device has not
+        // connected yet.
+        self.pairings.active_direct_pairing = None;
+        self.pairings_store
+            .save(&self.pairings)
+            .map_err(|message| {
+                MobileAccessCommandFailure::new(MobileAccessErrorCode::StoreLoadFailed, message)
+            })?;
+
+        self.pairing = MobilePairingState::Consumed {
+            offer_id: active.offer_id,
+        };
+        self.fan_out_state().await;
+
+        Ok(protocol::MobileDirectPairResponse {
+            device_id,
+            device_token: protocol::MobileDeviceToken(token),
+            host_label: "Tyde Host".to_owned(),
+            protocol_version: PROTOCOL_VERSION,
+        })
+    }
+
+    fn authenticate_direct_device(&self, token: &str) -> Option<MobileDeviceId> {
+        if !self.settings.mobile_direct_hosting_enabled {
+            return None;
+        }
+        self.pairings
+            .direct_device_for_token(token)
+            .map(|record| record.device_id.clone())
     }
 
     async fn start_managed_pairing(&mut self, requester: StreamPath) {
@@ -2102,18 +2380,12 @@ impl MobileAccessActor {
         &mut self,
         device_id: &MobileDeviceId,
     ) -> Result<(), MobileAccessCommandFailure> {
-        let Some(index) = self
-            .pairings
-            .devices
-            .iter()
-            .position(|record| &record.device_id == device_id)
-        else {
+        if !self.pairings.remove_device(device_id) {
             return Err(MobileAccessCommandFailure::new(
                 MobileAccessErrorCode::UnknownDevice,
                 format!("unknown mobile device {device_id}"),
             ));
-        };
-        self.pairings.devices.remove(index);
+        }
         if let Some(task) = self
             .accept_tasks
             .remove(&AcceptTaskKey::Device(device_id.clone()))
@@ -2143,18 +2415,13 @@ impl MobileAccessActor {
                 "mobile device label must not be empty",
             ));
         }
-        let Some(record) = self
-            .pairings
-            .devices
-            .iter_mut()
-            .find(|record| &record.device_id == device_id)
-        else {
+        let Some(device) = self.pairings.device_mut(device_id) else {
             return Err(MobileAccessCommandFailure::new(
                 MobileAccessErrorCode::UnknownDevice,
                 format!("unknown mobile device {device_id}"),
             ));
         };
-        record.label = label;
+        *device.label = label;
         self.pairings_store
             .save(&self.pairings)
             .map_err(|message| {
@@ -2247,12 +2514,7 @@ impl MobileAccessActor {
         let now = now_ms().map_err(|message| {
             MobileAccessCommandFailure::new(MobileAccessErrorCode::Internal, message)
         })?;
-        let Some(record) = self
-            .pairings
-            .devices
-            .iter_mut()
-            .find(|record| &record.device_id == device_id)
-        else {
+        let Some(device) = self.pairings.device_mut(device_id) else {
             return Err(MobileAccessCommandFailure::new(
                 MobileAccessErrorCode::UnknownDevice,
                 format!("unknown mobile device {device_id}"),
@@ -2260,7 +2522,7 @@ impl MobileAccessActor {
         };
         // Re-registering clears `expired`: the device just proved it holds a
         // live subscription, which is exactly what the flag denies.
-        record.push = Some(DevicePushRegistration {
+        *device.push = Some(DevicePushRegistration {
             subscription,
             registered_at_ms: now,
             expired: false,
@@ -2278,18 +2540,13 @@ impl MobileAccessActor {
         &mut self,
         device_id: &MobileDeviceId,
     ) -> Result<(), MobileAccessCommandFailure> {
-        let Some(record) = self
-            .pairings
-            .devices
-            .iter_mut()
-            .find(|record| &record.device_id == device_id)
-        else {
+        let Some(device) = self.pairings.device_mut(device_id) else {
             return Err(MobileAccessCommandFailure::new(
                 MobileAccessErrorCode::UnknownDevice,
                 format!("unknown mobile device {device_id}"),
             ));
         };
-        record.push = None;
+        *device.push = None;
         self.pairings_store
             .save(&self.pairings)
             .map_err(|message| {
@@ -2300,15 +2557,10 @@ impl MobileAccessActor {
     }
 
     async fn mark_push_expired(&mut self, device_id: &MobileDeviceId) {
-        let Some(record) = self
-            .pairings
-            .devices
-            .iter_mut()
-            .find(|record| &record.device_id == device_id)
-        else {
+        let Some(device) = self.pairings.device_mut(device_id) else {
             return;
         };
-        let Some(push) = record.push.as_mut() else {
+        let Some(push) = device.push.as_mut() else {
             return;
         };
         if push.expired {
@@ -2343,14 +2595,13 @@ impl MobileAccessActor {
         };
         let targets: Vec<(MobileDeviceId, MobilePushSubscription)> = self
             .pairings
-            .devices
-            .iter()
-            .filter(|record| record.state != MobileDeviceState::Revoked)
-            .filter(|record| !self.connected_tasks.contains_key(&record.device_id))
-            .filter_map(|record| {
-                let push = record.push.as_ref()?;
-                (!push.expired).then(|| (record.device_id.clone(), push.subscription.clone()))
+            .push_targets()
+            .into_iter()
+            .filter(|(device_id, _, state)| {
+                *state != MobileDeviceState::Revoked
+                    && !self.connected_tasks.contains_key(device_id)
             })
+            .map(|(device_id, subscription, _)| (device_id, subscription))
             .collect();
         if targets.is_empty() {
             tracing::info!(
@@ -2496,7 +2747,7 @@ impl MobileAccessActor {
         self.pairing = MobilePairingState::Consumed {
             offer_id: offer_id.clone(),
         };
-        self.spawn_connected_bridge(device_id.clone(), stream);
+        self.spawn_connected_bridge(device_id.clone(), Box::new(stream));
         self.spawn_device_accept(device_id);
         self.fan_out_state().await;
         self.schedule_pairing_grace(offer_id.clone());
@@ -2505,7 +2756,7 @@ impl MobileAccessActor {
     async fn device_transport_connected(
         &mut self,
         device_id: &MobileDeviceId,
-        stream: EnvelopeStream,
+        stream: BoxedMobileTransport,
     ) {
         self.accept_tasks
             .remove(&AcceptTaskKey::Device(device_id.clone()));
@@ -2850,23 +3101,27 @@ impl MobileAccessActor {
     }
 
     fn mark_device_connected(&mut self, device_id: &MobileDeviceId, now: Option<u64>) -> bool {
-        let Some(record) = self
+        let broker_url = self
             .pairings
             .devices
-            .iter_mut()
+            .iter()
             .find(|record| &record.device_id == device_id)
-        else {
+            .map(|record| record.broker.url.clone());
+        let Some(device) = self.pairings.device_mut(device_id) else {
             return false;
         };
-        record.state = MobileDeviceState::Connected;
+        *device.state = MobileDeviceState::Connected;
         if let Some(now) = now {
-            record.last_seen_at_ms = Some(now);
+            *device.last_seen_at_ms = Some(now);
         }
-        let broker_url = record.broker.url.clone();
         if let Err(message) = self.pairings_store.save(&self.pairings) {
             tracing::warn!(error = %message, "failed to persist mobile device connection state");
         }
-        self.broker_status = MobileBrokerStatus::Online { broker_url };
+        // Only an MQTT pairing has a broker whose health this reports; a direct
+        // device reached the host without one.
+        if let Some(broker_url) = broker_url {
+            self.broker_status = MobileBrokerStatus::Online { broker_url };
+        }
         true
     }
 
@@ -2999,20 +3254,22 @@ impl MobileAccessActor {
             return;
         }
         self.connected_tasks.remove(device_id);
-        if let Some(record) = self
+        let is_mqtt_device = self
             .pairings
             .devices
-            .iter_mut()
-            .find(|record| &record.device_id == device_id)
-        {
-            if record.state == MobileDeviceState::Connected {
-                record.state = MobileDeviceState::Paired;
+            .iter()
+            .any(|record| &record.device_id == device_id);
+        if let Some(device) = self.pairings.device_mut(device_id) {
+            if *device.state == MobileDeviceState::Connected {
+                *device.state = MobileDeviceState::Paired;
             }
             if let Err(message) = self.pairings_store.save(&self.pairings) {
                 tracing::warn!(error = %message, "failed to persist mobile device disconnect state");
             }
         }
-        if self.settings.enable_mobile_connections {
+        // The host re-arms an MQTT accept itself. A direct device owns its own
+        // reconnect, so waiting on one here would never resolve.
+        if is_mqtt_device && self.settings.enable_mobile_connections {
             self.spawn_device_accept(device_id.clone());
         }
         self.fan_out_state().await;
@@ -3111,7 +3368,7 @@ impl MobileAccessActor {
         self.accept_tasks.insert(key, task);
     }
 
-    fn spawn_connected_bridge(&mut self, device_id: MobileDeviceId, stream: EnvelopeStream) {
+    fn spawn_connected_bridge(&mut self, device_id: MobileDeviceId, stream: BoxedMobileTransport) {
         if let Some(previous) = self.connected_tasks.remove(&device_id) {
             previous.task.abort();
         }
@@ -3332,7 +3589,7 @@ fn spawn_device_accept_task(
                 Ok(stream) => {
                     let _ = tx.send(MobileAccessCommand::DeviceTransportConnected {
                         device_id: record.device_id.clone(),
-                        stream,
+                        stream: Box::new(stream),
                     });
                     return;
                 }
@@ -3649,7 +3906,7 @@ async fn bridge_authenticated_mobile(
     tx: mpsc::UnboundedSender<MobileAccessCommand>,
     device_id: MobileDeviceId,
     connection_instance_id: u64,
-    stream: EnvelopeStream,
+    stream: BoxedMobileTransport,
 ) {
     match accept(&ServerConfig::current(), stream).await {
         Ok(connection) => {
@@ -3894,6 +4151,13 @@ fn new_offer_id() -> Result<MobilePairingOfferId, String> {
         .map_err(|err| format!("failed to create mobile pairing offer id: {err}"))
 }
 
+/// A 244-bit secret as lowercase hex. Two v4 UUIDs rather than a hand-rolled
+/// RNG so the entropy comes from the same source the rest of the host trusts
+/// for identifiers.
+fn new_shared_secret() -> String {
+    format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple())
+}
+
 fn new_device_id() -> Result<MobileDeviceId, String> {
     Ok(MobileDeviceId(Uuid::new_v4().to_string()))
 }
@@ -3909,10 +4173,11 @@ fn now_ms() -> Result<u64, String> {
 fn start_direct_hosting(
     bind_addr: SocketAddr,
     bundle_dir: PathBuf,
+    mobile_access: mpsc::UnboundedSender<MobileAccessCommand>,
 ) -> Result<RunningDirectHost, String> {
     let assets = MobileWebAssets::from_dir(&bundle_dir)?;
     let asset_count = assets.asset_count() as u32;
-    let server = MobileHttpServer::start(bind_addr, Arc::new(assets))?;
+    let server = MobileHttpServer::start(bind_addr, Arc::new(assets), mobile_access)?;
     Ok(RunningDirectHost {
         server,
         bind_addr,

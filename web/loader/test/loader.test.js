@@ -20,6 +20,7 @@ import {
   REAL_STABLE,
   REAL_NO_RELEASE,
   REAL_MANAGED_V2,
+  REAL_DIRECT_V3,
   makePairingUri,
   EXAMPLE_MANIFEST,
 } from "./fixtures.js";
@@ -103,6 +104,14 @@ test("parsePairingUri extracts loader fields from real managed v2 URIs", () => {
   assert.equal(Object.hasOwn(parsed, "broker"), false);
 });
 
+test("parsePairingUri reads a real self-hosted v3 pairing URI", () => {
+  const parsed = parsePairingUri(REAL_DIRECT_V3);
+  assert.equal(parsed.releaseVersion, "0.8.19");
+  // The loader picks a bundle and nothing else: the offer secret must never be
+  // lifted out of the payload into loader-visible state.
+  assert.equal(Object.hasOwn(parsed, "offer_secret"), false);
+});
+
 test("parsePairingUri rejects non-pairing and malformed URIs", () => {
   assert.throws(() => parsePairingUri("https://evil.example/"));
   assert.throws(() => parsePairingUri("tyde-pair://v1?")); // empty payload
@@ -111,10 +120,11 @@ test("parsePairingUri rejects non-pairing and malformed URIs", () => {
   assert.throws(
     () =>
       parsePairingUri(
-        REAL_MANAGED_V2.replace("tyde-pair://v2?", "tyde-pair://v3?"),
+        REAL_MANAGED_V2.replace("tyde-pair://v2?", "tyde-pair://v4?"),
       ),
-    /unsupported tyde-pair URI version v3/,
+    /unsupported tyde-pair URI version v4/,
   );
+  assert.throws(() => parsePairingUri("tyde-pair://v3?")); // empty payload
   assert.throws(() => parsePairingUri(42));
 });
 

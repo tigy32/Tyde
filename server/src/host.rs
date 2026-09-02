@@ -8345,9 +8345,13 @@ impl HostHandle {
         Ok(())
     }
 
-    pub(crate) async fn start_mobile_pairing(&self, requester: StreamPath) -> AppResult<()> {
+    pub(crate) async fn start_mobile_pairing(
+        &self,
+        requester: StreamPath,
+        direct: bool,
+    ) -> AppResult<()> {
         let mobile_access = self.state.lock().await.mobile_access.clone();
-        mobile_access.start_pairing(requester)
+        mobile_access.start_pairing(requester, direct)
     }
 
     pub(crate) async fn cancel_mobile_pairing(

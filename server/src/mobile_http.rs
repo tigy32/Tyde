@@ -13,16 +13,26 @@
 //! bare-HTTP origin is a degraded app no matter who serves it.
 
 use std::collections::BTreeMap;
+use std::io;
 use std::net::SocketAddr;
 use std::path::Path;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
 use axum::Router;
 use axum::body::Body;
-use axum::extract::State;
-use axum::http::{HeaderValue, Method, StatusCode, Uri, header};
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::{Json, State};
+use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
+use axum::routing::{get, post};
+use protocol::{MobileAccessErrorCode, MobileDirectErrorResponse, MobileDirectPairRequest};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
+
+use crate::mobile_access::MobileAccessCommand;
 
 /// Loopback by default: the expected deployment puts a TLS-terminating proxy
 /// in front, and a proxy on this machine can reach loopback. Widening the bind
@@ -52,6 +62,29 @@ const SHELL_CACHE_CONTROL: &str = "public,max-age=60";
 const MANIFEST_CACHE_CONTROL: &str = "no-store";
 const MANIFEST_PATH: &str = "manifest.json";
 const INDEX_PATH: &str = "index.html";
+
+const PAIR_PATH: &str = "/tyde/pair";
+const WS_PATH: &str = "/tyde/ws";
+
+/// Subprotocol the client selects to name the wire it speaks.
+const WS_PROTOCOL: &str = "tyde.v1";
+/// Prefix of the second subprotocol entry, which carries the device token.
+///
+/// The browser WebSocket API cannot set request headers, and a token in the
+/// query string would be written to every reverse proxy access log on the way
+/// in. Subprotocols travel in `Sec-WebSocket-Protocol`, which proxies do not
+/// log by default, so this is where the credential goes.
+const WS_TOKEN_PREFIX: &str = "tyde.token.";
+
+/// Frames larger than this are refused rather than buffered. The protocol's own
+/// records are far smaller; anything approaching this is a client that has lost
+/// framing, and growing a buffer for it would be the bug.
+const WS_MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
+
+/// Depth of the byte queues bridging the WebSocket task and the protocol
+/// bridge. Bounded so a stalled reader applies backpressure to the socket
+/// instead of growing without limit.
+const WS_QUEUE_DEPTH: usize = 32;
 
 /// Bounds on what a bundle directory may be, so a misconfigured path (a home
 /// directory, `/`) fails loudly at load instead of being read into memory.
@@ -268,8 +301,8 @@ fn apply_common_headers(response: &mut Response) {
     );
 }
 
-async fn serve(State(assets): State<Arc<MobileWebAssets>>, method: Method, uri: Uri) -> Response {
-    let mut response = serve_inner(&assets, &method, uri.path());
+async fn serve(State(state): State<MobileHttpState>, method: Method, uri: Uri) -> Response {
+    let mut response = serve_inner(&state.assets, &method, uri.path());
     apply_common_headers(&mut response);
     response
 }
@@ -311,8 +344,296 @@ fn serve_inner(assets: &MobileWebAssets, method: &Method, path: &str) -> Respons
         .expect("static asset response must build")
 }
 
-fn router(assets: Arc<MobileWebAssets>) -> Router {
-    Router::new().fallback(serve).with_state(assets)
+/// A byte stream over a WebSocket, so `accept` can run the ordinary Tyde
+/// handshake on it exactly as it does over a Unix socket or an MQTT session.
+///
+/// The socket itself stays on the HTTP server's runtime and talks to this
+/// through channels. That is not indirection for its own sake: the mobile
+/// access actor runs on its own runtime, and hyper's upgraded IO is bound to
+/// the reactor that accepted it, so polling the socket from the actor's thread
+/// would never wake.
+struct WebSocketDuplex {
+    inbound: mpsc::Receiver<Vec<u8>>,
+    outbound: mpsc::Sender<Vec<u8>>,
+    /// Remainder of a frame that was larger than the last read buffer.
+    partial: Vec<u8>,
+    partial_offset: usize,
+    write_permit: Option<mpsc::OwnedPermit<Vec<u8>>>,
+}
+
+impl WebSocketDuplex {
+    fn new(inbound: mpsc::Receiver<Vec<u8>>, outbound: mpsc::Sender<Vec<u8>>) -> Self {
+        Self {
+            inbound,
+            outbound,
+            partial: Vec::new(),
+            partial_offset: 0,
+            write_permit: None,
+        }
+    }
+}
+
+impl AsyncRead for WebSocketDuplex {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        if self.partial_offset >= self.partial.len() {
+            match self.inbound.poll_recv(cx) {
+                // A closed inbound channel is the socket having ended, which is
+                // a clean EOF for the protocol reader above.
+                Poll::Ready(None) => return Poll::Ready(Ok(())),
+                Poll::Ready(Some(frame)) => {
+                    self.partial = frame;
+                    self.partial_offset = 0;
+                }
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+
+        let available = &self.partial[self.partial_offset..];
+        let take = available.len().min(buf.remaining());
+        buf.put_slice(&available[..take]);
+        self.partial_offset += take;
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl AsyncWrite for WebSocketDuplex {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let permit = match self.write_permit.take() {
+            Some(permit) => permit,
+            None => match self.outbound.clone().try_reserve_owned() {
+                Ok(permit) => permit,
+                Err(mpsc::error::TrySendError::Full(sender)) => {
+                    // Wake when the socket task drains one frame.
+                    let waker = cx.waker().clone();
+                    tokio::spawn(async move {
+                        let _ = sender.reserve_owned().await;
+                        waker.wake();
+                    });
+                    return Poll::Pending;
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "mobile websocket closed",
+                    )));
+                }
+            },
+        };
+        permit.send(buf.to_vec());
+        Poll::Ready(Ok(buf.len()))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        // Every accepted write has already been handed to the socket task.
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.write_permit = None;
+        self.inbound.close();
+        Poll::Ready(Ok(()))
+    }
+}
+
+/// Pumps an upgraded WebSocket into and out of the channels a
+/// [`WebSocketDuplex`] reads. Ends as soon as either direction does, so a
+/// half-dead socket cannot leave the protocol bridge waiting.
+async fn run_websocket_pump(
+    mut socket: WebSocket,
+    mut outbound: mpsc::Receiver<Vec<u8>>,
+    inbound: mpsc::Sender<Vec<u8>>,
+) {
+    loop {
+        tokio::select! {
+            received = socket.recv() => {
+                match received {
+                    Some(Ok(Message::Binary(bytes))) => {
+                        if bytes.len() > WS_MAX_FRAME_BYTES {
+                            tracing::warn!(
+                                bytes = bytes.len(),
+                                "mobile websocket frame exceeds the maximum; closing"
+                            );
+                            return;
+                        }
+                        if inbound.send(bytes.into()).await.is_err() {
+                            return;
+                        }
+                    }
+                    // The protocol is binary. A text frame means the peer is
+                    // not speaking it, which is worth ending rather than
+                    // silently dropping.
+                    Some(Ok(Message::Text(_))) => {
+                        tracing::warn!("mobile websocket sent a text frame; closing");
+                        return;
+                    }
+                    Some(Ok(Message::Close(_))) | None => return,
+                    Some(Ok(Message::Ping(_) | Message::Pong(_))) => {}
+                    Some(Err(error)) => {
+                        tracing::debug!(%error, "mobile websocket read failed");
+                        return;
+                    }
+                }
+            }
+            sending = outbound.recv() => {
+                let Some(bytes) = sending else {
+                    return;
+                };
+                if socket.send(Message::Binary(bytes.into())).await.is_err() {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// Reads the device token out of the offered subprotocols.
+fn device_token_from_headers(headers: &HeaderMap) -> Option<String> {
+    let offered = headers.get("sec-websocket-protocol")?.to_str().ok()?;
+    offered
+        .split(',')
+        .map(str::trim)
+        .find_map(|entry| entry.strip_prefix(WS_TOKEN_PREFIX))
+        .filter(|token| !token.is_empty())
+        .map(str::to_owned)
+}
+
+fn direct_error(status: StatusCode, code: MobileAccessErrorCode, message: &str) -> Response {
+    let mut response = (
+        status,
+        Json(MobileDirectErrorResponse {
+            code,
+            message: message.to_owned(),
+        }),
+    )
+        .into_response();
+    apply_common_headers(&mut response);
+    response
+}
+
+/// Exchanges a pairing offer secret for a durable device token.
+async fn pair(
+    State(state): State<MobileHttpState>,
+    Json(request): Json<MobileDirectPairRequest>,
+) -> Response {
+    let (reply_tx, reply_rx) = oneshot::channel();
+    if state
+        .mobile_access
+        .send(MobileAccessCommand::RedeemDirectPairing {
+            request: Box::new(request),
+            reply: reply_tx,
+        })
+        .is_err()
+    {
+        return direct_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            MobileAccessErrorCode::Internal,
+            "this host is shutting down",
+        );
+    }
+
+    match reply_rx.await {
+        Ok(Ok(response)) => {
+            let mut response = Json(response).into_response();
+            apply_common_headers(&mut response);
+            response
+        }
+        Ok(Err(failure)) => {
+            let (code, message) = failure.into_parts();
+            direct_error(StatusCode::FORBIDDEN, code, &message)
+        }
+        Err(_) => direct_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            MobileAccessErrorCode::Internal,
+            "this host is shutting down",
+        ),
+    }
+}
+
+/// Upgrades an authenticated device to a protocol connection.
+async fn websocket(
+    State(state): State<MobileHttpState>,
+    headers: HeaderMap,
+    upgrade: WebSocketUpgrade,
+) -> Response {
+    let Some(token) = device_token_from_headers(&headers) else {
+        return direct_error(
+            StatusCode::UNAUTHORIZED,
+            MobileAccessErrorCode::RepairRequired,
+            "this connection carried no device token; pair with the host again",
+        );
+    };
+
+    let (reply_tx, reply_rx) = oneshot::channel();
+    if state
+        .mobile_access
+        .send(MobileAccessCommand::AuthenticateDirectDevice {
+            token,
+            reply: reply_tx,
+        })
+        .is_err()
+    {
+        return direct_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            MobileAccessErrorCode::Internal,
+            "this host is shutting down",
+        );
+    }
+    let Ok(Some(device_id)) = reply_rx.await else {
+        return direct_error(
+            StatusCode::UNAUTHORIZED,
+            MobileAccessErrorCode::RepairRequired,
+            "this device is not paired with the host; pair again",
+        );
+    };
+
+    let mobile_access = state.mobile_access.clone();
+    let mut response = upgrade
+        .protocols([WS_PROTOCOL])
+        .on_upgrade(move |socket| async move {
+            let (inbound_tx, inbound_rx) = mpsc::channel(WS_QUEUE_DEPTH);
+            let (outbound_tx, outbound_rx) = mpsc::channel(WS_QUEUE_DEPTH);
+            let duplex = WebSocketDuplex::new(inbound_rx, outbound_tx);
+            if mobile_access
+                .send(MobileAccessCommand::DeviceTransportConnected {
+                    device_id,
+                    stream: Box::new(duplex),
+                })
+                .is_err()
+            {
+                return;
+            }
+            run_websocket_pump(socket, outbound_rx, inbound_tx).await;
+        });
+    apply_common_headers(&mut response);
+    response
+}
+
+#[derive(Clone)]
+struct MobileHttpState {
+    assets: Arc<MobileWebAssets>,
+    mobile_access: mpsc::UnboundedSender<MobileAccessCommand>,
+}
+
+fn router(
+    assets: Arc<MobileWebAssets>,
+    mobile_access: mpsc::UnboundedSender<MobileAccessCommand>,
+) -> Router {
+    Router::new()
+        .route(PAIR_PATH, post(pair))
+        .route(WS_PATH, get(websocket))
+        .fallback(serve)
+        .with_state(MobileHttpState {
+            assets,
+            mobile_access,
+        })
 }
 
 /// A running direct-hosting server. Dropping it stops serving.
@@ -328,6 +649,7 @@ impl MobileHttpServer {
     pub(crate) fn start(
         bind_addr: SocketAddr,
         assets: Arc<MobileWebAssets>,
+        mobile_access: mpsc::UnboundedSender<MobileAccessCommand>,
     ) -> Result<Self, String> {
         let listener = std::net::TcpListener::bind(bind_addr)
             .map_err(|err| format!("failed to bind mobile web server on {bind_addr}: {err}"))?;
@@ -361,7 +683,7 @@ impl MobileHttpServer {
                             return;
                         }
                     };
-                    let served = axum::serve(listener, router(assets))
+                    let served = axum::serve(listener, router(assets, mobile_access))
                         .with_graceful_shutdown(async move { serve_shutdown.cancelled().await })
                         .await;
                     if let Err(err) = served {

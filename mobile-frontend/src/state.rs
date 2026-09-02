@@ -451,6 +451,17 @@ pub enum PairingScreen {
         host_label: String,
         auth: MobileServiceAuthState,
     },
+    /// A self-hosted (`tyde-pair://v3`) offer: confirm, then redeem against the
+    /// origin this bundle was served from. No `tycode.dev` step exists on this
+    /// path, so there is no auth state to carry.
+    SelfHostedConfirm {
+        qr_uri: String,
+        host_label: String,
+    },
+    /// Redeeming a self-hosted offer and opening its connection.
+    SelfHostedPairing {
+        host_label: String,
+    },
     /// A boot OAuth callback completed after Safari lost the pending QR. The
     /// typed auth result remains renderable (paywall/retry/sign-in) without
     /// inventing pairing data or attempting redemption.
@@ -485,6 +496,10 @@ pub enum PairingOffer {
     /// `start_pairing` path. The native shell owns its own managed handshake, so
     /// the web bundle never produces this variant.
     DirectPairing { preview: MobilePairingPreview },
+    /// A host serving this bundle itself (`tyde-pair://v3`). Confirming
+    /// redeems the offer against the origin the page came from; there is no
+    /// broker and no `tycode.dev` step.
+    SelfHosted { host_label: String },
 }
 
 #[derive(Clone, Debug, PartialEq)]
