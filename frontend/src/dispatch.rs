@@ -3365,6 +3365,9 @@ fn apply_review_event(state: &AppState, review_id: &ReviewId, payload: ReviewEve
             );
         }
         ReviewEventPayload::CommentUpsert { comment } => {
+            state.review_add_comment_errors.update(|errors| {
+                errors.remove(review_id);
+            });
             let was_new = state.reviews.with_untracked(|map| {
                 map.get(review_id)
                     .map(|r| !r.comments.iter().any(|c| c.id == comment.id))
@@ -3590,6 +3593,9 @@ fn apply_review_event(state: &AppState, review_id: &ReviewId, payload: ReviewEve
                 ReviewErrorContext::AddComment => {
                     state.review_action_target_pending.update(|set| {
                         set.remove(&(review_id.clone(), ReviewActionTarget::AddComment));
+                    });
+                    state.review_add_comment_errors.update(|errors| {
+                        errors.insert(review_id.clone(), error.message.clone());
                     });
                 }
                 ReviewErrorContext::UpdateComment { comment_id } => {

@@ -3893,6 +3893,10 @@ pub struct AppState {
     /// the matching `ReviewEvent` echoes back, or on
     /// `ReviewEvent::Error` whose context matches.
     pub review_action_target_pending: RwSignal<HashSet<(ReviewId, ReviewActionTarget)>>,
+    /// The server's rejection of the most recent `AddComment` per review,
+    /// shown on the open composer until the next save is attempted or a
+    /// comment lands for that review.
+    pub review_add_comment_errors: RwSignal<HashMap<ReviewId, String>>,
     /// Agents whose compaction request is in flight, keyed by the old
     /// agent id, with a snapshot of identifying fields captured at
     /// compaction-start time. The fingerprint lets the `NewAgent`
@@ -4230,6 +4234,7 @@ impl AppState {
             review_create_pending: RwSignal::new(HashMap::new()),
             review_action_pending: RwSignal::new(HashMap::new()),
             review_action_target_pending: RwSignal::new(HashSet::new()),
+            review_add_comment_errors: RwSignal::new(HashMap::new()),
             compaction_in_progress: RwSignal::new(HashMap::new()),
             compaction_errors: RwSignal::new(HashMap::new()),
             compaction_pending_completion: RwSignal::new(HashMap::new()),

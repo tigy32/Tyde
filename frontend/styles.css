@@ -12564,6 +12564,13 @@ pre.tool-error-pre {
     justify-content: flex-end;
 }
 
+.review-composer-error {
+    color: var(--danger, #f85149);
+    font-size: 0.769rem;
+    line-height: 1.4;
+    overflow-wrap: anywhere;
+}
+
 .review-rejected-region {
     margin-top: var(--space-1);
 }

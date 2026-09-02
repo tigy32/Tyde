@@ -2135,7 +2135,7 @@ async fn create_review_does_not_require_origin_agent() {
 }
 
 #[tokio::test]
-async fn create_review_with_untracked_binary_file_allows_file_comment() {
+async fn create_review_with_untracked_binary_and_nested_repo_allows_file_comment() {
     let fixture = Fixture::new().await;
     let mut client = fixture.client;
     let root = tempfile::tempdir().expect("temp root");
@@ -2149,6 +2149,16 @@ async fn create_review_with_untracked_binary_file_allows_file_comment() {
     git(&repo, &["commit", "-m", "Initial"]);
     fs::write(repo.join("binary.dat"), [0xff_u8, 0xfe_u8, 0x00_u8])
         .expect("write untracked binary file");
+    // A nested checkout is listed by `ls-files --others` as `nested/`; it
+    // used to be read as a file and fail every refresh of the review.
+    let nested = repo.join("nested");
+    fs::create_dir_all(&nested).expect("create nested repo");
+    git(&nested, &["init"]);
+    git(&nested, &["config", "user.email", "review@example.com"]);
+    git(&nested, &["config", "user.name", "Review Test"]);
+    fs::write(nested.join("inner.txt"), "inner\n").expect("write nested file");
+    git(&nested, &["add", "."]);
+    git(&nested, &["commit", "-m", "Nested"]);
 
     let project = create_project(&mut client, &repo).await;
     client
@@ -2173,6 +2183,16 @@ async fn create_review_with_untracked_binary_file_allows_file_comment() {
         .expect("binary file diff");
     assert!(binary_file.is_binary);
     assert!(binary_file.hunks.is_empty());
+    assert!(
+        diff.files
+            .iter()
+            .all(|file| !file.relative_path.starts_with("nested")),
+        "a nested repository is not reviewable content: {:?}",
+        diff.files
+            .iter()
+            .map(|file| &file.relative_path)
+            .collect::<Vec<_>>()
+    );
 
     let location = ReviewLocation {
         root: diff.root.clone(),

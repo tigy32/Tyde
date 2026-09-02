@@ -2502,6 +2502,11 @@ where
             &mut run_git,
         )?;
         for relative_path in untracked_paths {
+            // `ls-files --others` reports a nested repository as `dir/`; it
+            // has no content this repository can stage or review.
+            if relative_path.ends_with('/') {
+                continue;
+            }
             files.push(build_untracked_diff_file(&payload.root.0, &relative_path)?);
         }
         files.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));

@@ -1000,6 +1000,9 @@ pub(crate) fn Composer(
             if !try_claim_review_action(&state_for_send, &rid, &ReviewActionTarget::AddComment) {
                 return;
             }
+            state_for_send.review_add_comment_errors.update(|errors| {
+                errors.remove(&rid);
+            });
             // Snapshot the User comments already at this location so the
             // level-triggered close effect can recognize the newly added
             // one. Set on the persistent ComposerState so a mid-flight
@@ -1055,6 +1058,15 @@ pub(crate) fn Composer(
     });
     autosize_textarea(textarea_ref, body);
 
+    let save_error = {
+        let rid = review_id.clone();
+        let s = state.clone();
+        Memo::new(move |_| {
+            s.review_add_comment_errors
+                .with(|errors| errors.get(&rid).cloned())
+        })
+    };
+
     view! {
         <div class="review-composer">
             <textarea
@@ -1077,6 +1089,11 @@ pub(crate) fn Composer(
                     }
                 }
             />
+            {move || save_error.get().map(|message| view! {
+                <div class="review-composer-error" role="alert" data-test="review-composer-error">
+                    {format!("Comment not saved: {message}")}
+                </div>
+            })}
             <div class="review-composer-actions">
                 <button class="review-btn primary review-composer-save"
                         disabled=save_disabled
@@ -1295,6 +1312,97 @@ mod wasm_tests {
     /// without a *new* comment at the location (the AddComment failed), the
     /// composer stays open with its body intact. Here a comment matching the
     /// baseline already exists, but no comment outside the baseline appears.
+    /// A server rejection of the save (e.g. `GitFailed` because the diff
+    /// refresh could not read the working tree) must be visible on the
+    /// composer, not just logged: the composer stays open with its body,
+    /// shows the server's message, and drops it once a comment lands.
+    #[wasm_bindgen_test]
+    async fn composer_shows_server_rejection_until_a_comment_lands() {
+        let container = make_container();
+        let review = review_with(Vec::new());
+        let rid = review.id.clone();
+        let state = AppState::new();
+        state.reviews.update(|m| {
+            m.insert(rid.clone(), review);
+        });
+        let composer: RwSignal<Option<ComposerState>> = RwSignal::new(None);
+        let mounted_state = state.clone();
+        let rid_for_mount = rid.clone();
+        let handle = mount_to(container.clone(), move || {
+            provide_context(mounted_state.clone());
+            let composer_state = ComposerState {
+                location: location(),
+                body: RwSignal::new("draft text".to_owned()),
+                submitted_baseline: RwSignal::new(Some(Vec::new())),
+            };
+            composer.set(Some(composer_state.clone()));
+            let is_draft = Memo::new(move |_| true);
+            view! {
+                <Composer
+                    composer=composer
+                    composer_state=composer_state
+                    host_id="h1".to_owned()
+                    review_id=rid_for_mount.clone()
+                    is_draft=is_draft
+                />
+            }
+        });
+        let _mounted = Mounted::new(handle, composer);
+        next_tick().await;
+        assert!(
+            container.query_selector("[role=alert]").unwrap().is_none(),
+            "no rejection is shown before the server rejects anything"
+        );
+
+        state.review_add_comment_errors.update(|errors| {
+            errors.insert(
+                rid.clone(),
+                "Failed to read untracked file 'nested/': Is a directory".to_owned(),
+            );
+        });
+        next_tick().await;
+
+        let alert = container
+            .query_selector("[role=alert]")
+            .unwrap()
+            .expect("the rejection is rendered on the composer");
+        let alert_text = alert.text_content().unwrap_or_default();
+        assert!(
+            alert_text.contains("Failed to read untracked file 'nested/'"),
+            "the server's message is shown verbatim, got {alert_text:?}"
+        );
+        assert!(
+            composer.get_untracked().is_some(),
+            "the composer stays open"
+        );
+        let textarea = container
+            .query_selector("textarea")
+            .unwrap()
+            .expect("composer textarea")
+            .dyn_into::<web_sys::HtmlTextAreaElement>()
+            .unwrap();
+        assert_eq!(textarea.value(), "draft text", "the draft body is kept");
+
+        state.reviews.update(|m| {
+            if let Some(review) = m.get_mut(&rid) {
+                review.comments.push(user_comment("landed"));
+            }
+        });
+        state.review_add_comment_errors.update(|errors| {
+            errors.remove(&rid);
+        });
+        next_tick().await;
+        next_tick().await;
+        assert!(
+            container.query_selector("[role=alert]").unwrap().is_none(),
+            "the rejection clears once a comment lands"
+        );
+        assert!(
+            composer.get_untracked().is_none(),
+            "the composer closes on the confirming comment"
+        );
+    }
+
     #[wasm_bindgen_test]
     async fn composer_stays_open_without_new_comment() {
         let container = make_container();
