@@ -1423,6 +1423,12 @@ with open(os.environ["DEV_CHECK_TEST_LOG"], "a", encoding="utf-8") as log:
                 "DEV_CHECK_TEST_LOG": str(self.log),
                 "RUSTUP_TOOLCHAIN": "nightly",
                 "TMPDIR": str(pathlib.Path(self.temp.name) / "tmp"),
+                # Fixture repositories are deleted after each test, so their
+                # sccache directories must not be created under the developer's
+                # real cache root, where nothing would ever reclaim them.
+                "DEV_CHECK_SCCACHE_ROOT": str(
+                    pathlib.Path(self.temp.name) / "sccache-root"
+                ),
                 "CHROME": str(self.bin / "google-chrome"),
                 "CHROMEDRIVER": str(self.bin / "chromedriver"),
                 "WASM_BINDGEN_TEST_RUNNER": str(
@@ -2549,6 +2555,22 @@ exec "$DEV_CHECK_REAL_PYTHON" "$@"
     # environment_identity from dev.sh — cache identity is now the schema plus
     # the git worktree fingerprint, and python3 --version is no longer probed —
     # so the failure path that test pinned no longer exists by design.
+
+    def test_sccache_root_override_keeps_cache_out_of_the_home_cache(self) -> None:
+        self._run()
+
+        run_dir = max((self.root / "target" / "dev-check-logs").glob("run-*"))
+        metadata = (run_dir / "metadata.txt").read_text(encoding="utf-8")
+        directory = next(
+            line.removeprefix("sccache.directory=")
+            for line in metadata.splitlines()
+            if line.startswith("sccache.directory=")
+        )
+
+        self.assertTrue(
+            directory.startswith(self.env["DEV_CHECK_SCCACHE_ROOT"]),
+            f"a temporary fixture wrote its sccache cache to {directory}",
+        )
 
     def test_sccache_validation_failure_has_log_and_failure_stats(self) -> None:
         env = self.env.copy()
