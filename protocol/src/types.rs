@@ -3192,10 +3192,23 @@ pub enum MobileDirectHostingStatus {
     Online {
         bind_addr: String,
         asset_count: u32,
+        source: MobileWebBundleSource,
     },
     Error {
         message: String,
     },
+}
+
+/// Where the mobile web bundle being served came from. Which one is live
+/// decides whether editing the bundle directory changes anything, so the host
+/// reports it rather than leaving the settings tab to infer it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MobileWebBundleSource {
+    /// The directory named by `mobile_direct_bundle_dir`.
+    Directory,
+    /// The bundle compiled into this host's binary.
+    BuiltIn,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

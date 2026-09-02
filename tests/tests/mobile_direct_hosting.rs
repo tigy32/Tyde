@@ -168,6 +168,10 @@ async fn enable_direct_hosting(
     bundle_dir: &str,
 ) -> MobileDirectHostingStatus {
     client
+        .replace_setting("/enable_mobile_connections", true, false)
+        .await
+        .expect("set enable_mobile_connections");
+    client
         .replace_setting(
             "/mobile_direct_bundle_dir",
             Some(bundle_dir),
@@ -379,6 +383,106 @@ async fn disabling_direct_hosting_stops_serving() {
     assert!(
         stopped.is_ok(),
         "the origin must stop answering once direct hosting is off"
+    );
+}
+
+/// A build with no bundle compiled in, pointed at no directory, has nothing to
+/// serve. It has to say so and say what to do about it, rather than binding a
+/// port that answers 404 for every asset the phone asks for. `./dev.sh check`
+/// never embeds a bundle, so this is the shape every development build has.
+#[tokio::test]
+async fn direct_hosting_without_any_bundle_explains_itself() {
+    server::install_default_crypto_provider();
+    let harness = Harness::new();
+    let mut client = harness.connect_desktop().await;
+    expect_initial_replay(&mut client).await;
+
+    client
+        .replace_setting("/enable_mobile_connections", true, false)
+        .await
+        .expect("set enable_mobile_connections");
+    client
+        .replace_setting(
+            "/mobile_direct_bind_addr",
+            Some("127.0.0.1:0"),
+            Option::<String>::None,
+        )
+        .await
+        .expect("set mobile_direct_bind_addr");
+    client
+        .replace_setting("/mobile_direct_hosting_enabled", true, false)
+        .await
+        .expect("set mobile_direct_hosting_enabled");
+
+    let status = wait_for_direct_hosting(
+        &mut client,
+        |status| !matches!(status, MobileDirectHostingStatus::Disabled),
+        "direct hosting to report a missing bundle",
+    )
+    .await;
+    let MobileDirectHostingStatus::Error { message } = status else {
+        panic!("expected a reported error, got {status:?}");
+    };
+    assert!(
+        message.contains("bundle") && message.contains("build-mobile-web-bundle.sh"),
+        "the failure must name what is missing and how to produce it; got: {message:?}"
+    );
+}
+
+/// `enable_mobile_connections` is documented as the master switch for mobile
+/// access. Direct hosting is a second transport, so turning that switch off has
+/// to take the HTTP origin down too — otherwise a paired phone keeps a working
+/// route into the host after the user believes they closed mobile access.
+#[tokio::test]
+async fn the_mobile_master_switch_stops_direct_hosting() {
+    server::install_default_crypto_provider();
+    let bundle = BundleFixture::write();
+    let harness = Harness::new();
+    let mut client = harness.connect_desktop().await;
+    expect_initial_replay(&mut client).await;
+
+    let status = enable_direct_hosting(&mut client, &bundle.path()).await;
+    let base = online_addr(&status);
+    assert_eq!(get(&base, "/tyde/").await.status(), 200);
+
+    // Only the master switch moves; direct hosting stays enabled.
+    client
+        .replace_setting("/enable_mobile_connections", false, true)
+        .await
+        .expect("clear enable_mobile_connections");
+    // Direct hosting is still switched on, so going quiet would read as
+    // "nothing happened" in the settings tab. The host says which switch did it.
+    let stopped_status = wait_for_direct_hosting(
+        &mut client,
+        |status| matches!(status, MobileDirectHostingStatus::Error { .. }),
+        "direct hosting to stop with the master switch",
+    )
+    .await;
+    let MobileDirectHostingStatus::Error { message } = &stopped_status else {
+        panic!("expected a reported reason, got {stopped_status:?}");
+    };
+    assert!(
+        message.contains("mobile connections are off"),
+        "the reason must name the switch that stopped it; got: {message:?}"
+    );
+
+    let stopped = timeout(EVENT_TIMEOUT, async {
+        loop {
+            if reqwest::Client::new()
+                .get(format!("http://{base}/tyde/"))
+                .send()
+                .await
+                .is_err()
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await;
+    assert!(
+        stopped.is_ok(),
+        "the origin must stop answering once mobile connections are off"
     );
 }
 

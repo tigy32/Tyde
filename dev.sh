@@ -785,6 +785,7 @@ usage() {
     printf 'Usage: %s check [--explain-cache]\n' "$0"
     printf '       %s rust-toolchain\n' "$0"
     printf '       %s release <command> [args]\n' "$0"
+    printf '       %s mobile-bundle [--out DIR] [--version X.Y.Z]\n' "$0"
 }
 
 case "${1:-}" in
@@ -805,6 +806,10 @@ case "${1:-}" in
     release)
         shift
         exec tools/release.sh "$@"
+        ;;
+    mobile-bundle)
+        shift
+        exec tools/build-mobile-web-bundle.sh "$@"
         ;;
     *)
         usage >&2

@@ -104,7 +104,17 @@ jobs:
         with:
           tool: trunk@0.21.14
 
+      # tyde-server serves the mobile web app itself when direct hosting is on,
+      # so a downloaded server has to carry the bundle rather than asking the
+      # operator to assemble one. The bundle is identical on every platform;
+      # each job builds its own because the matrix has no shared artifact stage.
+      - name: Build mobile web bundle for direct hosting
+        shell: bash
+        run: tools/build-mobile-web-bundle.sh
+
       - name: Build headless Tyde Server binary
+        env:
+          TYDE_MOBILE_BUNDLE_DIR: ${{ github.workspace }}/target/mobile-web
         run: cargo build --release --target ${{ matrix.server-target }} -p tyde-server --bin tyde-server
 
       - name: Smoke test headless binary

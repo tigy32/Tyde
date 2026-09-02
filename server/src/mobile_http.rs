@@ -106,7 +106,43 @@ pub(crate) struct MobileWebAssets {
     files: BTreeMap<String, MobileWebAsset>,
 }
 
+// The table `server/build.rs` generates: every file of the bundle a build
+// baked in, or nothing at all when it baked in none.
+include!(concat!(env!("OUT_DIR"), "/embedded_mobile_web.rs"));
+
 impl MobileWebAssets {
+    /// The bundle compiled into this binary, if the build had one.
+    ///
+    /// Release builds assemble the bundle and point `TYDE_MOBILE_BUNDLE_DIR`
+    /// at it, so a downloaded server serves the mobile app with nothing to
+    /// configure. A plain `cargo build` embeds nothing and returns `None`,
+    /// leaving the host to point at a directory it built itself.
+    pub(crate) fn has_embedded() -> bool {
+        !EMBEDDED_MOBILE_WEB.is_empty()
+    }
+
+    pub(crate) fn embedded() -> Option<Self> {
+        if !Self::has_embedded() {
+            return None;
+        }
+        // build.rs already refused to embed a tree without the loader shell
+        // and manifest, so unlike `from_dir` there is nothing left to check.
+        Some(Self {
+            files: EMBEDDED_MOBILE_WEB
+                .iter()
+                .map(|(key, bytes)| {
+                    (
+                        (*key).to_owned(),
+                        MobileWebAsset {
+                            content_type: content_type_for(Path::new(key)),
+                            bytes: Arc::from(*bytes),
+                        },
+                    )
+                })
+                .collect(),
+        })
+    }
+
     /// Reads a bundle directory laid out exactly like the deployed `tyde/`
     /// prefix: the loader shell and `manifest.json` at the root, each app
     /// bundle under `v<version>/`.

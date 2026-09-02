@@ -576,7 +576,7 @@ fn decorate_host_settings_schema(schema: &mut Value) {
         (
             "mobile_direct_hosting_enabled",
             "Host the mobile app directly",
-            "Serve the mobile web app from this host over HTTP instead of tunnelling it through the managed service. Put a TLS-terminating reverse proxy in front of it: over plain HTTP browsers disable service workers, WebCrypto, the camera and push notifications.",
+            "Serve the mobile web app from this host over HTTP instead of tunnelling it through the managed service. Needs Mobile connections on as well. Put a TLS-terminating reverse proxy in front of it: over plain HTTP browsers disable service workers, WebCrypto, the camera and push notifications.",
         ),
         (
             "mobile_direct_bind_addr",
@@ -591,7 +591,7 @@ fn decorate_host_settings_schema(schema: &mut Value) {
         (
             "mobile_direct_bundle_dir",
             "Mobile web bundle directory",
-            "Directory holding the built mobile web assets, laid out like the deployed site: the loader shell and manifest.json at the root, each app bundle under v<version>/.",
+            "Optional. A bundle directory to serve instead of the one built into this host, produced by ./dev.sh mobile-bundle. Release builds already carry a bundle; set this to serve one you built yourself.",
         ),
     ] {
         set_property_text(schema, "HostSettings", field, title, description);

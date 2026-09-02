@@ -8816,6 +8816,48 @@ math merror {
     border-color: var(--error, var(--accent-primary));
 }
 
+/* --- Direct hosting section --- */
+
+.settings-mobile-direct {
+    border: 1px solid var(--border-primary);
+    border-radius: 8px;
+    padding: var(--space-3);
+    background: var(--surface-2);
+}
+
+.settings-mobile-direct-status {
+    display: inline-block;
+    margin: var(--space-2) 0;
+    padding: 2px 8px;
+    border-radius: 999px;
+    font-size: 0.85rem;
+    font-weight: 600;
+    border: 1px solid var(--border-primary);
+}
+
+.settings-mobile-direct-status-online {
+    color: var(--success, var(--accent-primary));
+    border-color: var(--success, var(--accent-primary));
+}
+
+.settings-mobile-direct-status-error {
+    color: var(--error, var(--accent-primary));
+    border-color: var(--error, var(--accent-primary));
+}
+
+.settings-mobile-direct-field {
+    margin-top: var(--space-3);
+}
+
+.settings-mobile-direct-input {
+    width: 100%;
+    min-width: 0;
+}
+
+.settings-mobile-direct-pair {
+    margin-top: var(--space-3);
+}
+
 /* --- Mobile pairing section --- */
 
 .settings-mobile-pairing {

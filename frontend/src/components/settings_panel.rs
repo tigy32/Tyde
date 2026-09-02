@@ -17,11 +17,12 @@ use protocol::{
     BackendSetupInfo, BackendSetupStatus, BrokerUrl, CodeIntelProviderId, CustomAgent,
     CustomAgentId, DiffContextMode, FrameKind, InvokeSettingsActionPayload, LaunchProfileEntry,
     LaunchProfileId, McpServerConfig, McpServerId, McpTransportConfig, MobileAccessStatePayload,
-    MobileBrokerStatus, MobileDeviceState, MobilePairingOfferId, MobilePairingOfferPayload,
-    MobilePairingState, MobilePushState, ProjectId, RunBackendSetupPayload, SessionSchemaEntry,
-    SessionSettingField, SessionSettingFieldType, SessionSettingValue, SessionSettingsSchema,
-    SessionSettingsValues, SettingExpectation, SettingOp, SettingsWriteId, SettingsWritePayload,
-    Skill, SkillId, Steering, SteeringId, SteeringScope, ToolPolicy,
+    MobileBrokerStatus, MobileDeviceState, MobileDirectHostingStatus, MobilePairingOfferId,
+    MobilePairingOfferPayload, MobilePairingState, MobilePushState, MobileWebBundleSource,
+    ProjectId, RunBackendSetupPayload, SessionSchemaEntry, SessionSettingField,
+    SessionSettingFieldType, SessionSettingValue, SessionSettingsSchema, SessionSettingsValues,
+    SettingExpectation, SettingOp, SettingsWriteId, SettingsWritePayload, Skill, SkillId, Steering,
+    SteeringId, SteeringScope, ToolPolicy,
 };
 use settings_model::{HostExecutablePath, HostLaunchProfileConfig};
 
@@ -5848,30 +5849,13 @@ fn MobileTab() -> impl IntoView {
         mobile_state_for_host().map(|state| state.broker_status)
     };
     let state_for_can_start_settings = state.clone();
-    let can_start_pairing = move || -> bool {
-        let Some(host_id) = state_for_can_start_settings.selected_host_id.get() else {
-            return false;
-        };
-        let enabled = state_for_can_start_settings
-            .host_settings_by_host
-            .with(|m| {
-                m.get(&host_id)
-                    .map(|settings| settings.enable_mobile_connections)
-                    .unwrap_or(false)
-            });
-        if !enabled {
-            return false;
-        }
-        let in_flight = mobile_start_pending()
-            || matches!(pairing_phase(), Some(MobilePairingState::Active { .. }));
-        !in_flight
-    };
+    let can_start_pairing = move || can_start_mobile_pairing(&state_for_can_start_settings);
 
     view! {
         <h2 class="settings-panel-title">"Mobile"</h2>
 
         <p class="settings-description settings-panel-intro">
-            "Reach this host from the Tyde mobile app, so you can read what your agents are doing and reply to them away from your desk. Pairing provisions a scoped, tycode.dev-signed AWS IoT broker connection for the two devices — there is no public or free MQTT broker involved, and traffic is not relayed through a shared server. Your phone signs in with a Tyggs Pass to complete pairing; this host is never asked for your Tyggs credentials."
+            "Reach this host from the Tyde mobile app, so you can read what your agents are doing and reply to them away from your desk. Pairing provisions a scoped, tycode.dev-signed AWS IoT broker connection for the two devices — there is no public or free MQTT broker involved, and traffic is not relayed through a shared server. Your phone signs in with a Tyggs Pass to complete pairing; this host is never asked for your Tyggs credentials. This host can also serve the mobile app itself, over an address on your own network with no managed service in the path — see \"Host the mobile app from this machine\" below."
         </p>
 
         <div class="settings-field">
@@ -5923,6 +5907,25 @@ fn MobileTab() -> impl IntoView {
                     Some(seconds) => format!("expires in {seconds}s"),
                 };
                 let qr_uri_for_text = qr_uri.clone();
+                // A direct-hosting offer is a link the phone opens; a managed
+                // one is a URI pasted into an app the user already has. Telling
+                // someone to paste a URL into an app they have not installed is
+                // a dead end, so the fallback follows the offer.
+                let is_link =
+                    qr_uri.starts_with("https://") || qr_uri.starts_with("http://");
+                let (fallback_summary, fallback_hint, uri_label) = if is_link {
+                    (
+                        "Show pairing link",
+                        "If your phone can't scan the QR, open this link on it instead. Treat it like a one-shot password — anyone who opens it before it expires can pair as a device on this host.",
+                        "Pairing link",
+                    )
+                } else {
+                    (
+                        "Show pairing URI",
+                        "If your mobile device can't scan the QR, paste this URI into the Tyde mobile app's pairing screen instead. Treat it like a one-shot password — anyone with the URI before it expires can pair as a device on this host.",
+                        "Pairing URI",
+                    )
+                };
                 view! {
                     <div class="settings-mobile-pairing-active" role="region" aria-label="Active pairing QR">
                         <div
@@ -5939,17 +5942,15 @@ fn MobileTab() -> impl IntoView {
                                 {expires_label}
                             </p>
                             <details class="settings-mobile-pairing-fallback">
-                                <summary>"Show pairing URI"</summary>
-                                <p class="settings-description">
-                                    "If your mobile device can't scan the QR, paste this URI into the Tyde mobile app's pairing screen instead. Treat it like a one-shot password — anyone with the URI before it expires can pair as a device on this host."
-                                </p>
+                                <summary>{fallback_summary}</summary>
+                                <p class="settings-description">{fallback_hint}</p>
                                 <textarea
                                     class="settings-input settings-mobile-pairing-uri"
                                     readonly=true
                                     spellcheck="false"
                                     autocapitalize="none"
                                     autocomplete="off"
-                                    aria-label="Pairing URI"
+                                    aria-label=uri_label
                                     rows="3"
                                     prop:value=qr_uri_for_text
                                 />
@@ -6073,6 +6074,8 @@ fn MobileTab() -> impl IntoView {
             }}
         </div>
 
+        <MobileDirectSection />
+
         <div class="settings-field">
             <label class="settings-label">"Broker URL (dev override)"</label>
             <p class="settings-description">
@@ -6133,6 +6136,318 @@ fn MobileTab() -> impl IntoView {
             </p>
         </div>
     }
+}
+
+/// The direct-hosting half of the Mobile tab: the host serving the mobile web
+/// app itself over HTTP, with no tunnel out to the managed service.
+///
+/// Its own component rather than another block inside [`MobileTab`] because
+/// that tab's `view!` is already large enough that adding this section's tree
+/// to it overflowed the wasm stack while constructing the page.
+#[component]
+fn MobileDirectSection() -> AnyView {
+    let state = expect_context::<AppState>();
+    let state_for_direct_status = state.clone();
+    let pairing_error: RwSignal<Option<String>> = RwSignal::new(None);
+
+    let direct_state_for_host = move || -> Option<MobileAccessStatePayload> {
+        let host_id = state_for_direct_status.selected_host_id.get()?;
+        state_for_direct_status
+            .mobile_access_state
+            .with(|m| m.get(&host_id).cloned())
+    };
+    let state_for_can_start = state.clone();
+    let can_start_pairing = move || can_start_mobile_pairing(&state_for_can_start);
+
+    // The host can serve the mobile web app itself over HTTP so phones reach it
+    // like any other internal site, with no tunnel out to the managed service.
+    // As everywhere else on this tab the frontend only writes settings and
+    // renders the typed `direct_hosting` status back; it never decides whether
+    // the origin is usable.
+    let state_for_direct_checked = state.clone();
+    let state_for_direct_disabled = state.clone();
+    let state_for_direct_toggle = state.clone();
+    let state_for_direct_origin = state.clone();
+    let state_for_direct_start = state.clone();
+
+    let direct_status = move || -> Option<MobileDirectHostingStatus> {
+        direct_state_for_host().map(|state| state.direct_hosting)
+    };
+    let direct_enabled_checked = move || {
+        state_for_direct_checked
+            .selected_host_settings()
+            .is_some_and(|settings| settings.mobile_direct_hosting_enabled)
+    };
+    let direct_toggle_disabled =
+        move || state_for_direct_disabled.selected_host_settings().is_none();
+    let on_direct_toggle = move |ev: web_sys::Event| {
+        let target = ev.target().unwrap();
+        let input: web_sys::HtmlInputElement = target.unchecked_into();
+        send_host_replace(
+            &state_for_direct_toggle,
+            "/mobile_direct_hosting_enabled",
+            input.checked(),
+        );
+    };
+    let direct_origin_set = Memo::new(move |_| {
+        state_for_direct_origin
+            .selected_host_settings()
+            .and_then(|settings| settings.mobile_direct_public_origin)
+            .is_some_and(|origin| !origin.trim().is_empty())
+    });
+    // Gate the direct QR on the *reported* status, not on the toggle the user
+    // just flipped: a QR that points at an origin which never came up sends the
+    // phone to a dead address, and the failure surfaces on the phone instead of
+    // here where it can be fixed.
+    let direct_online = move || {
+        matches!(
+            direct_status(),
+            Some(MobileDirectHostingStatus::Online { .. })
+        )
+    };
+    let can_start_direct_pairing =
+        move || can_start_pairing() && direct_online() && direct_origin_set.get();
+    let on_start_direct_pairing_click = move |_: web_sys::MouseEvent| {
+        pairing_error.set(None);
+        let Some((host_id, host_stream)) = state_for_direct_start.selected_host_stream_untracked()
+        else {
+            pairing_error.set(Some("No host selected.".to_owned()));
+            return;
+        };
+        let host_id_for_gate = host_id.clone();
+        state_for_direct_start
+            .mobile_pairing_start_pending
+            .update(|set| {
+                set.insert(host_id_for_gate);
+            });
+        let state_for_async = state_for_direct_start.clone();
+        spawn_local(async move {
+            if let Err(err) = mobile_pairing_start(&host_id, host_stream, true).await {
+                log::error!("direct mobile_pairing_start send failed: {err}");
+                let host_id_for_clear = host_id.clone();
+                state_for_async.mobile_pairing_start_pending.update(|set| {
+                    set.remove(&host_id_for_clear);
+                });
+                pairing_error.set(Some(format!("Could not start pairing: {err}")));
+            }
+        });
+    };
+
+    view! {
+    <div class="settings-field settings-mobile-direct">
+        <div class="settings-toggle-row">
+            <div>
+                <label class="settings-label">"Host the mobile app from this machine"</label>
+                <p class="settings-description">
+                    "Serve the mobile web app from this host over HTTP, so phones reach it like any other internal site and nothing tunnels out through the managed service. Put your own TLS-terminating proxy in front of it: on a plain-HTTP origin browsers switch off service workers, WebCrypto, the camera and notifications, and the app needs all four. Needs mobile connections enabled above."
+                </p>
+            </div>
+            <label class="settings-toggle">
+                <input
+                    type="checkbox"
+                    prop:checked=direct_enabled_checked
+                    disabled=direct_toggle_disabled
+                    on:change=on_direct_toggle
+                />
+                <span class="settings-toggle-slider"></span>
+            </label>
+        </div>
+
+        {move || direct_status().and_then(|status| {
+            let (slug, role, text) = match status {
+                // Off is the default and the toggle already says so; a
+                // second line repeating it would just be noise.
+                MobileDirectHostingStatus::Disabled => return None,
+                MobileDirectHostingStatus::Online {
+                    bind_addr,
+                    asset_count,
+                    source,
+                } => {
+                    // Which bundle is live decides whether editing the
+                    // directory below changes anything, so say it.
+                    let which = match source {
+                        MobileWebBundleSource::BuiltIn => "built-in bundle",
+                        MobileWebBundleSource::Directory => "bundle directory",
+                    };
+                    (
+                        "online",
+                        "status",
+                        format!("Serving {asset_count} files from the {which} on {bind_addr}"),
+                    )
+                }
+                MobileDirectHostingStatus::Error { message } => ("error", "alert", message),
+            };
+            Some(view! {
+                <p
+                    class=format!("settings-mobile-direct-status settings-mobile-direct-status-{slug}")
+                    role=role
+                >
+                    {text}
+                </p>
+            })
+        })}
+
+        <MobileDirectField
+            label="Address phones use"
+            description="The URL your proxy publishes this host under, e.g. https://tyde.corp.internal. Pairing needs it because the host cannot see the name it is reached by."
+            placeholder="https://tyde.corp.internal"
+            pointer="/mobile_direct_public_origin"
+            slug="origin"
+            read=|settings| settings.mobile_direct_public_origin.clone()
+        />
+        <MobileDirectField
+            label="Listen address"
+            description="Where the HTTP server binds. The default only accepts connections from a proxy on this machine; widen it only if something else terminates TLS."
+            placeholder="127.0.0.1:8730"
+            pointer="/mobile_direct_bind_addr"
+            slug="bind"
+            read=|settings| settings.mobile_direct_bind_addr.clone()
+        />
+        <MobileDirectField
+            label="Mobile web bundle"
+            description="Optional. A bundle directory to serve instead of the one built into this host, produced by ./dev.sh mobile-bundle. Release builds already carry a bundle, so leave this blank unless you are serving one you built yourself."
+            placeholder="/opt/tyde/mobile-web"
+            pointer="/mobile_direct_bundle_dir"
+            slug="bundle"
+            read=|settings| settings.mobile_direct_bundle_dir.clone()
+        />
+
+        {move || {
+            let can = can_start_direct_pairing();
+            let title = if can {
+                "Show a QR that pairs a phone over this host's own address"
+            } else if !direct_online() {
+                "Turn direct hosting on and wait for it to come up first"
+            } else if !direct_origin_set.get() {
+                "Set the address phones use before pairing"
+            } else {
+                "A pairing session is already active — cancel it first"
+            };
+            view! {
+                <button
+                    type="button"
+                    class="filter-toggle settings-mobile-direct-pair"
+                    disabled=!can
+                    title=title
+                    on:click=on_start_direct_pairing_click.clone()
+                >
+                    "Pair over this host"
+                </button>
+            }
+        }}
+    </div>
+        {move || pairing_error.get().map(|message| view! {
+            <p class="settings-mobile-broker-error" role="alert">{message}</p>
+        })}
+    }
+    .into_any()
+}
+
+/// Whether a pairing can be started on the selected host: mobile access is on
+/// and no offer is already in flight. Both the managed and the direct pairing
+/// buttons gate on this, so they cannot drift into offering two at once.
+///
+/// It deliberately does not consider broker status. In the managed flow the
+/// broker only reaches `Online` *after* a pairing exists, so a `Connecting` /
+/// `RepairRequired` / `Error` broker is exactly when a fresh pairing is needed.
+fn can_start_mobile_pairing(state: &AppState) -> bool {
+    let Some(host_id) = state.selected_host_id.get() else {
+        return false;
+    };
+    let enabled = state.host_settings_by_host.with(|m| {
+        m.get(&host_id)
+            .map(|settings| settings.enable_mobile_connections)
+            .unwrap_or(false)
+    });
+    if !enabled {
+        return false;
+    }
+    let pending = state
+        .mobile_pairing_start_pending
+        .with(|set| set.contains(&host_id));
+    let active = state.mobile_access_state.with(|m| {
+        matches!(
+            m.get(&host_id).map(|entry| &entry.pairing),
+            Some(MobilePairingState::Active { .. })
+        )
+    });
+    !pending && !active
+}
+
+/// One host-scoped `Option<String>` setting in the direct-hosting section.
+/// Blank input clears the override rather than committing an empty string, so
+/// the field reads the same way as the server's "unset" default.
+#[component]
+fn MobileDirectField(
+    label: &'static str,
+    description: &'static str,
+    placeholder: &'static str,
+    pointer: &'static str,
+    slug: &'static str,
+    read: fn(&settings_model::HostSettings) -> Option<String>,
+) -> AnyView {
+    let state = expect_context::<AppState>();
+    let state_for_value = state.clone();
+    let state_for_disabled = state.clone();
+    let state_for_change = state.clone();
+    let state_for_keydown = state.clone();
+
+    let value = move || {
+        state_for_value
+            .selected_host_settings()
+            .and_then(|settings| read(&settings))
+            .unwrap_or_default()
+    };
+    let disabled = move || state_for_disabled.selected_host_settings().is_none();
+
+    // Shared by `change` (blur) and Enter so the two paths cannot drift.
+    let commit = move |state: &AppState, raw: &str| {
+        let trimmed = raw.trim();
+        send_host_replace(
+            state,
+            pointer,
+            (!trimmed.is_empty()).then(|| trimmed.to_owned()),
+        );
+    };
+    let on_change = move |ev: web_sys::Event| {
+        let target = ev.target().unwrap();
+        let input: web_sys::HtmlInputElement = target.unchecked_into();
+        commit(&state_for_change, &input.value());
+    };
+    let on_keydown = move |ev: web_sys::KeyboardEvent| {
+        if ev.key() != "Enter" {
+            return;
+        }
+        ev.prevent_default();
+        let Some(target) = ev.target() else {
+            return;
+        };
+        let Ok(input) = target.dyn_into::<web_sys::HtmlInputElement>() else {
+            return;
+        };
+        commit(&state_for_keydown, &input.value());
+    };
+
+    view! {
+        <div class="settings-mobile-direct-field">
+            <label class="settings-label">{label}</label>
+            <p class="settings-description">{description}</p>
+            <input
+                type="text"
+                class=format!("settings-input settings-mobile-direct-input settings-mobile-direct-{slug}")
+                prop:value=value
+                placeholder=placeholder
+                disabled=disabled
+                autocapitalize="none"
+                autocomplete="off"
+                spellcheck="false"
+                aria-label=label
+                on:change=on_change
+                on:keydown=on_keydown
+            />
+        </div>
+    }
+    .into_any()
 }
 
 #[component]
@@ -9080,6 +9395,344 @@ mod wasm_tests {
                 .iter()
                 .any(|op| op.get("path").and_then(Value::as_str) == Some("/voice/enabled")),
             "the mobile toggle must not commit the neighboring voice setting: {settings:?}"
+        );
+    }
+
+    // ---- Direct hosting section ----
+
+    /// Point the installed host at a direct-hosting status and public origin,
+    /// mirroring what a `MobileAccessState` frame plus host settings deliver.
+    fn install_direct_hosting(
+        state: &AppState,
+        status: protocol::MobileDirectHostingStatus,
+        origin: Option<&str>,
+    ) {
+        state.host_settings_by_host.update(|m| {
+            let settings = m.get_mut("host-mobile").expect("mobile host settings");
+            settings.mobile_direct_hosting_enabled = true;
+            settings.mobile_direct_public_origin = origin.map(str::to_owned);
+        });
+        state.mobile_access_state.update(|m| {
+            let entry = m.entry("host-mobile".to_owned()).or_insert_with(|| {
+                protocol::MobileAccessStatePayload {
+                    broker_status: MobileBrokerStatus::Disabled,
+                    pairing: MobilePairingState::Idle,
+                    paired_devices: Vec::new(),
+                    direct_hosting: protocol::MobileDirectHostingStatus::Disabled,
+                }
+            });
+            entry.direct_hosting = status;
+        });
+    }
+
+    fn direct_input(container: &HtmlElement, slug: &str) -> web_sys::HtmlInputElement {
+        container
+            .query_selector(&format!(".settings-mobile-direct-{slug}"))
+            .unwrap()
+            .unwrap_or_else(|| panic!("direct hosting {slug} input must render on the Mobile tab"))
+            .dyn_into()
+            .unwrap()
+    }
+
+    /// Turning direct hosting on must write its own setting and nothing else.
+    /// The two mobile toggles sit in the same tab, so a mis-wired handler would
+    /// silently flip the master switch instead.
+    #[wasm_bindgen_test]
+    async fn mobile_tab_direct_hosting_toggle_commits_setting() {
+        let calls = install_settings_send_stub();
+        let container = make_container();
+        let _handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            install_mobile_host_settings(&state, None, true);
+            state.settings_open.set(true);
+            provide_context(state);
+            view! { <SettingsPanel /> }
+        });
+        next_tick().await;
+        click_tab(&container, "Mobile");
+        next_tick().await;
+
+        let toggle = toggle_for_label(&container, "Host the mobile app from this machine");
+        assert!(
+            !toggle.checked(),
+            "direct hosting starts off in this fixture"
+        );
+        toggle.set_checked(true);
+        dispatch_change(&toggle);
+        for _ in 0..4 {
+            next_tick().await;
+        }
+
+        let settings = recorded_settings_write_ops(&calls);
+        let direct = settings
+            .iter()
+            .find(|op| {
+                op.get("path").and_then(Value::as_str) == Some("/mobile_direct_hosting_enabled")
+            })
+            .expect("toggling direct hosting must emit a settings write");
+        assert_eq!(
+            direct.get("value").and_then(Value::as_bool),
+            Some(true),
+            "the replacement must carry true"
+        );
+        assert!(
+            !settings.iter().any(|op| {
+                op.get("path").and_then(Value::as_str) == Some("/enable_mobile_connections")
+            }),
+            "the direct toggle must not touch the master switch: {settings:?}"
+        );
+    }
+
+    /// The three direct-hosting text fields must reflect the host's values and
+    /// commit edits to their own pointer, and a blank field must clear the
+    /// override rather than committing an empty string the server would then
+    /// have to treat as unset.
+    #[wasm_bindgen_test]
+    async fn mobile_tab_direct_fields_commit_and_clear() {
+        let calls = install_settings_send_stub();
+        let container = make_container();
+        let state = AppState::new();
+        install_mobile_host_settings(&state, None, true);
+        install_direct_hosting(
+            &state,
+            protocol::MobileDirectHostingStatus::Disabled,
+            Some("https://tyde.corp.internal"),
+        );
+        state.settings_open.set(true);
+        let state_for_mount = state.clone();
+        let _handle = mount_to(container.clone(), move || {
+            provide_context(state_for_mount.clone());
+            view! { <SettingsPanel /> }
+        });
+        next_tick().await;
+        click_tab(&container, "Mobile");
+        next_tick().await;
+
+        assert_eq!(
+            direct_input(&container, "origin").value(),
+            "https://tyde.corp.internal",
+            "the address field must reflect the host's configured origin"
+        );
+
+        set_and_change(&direct_input(&container, "bind"), "0.0.0.0:9000");
+        set_and_change(
+            &direct_input(&container, "bundle"),
+            " /opt/tyde/mobile-web ",
+        );
+        set_and_change(&direct_input(&container, "origin"), "   ");
+        for _ in 0..4 {
+            next_tick().await;
+        }
+
+        let settings = recorded_settings_write_ops(&calls);
+        let value_at = |pointer: &str| -> Option<Value> {
+            settings
+                .iter()
+                .rev()
+                .find(|op| op.get("path").and_then(Value::as_str) == Some(pointer))
+                .and_then(|op| op.get("value").cloned())
+        };
+        assert_eq!(
+            value_at("/mobile_direct_bind_addr"),
+            Some(Value::String("0.0.0.0:9000".to_owned())),
+            "the listen address must commit to its own pointer: {settings:?}"
+        );
+        assert_eq!(
+            value_at("/mobile_direct_bundle_dir"),
+            Some(Value::String("/opt/tyde/mobile-web".to_owned())),
+            "surrounding whitespace must be trimmed off the bundle path: {settings:?}"
+        );
+        assert_eq!(
+            value_at("/mobile_direct_public_origin"),
+            Some(Value::Null),
+            "blanking a field must clear the override, not commit an empty string: {settings:?}"
+        );
+    }
+
+    /// A direct pairing QR encodes the address the phone will be sent to, so it
+    /// is only offered once the host reports the origin actually serving *and*
+    /// knows the public URL to put in it. Otherwise the QR would hand the phone
+    /// a dead address and the failure would surface on the phone, away from the
+    /// settings that cause it.
+    #[wasm_bindgen_test]
+    async fn mobile_tab_direct_pairing_waits_for_a_live_origin() {
+        let container = make_container();
+        let state = AppState::new();
+        install_mobile_host_settings(&state, None, true);
+        install_direct_hosting(&state, protocol::MobileDirectHostingStatus::Disabled, None);
+        state.settings_open.set(true);
+        let state_for_mount = state.clone();
+        let _handle = mount_to(container.clone(), move || {
+            provide_context(state_for_mount.clone());
+            view! { <SettingsPanel /> }
+        });
+        next_tick().await;
+        click_tab(&container, "Mobile");
+        next_tick().await;
+
+        let pair_button = || {
+            find_button_by_text(&container, "Pair over this host")
+                .expect("the direct pairing button must always render")
+                .dyn_into::<web_sys::HtmlButtonElement>()
+                .unwrap()
+        };
+        assert!(
+            pair_button().disabled(),
+            "pairing must be refused while nothing is configured"
+        );
+
+        // The address is known, but the origin is not up. A QR now would carry
+        // a real-looking URL that answers nothing.
+        install_direct_hosting(
+            &state,
+            protocol::MobileDirectHostingStatus::Disabled,
+            Some("https://tyde.corp.internal"),
+        );
+        for _ in 0..3 {
+            next_tick().await;
+        }
+        assert!(
+            pair_button().disabled(),
+            "pairing must be refused while the origin is not serving"
+        );
+
+        // Serving, but the host still does not know the URL phones use.
+        install_direct_hosting(
+            &state,
+            protocol::MobileDirectHostingStatus::Online {
+                bind_addr: "127.0.0.1:8730".to_owned(),
+                asset_count: 42,
+                source: protocol::MobileWebBundleSource::Directory,
+            },
+            None,
+        );
+        for _ in 0..3 {
+            next_tick().await;
+        }
+        assert!(
+            pair_button().disabled(),
+            "pairing must be refused until the public address is set"
+        );
+
+        let status = container
+            .query_selector(".settings-mobile-direct-status")
+            .unwrap()
+            .expect("a serving origin must report its state")
+            .text_content()
+            .unwrap_or_default();
+        assert!(
+            status.contains("127.0.0.1:8730")
+                && status.contains("42")
+                && status.contains("bundle directory"),
+            "the status line must name the address it serves on, how much it serves, and which bundle it serves; got: {status:?}"
+        );
+
+        install_direct_hosting(
+            &state,
+            protocol::MobileDirectHostingStatus::Online {
+                bind_addr: "127.0.0.1:8730".to_owned(),
+                asset_count: 42,
+                source: protocol::MobileWebBundleSource::Directory,
+            },
+            Some("https://tyde.corp.internal"),
+        );
+        for _ in 0..3 {
+            next_tick().await;
+        }
+        assert!(
+            !pair_button().disabled(),
+            "a serving origin with a public address must be pairable"
+        );
+    }
+
+    /// A direct-hosting offer is a link the phone opens; a managed one is a URI
+    /// pasted into an app. Handing someone the wrong instruction is a dead end
+    /// at exactly the moment they have already failed to scan the QR.
+    #[wasm_bindgen_test]
+    async fn mobile_tab_direct_offer_falls_back_to_a_link() {
+        const LINK: &str = "https://tyde.corp.internal/tyde/#tyde-pair://v3?payload";
+
+        let container = make_container();
+        let _handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            install_mobile_host_settings(&state, None, true);
+            install_active_offer(&state, "offer-direct", LINK, 9_999_999_999_999);
+            state.settings_open.set(true);
+            provide_context(state);
+            view! { <SettingsPanel /> }
+        });
+        next_tick().await;
+        click_tab(&container, "Mobile");
+        next_tick().await;
+
+        let fallback = container
+            .query_selector(".settings-mobile-pairing-fallback")
+            .unwrap()
+            .expect("an active offer must render the copy-paste fallback")
+            .text_content()
+            .unwrap_or_default();
+        assert!(
+            fallback.contains("open this link"),
+            "a link offer must tell the user to open it; got: {fallback:?}"
+        );
+        assert!(
+            !fallback.contains("paste this URI"),
+            "a link offer must not point at an app pairing screen; got: {fallback:?}"
+        );
+
+        let textarea: web_sys::HtmlTextAreaElement = container
+            .query_selector(".settings-mobile-pairing-uri")
+            .unwrap()
+            .expect("fallback textarea")
+            .dyn_into()
+            .unwrap();
+        assert_eq!(
+            textarea.value(),
+            LINK,
+            "the fallback must carry the offer verbatim"
+        );
+    }
+
+    /// A bind or bundle failure is only actionable if the user can see it, and
+    /// it has to be announced: the host reports it asynchronously, long after
+    /// the click that caused it.
+    #[wasm_bindgen_test]
+    async fn mobile_tab_direct_hosting_error_is_announced() {
+        let container = make_container();
+        let state = AppState::new();
+        install_mobile_host_settings(&state, None, true);
+        install_direct_hosting(
+            &state,
+            protocol::MobileDirectHostingStatus::Error {
+                message: "bundle directory has no index.html".to_owned(),
+            },
+            Some("https://tyde.corp.internal"),
+        );
+        state.settings_open.set(true);
+        let state_for_mount = state.clone();
+        let _handle = mount_to(container.clone(), move || {
+            provide_context(state_for_mount.clone());
+            view! { <SettingsPanel /> }
+        });
+        next_tick().await;
+        click_tab(&container, "Mobile");
+        next_tick().await;
+
+        let status = container
+            .query_selector(".settings-mobile-direct-status")
+            .unwrap()
+            .expect("a failed origin must report its state");
+        assert!(
+            status
+                .text_content()
+                .unwrap_or_default()
+                .contains("bundle directory has no index.html"),
+            "the host's own reason must reach the user verbatim"
+        );
+        assert_eq!(
+            status.get_attribute("role").as_deref(),
+            Some("alert"),
+            "a hosting failure must be announced, not silently painted"
         );
     }
 

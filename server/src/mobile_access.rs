@@ -27,7 +27,7 @@ use protocol::{
     MobileDeviceRevokePayload, MobileDeviceState, MobileDirectHostingStatus,
     MobilePairingCancelPayload, MobilePairingOfferId, MobilePairingOfferPayload,
     MobilePairingQrUri, MobilePairingState, MobilePushNotification, MobilePushReason,
-    MobilePushSubscription, PROTOCOL_VERSION, StreamPath,
+    MobilePushSubscription, MobileWebBundleSource, PROTOCOL_VERSION, StreamPath,
 };
 use serde::{Deserialize, Serialize};
 use settings_model::HostSettings;
@@ -484,8 +484,26 @@ enum DirectHostingState {
 struct RunningDirectHost {
     server: MobileHttpServer,
     bind_addr: SocketAddr,
-    bundle_dir: PathBuf,
+    bundle: DirectBundleChoice,
     asset_count: u32,
+}
+
+/// Which bundle direct hosting should serve. An explicit directory always wins
+/// so a host can serve a bundle it just built; otherwise it serves the one this
+/// binary was built with, if it was built with one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DirectBundleChoice {
+    Directory(PathBuf),
+    BuiltIn,
+}
+
+impl DirectBundleChoice {
+    fn source(&self) -> MobileWebBundleSource {
+        match self {
+            Self::Directory(_) => MobileWebBundleSource::Directory,
+            Self::BuiltIn => MobileWebBundleSource::BuiltIn,
+        }
+    }
 }
 
 struct ConnectedMobileTask {
@@ -1629,6 +1647,22 @@ impl MobileAccessActor {
             self.direct_hosting = DirectHostingState::Disabled;
             return;
         }
+        // `enable_mobile_connections` is the master switch for every mobile
+        // transport, not just the broker: turning it off has to stop the direct
+        // origin too, or a paired phone would keep connecting over HTTP after
+        // the user believes they cut mobile access off. Report it rather than
+        // going quiet, or turning direct hosting on with the master switch off
+        // looks like nothing happened.
+        if !self.settings.enable_mobile_connections {
+            if !matches!(self.direct_hosting, DirectHostingState::Disabled) {
+                tracing::info!("mobile direct hosting stopped: mobile connections are off");
+            }
+            self.direct_hosting = DirectHostingState::Failed(
+                "mobile connections are off; turn them on to serve the mobile app from this host"
+                    .to_owned(),
+            );
+            return;
+        }
 
         let desired = match self.desired_direct_hosting() {
             Ok(desired) => desired,
@@ -1641,7 +1675,7 @@ impl MobileAccessActor {
 
         if let DirectHostingState::Running(running) = &self.direct_hosting
             && running.bind_addr == desired.0
-            && running.bundle_dir == desired.1
+            && running.bundle == desired.1
         {
             return;
         }
@@ -1665,18 +1699,25 @@ impl MobileAccessActor {
         };
     }
 
-    fn desired_direct_hosting(&self) -> Result<(SocketAddr, PathBuf), String> {
+    fn desired_direct_hosting(&self) -> Result<(SocketAddr, DirectBundleChoice), String> {
         let bind_addr = resolve_bind_addr(self.settings.mobile_direct_bind_addr.as_deref())?;
-        let bundle_dir = self
+        let configured = self
             .settings
             .mobile_direct_bundle_dir
             .as_deref()
             .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| {
-                "mobile direct hosting is on but no bundle directory is set; point it at a built mobile web bundle".to_owned()
-            })?;
-        Ok((bind_addr, PathBuf::from(bundle_dir)))
+            .filter(|value| !value.is_empty());
+        let bundle = match configured {
+            Some(dir) => DirectBundleChoice::Directory(PathBuf::from(dir)),
+            None if MobileWebAssets::has_embedded() => DirectBundleChoice::BuiltIn,
+            None => {
+                return Err(
+                    "mobile direct hosting is on but this build has no mobile web bundle in it; set the bundle directory to one built with tools/build-mobile-web-bundle.sh"
+                        .to_owned(),
+                );
+            }
+        };
+        Ok((bind_addr, bundle))
     }
 
     fn direct_hosting_status(&self) -> MobileDirectHostingStatus {
@@ -1685,6 +1726,7 @@ impl MobileAccessActor {
             DirectHostingState::Running(running) => MobileDirectHostingStatus::Online {
                 bind_addr: running.server.local_addr().to_string(),
                 asset_count: running.asset_count,
+                source: running.bundle.source(),
             },
             DirectHostingState::Failed(message) => MobileDirectHostingStatus::Error {
                 message: message.clone(),
@@ -1936,6 +1978,15 @@ impl MobileAccessActor {
         requester: StreamPath,
         offer_id: MobilePairingOfferId,
     ) {
+        if !self.settings.enable_mobile_connections {
+            self.fail_pairing(
+                offer_id,
+                MobileAccessErrorCode::InvalidConfig,
+                "mobile connections are disabled".to_owned(),
+            )
+            .await;
+            return;
+        }
         if !self.settings.mobile_direct_hosting_enabled {
             self.fail_pairing(
                 offer_id,
@@ -1987,7 +2038,7 @@ impl MobileAccessActor {
             release_version,
             offer_id.clone(),
             secret.clone(),
-            "Tyde Host".to_owned(),
+            HOST_LABEL.to_owned(),
             expires_at_ms,
         );
         let qr_uri = match payload.to_pairing_url(&origin) {
@@ -4172,16 +4223,20 @@ fn now_ms() -> Result<u64, String> {
 
 fn start_direct_hosting(
     bind_addr: SocketAddr,
-    bundle_dir: PathBuf,
+    bundle: DirectBundleChoice,
     mobile_access: mpsc::UnboundedSender<MobileAccessCommand>,
 ) -> Result<RunningDirectHost, String> {
-    let assets = MobileWebAssets::from_dir(&bundle_dir)?;
+    let assets = match &bundle {
+        DirectBundleChoice::Directory(dir) => MobileWebAssets::from_dir(dir)?,
+        DirectBundleChoice::BuiltIn => MobileWebAssets::embedded()
+            .ok_or_else(|| "this build has no mobile web bundle in it".to_owned())?,
+    };
     let asset_count = assets.asset_count() as u32;
     let server = MobileHttpServer::start(bind_addr, Arc::new(assets), mobile_access)?;
     Ok(RunningDirectHost {
         server,
         bind_addr,
-        bundle_dir,
+        bundle,
         asset_count,
     })
 }

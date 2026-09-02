@@ -111,6 +111,9 @@ node --test web/deploy/*.test.mjs
 log "Checking web deploy shell syntax"
 bash -n web/deploy/deploy.sh
 
+log "Checking mobile web bundle builder syntax"
+bash -n tools/build-mobile-web-bundle.sh
+
 TEMP_DIR="$(mktemp -d)"
 TEMP_DIST="$TEMP_DIR/mobile-frontend-dist"
 TEMP_MANIFEST="$TEMP_DIR/manifest.json"
