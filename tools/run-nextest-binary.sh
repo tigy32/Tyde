@@ -13,8 +13,15 @@ if [[ "$(uname -s)" != "Darwin" ]]; then
 fi
 
 workspace_key="$(stat -f '%d-%i' "$repo_root")"
-cache_dir="${TMPDIR:-/tmp}/tyde-nextest/$workspace_key"
+cache_root="${TMPDIR:-/tmp}/tyde-nextest"
+cache_dir="$cache_root/$workspace_key"
 ownerless_grace_seconds=5
+# A workspace directory is named after the inode of a repository root that the
+# AGENTS.md workflow deletes as its final step, so nothing can ever find it
+# again. Each one records the root it belongs to and is swept once that root is
+# gone. Directories predating the marker are only swept after a full day idle.
+workspace_marker=".workspace-root"
+legacy_grace_seconds=86400
 
 state_mtime() {
     stat -f '%m' "$1"
@@ -39,6 +46,38 @@ state_owner_pid() {
         sed -n 's/^pid=//p' "$state" 2>/dev/null || true
     fi
     return 0
+}
+
+workspace_dir_is_live() {
+    local peer="$1"
+    local marker="$peer/$workspace_marker"
+    local recorded modified now
+
+    if [[ -f "$marker" ]]; then
+        recorded="$(<"$marker")"
+        [[ -n "$recorded" && -d "$recorded" ]] || return 1
+        [[ "$(stat -f '%d-%i' "$recorded" 2>/dev/null)" == "$(basename "$peer")" ]]
+        return
+    fi
+
+    now="$(date +%s)"
+    modified="$(state_mtime "$peer" 2>/dev/null || true)"
+    [[ "$modified" =~ ^[0-9]+$ ]] || return 0
+    ((now - modified < legacy_grace_seconds))
+}
+
+workspace_dir_is_busy() {
+    local peer="$1"
+    local state owner_pid
+
+    for state in "$peer"/*.lock "$peer"/*.use.*; do
+        [[ -e "$state" || -L "$state" ]] || continue
+        owner_pid="$(state_owner_pid "$state")"
+        if [[ "$owner_pid" =~ ^[0-9]+$ ]] && kill -0 "$owner_pid" 2>/dev/null; then
+            return 0
+        fi
+    done
+    return 1
 }
 
 if [[ "${1:-}" == "--cleanup-stale" ]]; then
@@ -87,7 +126,17 @@ if [[ "${1:-}" == "--cleanup-stale" ]]; then
         )
         after_kib="$(du -sk "$cache_dir" | awk 'NR == 1 { print $1 }')"
     fi
-    printf '%s\n' "$(((before_kib - after_kib) * 1024))"
+    peers_kib=0
+    for peer in "$cache_root"/*; do
+        [[ -d "$peer" ]] || continue
+        [[ "$peer" != "$cache_dir" ]] || continue
+        workspace_dir_is_live "$peer" && continue
+        workspace_dir_is_busy "$peer" && continue
+        peer_kib="$(du -sk "$peer" | awk 'NR == 1 { print $1 }')"
+        rm -rf "$peer" 2>/dev/null || continue
+        peers_kib=$((peers_kib + peer_kib))
+    done
+    printf '%s\n' "$(((before_kib - after_kib + peers_kib) * 1024))"
     exit 0
 fi
 
@@ -109,6 +158,10 @@ cached_binary="$cache_dir/$logical_name.$binary_key"
 lock_dir="$cache_dir/$logical_name.lock"
 
 mkdir -p "$cache_dir"
+if [[ "$(cat "$cache_dir/$workspace_marker" 2>/dev/null || true)" != "$repo_root" ]]; then
+    printf '%s\n' "$repo_root" >"$cache_dir/$workspace_marker.tmp.$$"
+    mv "$cache_dir/$workspace_marker.tmp.$$" "$cache_dir/$workspace_marker"
+fi
 LOCK_HELD=false
 
 acquire_lock() {

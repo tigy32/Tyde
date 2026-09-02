@@ -33,3 +33,9 @@ uuid = { version = "1", features = ["v4"] }
 
 [patch.crates-io]
 webrtc-audio-processing-sys = { path = "vendor/webrtc-audio-processing-sys" }
+
+[profile.dev]
+# macOS already splits DWARF out of the linked binary, so this trims a measured
+# 4% per nextest binary, not the large win it looks like. Worth keeping only
+# because backtraces need file and line, which line tables still carry.
+debug = "line-tables-only"

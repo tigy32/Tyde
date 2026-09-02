@@ -11,6 +11,7 @@ readonly DEV_CHECK_LOG_DIR="target/dev-check-logs"
 readonly DEV_CHECK_LOCK_DIR="target/dev-check.lock"
 readonly DEV_CHECK_LOG_RETENTION=8
 readonly DEV_CHECK_CACHE_RETENTION=16
+readonly DEV_CHECK_SCCACHE_ROOT="${XDG_CACHE_HOME:-$HOME/.cache}/tyde-dev-check-sccache"
 readonly DEV_CHECK_SCCACHE_VERSION="0.16.0"
 readonly DEV_CHECK_SCCACHE_SIZE="10G"
 readonly DEV_CHECK_SCCACHE_SIZE_BYTES=10737418240
@@ -388,18 +389,25 @@ prepare_rust_toolchain() {
 }
 
 set_sccache_environment() {
-    local executable repository_hash port name
+    local executable repository_hash port name common_dir
 
     command -v sccache >/dev/null 2>&1 ||
         die "sccache $DEV_CHECK_SCCACHE_VERSION is required in PATH. Install it with: cargo install sccache --version $DEV_CHECK_SCCACHE_VERSION --locked"
     executable="$(command -v sccache)"
-    repository_hash="$(printf '%s' "$PWD" | hash_text)"
+    # Key the cache by the repository rather than the worktree. sccache is
+    # content-addressed, so every worktree can share one cache; keying by $PWD
+    # instead made each fresh workbench pay a full cold build and multiplied the
+    # size cap by the number of live worktrees.
+    common_dir="$(git rev-parse --git-common-dir 2>/dev/null)" ||
+        die "dev.sh check must run inside a Git repository"
+    common_dir="$(cd "$common_dir" && pwd)"
+    repository_hash="$(printf '%s' "$common_dir" | hash_text)"
     port=$((20000 + 16#${repository_hash:0:8} % 30000))
 
     while IFS= read -r name; do
         [[ "$name" == SCCACHE_* ]] && unset "$name"
     done < <(compgen -e)
-    export SCCACHE_DIR="$PWD/target/dev-check-sccache"
+    export SCCACHE_DIR="$DEV_CHECK_SCCACHE_ROOT/$repository_hash"
     export SCCACHE_CACHE_SIZE="$DEV_CHECK_SCCACHE_SIZE"
     export SCCACHE_IDLE_TIMEOUT=600
     export SCCACHE_SERVER_PORT="$port"
