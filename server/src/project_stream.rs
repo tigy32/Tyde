@@ -1879,6 +1879,16 @@ pub(crate) fn is_not_git_repository_error(error: &str) -> bool {
     error.to_ascii_lowercase().contains("not a git repository")
 }
 
+/// Whether git will place `root` inside a repository. Decided from the
+/// filesystem rather than git's stderr: a damaged repository (unreadable
+/// objects, broken HEAD) also reports "not a git repository", and that is a
+/// failure to surface, not a clean tree.
+pub(crate) fn root_is_git_repository(root: &str) -> bool {
+    Path::new(root)
+        .ancestors()
+        .any(|dir| dir.join(".git").exists())
+}
+
 fn build_git_status_with_runner<F>(
     project: &Project,
     mut run_git: F,

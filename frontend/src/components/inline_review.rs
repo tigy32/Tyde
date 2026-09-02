@@ -926,8 +926,8 @@ pub(crate) fn Composer(
     is_draft: Memo<bool>,
 ) -> impl IntoView {
     let state = expect_context::<AppState>();
-    let body = composer_state.body;
-    let submitted_baseline = composer_state.submitted_baseline;
+    let body = composer_state.body.clone();
+    let submitted_baseline = composer_state.submitted_baseline.clone();
     let location = composer_state.location.clone();
     let host_for_send = host_id.clone();
     let review_for_send = review_id.clone();
@@ -964,6 +964,7 @@ pub(crate) fn Composer(
         let rid = review_id.clone();
         let s = state.clone();
         let target_location = location.clone();
+        let submitted_baseline = submitted_baseline.clone();
         Effect::new(move |_| {
             let Some(baseline) = submitted_baseline.get() else {
                 return;
@@ -990,7 +991,7 @@ pub(crate) fn Composer(
         let review_for_send = review_for_send.clone();
         let location_for_send = location_for_send.clone();
         let state_for_send = state_for_send.clone();
-        let body_for_save = body;
+        let body_for_save = body.clone();
         std::sync::Arc::new(move || {
             let body_text = body_for_save.get_untracked().trim().to_owned();
             if body_text.is_empty() {
@@ -1056,7 +1057,7 @@ pub(crate) fn Composer(
             let _ = el.focus();
         }
     });
-    autosize_textarea(textarea_ref, body);
+    autosize_textarea(textarea_ref, body.clone());
 
     let save_error = {
         let rid = review_id.clone();
@@ -1067,14 +1068,17 @@ pub(crate) fn Composer(
         })
     };
 
+    let body_for_value = body.clone();
+    let body_for_input = body.clone();
+    let body_for_cancel = body.clone();
     view! {
         <div class="review-composer">
             <textarea
                 node_ref=textarea_ref
                 class="review-textarea"
                 placeholder="Comment\u{2026} (\u{2318}/Ctrl+Enter to save, Esc to cancel)"
-                prop:value=move || body.get()
-                on:input=move |ev| body.set(event_target_value(&ev))
+                prop:value=move || body_for_value.get()
+                on:input=move |ev| body_for_input.set(event_target_value(&ev))
                 on:keydown=move |ev: leptos::ev::KeyboardEvent| {
                     if ev.key() == "Escape" {
                         ev.prevent_default();
@@ -1102,7 +1106,7 @@ pub(crate) fn Composer(
                 </button>
                 <button class="review-btn review-composer-cancel"
                         on:click=move |_| {
-                            let body_now = body.get_untracked();
+                            let body_now = body_for_cancel.get_untracked();
                             if body_now.trim().is_empty() {
                                 composer.set(None);
                                 return;
@@ -1266,8 +1270,8 @@ mod wasm_tests {
             provide_context(state.clone());
             let composer_state = ComposerState {
                 location: composer_location.clone(),
-                body: RwSignal::new("draft text".to_owned()),
-                submitted_baseline: RwSignal::new(Some(baseline.clone())),
+                body: ArcRwSignal::new("draft text".to_owned()),
+                submitted_baseline: ArcRwSignal::new(Some(baseline.clone())),
             };
             composer.set(Some(composer_state.clone()));
             let is_draft = Memo::new(move |_| true);
@@ -1332,8 +1336,8 @@ mod wasm_tests {
             provide_context(mounted_state.clone());
             let composer_state = ComposerState {
                 location: location(),
-                body: RwSignal::new("draft text".to_owned()),
-                submitted_baseline: RwSignal::new(Some(Vec::new())),
+                body: ArcRwSignal::new("draft text".to_owned()),
+                submitted_baseline: ArcRwSignal::new(Some(Vec::new())),
             };
             composer.set(Some(composer_state.clone()));
             let is_draft = Memo::new(move |_| true);
@@ -1424,6 +1428,111 @@ mod wasm_tests {
         );
     }
 
+    fn click_selector(container: &HtmlElement, selector: &str) {
+        container
+            .query_selector(selector)
+            .unwrap()
+            .unwrap_or_else(|| panic!("no element matches {selector}"))
+            .dyn_ref::<HtmlElement>()
+            .unwrap()
+            .click();
+    }
+
+    fn composer_textarea(container: &HtmlElement) -> web_sys::HtmlTextAreaElement {
+        container
+            .query_selector(".review-textarea")
+            .unwrap()
+            .expect("composer textarea")
+            .dyn_into::<web_sys::HtmlTextAreaElement>()
+            .unwrap()
+    }
+
+    /// The file header's `+` button creates the composer state inside its
+    /// click handler, so the state's signals were owned by that header
+    /// render. A header re-render while the composer stayed open (a review
+    /// reset re-rendering the diff, a refreshed diff payload) disposed them
+    /// and the next Save read a disposed signal, aborting the whole wasm
+    /// instance. The composer must keep its draft and still save afterwards.
+    #[wasm_bindgen_test]
+    async fn composer_survives_file_header_rerender_before_save() {
+        let _bridge = TauriBridgeGuard::install();
+        let container = make_container();
+        let review = review_with(Vec::new());
+        let rid = review.id.clone();
+        let state = AppState::new();
+        state.reviews.update(|reviews| {
+            reviews.insert(rid.clone(), review);
+        });
+        let composer: RwSignal<Option<ComposerState>> = RwSignal::new(None);
+        let header_generation = RwSignal::new(0u32);
+        let mounted_state = state.clone();
+        let rid_for_mount = rid.clone();
+        let handle = mount_to(container.clone(), move || {
+            provide_context(mounted_state.clone());
+            let is_draft = Memo::new(move |_| true);
+            let header_action = crate::components::review_layer::make_gutter_action_for_file_header(
+                composer,
+                is_draft,
+                protocol::ReviewTarget::UnstagedDiff,
+            );
+            let rid_for_composer = rid_for_mount.clone();
+            view! {
+                <div class="test-file-header">
+                    {move || {
+                        header_generation.get();
+                        header_action(ProjectRootPath("/repo".to_owned()), "src/foo.rs".to_owned())
+                    }}
+                </div>
+                {move || {
+                    let composer_state = composer.get()?;
+                    let review_id = rid_for_composer.clone();
+                    Some(view! {
+                        <Composer
+                            composer=composer
+                            composer_state=composer_state
+                            host_id="h1".to_owned()
+                            review_id=review_id
+                            is_draft=is_draft
+                        />
+                    })
+                }}
+            }
+        });
+        let _mounted = Mounted::new(handle, composer);
+        next_tick().await;
+
+        click_selector(&container, ".review-file-comment-btn");
+        next_tick().await;
+        let textarea = composer_textarea(&container);
+        textarea.set_value("outlives the header");
+        textarea
+            .dispatch_event(&web_sys::Event::new("input").unwrap())
+            .unwrap();
+        next_tick().await;
+
+        header_generation.update(|generation| *generation += 1);
+        next_tick().await;
+        assert_eq!(
+            composer_textarea(&container).value(),
+            "outlives the header",
+            "the draft must survive the header that opened it re-rendering"
+        );
+
+        click_selector(&container, ".review-composer-save");
+        assert!(
+            state
+                .review_action_target_pending
+                .with_untracked(|pending| {
+                    pending.contains(&(rid.clone(), ReviewActionTarget::AddComment))
+                }),
+            "save must dispatch from the surviving composer body"
+        );
+        assert!(
+            composer.get_untracked().is_some(),
+            "composer stays open until the server echoes the comment"
+        );
+    }
+
     #[wasm_bindgen_test]
     async fn regular_file_composer_closes_on_server_revision_echo() {
         let _bridge = TauriBridgeGuard::install();
@@ -1448,8 +1557,8 @@ mod wasm_tests {
             provide_context(state);
             let composer_state = ComposerState {
                 location: requested_for_mount.clone(),
-                body: RwSignal::new("regular draft".to_owned()),
-                submitted_baseline: RwSignal::new(None),
+                body: ArcRwSignal::new("regular draft".to_owned()),
+                submitted_baseline: ArcRwSignal::new(None),
             };
             composer.set(Some(composer_state.clone()));
             let is_draft = Memo::new(move |_| true);

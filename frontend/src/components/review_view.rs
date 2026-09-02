@@ -69,7 +69,10 @@ pub(crate) fn format_relative_time(timestamp_ms: u64) -> String {
 /// height is capped to keep extremely long bodies from eating the
 /// composer area entirely; users can still scroll inside the textarea
 /// past the cap.
-pub(crate) fn autosize_textarea(node_ref: NodeRef<leptos::html::Textarea>, body: RwSignal<String>) {
+pub(crate) fn autosize_textarea(
+    node_ref: NodeRef<leptos::html::Textarea>,
+    body: impl Get<Value = String> + 'static,
+) {
     Effect::new(move |_| {
         let _ = body.get();
         if let Some(el) = node_ref.get() {

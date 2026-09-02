@@ -128,7 +128,7 @@ use crate::mobile_access::{
 };
 use crate::project_stream::{
     ProjectDiffRequestKey, ProjectFileDelivery, ProjectStreamHandle, ProjectStreamSubscription,
-    SearchSummary, build_dir_listing, commit, discard_file, is_not_git_repository_error, read_diff,
+    SearchSummary, build_dir_listing, commit, discard_file, read_diff, root_is_git_repository,
     search_project, spawn_project_subscription, stage_file, stage_hunk, unstage_file,
 };
 use crate::review::actor::{ReviewAiSpawnRequest, ReviewDeliveryOutcome, ReviewDeliveryRequest};
@@ -12870,6 +12870,9 @@ fn read_review_diffs(
         ReviewDiffSelection::AllUncommitted | ReviewDiffSelection::Workspace { .. } => {
             let mut diffs = Vec::new();
             for root in project.root_paths() {
+                if !root_is_git_repository(&root.0) {
+                    continue;
+                }
                 let payload = ProjectReadDiffPayload {
                     request_id: None,
                     root,
@@ -12878,15 +12881,14 @@ fn read_review_diffs(
                     path: None,
                     context_mode: protocol::DiffContextMode::FullFile,
                 };
-                match read_diff(project, payload) {
-                    Ok(diff) => diffs.push(diff),
-                    Err(error) if is_not_git_repository_error(&error) => {}
-                    Err(error) => return Err(error),
-                }
+                diffs.push(read_diff(project, payload)?);
             }
             Ok(diffs)
         }
         ReviewDiffSelection::Root { root, path, .. } => {
+            if !root_is_git_repository(&root.0) {
+                return Ok(Vec::new());
+            }
             let payload = ProjectReadDiffPayload {
                 request_id: None,
                 root: root.clone(),
@@ -12895,11 +12897,7 @@ fn read_review_diffs(
                 path: path.clone(),
                 context_mode: protocol::DiffContextMode::FullFile,
             };
-            match read_diff(project, payload) {
-                Ok(diff) => Ok(vec![diff]),
-                Err(error) if is_not_git_repository_error(&error) => Ok(Vec::new()),
-                Err(error) => Err(error),
-            }
+            Ok(vec![read_diff(project, payload)?])
         }
         ReviewDiffSelection::CommittedRange {
             root,

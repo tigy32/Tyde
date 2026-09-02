@@ -2467,6 +2467,84 @@ async fn review_resets_when_unstaged_diff_becomes_clean_with_staged_changes() {
     assert!(snapshot.diffs.is_empty());
 }
 
+/// A working tree git cannot read is not a clean working tree. A damaged
+/// repository makes git report "not a git repository", which used to make the
+/// refresh treat the root as non-git, see zero diffs, and reset the review,
+/// wiping its comments. The refresh must fail visibly and keep the review
+/// intact until git works again.
+#[tokio::test]
+async fn review_keeps_comments_when_git_cannot_read_the_repository() {
+    use std::os::unix::fs::PermissionsExt;
+
+    struct RestorePermissions {
+        path: std::path::PathBuf,
+        permissions: fs::Permissions,
+    }
+
+    impl Drop for RestorePermissions {
+        fn drop(&mut self) {
+            fs::set_permissions(&self.path, self.permissions.clone())
+                .expect("restore objects permissions");
+        }
+    }
+
+    let fixture = Fixture::new().await;
+    let mut client = fixture.client;
+    let root = tempfile::tempdir().expect("temp root");
+    let repo = root.path().join("review-root");
+    fs::create_dir_all(&repo).expect("create repo");
+    seed_repo(&repo);
+
+    let project = create_project(&mut client, &repo).await;
+    let (agent, _session_id) = spawn_project_agent(&mut client, &project).await;
+    let review = create_review(&mut client, &project, &agent).await;
+    let comment_id = add_comment(&mut client, &review, "Survives a git outage.").await;
+
+    let objects = repo.join(".git/objects");
+    let restore = RestorePermissions {
+        path: objects.clone(),
+        permissions: fs::metadata(&objects)
+            .expect("objects metadata")
+            .permissions(),
+    };
+    fs::set_permissions(&objects, fs::Permissions::from_mode(0o000))
+        .expect("make objects unreadable");
+
+    client
+        .review_action(
+            &review.id,
+            ReviewActionPayload::AddComment {
+                location: new_line_location(&review),
+                body: "Rejected while git is down.".to_owned(),
+            },
+        )
+        .await
+        .expect("add comment while git is down");
+    expect_review_error(
+        &mut client,
+        "add comment while git is down",
+        ReviewErrorCode::GitFailed,
+    )
+    .await;
+    drop(restore);
+
+    let snapshot = subscribe_review(&mut client, &review.id).await;
+    assert!(matches!(snapshot.status, ReviewStatus::Draft));
+    assert_eq!(
+        snapshot
+            .comments
+            .iter()
+            .map(|comment| comment.id.clone())
+            .collect::<Vec<_>>(),
+        vec![comment_id],
+        "a git failure must not reset the review"
+    );
+    assert!(
+        !snapshot.diffs.is_empty(),
+        "the working tree is still dirty once git can read it again"
+    );
+}
+
 #[tokio::test]
 async fn ai_reviewer_propose_tool_accepts_and_rejects_suggestions() {
     let fixture = Fixture::new().await;

@@ -20,7 +20,7 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 use uuid::Uuid;
 
 use crate::agent::now_ms;
-use crate::project_stream::{committed_range_commit_count, is_not_git_repository_error, read_diff};
+use crate::project_stream::{committed_range_commit_count, read_diff, root_is_git_repository};
 use crate::review::bundle::ReviewFeedbackBundle;
 use crate::store::project::ProjectStore;
 use crate::store::review::ReviewStore;
@@ -2212,6 +2212,9 @@ fn read_review_diffs(
         ReviewDiffSelection::AllUncommitted | ReviewDiffSelection::Workspace { .. } => {
             let mut diffs = Vec::new();
             for root in project.root_paths() {
+                if !root_is_git_repository(&root.0) {
+                    continue;
+                }
                 let unstaged = ProjectReadDiffPayload {
                     request_id: None,
                     root: root.clone(),
@@ -2220,11 +2223,7 @@ fn read_review_diffs(
                     path: None,
                     context_mode: DiffContextMode::FullFile,
                 };
-                match read_diff(project, unstaged) {
-                    Ok(diff) => diffs.push(diff),
-                    Err(error) if is_not_git_repository_error(&error) => continue,
-                    Err(error) => return Err(error),
-                }
+                diffs.push(read_diff(project, unstaged)?);
                 let staged = ProjectReadDiffPayload {
                     request_id: None,
                     root,
@@ -2233,17 +2232,17 @@ fn read_review_diffs(
                     path: None,
                     context_mode: DiffContextMode::FullFile,
                 };
-                match read_diff(project, staged) {
-                    Ok(diff) if !diff.files.is_empty() => diffs.push(diff),
-                    Ok(_) => {}
-                    Err(error) if is_not_git_repository_error(&error) => {}
-                    Err(error) => return Err(error),
+                let staged = read_diff(project, staged)?;
+                if !staged.files.is_empty() {
+                    diffs.push(staged);
                 }
             }
             Ok(diffs)
         }
         ReviewDiffSelection::Root { root, path, .. } => {
-            let mut diffs = Vec::new();
+            if !root_is_git_repository(&root.0) {
+                return Ok(Vec::new());
+            }
             let unstaged = ProjectReadDiffPayload {
                 request_id: None,
                 root: root.clone(),
@@ -2252,11 +2251,7 @@ fn read_review_diffs(
                 path: path.clone(),
                 context_mode: DiffContextMode::FullFile,
             };
-            match read_diff(project, unstaged) {
-                Ok(diff) => diffs.push(diff),
-                Err(error) if is_not_git_repository_error(&error) => return Ok(Vec::new()),
-                Err(error) => return Err(error),
-            }
+            let mut diffs = vec![read_diff(project, unstaged)?];
             let staged = ProjectReadDiffPayload {
                 request_id: None,
                 root: root.clone(),
@@ -2265,11 +2260,9 @@ fn read_review_diffs(
                 path: path.clone(),
                 context_mode: DiffContextMode::FullFile,
             };
-            match read_diff(project, staged) {
-                Ok(diff) if !diff.files.is_empty() => diffs.push(diff),
-                Ok(_) => {}
-                Err(error) if is_not_git_repository_error(&error) => {}
-                Err(error) => return Err(error),
+            let staged = read_diff(project, staged)?;
+            if !staged.files.is_empty() {
+                diffs.push(staged);
             }
             Ok(diffs)
         }

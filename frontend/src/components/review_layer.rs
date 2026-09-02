@@ -42,7 +42,12 @@ use protocol::{
 #[derive(Clone, Debug)]
 pub(crate) struct ComposerState {
     pub(crate) location: ReviewLocation,
-    pub(crate) body: RwSignal<String>,
+    /// `Arc` signals: the state is created inside the gutter/header click
+    /// handlers, whose reactive owner is the rendered header row. A header
+    /// re-render while the composer stays open (review reset, refreshed
+    /// diff) would dispose arena signals and the next Save would abort the
+    /// wasm instance.
+    pub(crate) body: ArcRwSignal<String>,
     /// Snapshot of the User-comment ids already at `location` captured the
     /// moment a save is dispatched. `None` until the first save.
     ///
@@ -54,7 +59,7 @@ pub(crate) struct ComposerState {
     /// `CommentUpsert` that clears the pending gate would otherwise miss the
     /// gate's falling edge and leave the composer stuck open with its body
     /// text intact.
-    pub(crate) submitted_baseline: RwSignal<Option<Vec<ReviewCommentId>>>,
+    pub(crate) submitted_baseline: ArcRwSignal<Option<Vec<ReviewCommentId>>>,
 }
 
 /// Live state of an in-progress click+drag line-range selection on the
@@ -276,8 +281,8 @@ pub(crate) fn install_drag_listeners(
                         end_line: end,
                     },
                 },
-                body: RwSignal::new(String::new()),
-                submitted_baseline: RwSignal::new(None),
+                body: ArcRwSignal::new(String::new()),
+                submitted_baseline: ArcRwSignal::new(None),
             }));
             drag_selection.set(None);
         });
@@ -427,8 +432,8 @@ pub(crate) fn make_gutter_action_for_file_header(
                             target: click_target.clone(),
                             anchor: ReviewAnchor::File,
                         },
-                        body: RwSignal::new(String::new()),
-                        submitted_baseline: RwSignal::new(None),
+                        body: ArcRwSignal::new(String::new()),
+                        submitted_baseline: ArcRwSignal::new(None),
                     }));
                 }
             >
