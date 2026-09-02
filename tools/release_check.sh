@@ -112,6 +112,8 @@ log "Checking web deploy shell syntax"
 bash -n web/deploy/deploy.sh
 
 log "Checking mobile web bundle builder syntax"
+[[ -x tools/build-mobile-web-bundle.sh ]] || \
+    die "tools/build-mobile-web-bundle.sh must be executable for release runners"
 bash -n tools/build-mobile-web-bundle.sh
 
 TEMP_DIR="$(mktemp -d)"

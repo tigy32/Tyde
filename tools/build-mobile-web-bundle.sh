@@ -31,6 +31,11 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 readonly SCRIPT_DIR REPO_ROOT
 readonly LOADER_DIR="${REPO_ROOT}/web/loader"
 readonly PREFIX="tyde"
+# Git Bash must leave served URL arguments as URLs while still translating the
+# filesystem arguments passed to native Windows programs.
+MSYS2_URL_ARG_EXCLUSION="${MSYS2_ARG_CONV_EXCL:+${MSYS2_ARG_CONV_EXCL};}"
+MSYS2_URL_ARG_EXCLUSION+="/${PREFIX}"
+readonly MSYS2_URL_ARG_EXCLUSION
 
 die() { echo "build-mobile-web-bundle: $*" >&2; exit 1; }
 log() { echo "build-mobile-web-bundle: $*" >&2; }
@@ -94,7 +99,8 @@ rm -rf "${OUT_DIR:?}"/*
 #    from, or the loader's absolute asset URLs miss.
 (
   cd "${REPO_ROOT}/mobile-frontend"
-  env -u NO_COLOR trunk build --release \
+  env -u NO_COLOR MSYS2_ARG_CONV_EXCL="${MSYS2_URL_ARG_EXCLUSION}" \
+    trunk build --release \
     --public-url "/${PREFIX}/v${VERSION}/" \
     --dist "${BUNDLE_DIR}" \
     "${REPO_ROOT}/mobile-frontend/index.html"
@@ -125,6 +131,7 @@ log "copying loader shell"
 #    authority the loader checks every executable artifact against, so it must
 #    be generated from this bundle and not copied from the checkout.
 log "generating manifest"
+MSYS2_ARG_CONV_EXCL="${MSYS2_URL_ARG_EXCLUSION}" \
 node "${REPO_ROOT}/web/deploy/generate-manifest.mjs" \
   --dist "${BUNDLE_DIR}" \
   --version "${VERSION}" \
