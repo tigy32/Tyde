@@ -61,13 +61,20 @@ pub fn pinned_models(backend: BackendKind) -> Vec<String> {
         BackendKind::Claude => vec!["haiku".to_owned(), "claude-haiku-4-5-20251001".to_owned()],
         // `codex.rs` documents this variable: pinning a different model without
         // a rebuild is how you tell model-specific drift from a real defect.
-        BackendKind::Codex => vec![if LEGACY_CODEX_DYNAMIC_AWAIT_ACTIVE.load(Ordering::Relaxed)
-            || CODEX_NESTED_SUBAGENT_ACTIVE.load(Ordering::Relaxed)
-        {
-            "gpt-5.6-sol".to_owned()
-        } else {
-            env_or("TYDE_CODEX_TEST_MODEL", "gpt-5.6-luna")
-        }],
+        BackendKind::Codex => vec![
+            std::env::var("TYDE_CODEX_TEST_MODEL")
+                .ok()
+                .filter(|model| !model.trim().is_empty())
+                .unwrap_or_else(|| {
+                    if LEGACY_CODEX_DYNAMIC_AWAIT_ACTIVE.load(Ordering::Relaxed)
+                        || CODEX_NESTED_SUBAGENT_ACTIVE.load(Ordering::Relaxed)
+                    {
+                        "gpt-5.6-sol".to_owned()
+                    } else {
+                        "gpt-5.6-luna".to_owned()
+                    }
+                }),
+        ],
         _ => Vec::new(),
     }
 }
@@ -999,6 +1006,110 @@ pub async fn ask(host: &mut Host, agent: &Agent, prompt: impl AsRef<str>) -> Tur
         .await
         .expect("send_message failed");
     collect_turn(host, agent, prompt).await
+}
+
+pub struct FinalResponseSettlement {
+    turn: Turn,
+    settled_in: Option<Duration>,
+}
+
+impl FinalResponseSettlement {
+    pub fn turn(&self) -> &Turn {
+        &self.turn
+    }
+
+    pub fn settled_in(&self) -> Option<Duration> {
+        self.settled_in
+    }
+}
+
+pub async fn ask_through_final_response(
+    host: &mut Host,
+    agent: &Agent,
+    prompt: &str,
+    final_marker: &str,
+    settle_window: Duration,
+) -> FinalResponseSettlement {
+    let backend = host.backend_kind;
+    let label = backend_label(backend);
+    let context = format!("{label} final-response turn for prompt {prompt:?}");
+    host.client
+        .send_message(&agent.stream, prompt.to_owned())
+        .await
+        .expect("send_message failed");
+
+    let mut events = Vec::new();
+    let mut saw_echo = false;
+    let mut saw_final_response = false;
+    let mut final_response_at = None;
+    loop {
+        let timeout = final_response_at
+            .map(|at: tokio::time::Instant| {
+                (at + settle_window).saturating_duration_since(tokio::time::Instant::now())
+            })
+            .unwrap_or(Duration::from_secs(240));
+        if timeout.is_zero() {
+            return FinalResponseSettlement {
+                turn: Turn {
+                    backend,
+                    prompt: prompt.to_owned(),
+                    events,
+                    activity_stats: Vec::new(),
+                },
+                settled_in: None,
+            };
+        }
+        let envelope = match tokio::time::timeout(timeout, host.client.next_event()).await {
+            Ok(Ok(Some(envelope))) => envelope,
+            Ok(Ok(None)) => panic!("{context}: event stream closed"),
+            Ok(Err(error)) => panic!("{context}: next_event failed: {error:?}"),
+            Err(_) if saw_final_response => {
+                return FinalResponseSettlement {
+                    turn: Turn {
+                        backend,
+                        prompt: prompt.to_owned(),
+                        events,
+                        activity_stats: Vec::new(),
+                    },
+                    settled_in: None,
+                };
+            }
+            Err(_) => panic!("{context}: final response did not arrive"),
+        };
+        fail_on_agent_error(&envelope, &context);
+        fail_on_client_error(&envelope, &context);
+        if envelope.stream != agent.stream {
+            continue;
+        }
+        for event in chat_events_in(&envelope) {
+            eprintln!("{label} {event:?}");
+            if is_user_echo(&event, prompt) {
+                saw_echo = true;
+            }
+            if !saw_echo {
+                continue;
+            }
+            if matches!(&event, ChatEvent::StreamEnd(end)
+                if end.message.content.contains(final_marker))
+            {
+                saw_final_response = true;
+                final_response_at = Some(tokio::time::Instant::now());
+            }
+            let idle = matches!(event, ChatEvent::TypingStatusChanged(false));
+            events.push(event);
+            if saw_final_response && idle {
+                return FinalResponseSettlement {
+                    turn: Turn {
+                        backend,
+                        prompt: prompt.to_owned(),
+                        events,
+                        activity_stats: Vec::new(),
+                    },
+                    settled_in: final_response_at.map(|at| at.elapsed()),
+                };
+            }
+        }
+    }
 }
 
 pub async fn ask_with_images(

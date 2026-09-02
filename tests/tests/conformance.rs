@@ -120,6 +120,7 @@ const CHILD_NAME: &str = "tyde-conformance-child";
 const SPAWNED_MARKER: &str = "TYDE_SPAWNED";
 const CHILD_DONE_MARKER: &str = "TYDE_CHILD_DONE";
 const AWAITED_MARKER: &str = "TYDE_AWAITED";
+const ABANDONED_AWAIT_MARKER: &str = "TYDE_ABANDONED_AWAIT_FINAL";
 
 /// Lines of filler the planted-payload turn carries, and the token floor that
 /// block has to move the reported input by.
@@ -2211,6 +2212,29 @@ fn real_agent_await_survives_a_resumed_session() {
             assert_no_provider_continuation_after_idle(&awaited.label(), &after_idle);
             assert_no_await_unavailable_warning(&[&launched, &spawned, &awaited]);
 
+            if host.backend() == BackendKind::Codex {
+                let prompt = abandoned_child_await_prompt(&child_id);
+                let abandoned = ask_through_final_response(
+                    &mut host,
+                    &resumed,
+                    &prompt,
+                    ABANDONED_AWAIT_MARKER,
+                    Duration::from_secs(10),
+                )
+                .await;
+                assert_orphaned_await_shape(abandoned.turn());
+                assert_final_text_contains(abandoned.turn(), ABANDONED_AWAIT_MARKER);
+                assert!(
+                    abandoned.settled_in().is_some(),
+                    "{}: Codex produced its marked final response but did not report idle within \
+                     10 seconds; completions: {:?}",
+                    abandoned.turn().label(),
+                    abandoned.turn().completion_summaries(),
+                );
+                assert_abandoned_await_was_cancelled(abandoned.turn());
+                assert_universal_contract(std::slice::from_ref(abandoned.turn()));
+            }
+
             assert_universal_contract(&[launched, spawned, child, awaited]);
             assert_clean_close(&mut host, &resumed).await;
         },
@@ -2312,6 +2336,50 @@ fn busy_child_await_prompt(backend: BackendKind, child_id: &protocol::AgentId) -
         ),
         _ => common,
     }
+}
+
+fn abandoned_child_await_prompt(child_id: &protocol::AgentId) -> String {
+    let child_task = "Run this exact foreground shell command and wait for it to finish: \
+        python3 -c \"import time; time.sleep(75); print('CHILD_READY')\". Then reply with exactly \
+        CHILD_READY and nothing else.";
+    format!(
+        "Use the Tyde agent-control tool whose name ends in `tyde_send_agent_message`, exactly \
+         once, passing agent_id \"{child_id}\" and this exact message: `{child_task}`. Then use \
+         one functions.exec code-mode cell to execute exactly this JavaScript:\n\nconst abandoned = \
+         tools.mcp__tyde_agent_await__tyde_await_agents({{agent_ids:[\"{child_id}\"]}});\nawait \
+         new Promise(resolve => setTimeout(resolve, 1000));\ntext(\"AWAIT_STARTED\");\n\nDo \
+         not await `abandoned`, do not call functions.wait, and do not call any other tool. When \
+         that cell returns, immediately reply with exactly {ABANDONED_AWAIT_MARKER} and nothing \
+         else."
+    )
+}
+
+fn assert_abandoned_await_was_cancelled(turn: &Turn) {
+    let await_request = turn
+        .tool_requests()
+        .find(|request| {
+            turn.declared_name(&request.tool_call_id)
+                .is_some_and(|name| name.contains("tyde_await_agents"))
+        })
+        .unwrap_or_else(|| panic!("{}: missing abandoned await request", turn.label()));
+    let completions = turn
+        .tool_completions()
+        .filter(|completion| completion.tool_call_id == await_request.tool_call_id)
+        .collect::<Vec<_>>();
+    let [completion] = completions.as_slice() else {
+        panic!(
+            "{}: abandoned await has {} completions, expected exactly one: {:?}",
+            turn.label(),
+            completions.len(),
+            turn.completion_summaries(),
+        );
+    };
+    assert!(
+        matches!(&completion.outcome, ToolExecutionOutcome::Cancelled { .. }),
+        "{}: abandoned await completed as {:?}, expected cancellation",
+        turn.label(),
+        completion.outcome,
+    );
 }
 
 /// The malformed-event regression is vacuous unless the provider actually

@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet, VecDeque, hash_map::Entry};
 use std::ffi::OsString;
-use std::io::Read;
+use std::io::{Read, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -12,7 +12,7 @@ use command_group::{AsyncCommandGroup, AsyncGroupChild};
 use indexmap::IndexMap;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader};
 use tokio::process::{ChildStdin, Command};
 use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
@@ -83,6 +83,8 @@ const MAX_CODEX_LATE_SUPERSEDED_BYTES: usize = 64 * 1024;
 const CODEX_SUPERSESSION_WARNING: &str = "Codex restarted part of its response mid-turn. \
 The partial output above was kept and the turn continued.";
 const CODEX_SKILLS_ROOT_PREFIX: &str = "tyde-codex-skills-";
+const CODEX_ROLLOUT_TRACE_ROOT_PREFIX: &str = "tyde-codex-rollout-trace-";
+const CODEX_ROLLOUT_TRACE_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const CODEX_SKILL_MANIFEST_MAX_ENTRIES: usize = 100_000;
 const CODEX_SKILL_MANIFEST_MAX_BYTES: u64 = 1024 * 1024 * 1024;
 #[cfg(feature = "test-support")]
@@ -4002,6 +4004,13 @@ struct CodexCommandTermination {
     tool_call_id: String,
 }
 
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+struct CodexCodeCellKey {
+    thread_id: String,
+    turn_id: String,
+    runtime_cell_id: String,
+}
+
 impl CodexBackgroundCommand {
     fn progress(&self) -> ToolProgressData {
         ToolProgressData {
@@ -4095,6 +4104,8 @@ struct CodexState {
     raw_contract_drift_warned: bool,
     tool_container_images: Vec<protocol::ImageData>,
     cancelled_tool_call_ids: HashSet<String>,
+    code_cell_tools: HashMap<CodexCodeCellKey, HashSet<String>>,
+    code_cell_by_tool: HashMap<String, CodexCodeCellKey>,
     /// A provider turn reached `turn/completed` while explicitly foreground
     /// tool requests were still open. The presentation remains active until
     /// those real requests complete, unless another turn starts first and
@@ -4179,6 +4190,8 @@ fn initial_codex_state(
         raw_contract_drift_warned: false,
         tool_container_images: Vec::new(),
         cancelled_tool_call_ids: HashSet::new(),
+        code_cell_tools: HashMap::new(),
+        code_cell_by_tool: HashMap::new(),
         close_active_stream_when_tools_idle: false,
         pending_message_metadata: None,
         completed_message_metadata_by_turn: HashMap::new(),
@@ -8242,6 +8255,15 @@ impl CodexInner {
                     self.emitter.subprocess_stderr(&line);
                 }
             }
+            CodexInbound::RolloutTrace(event) => {
+                self.handle_rollout_trace_event(event).await;
+            }
+            CodexInbound::RolloutTraceError(error) => {
+                tracing::error!(error, "Codex rollout trace reader stopped");
+                self.emitter.subprocess_stderr(&format!(
+                    "Codex rollout trace is unavailable; exact code-mode tool ownership cannot be reconciled: {error}"
+                ));
+            }
             CodexInbound::Closed { exit_code } => {
                 self.finalize_all_incomplete_strict_responses(
                     "Codex transport closed before rawResponse/completed",
@@ -8269,6 +8291,90 @@ impl CodexInner {
             }
             CodexInbound::ServerRequest { id, method, params } => {
                 self.handle_server_request(id, &method, &params).await;
+            }
+        }
+    }
+
+    async fn handle_rollout_trace_event(&self, event: CodexRolloutTraceEvent) {
+        match event {
+            CodexRolloutTraceEvent::ToolStarted {
+                owner,
+                tool_call_id,
+            } => {
+                let mut state = self.state.lock().await;
+                if let Some(previous) = state
+                    .code_cell_by_tool
+                    .insert(tool_call_id.clone(), owner.clone())
+                    && previous != owner
+                {
+                    tracing::error!(
+                        tool_call_id,
+                        "Codex rollout trace reassigned a live tool to another code cell"
+                    );
+                    return;
+                }
+                state
+                    .code_cell_tools
+                    .entry(owner)
+                    .or_default()
+                    .insert(tool_call_id);
+            }
+            CodexRolloutTraceEvent::ToolEnded { tool_call_id } => {
+                let mut state = self.state.lock().await;
+                let Some(owner) = state.code_cell_by_tool.remove(&tool_call_id) else {
+                    return;
+                };
+                if let Some(tools) = state.code_cell_tools.get_mut(&owner) {
+                    tools.remove(&tool_call_id);
+                    if tools.is_empty() {
+                        state.code_cell_tools.remove(&owner);
+                    }
+                }
+            }
+            CodexRolloutTraceEvent::CodeCellEnded { owner } => {
+                let abandoned = {
+                    let mut state = self.state.lock().await;
+                    let Some(tool_call_ids) = state.code_cell_tools.remove(&owner) else {
+                        return;
+                    };
+                    tool_call_ids
+                        .into_iter()
+                        .map(|provider_tool_call_id| {
+                            state.code_cell_by_tool.remove(&provider_tool_call_id);
+                            let tool_call_id = format!(
+                                "codex:{}:{}:{}",
+                                owner.thread_id, owner.turn_id, provider_tool_call_id
+                            );
+                            state.pending_tool_call_ids.remove(&tool_call_id);
+                            state.cancelled_tool_call_ids.insert(tool_call_id.clone());
+                            tool_call_id
+                        })
+                        .collect::<Vec<_>>()
+                };
+                let Some(emitter) = self.background_progress_emitter(&owner.thread_id).await else {
+                    return;
+                };
+                for tool_call_id in abandoned {
+                    tracing::warn!(
+                        thread_id = owner.thread_id,
+                        turn_id = owner.turn_id,
+                        runtime_cell_id = owner.runtime_cell_id,
+                        tool_call_id,
+                        "Codex code-mode program exited with an owned tool still open"
+                    );
+                    self.emit_or_defer_tool_completion(
+                        &owner.thread_id,
+                        &emitter,
+                        &tool_call_id,
+                        ToolExecutionOutcome::Cancelled {
+                            message:
+                                "Tool call was abandoned when its owning code-mode program exited"
+                                    .to_owned(),
+                        },
+                    )
+                    .await;
+                    self.mark_tool_completed(&tool_call_id).await;
+                }
             }
         }
     }
@@ -17759,9 +17865,173 @@ enum CodexInbound {
         params: Value,
     },
     Stderr(String),
+    RolloutTrace(CodexRolloutTraceEvent),
+    RolloutTraceError(String),
     Closed {
         exit_code: Option<i32>,
     },
+}
+
+#[derive(Clone)]
+enum CodexRolloutTraceEvent {
+    ToolStarted {
+        owner: CodexCodeCellKey,
+        tool_call_id: String,
+    },
+    ToolEnded {
+        tool_call_id: String,
+    },
+    CodeCellEnded {
+        owner: CodexCodeCellKey,
+    },
+}
+
+#[derive(Default)]
+struct CodexRolloutTraceCursor {
+    offset: u64,
+    buffered: Vec<u8>,
+}
+
+fn codex_rollout_trace_event(line: &[u8]) -> Result<Option<CodexRolloutTraceEvent>, String> {
+    let record: Value =
+        serde_json::from_slice(line).map_err(|error| format!("invalid JSON record: {error}"))?;
+    if record.get("schema_version").and_then(Value::as_u64) != Some(1) {
+        return Err(format!(
+            "unsupported schema_version {:?}",
+            record.get("schema_version")
+        ));
+    }
+    let Some(payload) = record.get("payload") else {
+        return Ok(None);
+    };
+    let Some(event_type) = payload.get("type").and_then(Value::as_str) else {
+        return Ok(None);
+    };
+    match event_type {
+        "tool_call_started"
+            if payload
+                .get("requester")
+                .and_then(|requester| requester.get("type"))
+                .and_then(Value::as_str)
+                == Some("code_cell") =>
+        {
+            let owner = codex_rollout_code_cell_key(&record, payload)?;
+            let tool_call_id = payload
+                .get("tool_call_id")
+                .and_then(Value::as_str)
+                .ok_or("tool_call_started record missing tool_call_id")?
+                .to_owned();
+            Ok(Some(CodexRolloutTraceEvent::ToolStarted {
+                owner,
+                tool_call_id,
+            }))
+        }
+        "tool_call_ended" => {
+            let tool_call_id = payload
+                .get("tool_call_id")
+                .and_then(Value::as_str)
+                .ok_or("tool_call_ended record missing tool_call_id")?
+                .to_owned();
+            Ok(Some(CodexRolloutTraceEvent::ToolEnded { tool_call_id }))
+        }
+        "code_cell_ended" => Ok(Some(CodexRolloutTraceEvent::CodeCellEnded {
+            owner: codex_rollout_code_cell_key(&record, payload)?,
+        })),
+        _ => Ok(None),
+    }
+}
+
+fn codex_rollout_code_cell_key(
+    record: &Value,
+    payload: &Value,
+) -> Result<CodexCodeCellKey, String> {
+    let runtime_cell_id = payload
+        .get("runtime_cell_id")
+        .or_else(|| {
+            payload
+                .get("requester")
+                .and_then(|requester| requester.get("runtime_cell_id"))
+        })
+        .and_then(Value::as_str)
+        .ok_or("rollout trace record missing runtime_cell_id")?;
+    Ok(CodexCodeCellKey {
+        thread_id: record
+            .get("thread_id")
+            .and_then(Value::as_str)
+            .ok_or("rollout trace record missing thread_id")?
+            .to_owned(),
+        turn_id: record
+            .get("codex_turn_id")
+            .and_then(Value::as_str)
+            .ok_or("rollout trace record missing codex_turn_id")?
+            .to_owned(),
+        runtime_cell_id: runtime_cell_id.to_owned(),
+    })
+}
+
+async fn forward_codex_rollout_trace(root: PathBuf, inbound: mpsc::UnboundedSender<CodexInbound>) {
+    let mut cursors = HashMap::<PathBuf, CodexRolloutTraceCursor>::new();
+    loop {
+        if let Err(error) = read_codex_rollout_trace(&root, &inbound, &mut cursors).await {
+            let _ = inbound.send(CodexInbound::RolloutTraceError(error));
+            return;
+        }
+        tokio::time::sleep(CODEX_ROLLOUT_TRACE_POLL_INTERVAL).await;
+    }
+}
+
+async fn read_codex_rollout_trace(
+    root: &Path,
+    inbound: &mpsc::UnboundedSender<CodexInbound>,
+    cursors: &mut HashMap<PathBuf, CodexRolloutTraceCursor>,
+) -> Result<(), String> {
+    let mut entries = tokio::fs::read_dir(root)
+        .await
+        .map_err(|error| format!("failed to read {}: {error}", root.display()))?;
+    while let Some(entry) = entries
+        .next_entry()
+        .await
+        .map_err(|error| format!("failed to enumerate {}: {error}", root.display()))?
+    {
+        let trace_path = entry.path().join("trace.jsonl");
+        let Ok(metadata) = tokio::fs::metadata(&trace_path).await else {
+            continue;
+        };
+        let cursor = cursors.entry(trace_path.clone()).or_default();
+        if metadata.len() < cursor.offset {
+            return Err(format!(
+                "rollout trace was truncated after Tyde read it: {}",
+                trace_path.display()
+            ));
+        }
+        if metadata.len() == cursor.offset {
+            continue;
+        }
+        let mut file = tokio::fs::File::open(&trace_path)
+            .await
+            .map_err(|error| format!("failed to open {}: {error}", trace_path.display()))?;
+        file.seek(SeekFrom::Start(cursor.offset))
+            .await
+            .map_err(|error| format!("failed to seek {}: {error}", trace_path.display()))?;
+        let bytes_read = file
+            .read_to_end(&mut cursor.buffered)
+            .await
+            .map_err(|error| format!("failed to read {}: {error}", trace_path.display()))?;
+        cursor.offset = cursor.offset.saturating_add(bytes_read as u64);
+        while let Some(newline) = cursor.buffered.iter().position(|byte| *byte == b'\n') {
+            let mut line = cursor.buffered.drain(..=newline).collect::<Vec<_>>();
+            line.pop();
+            if line.is_empty() {
+                continue;
+            }
+            if let Some(event) = codex_rollout_trace_event(&line)?
+                && inbound.send(CodexInbound::RolloutTrace(event)).is_err()
+            {
+                return Ok(());
+            }
+        }
+    }
+    Ok(())
 }
 
 fn codex_nested_generic_tool_notification(
@@ -18032,6 +18302,8 @@ struct CodexRpc {
     child: Arc<Mutex<Option<AsyncGroupChild>>>,
     stdout_task: JoinHandle<()>,
     stderr_task: JoinHandle<()>,
+    rollout_trace_task: Option<JoinHandle<()>>,
+    rollout_trace_root: Option<tempfile::TempDir>,
     compaction_capability: Arc<std::sync::Mutex<BackendCompactionCapability>>,
 }
 
@@ -18039,6 +18311,15 @@ impl CodexRpc {
     fn abort_readers(&self) {
         self.stdout_task.abort();
         self.stderr_task.abort();
+        if let Some(task) = &self.rollout_trace_task {
+            task.abort();
+        }
+        if let Some(root) = &self.rollout_trace_root {
+            tracing::debug!(
+                path = %root.path().display(),
+                "discarding private Codex rollout trace"
+            );
+        }
     }
 
     async fn spawn(
@@ -18072,6 +18353,10 @@ impl CodexRpc {
         }
         let mut config_overrides =
             codex_mcp_config_overrides(startup_mcp_servers, ssh_host.is_none());
+        if execution_mode == BackendExecutionMode::Agent {
+            config_overrides.push("features.multi_agent_v2=true".to_owned());
+            config_overrides.push("tools.update_plan.enabled=true".to_owned());
+        }
         if execution_mode == BackendExecutionMode::InferenceOnly {
             config_overrides.extend(codex_inference_config_overrides());
         }
@@ -18081,6 +18366,18 @@ impl CodexRpc {
                 toml_quoted(&path.display().to_string())
             ));
         }
+        let rollout_trace_root = if ssh_host.is_none()
+            && execution_mode == BackendExecutionMode::Agent
+        {
+            let root = tempfile::Builder::new()
+                .prefix(CODEX_ROLLOUT_TRACE_ROOT_PREFIX)
+                .tempdir()
+                .map_err(|error| format!("Failed to create Codex rollout trace root: {error}"))?;
+            restrict_codex_directory(root.path())?;
+            Some(root)
+        } else {
+            None
+        };
         let mut child = if let Some(host) = ssh_host {
             let remote_args = codex_app_server_args(access_mode, execution_mode, &config_overrides);
             crate::remote::spawn_remote_process(host, "codex", &remote_args, None).await?
@@ -18094,6 +18391,9 @@ impl CodexRpc {
             }
             if let Some(path) = process_env::resolved_child_process_path() {
                 cmd.env("PATH", path);
+            }
+            if let Some(root) = rollout_trace_root.as_ref() {
+                cmd.env("CODEX_ROLLOUT_TRACE_ROOT", root.path());
             }
             cmd.stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())
@@ -18193,6 +18493,12 @@ impl CodexRpc {
                 let _ = stderr_inbound.send(CodexInbound::Stderr(line));
             }
         });
+        let rollout_trace_task = rollout_trace_root.as_ref().map(|root| {
+            tokio::spawn(forward_codex_rollout_trace(
+                root.path().to_path_buf(),
+                inbound_tx,
+            ))
+        });
 
         Ok((
             Self {
@@ -18202,6 +18508,8 @@ impl CodexRpc {
                 child: child_ref,
                 stdout_task,
                 stderr_task,
+                rollout_trace_task,
+                rollout_trace_root,
                 compaction_capability: Arc::new(std::sync::Mutex::new(
                     BackendCompactionCapability::unknown(
                         BackendCompactionUnknownReason::ProcessNotInitialized,
@@ -18469,6 +18777,9 @@ impl Drop for CodexRpc {
     fn drop(&mut self) {
         self.stdout_task.abort();
         self.stderr_task.abort();
+        if let Some(task) = &self.rollout_trace_task {
+            task.abort();
+        }
         crate::backend::subprocess::reap_group_child_slot(&self.child);
     }
 }
