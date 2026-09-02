@@ -2,8 +2,9 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::future::Future;
 use std::io::Write;
-use std::net::IpAddr;
-use std::path::Path;
+use std::net::{IpAddr, SocketAddr};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::agent::registry::{AgentStatusTransition, PendingUserResponseKind};
@@ -23,9 +24,10 @@ use protocol::{
     ManagedBrokerCredentials, ManagedBrokerEndpoint, ManagedBrokerGrantId, ManagedBrokerProvider,
     ManagedBrokerRegion, ManagedBrokerRole, ManagedBrokerTopicNamespace, MobileAccessErrorCode,
     MobileAccessStatePayload, MobileBrokerStatus, MobileDeviceId, MobileDeviceRenamePayload,
-    MobileDeviceRevokePayload, MobileDeviceState, MobilePairingCancelPayload, MobilePairingOfferId,
-    MobilePairingOfferPayload, MobilePairingQrUri, MobilePairingState, MobilePushNotification,
-    MobilePushReason, MobilePushSubscription, PROTOCOL_VERSION, StreamPath,
+    MobileDeviceRevokePayload, MobileDeviceState, MobileDirectHostingStatus,
+    MobilePairingCancelPayload, MobilePairingOfferId, MobilePairingOfferPayload,
+    MobilePairingQrUri, MobilePairingState, MobilePushNotification, MobilePushReason,
+    MobilePushSubscription, PROTOCOL_VERSION, StreamPath,
 };
 use serde::{Deserialize, Serialize};
 use settings_model::HostSettings;
@@ -40,6 +42,7 @@ use crate::accept;
 use crate::connection::run_mobile_connection;
 use crate::error::{AppError, AppResult};
 use crate::host::HostHandle;
+use crate::mobile_http::{MobileHttpServer, MobileWebAssets, resolve_bind_addr};
 use crate::mobile_push::{PushSendError, send_push};
 use crate::store::mobile_pairings::{
     ActiveManagedMobilePairingCredential, ActiveMobilePairingCredential, DevicePushRegistration,
@@ -435,6 +438,24 @@ pub(crate) struct MobileAccessActor {
     push_client: reqwest::Client,
     agent_status_transitions: Option<broadcast::Receiver<AgentStatusTransition>>,
     idle_notifier_task: Option<JoinHandle<()>>,
+    direct_hosting: DirectHostingState,
+}
+
+/// The direct mobile web server is deliberately independent of
+/// `enable_mobile_connections`: that switch governs the managed broker path,
+/// and a network locked down enough to want direct hosting is exactly the one
+/// that does not want an outbound broker connection alongside it.
+enum DirectHostingState {
+    Disabled,
+    Running(RunningDirectHost),
+    Failed(String),
+}
+
+struct RunningDirectHost {
+    server: MobileHttpServer,
+    bind_addr: SocketAddr,
+    bundle_dir: PathBuf,
+    asset_count: u32,
 }
 
 struct ConnectedMobileTask {
@@ -1345,11 +1366,13 @@ impl MobileAccessActor {
             push_client: reqwest::Client::new(),
             agent_status_transitions: Some(init.agent_status_transitions),
             idle_notifier_task: None,
+            direct_hosting: DirectHostingState::Disabled,
         })
     }
 
     async fn run(mut self) {
         self.spawn_idle_notifier();
+        self.apply_direct_hosting();
         if self.settings.enable_mobile_connections {
             self.enable_mobile_access().await;
         }
@@ -1510,6 +1533,7 @@ impl MobileAccessActor {
     }
 
     async fn shutdown_runtime_state(&mut self) {
+        self.direct_hosting = DirectHostingState::Disabled;
         self.abort_all_tasks();
         self.mobile_pairings_lease = None;
         self.subscribers.clear();
@@ -1521,6 +1545,9 @@ impl MobileAccessActor {
         let old_url = self.settings.mobile_broker_url.clone();
         self.settings = settings;
         let url_changed = old_url != self.settings.mobile_broker_url;
+        let direct_hosting_before = self.direct_hosting_status();
+        self.apply_direct_hosting();
+        let direct_hosting_changed = self.direct_hosting_status() != direct_hosting_before;
         if mark_legacy_pairings_repair_required(&mut self.pairings, &self.settings)
             && let Err(message) = self.pairings_store.save(&self.pairings)
         {
@@ -1535,6 +1562,9 @@ impl MobileAccessActor {
 
         if !self.settings.enable_mobile_connections {
             if !was_enabled && !url_changed {
+                if direct_hosting_changed {
+                    self.fan_out_state().await;
+                }
                 return;
             }
             self.disable_mobile_access().await;
@@ -1545,6 +1575,83 @@ impl MobileAccessActor {
         if !was_enabled || url_changed {
             self.enable_mobile_access().await;
             self.fan_out_state().await;
+        } else if direct_hosting_changed {
+            self.fan_out_state().await;
+        }
+    }
+
+    /// Starts, stops, or restarts the direct mobile web server to match
+    /// settings. A configuration or bind failure is recorded as
+    /// [`DirectHostingState::Failed`] so it reaches the Mobile settings tab
+    /// through the state payload rather than living only in the host log.
+    fn apply_direct_hosting(&mut self) {
+        if !self.settings.mobile_direct_hosting_enabled {
+            if !matches!(self.direct_hosting, DirectHostingState::Disabled) {
+                tracing::info!("mobile direct hosting disabled");
+            }
+            self.direct_hosting = DirectHostingState::Disabled;
+            return;
+        }
+
+        let desired = match self.desired_direct_hosting() {
+            Ok(desired) => desired,
+            Err(message) => {
+                tracing::error!(error = %message, "mobile direct hosting misconfigured");
+                self.direct_hosting = DirectHostingState::Failed(message);
+                return;
+            }
+        };
+
+        if let DirectHostingState::Running(running) = &self.direct_hosting
+            && running.bind_addr == desired.0
+            && running.bundle_dir == desired.1
+        {
+            return;
+        }
+
+        // Release the running listener before binding, so restarting on the
+        // same address does not fail against the socket we are replacing.
+        self.direct_hosting = DirectHostingState::Disabled;
+        self.direct_hosting = match start_direct_hosting(desired.0, desired.1) {
+            Ok(running) => {
+                tracing::info!(
+                    bind_addr = %running.server.local_addr(),
+                    assets = running.asset_count,
+                    "mobile direct hosting started"
+                );
+                DirectHostingState::Running(running)
+            }
+            Err(message) => {
+                tracing::error!(error = %message, "mobile direct hosting failed to start");
+                DirectHostingState::Failed(message)
+            }
+        };
+    }
+
+    fn desired_direct_hosting(&self) -> Result<(SocketAddr, PathBuf), String> {
+        let bind_addr = resolve_bind_addr(self.settings.mobile_direct_bind_addr.as_deref())?;
+        let bundle_dir = self
+            .settings
+            .mobile_direct_bundle_dir
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                "mobile direct hosting is on but no bundle directory is set; point it at a built mobile web bundle".to_owned()
+            })?;
+        Ok((bind_addr, PathBuf::from(bundle_dir)))
+    }
+
+    fn direct_hosting_status(&self) -> MobileDirectHostingStatus {
+        match &self.direct_hosting {
+            DirectHostingState::Disabled => MobileDirectHostingStatus::Disabled,
+            DirectHostingState::Running(running) => MobileDirectHostingStatus::Online {
+                bind_addr: running.server.local_addr().to_string(),
+                asset_count: running.asset_count,
+            },
+            DirectHostingState::Failed(message) => MobileDirectHostingStatus::Error {
+                message: message.clone(),
+            },
         }
     }
 
@@ -3157,6 +3264,7 @@ impl MobileAccessActor {
             broker_status: self.broker_status.clone(),
             pairing: self.pairing.clone(),
             paired_devices,
+            direct_hosting: self.direct_hosting_status(),
         }
     }
 
@@ -3796,6 +3904,21 @@ fn now_ms() -> Result<u64, String> {
         .map_err(|err| format!("system clock is before UNIX epoch: {err}"))?;
     let millis = duration.as_millis();
     u64::try_from(millis).map_err(|_| "current time does not fit in u64 milliseconds".to_owned())
+}
+
+fn start_direct_hosting(
+    bind_addr: SocketAddr,
+    bundle_dir: PathBuf,
+) -> Result<RunningDirectHost, String> {
+    let assets = MobileWebAssets::from_dir(&bundle_dir)?;
+    let asset_count = assets.asset_count() as u32;
+    let server = MobileHttpServer::start(bind_addr, Arc::new(assets))?;
+    Ok(RunningDirectHost {
+        server,
+        bind_addr,
+        bundle_dir,
+        asset_count,
+    })
 }
 
 fn spawn_worker<F>(name: &'static str, future: F)

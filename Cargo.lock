@@ -8230,6 +8230,7 @@ dependencies = [
  "paste",
  "proc-macro2",
  "protocol",
+ "reqwest 0.12.28",
  "rmcp",
  "rumqttd",
  "serde",

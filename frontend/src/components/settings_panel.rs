@@ -8535,6 +8535,9 @@ mod wasm_tests {
                     mobile_broker_url: broker_url
                         .map(|s| protocol::BrokerUrl::new(s.to_owned()).expect("broker url")),
                     mobile_broker_auth: Default::default(),
+                    mobile_direct_hosting_enabled: false,
+                    mobile_direct_bind_addr: None,
+                    mobile_direct_bundle_dir: None,
                     tyde_debug_mcp_enabled: false,
                     tyde_agent_control_mcp_enabled: true,
                     tyde_agent_control_max_depth: settings_model::default_agent_control_max_depth(),
@@ -9318,6 +9321,7 @@ mod wasm_tests {
             broker_status: MobileBrokerStatus::Online { broker_url: url },
             pairing: MobilePairingState::Idle,
             paired_devices: Vec::new(),
+            direct_hosting: protocol::MobileDirectHostingStatus::Disabled,
         };
         state.mobile_access_state.update(|m| {
             m.insert("host-mobile".to_owned(), payload);
@@ -9344,6 +9348,7 @@ mod wasm_tests {
                 expires_at_ms,
             },
             paired_devices: Vec::new(),
+            direct_hosting: protocol::MobileDirectHostingStatus::Disabled,
         };
         state.mobile_access_state.update(|m| {
             m.insert("host-mobile".to_owned(), payload);
@@ -9489,6 +9494,7 @@ mod wasm_tests {
                     protocol::MobileAccessStatePayload {
                         broker_status: MobileBrokerStatus::Online { broker_url: url },
                         pairing: MobilePairingState::Idle,
+                        direct_hosting: protocol::MobileDirectHostingStatus::Disabled,
                         paired_devices: vec![protocol::MobileDeviceSummary {
                             device_id: protocol::MobileDeviceId("device-1".to_owned()),
                             label: "Old Test Phone".to_owned(),
@@ -9653,6 +9659,7 @@ mod wasm_tests {
                 },
                 pairing: MobilePairingState::Idle,
                 paired_devices: Vec::new(),
+                direct_hosting: protocol::MobileDirectHostingStatus::Disabled,
             };
             state.mobile_access_state.update(|m| {
                 m.insert("host-mobile".to_owned(), payload);
@@ -9699,6 +9706,7 @@ mod wasm_tests {
                 },
                 pairing: MobilePairingState::Idle,
                 paired_devices: Vec::new(),
+                direct_hosting: protocol::MobileDirectHostingStatus::Disabled,
             };
             state.mobile_access_state.update(|m| {
                 m.insert("host-mobile".to_owned(), payload);
@@ -9781,6 +9789,7 @@ mod wasm_tests {
                 expires_at_ms: u64::MAX,
             },
             paired_devices: Vec::new(),
+            direct_hosting: protocol::MobileDirectHostingStatus::Disabled,
         };
         let stream = protocol::StreamPath(format!("/host/{host_id}"));
         let envelope = Envelope::from_payload(stream, FrameKind::MobileAccessState, 0, &new_state)
@@ -9849,6 +9858,7 @@ mod wasm_tests {
                 expires_at_ms: u64::MAX,
             },
             paired_devices: Vec::new(),
+            direct_hosting: protocol::MobileDirectHostingStatus::Disabled,
         };
         let stream = protocol::StreamPath(format!("/host/{host_id}"));
         let envelope =
@@ -9907,6 +9917,7 @@ mod wasm_tests {
                 offer_id: MobilePairingOfferId("offer-Z".to_owned()),
             },
             paired_devices: Vec::new(),
+            direct_hosting: protocol::MobileDirectHostingStatus::Disabled,
         };
         let stream = protocol::StreamPath(format!("/host/{host_id}"));
         let envelope =
@@ -9971,6 +9982,9 @@ mod wasm_tests {
                     enable_mobile_connections: false,
                     mobile_broker_url: None,
                     mobile_broker_auth: Default::default(),
+                    mobile_direct_hosting_enabled: false,
+                    mobile_direct_bind_addr: None,
+                    mobile_direct_bundle_dir: None,
                     tyde_debug_mcp_enabled: false,
                     tyde_agent_control_mcp_enabled: true,
                     tyde_agent_control_max_depth: settings_model::default_agent_control_max_depth(),
@@ -10667,6 +10681,9 @@ mod wasm_tests {
             enable_mobile_connections: false,
             mobile_broker_url: None,
             mobile_broker_auth: Default::default(),
+            mobile_direct_hosting_enabled: false,
+            mobile_direct_bind_addr: None,
+            mobile_direct_bundle_dir: None,
             tyde_debug_mcp_enabled: false,
             tyde_agent_control_mcp_enabled: true,
             tyde_agent_control_max_depth: settings_model::default_agent_control_max_depth(),
@@ -12301,6 +12318,9 @@ mod wasm_tests {
                     enable_mobile_connections: false,
                     mobile_broker_url: None,
                     mobile_broker_auth: Default::default(),
+                    mobile_direct_hosting_enabled: false,
+                    mobile_direct_bind_addr: None,
+                    mobile_direct_bundle_dir: None,
                     tyde_debug_mcp_enabled: false,
                     tyde_agent_control_mcp_enabled: true,
                     tyde_agent_control_max_depth: settings_model::default_agent_control_max_depth(),

@@ -49,6 +49,23 @@ pub struct HostSettings {
     pub mobile_broker_url: Option<BrokerUrl>,
     #[serde(default)]
     pub mobile_broker_auth: MobileBrokerAuthSettings,
+    /// Serve the mobile web app straight from this host over HTTP instead of
+    /// tunnelling it through the managed service. Tyde speaks plain HTTP; the
+    /// deployment is expected to terminate TLS in front of it, because
+    /// browsers withhold service workers, WebCrypto, camera access and push
+    /// from any origin that is not a secure context.
+    #[serde(default)]
+    pub mobile_direct_hosting_enabled: bool,
+    /// Address the direct mobile web server binds, defaulting to
+    /// `127.0.0.1:8730`.
+    #[serde(default)]
+    pub mobile_direct_bind_addr: Option<String>,
+    /// Directory holding the built mobile web assets, laid out exactly like the
+    /// deployed `tyde/` prefix: the loader shell at the root, `manifest.json`
+    /// beside it, and each bundle under `v<version>/`. Required while direct
+    /// hosting is enabled.
+    #[serde(default)]
+    pub mobile_direct_bundle_dir: Option<String>,
     #[serde(default)]
     pub tyde_debug_mcp_enabled: bool,
     #[serde(default = "default_agent_control_mcp_enabled")]
@@ -106,6 +123,9 @@ impl Default for HostSettings {
             enable_mobile_connections: false,
             mobile_broker_url: None,
             mobile_broker_auth: MobileBrokerAuthSettings::default(),
+            mobile_direct_hosting_enabled: false,
+            mobile_direct_bind_addr: None,
+            mobile_direct_bundle_dir: None,
             tyde_debug_mcp_enabled: false,
             tyde_agent_control_mcp_enabled: true,
             tyde_agent_control_max_depth: default_agent_control_max_depth(),
@@ -498,6 +518,9 @@ fn decorate_host_settings_schema(schema: &mut Value) {
         ("complexity_tiers_enabled", "subagents", 30, "toggle"),
         ("enable_mobile_connections", "mobile", 10, "toggle"),
         ("mobile_broker_url", "mobile", 20, "text"),
+        ("mobile_direct_hosting_enabled", "mobile", 50, "toggle"),
+        ("mobile_direct_bind_addr", "mobile", 60, "text"),
+        ("mobile_direct_bundle_dir", "mobile", 70, "text"),
     ] {
         annotate_property(schema, "HostSettings", field, section, order, widget);
     }
@@ -541,6 +564,21 @@ fn decorate_host_settings_schema(schema: &mut Value) {
             "mobile_broker_url",
             "Development broker URL",
             "Optional loopback MQTT broker override used for local development.",
+        ),
+        (
+            "mobile_direct_hosting_enabled",
+            "Host the mobile app directly",
+            "Serve the mobile web app from this host over HTTP instead of tunnelling it through the managed service. Put a TLS-terminating reverse proxy in front of it: over plain HTTP browsers disable service workers, WebCrypto, the camera and push notifications.",
+        ),
+        (
+            "mobile_direct_bind_addr",
+            "Direct hosting address",
+            "Address the direct mobile web server listens on. Defaults to 127.0.0.1:8730, which only accepts connections from a proxy running on this machine.",
+        ),
+        (
+            "mobile_direct_bundle_dir",
+            "Mobile web bundle directory",
+            "Directory holding the built mobile web assets, laid out like the deployed site: the loader shell and manifest.json at the root, each app bundle under v<version>/.",
         ),
     ] {
         set_property_text(schema, "HostSettings", field, title, description);

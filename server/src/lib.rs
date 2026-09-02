@@ -11,6 +11,7 @@ pub(crate) mod error;
 pub(crate) mod host;
 pub mod mcp_bridge;
 pub(crate) mod mobile_access;
+pub(crate) mod mobile_http;
 pub(crate) mod mobile_push;
 pub mod paths;
 pub(crate) mod process_env;

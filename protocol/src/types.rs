@@ -3132,6 +3132,26 @@ pub struct MobileAccessStatePayload {
     pub broker_status: MobileBrokerStatus,
     pub pairing: MobilePairingState,
     pub paired_devices: Vec<MobileDeviceSummary>,
+    #[serde(default)]
+    pub direct_hosting: MobileDirectHostingStatus,
+}
+
+/// State of the host's own mobile web server, which serves the loader shell and
+/// app bundles over HTTP instead of tunnelling them through the managed
+/// service. Reported so a bad bundle directory or an unavailable port is
+/// visible in the Mobile settings tab rather than only in the host log.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum MobileDirectHostingStatus {
+    #[default]
+    Disabled,
+    Online {
+        bind_addr: String,
+        asset_count: u32,
+    },
+    Error {
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
