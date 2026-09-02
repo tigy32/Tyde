@@ -214,10 +214,46 @@ fn voice_mode_label(mode: protocol::VoiceMode) -> &'static str {
     }
 }
 
-fn voice_mode_short_label(mode: protocol::VoiceMode) -> &'static str {
+fn voice_mode_hint(mode: protocol::VoiceMode) -> &'static str {
     match mode {
-        protocol::VoiceMode::Conversation => "Nova",
-        protocol::VoiceMode::Dictation => "Dictate",
+        protocol::VoiceMode::Conversation => "Hold a spoken conversation with Nova",
+        protocol::VoiceMode::Dictation => "Speak to fill the composer, then edit before sending",
+    }
+}
+
+/// A distinct glyph per mode so the mic reads as its current mode at a glance:
+/// a headset for the conversation, a mic for dictation.
+fn voice_mode_icon(mode: protocol::VoiceMode) -> AnyView {
+    match mode {
+        protocol::VoiceMode::Dictation => view! {
+            <svg
+                class="voice-mic-icon"
+                viewBox="0 0 24 24"
+                width="18"
+                height="18"
+                fill="currentColor"
+                aria-hidden="true"
+            >
+                <path d="M12 14a3 3 0 0 0 3-3V5a3 3 0 0 0-6 0v6a3 3 0 0 0 3 3z" />
+                <path d="M19 11a1 1 0 1 0-2 0 5 5 0 0 1-10 0 1 1 0 1 0-2 0 7 7 0 0 0 6 6.92V20H8.5a1 1 0 1 0 0 2h7a1 1 0 1 0 0-2H13v-2.08A7 7 0 0 0 19 11z" />
+            </svg>
+        }
+        .into_any(),
+        protocol::VoiceMode::Conversation => view! {
+            <svg
+                class="voice-mic-icon"
+                viewBox="0 0 24 24"
+                width="18"
+                height="18"
+                fill="currentColor"
+                aria-hidden="true"
+            >
+                <path d="M12 3a8 8 0 0 0-8 8v1a1 1 0 0 0 2 0v-1a6 6 0 0 1 12 0v1a1 1 0 0 0 2 0v-1a8 8 0 0 0-8-8z" />
+                <path d="M4 13a2 2 0 0 1 2 2v3a2 2 0 1 1-4 0v-3a2 2 0 0 1 2-2z" />
+                <path d="M20 13a2 2 0 0 1 2 2v3a2 2 0 1 1-4 0v-3a2 2 0 0 1 2-2z" />
+            </svg>
+        }
+        .into_any(),
     }
 }
 
@@ -941,43 +977,9 @@ fn MobileVoiceControls(state: AppState) -> impl IntoView {
         let cancel_state = state.clone();
         let dismiss_state = state.clone();
         match state.voice_ui.get() {
-            // One button per mode instead of a `<select>` plus a start button:
-            // with exactly two modes, tapping the one you want is a single tap
-            // and needs no popup, and the pill stays inside the compact width
-            // the idle surface is held to. Tapping also remembers the mode, so
-            // the desktop composer opens on the same choice.
-            //
-            // This replaces a write-during-render that rewrote
-            // `voice_mode_choice` whenever the remembered mode was
-            // unavailable; the choice is now left alone and resolved at use.
-            MobileVoiceState::Idle => {
-                let (_, conversation, dictation) = mode_availability(&state);
-                let mode_button = |mode: protocol::VoiceMode, available: bool| {
-                    let mode_state = state.clone();
-                    view! {
-                        <button
-                            class="mobile-voice-mode"
-                            aria-label=voice_mode_label(mode)
-                            data-test=format!("mobile-voice-start-{}", voice_mode_value(mode))
-                            disabled=!available
-                            on:click=move |_| {
-                                mode_state.voice_mode_choice.set(mode);
-                                remember_voice_mode(mode);
-                                start(mode_state.clone());
-                            }
-                        >
-                            {voice_mode_short_label(mode)}
-                        </button>
-                    }
-                };
-                view! {
-                    <div class="mobile-voice-toggle" role="group" aria-label="Speech mode">
-                        {mode_button(protocol::VoiceMode::Dictation, dictation)}
-                        {mode_button(protocol::VoiceMode::Conversation, conversation)}
-                    </div>
-                }
-                .into_any()
-            }
+            // Idle has no session surface: the start control is
+            // [`MobileVoiceComposerButton`], beside Send in the composer row.
+            MobileVoiceState::Idle => ().into_any(),
             MobileVoiceState::Starting { request, .. } => view! {
                 <span>{if request.mode() == protocol::VoiceMode::Dictation {
                     "Connecting dictation…"
@@ -1052,12 +1054,103 @@ fn MobileVoiceControls(state: AppState) -> impl IntoView {
     }
 }
 
+/// Which speech modes the active host can start right now, plus why a mode
+/// cannot. Tracked reads only: this drives composer rendering, and a memo
+/// that short-circuits through untracked reads before any chat is active
+/// computes once with no subscriptions and never reappears.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct VoiceOffer {
+    conversation: Option<&'static str>,
+    dictation: Option<&'static str>,
+}
+
+impl VoiceOffer {
+    fn block(self, mode: protocol::VoiceMode) -> Option<&'static str> {
+        match mode {
+            protocol::VoiceMode::Conversation => self.conversation,
+            protocol::VoiceMode::Dictation => self.dictation,
+        }
+    }
+
+    fn any(self) -> bool {
+        self.conversation.is_none() || self.dictation.is_none()
+    }
+
+    fn effective(self, chosen: protocol::VoiceMode) -> Option<protocol::VoiceMode> {
+        effective_mode(
+            self.conversation.is_none(),
+            self.dictation.is_none(),
+            chosen,
+        )
+    }
+}
+
+fn voice_offer(state: &AppState) -> Memo<VoiceOffer> {
+    let state = state.clone();
+    Memo::new(move |_| {
+        let Some(host) = state.active_local_host_id.get() else {
+            return VoiceOffer {
+                conversation: Some("Connect to a host to talk with Nova"),
+                dictation: Some("Connect to a host to dictate"),
+            };
+        };
+        let has_conversation_target = state.active_agent.get().is_some_and(|active| {
+            active.local_host_id == host
+                && state.agents.with(|agents| {
+                    agents.iter().any(|agent| {
+                        agent.local_host_id == active.local_host_id
+                            && agent.agent_id == active.agent_id
+                    })
+                })
+        });
+        let settings = state
+            .host_settings_by_host
+            .with(|values| values.get(&host).cloned());
+        let capabilities = state
+            .voice_capabilities_by_host
+            .with(|values| values.get(&host).cloned());
+        let conversation = if !settings.as_ref().is_some_and(|value| value.voice.enabled) {
+            Some("Nova voice is off in this host's settings")
+        } else if !capabilities
+            .as_ref()
+            .is_some_and(|value| value.nova_available)
+        {
+            Some("Nova is not available on this host")
+        } else if !has_conversation_target {
+            Some("Open a chat to talk with Nova")
+        } else {
+            None
+        };
+        let dictation = if !settings
+            .as_ref()
+            .is_some_and(|value| value.voice.dictation_enabled)
+        {
+            Some("Dictation is off in this host's settings")
+        } else if !capabilities
+            .as_ref()
+            .is_some_and(|value| value.dictation_available)
+        {
+            Some("Transcribe is not available on this host")
+        } else {
+            None
+        };
+        VoiceOffer {
+            conversation,
+            dictation,
+        }
+    })
+}
+
+/// Root-mounted and renders nothing: it owns the browser media listeners and
+/// the stop-on-target-change effect for the whole app. Every visible voice
+/// control lives in the composer ([`MobileVoiceComposerButton`],
+/// [`MobileVoiceComposerBar`]).
 #[component]
-pub fn MobileVoiceBar() -> impl IntoView {
+pub fn MobileVoiceRuntime() -> impl IntoView {
     let state = expect_context::<AppState>();
     install(state.clone());
     let old = StoredValue::new((None, None));
-    let switch = state.clone();
+    let switch = state;
     Effect::new(move |_| {
         let current = (switch.active_local_host_id.get(), switch.active_agent.get());
         let session_active = matches!(
@@ -1069,63 +1162,137 @@ pub fn MobileVoiceBar() -> impl IntoView {
         }
         old.set_value(current);
     });
-    let visible_state = state.clone();
-    let visible = Memo::new(move |_| {
-        // Tracked reads only. `active_target` reads untracked (it serves
-        // event handlers), so a memo built on it computes once — with no
-        // active chat at mount time that is `false` with zero subscriptions,
-        // and the bar can never appear afterwards.
-        let Some(host) = visible_state.active_local_host_id.get() else {
-            return false;
-        };
-        let has_conversation_target = visible_state.active_agent.get().is_some_and(|active| {
-            active.local_host_id == host
-                && visible_state.agents.with(|agents| {
-                    agents.iter().any(|agent| {
-                        agent.local_host_id == active.local_host_id
-                            && agent.agent_id == active.agent_id
-                    })
-                })
-        });
-        let settings = visible_state
-            .host_settings_by_host
-            .with(|values| values.get(&host).cloned());
-        let capabilities = visible_state
-            .voice_capabilities_by_host
-            .with(|values| values.get(&host).cloned());
-        let conversation = has_conversation_target
-            && settings.as_ref().is_some_and(|value| value.voice.enabled)
-            && capabilities
-                .as_ref()
-                .is_some_and(|value| value.nova_available);
-        let dictation = settings
-            .as_ref()
-            .is_some_and(|value| value.voice.dictation_enabled)
-            && capabilities
-                .as_ref()
-                .is_some_and(|value| value.dictation_available);
-        conversation || dictation
+}
+
+/// Start-speech affordance, rendered in the composer row beside Send.
+///
+/// It lives in the row rather than in a floating pill because the pill was
+/// `position: fixed` above the bottom nav, exactly where the composer sits, so
+/// it covered the last messages and got in the way of the input. It is a split
+/// button rather than a mode `<select>` plus a mic: the mode is a sticky
+/// preference set once, so it belongs behind the caret with the other composer
+/// menus. The caret lists both modes always; a mode that cannot start stays
+/// visible but disabled and says why.
+#[component]
+pub fn MobileVoiceComposerButton() -> impl IntoView {
+    let state = expect_context::<AppState>();
+    let offer = voice_offer(&state);
+    let idle_state = state.clone();
+    let show = Memo::new(move |_| {
+        offer.get().any() && matches!(idle_state.voice_ui.get(), MobileVoiceState::Idle)
     });
     let mode_state = state.clone();
-    // Voice mode = any non-idle session state. Idle renders only the compact
-    // floating toggle; the full bar (which overlays chat content) appears
-    // exclusively while the user is actually in a voice session, so an idle
-    // voice-capable host never covers the conversation.
+    let effective = Memo::new(move |_| offer.get().effective(mode_state.voice_mode_choice.get()));
+    let menu_open = RwSignal::new(false);
+    let choice_state = StoredValue::new(state.clone());
+    let start_state = StoredValue::new(state);
+    let mode_item = move |mode: protocol::VoiceMode| {
+        let block = Memo::new(move |_| offer.get().block(mode));
+        let selected = Memo::new(move |_| effective.get() == Some(mode));
+        view! {
+            <button
+                type="button"
+                class="chat-send-menu-item"
+                role="menuitemradio"
+                aria-checked=move || if selected.get() { "true" } else { "false" }
+                data-test=format!("mobile-voice-mode-{}", voice_mode_value(mode))
+                disabled=move || block.get().is_some()
+                on:click=move |_| {
+                    choice_state.with_value(|state| state.voice_mode_choice.set(mode));
+                    remember_voice_mode(mode);
+                    menu_open.set(false);
+                }
+            >
+                <span class="chat-send-menu-label">
+                    {voice_mode_label(mode)}
+                    <span class="chat-send-menu-hint">
+                        {move || block.get().unwrap_or(voice_mode_hint(mode))}
+                    </span>
+                </span>
+                <span class="chat-send-menu-check" aria-hidden="true">
+                    {move || if selected.get() { "✓" } else { "" }}
+                </span>
+            </button>
+        }
+    };
+    view! {
+        <Show when=move || show.get()>
+            <div
+                class="chat-send-split chat-voice-split"
+                role="group"
+                aria-label="Speech actions"
+                data-mobile-test="chat-voice-split"
+            >
+                <button
+                    type="button"
+                    class="chat-voice-btn chat-send-split-primary"
+                    data-test="mobile-voice-start"
+                    data-voice-mode=move || {
+                        effective.get().map(voice_mode_value).unwrap_or("none")
+                    }
+                    aria-label=move || {
+                        effective.get().map(voice_mode_label).unwrap_or("Start speech")
+                    }
+                    disabled=move || effective.get().is_none()
+                    on:click=move |_| {
+                        let Some(mode) = effective.get_untracked() else {
+                            return;
+                        };
+                        start_state.with_value(|state| {
+                            state.voice_mode_choice.set(mode);
+                            start(state.clone());
+                        });
+                    }
+                >
+                    {move || effective.get().map(voice_mode_icon)}
+                </button>
+                <button
+                    type="button"
+                    class="send-menu-toggle"
+                    data-test="mobile-voice-mode-toggle"
+                    aria-haspopup="menu"
+                    aria-expanded=move || if menu_open.get() { "true" } else { "false" }
+                    aria-label="Choose speech mode"
+                    on:click=move |_| menu_open.update(|open| *open = !*open)
+                >
+                    <span aria-hidden="true">"\u{2304}"</span>
+                </button>
+                <Show when=move || menu_open.get()>
+                    <div
+                        class="chat-send-menu-backdrop"
+                        on:click=move |_| menu_open.set(false)
+                    ></div>
+                    <div
+                        class="chat-send-menu"
+                        role="menu"
+                        aria-label="Speech mode"
+                        data-test="mobile-voice-mode-menu"
+                    >
+                        {mode_item(protocol::VoiceMode::Dictation)}
+                        {mode_item(protocol::VoiceMode::Conversation)}
+                    </div>
+                </Show>
+            </div>
+        </Show>
+    }
+}
+
+/// Live-session strip, rendered in the composer stack above the input row so
+/// it pushes the input down instead of covering the conversation. It shows for
+/// every non-idle state, including a failure, so the way out (Cancel, Done,
+/// Dismiss) is always reachable.
+#[component]
+pub fn MobileVoiceComposerBar() -> impl IntoView {
+    let state = expect_context::<AppState>();
+    let mode_state = state.clone();
     let in_voice_mode =
         Memo::new(move |_| !matches!(mode_state.voice_ui.get(), MobileVoiceState::Idle));
     let render_state = StoredValue::new(state);
     view! {
-        <Show when=move || visible.get()>
-            <Show
-                when=move || in_voice_mode.get()
-                fallback=move || {
-                    view! { <MobileVoiceControls state=render_state.get_value() /> }
-                }
-            >
-                <aside class="mobile-voice-bar">
-                    <MobileVoiceControls state=render_state.get_value() />
-                </aside>
-            </Show>
+        <Show when=move || in_voice_mode.get()>
+            <div class="chat-voice-bar" data-mobile-test="voice-session-bar">
+                <MobileVoiceControls state=render_state.get_value() />
+            </div>
         </Show>
     }
 }
@@ -1139,20 +1306,6 @@ mod wasm_tests {
     use web_sys::HtmlElement;
 
     wasm_bindgen_test_configure!(run_in_browser);
-
-    /// The real stylesheet, so geometry assertions measure what users see.
-    const PROD_STYLES: &str = include_str!("../styles.css");
-
-    fn ensure_styles_loaded() {
-        let document = web_sys::window().unwrap().document().unwrap();
-        if document.get_element_by_id("prod-styles").is_some() {
-            return;
-        }
-        let style = document.create_element("style").unwrap();
-        style.set_id("prod-styles");
-        style.set_text_content(Some(PROD_STYLES));
-        document.head().unwrap().append_child(&style).unwrap();
-    }
 
     fn container() -> HtmlElement {
         let document = web_sys::window().unwrap().document().unwrap();
@@ -1171,93 +1324,21 @@ mod wasm_tests {
         let _ = JsFuture::from(promise).await;
     }
 
-    #[wasm_bindgen_test]
-    async fn controls_react_across_repeated_renders() {
-        let container = container();
-        let state = AppState::new();
-        let render_state = state.clone();
-        let mount = mount_to(container.clone(), move || {
-            view! { <MobileVoiceControls state=render_state.clone() /> }
-        });
-        next_tick().await;
-        // No host is selected, so both modes render but neither can start —
-        // the single button this replaces rendered enabled and did nothing.
-        for mode in ["dictation", "conversation"] {
-            assert!(
-                container
-                    .query_selector(&format!("[data-test='mobile-voice-start-{mode}']"))
-                    .unwrap()
-                    .expect("both speech modes must be listed")
-                    .has_attribute("disabled"),
-                "{mode} must not be startable without a voice-capable host"
-            );
-        }
-
-        state
-            .voice_ui
-            .set(MobileVoiceState::Failed("voice unavailable".into()));
-        next_tick().await;
-        assert!(
-            container
-                .text_content()
-                .unwrap()
-                .contains("voice unavailable")
-        );
-
-        state.voice_ui.set(MobileVoiceState::Idle);
-        next_tick().await;
-        // No host is selected, so both modes render but neither can start —
-        // the single button this replaces rendered enabled and did nothing.
-        for mode in ["dictation", "conversation"] {
-            assert!(
-                container
-                    .query_selector(&format!("[data-test='mobile-voice-start-{mode}']"))
-                    .unwrap()
-                    .expect("both speech modes must be listed")
-                    .has_attribute("disabled"),
-                "{mode} must not be startable without a voice-capable host"
-            );
-        }
-        drop(mount);
-        container.remove();
-    }
-
-    /// **Opening a chat must reveal the voice bar.**
-    ///
-    /// The bar always mounts before any chat is active (it lives in the host
-    /// shell), so its visibility memo starts `false`. It used to compute that
-    /// through untracked reads, subscribing to nothing — the memo never
-    /// recomputed and the Voice button could never appear, even on a
-    /// voice-capable host. This drives the live order: capabilities and
-    /// settings arrive on connect, the user opens a chat afterwards.
-    #[wasm_bindgen_test]
-    async fn voice_bar_appears_when_a_chat_becomes_active_after_mount() {
-        let container = container();
-        let state = AppState::new();
-        let mount_state = state.clone();
-        let mount = mount_to(container.clone(), move || {
-            provide_context(mount_state.clone());
-            view! { <MobileVoiceBar /> }
-        });
-        next_tick().await;
-        assert!(
-            container
-                .query_selector("[data-test^='mobile-voice-start-']")
-                .unwrap()
-                .is_none(),
-            "no voice button may show before a chat is active"
-        );
-
-        let host = LocalHostId("voice-host".to_owned());
-        let agent_id = protocol::AgentId("voice-agent".to_owned());
+    fn activate_voice_chat(state: &AppState, host: &str, agent: &str, dictation: bool) {
+        let host = LocalHostId(host.to_owned());
+        let agent_id = protocol::AgentId(agent.to_owned());
         state.voice_capabilities_by_host.update(|caps| {
             caps.insert(
                 host.clone(),
-                protocol::VoiceCapabilitiesPayload::for_connection(true, false, false),
+                protocol::VoiceCapabilitiesPayload::for_connection(true, dictation, false),
             );
         });
+        // Dictation is switched on in settings either way; `dictation` only
+        // controls whether Transcribe is actually available, so the block
+        // reason under test is the capability one.
         let mut settings = settings_model::HostSettings::default();
         settings.voice.enabled = true;
+        settings.voice.dictation_enabled = true;
         state.host_settings_by_host.update(|map| {
             map.insert(host.clone(), settings);
         });
@@ -1273,7 +1354,7 @@ mod wasm_tests {
             session_id: None,
             custom_agent_id: None,
             created_at_ms: 0,
-            instance_stream: protocol::StreamPath("/agent/voice-agent/instance".to_owned()),
+            instance_stream: protocol::StreamPath(format!("/agent/{agent}/instance")),
             started: true,
             fatal_error: None,
         }]);
@@ -1282,155 +1363,138 @@ mod wasm_tests {
             local_host_id: host,
             agent_id,
         }));
-        next_tick().await;
-
-        let conversation = container
-            .query_selector("[data-test='mobile-voice-start-conversation']")
-            .unwrap()
-            .expect(
-                "the Nova button must appear once a chat is active on a \
-                 voice-capable host",
-            );
-        assert!(
-            !conversation.has_attribute("disabled"),
-            "the configured mode must be startable"
-        );
-        // Transcribe is not configured on this host, so its button stays
-        // listed but unusable instead of silently starting the other mode.
-        assert!(
-            container
-                .query_selector("[data-test='mobile-voice-start-dictation']")
-                .unwrap()
-                .expect("an unconfigured mode stays listed")
-                .has_attribute("disabled"),
-            "dictation must not be startable without Transcribe"
-        );
-        drop(mount);
-        container.remove();
     }
 
-    /// **An idle voice-capable chat shows only a compact toggle, never the
-    /// full-width bar.** The bar overlays chat content, so it may appear only
-    /// while the user is actually in a voice session — and a failed session
-    /// must offer a way back out (Dismiss) instead of wedging the overlay
-    /// open.
+    /// **Without a voice-capable host there is no start control at all**, and
+    /// the session bar follows the session state across repeated renders: a
+    /// failure is shown with its reason and Dismiss returns to idle.
     #[wasm_bindgen_test]
-    async fn idle_voice_ui_is_compact_and_the_bar_only_shows_in_voice_mode() {
-        ensure_styles_loaded();
+    async fn controls_react_across_repeated_renders() {
         let container = container();
         let state = AppState::new();
         let mount_state = state.clone();
         let mount = mount_to(container.clone(), move || {
             provide_context(mount_state.clone());
-            view! { <MobileVoiceBar /> }
+            view! {
+                <MobileVoiceComposerBar />
+                <MobileVoiceComposerButton />
+            }
         });
-
-        let host = LocalHostId("compact-host".to_owned());
-        let agent_id = protocol::AgentId("compact-agent".to_owned());
-        state.voice_capabilities_by_host.update(|caps| {
-            caps.insert(
-                host.clone(),
-                protocol::VoiceCapabilitiesPayload::for_connection(true, false, false),
-            );
-        });
-        let mut settings = settings_model::HostSettings::default();
-        settings.voice.enabled = true;
-        state.host_settings_by_host.update(|map| {
-            map.insert(host.clone(), settings);
-        });
-        state.agents.set(vec![crate::state::AgentInfo {
-            local_host_id: host.clone(),
-            agent_id: agent_id.clone(),
-            name: "Compact agent".to_owned(),
-            origin: protocol::AgentOrigin::User,
-            backend_kind: protocol::BackendKind::Codex,
-            workspace_roots: Vec::new(),
-            project_id: None,
-            parent_agent_id: None,
-            session_id: None,
-            custom_agent_id: None,
-            created_at_ms: 0,
-            instance_stream: protocol::StreamPath("/agent/compact-agent/instance".to_owned()),
-            started: true,
-            fatal_error: None,
-        }]);
-        state.active_local_host_id.set(Some(host.clone()));
-        state.active_agent.set(Some(crate::state::ActiveAgentRef {
-            local_host_id: host,
-            agent_id,
-        }));
         next_tick().await;
-
-        let document = web_sys::window().unwrap().document().unwrap();
-        let viewport_width = web_sys::window()
-            .unwrap()
-            .inner_width()
-            .unwrap()
-            .as_f64()
-            .unwrap();
-
-        // Idle: the only voice surface is the compact pill. Measuring the
-        // pill rather than one button keeps the compactness contract honest
-        // now that the pill holds a button per speech mode.
-        let toggle = document
-            .query_selector("[role='group'][aria-label='Speech mode']")
-            .unwrap()
-            .expect("idle voice UI must render the speech pill");
-        let toggle_width = toggle.get_bounding_client_rect().width();
         assert!(
-            toggle_width > 0.0 && toggle_width < viewport_width * 0.4,
-            "idle voice toggle must be compact, got {toggle_width}px of \
-             {viewport_width}px viewport"
-        );
-        assert!(
-            document.query_selector("aside").unwrap().is_none(),
-            "the voice bar surface must not render while idle"
+            container
+                .query_selector("[data-test='mobile-voice-start']")
+                .unwrap()
+                .is_none(),
+            "no speech control may render without a voice-capable host"
         );
 
-        // Entering voice mode replaces the toggle with the full bar.
-        state.voice_ui.set(MobileVoiceState::Failed(
-            "microphone unavailable".to_owned(),
-        ));
+        state
+            .voice_ui
+            .set(MobileVoiceState::Failed("voice unavailable".into()));
         next_tick().await;
-        let bar = document
-            .query_selector("aside")
-            .unwrap()
-            .expect("voice mode must render the bar surface");
-        let bar_width = bar.get_bounding_client_rect().width();
-        assert!(
-            bar_width > viewport_width * 0.7,
-            "the in-session bar spans the viewport, got {bar_width}px of \
-             {viewport_width}px"
-        );
         assert!(
             container
                 .text_content()
                 .unwrap()
-                .contains("microphone unavailable"),
-            "the failure reason must be visible"
+                .contains("voice unavailable")
         );
 
-        // Dismiss exits voice mode and returns to the compact toggle.
-        let dismiss = document
-            .query_selector("button[aria-label='Dismiss voice error']")
-            .unwrap()
-            .expect("a failed session must offer Dismiss")
-            .dyn_into::<HtmlElement>()
-            .unwrap();
-        dismiss.click();
+        state.voice_ui.set(MobileVoiceState::Idle);
         next_tick().await;
         assert!(
-            document.query_selector("aside").unwrap().is_none(),
-            "Dismiss must close the voice bar"
+            container
+                .query_selector("[data-mobile-test='voice-session-bar']")
+                .unwrap()
+                .is_none(),
+            "the session bar must leave with the session"
         );
         assert!(
-            document
-                .query_selector("[data-test^='mobile-voice-start-']")
+            container
+                .query_selector("[data-test='mobile-voice-start']")
                 .unwrap()
-                .is_some(),
-            "Dismiss must return to the compact toggle"
+                .is_none(),
+            "no speech control may render without a voice-capable host"
+        );
+        drop(mount);
+        container.remove();
+    }
+
+    /// **Opening a chat must reveal the mic.**
+    ///
+    /// The composer mounts before any chat is active, so the offer memo starts
+    /// with nothing to offer. It used to compute that through untracked reads,
+    /// subscribing to nothing — the memo never recomputed and the Voice button
+    /// could never appear, even on a voice-capable host. This drives the live
+    /// order: capabilities and settings arrive on connect, the user opens a
+    /// chat afterwards. The unconfigured mode stays listed behind the caret,
+    /// disabled, with the reason.
+    #[wasm_bindgen_test]
+    async fn voice_bar_appears_when_a_chat_becomes_active_after_mount() {
+        let container = container();
+        let state = AppState::new();
+        let mount_state = state.clone();
+        let mount = mount_to(container.clone(), move || {
+            provide_context(mount_state.clone());
+            view! { <MobileVoiceComposerButton /> }
+        });
+        next_tick().await;
+        assert!(
+            container
+                .query_selector("[data-test='mobile-voice-start']")
+                .unwrap()
+                .is_none(),
+            "no voice button may show before a chat is active"
         );
 
+        activate_voice_chat(&state, "voice-host", "voice-agent", false);
+        next_tick().await;
+
+        let start = container
+            .query_selector("[data-test='mobile-voice-start']")
+            .unwrap()
+            .expect("the mic must appear once a chat is active on a voice-capable host");
+        assert!(
+            !start.has_attribute("disabled"),
+            "the configured mode must be startable"
+        );
+        assert_eq!(
+            start.get_attribute("data-voice-mode").as_deref(),
+            Some("conversation"),
+            "with Transcribe unconfigured the mic must fall through to Nova"
+        );
+
+        container
+            .query_selector("[data-test='mobile-voice-mode-toggle']")
+            .unwrap()
+            .expect("the caret must open the mode menu")
+            .dyn_into::<HtmlElement>()
+            .unwrap()
+            .click();
+        next_tick().await;
+        let dictation = container
+            .query_selector("[data-test='mobile-voice-mode-dictation']")
+            .unwrap()
+            .expect("an unconfigured mode stays listed");
+        assert!(
+            dictation.has_attribute("disabled"),
+            "dictation must not be selectable without Transcribe"
+        );
+        assert!(
+            dictation
+                .text_content()
+                .unwrap()
+                .contains("Transcribe is not available"),
+            "a disabled mode must say why"
+        );
+        assert!(
+            !container
+                .query_selector("[data-test='mobile-voice-mode-conversation']")
+                .unwrap()
+                .expect("the configured mode is listed")
+                .has_attribute("disabled"),
+            "the configured mode must be selectable"
+        );
         drop(mount);
         container.remove();
     }

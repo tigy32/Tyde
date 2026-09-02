@@ -808,7 +808,15 @@ pub async fn close_host_browse(
 pub async fn deliver_push_subscription(state: &AppState, host: LocalHostId) {
     let subscription = match crate::push::current_subscription().await {
         Ok(Some(subscription)) => subscription,
-        Ok(None) => return,
+        Ok(None) => {
+            if crate::push::availability() == crate::push::PushAvailability::Granted {
+                log::warn!(
+                    "notification permission is granted but this device holds no push \
+                     subscription; hosts cannot notify it until it subscribes again"
+                );
+            }
+            return;
+        }
         Err(message) => {
             log::error!("failed to read push subscription: {message}");
             state.set_command_error(&host, format!("Notifications unavailable: {message}"));

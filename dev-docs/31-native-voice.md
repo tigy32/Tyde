@@ -19,8 +19,9 @@ mode and the caret picks between them. Dictation is the default because it is
 the mode that needs neither an agent nor a resolvable target and cannot act on
 the user's behalf. A mode that cannot start stays listed in the caret menu but
 is disabled and carries the reason, so an unavailable capability is explained
-rather than silently dropped. Mobile shows the same choice as a two-segment
-radio group.
+rather than silently dropped. Mobile renders the same split button inside the
+chat input row, beside Send, and its live-session strip sits in the composer
+stack above the input row; neither surface floats over the conversation.
 
 On desktop the mic is a press-and-hold control for dictation: holding it
 records and releasing ends the turn, while a press shorter than the hold

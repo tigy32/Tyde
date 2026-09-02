@@ -120,6 +120,15 @@ subscription says so rather than silently delivering nothing.
 - **iOS requires installation.** Web Push does not work in a Safari tab; the app
   must be added to the Home Screen. The settings section says so rather than
   offering a control that cannot work.
+- **"On" means a live browser subscription, not granted permission.** The
+  browser can drop its push subscription while the permission stays granted;
+  in that state every host silently has nothing to deliver to. The settings
+  section reads `pushManager.getSubscription()` and, when permission is granted
+  but no subscription exists, says so and offers "Turn on" to subscribe again.
+  Delivery outcomes are logged on the host (`delivered mobile push
+  notification`, the subscription-gone warning, and a note when no
+  disconnected device holds a live subscription) so a quiet phone can be
+  explained from the host log.
 
 ## Testing
 

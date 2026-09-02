@@ -1686,6 +1686,7 @@ pub fn ChatInput() -> impl IntoView {
                     {move || attachment_error.get().unwrap_or_default()}
                 </div>
             </Show>
+            <crate::voice::MobileVoiceComposerBar />
             <div class="chat-input-row" data-mobile-test="chat-input-capsule">
                 <Show when=move || is_running.get()>
                     <svg
@@ -1739,6 +1740,7 @@ pub fn ChatInput() -> impl IntoView {
                     }
                     on:keydown=on_keydown
                 />
+                <crate::voice::MobileVoiceComposerButton />
                 <div
                     class="chat-send-split"
                     role="group"
@@ -2321,6 +2323,154 @@ mod wasm_tests {
         input
             .dispatch_event(&web_sys::Event::new("input").unwrap())
             .unwrap();
+    }
+
+    /// The real stylesheet, so geometry assertions measure what users see.
+    const PROD_STYLES: &str = include_str!("../../styles.css");
+
+    fn ensure_styles_loaded() {
+        let document = web_sys::window().unwrap().document().unwrap();
+        if document.get_element_by_id("prod-styles").is_some() {
+            return;
+        }
+        let style = document.create_element("style").unwrap();
+        style.set_id("prod-styles");
+        style.set_text_content(Some(PROD_STYLES));
+        document.head().unwrap().append_child(&style).unwrap();
+    }
+
+    fn rect(element: &web_sys::Element) -> web_sys::DomRect {
+        element.get_bounding_client_rect()
+    }
+
+    /// **Voice controls are part of the input bar, never a float over the
+    /// chat.** The idle mic renders inside the composer capsule, between the
+    /// text field and Send, and a live session strip sits above the capsule in
+    /// the composer stack without overlapping it. Both used to be
+    /// `position: fixed` pills above the bottom nav, covering the conversation.
+    #[wasm_bindgen_test]
+    async fn voice_controls_live_inside_the_composer() {
+        ensure_styles_loaded();
+        let container = make_container();
+        let state = mount_new_chat(&container);
+        let host = LocalHostId("host-1".to_owned());
+        let mut settings = settings_model::HostSettings::default();
+        settings.voice.dictation_enabled = true;
+        state.host_settings_by_host.update(|map| {
+            map.insert(host.clone(), settings);
+        });
+        state.voice_capabilities_by_host.update(|caps| {
+            caps.insert(
+                host,
+                protocol::VoiceCapabilitiesPayload::for_connection(false, true, false),
+            );
+        });
+        next_tick().await;
+
+        let capsule = container
+            .query_selector("[data-mobile-test='chat-input-capsule']")
+            .unwrap()
+            .expect("the composer capsule renders");
+        let mic = container
+            .query_selector("[data-test='mobile-voice-start']")
+            .unwrap()
+            .expect("a host offering dictation must show the mic in the composer");
+        let send = container
+            .query_selector("[data-mobile-test='chat-send']")
+            .unwrap()
+            .expect("send renders");
+        let (capsule_rect, mic_rect, send_rect) = (rect(&capsule), rect(&mic), rect(&send));
+        assert!(
+            mic_rect.width() > 0.0 && mic_rect.height() > 0.0,
+            "the mic is visible"
+        );
+        assert!(
+            mic_rect.left() >= capsule_rect.left() - 0.5
+                && mic_rect.right() <= capsule_rect.right() + 0.5
+                && mic_rect.top() >= capsule_rect.top() - 0.5
+                && mic_rect.bottom() <= capsule_rect.bottom() + 0.5,
+            "the mic must sit inside the composer capsule, got mic {:?}..{:?} in capsule {:?}..{:?}",
+            (mic_rect.left(), mic_rect.top()),
+            (mic_rect.right(), mic_rect.bottom()),
+            (capsule_rect.left(), capsule_rect.top()),
+            (capsule_rect.right(), capsule_rect.bottom()),
+        );
+        assert!(
+            mic_rect.right() <= send_rect.left() + 0.5,
+            "the mic sits before Send, got mic right {} vs send left {}",
+            mic_rect.right(),
+            send_rect.left()
+        );
+        assert_eq!(
+            mic.get_attribute("data-voice-mode").as_deref(),
+            Some("dictation"),
+            "with only Transcribe configured the mic dictates"
+        );
+        assert!(
+            container
+                .query_selector("[data-mobile-test='voice-session-bar']")
+                .unwrap()
+                .is_none(),
+            "no session strip while idle"
+        );
+
+        state.voice_ui.set(crate::voice::MobileVoiceState::Failed(
+            "microphone unavailable".to_owned(),
+        ));
+        next_tick().await;
+        let bar = container
+            .query_selector("[data-mobile-test='voice-session-bar']")
+            .unwrap()
+            .expect("a voice session renders its strip in the composer");
+        let capsule_rect = rect(&capsule);
+        let bar_rect = rect(&bar);
+        assert!(
+            bar_rect.width() > 0.0 && bar_rect.bottom() <= capsule_rect.top() + 0.5,
+            "the session strip sits above the capsule instead of covering it, got strip bottom {} vs capsule top {}",
+            bar_rect.bottom(),
+            capsule_rect.top()
+        );
+        assert!(
+            (bar_rect.left() - capsule_rect.left()).abs() < 1.0
+                && (bar_rect.right() - capsule_rect.right()).abs() < 1.0,
+            "the session strip spans the composer width"
+        );
+        assert!(
+            bar.text_content()
+                .unwrap()
+                .contains("microphone unavailable"),
+            "the failure reason is visible"
+        );
+        assert!(
+            container
+                .query_selector("[data-test='mobile-voice-start']")
+                .unwrap()
+                .is_none(),
+            "the mic yields to the session strip while a session is open"
+        );
+
+        container
+            .query_selector("button[aria-label='Dismiss voice error']")
+            .unwrap()
+            .expect("a failed session offers Dismiss")
+            .dyn_into::<HtmlElement>()
+            .unwrap()
+            .click();
+        next_tick().await;
+        assert!(
+            container
+                .query_selector("[data-mobile-test='voice-session-bar']")
+                .unwrap()
+                .is_none(),
+            "Dismiss closes the strip"
+        );
+        assert!(
+            container
+                .query_selector("[data-test='mobile-voice-start']")
+                .unwrap()
+                .is_some(),
+            "Dismiss returns the mic to the composer"
+        );
     }
 
     /// Mount a composer in new-chat mode (no active agent) on a connected host.

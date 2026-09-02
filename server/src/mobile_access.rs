@@ -2245,6 +2245,13 @@ impl MobileAccessActor {
                 (!push.expired).then(|| (record.device_id.clone(), push.subscription.clone()))
             })
             .collect();
+        if targets.is_empty() {
+            tracing::info!(
+                agent_id = %notification.agent_id,
+                reason = ?notification.reason,
+                "no disconnected device holds a live push subscription; agent idle not delivered"
+            );
+        }
 
         for (device_id, subscription) in targets {
             let client = self.push_client.clone();
@@ -2254,8 +2261,20 @@ impl MobileAccessActor {
             // holding the actor loop for it would stall every other command.
             tokio::spawn(async move {
                 match send_push(&client, &subscription, &notification, now_secs).await {
-                    Ok(()) => {}
+                    Ok(()) => {
+                        tracing::info!(
+                            %device_id,
+                            agent_id = %notification.agent_id,
+                            reason = ?notification.reason,
+                            "delivered mobile push notification"
+                        );
+                    }
                     Err(PushSendError::SubscriptionGone) => {
+                        tracing::warn!(
+                            %device_id,
+                            agent_id = %notification.agent_id,
+                            "push service reports the device subscription is gone; marking it expired"
+                        );
                         let _ = tx.send(MobileAccessCommand::PushSubscriptionGone { device_id });
                     }
                     Err(error) => {

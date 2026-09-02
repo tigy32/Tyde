@@ -4839,9 +4839,19 @@ html[data-keyboard-open] .mobile-app {
     opacity: 0.6;
     cursor: default;
 }
-.mobile-voice-bar{position:fixed;z-index:90;left:12px;right:12px;bottom:calc(76px + env(safe-area-inset-bottom));display:flex;gap:10px;align-items:center;padding:10px 14px;border-radius:18px;background:var(--surface-raised,#20232b);box-shadow:0 10px 30px rgba(0,0,0,.3)}.mobile-voice-bar span{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.mobile-voice-bar button{border-radius:999px;padding:8px 14px}.mobile-voice-bar button:first-of-type{margin-left:auto}
-/* Idle voice UI: a compact floating pill instead of the full-width bar, so a
-   voice-capable host does not cover chat content until the user enters voice
-   mode. */
-.mobile-voice-toggle{position:fixed;z-index:90;right:12px;bottom:calc(76px + env(safe-area-inset-bottom));display:flex;align-items:center;gap:8px;border-radius:999px;padding:8px 10px;background:var(--surface-raised,#20232b);box-shadow:0 10px 30px rgba(0,0,0,.3)}
-.mobile-voice-toggle button{border-radius:999px;padding:8px 12px}.mobile-voice-mode{padding:6px 12px;font-size:.8rem;color:var(--text-primary,#e6e9ef);background:var(--surface-2,#171a21)}.mobile-voice-mode:disabled{opacity:.4}
+/* Voice lives in the composer, not in a floating overlay. The previous idle
+   pill and session bar were `position: fixed` above the bottom nav, exactly
+   where the composer sits, so they covered the last messages and got in the
+   way of the input. Both surfaces below are in normal flow: the session bar
+   sits above the input row (pushing it down), the mic sits beside Send. */
+.chat-voice-bar{display:flex;align-items:center;gap:var(--space-2);min-width:0;margin-bottom:var(--space-2);padding:var(--space-2) var(--space-3);border-radius:var(--radius-lg);background:var(--bg-surface-2);border:1px solid var(--border-default);font-size:14px;color:var(--text-primary)}
+.chat-voice-bar span{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.chat-voice-bar button{height:32px;padding:0 var(--space-3);border-radius:var(--radius-full);background:var(--accent-primary);color:white;font-size:13px;font-weight:600;flex-shrink:0}
+.chat-voice-bar button:first-of-type{margin-left:auto}
+.chat-voice-bar button:disabled{opacity:var(--button-disabled-opacity)}
+.chat-voice-split{margin-right:var(--space-1)}
+.chat-voice-btn{min-width:var(--button-height);height:var(--button-height);padding:0 var(--space-2);border-radius:var(--radius-lg) 0 0 var(--radius-lg);background:var(--bg-surface-2);color:var(--text-primary);border:1px solid var(--border-default);display:grid;place-items:center}
+.chat-voice-btn:disabled{opacity:var(--button-disabled-opacity)}
+.chat-voice-btn:active:not(:disabled){transform:scale(.92)}
+.chat-send-menu-item:disabled{opacity:var(--button-disabled-opacity)}
+.chat-send-menu-hint{display:block;font-size:12px;font-weight:400;color:var(--text-secondary);white-space:normal;max-width:220px}

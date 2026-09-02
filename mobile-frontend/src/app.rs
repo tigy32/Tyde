@@ -292,7 +292,7 @@ fn ActiveHostShell() -> impl IntoView {
     let state = use_context::<AppState>().unwrap();
     view! {
         <components::ConnectionBanner />
-        <crate::voice::MobileVoiceBar />
+        <crate::voice::MobileVoiceRuntime />
         // Host-scoped, so a new-chat submission the transport lost stays
         // recoverable wherever the user navigates — it has no agent to live
         // under, and the client will not guess one. Above the content (and so

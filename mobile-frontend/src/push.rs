@@ -136,6 +136,27 @@ async fn to_protocol(
     })
 }
 
+/// Whether this device currently holds a browser push subscription. Permission
+/// alone is not enough: the browser can drop a subscription while the
+/// permission stays granted, and then no host can reach this device until it
+/// subscribes again.
+pub async fn subscribed() -> Result<bool, String> {
+    if availability() != PushAvailability::Granted {
+        return Ok(false);
+    }
+    let registration = registration().await?;
+    let existing = JsFuture::from(
+        registration
+            .push_manager()
+            .map_err(|error| format!("push manager unavailable: {error:?}"))?
+            .get_subscription()
+            .map_err(|error| format!("failed to read push subscription: {error:?}"))?,
+    )
+    .await
+    .map_err(|error| format!("failed to read push subscription: {error:?}"))?;
+    Ok(!existing.is_null() && !existing.is_undefined())
+}
+
 /// The subscription this device already holds, if any. Read on every connect so
 /// a rotated subscription reaches the host without depending on
 /// `pushsubscriptionchange`, which iOS does not reliably fire.

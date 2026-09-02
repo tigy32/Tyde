@@ -99,18 +99,34 @@ fn backend_setup_status(status: &protocol::BackendSetupStatus) -> (&'static str,
 /// host cannot observe, so unlike the rest of this app it is read from the
 /// platform rather than from server state. What the *host* knows — that it holds
 /// a live subscription for a device — is rendered in the desktop device list.
+///
+/// "On" means the browser holds a push subscription, not merely that permission
+/// was granted. Permission survives the browser dropping the subscription, and
+/// in that state every host silently has nothing to deliver to; the section
+/// must say so and offer the way back, or the only control left is "Turn off".
 #[component]
 fn NotificationsSection() -> impl IntoView {
     let state = use_context::<AppState>().unwrap();
     let availability = RwSignal::new(PushAvailability::Unsupported);
+    let subscribed = RwSignal::new(Option::<bool>::None);
     let busy = RwSignal::new(false);
     let error = RwSignal::new(Option::<String>::None);
 
     // Read once on mount, then after every action, so the row always reflects
-    // the permission the browser actually holds.
-    availability.set(crate::push::availability());
-
-    let refresh = move || availability.set(crate::push::availability());
+    // the permission and subscription the browser actually holds.
+    let refresh = move || {
+        availability.set(crate::push::availability());
+        spawn_local(async move {
+            match crate::push::subscribed().await {
+                Ok(value) => subscribed.set(Some(value)),
+                Err(message) => {
+                    subscribed.set(Some(false));
+                    error.set(Some(format!("Notifications unavailable: {message}")));
+                }
+            }
+        });
+    };
+    refresh();
 
     let enable = {
         let state = state.clone();
@@ -182,23 +198,50 @@ fn NotificationsSection() -> impl IntoView {
                             </div>
                         </>
                     }.into_any(),
-                    PushAvailability::Granted => view! {
-                        <>
+                    PushAvailability::Granted => match subscribed.get() {
+                        None => view! {
                             <SettingsRow label="Agent idle alerts">
-                                <span class="settings-value">"On"</span>
+                                <span class="settings-value">"Checking…"</span>
                             </SettingsRow>
-                            <div class="settings-row settings-row-action">
-                                <Button
-                                    label="Turn off"
-                                    variant=ButtonVariant::Secondary
-                                    full_width=true
-                                    data_mobile_test="settings-notifications-disable"
-                                    disabled=Signal::derive(move || busy.get())
-                                    on_click=Callback::new(disable.clone())
-                                />
-                            </div>
-                        </>
-                    }.into_any(),
+                        }.into_any(),
+                        Some(true) => view! {
+                            <>
+                                <SettingsRow label="Agent idle alerts">
+                                    <span class="settings-value" data-mobile-test="settings-notifications-state">"On"</span>
+                                </SettingsRow>
+                                <div class="settings-row settings-row-action">
+                                    <Button
+                                        label="Turn off"
+                                        variant=ButtonVariant::Secondary
+                                        full_width=true
+                                        data_mobile_test="settings-notifications-disable"
+                                        disabled=Signal::derive(move || busy.get())
+                                        on_click=Callback::new(disable.clone())
+                                    />
+                                </div>
+                            </>
+                        }.into_any(),
+                        Some(false) => view! {
+                            <>
+                                <SettingsRow label="Agent idle alerts">
+                                    <span class="settings-value" data-mobile-test="settings-notifications-state">"Off"</span>
+                                </SettingsRow>
+                                <p class="settings-note">
+                                    "Notifications are allowed, but this device is not subscribed, so your hosts cannot reach it. Turn them on to subscribe again."
+                                </p>
+                                <div class="settings-row settings-row-action">
+                                    <Button
+                                        label="Turn on"
+                                        variant=ButtonVariant::Primary
+                                        full_width=true
+                                        data_mobile_test="settings-notifications-enable"
+                                        disabled=Signal::derive(move || busy.get())
+                                        on_click=Callback::new(enable.clone())
+                                    />
+                                </div>
+                            </>
+                        }.into_any(),
+                    },
                 }}
                 {move || error.get().map(|message| view! {
                     <p class="settings-error" role="alert" data-mobile-test="settings-notifications-error">
@@ -1070,10 +1113,21 @@ mod wasm_tests {
                 );
             }
             PushAvailability::Granted => {
-                assert!(
-                    text.contains("On"),
-                    "a granted browser must show notifications as on, got {text:?}"
-                );
+                // Granted permission is not the same as a live subscription:
+                // the section reports the subscription and, when it is gone,
+                // offers the way back rather than a lone "Turn off".
+                let subscribed = crate::push::subscribed().await.unwrap_or(false);
+                if subscribed {
+                    assert!(
+                        text.contains("On"),
+                        "a subscribed browser must show notifications as on, got {text:?}"
+                    );
+                } else {
+                    assert!(
+                        text.contains("not subscribed") && enable.is_some(),
+                        "a granted but unsubscribed browser must say so and offer Turn on, got {text:?}"
+                    );
+                }
             }
         }
     }
