@@ -4591,16 +4591,32 @@ mod wasm_tests {
         let (_, text) = command_preview_element(&container).expect("preview");
         assert_eq!(text, "cat <<'EOF' > notes.txt hello world EOF");
 
-        let long = format!("echo {}", "abcdefghij ".repeat(80));
+        let long = format!(
+            "echo \"=== who depends on AxdbStorageNetworkProxy (Config) ===\"; curl -s -b ~/.midway/cookie https://code.amazon.com/search?term={}",
+            "AxdbStorageNetworkProxy%20path:Config&raw=".repeat(24)
+        );
         let container = mount_card(run_command_entry("Bash", &long, false));
-        container.style().set_property("width", "360px").unwrap();
+        container.style().set_property("width", "320px").unwrap();
         next_tick().await;
         let (preview, _) = command_preview_element(&container).expect("preview");
+        let preview: HtmlElement = preview.dyn_into().unwrap();
         let line_height = 12.0 * 1.35;
         let height = preview.get_bounding_client_rect().height();
         assert!(
             height > line_height * 1.5 && height < line_height * 2.6,
-            "an 880-char command must render as exactly two clamped rows, got {height}px"
+            "a long command must render as exactly two clamped rows, got {height}px"
+        );
+        assert!(
+            preview.scroll_width() <= preview.client_width() + 1,
+            "the command preview must not overflow its card: {} vs {}",
+            preview.scroll_width(),
+            preview.client_width()
+        );
+        assert!(
+            container.scroll_width() <= container.client_width() + 1,
+            "the complete tool card must stay inside phone width: {} vs {}",
+            container.scroll_width(),
+            container.client_width()
         );
     }
 }

@@ -1014,10 +1014,9 @@ fn NewChatOptions() -> impl IntoView {
 ///
 /// Primary button label follows the state matrix: "Send" when idle, "Queue"
 /// when a turn is running and there is draft text, "Cancel" when running with
-/// an empty composer. The caret is always rendered but disabled when the
-/// dropdown would be empty. The dropdown carries secondary actions only:
-/// "Steer" and "Cancel" when running+input; "Fork + send" when a forkable
-/// session exists and there is draft text.
+/// an empty composer. The only persistent actions are that primary button and
+/// its caret. Photos, speech, and state-specific secondary actions live in the
+/// shared menu so the textarea keeps the width of the capsule.
 #[component]
 pub fn ChatInput() -> impl IntoView {
     let state = use_context::<AppState>().unwrap();
@@ -1338,18 +1337,7 @@ pub fn ChatInput() -> impl IntoView {
         Memo::new(move |_| has_input.get() && active_agent_has_session_id_tracked(&btw_state));
     // Steer = thinking + draft text or photos.
     let is_steer = Memo::new(move |_| is_running.get() && has_input.get());
-    // Menu holds items only for: Fork + send (input+session) or Steer+Cancel (thinking+input).
-    // Steer and Fork + send are submissions too, and both spend money (Fork + send
-    // creates an agent). The in-flight latch closes the whole surface, not just
-    // the primary button — otherwise the dropdown is a way around the guard.
-    let menu_has_items = Memo::new(move |_| (can_btw.get() || is_steer.get()) && !submitting.get());
     let menu_open = RwSignal::new(false);
-    // Auto-dismiss a stale-open menu when its items disappear.
-    Effect::new(move |_| {
-        if !menu_has_items.get() {
-            menu_open.set(false);
-        }
-    });
     let on_split_keydown = move |ev: web_sys::KeyboardEvent| {
         if ev.key() == "Escape" && menu_open.get() {
             ev.prevent_default();
@@ -1358,7 +1346,7 @@ pub fn ChatInput() -> impl IntoView {
     };
 
     let add_photo_state = state.clone();
-    let on_add_photo = move |_| {
+    let on_add_photo = Callback::new(move |_| {
         if !selected_backend_kind(&add_photo_state)
             .map(protocol::BackendKind::supports_image_input)
             .unwrap_or(false)
@@ -1373,7 +1361,7 @@ pub fn ChatInput() -> impl IntoView {
             let input: web_sys::HtmlElement = input.unchecked_into();
             input.click();
         }
-    };
+    });
 
     let choose_photo_state = state.clone();
     let on_photos_chosen = move |ev| {
@@ -1704,18 +1692,6 @@ pub fn ChatInput() -> impl IntoView {
                         />
                     </svg>
                 </Show>
-                <button
-                    type="button"
-                    class="chat-photo-button"
-                    aria-label="Add photos"
-                    data-mobile-test="chat-add-photo"
-                    disabled=move || loading_photos.get() || submitting.get()
-                    on:click=on_add_photo
-                >
-                    <span aria-hidden="true">
-                        {move || if loading_photos.get() { "…" } else { "+" }}
-                    </span>
-                </button>
                 <textarea
                     class="chat-input-field"
                     // Visible, not just a tooltip. On a touch UI `title` never
@@ -1740,7 +1716,6 @@ pub fn ChatInput() -> impl IntoView {
                     }
                     on:keydown=on_keydown
                 />
-                <crate::voice::MobileVoiceComposerButton />
                 <div
                     class="chat-send-split"
                     role="group"
@@ -1805,13 +1780,12 @@ pub fn ChatInput() -> impl IntoView {
                             if menu_open.get() { "true" } else { "false" }
                         }
                         aria-label="More send actions"
-                        disabled=move || !menu_has_items.get()
                         on:click=move |_| menu_open.update(|open| *open = !*open)
                     >
                         <span aria-hidden="true">"\u{2304}"</span>
                     </button>
                     {move || {
-                        if !(menu_open.get() && menu_has_items.get()) {
+                        if !menu_open.get() {
                             return view! { <div></div> }.into_any();
                         }
                         let on_btw = btw_for_menu.clone();
@@ -1832,6 +1806,27 @@ pub fn ChatInput() -> impl IntoView {
                                 aria-label="Send actions"
                                 data-mobile-test="chat-send-menu"
                             >
+                                <button
+                                    type="button"
+                                    class="chat-send-menu-item"
+                                    role="menuitem"
+                                    data-mobile-test="chat-add-photo"
+                                    disabled=move || loading_photos.get() || submitting.get()
+                                    on:click=move |_| {
+                                        menu_open.set(false);
+                                        on_add_photo.run(());
+                                    }
+                                >
+                                    <span class="chat-send-menu-icon" aria-hidden="true">
+                                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+                                            <path d="M12 5v14M5 12h14" />
+                                        </svg>
+                                    </span>
+                                    <span class="chat-send-menu-label">"Add photos"</span>
+                                </button>
+                                <crate::voice::MobileVoiceComposerMenuItems
+                                    on_select=Callback::new(move |_| menu_open.set(false))
+                                />
                                 {show_steer.then(|| view! {
                                     <button
                                         type="button"
@@ -2343,11 +2338,9 @@ mod wasm_tests {
         element.get_bounding_client_rect()
     }
 
-    /// **Voice controls are part of the input bar, never a float over the
-    /// chat.** The idle mic renders inside the composer capsule, between the
-    /// text field and Send, and a live session strip sits above the capsule in
-    /// the composer stack without overlapping it. Both used to be
-    /// `position: fixed` pills above the bottom nav, covering the conversation.
+    /// **The idle composer shows only the field and one send split.** Photos and
+    /// speech live behind its caret; a live voice session still sits above the
+    /// capsule without overlapping it.
     #[wasm_bindgen_test]
     async fn voice_controls_live_inside_the_composer() {
         ensure_styles_loaded();
@@ -2371,40 +2364,58 @@ mod wasm_tests {
             .query_selector("[data-mobile-test='chat-input-capsule']")
             .unwrap()
             .expect("the composer capsule renders");
-        let mic = container
-            .query_selector("[data-test='mobile-voice-start']")
-            .unwrap()
-            .expect("a host offering dictation must show the mic in the composer");
-        let send = container
-            .query_selector("[data-mobile-test='chat-send']")
-            .unwrap()
-            .expect("send renders");
-        let (capsule_rect, mic_rect, send_rect) = (rect(&capsule), rect(&mic), rect(&send));
-        assert!(
-            mic_rect.width() > 0.0 && mic_rect.height() > 0.0,
-            "the mic is visible"
-        );
-        assert!(
-            mic_rect.left() >= capsule_rect.left() - 0.5
-                && mic_rect.right() <= capsule_rect.right() + 0.5
-                && mic_rect.top() >= capsule_rect.top() - 0.5
-                && mic_rect.bottom() <= capsule_rect.bottom() + 0.5,
-            "the mic must sit inside the composer capsule, got mic {:?}..{:?} in capsule {:?}..{:?}",
-            (mic_rect.left(), mic_rect.top()),
-            (mic_rect.right(), mic_rect.bottom()),
-            (capsule_rect.left(), capsule_rect.top()),
-            (capsule_rect.right(), capsule_rect.bottom()),
-        );
-        assert!(
-            mic_rect.right() <= send_rect.left() + 0.5,
-            "the mic sits before Send, got mic right {} vs send left {}",
-            mic_rect.right(),
-            send_rect.left()
-        );
         assert_eq!(
-            mic.get_attribute("data-voice-mode").as_deref(),
-            Some("dictation"),
-            "with only Transcribe configured the mic dictates"
+            capsule.query_selector_all("button").unwrap().length(),
+            2,
+            "the closed composer shows only the primary send action and its caret"
+        );
+        let split = container
+            .query_selector("[data-mobile-test='chat-send-split']")
+            .unwrap()
+            .expect("send split");
+        assert!(
+            rect(&split).width() <= 110.0,
+            "the compact send split must preserve textarea width, got {}px",
+            rect(&split).width()
+        );
+        assert!(
+            container
+                .query_selector("[data-mobile-test='chat-add-photo']")
+                .unwrap()
+                .is_none(),
+            "the attachment action must not clutter the closed composer"
+        );
+        assert!(
+            container
+                .query_selector("[data-test='mobile-voice-mode-dictation']")
+                .unwrap()
+                .is_none(),
+            "speech actions must not clutter the closed composer"
+        );
+
+        open_menu(&container).await;
+        let _menu = container
+            .query_selector("[data-mobile-test='chat-send-menu']")
+            .unwrap()
+            .expect("the shared send menu opens");
+        let photo = container
+            .query_selector("[data-mobile-test='chat-add-photo']")
+            .unwrap()
+            .expect("attachments move into the send menu");
+        let dictation = container
+            .query_selector("[data-test='mobile-voice-mode-dictation']")
+            .unwrap()
+            .expect("dictation moves into the send menu");
+        assert!(
+            photo
+                .closest("[data-mobile-test='chat-send-menu']")
+                .unwrap()
+                .is_some()
+                && dictation
+                    .closest("[data-mobile-test='chat-send-menu']")
+                    .unwrap()
+                    .is_some(),
+            "photo and microphone actions must share the send caret menu"
         );
         assert!(
             container
@@ -2443,10 +2454,10 @@ mod wasm_tests {
         );
         assert!(
             container
-                .query_selector("[data-test='mobile-voice-start']")
+                .query_selector("[data-test='mobile-voice-mode-dictation']")
                 .unwrap()
                 .is_none(),
-            "the mic yields to the session strip while a session is open"
+            "speech actions yield to the session strip while a session is open"
         );
 
         container
@@ -2466,10 +2477,10 @@ mod wasm_tests {
         );
         assert!(
             container
-                .query_selector("[data-test='mobile-voice-start']")
+                .query_selector("[data-test='mobile-voice-mode-dictation']")
                 .unwrap()
                 .is_some(),
-            "Dismiss returns the mic to the composer"
+            "Dismiss returns speech to the shared menu"
         );
     }
 
@@ -2735,9 +2746,9 @@ mod wasm_tests {
     }
 
     // ── State matrix row 1: Idle + empty ─────────────────────────────────────
-    // Primary "Send" disabled; caret visible but disabled.
+    // Primary "Send" disabled; caret still exposes composer utilities.
     #[wasm_bindgen_test]
-    async fn idle_empty_send_disabled_caret_disabled() {
+    async fn idle_empty_send_disabled_caret_opens_utilities() {
         let container = make_container();
         let _h = mount_to(container.clone(), move || {
             let state = AppState::new();
@@ -2755,8 +2766,8 @@ mod wasm_tests {
 
         let c = caret(&container);
         assert!(
-            c.has_attribute("disabled"),
-            "caret must be disabled with no menu items"
+            !c.has_attribute("disabled"),
+            "the caret must remain available for attachments and speech"
         );
 
         let picker: web_sys::HtmlInputElement = container
@@ -2767,12 +2778,13 @@ mod wasm_tests {
             .unwrap();
         assert_eq!(picker.accept(), "image/*");
         assert!(picker.multiple(), "the picker should allow multiple photos");
+        open_menu(&container).await;
         assert!(
             container
                 .query_selector("[data-mobile-test='chat-add-photo']")
                 .unwrap()
                 .is_some(),
-            "the photo picker needs a visible touch target"
+            "the photo picker needs a touch target in the send menu"
         );
     }
 
@@ -3432,9 +3444,9 @@ mod wasm_tests {
     }
 
     // ── State matrix row 4: Thinking + empty ─────────────────────────────────
-    // Primary "Cancel" enabled; caret disabled; no menu items.
+    // Primary "Cancel" enabled; caret still exposes composer utilities.
     #[wasm_bindgen_test]
-    async fn thinking_empty_primary_cancel_caret_disabled() {
+    async fn thinking_empty_primary_cancel_caret_opens_utilities() {
         let host = LocalHostId("host-1".to_owned());
         let host_clone = host.clone();
         let container = make_container();
@@ -3469,9 +3481,11 @@ mod wasm_tests {
 
         let c = caret(&container);
         assert!(
-            c.has_attribute("disabled"),
-            "caret must be disabled when thinking+empty (no menu items)"
+            !c.has_attribute("disabled"),
+            "composer utilities remain available while a turn is running"
         );
+        open_menu(&container).await;
+        assert_eq!(menu_item_texts(&container), vec!["Add photos".to_owned()]);
     }
 
     // ── State matrix row 5: Thinking + input, no session ─────────────────────
@@ -3521,8 +3535,12 @@ mod wasm_tests {
         open_menu(&container).await;
         assert_eq!(
             menu_item_texts(&container),
-            vec!["Steer".to_owned(), "Cancel".to_owned()],
-            "thinking+input menu must be Steer then Cancel"
+            vec![
+                "Add photos".to_owned(),
+                "Steer".to_owned(),
+                "Cancel".to_owned()
+            ],
+            "thinking+input menu must include utilities before turn actions"
         );
     }
 
@@ -3560,11 +3578,11 @@ mod wasm_tests {
         });
         next_tick().await;
 
-        // No draft → caret present but disabled.
+        // No draft still leaves composer utilities reachable.
         let c = caret(&container);
         assert!(
-            c.has_attribute("disabled"),
-            "caret must be disabled while no menu items (idle, no draft)"
+            !c.has_attribute("disabled"),
+            "caret must expose composer utilities before there is a draft"
         );
 
         type_text(&container, "why is this slow?");
@@ -3587,8 +3605,8 @@ mod wasm_tests {
         );
         assert_eq!(
             menu_item_texts(&container),
-            vec!["Fork + send".to_owned()],
-            "idle+session menu must be exactly 'Fork + send'"
+            vec!["Add photos".to_owned(), "Fork + send".to_owned()],
+            "idle+session menu must include attachments and Fork + send"
         );
         // Fork + send must only exist inside the dropdown, not as a standalone button.
         assert!(
@@ -3601,9 +3619,9 @@ mod wasm_tests {
     }
 
     // ── State matrix row 2: Idle + input, no session ─────────────────────────
-    // Primary "Send" enabled; caret disabled (no menu items).
+    // Primary "Send" enabled; caret exposes composer utilities.
     #[wasm_bindgen_test]
-    async fn idle_input_no_session_send_enabled_caret_disabled() {
+    async fn idle_input_no_session_send_enabled_caret_opens_utilities() {
         let host = LocalHostId("host-1".to_owned());
         let host_clone = host.clone();
         let container = make_container();
@@ -3644,12 +3662,14 @@ mod wasm_tests {
             "Send must be enabled with draft"
         );
 
-        // No session → Fork + send absent → caret disabled.
+        // No session → Fork + send absent, but utilities remain.
         let c = caret(&container);
         assert!(
-            c.has_attribute("disabled"),
-            "caret must be disabled with no session (idle+input)"
+            !c.has_attribute("disabled"),
+            "caret must retain composer utilities without a session"
         );
+        open_menu(&container).await;
+        assert_eq!(menu_item_texts(&container), vec!["Add photos".to_owned()]);
         assert!(
             container
                 .query_selector("[data-mobile-test='chat-send-menu-ask-aside']")
@@ -3718,11 +3738,12 @@ mod wasm_tests {
         assert_eq!(
             menu_item_texts(&container),
             vec![
+                "Add photos".to_owned(),
                 "Steer".to_owned(),
                 "Fork + send".to_owned(),
                 "Cancel".to_owned(),
             ],
-            "thinking+session+input menu must be Steer, Fork + send, Cancel"
+            "thinking+session+input menu must include utilities and turn actions"
         );
     }
 
@@ -3919,8 +3940,8 @@ mod wasm_tests {
         open_menu(&container).await;
         assert_eq!(
             menu_item_texts(&container),
-            vec!["Fork + send".to_owned()],
-            "a dead agent's menu offers recovery only — never Steer or Cancel"
+            vec!["Add photos".to_owned(), "Fork + send".to_owned()],
+            "a dead agent's menu offers composer utilities and recovery — never Steer or Cancel"
         );
 
         let fork: HtmlElement = container
@@ -4145,8 +4166,8 @@ mod wasm_tests {
         );
     }
 
-    /// Without a forkable session there is no in-context recovery, so the caret
-    /// closes too — but that must not quietly re-open same-actor Send.
+    /// Without a forkable session there is no in-context recovery, but the
+    /// composer menu stays available without quietly re-opening same-actor Send.
     #[wasm_bindgen_test]
     async fn terminated_agent_without_a_session_offers_no_send_and_no_fork() {
         let container = make_container();
@@ -4159,9 +4180,11 @@ mod wasm_tests {
         assert_eq!(p.text_content().unwrap_or_default().trim(), "Terminated");
         assert!(p.has_attribute("disabled"));
         assert!(
-            caret(&container).has_attribute("disabled"),
-            "no session means no Fork + send, so the menu has nothing to offer"
+            !caret(&container).has_attribute("disabled"),
+            "attachments remain available even though Fork + send is absent"
         );
+        open_menu(&container).await;
+        assert_eq!(menu_item_texts(&container), vec!["Add photos".to_owned()]);
     }
 
     /// The composer carries desktop's thinking indicator, grown from a line

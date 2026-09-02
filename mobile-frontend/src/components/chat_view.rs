@@ -880,7 +880,7 @@ pub fn ChatView() -> impl IntoView {
                             <rect
                                 class="chat-context-bar-fill"
                                 {..leptos::attr::custom::custom_attribute("pathLength", "100")}
-                                style=format!("--context-fill: {pct:.1}")
+                                style=format!("--context-remaining: {:.1}%", 100.0 - pct)
                             />
                         </svg>
                     }
@@ -2937,17 +2937,10 @@ mod wasm_tests {
             "the ring follows the capsule's rounded ends ({corner} vs {})",
             header.height()
         );
-        let dashes = context_bar_fill_style(&container, "stroke-dasharray");
-        let mut lengths = dashes
-            .split([',', ' '])
-            .filter(|part| !part.is_empty())
-            .map(px);
-        let lit = lengths.next().expect("lit length");
-        let whole = lengths.next().expect("perimeter length");
-        let share = lit / whole;
+        let clip = context_bar_fill_style(&container, "clip-path");
         assert!(
-            (share - 0.60).abs() < 0.02,
-            "the lit arc is the used share of the window, got {share} from {dashes}"
+            clip.contains("40%"),
+            "60% usage must reveal the capsule from the left through 60% of its width, got {clip}"
         );
         let calm = context_bar_fill_colour(&container);
 

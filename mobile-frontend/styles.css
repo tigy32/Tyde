@@ -1265,12 +1265,9 @@ html[data-keyboard-open] .mobile-app {
     gap: var(--space-2);
 }
 
-/* Context occupancy as a ring around the header capsule, drawn like the
-   composer's thinking ring below: a faint hairline track traces the whole
-   silhouette and the used share is a lit stroke that grows clockwise from the
-   top-left corner, so a full window closes the loop. `pathLength` normalises
-   the outline to 100 units, which makes the dash a share of the perimeter; a
-   conic gradient would make it a share of an angle, which a wide pill skews. */
+/* Context occupancy as a ring around the header capsule. The complete outline
+   is revealed from left to right, so the top and bottom advance together around
+   the title and a full window closes the capsule. */
 .chat-context-bar {
     position: absolute;
     inset: 0;
@@ -1301,9 +1298,9 @@ html[data-keyboard-open] .mobile-app {
        red), so the level stays readable to anything that inspects the
        computed colour. */
     stroke: var(--ring-colour);
-    stroke-dasharray: var(--context-fill) 100;
+    clip-path: inset(0 var(--context-remaining) 0 0);
     filter: drop-shadow(0 0 3px color-mix(in srgb, var(--ring-colour) 70%, transparent));
-    transition: stroke-dasharray var(--motion-slow) var(--ease-standard);
+    transition: clip-path var(--motion-slow) var(--ease-standard);
 }
 
 .chat-context-bar[data-context-level="warning"] {
@@ -1789,11 +1786,17 @@ html[data-keyboard-open] .mobile-app {
 .tool-cards {
     display: flex;
     flex-direction: column;
+    min-width: 0;
+    max-width: 100%;
     gap: var(--space-1);
     margin-top: var(--space-2);
 }
 
 .tool-card {
+    min-width: 0;
+    max-width: 100%;
+    overflow: hidden;
+    box-sizing: border-box;
     padding: var(--space-2) var(--space-3);
     background: var(--bg-surface-2);
     border-radius: var(--radius-sm);
@@ -1817,6 +1820,7 @@ html[data-keyboard-open] .mobile-app {
 .tool-card-header {
     display: flex;
     align-items: center;
+    min-width: 0;
     gap: var(--space-2);
 }
 
@@ -1825,9 +1829,11 @@ html[data-keyboard-open] .mobile-app {
 }
 
 .tool-name {
+    min-width: 0;
     font-weight: 500;
     font-family: var(--font-mono);
     font-size: 12px;
+    overflow-wrap: anywhere;
 }
 
 /* The command (or other request detail) under the tool name. Clamped to two
@@ -1858,7 +1864,15 @@ html[data-keyboard-open] .mobile-app {
     margin-top: var(--space-1);
 }
 
+.tool-result {
+    min-width: 0;
+    max-width: 100%;
+}
+
 .tool-output {
+    box-sizing: border-box;
+    width: 100%;
+    max-width: 100%;
     margin-top: var(--space-1);
     font-family: var(--font-mono);
     font-size: 11px;
@@ -2283,7 +2297,7 @@ html[data-keyboard-open] .mobile-app {
     position: relative;
     display: flex;
     align-items: flex-end;
-    gap: var(--space-2);
+    gap: var(--space-1);
     padding: var(--space-1);
     border-radius: var(--radius-xl);
     box-shadow: var(--rim-float), var(--shadow-float);
@@ -2352,29 +2366,6 @@ html[data-keyboard-open] .mobile-app {
     font-size: var(--text-xs);
 }
 
-.chat-photo-button {
-    width: var(--button-height);
-    height: var(--button-height);
-    flex: 0 0 var(--button-height);
-    display: grid;
-    place-items: center;
-    padding: 0;
-    border-radius: var(--radius-full);
-    background: transparent;
-    color: var(--text-secondary);
-    font-size: 24px;
-    font-weight: 400;
-    line-height: 1;
-}
-
-.chat-photo-button:disabled {
-    opacity: var(--button-disabled-opacity);
-}
-
-.chat-photo-button:active:not(:disabled) {
-    transform: scale(0.92);
-}
-
 .chat-input-field {
     flex: 1;
     min-height: 36px;
@@ -2396,7 +2387,7 @@ html[data-keyboard-open] .mobile-app {
 .send-button {
     min-width: var(--button-height);
     height: var(--button-height);
-    padding: 0 var(--space-3);
+    padding: 0 10px;
     border-radius: var(--radius-lg);
     background: var(--accent-primary);
     color: white;
@@ -2433,7 +2424,8 @@ html[data-keyboard-open] .mobile-app {
 }
 
 .send-menu-toggle {
-    min-width: var(--button-height);
+    min-width: 40px;
+    width: 40px;
     height: var(--button-height);
     padding: 0 var(--space-2);
     margin-left: -1px;
@@ -2467,6 +2459,7 @@ html[data-keyboard-open] .mobile-app {
     z-index: 41;
     min-width: 140px;
     width: max-content;
+    max-width: min(320px, calc(100vw - 2 * var(--chrome-gutter)));
     display: flex;
     flex-direction: column;
     padding: var(--space-1);
@@ -2477,6 +2470,10 @@ html[data-keyboard-open] .mobile-app {
 }
 
 .chat-send-menu-item {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    width: 100%;
     text-align: left;
     padding: var(--space-2) var(--space-3);
     border-radius: var(--radius-sm);
@@ -2485,6 +2482,21 @@ html[data-keyboard-open] .mobile-app {
     font-size: 15px;
     font-weight: 500;
     white-space: nowrap;
+}
+
+.chat-send-menu-icon {
+    width: 20px;
+    height: 20px;
+    flex: 0 0 20px;
+    display: grid;
+    place-items: center;
+    font-size: 20px;
+    line-height: 1;
+}
+
+.chat-send-menu-icon svg {
+    width: 18px;
+    height: 18px;
 }
 
 .chat-send-menu-item:active {
@@ -4839,19 +4851,14 @@ html[data-keyboard-open] .mobile-app {
     opacity: 0.6;
     cursor: default;
 }
-/* Voice lives in the composer, not in a floating overlay. The previous idle
-   pill and session bar were `position: fixed` above the bottom nav, exactly
-   where the composer sits, so they covered the last messages and got in the
-   way of the input. Both surfaces below are in normal flow: the session bar
-   sits above the input row (pushing it down), the mic sits beside Send. */
+/* A live voice session stays in normal flow above the composer. Idle speech
+   actions share the send menu and need no separate capsule styles. */
 .chat-voice-bar{display:flex;align-items:center;gap:var(--space-2);min-width:0;margin-bottom:var(--space-2);padding:var(--space-2) var(--space-3);border-radius:var(--radius-lg);background:var(--bg-surface-2);border:1px solid var(--border-default);font-size:14px;color:var(--text-primary)}
 .chat-voice-bar span{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .chat-voice-bar button{height:32px;padding:0 var(--space-3);border-radius:var(--radius-full);background:var(--accent-primary);color:white;font-size:13px;font-weight:600;flex-shrink:0}
 .chat-voice-bar button:first-of-type{margin-left:auto}
 .chat-voice-bar button:disabled{opacity:var(--button-disabled-opacity)}
-.chat-voice-split{margin-right:var(--space-1)}
-.chat-voice-btn{min-width:var(--button-height);height:var(--button-height);padding:0 var(--space-2);border-radius:var(--radius-lg) 0 0 var(--radius-lg);background:var(--bg-surface-2);color:var(--text-primary);border:1px solid var(--border-default);display:grid;place-items:center}
-.chat-voice-btn:disabled{opacity:var(--button-disabled-opacity)}
-.chat-voice-btn:active:not(:disabled){transform:scale(.92)}
 .chat-send-menu-item:disabled{opacity:var(--button-disabled-opacity)}
+.chat-send-menu-label{min-width:0;flex:1}
 .chat-send-menu-hint{display:block;font-size:12px;font-weight:400;color:var(--text-secondary);white-space:normal;max-width:220px}
+.chat-send-menu-check{margin-left:auto}
