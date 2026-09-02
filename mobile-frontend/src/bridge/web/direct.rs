@@ -208,12 +208,18 @@ impl AsyncRead for DirectWebSocketStream {
         if self.partial_offset >= self.partial.len() {
             let next = {
                 let mut inbound = self.inbound.borrow_mut();
-                match inbound.frames.pop_front() {
-                    Some(frame) => Some(frame),
-                    None if inbound.closed => None,
-                    None => {
-                        inbound.waker = Some(cx.waker().clone());
-                        return Poll::Pending;
+                loop {
+                    match inbound.frames.pop_front() {
+                        // A zero-length frame carries nothing. Handing it up
+                        // would fill zero bytes, which the reader above reads
+                        // as EOF and would end a live connection.
+                        Some(frame) if frame.is_empty() => continue,
+                        Some(frame) => break Some(frame),
+                        None if inbound.closed => break None,
+                        None => {
+                            inbound.waker = Some(cx.waker().clone());
+                            return Poll::Pending;
+                        }
                     }
                 }
             };
