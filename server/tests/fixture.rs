@@ -288,6 +288,23 @@ impl Fixture {
     }
 
     #[allow(dead_code)]
+    pub async fn restart_host(&mut self) -> HostBootstrapPayload {
+        self.host.shutdown_agents_for_conformance().await;
+        let host = server::spawn_host_with_mock_backend_and_runtime_config(
+            self.session_store_path(),
+            self.project_store_path(),
+            self.settings_store_path(),
+            self.fresh_host_runtime_config(),
+        )
+        .expect("initialize restarted host with existing stores");
+        let (client, bootstrap) = connect_client_with_bootstrap(host.clone()).await;
+        self.host = host;
+        self.client = client;
+        self.bootstrap = bootstrap.clone();
+        bootstrap
+    }
+
+    #[allow(dead_code)]
     pub async fn agent_ids(&self) -> Vec<AgentId> {
         self.host.agent_ids().await
     }
