@@ -9340,7 +9340,7 @@ impl HostHandle {
         agent_id: &AgentId,
         recorded_visibility_only: bool,
     ) -> bool {
-        let (close_targets, host_streams) = {
+        let (close_targets, host_streams, session_store, closing_session_ids) = {
             let state = self.state.lock().await;
             let close_targets = state.registry.agent_subtree_post_order(agent_id);
             if close_targets.is_empty() {
@@ -9366,8 +9366,35 @@ impl HostHandle {
                     )
                 })
                 .collect::<Vec<_>>();
-            (close_targets, host_streams)
+            let closing_session_ids = close_targets
+                .iter()
+                .filter_map(|(agent_id, handle)| {
+                    state
+                        .agent_sessions
+                        .get(agent_id)
+                        .or_else(|| state.pending_agent_sessions.get(agent_id))
+                        .cloned()
+                        .or_else(|| handle.snapshot().session_id)
+                })
+                .collect::<HashSet<_>>();
+            (
+                close_targets,
+                host_streams,
+                Arc::clone(&state.session_store),
+                closing_session_ids,
+            )
         };
+
+        if let Err(error) = session_store
+            .lock()
+            .await
+            .clear_restore_states(&closing_session_ids)
+        {
+            tracing::error!(
+                error = %error,
+                "failed to clear agent restart restoration markers"
+            );
+        }
 
         let close_ids = close_targets
             .iter()
@@ -9563,6 +9590,30 @@ impl HostHandle {
 
     pub async fn agent_ids(&self) -> Vec<AgentId> {
         self.state.lock().await.registry.agent_ids()
+    }
+
+    /// Session ids the live registry is currently bound to, including agents
+    /// whose binding has not been published yet.
+    pub async fn live_agent_session_ids(&self) -> Vec<SessionId> {
+        let state = self.state.lock().await;
+        state
+            .registry
+            .agent_ids()
+            .into_iter()
+            .filter_map(|agent_id| {
+                state
+                    .agent_sessions
+                    .get(&agent_id)
+                    .or_else(|| state.pending_agent_sessions.get(&agent_id))
+                    .cloned()
+                    .or_else(|| {
+                        state
+                            .registry
+                            .agent_handle(&agent_id)
+                            .and_then(|handle| handle.snapshot().session_id)
+                    })
+            })
+            .collect()
     }
 
     pub(crate) async fn subscribe_agent_status_changes(&self) -> tokio::sync::watch::Receiver<u64> {
@@ -11226,7 +11277,7 @@ impl HostHandle {
             .collect::<Vec<_>>();
         let fanout_guard = NewAgentFanoutBatchGuard::new(Arc::clone(&self.state), fanout_paths);
 
-        if let Err(err) = session_store.lock().await.upsert_backend_session(
+        let persist_result = session_store.lock().await.upsert_backend_session(
             &BackendSession {
                 id: session_id.clone(),
                 backend_kind: start.backend_kind,
@@ -11241,7 +11292,8 @@ impl HostHandle {
             start.project_id.clone(),
             start.custom_agent_id.clone(),
             start.launch_profile_id.clone(),
-        ) {
+        );
+        if let Err(err) = persist_result {
             let message = format!(
                 "failed to persist backend-native child session {}: {err}",
                 session_id
@@ -14184,8 +14236,267 @@ fn spawn_host_inner(
     spawn_task_token_usage_task(host.clone());
     spawn_agent_activity_summary_task(host.clone());
     spawn_supervisor_compaction_executor(host.clone(), supervisor_compaction_rx);
+    spawn_open_agent_restoration_task(host.clone());
 
     Ok(host)
+}
+
+fn spawn_open_agent_restoration_task(host: HostHandle) {
+    let worker = async move {
+        if let Err(error) = host.restore_open_agents().await {
+            tracing::error!(error = %error, "failed to restore open agents after host restart");
+        }
+    };
+
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        handle.spawn(worker);
+        return;
+    }
+
+    if let Err(error) = std::thread::Builder::new()
+        .name("tyde-agent-restore".to_owned())
+        .spawn(move || {
+            let runtime = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    tracing::error!(error = %error, "failed to build agent restoration runtime");
+                    return;
+                }
+            };
+            runtime.block_on(worker);
+        })
+    {
+        tracing::error!(error = %error, "failed to spawn agent restoration worker");
+    }
+}
+
+impl HostHandle {
+    async fn restore_open_agents(&self) -> Result<(), String> {
+        let (session_store, team_registry, antigravity_conversations_dir) = {
+            let state = self.state.lock().await;
+            (
+                Arc::clone(&state.session_store),
+                state.team_registry.clone(),
+                state.antigravity_conversations_dir.clone(),
+            )
+        };
+        let mut records = session_store
+            .lock()
+            .await
+            .list()
+            .map_err(|error| format!("failed to load open agent sessions: {error}"))?
+            .into_iter()
+            .filter(|record| record.restore_state.is_some())
+            .collect::<Vec<_>>();
+
+        // A marked session that the resume path would reject is not restorable.
+        // Reconstructing it anyway produces a failed card the user has to
+        // dismiss on every launch, so drop it here using the same predicate
+        // the resume path applies.
+        records.retain(|record| {
+            if session_record_is_resumable(record, &antigravity_conversations_dir) {
+                return true;
+            }
+            tracing::info!(
+                session_id = %record.id,
+                backend_kind = ?record.backend_kind,
+                "skipping restoration of an open agent whose session is no longer resumable"
+            );
+            false
+        });
+
+        // Team identity is owned by the team member store, which already holds
+        // the member's session id. Read it back rather than persisting a second
+        // copy that can disagree with the binding it is used to re-establish.
+        let team_contexts = team_registry
+            .snapshot()
+            .await
+            .map_err(|error| {
+                format!("failed to read team registry for agent restoration: {error}")
+            })?
+            .members
+            .into_iter()
+            .filter_map(|member| {
+                member.session_id.map(|session_id| {
+                    (
+                        session_id,
+                        TeamSpawnContext {
+                            team_id: member.team_id,
+                            team_member_id: member.id,
+                        },
+                    )
+                })
+            })
+            .collect::<HashMap<_, _>>();
+
+        let restore_session_ids = records
+            .iter()
+            .map(|record| record.id.clone())
+            .collect::<HashSet<_>>();
+        let mut restored_agent_ids = HashMap::<SessionId, AgentId>::new();
+
+        while !records.is_empty() {
+            // Parents first, so a child's ephemeral parent agent id can be
+            // rebuilt from its durable parent session id.
+            let index = match records.iter().position(|record| {
+                record.parent_id.as_ref().is_none_or(|parent_id| {
+                    !restore_session_ids.contains(parent_id)
+                        || restored_agent_ids.contains_key(parent_id)
+                })
+            }) {
+                Some(index) => index,
+                None => {
+                    tracing::error!(
+                        unresolved_session_ids = ?records
+                            .iter()
+                            .map(|record| (record.id.clone(), record.parent_id.clone()))
+                            .collect::<Vec<_>>(),
+                        "open agent restoration could not order the remaining sessions \
+                         parent-first; restoring them as root agents"
+                    );
+                    0
+                }
+            };
+            let record = records.remove(index);
+            let restore_state = record
+                .restore_state
+                .clone()
+                .expect("filtered restoration record must have restore state");
+
+            let already_live = {
+                let state = self.state.lock().await;
+                state.agent_sessions.values().any(|id| id == &record.id)
+                    || state
+                        .pending_agent_sessions
+                        .values()
+                        .any(|id| id == &record.id)
+            };
+            if already_live {
+                continue;
+            }
+
+            let parent_agent_id = match record.parent_id.as_ref() {
+                Some(parent_session_id) => {
+                    let parent_agent_id = restored_agent_ids.get(parent_session_id).cloned();
+                    if parent_agent_id.is_none() {
+                        tracing::warn!(
+                            session_id = %record.id,
+                            parent_session_id = %parent_session_id,
+                            "restoring an open agent as a root because its parent was not restored"
+                        );
+                    }
+                    parent_agent_id
+                }
+                None => None,
+            };
+            let team_context = team_contexts.get(&record.id).cloned();
+            let restored = self
+                .spawn_agent_with_origin_config_and_team(
+                    SpawnAgentPayload {
+                        name: None,
+                        custom_agent_id: record.custom_agent_id.clone(),
+                        parent_agent_id,
+                        project_id: record.project_id.clone(),
+                        params: SpawnAgentParams::Resume {
+                            session_id: record.id.clone(),
+                            prompt: None,
+                        },
+                    },
+                    restore_state.origin,
+                    None,
+                    team_context.clone(),
+                    restore_state.workflow,
+                    None,
+                )
+                .await;
+
+            match restored {
+                Ok(agent_id) => {
+                    restored_agent_ids.insert(record.id.clone(), agent_id.clone());
+                    if let Some(team_context) = team_context {
+                        self.bind_restored_team_member(team_context, agent_id, record.id)
+                            .await;
+                    }
+                }
+                Err(error) => {
+                    tracing::error!(
+                        session_id = %record.id,
+                        error = %error,
+                        "failed to reconstruct open agent"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn bind_restored_team_member(
+        &self,
+        team_context: TeamSpawnContext,
+        agent_id: AgentId,
+        session_id: SessionId,
+    ) {
+        let (registry, refs) = {
+            let state = self.state.lock().await;
+            let refs = match agent_team_validation_refs(&state, "restore_open_agents").await {
+                Ok(refs) => refs,
+                Err(error) => {
+                    tracing::error!(
+                        team_member_id = %team_context.team_member_id,
+                        error = %error,
+                        "failed to validate restored team member"
+                    );
+                    return;
+                }
+            };
+            (state.team_registry.clone(), refs)
+        };
+        match registry
+            .bind_member_agent(
+                team_context.team_member_id.clone(),
+                agent_id.clone(),
+                Some(session_id),
+                refs,
+            )
+            .await
+        {
+            Ok(events) => self.fan_out_team_registry_events(events).await,
+            Err(error) => {
+                tracing::error!(
+                    team_member_id = %team_context.team_member_id,
+                    agent_id = %agent_id,
+                    error = %error,
+                    "failed to bind restored team member agent"
+                );
+                return;
+            }
+        }
+        if let Some(status) = self.agent_status_snapshot(&agent_id).await {
+            let update = if status.terminated {
+                registry.clear_binding_by_agent(agent_id.clone()).await
+            } else if status.is_user_response_pending() {
+                registry
+                    .record_agent_activity(agent_id.clone(), AgentControlStatus::Thinking)
+                    .await
+            } else {
+                registry
+                    .record_agent_activity(agent_id.clone(), status.status())
+                    .await
+            };
+            match update {
+                Ok(events) => self.fan_out_team_registry_events(events).await,
+                Err(error) => tracing::error!(
+                    team_member_id = %team_context.team_member_id,
+                    agent_id = %agent_id,
+                    error = %error,
+                    "failed to publish restored team member status"
+                ),
+            }
+        }
+    }
 }
 
 fn spawn_task_token_usage_task(host: HostHandle) {

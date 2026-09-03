@@ -46,8 +46,8 @@ use crate::host::{
 };
 use crate::review::ReviewRegistryHandle;
 use crate::store::session::{
-    CommitCompactedBinding, CompactionOperationRecord, FinishCompactionOperation, SessionStore,
-    StoredCompactionState,
+    CommitCompactedBinding, CompactionOperationRecord, FinishCompactionOperation,
+    SessionRestoreState, SessionStore, StoredCompactionState,
 };
 use crate::store::transcript::TranscriptStore;
 use crate::stream::Stream;
@@ -10149,6 +10149,19 @@ async fn persist_agent_session(
         )?;
         store.set_access_mode(session_id, resolved_spawn_config.access_mode)?;
         store.set_session_settings(session_id, current_session_settings.clone())?;
+        // Only a session that can actually be resumed earns a marker. Marking
+        // one that cannot means the next launch reconstructs it through the
+        // resume path, which rejects it and leaves the user a failed card to
+        // dismiss on every start.
+        if session.resumable {
+            store.set_restore_state(
+                session_id,
+                SessionRestoreState {
+                    origin: current_start.origin,
+                    workflow: current_start.workflow.clone(),
+                },
+            )?;
+        }
         if let Some(alias) = pending_alias.take() {
             match alias.persistence {
                 InitialAgentAliasPersistence::GeneratedIfNoUserAlias => {
