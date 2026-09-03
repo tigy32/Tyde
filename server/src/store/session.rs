@@ -413,6 +413,22 @@ impl SessionStore {
         Ok(detached)
     }
 
+    pub fn move_to_project(
+        &self,
+        session_id: &SessionId,
+        project_id: ProjectId,
+        workspace_roots: Vec<String>,
+    ) -> Result<(), String> {
+        self.read_modify_write(|records| {
+            let record = records
+                .get_mut(&session_id.0)
+                .ok_or_else(|| format!("Session not found: {}", session_id.0))?;
+            record.project_id = Some(project_id);
+            record.workspace_roots = workspace_roots;
+            Ok(())
+        })?
+    }
+
     pub fn delete_for_project(&self, project_id: &ProjectId) -> Result<Vec<SessionId>, String> {
         let mut records = Self::read_from_disk(&self.path)?;
         let mut deleted = records

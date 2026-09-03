@@ -2,9 +2,10 @@ use leptos::prelude::*;
 use wasm_bindgen_futures::spawn_local;
 
 use protocol::{
-    BackendKind, DeleteSessionPayload, FrameKind, ListSessionsPayload, SessionListPageStatus,
-    StreamPath,
+    BackendKind, DeleteSessionPayload, FrameKind, ListSessionsPayload, MoveSessionPayload,
+    ProjectId, SessionId, SessionListPageStatus, StreamPath,
 };
+use wasm_bindgen::JsCast;
 
 use crate::actions::resume_session;
 use crate::send::send_frame;
@@ -567,6 +568,92 @@ fn format_turn_count(turns: u32) -> String {
     }
 }
 
+fn move_session_control(
+    state: AppState,
+    host_id: String,
+    session_id: SessionId,
+    current_project_id: Option<ProjectId>,
+) -> impl IntoView {
+    let state_for_projects = state.clone();
+    let host_for_projects = host_id.clone();
+    let current_for_projects = current_project_id.clone();
+    let destinations = Memo::new(move |_| {
+        state_for_projects.projects.with(|projects| {
+            projects
+                .iter()
+                .filter(|project| {
+                    project.host_id == host_for_projects
+                        && Some(&project.project.id) != current_for_projects.as_ref()
+                })
+                .map(|project| (project.project.id.clone(), project.project.name.clone()))
+                .collect::<Vec<_>>()
+        })
+    });
+    let state_for_active = state.clone();
+    let host_for_active = host_id.clone();
+    let session_for_active = session_id.clone();
+    let active = Memo::new(move |_| {
+        state_for_active.agents.with(|agents| {
+            agents.iter().any(|agent| {
+                agent.host_id == host_for_active
+                    && agent.session_id.as_ref() == Some(&session_for_active)
+            })
+        })
+    });
+    let on_move = move |ev: leptos::ev::Event| {
+        ev.stop_propagation();
+        let select: web_sys::HtmlSelectElement = ev.target().unwrap().unchecked_into();
+        let project_id = select.value();
+        select.set_selected_index(0);
+        if project_id.is_empty() || active.get_untracked() {
+            return;
+        }
+        let state = state.clone();
+        let host_id = host_id.clone();
+        let session_id = session_id.clone();
+        spawn_local(async move {
+            let Some(host_stream) = state.host_stream_untracked(&host_id) else {
+                return;
+            };
+            if let Err(error) = send_frame(
+                &host_id,
+                host_stream,
+                FrameKind::MoveSession,
+                &MoveSessionPayload {
+                    session_id,
+                    project_id: ProjectId(project_id),
+                },
+            )
+            .await
+            {
+                log::error!("failed to send MoveSession: {error}");
+            }
+        });
+    };
+
+    view! {
+        <select
+            class="filter-toggle"
+            data-test="session-move"
+            aria-label="Move chat to project"
+            title=move || if active.get() {
+                "Close this chat before moving it"
+            } else {
+                "Move chat to another project"
+            }
+            disabled=move || active.get() || destinations.get().is_empty()
+            on:click=move |ev| ev.stop_propagation()
+            on:keydown=move |ev| ev.stop_propagation()
+            on:change=on_move
+        >
+            <option value="">"Move to…"</option>
+            {move || destinations.get().into_iter().map(|(id, name)| view! {
+                <option value=id.0>{name}</option>
+            }).collect_view()}
+        </select>
+    }
+}
+
 fn session_card(state: AppState, session: SessionInfo) -> impl IntoView {
     let title = session_title(&session);
     let short_id = session_id_short(&session);
@@ -685,6 +772,12 @@ fn session_card(state: AppState, session: SessionInfo) -> impl IntoView {
                         let state = state_for_delete.clone();
                         let host_id = delete_host_id.clone();
                         let sid = delete_session_id.clone();
+                        let move_control = move_session_control(
+                            state.clone(),
+                            host_id.clone(),
+                            sid.clone(),
+                            session_project_id.clone(),
+                        );
                         let on_delete = move |ev: web_sys::MouseEvent| {
                             ev.stop_propagation();
                             let state = state.clone();
@@ -705,6 +798,7 @@ fn session_card(state: AppState, session: SessionInfo) -> impl IntoView {
                             });
                         };
                         Some(view! {
+                            {move_control}
                             <button type="button" class="filter-toggle" on:click=on_delete>
                                 "Delete"
                             </button>
@@ -745,7 +839,7 @@ fn session_card(state: AppState, session: SessionInfo) -> impl IntoView {
 mod wasm_tests {
     use super::*;
     use leptos::mount::mount_to;
-    use protocol::{SessionId, SessionSummary};
+    use protocol::{Project, ProjectRootPath, ProjectSource, SessionId, SessionSummary};
     use wasm_bindgen::JsCast;
     use wasm_bindgen_test::*;
     use web_sys::HtmlElement;
@@ -909,6 +1003,27 @@ mod wasm_tests {
         .as_string()
         .unwrap_or_else(|| "[]".to_owned());
         serde_json::from_str(&raw).expect("probe returns outcome strings")
+    }
+
+    fn move_session_payloads() -> Vec<MoveSessionPayload> {
+        let raw = js_sys::eval(
+            r#"
+            (function() {
+                const out = [];
+                for (const call of (window.__test_send_calls || [])) {
+                    if (call[0] !== "send_host_line") continue;
+                    const parsed = JSON.parse(call[1]);
+                    const env = JSON.parse(parsed.line);
+                    if (env.kind === "move_session") out.push(env.payload);
+                }
+                return JSON.stringify(out);
+            })()
+            "#,
+        )
+        .expect("probe move_session frames")
+        .as_string()
+        .unwrap_or_else(|| "[]".to_owned());
+        serde_json::from_str(&raw).expect("probe returns move payloads")
     }
 
     /// Takes the state by value so the returned mount handle borrows nothing:
@@ -1344,6 +1459,84 @@ mod wasm_tests {
             list_sessions_limits(),
             vec![Some(20)],
             "a bounded view re-asks for its own bound"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    async fn move_control_lists_same_host_projects_and_sends_the_choice() {
+        install_send_stub();
+        let state = AppState::new();
+        state.active_project.set(None);
+        state.selected_host_id.set(Some("host-a".to_owned()));
+        let mut session = listed_session("host-a", "session-1", 1, 100);
+        session.summary.project_id = Some(ProjectId("source".to_owned()));
+        state.sessions.set(vec![session]);
+        state.projects.set(vec![
+            crate::state::ProjectInfo {
+                host_id: "host-a".to_owned(),
+                project: Project {
+                    id: ProjectId("source".to_owned()),
+                    name: "Source".to_owned(),
+                    sort_order: 0,
+                    source: ProjectSource::Standalone {
+                        roots: vec![ProjectRootPath("/source".to_owned())],
+                    },
+                },
+            },
+            crate::state::ProjectInfo {
+                host_id: "host-a".to_owned(),
+                project: Project {
+                    id: ProjectId("destination".to_owned()),
+                    name: "Destination".to_owned(),
+                    sort_order: 1,
+                    source: ProjectSource::Standalone {
+                        roots: vec![ProjectRootPath("/destination".to_owned())],
+                    },
+                },
+            },
+            crate::state::ProjectInfo {
+                host_id: "host-b".to_owned(),
+                project: Project {
+                    id: ProjectId("remote".to_owned()),
+                    name: "Remote".to_owned(),
+                    sort_order: 0,
+                    source: ProjectSource::Standalone { roots: vec![] },
+                },
+            },
+        ]);
+        connect(&state, "host-a", "/host-1");
+        state.connection_statuses.update(|statuses| {
+            statuses.insert("host-a".to_owned(), ConnectionStatus::Connected);
+        });
+
+        let (container, _handle) = mount_panel(state);
+        settle().await;
+        let select = container
+            .query_selector("[data-test='session-move']")
+            .unwrap()
+            .expect("move control is rendered")
+            .dyn_into::<web_sys::HtmlSelectElement>()
+            .unwrap();
+        let text = select.text_content().unwrap_or_default();
+        assert!(
+            !text.contains("Source"),
+            "the current project is not offered"
+        );
+        assert!(text.contains("Destination"));
+        assert!(!text.contains("Remote"), "cross-host moves are not offered");
+
+        select.set_value("destination");
+        select
+            .dispatch_event(&web_sys::Event::new("change").unwrap())
+            .unwrap();
+        settle().await;
+
+        assert_eq!(
+            move_session_payloads(),
+            vec![MoveSessionPayload {
+                session_id: SessionId("session-1".to_owned()),
+                project_id: ProjectId("destination".to_owned()),
+            }]
         );
     }
 }

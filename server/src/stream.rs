@@ -694,6 +694,7 @@ pub(crate) fn classify(kind: FrameKind) -> OutputLane {
         | FrameKind::LoadAgent
         | FrameKind::FetchSessionHistory
         | FrameKind::ListSessions
+        | FrameKind::MoveSession
         | FrameKind::DeleteSession
         | FrameKind::SendMessage
         | FrameKind::EditQueuedMessage

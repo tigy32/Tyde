@@ -17,13 +17,13 @@ use protocol::{
     LoadAgentPayload, McpServerDeletePayload, McpServerUpsertPayload, MobileDeviceId,
     MobileDeviceRenamePayload, MobileDeviceRevokePayload, MobilePairingCancelPayload,
     MobilePairingStartPayload, MobilePushSubscribePayload, MobilePushUnsubscribePayload,
-    ProjectAccessedPayload, ProjectAddRootPayload, ProjectCreatePayload, ProjectDeletePayload,
-    ProjectDeleteRootPayload, ProjectDiscardFilePayload, ProjectGitCommitPayload, ProjectId,
-    ProjectListDirPayload, ProjectReadDiffPayload, ProjectReadFilePayload, ProjectRenamePayload,
-    ProjectReorderPayload, ProjectReorderScope, ProjectRootPath, ProjectSearchCancelPayload,
-    ProjectSearchPayload, ProjectStageFilePayload, ProjectStageHunkPayload,
-    ProjectUnstageFilePayload, ReviewActionPayload, ReviewCreatePayload, ReviewId,
-    ReviewSubscribePayload, RunBackendSetupPayload, SendMessagePayload,
+    MoveSessionPayload, ProjectAccessedPayload, ProjectAddRootPayload, ProjectCreatePayload,
+    ProjectDeletePayload, ProjectDeleteRootPayload, ProjectDiscardFilePayload,
+    ProjectGitCommitPayload, ProjectId, ProjectListDirPayload, ProjectReadDiffPayload,
+    ProjectReadFilePayload, ProjectRenamePayload, ProjectReorderPayload, ProjectReorderScope,
+    ProjectRootPath, ProjectSearchCancelPayload, ProjectSearchPayload, ProjectStageFilePayload,
+    ProjectStageHunkPayload, ProjectUnstageFilePayload, ReviewActionPayload, ReviewCreatePayload,
+    ReviewId, ReviewSubscribePayload, RunBackendSetupPayload, SendMessagePayload,
     SendQueuedMessageNowPayload, SetAgentGroupsPayload, SetAgentNamePayload, SetAgentPinsPayload,
     SetAgentTagsPayload, SetAgentsSmartViewsPayload, SetAgentsViewPreferencesPayload,
     SetSessionSettingsPayload, SettingsWritePayload, SkillRefreshPayload, SpawnAgentParams,
@@ -224,6 +224,12 @@ pub(crate) async fn route_client_envelope(
             FrameKind::ListSessions => {
                 let payload: ListSessionsPayload = parse_payload(&envelope, "list_sessions")?;
                 host.list_sessions(host_output_stream, payload).await?;
+            }
+            FrameKind::MoveSession => {
+                let payload: MoveSessionPayload = parse_payload(&envelope, "move_session")?;
+                ensure_non_empty("move_session", "session_id", payload.session_id.0.as_str())?;
+                ensure_non_empty("move_session", "project_id", payload.project_id.0.as_str())?;
+                host.move_session(payload).await?;
             }
             FrameKind::DeleteSession => {
                 let payload: DeleteSessionPayload = parse_payload(&envelope, "delete_session")?;
