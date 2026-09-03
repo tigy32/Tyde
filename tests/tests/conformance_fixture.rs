@@ -58,7 +58,19 @@ pub const SCRATCH_DIR: &str = "scratch";
 /// have to come from the same place.
 pub fn pinned_models(backend: BackendKind) -> Vec<String> {
     match backend {
-        BackendKind::Claude => vec!["haiku".to_owned(), "claude-haiku-4-5-20251001".to_owned()],
+        BackendKind::Claude => {
+            let selected = env_or("TYDE_CLAUDE_TEST_MODEL", "haiku");
+            let mut expected = vec![selected.clone()];
+            if selected == "haiku" {
+                expected.push("claude-haiku-4-5-20251001".to_owned());
+            }
+            if let Ok(reported) = std::env::var("TYDE_CLAUDE_TEST_REPORTED_MODEL")
+                && !reported.trim().is_empty()
+            {
+                expected.push(reported);
+            }
+            expected
+        }
         // `codex.rs` documents this variable: pinning a different model without
         // a rebuild is how you tell model-specific drift from a real defect.
         BackendKind::Codex => vec![
@@ -2311,7 +2323,8 @@ fn host_settings(backend_kind: BackendKind) -> serde_json::Value {
     match backend_kind {
         BackendKind::Claude => {
             let model = &pinned_models(backend_kind)[0];
-            let tier = json!({"model": {"string": model}, "effort": {"string": "low"}});
+            let effort = env_or("TYDE_CLAUDE_TEST_EFFORT", "low");
+            let tier = json!({"model": {"string": model}, "effort": {"string": effort}});
             settings["settings"]["backend_tier_configs"] =
                 json!({"claude": {"low": tier, "high": tier}});
         }
