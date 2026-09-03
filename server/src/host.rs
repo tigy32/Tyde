@@ -41,14 +41,14 @@ use protocol::{
     MobilePairingCancelPayload, NewAgentPayload, Project, ProjectAddRootPayload,
     ProjectCreatePayload, ProjectDeletePayload, ProjectDeleteRootPayload,
     ProjectDiscardFilePayload, ProjectGitCommitPayload, ProjectGitCommitResultPayload, ProjectId,
-    ProjectListDirPayload, ProjectNotifyPayload, ProjectPath, ProjectReadDiffPayload,
-    ProjectReadFilePayload, ProjectRenamePayload, ProjectReorderPayload, ProjectRootPath,
-    ProjectSearchCancelPayload, ProjectSearchCompletePayload, ProjectSearchFileResult,
-    ProjectSearchPayload, ProjectSearchResultsPayload, ProjectSource, ProjectStageFilePayload,
-    ProjectStageHunkPayload, ProjectUnstageFilePayload, RequestedCompactionAvailability,
-    RequestedCompactionRoute, ReviewActionPayload, ReviewCreatePayload, ReviewDiffSelection,
-    ReviewId, ReviewSubmitTarget, RunBackendSetupPayload, SendMessagePayload,
-    SessionHistoryPayload, SessionId, SessionListCursor, SessionListGeneration,
+    ProjectListDirPayload, ProjectNotifyPayload, ProjectOpenPathPayload, ProjectPath,
+    ProjectReadDiffPayload, ProjectReadFilePayload, ProjectRenamePayload, ProjectReorderPayload,
+    ProjectRootPath, ProjectSearchCancelPayload, ProjectSearchCompletePayload,
+    ProjectSearchFileResult, ProjectSearchPayload, ProjectSearchResultsPayload, ProjectSource,
+    ProjectStageFilePayload, ProjectStageHunkPayload, ProjectUnstageFilePayload,
+    RequestedCompactionAvailability, RequestedCompactionRoute, ReviewActionPayload,
+    ReviewCreatePayload, ReviewDiffSelection, ReviewId, ReviewSubmitTarget, RunBackendSetupPayload,
+    SendMessagePayload, SessionHistoryPayload, SessionId, SessionListCursor, SessionListGeneration,
     SessionListPageInfo, SessionListPageStatus, SessionListPayload, SessionListScope,
     SessionSchemaEntry, SessionSchemasPayload, SessionSettingsSchema, SessionSummary,
     SessionSummaryCountUpdatedPayload, SetAgentGroupsPayload, SetAgentPinsPayload,
@@ -379,6 +379,8 @@ pub struct HostRuntimeConfig {
     pub enable_actor_transcript_io: bool,
     #[cfg(any(test, feature = "test-support"))]
     pub force_project_watch_limit: bool,
+    #[cfg(any(test, feature = "test-support"))]
+    pub project_path_opener_program: Option<PathBuf>,
 }
 
 impl Default for HostRuntimeConfig {
@@ -402,6 +404,8 @@ impl Default for HostRuntimeConfig {
             enable_actor_transcript_io: false,
             #[cfg(any(test, feature = "test-support"))]
             force_project_watch_limit: false,
+            #[cfg(any(test, feature = "test-support"))]
+            project_path_opener_program: None,
         }
     }
 }
@@ -746,6 +750,8 @@ pub(crate) struct HostState {
     kiro_probe_workspace_root: Option<PathBuf>,
     skip_real_backend_probe: bool,
     force_project_watch_limit: bool,
+    #[cfg(any(test, feature = "test-support"))]
+    project_path_opener_program: Option<PathBuf>,
     host_streams: HashMap<StreamPath, HostSubscriber>,
     project_streams: HashMap<ProjectId, ProjectStreamSubscription>,
     terminal_streams: HashMap<(StreamPath, TerminalId), TerminalHandle>,
@@ -11503,6 +11509,25 @@ impl HostHandle {
         Ok(())
     }
 
+    pub(crate) async fn open_project_path(
+        &self,
+        project_id: ProjectId,
+        payload: ProjectOpenPathPayload,
+    ) -> AppResult<()> {
+        const OPERATION: &str = "project_open_path";
+        let (project_store, opener_program) = {
+            let state = self.state.lock().await;
+            #[cfg(any(test, feature = "test-support"))]
+            let opener_program = state.project_path_opener_program.clone();
+            #[cfg(not(any(test, feature = "test-support")))]
+            let opener_program = None;
+            (Arc::clone(&state.project_store), opener_program)
+        };
+        let project = load_project(&project_store, &project_id, OPERATION).await?;
+        crate::project_stream::open_project_path(&project, payload, opener_program.as_deref())
+            .map_err(|error| project_command_error(OPERATION, error))
+    }
+
     /// Run a project-wide text search. The walk is offloaded to a blocking
     /// task that streams one `ProjectSearchResults` frame per matching file and
     /// a final `ProjectSearchComplete` frame, so the serial connection loop is
@@ -13951,6 +13976,8 @@ fn spawn_host_inner(
                     false
                 }
             },
+            #[cfg(any(test, feature = "test-support"))]
+            project_path_opener_program: runtime_config.project_path_opener_program.clone(),
             host_streams: HashMap::new(),
             project_streams: HashMap::new(),
             terminal_streams: HashMap::new(),

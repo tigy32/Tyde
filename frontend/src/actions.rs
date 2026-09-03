@@ -13,11 +13,12 @@ use protocol::{
     CodeIntelHoverPayload, CodeIntelNavigatePayload, CodeIntelSetVisibleRangePayload,
     CodeIntelSubscribeFilePayload, CompactionAvailabilityReason, CustomAgentId, FrameKind,
     GitBranchName, ImageData, LaunchProfile, LaunchProfileEntry, ProjectDeletePayload,
-    ProjectDeleteRootPayload, ProjectFileVersion, ProjectId, ProjectPath, ProjectReadFilePayload,
-    ProjectRenamePayload, ProjectReorderPayload, ProjectReorderScope, ProjectRootPath,
-    ProjectSearchCancelPayload, ProjectSearchPayload, RequestedCompactionAvailability, SessionId,
-    SessionSettingsValues, SetSessionSettingsPayload, SpawnAgentParams, SpawnAgentPayload,
-    StreamPath, WorkbenchCreatePayload, WorkbenchRemovePayload,
+    ProjectDeleteRootPayload, ProjectFileVersion, ProjectId, ProjectOpenPathAction,
+    ProjectOpenPathPayload, ProjectPath, ProjectReadFilePayload, ProjectRenamePayload,
+    ProjectReorderPayload, ProjectReorderScope, ProjectRootPath, ProjectSearchCancelPayload,
+    ProjectSearchPayload, RequestedCompactionAvailability, SessionId, SessionSettingsValues,
+    SetSessionSettingsPayload, SpawnAgentParams, SpawnAgentPayload, StreamPath,
+    WorkbenchCreatePayload, WorkbenchRemovePayload,
 };
 
 /// Resume a session on the given host. Synchronously switches the active
@@ -729,6 +730,21 @@ pub fn refresh_open_file(
     };
     state.record_pending_file_open(key, PendingFileOpen::RefreshInPlace);
     send_read_and_subscribe(host_id, project_id.0, path);
+}
+
+pub fn request_project_path_action(key: FileResourceKey, action: ProjectOpenPathAction) {
+    let payload = ProjectOpenPathPayload {
+        path: key.path,
+        action,
+    };
+    let stream = StreamPath(format!("/project/{}", key.project_id.0));
+    spawn_local(async move {
+        if let Err(error) =
+            send_frame(&key.host_id, stream, FrameKind::ProjectOpenPath, &payload).await
+        {
+            log::error!("failed to send ProjectOpenPath: {error}");
+        }
+    });
 }
 
 /// Pull a file's contents and code-intel subscription for a **diff** tab.

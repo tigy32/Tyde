@@ -28,10 +28,10 @@ use protocol::{
     ProjectDeletePayload, ProjectDeleteRootPayload, ProjectEventPayload,
     ProjectFileContentsPayload, ProjectFileListPayload, ProjectGitDiffPayload,
     ProjectGitStatusPayload, ProjectId, ProjectListDirPayload, ProjectNotifyPayload,
-    ProjectReadDiffPayload, ProjectReadFilePayload, ProjectRenamePayload, ProjectReorderPayload,
-    ProjectStageFilePayload, ProjectStageHunkPayload, ProtocolFrame, QueuedMessagesPayload,
-    RejectPayload, ReviewActionPayload, ReviewBootstrapPayload, ReviewCreatePayload,
-    ReviewEventPayload, ReviewId, ReviewSubscribePayload, SendMessagePayload,
+    ProjectOpenPathPayload, ProjectReadDiffPayload, ProjectReadFilePayload, ProjectRenamePayload,
+    ProjectReorderPayload, ProjectStageFilePayload, ProjectStageHunkPayload, ProtocolFrame,
+    QueuedMessagesPayload, RejectPayload, ReviewActionPayload, ReviewBootstrapPayload,
+    ReviewCreatePayload, ReviewEventPayload, ReviewId, ReviewSubscribePayload, SendMessagePayload,
     SendQueuedMessageNowPayload, SeqValidator, SessionHistoryPayload, SessionListPayload,
     SessionSchemasPayload, SessionSettingsPayload, SessionSummaryCountUpdatedPayload,
     SetAgentNamePayload, SetSessionSettingsPayload, SkillNotifyPayload, SkillRefreshPayload,
@@ -798,6 +798,15 @@ impl Connection {
         payload: ProjectReadFilePayload,
     ) -> Result<(), FrameError> {
         self.send_project_payload(project_id, FrameKind::ProjectReadFile, &payload)
+            .await
+    }
+
+    pub async fn project_open_path(
+        &mut self,
+        project_id: &ProjectId,
+        payload: ProjectOpenPathPayload,
+    ) -> Result<(), FrameError> {
+        self.send_project_payload(project_id, FrameKind::ProjectOpenPath, &payload)
             .await
     }
 

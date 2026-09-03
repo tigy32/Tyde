@@ -5,6 +5,9 @@ multiplexing, connection handshake, and version negotiation.
 
 See `01-philosophy.md` for the design decisions that shaped this spec.
 
+Protocol version 58 adds typed binary file metadata and the
+`project_open_path` request used for host-side open and reveal actions.
+
 Protocol version 56 adds Grok billing as a typed subscription-capacity source
 and Grok subscription periods as provider-owned capacity buckets.
 

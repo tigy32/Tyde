@@ -3428,6 +3428,7 @@ mod wasm_tests {
                     contents: Some("fn main() {}".to_owned()),
                     is_binary: false,
                     missing: false,
+                    binary: None,
                 },
             ),
         );

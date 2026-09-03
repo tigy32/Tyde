@@ -20,7 +20,7 @@ async fn handshake_rejects_incompatible_protocol() {
     let (client_stream, server_stream) = tokio::io::duplex(8192);
     let server_config = server::ServerConfig::current();
     let client_config = client::ClientConfig {
-        protocol_version: 999,
+        protocol_version: PROTOCOL_VERSION - 1,
         ..client::ClientConfig::current()
     };
 
@@ -39,7 +39,7 @@ async fn handshake_rejects_incompatible_protocol() {
     let server_result = server_handle.await.expect("server task panicked");
     match server_result {
         Err(server::HandshakeError::IncompatibleProtocol { client, server }) => {
-            assert_eq!(client, 999);
+            assert_eq!(client, PROTOCOL_VERSION - 1);
             assert_eq!(server, protocol::PROTOCOL_VERSION);
         }
         _ => panic!("expected server incompatible protocol error"),

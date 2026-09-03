@@ -1918,21 +1918,30 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                         // disk" over the final version instead of a blank
                         // pane. Any non-missing frame (the file was
                         // re-created) replaces contents and clears the flag.
-                        let prior_contents = payload
-                            .missing
-                            .then(|| files.get(&key).and_then(|open| open.contents.clone()))
-                            .flatten();
+                        let prior_file = if payload.missing {
+                            files.get(&key).cloned()
+                        } else {
+                            None
+                        };
                         files.insert(
                             key.clone(),
                             OpenFile {
                                 path: payload.path,
                                 version,
                                 contents: if payload.missing {
-                                    prior_contents
+                                    prior_file.as_ref().and_then(|open| open.contents.clone())
+                                } else if payload.is_binary {
+                                    payload
+                                        .binary
+                                        .as_ref()
+                                        .and_then(|binary| serde_json::to_string(binary).ok())
                                 } else {
                                     payload.contents
                                 },
-                                is_binary: payload.is_binary,
+                                is_binary: prior_file
+                                    .as_ref()
+                                    .map(|open| open.is_binary)
+                                    .unwrap_or(payload.is_binary),
                                 missing: payload.missing,
                             },
                         );
@@ -9194,9 +9203,101 @@ mod wasm_tests {
                 contents: Some("fn main() {}".to_owned()),
                 is_binary: false,
                 missing: false,
+                binary: None,
             },
         )
         .expect("synthetic ProjectFileContents")
+    }
+
+    #[wasm_bindgen_test]
+    async fn missing_refresh_preserves_binary_viewer_state() {
+        install_send_stub();
+        let state = AppState::new();
+        let host_id = "binary-refresh-host";
+        let project_id = ProjectId("binary-refresh-project".to_owned());
+        let path = ProjectPath {
+            root: ProjectRootPath("/repo".to_owned()),
+            relative_path: "assets/archive.bin".to_owned(),
+        };
+        let key = FileResourceKey {
+            host_id: host_id.to_owned(),
+            project_id: project_id.clone(),
+            path: path.clone(),
+        };
+
+        prime_host_for_tests(&state, host_id);
+        dispatch_envelope(&state, host_id, project_bootstrap_envelope(&project_id, 0));
+        state.switch_active_project(Some(ActiveProjectRef {
+            host_id: host_id.to_owned(),
+            project_id: project_id.clone(),
+        }));
+        state.record_pending_file_open(
+            key.clone(),
+            PendingFileOpen::Open {
+                destination: crate::state::PendingOpenDestination::new(
+                    crate::state::PaneId::Primary,
+                ),
+                navigation: None,
+            },
+        );
+        let binary = protocol::ProjectBinaryFilePayload {
+            mime_type: "application/octet-stream".to_owned(),
+            size_bytes: 32,
+            data_base64: None,
+            preview_error: Some("No inline preview".to_owned()),
+        };
+        dispatch_envelope(
+            &state,
+            host_id,
+            Envelope::from_payload(
+                StreamPath(format!("/project/{}", project_id.0)),
+                FrameKind::ProjectFileContents,
+                1,
+                &ProjectFileContentsPayload {
+                    path: path.clone(),
+                    version: ProjectFileVersion(1),
+                    contents: None,
+                    is_binary: true,
+                    missing: false,
+                    binary: Some(binary.clone()),
+                },
+            )
+            .expect("binary contents envelope"),
+        );
+        state.record_pending_file_open(key.clone(), PendingFileOpen::RefreshInPlace);
+        dispatch_envelope(
+            &state,
+            host_id,
+            Envelope::from_payload(
+                StreamPath(format!("/project/{}", project_id.0)),
+                FrameKind::ProjectFileContents,
+                2,
+                &ProjectFileContentsPayload {
+                    path,
+                    version: ProjectFileVersion(2),
+                    contents: None,
+                    is_binary: false,
+                    missing: true,
+                    binary: None,
+                },
+            )
+            .expect("missing contents envelope"),
+        );
+        next_tick().await;
+
+        state.open_files.with_untracked(|files| {
+            let open = files.get(&key).expect("open binary file remains tracked");
+            assert!(open.missing);
+            assert!(
+                open.is_binary,
+                "deletion must not turn binary data into text"
+            );
+            assert_eq!(
+                open.contents.as_deref(),
+                Some(serde_json::to_string(&binary).unwrap().as_str()),
+                "the final typed binary descriptor remains available under the deletion banner"
+            );
+        });
     }
 
     fn stale_diagnostic(message: &str) -> CodeIntelDiagnostic {
