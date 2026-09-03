@@ -2600,6 +2600,15 @@ pub struct OpenFile {
     pub missing: bool,
 }
 
+impl OpenFile {
+    pub fn binary_preview(&self) -> Option<protocol::ProjectBinaryFilePayload> {
+        self.is_binary
+            .then_some(self.contents.as_deref())
+            .flatten()
+            .and_then(|contents| serde_json::from_str(contents).ok())
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct FileFocus {
     pub tab: TabId,

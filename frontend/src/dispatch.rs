@@ -1928,6 +1928,11 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                                 version,
                                 contents: if payload.missing {
                                     prior_contents
+                                } else if payload.is_binary {
+                                    payload
+                                        .binary
+                                        .as_ref()
+                                        .and_then(|binary| serde_json::to_string(binary).ok())
                                 } else {
                                     payload.contents
                                 },
@@ -9193,6 +9198,7 @@ mod wasm_tests {
                 contents: Some("fn main() {}".to_owned()),
                 is_binary: false,
                 missing: false,
+                binary: None,
             },
         )
         .expect("synthetic ProjectFileContents")

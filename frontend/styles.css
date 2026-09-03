@@ -7546,6 +7546,115 @@ math merror {
     color: var(--text-primary);
 }
 
+.binary-preview {
+    display: flex;
+    flex-direction: column;
+    flex: 1;
+    min-height: 0;
+    background: var(--surface-1);
+}
+
+.binary-preview-meta,
+.binary-image-toolbar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 7px 12px;
+    border-bottom: 1px solid var(--border);
+    color: var(--text-tertiary);
+    font-size: 0.846rem;
+    flex-shrink: 0;
+}
+
+.binary-preview-meta span + span {
+    margin-left: auto;
+}
+
+.binary-image-toolbar button {
+    min-height: 28px;
+    padding: 3px 9px;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    color: var(--text-secondary);
+    background: var(--surface-2);
+}
+
+.binary-image-toolbar button:hover {
+    color: var(--text-primary);
+    background: var(--surface-3);
+}
+
+.binary-image-stage,
+.binary-media-stage,
+.binary-audio-stage,
+.binary-preview-state {
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: clamp(12px, 3vw, 32px);
+}
+
+.binary-image-stage {
+    overflow: auto;
+}
+
+.binary-image-stage img {
+    display: block;
+    max-width: none;
+    max-height: none;
+    transform-origin: center;
+}
+
+.binary-image-stage img.binary-image-fit {
+    max-width: 100%;
+    max-height: 100%;
+    object-fit: contain;
+}
+
+.binary-media-stage video {
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+    background: #000;
+}
+
+.binary-audio-stage {
+    flex-direction: column;
+    gap: 24px;
+}
+
+.binary-audio-stage audio {
+    width: min(560px, 100%);
+}
+
+.binary-file-icon {
+    font-size: clamp(56px, 12vw, 112px);
+    color: var(--text-tertiary);
+}
+
+.binary-pdf-preview {
+    flex: 1;
+    width: 100%;
+    min-height: 0;
+    border: 0;
+    background: white;
+}
+
+.binary-preview-state {
+    flex-direction: column;
+    gap: 8px;
+    text-align: center;
+    color: var(--text-secondary);
+}
+
+.binary-preview-state code {
+    max-width: 100%;
+    overflow-wrap: anywhere;
+    color: var(--text-tertiary);
+}
+
 /* ===== Diff Viewer ===== */
 .diff-view {
     display: flex;
