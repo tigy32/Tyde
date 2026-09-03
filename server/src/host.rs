@@ -14130,6 +14130,11 @@ fn spawn_host_inner(
 fn spawn_task_token_usage_task(host: HostHandle) {
     let worker = async move {
         let mut status_rx = host.subscribe_agent_status_changes().await;
+        tracing::debug!(
+            status_version = *status_rx.borrow(),
+            "task token usage worker subscribed; synchronizing current state"
+        );
+        host.fan_out_task_token_usages().await;
         loop {
             if status_rx.changed().await.is_err() {
                 break;
