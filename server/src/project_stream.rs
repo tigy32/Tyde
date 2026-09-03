@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::fs;
+use std::fs::{self, File};
+use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
@@ -9,12 +10,13 @@ use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watche
 use protocol::{
     CodeIntelOverviewHeadline, CodeIntelOverviewPayload, CodeIntelOverviewSummary,
     CodeIntelProviderStatus, CodeIntelRootOverview, CodeIntelState, CommandErrorCode,
-    CommandErrorPayload, DiffContextMode, FileEntryOp, FrameKind, Project, ProjectDiffRevision,
-    ProjectDiffScope, ProjectEventPayload, ProjectFileContentsPayload, ProjectFileEntry,
-    ProjectFileKind, ProjectFileListPayload, ProjectFileVersion, ProjectFileVersionChange,
-    ProjectGitChangeKind, ProjectGitCommitSummary, ProjectGitDiffFile, ProjectGitDiffHunk,
-    ProjectGitDiffLine, ProjectGitDiffLineKind, ProjectGitDiffPayload, ProjectGitFileStatus,
-    ProjectGitStatusPayload, ProjectId, ProjectPath, ProjectReadDiffPayload,
+    CommandErrorPayload, DiffContextMode, FileEntryOp, FrameKind, Project,
+    ProjectBinaryFilePayload, ProjectDiffRevision, ProjectDiffScope, ProjectEventPayload,
+    ProjectFileContentsPayload, ProjectFileEntry, ProjectFileKind, ProjectFileListPayload,
+    ProjectFileVersion, ProjectFileVersionChange, ProjectGitChangeKind, ProjectGitCommitSummary,
+    ProjectGitDiffFile, ProjectGitDiffHunk, ProjectGitDiffLine, ProjectGitDiffLineKind,
+    ProjectGitDiffPayload, ProjectGitFileStatus, ProjectGitStatusPayload, ProjectId,
+    ProjectOpenPathAction, ProjectOpenPathPayload, ProjectPath, ProjectReadDiffPayload,
     ProjectReadFilePayload, ProjectRootGitStatus, ProjectRootListing, ProjectRootPath,
     ProjectSearchFileResult, ProjectSearchMatch, ProjectSearchPayload, ReviewSummary, StreamPath,
 };
@@ -30,6 +32,21 @@ use crate::stream::Stream;
 const PROJECT_REFRESH_DEBOUNCE: Duration = Duration::from_millis(250);
 const GIT_STATUS_POLL_INTERVAL: Duration = Duration::from_secs(5);
 const RECENT_HISTORY_LIMIT: usize = 100;
+const BINARY_PREVIEW_LIMIT_BYTES: u64 = 8 * 1024 * 1024;
+const TEXT_READ_LIMIT_BYTES: u64 = (protocol::framing::MAX_LOGICAL_HEADER - 128 * 1024) as u64;
+const FILE_READ_LIMIT_BYTES: u64 = TEXT_READ_LIMIT_BYTES + 1;
+const BINARY_PREVIEW_ENCODED_LIMIT_BYTES: usize =
+    (BINARY_PREVIEW_LIMIT_BYTES as usize).div_ceil(3) * 4;
+const BINARY_PREVIEW_PROTOCOL_RESERVE_BYTES: usize = 4 * 1024 * 1024;
+const TEXT_PROTOCOL_RESERVE_BYTES: usize = 64 * 1024;
+const _: () = assert!(
+    BINARY_PREVIEW_ENCODED_LIMIT_BYTES + BINARY_PREVIEW_PROTOCOL_RESERVE_BYTES
+        < protocol::framing::MAX_LOGICAL_HEADER
+);
+const _: () = assert!(
+    TEXT_READ_LIMIT_BYTES as usize + TEXT_PROTOCOL_RESERVE_BYTES
+        < protocol::framing::MAX_LOGICAL_HEADER
+);
 
 struct ProjectWatcherFailure {
     message: String,
@@ -2140,48 +2157,435 @@ pub(crate) fn read_file(
     payload: ProjectReadFilePayload,
 ) -> Result<ProjectFileContentsPayload, String> {
     let path = normalize_read_path(project, payload.path)?;
-    validate_project_path(project, &path)?;
-    let absolute = absolute_project_path(&path)?;
+    let Some(absolute) = resolve_project_file_path(project, &path)? else {
+        return Ok(missing_file_payload(path));
+    };
     // `version` is a placeholder here; the project-stream actor overwrites it
     // with the centralized counter's next value (the single bump point) before
     // the payload leaves the actor. See `ProjectStreamCommand::ReadFile`.
-    let bytes = match fs::read(&absolute) {
-        Ok(bytes) => bytes,
+    let mut file = match File::open(&absolute) {
+        Ok(file) => file,
         // Deletion is an answer, not a failure: report it as a typed payload
         // (a command error carries no path, so the client could not attribute
         // it to the right viewer).
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(ProjectFileContentsPayload {
-                path,
-                version: ProjectFileVersion(0),
-                contents: None,
-                is_binary: false,
-                missing: true,
-            });
+            return Ok(missing_file_payload(path));
         }
         Err(err) => {
+            return Ok(unreadable_file_payload(path, &absolute, err));
+        }
+    };
+    let initial_size_bytes = file.metadata().map(|metadata| metadata.len()).unwrap_or(0);
+    let mut bytes = Vec::with_capacity(
+        initial_size_bytes
+            .min(FILE_READ_LIMIT_BYTES)
+            .try_into()
+            .unwrap_or(TEXT_READ_LIMIT_BYTES as usize),
+    );
+    if let Err(err) = (&mut file)
+        .take(FILE_READ_LIMIT_BYTES)
+        .read_to_end(&mut bytes)
+    {
+        return Ok(unreadable_file_payload(path, &absolute, err));
+    }
+    let final_size_bytes = file
+        .metadata()
+        .map(|metadata| metadata.len())
+        .unwrap_or(initial_size_bytes);
+    let observed_size_bytes = initial_size_bytes
+        .max(final_size_bytes)
+        .max(bytes.len() as u64);
+    let sniffed_mime = sniff_binary_mime(&bytes);
+    if sniffed_mime.is_some() || bytes.contains(&0) {
+        let mime_type = sniffed_mime
+            .or_else(|| binary_mime_from_path(&absolute))
+            .unwrap_or("application/octet-stream");
+        return Ok(binary_file_payload(
+            path,
+            bytes,
+            mime_type,
+            observed_size_bytes,
+        ));
+    }
+    match String::from_utf8(bytes) {
+        Ok(mut contents) => {
+            let truncated = contents.len() as u64 > TEXT_READ_LIMIT_BYTES
+                || observed_size_bytes > TEXT_READ_LIMIT_BYTES;
+            if contents.len() as u64 > TEXT_READ_LIMIT_BYTES {
+                let mut end = TEXT_READ_LIMIT_BYTES as usize;
+                while !contents.is_char_boundary(end) {
+                    end -= 1;
+                }
+                contents.truncate(end);
+            }
+            Ok(text_file_payload(
+                path,
+                contents,
+                observed_size_bytes,
+                truncated,
+            ))
+        }
+        Err(error)
+            if observed_size_bytes > TEXT_READ_LIMIT_BYTES
+                && error.utf8_error().error_len().is_none()
+                && error.utf8_error().valid_up_to() + 4 >= TEXT_READ_LIMIT_BYTES as usize =>
+        {
+            let valid_up_to = error.utf8_error().valid_up_to();
+            let mut bytes = error.into_bytes();
+            bytes.truncate(valid_up_to);
+            let contents = String::from_utf8(bytes)
+                .map_err(|_| "validated UTF-8 prefix could not be decoded".to_owned())?;
+            Ok(text_file_payload(path, contents, observed_size_bytes, true))
+        }
+        Err(error) => Ok(binary_file_payload(
+            path,
+            error.into_bytes(),
+            binary_mime_from_path(&absolute).unwrap_or("application/octet-stream"),
+            observed_size_bytes,
+        )),
+    }
+}
+
+pub(crate) fn open_project_path(
+    project: &Project,
+    payload: ProjectOpenPathPayload,
+    opener_program: Option<&Path>,
+) -> Result<(), String> {
+    let canonical_path = resolve_project_file_path(project, &payload.path)?.ok_or_else(|| {
+        format!(
+            "Project path '{}' does not exist",
+            payload.path.relative_path
+        )
+    })?;
+    if !canonical_path.is_file() {
+        return Err(format!(
+            "Project path '{}' is not a regular file",
+            payload.path.relative_path
+        ));
+    }
+
+    let mut command = project_path_command(&canonical_path, payload.action, opener_program)?;
+    let mut child = command.spawn().map_err(|error| {
+        format!(
+            "Failed to {} '{}': {error}",
+            match payload.action {
+                ProjectOpenPathAction::OpenExternally => "open",
+                ProjectOpenPathAction::Reveal => "reveal",
+            },
+            payload.path.relative_path
+        )
+    })?;
+    tokio::task::spawn_blocking(move || {
+        if let Err(error) = child.wait() {
+            tracing::debug!(%error, "failed to reap project path opener process");
+        }
+    });
+    Ok(())
+}
+
+fn resolve_project_file_path(
+    project: &Project,
+    path: &ProjectPath,
+) -> Result<Option<PathBuf>, String> {
+    validate_project_path(project, path)?;
+    let canonical_root = match fs::canonicalize(&path.root.0) {
+        Ok(root) => root,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
             return Err(format!(
-                "Failed to read file '{}': {err}",
-                absolute.display()
+                "Failed to resolve project root '{}': {error}",
+                path.root
             ));
         }
     };
-    match String::from_utf8(bytes) {
-        Ok(contents) => Ok(ProjectFileContentsPayload {
-            path,
-            version: ProjectFileVersion(0),
-            contents: Some(contents),
-            is_binary: false,
-            missing: false,
-        }),
-        Err(_) => Ok(ProjectFileContentsPayload {
-            path,
-            version: ProjectFileVersion(0),
-            contents: None,
-            is_binary: true,
-            missing: false,
+    let unresolved = absolute_project_path(path)?;
+    let canonical_path = match fs::canonicalize(&unresolved) {
+        Ok(path) => path,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(format!(
+                "Failed to resolve file '{}': {error}",
+                unresolved.display()
+            ));
+        }
+    };
+    if !canonical_path.starts_with(&canonical_root) {
+        return Err(format!(
+            "Refusing to read or open '{}' because it resolves outside project root '{}'",
+            path.relative_path, path.root
+        ));
+    }
+    Ok(Some(canonical_path))
+}
+
+fn project_path_command(
+    path: &Path,
+    action: ProjectOpenPathAction,
+    opener_program: Option<&Path>,
+) -> Result<Command, String> {
+    if let Some(program) = opener_program {
+        let mut command = Command::new(program);
+        command
+            .arg(match action {
+                ProjectOpenPathAction::OpenExternally => "open",
+                ProjectOpenPathAction::Reveal => "reveal",
+            })
+            .arg(path);
+        return Ok(command);
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let mut command = Command::new("open");
+        if matches!(action, ProjectOpenPathAction::Reveal) {
+            command.arg("-R");
+        }
+        command.arg(path);
+        Ok(command)
+    }
+    #[cfg(target_os = "windows")]
+    {
+        use std::ffi::OsString;
+        match action {
+            ProjectOpenPathAction::OpenExternally => {
+                let mut command = Command::new("rundll32.exe");
+                command.arg("url.dll,FileProtocolHandler").arg(path);
+                Ok(command)
+            }
+            ProjectOpenPathAction::Reveal => {
+                let mut argument = OsString::from("/select,");
+                argument.push(path);
+                let mut command = Command::new("explorer.exe");
+                command.arg(argument);
+                Ok(command)
+            }
+        }
+    }
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    {
+        let mut command = Command::new("xdg-open");
+        command.arg(match action {
+            ProjectOpenPathAction::OpenExternally => path,
+            ProjectOpenPathAction::Reveal => path.parent().ok_or_else(|| {
+                format!("Cannot reveal file without a parent: {}", path.display())
+            })?,
+        });
+        Ok(command)
+    }
+}
+
+fn unreadable_file_payload(
+    path: ProjectPath,
+    absolute: &Path,
+    error: std::io::Error,
+) -> ProjectFileContentsPayload {
+    ProjectFileContentsPayload {
+        path,
+        version: ProjectFileVersion(0),
+        contents: Some(format!(
+            "Unable to read this file.\n\n{}: {error}",
+            absolute.display()
+        )),
+        is_binary: false,
+        missing: false,
+        binary: None,
+    }
+}
+
+fn missing_file_payload(path: ProjectPath) -> ProjectFileContentsPayload {
+    ProjectFileContentsPayload {
+        path,
+        version: ProjectFileVersion(0),
+        contents: None,
+        is_binary: false,
+        missing: true,
+        binary: None,
+    }
+}
+
+fn text_file_payload(
+    path: ProjectPath,
+    mut contents: String,
+    size_bytes: u64,
+    truncated: bool,
+) -> ProjectFileContentsPayload {
+    if truncated {
+        let displayed_bytes = contents.len();
+        contents.push_str(&format!(
+            "\n\n[Tyde displayed a bounded {displayed_bytes} byte prefix of this {size_bytes} byte text file.]"
+        ));
+    }
+    let mut payload = ProjectFileContentsPayload {
+        path,
+        version: ProjectFileVersion(0),
+        contents: Some(contents),
+        is_binary: false,
+        missing: false,
+        binary: None,
+    };
+    let encoded_contents_bound = payload
+        .contents
+        .as_deref()
+        .and_then(|contents| {
+            contents.bytes().try_fold(2_usize, |size, byte| {
+                size.checked_add(match byte {
+                    b'"' | b'\\' => 2,
+                    0x00..=0x1f => 6,
+                    _ => 1,
+                })
+            })
+        })
+        .unwrap_or(usize::MAX);
+    let fits = encoded_contents_bound
+        .checked_add(TEXT_PROTOCOL_RESERVE_BYTES)
+        .is_some_and(|encoded| encoded < protocol::framing::MAX_LOGICAL_HEADER);
+    if !fits {
+        payload.contents = Some(format!(
+            "Unable to display this text file because its escaped contents exceed Tyde's {} MiB protocol limit.",
+            protocol::framing::MAX_LOGICAL_HEADER / 1024 / 1024
+        ));
+    }
+    payload
+}
+
+fn binary_file_payload(
+    path: ProjectPath,
+    bytes: Vec<u8>,
+    mime_type: &str,
+    size_bytes: u64,
+) -> ProjectFileContentsPayload {
+    let supported = is_supported_preview_mime(mime_type);
+    let within_preview_limit = size_bytes <= BINARY_PREVIEW_LIMIT_BYTES
+        && bytes.len() as u64 <= BINARY_PREVIEW_LIMIT_BYTES;
+    ProjectFileContentsPayload {
+        path,
+        version: ProjectFileVersion(0),
+        contents: None,
+        is_binary: true,
+        missing: false,
+        binary: Some(ProjectBinaryFilePayload {
+            mime_type: mime_type.to_owned(),
+            size_bytes,
+            data_base64: (supported && within_preview_limit).then(|| {
+                use base64::Engine;
+                base64::engine::general_purpose::STANDARD.encode(bytes)
+            }),
+            preview_error: if !within_preview_limit {
+                Some(format!(
+                    "Preview unavailable because this file exceeds the {} MiB limit.",
+                    BINARY_PREVIEW_LIMIT_BYTES / 1024 / 1024
+                ))
+            } else {
+                (!supported)
+                    .then(|| "Tyde does not have an inline preview for this file type.".to_owned())
+            },
         }),
     }
+}
+
+fn sniff_binary_mime(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("image/png")
+    } else if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+        Some("image/jpeg")
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some("image/gif")
+    } else if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
+        Some("image/webp")
+    } else if bytes.starts_with(b"%PDF-") {
+        Some("application/pdf")
+    } else if bytes.len() >= 12 && &bytes[4..8] == b"ftyp" {
+        sniff_iso_bmff_mime(bytes)
+    } else if bytes.starts_with(&[0x1a, 0x45, 0xdf, 0xa3]) {
+        Some("video/webm")
+    } else if bytes.starts_with(b"ID3") || looks_like_mp3_frame(bytes) {
+        Some("audio/mpeg")
+    } else if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WAVE" {
+        Some("audio/wav")
+    } else if bytes.starts_with(b"OggS") {
+        Some("audio/ogg")
+    } else if bytes.starts_with(b"fLaC") {
+        Some("audio/flac")
+    } else {
+        None
+    }
+}
+
+fn sniff_iso_bmff_mime(bytes: &[u8]) -> Option<&'static str> {
+    let declared_size = u32::from_be_bytes(bytes.get(..4)?.try_into().ok()?);
+    let (major_start, compatible_start, minimum_size) = if declared_size == 1 {
+        (16, 24, 24)
+    } else {
+        (8, 16, 16)
+    };
+    let box_size = match declared_size {
+        0 => bytes.len(),
+        1 => usize::try_from(u64::from_be_bytes(bytes.get(8..16)?.try_into().ok()?)).ok()?,
+        size => size as usize,
+    };
+    if box_size < minimum_size || box_size > bytes.len() {
+        return None;
+    }
+
+    let major: &[u8; 4] = bytes.get(major_start..major_start + 4)?.try_into().ok()?;
+    let (compatible_brands, _) = bytes[compatible_start..box_size].as_chunks::<4>();
+    let mut avif = false;
+    let mut heic = false;
+    let mut heif = false;
+    let mut audio = false;
+    let mut video = false;
+    for brand in std::iter::once(major).chain(compatible_brands) {
+        match brand {
+            b"avif" | b"avis" => avif = true,
+            b"heic" | b"heix" | b"hevc" | b"hevx" => heic = true,
+            b"mif1" | b"msf1" => heif = true,
+            b"M4A " | b"M4B " | b"M4P " => audio = true,
+            b"isom" | b"iso2" | b"iso3" | b"iso4" | b"iso5" | b"iso6" | b"mp41" | b"mp42"
+            | b"avc1" | b"M4V " | b"qt  " => video = true,
+            _ => {}
+        }
+    }
+    if avif {
+        Some("image/avif")
+    } else if heic {
+        Some("image/heic")
+    } else if heif {
+        Some("image/heif")
+    } else if audio {
+        Some("audio/mp4")
+    } else if video {
+        Some("video/mp4")
+    } else {
+        None
+    }
+}
+
+fn looks_like_mp3_frame(bytes: &[u8]) -> bool {
+    bytes.len() >= 2 && bytes[0] == 0xff && bytes[1] & 0xe0 == 0xe0
+}
+
+fn binary_mime_from_path(path: &Path) -> Option<&'static str> {
+    match path.extension()?.to_str()?.to_ascii_lowercase().as_str() {
+        "png" => Some("image/png"),
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "gif" => Some("image/gif"),
+        "webp" => Some("image/webp"),
+        "mp4" | "m4v" => Some("video/mp4"),
+        "webm" => Some("video/webm"),
+        "mp3" => Some("audio/mpeg"),
+        "wav" => Some("audio/wav"),
+        "ogg" | "oga" => Some("audio/ogg"),
+        "flac" => Some("audio/flac"),
+        "pdf" => Some("application/pdf"),
+        _ => None,
+    }
+}
+
+fn is_supported_preview_mime(mime_type: &str) -> bool {
+    mime_type.starts_with("image/")
+        || mime_type.starts_with("video/")
+        || mime_type.starts_with("audio/")
+        || mime_type == "application/pdf"
 }
 
 // ── Project global search ─────────────────────────────────────────────────

@@ -739,6 +739,7 @@ pub(crate) fn classify(kind: FrameKind) -> OutputLane {
         | FrameKind::TeamDraftDiscard
         | FrameKind::ProjectReadDiff
         | FrameKind::ProjectReadFile
+        | FrameKind::ProjectOpenPath
         | FrameKind::ProjectSearch
         | FrameKind::ProjectSearchCancel
         | FrameKind::ProjectAccessed

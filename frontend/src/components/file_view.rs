@@ -249,11 +249,21 @@ fn FileViewLoaded(
     let header_thread_root = review_root.clone();
     let header_thread_path = review_path.clone();
     let header_thread_target = review_target.clone();
+    let binary_preview = f.binary_preview().or_else(|| {
+        f.is_binary.then(|| protocol::ProjectBinaryFilePayload {
+            mime_type: "application/octet-stream".to_owned(),
+            size_bytes: 0,
+            data_base64: None,
+            preview_error: Some("Preview data was not provided by this host.".to_owned()),
+        })
+    });
     let content = if f.is_binary {
         "(binary file)".to_owned()
     } else {
         f.contents.unwrap_or_else(|| "(file not found)".to_owned())
     };
+    let is_binary = f.is_binary;
+    let binary_key = key.clone();
 
     let state_for_close = state.clone();
     let on_close = move |_| state_for_close.close_tab(tab_id);
@@ -919,7 +929,7 @@ fn FileViewLoaded(
 
     view! {
                             <div class="file-view-header">
-                                <span class="file-view-path">{path_display}</span>
+                                <span class="file-view-path">{path_display.clone()}</span>
                                 {move || {
                                     let (host, review_id) = draft.get()?;
                                     let decorations = build_review_decorations(
@@ -1014,7 +1024,16 @@ fn FileViewLoaded(
                                     None
                                 }
                             }}
-                            <pre
+                            {if is_binary {
+                                binary_preview.map(|binary| view! {
+                                    <BinaryPreview
+                                        binary=binary
+                                        path=path_display.clone()
+                                        key=binary_key
+                                    />
+                                }.into_any())
+                            } else {
+                                Some(view! { <pre
                                 class="file-view-content"
                                 node_ref=pre_ref
                                 on:scroll=on_scroll
@@ -1143,7 +1162,8 @@ fn FileViewLoaded(
                                         ></div>
                                     })
                                 }}
-                            </pre>
+                            </pre> }.into_any())
+                            }}
                             {move || {
                                 context_menu.get().map(|m| view! {
                                     <CodeIntelContextMenu
@@ -1155,6 +1175,247 @@ fn FileViewLoaded(
                                     />
                                 })
                             }}
+    }
+}
+
+#[component]
+fn BinaryPreview(
+    binary: protocol::ProjectBinaryFilePayload,
+    path: String,
+    key: FileResourceKey,
+) -> impl IntoView {
+    let zoom = RwSignal::new(1.0_f64);
+    let fit = RwSignal::new(true);
+    let loaded = RwSignal::new(false);
+    let natural_size = RwSignal::new(None::<(u32, u32)>);
+    let size = format_file_size(binary.size_bytes);
+    let mime_type = binary.mime_type.clone();
+    let had_preview_bytes = binary.data_base64.is_some();
+    let source = binary
+        .data_base64
+        .as_deref()
+        .and_then(|data| create_binary_object_url(data, &binary.mime_type).ok());
+    let failed = RwSignal::new(had_preview_bytes && source.is_none());
+    let source_for_cleanup = source.clone();
+    on_cleanup(move || {
+        if let Some(source) = source_for_cleanup.as_deref() {
+            revoke_binary_object_url(source);
+        }
+    });
+    let decode_error = move |_| failed.set(true);
+    let mark_loaded = move |_| loaded.set(true);
+    let image_loaded = move |event: web_sys::Event| {
+        if let Some(image) = event
+            .target()
+            .and_then(|target| target.dyn_into::<web_sys::HtmlImageElement>().ok())
+        {
+            natural_size.set(Some((image.natural_width(), image.natural_height())));
+        }
+        loaded.set(true);
+    };
+
+    view! {
+        <section class="binary-preview" aria-label="Binary file preview">
+            <div class="binary-preview-meta">
+                <span>{mime_type.clone()}</span>
+                <span>{size}</span>
+            </div>
+            {move || {
+                if failed.get() {
+                    return view! {
+                        <div class="binary-preview-state" role="alert">
+                            <strong>"Preview could not be decoded"</strong>
+                            <span>"The file may be damaged or use a codec this platform does not support."</span>
+                            <code>{path.clone()}</code>
+                            <BinaryFallbackActions key=key.clone() />
+                        </div>
+                    }.into_any();
+                }
+                let Some(src) = source.clone() else {
+                    let message = binary.preview_error.clone().unwrap_or_else(|| {
+                        "Tyde does not have an inline preview for this file type.".to_owned()
+                    });
+                    return view! {
+                        <div class="binary-preview-state">
+                            <strong>"No inline preview available"</strong>
+                            <span>{message}</span>
+                            <code>{path.clone()}</code>
+                            <BinaryFallbackActions key=key.clone() />
+                        </div>
+                    }.into_any();
+                };
+                if mime_type.starts_with("image/") {
+                    view! {
+                        <div class="binary-image-toolbar" aria-label="Image zoom controls">
+                            <button on:click=move |_| { fit.set(true); zoom.set(1.0); }>
+                                "Fit"
+                            </button>
+                            <button on:click=move |_| { fit.set(false); zoom.set(1.0); }>
+                                "Actual size"
+                            </button>
+                            <button aria-label="Zoom out" on:click=move |_| {
+                                fit.set(false);
+                                zoom.update(|value| *value = (*value - 0.25).max(0.25));
+                            }>"−"</button>
+                            <span>{move || format!("{}%", (zoom.get() * 100.0).round())}</span>
+                            <button aria-label="Zoom in" on:click=move |_| {
+                                fit.set(false);
+                                zoom.update(|value| *value = (*value + 0.25).min(8.0));
+                            }>"+"</button>
+                        </div>
+                        <div class="binary-image-stage">
+                            <div
+                                class="binary-image-canvas"
+                                class:binary-image-canvas-fit=move || fit.get()
+                            >
+                                <img
+                                    src=src
+                                    alt=format!("Preview of {path}")
+                                    class:binary-image-fit=move || fit.get()
+                                    style:width=move || {
+                                        (!fit.get()).then(|| {
+                                            natural_size.get().map(|(width, _)| {
+                                                format!("{}px", width as f64 * zoom.get())
+                                            })
+                                        }).flatten()
+                                    }
+                                    style:height=move || {
+                                        (!fit.get()).then(|| {
+                                            natural_size.get().map(|(_, height)| {
+                                                format!("{}px", height as f64 * zoom.get())
+                                            })
+                                        }).flatten()
+                                    }
+                                    on:load=image_loaded
+                                    on:error=decode_error
+                                />
+                            </div>
+                            {move || (!loaded.get()).then(|| view! {
+                                <div class="binary-preview-loading" role="status">
+                                    "Loading preview…"
+                                </div>
+                            })}
+                        </div>
+                    }.into_any()
+                } else if mime_type.starts_with("video/") {
+                    view! {
+                        <div class="binary-media-stage">
+                            <video
+                                src=src
+                                controls=true
+                                on:loadedmetadata=mark_loaded
+                                on:error=decode_error
+                            >
+                                "This platform cannot play this video."
+                            </video>
+                            {move || (!loaded.get()).then(|| view! {
+                                <div class="binary-preview-loading" role="status">
+                                    "Loading preview…"
+                                </div>
+                            })}
+                        </div>
+                    }.into_any()
+                } else if mime_type.starts_with("audio/") {
+                    view! {
+                        <div class="binary-audio-stage">
+                            <div class="binary-file-icon" aria-hidden="true">"♪"</div>
+                            <audio
+                                src=src
+                                controls=true
+                                on:loadedmetadata=mark_loaded
+                                on:error=decode_error
+                            >
+                                "This platform cannot play this audio."
+                            </audio>
+                            {move || (!loaded.get()).then(|| view! {
+                                <div class="binary-preview-loading" role="status">
+                                    "Loading preview…"
+                                </div>
+                            })}
+                        </div>
+                    }.into_any()
+                } else {
+                    view! {
+                        <object
+                            class="binary-pdf-preview"
+                            data=src
+                            type="application/pdf"
+                            on:load=mark_loaded
+                            on:error=decode_error
+                        >
+                            <div class="binary-preview-state">
+                                "This platform cannot display the PDF preview."
+                            </div>
+                        </object>
+                    }.into_any()
+                }
+            }}
+        </section>
+    }
+}
+
+#[component]
+fn BinaryFallbackActions(key: FileResourceKey) -> impl IntoView {
+    let open_key = key.clone();
+    view! {
+        <div class="binary-preview-actions">
+            <button on:click=move |_| {
+                crate::actions::request_project_path_action(
+                    open_key.clone(),
+                    protocol::ProjectOpenPathAction::OpenExternally,
+                );
+            }>
+                "Open externally"
+            </button>
+            <button on:click=move |_| {
+                crate::actions::request_project_path_action(
+                    key.clone(),
+                    protocol::ProjectOpenPathAction::Reveal,
+                );
+            }>
+                "Reveal in file manager"
+            </button>
+        </div>
+    }
+}
+
+fn create_binary_object_url(data_base64: &str, mime_type: &str) -> Result<String, String> {
+    let function = js_sys::Function::new_with_args(
+        "data,mime",
+        "const raw = atob(data); \
+         const bytes = new Uint8Array(raw.length); \
+         for (let i = 0; i < raw.length; i++) bytes[i] = raw.charCodeAt(i); \
+         return URL.createObjectURL(new Blob([bytes], { type: mime }));",
+    );
+    function
+        .call2(
+            &wasm_bindgen::JsValue::NULL,
+            &wasm_bindgen::JsValue::from_str(data_base64),
+            &wasm_bindgen::JsValue::from_str(mime_type),
+        )
+        .map_err(|error| format!("failed to create media resource: {error:?}"))?
+        .as_string()
+        .ok_or_else(|| "browser did not return a media resource URL".to_owned())
+}
+
+fn revoke_binary_object_url(url: &str) {
+    let function = js_sys::Function::new_with_args("url", "URL.revokeObjectURL(url);");
+    let _ = function.call1(
+        &wasm_bindgen::JsValue::NULL,
+        &wasm_bindgen::JsValue::from_str(url),
+    );
+}
+
+fn format_file_size(bytes: u64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = KIB * 1024.0;
+    let bytes = bytes as f64;
+    if bytes >= MIB {
+        format!("{:.1} MiB", bytes / MIB)
+    } else if bytes >= KIB {
+        format!("{:.1} KiB", bytes / KIB)
+    } else {
+        format!("{} bytes", bytes as u64)
     }
 }
 
@@ -1823,7 +2084,9 @@ mod wasm_tests {
     use super::*;
     use crate::state::{AppState, FileResourceKey, OpenFile, OpenTarget};
     use leptos::mount::mount_to;
-    use protocol::{ProjectFileVersion, ProjectId, ProjectPath, ProjectRootPath};
+    use protocol::{
+        ProjectBinaryFilePayload, ProjectFileVersion, ProjectId, ProjectPath, ProjectRootPath,
+    };
     use std::cell::RefCell;
     use std::rc::Rc;
     use wasm_bindgen::JsCast;
@@ -2033,6 +2296,56 @@ mod wasm_tests {
         routes
     }
 
+    fn recorded_project_open_actions() -> Vec<(String, String, String, String)> {
+        let calls = js_sys::eval("window.__test_send_calls || []")
+            .expect("read send calls")
+            .dyn_into::<js_sys::Array>()
+            .expect("send calls array");
+        let mut actions = Vec::new();
+        for entry in calls.iter() {
+            let entry = entry.dyn_into::<js_sys::Array>().expect("send call entry");
+            if entry.get(0).as_string().as_deref() != Some("send_host_line") {
+                continue;
+            }
+            let args: serde_json::Value =
+                serde_json::from_str(&entry.get(1).as_string().expect("send call args"))
+                    .expect("parse send call args");
+            let envelope: serde_json::Value = serde_json::from_str(
+                args.get("line")
+                    .and_then(|value| value.as_str())
+                    .expect("send frame line"),
+            )
+            .expect("parse send frame");
+            if envelope.get("kind").and_then(|value| value.as_str()) != Some("project_open_path") {
+                continue;
+            }
+            let payload = envelope.get("payload").expect("open path payload");
+            actions.push((
+                args.get("hostId")
+                    .and_then(|value| value.as_str())
+                    .expect("frame host")
+                    .to_owned(),
+                envelope
+                    .get("stream")
+                    .and_then(|value| value.as_str())
+                    .expect("frame stream")
+                    .to_owned(),
+                payload
+                    .get("path")
+                    .and_then(|path| path.get("relative_path"))
+                    .and_then(|value| value.as_str())
+                    .expect("frame path")
+                    .to_owned(),
+                payload
+                    .get("action")
+                    .and_then(|value| value.as_str())
+                    .expect("frame action")
+                    .to_owned(),
+            ));
+        }
+        actions
+    }
+
     /// Whether a `code_intel_navigate` frame was put on the wire via the
     /// `install_send_stub` capture buffer.
     fn navigate_frame_was_sent() -> bool {
@@ -2096,6 +2409,236 @@ mod wasm_tests {
                 .unwrap();
         });
         let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+    }
+
+    #[wasm_bindgen_test]
+    async fn renders_binary_preview_and_unsupported_metadata() {
+        ensure_styles_loaded();
+        install_send_stub();
+        let image_path = ProjectPath {
+            root: ProjectRootPath("test-root".to_owned()),
+            relative_path: "art/preview.png".to_owned(),
+        };
+        let unsupported_path = ProjectPath {
+            root: ProjectRootPath("test-root".to_owned()),
+            relative_path: "build/archive.bin".to_owned(),
+        };
+        let container = make_container();
+        let mount_image_path = image_path.clone();
+        let mount_unsupported_path = unsupported_path.clone();
+        let _handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            state.open_files.update(|files| {
+                files.insert(
+                    file_key(mount_image_path.clone()),
+                    OpenFile {
+                        path: mount_image_path.clone(),
+                        version: ProjectFileVersion(1),
+                        contents: Some(
+                            serde_json::to_string(&ProjectBinaryFilePayload {
+                                mime_type: "image/png".to_owned(),
+                                size_bytes: 68,
+                                data_base64: Some("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=".to_owned()),
+                                preview_error: None,
+                            })
+                            .unwrap(),
+                        ),
+                        is_binary: true,
+                        missing: false,
+                    },
+                );
+                files.insert(
+                    file_key(mount_unsupported_path.clone()),
+                    OpenFile {
+                        path: mount_unsupported_path.clone(),
+                        version: ProjectFileVersion(1),
+                        contents: Some(
+                            serde_json::to_string(&ProjectBinaryFilePayload {
+                                mime_type: "application/octet-stream".to_owned(),
+                                size_bytes: 1_572_864,
+                                data_base64: None,
+                                preview_error: Some(
+                                    "Tyde does not have an inline preview for this file type."
+                                        .to_owned(),
+                                ),
+                            })
+                            .unwrap(),
+                        ),
+                        is_binary: true,
+                        missing: false,
+                    },
+                );
+            });
+            provide_context(state);
+            view! {
+                <div>
+                    <FileView tab_id=TabId(20_100) key=file_key(mount_image_path) />
+                    <FileView tab_id=TabId(20_101) key=file_key(mount_unsupported_path) />
+                </div>
+            }
+        });
+
+        assert!(
+            container
+                .text_content()
+                .unwrap_or_default()
+                .contains("Loading preview"),
+            "preview exposes a user-visible loading state before image decode completes"
+        );
+        next_tick().await;
+        let image = container
+            .query_selector("img[alt*='preview.png']")
+            .unwrap()
+            .expect("supported image renders inline");
+        assert!(
+            image
+                .get_attribute("src")
+                .is_some_and(|src| src.starts_with("blob:")),
+            "image receives a browser-managed resource for the preview bytes"
+        );
+        let text = container.text_content().unwrap_or_default();
+        assert!(text.contains("Fit"));
+        assert!(text.contains("Actual size"));
+        assert!(text.contains("application/octet-stream"));
+        assert!(text.contains("1.5 MiB"));
+        assert!(text.contains("build/archive.bin"));
+        assert!(text.contains("No inline preview available"));
+        assert!(!text.contains("(binary file)"));
+
+        let buttons = container.query_selector_all("button").unwrap();
+        for label in ["Open externally", "Reveal in file manager"] {
+            let button = (0..buttons.length())
+                .filter_map(|index| buttons.item(index))
+                .find(|button| button.text_content().as_deref() == Some(label))
+                .unwrap_or_else(|| panic!("missing {label} action"))
+                .dyn_into::<web_sys::HtmlElement>()
+                .expect("action button");
+            button.click();
+        }
+        next_tick().await;
+        assert_eq!(
+            recorded_project_open_actions(),
+            vec![
+                (
+                    "h".to_owned(),
+                    "/project/p".to_owned(),
+                    "build/archive.bin".to_owned(),
+                    "open_externally".to_owned(),
+                ),
+                (
+                    "h".to_owned(),
+                    "/project/p".to_owned(),
+                    "build/archive.bin".to_owned(),
+                    "reveal".to_owned(),
+                ),
+            ]
+        );
+
+        image
+            .dispatch_event(&web_sys::Event::new("error").unwrap())
+            .unwrap();
+        next_tick().await;
+        assert!(
+            container
+                .text_content()
+                .unwrap_or_default()
+                .contains("Preview could not be decoded"),
+            "a browser decode failure becomes a useful visible state"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    async fn actual_size_image_edges_are_scroll_reachable() {
+        ensure_styles_loaded();
+        let path = ProjectPath {
+            root: ProjectRootPath("test-root".to_owned()),
+            relative_path: "art/large.svg".to_owned(),
+        };
+        let container = make_container();
+        container
+            .set_attribute(
+                "style",
+                "position: fixed; top: 0; left: 0; width: 500px; height: 350px; \
+                 z-index: 2147483647; background: white; display: flex; flex-direction: column;",
+            )
+            .unwrap();
+        let mount_path = path.clone();
+        let _handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            state.open_files.update(|files| {
+                files.insert(
+                    file_key(mount_path.clone()),
+                    OpenFile {
+                        path: mount_path.clone(),
+                        version: ProjectFileVersion(1),
+                        contents: Some(
+                            serde_json::to_string(&ProjectBinaryFilePayload {
+                                mime_type: "image/svg+xml".to_owned(),
+                                size_bytes: 76,
+                                data_base64: Some(
+                                    "PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIxNjAwIiBoZWlnaHQ9IjEyMDAiPjwvc3ZnPg==".to_owned(),
+                                ),
+                                preview_error: None,
+                            })
+                            .unwrap(),
+                        ),
+                        is_binary: true,
+                        missing: false,
+                    },
+                );
+            });
+            provide_context(state);
+            view! { <FileView tab_id=TabId(20_102) key=file_key(mount_path) /> }
+        });
+
+        for _ in 0..10 {
+            next_tick().await;
+            if !container
+                .text_content()
+                .unwrap_or_default()
+                .contains("Loading preview")
+            {
+                break;
+            }
+        }
+        let buttons = container.query_selector_all("button").unwrap();
+        let actual = (0..buttons.length())
+            .filter_map(|index| buttons.item(index))
+            .find(|button| button.text_content().as_deref() == Some("Actual size"))
+            .expect("actual-size action")
+            .dyn_into::<HtmlElement>()
+            .unwrap();
+        actual.click();
+        next_tick().await;
+
+        let stage = container
+            .query_selector(".binary-image-stage")
+            .unwrap()
+            .expect("image stage")
+            .dyn_into::<HtmlElement>()
+            .unwrap();
+        assert!(stage.scroll_width() >= 1_600);
+        assert!(stage.scroll_height() >= 1_200);
+        assert!(stage.scroll_width() > stage.client_width());
+        assert!(stage.scroll_height() > stage.client_height());
+
+        stage.set_scroll_left(stage.scroll_width());
+        stage.set_scroll_top(stage.scroll_height());
+        next_tick().await;
+        let image = container
+            .query_selector("img")
+            .unwrap()
+            .expect("preview image");
+        let stage_rect = stage.get_bounding_client_rect();
+        let image_rect = image.get_bounding_client_rect();
+        assert!(
+            image_rect.right() <= stage_rect.right() + 1.0,
+            "right edge remains unreachable after maximum horizontal scroll"
+        );
+        assert!(
+            image_rect.bottom() <= stage_rect.bottom() + 1.0,
+            "bottom edge remains unreachable after maximum vertical scroll"
+        );
     }
 
     #[wasm_bindgen_test]

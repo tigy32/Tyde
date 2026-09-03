@@ -13,7 +13,7 @@ use serde_json::Value;
 /// `protocol::TydeReleaseVersion`.
 pub use host_config::{LOCAL_HOST_ID, TydeReleaseVersion};
 
-pub const PROTOCOL_VERSION: u32 = 57;
+pub const PROTOCOL_VERSION: u32 = 58;
 pub const TYDE_VERSION: Version = Version {
     major: 0,
     minor: 8,
@@ -1113,6 +1113,7 @@ pub enum FrameKind {
     TeamDraftDiscard,
     ProjectReadDiff,
     ProjectReadFile,
+    ProjectOpenPath,
     ProjectSearch,
     ProjectSearchCancel,
     ProjectAccessed,
@@ -1309,6 +1310,7 @@ impl fmt::Display for FrameKind {
             Self::TeamDraftDiscard => f.write_str("team_draft_discard"),
             Self::ProjectReadDiff => f.write_str("project_read_diff"),
             Self::ProjectReadFile => f.write_str("project_read_file"),
+            Self::ProjectOpenPath => f.write_str("project_open_path"),
             Self::ProjectSearch => f.write_str("project_search"),
             Self::ProjectSearchCancel => f.write_str("project_search_cancel"),
             Self::ProjectAccessed => f.write_str("project_accessed"),
@@ -5296,6 +5298,19 @@ pub struct ProjectReadFilePayload {
     pub path: ProjectPath,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectOpenPathAction {
+    OpenExternally,
+    Reveal,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectOpenPathPayload {
+    pub path: ProjectPath,
+    pub action: ProjectOpenPathAction,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProjectDiffScope {
@@ -5495,6 +5510,25 @@ pub struct ProjectFileContentsPayload {
     /// "deleted on disk" without inferring deletion from directory listings.
     #[serde(default)]
     pub missing: bool,
+    /// Metadata and optional bounded bytes for a binary-file preview. The
+    /// server owns type detection and the memory limit; clients must not infer
+    /// that an arbitrary extension is safe to embed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binary: Option<ProjectBinaryFilePayload>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectBinaryFilePayload {
+    /// Content type selected from server-side signature sniffing, with a
+    /// conservative extension fallback for already-confirmed binary data.
+    pub mime_type: String,
+    pub size_bytes: u64,
+    /// Base64 bytes are present only for supported preview types below the
+    /// server's preview limit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data_base64: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview_error: Option<String>,
 }
 
 // ── Project global search ─────────────────────────────────────────────────

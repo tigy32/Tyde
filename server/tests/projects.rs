@@ -8,11 +8,12 @@ use protocol::{
     Project, ProjectAddRootPayload, ProjectBootstrapPayload, ProjectCreatePayload,
     ProjectDeletePayload, ProjectDiffScope, ProjectFileContentsPayload, ProjectFileListPayload,
     ProjectGitDiffLineKind, ProjectGitDiffPayload, ProjectGitStatusPayload, ProjectId,
-    ProjectListDirPayload, ProjectNotifyPayload, ProjectPath, ProjectReadDiffPayload,
-    ProjectReadFilePayload, ProjectRenamePayload, ProjectReorderPayload, ProjectReorderScope,
-    ProjectRootPath, ProjectStageFilePayload, ProjectStageHunkPayload, ReviewStatus,
-    ReviewSummaryScope, Steering, SteeringId, SteeringNotifyPayload, SteeringScope,
-    SteeringUpsertPayload, StreamPath, WorkbenchCreatePayload,
+    ProjectListDirPayload, ProjectNotifyPayload, ProjectOpenPathAction, ProjectOpenPathPayload,
+    ProjectPath, ProjectReadDiffPayload, ProjectReadFilePayload, ProjectRenamePayload,
+    ProjectReorderPayload, ProjectReorderScope, ProjectRootPath, ProjectStageFilePayload,
+    ProjectStageHunkPayload, ReviewStatus, ReviewSummaryScope, Steering, SteeringId,
+    SteeringNotifyPayload, SteeringScope, SteeringUpsertPayload, StreamPath,
+    WorkbenchCreatePayload,
 };
 use std::fs;
 use std::io::Write;
@@ -1103,6 +1104,34 @@ async fn project_read_file_returns_file_contents() {
         "read-file",
         &[("src/main.rs", "fn main() { println!(\"hi\"); }\n")],
     );
+    std::fs::write(
+        repo.path().join("preview.png"),
+        b"\x89PNG\r\n\x1a\n\0test preview bytes",
+    )
+    .expect("write binary preview fixture");
+    std::fs::write(repo.path().join("archive.bin"), b"\0unsupported bytes")
+        .expect("write unsupported binary fixture");
+    std::fs::write(repo.path().join("not-really.png"), b"ordinary text")
+        .expect("write misleading extension fixture");
+    let mut delayed_invalid = vec![b'a'; 9 * 1024 * 1024];
+    delayed_invalid.push(0xff);
+    std::fs::write(repo.path().join("delayed-invalid.dat"), delayed_invalid)
+        .expect("write delayed invalid UTF-8 fixture");
+    let mut m4a = b"\0\0\0\x18ftypM4A \0\0\0\0isomM4A ".to_vec();
+    m4a.push(0xff);
+    std::fs::write(repo.path().join("recording.data"), m4a).expect("write ISO BMFF audio fixture");
+    let mut unknown_bmff = b"\0\0\0\x18ftypzzzz\0\0\0\0zzzzzzzz".to_vec();
+    unknown_bmff.push(0xff);
+    std::fs::write(repo.path().join("unknown-ftyp.data"), unknown_bmff)
+        .expect("write unknown ISO BMFF fixture");
+    std::fs::write(
+        repo.path().join("oversized.bin"),
+        vec![0_u8; 8 * 1024 * 1024 + 1],
+    )
+    .expect("write oversized binary fixture");
+    let large_text = "large text line\n".repeat(600_000);
+    assert!(large_text.len() > 8 * 1024 * 1024);
+    std::fs::write(repo.path().join("large.txt"), &large_text).expect("write large text fixture");
     let project = create_project_with_real_roots(
         &mut fixture.client,
         "Read File",
@@ -1132,6 +1161,258 @@ async fn project_read_file_returns_file_contents() {
         file_contents.contents.as_deref(),
         Some("fn main() { println!(\"hi\"); }\n")
     );
+
+    fixture
+        .client
+        .project_read_file(
+            &project.id,
+            ProjectReadFilePayload {
+                path: ProjectPath {
+                    root: protocol::ProjectRootPath(project_root(&project, 0)),
+                    relative_path: "preview.png".to_owned(),
+                },
+            },
+        )
+        .await
+        .expect("binary project_read_file failed");
+    let image = expect_project_file_contents(&mut fixture.client, "binary preview").await;
+    let image = image.binary.expect("binary preview metadata");
+    assert_eq!(image.mime_type, "image/png");
+    assert_eq!(image.size_bytes, 27);
+    assert!(image.data_base64.is_some(), "previewable bytes are carried");
+    assert!(image.preview_error.is_none());
+
+    fixture
+        .client
+        .project_read_file(
+            &project.id,
+            ProjectReadFilePayload {
+                path: ProjectPath {
+                    root: protocol::ProjectRootPath(project_root(&project, 0)),
+                    relative_path: "archive.bin".to_owned(),
+                },
+            },
+        )
+        .await
+        .expect("unsupported project_read_file failed");
+    let unsupported = expect_project_file_contents(&mut fixture.client, "unsupported binary").await;
+    let unsupported = unsupported.binary.expect("unsupported binary metadata");
+    assert_eq!(unsupported.mime_type, "application/octet-stream");
+    assert!(unsupported.data_base64.is_none());
+    assert!(unsupported.preview_error.is_some());
+
+    fixture
+        .client
+        .project_read_file(
+            &project.id,
+            ProjectReadFilePayload {
+                path: ProjectPath {
+                    root: protocol::ProjectRootPath(project_root(&project, 0)),
+                    relative_path: "not-really.png".to_owned(),
+                },
+            },
+        )
+        .await
+        .expect("misleading extension project_read_file failed");
+    let misleading =
+        expect_project_file_contents(&mut fixture.client, "misleading extension").await;
+    assert!(
+        !misleading.is_binary,
+        "content beats the filename extension"
+    );
+    assert_eq!(misleading.contents.as_deref(), Some("ordinary text"));
+
+    for (relative_path, expected_mime, has_preview) in [
+        ("delayed-invalid.dat", "application/octet-stream", false),
+        ("recording.data", "audio/mp4", true),
+        ("unknown-ftyp.data", "application/octet-stream", false),
+    ] {
+        fixture
+            .client
+            .project_read_file(
+                &project.id,
+                ProjectReadFilePayload {
+                    path: ProjectPath {
+                        root: protocol::ProjectRootPath(project_root(&project, 0)),
+                        relative_path: relative_path.to_owned(),
+                    },
+                },
+            )
+            .await
+            .expect("classified binary project_read_file failed");
+        let payload =
+            expect_project_file_contents(&mut fixture.client, "classified binary preview").await;
+        assert!(payload.is_binary, "{relative_path} must not render as text");
+        let binary = payload.binary.expect("classified binary metadata");
+        assert_eq!(binary.mime_type, expected_mime, "{relative_path}");
+        assert_eq!(binary.data_base64.is_some(), has_preview, "{relative_path}");
+    }
+
+    fixture
+        .client
+        .project_read_file(
+            &project.id,
+            ProjectReadFilePayload {
+                path: ProjectPath {
+                    root: protocol::ProjectRootPath(project_root(&project, 0)),
+                    relative_path: "oversized.bin".to_owned(),
+                },
+            },
+        )
+        .await
+        .expect("oversized project_read_file failed");
+    let oversized = expect_project_file_contents(&mut fixture.client, "oversized binary").await;
+    let oversized = oversized.binary.expect("oversized binary metadata");
+    assert_eq!(oversized.size_bytes, 8 * 1024 * 1024 + 1);
+    assert!(oversized.data_base64.is_none());
+    assert!(
+        oversized
+            .preview_error
+            .as_deref()
+            .is_some_and(|message| message.contains("exceeds the 8 MiB limit"))
+    );
+
+    fixture
+        .client
+        .project_read_file(
+            &project.id,
+            ProjectReadFilePayload {
+                path: ProjectPath {
+                    root: protocol::ProjectRootPath(project_root(&project, 0)),
+                    relative_path: "large.txt".to_owned(),
+                },
+            },
+        )
+        .await
+        .expect("large text project_read_file failed");
+    let returned_large_text =
+        expect_project_file_contents(&mut fixture.client, "large text contents").await;
+    assert!(!returned_large_text.is_binary);
+    assert_eq!(
+        returned_large_text.contents.as_deref(),
+        Some(large_text.as_str())
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn project_open_path_dispatches_and_blocks_symlink_escape() {
+    use std::os::unix::fs::symlink;
+
+    let runtime_config = server::HostRuntimeConfig {
+        project_path_opener_program: Some("/usr/bin/true".into()),
+        ..server::HostRuntimeConfig::default()
+    };
+    let mut fixture = Fixture::new_with_runtime_config(runtime_config).await;
+    let repo = init_git_repo("open-path", &[("asset.bin", "inside")]);
+    let outside = tempfile::tempdir().expect("outside tempdir");
+    std::fs::write(outside.path().join("secret.bin"), b"\0outside binary")
+        .expect("outside binary fixture");
+    std::fs::write(outside.path().join("secret.txt"), b"outside text")
+        .expect("outside text fixture");
+    symlink(
+        outside.path().join("secret.bin"),
+        repo.path().join("escaped.bin"),
+    )
+    .expect("symlink fixture");
+    symlink(
+        outside.path().join("secret.txt"),
+        repo.path().join("escaped.txt"),
+    )
+    .expect("text symlink fixture");
+    let project = create_project_with_real_roots(
+        &mut fixture.client,
+        "Open Path",
+        vec![repo.path().to_string_lossy().to_string()],
+    )
+    .await;
+    let root = ProjectRootPath(project_root(&project, 0));
+
+    for relative_path in ["escaped.bin", "escaped.txt"] {
+        fixture
+            .client
+            .project_read_file(
+                &project.id,
+                ProjectReadFilePayload {
+                    path: ProjectPath {
+                        root: root.clone(),
+                        relative_path: relative_path.to_owned(),
+                    },
+                },
+            )
+            .await
+            .expect("escaped project_read_file send failed");
+        let error = expect_command_error(&mut fixture.client, "read symlink escape error").await;
+        assert_eq!(error.operation, "project_read_file");
+        assert_eq!(error.code, CommandErrorCode::InvalidInput);
+        assert!(error.message.contains("outside project root"));
+    }
+
+    for action in [
+        ProjectOpenPathAction::OpenExternally,
+        ProjectOpenPathAction::Reveal,
+    ] {
+        fixture
+            .client
+            .project_open_path(
+                &project.id,
+                ProjectOpenPathPayload {
+                    path: ProjectPath {
+                        root: root.clone(),
+                        relative_path: "asset.bin".to_owned(),
+                    },
+                    action,
+                },
+            )
+            .await
+            .expect("valid project_open_path failed");
+    }
+
+    fixture
+        .client
+        .project_open_path(
+            &project.id,
+            ProjectOpenPathPayload {
+                path: ProjectPath {
+                    root,
+                    relative_path: "escaped.bin".to_owned(),
+                },
+                action: ProjectOpenPathAction::OpenExternally,
+            },
+        )
+        .await
+        .expect("escaped project_open_path send failed");
+    let error = expect_command_error(&mut fixture.client, "symlink escape error").await;
+    assert_eq!(error.operation, "project_open_path");
+    assert_eq!(error.code, CommandErrorCode::InvalidInput);
+    assert!(error.message.contains("outside project root"));
+
+    let linked_repo = init_git_repo("linked-open-path-root", &[("asset.bin", "linked")]);
+    let linked_root_parent = tempfile::tempdir().expect("linked root parent");
+    let linked_root = linked_root_parent.path().join("linked-project-root");
+    symlink(linked_repo.path(), &linked_root).expect("linked project root");
+    let linked_project = create_project_with_real_roots(
+        &mut fixture.client,
+        "Linked Root",
+        vec![linked_root.to_string_lossy().to_string()],
+    )
+    .await;
+    fixture
+        .client
+        .project_read_file(
+            &linked_project.id,
+            ProjectReadFilePayload {
+                path: ProjectPath {
+                    root: ProjectRootPath(project_root(&linked_project, 0)),
+                    relative_path: "asset.bin".to_owned(),
+                },
+            },
+        )
+        .await
+        .expect("symlinked-root project_read_file failed");
+    let linked_contents =
+        expect_project_file_contents(&mut fixture.client, "symlinked root contents").await;
+    assert_eq!(linked_contents.contents.as_deref(), Some("linked"));
 }
 
 #[tokio::test]

@@ -12,14 +12,17 @@ mod router;
 mod voice_media;
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::HashMap,
     process::Command,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+use std::{collections::VecDeque, time::Instant};
 
 use devtools_protocol::UiDebugResponseSubmission;
 use host_config::RemoteHostLifecycleSnapshot;
@@ -172,6 +175,7 @@ struct ShellState {
     voice_media: voice_media::NativeVoiceMedia,
 }
 
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RecoveryDecision {
     Reload {
@@ -189,9 +193,11 @@ enum RecoveryDecision {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RecoveryFailure {
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     ReloadFailed,
     RepeatedTermination,
     ReadinessDeadline,
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     AttemptLimit,
 }
 
@@ -209,7 +215,9 @@ enum RecoveryDialogAction {
 
 const RECOVERY_RESTART_LABEL: &str = "Restart";
 const RECOVERY_KEEP_WAITING_LABEL: &str = "Keep Waiting";
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 const RECOVERY_ATTEMPT_LIMIT: usize = 3;
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 const RECOVERY_ATTEMPT_WINDOW: Duration = Duration::from_secs(5 * 60);
 const RECOVERY_READINESS_DEADLINE: Duration = Duration::from_secs(15);
 
@@ -225,10 +233,12 @@ struct WebContentRecoveryPolicy {
     frontend_visible: Option<bool>,
     native_window_focused: Option<bool>,
     readiness_deadline_epoch: u64,
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     attempts: VecDeque<Instant>,
 }
 
 impl WebContentRecoveryPolicy {
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     fn web_content_process_terminated(&mut self, now: Instant) -> RecoveryDecision {
         if self.failure_presented {
             return RecoveryDecision::Suppress {
@@ -308,6 +318,7 @@ impl WebContentRecoveryPolicy {
         }
     }
 
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     fn reload_failed(&mut self, generation: u64) -> Option<RecoveryFailure> {
         self.fail_if_pending(generation, RecoveryFailure::ReloadFailed)
     }
@@ -392,6 +403,7 @@ impl WebContentRecoveryPolicy {
         }
     }
 
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     fn fail_if_pending(
         &mut self,
         generation: u64,
@@ -494,9 +506,14 @@ fn recovery_dialog_buttons(failure: RecoveryFailure) -> MessageDialogButtons {
         RecoveryFailure::ReadinessDeadline => {
             MessageDialogButtons::OkCustom(RECOVERY_KEEP_WAITING_LABEL.to_owned())
         }
-        RecoveryFailure::ReloadFailed
-        | RecoveryFailure::RepeatedTermination
-        | RecoveryFailure::AttemptLimit => MessageDialogButtons::OkCancelCustom(
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        RecoveryFailure::ReloadFailed | RecoveryFailure::AttemptLimit => {
+            MessageDialogButtons::OkCancelCustom(
+                RECOVERY_RESTART_LABEL.to_owned(),
+                RECOVERY_KEEP_WAITING_LABEL.to_owned(),
+            )
+        }
+        RecoveryFailure::RepeatedTermination => MessageDialogButtons::OkCancelCustom(
             RECOVERY_RESTART_LABEL.to_owned(),
             RECOVERY_KEEP_WAITING_LABEL.to_owned(),
         ),
@@ -528,6 +545,7 @@ fn show_web_content_recovery_notice(
             "Tyde recovery is still waiting",
             "Tyde reloaded its interface, but background or system scheduling may have delayed readiness. Tyde will keep waiting without restarting or quitting.",
         ),
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
         RecoveryFailure::ReloadFailed => (
             "recovery_failed",
             "Tyde recovery failed",
@@ -538,6 +556,7 @@ fn show_web_content_recovery_notice(
             "Tyde recovery stopped",
             "Tyde's interface stopped again before recovery completed. You can restart Tyde, or keep waiting without exiting.",
         ),
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
         RecoveryFailure::AttemptLimit => (
             "recovery_failed",
             "Tyde recovery stopped",
@@ -548,9 +567,11 @@ fn show_web_content_recovery_notice(
         RecoveryFailure::ReadinessDeadline => tracing::warn!(
             "webview.recovery event={event} label={label} generation={generation} failure={failure:?} action=prompt"
         ),
-        RecoveryFailure::ReloadFailed
-        | RecoveryFailure::RepeatedTermination
-        | RecoveryFailure::AttemptLimit => tracing::error!(
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        RecoveryFailure::ReloadFailed | RecoveryFailure::AttemptLimit => tracing::error!(
+            "webview.recovery event={event} label={label} generation={generation} failure={failure:?} action=prompt"
+        ),
+        RecoveryFailure::RepeatedTermination => tracing::error!(
             "webview.recovery event={event} label={label} generation={generation} failure={failure:?} action=prompt"
         ),
     }
@@ -560,9 +581,11 @@ fn show_web_content_recovery_notice(
         .title(title)
         .kind(match failure {
             RecoveryFailure::ReadinessDeadline => MessageDialogKind::Warning,
-            RecoveryFailure::ReloadFailed
-            | RecoveryFailure::RepeatedTermination
-            | RecoveryFailure::AttemptLimit => MessageDialogKind::Error,
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
+            RecoveryFailure::ReloadFailed | RecoveryFailure::AttemptLimit => {
+                MessageDialogKind::Error
+            }
+            RecoveryFailure::RepeatedTermination => MessageDialogKind::Error,
         })
         .buttons(recovery_dialog_buttons(failure));
     if let Some(window) = app.get_webview_window(&label) {

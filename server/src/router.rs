@@ -19,11 +19,11 @@ use protocol::{
     MobilePairingStartPayload, MobilePushSubscribePayload, MobilePushUnsubscribePayload,
     ProjectAccessedPayload, ProjectAddRootPayload, ProjectCreatePayload, ProjectDeletePayload,
     ProjectDeleteRootPayload, ProjectDiscardFilePayload, ProjectGitCommitPayload, ProjectId,
-    ProjectListDirPayload, ProjectReadDiffPayload, ProjectReadFilePayload, ProjectRenamePayload,
-    ProjectReorderPayload, ProjectReorderScope, ProjectRootPath, ProjectSearchCancelPayload,
-    ProjectSearchPayload, ProjectStageFilePayload, ProjectStageHunkPayload,
-    ProjectUnstageFilePayload, ReviewActionPayload, ReviewCreatePayload, ReviewId,
-    ReviewSubscribePayload, RunBackendSetupPayload, SendMessagePayload,
+    ProjectListDirPayload, ProjectOpenPathPayload, ProjectReadDiffPayload, ProjectReadFilePayload,
+    ProjectRenamePayload, ProjectReorderPayload, ProjectReorderScope, ProjectRootPath,
+    ProjectSearchCancelPayload, ProjectSearchPayload, ProjectStageFilePayload,
+    ProjectStageHunkPayload, ProjectUnstageFilePayload, ReviewActionPayload, ReviewCreatePayload,
+    ReviewId, ReviewSubscribePayload, RunBackendSetupPayload, SendMessagePayload,
     SendQueuedMessageNowPayload, SetAgentGroupsPayload, SetAgentNamePayload, SetAgentPinsPayload,
     SetAgentTagsPayload, SetAgentsSmartViewsPayload, SetAgentsViewPreferencesPayload,
     SetSessionSettingsPayload, SettingsWritePayload, SkillRefreshPayload, SpawnAgentParams,
@@ -912,6 +912,17 @@ pub(crate) async fn route_client_envelope(
                     parse_payload(&envelope, "code_intel_cancel_references")?;
                 host.code_intel_cancel_references(project_id, payload)
                     .await?;
+            }
+            FrameKind::ProjectOpenPath => {
+                let payload: ProjectOpenPathPayload =
+                    parse_payload(&envelope, "project_open_path")?;
+                ensure_non_empty("project_open_path", "root", payload.path.root.0.as_str())?;
+                ensure_non_empty(
+                    "project_open_path",
+                    "relative_path",
+                    payload.path.relative_path.as_str(),
+                )?;
+                host.open_project_path(project_id, payload).await?;
             }
             FrameKind::ProjectReadDiff => {
                 let payload: ProjectReadDiffPayload =
