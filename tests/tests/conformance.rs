@@ -1813,6 +1813,7 @@ fn real_usage_accounting() {
             }
             assert_cumulative_never_shrinks(&turns);
             assert_context_usage_capability_matches_behaviour(&turns, declares_context_usage);
+            assert_selected_context_window_matches_behaviour(&turns);
             assert_context_usage_updates_within_turn(
                 &turns[3],
                 declares_context_usage,
@@ -5351,6 +5352,39 @@ fn assert_context_usage_updates_within_turn(
          provider requests; observed {occupancies:?}",
         turn.label(),
         occupancies.len()
+    );
+}
+
+/// A context-qualified model selection is a request for that actual window,
+/// not a display hint. Claude Code accepts the qualifier on aliases and full
+/// Bedrock model IDs, then reports the effective value in its result frame.
+/// Comparing the selection to the normalized event proves both halves reached
+/// the app without teaching production code a model-specific window size.
+fn assert_selected_context_window_matches_behaviour(turns: &[Turn]) {
+    let selected = &pinned_models(turns[0].backend())[0];
+    let expected = if selected.ends_with("[1m]") {
+        Some(1_000_000)
+    } else {
+        None
+    };
+    let Some(expected) = expected else {
+        return;
+    };
+
+    let windows = turns
+        .iter()
+        .flat_map(Turn::activity_stats)
+        .filter_map(|stats| match stats.current_context_usage.as_ref() {
+            Some(CurrentContextUsage::Known { context_window, .. }) => Some(*context_window),
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        windows,
+        BTreeSet::from([expected]),
+        "{}: selected model {selected:?}, but the effective context windows reported to the \
+         client were {windows:?}",
+        turns[0].label()
     );
 }
 

@@ -88,6 +88,7 @@ cargo test -p tests --test backend \
 
 `TYDE_REAL_BACKENDS` accepts `claude`, `codex`, `kiro`, and `hermes`. A selected
 backend that is missing or unrunnable is a qualification failure, not a silent
-skip. Claude qualification calls are pinned to Haiku with `low` effort, and
-Codex calls are pinned to `gpt-5.6-luna` with `low` reasoning rather than
-inheriting potentially expensive local defaults.
+skip. Claude qualification calls are pinned to Haiku with `low` effort unless
+`TYDE_CLAUDE_TEST_MODEL` or `TYDE_CLAUDE_TEST_EFFORT` overrides them, and Codex
+calls are pinned to `gpt-5.6-luna` with `low` reasoning rather than inheriting
+potentially expensive local defaults.

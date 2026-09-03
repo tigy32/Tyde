@@ -8756,6 +8756,9 @@ async fn detect_subagent_completions(value: &Value, streams: &mut HashMap<String
 /// data (process exit) pass `SubAgentFinalOutcome::default()`.
 fn finalize_subagent_stream(mut stream: SubAgentStream, outcome: SubAgentFinalOutcome) {
     flush_pending_tool_uses_with_fallback(&mut stream.summary, &mut stream.segment);
+    if !stream.summary.tool_calls.is_empty() {
+        close_current_phase(&mut stream.summary, &mut stream.segment, &stream.inner);
+    }
     if let Some(text) = outcome
         .text
         .as_deref()
@@ -8774,9 +8777,8 @@ fn finalize_subagent_stream(mut stream: SubAgentStream, outcome: SubAgentFinalOu
         });
     }
     if phase_has_pending_output(&stream.summary, &stream.segment) {
-        // The child's previous phase closed on its last tool_result, so an
-        // injected final message opens a fresh segment: a StreamStart may
-        // still be owed before the closing StreamEnd (no-op otherwise).
+        // An injected final message opens a fresh segment, so a StreamStart
+        // may still be owed before the closing StreamEnd (no-op otherwise).
         let base_message_id = stream.message_id.clone();
         let mut terminal_message_id = base_message_id.clone();
         let model = stream.summary.model.clone();
@@ -12867,14 +12869,19 @@ fn extract_images_from_content(content: &Value) -> Vec<Value> {
 
 fn claude_known_models() -> Vec<Value> {
     // Use the CLI's family aliases rather than pinned model IDs so we always
-    // resolve to whatever the installed CLI considers the latest opus/sonnet/
-    // haiku. The concrete model is reported back in the stream-start event, and
-    // the context-window lookup keys off the family hint, so no pinned IDs are
-    // needed here.
+    // resolve to whatever the installed CLI considers the latest model in each
+    // family. The concrete model is reported back in the stream-start event,
+    // and the context-window lookup keys off the family hint, so no pinned IDs
+    // are needed here. The qualified aliases are Claude Code's native way to
+    // request the long-context variant of a configured provider model.
     let models = [
         ("opus", "Opus (latest)", true),
+        ("opus[1m]", "Opus (latest, 1M context)", false),
         ("sonnet", "Sonnet (latest)", false),
+        ("sonnet[1m]", "Sonnet (latest, 1M context)", false),
         ("haiku", "Haiku (latest)", false),
+        ("fable", "Fable (latest)", false),
+        ("fable[1m]", "Fable (latest, 1M context)", false),
     ];
 
     models
@@ -14056,8 +14063,20 @@ impl Backend for ClaudeBackend {
                                 label: "Opus".to_string(),
                             },
                             SelectOption {
+                                value: "sonnet[1m]".to_string(),
+                                label: "Sonnet (1M context)".to_string(),
+                            },
+                            SelectOption {
+                                value: "opus[1m]".to_string(),
+                                label: "Opus (1M context)".to_string(),
+                            },
+                            SelectOption {
                                 value: "fable".to_string(),
                                 label: "Fable".to_string(),
+                            },
+                            SelectOption {
+                                value: "fable[1m]".to_string(),
+                                label: "Fable (1M context)".to_string(),
                             },
                         ],
                         default: None,
