@@ -5,6 +5,9 @@ multiplexing, connection handshake, and version negotiation.
 
 See `01-philosophy.md` for the design decisions that shaped this spec.
 
+Protocol version 56 adds Grok billing as a typed subscription-capacity source
+and Grok subscription periods as provider-owned capacity buckets.
+
 Protocol version 55 folds committed-range review into the single workspace
 review: `ReviewSummaryScope::CommittedRange` is gone, `StartAiReview` and
 `ReviewAiReviewerState` carry a `ReviewAiScope`, and `ReviewFileCommentCount`

@@ -32,7 +32,7 @@ The built-in adapter declarations are:
 | Codex | resume, fork | image, interrupt | session, MCP, workspace, customization | turn, request, context | subagents, background, initiated turns |
 | Antigravity | resume | interrupt | session, MCP, workspace, customization | — | — |
 | Hermes | list, resume | interrupt | session, MCP, workspace, customization | turn, context | subagents, background |
-| Grok | list, resume | interrupt | session, MCP, workspace, customization | turn, request, cumulative, context, breakdown | subagents |
+| Grok | list, resume | image, interrupt | session, MCP, workspace, customization | turn, request, cumulative, context, breakdown, subscription | subagents |
 
 Grok reports authoritative context breakdowns. No built-in adapter currently
 claims mid-turn steering. Background support does not imply autonomous

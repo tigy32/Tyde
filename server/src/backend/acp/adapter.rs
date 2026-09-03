@@ -168,6 +168,10 @@ pub trait AcpAgentAdapter: Send + Sync + 'static {
         })
     }
 
+    /// Correct agent capability declarations with adapter-specific, measured
+    /// behavior before the generic backend relies on them.
+    fn normalize_capabilities(&self, _capabilities: &mut AcpCapabilities) {}
+
     /// Classify an advertised auth method before the generic lifecycle uses it.
     fn auth_method_handling(&self, _method: &AcpAuthMethod) -> AcpAuthMethodHandling {
         AcpAuthMethodHandling::ProtocolAuthenticate

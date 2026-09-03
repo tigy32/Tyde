@@ -9,7 +9,7 @@ use serde_json::{Value, json};
 
 use crate::backend::acp::AcpSpawnSpec;
 use crate::backend::acp::adapter::{
-    AcpAgentAdapter, AcpSessionKind, AcpSessionRoots, NormalizedUpdate,
+    AcpAgentAdapter, AcpCapabilities, AcpSessionKind, AcpSessionRoots, NormalizedUpdate,
 };
 use crate::backend::acp::adapters::stock::pick_local_workspace_root;
 
@@ -38,6 +38,12 @@ impl AcpAgentAdapter for GrokAdapter {
 
     fn agent_name(&self) -> &str {
         "grok"
+    }
+
+    fn normalize_capabilities(&self, capabilities: &mut AcpCapabilities) {
+        // Grok 1.0.13 advertises image=false but accepts ACP ImageContent,
+        // preserves it in session history, and sends it to the vision model.
+        capabilities.image = true;
     }
 
     fn resolve_roots<'a>(

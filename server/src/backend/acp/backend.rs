@@ -44,8 +44,8 @@ pub(crate) const KIRO_EPHEMERAL_SESSION_SUBDIR: &str = ".tyde/kiro-ephemeral";
 const KIRO_SCHEMA_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 const KIRO_SCHEMA_PROBE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 const KIRO_PROMPT_MAX_RETRIES: u64 = 5;
-const KIRO_CAPACITY_TIMEOUT: Duration = Duration::from_secs(20);
-const KIRO_CAPACITY_REFRESH_INTERVAL: Duration = Duration::from_secs(120);
+const ACP_CAPACITY_TIMEOUT: Duration = Duration::from_secs(20);
+const ACP_CAPACITY_REFRESH_INTERVAL: Duration = Duration::from_secs(120);
 
 fn kiro_prompt_error_is_retryable(error: &str) -> bool {
     let error = error.to_ascii_lowercase();
@@ -487,7 +487,8 @@ impl KiroSession {
             bridge.request("initialize", acp_initialize_params(adapter.as_ref())),
         )
         .await?;
-        let capabilities = parse_capabilities(&initialize_response);
+        let mut capabilities = parse_capabilities(&initialize_response);
+        adapter.normalize_capabilities(&mut capabilities);
 
         // Adapter-specific external setup remains a hard gate; protocol auth
         // methods must succeed before a session can be created.
@@ -726,7 +727,9 @@ struct KiroCapacityState {
 impl KiroInner {
     async fn set_capacity_emitter(self: &Arc<Self>, emitter: Arc<dyn SubAgentEmitter>) {
         self.capacity_state.lock().await.emitter = Some(emitter.clone());
-        if self.capacity_probe.is_none() {
+        if self.capacity_probe.is_none()
+            && self.adapter.backend_kind() != protocol::BackendKind::Grok
+        {
             emitter.on_backend_capacity(
                 self.adapter.backend_kind(),
                 BackendCapacityState::Unsupported {
@@ -745,7 +748,7 @@ impl KiroInner {
                 || (!force
                     && state
                         .read_at
-                        .is_some_and(|last| last.elapsed() < KIRO_CAPACITY_REFRESH_INTERVAL))
+                        .is_some_and(|last| last.elapsed() < ACP_CAPACITY_REFRESH_INTERVAL))
             {
                 return;
             }
@@ -758,13 +761,16 @@ impl KiroInner {
         };
         let inner = Arc::clone(self);
         tokio::spawn(async move {
-            let capacity = inner.read_kiro_capacity().await;
+            let capacity = inner.read_capacity().await;
             inner.capacity_state.lock().await.in_flight = false;
             emitter.on_backend_capacity(inner.adapter.backend_kind(), capacity);
         });
     }
 
-    async fn read_kiro_capacity(&self) -> BackendCapacityState {
+    async fn read_capacity(&self) -> BackendCapacityState {
+        if self.adapter.backend_kind() == protocol::BackendKind::Grok {
+            return self.read_grok_capacity().await;
+        }
         let Some(spec) = self.capacity_probe.as_ref() else {
             return BackendCapacityState::Unsupported {
                 reason: protocol::CapacityUnsupportedReason::ExternalProvider,
@@ -777,7 +783,7 @@ impl KiroInner {
             }
             parts.push(crate::remote::shell_quote_command(&spec.remote_args));
             tokio::time::timeout(
-                KIRO_CAPACITY_TIMEOUT,
+                ACP_CAPACITY_TIMEOUT,
                 crate::remote::run_ssh_raw(host, &parts.join(" ")),
             )
             .await
@@ -796,7 +802,7 @@ impl KiroInner {
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped());
-            tokio::time::timeout(KIRO_CAPACITY_TIMEOUT, command.output())
+            tokio::time::timeout(ACP_CAPACITY_TIMEOUT, command.output())
                 .await
                 .map_err(|_| CapacityUnavailableReason::SourceTimedOut)
                 .and_then(|result| result.map_err(|_| CapacityUnavailableReason::SourceUnreachable))
@@ -819,6 +825,39 @@ impl KiroInner {
             };
         }
         match map_kiro_capacity(&capture) {
+            Ok(report) => BackendCapacityState::Known { report },
+            Err(reason) => BackendCapacityState::Unavailable { reason },
+        }
+    }
+
+    async fn read_grok_capacity(&self) -> BackendCapacityState {
+        let response = match tokio::time::timeout(
+            ACP_CAPACITY_TIMEOUT,
+            self.bridge.request("_x.ai/billing", json!({})),
+        )
+        .await
+        {
+            Err(_) => {
+                return BackendCapacityState::Unavailable {
+                    reason: CapacityUnavailableReason::SourceTimedOut,
+                };
+            }
+            Ok(Err(error)) => {
+                if error.to_ascii_lowercase().contains("auth") {
+                    return BackendCapacityState::AuthError {
+                        detail: protocol::CapacityErrorDetail {
+                            summary: "Grok login is required to read subscription usage".to_owned(),
+                            code: protocol::CapacityErrorCode::NotAuthenticated,
+                        },
+                    };
+                }
+                return BackendCapacityState::Unavailable {
+                    reason: CapacityUnavailableReason::SourceUnreachable,
+                };
+            }
+            Ok(Ok(response)) => response,
+        };
+        match map_grok_capacity(&response) {
             Ok(report) => BackendCapacityState::Known { report },
             Err(reason) => BackendCapacityState::Unavailable { reason },
         }
@@ -4115,6 +4154,67 @@ pub(crate) fn unix_now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_else(|_| Duration::from_secs(0))
         .as_millis() as u64
+}
+
+fn map_grok_capacity(response: &Value) -> Result<CapacityReport, CapacityUnavailableReason> {
+    let config = response
+        .get("config")
+        .ok_or(CapacityUnavailableReason::MalformedReport)?;
+    let percent = config
+        .get("creditUsagePercent")
+        .and_then(Value::as_f64)
+        .filter(|percent| (0.0..=100.0).contains(percent))
+        .ok_or(CapacityUnavailableReason::MalformedReport)?;
+    let used_percent = percent.round().clamp(0.0, 100.0) as u8;
+    let period = config.get("currentPeriod");
+    let period_type = period
+        .and_then(|period| period.get("type"))
+        .and_then(Value::as_str);
+    let (bucket, label) = match period_type {
+        Some("USAGE_PERIOD_TYPE_WEEKLY") => ("weekly", "weekly limit"),
+        Some("USAGE_PERIOD_TYPE_MONTHLY") => ("monthly", "monthly limit"),
+        _ => ("subscription", "subscription limit"),
+    };
+    let reset_at_ms = period
+        .and_then(|period| period.get("end"))
+        .and_then(Value::as_str)
+        .or_else(|| config.get("billingPeriodEnd").and_then(Value::as_str))
+        .and_then(|stamp| chrono::DateTime::parse_from_rfc3339(stamp).ok())
+        .and_then(|stamp| u64::try_from(stamp.timestamp_millis()).ok());
+    let plan = response
+        .get("subscription_tier")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|plan| !plan.is_empty() && plan.len() <= 128)
+        .map(|plan| CapacityPlanLabel {
+            label: plan.to_owned(),
+        });
+
+    Ok(CapacityReport {
+        source: CapacitySource::GrokBilling,
+        observed_at_ms: Some(unix_now_ms()),
+        plan,
+        buckets: vec![CapacityBucket {
+            id: CapacityBucketId::Grok {
+                bucket: bucket.to_owned(),
+            },
+            label: label.to_owned(),
+            measure: CapacityMeasure::UsedPercent {
+                used_percent,
+                remaining_percent: 100 - used_percent,
+                provenance: ValueProvenance {
+                    vendor_reported: true,
+                },
+            },
+            scope: CapacityScope::Account,
+            window: CapacityWindow::NotReported,
+            reset: reset_at_ms
+                .map(|at_ms| CapacityReset::At { at_ms })
+                .unwrap_or(CapacityReset::NotReported),
+            status: None,
+        }],
+        coverage: CapacityCoverage::RepresentativeBucketOnly,
+    })
 }
 
 fn map_kiro_capacity(capture: &str) -> Result<CapacityReport, CapacityUnavailableReason> {

@@ -1859,6 +1859,7 @@ fn real_subscription_capacity() {
                         BackendKind::Codex,
                         CapacitySource::CodexAccountRateLimitsUpdated
                     )
+                    | (BackendKind::Grok, CapacitySource::GrokBilling)
             );
             assert!(
                 source_matches_backend,

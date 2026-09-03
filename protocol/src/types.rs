@@ -13,7 +13,7 @@ use serde_json::Value;
 /// `protocol::TydeReleaseVersion`.
 pub use host_config::{LOCAL_HOST_ID, TydeReleaseVersion};
 
-pub const PROTOCOL_VERSION: u32 = 55;
+pub const PROTOCOL_VERSION: u32 = 56;
 pub const TYDE_VERSION: Version = Version {
     major: 0,
     minor: 8,
@@ -659,8 +659,8 @@ impl BackendKind {
     /// than silently dropping it.
     pub const fn supports_image_input(self) -> bool {
         match self {
-            Self::Kiro | Self::Claude | Self::Codex | Self::Hermes => true,
-            Self::Tycode | Self::Antigravity | Self::Grok => false,
+            Self::Kiro | Self::Claude | Self::Codex | Self::Hermes | Self::Grok => true,
+            Self::Tycode | Self::Antigravity => false,
         }
     }
 }
@@ -2773,6 +2773,8 @@ pub enum CapacitySource {
     /// `kiro-cli-chat chat --agent-engine v1 --no-interactive /usage`, which
     /// reports subscription credits without starting a model turn.
     KiroUsageCommand,
+    /// Grok's authenticated `_x.ai/billing` ACP extension.
+    GrokBilling,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -2819,6 +2821,9 @@ pub enum CapacityBucketId {
         bucket: String,
     },
     Kiro {
+        bucket: String,
+    },
+    Grok {
         bucket: String,
     },
 }

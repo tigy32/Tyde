@@ -25,6 +25,7 @@ pub(crate) fn capabilities() -> BackendCapabilities {
     [
         BackendCapability::ListSessions,
         BackendCapability::ResumeSession,
+        BackendCapability::ImageInput,
         BackendCapability::Interrupt,
         BackendCapability::SessionSettings,
         BackendCapability::StartupMcpServers,
@@ -45,6 +46,7 @@ pub(crate) fn capabilities() -> BackendCapabilities {
         BackendCapability::TaskUpdates,
         BackendCapability::TaskListReplacement,
         BackendCapability::TaskListClear,
+        BackendCapability::CapacityTelemetry,
     ]
     .into()
 }
