@@ -4,6 +4,7 @@ use leptos::prelude::*;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::spawn_local;
 
+use crate::components::review_view::ReviewSidebar;
 use crate::send::send_frame;
 use crate::state::{AppState, DiffKey, DiffViewState, next_client_request_id, root_display_name};
 
@@ -111,7 +112,7 @@ pub fn GitPanel() -> impl IntoView {
     view! {
         <div class="git-panel">
             <div class="gp-content">
-                <ReviewStatusRow />
+                <ReviewCard />
                 {move || {
                     match git_roots.get() {
                         Some((project, roots)) => {
@@ -138,13 +139,16 @@ pub fn GitPanel() -> impl IntoView {
     }
 }
 
-/// One-line summary of the project's workspace review: live counts, whether
-/// the AI reviewer is running, and the way into the full review surface. The
-/// review controls themselves (AI reviewer form, submit, clear) live on that
-/// surface, not in the git panel. Hidden while there is nothing to review and
-/// nothing reviewed, so a clean project pays no vertical cost.
+/// The project's workspace review card: a one-line status header (live
+/// counts, an AI-running marker, and the way into the full comments surface)
+/// over the draft's controls — the AI reviewer form, the submit target, and
+/// Clear. The controls sit here, next to the working tree they act on; the
+/// comments surface the header opens reads and threads feedback only.
+///
+/// Hidden while there is nothing to review and nothing reviewed, so a clean
+/// project pays no vertical cost.
 #[component]
-fn ReviewStatusRow() -> impl IntoView {
+fn ReviewCard() -> impl IntoView {
     let state = expect_context::<AppState>();
 
     let target_state = state.clone();
@@ -215,6 +219,43 @@ fn ReviewStatusRow() -> impl IntoView {
             })
     });
 
+    // The controls mount only once the full record is loaded. Reviews track
+    // unstaged state, so the AI reviewer is gated on some root having an
+    // unstaged or untracked change; staged-only edits would hand it an empty
+    // diff.
+    let loaded_state = state.clone();
+    let loaded = Memo::new(move |_| {
+        let Some((_, rid)) = target.get() else {
+            return false;
+        };
+        loaded_state.reviews.with(|map| map.contains_key(&rid))
+    });
+    let isdraft_state = state.clone();
+    let is_draft = Memo::new(move |_| {
+        let Some((_, rid)) = target.get() else {
+            return false;
+        };
+        isdraft_state.reviews.with(|map| {
+            map.get(&rid)
+                .is_none_or(|review| matches!(review.status, protocol::ReviewStatus::Draft))
+        })
+    });
+    let changes_state = state.clone();
+    let has_reviewable_changes = Memo::new(move |_| {
+        let Some(ap) = changes_state.active_project.get() else {
+            return false;
+        };
+        changes_state.git_status.with(|map| {
+            map.get(&ap.project_id).is_some_and(|roots| {
+                roots.iter().any(|root| {
+                    root.files
+                        .iter()
+                        .any(|f| f.unstaged.is_some() || f.untracked)
+                })
+            })
+        })
+    });
+
     let open_state = state.clone();
     let on_open = move |_| {
         let Some((host, _)) = target.get_untracked() else {
@@ -232,43 +273,85 @@ fn ReviewStatusRow() -> impl IntoView {
 
     view! {
         <Show when=move || visible.get()>
-            <div class="gp-review-status" data-test="gp-review-status">
-                <span class="gp-review-status-title">"Review"</span>
-                <span class="gp-review-counts" data-test="gp-review-counts">
+            <div class="gp-review-card" data-test="gp-review-card">
+                <div class="gp-review-status" data-test="gp-review-status">
+                    <span class="gp-review-status-title">"Review"</span>
+                    <span class="gp-review-counts" data-test="gp-review-counts">
+                        {move || {
+                            counts
+                                .get()
+                                .map(|(comments, suggestions, _)| {
+                                    format!(
+                                        "{comments} comment{} \u{00b7} {suggestions} AI",
+                                        if comments == 1 { "" } else { "s" },
+                                    )
+                                })
+                                .unwrap_or_default()
+                        }}
+                    </span>
                     {move || {
-                        counts
-                            .get()
-                            .map(|(comments, suggestions, _)| {
-                                format!(
-                                    "{comments} comment{} \u{00b7} {suggestions} AI",
-                                    if comments == 1 { "" } else { "s" },
-                                )
-                            })
-                            .unwrap_or_default()
+                        counts.get().is_some_and(|(_, _, running)| running).then(|| view! {
+                            <span
+                                class="gp-review-ai"
+                                data-test="gp-review-ai"
+                                title="The AI reviewer is running"
+                            >
+                                "reviewing\u{2026}"
+                            </span>
+                        })
                     }}
-                </span>
+                    <button
+                        class="gp-review-open-btn"
+                        data-test="gp-review-open"
+                        title="Open every review comment, grouped by root"
+                        on:click=on_open.clone()
+                    >
+                        "Open"
+                    </button>
+                </div>
                 {move || {
-                    counts.get().is_some_and(|(_, _, running)| running).then(|| view! {
-                        <span
-                            class="gp-review-ai"
-                            data-test="gp-review-ai"
-                            title="The AI reviewer is running"
-                        >
-                            "reviewing\u{2026}"
-                        </span>
+                    if !loaded.get() {
+                        return None;
+                    }
+                    let (host_id, review_id) = target.get()?;
+                    Some(view! {
+                        <ReviewCardControls
+                            host_id=host_id
+                            review_id=review_id
+                            is_draft=is_draft
+                            can_run_ai=has_reviewable_changes
+                        />
                     })
                 }}
-                <button
-                    class="gp-review-open-btn"
-                    data-test="gp-review-open"
-                    title="Open the review: comments, AI reviewer, and submit"
-                    on:click=on_open.clone()
-                >
-                    "Open"
-                </button>
             </div>
         </Show>
     }
+}
+
+/// The review card's controls, mounted once the full record is loaded. Split
+/// out so `ReviewSidebar` gets its seed record read untracked: the card body
+/// must not re-render (and reset the reviewer's in-progress form) every time
+/// a comment lands.
+#[component]
+fn ReviewCardControls(
+    host_id: String,
+    review_id: ReviewId,
+    is_draft: Memo<bool>,
+    can_run_ai: Memo<bool>,
+) -> impl IntoView {
+    let state = expect_context::<AppState>();
+    let seed = state
+        .reviews
+        .with_untracked(|map| map.get(&review_id).cloned())?;
+    Some(view! {
+        <ReviewSidebar
+            review=seed
+            host_id=host_id
+            review_id=review_id
+            is_draft=is_draft
+            can_run_ai=can_run_ai
+        />
+    })
 }
 
 /// Ask the AI reviewer to read one committed range. Its suggestions land in
@@ -3110,11 +3193,11 @@ mod wasm_tests {
         );
     }
 
-    /// A Draft review ⇒ exactly one compact status row for the project with
-    /// the workspace-wide counts and a way into the review surface. The
-    /// review controls themselves are not in the panel.
+    /// A Draft review ⇒ exactly one review card for the project: a one-line
+    /// status header carrying the workspace-wide counts and the way into the
+    /// comments surface, over the draft's own controls.
     #[wasm_bindgen_test]
-    async fn draft_shows_one_review_status_row_with_counts() {
+    async fn draft_shows_one_review_card_with_counts_and_controls() {
         ensure_styles_loaded();
         let container = make_container();
         let _mounted = mount_git_panel(container.clone(), true);
@@ -3132,14 +3215,16 @@ mod wasm_tests {
         );
         assert!(query(&container, "[data-test=gp-review-open]").is_some());
         assert!(
-            query(&container, "[data-test=review-run-ai]").is_none()
-                && query(&container, ".review-submit-btn").is_none(),
-            "AI reviewer and submit controls live on the review surface, not the panel"
+            query(&container, "[data-test=review-run-ai]").is_some()
+                && query(&container, "[data-test=review-submit-target]").is_some()
+                && query(&container, ".review-submit-btn").is_some()
+                && query(&container, "[data-test=review-clear-btn]").is_some(),
+            "the card hosts the draft's AI reviewer, submit, and clear controls"
         );
         let height = rows[0].get_bounding_client_rect().height();
         assert!(
             height > 0.0 && height <= 32.0,
-            "the status row is one line; got {height}px"
+            "the status header stays one line above the controls; got {height}px"
         );
     }
 

@@ -1776,6 +1776,10 @@ fn file_diff_cached(
 /// suggestions are excluded from the entry list (they
 /// stay reachable under each thread's existing "N rejected" toggle). An empty
 /// state covers the no-feedback case.
+///
+/// It reads and threads feedback only. The draft's write controls — the AI
+/// reviewer, the submit target, and Clear — live on the git panel's review
+/// card, next to the working tree they act on.
 #[component]
 pub fn ReviewCommentsSurface(host_id: String, project_id: ProjectId) -> impl IntoView {
     let state = expect_context::<AppState>();
@@ -1809,32 +1813,6 @@ pub fn ReviewCommentsSurface(host_id: String, project_id: ProjectId) -> impl Int
     subscribe_review_reactive(&state, draft);
 
     let is_draft: Memo<bool> = Memo::new(move |_| draft.get().is_some());
-
-    // The review controls (AI reviewer, submit, clear) mount here once the
-    // full record is available. Reviews track unstaged state, so the AI
-    // reviewer is gated on some root having an unstaged or untracked change;
-    // staged-only edits would hand it an empty diff.
-    let loaded_state = state.clone();
-    let loaded: Memo<bool> = Memo::new(move |_| {
-        let Some((_, rid)) = draft.get() else {
-            return false;
-        };
-        loaded_state.reviews.with(|map| map.contains_key(&rid))
-    });
-    let changes_state = state.clone();
-    let changes_project = project_id.clone();
-    let has_reviewable_changes: Memo<bool> = Memo::new(move |_| {
-        changes_state.git_status.with(|map| {
-            map.get(&changes_project).is_some_and(|roots| {
-                roots.iter().any(|root| {
-                    root.files
-                        .iter()
-                        .any(|f| f.unstaged.is_some() || f.untracked)
-                })
-            })
-        })
-    });
-    let actions_state = state.clone();
 
     // A composer signal is required by `ThreadRegionFiltered`, but this
     // surface has no drag-to-comment gutter, so it never opens.
@@ -2049,28 +2027,6 @@ pub fn ReviewCommentsSurface(host_id: String, project_id: ProjectId) -> impl Int
                     }
                 })}
             </div>
-            <Show when=move || loaded.get()>
-                <div class="review-comments-actions" data-test="review-comments-actions">
-                    {
-                        let actions_state = actions_state.clone();
-                        move || {
-                            let (host, rid) = draft.get()?;
-                            let seed = actions_state
-                                .reviews
-                                .with_untracked(|map| map.get(&rid).cloned())?;
-                            Some(view! {
-                                <ReviewSidebar
-                                    review=seed
-                                    host_id=host
-                                    review_id=rid
-                                    is_draft=is_draft
-                                    can_run_ai=has_reviewable_changes
-                                />
-                            })
-                        }
-                    }
-                </div>
-            </Show>
             <Show
                 when=move || has_entries.get()
                 fallback=move || view! {
@@ -3447,6 +3403,10 @@ mod wasm_tests {
         );
     }
 
+    /// The comments surface reads and threads feedback; the draft's write
+    /// controls live on the git panel's review card, so a loaded draft with
+    /// feedback still offers neither the AI reviewer nor the submit target
+    /// here, and navigating to a comment's source keeps working.
     #[wasm_bindgen_test]
     async fn comments_surface_opens_the_staged_comment_source() {
         let container = make_container();
@@ -3457,6 +3417,15 @@ mod wasm_tests {
         let holder = mount_comments_surface(container.clone(), review, false);
 
         next_tick().await;
+        for control in ["review-run-ai", "review-submit-target", "review-clear-btn"] {
+            assert!(
+                container
+                    .query_selector(&format!("[data-test=\"{control}\"]"))
+                    .unwrap()
+                    .is_none(),
+                "{control} belongs on the git panel's review card, not the comments surface"
+            );
+        }
         container
             .query_selector("[data-test=\"review-comments-open-full\"]")
             .unwrap()
@@ -4109,16 +4078,20 @@ mod wasm_tests {
         None
     }
 
-    fn mount_comments_surface_with_roots(
+    /// Mount the git panel over a project whose workspace draft is `review`
+    /// and whose git status is `roots`. The panel's review card is where the
+    /// draft's write controls (AI reviewer, submit target, Clear) live.
+    fn mount_git_panel_review_card(
         container: HtmlElement,
         roots: Vec<protocol::ProjectRootGitStatus>,
+        review: Review,
     ) -> Mounted<std::rc::Rc<std::cell::RefCell<Option<AppState>>>> {
         let holder: std::rc::Rc<std::cell::RefCell<Option<AppState>>> =
             std::rc::Rc::new(std::cell::RefCell::new(None));
         let holder_for_mount = holder.clone();
         let handle = mount_to(container, move || {
             let state = AppState::new();
-            let review = make_review();
+            let review = review.clone();
             let rid = review.id.clone();
             let pid = review.project_id.clone();
             state
@@ -4156,12 +4129,7 @@ mod wasm_tests {
             seed_host_settings(&state, Some(BackendKind::Codex), vec![BackendKind::Codex]);
             *holder_for_mount.borrow_mut() = Some(state.clone());
             provide_context(state.clone());
-            view! {
-                <ReviewCommentsSurface
-                    host_id="h1".to_owned()
-                    project_id=pid.clone()
-                />
-            }
+            view! { <crate::components::git_panel::GitPanel /> }
         });
         Mounted::new(handle, holder)
     }
@@ -4175,16 +4143,18 @@ mod wasm_tests {
         )
     }
 
-    /// The review surface hosts the AI reviewer: with a draft, a backend, and
-    /// a reviewable change in any root, Run sends `StartAiReview` on the
-    /// single workspace review stream regardless of how many roots there are.
+    /// The git panel's review card hosts the AI reviewer: with a draft, a
+    /// backend, and a reviewable change in any root, Run sends
+    /// `StartAiReview` on the single workspace review stream regardless of
+    /// how many roots there are.
     #[wasm_bindgen_test]
-    async fn comments_surface_run_ai_targets_workspace_review() {
+    async fn git_panel_review_card_run_ai_targets_workspace_review() {
         record_bridge();
         let container = make_container();
-        let _mounted = mount_comments_surface_with_roots(
+        let _mounted = mount_git_panel_review_card(
             container.clone(),
             vec![dirty_root("/repo-a"), dirty_root("/repo-b")],
+            make_review(),
         );
         next_tick().await;
         next_tick().await;
@@ -4192,7 +4162,7 @@ mod wasm_tests {
         let btn = container
             .query_selector("[data-test=\"review-run-ai\"]")
             .unwrap()
-            .expect("Run AI button must render on the review surface");
+            .expect("Run AI button must render on the git panel's review card");
         let btn: HtmlElement = btn.dyn_into().unwrap();
         assert!(
             !btn.has_attribute("disabled"),
@@ -4215,14 +4185,18 @@ mod wasm_tests {
 
     /// With a draft but a clean tree there is nothing for the reviewer to
     /// read, so Run is disabled and a click sends nothing; it enables
-    /// reactively once a root gains an unstaged change.
+    /// reactively once a root gains an unstaged change. The card is on screen
+    /// throughout because the draft already carries a comment.
     #[wasm_bindgen_test]
-    async fn comments_surface_run_ai_disabled_without_reviewable_changes() {
+    async fn git_panel_review_card_run_ai_disabled_without_reviewable_changes() {
         record_bridge();
         let container = make_container();
-        let holder = mount_comments_surface_with_roots(
+        let mut review = make_review();
+        review.comments.push(comment_at_line(2, "already reviewed"));
+        let holder = mount_git_panel_review_card(
             container.clone(),
             vec![root_status("/repo", None, None, false)],
+            review,
         );
         next_tick().await;
         next_tick().await;

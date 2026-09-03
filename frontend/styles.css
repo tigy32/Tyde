@@ -6781,18 +6781,41 @@ math merror {
     padding: var(--space-1) 0;
 }
 
-/* One-line workspace review summary at the top of the panel. The review
- * controls themselves live on the review surface it opens. */
+/* Workspace review card at the top of the panel: a one-line status header
+ * over the draft's controls. It reuses `ReviewSidebar` for the AI reviewer,
+ * submit, and Clear, so it neutralizes that component's docked-pane chrome
+ * (left border, own scroll container) to sit flush in the narrow panel. */
+.gp-review-card {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+    margin: 0 var(--space-2) var(--space-2);
+    padding: var(--space-2);
+    border: 1px solid var(--border-primary);
+    border-radius: 6px;
+    background: var(--surface-2);
+}
+
 .gp-review-status {
     display: flex;
     align-items: center;
     gap: var(--space-2);
-    min-height: 28px;
-    margin: 0 var(--space-2) var(--space-1);
-    padding: 0 var(--space-2);
-    border: 1px solid var(--border-primary);
-    border-radius: 6px;
-    background: var(--surface-2);
+    min-height: 24px;
+}
+
+.gp-review-card .review-sidebar {
+    border-left: 0;
+    background: transparent;
+    padding: 0;
+    overflow: visible;
+    gap: var(--space-2);
+}
+
+/* Hairline between the AI-reviewer block and the submit block so the two
+ * halves of the card read as separate steps. */
+.gp-review-card .review-sidebar-section + .review-sidebar-section {
+    border-top: 1px solid var(--border-primary);
+    padding-top: var(--space-2);
 }
 
 .gp-review-status-title {
@@ -7077,31 +7100,6 @@ math merror {
 
 .gp-commit-meta .gp-commit-ai-review {
     margin-left: auto;
-}
-
-/* `ReviewSidebar` is built for a docked pane; drop that chrome where the
- * comments surface embeds it so it reads as a section of its host. */
-.review-comments-actions .review-sidebar {
-    border-left: 0;
-    background: transparent;
-    padding: 0;
-    overflow: visible;
-    gap: var(--space-3);
-}
-
-.review-comments-actions .review-sidebar-section + .review-sidebar-section {
-    border-top: 1px solid var(--border-primary);
-    padding-top: var(--space-3);
-}
-
-.review-comments-actions {
-    display: flex;
-    flex-direction: column;
-    gap: var(--space-3);
-    padding: var(--space-3);
-    border: 1px solid var(--border-primary);
-    border-radius: var(--radius-md);
-    background: var(--surface-1);
 }
 
 .gp-history-older {
