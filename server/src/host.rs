@@ -381,6 +381,16 @@ pub struct HostRuntimeConfig {
     pub force_project_watch_limit: bool,
     #[cfg(any(test, feature = "test-support"))]
     pub project_path_opener_program: Option<PathBuf>,
+    /// Holds the open-agent restoration pass once it has read the store but
+    /// before it reconstructs anything, so a test can invalidate the snapshot
+    /// underneath it. Restoration runs during host construction, so a test
+    /// cannot install this afterwards.
+    #[cfg(feature = "test-support")]
+    pub restoration_snapshot_test_gate: Option<Arc<SpawnOperationTestGateInner>>,
+    /// Holds the open-agent restoration pass once it has finished, so a test
+    /// can assert on what the pass did without waiting a fixed time for it.
+    #[cfg(feature = "test-support")]
+    pub restoration_complete_test_gate: Option<Arc<SpawnOperationTestGateInner>>,
 }
 
 impl Default for HostRuntimeConfig {
@@ -407,6 +417,10 @@ impl Default for HostRuntimeConfig {
             force_project_watch_limit: false,
             #[cfg(any(test, feature = "test-support"))]
             project_path_opener_program: None,
+            #[cfg(feature = "test-support")]
+            restoration_snapshot_test_gate: None,
+            #[cfg(feature = "test-support")]
+            restoration_complete_test_gate: None,
         }
     }
 }
@@ -700,6 +714,23 @@ pub(crate) struct HostState {
     pub skill_store: Arc<Mutex<SkillStore>>,
     pub agent_sessions: HashMap<AgentId, SessionId>,
     pending_agent_sessions: HashMap<AgentId, SessionId>,
+    /// Serializes resume admission per session. A resume resolves discovery and
+    /// the spawn configuration before it registers an actor, so the ownership
+    /// check and the registration are separated by awaits; without this, a
+    /// restoration pass and a client resuming the same session from Sessions
+    /// both pass the check and the session ends up with two owners.
+    session_resume_admission: HashMap<SessionId, Arc<Mutex<()>>>,
+    /// Serialises a resume publishing that it owns a session against a close
+    /// deciding that nobody does. Separate from the resume admission claim
+    /// because that one is held across backend discovery, which has no
+    /// deadline: a close that waited on it would be at the mercy of an
+    /// unresponsive provider belonging to another card.
+    session_ownership_claims: HashMap<SessionId, Arc<Mutex<()>>>,
+    /// Sessions a resume has taken ownership of but whose agent the host has
+    /// not registered yet. An actor persists its restoration marker before the
+    /// host learns the binding, so without this a close between the two reads
+    /// no owner and withdraws a marker the resumed card still needs.
+    resuming_sessions: Arc<std::sync::Mutex<HashMap<SessionId, usize>>>,
     agent_visibility: AgentVisibilityRegistry,
     spawn_publication_claims: HashMap<AgentId, SpawnOperationTerminalClaim>,
     pub agent_activity_summaries: HashMap<AgentId, AgentActivitySummaryState>,
@@ -756,6 +787,14 @@ pub(crate) struct HostState {
     force_project_watch_limit: bool,
     #[cfg(any(test, feature = "test-support"))]
     project_path_opener_program: Option<PathBuf>,
+    #[cfg(feature = "test-support")]
+    restoration_snapshot_test_gate: Option<Arc<SpawnOperationTestGateInner>>,
+    #[cfg(feature = "test-support")]
+    restoration_complete_test_gate: Option<Arc<SpawnOperationTestGateInner>>,
+    #[cfg(feature = "test-support")]
+    resume_admission_test_gate: Option<Arc<SpawnOperationTestGateInner>>,
+    #[cfg(feature = "test-support")]
+    restore_marker_withdraw_test_gate: Option<Arc<SpawnOperationTestGateInner>>,
     host_streams: HashMap<StreamPath, HostSubscriber>,
     project_streams: HashMap<ProjectId, ProjectStreamSubscription>,
     terminal_streams: HashMap<(StreamPath, TerminalId), TerminalHandle>,
@@ -1381,6 +1420,33 @@ impl Drop for SpawnVisibilityGuard {
     }
 }
 
+/// Keeps a session published as owned by an in-flight resume. Dropped once the
+/// host has registered the resumed agent, or once the spawn has given up.
+struct InflightResumeClaim {
+    resuming: Arc<std::sync::Mutex<HashMap<SessionId, usize>>>,
+    session_id: SessionId,
+}
+
+fn lock_resuming_sessions(
+    resuming: &Arc<std::sync::Mutex<HashMap<SessionId, usize>>>,
+) -> std::sync::MutexGuard<'_, HashMap<SessionId, usize>> {
+    resuming
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+impl Drop for InflightResumeClaim {
+    fn drop(&mut self) {
+        let mut resuming = lock_resuming_sessions(&self.resuming);
+        match resuming.get_mut(&self.session_id) {
+            Some(count) if *count > 1 => *count -= 1,
+            _ => {
+                resuming.remove(&self.session_id);
+            }
+        }
+    }
+}
+
 impl PendingAgentSessionPublication {
     fn publish(mut self) {
         let Some(publish_tx) = self.publish_tx.take() else {
@@ -1517,11 +1583,18 @@ pub struct InstalledSpawnOperationTestGate {
 }
 
 #[cfg(feature = "test-support")]
-pub(crate) struct SpawnOperationTestGateInner {
+pub struct SpawnOperationTestGateInner {
     entered_tx: mpsc::UnboundedSender<()>,
     entered_rx: Mutex<mpsc::UnboundedReceiver<()>>,
     release: Semaphore,
     panic_on_release: AtomicBool,
+}
+
+#[cfg(feature = "test-support")]
+impl std::fmt::Debug for SpawnOperationTestGateInner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SpawnOperationTestGateInner")
+    }
 }
 
 #[cfg(feature = "test-support")]
@@ -1542,6 +1615,13 @@ impl InstalledSpawnOperationTestGate {
 
     pub fn panic_on_release(&self) {
         self.inner.panic_on_release.store(true, Ordering::SeqCst);
+    }
+
+    /// The gate itself, for the one hook that has to be in place before the
+    /// host exists: restoration starts during host construction, so its gate
+    /// arrives through `HostRuntimeConfig` rather than being installed after.
+    pub fn shared(&self) -> Arc<SpawnOperationTestGateInner> {
+        Arc::clone(&self.inner)
     }
 }
 
@@ -2204,6 +2284,25 @@ impl HostHandle {
         gate
     }
 
+    /// Holds a client resume after it has claimed its session and before it
+    /// registers an actor. That is the window a restoration pass used to race.
+    pub async fn install_resume_admission_test_gate(&self) -> InstalledSpawnOperationTestGate {
+        let gate = new_spawn_operation_test_gate();
+        self.state.lock().await.resume_admission_test_gate = Some(gate.shared());
+        gate
+    }
+
+    /// Holds a close between deciding which sessions have no other owner and
+    /// writing that decision, which is the window a concurrent resume has to
+    /// register a marker the close then removes.
+    pub async fn install_restore_marker_withdraw_test_gate(
+        &self,
+    ) -> InstalledSpawnOperationTestGate {
+        let gate = new_spawn_operation_test_gate();
+        self.state.lock().await.restore_marker_withdraw_test_gate = Some(gate.shared());
+        gate
+    }
+
     pub fn install_resume_queue_dispatch_test_gate(
         &self,
         agent_name: &str,
@@ -2286,7 +2385,7 @@ impl HostHandle {
 }
 
 #[cfg(feature = "test-support")]
-fn new_spawn_operation_test_gate() -> InstalledSpawnOperationTestGate {
+pub fn new_spawn_operation_test_gate() -> InstalledSpawnOperationTestGate {
     let (entered_tx, entered_rx) = mpsc::unbounded_channel();
     InstalledSpawnOperationTestGate {
         inner: Arc::new(SpawnOperationTestGateInner {
@@ -3213,11 +3312,10 @@ impl HostHandle {
     ) -> AppResult<AgentId> {
         self.spawn_agent_with_origin_config_and_team(
             payload,
-            AgentOrigin::User,
-            None,
-            None,
-            None,
-            Some(terminal_claim),
+            SpawnAgentContext {
+                operation_terminal_claim: Some(terminal_claim),
+                ..Default::default()
+            },
         )
         .await
     }
@@ -4103,11 +4201,11 @@ impl HostHandle {
         let new_agent_id = self
             .spawn_agent_with_origin_config_and_team(
                 replacement_payload,
-                start.origin,
-                None,
-                team_context.clone(),
-                None,
-                None,
+                SpawnAgentContext {
+                    origin: start.origin,
+                    team_context: team_context.clone(),
+                    ..Default::default()
+                },
             )
             .await;
         let new_agent_id = match new_agent_id {
@@ -4311,11 +4409,12 @@ impl HostHandle {
     ) -> AppResult<AgentId> {
         self.spawn_agent_with_origin_config_and_team(
             payload,
-            origin,
-            resolved_spawn_config_override,
-            None,
-            workflow,
-            None,
+            SpawnAgentContext {
+                origin,
+                resolved_spawn_config_override,
+                workflow,
+                ..Default::default()
+            },
         )
         .await
     }
@@ -4323,18 +4422,46 @@ impl HostHandle {
     async fn spawn_agent_with_origin_config_and_team(
         &self,
         payload: SpawnAgentPayload,
-        origin: AgentOrigin,
-        resolved_spawn_config_override: Option<ResolvedSpawnConfig>,
-        team_context: Option<TeamSpawnContext>,
-        workflow: Option<AgentWorkflowMetadata>,
-        operation_terminal_claim: Option<SpawnOperationTerminalClaim>,
+        context: SpawnAgentContext,
     ) -> AppResult<AgentId> {
+        let SpawnAgentContext {
+            origin,
+            resolved_spawn_config_override,
+            team_context,
+            workflow,
+            operation_terminal_claim,
+            admitted_session,
+        } = context;
         tracing::info!(
             parent_agent_id = ?payload.parent_agent_id,
             project_id = ?payload.project_id,
             requested_name = ?payload.name,
             "host spawn_agent requested"
         );
+        // Claim the session before resolving anything. A resume resolves
+        // discovery and its spawn configuration before it registers an actor,
+        // so without the claim two resumes of one session interleave between
+        // the ownership check and the registration.
+        //
+        // Deliberately resuming a session that is already open is an ordinary
+        // thing for a user to do and still produces a second card, so the claim
+        // only serializes. Restoration is the caller that must not add a card
+        // the user did not ask for, and it alone reuses the live agent.
+        let _resume_admission = match (&payload.params, admitted_session) {
+            (SpawnAgentParams::Resume { session_id, .. }, None) => {
+                let admission = self.session_resume_admission(session_id).await;
+                let guard = admission.clone().lock_owned().await;
+                #[cfg(feature = "test-support")]
+                {
+                    let gate = self.state.lock().await.resume_admission_test_gate.clone();
+                    if let Some(gate) = gate {
+                        wait_for_spawn_operation_test_gate_inner(&gate).await;
+                    }
+                }
+                Some(guard)
+            }
+            (_, admitted) => admitted,
+        };
         let (
             session_store,
             project_store,
@@ -4743,7 +4870,7 @@ impl HostHandle {
                 );
                 let (
                     effective_custom_agent_id,
-                    resolved_spawn_config,
+                    mut resolved_spawn_config,
                     startup_warning,
                     startup_failure,
                 ) = if let Some(stored_custom_agent_id) = record.custom_agent_id.as_ref() {
@@ -4863,6 +4990,12 @@ impl HostHandle {
                         (effective, None)
                     }
                 };
+                // Resume resolves a fresh user configuration, which defaults to
+                // unrestricted. Without reapplying the stored mode a read-only
+                // session comes back unrestricted, and `persist_agent_session`
+                // then writes that default over the saved one, so the setting is
+                // gone for good. Fork already does this from its own record.
+                resolved_spawn_config.access_mode = record.access_mode;
                 let (sanitized_settings, settings_failure, settings_warning) =
                     sanitize_stored_session_settings(
                         record.backend_kind,
@@ -5247,6 +5380,14 @@ impl HostHandle {
             fork_from_session_id = ?request.fork_from_session_id,
             "host spawn_agent resolved request"
         );
+        // Published before the actor exists. The actor persists this session's
+        // restoration marker before the host registers the binding a close
+        // reads, so a close in between would find no owner and withdraw a
+        // marker the resumed card still needs.
+        let inflight_resume = match request.resume_session_id.as_ref() {
+            Some(session_id) => Some(self.claim_inflight_resume(session_id).await),
+            None => None,
+        };
 
         let (start, agent_handle, startup_rx, agent_visibility, session_summary_count_tx) = {
             let mut state = self.state.lock().await;
@@ -5334,6 +5475,7 @@ impl HostHandle {
             agent_id.clone(),
             startup_rx,
             visibility.clone(),
+            inflight_resume,
         );
 
         let fanout_started = visibility.begin_fanout();
@@ -5717,6 +5859,14 @@ impl HostHandle {
             fork_from_session_id = ?request.fork_from_session_id,
             "host spawn_agent resolved request"
         );
+        // Published before the actor exists. The actor persists this session's
+        // restoration marker before the host registers the binding a close
+        // reads, so a close in between would find no owner and withdraw a
+        // marker the resumed card still needs.
+        let inflight_resume = match request.resume_session_id.as_ref() {
+            Some(session_id) => Some(self.claim_inflight_resume(session_id).await),
+            None => None,
+        };
 
         let session_store = {
             let state = self.state.lock().await;
@@ -5773,6 +5923,7 @@ impl HostHandle {
             agent_id.clone(),
             startup_rx,
             visibility.clone(),
+            inflight_resume,
         );
 
         let fanout_started = visibility.begin_fanout();
@@ -7286,14 +7437,14 @@ impl HostHandle {
         let agent_id = self
             .spawn_agent_with_origin_config_and_team(
                 payload,
-                AgentOrigin::TeamMember,
-                None,
-                Some(TeamSpawnContext {
-                    team_id: plan.team.id.clone(),
-                    team_member_id: plan.member.id.clone(),
-                }),
-                None,
-                None,
+                SpawnAgentContext {
+                    origin: AgentOrigin::TeamMember,
+                    team_context: Some(TeamSpawnContext {
+                        team_id: plan.team.id.clone(),
+                        team_member_id: plan.member.id.clone(),
+                    }),
+                    ..Default::default()
+                },
             )
             .await
             .map_err(|error| error.to_string())?;
@@ -9443,7 +9594,7 @@ impl HostHandle {
         agent_id: &AgentId,
         recorded_visibility_only: bool,
     ) -> bool {
-        let (close_targets, host_streams) = {
+        let (close_targets, host_streams, session_store, closing_sessions_by_agent) = {
             let state = self.state.lock().await;
             let close_targets = state.registry.agent_subtree_post_order(agent_id);
             if close_targets.is_empty() {
@@ -9469,8 +9620,35 @@ impl HostHandle {
                     )
                 })
                 .collect::<Vec<_>>();
-            (close_targets, host_streams)
+            let closing_sessions_by_agent = close_targets
+                .iter()
+                .filter_map(|(agent_id, handle)| {
+                    state
+                        .agent_sessions
+                        .get(agent_id)
+                        .or_else(|| state.pending_agent_sessions.get(agent_id))
+                        .cloned()
+                        .or_else(|| handle.snapshot().session_id)
+                        .map(|session_id| (agent_id.clone(), session_id))
+                })
+                .collect::<HashMap<_, _>>();
+            (
+                close_targets,
+                host_streams,
+                Arc::clone(&state.session_store),
+                closing_sessions_by_agent,
+            )
         };
+        let closing_session_ids = closing_sessions_by_agent
+            .values()
+            .cloned()
+            .collect::<HashSet<_>>();
+        self.withdraw_unowned_restoration_markers(
+            &closing_session_ids,
+            &session_store,
+            "closing subtree",
+        )
+        .await;
 
         let close_ids = close_targets
             .iter()
@@ -9519,6 +9697,31 @@ impl HostHandle {
                     "agent did not acknowledge close; continuing teardown without it"
                 );
             }
+
+            // The bulk clear above races the actor's own teardown: a startup or
+            // turn that persists its session after the clear puts the marker
+            // straight back, and the agent then reopens on the next launch
+            // despite an acknowledged close. Clearing again here, once the
+            // actor has stopped, is the point after which nothing can re-mark
+            // it. `cas` skips the write when the marker is already gone, so the
+            // ordinary close still costs the single store write.
+            //
+            // The handle is re-read rather than trusted from the pre-teardown
+            // capture: an agent closed while its startup was still pending had
+            // no session id to capture, and establishing one during teardown is
+            // exactly the case that leaves a marker behind.
+            let mut settled_session_ids = closing_sessions_by_agent
+                .get(&target_agent_id)
+                .cloned()
+                .into_iter()
+                .collect::<HashSet<_>>();
+            settled_session_ids.extend(agent_handle.snapshot().session_id);
+            self.withdraw_unowned_restoration_markers(
+                &settled_session_ids,
+                &session_store,
+                "settled close",
+            )
+            .await;
 
             let payload = AgentClosedPayload {
                 agent_id: target_agent_id,
@@ -9670,6 +9873,199 @@ impl HostHandle {
 
     pub async fn agent_ids(&self) -> Vec<AgentId> {
         self.state.lock().await.registry.agent_ids()
+    }
+
+    /// Session ids the live registry is currently bound to, including agents
+    /// whose binding has not been published yet.
+    pub async fn live_agent_session_ids(&self) -> Vec<SessionId> {
+        let state = self.state.lock().await;
+        state
+            .registry
+            .agent_ids()
+            .into_iter()
+            .filter_map(|agent_id| {
+                state
+                    .agent_sessions
+                    .get(&agent_id)
+                    .or_else(|| state.pending_agent_sessions.get(&agent_id))
+                    .cloned()
+                    .or_else(|| {
+                        state
+                            .registry
+                            .agent_handle(&agent_id)
+                            .and_then(|handle| handle.snapshot().session_id)
+                    })
+            })
+            .collect()
+    }
+
+    /// The agent that currently owns `session_id`, including one whose binding
+    /// has not been published yet. Both session maps stay empty until a spawn
+    /// finishes startup, so the registry snapshot is what makes an in-flight
+    /// resume visible.
+    async fn live_agent_for_session(&self, session_id: &SessionId) -> Option<AgentId> {
+        let state = self.state.lock().await;
+        // A closing agent still sits in the registry and still carries its
+        // session, but it is on its way out and reusing it would hand the
+        // caller a card that is about to disappear. Resuming a session whose
+        // agent is closing is an ordinary thing to do and must still spawn.
+        let owns_session = |agent_id: &AgentId, id: &SessionId| {
+            id == session_id
+                && state
+                    .registry
+                    .agent_handle(agent_id)
+                    .is_some_and(|handle| !handle.is_closing())
+        };
+        state
+            .agent_sessions
+            .iter()
+            .chain(state.pending_agent_sessions.iter())
+            .find_map(|(agent_id, id)| owns_session(agent_id, id).then(|| agent_id.clone()))
+            .or_else(|| {
+                state.registry.agent_ids().into_iter().find(|agent_id| {
+                    state
+                        .registry
+                        .agent_handle(agent_id)
+                        .filter(|handle| !handle.is_closing())
+                        .and_then(|handle| handle.snapshot().session_id)
+                        .is_some_and(|id| &id == session_id)
+                })
+            })
+    }
+
+    /// Withdraws the restoration marker of every session in `sessions` that no
+    /// other still-open card represents.
+    ///
+    /// A session can back more than one card, because resuming one that is
+    /// already open deliberately produces a second. Withdrawing the marker
+    /// because one of them closed would strand the others: nothing re-marks a
+    /// session during ordinary turns, so the cards still open would not come
+    /// back after a restart.
+    ///
+    /// The ownership test and the write happen under each session's ownership
+    /// claim, which is what a resume takes to publish that it owns a session.
+    /// Reading ownership outside it is two separate lock acquisitions: an
+    /// actor publishes its session id on its start watch before it persists
+    /// its marker, so a resume that registers between the test and the write
+    /// leaves a marker this clear then removes and nothing restores.
+    ///
+    /// The claim deliberately is not the resume admission claim. That one is
+    /// held across backend discovery, which has no deadline by design, so a
+    /// close that waited on it could be held open indefinitely by another
+    /// card's unresponsive provider.
+    async fn withdraw_unowned_restoration_markers(
+        &self,
+        sessions: &HashSet<SessionId>,
+        session_store: &Arc<Mutex<SessionStore>>,
+        context: &'static str,
+    ) {
+        if sessions.is_empty() {
+            return;
+        }
+        // A closing subtree takes several claims at once, so they are taken in
+        // a deterministic order; every other holder takes exactly one and none
+        // of them waits on a close, which leaves no cycle to close.
+        let mut ordered = sessions.iter().cloned().collect::<Vec<_>>();
+        ordered.sort_by(|left, right| left.0.cmp(&right.0));
+        let mut claims = Vec::with_capacity(ordered.len());
+        for session_id in &ordered {
+            let claim = self.session_ownership_claim(session_id).await;
+            claims.push(claim.lock_owned().await);
+        }
+
+        let mut orphaned = HashSet::new();
+        for session_id in &ordered {
+            if self.live_agent_for_session(session_id).await.is_none()
+                && !self.session_has_inflight_resume(session_id).await
+            {
+                orphaned.insert(session_id.clone());
+            }
+        }
+        #[cfg(feature = "test-support")]
+        {
+            let gate = self
+                .state
+                .lock()
+                .await
+                .restore_marker_withdraw_test_gate
+                .clone();
+            if let Some(gate) = gate {
+                wait_for_spawn_operation_test_gate_inner(&gate).await;
+            }
+        }
+
+        if !orphaned.is_empty()
+            && let Err(error) = session_store.lock().await.clear_restore_states(&orphaned)
+        {
+            tracing::error!(
+                error = %error,
+                context,
+                "failed to clear agent restart restoration markers"
+            );
+        }
+    }
+
+    /// The admission lock for `session_id`, held across a resume so a second
+    /// resume waits and then finds the agent the first one registered.
+    async fn session_resume_admission(&self, session_id: &SessionId) -> Arc<Mutex<()>> {
+        let mut state = self.state.lock().await;
+        // Entries only outlive their resume when no one is waiting on them, so
+        // dropping the unheld ones keeps the map to the sessions in flight.
+        state
+            .session_resume_admission
+            .retain(|_, lock| Arc::strong_count(lock) > 1);
+        Arc::clone(
+            state
+                .session_resume_admission
+                .entry(session_id.clone())
+                .or_insert_with(|| Arc::new(Mutex::new(()))),
+        )
+    }
+
+    /// The claim a resume takes while it publishes its ownership of a session
+    /// and a close takes while it decides that nobody owns one. It is held
+    /// across no backend work at all, which is what lets a close that shares a
+    /// session with an in-flight resume still finish promptly.
+    async fn session_ownership_claim(&self, session_id: &SessionId) -> Arc<Mutex<()>> {
+        let mut state = self.state.lock().await;
+        state
+            .session_ownership_claims
+            .retain(|_, lock| Arc::strong_count(lock) > 1);
+        Arc::clone(
+            state
+                .session_ownership_claims
+                .entry(session_id.clone())
+                .or_insert_with(|| Arc::new(Mutex::new(()))),
+        )
+    }
+
+    /// Publishes that a resume owns `session_id` from before its actor exists
+    /// until the host registers the binding, which is the window in which the
+    /// actor persists the session's restoration marker.
+    async fn claim_inflight_resume(&self, session_id: &SessionId) -> InflightResumeClaim {
+        let resuming = {
+            let state = self.state.lock().await;
+            Arc::clone(&state.resuming_sessions)
+        };
+        let claim = self.session_ownership_claim(session_id).await;
+        let _published = claim.lock().await;
+        *lock_resuming_sessions(&resuming)
+            .entry(session_id.clone())
+            .or_insert(0) += 1;
+        InflightResumeClaim {
+            resuming,
+            session_id: session_id.clone(),
+        }
+    }
+
+    /// Whether a resume owns this session but has not registered its agent yet.
+    async fn session_has_inflight_resume(&self, session_id: &SessionId) -> bool {
+        let resuming = {
+            let state = self.state.lock().await;
+            Arc::clone(&state.resuming_sessions)
+        };
+        let held = lock_resuming_sessions(&resuming);
+        held.get(session_id).is_some_and(|count| *count > 0)
     }
 
     pub(crate) async fn subscribe_agent_status_changes(&self) -> tokio::sync::watch::Receiver<u64> {
@@ -10951,6 +11347,7 @@ impl HostHandle {
         agent_id: AgentId,
         startup_rx: tokio::sync::oneshot::Receiver<Result<SessionId, String>>,
         visibility: SpawnVisibility,
+        inflight_resume: Option<InflightResumeClaim>,
     ) -> PendingAgentSessionPublication {
         // NewAgent publication cannot wait for backend startup: its stream is
         // how clients observe held and failed startup attempts.
@@ -10958,6 +11355,12 @@ impl HostHandle {
         let host = self.clone();
         let task_agent_id = agent_id.clone();
         tokio::spawn(async move {
+            // Released once the binding below is registered, or as soon as this
+            // spawn gives up, whichever comes first. A spawn that has given up
+            // must stop counting as an owner before it awaits anything else:
+            // otherwise its own close reads it as an in-flight owner and leaves
+            // behind the restoration marker it was closing.
+            let mut inflight_resume = inflight_resume;
             let agent_id = task_agent_id;
             let mut startup_rx = startup_rx;
             let startup_result = tokio::select! {
@@ -10965,6 +11368,7 @@ impl HostHandle {
                 publication = publish_rx.recv() => match publication {
                     Some(()) => None,
                     None => {
+                        inflight_resume.take();
                         host.cleanup_unpublished_agent_session(agent_id.clone(), None, &visibility)
                             .await;
                         return;
@@ -10989,10 +11393,12 @@ impl HostHandle {
                             state
                                 .pending_agent_sessions
                                 .insert(agent_id.clone(), session_id.clone());
+                            inflight_resume.take();
                             Ok(())
                         }
                     };
                     if let Err(error) = pending_inserted {
+                        inflight_resume.take();
                         tracing::error!(
                             agent_id = %agent_id,
                             session_id = %session_id,
@@ -11011,6 +11417,7 @@ impl HostHandle {
                         error = %err,
                         "agent startup failed before session registration"
                     );
+                    inflight_resume.take();
                     let failure_visibility = visibility.claim_startup_failure();
                     if failure_visibility == StartupFailureVisibility::AwaitPublication
                         && (publication_authorized || publish_rx.recv().await.is_some())
@@ -11031,6 +11438,7 @@ impl HostHandle {
                         agent_id = %agent_id,
                         "agent startup channel dropped before session registration"
                     );
+                    inflight_resume.take();
                     host.cleanup_unpublished_agent_session(agent_id.clone(), None, &visibility)
                         .await;
                     return;
@@ -11388,7 +11796,7 @@ impl HostHandle {
             .collect::<Vec<_>>();
         let fanout_guard = NewAgentFanoutBatchGuard::new(Arc::clone(&self.state), fanout_paths);
 
-        if let Err(err) = session_store.lock().await.upsert_backend_session(
+        let persist_result = session_store.lock().await.upsert_backend_session(
             &BackendSession {
                 id: session_id.clone(),
                 backend_kind: start.backend_kind,
@@ -11403,7 +11811,8 @@ impl HostHandle {
             start.project_id.clone(),
             start.custom_agent_id.clone(),
             start.launch_profile_id.clone(),
-        ) {
+        );
+        if let Err(err) = persist_result {
             let message = format!(
                 "failed to persist backend-native child session {}: {err}",
                 session_id
@@ -14282,6 +14691,9 @@ fn spawn_host_inner(
             skill_store: Arc::new(Mutex::new(skill_store)),
             agent_sessions: HashMap::new(),
             pending_agent_sessions: HashMap::new(),
+            session_resume_admission: HashMap::new(),
+            session_ownership_claims: HashMap::new(),
+            resuming_sessions: Arc::new(std::sync::Mutex::new(HashMap::new())),
             agent_visibility: AgentVisibilityRegistry::default(),
             spawn_publication_claims: HashMap::new(),
             agent_activity_summaries: HashMap::new(),
@@ -14338,6 +14750,14 @@ fn spawn_host_inner(
             },
             #[cfg(any(test, feature = "test-support"))]
             project_path_opener_program: runtime_config.project_path_opener_program.clone(),
+            #[cfg(feature = "test-support")]
+            restoration_snapshot_test_gate: runtime_config.restoration_snapshot_test_gate.clone(),
+            #[cfg(feature = "test-support")]
+            restoration_complete_test_gate: runtime_config.restoration_complete_test_gate.clone(),
+            #[cfg(feature = "test-support")]
+            resume_admission_test_gate: None,
+            #[cfg(feature = "test-support")]
+            restore_marker_withdraw_test_gate: None,
             host_streams: HashMap::new(),
             project_streams: HashMap::new(),
             terminal_streams: HashMap::new(),
@@ -14510,8 +14930,355 @@ fn spawn_host_inner(
     spawn_task_token_usage_task(host.clone());
     spawn_agent_activity_summary_task(host.clone());
     spawn_supervisor_compaction_executor(host.clone(), supervisor_compaction_rx);
+    spawn_open_agent_restoration_task(host.clone());
 
     Ok(host)
+}
+
+/// Everything a spawn needs beyond the request itself.
+struct SpawnAgentContext {
+    origin: AgentOrigin,
+    resolved_spawn_config_override: Option<ResolvedSpawnConfig>,
+    team_context: Option<TeamSpawnContext>,
+    workflow: Option<AgentWorkflowMetadata>,
+    operation_terminal_claim: Option<SpawnOperationTerminalClaim>,
+    /// A resume admission claim the caller already holds. Restoration takes the
+    /// claim itself so it can decide, inside it, whether the session still
+    /// wants restoring at all; the guard rides along so this spawn does not
+    /// deadlock trying to take it a second time.
+    admitted_session: Option<tokio::sync::OwnedMutexGuard<()>>,
+}
+
+impl Default for SpawnAgentContext {
+    fn default() -> Self {
+        Self {
+            origin: AgentOrigin::User,
+            resolved_spawn_config_override: None,
+            team_context: None,
+            workflow: None,
+            operation_terminal_claim: None,
+            admitted_session: None,
+        }
+    }
+}
+
+fn spawn_open_agent_restoration_task(host: HostHandle) {
+    let worker = async move {
+        if let Err(error) = host.restore_open_agents().await {
+            tracing::error!(error = %error, "failed to restore open agents after host restart");
+        }
+    };
+
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        handle.spawn(worker);
+        return;
+    }
+
+    if let Err(error) = std::thread::Builder::new()
+        .name("tyde-agent-restore".to_owned())
+        .spawn(move || {
+            let runtime = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    tracing::error!(error = %error, "failed to build agent restoration runtime");
+                    return;
+                }
+            };
+            // Restored agents spawn their actor tasks onto the current runtime,
+            // so this one has to outlive the pass that created them. Every
+            // other fallback worker in this file loops forever and keeps its
+            // runtime alive for free; restoration finishes, so it has to hold
+            // the runtime open itself or drop every agent it just rebuilt.
+            runtime.block_on(async move {
+                worker.await;
+                std::future::pending::<()>().await
+            });
+        })
+    {
+        tracing::error!(error = %error, "failed to spawn agent restoration worker");
+    }
+}
+
+impl HostHandle {
+    async fn restore_open_agents(&self) -> Result<(), String> {
+        let (session_store, team_registry, backend_storage) = {
+            let state = self.state.lock().await;
+            (
+                Arc::clone(&state.session_store),
+                state.team_registry.clone(),
+                state.backend_storage.clone(),
+            )
+        };
+        let mut records = session_store
+            .lock()
+            .await
+            .list()
+            .map_err(|error| format!("failed to load open agent sessions: {error}"))?
+            .into_iter()
+            .filter(|record| record.restore_state.is_some())
+            .collect::<Vec<_>>();
+
+        // A marked session that the resume path would reject is not restorable.
+        // Reconstructing it anyway produces a failed card the user has to
+        // dismiss on every launch, so drop it here using the same predicate
+        // the resume path applies.
+        records.retain(|record| {
+            if session_record_is_resumable(record, &backend_storage) {
+                return true;
+            }
+            tracing::info!(
+                session_id = %record.id,
+                backend_kind = ?record.backend_kind,
+                "skipping restoration of an open agent whose session is no longer resumable"
+            );
+            false
+        });
+
+        #[cfg(feature = "test-support")]
+        {
+            let gate = self
+                .state
+                .lock()
+                .await
+                .restoration_snapshot_test_gate
+                .clone();
+            if let Some(gate) = gate {
+                wait_for_spawn_operation_test_gate_inner(&gate).await;
+            }
+        }
+
+        // Team identity is owned by the team member store, which already holds
+        // the member's session id. Read it back rather than persisting a second
+        // copy that can disagree with the binding it is used to re-establish.
+        let team_contexts = team_registry
+            .snapshot()
+            .await
+            .map_err(|error| {
+                format!("failed to read team registry for agent restoration: {error}")
+            })?
+            .members
+            .into_iter()
+            .filter_map(|member| {
+                member.session_id.map(|session_id| {
+                    (
+                        session_id,
+                        TeamSpawnContext {
+                            team_id: member.team_id,
+                            team_member_id: member.id,
+                        },
+                    )
+                })
+            })
+            .collect::<HashMap<_, _>>();
+
+        let restore_session_ids = records
+            .iter()
+            .map(|record| record.id.clone())
+            .collect::<HashSet<_>>();
+        let mut restored_agent_ids = HashMap::<SessionId, AgentId>::new();
+
+        while !records.is_empty() {
+            // Parents first, so a child's ephemeral parent agent id can be
+            // rebuilt from its durable parent session id.
+            let index = match records.iter().position(|record| {
+                record.parent_id.as_ref().is_none_or(|parent_id| {
+                    !restore_session_ids.contains(parent_id)
+                        || restored_agent_ids.contains_key(parent_id)
+                })
+            }) {
+                Some(index) => index,
+                None => {
+                    tracing::error!(
+                        unresolved_session_ids = ?records
+                            .iter()
+                            .map(|record| (record.id.clone(), record.parent_id.clone()))
+                            .collect::<Vec<_>>(),
+                        "open agent restoration could not order the remaining sessions \
+                         parent-first; restoring them as root agents"
+                    );
+                    0
+                }
+            };
+            let record = records.remove(index);
+            let restore_state = record
+                .restore_state
+                .clone()
+                .expect("filtered restoration record must have restore state");
+
+            // Take the claim here rather than letting the spawn take it, so the
+            // decision of whether this session still wants restoring is made
+            // inside it. Both things it depends on can change while the claim
+            // is contended: a resume can finish and take ownership, and a close
+            // can complete and withdraw the intent.
+            let admission = self.session_resume_admission(&record.id).await;
+            let admitted = admission.clone().lock_owned().await;
+
+            if let Some(agent_id) = self.live_agent_for_session(&record.id).await {
+                // Skipping the spawn does not make this session stop being a
+                // parent; without recording the owner a restored child loses
+                // its binding and comes back as a root card.
+                tracing::info!(
+                    session_id = %record.id,
+                    agent_id = %agent_id,
+                    "restoration reused the agent already bound to this session"
+                );
+                restored_agent_ids.insert(record.id.clone(), agent_id);
+                continue;
+            }
+
+            // The snapshot was taken before the pass began. A close that
+            // completed while this claim was contended has already withdrawn
+            // the marker, and reconstructing the card anyway would reopen an
+            // agent the user explicitly closed.
+            let still_marked = session_store
+                .lock()
+                .await
+                .get(&record.id)
+                .is_some_and(|current| current.restore_state.is_some());
+            if !still_marked {
+                tracing::info!(
+                    session_id = %record.id,
+                    "skipping restoration of an open agent closed while the pass was running"
+                );
+                continue;
+            }
+
+            let parent_agent_id = match record.parent_id.as_ref() {
+                Some(parent_session_id) => {
+                    let parent_agent_id = restored_agent_ids.get(parent_session_id).cloned();
+                    if parent_agent_id.is_none() {
+                        tracing::warn!(
+                            session_id = %record.id,
+                            parent_session_id = %parent_session_id,
+                            "restoring an open agent as a root because its parent was not restored"
+                        );
+                    }
+                    parent_agent_id
+                }
+                None => None,
+            };
+            let team_context = team_contexts.get(&record.id).cloned();
+            let restored = self
+                .spawn_agent_with_origin_config_and_team(
+                    SpawnAgentPayload {
+                        name: None,
+                        custom_agent_id: record.custom_agent_id.clone(),
+                        parent_agent_id,
+                        project_id: record.project_id.clone(),
+                        params: SpawnAgentParams::Resume {
+                            session_id: record.id.clone(),
+                            prompt: None,
+                        },
+                    },
+                    SpawnAgentContext {
+                        origin: restore_state.origin,
+                        team_context: team_context.clone(),
+                        workflow: restore_state.workflow,
+                        admitted_session: Some(admitted),
+                        ..Default::default()
+                    },
+                )
+                .await;
+
+            match restored {
+                Ok(agent_id) => {
+                    restored_agent_ids.insert(record.id.clone(), agent_id.clone());
+                    if let Some(team_context) = team_context {
+                        self.bind_restored_team_member(team_context, agent_id, record.id)
+                            .await;
+                    }
+                }
+                Err(error) => {
+                    tracing::error!(
+                        session_id = %record.id,
+                        error = %error,
+                        "failed to reconstruct open agent"
+                    );
+                }
+            }
+        }
+        #[cfg(feature = "test-support")]
+        {
+            let gate = self
+                .state
+                .lock()
+                .await
+                .restoration_complete_test_gate
+                .clone();
+            if let Some(gate) = gate {
+                wait_for_spawn_operation_test_gate_inner(&gate).await;
+            }
+        }
+        Ok(())
+    }
+
+    async fn bind_restored_team_member(
+        &self,
+        team_context: TeamSpawnContext,
+        agent_id: AgentId,
+        session_id: SessionId,
+    ) {
+        let (registry, refs) = {
+            let state = self.state.lock().await;
+            let refs = match agent_team_validation_refs(&state, "restore_open_agents").await {
+                Ok(refs) => refs,
+                Err(error) => {
+                    tracing::error!(
+                        team_member_id = %team_context.team_member_id,
+                        error = %error,
+                        "failed to validate restored team member"
+                    );
+                    return;
+                }
+            };
+            (state.team_registry.clone(), refs)
+        };
+        match registry
+            .bind_member_agent(
+                team_context.team_member_id.clone(),
+                agent_id.clone(),
+                Some(session_id),
+                refs,
+            )
+            .await
+        {
+            Ok(events) => self.fan_out_team_registry_events(events).await,
+            Err(error) => {
+                tracing::error!(
+                    team_member_id = %team_context.team_member_id,
+                    agent_id = %agent_id,
+                    error = %error,
+                    "failed to bind restored team member agent"
+                );
+                return;
+            }
+        }
+        if let Some(status) = self.agent_status_snapshot(&agent_id).await {
+            let update = if status.terminated {
+                registry.clear_binding_by_agent(agent_id.clone()).await
+            } else if status.is_user_response_pending() {
+                registry
+                    .record_agent_activity(agent_id.clone(), AgentControlStatus::Thinking)
+                    .await
+            } else {
+                registry
+                    .record_agent_activity(agent_id.clone(), status.status())
+                    .await
+            };
+            match update {
+                Ok(events) => self.fan_out_team_registry_events(events).await,
+                Err(error) => tracing::error!(
+                    team_member_id = %team_context.team_member_id,
+                    agent_id = %agent_id,
+                    error = %error,
+                    "failed to publish restored team member status"
+                ),
+            }
+        }
+    }
 }
 
 fn spawn_task_token_usage_task(host: HostHandle) {

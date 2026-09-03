@@ -13,6 +13,19 @@ use server::backend::BackendSession;
 use server::backend::mock::MockTurn;
 use server::store::session::{SessionRecord, SessionStore};
 
+/// Waits for the host to finish closing `agent_id`. `close_agent` only writes
+/// the command frame, so a caller that restarts the host immediately after it
+/// races the close; the restarted host can then still see the agent as open.
+async fn expect_agent_closed(client: &mut client::Connection, agent_id: &AgentId, context: &str) {
+    fixture::next_frame_matching_on(client, context, |env| {
+        env.kind == FrameKind::AgentClosed
+            && env
+                .parse_payload::<protocol::AgentClosedPayload>()
+                .is_ok_and(|payload| &payload.agent_id == agent_id)
+    })
+    .await;
+}
+
 async fn expect_event(client: &mut client::Connection, context: &str) -> Envelope {
     loop {
         let env = fixture::next_logical_frame_on(client, context).await;
@@ -810,11 +823,23 @@ async fn btw_sessions_recover_after_model_catalog_changes() {
         .close_agent(&source.stream)
         .await
         .expect("close source");
+    expect_agent_closed(
+        &mut fixture.client,
+        &source.new_agent.agent_id,
+        "source AgentClosed before restart",
+    )
+    .await;
     fixture
         .client
         .close_agent(&btw.stream)
         .await
         .expect("close BTW");
+    expect_agent_closed(
+        &mut fixture.client,
+        &btw.new_agent.agent_id,
+        "BTW AgentClosed before restart",
+    )
+    .await;
     for (stage, (model, effort)) in [
         ("saved-model", "high"),
         ("replacement-model", "high"),
@@ -935,6 +960,7 @@ async fn btw_sessions_recover_after_model_catalog_changes() {
                 .close_agent(&agent.instance_stream)
                 .await
                 .expect("close resumed agent");
+            expect_agent_closed(&mut client, &agent.agent_id, "resumed AgentClosed").await;
         }
         if stage == 1 {
             client
@@ -976,6 +1002,7 @@ async fn btw_sessions_recover_after_model_catalog_changes() {
                 .close_agent(&agent.instance_stream)
                 .await
                 .expect("close failed fresh agent");
+            expect_agent_closed(&mut client, &agent.agent_id, "failed fresh AgentClosed").await;
         }
     }
 }

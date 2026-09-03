@@ -57,7 +57,8 @@ pub use host::{
 #[cfg(feature = "test-support")]
 pub use host::{
     InstalledAgentNameGate, InstalledSpawnOperationTestGate, InstalledWorkbenchRemoveHook,
-    MockLaunchReservation, UsageWakeupLaunchForTest,
+    MockLaunchReservation, SpawnOperationTestGateInner, UsageWakeupLaunchForTest,
+    new_spawn_operation_test_gate,
 };
 pub use process_env::init_process_env;
 #[cfg(feature = "test-support")]

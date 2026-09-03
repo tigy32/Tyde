@@ -2,10 +2,11 @@ mod fixture;
 
 use fixture::Fixture;
 use protocol::{
-    AgentBootstrapEvent, AgentBootstrapPayload, AgentErrorPayload, AgentStartPayload, BackendKind,
-    ChatEvent, DeleteSessionPayload, Envelope, FetchSessionHistoryPayload, FrameKind,
-    ListSessionsPayload, NewAgentPayload, Project, ProjectCreatePayload, ProjectNotifyPayload,
-    ProjectRootPath, SessionHistoryPayload, SessionId, SessionListPayload, SpawnAgentParams,
+    AgentBootstrapEvent, AgentBootstrapPayload, AgentErrorPayload, AgentStartPayload,
+    BackendAccessMode, BackendKind, ChatEvent, DeleteSessionPayload, Envelope,
+    FetchSessionHistoryPayload, FrameKind, ListSessionsPayload, NewAgentPayload, Project,
+    ProjectCreatePayload, ProjectNotifyPayload, ProjectRootPath, SessionHistoryPayload, SessionId,
+    SessionListPayload, SessionSettingValue, SessionSettingsValues, SpawnAgentParams,
     SpawnAgentPayload, StreamPath,
 };
 use server::backend::mock::{MockScript, MockTurn};
@@ -649,6 +650,1156 @@ async fn session_store_keeps_foreign_records_across_turn() {
             .map(|record| record.id.0.as_str())
             .collect::<Vec<_>>()
     );
+}
+
+/// Collects what a restart replayed for `sessions`: the reconstructed
+/// `NewAgent` for each, plus the `AgentBootstrap` that follows on its instance
+/// stream. One scan for all of it — the frame readers discard what they skip,
+/// so searching per session or per frame kind throws away the frame the next
+/// search is waiting for.
+async fn collect_restart_replay(
+    fixture: &mut Fixture,
+    bootstrap: &settings_model::HostBootstrapPayload,
+    sessions: &[SessionId],
+) -> (
+    std::collections::HashMap<SessionId, NewAgentPayload>,
+    std::collections::HashMap<StreamPath, AgentBootstrapPayload>,
+) {
+    let mut agents = std::collections::HashMap::new();
+    let mut bootstraps = std::collections::HashMap::<StreamPath, AgentBootstrapPayload>::new();
+    for agent in &bootstrap.agents {
+        if let Some(session_id) = agent.session_id.as_ref()
+            && sessions.contains(session_id)
+        {
+            agents.insert(session_id.clone(), agent.clone());
+        }
+    }
+    loop {
+        let have_all = agents.len() == sessions.len()
+            && agents
+                .values()
+                .all(|agent| bootstraps.contains_key(&agent.instance_stream));
+        if have_all {
+            return (agents, bootstraps);
+        }
+        let env = fixture::next_frame_matching_on(&mut fixture.client, "restart replay", |env| {
+            matches!(env.kind, FrameKind::NewAgent | FrameKind::AgentBootstrap)
+        })
+        .await;
+        match env.kind {
+            FrameKind::NewAgent => {
+                let agent: NewAgentPayload = env.parse_payload().expect("parse restored NewAgent");
+                if let Some(session_id) = agent.session_id.as_ref()
+                    && sessions.contains(session_id)
+                {
+                    agents.insert(session_id.clone(), agent);
+                }
+            }
+            FrameKind::AgentBootstrap => {
+                let payload: AgentBootstrapPayload =
+                    env.parse_payload().expect("parse restored AgentBootstrap");
+                bootstraps.insert(env.stream.clone(), payload);
+            }
+            kind => unreachable!("unexpected restart replay frame {kind:?}"),
+        }
+    }
+}
+
+fn stored_access_mode(fixture: &Fixture, session_id: &SessionId) -> BackendAccessMode {
+    let store =
+        SessionStore::load(fixture.store_dir().join("sessions.json")).expect("load session store");
+    store
+        .get(session_id)
+        .expect("stored session record")
+        .access_mode
+}
+
+/// A read-only agent that is open when Tyde restarts has to come back
+/// read-only. Restoration reopens it through the resume path, which resolves a
+/// fresh user configuration; if that path does not reapply the stored mode the
+/// agent returns unrestricted and startup persists that default over the saved
+/// one, so the restriction is gone from disk too and every later resume is
+/// unrestricted as well.
+/// The desktop builds its host in Tauri's setup hook, outside any tokio
+/// runtime, so the restoration pass runs on a runtime it builds itself.
+/// Restored agents spawn their actor tasks onto that runtime; if it is dropped
+/// when the pass finishes, every card it just rebuilt is backed by a dead
+/// actor and the user's agents answer nothing. Constructing the replacement
+/// host on a plain OS thread is what puts restoration on that path.
+/// Restoration and a client resume both resolve discovery and a spawn
+/// configuration before they register an actor, so the ownership check and the
+/// registration are separated by awaits. Without a claim held across that gap,
+/// a user picking the session out of Sessions while the restart is still
+/// restoring gives one session two owners: two cards, two backends, and a
+/// close of either one clearing the marker while the other is still open.
+/// Resuming a session that is already open deliberately produces a second
+/// card, so one session can back several. Closing one of them withdraws that
+/// card, not the session's restoration intent: nothing re-marks a session
+/// during ordinary turns, so clearing the marker on the first close would
+/// leave the cards still open unable to come back after a restart.
+#[tokio::test]
+async fn closing_one_card_does_not_strand_another_on_the_same_session() {
+    let mut fixture = Fixture::new().await;
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            name: Some("shared session".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::New {
+                workspace_roots: vec!["/tmp/shared-session".to_owned()],
+                prompt: "hello".to_owned(),
+                images: None,
+                backend_kind: BackendKind::Claude,
+                launch_profile_id: None,
+                cost_hint: None,
+                access_mode: Default::default(),
+                session_settings: None,
+            },
+        })
+        .await
+        .expect("spawn first card");
+    let first: NewAgentPayload = expect_next_event(&mut fixture.client, "first NewAgent")
+        .await
+        .parse_payload()
+        .expect("parse first NewAgent");
+    let start =
+        expect_agent_start_on_stream(&mut fixture.client, &first.instance_stream, "first start")
+            .await;
+    let session = start.session_id.expect("shared session id");
+    expect_turn_on_stream(
+        &mut fixture.client,
+        &first.instance_stream,
+        "mock backend response to: hello",
+    )
+    .await;
+
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            name: None,
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::Resume {
+                session_id: session.clone(),
+                prompt: None,
+            },
+        })
+        .await
+        .expect("resume the same session as a second card");
+    let second: NewAgentPayload = expect_next_event(&mut fixture.client, "second NewAgent")
+        .await
+        .parse_payload()
+        .expect("parse second NewAgent");
+    expect_agent_start_on_stream(&mut fixture.client, &second.instance_stream, "second start")
+        .await;
+    assert_ne!(
+        first.agent_id, second.agent_id,
+        "resuming an open session must produce a distinct card"
+    );
+
+    fixture
+        .client
+        .close_agent(&second.instance_stream)
+        .await
+        .expect("close the second card");
+    fixture::next_frame_matching_on(&mut fixture.client, "second AgentClosed", |env| {
+        env.kind == FrameKind::AgentClosed
+            && env
+                .parse_payload::<protocol::AgentClosedPayload>()
+                .is_ok_and(|payload| payload.agent_id == second.agent_id)
+    })
+    .await;
+
+    let bootstrap = fixture.restart_host().await;
+    let (restored_by_session, _) =
+        collect_restart_replay(&mut fixture, &bootstrap, std::slice::from_ref(&session)).await;
+    restored_by_session.get(&session).expect(
+        "the card still open must be restored; closing its sibling must not withdraw the session",
+    );
+}
+
+/// A close decides which of its sessions no other card owns, then writes that
+/// decision to the store. An actor publishes its session id on its start watch
+/// before it persists its restoration marker, so a resume that registers in
+/// between is invisible to the decision and still leaves a marker behind for
+/// the write to remove. Nothing re-marks a session during ordinary turns, so
+/// the resumed card would never come back. The decision and the write are
+/// therefore made under the session's resume admission claim, which is what
+/// makes the resume wait rather than slip between them.
+#[tokio::test]
+async fn a_resume_racing_a_close_keeps_its_session_restorable() {
+    let mut fixture = Fixture::new().await;
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            name: Some("raced session".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::New {
+                workspace_roots: vec!["/tmp/restore-withdraw-race".to_owned()],
+                prompt: "hello".to_owned(),
+                images: None,
+                backend_kind: BackendKind::Claude,
+                launch_profile_id: None,
+                cost_hint: None,
+                access_mode: Default::default(),
+                session_settings: None,
+            },
+        })
+        .await
+        .expect("spawn the card that will be closed");
+    let first: NewAgentPayload = expect_next_event(&mut fixture.client, "first NewAgent")
+        .await
+        .parse_payload()
+        .expect("parse first NewAgent");
+    let start =
+        expect_agent_start_on_stream(&mut fixture.client, &first.instance_stream, "first start")
+            .await;
+    let session = start.session_id.expect("raced session id");
+    expect_turn_on_stream(
+        &mut fixture.client,
+        &first.instance_stream,
+        "mock backend response to: hello",
+    )
+    .await;
+
+    // The resume has to travel on its own connection. A connection routes its
+    // client's frames one at a time, so a resume sent on the same one as the
+    // close would not even be dispatched until the close it is racing had
+    // finished. Two clients on one host is the ordinary case this race comes
+    // from.
+    let mut resumer = fixture.connect().await;
+
+    // Hold the close after it has decided nobody else owns this session and
+    // before it writes that decision.
+    let withdraw_gate = fixture
+        .host_for_test()
+        .install_restore_marker_withdraw_test_gate()
+        .await;
+    fixture
+        .client
+        .close_agent(&first.instance_stream)
+        .await
+        .expect("close the first card");
+    withdraw_gate.wait_until_entered().await;
+
+    // Resume the same session into that window. Without the claim it registers
+    // and persists its marker before the held write erases it.
+    resumer
+        .spawn_agent(SpawnAgentPayload {
+            name: None,
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::Resume {
+                session_id: session.clone(),
+                prompt: None,
+            },
+        })
+        .await
+        .expect("resume the session the close is withdrawing");
+    // The claim makes this resume wait, so its start may never arrive here. A
+    // bounded wait keeps the unclaimed build deterministic without making the
+    // claimed build depend on a sleep being long enough.
+    let raced_agent = first.agent_id.clone();
+    let raced = tokio::time::timeout(
+        Duration::from_secs(3),
+        fixture::next_frame_matching_on(&mut resumer, "raced NewAgent", |env| {
+            env.kind == FrameKind::NewAgent
+                && env
+                    .parse_payload::<NewAgentPayload>()
+                    .is_ok_and(|payload| payload.agent_id != raced_agent)
+        }),
+    )
+    .await
+    .ok();
+    if raced.is_some() {
+        // Let the actor's own startup persist land before the held write runs.
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+
+    // One permit for the held decision, one for the re-clear this close runs
+    // after its actor stops. The second also holds the claim, so the resume
+    // stays blocked until both have passed.
+    withdraw_gate.release_one();
+    withdraw_gate.release_one();
+
+    let second: NewAgentPayload = match raced {
+        Some(frame) => frame.parse_payload().expect("parse raced NewAgent"),
+        None => fixture::next_frame_matching_on(&mut resumer, "second NewAgent", |env| {
+            env.kind == FrameKind::NewAgent
+                && env
+                    .parse_payload::<NewAgentPayload>()
+                    .is_ok_and(|payload| payload.agent_id != raced_agent)
+        })
+        .await
+        .parse_payload()
+        .expect("parse second NewAgent"),
+    };
+    expect_agent_start_on_stream(&mut resumer, &second.instance_stream, "second start").await;
+
+    // Closing the gate lets the shutdown inside the restart run unheld.
+    drop(withdraw_gate);
+    let bootstrap = fixture.restart_host().await;
+    let (restored_by_session, _) =
+        collect_restart_replay(&mut fixture, &bootstrap, std::slice::from_ref(&session)).await;
+    restored_by_session
+        .get(&session)
+        .expect("a resume that raced the close must keep its session restorable across a restart");
+}
+
+/// A close of one card must not wait on another card's resume. The claim that
+/// makes the ownership decision atomic is deliberately not the resume
+/// admission claim: that one is held from the start of a resume through
+/// backend discovery, and discovery has no deadline, so a close that waited
+/// on it could be held open for as long as an unrelated provider stays
+/// unresponsive. Closing a card is something a user sits in front of.
+#[tokio::test]
+async fn a_close_does_not_wait_on_a_held_resume_of_its_session() {
+    let mut fixture = Fixture::new().await;
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            name: Some("closed while resumed".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::New {
+                workspace_roots: vec!["/tmp/restore-close-liveness".to_owned()],
+                prompt: "hello".to_owned(),
+                images: None,
+                backend_kind: BackendKind::Claude,
+                launch_profile_id: None,
+                cost_hint: None,
+                access_mode: Default::default(),
+                session_settings: None,
+            },
+        })
+        .await
+        .expect("spawn the card that will be closed");
+    let card: NewAgentPayload = expect_next_event(&mut fixture.client, "card NewAgent")
+        .await
+        .parse_payload()
+        .expect("parse card NewAgent");
+    let start =
+        expect_agent_start_on_stream(&mut fixture.client, &card.instance_stream, "card start")
+            .await;
+    let session = start.session_id.expect("card session id");
+    expect_turn_on_stream(
+        &mut fixture.client,
+        &card.instance_stream,
+        "mock backend response to: hello",
+    )
+    .await;
+
+    // Stall a resume of the same session where a real one stalls: holding its
+    // admission claim, with its backend discovery outstanding.
+    let admission_gate = fixture
+        .host_for_test()
+        .install_resume_admission_test_gate()
+        .await;
+    let mut resumer = fixture.connect().await;
+    resumer
+        .spawn_agent(SpawnAgentPayload {
+            name: None,
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::Resume {
+                session_id: session.clone(),
+                prompt: None,
+            },
+        })
+        .await
+        .expect("resume the session the close shares");
+    admission_gate.wait_until_entered().await;
+
+    fixture
+        .client
+        .close_agent(&card.instance_stream)
+        .await
+        .expect("close the card");
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        fixture::next_frame_matching_on(&mut fixture.client, "card AgentClosed", |env| {
+            env.kind == FrameKind::AgentClosed
+                && env
+                    .parse_payload::<protocol::AgentClosedPayload>()
+                    .is_ok_and(|payload| payload.agent_id == card.agent_id)
+        }),
+    )
+    .await
+    .expect("a close must not wait for another card's held resume to finish");
+
+    // The connection routes one frame at a time, so a close that blocked would
+    // take every later request from that client with it.
+    fixture
+        .client
+        .list_sessions(ListSessionsPayload::default())
+        .await
+        .expect("list sessions after the close");
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        wait_for_session_list(&mut fixture.client, "session list after close"),
+    )
+    .await
+    .expect("a client must still be answered while a resume is held");
+
+    admission_gate.release_one();
+}
+
+/// A resume publishes that it owns a session before its actor exists, because
+/// the actor persists that session's restoration marker before the host
+/// learns the binding a close reads. A resume whose startup fails never gets
+/// an actor or a binding, so it has nothing left to protect: if it kept
+/// answering for the session, the close of the healthy card would find an
+/// owner that will never exist, skip the marker, and the restart would reopen
+/// a session the user closed everywhere.
+#[tokio::test]
+async fn a_failed_resume_stops_owning_the_session_it_could_not_open() {
+    let mut fixture = Fixture::new().await;
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            name: Some("healthy card".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::New {
+                workspace_roots: vec!["/tmp/restore-failed-resume".to_owned()],
+                prompt: "hello".to_owned(),
+                images: None,
+                backend_kind: BackendKind::Claude,
+                launch_profile_id: None,
+                cost_hint: None,
+                access_mode: Default::default(),
+                session_settings: None,
+            },
+        })
+        .await
+        .expect("spawn the healthy card");
+    let healthy: NewAgentPayload = expect_next_event(&mut fixture.client, "healthy NewAgent")
+        .await
+        .parse_payload()
+        .expect("parse healthy NewAgent");
+    let start = expect_agent_start_on_stream(
+        &mut fixture.client,
+        &healthy.instance_stream,
+        "healthy start",
+    )
+    .await;
+    let session = start.session_id.expect("healthy session id");
+    expect_turn_on_stream(
+        &mut fixture.client,
+        &healthy.instance_stream,
+        "mock backend response to: hello",
+    )
+    .await;
+
+    // Hold the failing resume's spawn where one waits after its card is
+    // visible and before the host authorises the session binding, which is the
+    // window a failed spawn sits in while the user closes the cards.
+    let publication_gate = fixture.install_spawn_operation_publication_test_gate();
+    let failing_launch = fixture
+        .host_for_test()
+        .reserve_next_mock_spawn_failure("failed resume", "mock backend forced spawn failure")
+        .await;
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            name: Some("failed resume".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::Resume {
+                session_id: session.clone(),
+                prompt: None,
+            },
+        })
+        .await
+        .expect("resume the session with a backend that cannot start");
+    let healthy_agent = healthy.agent_id.clone();
+    let failed: NewAgentPayload =
+        fixture::next_frame_matching_on(&mut fixture.client, "failed resume NewAgent", |env| {
+            env.kind == FrameKind::NewAgent
+                && env
+                    .parse_payload::<NewAgentPayload>()
+                    .is_ok_and(|payload| payload.agent_id != healthy_agent)
+        })
+        .await
+        .parse_payload()
+        .expect("parse failed resume NewAgent");
+    publication_gate.wait_until_entered().await;
+    drop(failing_launch);
+    // A held spawn keeps its card's attach pending, so the fatal startup error
+    // reaches the client in the flushed bootstrap. The actor flushes it after
+    // it has reported the failure, which is what makes the close below land
+    // after the resume has given up rather than racing it.
+    let bootstrap = expect_raw_event_on_stream(
+        &mut fixture.client,
+        &failed.instance_stream,
+        FrameKind::AgentBootstrap,
+        "failed resume AgentBootstrap",
+    )
+    .await;
+    let bootstrap: AgentBootstrapPayload = bootstrap
+        .parse_payload()
+        .expect("parse failed resume AgentBootstrap");
+    let failure = bootstrap
+        .events
+        .iter()
+        .find_map(|event| match event {
+            AgentBootstrapEvent::AgentError(error) => Some(error),
+            _ => None,
+        })
+        .expect("a failed resume must surface its fatal startup error");
+    assert!(
+        failure.fatal
+            && failure
+                .message
+                .contains("mock backend forced spawn failure"),
+        "the resume must have failed for good before the cards are closed: {failure:?}"
+    );
+
+    fixture
+        .client
+        .close_agent(&healthy.instance_stream)
+        .await
+        .expect("close the healthy card");
+    fixture::next_frame_matching_on(&mut fixture.client, "healthy AgentClosed", |env| {
+        env.kind == FrameKind::AgentClosed
+            && env
+                .parse_payload::<protocol::AgentClosedPayload>()
+                .is_ok_and(|payload| payload.agent_id == healthy.agent_id)
+    })
+    .await;
+    fixture
+        .client
+        .close_agent(&failed.instance_stream)
+        .await
+        .expect("close the failed card");
+    fixture::next_frame_matching_on(&mut fixture.client, "failed resume AgentClosed", |env| {
+        env.kind == FrameKind::AgentClosed
+            && env
+                .parse_payload::<protocol::AgentClosedPayload>()
+                .is_ok_and(|payload| payload.agent_id == failed.agent_id)
+    })
+    .await;
+
+    publication_gate.release_one();
+    drop(publication_gate);
+
+    // The replacement host reports when its restoration pass has finished, so
+    // the count below is taken once everything it was going to reopen is open.
+    let restoration_finished = server::new_spawn_operation_test_gate();
+    let host = server::spawn_host_with_mock_backend_and_runtime_config(
+        fixture.store_dir().join("sessions.json"),
+        fixture.store_dir().join("projects.json"),
+        fixture.store_dir().join("settings.json"),
+        server::HostRuntimeConfig {
+            skip_real_backend_probe: true,
+            restoration_complete_test_gate: Some(restoration_finished.shared()),
+            ..Default::default()
+        },
+    )
+    .expect("spawn replacement host");
+    restoration_finished.wait_until_entered().await;
+    let owners = host
+        .live_agent_session_ids()
+        .await
+        .into_iter()
+        .filter(|id| id == &session)
+        .count();
+    assert_eq!(
+        owners, 0,
+        "a session whose cards were all closed must not come back because a resume failed to open it"
+    );
+}
+
+/// Restoration reads the store once and then reconstructs cards one at a
+/// time, so its snapshot ages while the pass runs. A card the user closes in
+/// that window has already had its restoration intent withdrawn, and the
+/// stale snapshot still says the session wants restoring. Rebuilding it from
+/// the snapshot alone reopens an agent the user explicitly closed, so the
+/// marker is re-read once the session's admission claim is held.
+#[tokio::test]
+async fn restoration_skips_a_session_closed_while_its_pass_was_held() {
+    let mut fixture = Fixture::new().await;
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            name: Some("closed mid-pass".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::New {
+                workspace_roots: vec!["/tmp/restore-stale-snapshot".to_owned()],
+                prompt: "hello".to_owned(),
+                images: None,
+                backend_kind: BackendKind::Claude,
+                launch_profile_id: None,
+                cost_hint: None,
+                access_mode: Default::default(),
+                session_settings: None,
+            },
+        })
+        .await
+        .expect("spawn the agent that will be closed mid-pass");
+    let agent: NewAgentPayload = expect_next_event(&mut fixture.client, "original NewAgent")
+        .await
+        .parse_payload()
+        .expect("parse original NewAgent");
+    let start = expect_agent_start_on_stream(
+        &mut fixture.client,
+        &agent.instance_stream,
+        "original start",
+    )
+    .await;
+    let session = start.session_id.expect("original session id");
+    expect_turn_on_stream(
+        &mut fixture.client,
+        &agent.instance_stream,
+        "mock backend response to: hello",
+    )
+    .await;
+
+    // The replacement host takes its restoration snapshot, which still marks
+    // this session, and is then held before it reconstructs anything.
+    let restoration_gate = server::new_spawn_operation_test_gate();
+    let restoration_finished = server::new_spawn_operation_test_gate();
+    let host = server::spawn_host_with_mock_backend_and_runtime_config(
+        fixture.store_dir().join("sessions.json"),
+        fixture.store_dir().join("projects.json"),
+        fixture.store_dir().join("settings.json"),
+        server::HostRuntimeConfig {
+            skip_real_backend_probe: true,
+            restoration_snapshot_test_gate: Some(restoration_gate.shared()),
+            restoration_complete_test_gate: Some(restoration_finished.shared()),
+            ..Default::default()
+        },
+    )
+    .expect("spawn replacement host");
+    let (mut client, _) = fixture::connect_host(host.clone()).await;
+    // The snapshot is only stale if it was taken first. Waiting for the pass to
+    // reach the hold is what establishes that the close below happens after it.
+    restoration_gate.wait_until_entered().await;
+
+    // Open the session by hand and close it again, entirely inside the window
+    // the held pass is stalled in. The close withdraws the marker the snapshot
+    // still carries.
+    client
+        .spawn_agent(SpawnAgentPayload {
+            name: None,
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::Resume {
+                session_id: session.clone(),
+                prompt: None,
+            },
+        })
+        .await
+        .expect("resume the session while restoration is held");
+    let resumed: NewAgentPayload = expect_next_event(&mut client, "resumed NewAgent")
+        .await
+        .parse_payload()
+        .expect("parse resumed NewAgent");
+    expect_agent_start_on_stream(&mut client, &resumed.instance_stream, "resumed start").await;
+    client
+        .close_agent(&resumed.instance_stream)
+        .await
+        .expect("close the resumed card");
+    fixture::next_frame_matching_on(&mut client, "resumed AgentClosed", |env| {
+        env.kind == FrameKind::AgentClosed
+            && env
+                .parse_payload::<protocol::AgentClosedPayload>()
+                .is_ok_and(|payload| payload.agent_id == resumed.agent_id)
+    })
+    .await;
+
+    restoration_gate.release_one();
+
+    // The pass reports when it has finished, so the count below is taken after
+    // it has done everything it is going to do. Without the re-read it rebuilds
+    // the session from the stale snapshot and the closed card comes back.
+    restoration_finished.wait_until_entered().await;
+    let owners = host
+        .live_agent_session_ids()
+        .await
+        .into_iter()
+        .filter(|id| id == &session)
+        .count();
+    assert_eq!(
+        owners, 0,
+        "restoration must not reopen a session whose close completed while the pass was held"
+    );
+}
+
+#[tokio::test]
+async fn restoration_does_not_duplicate_a_session_a_client_is_resuming() {
+    let mut fixture = Fixture::new().await;
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            name: Some("contended session".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::New {
+                workspace_roots: vec!["/tmp/restore-race".to_owned()],
+                prompt: "hello".to_owned(),
+                images: None,
+                backend_kind: BackendKind::Claude,
+                launch_profile_id: None,
+                cost_hint: None,
+                access_mode: Default::default(),
+                session_settings: None,
+            },
+        })
+        .await
+        .expect("spawn contended agent");
+    let agent: NewAgentPayload = expect_next_event(&mut fixture.client, "contended NewAgent")
+        .await
+        .parse_payload()
+        .expect("parse contended NewAgent");
+    let start = expect_agent_start_on_stream(
+        &mut fixture.client,
+        &agent.instance_stream,
+        "contended start",
+    )
+    .await;
+    let session = start.session_id.expect("contended session id");
+    expect_turn_on_stream(
+        &mut fixture.client,
+        &agent.instance_stream,
+        "mock backend response to: hello",
+    )
+    .await;
+
+    // The replacement host starts with restoration held, so the client can get
+    // its resume into exactly the window the claim protects.
+    let restoration_gate = server::new_spawn_operation_test_gate();
+    let host = server::spawn_host_with_mock_backend_and_runtime_config(
+        fixture.store_dir().join("sessions.json"),
+        fixture.store_dir().join("projects.json"),
+        fixture.store_dir().join("settings.json"),
+        server::HostRuntimeConfig {
+            skip_real_backend_probe: true,
+            restoration_snapshot_test_gate: Some(restoration_gate.shared()),
+            ..Default::default()
+        },
+    )
+    .expect("spawn replacement host");
+
+    let resume_gate = host.install_resume_admission_test_gate().await;
+    let (mut client, _) = fixture::connect_host(host.clone()).await;
+    client
+        .spawn_agent(SpawnAgentPayload {
+            name: None,
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::Resume {
+                session_id: session.clone(),
+                prompt: None,
+            },
+        })
+        .await
+        .expect("client resume during restoration");
+    // The resume now holds the session claim and has not registered an actor.
+    resume_gate.wait_until_entered().await;
+
+    restoration_gate.release_one();
+    // Let restoration reach this session and block on the claim rather than
+    // racing past it. Releasing the resume first would hide the bug.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    resume_gate.release_one();
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let owners = host
+                .live_agent_session_ids()
+                .await
+                .into_iter()
+                .filter(|id| id == &session)
+                .count();
+            if owners == 1 {
+                // Hold it for long enough that a second owner appearing late
+                // still fails the assertion below rather than slipping through.
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the resumed session should end up with exactly one owner");
+
+    let owners = host
+        .live_agent_session_ids()
+        .await
+        .into_iter()
+        .filter(|id| id == &session)
+        .count();
+    assert_eq!(
+        owners, 1,
+        "restoration must reuse the agent a concurrent resume already claimed"
+    );
+}
+
+#[tokio::test]
+async fn restart_without_an_ambient_runtime_restores_working_agents() {
+    let mut fixture = Fixture::new().await;
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            name: Some("survives a runtimeless restart".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::New {
+                workspace_roots: vec!["/tmp/restart-no-runtime".to_owned()],
+                prompt: "remember me".to_owned(),
+                images: None,
+                backend_kind: BackendKind::Claude,
+                launch_profile_id: None,
+                cost_hint: None,
+                access_mode: Default::default(),
+                session_settings: None,
+            },
+        })
+        .await
+        .expect("spawn agent that will be restored");
+    let agent: NewAgentPayload = expect_next_event(&mut fixture.client, "survivor NewAgent")
+        .await
+        .parse_payload()
+        .expect("parse survivor NewAgent");
+    let start = expect_agent_start_on_stream(
+        &mut fixture.client,
+        &agent.instance_stream,
+        "survivor start",
+    )
+    .await;
+    let session = start.session_id.expect("survivor session id");
+    expect_turn_on_stream(
+        &mut fixture.client,
+        &agent.instance_stream,
+        "mock backend response to: remember me",
+    )
+    .await;
+
+    let session_path = fixture.store_dir().join("sessions.json");
+    let project_path = fixture.store_dir().join("projects.json");
+    let settings_path = fixture.store_dir().join("settings.json");
+    let host = std::thread::spawn(move || {
+        server::spawn_host_with_mock_backend_and_runtime_config(
+            session_path,
+            project_path,
+            settings_path,
+            server::HostRuntimeConfig {
+                skip_real_backend_probe: true,
+                ..Default::default()
+            },
+        )
+    })
+    .join()
+    .expect("host construction thread")
+    .expect("construct replacement host off-runtime");
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if host.live_agent_session_ids().await.contains(&session) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("restoration should reconstruct the open agent");
+
+    let (mut client, bootstrap) = fixture::connect_host(host.clone()).await;
+    let restored = bootstrap
+        .agents
+        .iter()
+        .find(|restored| restored.session_id.as_ref() == Some(&session))
+        .expect("restored agent in bootstrap")
+        .clone();
+
+    // The restored card is only worth anything if its actor is still alive to
+    // answer. A dropped restoration runtime leaves the card and loses the
+    // actor, which is exactly the failure this asserts against.
+    client
+        .send_message(&restored.instance_stream, "are you alive".to_owned())
+        .await
+        .expect("send to restored agent");
+    fixture::next_frame_matching_on(&mut client, "restored agent reply", |env| {
+        env.stream == restored.instance_stream
+            && env.kind == FrameKind::ChatEvent
+            && matches!(
+                env.parse_payload::<ChatEvent>(),
+                Ok(ChatEvent::StreamDelta(delta))
+                    if delta.text.contains("mock backend response to: are you alive")
+            )
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn restart_keeps_a_read_only_agent_read_only() {
+    let mut fixture = Fixture::new().await;
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            name: Some("read-only survivor".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::New {
+                workspace_roots: vec!["/tmp/restart-read-only".to_owned()],
+                prompt: "stay read only".to_owned(),
+                images: None,
+                backend_kind: BackendKind::Claude,
+                launch_profile_id: None,
+                cost_hint: None,
+                access_mode: BackendAccessMode::ReadOnly,
+                session_settings: None,
+            },
+        })
+        .await
+        .expect("spawn read-only agent");
+    let agent: NewAgentPayload = expect_next_event(&mut fixture.client, "read-only NewAgent")
+        .await
+        .parse_payload()
+        .expect("parse read-only NewAgent");
+    let start = expect_agent_start_on_stream(
+        &mut fixture.client,
+        &agent.instance_stream,
+        "read-only start",
+    )
+    .await;
+    let session = start.session_id.expect("read-only session id");
+    expect_turn_on_stream(
+        &mut fixture.client,
+        &agent.instance_stream,
+        "mock backend response to: stay read only",
+    )
+    .await;
+    assert_eq!(
+        stored_access_mode(&fixture, &session),
+        BackendAccessMode::ReadOnly,
+        "spawning read-only must persist the restriction"
+    );
+
+    let bootstrap = fixture.restart_host().await;
+    let (restored_by_session, _) =
+        collect_restart_replay(&mut fixture, &bootstrap, std::slice::from_ref(&session)).await;
+    restored_by_session
+        .get(&session)
+        .expect("read-only agent restored after restart");
+
+    assert_eq!(
+        stored_access_mode(&fixture, &session),
+        BackendAccessMode::ReadOnly,
+        "restoring an open agent must not relax its read-only mode"
+    );
+}
+
+#[tokio::test]
+async fn restart_restores_open_agents_and_preserves_settings() {
+    let mut fixture = Fixture::new().await;
+    let mut settings = SessionSettingsValues::default();
+    settings.0.insert(
+        "effort".to_owned(),
+        SessionSettingValue::String("high".to_owned()),
+    );
+
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            name: Some("survives restart".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::New {
+                workspace_roots: vec!["/tmp/restart-survivor".to_owned()],
+                prompt: "remember this turn".to_owned(),
+                images: None,
+                backend_kind: BackendKind::Claude,
+                launch_profile_id: None,
+                cost_hint: None,
+                access_mode: Default::default(),
+                session_settings: Some(settings.clone()),
+            },
+        })
+        .await
+        .expect("spawn restart survivor");
+    let survivor: NewAgentPayload = expect_next_event(&mut fixture.client, "survivor NewAgent")
+        .await
+        .parse_payload()
+        .expect("parse survivor NewAgent");
+    let survivor_start = expect_agent_start_on_stream(
+        &mut fixture.client,
+        &survivor.instance_stream,
+        "survivor start",
+    )
+    .await;
+    let survivor_session = survivor_start.session_id.expect("survivor session id");
+    expect_turn_on_stream(
+        &mut fixture.client,
+        &survivor.instance_stream,
+        "mock backend response to: remember this turn",
+    )
+    .await;
+
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            name: Some("child survives restart".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: Some(survivor.agent_id.clone()),
+            project_id: None,
+            params: SpawnAgentParams::New {
+                workspace_roots: vec!["/tmp/restart-survivor-child".to_owned()],
+                prompt: "child turn".to_owned(),
+                images: None,
+                backend_kind: BackendKind::Claude,
+                launch_profile_id: None,
+                cost_hint: None,
+                access_mode: Default::default(),
+                session_settings: None,
+            },
+        })
+        .await
+        .expect("spawn restart survivor child");
+    let survivor_child: NewAgentPayload =
+        expect_next_event(&mut fixture.client, "survivor child NewAgent")
+            .await
+            .parse_payload()
+            .expect("parse survivor child NewAgent");
+    let survivor_child_start = expect_agent_start_on_stream(
+        &mut fixture.client,
+        &survivor_child.instance_stream,
+        "survivor child start",
+    )
+    .await;
+    let survivor_child_session = survivor_child_start
+        .session_id
+        .expect("survivor child session id");
+    expect_turn_on_stream(
+        &mut fixture.client,
+        &survivor_child.instance_stream,
+        "mock backend response to: child turn",
+    )
+    .await;
+
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            name: Some("closed before restart".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::New {
+                workspace_roots: vec!["/tmp/restart-closed".to_owned()],
+                prompt: "do not restore me".to_owned(),
+                images: None,
+                backend_kind: BackendKind::Claude,
+                launch_profile_id: None,
+                cost_hint: None,
+                access_mode: Default::default(),
+                session_settings: None,
+            },
+        })
+        .await
+        .expect("spawn agent that will be closed");
+    let closed: NewAgentPayload = expect_next_event(&mut fixture.client, "closed NewAgent")
+        .await
+        .parse_payload()
+        .expect("parse closed NewAgent");
+    let _ = expect_agent_start_on_stream(
+        &mut fixture.client,
+        &closed.instance_stream,
+        "closed agent start",
+    )
+    .await;
+    expect_turn_on_stream(
+        &mut fixture.client,
+        &closed.instance_stream,
+        "mock backend response to: do not restore me",
+    )
+    .await;
+    fixture
+        .client
+        .close_agent(&closed.instance_stream)
+        .await
+        .expect("close second agent");
+    fixture::next_frame_matching_on(&mut fixture.client, "closed AgentClosed", |env| {
+        env.kind == FrameKind::AgentClosed
+            && env
+                .parse_payload::<protocol::AgentClosedPayload>()
+                .is_ok_and(|payload| payload.agent_id == closed.agent_id)
+    })
+    .await;
+
+    let bootstrap = fixture.restart_host().await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if fixture.agent_ids().await.len() == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("both open agents should be reconstructed after restart");
+
+    let (mut restored_by_session, restored_bootstraps) = collect_restart_replay(
+        &mut fixture,
+        &bootstrap,
+        &[survivor_session.clone(), survivor_child_session.clone()],
+    )
+    .await;
+    let restored = restored_by_session
+        .remove(&survivor_session)
+        .expect("restored parent");
+    let restored_child = restored_by_session
+        .remove(&survivor_child_session)
+        .expect("restored child");
+    assert_ne!(restored.agent_id, survivor.agent_id);
+    assert_ne!(restored_child.agent_id, survivor_child.agent_id);
+    assert_eq!(restored_child.name, "child survives restart");
+    // The durable parent session id is the only lineage that survives a
+    // restart; the restored child must hang off the parent's *new* agent id.
+    assert_eq!(
+        restored_child.parent_agent_id.as_ref(),
+        Some(&restored.agent_id),
+        "restored child must be re-parented onto the restored parent agent",
+    );
+    assert_eq!(restored.name, "survives restart");
+    assert_eq!(restored.workspace_roots, vec!["/tmp/restart-survivor"]);
+    assert_eq!(restored.session_id.as_ref(), Some(&survivor_session));
+
+    let restored_bootstrap = restored_bootstraps
+        .get(&restored.instance_stream)
+        .expect("restored parent AgentBootstrap");
+    assert_bootstrap_tail_messages(restored_bootstrap, &["remember this turn"]);
+    let restored_child_bootstrap = restored_bootstraps
+        .get(&restored_child.instance_stream)
+        .expect("restored child AgentBootstrap");
+    assert_bootstrap_tail_messages(restored_child_bootstrap, &["child turn"]);
+    let restored_settings = restored_bootstrap
+        .events
+        .iter()
+        .find_map(|event| match event {
+            AgentBootstrapEvent::SessionSettings(payload) => Some(&payload.values),
+            _ => None,
+        })
+        .expect("restored bootstrap includes session settings");
+    assert_eq!(restored_settings, &settings);
 }
 
 #[tokio::test]
@@ -2457,5 +3608,118 @@ async fn a_record_this_build_cannot_read_is_kept_on_disk() {
         journal_lines(&journal)[..intact_lines.len()],
         intact_lines[..],
         "records written before the unreadable one must be untouched"
+    );
+}
+
+/// A backend-native child is a relay over its parent's sub-agent stream, not an
+/// independently resumable session. Marking it for restoration made every
+/// restart reconstruct it through the resume path, which rejects it and leaves
+/// the user a failed card to dismiss. The parent still comes back; the child
+/// must not come back at all.
+#[tokio::test]
+async fn restart_does_not_resurrect_backend_native_children() {
+    let mut fixture = Fixture::new().await;
+    let reservation = fixture
+        .reserve_next_mock_launch(
+            "parent-with-native-child",
+            MockScript::one(
+                MockTurn::text("mock backend response to: parent prompt")
+                    .with_native_child("mock-native-child", "parent prompt"),
+            ),
+        )
+        .await;
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            name: Some("parent-with-native-child".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::New {
+                workspace_roots: vec!["/tmp/restart-native-parent".to_owned()],
+                prompt: "parent prompt".to_owned(),
+                images: None,
+                backend_kind: BackendKind::Claude,
+                launch_profile_id: None,
+                cost_hint: None,
+                access_mode: Default::default(),
+                session_settings: None,
+            },
+        })
+        .await
+        .expect("spawn parent with native child");
+
+    let parent: NewAgentPayload = expect_next_event(&mut fixture.client, "parent NewAgent")
+        .await
+        .parse_payload()
+        .expect("parse parent NewAgent");
+    let parent_start =
+        expect_agent_start_on_stream(&mut fixture.client, &parent.instance_stream, "parent start")
+            .await;
+    let parent_session = parent_start.session_id.expect("parent session id");
+    drop(reservation);
+    expect_turn_on_stream(
+        &mut fixture.client,
+        &parent.instance_stream,
+        "mock backend response to: parent prompt",
+    )
+    .await;
+
+    let child =
+        fixture::next_frame_matching_on(&mut fixture.client, "native child NewAgent", |env| {
+            env.kind == FrameKind::NewAgent
+                && env
+                    .parse_payload::<NewAgentPayload>()
+                    .is_ok_and(|agent| agent.parent_agent_id.as_ref() == Some(&parent.agent_id))
+        })
+        .await
+        .parse_payload::<NewAgentPayload>()
+        .expect("parse native child NewAgent");
+    let child_start = expect_agent_start_on_stream(
+        &mut fixture.client,
+        &child.instance_stream,
+        "native child start",
+    )
+    .await;
+    let child_session = child_start.session_id.expect("native child session id");
+    assert_eq!(child_start.origin, protocol::AgentOrigin::BackendNative);
+    assert_ne!(child_session, parent_session);
+
+    let bootstrap = fixture.restart_host().await;
+    let (mut restored, _) = collect_restart_replay(
+        &mut fixture,
+        &bootstrap,
+        std::slice::from_ref(&parent_session),
+    )
+    .await;
+    let restored_parent = restored.remove(&parent_session).expect("restored parent");
+    assert_ne!(restored_parent.agent_id, parent.agent_id);
+
+    // Restoration is one sequential pass, so the child would be reconstructed
+    // moments after the parent. Give the pass room to do it and require that
+    // the agent count never grows past the parent.
+    let resurrected = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if fixture.agent_ids().await.len() > 1 {
+                return fixture.agent_session_ids().await;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert!(
+        resurrected.is_err(),
+        "backend-native child must not be reconstructed after restart, live sessions: {:?}",
+        resurrected.unwrap_or_default()
+    );
+    let live_sessions = fixture.agent_session_ids().await;
+    assert_eq!(
+        live_sessions,
+        vec![parent_session.clone()],
+        "only the parent session should be live after restart"
+    );
+    assert!(
+        !live_sessions.contains(&child_session),
+        "backend-native child session must not be reconstructed after restart"
     );
 }

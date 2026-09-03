@@ -8,10 +8,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use super::write_seq::{CAS_ATTEMPTS, peek_write_seq};
 
 use protocol::{
-    BackendKind, CompactionMethod, CompactionMetrics, CompactionMutation, CompactionOperationId,
-    CompactionTrigger, CustomAgentId, KIRO_BACKEND, KIRO_LAUNCH_PROFILE_ID, LEGACY_ACP_BACKEND,
-    LaunchProfileId, ProjectId, SessionId, SessionListScope, SessionSettingsValues, SessionSummary,
-    TaskList,
+    AgentOrigin, AgentWorkflowMetadata, BackendKind, CompactionMethod, CompactionMetrics,
+    CompactionMutation, CompactionOperationId, CompactionTrigger, CustomAgentId, KIRO_BACKEND,
+    KIRO_LAUNCH_PROFILE_ID, LEGACY_ACP_BACKEND, LaunchProfileId, ProjectId, SessionId,
+    SessionListScope, SessionSettingsValues, SessionSummary, TaskList,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -87,6 +87,13 @@ pub(crate) struct FinishCompactionOperation {
     pub message: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct SessionRestoreState {
+    pub origin: AgentOrigin,
+    #[serde(default)]
+    pub workflow: Option<AgentWorkflowMetadata>,
+}
+
 pub(crate) struct CommitCompactedBinding {
     pub operation_id: CompactionOperationId,
     pub expected_generation: u64,
@@ -146,6 +153,11 @@ pub struct SessionRecord {
     pub compaction_epoch: u64,
     #[serde(default)]
     pub(crate) compaction_operations: Vec<CompactionOperationRecord>,
+    /// Present while this saved session owns an open agent card. The actor and
+    /// provider process are intentionally not durable; this descriptor lets a
+    /// replacement host reconstruct them through the ordinary resume path.
+    #[serde(default)]
+    pub(crate) restore_state: Option<SessionRestoreState>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -292,6 +304,7 @@ impl SessionStore {
                     active_backend_binding_generation: 0,
                     compaction_epoch: 0,
                     compaction_operations: Vec::new(),
+                    restore_state: None,
                 });
 
             entry.backend_kind = session.backend_kind;
@@ -436,6 +449,36 @@ impl SessionStore {
             record.project_id = project_id;
             record.workspace_roots = roots;
             record.updated_at_ms = now_ms();
+        })
+    }
+
+    pub(crate) fn set_restore_state(
+        &self,
+        session_id: &SessionId,
+        restore_state: SessionRestoreState,
+    ) -> Result<(), String> {
+        self.update(session_id, |record| {
+            record.restore_state = Some(restore_state);
+        })
+    }
+
+    /// Clears the marker for a whole closing subtree in a single store write.
+    /// Each `cas` rewrites and fsyncs the entire store, so a per-session loop
+    /// here costs one full rewrite per descendant.
+    pub(crate) fn clear_restore_states(
+        &self,
+        session_ids: &HashSet<SessionId>,
+    ) -> Result<(), String> {
+        self.cas(|records| {
+            let mut changed = false;
+            for session_id in session_ids {
+                if let Some(record) = records.get_mut(&session_id.0)
+                    && record.restore_state.take().is_some()
+                {
+                    changed = true;
+                }
+            }
+            Ok(((), changed))
         })
     }
 

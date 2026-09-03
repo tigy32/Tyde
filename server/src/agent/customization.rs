@@ -79,6 +79,17 @@ impl ResolvedSpawnConfig {
         Self::empty(SpawnConfigPolicy::FailedStartup)
     }
 
+    /// Whether a plain `Resume` rebuilds this configuration faithfully.
+    ///
+    /// Only the user policy is reconstructed from the session record alone. A
+    /// reviewer carries dedicated instructions, a read-only tool policy, its
+    /// review MCP and a tool bridge that live entirely outside the record, so
+    /// resuming one produces an ordinary user agent wearing its name. The
+    /// remaining policies never describe a session a user has open.
+    pub(crate) fn is_rebuilt_by_resume(&self) -> bool {
+        matches!(self.policy, SpawnConfigPolicy::User)
+    }
+
     pub(crate) fn assert_session_policy(&self, startup_failed: bool) {
         assert!(
             matches!(
