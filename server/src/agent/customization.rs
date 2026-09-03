@@ -110,7 +110,9 @@ impl SkillDelivery {
             // Hermes provides its own name-only catalog. Kiro has no native
             // selected-skill projection yet, so its resolved names remain
             // available to a future adapter without loading any body today.
-            BackendKind::Hermes | BackendKind::Kiro | BackendKind::Grok => Self::NamesOnly,
+            BackendKind::Hermes | BackendKind::Kiro | BackendKind::Grok | BackendKind::Opencode => {
+                Self::NamesOnly
+            }
         }
     }
 }

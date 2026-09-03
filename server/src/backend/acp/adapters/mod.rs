@@ -6,4 +6,5 @@
 
 pub mod grok;
 pub mod kiro;
+pub mod opencode;
 pub mod stock;

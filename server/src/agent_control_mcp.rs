@@ -306,6 +306,7 @@ enum BackendKindInput {
     Antigravity,
     Hermes,
     Grok,
+    Opencode,
 }
 
 impl From<BackendKindInput> for BackendKind {
@@ -317,6 +318,7 @@ impl From<BackendKindInput> for BackendKind {
             BackendKindInput::Antigravity => Self::Antigravity,
             BackendKindInput::Hermes => Self::Hermes,
             BackendKindInput::Grok => Self::Grok,
+            BackendKindInput::Opencode => Self::Opencode,
         }
     }
 }
@@ -358,12 +360,17 @@ impl From<CostHintInput> for SpawnCostHint {
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct SpawnAgentToolInput {
+    /// Absolute roots for the child.
     #[serde(default)]
     workspace_roots: Vec<String>,
+    #[serde(alias = "task")]
     prompt: String,
     launch_profile_id: Option<String>,
     backend_kind: Option<BackendKindInput>,
+    #[schemars(skip)]
     parent_agent_id: Option<String>,
+    /// An opaque UUID returned by tyde_list_workbenches. Never derive this from
+    /// a directory name or path.
     project_id: Option<String>,
     name: Option<String>,
     /// Task complexity. `low`: trivial task that needs no real reasoning —
@@ -371,6 +378,17 @@ struct SpawnAgentToolInput {
     /// task — runs on the most capable configuration. Omit for normal tasks.
     cost_hint: Option<CostHintInput>,
     access_mode: Option<BackendAccessModeInput>,
+    // OpenCode decorates MCP calls that resemble its native task tool with
+    // these fields even though they are absent from the advertised schema.
+    #[serde(default)]
+    #[schemars(skip)]
+    command: Option<String>,
+    #[serde(default)]
+    #[schemars(skip)]
+    description: Option<String>,
+    #[serde(default)]
+    #[schemars(skip)]
+    subagent_type: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
@@ -1287,7 +1305,7 @@ pub fn start_server(
 
 async fn do_spawn_agent(
     host: &HostHandle,
-    input: SpawnRequestInput,
+    mut input: SpawnRequestInput,
     request_agent_id: Option<AgentId>,
 ) -> Result<SpawnAgentResult, String> {
     if input.workspace_roots.iter().any(|r| r.trim().is_empty()) {
@@ -1356,6 +1374,22 @@ async fn do_spawn_agent(
         }
         (None, None) => None,
     };
+    if input.workspace_roots.is_empty()
+        && project_id.is_none()
+        && let Some(caller_agent_id) = caller_agent_id.as_ref()
+    {
+        // OpenCode's native task tool omits Tyde-specific root arguments. Its
+        // authenticated child must still remain inside the caller's roots.
+        input.workspace_roots = host
+            .list_agents()
+            .await
+            .into_iter()
+            .find(|agent| {
+                &agent.agent_id == caller_agent_id && agent.backend_kind == BackendKind::Opencode
+            })
+            .map(|agent| agent.workspace_roots)
+            .unwrap_or_default();
+    }
     let requested_name = input.name.filter(|value| !value.trim().is_empty());
 
     let payload = SpawnAgentPayload {
@@ -2070,16 +2104,30 @@ struct SpawnRequestInput {
 
 impl From<SpawnAgentToolInput> for SpawnRequestInput {
     fn from(v: SpawnAgentToolInput) -> Self {
+        let SpawnAgentToolInput {
+            workspace_roots,
+            prompt,
+            launch_profile_id,
+            backend_kind,
+            parent_agent_id,
+            project_id,
+            name,
+            cost_hint,
+            access_mode,
+            command: _,
+            description: _,
+            subagent_type: _,
+        } = v;
         Self {
-            workspace_roots: v.workspace_roots,
-            prompt: v.prompt,
-            launch_profile_id: v.launch_profile_id,
-            backend_kind: v.backend_kind,
-            parent_agent_id: v.parent_agent_id,
-            project_id: v.project_id,
-            name: v.name,
-            cost_hint: v.cost_hint,
-            access_mode: v.access_mode,
+            workspace_roots,
+            prompt,
+            launch_profile_id,
+            backend_kind,
+            parent_agent_id,
+            project_id,
+            name,
+            cost_hint,
+            access_mode,
         }
     }
 }

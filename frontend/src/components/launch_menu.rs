@@ -15,6 +15,7 @@ fn backend_label_for(kind: BackendKind) -> &'static str {
         BackendKind::Antigravity => "Antigravity",
         BackendKind::Hermes => "Hermes",
         BackendKind::Grok => "Grok",
+        BackendKind::Opencode => "OpenCode",
     }
 }
 

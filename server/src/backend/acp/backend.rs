@@ -583,6 +583,13 @@ impl KiroSession {
                 grok_last_message_id: None,
                 grok_pending_response_end: None,
                 grok_pending_turn_end: None,
+                opencode_turn_sequence: 0,
+                opencode_request_usages: Vec::new(),
+                opencode_provider_request_ids: HashSet::new(),
+                opencode_active_provider_message_id: None,
+                opencode_pending_response_usage: None,
+                opencode_cumulative_usage: TokenUsage::default(),
+                opencode_current_context_usage: None,
             }),
         });
 
@@ -656,6 +663,13 @@ struct KiroState {
     grok_last_message_id: Option<ChatMessageId>,
     grok_pending_response_end: Option<Value>,
     grok_pending_turn_end: Option<Value>,
+    opencode_turn_sequence: u64,
+    opencode_request_usages: Vec<(TokenUsage, Option<ChatMessageId>)>,
+    opencode_provider_request_ids: HashSet<String>,
+    opencode_active_provider_message_id: Option<String>,
+    opencode_pending_response_usage: Option<Value>,
+    opencode_cumulative_usage: TokenUsage,
+    opencode_current_context_usage: Option<CurrentContextUsage>,
 }
 
 struct GrokRequestUsage {
@@ -697,11 +711,28 @@ fn kiro_is_startup_mcp_tool(tool_name: &str, servers: &[StartupMcpServer]) -> bo
     servers.iter().any(|server| {
         let marker = format!("@{}/", server.name);
         let grok_marker = format!("{}__", server.name);
+        let opencode_marker = format!("{}_", server.name);
+        let opencode_sanitized_marker = format!(
+            "{}_",
+            server
+                .name
+                .chars()
+                .map(|character| {
+                    if character.is_ascii_alphanumeric() {
+                        character
+                    } else {
+                        '_'
+                    }
+                })
+                .collect::<String>()
+        );
         tool_name
             .split_whitespace()
             .any(|part| part.contains(&marker))
             || tool_name.contains(&marker)
             || tool_name.starts_with(&grok_marker)
+            || tool_name.starts_with(&opencode_marker)
+            || tool_name.starts_with(&opencode_sanitized_marker)
     })
 }
 
@@ -913,6 +944,14 @@ impl KiroInner {
                         state.grok_last_message_id = None;
                         state.grok_pending_response_end = None;
                     }
+                    if self.adapter.backend_kind() == protocol::BackendKind::Opencode {
+                        state.opencode_turn_sequence =
+                            state.opencode_turn_sequence.saturating_add(1);
+                        state.opencode_request_usages.clear();
+                        state.opencode_provider_request_ids.clear();
+                        state.opencode_active_provider_message_id = None;
+                        state.opencode_pending_response_usage = None;
+                    }
                 }
                 self.emit_user_message_added(&message, images.as_deref());
                 self.emitter.typing_status_changed(true);
@@ -1052,8 +1091,17 @@ impl KiroInner {
                     return Ok(());
                 }
 
-                self.finalize_active_stream_if_any(Some(response), true)
-                    .await;
+                if self.adapter.backend_kind() == protocol::BackendKind::Opencode {
+                    let message_id = self
+                        .finalize_active_stream_if_any(Some(response.clone()), false)
+                        .await;
+                    self.record_opencode_request(Some(&response), message_id)
+                        .await;
+                    self.finalize_opencode_turn().await;
+                } else {
+                    self.finalize_active_stream_if_any(Some(response), true)
+                        .await;
+                }
                 self.spawn_capacity_refresh(false).await;
                 Ok(())
             }
@@ -1552,8 +1600,10 @@ impl KiroInner {
             match (expected, actual) {
                 (Some(expected), Some(actual)) if expected == actual => None,
                 (Some(_), Some(actual))
-                    if self.adapter.backend_kind() == protocol::BackendKind::Grok
-                        && actual == state.session_id =>
+                    if matches!(
+                        self.adapter.backend_kind(),
+                        protocol::BackendKind::Grok | protocol::BackendKind::Opencode
+                    ) && actual == state.session_id =>
                 {
                     None
                 }
@@ -1583,12 +1633,29 @@ impl KiroInner {
     /// ACP carries the classification in `kind`; everything else in the
     /// payload is agent-defined, which is why the adapter decides.
     async fn map_tool_request(&self, params: &Value, args: &Value, workspace_root: &str) -> Value {
-        let kind = params.get("kind").and_then(Value::as_str).unwrap_or("");
+        let wire_kind = params.get("kind").and_then(Value::as_str).unwrap_or("");
+        let normalized_kind = if wire_kind == "other"
+            && self.adapter.backend_kind() == protocol::BackendKind::Opencode
+        {
+            self.adapter
+                .normalize_tool_name(
+                    params
+                        .get("title")
+                        .and_then(Value::as_str)
+                        .unwrap_or(wire_kind),
+                    args,
+                    params,
+                )
+                .into_owned()
+        } else {
+            wire_kind.to_owned()
+        };
         let mapped = self
             .adapter
-            .map_tool_request(kind, args, workspace_root)
+            .map_tool_request(&normalized_kind, args, workspace_root)
             .await;
-        if kind == "read" && mapped.get("kind").and_then(Value::as_str) == Some("Other") {
+        if normalized_kind == "read" && mapped.get("kind").and_then(Value::as_str) == Some("Other")
+        {
             let tool_call_id = params
                 .get("toolCallId")
                 .or_else(|| params.get("tool_call_id"))
@@ -1651,6 +1718,19 @@ impl KiroInner {
             "tool_call_update" => self.handle_tool_call_update(update).await,
             "error" => self.handle_error_notification(update).await,
             "plan" => self.handle_plan_update(update),
+            "usage_update" if self.adapter.backend_kind() == protocol::BackendKind::Opencode => {
+                let used = update.get("used").and_then(Value::as_u64);
+                let size = update.get("size").and_then(Value::as_u64);
+                if let (Some(input_tokens), Some(context_window)) = (used, size)
+                    && context_window >= input_tokens
+                {
+                    self.state.lock().await.opencode_current_context_usage =
+                        Some(CurrentContextUsage::Known {
+                            input_tokens,
+                            context_window,
+                        });
+                }
+            }
             "response_end" => self.handle_grok_response_end(update).await,
             // Not part of the standard update family; adapters for agents that
             // signal end-of-turn out of band normalize onto this.
@@ -1736,6 +1816,9 @@ impl KiroInner {
             return;
         }
 
+        self.transition_opencode_provider_message(extract_kiro_message_id(params))
+            .await;
+
         let response = {
             let mut state = self.state.lock().await;
             if state.replaying_history {
@@ -1820,6 +1903,9 @@ impl KiroInner {
             return;
         }
 
+        self.transition_opencode_provider_message(extract_kiro_message_id(params))
+            .await;
+
         if !has_renderable_stream_text(&delta) {
             let has_active_stream = self.state.lock().await.active_response.is_some();
             if !has_active_stream {
@@ -1887,6 +1973,30 @@ impl KiroInner {
             .await;
             return;
         };
+        let raw_tool_name = request.tool_name.clone();
+        let opencode_shell_missing_command = self.adapter.backend_kind()
+            == protocol::BackendKind::Opencode
+            && matches!(raw_tool_name.as_str(), "bash" | "shell")
+            && request.args.get("command").is_none()
+            && request.args.get("cmd").is_none();
+        if opencode_shell_missing_command
+            || request
+                .args
+                .as_object()
+                .is_some_and(serde_json::Map::is_empty)
+        {
+            let (session_id, workspace_root) = {
+                let state = self.state.lock().await;
+                (state.session_id.clone(), state.workspace_root.clone())
+            };
+            if let Some(args) = self
+                .adapter
+                .args_for_tool_request(&session_id, &workspace_root, &request.tool_call_id)
+                .await
+            {
+                request.args = args;
+            }
+        }
         request.tool_name = self
             .adapter
             .normalize_tool_name(&request.tool_name, &request.args, params)
@@ -1910,7 +2020,7 @@ impl KiroInner {
             let state = self.state.lock().await;
             (
                 state.workspace_root.clone(),
-                kiro_is_startup_mcp_tool(&request.tool_name, &state.startup_mcp_servers),
+                kiro_is_startup_mcp_tool(&raw_tool_name, &state.startup_mcp_servers),
             )
         };
         let tool_type = self
@@ -2002,6 +2112,30 @@ impl KiroInner {
         };
         completion.tool_call_id = resolved_tool_call_id;
 
+        let opencode_mcp = if self.adapter.backend_kind() == protocol::BackendKind::Opencode {
+            self.state
+                .lock()
+                .await
+                .active_tool_contexts
+                .get(&completion.tool_call_id)
+                .is_some_and(|context| context.is_mcp_tool)
+        } else {
+            false
+        };
+        if opencode_mcp {
+            let (session_id, workspace_root) = {
+                let state = self.state.lock().await;
+                (state.session_id.clone(), state.workspace_root.clone())
+            };
+            if let Some(result) = self
+                .adapter
+                .result_for_tool_completion(&session_id, &workspace_root, &completion.tool_call_id)
+                .await
+            {
+                completion.tool_result = result;
+            }
+        }
+
         let completion_to_emit = {
             let mut state = self.state.lock().await;
             let Some(context) = state.active_tool_contexts.get(&completion.tool_call_id) else {
@@ -2075,6 +2209,42 @@ impl KiroInner {
             ));
             return;
         };
+        if self.adapter.backend_kind() == protocol::BackendKind::Opencode {
+            let (session_id, workspace_root) = {
+                let state = self.state.lock().await;
+                (state.session_id.clone(), state.workspace_root.clone())
+            };
+            let provider_message_id = self
+                .adapter
+                .provider_message_id_for_tool(&session_id, &workspace_root, &request.tool_call_id)
+                .await;
+            self.transition_opencode_provider_message(provider_message_id)
+                .await;
+        }
+        let raw_tool_name = request.tool_name.clone();
+        let opencode_shell_missing_command = self.adapter.backend_kind()
+            == protocol::BackendKind::Opencode
+            && matches!(raw_tool_name.as_str(), "bash" | "shell")
+            && request.args.get("command").is_none()
+            && request.args.get("cmd").is_none();
+        if opencode_shell_missing_command
+            || request
+                .args
+                .as_object()
+                .is_some_and(serde_json::Map::is_empty)
+        {
+            let (session_id, workspace_root) = {
+                let state = self.state.lock().await;
+                (state.session_id.clone(), state.workspace_root.clone())
+            };
+            if let Some(args) = self
+                .adapter
+                .args_for_tool_request(&session_id, &workspace_root, &request.tool_call_id)
+                .await
+            {
+                request.args = args;
+            }
+        }
         request.tool_name = self
             .adapter
             .normalize_tool_name(&request.tool_name, &request.args, params)
@@ -2090,7 +2260,7 @@ impl KiroInner {
             let state = self.state.lock().await;
             (
                 state.workspace_root.clone(),
-                kiro_is_startup_mcp_tool(&request.tool_name, &state.startup_mcp_servers),
+                kiro_is_startup_mcp_tool(&raw_tool_name, &state.startup_mcp_servers),
             )
         };
 
@@ -2238,11 +2408,45 @@ impl KiroInner {
         };
         completion.tool_call_id = resolved_tool_call_id;
 
+        let opencode_mcp = if self.adapter.backend_kind() == protocol::BackendKind::Opencode {
+            self.state
+                .lock()
+                .await
+                .active_tool_contexts
+                .get(&completion.tool_call_id)
+                .is_some_and(|context| context.is_mcp_tool)
+        } else {
+            false
+        };
+        if opencode_mcp {
+            let (session_id, workspace_root) = {
+                let state = self.state.lock().await;
+                (state.session_id.clone(), state.workspace_root.clone())
+            };
+            if let Some(result) = self
+                .adapter
+                .result_for_tool_completion(&session_id, &workspace_root, &completion.tool_call_id)
+                .await
+            {
+                completion.tool_result = result;
+            }
+        }
+
         // The first result ends the response that issued the calls. Every call
         // of a batch has arrived by now, so the closing `StreamEnd` carries all
         // of them and the client can tell they came from one response.
         if self.adapter.backend_kind() == protocol::BackendKind::Grok {
             self.flush_pending_grok_response_end().await;
+        } else if self.adapter.backend_kind() == protocol::BackendKind::Opencode {
+            let (session_id, workspace_root) = {
+                let state = self.state.lock().await;
+                (state.session_id.clone(), state.workspace_root.clone())
+            };
+            let usage = self
+                .adapter
+                .usage_for_tool_completion(&session_id, &workspace_root, &completion.tool_call_id)
+                .await;
+            self.state.lock().await.opencode_pending_response_usage = usage;
         } else {
             self.finalize_active_stream_if_any(None, false).await;
         }
@@ -2305,6 +2509,9 @@ impl KiroInner {
         let mut emit_completion_now: Option<(String, PendingToolCompletion)> = None;
         {
             let mut state = self.state.lock().await;
+            let defer_opencode_completion = self.adapter.backend_kind()
+                == protocol::BackendKind::Opencode
+                && state.active_response.is_some();
             if let Some(context) = state.active_tool_contexts.get_mut(&completion.tool_call_id) {
                 if let Some(refined) = self
                     .adapter
@@ -2353,7 +2560,7 @@ impl KiroInner {
                     emit_request_now =
                         Some((completion.tool_call_id.clone(), context.tool_type.clone()));
                 }
-                if context.request_emitted {
+                if context.request_emitted && !defer_opencode_completion {
                     emit_completion_now = Some((completion.tool_call_id.clone(), pending));
                 } else {
                     context.pending_completion = Some(pending);
@@ -2654,6 +2861,138 @@ impl KiroInner {
         self.emitter.typing_status_changed(false);
     }
 
+    async fn record_opencode_request(
+        &self,
+        raw: Option<&Value>,
+        message_id: Option<ChatMessageId>,
+    ) {
+        let Some(usage) = self
+            .adapter
+            .map_usage(raw)
+            .and_then(|usage| usage.request.known_usage().cloned())
+        else {
+            return;
+        };
+        self.state
+            .lock()
+            .await
+            .opencode_request_usages
+            .push((usage, message_id));
+    }
+
+    async fn transition_opencode_provider_message(&self, provider_message_id: Option<String>) {
+        if self.adapter.backend_kind() != protocol::BackendKind::Opencode {
+            return;
+        }
+        let Some(provider_message_id) = provider_message_id else {
+            return;
+        };
+        let usage = {
+            let mut state = self.state.lock().await;
+            match state.opencode_active_provider_message_id.as_deref() {
+                None => {
+                    state.opencode_active_provider_message_id = Some(provider_message_id);
+                    return;
+                }
+                Some(active) if active == provider_message_id => return,
+                Some(_) => {
+                    state.opencode_active_provider_message_id = Some(provider_message_id);
+                    state.opencode_pending_response_usage.take()
+                }
+            }
+        };
+        let usage = self.dedupe_opencode_usage(usage).await;
+        let message_id = self
+            .finalize_active_stream_if_any(usage.clone(), false)
+            .await;
+        self.record_opencode_request(usage.as_ref(), message_id)
+            .await;
+    }
+
+    async fn dedupe_opencode_usage(&self, raw: Option<Value>) -> Option<Value> {
+        let raw = raw?;
+        let Some(provider_message_id) = raw
+            .get("_tyde_provider_message_id")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+        else {
+            return Some(raw);
+        };
+        self.state
+            .lock()
+            .await
+            .opencode_provider_request_ids
+            .insert(provider_message_id)
+            .then_some(raw)
+    }
+
+    async fn finalize_opencode_turn(&self) {
+        let (turn_id, requests, turn, cumulative, model, reported_context_usage) = {
+            let mut state = self.state.lock().await;
+            let requests = std::mem::take(&mut state.opencode_request_usages);
+            let mut turn = TokenUsage::default();
+            for (usage, _) in &requests {
+                add_token_usage(&mut turn, usage);
+            }
+            let turn_id = ModelTurnId(format!(
+                "{}:{}",
+                state.session_id, state.opencode_turn_sequence
+            ));
+            add_token_usage(&mut state.opencode_cumulative_usage, &turn);
+            let cumulative = state.opencode_cumulative_usage.clone();
+            let model = state.model.clone().unwrap_or_else(|| "opencode".to_owned());
+            let current_context_usage = state.opencode_current_context_usage.clone();
+            (
+                turn_id,
+                requests,
+                turn,
+                cumulative,
+                model,
+                current_context_usage,
+            )
+        };
+
+        for (sequence, (request, _)) in requests.iter().enumerate() {
+            let current_context_usage =
+                opencode_context_usage(&model, request).or_else(|| reported_context_usage.clone());
+            tracing::debug!(
+                model,
+                ?request,
+                ?current_context_usage,
+                "OpenCode request context usage diagnostic"
+            );
+            self.emitter
+                .model_request_token_usage(&ModelRequestTokenUsage {
+                    request_id: ModelRequestId {
+                        turn_id: turn_id.clone(),
+                        sequence: u32::try_from(sequence + 1).unwrap_or(u32::MAX),
+                    },
+                    request: request.clone(),
+                    turn: turn.clone(),
+                    cumulative: cumulative.clone(),
+                    model_context_window: current_context_usage
+                        .as_ref()
+                        .and_then(|usage| usage.known().map(|(_, window)| window)),
+                    current_context_usage,
+                    estimated_context_breakdown: None,
+                });
+        }
+
+        if let Some((request, Some(message_id))) = requests.last() {
+            self.emitter
+                .message_metadata_updated(MessageMetadataUpdateData {
+                    message_id: message_id.clone(),
+                    model_info: Some(ModelInfo { model }),
+                    token_usage: Some(
+                        MessageTokenUsage::request_and_turn_known(request.clone(), turn)
+                            .with_cumulative(cumulative),
+                    ),
+                    context_breakdown: None,
+                });
+        }
+        self.emitter.typing_status_changed(false);
+    }
+
     async fn finalize_active_stream_if_any(
         &self,
         usage: Option<Value>,
@@ -2728,6 +3067,8 @@ impl KiroInner {
                 .and_then(|usage| {
                     grok_context_telemetry(token_usage.as_ref().unwrap_or(&Value::Null), &usage).1
                 })
+        } else if self.adapter.backend_kind() == protocol::BackendKind::Opencode {
+            None
         } else {
             normalized_usage
                 .as_ref()
@@ -2826,6 +3167,18 @@ impl KiroInner {
         });
         self.emitter.user_message(content, image_payload);
     }
+}
+
+fn opencode_context_usage(model: &str, usage: &TokenUsage) -> Option<CurrentContextUsage> {
+    let context_window = crate::backend::opencode::model_context_window(model)?;
+    let input_tokens = usage
+        .input_tokens
+        .saturating_add(usage.cached_prompt_tokens.unwrap_or(0))
+        .saturating_add(usage.cache_creation_input_tokens.unwrap_or(0));
+    (input_tokens > 0 && input_tokens <= context_window).then_some(CurrentContextUsage::Known {
+        input_tokens,
+        context_window,
+    })
 }
 
 fn kiro_plan_status_to_task_status(raw: &str) -> protocol::TaskStatus {
@@ -3400,6 +3753,24 @@ fn parse_json_value_from_string(value: &Value) -> Option<Value> {
         return None;
     }
     serde_json::from_str::<Value>(raw).ok()
+}
+
+fn add_token_usage(total: &mut TokenUsage, usage: &TokenUsage) {
+    total.input_tokens = total.input_tokens.saturating_add(usage.input_tokens);
+    total.output_tokens = total.output_tokens.saturating_add(usage.output_tokens);
+    total.total_tokens = total.total_tokens.saturating_add(usage.total_tokens);
+    add_optional_token_usage(&mut total.cached_prompt_tokens, usage.cached_prompt_tokens);
+    add_optional_token_usage(
+        &mut total.cache_creation_input_tokens,
+        usage.cache_creation_input_tokens,
+    );
+    add_optional_token_usage(&mut total.reasoning_tokens, usage.reasoning_tokens);
+}
+
+fn add_optional_token_usage(total: &mut Option<u64>, usage: Option<u64>) {
+    if let Some(usage) = usage {
+        *total = Some(total.unwrap_or(0).saturating_add(usage));
+    }
 }
 
 fn resolve_tool_file_path(file_path: &str, workspace_root: &str) -> String {
@@ -4583,8 +4954,8 @@ use protocol::{
 };
 
 use crate::backend::{
-    Backend, BackendCompactionCapability, BackendCompactionUnavailableReason, BackendSession,
-    BackendSpawnConfig, EventStream, protocol_images_to_attachments,
+    Backend, BackendCompactionCapability, BackendCompactionUnavailableReason, BackendEvent,
+    BackendSession, BackendSpawnConfig, EventStream, protocol_images_to_attachments,
     resolve_settings as resolve_backend_settings, session_settings_to_json,
 };
 
@@ -4655,14 +5026,14 @@ pub(crate) fn resolve_session_settings(
 }
 
 fn resolve_agent_session_settings(config: &BackendSpawnConfig) -> protocol::SessionSettingsValues {
-    if config
-        .acp_agent
-        .as_ref()
-        .is_some_and(|agent| agent.adapter == protocol::AcpAdapterId::Grok)
-    {
-        crate::backend::grok::resolve_session_settings(config)
-    } else {
-        resolve_session_settings(config)
+    match config.acp_agent.as_ref().map(|agent| agent.adapter) {
+        Some(protocol::AcpAdapterId::Grok) => {
+            crate::backend::grok::resolve_session_settings(config)
+        }
+        Some(protocol::AcpAdapterId::Opencode) => {
+            crate::backend::opencode::resolve_session_settings(config)
+        }
+        _ => resolve_session_settings(config),
     }
 }
 
@@ -4729,7 +5100,7 @@ impl Backend for KiroBackend {
         let initial_images = protocol_images_to_attachments(initial_input.images);
         let (input_tx, mut input_rx) = mpsc::unbounded_channel::<AgentInput>();
         let (interrupt_tx, mut interrupt_rx) = mpsc::unbounded_channel::<()>();
-        let (events_tx, events_rx) = mpsc::unbounded_channel::<ChatEvent>();
+        let (events_tx, events_rx) = mpsc::unbounded_channel::<BackendEvent>();
         let events_tx_task = events_tx.clone();
         let session_id = Arc::new(std::sync::Mutex::new(None));
         let session_id_task = Arc::clone(&session_id);
@@ -4790,7 +5161,7 @@ impl Backend for KiroBackend {
             let events_tx_forward = events_tx_task.clone();
             let forward_task = tokio::spawn(async move {
                 while let Some(raw) = raw_events.recv().await {
-                    if let Some(event) = map_kiro_value_to_chat_event(&raw)
+                    if let Some(event) = map_kiro_value_to_backend_event(&raw)
                         && events_tx_forward.send(event).is_err()
                     {
                         return;
@@ -4904,7 +5275,7 @@ impl Backend for KiroBackend {
                 session_id,
                 subagent_emitter_tx,
             },
-            EventStream::new(events_rx),
+            EventStream::new_backend(events_rx),
         ))
     }
 
@@ -4915,7 +5286,7 @@ impl Backend for KiroBackend {
     ) -> Result<(Self, EventStream), String> {
         let (input_tx, mut input_rx) = mpsc::unbounded_channel::<AgentInput>();
         let (interrupt_tx, mut interrupt_rx) = mpsc::unbounded_channel::<()>();
-        let (events_tx, events_rx) = mpsc::unbounded_channel::<ChatEvent>();
+        let (events_tx, events_rx) = mpsc::unbounded_channel::<BackendEvent>();
         let (resume_replay_complete_tx, resume_replay_complete_rx) =
             tokio::sync::oneshot::channel();
         let events_tx_task = events_tx.clone();
@@ -4986,7 +5357,7 @@ impl Backend for KiroBackend {
                 return;
             }
             while let Ok(raw) = raw_events.try_recv() {
-                if let Some(event) = map_kiro_value_to_chat_event(&raw)
+                if let Some(event) = map_kiro_value_to_backend_event(&raw)
                     && events_tx_task.send(event).is_err()
                 {
                     session.shutdown().await;
@@ -5002,7 +5373,7 @@ impl Backend for KiroBackend {
             let events_tx_forward = events_tx_task.clone();
             let forward_task = tokio::spawn(async move {
                 while let Some(raw) = raw_events.recv().await {
-                    if let Some(event) = map_kiro_value_to_chat_event(&raw)
+                    if let Some(event) = map_kiro_value_to_backend_event(&raw)
                         && events_tx_forward.send(event).is_err()
                     {
                         return;
@@ -5100,7 +5471,10 @@ impl Backend for KiroBackend {
                 session_id: known_session_id,
                 subagent_emitter_tx,
             },
-            EventStream::new_with_resume_replay_barrier(events_rx, resume_replay_complete_rx),
+            EventStream::new_backend_with_resume_replay_barrier(
+                events_rx,
+                resume_replay_complete_rx,
+            ),
         ))
     }
 
@@ -5238,4 +5612,13 @@ fn map_kiro_value_to_chat_event(value: &Value) -> Option<ChatEvent> {
         }
         _ => None,
     }
+}
+
+fn map_kiro_value_to_backend_event(value: &Value) -> Option<BackendEvent> {
+    if value.get("kind").and_then(Value::as_str) == Some("ModelRequestTokenUsage") {
+        return serde_json::from_value(value.get("data")?.clone())
+            .ok()
+            .map(BackendEvent::ModelRequestTokenUsage);
+    }
+    map_kiro_value_to_chat_event(value).map(BackendEvent::Chat)
 }

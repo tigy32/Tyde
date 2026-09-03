@@ -3324,7 +3324,7 @@ fn nested_native_subagent_prompt(backend: BackendKind, workspace: &Path, payload
              spawn.",
             workspace.display()
         ),
-        BackendKind::Tycode | BackendKind::Kiro | BackendKind::Grok => {
+        BackendKind::Tycode | BackendKind::Kiro | BackendKind::Grok | BackendKind::Opencode => {
             "Use the backend's native spawn-agent and wait collaboration tools.".to_owned()
         }
     };

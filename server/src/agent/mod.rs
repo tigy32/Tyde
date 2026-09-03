@@ -2673,6 +2673,17 @@ async fn spawn_backend(
             let session_id = Backend::session_id(&b);
             Ok((Box::new(b), events, session_id))
         }
+        BackendKind::Opencode => {
+            let config = crate::backend::opencode::configure(config);
+            let (b, events) =
+                KiroBackend::spawn(workspace_roots.clone(), config, initial_input).await?;
+            b.set_subagent_emitter(Arc::new(
+                sub_agent_context.emitter(agent_id.clone(), workspace_roots),
+            ))
+            .await;
+            let session_id = Backend::session_id(&b);
+            Ok((Box::new(b), events, session_id))
+        }
     }
 }
 
@@ -2744,6 +2755,16 @@ async fn resume_backend(
         }
         BackendKind::Grok => {
             let config = crate::backend::grok::configure(config);
+            let (b, events) =
+                KiroBackend::resume(workspace_roots.clone(), config, session_id).await?;
+            b.set_subagent_emitter(Arc::new(
+                sub_agent_context.emitter(agent_id.clone(), workspace_roots),
+            ))
+            .await;
+            (Box::new(b), events)
+        }
+        BackendKind::Opencode => {
+            let config = crate::backend::opencode::configure(config);
             let (b, events) =
                 KiroBackend::resume(workspace_roots.clone(), config, session_id).await?;
             b.set_subagent_emitter(Arc::new(
@@ -2826,6 +2847,9 @@ async fn fork_backend(
         }
         BackendKind::Grok => Err(BackendStartupError::unsupported(
             crate::backend::backend_fork_unsupported_message(BackendKind::Grok),
+        )),
+        BackendKind::Opencode => Err(BackendStartupError::unsupported(
+            crate::backend::backend_fork_unsupported_message(BackendKind::Opencode),
         )),
     }
 }
@@ -8109,6 +8133,7 @@ fn backend_startup_drop_cancels_workers(backend_kind: BackendKind) -> bool {
             | BackendKind::Kiro
             | BackendKind::Hermes
             | BackendKind::Grok
+            | BackendKind::Opencode
     )
 }
 
@@ -10059,7 +10084,11 @@ fn backend_session_is_resumable(
             workspace_roots,
             resolved_spawn_config,
         ),
-        BackendKind::Kiro | BackendKind::Claude | BackendKind::Codex | BackendKind::Grok => true,
+        BackendKind::Kiro
+        | BackendKind::Claude
+        | BackendKind::Codex
+        | BackendKind::Grok
+        | BackendKind::Opencode => true,
     }
 }
 

@@ -20,12 +20,13 @@ const EDIT_AFTER_KEYS: &[&str] = &[
     "newStr",
     "new_str",
     "new_string",
+    "newString",
     "file_text",
     "content",
     "newText",
 ];
 /// Field names an agent might use for the original text of an edit.
-const EDIT_BEFORE_KEYS: &[&str] = &["oldStr", "old_str", "old_string", "oldText"];
+const EDIT_BEFORE_KEYS: &[&str] = &["oldStr", "old_str", "old_string", "oldString", "oldText"];
 
 fn first_str<'a>(value: &'a Value, keys: &[&str]) -> Option<&'a str> {
     keys.iter()

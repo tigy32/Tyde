@@ -13,7 +13,7 @@ use serde_json::Value;
 /// `protocol::TydeReleaseVersion`.
 pub use host_config::{LOCAL_HOST_ID, TydeReleaseVersion};
 
-pub const PROTOCOL_VERSION: u32 = 56;
+pub const PROTOCOL_VERSION: u32 = 57;
 pub const TYDE_VERSION: Version = Version {
     major: 0,
     minor: 8,
@@ -646,6 +646,7 @@ pub enum BackendKind {
     Antigravity,
     Hermes,
     Grok,
+    Opencode,
 }
 
 impl BackendKind {
@@ -659,7 +660,12 @@ impl BackendKind {
     /// than silently dropping it.
     pub const fn supports_image_input(self) -> bool {
         match self {
-            Self::Kiro | Self::Claude | Self::Codex | Self::Hermes | Self::Grok => true,
+            Self::Kiro
+            | Self::Claude
+            | Self::Codex
+            | Self::Hermes
+            | Self::Grok
+            | Self::Opencode => true,
             Self::Tycode | Self::Antigravity => false,
         }
     }
@@ -696,6 +702,7 @@ pub enum AcpAdapterId {
     Stock,
     Kiro,
     Grok,
+    Opencode,
 }
 
 /// How to launch one ACP agent. Carried by a launch profile whose

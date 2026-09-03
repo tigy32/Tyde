@@ -16,6 +16,7 @@ pub mod grok;
 pub mod hermes;
 pub mod hermes_config;
 pub mod mock;
+pub mod opencode;
 pub mod setup;
 pub mod skill_projection;
 pub mod subprocess;
@@ -1140,6 +1141,7 @@ pub fn capabilities_for_backend_kind(kind: BackendKind) -> BackendCapabilities {
         BackendKind::Antigravity => antigravity::AntigravityBackend::capabilities(),
         BackendKind::Hermes => hermes::HermesBackend::capabilities(),
         BackendKind::Grok => grok::capabilities(),
+        BackendKind::Opencode => opencode::capabilities(),
     }
 }
 
@@ -1171,6 +1173,7 @@ pub async fn list_sessions_for_backend_kind(
         BackendKind::Antigravity => antigravity::AntigravityBackend::list_sessions().await,
         BackendKind::Hermes => hermes::HermesBackend::list_sessions().await,
         BackendKind::Grok => grok::list_sessions().await,
+        BackendKind::Opencode => opencode::list_sessions().await,
     }
 }
 
@@ -1270,6 +1273,10 @@ pub(crate) async fn prepare_compacted_backend_binding(
         BackendKind::Grok => Err(BackendBindingPrepareError::SpawnFailed {
             backend_kind: kind,
             message: "Grok does not expose manual compaction through ACP".to_owned(),
+        }),
+        BackendKind::Opencode => Err(BackendBindingPrepareError::SpawnFailed {
+            backend_kind: kind,
+            message: "OpenCode does not expose manual compaction through ACP".to_owned(),
         }),
     }
 }
@@ -1550,6 +1557,7 @@ pub(crate) fn session_settings_schema_for_backend(
         BackendKind::Antigravity => antigravity::AntigravityBackend::session_settings_schema(),
         BackendKind::Hermes => hermes::HermesBackend::session_settings_schema(),
         BackendKind::Grok => grok::session_settings_schema(),
+        BackendKind::Opencode => opencode::session_settings_schema(),
     }
 }
 
@@ -1565,6 +1573,7 @@ pub(crate) fn backend_config_schema_for_backend(
         BackendKind::Antigravity => antigravity::AntigravityBackend::backend_config_schema(),
         BackendKind::Hermes => hermes::HermesBackend::backend_config_schema(),
         BackendKind::Grok => None,
+        BackendKind::Opencode => None,
     }
 }
 
@@ -1578,6 +1587,7 @@ pub(crate) fn backend_config_schema_catalog() -> Vec<BackendConfigSchema> {
         BackendKind::Antigravity,
         BackendKind::Hermes,
         BackendKind::Grok,
+        BackendKind::Opencode,
     ]
     .into_iter()
     .filter_map(backend_config_schema_for_backend)
@@ -1701,6 +1711,7 @@ pub(crate) fn resolve_backend_session_settings(
         BackendKind::Antigravity => antigravity::resolve_session_settings(config),
         BackendKind::Hermes => hermes::resolve_session_settings(config),
         BackendKind::Grok => grok::resolve_session_settings(config),
+        BackendKind::Opencode => opencode::resolve_session_settings(config),
     }
 }
 
@@ -1740,6 +1751,7 @@ pub(crate) fn validate_runtime_session_settings_update(
         | BackendKind::Codex
         | BackendKind::Antigravity
         | BackendKind::Grok => Ok(()),
+        BackendKind::Opencode => Ok(()),
     }
 }
 
@@ -1780,9 +1792,11 @@ pub(crate) fn apply_session_settings_update(
 pub(crate) fn builtin_tier_config(kind: BackendKind) -> BackendTierConfig {
     let defaults: fn(SpawnCostHint) -> SessionSettingsValues = match kind {
         BackendKind::Claude => claude::claude_cost_hint_defaults,
-        BackendKind::Codex | BackendKind::Hermes | BackendKind::Tycode | BackendKind::Grok => {
-            |_| SessionSettingsValues::default()
-        }
+        BackendKind::Codex
+        | BackendKind::Hermes
+        | BackendKind::Tycode
+        | BackendKind::Grok
+        | BackendKind::Opencode => |_| SessionSettingsValues::default(),
         BackendKind::Antigravity => antigravity::antigravity_cost_hint_defaults,
         BackendKind::Kiro => kiro::kiro_cost_hint_defaults,
     };

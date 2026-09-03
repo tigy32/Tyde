@@ -16119,6 +16119,10 @@ fn backend_system_tag(backend: BackendKind) -> (AgentSystemTagId, String) {
             AgentSystemTagId("system:backend:grok".to_owned()),
             "Grok".to_owned(),
         ),
+        BackendKind::Opencode => (
+            AgentSystemTagId("system:backend:opencode".to_owned()),
+            "OpenCode".to_owned(),
+        ),
     }
 }
 
@@ -17862,7 +17866,8 @@ async fn backend_config_snapshots_for_enabled_backends(
             | BackendKind::Claude
             | BackendKind::Codex
             | BackendKind::Antigravity
-            | BackendKind::Grok => {}
+            | BackendKind::Grok
+            | BackendKind::Opencode => {}
         }
     }
     // The Hermes snapshot is published regardless of enablement, like the
@@ -17926,13 +17931,14 @@ async fn fan_out_backend_config_snapshots(state: &mut HostState, force_emit: boo
 }
 
 fn initial_backend_capacity_snapshots() -> HashMap<BackendKind, BackendCapacitySnapshot> {
-    const BACKENDS: [BackendKind; 6] = [
+    const BACKENDS: [BackendKind; 7] = [
         BackendKind::Kiro,
         BackendKind::Claude,
         BackendKind::Codex,
         BackendKind::Antigravity,
         BackendKind::Hermes,
         BackendKind::Grok,
+        BackendKind::Opencode,
     ];
     BACKENDS
         .into_iter()
@@ -18000,7 +18006,8 @@ fn backend_capacity_snapshots(state: &HostState) -> Vec<BackendCapacitySnapshot>
         BackendKind::Antigravity => 3,
         BackendKind::Hermes => 4,
         BackendKind::Grok => 5,
-        BackendKind::Tycode => 6,
+        BackendKind::Opencode => 6,
+        BackendKind::Tycode => 7,
     });
     snapshots
 }
@@ -18920,6 +18927,7 @@ fn backend_slug(backend_kind: protocol::BackendKind) -> &'static str {
         protocol::BackendKind::Antigravity => "antigravity",
         protocol::BackendKind::Hermes => "hermes",
         protocol::BackendKind::Grok => "grok",
+        protocol::BackendKind::Opencode => "opencode",
     }
 }
 
@@ -18932,6 +18940,7 @@ fn backend_launch_profile_label(backend_kind: protocol::BackendKind) -> &'static
         protocol::BackendKind::Antigravity => "Antigravity",
         protocol::BackendKind::Hermes => "Hermes",
         protocol::BackendKind::Grok => "Grok",
+        protocol::BackendKind::Opencode => "OpenCode",
     }
 }
 

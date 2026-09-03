@@ -6881,7 +6881,7 @@ pub(super) fn send_hermes_disabled_providers(
     }
 }
 
-fn all_backends() -> [BackendKind; 6] {
+fn all_backends() -> [BackendKind; 7] {
     crate::components::agents_panel::BACKENDS_BY_PREFERENCE
 }
 
@@ -6900,6 +6900,7 @@ fn acp_adapter_value(adapter: AcpAdapterId) -> &'static str {
         AcpAdapterId::Stock => "stock",
         AcpAdapterId::Kiro => "kiro",
         AcpAdapterId::Grok => "grok",
+        AcpAdapterId::Opencode => "opencode",
     }
 }
 
@@ -6908,6 +6909,7 @@ fn parse_acp_adapter(value: &str) -> Option<AcpAdapterId> {
         "stock" => Some(AcpAdapterId::Stock),
         "kiro" => Some(AcpAdapterId::Kiro),
         "grok" => Some(AcpAdapterId::Grok),
+        "opencode" => Some(AcpAdapterId::Opencode),
         _ => None,
     }
 }
@@ -6922,6 +6924,7 @@ fn parse_backend_kind(value: &str) -> Option<BackendKind> {
         "antigravity" => Some(BackendKind::Antigravity),
         "hermes" => Some(BackendKind::Hermes),
         "grok" => Some(BackendKind::Grok),
+        "opencode" => Some(BackendKind::Opencode),
         _ => None,
     }
 }
@@ -6935,6 +6938,7 @@ fn backend_value(kind: BackendKind) -> &'static str {
         BackendKind::Antigravity => "antigravity",
         BackendKind::Hermes => "hermes",
         BackendKind::Grok => "grok",
+        BackendKind::Opencode => "opencode",
     }
 }
 
@@ -6947,6 +6951,7 @@ fn backend_label(kind: BackendKind) -> &'static str {
         BackendKind::Antigravity => "Antigravity",
         BackendKind::Hermes => "Hermes",
         BackendKind::Grok => "Grok",
+        BackendKind::Opencode => "OpenCode",
     }
 }
 
@@ -6959,6 +6964,7 @@ fn backend_description(kind: BackendKind) -> &'static str {
         BackendKind::Antigravity => "Google Antigravity CLI — agentic coding assistant",
         BackendKind::Hermes => "Hermes — native JSON-RPC agent backend",
         BackendKind::Grok => "Grok Build — ACP coding agent",
+        BackendKind::Opencode => "OpenCode — free multimodal ACP coding agent",
     }
 }
 
@@ -6971,6 +6977,7 @@ fn backend_badge_class(kind: BackendKind) -> &'static str {
         BackendKind::Antigravity => "backend-badge antigravity",
         BackendKind::Hermes => "backend-badge hermes",
         BackendKind::Grok => "backend-badge grok",
+        BackendKind::Opencode => "backend-badge opencode",
     }
 }
 
@@ -12385,6 +12392,7 @@ mod wasm_tests {
                 "Antigravity".to_owned(),
                 "Kiro".to_owned(),
                 "Grok".to_owned(),
+                "OpenCode".to_owned(),
             ],
             "the enable rows follow the preference order and use agent names"
         );

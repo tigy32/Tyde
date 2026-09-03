@@ -15,24 +15,26 @@ use settings_model::{
     TYDE_AGENT_CONTROL_MAX_DEPTH_MIN,
 };
 
-const CANONICAL_BACKENDS: [BackendKind; 6] = [
+const CANONICAL_BACKENDS: [BackendKind; 7] = [
     BackendKind::Kiro,
     BackendKind::Claude,
     BackendKind::Codex,
     BackendKind::Antigravity,
     BackendKind::Hermes,
     BackendKind::Grok,
+    BackendKind::Opencode,
 ];
 
 /// Preference order for choosing the initial default backend when seeding a
 /// brand-new install. Most capable / most widely used first.
-const DEFAULT_BACKEND_PREFERENCE: [BackendKind; 6] = [
+const DEFAULT_BACKEND_PREFERENCE: [BackendKind; 7] = [
     BackendKind::Claude,
     BackendKind::Codex,
     BackendKind::Antigravity,
     BackendKind::Hermes,
     BackendKind::Kiro,
     BackendKind::Grok,
+    BackendKind::Opencode,
 ];
 
 /// The agent spec a migrated Kiro launch profile receives.
@@ -980,6 +982,7 @@ fn backend_slug(backend_kind: BackendKind) -> &'static str {
         BackendKind::Antigravity => "antigravity",
         BackendKind::Hermes => "hermes",
         BackendKind::Grok => "grok",
+        BackendKind::Opencode => "opencode",
     }
 }
 

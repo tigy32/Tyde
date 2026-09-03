@@ -272,6 +272,7 @@ fn draft_backend_label(kind: BackendKind) -> &'static str {
         BackendKind::Antigravity => "Antigravity",
         BackendKind::Hermes => "Hermes",
         BackendKind::Grok => "Grok",
+        BackendKind::Opencode => "OpenCode",
     }
 }
 

@@ -33,6 +33,7 @@ The built-in adapter declarations are:
 | Antigravity | resume | interrupt | session, MCP, workspace, customization | — | — |
 | Hermes | list, resume | interrupt | session, MCP, workspace, customization | turn, context | subagents, background |
 | Grok | list, resume | image, interrupt | session, MCP, workspace, customization | turn, request, cumulative, context, breakdown, subscription | subagents |
+| OpenCode | list, resume | image | session, MCP, workspace, customization | turn, request, cumulative, context | subagents |
 
 Grok reports authoritative context breakdowns. No built-in adapter currently
 claims mid-turn steering. Background support does not imply autonomous

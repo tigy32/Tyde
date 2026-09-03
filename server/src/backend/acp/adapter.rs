@@ -311,6 +311,42 @@ pub trait AcpAgentAdapter: Send + Sync + 'static {
         None
     }
 
+    fn usage_for_tool_completion<'a>(
+        &'a self,
+        _session_id: &'a str,
+        _workspace_root: &'a str,
+        _tool_call_id: &'a str,
+    ) -> BoxFuture<'a, Option<Value>> {
+        Box::pin(async { None })
+    }
+
+    fn args_for_tool_request<'a>(
+        &'a self,
+        _session_id: &'a str,
+        _workspace_root: &'a str,
+        _tool_call_id: &'a str,
+    ) -> BoxFuture<'a, Option<Value>> {
+        Box::pin(async { None })
+    }
+
+    fn result_for_tool_completion<'a>(
+        &'a self,
+        _session_id: &'a str,
+        _workspace_root: &'a str,
+        _tool_call_id: &'a str,
+    ) -> BoxFuture<'a, Option<Value>> {
+        Box::pin(async { None })
+    }
+
+    fn provider_message_id_for_tool<'a>(
+        &'a self,
+        _session_id: &'a str,
+        _workspace_root: &'a str,
+        _tool_call_id: &'a str,
+    ) -> BoxFuture<'a, Option<String>> {
+        Box::pin(async { None })
+    }
+
     /// Extra environment for the agent process, merged over the spec's `env`.
     fn extra_env(&self) -> HashMap<String, String> {
         HashMap::new()
@@ -323,5 +359,8 @@ pub fn adapter_for_spec(spec: &AcpAgentSpec) -> Arc<dyn AcpAgentAdapter> {
         AcpAdapterId::Stock => Arc::new(super::adapters::stock::StockAdapter::new(spec.clone())),
         AcpAdapterId::Kiro => Arc::new(super::adapters::kiro::KiroAdapter::new(spec.clone())),
         AcpAdapterId::Grok => Arc::new(super::adapters::grok::GrokAdapter::new(spec.clone())),
+        AcpAdapterId::Opencode => Arc::new(super::adapters::opencode::OpenCodeAdapter::new(
+            spec.clone(),
+        )),
     }
 }

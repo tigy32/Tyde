@@ -22,6 +22,7 @@ const CLAUDE_CLI_CANDIDATES: &[&str] = &["claude"];
 const CODEX_CLI_CANDIDATES: &[&str] = &["codex"];
 const ANTIGRAVITY_CLI_CANDIDATES: &[&str] = &["agy"];
 const GROK_CLI_CANDIDATES: &[&str] = &["grok"];
+const OPENCODE_CLI_CANDIDATES: &[&str] = &["opencode"];
 const KIRO_CLI_CANDIDATES: &[&str] = &["kiro-cli", "kiro-cli-chat"];
 const HERMES_PYTHON_MODULE: &str = "tui_gateway.entry";
 const ACP_AGGREGATE_MAX_FAILURES: usize = 4;
@@ -87,6 +88,7 @@ pub(crate) async fn collect_backend_setup(
             BackendKind::Antigravity,
             BackendKind::Hermes,
             BackendKind::Grok,
+            BackendKind::Opencode,
         ]
         .into_iter()
         .map(|kind| probe_backend(kind, platform, acp_agents)),
@@ -114,6 +116,7 @@ pub(crate) fn stub_backend_setup() -> BackendSetupPayload {
         BackendKind::Antigravity,
         BackendKind::Hermes,
         BackendKind::Grok,
+        BackendKind::Opencode,
     ]
     .into_iter()
     .map(|kind| {
@@ -247,6 +250,9 @@ async fn probe_backend(
         }
         BackendKind::Hermes => probe_hermes_gateway().await,
         BackendKind::Grok => probe_candidates(&command_candidates(GROK_CLI_CANDIDATES)).await,
+        BackendKind::Opencode => {
+            probe_candidates(&command_candidates(OPENCODE_CLI_CANDIDATES)).await
+        }
     };
 
     backend_setup_info_from_probe(kind, platform, probe)
@@ -383,6 +389,10 @@ fn acp_agent_command_candidates(agent: &ConfiguredAcpAgent) -> Vec<String> {
             .map(|candidate| (*candidate).to_owned())
             .collect(),
         AcpAdapterId::Grok => GROK_CLI_CANDIDATES
+            .iter()
+            .map(|candidate| (*candidate).to_owned())
+            .collect(),
+        AcpAdapterId::Opencode => OPENCODE_CLI_CANDIDATES
             .iter()
             .map(|candidate| (*candidate).to_owned())
             .collect(),
@@ -870,6 +880,7 @@ fn docs_url(kind: BackendKind) -> String {
             "https://github.com/NousResearch/hermes-agent/tree/main/ui-tui".to_string()
         }
         BackendKind::Grok => "https://docs.x.ai/build/overview".to_string(),
+        BackendKind::Opencode => "https://opencode.ai/docs/cli/".to_string(),
     }
 }
 
@@ -928,6 +939,16 @@ fn install_command(kind: BackendKind, platform: HostPlatform) -> Option<BackendS
             display_command: None,
             runnable: true,
         }),
+        BackendKind::Opencode => Some(BackendSetupCommand {
+            title: "Install CLI".to_string(),
+            description: "Install OpenCode on this host.".to_string(),
+            command: match platform {
+                HostPlatform::Windows => "npm install -g opencode-ai".to_string(),
+                _ => "brew install anomalyco/tap/opencode".to_string(),
+            },
+            display_command: None,
+            runnable: true,
+        }),
     }
 }
 
@@ -980,6 +1001,13 @@ fn sign_in_command(
             title: "Sign In".to_string(),
             description: "Start the Grok login flow for this host.".to_string(),
             command: "grok login".to_string(),
+            display_command: None,
+            runnable: true,
+        }),
+        BackendKind::Opencode => Some(BackendSetupCommand {
+            title: "Sign In".to_string(),
+            description: "Add an OpenCode Zen API key or another provider credential.".to_string(),
+            command: "opencode providers login".to_string(),
             display_command: None,
             runnable: true,
         }),

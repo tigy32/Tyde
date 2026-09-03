@@ -76,6 +76,7 @@ pub fn pinned_models(backend: BackendKind) -> Vec<String> {
                 }),
         ],
         BackendKind::Grok => vec!["grok-4.6".to_owned(), "grok-4.6-build".to_owned()],
+        BackendKind::Opencode => vec!["opencode/mimo-v2.5-free".to_owned()],
         _ => Vec::new(),
     }
 }
@@ -188,6 +189,7 @@ fn enabled_backends() -> Vec<BackendKind> {
             BackendKind::Hermes,
             BackendKind::Antigravity,
             BackendKind::Grok,
+            BackendKind::Opencode,
         ],
         Ok(configured) => {
             let mut selected = Vec::new();
@@ -203,6 +205,7 @@ fn enabled_backends() -> Vec<BackendKind> {
                     "hermes" => BackendKind::Hermes,
                     "antigravity" | "agy" => BackendKind::Antigravity,
                     "grok" => BackendKind::Grok,
+                    "opencode" => BackendKind::Opencode,
                     other => panic!("unknown backend {other:?} in TYDE_REAL_BACKENDS"),
                 };
                 if !selected.contains(&backend) {
@@ -1485,6 +1488,7 @@ pub fn spawn_tool_backend_name(backend_kind: BackendKind) -> &'static str {
         BackendKind::Hermes => "hermes",
         BackendKind::Antigravity => "antigravity",
         BackendKind::Grok => "grok",
+        BackendKind::Opencode => "opencode",
     }
 }
 
@@ -2299,6 +2303,7 @@ fn backend_label(backend_kind: BackendKind) -> &'static str {
         BackendKind::Kiro => "kiro",
         BackendKind::Hermes => "hermes",
         BackendKind::Grok => "grok",
+        BackendKind::Opencode => "opencode",
     }
 }
 
@@ -2339,6 +2344,14 @@ fn host_settings(backend_kind: BackendKind) -> serde_json::Value {
             });
             settings["settings"]["backend_tier_configs"] =
                 json!({"grok": {"low": tier, "high": tier}});
+        }
+        BackendKind::Opencode => {
+            let tier = json!({
+                "model": {"string": "opencode/mimo-v2.5-free"},
+                "mode": {"string": "build"}
+            });
+            settings["settings"]["backend_tier_configs"] =
+                json!({"opencode": {"low": tier, "high": tier}});
         }
         _ => {}
     }

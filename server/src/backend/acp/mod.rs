@@ -58,6 +58,7 @@ pub struct AcpSpawnSpec {
     pub remote_args: Vec<String>,
     pub local_cwd: Option<String>,
     pub remote_cwd: Option<String>,
+    pub local_env: Vec<(String, String)>,
 }
 
 impl AcpSpawnSpec {
@@ -81,6 +82,7 @@ impl AcpSpawnSpec {
             remote_args,
             local_cwd: None,
             remote_cwd: None,
+            local_env: Vec::new(),
         }
     }
 
@@ -97,6 +99,11 @@ impl AcpSpawnSpec {
         if !cwd.trim().is_empty() {
             self.remote_cwd = Some(cwd);
         }
+        self
+    }
+
+    pub fn with_local_env(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.local_env.push((name.into(), value.into()));
         self
     }
 }
@@ -1147,6 +1154,7 @@ impl AcpRpc {
             if let Some(path) = process_env::resolved_child_process_path() {
                 cmd.env("PATH", path);
             }
+            cmd.envs(spec.local_env);
             if let Some(path) = spec
                 .local_cwd
                 .as_deref()

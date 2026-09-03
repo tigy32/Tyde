@@ -1125,7 +1125,8 @@ where
         | BackendKind::Claude
         | BackendKind::Codex
         | BackendKind::Hermes
-        | BackendKind::Grok => record.resumable,
+        | BackendKind::Grok
+        | BackendKind::Opencode => record.resumable,
     }
 }
 

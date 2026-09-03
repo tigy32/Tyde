@@ -930,6 +930,7 @@ pub fn ChatView(
                             BackendKind::Antigravity => ("backend-badge antigravity", "Antigravity"),
                             BackendKind::Hermes => ("backend-badge hermes", "Hermes"),
                             BackendKind::Grok => ("backend-badge grok", "Grok"),
+                            BackendKind::Opencode => ("backend-badge opencode", "OpenCode"),
                         };
                         view! { <span class=badge_class>{label}</span> }
                     })}
