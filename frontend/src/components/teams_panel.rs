@@ -2297,6 +2297,7 @@ pub(crate) fn backend_kind_label(kind: BackendKind) -> &'static str {
         BackendKind::Codex => "Codex",
         BackendKind::Antigravity => "Antigravity",
         BackendKind::Hermes => "Hermes",
+        BackendKind::Grok => "Grok",
     }
 }
 
@@ -2308,6 +2309,7 @@ fn backend_kind_value(kind: BackendKind) -> &'static str {
         BackendKind::Codex => "codex",
         BackendKind::Antigravity => "antigravity",
         BackendKind::Hermes => "hermes",
+        BackendKind::Grok => "grok",
     }
 }
 

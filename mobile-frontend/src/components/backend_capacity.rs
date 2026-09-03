@@ -27,6 +27,7 @@ fn backend_label(kind: BackendKind) -> &'static str {
         BackendKind::Codex => "Codex",
         BackendKind::Antigravity => "Antigravity",
         BackendKind::Hermes => "Hermes",
+        BackendKind::Grok => "Grok",
         BackendKind::Kiro => "Kiro",
         BackendKind::Tycode => "Tycode",
     }
@@ -40,6 +41,7 @@ fn backend_rank(kind: BackendKind) -> usize {
         BackendKind::Codex => 0,
         BackendKind::Claude => 1,
         BackendKind::Hermes => 2,
+        BackendKind::Grok => 5,
         BackendKind::Antigravity => 3,
         BackendKind::Tycode => 4,
         BackendKind::Kiro => 5,

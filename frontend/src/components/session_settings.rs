@@ -572,6 +572,7 @@ pub fn SessionSettingsBar(
             BackendKind::Codex => "Session Settings (Codex)",
             BackendKind::Antigravity => "Session Settings (Antigravity)",
             BackendKind::Hermes => "Session Settings (Hermes)",
+            BackendKind::Grok => "Session Settings (Grok)",
             BackendKind::Kiro => "Session Settings (Kiro)",
             BackendKind::Tycode => "Session Settings",
         }
@@ -584,6 +585,7 @@ pub fn SessionSettingsBar(
             BackendKind::Codex => "Codex settings unavailable — check installation",
             BackendKind::Antigravity => "Antigravity settings unavailable — check installation",
             BackendKind::Hermes => "Hermes settings unavailable — check installation",
+            BackendKind::Grok => "Grok settings unavailable — check installation",
             BackendKind::Tycode => "Tycode settings unavailable",
         }
     }
@@ -595,6 +597,7 @@ pub fn SessionSettingsBar(
             BackendKind::Codex => "Codex settings are loading...",
             BackendKind::Antigravity => "Antigravity settings are loading...",
             BackendKind::Hermes => "Hermes settings are loading...",
+            BackendKind::Grok => "Grok settings are loading...",
             BackendKind::Tycode => "Tycode settings are loading...",
         }
     }

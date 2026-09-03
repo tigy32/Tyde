@@ -645,6 +645,7 @@ pub enum BackendKind {
     Codex,
     Antigravity,
     Hermes,
+    Grok,
 }
 
 impl BackendKind {
@@ -659,7 +660,7 @@ impl BackendKind {
     pub const fn supports_image_input(self) -> bool {
         match self {
             Self::Kiro | Self::Claude | Self::Codex | Self::Hermes => true,
-            Self::Tycode | Self::Antigravity => false,
+            Self::Tycode | Self::Antigravity | Self::Grok => false,
         }
     }
 }
@@ -694,6 +695,7 @@ pub enum AcpAdapterId {
     #[default]
     Stock,
     Kiro,
+    Grok,
 }
 
 /// How to launch one ACP agent. Carried by a launch profile whose

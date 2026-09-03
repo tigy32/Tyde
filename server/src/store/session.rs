@@ -1121,9 +1121,11 @@ where
             !antigravity_record_is_permanently_non_resumable(record)
                 && is_antigravity_resumable(&record.id)
         }
-        BackendKind::Kiro | BackendKind::Claude | BackendKind::Codex | BackendKind::Hermes => {
-            record.resumable
-        }
+        BackendKind::Kiro
+        | BackendKind::Claude
+        | BackendKind::Codex
+        | BackendKind::Hermes
+        | BackendKind::Grok => record.resumable,
     }
 }
 

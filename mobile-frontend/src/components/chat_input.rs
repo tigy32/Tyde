@@ -871,6 +871,7 @@ fn backend_value(backend: protocol::BackendKind) -> &'static str {
         protocol::BackendKind::Codex => "codex",
         protocol::BackendKind::Antigravity => "antigravity",
         protocol::BackendKind::Hermes => "hermes",
+        protocol::BackendKind::Grok => "grok",
     }
 }
 
@@ -882,6 +883,7 @@ fn backend_label(backend: protocol::BackendKind) -> &'static str {
         protocol::BackendKind::Codex => "Codex",
         protocol::BackendKind::Antigravity => "Antigravity",
         protocol::BackendKind::Hermes => "Hermes",
+        protocol::BackendKind::Grok => "Grok",
     }
 }
 

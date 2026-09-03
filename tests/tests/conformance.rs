@@ -3262,6 +3262,19 @@ fn subagent_prompt(backend: BackendKind, workspace: &Path, first: &str, second: 
             workspace_root(workspace),
             workspace_root(workspace),
         ),
+        BackendKind::Grok => format!(
+            "{behavior} You must use Grok's native spawn_subagent tool twice in parallel, with \
+             background=true, and then use get_command_or_subagent_output to wait for both. Do \
+             not use search_tool, use_tool, any Tyde MCP tool, or any file/terminal tool in the \
+             parent. In each spawn_subagent prompt, require the child to use its terminal tool \
+             exactly once: the first child must run `printf '{first}\\n' > {}/{HELLO_FILE} && cat \
+             {}/{HELLO_FILE}`, and the second must run `printf '{second}\\n' > {}/{BG_FILE} && cat \
+             {}/{BG_FILE}`.",
+            workspace_root(workspace),
+            workspace_root(workspace),
+            workspace_root(workspace),
+            workspace_root(workspace),
+        ),
         _ => behavior,
     }
 }
@@ -3310,7 +3323,7 @@ fn nested_native_subagent_prompt(backend: BackendKind, workspace: &Path, payload
              spawn.",
             workspace.display()
         ),
-        BackendKind::Tycode | BackendKind::Kiro => {
+        BackendKind::Tycode | BackendKind::Kiro | BackendKind::Grok => {
             "Use the backend's native spawn-agent and wait collaboration tools.".to_owned()
         }
     };

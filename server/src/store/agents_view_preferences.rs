@@ -933,6 +933,7 @@ fn canonicalize_backends(mut backends: Vec<BackendKind>) -> Vec<BackendKind> {
         BackendKind::Codex => 2,
         BackendKind::Antigravity => 3,
         BackendKind::Hermes => 4,
+        BackendKind::Grok => 5,
     });
     backends.dedup();
     backends

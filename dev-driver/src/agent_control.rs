@@ -337,6 +337,7 @@ impl AgentControlHandle {
             BackendKind::Codex => 2,
             BackendKind::Antigravity => 3,
             BackendKind::Hermes => 4,
+            BackendKind::Grok => 5,
             BackendKind::Tycode => 5,
         });
         ListLaunchOptionsResult {

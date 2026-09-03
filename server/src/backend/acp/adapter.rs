@@ -19,7 +19,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use futures_util::future::BoxFuture;
-use protocol::{AcpAdapterId, AcpAgentSpec};
+use protocol::{AcpAdapterId, AcpAgentSpec, BackendKind};
 use serde_json::Value;
 
 use super::AcpSpawnSpec;
@@ -123,6 +123,14 @@ pub trait AcpAgentAdapter: Send + Sync + 'static {
     /// Human-readable agent name used in spawn failures and setup errors.
     fn display_name(&self) -> &str;
 
+    fn backend_kind(&self) -> BackendKind {
+        BackendKind::Kiro
+    }
+
+    fn agent_name(&self) -> &str {
+        "kiro"
+    }
+
     /// Resolve the working directories for a session. The default puts the
     /// agent in the first workspace root and reports that same root as scope;
     /// override when the agent needs a scratch directory.
@@ -183,6 +191,27 @@ pub trait AcpAgentAdapter: Send + Sync + 'static {
     /// message content is the exception, not the rule.
     fn sanitize_stream_text<'a>(&self, text: &'a str) -> Cow<'a, str> {
         Cow::Borrowed(text)
+    }
+
+    fn normalize_tool_name<'a>(
+        &self,
+        tool_name: &'a str,
+        _args: &Value,
+        _params: &Value,
+    ) -> Cow<'a, str> {
+        Cow::Borrowed(tool_name)
+    }
+
+    fn defer_tool_request(&self, _kind: &str, _args: &Value) -> bool {
+        false
+    }
+
+    fn refine_tool_request(
+        &self,
+        _completion: &super::AcpToolCallCompletion,
+        _request_payload: &Value,
+    ) -> Option<Value> {
+        None
     }
 
     /// Enumerate resumable sessions. The default returns none, which is
@@ -289,5 +318,6 @@ pub fn adapter_for_spec(spec: &AcpAgentSpec) -> Arc<dyn AcpAgentAdapter> {
     match spec.adapter {
         AcpAdapterId::Stock => Arc::new(super::adapters::stock::StockAdapter::new(spec.clone())),
         AcpAdapterId::Kiro => Arc::new(super::adapters::kiro::KiroAdapter::new(spec.clone())),
+        AcpAdapterId::Grok => Arc::new(super::adapters::grok::GrokAdapter::new(spec.clone())),
     }
 }

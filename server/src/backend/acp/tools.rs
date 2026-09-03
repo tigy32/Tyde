@@ -16,9 +16,16 @@ use super::AcpToolCallCompletion;
 /// Field names an agent might use for a shell command's working directory.
 const WORKING_DIR_KEYS: &[&str] = &["working_dir", "workingDir", "cwd", "working_directory"];
 /// Field names an agent might use for the replacement text of an edit.
-const EDIT_AFTER_KEYS: &[&str] = &["newStr", "new_str", "file_text", "content", "newText"];
+const EDIT_AFTER_KEYS: &[&str] = &[
+    "newStr",
+    "new_str",
+    "new_string",
+    "file_text",
+    "content",
+    "newText",
+];
 /// Field names an agent might use for the original text of an edit.
-const EDIT_BEFORE_KEYS: &[&str] = &["oldStr", "old_str", "oldText"];
+const EDIT_BEFORE_KEYS: &[&str] = &["oldStr", "old_str", "old_string", "oldText"];
 
 fn first_str<'a>(value: &'a Value, keys: &[&str]) -> Option<&'a str> {
     keys.iter()
@@ -55,7 +62,7 @@ pub(crate) fn read_paths(args: &Value) -> Vec<String> {
             return paths;
         }
     }
-    ["path", "file_path", "filePath"]
+    ["path", "file_path", "filePath", "target_file"]
         .iter()
         .find_map(|key| {
             args.get(*key)
@@ -95,7 +102,8 @@ pub async fn default_map_tool_request(kind: &str, args: &Value, workspace_root: 
         }
         "edit" => {
             let Some(file_path) =
-                first_str(args, &["path", "file_path", "filePath"]).filter(|path| !path.is_empty())
+                first_str(args, &["path", "file_path", "filePath", "target_file"])
+                    .filter(|path| !path.is_empty())
             else {
                 return other();
             };

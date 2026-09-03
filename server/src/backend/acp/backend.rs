@@ -12,9 +12,11 @@ use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use protocol::{
     BackendCapacityState, CapacityBucket, CapacityBucketId, CapacityCoverage, CapacityMeasure,
     CapacityPlanLabel, CapacityReport, CapacityReset, CapacityScope, CapacitySource,
-    CapacityUnavailableReason, CapacityWindow, ChatMessageId, ContextBreakdown, ImageData,
-    MessageTokenUsage, ModelInfo, ReasoningData, TokenUsage, TokenUsageUnavailableReason,
-    ToolExecutionOutcome, ToolExecutionResult, ToolRequestType, ToolUseData, ValueProvenance,
+    CapacityUnavailableReason, CapacityWindow, ChatMessageId, ContextBreakdown,
+    CurrentContextUsage, ImageData, MessageMetadataUpdateData, MessageTokenUsage, ModelInfo,
+    ModelRequestId, ModelRequestTokenUsage, ModelTurnId, ReasoningData, TokenUsage,
+    TokenUsageScope, TokenUsageUnavailableReason, ToolExecutionOutcome, ToolExecutionResult,
+    ToolRequestType, ToolUseData, ValueProvenance,
 };
 
 use crate::acp::adapter::{
@@ -37,7 +39,6 @@ use crate::process_env;
 use crate::sub_agent::SubAgentEmitter;
 use crate::subprocess::ImageAttachment;
 
-pub(crate) const KIRO_AGENT_NAME: &str = "kiro";
 pub(crate) const KIRO_ADMIN_SESSION_SUBDIR: &str = ".tyde/kiro-admin";
 pub(crate) const KIRO_EPHEMERAL_SESSION_SUBDIR: &str = ".tyde/kiro-ephemeral";
 const KIRO_SCHEMA_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -540,14 +541,12 @@ impl KiroSession {
         let capacity_probe = (!mode.admin_session)
             .then(|| adapter.capacity_probe_spec(&roots))
             .flatten();
+        let agent_name = adapter.agent_name().to_owned();
         let inner = Arc::new(KiroInner {
             adapter,
             capabilities,
             bridge,
-            emitter: Arc::new(TurnEmitter::new_for_agent(
-                event_tx,
-                AgentName(KIRO_AGENT_NAME),
-            )),
+            emitter: Arc::new(TurnEmitter::new_for_agent(event_tx, AgentName(&agent_name))),
             shutting_down: AtomicBool::new(false),
             ssh_host: mode.ssh_host,
             capacity_probe,
@@ -578,6 +577,11 @@ impl KiroSession {
                 replay_assistant_reasoning: String::new(),
                 replay_assistant_message_emitted_since_user: false,
                 replay_error: None,
+                grok_turn_sequence: 0,
+                grok_request_usages: Vec::new(),
+                grok_last_message_id: None,
+                grok_pending_response_end: None,
+                grok_pending_turn_end: None,
             }),
         });
 
@@ -646,6 +650,17 @@ struct KiroState {
     replay_assistant_reasoning: String,
     replay_assistant_message_emitted_since_user: bool,
     replay_error: Option<String>,
+    grok_turn_sequence: u64,
+    grok_request_usages: Vec<GrokRequestUsage>,
+    grok_last_message_id: Option<ChatMessageId>,
+    grok_pending_response_end: Option<Value>,
+    grok_pending_turn_end: Option<Value>,
+}
+
+struct GrokRequestUsage {
+    usage: TokenUsage,
+    current_context_usage: Option<CurrentContextUsage>,
+    context_breakdown: Option<ContextBreakdown>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -673,16 +688,19 @@ pub(crate) struct KiroToolContext {
     pub(crate) tool_type: Value,
     is_mcp_tool: bool,
     request_emitted: bool,
+    defer_request_until_completion: bool,
     pending_completion: Option<PendingToolCompletion>,
 }
 
 fn kiro_is_startup_mcp_tool(tool_name: &str, servers: &[StartupMcpServer]) -> bool {
     servers.iter().any(|server| {
         let marker = format!("@{}/", server.name);
+        let grok_marker = format!("{}__", server.name);
         tool_name
             .split_whitespace()
             .any(|part| part.contains(&marker))
             || tool_name.contains(&marker)
+            || tool_name.starts_with(&grok_marker)
     })
 }
 
@@ -710,7 +728,7 @@ impl KiroInner {
         self.capacity_state.lock().await.emitter = Some(emitter.clone());
         if self.capacity_probe.is_none() {
             emitter.on_backend_capacity(
-                protocol::BackendKind::Kiro,
+                self.adapter.backend_kind(),
                 BackendCapacityState::Unsupported {
                     reason: protocol::CapacityUnsupportedReason::ExternalProvider,
                 },
@@ -742,7 +760,7 @@ impl KiroInner {
         tokio::spawn(async move {
             let capacity = inner.read_kiro_capacity().await;
             inner.capacity_state.lock().await.in_flight = false;
-            emitter.on_backend_capacity(protocol::BackendKind::Kiro, capacity);
+            emitter.on_backend_capacity(inner.adapter.backend_kind(), capacity);
         });
     }
 
@@ -847,7 +865,16 @@ impl KiroInner {
                 "this backend cannot cancel background command {tool_call_id}"
             )),
             SessionCommand::SendMessage { message, images } => {
-                self.state.lock().await.provider_turn_quarantined = false;
+                {
+                    let mut state = self.state.lock().await;
+                    state.provider_turn_quarantined = false;
+                    if self.adapter.backend_kind() == protocol::BackendKind::Grok {
+                        state.grok_turn_sequence = state.grok_turn_sequence.saturating_add(1);
+                        state.grok_request_usages.clear();
+                        state.grok_last_message_id = None;
+                        state.grok_pending_response_end = None;
+                    }
+                }
                 self.emit_user_message_added(&message, images.as_deref());
                 self.emitter.typing_status_changed(true);
 
@@ -1003,8 +1030,14 @@ impl KiroInner {
                     .bridge
                     .notify("session/cancel", json!({ "sessionId": session_id }))
                     .await;
+                let terminal_result = if self.adapter.backend_kind() == protocol::BackendKind::Grok
+                {
+                    self.bridge.kill_active_terminals().await
+                } else {
+                    Ok(())
+                };
                 self.abort_active_turn("Operation cancelled").await;
-                result
+                result.and(terminal_result)
             }
             SessionCommand::GetSettings => {
                 let state = self.state.lock().await;
@@ -1119,7 +1152,9 @@ impl KiroInner {
                 .and_then(Value::as_array)
                 .ok_or_else(|| format!("ACP session/list response missing sessions: {response}"))?;
             for session in page_sessions {
-                if let Some(session) = acp_session_info_to_backend_session(session) {
+                if let Some(session) =
+                    acp_session_info_to_backend_session(session, self.adapter.backend_kind())
+                {
                     sessions.push(session);
                 }
             }
@@ -1275,6 +1310,31 @@ impl KiroInner {
             return Err(format!("Failed to finish Kiro session replay: {err}"));
         }
 
+        if self.adapter.backend_kind() == protocol::BackendKind::Grok {
+            let unresolved = {
+                let mut state = self.state.lock().await;
+                let unresolved = state
+                    .active_tool_contexts
+                    .keys()
+                    .cloned()
+                    .collect::<Vec<_>>();
+                for tool_call_id in &unresolved {
+                    state.completed_tool_call_ids.insert(tool_call_id.clone());
+                }
+                state.active_tool_contexts.clear();
+                state.tool_call_aliases.clear();
+                unresolved
+            };
+            for tool_call_id in unresolved {
+                self.emitter.tool_completed(
+                    &tool_call_id,
+                    ToolExecutionOutcome::Cancelled {
+                        message: "Grok does not replay historical tool results".to_owned(),
+                    },
+                );
+            }
+        }
+
         {
             let mut state = self.state.lock().await;
             if let Some(error) = state.replay_error.take() {
@@ -1412,7 +1472,28 @@ impl KiroInner {
                 if !self.accept_replay_notification_session(params).await {
                     return;
                 }
-                self.handle_normalized_update(normalized.session_update, &normalized.params)
+                let mut normalized_params = normalized.params;
+                if self.adapter.backend_kind() == protocol::BackendKind::Grok
+                    && matches!(normalized.session_update, "response_end" | "turn_end")
+                {
+                    let session_id = self.state.lock().await.session_id.clone();
+                    if let Ok(info) = self
+                        .bridge
+                        .request("_x.ai/session/info", json!({ "sessionId": session_id }))
+                        .await
+                    {
+                        normalized_params["_tydeSessionInfo"] = info;
+                    }
+                    if normalized.session_update == "turn_end"
+                        && let Ok(usage) = self
+                            .bridge
+                            .request("_x.ai/session/usage", json!({ "sessionId": session_id }))
+                            .await
+                    {
+                        normalized_params["_tydeSessionUsage"] = usage;
+                    }
+                }
+                self.handle_normalized_update(normalized.session_update, &normalized_params)
                     .await;
             }
         }
@@ -1431,9 +1512,16 @@ impl KiroInner {
                 .and_then(Value::as_str);
             match (expected, actual) {
                 (Some(expected), Some(actual)) if expected == actual => None,
-                (Some(_), Some(_)) => Some(
-                    "Kiro session replay received an event for a different session".to_string(),
-                ),
+                (Some(_), Some(actual))
+                    if self.adapter.backend_kind() == protocol::BackendKind::Grok
+                        && actual == state.session_id =>
+                {
+                    None
+                }
+                (Some(expected), Some(actual)) => Some(format!(
+                    "{} session replay expected {expected} but received {actual}",
+                    self.adapter.display_name()
+                )),
                 (Some(_), None) => {
                     Some("Kiro session replay event omitted its session identity".to_string())
                 }
@@ -1511,6 +1599,11 @@ impl KiroInner {
     /// here, so an agent with a proprietary notification family gets exactly
     /// the same handling as a conforming one.
     async fn dispatch_session_update(&self, update_type: &str, update: &Value) {
+        if self.adapter.backend_kind() == protocol::BackendKind::Grok
+            && matches!(update_type, "agent_message_chunk" | "agent_thought_chunk")
+        {
+            self.flush_pending_grok_response_end().await;
+        }
         match update_type {
             "agent_message_chunk" => self.handle_agent_message_chunk(update).await,
             "user_message_chunk" => self.handle_user_message_chunk(update).await,
@@ -1519,6 +1612,7 @@ impl KiroInner {
             "tool_call_update" => self.handle_tool_call_update(update).await,
             "error" => self.handle_error_notification(update).await,
             "plan" => self.handle_plan_update(update),
+            "response_end" => self.handle_grok_response_end(update).await,
             // Not part of the standard update family; adapters for agents that
             // signal end-of-turn out of band normalize onto this.
             "turn_end" => {
@@ -1526,8 +1620,12 @@ impl KiroInner {
                     self.flush_replay_assistant_message().await;
                     return;
                 }
-                self.finalize_active_stream_if_any(Some(update.clone()), true)
-                    .await;
+                if self.adapter.backend_kind() == protocol::BackendKind::Grok {
+                    self.handle_grok_turn_end(update).await;
+                } else {
+                    self.finalize_active_stream_if_any(Some(update.clone()), true)
+                        .await;
+                }
             }
             "current_mode_update" => {
                 if let Some(mode) = extract_current_mode(update) {
@@ -1743,13 +1841,17 @@ impl KiroInner {
             return;
         }
 
-        let Some(request) = parse_tool_call_request(params) else {
+        let Some(mut request) = parse_tool_call_request(params) else {
             self.set_replay_error(format!(
                 "Kiro session replay contained tool_call without toolCallId: {params}"
             ))
             .await;
             return;
         };
+        request.tool_name = self
+            .adapter
+            .normalize_tool_name(&request.tool_name, &request.args, params)
+            .into_owned();
 
         let raw_tool_call_id = normalize_tool_call_id_fragment(&request.tool_call_id);
         self.append_replay_assistant_chunk(extract_kiro_chat_message_id(params), "", false)
@@ -1793,6 +1895,7 @@ impl KiroInner {
                     tool_type: tool_type.clone(),
                     is_mcp_tool,
                     request_emitted: true,
+                    defer_request_until_completion: false,
                     pending_completion: None,
                 },
             );
@@ -1927,13 +2030,21 @@ impl KiroInner {
             return;
         }
 
-        let Some(request) = parse_tool_call_request(params) else {
+        let Some(mut request) = parse_tool_call_request(params) else {
             self.emitter.subprocess_stderr(&format!(
                 "Ignoring ACP tool_call without toolCallId: {params}"
             ));
             return;
         };
+        request.tool_name = self
+            .adapter
+            .normalize_tool_name(&request.tool_name, &request.args, params)
+            .into_owned();
         let raw_tool_call_id = normalize_tool_call_id_fragment(&request.tool_call_id);
+        let defer_request_until_completion = self.adapter.defer_tool_request(
+            params.get("kind").and_then(Value::as_str).unwrap_or(""),
+            &request.args,
+        );
 
         let incoming_message_id = extract_kiro_message_id(params);
         let (workspace_root, is_mcp_tool) = {
@@ -1966,6 +2077,7 @@ impl KiroInner {
                     tool_type: tool_type.clone(),
                     is_mcp_tool,
                     request_emitted: false,
+                    defer_request_until_completion,
                     pending_completion: None,
                 });
             let prev_tool_type = context.tool_type.clone();
@@ -2043,11 +2155,13 @@ impl KiroInner {
             if let Some(response) = response {
                 self.emitter
                     .declare_streaming_tools(&response, vec![declaration]);
-                self.emitter
-                    .tool_request(&canonical_id, kiro_tool_request_type(tool_type));
-                let mut state = self.state.lock().await;
-                if let Some(context) = state.active_tool_contexts.get_mut(&canonical_id) {
-                    context.request_emitted = true;
+                if !defer_request_until_completion {
+                    self.emitter
+                        .tool_request(&canonical_id, kiro_tool_request_type(tool_type));
+                    let mut state = self.state.lock().await;
+                    if let Some(context) = state.active_tool_contexts.get_mut(&canonical_id) {
+                        context.request_emitted = true;
+                    }
                 }
             }
         }
@@ -2088,7 +2202,11 @@ impl KiroInner {
         // The first result ends the response that issued the calls. Every call
         // of a batch has arrived by now, so the closing `StreamEnd` carries all
         // of them and the client can tell they came from one response.
-        self.finalize_active_stream_if_any(None, false).await;
+        if self.adapter.backend_kind() == protocol::BackendKind::Grok {
+            self.flush_pending_grok_response_end().await;
+        } else {
+            self.finalize_active_stream_if_any(None, false).await;
+        }
 
         let backfill_after_path = {
             let state = self.state.lock().await;
@@ -2144,10 +2262,17 @@ impl KiroInner {
             None
         };
 
+        let mut emit_request_now: Option<(String, Value)> = None;
         let mut emit_completion_now: Option<(String, PendingToolCompletion)> = None;
         {
             let mut state = self.state.lock().await;
             if let Some(context) = state.active_tool_contexts.get_mut(&completion.tool_call_id) {
+                if let Some(refined) = self
+                    .adapter
+                    .refine_tool_request(&completion, &context.tool_type)
+                {
+                    context.tool_type = refined;
+                }
                 if let Some(after_contents) = backfilled_after_contents.clone() {
                     let current_after = context
                         .tool_type
@@ -2184,6 +2309,11 @@ impl KiroInner {
                     error,
                     task_update,
                 };
+                if context.defer_request_until_completion && !context.request_emitted {
+                    context.request_emitted = true;
+                    emit_request_now =
+                        Some((completion.tool_call_id.clone(), context.tool_type.clone()));
+                }
                 if context.request_emitted {
                     emit_completion_now = Some((completion.tool_call_id.clone(), pending));
                 } else {
@@ -2207,6 +2337,10 @@ impl KiroInner {
             }
         }
 
+        if let Some((tool_call_id, tool_type)) = emit_request_now {
+            self.emitter
+                .tool_request(&tool_call_id, kiro_tool_request_type(tool_type));
+        }
         if let Some((tool_call_id, completion)) = emit_completion_now {
             self.emitter.tool_completed(
                 &tool_call_id,
@@ -2219,6 +2353,17 @@ impl KiroInner {
             if let Some(tasks) = completion.task_update {
                 self.emitter.task_update(&tasks);
             }
+        }
+        let pending_turn_end = {
+            let mut state = self.state.lock().await;
+            if state.active_tool_contexts.is_empty() {
+                state.grok_pending_turn_end.take()
+            } else {
+                None
+            }
+        };
+        if let Some(update) = pending_turn_end {
+            self.finalize_grok_turn_end(&update).await;
         }
     }
 
@@ -2245,6 +2390,7 @@ impl KiroInner {
                 let description = step
                     .get("title")
                     .or_else(|| step.get("description"))
+                    .or_else(|| step.get("content"))
                     .and_then(Value::as_str)
                     .unwrap_or("step")
                     .to_string();
@@ -2358,7 +2504,122 @@ impl KiroInner {
         self.emit_replay_message(replay).await;
     }
 
-    async fn finalize_active_stream_if_any(&self, usage: Option<Value>, end_typing: bool) {
+    async fn handle_grok_response_end(&self, update: &Value) {
+        self.flush_pending_grok_response_end().await;
+        self.state.lock().await.grok_pending_response_end = Some(update.clone());
+    }
+
+    async fn flush_pending_grok_response_end(&self) {
+        let Some(update) = self.state.lock().await.grok_pending_response_end.take() else {
+            return;
+        };
+        let request_usage = normalize_token_usage(Some(&update))
+            .and_then(|value| serde_json::from_value::<TokenUsage>(value).ok())
+            .map(grok_request_usage_with_cache);
+        let (current_context_usage, context_breakdown) = request_usage
+            .as_ref()
+            .map(|usage| grok_context_telemetry(&update, usage))
+            .unwrap_or((None, None));
+        let message_id = self
+            .finalize_active_stream_if_any(Some(update.clone()), false)
+            .await;
+
+        let mut state = self.state.lock().await;
+        state.grok_last_message_id = message_id;
+        if let Some(usage) = request_usage {
+            state.grok_request_usages.push(GrokRequestUsage {
+                usage,
+                current_context_usage,
+                context_breakdown,
+            });
+        }
+    }
+
+    async fn handle_grok_turn_end(&self, update: &Value) {
+        self.flush_pending_grok_response_end().await;
+        if !self.state.lock().await.active_tool_contexts.is_empty() {
+            self.state.lock().await.grok_pending_turn_end = Some(update.clone());
+            return;
+        }
+        self.finalize_grok_turn_end(update).await;
+    }
+
+    async fn finalize_grok_turn_end(&self, update: &Value) {
+        let turn = normalize_token_usage(Some(update))
+            .and_then(|value| serde_json::from_value::<TokenUsage>(value).ok());
+        let cumulative = update
+            .get("_tydeSessionUsage")
+            .and_then(find_usage_object)
+            .and_then(|value| normalize_token_usage(Some(value)))
+            .and_then(|value| serde_json::from_value::<TokenUsage>(value).ok());
+
+        let (turn_id, requests, last_message_id, model) = {
+            let mut state = self.state.lock().await;
+            let turn_id = ModelTurnId(format!("{}:{}", state.session_id, state.grok_turn_sequence));
+            (
+                turn_id,
+                std::mem::take(&mut state.grok_request_usages),
+                state.grok_last_message_id.take(),
+                state.model.clone().unwrap_or_else(|| "grok".to_owned()),
+            )
+        };
+
+        if let Some(turn) = turn.as_ref() {
+            let cumulative = cumulative.clone().unwrap_or_else(|| turn.clone());
+            for (sequence, request) in requests.iter().enumerate() {
+                self.emitter
+                    .model_request_token_usage(&ModelRequestTokenUsage {
+                        request_id: ModelRequestId {
+                            turn_id: turn_id.clone(),
+                            sequence: u32::try_from(sequence + 1).unwrap_or(u32::MAX),
+                        },
+                        request: request.usage.clone(),
+                        turn: turn.clone(),
+                        cumulative: cumulative.clone(),
+                        model_context_window: request.current_context_usage.as_ref().and_then(
+                            |usage| usage.known().map(|(_, context_window)| context_window),
+                        ),
+                        current_context_usage: request.current_context_usage.clone(),
+                        estimated_context_breakdown: request.context_breakdown.clone(),
+                    });
+            }
+
+            if let Some(message_id) = last_message_id {
+                let request = requests.last().map(|request| request.usage.clone());
+                self.emitter
+                    .message_metadata_updated(MessageMetadataUpdateData {
+                        message_id,
+                        model_info: Some(ModelInfo { model }),
+                        token_usage: Some(MessageTokenUsage {
+                            request: request.map_or(
+                                TokenUsageScope::Unavailable {
+                                    reason: TokenUsageUnavailableReason::BackendDidNotReport,
+                                },
+                                |usage| TokenUsageScope::Known {
+                                    usage: Box::new(usage),
+                                },
+                            ),
+                            turn: TokenUsageScope::Known {
+                                usage: Box::new(turn.clone()),
+                            },
+                            cumulative: TokenUsageScope::Known {
+                                usage: Box::new(cumulative),
+                            },
+                        }),
+                        context_breakdown: requests
+                            .last()
+                            .and_then(|request| request.context_breakdown.clone()),
+                    });
+            }
+        }
+        self.emitter.typing_status_changed(false);
+    }
+
+    async fn finalize_active_stream_if_any(
+        &self,
+        usage: Option<Value>,
+        end_typing: bool,
+    ) -> Option<ChatMessageId> {
         let active = {
             let mut state = self.state.lock().await;
             state.active_response.take().map(|response| {
@@ -2371,10 +2632,15 @@ impl KiroInner {
         };
 
         if let Some((response, text, tool_calls)) = active {
+            let message_id = response.message_id();
             self.emit_stream_end(response, text, usage, tool_calls, end_typing)
                 .await;
+            Some(message_id)
         } else if end_typing {
             self.emitter.typing_status_changed(false);
+            None
+        } else {
+            None
         }
     }
 
@@ -2416,13 +2682,23 @@ impl KiroInner {
             "Finalizing Kiro response stream"
         );
         let normalized_usage = normalize_token_usage(token_usage.as_ref());
-        let context_breakdown = normalized_usage
-            .as_ref()
-            .map(estimate_context_breakdown_from_usage)
-            .and_then(|value| serde_json::from_value::<ContextBreakdown>(value).ok());
-        let message_token_usage = normalized_usage
-            .as_ref()
-            .map(kiro_message_token_usage)
+        let context_breakdown = if self.adapter.backend_kind() == protocol::BackendKind::Grok {
+            normalized_usage
+                .as_ref()
+                .and_then(|usage| serde_json::from_value::<TokenUsage>(usage.clone()).ok())
+                .and_then(|usage| {
+                    grok_context_telemetry(token_usage.as_ref().unwrap_or(&Value::Null), &usage).1
+                })
+        } else {
+            normalized_usage
+                .as_ref()
+                .map(estimate_context_breakdown_from_usage)
+                .and_then(|value| serde_json::from_value::<ContextBreakdown>(value).ok())
+        };
+        let message_token_usage = self
+            .adapter
+            .map_usage(token_usage.as_ref())
+            .or_else(|| normalized_usage.as_ref().map(kiro_message_token_usage))
             .unwrap_or_else(|| {
                 MessageTokenUsage::unavailable(TokenUsageUnavailableReason::BackendDidNotReport)
             });
@@ -3123,6 +3399,7 @@ pub(crate) fn normalize_token_usage(raw: Option<&Value>) -> Option<Value> {
             "cachedInputTokens",
             "cache_read_input_tokens",
             "cacheReadInputTokens",
+            "cachedReadTokens",
         ],
     )
     .unwrap_or(0);
@@ -3232,6 +3509,14 @@ pub(crate) fn normalize_token_usage(raw: Option<&Value>) -> Option<Value> {
     }))
 }
 
+pub(crate) fn grok_request_usage_with_cache(mut usage: TokenUsage) -> TokenUsage {
+    usage.total_tokens = usage
+        .total_tokens
+        .saturating_add(usage.cached_prompt_tokens.unwrap_or(0))
+        .saturating_add(usage.cache_creation_input_tokens.unwrap_or(0));
+    usage
+}
+
 fn usage_u64(value: &Value, keys: &[&str]) -> Option<u64> {
     for key in keys {
         let Some(raw) = value.get(*key) else {
@@ -3252,6 +3537,80 @@ fn usage_u64(value: &Value, keys: &[&str]) -> Option<u64> {
         }
     }
     None
+}
+
+fn find_usage_object(value: &Value) -> Option<&Value> {
+    if value.is_object()
+        && ["input_tokens", "inputTokens", "total_tokens", "totalTokens"]
+            .iter()
+            .any(|key| value.get(*key).is_some())
+    {
+        return Some(value);
+    }
+    match value {
+        Value::Object(object) => object.values().find_map(find_usage_object),
+        Value::Array(values) => values.iter().find_map(find_usage_object),
+        _ => None,
+    }
+}
+
+fn find_context_object(value: &Value) -> Option<&Value> {
+    if value.is_object()
+        && value.get("used").is_some()
+        && value.get("total").is_some()
+        && value.get("systemPromptTokens").is_some()
+    {
+        return Some(value);
+    }
+    match value {
+        Value::Object(object) => object.values().find_map(find_context_object),
+        Value::Array(values) => values.iter().find_map(find_context_object),
+        _ => None,
+    }
+}
+
+fn grok_context_telemetry(
+    value: &Value,
+    request_usage: &TokenUsage,
+) -> (Option<CurrentContextUsage>, Option<ContextBreakdown>) {
+    let Some(context) = value.get("_tydeSessionInfo").and_then(find_context_object) else {
+        return (None, None);
+    };
+    let used = context.get("used").and_then(Value::as_u64).unwrap_or(0);
+    let total = context.get("total").and_then(Value::as_u64).unwrap_or(0);
+    if used == 0 || total < used {
+        return (None, None);
+    }
+
+    let input_tokens = request_usage.prompt_tokens();
+    let system_tokens = context
+        .get("systemPromptTokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        .min(input_tokens);
+    let remaining = input_tokens.saturating_sub(system_tokens);
+    let tool_tokens = context
+        .get("toolDefinitionsTokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        .min(remaining);
+    let conversation_tokens = remaining.saturating_sub(tool_tokens);
+    let breakdown = ContextBreakdown {
+        system_prompt_bytes: system_tokens.saturating_mul(4),
+        tool_io_bytes: tool_tokens.saturating_mul(4),
+        conversation_history_bytes: conversation_tokens.saturating_mul(4),
+        reasoning_bytes: 0,
+        context_injection_bytes: 0,
+        input_tokens,
+        context_window: total,
+    };
+    (
+        Some(CurrentContextUsage::Known {
+            input_tokens: used,
+            context_window: total,
+        }),
+        Some(breakdown),
+    )
 }
 
 pub(crate) fn estimate_context_breakdown_from_usage(token_usage: &Value) -> Value {
@@ -3684,7 +4043,10 @@ pub(crate) fn pick_workspace_root(workspace_roots: &[String]) -> Result<String, 
 /// `resumable` is reported as true because `session/list` exists to enumerate
 /// sessions for resuming. An agent that lists a session it cannot load is
 /// misbehaving, and `session/load` reports that at the point it happens.
-fn acp_session_info_to_backend_session(info: &Value) -> Option<BackendSession> {
+fn acp_session_info_to_backend_session(
+    info: &Value,
+    backend_kind: BackendKind,
+) -> Option<BackendSession> {
     let session_id = info
         .get("sessionId")
         .and_then(Value::as_str)
@@ -3702,7 +4064,7 @@ fn acp_session_info_to_backend_session(info: &Value) -> Option<BackendSession> {
 
     Some(BackendSession {
         id: SessionId(session_id.to_string()),
-        backend_kind: BackendKind::Kiro,
+        backend_kind,
         workspace_roots: cwd.map(|cwd| vec![cwd.to_string()]).unwrap_or_default(),
         title: info
             .get("title")
@@ -4192,6 +4554,18 @@ pub(crate) fn resolve_session_settings(
     )
 }
 
+fn resolve_agent_session_settings(config: &BackendSpawnConfig) -> protocol::SessionSettingsValues {
+    if config
+        .acp_agent
+        .as_ref()
+        .is_some_and(|agent| agent.adapter == protocol::AcpAdapterId::Grok)
+    {
+        crate::backend::grok::resolve_session_settings(config)
+    } else {
+        resolve_session_settings(config)
+    }
+}
+
 impl Backend for KiroBackend {
     fn capabilities() -> tyde_agent_adapter::BackendCapabilities {
         // Kiro 2.20.1 acknowledges session/cancel but lets an active shell
@@ -4293,7 +4667,7 @@ impl Backend for KiroBackend {
             ));
 
             let handle = session.command_handle();
-            let resolved_settings = resolve_session_settings(&config);
+            let resolved_settings = resolve_agent_session_settings(&config);
             if !resolved_settings.0.is_empty()
                 && let Err(err) = handle
                     .execute(SessionCommand::UpdateSettings {
@@ -4493,7 +4867,7 @@ impl Backend for KiroBackend {
                 .lock()
                 .expect("kiro session_id mutex poisoned") = Some(session_id);
 
-            let resolved_settings = resolve_session_settings(&config);
+            let resolved_settings = resolve_agent_session_settings(&config);
             if !resolved_settings.0.is_empty()
                 && let Err(err) = handle
                     .execute(SessionCommand::UpdateSettings {

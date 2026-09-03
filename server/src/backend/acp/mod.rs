@@ -17,6 +17,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use command_group::{AsyncCommandGroup, AsyncGroupChild};
 use serde_json::{Value, json};
@@ -168,6 +169,20 @@ impl AcpBridge {
         }
     }
 
+    pub async fn kill_active_terminals(&self) -> Result<(), String> {
+        let terminals = self
+            .terminals
+            .lock()
+            .await
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        for terminal in terminals {
+            kill_terminal(terminal).await?;
+        }
+        Ok(())
+    }
+
     pub async fn handle_server_request(
         &self,
         id: Value,
@@ -302,7 +317,7 @@ impl AcpBridge {
             .filter(|cmd| !cmd.is_empty())
             .ok_or("terminal/create requires non-empty 'command'")?;
 
-        let args = params
+        let mut args = params
             .get("args")
             .and_then(Value::as_array)
             .map(|values| {
@@ -313,6 +328,11 @@ impl AcpBridge {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
+
+        let (command, normalized_args) = normalize_grok_shell_command(command, &args);
+        if let Some(normalized_args) = normalized_args {
+            args = normalized_args;
+        }
 
         let env_vars = params
             .get("env")
@@ -501,6 +521,35 @@ impl AcpBridge {
             }))
         }
     }
+}
+
+fn normalize_grok_shell_command<'a>(
+    command: &'a str,
+    args: &[String],
+) -> (&'a str, Option<Vec<String>>) {
+    if !args.is_empty() {
+        return (command, None);
+    }
+    for shell in ["/bin/bash", "/bin/zsh", "/bin/sh"] {
+        let prefix = format!("{shell} -lc ");
+        let Some(raw_script) = command.strip_prefix(&prefix) else {
+            continue;
+        };
+        let script = raw_script.trim();
+        let script = if script.len() >= 2
+            && ((script.starts_with('"') && script.ends_with('"'))
+                || (script.starts_with('\'') && script.ends_with('\'')))
+        {
+            &script[1..script.len() - 1]
+        } else {
+            script
+        };
+        return (
+            shell,
+            Some(vec!["-lc".to_owned(), script.replace("\\\"", "\"")]),
+        );
+    }
+    (command, None)
 }
 
 #[derive(Clone)]
@@ -958,28 +1007,16 @@ async fn refresh_terminal_status(terminal: &Arc<Mutex<AcpTerminal>>) {
 async fn wait_for_terminal_exit(
     terminal: Arc<Mutex<AcpTerminal>>,
 ) -> Result<(Option<i32>, Option<String>), String> {
-    let child_opt = {
-        let mut guard = terminal.lock().await;
-        if guard.exit_code.is_some() || guard.exit_signal.is_some() {
-            return Ok((guard.exit_code, guard.exit_signal.clone()));
+    loop {
+        refresh_terminal_status(&terminal).await;
+        {
+            let guard = terminal.lock().await;
+            if guard.exit_code.is_some() || guard.exit_signal.is_some() {
+                return Ok((guard.exit_code, guard.exit_signal.clone()));
+            }
         }
-        guard.child.take()
-    };
-
-    if let Some(mut child) = child_opt {
-        let status = child
-            .wait()
-            .await
-            .map_err(|err| format!("Failed to wait for terminal process: {err}"))?;
-        let (exit_code, signal) = exit_status_pair(&status);
-        let mut guard = terminal.lock().await;
-        guard.exit_code = exit_code;
-        guard.exit_signal = signal.clone();
-        return Ok((exit_code, signal));
+        tokio::time::sleep(Duration::from_millis(25)).await;
     }
-
-    let guard = terminal.lock().await;
-    Ok((guard.exit_code, guard.exit_signal.clone()))
 }
 
 async fn kill_terminal(terminal: Arc<Mutex<AcpTerminal>>) -> Result<(), String> {

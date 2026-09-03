@@ -253,7 +253,13 @@ fn canonical_result_value(value: &Value) -> Value {
         tracing::debug!("normalized canonical tool result from ACP MCP envelope");
         return canonical_result_value(&parsed);
     }
-    for key in ["result", "structuredContent", "structured_content"] {
+    for key in [
+        "result",
+        "structuredContent",
+        "structured_content",
+        "output",
+        "OkayOutput",
+    ] {
         if let Some(candidate) = value.get(key) {
             let normalized = canonical_result_value(candidate);
             if normalized.is_object() {

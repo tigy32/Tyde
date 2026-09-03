@@ -21,6 +21,7 @@ use crate::process_env;
 const CLAUDE_CLI_CANDIDATES: &[&str] = &["claude"];
 const CODEX_CLI_CANDIDATES: &[&str] = &["codex"];
 const ANTIGRAVITY_CLI_CANDIDATES: &[&str] = &["agy"];
+const GROK_CLI_CANDIDATES: &[&str] = &["grok"];
 const KIRO_CLI_CANDIDATES: &[&str] = &["kiro-cli", "kiro-cli-chat"];
 const HERMES_PYTHON_MODULE: &str = "tui_gateway.entry";
 const ACP_AGGREGATE_MAX_FAILURES: usize = 4;
@@ -85,6 +86,7 @@ pub(crate) async fn collect_backend_setup(
             BackendKind::Codex,
             BackendKind::Antigravity,
             BackendKind::Hermes,
+            BackendKind::Grok,
         ]
         .into_iter()
         .map(|kind| probe_backend(kind, platform, acp_agents)),
@@ -111,6 +113,7 @@ pub(crate) fn stub_backend_setup() -> BackendSetupPayload {
         BackendKind::Codex,
         BackendKind::Antigravity,
         BackendKind::Hermes,
+        BackendKind::Grok,
     ]
     .into_iter()
     .map(|kind| {
@@ -243,6 +246,7 @@ async fn probe_backend(
             probe_candidates(&command_candidates(ANTIGRAVITY_CLI_CANDIDATES)).await
         }
         BackendKind::Hermes => probe_hermes_gateway().await,
+        BackendKind::Grok => probe_candidates(&command_candidates(GROK_CLI_CANDIDATES)).await,
     };
 
     backend_setup_info_from_probe(kind, platform, probe)
@@ -375,6 +379,10 @@ fn acp_agent_command_candidates(agent: &ConfiguredAcpAgent) -> Vec<String> {
     }
     match agent.adapter {
         AcpAdapterId::Kiro => KIRO_CLI_CANDIDATES
+            .iter()
+            .map(|candidate| (*candidate).to_owned())
+            .collect(),
+        AcpAdapterId::Grok => GROK_CLI_CANDIDATES
             .iter()
             .map(|candidate| (*candidate).to_owned())
             .collect(),
@@ -861,6 +869,7 @@ fn docs_url(kind: BackendKind) -> String {
         BackendKind::Hermes => {
             "https://github.com/NousResearch/hermes-agent/tree/main/ui-tui".to_string()
         }
+        BackendKind::Grok => "https://docs.x.ai/build/overview".to_string(),
     }
 }
 
@@ -906,6 +915,16 @@ fn install_command(kind: BackendKind, platform: HostPlatform) -> Option<BackendS
             title: "Install Hermes".to_string(),
             description: "Install Hermes Agent so the hermes executable is on PATH. Set HERMES_EXECUTABLE only if Tyde cannot resolve it.".to_string(),
             command: "curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash".to_string(),
+            display_command: None,
+            runnable: true,
+        }),
+        BackendKind::Grok => Some(BackendSetupCommand {
+            title: "Install CLI".to_string(),
+            description: "Install Grok Build on this host.".to_string(),
+            command: match platform {
+                HostPlatform::Windows => "npm install -g @xai-official/grok".to_string(),
+                _ => "curl -fsSL https://x.ai/cli/install.sh | bash".to_string(),
+            },
             display_command: None,
             runnable: true,
         }),
@@ -957,6 +976,13 @@ fn sign_in_command(
                 runnable: true,
             })
         }
+        BackendKind::Grok => Some(BackendSetupCommand {
+            title: "Sign In".to_string(),
+            description: "Start the Grok login flow for this host.".to_string(),
+            command: "grok login".to_string(),
+            display_command: None,
+            runnable: true,
+        }),
     }
 }
 

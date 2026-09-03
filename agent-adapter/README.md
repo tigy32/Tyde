@@ -32,10 +32,11 @@ The built-in adapter declarations are:
 | Codex | resume, fork | image, interrupt | session, MCP, workspace, customization | turn, request, context | subagents, background, initiated turns |
 | Antigravity | resume | interrupt | session, MCP, workspace, customization | — | — |
 | Hermes | list, resume | interrupt | session, MCP, workspace, customization | turn, context | subagents, background |
+| Grok | list, resume | interrupt | session, MCP, workspace, customization | turn, request, cumulative, context, breakdown | subagents |
 
-No built-in adapter currently claims authoritative context breakdowns or
-mid-turn steering. Background support does not imply autonomous continuation;
-Claude and Codex currently declare agent-initiated turns.
+Grok reports authoritative context breakdowns. No built-in adapter currently
+claims mid-turn steering. Background support does not imply autonomous
+continuation; Claude and Codex currently declare agent-initiated turns.
 
 ## Conformance validation
 
@@ -59,35 +60,31 @@ run.
 
 ## Paid qualification suite
 
-`CertificationCase` defines the catalog of narrow live contracts. Every case is an
-independent ignored test, so a model can iterate on one invariant with one cheap
-provider call. The aggregate `real_universal_backend_qualification_suite` runs
-the same catalog across every selected backend and reports all failures it can
-reach. Capability-gated cases cover lifecycle and stream identity, follow-up
-turns, usage and context, tools, interrupts, resume, workspace instructions,
-steering, skills, MCP, images, native subagents, background work, and
-agent-initiated continuation.
+Each case in `tests/tests/conformance.rs` is an independent ignored test, so an
+adapter can iterate on one flow before running the complete file. Capability-
+gated cases cover lifecycle and stream identity, follow-up turns, usage and
+context, tools, interrupts, resume, workspace instructions, steering, skills,
+MCP, images, native subagents, background work, and agent-initiated
+continuation.
 
 It never runs as part of ordinary repository validation. Explicitly authorize
 real calls and select backends with:
 
 ```sh
 TYDE_RUN_REAL_AI_TESTS=1 \
-TYDE_REAL_BACKENDS=claude,codex,kiro,hermes \
-cargo test -p tests --test backend \
-  real_universal_backend_qualification_suite -- --ignored --nocapture
+TYDE_REAL_BACKENDS=claude,codex,kiro,hermes,grok \
+cargo test -p tests --test conformance -- --ignored --nocapture
 ```
 
 Run one narrow case while iterating:
 
 ```sh
 TYDE_RUN_REAL_AI_TESTS=1 TYDE_REAL_BACKENDS=codex \
-cargo test -p tests --test backend \
-  real_cert_request_sequence_starts_at_one -- --ignored --nocapture
+cargo test -p tests --test conformance real_usage_accounting \
+  -- --ignored --nocapture --exact
 ```
 
-`TYDE_REAL_BACKENDS` accepts `claude`, `codex`, `kiro`, and `hermes`. A selected
-backend that is missing or unrunnable is a qualification failure, not a silent
-skip. Claude qualification calls are pinned to Haiku with `low` effort, and
-Codex calls are pinned to `gpt-5.6-luna` with `low` reasoning rather than
-inheriting potentially expensive local defaults.
+`TYDE_REAL_BACKENDS` accepts `claude`, `codex`, `antigravity`, `kiro`, `hermes`,
+and `grok`. A selected backend that is missing or unrunnable is a qualification
+failure, not a silent skip. Each backend is pinned to the suite's low-cost model
+and effort settings rather than inheriting potentially expensive local defaults.

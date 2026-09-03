@@ -115,6 +115,7 @@ pub(crate) fn backend_class(kind: protocol::BackendKind) -> &'static str {
         protocol::BackendKind::Codex => "backend-badge codex",
         protocol::BackendKind::Antigravity => "backend-badge antigravity",
         protocol::BackendKind::Hermes => "backend-badge hermes",
+        protocol::BackendKind::Grok => "backend-badge grok",
     }
 }
 
@@ -122,12 +123,13 @@ pub(crate) fn backend_class(kind: protocol::BackendKind) -> &'static str {
 /// alphabetical. Alphabetical order buried the two backends in daily use under
 /// ones that are rarely picked, on every list the user chooses from. This is
 /// the single source of that order; lists that need one sort by it.
-pub(crate) const BACKENDS_BY_PREFERENCE: [protocol::BackendKind; 5] = [
+pub(crate) const BACKENDS_BY_PREFERENCE: [protocol::BackendKind; 6] = [
     protocol::BackendKind::Codex,
     protocol::BackendKind::Claude,
     protocol::BackendKind::Hermes,
     protocol::BackendKind::Antigravity,
     protocol::BackendKind::Kiro,
+    protocol::BackendKind::Grok,
 ];
 
 /// Position in `BACKENDS_BY_PREFERENCE`, for use as a sort key.
@@ -146,6 +148,7 @@ pub(crate) fn backend_label(kind: protocol::BackendKind) -> &'static str {
         protocol::BackendKind::Codex => "Codex",
         protocol::BackendKind::Antigravity => "Antigravity",
         protocol::BackendKind::Hermes => "Hermes",
+        protocol::BackendKind::Grok => "Grok",
     }
 }
 

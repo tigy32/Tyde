@@ -16110,6 +16110,10 @@ fn backend_system_tag(backend: BackendKind) -> (AgentSystemTagId, String) {
             AgentSystemTagId("system:backend:hermes".to_owned()),
             "Hermes".to_owned(),
         ),
+        BackendKind::Grok => (
+            AgentSystemTagId("system:backend:grok".to_owned()),
+            "Grok".to_owned(),
+        ),
     }
 }
 
@@ -17852,7 +17856,8 @@ async fn backend_config_snapshots_for_enabled_backends(
             | BackendKind::Kiro
             | BackendKind::Claude
             | BackendKind::Codex
-            | BackendKind::Antigravity => {}
+            | BackendKind::Antigravity
+            | BackendKind::Grok => {}
         }
     }
     // The Hermes snapshot is published regardless of enablement, like the
@@ -17916,12 +17921,13 @@ async fn fan_out_backend_config_snapshots(state: &mut HostState, force_emit: boo
 }
 
 fn initial_backend_capacity_snapshots() -> HashMap<BackendKind, BackendCapacitySnapshot> {
-    const BACKENDS: [BackendKind; 5] = [
+    const BACKENDS: [BackendKind; 6] = [
         BackendKind::Kiro,
         BackendKind::Claude,
         BackendKind::Codex,
         BackendKind::Antigravity,
         BackendKind::Hermes,
+        BackendKind::Grok,
     ];
     BACKENDS
         .into_iter()
@@ -17988,7 +17994,8 @@ fn backend_capacity_snapshots(state: &HostState) -> Vec<BackendCapacitySnapshot>
         BackendKind::Codex => 2,
         BackendKind::Antigravity => 3,
         BackendKind::Hermes => 4,
-        BackendKind::Tycode => 5,
+        BackendKind::Grok => 5,
+        BackendKind::Tycode => 6,
     });
     snapshots
 }
@@ -18447,6 +18454,7 @@ fn session_schema_for_backend(
                 AcpSessionSchemaState::Pending | AcpSessionSchemaState::Unavailable(_) => None,
             }
         }
+        protocol::BackendKind::Grok => Some(session_settings_schema_for_backend(backend_kind)),
         protocol::BackendKind::Hermes => match &state.hermes_session_schema {
             HermesSessionSchemaState::Ready(schema) => Some(schema.clone()),
             HermesSessionSchemaState::Pending | HermesSessionSchemaState::Unavailable(_) => None,
@@ -18906,6 +18914,7 @@ fn backend_slug(backend_kind: protocol::BackendKind) -> &'static str {
         protocol::BackendKind::Codex => "codex",
         protocol::BackendKind::Antigravity => "antigravity",
         protocol::BackendKind::Hermes => "hermes",
+        protocol::BackendKind::Grok => "grok",
     }
 }
 
@@ -18917,6 +18926,7 @@ fn backend_launch_profile_label(backend_kind: protocol::BackendKind) -> &'static
         protocol::BackendKind::Codex => "Codex",
         protocol::BackendKind::Antigravity => "Antigravity",
         protocol::BackendKind::Hermes => "Hermes",
+        protocol::BackendKind::Grok => "Grok",
     }
 }
 

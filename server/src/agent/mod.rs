@@ -2662,6 +2662,17 @@ async fn spawn_backend(
             let session_id = Backend::session_id(&b);
             Ok((Box::new(b), events, session_id))
         }
+        BackendKind::Grok => {
+            let config = crate::backend::grok::configure(config);
+            let (b, events) =
+                KiroBackend::spawn(workspace_roots.clone(), config, initial_input).await?;
+            b.set_subagent_emitter(Arc::new(
+                sub_agent_context.emitter(agent_id.clone(), workspace_roots),
+            ))
+            .await;
+            let session_id = Backend::session_id(&b);
+            Ok((Box::new(b), events, session_id))
+        }
     }
 }
 
@@ -2725,6 +2736,16 @@ async fn resume_backend(
         BackendKind::Hermes => {
             let (b, events) =
                 HermesBackend::resume(workspace_roots.clone(), config, session_id).await?;
+            b.set_subagent_emitter(Arc::new(
+                sub_agent_context.emitter(agent_id.clone(), workspace_roots),
+            ))
+            .await;
+            (Box::new(b), events)
+        }
+        BackendKind::Grok => {
+            let config = crate::backend::grok::configure(config);
+            let (b, events) =
+                KiroBackend::resume(workspace_roots.clone(), config, session_id).await?;
             b.set_subagent_emitter(Arc::new(
                 sub_agent_context.emitter(agent_id.clone(), workspace_roots),
             ))
@@ -2803,6 +2824,9 @@ async fn fork_backend(
             let session_id = Backend::session_id(&b);
             Ok((Box::new(b), events, session_id))
         }
+        BackendKind::Grok => Err(BackendStartupError::unsupported(
+            crate::backend::backend_fork_unsupported_message(BackendKind::Grok),
+        )),
     }
 }
 
@@ -8080,7 +8104,11 @@ fn backend_startup_drop_cancels_workers(backend_kind: BackendKind) -> bool {
     // backend explicitly cancels or reaps work after its returned future drops.
     matches!(
         backend_kind,
-        BackendKind::Claude | BackendKind::Codex | BackendKind::Kiro | BackendKind::Hermes
+        BackendKind::Claude
+            | BackendKind::Codex
+            | BackendKind::Kiro
+            | BackendKind::Hermes
+            | BackendKind::Grok
     )
 }
 
@@ -10031,7 +10059,7 @@ fn backend_session_is_resumable(
             workspace_roots,
             resolved_spawn_config,
         ),
-        BackendKind::Kiro | BackendKind::Claude | BackendKind::Codex => true,
+        BackendKind::Kiro | BackendKind::Claude | BackendKind::Codex | BackendKind::Grok => true,
     }
 }
 

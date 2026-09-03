@@ -75,6 +75,7 @@ pub fn pinned_models(backend: BackendKind) -> Vec<String> {
                     }
                 }),
         ],
+        BackendKind::Grok => vec!["grok-4.6".to_owned(), "grok-4.6-build".to_owned()],
         _ => Vec::new(),
     }
 }
@@ -186,6 +187,7 @@ fn enabled_backends() -> Vec<BackendKind> {
             BackendKind::Kiro,
             BackendKind::Hermes,
             BackendKind::Antigravity,
+            BackendKind::Grok,
         ],
         Ok(configured) => {
             let mut selected = Vec::new();
@@ -200,6 +202,7 @@ fn enabled_backends() -> Vec<BackendKind> {
                     "kiro" | "acp" => BackendKind::Kiro,
                     "hermes" => BackendKind::Hermes,
                     "antigravity" | "agy" => BackendKind::Antigravity,
+                    "grok" => BackendKind::Grok,
                     other => panic!("unknown backend {other:?} in TYDE_REAL_BACKENDS"),
                 };
                 if !selected.contains(&backend) {
@@ -1481,6 +1484,7 @@ pub fn spawn_tool_backend_name(backend_kind: BackendKind) -> &'static str {
         BackendKind::Kiro => "kiro",
         BackendKind::Hermes => "hermes",
         BackendKind::Antigravity => "antigravity",
+        BackendKind::Grok => "grok",
     }
 }
 
@@ -2294,6 +2298,7 @@ fn backend_label(backend_kind: BackendKind) -> &'static str {
         BackendKind::Antigravity => "antigravity",
         BackendKind::Kiro => "kiro",
         BackendKind::Hermes => "hermes",
+        BackendKind::Grok => "grok",
     }
 }
 
@@ -2326,6 +2331,14 @@ fn host_settings(backend_kind: BackendKind) -> serde_json::Value {
                 .expect("serialize Hermes conformance tier");
             settings["settings"]["backend_tier_configs"] =
                 json!({"hermes": {"low": tier, "high": tier}});
+        }
+        BackendKind::Grok => {
+            let tier = json!({
+                "model": {"string": "grok-4.6"},
+                "mode": {"string": "low"}
+            });
+            settings["settings"]["backend_tier_configs"] =
+                json!({"grok": {"low": tier, "high": tier}});
         }
         _ => {}
     }
