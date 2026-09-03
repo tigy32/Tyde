@@ -29,6 +29,7 @@ use settings_model::{HostExecutablePath, HostLaunchProfileConfig};
 use serde_json::{Map, Value};
 use std::collections::{HashMap, HashSet};
 
+use crate::backend_statistics::BackendStatisticsPage;
 use crate::components::backend_capacity::SubscriptionCapacitySection;
 use crate::components::session_settings::{
     SessionSettingsControls, clear_invalid_dependent_select_values,
@@ -807,6 +808,7 @@ enum SettingsPage {
     Tab(SettingsTab),
     LaunchProfiles,
     Usage,
+    Statistics,
     Backend(BackendKind),
 }
 
@@ -816,7 +818,9 @@ impl SettingsPage {
             Self::Tab(tab) => tab.scope(),
             // All three are derived from the selected host's server-owned
             // state: its catalog, its profiles, its backends' own accounts.
-            Self::LaunchProfiles | Self::Usage | Self::Backend(_) => SettingsScope::Host,
+            Self::LaunchProfiles | Self::Usage | Self::Statistics | Self::Backend(_) => {
+                SettingsScope::Host
+            }
         }
     }
 }
@@ -1003,6 +1007,7 @@ pub fn SettingsPanel() -> impl IntoView {
                                     view! { <LaunchProfilesPage /> }.into_any()
                                 }
                                 SettingsPage::Usage => view! { <UsagePage /> }.into_any(),
+                                SettingsPage::Statistics => view! { <BackendStatisticsPage /> }.into_any(),
                             }}
                         </div>
                     </div>
@@ -1283,6 +1288,7 @@ fn BackendsNavGroup(
         let query = search_query.get();
         SettingsTab::Backends.matches_query(&query)
             || usage_page_matches_query(&query)
+            || statistics_page_matches_query(&query)
             || launch_profiles_page_matches_query(&query)
             || schema_backends(&state)
                 .into_iter()
@@ -1313,6 +1319,15 @@ fn BackendsNavGroup(
                             on:click=move |_| active_page.set(SettingsPage::Usage)
                         >
                             "Usage"
+                        </button>
+                    </Show>
+                    <Show when=move || statistics_page_matches_query(&search_query.get())>
+                        <button
+                            class="settings-nav-item"
+                            class:active=move || active_page.get() == SettingsPage::Statistics
+                            on:click=move |_| active_page.set(SettingsPage::Statistics)
+                        >
+                            "Statistics"
                         </button>
                     </Show>
                     <Show when=move || launch_profiles_page_matches_query(&search_query.get())>
@@ -2376,6 +2391,22 @@ fn usage_page_matches_query(query: &str) -> bool {
         "Rate limit",
         "Credits",
         "Plan",
+    ]
+    .iter()
+    .any(|text| text.to_lowercase().contains(&query))
+}
+
+fn statistics_page_matches_query(query: &str) -> bool {
+    if query.is_empty() {
+        return true;
+    }
+    let query = query.to_lowercase();
+    [
+        "Statistics",
+        "Latency",
+        "Throughput",
+        "Tokens",
+        "Performance",
     ]
     .iter()
     .any(|text| text.to_lowercase().contains(&query))
