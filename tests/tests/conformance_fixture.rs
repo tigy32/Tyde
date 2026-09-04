@@ -1788,6 +1788,7 @@ pub enum InterruptTrigger {
     AfterStreamedChars(usize),
     /// Once a tool card has opened, plus [`TOOL_STARTUP_GRACE`].
     AfterToolRequest,
+    ResponseContaining(&'static str),
 }
 
 /// How long the client waits for an interrupted turn to report idle.
@@ -1806,6 +1807,7 @@ const TOOL_STARTUP_GRACE: Duration = Duration::from_secs(3);
 /// A turn that was interrupted, and where the interrupt falls in it.
 pub struct Interrupted {
     turn: Turn,
+    after_completed_response: bool,
     /// How long between sending the interrupt and the turn reporting idle.
     /// `None` when it never did within [`INTERRUPT_DEADLINE`] — deciding
     /// whether that is a defect belongs to `conformance.rs`.
@@ -1813,6 +1815,10 @@ pub struct Interrupted {
 }
 
 impl Interrupted {
+    pub fn after_completed_response(&self) -> bool {
+        self.after_completed_response
+    }
+
     /// The turn itself, for the assertions that do not care that it was cut
     /// short.
     pub fn turn(&self) -> &Turn {
@@ -1898,6 +1904,9 @@ pub async fn interrupt_turn(
                     fire |= streamed >= *wanted;
                 }
                 (ChatEvent::ToolRequest(_), InterruptTrigger::AfterToolRequest) => fire = true,
+                (ChatEvent::StreamEnd(end), InterruptTrigger::ResponseContaining(marker)) => {
+                    fire |= end.message.content.contains(marker);
+                }
                 (ChatEvent::TypingStatusChanged(false), _) => panic!(
                     "{context}: the turn went idle before there was anything to interrupt \
                      ({streamed} character(s) streamed, {} tool request(s) seen). The prompt has \
@@ -1925,6 +1934,8 @@ pub async fn interrupt_turn(
         .expect("interrupt failed");
 
     let deadline = sent_at + INTERRUPT_DEADLINE;
+    let after_completed_response = matches!(trigger, InterruptTrigger::ResponseContaining(_));
+    let mut saw_cancellation = false;
     let mut settled_in = None;
     'settle: loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -1941,8 +1952,9 @@ pub async fn interrupt_turn(
                 for event in chat_events_in(&envelope) {
                     eprintln!("{label} {event:?}");
                     let idle = matches!(event, ChatEvent::TypingStatusChanged(false));
+                    saw_cancellation |= matches!(event, ChatEvent::OperationCancelled(_));
                     events.push(event);
-                    if idle {
+                    if idle && (!after_completed_response || saw_cancellation) {
                         settled_in = Some(sent_at.elapsed());
                         break 'settle;
                     }
@@ -1962,6 +1974,7 @@ pub async fn interrupt_turn(
             activity_stats: Vec::new(),
         },
         settled_in,
+        after_completed_response,
     }
 }
 

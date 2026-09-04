@@ -4059,6 +4059,7 @@ struct CodexState {
     turn_network_access: bool,
     active_turn_id: Option<String>,
     foreground_response_completed: bool,
+    interrupt_requested_turn_id: Option<String>,
     awaiting_root_turn_start: bool,
     /// Set when the user cancels while no root turn is tracked. A root turn
     /// that starts while this is set raced the cancel — the user has already
@@ -4156,6 +4157,7 @@ fn initial_codex_state(
         turn_network_access,
         active_turn_id: None,
         foreground_response_completed: false,
+        interrupt_requested_turn_id: None,
         awaiting_root_turn_start: false,
         interrupt_next_root_turn: false,
         pending_compaction: None,
@@ -7656,8 +7658,9 @@ impl CodexInner {
                     interrupting_compaction,
                     foreground_ended_with_background_work,
                 ) = {
-                    let state = self.state.lock().await;
+                    let mut state = self.state.lock().await;
                     let active_turn_id = state.active_turn_id.clone();
+                    state.interrupt_requested_turn_id = active_turn_id.clone();
                     let compaction_turn_id = state
                         .pending_compaction
                         .as_ref()
@@ -7670,13 +7673,29 @@ impl CodexInner {
                         active_turn_id.is_none() && compaction_turn_id.is_some(),
                         (!state.background_commands.is_empty()
                             || !state.subagent_streams.is_empty())
-                            && (state.active_turn_id.is_none()
-                                || state.foreground_response_completed),
+                            && state.active_turn_id.is_none()
+                            && compaction_turn_id.is_none()
+                            && !state.awaiting_root_turn_start
+                            && !state.background_wake_request_in_flight,
                     )
                 };
+                {
+                    let state = self.state.lock().await;
+                    tracing::info!(
+                        thread_id = %thread_id,
+                        turn_id = ?turn_id_opt,
+                        foreground_response_completed = state.foreground_response_completed,
+                        background_commands = state.background_commands.len(),
+                        subagent_streams = state.subagent_streams.len(),
+                        foreground_ended_with_background_work,
+                        "Codex interrupt routing state"
+                    );
+                }
                 eprintln!(
                     "TYDE CODEX CANCEL STATE turn_id={turn_id_opt:?} interrupting_compaction={interrupting_compaction} compaction_start_pending={compaction_start_pending}"
                 );
+                // An answer can finish before its provider turn releases the
+                // reservation that blocks queued messages.
                 if foreground_ended_with_background_work {
                     self.emitter.interrupt_acknowledged(
                         "Codex foreground turn already ended; background work continues.",
@@ -7908,6 +7927,7 @@ impl CodexInner {
                 state.effective_model = Some(model);
             }
             state.active_turn_id = None;
+            state.interrupt_requested_turn_id = None;
             state.active_stream = None;
             state.provider_supersessions_this_turn = 0;
             state.supersession_warning_emitted = false;
@@ -9904,6 +9924,7 @@ impl CodexInner {
                     state.background_wake_request_in_flight = false;
                     state.active_turn_id = Some(turn_id.clone());
                     state.foreground_response_completed = false;
+                    state.interrupt_requested_turn_id = None;
                     state.active_stream = None;
                     state.retired_unpublished_message_ids.clear();
                     state.provider_supersessions_this_turn = 0;
@@ -15074,6 +15095,7 @@ impl CodexInner {
             model_usage,
             terminated_background_commands,
             defer_idle_until_foreground_tools_complete,
+            completed_after_interrupt,
         ) = {
             let mut state = self.state.lock().await;
             if let Some((turn_id, token_usage)) = turn_usage {
@@ -15093,6 +15115,18 @@ impl CodexInner {
 
             let completed_turn_id =
                 extract_turn_id(params).or_else(|| state.active_turn_id.clone());
+            let requested_interrupt = completed_turn_id.is_some()
+                && state.interrupt_requested_turn_id == completed_turn_id;
+            if requested_interrupt {
+                state.interrupt_requested_turn_id = None;
+            }
+            let completed_after_interrupt = requested_interrupt && turn_status == "completed";
+            tracing::info!(
+                thread_id = %state.thread_id,
+                turn_id = ?completed_turn_id,
+                completed_after_interrupt,
+                "Codex turn completion reconciled with interrupt request"
+            );
             state.active_turn_id = None;
             state.foreground_response_completed = false;
             let mut open_item_without_completion = false;
@@ -15226,6 +15260,7 @@ impl CodexInner {
                 model_usage,
                 terminated_background_commands,
                 defer_idle_until_foreground_tools_complete,
+                completed_after_interrupt,
             )
         };
 
@@ -15296,7 +15331,7 @@ impl CodexInner {
             );
         }
 
-        if turn_status == "interrupted" {
+        if turn_status == "interrupted" || completed_after_interrupt {
             self.retire_idle_codex_subagents().await;
             // emitter.operation_cancelled runs the full cancel tail:
             // flush pending tools → OperationCancelled → TypingStatusChanged(false).

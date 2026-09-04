@@ -776,6 +776,61 @@ fn real_interruption() {
 
 #[test]
 #[ignore = "paid real-backend suite; use --run-ignored all with TYDE_RUN_REAL_AI_TESTS=1"]
+fn real_interrupt_after_background_response() {
+    run_scenario(
+        &[
+            BackendCapability::Interrupt,
+            BackendCapability::BackgroundTasks,
+        ],
+        |mut host| async move {
+            let agent = spawn_agent(&mut host, &launch_prompt()).await;
+            let launched = collect_turn(&mut host, &agent, &launch_prompt()).await;
+            assert_ready_handshake(&launched);
+            let prompt = background_prompt(
+                host.workspace(),
+                host.backend(),
+                BG_SECONDS_FOR_INTERRUPT,
+                BG_FILE,
+            );
+            let stopped = interrupt_turn(
+                &mut host,
+                &agent,
+                &prompt,
+                InterruptTrigger::ResponseContaining(BG_MARKER),
+            )
+            .await;
+            assert_cancellation_contract(&stopped);
+            assert_background_task_is_still_open(stopped.turn());
+            let follow_up = ask_expecting_delivery(&mut host, &agent, &launch_prompt()).await;
+            assert_ready_handshake(&follow_up);
+            let settled = drain_events_for(&mut host, BG_SETTLE).await;
+            assert_background_task_survived_the_interrupt(
+                stopped.turn(),
+                &stopped,
+                &settled,
+                host.workspace(),
+            );
+            let card_ids = stopped
+                .turn()
+                .tool_requests()
+                .map(|request| request.tool_call_id.clone())
+                .collect::<Vec<_>>();
+            assert_background_output_reached_its_card(
+                &stopped.label(),
+                &card_ids,
+                stopped
+                    .events()
+                    .iter()
+                    .chain(follow_up.events())
+                    .chain(&settled),
+            );
+            assert_universal_contract(&[launched, follow_up]);
+        },
+    );
+}
+
+#[test]
+#[ignore = "paid real-backend suite; use --run-ignored all with TYDE_RUN_REAL_AI_TESTS=1"]
 /// Hermes v0.20.6 made `session.resume.messages` the user-visible transcript;
 /// its live `session.history` projection can omit the persisted user turns.
 fn real_conversation_on_resumed_session() {
@@ -4646,9 +4701,22 @@ fn assert_cancellation_contract(interrupted: &Interrupted) {
         turn.label(),
         cancellations.len()
     );
-    let idles: Vec<usize> = event_positions(turn, |event| {
+    let cancelled_at = cancellations[0];
+    let mut idles: Vec<usize> = event_positions(turn, |event| {
         matches!(event, ChatEvent::TypingStatusChanged(false))
     });
+    if interrupted.after_completed_response() {
+        // Claude emits final StreamEnd and natural idle before the client's
+        // interrupt arrives. Keep that event, but distinguish it from the idle
+        // that must follow the cancellation acknowledgment on every backend.
+        let natural_idles = idles.iter().filter(|index| **index < cancelled_at).count();
+        assert!(
+            natural_idles <= 1,
+            "{}: the completed response reported idle {natural_idles} times before cancellation",
+            turn.label()
+        );
+        idles.retain(|index| *index > cancelled_at);
+    }
     assert_eq!(
         idles.len(),
         1,
@@ -4658,7 +4726,6 @@ fn assert_cancellation_contract(interrupted: &Interrupted) {
         idles.len()
     );
 
-    let cancelled_at = cancellations[0];
     let idle_at = idles[0];
     assert!(
         cancelled_at < idle_at,
