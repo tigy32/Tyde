@@ -5,8 +5,8 @@ use protocol::{
     AgentBootstrapEvent, AgentBootstrapPayload, AgentStartPayload, BackendKind, ChatEvent,
     DeleteSessionPayload, Envelope, FetchSessionHistoryPayload, FrameKind, ListSessionsPayload,
     NewAgentPayload, Project, ProjectCreatePayload, ProjectNotifyPayload, ProjectRootPath,
-    SessionHistoryPayload, SessionId, SessionListPayload, SpawnAgentParams, SpawnAgentPayload,
-    StreamPath,
+    SessionHistoryPayload, SessionId, SessionListPayload, SessionSettingValue,
+    SessionSettingsValues, SpawnAgentParams, SpawnAgentPayload, StreamPath,
 };
 use server::backend::mock::{MockScript, MockTurn};
 use std::time::Duration;
@@ -511,6 +511,157 @@ async fn list_sessions_and_resume_agent() {
     );
     assert_eq!(list.sessions[0].id, session.id);
     assert_eq!(list.sessions[0].message_count, 2);
+}
+
+#[tokio::test]
+async fn restart_restores_open_agents_and_preserves_settings() {
+    let mut fixture = Fixture::new().await;
+    let mut settings = SessionSettingsValues::default();
+    settings.0.insert(
+        "effort".to_owned(),
+        SessionSettingValue::String("high".to_owned()),
+    );
+
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            name: Some("survives restart".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::New {
+                workspace_roots: vec!["/tmp/restart-survivor".to_owned()],
+                prompt: "remember this turn".to_owned(),
+                images: None,
+                backend_kind: BackendKind::Claude,
+                launch_profile_id: None,
+                cost_hint: None,
+                access_mode: Default::default(),
+                session_settings: Some(settings.clone()),
+            },
+        })
+        .await
+        .expect("spawn restart survivor");
+    let survivor: NewAgentPayload = expect_next_event(&mut fixture.client, "survivor NewAgent")
+        .await
+        .parse_payload()
+        .expect("parse survivor NewAgent");
+    let survivor_start = expect_agent_start_on_stream(
+        &mut fixture.client,
+        &survivor.instance_stream,
+        "survivor start",
+    )
+    .await;
+    let survivor_session = survivor_start.session_id.expect("survivor session id");
+    expect_turn_on_stream(
+        &mut fixture.client,
+        &survivor.instance_stream,
+        "mock backend response to: remember this turn",
+    )
+    .await;
+
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            name: Some("closed before restart".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::New {
+                workspace_roots: vec!["/tmp/restart-closed".to_owned()],
+                prompt: "do not restore me".to_owned(),
+                images: None,
+                backend_kind: BackendKind::Claude,
+                launch_profile_id: None,
+                cost_hint: None,
+                access_mode: Default::default(),
+                session_settings: None,
+            },
+        })
+        .await
+        .expect("spawn agent that will be closed");
+    let closed: NewAgentPayload = expect_next_event(&mut fixture.client, "closed NewAgent")
+        .await
+        .parse_payload()
+        .expect("parse closed NewAgent");
+    let _ = expect_agent_start_on_stream(
+        &mut fixture.client,
+        &closed.instance_stream,
+        "closed agent start",
+    )
+    .await;
+    expect_turn_on_stream(
+        &mut fixture.client,
+        &closed.instance_stream,
+        "mock backend response to: do not restore me",
+    )
+    .await;
+    fixture
+        .client
+        .close_agent(&closed.instance_stream)
+        .await
+        .expect("close second agent");
+    fixture::next_frame_matching_on(&mut fixture.client, "closed AgentClosed", |env| {
+        env.kind == FrameKind::AgentClosed
+            && env
+                .parse_payload::<protocol::AgentClosedPayload>()
+                .is_ok_and(|payload| payload.agent_id == closed.agent_id)
+    })
+    .await;
+
+    let bootstrap = fixture.restart_host().await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if fixture.agent_ids().await.len() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("one open agent should be reconstructed after restart");
+
+    let restored = if let Some(agent) = bootstrap
+        .agents
+        .iter()
+        .find(|agent| agent.session_id.as_ref() == Some(&survivor_session))
+    {
+        agent.clone()
+    } else {
+        fixture::next_frame_matching_on(&mut fixture.client, "restored NewAgent", |env| {
+            env.kind == FrameKind::NewAgent
+                && env
+                    .parse_payload::<NewAgentPayload>()
+                    .is_ok_and(|agent| agent.session_id.as_ref() == Some(&survivor_session))
+        })
+        .await
+        .parse_payload()
+        .expect("parse restored NewAgent")
+    };
+    assert_ne!(restored.agent_id, survivor.agent_id);
+    assert_eq!(restored.name, "survives restart");
+    assert_eq!(restored.workspace_roots, vec!["/tmp/restart-survivor"]);
+    assert_eq!(restored.session_id.as_ref(), Some(&survivor_session));
+
+    let restored_bootstrap = expect_raw_event_on_stream(
+        &mut fixture.client,
+        &restored.instance_stream,
+        FrameKind::AgentBootstrap,
+        "restored AgentBootstrap",
+    )
+    .await
+    .parse_payload::<AgentBootstrapPayload>()
+    .expect("parse restored AgentBootstrap");
+    assert_bootstrap_tail_messages(&restored_bootstrap, &["remember this turn"]);
+    let restored_settings = restored_bootstrap
+        .events
+        .iter()
+        .find_map(|event| match event {
+            AgentBootstrapEvent::SessionSettings(payload) => Some(&payload.values),
+            _ => None,
+        })
+        .expect("restored bootstrap includes session settings");
+    assert_eq!(restored_settings, &settings);
 }
 
 #[tokio::test]

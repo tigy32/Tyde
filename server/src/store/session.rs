@@ -5,10 +5,10 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use protocol::{
-    BackendKind, CompactionMethod, CompactionMetrics, CompactionMutation, CompactionOperationId,
-    CompactionTrigger, CustomAgentId, KIRO_BACKEND, KIRO_LAUNCH_PROFILE_ID, LEGACY_ACP_BACKEND,
-    LaunchProfileId, ProjectId, SessionId, SessionListScope, SessionSettingsValues, SessionSummary,
-    TaskList,
+    AgentOrigin, AgentWorkflowMetadata, BackendKind, CompactionMethod, CompactionMetrics,
+    CompactionMutation, CompactionOperationId, CompactionTrigger, CustomAgentId, KIRO_BACKEND,
+    KIRO_LAUNCH_PROFILE_ID, LEGACY_ACP_BACKEND, LaunchProfileId, ProjectId, SessionId,
+    SessionListScope, SessionSettingsValues, SessionSummary, TaskList, TeamId, TeamMemberId,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -85,6 +85,17 @@ pub(crate) struct FinishCompactionOperation {
     pub message: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct SessionRestoreState {
+    pub origin: AgentOrigin,
+    #[serde(default)]
+    pub team_id: Option<TeamId>,
+    #[serde(default)]
+    pub team_member_id: Option<TeamMemberId>,
+    #[serde(default)]
+    pub workflow: Option<AgentWorkflowMetadata>,
+}
+
 pub(crate) struct CommitCompactedBinding {
     pub operation_id: CompactionOperationId,
     pub expected_generation: u64,
@@ -144,6 +155,11 @@ pub struct SessionRecord {
     pub compaction_epoch: u64,
     #[serde(default)]
     pub(crate) compaction_operations: Vec<CompactionOperationRecord>,
+    /// Present while this saved session owns an open agent card. The actor and
+    /// provider process are intentionally not durable; this descriptor lets a
+    /// replacement host reconstruct them through the ordinary resume path.
+    #[serde(default)]
+    pub(crate) restore_state: Option<SessionRestoreState>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -277,6 +293,7 @@ impl SessionStore {
                     active_backend_binding_generation: 0,
                     compaction_epoch: 0,
                     compaction_operations: Vec::new(),
+                    restore_state: None,
                 });
 
             entry.backend_kind = session.backend_kind;
@@ -394,6 +411,22 @@ impl SessionStore {
         self.update(session_id, |record| {
             record.session_settings = Some(settings);
             record.updated_at_ms = now_ms();
+        })
+    }
+
+    pub(crate) fn set_restore_state(
+        &self,
+        session_id: &SessionId,
+        restore_state: SessionRestoreState,
+    ) -> Result<(), String> {
+        self.update(session_id, |record| {
+            record.restore_state = Some(restore_state);
+        })
+    }
+
+    pub(crate) fn clear_restore_state(&self, session_id: &SessionId) -> Result<(), String> {
+        self.update(session_id, |record| {
+            record.restore_state = None;
         })
     }
 

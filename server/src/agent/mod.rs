@@ -46,8 +46,8 @@ use crate::host::{
 };
 use crate::review::ReviewRegistryHandle;
 use crate::store::session::{
-    CommitCompactedBinding, CompactionOperationRecord, FinishCompactionOperation, SessionStore,
-    StoredCompactionState,
+    CommitCompactedBinding, CompactionOperationRecord, FinishCompactionOperation,
+    SessionRestoreState, SessionStore, StoredCompactionState,
 };
 use crate::store::transcript::TranscriptStore;
 use crate::stream::Stream;
@@ -10056,6 +10056,15 @@ async fn persist_agent_session(
         )?;
         store.set_access_mode(session_id, resolved_spawn_config.access_mode)?;
         store.set_session_settings(session_id, current_session_settings.clone())?;
+        store.set_restore_state(
+            session_id,
+            SessionRestoreState {
+                origin: current_start.origin,
+                team_id: current_start.team_id.clone(),
+                team_member_id: current_start.team_member_id.clone(),
+                workflow: current_start.workflow.clone(),
+            },
+        )?;
         if let Some(alias) = pending_alias.take() {
             match alias.persistence {
                 InitialAgentAliasPersistence::GeneratedIfNoUserAlias => {
