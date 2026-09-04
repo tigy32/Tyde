@@ -2415,6 +2415,7 @@ async fn task_token_usage_marks_missing_then_partial_descendant_usage_partial() 
         "mock backend response to: root usage",
     )
     .await;
+    let (mut usage_client, _) = fixture.connect_with_bootstrap().await;
     let reservation = fixture
         .reserve_next_mock_launch(
             "partial-descendant-child",
@@ -2437,7 +2438,7 @@ async fn task_token_usage_marks_missing_then_partial_descendant_usage_partial() 
     // Before the child reports any usage, the aggregate is Partial and the
     // descendant scope is wholly Unavailable — never a fabricated zero.
     let missing = expect_task_token_usage_matching(
-        &mut fixture.client,
+        &mut usage_client,
         &root.agent_id,
         "missing descendant aggregate",
         |payload| {
@@ -2511,7 +2512,7 @@ async fn task_token_usage_marks_missing_then_partial_descendant_usage_partial() 
     );
 
     let payload = expect_task_token_usage_matching(
-        &mut fixture.client,
+        &mut usage_client,
         &root.agent_id,
         "partial descendant aggregate",
         |payload| {
@@ -2593,7 +2594,7 @@ async fn task_token_usage_marks_missing_then_partial_descendant_usage_partial() 
     assert_eq!(closed.agent_id, child.agent_id);
 
     let after_close = expect_task_token_usage_matching(
-        &mut fixture.client,
+        &mut usage_client,
         &root.agent_id,
         "partial aggregate after child close",
         |payload| {
@@ -2685,6 +2686,7 @@ async fn task_token_usage_all_unavailable_omits_split_zeroes() {
         "mock backend response to: root missing usage",
     )
     .await;
+    let (mut usage_client, _) = fixture.connect_with_bootstrap().await;
     let reservation = fixture
         .reserve_next_mock_launch(
             "unavailable-child",
@@ -2704,7 +2706,7 @@ async fn task_token_usage_all_unavailable_omits_split_zeroes() {
     drop(reservation);
 
     let payload = expect_task_token_usage_matching(
-        &mut fixture.client,
+        &mut usage_client,
         &root.agent_id,
         "all-unavailable aggregate",
         |payload| {
