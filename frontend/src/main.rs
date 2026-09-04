@@ -1,5 +1,6 @@
 mod actions;
 mod app;
+mod backend_statistics;
 mod bridge;
 mod code_intel_dom;
 mod components;

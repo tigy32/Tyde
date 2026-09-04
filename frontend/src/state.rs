@@ -3759,6 +3759,12 @@ pub struct AppState {
     /// infers capacity from Tyde's own token usage. Cleared on host disconnect.
     pub backend_capacity:
         RwSignal<HashMap<String, HashMap<BackendKind, protocol::BackendCapacitySnapshot>>>,
+    /// Device-local, content-free observations derived from live protocol
+    /// events. The persisted store is bounded in `backend_statistics`; active
+    /// requests exist only in memory and are never reconstructed from replay.
+    pub backend_statistics: RwSignal<crate::backend_statistics::TelemetryStore>,
+    pub active_backend_requests:
+        RwSignal<HashMap<(String, AgentId), crate::backend_statistics::ActiveRequest>>,
     /// Server-owned backend-native settings snapshots (JSON-schema-driven,
     /// grouped), keyed by host id then backend kind. Each snapshot carries the
     /// backend's current settings document and grouped schemas, or an explicit
@@ -4187,6 +4193,8 @@ impl AppState {
             backend_config_schemas: RwSignal::new(HashMap::new()),
             backend_config_snapshots: RwSignal::new(HashMap::new()),
             backend_capacity: RwSignal::new(HashMap::new()),
+            backend_statistics: RwSignal::new(crate::backend_statistics::load_store()),
+            active_backend_requests: RwSignal::new(HashMap::new()),
             backend_native_settings: RwSignal::new(HashMap::new()),
             native_settings_save_state: RwSignal::new(HashMap::new()),
             pending_terminal_focus: RwSignal::new(None),
