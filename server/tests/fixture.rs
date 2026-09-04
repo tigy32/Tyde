@@ -1222,11 +1222,26 @@ async fn connect_client_with_bootstrap(
 ) -> (client::Connection, HostBootstrapPayload) {
     let mut client = connect_raw_client(host).await;
 
-    let env = match tokio::time::timeout(EVENT_TIMEOUT, client.next_event()).await {
-        Ok(Ok(Some(env))) => env,
-        Ok(Ok(None)) => panic!("connection closed before initial host bootstrap"),
-        Ok(Err(err)) => panic!("initial host bootstrap read failed: {err:?}"),
-        Err(_) => panic!("timed out waiting for initial host bootstrap"),
+    let env = {
+        let deadline = std::time::Instant::now() + EVENT_TIMEOUT;
+        let next_event = client.next_event();
+        tokio::pin!(next_event);
+        loop {
+            tokio::select! {
+                biased;
+                result = &mut next_event => match result {
+                    Ok(Some(env)) => break env,
+                    Ok(None) => panic!("connection closed before initial host bootstrap"),
+                    Err(err) => panic!("initial host bootstrap read failed: {err:?}"),
+                },
+                _ = tokio::task::yield_now() => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "timed out waiting for initial host bootstrap"
+                    );
+                }
+            }
+        }
     };
     assert_eq!(
         env.kind,
