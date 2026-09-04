@@ -1103,6 +1103,15 @@ async fn project_read_file_returns_file_contents() {
         "read-file",
         &[("src/main.rs", "fn main() { println!(\"hi\"); }\n")],
     );
+    std::fs::write(
+        repo.path().join("preview.png"),
+        b"\x89PNG\r\n\x1a\n\0test preview bytes",
+    )
+    .expect("write binary preview fixture");
+    std::fs::write(repo.path().join("archive.bin"), b"\0unsupported bytes")
+        .expect("write unsupported binary fixture");
+    std::fs::write(repo.path().join("not-really.png"), b"ordinary text")
+        .expect("write misleading extension fixture");
     let project = create_project_with_real_roots(
         &mut fixture.client,
         "Read File",
@@ -1132,6 +1141,66 @@ async fn project_read_file_returns_file_contents() {
         file_contents.contents.as_deref(),
         Some("fn main() { println!(\"hi\"); }\n")
     );
+
+    fixture
+        .client
+        .project_read_file(
+            &project.id,
+            ProjectReadFilePayload {
+                path: ProjectPath {
+                    root: protocol::ProjectRootPath(project_root(&project, 0)),
+                    relative_path: "preview.png".to_owned(),
+                },
+            },
+        )
+        .await
+        .expect("binary project_read_file failed");
+    let image = expect_project_file_contents(&mut fixture.client, "binary preview").await;
+    let image = image.binary.expect("binary preview metadata");
+    assert_eq!(image.mime_type, "image/png");
+    assert_eq!(image.size_bytes, 27);
+    assert!(image.data_base64.is_some(), "previewable bytes are carried");
+    assert!(image.preview_error.is_none());
+
+    fixture
+        .client
+        .project_read_file(
+            &project.id,
+            ProjectReadFilePayload {
+                path: ProjectPath {
+                    root: protocol::ProjectRootPath(project_root(&project, 0)),
+                    relative_path: "archive.bin".to_owned(),
+                },
+            },
+        )
+        .await
+        .expect("unsupported project_read_file failed");
+    let unsupported = expect_project_file_contents(&mut fixture.client, "unsupported binary").await;
+    let unsupported = unsupported.binary.expect("unsupported binary metadata");
+    assert_eq!(unsupported.mime_type, "application/octet-stream");
+    assert!(unsupported.data_base64.is_none());
+    assert!(unsupported.preview_error.is_some());
+
+    fixture
+        .client
+        .project_read_file(
+            &project.id,
+            ProjectReadFilePayload {
+                path: ProjectPath {
+                    root: protocol::ProjectRootPath(project_root(&project, 0)),
+                    relative_path: "not-really.png".to_owned(),
+                },
+            },
+        )
+        .await
+        .expect("misleading extension project_read_file failed");
+    let misleading =
+        expect_project_file_contents(&mut fixture.client, "misleading extension").await;
+    assert!(
+        !misleading.is_binary,
+        "content beats the filename extension"
+    );
+    assert_eq!(misleading.contents.as_deref(), Some("ordinary text"));
 }
 
 #[tokio::test]

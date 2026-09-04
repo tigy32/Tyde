@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::fs;
+use std::fs::{self, File};
+use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
@@ -9,14 +10,15 @@ use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watche
 use protocol::{
     CodeIntelOverviewHeadline, CodeIntelOverviewPayload, CodeIntelOverviewSummary,
     CodeIntelProviderStatus, CodeIntelRootOverview, CodeIntelState, CommandErrorCode,
-    CommandErrorPayload, DiffContextMode, FileEntryOp, FrameKind, Project, ProjectDiffRevision,
-    ProjectDiffScope, ProjectEventPayload, ProjectFileContentsPayload, ProjectFileEntry,
-    ProjectFileKind, ProjectFileListPayload, ProjectFileVersion, ProjectFileVersionChange,
-    ProjectGitChangeKind, ProjectGitCommitSummary, ProjectGitDiffFile, ProjectGitDiffHunk,
-    ProjectGitDiffLine, ProjectGitDiffLineKind, ProjectGitDiffPayload, ProjectGitFileStatus,
-    ProjectGitStatusPayload, ProjectId, ProjectPath, ProjectReadDiffPayload,
-    ProjectReadFilePayload, ProjectRootGitStatus, ProjectRootListing, ProjectRootPath,
-    ProjectSearchFileResult, ProjectSearchMatch, ProjectSearchPayload, ReviewSummary, StreamPath,
+    CommandErrorPayload, DiffContextMode, FileEntryOp, FrameKind, Project,
+    ProjectBinaryFilePayload, ProjectDiffRevision, ProjectDiffScope, ProjectEventPayload,
+    ProjectFileContentsPayload, ProjectFileEntry, ProjectFileKind, ProjectFileListPayload,
+    ProjectFileVersion, ProjectFileVersionChange, ProjectGitChangeKind, ProjectGitCommitSummary,
+    ProjectGitDiffFile, ProjectGitDiffHunk, ProjectGitDiffLine, ProjectGitDiffLineKind,
+    ProjectGitDiffPayload, ProjectGitFileStatus, ProjectGitStatusPayload, ProjectId, ProjectPath,
+    ProjectReadDiffPayload, ProjectReadFilePayload, ProjectRootGitStatus, ProjectRootListing,
+    ProjectRootPath, ProjectSearchFileResult, ProjectSearchMatch, ProjectSearchPayload,
+    ReviewSummary, StreamPath,
 };
 use serde_json::Value;
 use tokio::sync::{Mutex, mpsc, oneshot};
@@ -30,6 +32,8 @@ use crate::stream::Stream;
 const PROJECT_REFRESH_DEBOUNCE: Duration = Duration::from_millis(250);
 const GIT_STATUS_POLL_INTERVAL: Duration = Duration::from_secs(5);
 const RECENT_HISTORY_LIMIT: usize = 100;
+const BINARY_PREVIEW_LIMIT_BYTES: u64 = 32 * 1024 * 1024;
+const CONTENT_SNIFF_BYTES: u64 = 8192;
 
 struct ProjectWatcherFailure {
     message: String,
@@ -2145,8 +2149,8 @@ pub(crate) fn read_file(
     // `version` is a placeholder here; the project-stream actor overwrites it
     // with the centralized counter's next value (the single bump point) before
     // the payload leaves the actor. See `ProjectStreamCommand::ReadFile`.
-    let bytes = match fs::read(&absolute) {
-        Ok(bytes) => bytes,
+    let metadata = match fs::metadata(&absolute) {
+        Ok(metadata) => metadata,
         // Deletion is an answer, not a failure: report it as a typed payload
         // (a command error carries no path, so the client could not attribute
         // it to the right viewer).
@@ -2157,15 +2161,56 @@ pub(crate) fn read_file(
                 contents: None,
                 is_binary: false,
                 missing: true,
+                binary: None,
             });
         }
         Err(err) => {
-            return Err(format!(
-                "Failed to read file '{}': {err}",
-                absolute.display()
-            ));
+            return Ok(unreadable_file_payload(path, &absolute, err));
         }
     };
+    let size_bytes = metadata.len();
+    let mut prefix = Vec::new();
+    if let Err(err) = File::open(&absolute).and_then(|file| {
+        file.take(CONTENT_SNIFF_BYTES)
+            .read_to_end(&mut prefix)
+            .map(|_| ())
+    }) {
+        return Ok(unreadable_file_payload(path, &absolute, err));
+    }
+    let sniffed_mime = sniff_binary_mime(&prefix);
+    let prefix_is_binary =
+        sniffed_mime.is_some() || prefix.contains(&0) || std::str::from_utf8(&prefix).is_err();
+    if prefix_is_binary && size_bytes > BINARY_PREVIEW_LIMIT_BYTES {
+        return Ok(ProjectFileContentsPayload {
+            path,
+            version: ProjectFileVersion(0),
+            contents: None,
+            is_binary: true,
+            missing: false,
+            binary: Some(ProjectBinaryFilePayload {
+                mime_type: sniffed_mime
+                    .or_else(|| binary_mime_from_path(&absolute))
+                    .unwrap_or("application/octet-stream")
+                    .to_owned(),
+                size_bytes,
+                data_base64: None,
+                preview_error: Some(format!(
+                    "Preview unavailable because this file exceeds the {} MiB limit.",
+                    BINARY_PREVIEW_LIMIT_BYTES / 1024 / 1024
+                )),
+            }),
+        });
+    }
+    let bytes = match fs::read(&absolute) {
+        Ok(bytes) => bytes,
+        Err(err) => return Ok(unreadable_file_payload(path, &absolute, err)),
+    };
+    if prefix_is_binary {
+        let mime_type = sniffed_mime
+            .or_else(|| binary_mime_from_path(&absolute))
+            .unwrap_or("application/octet-stream");
+        return Ok(binary_file_payload(path, bytes, mime_type, size_bytes));
+    }
     match String::from_utf8(bytes) {
         Ok(contents) => Ok(ProjectFileContentsPayload {
             path,
@@ -2173,15 +2218,115 @@ pub(crate) fn read_file(
             contents: Some(contents),
             is_binary: false,
             missing: false,
+            binary: None,
         }),
-        Err(_) => Ok(ProjectFileContentsPayload {
+        Err(error) => Ok(binary_file_payload(
             path,
-            version: ProjectFileVersion(0),
-            contents: None,
-            is_binary: true,
-            missing: false,
+            error.into_bytes(),
+            binary_mime_from_path(&absolute).unwrap_or("application/octet-stream"),
+            size_bytes,
+        )),
+    }
+}
+
+fn unreadable_file_payload(
+    path: ProjectPath,
+    absolute: &Path,
+    error: std::io::Error,
+) -> ProjectFileContentsPayload {
+    ProjectFileContentsPayload {
+        path,
+        version: ProjectFileVersion(0),
+        contents: Some(format!(
+            "Unable to read this file.\n\n{}: {error}",
+            absolute.display()
+        )),
+        is_binary: false,
+        missing: false,
+        binary: None,
+    }
+}
+
+fn binary_file_payload(
+    path: ProjectPath,
+    bytes: Vec<u8>,
+    mime_type: &str,
+    size_bytes: u64,
+) -> ProjectFileContentsPayload {
+    let supported = is_supported_preview_mime(mime_type);
+    ProjectFileContentsPayload {
+        path,
+        version: ProjectFileVersion(0),
+        contents: None,
+        is_binary: true,
+        missing: false,
+        binary: Some(ProjectBinaryFilePayload {
+            mime_type: mime_type.to_owned(),
+            size_bytes,
+            data_base64: supported.then(|| {
+                use base64::Engine;
+                base64::engine::general_purpose::STANDARD.encode(bytes)
+            }),
+            preview_error: (!supported)
+                .then(|| "Tyde does not have an inline preview for this file type.".to_owned()),
         }),
     }
+}
+
+fn sniff_binary_mime(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("image/png")
+    } else if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+        Some("image/jpeg")
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some("image/gif")
+    } else if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
+        Some("image/webp")
+    } else if bytes.starts_with(b"%PDF-") {
+        Some("application/pdf")
+    } else if bytes.len() >= 12 && &bytes[4..8] == b"ftyp" {
+        Some("video/mp4")
+    } else if bytes.starts_with(&[0x1a, 0x45, 0xdf, 0xa3]) {
+        Some("video/webm")
+    } else if bytes.starts_with(b"ID3") || looks_like_mp3_frame(bytes) {
+        Some("audio/mpeg")
+    } else if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WAVE" {
+        Some("audio/wav")
+    } else if bytes.starts_with(b"OggS") {
+        Some("audio/ogg")
+    } else if bytes.starts_with(b"fLaC") {
+        Some("audio/flac")
+    } else {
+        None
+    }
+}
+
+fn looks_like_mp3_frame(bytes: &[u8]) -> bool {
+    bytes.len() >= 2 && bytes[0] == 0xff && bytes[1] & 0xe0 == 0xe0
+}
+
+fn binary_mime_from_path(path: &Path) -> Option<&'static str> {
+    match path.extension()?.to_str()?.to_ascii_lowercase().as_str() {
+        "png" => Some("image/png"),
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "gif" => Some("image/gif"),
+        "webp" => Some("image/webp"),
+        "mp4" | "m4v" => Some("video/mp4"),
+        "webm" => Some("video/webm"),
+        "mp3" => Some("audio/mpeg"),
+        "wav" => Some("audio/wav"),
+        "ogg" | "oga" => Some("audio/ogg"),
+        "flac" => Some("audio/flac"),
+        "pdf" => Some("application/pdf"),
+        _ => None,
+    }
+}
+
+fn is_supported_preview_mime(mime_type: &str) -> bool {
+    mime_type.starts_with("image/")
+        || mime_type.starts_with("video/")
+        || mime_type.starts_with("audio/")
+        || mime_type == "application/pdf"
 }
 
 // ── Project global search ─────────────────────────────────────────────────
