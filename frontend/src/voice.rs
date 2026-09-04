@@ -1168,6 +1168,23 @@ async fn register_media_listeners(state: AppState) -> Result<VoiceMediaListenerH
             .await?,
     );
 
+    let recovery_state = state.clone();
+    listeners.push(
+        bridge::listen_host_recovery(move |event| {
+            if !event.connected
+                && matches!(recovery_state.voice_ui.get_untracked(),
+            VoiceUiState::Starting { ref host_id, .. } | VoiceUiState::Active { ref host_id, .. }
+                if host_id == &event.host_id)
+            {
+                stop(
+                    recovery_state.clone(),
+                    protocol::VoiceStopReason::TransportLost,
+                );
+            }
+        })
+        .await?,
+    );
+
     let disconnect_state = state.clone();
     listeners.push(
         bridge::listen_host_disconnected(move |event| {
@@ -2353,7 +2370,7 @@ mod wasm_tests {
             provide_context(render_state.clone());
             view! { <VoiceRuntime /> }
         });
-        wait_for_voice_listener_attempts(4).await;
+        wait_for_voice_listener_attempts(5).await;
         next_tick().await;
 
         dispatch_tauri_voice_event(
@@ -2520,7 +2537,7 @@ mod wasm_tests {
                 <VoiceComposerButton agent_ref=agent_ref composer=composer />
             }
         });
-        wait_for_voice_listener_attempts(4).await;
+        wait_for_voice_listener_attempts(5).await;
         next_tick().await;
 
         let mic = start_button(&container).expect("the mic must be offered");
@@ -2679,7 +2696,7 @@ mod wasm_tests {
             provide_context(render_state.clone());
             view! { <VoiceRuntime /> }
         });
-        wait_for_voice_listener_attempts(4).await;
+        wait_for_voice_listener_attempts(5).await;
         next_tick().await;
 
         for seq in 0..3u64 {
@@ -2781,7 +2798,9 @@ mod wasm_tests {
 
     #[wasm_bindgen_test]
     async fn registration_success_after_unmount_unlistens_every_late_handle() {
-        let _stub = install_voice_listener_stub(None, Some(4));
+        // Recovery adds a fifth real listener. Defer the final registration
+        // and require cleanup of all five, including that late handle.
+        let _stub = install_voice_listener_stub(None, Some(5));
         let container = container();
         let state = AppState::new();
         let mount = mount_to(container.clone(), move || {
@@ -2789,10 +2808,10 @@ mod wasm_tests {
             view! { <VoiceRuntime /> }
         });
 
-        wait_for_voice_listener_attempts(4).await;
+        wait_for_voice_listener_attempts(5).await;
         assert_eq!(
             voice_listener_counter("__tyde_voice_test_active_listeners"),
-            4
+            5
         );
         assert_eq!(
             voice_listener_counter("__tyde_voice_test_unlisten_calls"),
@@ -2805,7 +2824,7 @@ mod wasm_tests {
         next_tick().await;
         assert_eq!(
             voice_listener_counter("__tyde_voice_test_unlisten_calls"),
-            4,
+            5,
             "late successful registration must drop the complete stale owner"
         );
         assert_eq!(

@@ -133,10 +133,13 @@ fn tab_scroll_state_from_element(el: &web_sys::Element) -> TabScrollState {
 pub fn FileView(tab_id: TabId, key: FileResourceKey) -> impl IntoView {
     let state = expect_context::<AppState>();
     let file_key = key.clone();
-    let loaded_version: Memo<Option<ProjectFileVersion>> = Memo::new(move |_| {
+    let loaded_version = Memo::new(move |_| {
+        let generation = state
+            .file_view_generations
+            .with(|generations| generations.get(&file_key).copied().unwrap_or(0));
         state
             .open_files
-            .with(|files| files.get(&file_key).map(|file| file.version))
+            .with(|files| files.get(&file_key).map(|file| (file.version, generation)))
     });
 
     let key_for_loaded = key.clone();
@@ -151,7 +154,7 @@ pub fn FileView(tab_id: TabId, key: FileResourceKey) -> impl IntoView {
                     key=|version| *version
                     children={
                         let key_for_loaded = key_for_loaded.clone();
-                        move |version| {
+                        move |(version, _)| {
                             view! {
                                 <FileViewLoaded
                                     tab_id=tab_id

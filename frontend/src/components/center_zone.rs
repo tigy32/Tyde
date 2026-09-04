@@ -4941,4 +4941,194 @@ mod wasm_tests {
             "the replaced file must not still be on screen"
         );
     }
+
+    #[wasm_bindgen_test]
+    async fn reconnect_and_fresh_bootstrap_keep_the_workspace_mounted() {
+        use crate::state::ConnectionStatus;
+        let container = make_container();
+        let state = AppState::new();
+        let key = file_key("recovery.rs");
+        let host = key.host_id.clone();
+        state
+            .active_project
+            .set(Some(crate::state::ActiveProjectRef {
+                host_id: host.clone(),
+                project_id: key.project_id.clone(),
+            }));
+        state.projects.set(vec![crate::state::ProjectInfo {
+            host_id: host.clone(),
+            project: protocol::Project {
+                id: key.project_id.clone(),
+                name: "Recovery".into(),
+                sort_order: 0,
+                source: protocol::ProjectSource::Standalone {
+                    roots: vec![key.path.root.clone()],
+                },
+            },
+        }]);
+        state
+            .configured_hosts
+            .set(vec![crate::bridge::ConfiguredHost {
+                id: host.clone(),
+                label: "Remote recovery".into(),
+                transport: crate::bridge::HostTransportConfig::LocalEmbedded,
+                auto_connect: false,
+            }]);
+        state.selected_host_id.set(Some(host.clone()));
+        state.connection_statuses.update(|statuses| {
+            statuses.insert(host.clone(), ConnectionStatus::Connected);
+        });
+        let mount_state = state.clone();
+        let _handle = mount_to(container.clone(), move || {
+            provide_context(mount_state.clone());
+            install_tab_lru_effect(&mount_state);
+            view! { <crate::components::header::Header /><CenterZone /> }
+        });
+        settle().await;
+        let draft_tab = state
+            .open_tab(TabContent::empty_chat(), "Recovery draft".into(), true)
+            .expect("draft tab");
+        settle().await;
+        let draft = container
+            .query_selector("textarea")
+            .unwrap()
+            .expect("visible draft composer")
+            .dyn_into::<web_sys::HtmlTextAreaElement>()
+            .unwrap();
+        draft.set_value("Unsent recovery draft");
+        draft
+            .dispatch_event(&web_sys::Event::new("input").unwrap())
+            .unwrap();
+        settle().await;
+        open_file_tab(&state, "recovery.rs", "fn preserved_workspace() {}");
+        settle().await;
+        let file_tab = state
+            .center_zone
+            .with_untracked(|zone| zone.active_tab_id())
+            .expect("file tab");
+        let before = mount_containing(&container, "fn preserved_workspace()")
+            .expect("file visible before drop");
+        state.connection_statuses.update(|statuses| {
+            statuses.insert(
+                host.clone(),
+                ConnectionStatus::Reconnecting {
+                    attempt: 3,
+                    retry_in_seconds: 4,
+                    message: "Connection reset".into(),
+                },
+            );
+        });
+        settle().await;
+        assert!(text_of(&container).contains("Disconnected — reconnecting"));
+        assert!(text_of(&container).contains("Attempt 3"));
+        assert!(
+            before.is_same_node(
+                mount_containing(&container, "fn preserved_workspace()")
+                    .as_ref()
+                    .map(|node| node.as_ref())
+            )
+        );
+        state.prepare_host_refresh(&host);
+        settle().await;
+        assert!(
+            before.is_same_node(
+                mount_containing(&container, "fn preserved_workspace()")
+                    .as_ref()
+                    .map(|node| node.as_ref())
+            ),
+            "fallback must not unmount or close the file tab"
+        );
+        // Hidden chats intentionally unmount their composer; reopening the
+        // tab must render the retained draft in a fresh textarea.
+        assert!(reveal_tab(&state, draft_tab));
+        settle().await;
+        let restored_draft = container
+            .query_selector("textarea")
+            .unwrap()
+            .expect("restored composer")
+            .dyn_into::<web_sys::HtmlTextAreaElement>()
+            .unwrap();
+        assert_eq!(restored_draft.value(), "Unsent recovery draft");
+        assert!(reveal_tab(&state, file_tab));
+        settle().await;
+        state.connection_statuses.update(|statuses| {
+            statuses.insert(host.clone(), ConnectionStatus::Connected);
+        });
+        settle().await;
+        assert!(text_of(&container).contains("1/1 hosts connected"));
+        assert!(
+            before.is_same_node(
+                mount_containing(&container, "fn preserved_workspace()")
+                    .as_ref()
+                    .map(|node| node.as_ref())
+            )
+        );
+        crate::dispatch::prime_host_for_tests(&state, &host);
+        state
+            .active_project
+            .set(Some(crate::state::ActiveProjectRef {
+                host_id: host.clone(),
+                project_id: key.project_id.clone(),
+            }));
+        let stream = protocol::StreamPath(format!("/project/{}", key.project_id.0));
+        crate::dispatch::dispatch_envelope(
+            &state,
+            &host,
+            protocol::Envelope::from_payload(
+                stream.clone(),
+                protocol::FrameKind::ProjectBootstrap,
+                0,
+                &protocol::ProjectBootstrapPayload {
+                    project: protocol::Project {
+                        id: key.project_id.clone(),
+                        name: "Recovery".into(),
+                        sort_order: 0,
+                        source: protocol::ProjectSource::Standalone {
+                            roots: vec![key.path.root.clone()],
+                        },
+                    },
+                    file_list: protocol::ProjectFileListPayload {
+                        incremental: false,
+                        roots: vec![],
+                    },
+                    git_status: protocol::ProjectGitStatusPayload { roots: vec![] },
+                    review_summaries: vec![],
+                },
+            )
+            .unwrap(),
+        );
+        crate::dispatch::dispatch_envelope(
+            &state,
+            &host,
+            protocol::Envelope::from_payload(
+                stream,
+                protocol::FrameKind::ProjectFileContents,
+                1,
+                &protocol::ProjectFileContentsPayload {
+                    path: key.path,
+                    version: ProjectFileVersion(1),
+                    contents: Some("fn refreshed_after_restart() {}".into()),
+                    is_binary: false,
+                    missing: false,
+                    binary: None,
+                },
+            )
+            .unwrap(),
+        );
+        settle().await;
+        assert!(
+            text_of(&container).contains("fn refreshed_after_restart()"),
+            "a restarted server can reuse the same file version for new text"
+        );
+        assert!(!text_of(&container).contains("fn preserved_workspace()"));
+        assert!(reveal_tab(&state, draft_tab));
+        settle().await;
+        let restored_draft = container
+            .query_selector("textarea")
+            .unwrap()
+            .expect("composer after server restart")
+            .dyn_into::<web_sys::HtmlTextAreaElement>()
+            .unwrap();
+        assert_eq!(restored_draft.value(), "Unsent recovery draft");
+    }
 }

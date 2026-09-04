@@ -381,7 +381,23 @@ fn TerminalContent(term: TerminalInfo) -> impl IntoView {
         // Outgoing user keystrokes -> TerminalSend
         let send_host = mount_host.clone();
         let send_stream = mount_stream.clone();
+        let send_state = mount_state.clone();
+        let send_terminal = mount_tid.clone();
         let on_data = Closure::<dyn Fn(String)>::new(move |data: String| {
+            if !send_state.terminals.with_untracked(|terminals| {
+                terminals.iter().any(|terminal| {
+                    terminal.host_id == send_host
+                        && terminal.terminal_id == send_terminal
+                        && !terminal.exited
+                })
+            }) || !send_state.connection_statuses.with_untracked(|statuses| {
+                matches!(
+                    statuses.get(&send_host),
+                    Some(crate::state::ConnectionStatus::Connected)
+                )
+            }) {
+                return;
+            }
             let host_id = send_host.clone();
             let stream = send_stream.clone();
             spawn_local(async move {
@@ -397,7 +413,23 @@ fn TerminalContent(term: TerminalInfo) -> impl IntoView {
         // PTY size changes -> TerminalResize
         let resize_host = mount_host.clone();
         let resize_stream = mount_stream.clone();
+        let resize_state = mount_state.clone();
+        let resize_terminal = mount_tid.clone();
         let on_resize = Closure::<dyn Fn(f64, f64)>::new(move |cols: f64, rows: f64| {
+            if !resize_state.terminals.with_untracked(|terminals| {
+                terminals.iter().any(|terminal| {
+                    terminal.host_id == resize_host
+                        && terminal.terminal_id == resize_terminal
+                        && !terminal.exited
+                })
+            }) || !resize_state.connection_statuses.with_untracked(|statuses| {
+                matches!(
+                    statuses.get(&resize_host),
+                    Some(crate::state::ConnectionStatus::Connected)
+                )
+            }) {
+                return;
+            }
             let cols = cols as u16;
             let rows = rows as u16;
             if cols < 2 || rows < 1 {

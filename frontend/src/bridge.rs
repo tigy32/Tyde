@@ -8,7 +8,7 @@ use wasm_bindgen_futures::JsFuture;
 // verbatim with the Tauri shell. Re-export them for downstream modules.
 pub use host_config::{
     ConfiguredHost, ConfiguredHostStore, HostDisconnectedEvent, HostErrorEvent, HostIdRequest,
-    HostLifecycleEvent, HostLineEvent, HostTransportConfig, HostWarningEvent,
+    HostLifecycleEvent, HostLineEvent, HostRecoveryEvent, HostTransportConfig, HostWarningEvent,
     RemoteHostLifecycleConfig, RemoteHostLifecycleSnapshot, RemoteHostLifecycleStatus,
     RemoteHostLifecycleStep, RemoteTydeRunningState, SendHostLineRequest, SetSelectedHostRequest,
     UpsertConfiguredHostRequest,
@@ -91,6 +91,15 @@ pub async fn connect_host(request: HostIdRequest) -> Result<(), String> {
     tauri_invoke("connect_host", args)
         .await
         .map_err(|error| tauri_error_message("connect_host", error))?;
+    Ok(())
+}
+
+pub async fn retry_host(host_id: String) -> Result<(), String> {
+    let args = serde_wasm_bindgen::to_value(&HostIdRequest { host_id })
+        .map_err(|error| error.to_string())?;
+    tauri_invoke("retry_host", args)
+        .await
+        .map_err(|error| tauri_error_message("retry_host", error))?;
     Ok(())
 }
 
@@ -498,6 +507,21 @@ pub async fn listen_host_line(
         move |val: JsValue| match serde_wasm_bindgen::from_value::<TauriEvent<HostLineEvent>>(val) {
             Ok(event) => callback(event.payload),
             Err(error) => log::error!("failed to parse host-line event: {error}"),
+        },
+    )
+    .await
+}
+
+pub async fn listen_host_recovery(
+    callback: impl Fn(HostRecoveryEvent) + 'static,
+) -> Result<UnlistenHandle, String> {
+    listen_event(
+        "tyde://host-recovery",
+        move |val: JsValue| match serde_wasm_bindgen::from_value::<TauriEvent<HostRecoveryEvent>>(
+            val,
+        ) {
+            Ok(event) => callback(event.payload),
+            Err(error) => log::error!("failed to parse host-recovery event: {error}"),
         },
     )
     .await

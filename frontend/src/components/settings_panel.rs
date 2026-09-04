@@ -1113,7 +1113,9 @@ fn SettingsHostScope() -> impl IntoView {
 
     let status_class = move || match status_state.selected_host_connection_status() {
         ConnectionStatus::Connected => "status-dot connected",
-        ConnectionStatus::Connecting => "status-dot connecting",
+        ConnectionStatus::Connecting | ConnectionStatus::Reconnecting { .. } => {
+            "status-dot connecting"
+        }
         ConnectionStatus::Disconnected => "status-dot disconnected",
         ConnectionStatus::Error(_) => "status-dot error",
     };
@@ -1203,6 +1205,9 @@ fn SettingsScopeNotices(
 
     let unavailable = move || match status_state.selected_host_connection_status() {
         ConnectionStatus::Connected => None,
+        ConnectionStatus::Reconnecting { message, .. } => {
+            Some(format!("Disconnected — reconnecting… {message}"))
+        }
         ConnectionStatus::Connecting => {
             Some("Connecting — settings load once it is up.".to_owned())
         }
@@ -1487,11 +1492,15 @@ fn HostsTab() -> impl IntoView {
                         .unwrap_or(crate::state::ConnectionStatus::Disconnected);
                     let (status_class, status_text) = match &status {
                         crate::state::ConnectionStatus::Connected => ("connected", "Connected".to_string()),
+                        crate::state::ConnectionStatus::Reconnecting { attempt, retry_in_seconds, message } => ("connecting", if *attempt == 0 { message.clone() } else { format!("Disconnected — reconnecting… Attempt {attempt} · retry in {retry_in_seconds}s · {message}") }),
                         crate::state::ConnectionStatus::Connecting => ("connecting", "Connecting…".to_string()),
                         crate::state::ConnectionStatus::Disconnected => ("disconnected", "Disconnected".to_string()),
                         crate::state::ConnectionStatus::Error(message) => ("error", format!("Error: {message}")),
                     };
-                    let is_connected = matches!(status, crate::state::ConnectionStatus::Connected);
+                    let is_connected = matches!(status, crate::state::ConnectionStatus::Connected | crate::state::ConnectionStatus::Connecting | crate::state::ConnectionStatus::Reconnecting { .. });
+                    let is_reconnecting = matches!(status, crate::state::ConnectionStatus::Reconnecting { .. });
+                    let retry_host_id = host_id.clone();
+                    let retry_state = state.clone();
                     let is_connecting = matches!(status, crate::state::ConnectionStatus::Connecting);
                     let lifecycle_status = state_for_configured_hosts
                         .host_lifecycle_statuses
@@ -1535,6 +1544,17 @@ fn HostsTab() -> impl IntoView {
                                 })}
                             </div>
                             <div class="host-card-actions">
+                                {is_reconnecting.then(|| view! {
+                                    <button class="settings-btn" on:click=move |_| {
+                                        let host_id = retry_host_id.clone();
+                                        let state = retry_state.clone();
+                                        spawn_local(async move {
+                                            if bridge::retry_host(host_id.clone()).await.is_err() {
+                                                connect_one_host(state, host_id).await;
+                                            }
+                                        });
+                                    }>"Retry now"</button>
+                                })}
                                 {(!is_local).then(|| {
                                     let host_id_for_connect = host_id_for_connect.clone();
                                     let host_id_for_disconnect = host_id_for_disconnect.clone();
@@ -1548,13 +1568,13 @@ fn HostsTab() -> impl IntoView {
                                                     let host_id = host_id_for_disconnect.clone();
                                                     let state = disconnect_state.clone();
                                                     spawn_local(async move {
+                                                        state.cancel_host_connect(&host_id);
                                                         if let Err(e) = bridge::disconnect_host(host_id.clone()).await {
                                                             error_sig.set(Some(format!("Failed to disconnect host: {e}")));
                                                         }
                                                         state.connection_statuses.update(|statuses| {
                                                             statuses.insert(host_id.clone(), crate::state::ConnectionStatus::Disconnected);
                                                         });
-                                                        state.clear_host_runtime(&host_id);
                                                         // Explicit user disconnect ends the connection
                                                         // lifecycle, so release the one-shot forced-upgrade
                                                         // guard: a later manual reconnect can attempt the
@@ -1613,8 +1633,12 @@ fn HostsTab() -> impl IntoView {
                                                 let state = remove_state.clone();
                                                 let host_id = host_id.clone();
                                                 spawn_local(async move {
-                                                    match bridge::remove_configured_host(host_id).await {
-                                                        Ok(_) => refresh_configured_hosts(&state).await,
+                                                    state.cancel_host_connect(&host_id);
+                                                    match bridge::remove_configured_host(host_id.clone()).await {
+                                                        Ok(_) => {
+                                                            state.clear_host_runtime(&host_id);
+                                                            refresh_configured_hosts(&state).await;
+                                                        },
                                                         Err(e) => error_sig.set(Some(format!("Failed to remove host: {e}"))),
                                                     }
                                                 });

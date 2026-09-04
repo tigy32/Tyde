@@ -67,6 +67,7 @@ pub struct ProxyRouterHandle {
 struct RouterState {
     hosts: HashMap<String, Connection>,
     next_connection_id: u64,
+    pending: HashMap<String, Arc<AtomicBool>>,
 }
 
 struct Connection {
@@ -85,6 +86,28 @@ struct Connection {
     /// reused the same host id.
     live: Arc<AtomicBool>,
     audio_pending: Arc<AtomicUsize>,
+    available: Arc<AtomicBool>,
+    retry: Arc<tokio::sync::Notify>,
+}
+
+struct PendingConnection {
+    state: Arc<Mutex<RouterState>>,
+    host_id: String,
+    live: Arc<AtomicBool>,
+}
+
+impl Drop for PendingConnection {
+    fn drop(&mut self) {
+        let mut state = self.state.lock().expect("router state poisoned");
+        if state
+            .pending
+            .get(&self.host_id)
+            .is_some_and(|entry| Arc::ptr_eq(entry, &self.live))
+        {
+            state.pending.remove(&self.host_id);
+            self.live.store(false, Ordering::Release);
+        }
+    }
 }
 
 struct SshChild {
@@ -131,6 +154,7 @@ impl ProxyRouterHandle {
             state: Arc::new(Mutex::new(RouterState {
                 hosts: HashMap::new(),
                 next_connection_id: 1,
+                pending: HashMap::new(),
             })),
         }
     }
@@ -149,9 +173,18 @@ impl ProxyRouterHandle {
         // sender (stopping the old writer); reaping the child closes the old
         // reader via EOF. The old reader's teardown will no-op because the new
         // connection carries a different connection id.
+        let live = Arc::new(AtomicBool::new(true));
         let existing = {
             let mut guard = self.state.lock().expect("router state poisoned");
+            if let Some(old) = guard.pending.insert(host_id.clone(), live.clone()) {
+                old.store(false, Ordering::Release);
+            }
             guard.hosts.remove(&host_id)
+        };
+        let pending = PendingConnection {
+            state: self.state.clone(),
+            host_id: host_id.clone(),
+            live: live.clone(),
         };
         if let Some(existing) = existing {
             tracing::info!(host_id, "replacing existing host connection");
@@ -174,18 +207,55 @@ impl ProxyRouterHandle {
             id
         };
 
-        let live = Arc::new(AtomicBool::new(true));
-        let setup =
-            setup_connection_transport(&host_id, app.clone(), transport, host, live.clone())
-                .await?;
+        let available = Arc::new(AtomicBool::new(true));
+        let retry = Arc::new(tokio::sync::Notify::new());
+        let resumable = matches!(&transport, HostTransportConfig::SshStdio { remote_command, lifecycle, .. }
+            if matches!(lifecycle, RemoteHostLifecycleConfig::ManagedTyde) || remote_command.is_none());
+        let setup = setup_connection_transport(
+            &host_id,
+            app.clone(),
+            transport.clone(),
+            host.clone(),
+            live.clone(),
+        )
+        .await?;
+        let setup = if resumable {
+            setup_recovery(
+                RecoveryContext {
+                    host_id: host_id.clone(),
+                    app: app.clone(),
+                    transport,
+                    host,
+                    live: live.clone(),
+                    available: available.clone(),
+                    retry: retry.clone(),
+                },
+                setup,
+            )
+            .await?
+        } else {
+            setup
+        };
 
         let (outbound_tx, outbound_rx) = mpsc::unbounded_channel::<Outbound>();
         let audio_pending = Arc::new(AtomicUsize::new(0));
 
         // Register before spawning so that an immediate reader EOF can find the
         // entry (and thus reap the child / emit disconnect) instead of racing.
+        if !live.load(Ordering::Acquire) {
+            abort_child(setup.child).await;
+            return Err("connection attempt cancelled".into());
+        }
         {
             let mut guard = self.state.lock().expect("router state poisoned");
+            if !guard
+                .pending
+                .get(&host_id)
+                .is_some_and(|entry| Arc::ptr_eq(entry, &live))
+            {
+                return Err("connection attempt superseded".into());
+            }
+            guard.pending.remove(&host_id);
             guard.hosts.insert(
                 host_id.clone(),
                 Connection {
@@ -194,10 +264,13 @@ impl ProxyRouterHandle {
                     child: setup.child,
                     live: live.clone(),
                     audio_pending,
+                    available,
+                    retry,
                 },
             );
         }
 
+        drop(pending);
         tokio::spawn(reader_task(
             self.state.clone(),
             app.clone(),
@@ -223,10 +296,13 @@ impl ProxyRouterHandle {
     pub async fn disconnect(&self, host_id: String) -> Result<(), String> {
         let connection = {
             let mut guard = self.state.lock().expect("router state poisoned");
+            if let Some(pending) = guard.pending.remove(&host_id) {
+                pending.store(false, Ordering::Release);
+            }
             guard.hosts.remove(&host_id)
         };
         let Some(connection) = connection else {
-            return Err(format!("host {host_id} is not connected"));
+            return Ok(());
         };
 
         // Quiet teardown: clearing `live` stops the reader/stderr tasks from
@@ -240,14 +316,30 @@ impl ProxyRouterHandle {
         Ok(())
     }
 
+    pub fn retry(&self, host_id: &str) -> Result<(), String> {
+        let state = self.state.lock().expect("router state poisoned");
+        let connection = state
+            .hosts
+            .get(host_id)
+            .ok_or_else(|| "host needs a fresh connection".to_owned())?;
+        connection.retry.notify_one();
+        Ok(())
+    }
+
     pub async fn send_line(&self, host_id: String, line: String) -> Result<(), String> {
         if line.contains('\n') {
             return Err("host line must not contain a newline".to_owned());
         }
 
+        let stopping_voice = serde_json::from_str::<protocol::Envelope>(&line)
+            .is_ok_and(|envelope| envelope.kind == protocol::FrameKind::VoiceStop);
         let outbound_tx = {
             let guard = self.state.lock().expect("router state poisoned");
-            guard.hosts.get(&host_id).map(|c| c.outbound_tx.clone())
+            guard
+                .hosts
+                .get(&host_id)
+                .filter(|c| c.available.load(Ordering::Acquire) || stopping_voice)
+                .map(|c| c.outbound_tx.clone())
         };
         let Some(outbound_tx) = outbound_tx else {
             return Err(format!("host {host_id} is not connected"));
@@ -286,6 +378,7 @@ impl ProxyRouterHandle {
             .expect("router state poisoned")
             .hosts
             .get(&host_id)
+            .filter(|c| c.available.load(Ordering::Acquire))
             .map(|c| (c.outbound_tx.clone(), c.audio_pending.clone()))
             .ok_or_else(|| format!("host {host_id} is not connected"))?;
         let previous = audio_pending.fetch_add(1, Ordering::AcqRel);
@@ -617,6 +710,201 @@ struct ConnectionSetup {
     child: Option<SshChild>,
 }
 
+struct RecoveryContext {
+    host_id: String,
+    app: AppHandle,
+    transport: HostTransportConfig,
+    host: server::HostHandle,
+    live: Arc<AtomicBool>,
+    available: Arc<AtomicBool>,
+    retry: Arc<tokio::sync::Notify>,
+}
+
+impl RecoveryContext {
+    fn status(&self, connected: bool, attempt: u32, retry_in_seconds: u32, message: String) {
+        if !self.live.load(Ordering::Acquire) {
+            return;
+        }
+        let _ = self.app.emit(
+            "tyde://host-recovery",
+            host_config::HostRecoveryEvent {
+                host_id: self.host_id.clone(),
+                connected,
+                attempt,
+                retry_in_seconds,
+                message,
+            },
+        );
+    }
+}
+
+async fn setup_recovery(
+    context: RecoveryContext,
+    mut setup: ConnectionSetup,
+) -> Result<ConnectionSetup, String> {
+    let (session, logical) = server::recovery::Session::new();
+    let handshake =
+        server::recovery::connect(&mut setup.reader, &mut setup.writer, None, &session).await;
+    let (id, mut received, mut tail) = match handshake {
+        Ok(handshake) => handshake,
+        Err(error) => {
+            session.close();
+            let diagnostic = finish_child(setup.child, CloseCause::NaturalEof).await;
+            return Err(format!(
+                "recovery handshake failed: {error}; {}",
+                diagnostic.unwrap_or_default()
+            ));
+        }
+    };
+    tokio::spawn(async move {
+        let lifetime = session.clone();
+        let live = context.live.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = lifetime.closed() => return,
+                    _ = tokio::time::sleep(Duration::from_millis(100)) => {
+                        if !live.load(Ordering::Acquire) {
+                            lifetime.close();
+                            return;
+                        }
+                    }
+                }
+            }
+        });
+        let mut recovering = false;
+        loop {
+            let attached_at = std::time::Instant::now();
+            let attachment = session.clone().attach(setup.reader, setup.writer, received);
+            tokio::pin!(attachment);
+            let result = if recovering {
+                context.status(false, 0, 0, "Connected — catching up…".into());
+                tokio::select! {
+                    result = &mut attachment => result,
+                    _ = session.caught_up(tail) => {
+                        if !session.is_closed() {
+                            context.available.store(true, Ordering::Release);
+                            context.status(true, 0, 0, "Connected".into());
+                        }
+                        attachment.await
+                    }
+                }
+            } else {
+                attachment.await
+            };
+            context.available.store(false, Ordering::Release);
+            #[cfg(not(target_os = "windows"))]
+            if let Err(error) = context
+                .app
+                .state::<crate::ShellState>()
+                .voice_media
+                .stop_for_host(&context.host_id)
+            {
+                tracing::warn!(%error, "failed to stop voice after transport loss");
+            }
+            context.status(false, 1, 0, "SSH transport disconnected".into());
+            let diagnostic = finish_child(setup.child, CloseCause::NaturalEof).await;
+            let mut reason = format!(
+                "{}{}",
+                result
+                    .err()
+                    .map(|e| e.to_string())
+                    .unwrap_or_else(|| "SSH transport closed".into()),
+                diagnostic.map(|d| format!("; {d}")).unwrap_or_default()
+            );
+            tracing::warn!(host_id = %context.host_id, connection_age_seconds = attached_at.elapsed().as_secs(),
+                received = session.received(), sent = session.tail(), %reason, "SSH session detached");
+            if session.is_closed() {
+                return;
+            }
+            recovering = true;
+            let mut attempt: u32 = 0;
+            loop {
+                attempt = attempt.saturating_add(1);
+                let delay = if attempt == 1 {
+                    0
+                } else {
+                    (1u32 << attempt.min(7).saturating_sub(2)).min(30)
+                };
+                for remaining in (0..=delay).rev() {
+                    context.status(false, attempt, remaining, reason.clone());
+                    if remaining > 0 {
+                        tokio::select! {
+                            _ = session.closed() => return,
+                            _ = context.retry.notified() => break,
+                            _ = tokio::time::sleep(Duration::from_secs(1)) => {},
+                        }
+                    }
+                }
+                if delay > 0 {
+                    let jitter = u64::from(uuid::Uuid::new_v4().as_bytes()[0]);
+                    tokio::select! {
+                        _ = session.closed() => return,
+                        _ = tokio::time::sleep(Duration::from_millis(jitter)) => {},
+                    }
+                }
+                let next = tokio::select! {
+                    _ = session.closed() => return,
+                    result = setup_connection_transport(&context.host_id, context.app.clone(), context.transport.clone(), context.host.clone(), context.live.clone()) => result,
+                };
+                let mut next = match next {
+                    Ok(next) => next,
+                    Err(error) => {
+                        reason = error;
+                        continue;
+                    }
+                };
+                let handshake = server::recovery::connect(
+                    &mut next.reader,
+                    &mut next.writer,
+                    Some(id),
+                    &session,
+                )
+                .await;
+                match handshake {
+                    Ok((_, next_received, next_tail)) => {
+                        setup = next;
+                        received = next_received;
+                        tail = next_tail;
+                        break;
+                    }
+                    Err(error) => {
+                        let expired = error.kind() == std::io::ErrorKind::NotFound;
+                        reason = error.to_string();
+                        if let Some(diagnostic) =
+                            finish_child(next.child, CloseCause::NaturalEof).await
+                        {
+                            reason.push_str(&format!("; {diagnostic}"));
+                        }
+                        tracing::warn!(host_id = %context.host_id, attempt, %reason, "SSH reconnect attempt failed");
+                        if host_config::ssh_requires_attention(&reason) {
+                            let _ = emit_error(&context.app, &context.host_id, reason);
+                            session.close();
+                            return;
+                        }
+                        if expired {
+                            context.status(
+                                false,
+                                attempt,
+                                0,
+                                "Session expired — refreshing workspace…".into(),
+                            );
+                            session.close();
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+    });
+    let (reader, writer) = tokio::io::split(logical);
+    Ok(ConnectionSetup {
+        reader: Box::new(BufReader::new(reader)),
+        writer: Box::new(writer),
+        child: None,
+    })
+}
+
 async fn write_line<W: AsyncWriteExt + Unpin>(writer: &mut W, line: String) -> Result<(), String> {
     tracing::info!(line_len = line.len(), "proxy router sending line to host");
 
@@ -727,12 +1015,23 @@ async fn setup_connection_transport(
             let mut child = Command::new("ssh");
             child
                 .arg("-T")
+                .args([
+                    "-o",
+                    "ServerAliveInterval=15",
+                    "-o",
+                    "ServerAliveCountMax=3",
+                    "-o",
+                    "ConnectTimeout=10",
+                    "-o",
+                    "BatchMode=yes",
+                ])
                 .arg(&ssh_destination)
                 .arg(&command)
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped());
 
+            child.kill_on_drop(true);
             let mut child = child.spawn().map_err(|err| {
                 format!("failed to start ssh transport for host {host_id}: {err}")
             })?;

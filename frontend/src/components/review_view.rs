@@ -1165,6 +1165,7 @@ fn conn_diag(state: &AppState, host_id: &str) -> String {
     let label = match status {
         Some(crate::state::ConnectionStatus::Connected) => "connected",
         Some(crate::state::ConnectionStatus::Connecting) => "connecting",
+        Some(crate::state::ConnectionStatus::Reconnecting { .. }) => "reconnecting",
         Some(crate::state::ConnectionStatus::Disconnected) => "disconnected",
         Some(crate::state::ConnectionStatus::Error(_)) => "error",
         None => "unknown",

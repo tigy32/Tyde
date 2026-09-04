@@ -12,6 +12,8 @@ use protocol::{
     StreamPath, WelcomePayload, read_envelope, write_envelope,
 };
 use std::collections::HashMap;
+#[cfg(unix)]
+use tokio::io::AsyncBufReadExt;
 use tokio::io::{AsyncRead, AsyncWrite, BufReader};
 #[cfg(unix)]
 use tokio::net::{UnixListener, UnixStream};
@@ -214,13 +216,33 @@ pub async fn serve_uds(
     config: ServerConfig,
     host: HostHandle,
 ) -> io::Result<()> {
+    let recovery = crate::recovery::Registry::default();
     let result = async {
         loop {
             let (stream, _) = listener.listener.accept().await?;
             let host = host.clone();
+            let recovery = recovery.clone();
 
             tokio::spawn(async move {
-                let connection = match accept(&config, stream).await {
+                let mut stream = BufReader::new(stream);
+                let resumable = match timeout(HANDSHAKE_TIMEOUT, stream.fill_buf()).await {
+                    Ok(Ok(bytes)) => bytes.first() == Some(&crate::recovery::MAGIC[0]),
+                    _ => return,
+                };
+                let connection = if resumable {
+                    let (reader, writer) = tokio::io::split(stream);
+                    match recovery.accept(reader, writer).await {
+                        Ok(Some(logical)) => accept(&config, logical).await,
+                        Ok(None) => return,
+                        Err(error) => {
+                            tracing::warn!(%error, "recovery handshake failed");
+                            return;
+                        }
+                    }
+                } else {
+                    accept(&config, stream).await
+                };
+                let connection = match connection {
                     Ok(connection) => connection,
                     Err(err) => {
                         tracing::error!("handshake failed: {err:?}");

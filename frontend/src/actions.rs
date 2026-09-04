@@ -773,7 +773,7 @@ pub fn hold_file_for_diff_code_intel(state: &AppState, tab: TabId, key: &FileRes
 /// project stream. Order matters: the server processes them in arrival order,
 /// so the read resolves the file version the subscribe then peeks — the pushed
 /// semantic model carries the same version as the rendered contents.
-fn send_read_and_subscribe(host_id: String, project_id: String, path: ProjectPath) {
+pub(crate) fn send_read_and_subscribe(host_id: String, project_id: String, path: ProjectPath) {
     let read_payload = ProjectReadFilePayload { path: path.clone() };
     let subscribe_payload = CodeIntelSubscribeFilePayload { path };
     let project_stream = StreamPath(format!("/project/{project_id}"));

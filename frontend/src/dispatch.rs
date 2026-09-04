@@ -331,15 +331,28 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
             // incompatibility (e.g. after the app itself updates) can trigger
             // one fresh auto-upgrade attempt.
             state.clear_upgrade_attempted(host_id);
-            state.connection_statuses.update(|statuses| {
-                statuses.insert(host_id.to_string(), ConnectionStatus::Connected);
-            });
+            if !state
+                .host_refresh_pending
+                .with_untracked(|hosts| hosts.contains(host_id))
+            {
+                state.connection_statuses.update(|statuses| {
+                    statuses.insert(host_id.to_string(), ConnectionStatus::Connected);
+                });
+            }
             // Sessions/projects/teams etc. now arrive via HostBootstrap
             // (seq 1 on the host stream) — see the HostBootstrap arm below.
             log::info!("connected to host {}", host_id);
         }
         FrameKind::HostBootstrap => match envelope.parse_payload::<HostBootstrapPayload>() {
-            Ok(payload) => apply_host_bootstrap(state, host_id, payload),
+            Ok(payload) => {
+                apply_host_bootstrap(state, host_id, payload);
+                state.host_refresh_pending.update(|hosts| {
+                    hosts.remove(host_id);
+                });
+                state.connection_statuses.update(|statuses| {
+                    statuses.insert(host_id.to_owned(), ConnectionStatus::Connected);
+                });
+            }
             Err(error) => report_dispatch_error(
                 state,
                 host_id,
@@ -1912,6 +1925,7 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                         base_label
                     };
                     let version = payload.version;
+                    let mut same_version_changed = false;
                     state.open_files.update(|files| {
                         // A `missing` read carries no contents; keep the
                         // last-seen text so the viewer shows "deleted on
@@ -1923,29 +1937,47 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                         } else {
                             None
                         };
-                        files.insert(
-                            key.clone(),
-                            OpenFile {
-                                path: payload.path,
-                                version,
-                                contents: if payload.missing {
-                                    prior_file.as_ref().and_then(|open| open.contents.clone())
-                                } else if payload.is_binary {
-                                    payload
-                                        .binary
-                                        .as_ref()
-                                        .and_then(|binary| serde_json::to_string(binary).ok())
-                                } else {
-                                    payload.contents
-                                },
-                                is_binary: prior_file
+                        let next = OpenFile {
+                            path: payload.path,
+                            version,
+                            contents: if payload.missing {
+                                prior_file.as_ref().and_then(|open| open.contents.clone())
+                            } else if payload.is_binary {
+                                payload
+                                    .binary
                                     .as_ref()
-                                    .map(|open| open.is_binary)
-                                    .unwrap_or(payload.is_binary),
-                                missing: payload.missing,
+                                    .and_then(|binary| serde_json::to_string(binary).ok())
+                            } else {
+                                payload.contents
                             },
-                        );
+                            is_binary: prior_file
+                                .as_ref()
+                                .map(|open| open.is_binary)
+                                .unwrap_or(payload.is_binary),
+                            missing: payload.missing,
+                        };
+                        same_version_changed = files.get(&key).is_some_and(|prior| {
+                            prior.version == version
+                                && (prior.contents != next.contents
+                                    || prior.is_binary != next.is_binary
+                                    || prior.missing != next.missing)
+                        });
+                        files.insert(key.clone(), next);
                     });
+                    if same_version_changed {
+                        log::info!(
+                            "file refresh reused version host={} project={} path={} version={}",
+                            host_id,
+                            project_id,
+                            path.relative_path,
+                            version
+                        );
+                        // File versions belong to a host process. A restarted
+                        // host can reuse a version for different contents.
+                        state.file_view_generations.update(|generations| {
+                            *generations.entry(key.clone()).or_default() += 1;
+                        });
+                    }
 
                     let code_intel_key = CodeIntelKey {
                         host_id: key.host_id.clone(),
@@ -6798,6 +6830,16 @@ fn apply_project_bootstrap(
     state.git_status.update(|git_status| {
         git_status.insert(project_id.clone(), payload.git_status.roots);
     });
+    let open_paths: Vec<_> = state.open_files.with_untracked(|files| {
+        files
+            .keys()
+            .filter(|key| key.host_id == host_id && key.project_id == project_id)
+            .map(|key| key.path.clone())
+            .collect()
+    });
+    for path in open_paths {
+        crate::actions::send_read_and_subscribe(host_id.to_owned(), project_id.0.clone(), path);
+    }
     state.review_summaries.update(|map| {
         map.insert(project_id, payload.review_summaries);
     });

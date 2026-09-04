@@ -807,6 +807,11 @@ async fn disconnect_host(
 }
 
 #[tauri::command]
+fn retry_host(state: tauri::State<'_, ShellState>, host_id: String) -> Result<(), String> {
+    state.router.retry(&host_id)
+}
+
+#[tauri::command]
 async fn send_host_line(
     state: tauri::State<'_, ShellState>,
     host_id: String,
@@ -1093,6 +1098,7 @@ macro_rules! other_production_invoke_handler {
         tauri::generate_handler![
             connect_host,
             disconnect_host,
+            retry_host,
             send_host_line,
             send_host_frame,
             voice_media_start,
@@ -1122,6 +1128,7 @@ macro_rules! other_production_invoke_handler {
         tauri::generate_handler![
             connect_host,
             disconnect_host,
+            retry_host,
             send_host_line,
             send_host_frame,
             voice_media_supported,

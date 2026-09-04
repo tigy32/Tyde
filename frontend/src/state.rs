@@ -55,6 +55,11 @@ pub enum ToolOutputMode {
 pub enum ConnectionStatus {
     Disconnected,
     Connecting,
+    Reconnecting {
+        attempt: u32,
+        retry_in_seconds: u32,
+        message: String,
+    },
     Connected,
     Error(String),
 }
@@ -3206,6 +3211,7 @@ pub struct BrowseDialogState {
 /// another.
 #[derive(Clone, Debug, Default)]
 pub struct ProjectViewMemory {
+    pub needs_refresh: bool,
     pub center_zone: Option<CenterZoneState>,
     pub active_terminal: Option<ActiveTerminalRef>,
     pub open_files: HashMap<FileResourceKey, OpenFile>,
@@ -3489,6 +3495,8 @@ impl ComposerHandle {
 #[derive(Clone)]
 pub struct AppState {
     pub configured_hosts: RwSignal<Vec<ConfiguredHost>>,
+    pub host_connection_epochs: RwSignal<HashMap<String, u64>>,
+    pub host_refresh_pending: RwSignal<HashSet<String>>,
     pub selected_host_id: RwSignal<Option<String>>,
     pub host_streams: RwSignal<HashMap<String, StreamPath>>,
     pub connection_statuses: RwSignal<HashMap<String, ConnectionStatus>>,
@@ -3639,6 +3647,7 @@ pub struct AppState {
     /// infers provider state from open files or extensions.
     pub code_intel_overview: RwSignal<HashMap<ActiveProjectRef, CodeIntelOverviewPayload>>,
     pub open_files: RwSignal<HashMap<FileResourceKey, OpenFile>>,
+    pub file_view_generations: RwSignal<HashMap<FileResourceKey, u64>>,
     /// Invocation-time routing for cold file opens and in-place refreshes.
     /// Open wins over RefreshInPlace so a failed refresh marker cannot swallow
     /// the user's next explicit open.
@@ -4090,6 +4099,8 @@ impl AppState {
 
         Self {
             configured_hosts: RwSignal::new(Vec::new()),
+            host_connection_epochs: RwSignal::new(HashMap::new()),
+            host_refresh_pending: RwSignal::new(HashSet::new()),
             selected_host_id: RwSignal::new(None),
             host_streams: RwSignal::new(HashMap::new()),
             connection_statuses: RwSignal::new(HashMap::new()),
@@ -4151,6 +4162,7 @@ impl AppState {
             git_status: RwSignal::new(HashMap::new()),
             code_intel_overview: RwSignal::new(HashMap::new()),
             open_files: RwSignal::new(HashMap::new()),
+            file_view_generations: RwSignal::new(HashMap::new()),
             pending_file_opens: RwSignal::new(HashMap::new()),
             code_intel: RwSignal::new(HashMap::new()),
             diff_code_intel_holds: RwSignal::new(HashMap::new()),
@@ -6210,6 +6222,11 @@ impl AppState {
 
         if let Some(outgoing) = current {
             let snapshot = ProjectViewMemory {
+                needs_refresh: self.project_view_memory.with_untracked(|memories| {
+                    memories
+                        .get(&outgoing)
+                        .is_some_and(|memory| memory.needs_refresh)
+                }),
                 center_zone: Some(self.center_zone.get_untracked()),
                 active_terminal: self.active_terminal.get_untracked(),
                 open_files: self.open_files.get_untracked(),
@@ -6225,6 +6242,8 @@ impl AppState {
                 .with_untracked(|m| m.get(r).cloned())
         });
 
+        #[cfg(target_arch = "wasm32")]
+        let refresh_files = restored.as_ref().is_some_and(|memory| memory.needs_refresh);
         self.active_project.set(next.clone());
         persist_active_project(next.as_ref());
 
@@ -6298,6 +6317,33 @@ impl AppState {
             }
         }
 
+        #[cfg(target_arch = "wasm32")]
+        if refresh_files
+            && let Some(project) = next.as_ref()
+            && matches!(
+                self.connection_statuses
+                    .with_untracked(|statuses| statuses.get(&project.host_id).cloned()),
+                Some(ConnectionStatus::Connected)
+            )
+        {
+            let paths: Vec<_> = self.open_files.with_untracked(|files| {
+                files
+                    .keys()
+                    .filter(|key| {
+                        key.host_id == project.host_id && key.project_id == project.project_id
+                    })
+                    .map(|key| key.path.clone())
+                    .collect()
+            });
+            for path in paths {
+                crate::actions::send_read_and_subscribe(
+                    project.host_id.clone(),
+                    project.project_id.0.clone(),
+                    path,
+                );
+            }
+        }
+
         // Synchronous counterpart to the browser-only guard: a project switch is
         // the context change a native build can drive, and a draft bound to the
         // old host must not survive it. Last, so the context it compares
@@ -6335,6 +6381,88 @@ impl AppState {
 
     pub fn total_host_count(&self) -> usize {
         self.configured_hosts.get().len()
+    }
+
+    pub fn cancel_host_connect(&self, host_id: &str) -> u64 {
+        self.host_connection_epochs
+            .try_update(|epochs| {
+                let epoch = epochs.entry(host_id.to_owned()).or_default();
+                *epoch += 1;
+                *epoch
+            })
+            .expect("connection epoch state")
+    }
+
+    pub fn prepare_host_refresh(&self, host_id: &str) {
+        self.diff_contents
+            .update(|diffs| diffs.retain(|key, _| key.host_id != host_id));
+        self.project_view_memory.update(|memories| {
+            for (project, memory) in memories.iter_mut() {
+                if project.host_id == host_id {
+                    memory.needs_refresh = true;
+                }
+                memory.diff_contents.retain(|key, _| key.host_id != host_id);
+            }
+        });
+        self.terminals.update(|terminals| {
+            for terminal in terminals
+                .iter_mut()
+                .filter(|terminal| terminal.host_id == host_id && !terminal.exited)
+            {
+                terminal.exited = true;
+                terminal.exit_signal = Some("Connection expired — open a new terminal".into());
+            }
+        });
+        self.host_refresh_pending.update(|hosts| {
+            hosts.insert(host_id.to_owned());
+        });
+        self.code_intel
+            .update(|models| models.retain(|key, _| key.host_id != host_id));
+        let review_ids: HashSet<_> = self.reviews.with_untracked(|reviews| {
+            let projects: HashSet<_> = self.projects.with_untracked(|projects| {
+                projects
+                    .iter()
+                    .filter(|p| p.host_id == host_id)
+                    .map(|p| p.project.id.clone())
+                    .collect()
+            });
+            reviews
+                .iter()
+                .filter(|(_, review)| projects.contains(&review.project_id))
+                .map(|(id, _)| id.clone())
+                .collect()
+        });
+        self.reviews
+            .update(|reviews| reviews.retain(|id, _| !review_ids.contains(id)));
+        self.review_action_pending
+            .update(|pending| pending.retain(|id, _| !review_ids.contains(id)));
+        self.review_action_target_pending
+            .update(|pending| pending.retain(|(id, _)| !review_ids.contains(id)));
+        self.review_create_pending
+            .update(|pending| pending.retain(|(host, _), _| host != host_id));
+        self.pending_workbench_creates
+            .update(|pending| pending.retain(|entry| entry.host_id != host_id));
+        self.pending_workbench_removes
+            .update(|pending| pending.retain(|entry| entry.host_id != host_id));
+        // Bootstrap replaces server snapshots. Keep view identity and drafts;
+        // only cursors and in-flight requests belong to the lost connection.
+        self.host_streams.update(|streams| {
+            streams.remove(host_id);
+        });
+        crate::send::clear_host_seqs(host_id);
+        crate::dispatch::reset_inbound_state_for_host(host_id);
+        self.session_list_pages
+            .update(|pages| pages.retain(|(host, _), _| host != host_id));
+        self.session_list_refresh_in_flight.update(|hosts| {
+            hosts.remove(host_id);
+        });
+        self.pending_agent_session_settings
+            .update(|pending| pending.retain(|(host, _), _| host != host_id));
+        self.pending_file_opens
+            .update(|pending| pending.retain(|key, _| key.host_id != host_id));
+        self.command_errors_by_host.update(|errors| {
+            errors.remove(host_id);
+        });
     }
 
     pub fn clear_host_runtime(&self, host_id: &str) {
@@ -6534,6 +6662,8 @@ impl AppState {
         self.code_intel.update(|map| {
             map.retain(|key, _| key.host_id != host_id);
         });
+        self.file_view_generations
+            .update(|map| map.retain(|key, _| key.host_id != host_id));
         self.open_files.update(|map| {
             map.retain(|key, _| key.host_id != host_id);
         });

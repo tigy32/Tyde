@@ -78,6 +78,19 @@ pub fn Header() -> impl IntoView {
                     None => base,
                 }
             }
+            ConnectionStatus::Reconnecting {
+                attempt,
+                retry_in_seconds,
+                message,
+            } => {
+                if attempt == 0 {
+                    format!("{selected_label}: {message}")
+                } else {
+                    format!(
+                        "{selected_label}: Disconnected — reconnecting… Attempt {attempt} · retry in {retry_in_seconds}s"
+                    )
+                }
+            }
             ConnectionStatus::Connecting => format!("Connecting to {selected_label}"),
             ConnectionStatus::Disconnected => {
                 format!("{connected}/{total} hosts connected · {selected_label} offline")
@@ -91,7 +104,9 @@ pub fn Header() -> impl IntoView {
         Memo::new(
             move |_| match status_class_state.selected_host_connection_status() {
                 ConnectionStatus::Disconnected => "status-dot disconnected",
-                ConnectionStatus::Connecting => "status-dot connecting",
+                ConnectionStatus::Connecting | ConnectionStatus::Reconnecting { .. } => {
+                    "status-dot connecting"
+                }
                 ConnectionStatus::Connected => "status-dot connected",
                 ConnectionStatus::Error(_) => "status-dot error",
             },

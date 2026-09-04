@@ -2135,7 +2135,9 @@ exec "$DEV_CHECK_REAL_PYTHON" "$@"
         )
         self.assertEqual(
             len(re.findall(non_windows_cfg + r"\s*if ", shell_router)),
-            3,
+            # SSH recovery adds native voice teardown on physical transport loss.
+            # All four authorization/teardown sites must stay excluded on Windows.
+            4,
             "router native-media authorization and teardown must be absent on Windows",
         )
         windows_handler = re.search(

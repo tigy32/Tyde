@@ -239,6 +239,66 @@ impl Fixture {
     }
 
     #[allow(dead_code)]
+    pub fn recovery_wire(
+        &self,
+        registry: server::recovery::Registry,
+    ) -> (tokio::io::DuplexStream, tokio::task::JoinHandle<()>) {
+        let (wire, relay, _) = self.recovery_wire_controlled(registry);
+        (wire, relay)
+    }
+
+    #[allow(dead_code)]
+    pub fn recovery_wire_controlled(
+        &self,
+        registry: server::recovery::Registry,
+    ) -> (
+        tokio::io::DuplexStream,
+        tokio::task::JoinHandle<()>,
+        tokio::sync::watch::Sender<bool>,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (client, uplink) = tokio::io::duplex(8192);
+        let (downlink, server) = tokio::io::duplex(8192);
+        let (control, mut gate) = tokio::sync::watch::channel(true);
+        let relay = tokio::spawn(async move {
+            let (mut from_client, mut to_client) = tokio::io::split(uplink);
+            let (mut from_server, mut to_server) = tokio::io::split(downlink);
+            let downstream = async {
+                let mut bytes = [0; 4096];
+                loop {
+                    let n = from_server.read(&mut bytes).await?;
+                    if n == 0 {
+                        return Ok::<_, std::io::Error>(());
+                    }
+                    while !*gate.borrow_and_update() {
+                        gate.changed().await.map_err(std::io::Error::other)?;
+                    }
+                    to_client.write_all(&bytes[..n]).await?;
+                }
+            };
+            tokio::select! {
+                _ = tokio::io::copy(&mut from_client, &mut to_server) => {},
+                _ = downstream => {},
+            }
+        });
+        let host = self.host.clone();
+        tokio::spawn(async move {
+            let (reader, writer) = tokio::io::split(server);
+            if let Some(logical) = registry
+                .accept(reader, writer)
+                .await
+                .expect("recovery handshake")
+            {
+                let connection = server::accept(&server::ServerConfig::current(), logical)
+                    .await
+                    .expect("logical handshake");
+                let _ = server::run_connection(connection, host).await;
+            }
+        });
+        (client, relay, control)
+    }
+
+    #[allow(dead_code)]
     pub async fn connect(&self) -> client::Connection {
         connect_client(self.host.clone()).await
     }

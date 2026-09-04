@@ -1078,33 +1078,105 @@ async fn install_host_listeners(state: AppState) -> Result<Vec<bridge::UnlistenH
         .await?,
     );
 
-    let disconnect_state = state.clone();
+    let recovery_state = state.clone();
     handles.push(
-        bridge::listen_host_disconnected(move |event| {
-            let reconnect_local = event.host_id == "local"
-                && !matches!(
-                    disconnect_state
+        bridge::listen_host_recovery(move |event| {
+            if !recovery_state
+                .configured_hosts
+                .with_untracked(|hosts| hosts.iter().any(|host| host.id == event.host_id))
+                || matches!(
+                    recovery_state
                         .connection_statuses
                         .get_untracked()
                         .get(&event.host_id),
-                    Some(ConnectionStatus::Connecting)
+                    Some(ConnectionStatus::Disconnected)
+                )
+            {
+                return;
+            }
+            recovery_state.connection_statuses.update(|statuses| {
+                statuses.insert(
+                    event.host_id,
+                    if event.connected {
+                        ConnectionStatus::Connected
+                    } else {
+                        ConnectionStatus::Reconnecting {
+                            attempt: event.attempt,
+                            retry_in_seconds: event.retry_in_seconds,
+                            message: event.message,
+                        }
+                    },
                 );
-            disconnect_state.connection_statuses.update(|statuses| {
-                if !matches!(
-                    statuses.get(&event.host_id),
-                    Some(ConnectionStatus::Error(_))
-                ) {
-                    statuses.insert(event.host_id.clone(), ConnectionStatus::Disconnected);
+            });
+        })
+        .await?,
+    );
+
+    let disconnect_state = state.clone();
+    handles.push(
+        bridge::listen_host_disconnected(move |event| {
+            let state = disconnect_state.clone();
+            let host_id = event.host_id;
+            if !state.configured_hosts.with_untracked(|hosts| hosts.iter().any(|host| host.id == host_id)) { return; }
+            if state.connection_statuses.with_untracked(|statuses| matches!(statuses.get(&host_id), Some(ConnectionStatus::Error(message)) if host_config::ssh_requires_attention(message))) { return; }
+            if matches!(
+                state.connection_statuses.get_untracked().get(&host_id),
+                Some(ConnectionStatus::Disconnected)
+            ) {
+                return;
+            }
+            state.connection_statuses.update(|statuses| {
+                statuses.insert(
+                    host_id.clone(),
+                    ConnectionStatus::Reconnecting {
+                        attempt: 1,
+                        retry_in_seconds: 0,
+                        message: "Refreshing connection…".into(),
+                    },
+                );
+            });
+            spawn_local(async move {
+                let mut attempt = 0u32;
+                loop {
+                    attempt = attempt.saturating_add(1);
+                    if matches!(
+                        state.connection_statuses.get_untracked().get(&host_id),
+                        Some(ConnectionStatus::Disconnected | ConnectionStatus::Connected)
+                    ) {
+                        return;
+                    }
+                    connect_one_host(state.clone(), host_id.clone()).await;
+                    if !matches!(
+                        state.connection_statuses.get_untracked().get(&host_id),
+                        Some(ConnectionStatus::Error(_))
+                    ) {
+                        return;
+                    }
+                    if state.connection_statuses.with_untracked(|statuses| matches!(statuses.get(&host_id), Some(ConnectionStatus::Error(message)) if host_config::ssh_requires_attention(message))) { return; }
+                    let retry_epoch = state.host_connection_epochs.with_untracked(|epochs| epochs.get(&host_id).copied());
+                    let seconds = (1u32 << attempt.min(5)).min(30);
+                    state.connection_statuses.update(|statuses| {
+                        statuses.insert(
+                            host_id.clone(),
+                            ConnectionStatus::Reconnecting {
+                                attempt: attempt + 1,
+                                retry_in_seconds: seconds,
+                                message: "Disconnected — refreshing connection…".into(),
+                            },
+                        );
+                    });
+                    let promise = js_sys::Promise::new(&mut |resolve, _| {
+                        if let Some(window) = web_sys::window() {
+                            let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(
+                                &resolve,
+                                (seconds * 1000) as i32,
+                            );
+                        }
+                    });
+                    let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+                    if state.host_connection_epochs.with_untracked(|epochs| epochs.get(&host_id).copied()) != retry_epoch { return; }
                 }
             });
-            disconnect_state.clear_host_runtime(&event.host_id);
-            if reconnect_local {
-                let state = disconnect_state.clone();
-                spawn_local(async move {
-                    log::warn!("local host disconnected; reconnecting");
-                    connect_one_host(state, "local".to_string()).await;
-                });
-            }
         })
         .await?,
     );
@@ -1128,6 +1200,20 @@ async fn install_host_listeners(state: AppState) -> Result<Vec<bridge::UnlistenH
     let warning_state = state.clone();
     handles.push(
         bridge::listen_host_warning(move |event| {
+            if matches!(
+                warning_state
+                    .connection_statuses
+                    .get_untracked()
+                    .get(&event.host_id),
+                Some(ConnectionStatus::Reconnecting { .. })
+            ) {
+                log::warn!(
+                    "host {} reconnect diagnostic: {}",
+                    event.host_id,
+                    event.message
+                );
+                return;
+            }
             log::warn!("host {} warning: {}", event.host_id, event.message);
             let label = configured_host_label(&warning_state, &event.host_id);
             let message = match label {
@@ -1179,6 +1265,18 @@ pub async fn refresh_configured_hosts(state: &AppState) {
 }
 
 pub async fn connect_one_host(state: AppState, host_id: String) {
+    let epoch = state.cancel_host_connect(&host_id);
+    let epoch_state = state.clone();
+    let epoch_host = host_id.clone();
+    let current = move || {
+        epoch_state
+            .host_connection_epochs
+            .with_untracked(|epochs| epochs.get(&epoch_host) == Some(&epoch))
+    };
+    let recovering = matches!(
+        state.connection_statuses.get_untracked().get(&host_id),
+        Some(ConnectionStatus::Reconnecting { .. })
+    );
     let target_label = configured_host_label(&state, &host_id);
     log::info!("host.connect.start host={}", host_id);
     state.connection_statuses.update(|statuses| {
@@ -1186,7 +1284,11 @@ pub async fn connect_one_host(state: AppState, host_id: String) {
     });
 
     if is_managed_remote_host(&state, &host_id) {
-        match bridge::ensure_configured_host_ready(host_id.clone()).await {
+        let readiness = bridge::ensure_configured_host_ready(host_id.clone()).await;
+        if !current() {
+            return;
+        }
+        match readiness {
             Ok(snapshot) => {
                 state.host_lifecycle_statuses.update(|statuses| {
                     statuses.insert(
@@ -1197,10 +1299,12 @@ pub async fn connect_one_host(state: AppState, host_id: String) {
             }
             Err(error) => {
                 log::error!("failed to prepare remote host {}: {}", host_id, error);
-                crate::components::header::report_user_error(prepare_host_failure_message(
-                    target_label.as_deref(),
-                    &error,
-                ));
+                if !recovering {
+                    crate::components::header::report_user_error(prepare_host_failure_message(
+                        target_label.as_deref(),
+                        &error,
+                    ));
+                }
                 state.host_lifecycle_statuses.update(|statuses| {
                     statuses.insert(
                         host_id.clone(),
@@ -1220,21 +1324,28 @@ pub async fn connect_one_host(state: AppState, host_id: String) {
         }
     }
 
-    if let Err(error) = bridge::connect_host(bridge::HostIdRequest {
+    let connected = bridge::connect_host(bridge::HostIdRequest {
         host_id: host_id.clone(),
     })
-    .await
-    {
+    .await;
+    if !current() {
+        return;
+    }
+    if let Err(error) = connected {
         log::error!("failed to connect host {}: {}", host_id, error);
-        crate::components::header::report_user_error(connect_host_failure_message(
-            target_label.as_deref(),
-            &error,
-        ));
+        if !recovering {
+            crate::components::header::report_user_error(connect_host_failure_message(
+                target_label.as_deref(),
+                &error,
+            ));
+        }
         state.connection_statuses.update(|statuses| {
             statuses.insert(host_id, ConnectionStatus::Error(error));
         });
         return;
     }
+
+    state.prepare_host_refresh(&host_id);
 
     // The native router replaces any existing connection for this host
     // without emitting a disconnect event. Start a fresh protocol epoch here

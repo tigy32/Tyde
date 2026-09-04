@@ -256,6 +256,16 @@ pub struct HostDisconnectedEvent {
     pub host_id: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostRecoveryEvent {
+    pub host_id: String,
+    pub connected: bool,
+    pub attempt: u32,
+    pub retry_in_seconds: u32,
+    pub message: String,
+}
+
 /// Tauri event payload: a host connection encountered an error.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -356,4 +366,19 @@ pub enum RemoteHostLifecycleStatus {
 pub struct HostLifecycleEvent {
     pub host_id: String,
     pub status: RemoteHostLifecycleStatus,
+}
+
+/// OpenSSH failures which require user action rather than another network try.
+pub fn ssh_requires_attention(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    [
+        "permission denied",
+        "host key verification failed",
+        "remote host identification has changed",
+        "no supported authentication methods",
+        "too many authentication failures",
+        "bad configuration option",
+    ]
+    .iter()
+    .any(|reason| message.contains(reason))
 }

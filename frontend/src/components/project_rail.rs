@@ -162,6 +162,7 @@ pub fn ProjectRail() -> impl IntoView {
                                         {move || match status() {
                                             crate::state::ConnectionStatus::Connected => "●",
                                             crate::state::ConnectionStatus::Connecting => "◐",
+                                            crate::state::ConnectionStatus::Reconnecting { .. } => "Reconnecting…",
                                             crate::state::ConnectionStatus::Disconnected => "○",
                                             crate::state::ConnectionStatus::Error(_) => "!",
                                         }}

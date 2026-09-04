@@ -41,6 +41,7 @@ pub fn HomeView() -> impl IntoView {
                 "The selected host is offline. Connect it before creating projects or starting chats."
                     .to_owned(),
             ),
+            ConnectionStatus::Reconnecting { .. } => Some("Disconnected — reconnecting. Your workspace is preserved.".into()),
             ConnectionStatus::Connecting | ConnectionStatus::Connected => None,
         }
     });

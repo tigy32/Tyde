@@ -16,6 +16,7 @@ pub(crate) mod mobile_push;
 pub mod paths;
 pub(crate) mod process_env;
 pub(crate) mod project_stream;
+pub mod recovery;
 pub mod remote;
 pub(crate) mod review;
 pub(crate) mod review_mcp;
