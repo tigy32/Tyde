@@ -11520,7 +11520,7 @@ impl HostHandle {
             #[cfg(any(test, feature = "test-support"))]
             let opener_program = state.project_path_opener_program.clone();
             #[cfg(not(any(test, feature = "test-support")))]
-            let opener_program = None;
+            let opener_program: Option<String> = None;
             (Arc::clone(&state.project_store), opener_program)
         };
         let project = load_project(&project_store, &project_id, OPERATION).await?;
