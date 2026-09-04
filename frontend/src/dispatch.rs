@@ -86,6 +86,7 @@ impl FrontendSeqValidator {
 
 /// Drop per-host inbound sequence state only. Tests use this to rewind seq
 /// counters while preserving protocol bootstrap state.
+#[cfg(all(test, target_arch = "wasm32"))]
 pub fn clear_host_seqs(host_id: &str) {
     INBOUND_SEQ.with(|validator| validator.borrow_mut().forget_host(host_id));
 }
@@ -99,7 +100,7 @@ pub fn reset_inbound_state_for_host(host_id: &str) {
 
 /// Test helper: drop the seq counter for a single `(host_id, stream)`
 /// pair so the next envelope on that stream is accepted at seq 0.
-#[allow(dead_code)]
+#[cfg(all(test, target_arch = "wasm32"))]
 pub fn clear_stream_seq_for_tests(host_id: &str, stream: &StreamPath) {
     INBOUND_SEQ.with(|validator| {
         let key = (host_id.to_string(), stream.clone());
@@ -119,7 +120,7 @@ pub fn clear_stream_seq_for_tests(host_id: &str, stream: &StreamPath) {
 /// test populated via `AppState` setters survives — the bootstrap only
 /// inserts empty maps/vecs for the keyed slots that already accept
 /// upserts.
-#[allow(dead_code)]
+#[cfg(all(test, target_arch = "wasm32"))]
 pub fn prime_host_for_tests(state: &AppState, host_id: &str) {
     use protocol::{
         BackendSetupPayload as BootstrapBackendSetup, HostBootstrapPayload as BootstrapHostPayload,
@@ -227,7 +228,7 @@ pub fn prime_host_for_tests(state: &AppState, host_id: &str) {
 /// Use after seeding the agent into `state.agents` (e.g. via a
 /// `NewAgent` dispatch on the host stream). The bootstrap payload
 /// includes an `AgentStart` to represent the server bootstrap shape.
-#[allow(dead_code)]
+#[cfg(all(test, target_arch = "wasm32"))]
 pub fn prime_agent_stream_for_tests(
     state: &AppState,
     host_id: &str,

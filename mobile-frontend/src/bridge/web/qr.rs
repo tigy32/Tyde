@@ -124,10 +124,7 @@ pub async fn scan_qr() -> Result<BarcodeScanResult, String> {
     };
 
     drop(guard);
-    result.map(|content| BarcodeScanResult {
-        content,
-        format: Some("qr_code".to_owned()),
-    })
+    result.map(|content| BarcodeScanResult { content })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

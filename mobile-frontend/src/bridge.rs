@@ -126,9 +126,6 @@ use crate::state::{
 #[derive(Deserialize)]
 pub struct BarcodeScanResult {
     pub content: String,
-    #[serde(default)]
-    #[allow(dead_code)]
-    pub format: Option<String>,
 }
 
 /// Opaque listener handle. `remove()` unregisters the web listener.

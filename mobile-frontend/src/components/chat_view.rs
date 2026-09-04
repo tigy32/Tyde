@@ -252,27 +252,10 @@ const EDGE_ZONE_PX: f64 = 24.0;
 const SWIPE_THRESHOLD_PX: f64 = 64.0;
 const SWIPE_HORIZONTAL_DOMINANCE: f64 = 1.5;
 
-/// Which edge the back-swipe starts from, and therefore which way the finger
-/// travels. Flip this single constant to switch between the iOS convention
-/// (`LeftEdgeMoveRight`) and `RightEdgeMoveLeft`; the rest of the gesture logic
-/// keys off it.
-const BACK_SWIPE: BackSwipe = BackSwipe::LeftEdgeMoveRight;
-
-// One variant is intentionally unselected: it is the alternative the
-// `BACK_SWIPE` constant can be flipped to without touching the gesture logic.
-#[derive(Clone, Copy)]
-#[allow(dead_code)]
-enum BackSwipe {
-    /// Start near the right screen edge, finger moves left.
-    RightEdgeMoveLeft,
-    /// Start near the left screen edge, finger moves right. (iOS-style, default)
-    LeftEdgeMoveRight,
-}
-
 /// Pure decision for the edge-swipe-back gesture, given the touch start X, the
-/// total horizontal/vertical travel, and the viewport width. Kept free of DOM
-/// types so it is directly unit-testable.
-fn back_swipe_triggered(start_x: f64, dx: f64, dy: f64, viewport_width: f64) -> bool {
+/// total horizontal/vertical travel. Kept free of DOM types so it is directly
+/// unit-testable.
+fn back_swipe_triggered(start_x: f64, dx: f64, dy: f64) -> bool {
     // Must be dominantly horizontal so vertical scrolling never fires it.
     if dx.abs() <= dy.abs() * SWIPE_HORIZONTAL_DOMINANCE {
         return false;
@@ -280,10 +263,7 @@ fn back_swipe_triggered(start_x: f64, dx: f64, dy: f64, viewport_width: f64) -> 
     if dx.abs() < SWIPE_THRESHOLD_PX {
         return false;
     }
-    match BACK_SWIPE {
-        BackSwipe::RightEdgeMoveLeft => start_x >= viewport_width - EDGE_ZONE_PX && dx < 0.0,
-        BackSwipe::LeftEdgeMoveRight => start_x <= EDGE_ZONE_PX && dx > 0.0,
-    }
+    start_x <= EDGE_ZONE_PX && dx > 0.0
 }
 
 /// Conversation surface.
@@ -352,11 +332,7 @@ pub fn ChatView() -> impl IntoView {
         };
         let dx = t.client_x() as f64 - sx;
         let dy = t.client_y() as f64 - sy;
-        let viewport_width = web_sys::window()
-            .and_then(|w| w.inner_width().ok())
-            .and_then(|v| v.as_f64())
-            .unwrap_or(0.0);
-        if back_swipe_triggered(sx, dx, dy, viewport_width) {
+        if back_swipe_triggered(sx, dx, dy) {
             more_open.set(false);
             s_swipe.viewing_chat.set(false);
         }
@@ -2768,27 +2744,27 @@ mod wasm_tests {
         let vw = 400.0;
         // Starts in the left edge zone, long rightward, horizontal: fires.
         assert!(
-            back_swipe_triggered(5.0, 120.0, 10.0, vw),
+            back_swipe_triggered(5.0, 120.0, 10.0),
             "left-edge rightward horizontal swipe must trigger back"
         );
         // Starts in the middle of the screen: not an edge swipe.
         assert!(
-            !back_swipe_triggered(vw / 2.0, 120.0, 10.0, vw),
+            !back_swipe_triggered(vw / 2.0, 120.0, 10.0),
             "swipe starting mid-screen must not trigger back"
         );
         // Horizontal travel below threshold: ignored.
         assert!(
-            !back_swipe_triggered(5.0, 40.0, 5.0, vw),
+            !back_swipe_triggered(5.0, 40.0, 5.0),
             "short swipe must not trigger back"
         );
         // Dominantly vertical (a transcript scroll): ignored.
         assert!(
-            !back_swipe_triggered(5.0, 70.0, -200.0, vw),
+            !back_swipe_triggered(5.0, 70.0, -200.0),
             "dominantly vertical drag must not trigger back"
         );
         // Left edge but moving the wrong way (leftward): ignored.
         assert!(
-            !back_swipe_triggered(5.0, -120.0, 10.0, vw),
+            !back_swipe_triggered(5.0, -120.0, 10.0),
             "leftward travel from the left edge must not trigger back"
         );
     }

@@ -1470,8 +1470,6 @@ fn resolve_launch_profile_backend(
 
 #[derive(Debug, Deserialize)]
 struct JsonRpcRequest {
-    #[allow(dead_code)]
-    jsonrpc: Option<String>,
     id: Option<Value>,
     method: String,
     params: Option<Value>,

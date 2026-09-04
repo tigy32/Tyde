@@ -129,17 +129,8 @@ pub(crate) fn ReviewSidebar(
         let id = review_id.clone();
         Memo::new(move |_| state.reviews.with(|map| map.get(&id).cloned()))
     };
-    let live_for_status = live;
     let live_for_count = live;
     let live_for_ai = live;
-
-    let review_clone = review.clone();
-    let status: Memo<ReviewStatus> = Memo::new(move |_| {
-        live_for_status
-            .get()
-            .map(|r| r.status)
-            .unwrap_or_else(|| review_clone.status.clone())
-    });
 
     // Reactive counts derived from the live signal — never cached.
     let user_comment_count: Memo<usize> = Memo::new(move |_| {
@@ -787,8 +778,6 @@ pub(crate) fn ReviewSidebar(
             "\u{25b8}"
         }
     };
-    let _ = status; // silence unused if banner moved out of sidebar
-
     view! {
         <div class="review-sidebar">
             <div class="review-sidebar-section">

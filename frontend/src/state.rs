@@ -1366,8 +1366,6 @@ pub enum DuplicateFileEligibility {
     TargetAlreadyContainsResource { existing: TabId },
 }
 
-impl DuplicateFileEligibility {}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DuplicateFileResult {
     Duplicated {

@@ -92,7 +92,7 @@ pub fn reset_inbound_seq_for_host(host: &LocalHostId) {
 ///
 /// After priming, the `FrontendSeqValidator` is rewound so tests can
 /// dispatch their first envelope at seq `0` without a seq-mismatch error.
-#[allow(dead_code)]
+#[cfg(all(test, target_arch = "wasm32"))]
 pub fn prime_host_for_tests(state: &AppState, host: &LocalHostId) {
     use protocol::{
         BackendSetupPayload as BootstrapBackendSetup, HostBootstrapPayload as BootstrapHostPayload,

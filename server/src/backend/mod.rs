@@ -264,7 +264,6 @@ pub enum SessionCommand {
 }
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub enum StartupMcpTransport {
     Http {
         url: String,
