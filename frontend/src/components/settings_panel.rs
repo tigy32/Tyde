@@ -479,6 +479,7 @@ pub fn restore_appearance(state: &AppState) {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SettingsTab {
     Hosts,
+    Updates,
     Appearance,
     Display,
     AiSummaries,
@@ -508,6 +509,7 @@ impl SettingsTab {
     fn label(self) -> &'static str {
         match self {
             Self::Hosts => "Hosts",
+            Self::Updates => "Updates",
             Self::Appearance => "Appearance",
             Self::Display => "Code & Output Display",
             Self::AiSummaries => "AI Summaries",
@@ -530,7 +532,7 @@ impl SettingsTab {
     /// to say so.
     fn scope(self) -> SettingsScope {
         match self {
-            Self::Hosts | Self::Appearance | Self::Display => SettingsScope::Device,
+            Self::Hosts | Self::Updates | Self::Appearance | Self::Display => SettingsScope::Device,
             Self::AiSummaries
             | Self::Supervisor
             | Self::Subagents
@@ -563,6 +565,14 @@ impl SettingsTab {
                 "Connect",
                 "Disconnect",
                 "Remove host",
+            ],
+            Self::Updates => &[
+                "Updates",
+                "Check for Updates",
+                "Current version",
+                "New release",
+                "Download installer",
+                "Release notes",
             ],
             Self::Appearance => &[
                 "Appearance",
@@ -753,8 +763,9 @@ impl SettingsTab {
     }
 }
 
-const ALL_TABS: [SettingsTab; 15] = [
+const ALL_TABS: [SettingsTab; 16] = [
     SettingsTab::Hosts,
+    SettingsTab::Updates,
     SettingsTab::Appearance,
     SettingsTab::Display,
     SettingsTab::AiSummaries,
@@ -772,8 +783,9 @@ const ALL_TABS: [SettingsTab; 15] = [
 ];
 
 /// Device-local tabs, listed under the "This Device" sidebar group.
-const DEVICE_GROUP_TABS: [SettingsTab; 3] = [
+const DEVICE_GROUP_TABS: [SettingsTab; 4] = [
     SettingsTab::Hosts,
+    SettingsTab::Updates,
     SettingsTab::Appearance,
     SettingsTab::Display,
 ];
@@ -981,6 +993,7 @@ pub fn SettingsPanel() -> impl IntoView {
                             {move || match active_page.get() {
                                 SettingsPage::Tab(tab) => match tab {
                                     SettingsTab::Hosts => view! { <HostsTab /> }.into_any(),
+                                    SettingsTab::Updates => view! { <UpdatesTab /> }.into_any(),
                                     SettingsTab::Appearance => view! { <AppearanceTab /> }.into_any(),
                                     SettingsTab::Display => view! { <DisplayTab /> }.into_any(),
                                     SettingsTab::AiSummaries => view! { <AiSummariesTab /> }.into_any(),
@@ -1797,6 +1810,136 @@ fn managed_lifecycle_button_disabled(status: &bridge::RemoteHostLifecycleStatus)
                 }
             }
     )
+}
+
+#[derive(Clone)]
+enum UpdateUiState {
+    Idle,
+    Checking,
+    Current(String),
+    Available(bridge::AvailableAppUpdate),
+    Error(String),
+}
+
+#[component]
+fn UpdatesTab() -> impl IntoView {
+    let check_state = RwSignal::new(UpdateUiState::Idle);
+    let check_for_updates = move |_| {
+        check_state.set(UpdateUiState::Checking);
+        spawn_local(async move {
+            match bridge::check_for_app_update().await {
+                Ok(result) => match result.available {
+                    Some(update) => check_state.set(UpdateUiState::Available(update)),
+                    None => check_state.set(UpdateUiState::Current(result.current_version)),
+                },
+                Err(error) => check_state.set(UpdateUiState::Error(error)),
+            }
+        });
+    };
+
+    view! {
+        <h2 class="settings-panel-title">"Updates"</h2>
+
+        <p class="settings-description settings-panel-intro">
+            "Check GitHub Releases for a newer Tyde build. Tyde only checks when you ask it to and never closes the app or interrupts active agents."
+        </p>
+
+        <div class="settings-field settings-update-card">
+            <label class="settings-label">"Tyde app"</label>
+            <p class="settings-description">
+                "When an update is available, Tyde chooses the installer for this device and opens its trusted GitHub download in your browser. Your hosts, settings, projects, and workspace state remain in Tyde's data directory when you install the new build."
+            </p>
+            <button
+                class="settings-btn settings-btn-primary"
+                disabled=move || matches!(check_state.get(), UpdateUiState::Checking)
+                on:click=check_for_updates
+            >
+                {move || if matches!(check_state.get(), UpdateUiState::Checking) {
+                    "Checking…"
+                } else {
+                    "Check for Updates"
+                }}
+            </button>
+
+            <div class="settings-update-result" role="status" aria-live="polite">
+                {move || match check_state.get() {
+                    UpdateUiState::Idle => view! {
+                        <p>"No update check has run yet."</p>
+                    }.into_any(),
+                    UpdateUiState::Checking => view! {
+                        <p>"Checking published releases…"</p>
+                    }.into_any(),
+                    UpdateUiState::Current(version) => view! {
+                        <p class="settings-update-current">
+                            {format!("Tyde {version} is up to date.")}
+                        </p>
+                    }.into_any(),
+                    UpdateUiState::Error(error) => view! {
+                        <p class="settings-update-error">
+                            {format!("Could not check for updates: {error}")}
+                        </p>
+                    }.into_any(),
+                    UpdateUiState::Available(update) => {
+                        let download = update.download_url.clone();
+                        let release_url = update.release_url.clone();
+                        let download_label = format!("Download Tyde {}", update.version);
+                        let version = update.version.clone();
+                        let asset_name = update.asset_name.clone();
+                        view! {
+                            <p class="settings-update-available">
+                                {format!("Tyde {version} is available.")}
+                            </p>
+                            {asset_name.map(|name| view! {
+                                <p class="settings-update-asset">{format!("Installer: {name}")}</p>
+                            })}
+                            <div class="settings-update-actions">
+                                {download.map(|url| {
+                                    let open_state = check_state;
+                                    view! {
+                                        <button
+                                            class="settings-btn settings-btn-primary"
+                                            on:click=move |_| {
+                                                let url = url.clone();
+                                                spawn_local(async move {
+                                                    if let Err(error) = bridge::open_external_url(url).await {
+                                                        open_state.set(UpdateUiState::Error(format!(
+                                                            "The installer could not be opened: {error}"
+                                                        )));
+                                                    }
+                                                });
+                                            }
+                                        >{download_label.clone()}</button>
+                                    }
+                                })}
+                                <button
+                                    class="settings-btn"
+                                    on:click=move |_| {
+                                        let url = release_url.clone();
+                                        spawn_local(async move {
+                                            if let Err(error) = bridge::open_external_url(url).await {
+                                                check_state.set(UpdateUiState::Error(format!(
+                                                    "The release page could not be opened: {error}"
+                                                )));
+                                            }
+                                        });
+                                    }
+                                >"View Release Notes"</button>
+                            </div>
+                            {if update.download_url.is_none() {
+                                Some(view! {
+                                    <p class="settings-update-note">
+                                        "This release has no installer matching this device. Open the release notes to see the available downloads."
+                                    </p>
+                                })
+                            } else {
+                                None
+                            }}
+                        }.into_any()
+                    }
+                }}
+            </div>
+        </div>
+    }
 }
 
 #[component]
@@ -8910,6 +9053,81 @@ mod wasm_tests {
             observed.push(text);
         }
         panic!("settings tab labelled {label:?} not found among {observed:?}");
+    }
+
+    #[wasm_bindgen_test]
+    async fn updates_page_checks_and_opens_platform_installer() {
+        let expected_url =
+            "https://github.com/tigy32/Tyde/releases/download/v0.9.2/Tyde_0.9.2_amd64.deb";
+        js_sys::eval(&format!(
+            r#"
+            window.__update_calls = [];
+            window.__TAURI__ = window.__TAURI__ || {{}};
+            window.__TAURI__.core = window.__TAURI__.core || {{}};
+            window.__TAURI__.core.invoke = function(cmd, args) {{
+                window.__update_calls.push([cmd, args || {{}}]);
+                if (cmd === "check_for_app_update") {{
+                    return Promise.resolve({{
+                        currentVersion: "0.9.1",
+                        available: {{
+                            version: "0.9.2",
+                            releaseUrl: "https://github.com/tigy32/Tyde/releases/tag/v0.9.2",
+                            assetName: "Tyde_0.9.2_amd64.deb",
+                            downloadUrl: "{expected_url}"
+                        }}
+                    }});
+                }}
+                return Promise.resolve();
+            }};
+            window.__TAURI__.event = window.__TAURI__.event || {{}};
+            window.__TAURI__.event.listen = function() {{ return Promise.resolve(null); }};
+            "#
+        ))
+        .expect("install update bridge stub");
+
+        let container = make_container();
+        let _handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            state.settings_open.set(true);
+            provide_context(state);
+            view! { <SettingsPanel /> }
+        });
+        next_tick().await;
+        click_tab(&container, "Updates");
+        next_tick().await;
+
+        let initial = container.text_content().unwrap_or_default();
+        assert!(
+            initial.contains("No update check has run yet"),
+            "the page must make clear that checking is user-initiated; got {initial:?}"
+        );
+
+        click_tab(&container, "Check for Updates");
+        next_tick().await;
+        next_tick().await;
+
+        let result = container.text_content().unwrap_or_default();
+        assert!(
+            result.contains("Tyde 0.9.2 is available"),
+            "the available version must be visible; got {result:?}"
+        );
+        assert!(
+            result.contains("Installer: Tyde_0.9.2_amd64.deb"),
+            "the user must see which platform installer will open; got {result:?}"
+        );
+        click_tab(&container, "Download Tyde 0.9.2");
+        next_tick().await;
+
+        let opened = js_sys::eval(&format!(
+            "window.__update_calls.some(([cmd, args]) => cmd === 'open_external_url' && args.url === '{expected_url}')"
+        ))
+        .expect("inspect bridge calls")
+        .as_bool()
+        .unwrap_or(false);
+        assert!(
+            opened,
+            "the download action must open the exact platform asset returned by the trusted shell"
+        );
     }
 
     fn broker_input(container: &HtmlElement) -> web_sys::HtmlInputElement {

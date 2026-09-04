@@ -305,6 +305,29 @@ pub async fn open_external_url(url: String) -> Result<(), String> {
     Ok(())
 }
 
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AppUpdateCheckResult {
+    pub current_version: String,
+    pub available: Option<AvailableAppUpdate>,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AvailableAppUpdate {
+    pub version: String,
+    pub release_url: String,
+    pub asset_name: Option<String>,
+    pub download_url: Option<String>,
+}
+
+pub async fn check_for_app_update() -> Result<AppUpdateCheckResult, String> {
+    let value = tauri_invoke("check_for_app_update", JsValue::NULL)
+        .await
+        .map_err(|error| tauri_error_message("check_for_app_update", error))?;
+    serde_wasm_bindgen::from_value(value).map_err(|error| error.to_string())
+}
+
 /// Show a native OK/Cancel confirmation dialog via tauri-plugin-dialog.
 ///
 /// Use this instead of `web_sys::Window::confirm_with_message` — the WKWebView

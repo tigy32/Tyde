@@ -8619,6 +8619,46 @@ math merror {
     margin-bottom: var(--space-2);
 }
 
+.settings-update-card {
+    padding: var(--space-4);
+    background: var(--surface-2);
+    border: 1px solid var(--border-primary);
+    border-radius: 8px;
+}
+
+.settings-update-result {
+    min-height: 1.5em;
+    margin-top: var(--space-3);
+    color: var(--text-secondary);
+    font-size: 0.923rem;
+}
+
+.settings-update-current,
+.settings-update-available {
+    color: var(--text-primary);
+}
+
+.settings-update-error {
+    color: var(--error);
+}
+
+.settings-update-asset,
+.settings-update-note {
+    margin-top: var(--space-1);
+}
+
+.settings-update-asset {
+    font-family: var(--font-mono);
+    overflow-wrap: anywhere;
+}
+
+.settings-update-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-2);
+    margin-top: var(--space-3);
+}
+
 .settings-segmented-control {
     display: inline-flex;
     gap: 1px;
