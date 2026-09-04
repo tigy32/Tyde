@@ -3,10 +3,10 @@ mod fixture;
 use fixture::Fixture;
 use protocol::{
     AgentBootstrapEvent, AgentBootstrapPayload, AgentStartPayload, BackendKind, ChatEvent,
-    DeleteSessionPayload, Envelope, FetchSessionHistoryPayload, FrameKind, ListSessionsPayload,
-    NewAgentPayload, Project, ProjectCreatePayload, ProjectNotifyPayload, ProjectRootPath,
-    SessionHistoryPayload, SessionId, SessionListPayload, SpawnAgentParams, SpawnAgentPayload,
-    StreamPath,
+    CommandErrorPayload, DeleteSessionPayload, Envelope, FetchSessionHistoryPayload, FrameKind,
+    ListSessionsPayload, MoveSessionPayload, NewAgentPayload, Project, ProjectCreatePayload,
+    ProjectNotifyPayload, ProjectRootPath, SessionHistoryPayload, SessionId, SessionListPayload,
+    SpawnAgentParams, SpawnAgentPayload, StreamPath,
 };
 use server::backend::mock::{MockScript, MockTurn};
 use std::time::Duration;
@@ -1548,6 +1548,131 @@ fn project_roots(project: &Project) -> Vec<String> {
         .into_iter()
         .map(|root| root.0)
         .collect()
+}
+
+#[tokio::test]
+async fn move_session_retargets_an_inactive_chat() {
+    let mut fixture = Fixture::new().await;
+    let project_a = create_project(
+        &mut fixture.client,
+        "Move source",
+        vec!["/tmp/move-source".to_owned()],
+    )
+    .await;
+    let project_b = create_project(
+        &mut fixture.client,
+        "Move destination",
+        vec!["/tmp/move-destination".to_owned()],
+    )
+    .await;
+
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            name: Some("move-me".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: Some(project_a.id.clone()),
+            params: SpawnAgentParams::New {
+                workspace_roots: project_roots(&project_a),
+                prompt: "move this chat".to_owned(),
+                images: None,
+                backend_kind: BackendKind::Claude,
+                launch_profile_id: None,
+                cost_hint: None,
+                access_mode: Default::default(),
+                session_settings: None,
+            },
+        })
+        .await
+        .expect("spawn movable session");
+    let new_agent: NewAgentPayload = expect_next_event(&mut fixture.client, "move NewAgent")
+        .await
+        .parse_payload()
+        .expect("parse move NewAgent");
+    let start: AgentStartPayload = expect_next_event(&mut fixture.client, "move AgentStart")
+        .await
+        .parse_payload()
+        .expect("parse move AgentStart");
+    let session_id = start.session_id.expect("move AgentStart has session id");
+    expect_turn(
+        &mut fixture.client,
+        "mock backend response to: move this chat",
+    )
+    .await;
+
+    fixture
+        .client
+        .move_session(MoveSessionPayload {
+            session_id: session_id.clone(),
+            project_id: project_b.id.clone(),
+        })
+        .await
+        .expect("send active move");
+    let error: CommandErrorPayload =
+        fixture::next_frame_matching_on(&mut fixture.client, "active move error", |env| {
+            env.kind == FrameKind::CommandError
+        })
+        .await
+        .parse_payload()
+        .expect("parse active move error");
+    assert_eq!(error.request_kind, FrameKind::MoveSession);
+    assert!(error.message.contains("active; close it before moving"));
+
+    fixture
+        .client
+        .close_agent(&new_agent.instance_stream)
+        .await
+        .expect("close movable session");
+    let _ = fixture::next_frame_matching_on(&mut fixture.client, "moved agent closed", |env| {
+        env.kind == FrameKind::AgentClosed
+    })
+    .await;
+
+    fixture
+        .client
+        .move_session(MoveSessionPayload {
+            session_id: session_id.clone(),
+            project_id: project_b.id.clone(),
+        })
+        .await
+        .expect("move inactive session");
+    let mut moved = None;
+    for _ in 0..3 {
+        let list = wait_for_session_list(&mut fixture.client, "SessionList after move").await;
+        let candidate = list
+            .sessions
+            .into_iter()
+            .find(|session| session.id == session_id)
+            .expect("moved session remains listed");
+        if candidate.project_id.as_ref() == Some(&project_b.id) {
+            moved = Some(candidate);
+            break;
+        }
+    }
+    let moved = moved.expect("move fanout publishes the destination project");
+    assert_eq!(moved.project_id.as_ref(), Some(&project_b.id));
+    assert_eq!(moved.workspace_roots, project_roots(&project_b));
+
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            name: None,
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::Resume {
+                session_id,
+                prompt: None,
+            },
+        })
+        .await
+        .expect("resume moved session");
+    let resumed: NewAgentPayload = expect_next_event(&mut fixture.client, "moved NewAgent")
+        .await
+        .parse_payload()
+        .expect("parse moved NewAgent");
+    assert_eq!(resumed.project_id.as_ref(), Some(&project_b.id));
 }
 
 // Bug 6: Delete Session

@@ -1068,6 +1068,7 @@ pub enum FrameKind {
     LoadAgent,
     FetchSessionHistory,
     ListSessions,
+    MoveSession,
     DeleteSession,
     SendMessage,
     EditQueuedMessage,
@@ -1264,6 +1265,7 @@ impl fmt::Display for FrameKind {
             Self::LoadAgent => f.write_str("load_agent"),
             Self::FetchSessionHistory => f.write_str("fetch_session_history"),
             Self::ListSessions => f.write_str("list_sessions"),
+            Self::MoveSession => f.write_str("move_session"),
             Self::DeleteSession => f.write_str("delete_session"),
             Self::SendMessage => f.write_str("send_message"),
             Self::EditQueuedMessage => f.write_str("edit_queued_message"),
@@ -3978,6 +3980,12 @@ pub struct ListSessionsPayload {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeleteSessionPayload {
     pub session_id: SessionId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MoveSessionPayload {
+    pub session_id: SessionId,
+    pub project_id: ProjectId,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

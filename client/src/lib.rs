@@ -23,9 +23,9 @@ use protocol::{
     FrameReader, HelloPayload, HostBootstrapPayload, HostBrowseStartPayload, HostSettingsPayload,
     InterruptPayload, LaunchProfileCatalogPayload, ListSessionsPayload, McpServerDeletePayload,
     McpServerNotifyPayload, McpServerUpsertPayload, MobileAccessStatePayload,
-    MobilePairingOfferPayload, NewAgentPayload, NewTerminalPayload, PROTOCOL_VERSION,
-    ProjectAccessedPayload, ProjectAddRootPayload, ProjectBootstrapPayload, ProjectCreatePayload,
-    ProjectDeletePayload, ProjectDeleteRootPayload, ProjectEventPayload,
+    MobilePairingOfferPayload, MoveSessionPayload, NewAgentPayload, NewTerminalPayload,
+    PROTOCOL_VERSION, ProjectAccessedPayload, ProjectAddRootPayload, ProjectBootstrapPayload,
+    ProjectCreatePayload, ProjectDeletePayload, ProjectDeleteRootPayload, ProjectEventPayload,
     ProjectFileContentsPayload, ProjectFileListPayload, ProjectGitDiffPayload,
     ProjectGitStatusPayload, ProjectId, ProjectListDirPayload, ProjectNotifyPayload,
     ProjectReadDiffPayload, ProjectReadFilePayload, ProjectRenamePayload, ProjectReorderPayload,
@@ -455,6 +455,11 @@ impl Connection {
         payload: DeleteSessionPayload,
     ) -> Result<(), FrameError> {
         self.send_host_payload(FrameKind::DeleteSession, &payload)
+            .await
+    }
+
+    pub async fn move_session(&mut self, payload: MoveSessionPayload) -> Result<(), FrameError> {
+        self.send_host_payload(FrameKind::MoveSession, &payload)
             .await
     }
 

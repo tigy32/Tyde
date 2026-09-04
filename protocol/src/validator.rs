@@ -25,7 +25,7 @@ use crate::{
     LoadAgentPayload, McpServerDeletePayload, McpServerNotifyPayload, McpServerUpsertPayload,
     MobileAccessStatePayload, MobileDeviceRenamePayload, MobileDeviceRevokePayload,
     MobilePairingCancelPayload, MobilePairingOfferPayload, MobilePairingStartPayload,
-    MobilePushSubscribePayload, MobilePushUnsubscribePayload, NewAgentPayload,
+    MobilePushSubscribePayload, MobilePushUnsubscribePayload, MoveSessionPayload, NewAgentPayload,
     ProjectAddRootPayload, ProjectCreatePayload, ProjectDeletePayload, ProjectDeleteRootPayload,
     ProjectEventPayload, ProjectFileContentsPayload, ProjectFileListPayload, ProjectGitDiffPayload,
     ProjectGitStatusPayload, ProjectNotifyPayload, ProjectRenamePayload, ProjectReorderPayload,
@@ -816,6 +816,9 @@ impl ProtocolValidator {
             }
             FrameKind::ListSessions => {
                 parse_host_payload::<ListSessionsPayload>(self, envelope, "ListSessions")
+            }
+            FrameKind::MoveSession => {
+                parse_host_payload::<MoveSessionPayload>(self, envelope, "MoveSession")
             }
             FrameKind::DeleteSession => {
                 parse_host_payload::<DeleteSessionPayload>(self, envelope, "DeleteSession")

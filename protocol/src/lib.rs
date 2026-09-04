@@ -91,7 +91,7 @@ pub use types::{
     MobilePushNotification, MobilePushReason, MobilePushState, MobilePushSubscribePayload,
     MobilePushSubscription, MobilePushUnsubscribePayload, MobileServiceAuthState,
     MobileServiceAuthStatePayload, MobileWebBundleSource, ModelInfo, ModelRequestId,
-    ModelRequestTokenUsage, ModelTurnId, NewAgentPayload, NewTerminalPayload,
+    ModelRequestTokenUsage, ModelTurnId, MoveSessionPayload, NewAgentPayload, NewTerminalPayload,
     OperationCancelledData, OrchestrationAgentOrigin, OrchestrationAgentType,
     OrchestrationCandidateInfo, OrchestrationEvent, OrchestrationId, OrchestrationOutcomeStatus,
     OrchestrationPanelPosition, OrchestrationPanelVerdict, OrchestrationPayload,

@@ -7525,6 +7525,58 @@ impl HostHandle {
         Ok(())
     }
 
+    pub(crate) async fn move_session(
+        &self,
+        payload: protocol::MoveSessionPayload,
+    ) -> AppResult<()> {
+        const OPERATION: &str = "move_session";
+        let mut state = self.state.lock().await;
+        if state.removing_projects.contains(&payload.project_id) {
+            return Err(AppError::conflict(
+                OPERATION,
+                format!("project {} is being removed", payload.project_id),
+            ));
+        }
+        if state
+            .agent_sessions
+            .values()
+            .chain(state.pending_agent_sessions.values())
+            .any(|session_id| session_id == &payload.session_id)
+        {
+            return Err(AppError::conflict(
+                OPERATION,
+                format!(
+                    "session {} is active; close it before moving it",
+                    payload.session_id
+                ),
+            ));
+        }
+        let project = state
+            .project_store
+            .lock()
+            .await
+            .get(&payload.project_id)
+            .ok_or_else(|| {
+                AppError::not_found(
+                    OPERATION,
+                    format!("project {} not found", payload.project_id),
+                )
+            })?;
+        let workspace_roots = project
+            .root_paths()
+            .into_iter()
+            .map(|root| root.0)
+            .collect();
+        state
+            .session_store
+            .lock()
+            .await
+            .move_to_project(&payload.session_id, payload.project_id, workspace_roots)
+            .map_err(|error| session_store_error(OPERATION, error))?;
+        fan_out_session_lists(&mut state).await;
+        Ok(())
+    }
+
     pub(crate) async fn fan_out_session_lists(&self) {
         let mut state = self.state.lock().await;
         fan_out_session_lists(&mut state).await;
