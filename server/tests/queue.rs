@@ -113,6 +113,42 @@ async fn stale_tool_response_while_idle_does_not_wedge_follow_up() {
         })
         .await;
 
+    for malformed in [
+        serde_json::json!({"kind": "AskUserQuestion", "tool_call_id": "missing-answer"}),
+        serde_json::json!({"kind": "AskUserQuestion", "tool_call_id": "wrong-answer", "answer": []}),
+        serde_json::json!({"kind": "AskUserQuestion", "tool_call_id": null, "answer": "é\nanswer"}),
+    ] {
+        let seq = fixture
+            .client
+            .outgoing_seq
+            .get_mut(&agent.stream)
+            .expect("agent sequence");
+        let envelope = protocol::Envelope {
+            stream: agent.stream.clone(),
+            seq: *seq,
+            kind: FrameKind::SendMessage,
+            payload: serde_json::json!({"message": "answer", "tool_response": malformed}),
+        };
+        *seq += 1;
+        protocol::write_envelope(&mut fixture.client.writer, &envelope)
+            .await
+            .expect("send malformed answer");
+        let error = fixture::next_frame_matching_on(
+            &mut fixture.client,
+            "malformed answer rejection",
+            |env| env.kind == FrameKind::CommandError,
+        )
+        .await;
+        let error: protocol::CommandErrorPayload = error.parse_payload().expect("command error");
+        assert!(
+            !error.fatal,
+            "malformed answer must not close the connection"
+        );
+        assert_eq!(error.request_kind, FrameKind::SendMessage);
+        assert_eq!(error.stream, agent.stream);
+        assert_eq!(error.code, protocol::CommandErrorCode::InvalidInput);
+    }
+
     fixture
         .client
         .send_message_payload(

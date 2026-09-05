@@ -1154,7 +1154,14 @@ fn completion_outcome_summary(req: &ToolRequestType, outcome: &ToolExecutionOutc
         ToolExecutionOutcome::Failed { message, .. } => {
             let trimmed = message.replace('\n', " ");
             if trimmed.len() > 90 {
-                format!("error \u{b7} {}\u{2026}", &trimmed[..87])
+                let end = trimmed.floor_char_boundary(87);
+                if end != 87 {
+                    log::debug!(
+                        "adjusted tool failure header UTF-8 cutoff: bytes={} end={end}",
+                        trimmed.len()
+                    );
+                }
+                format!("error \u{b7} {}\u{2026}", &trimmed[..end])
             } else {
                 format!("error \u{b7} {trimmed}")
             }
@@ -2675,6 +2682,42 @@ mod live_card_wasm_tests {
                 Some(normalization_failure),
             )),
         }
+    }
+
+    #[wasm_bindgen_test]
+    async fn failed_question_with_unicode_error_remains_readable() {
+        let message = "é".repeat(100);
+        let entry = ToolRequestEntry {
+            tool_name: "AskUserQuestion".to_owned(),
+            request: ToolRequest {
+                tool_call_id: "unicode-question-error".to_owned(),
+                tool_name: "AskUserQuestion".to_owned(),
+                tool_type: ToolRequestType::AskUserQuestion {
+                    questions: Vec::new(),
+                },
+            },
+            result: Some(failed_completion(
+                "unicode-question-error",
+                &message,
+                None,
+                None,
+            )),
+        };
+        let (container, state) = mount_card(entry, None);
+        state.tool_output_mode.set(ToolOutputMode::Summary);
+        next_tick().await;
+        assert_eq!(tool_header_status(&container), "Failed");
+        assert_eq!(
+            completion_summary(&container),
+            format!("error · {}…", "é".repeat(43))
+        );
+        assert!(text(&container).contains(&format!("Error: {}…", "é".repeat(78))));
+        state.tool_output_mode.set(ToolOutputMode::Full);
+        next_tick().await;
+        assert!(
+            text(&container).contains(&message),
+            "full error remains readable"
+        );
     }
 
     #[wasm_bindgen_test]

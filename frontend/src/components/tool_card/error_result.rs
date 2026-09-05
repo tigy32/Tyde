@@ -57,7 +57,14 @@ fn single_line(text: &str) -> String {
         .collect();
     let trimmed = s.split_whitespace().collect::<Vec<_>>().join(" ");
     if trimmed.len() > 160 {
-        format!("{}\u{2026}", &trimmed[..157])
+        let end = trimmed.floor_char_boundary(157);
+        if end != 157 {
+            log::debug!(
+                "adjusted tool failure body UTF-8 cutoff: bytes={} end={end}",
+                trimmed.len()
+            );
+        }
+        format!("{}\u{2026}", &trimmed[..end])
     } else {
         trimmed
     }
@@ -85,6 +92,11 @@ mod wasm_tests {
         let body = text(&container);
         // Newlines collapsed into a single visible line.
         assert!(body.contains("Error: boom over multiple lines"));
+        assert_eq!(count(&container, "pre"), 0);
+        let container =
+            mount(move || render(&"é".repeat(100), None, None, ToolOutputMode::Summary));
+        next_tick().await;
+        assert!(text(&container).contains(&format!("Error: {}…", "é".repeat(78))));
         assert_eq!(count(&container, "pre"), 0);
     }
 
