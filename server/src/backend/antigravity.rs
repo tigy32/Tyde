@@ -27,8 +27,8 @@ use crate::backend::antigravity_stream::{
     AgyFrame, AgyResult, AgyStep, AgyUsage, AgyUsageBucket, AgyUsageReport, MCP_DISPATCH_TOOL,
     STATE_ACTIVE, STATE_CANCELLED, STATE_DONE, STATE_ERROR, STEP_AGENT_RESPONSE, STEP_CHECKPOINT,
     STEP_SUBAGENT, STEP_SYSTEM_MESSAGE, STEP_TOOL, STEP_UNKNOWN, STEP_USER_INPUT, TranscriptReader,
-    answers_from_result, exit_code_from_result, mcp_inner_call, parse_frame, subagent_request_type,
-    tool_request_type, usage_report_from_frame,
+    TranscriptToolCall, answers_from_result, exit_code_from_result, mcp_inner_call, parse_frame,
+    subagent_request_type, tool_request_type, usage_report_from_frame,
 };
 use crate::backend::skill_projection::{
     DescriptionPolicy, ProjectionPolicy, SkillRefusal, create_private_dir, create_private_root,
@@ -473,6 +473,7 @@ struct TurnMapper {
     model: String,
     response: Option<OpenResponse>,
     open_tools: BTreeMap<u64, OpenTool>,
+    deferred_tools: BTreeMap<u64, AgyStep>,
     completed_steps: BTreeSet<u64>,
     turn_usage: AgyUsage,
     cumulative_usage: AgyUsage,
@@ -515,6 +516,7 @@ impl TurnMapper {
             model,
             response: None,
             open_tools: BTreeMap::new(),
+            deferred_tools: BTreeMap::new(),
             completed_steps: BTreeSet::new(),
             turn_usage: AgyUsage::default(),
             cumulative_usage: cumulative,
@@ -525,10 +527,12 @@ impl TurnMapper {
         }
     }
 
-    fn handle_step(&mut self, emitter: &TurnEmitter, step: AgyStep) {
+    async fn handle_step(&mut self, emitter: &TurnEmitter, step: AgyStep) {
         match step.step_type.as_str() {
             STEP_AGENT_RESPONSE => self.handle_agent_response(emitter, step),
-            STEP_TOOL | STEP_SUBAGENT | STEP_UNKNOWN => self.handle_tool_like(emitter, step),
+            STEP_TOOL | STEP_SUBAGENT | STEP_UNKNOWN => {
+                self.handle_tool_like(emitter, step).await;
+            }
             // Tyde emits the user's own message, `agy` re-states the prompt it
             // was given, and a checkpoint is the CLI's private context
             // bookkeeping. A `system_message` is how a subagent's reply and a
@@ -604,46 +608,53 @@ impl TurnMapper {
         self.response.as_mut().expect("response just created")
     }
 
-    fn handle_tool_like(&mut self, emitter: &TurnEmitter, step: AgyStep) {
+    async fn handle_tool_like(&mut self, emitter: &TurnEmitter, step: AgyStep) {
         let step_index = step.step_index;
         if self.completed_steps.contains(&step_index) {
             return;
         }
 
-        // An `unknown` step carries no `tool_name` and no `tool_info`, so the
-        // transcript is the only place its identity exists.
-        if step.step_type == STEP_UNKNOWN {
-            self.transcript.refresh();
+        let needs_call =
+            step.step_type != STEP_SUBAGENT && !self.open_tools.contains_key(&step_index);
+        let call = if needs_call {
+            self.recover_tool_call(&step).await
+        } else {
+            None
+        };
+        if needs_call && call.is_none() && step.state == STATE_ACTIVE {
+            // A request cannot be retyped once emitted. Wait for a later tool
+            // update rather than permanently publishing the stream summary.
+            self.deferred_tools.insert(step_index, step);
+            return;
+        }
+        if self.deferred_tools.remove(&step_index).is_some() && call.is_some() {
+            tracing::info!(step_index, "Antigravity recovered deferred tool arguments");
         }
         let tool_name = step
             .tool_name
             .clone()
             .or_else(|| step.tool_info.as_ref().and_then(|info| info.name.clone()))
-            .or_else(|| {
-                self.transcript
-                    .unnamed_call_for_tool_step(step_index)
-                    .map(|call| call.name.clone())
-            })
+            .or_else(|| call.as_ref().map(|call| call.name.clone()))
             .unwrap_or_else(|| step.step_type.clone());
 
         match step.state.as_str() {
             STATE_ACTIVE => {
                 if !self.open_tools.contains_key(&step_index) {
-                    self.open_tool(emitter, step_index, &tool_name, &step);
+                    self.open_tool(emitter, step_index, &tool_name, &step, call);
                 }
             }
             STATE_DONE | STATE_ERROR => {
                 // A tool whose ACTIVE never arrived still gets a card, so the
                 // work shows up rather than vanishing.
                 if !self.open_tools.contains_key(&step_index) {
-                    self.open_tool(emitter, step_index, &tool_name, &step);
+                    self.open_tool(emitter, step_index, &tool_name, &step, call);
                 }
                 self.close_tool(emitter, step_index, &step);
                 self.completed_steps.insert(step_index);
             }
             STATE_CANCELLED => {
                 if !self.open_tools.contains_key(&step_index) {
-                    self.open_tool(emitter, step_index, &tool_name, &step);
+                    self.open_tool(emitter, step_index, &tool_name, &step, call);
                 }
                 self.cancel_tool(emitter, step_index);
                 self.completed_steps.insert(step_index);
@@ -651,6 +662,48 @@ impl TurnMapper {
             other => {
                 tracing::debug!("Antigravity tool step state {other:?} has no Tyde mapping");
             }
+        }
+    }
+
+    async fn recover_tool_call(&mut self, step: &AgyStep) -> Option<TranscriptToolCall> {
+        let tool_name = step.tool_name.as_deref().or_else(|| {
+            step.tool_info
+                .as_ref()
+                .and_then(|info| info.name.as_deref())
+        });
+        let started = tokio::time::Instant::now();
+        loop {
+            self.transcript.refresh();
+            let call = match tool_name {
+                Some(name) => self.transcript.call_for_tool_step(step.step_index, name),
+                None => self.transcript.unnamed_call_for_tool_step(step.step_index),
+            }
+            .cloned();
+            if call.is_some() {
+                return call;
+            }
+            if step.state == STATE_ACTIVE {
+                if !self.deferred_tools.contains_key(&step.step_index) {
+                    tracing::warn!(
+                        step_index = step.step_index,
+                        tool_name,
+                        transcript = %self.transcript.path().display(),
+                        "Antigravity tool arguments not yet available; deferring request"
+                    );
+                }
+                return None;
+            }
+            if started.elapsed() >= Duration::from_secs(1) {
+                tracing::warn!(
+                    step_index = step.step_index,
+                    tool_name,
+                    transcript = %self.transcript.path().display(),
+                    "Antigravity completed tool arguments unavailable; using stream summary"
+                );
+                return None;
+            }
+            // The CLI can publish a tool update before flushing its transcript.
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
     }
 
@@ -677,6 +730,7 @@ impl TurnMapper {
         step_index: u64,
         tool_name: &str,
         step: &AgyStep,
+        call: Option<TranscriptToolCall>,
     ) {
         let tool_call_id = format!("agy-{}-{step_index}", self.turn_id.0);
         let mut card_name = tool_name.to_string();
@@ -703,11 +757,7 @@ impl TurnMapper {
                     });
             (arguments, tool_type)
         } else {
-            self.transcript.refresh();
-            let enriched = self
-                .transcript
-                .call_for_tool_step(step_index, tool_name)
-                .map(|call| call.args.clone());
+            let enriched = call.map(|call| call.args);
             let summary = step
                 .tool_info
                 .as_ref()
@@ -879,6 +929,7 @@ impl TurnMapper {
     /// cancelled. Doing it here as well would report each card twice.
     fn abandon_open_work(&mut self) {
         self.open_tools.clear();
+        self.deferred_tools.clear();
         self.completed_steps.clear();
         self.response = None;
     }
@@ -965,6 +1016,17 @@ impl Supervisor {
                                 self.finish_turn().await;
                             }
                             break;
+                        }
+                    }
+                }
+
+                () = tokio::time::sleep(Duration::from_millis(50)),
+                    if self.mapper.as_ref().is_some_and(|mapper| !mapper.deferred_tools.is_empty()) =>
+                {
+                    if let Some(mapper) = self.mapper.as_mut() {
+                        let pending = mapper.deferred_tools.values().cloned().collect::<Vec<_>>();
+                        for step in pending {
+                            mapper.handle_tool_like(&emitter, step).await;
                         }
                     }
                 }
@@ -1126,7 +1188,7 @@ impl Supervisor {
         match frame {
             AgyFrame::Step(step) => {
                 if let Some(mapper) = self.mapper.as_mut() {
-                    mapper.handle_step(&self.inner.emitter, step);
+                    mapper.handle_step(&self.inner.emitter, step).await;
                 }
             }
             AgyFrame::Result(result) => {
@@ -1155,6 +1217,10 @@ impl Supervisor {
 
     async fn finish_turn(&mut self) {
         if let Some(mut mapper) = self.mapper.take() {
+            for (_, mut step) in std::mem::take(&mut mapper.deferred_tools) {
+                step.state = STATE_CANCELLED.to_string();
+                mapper.handle_tool_like(&self.inner.emitter, step).await;
+            }
             mapper.close_response(&self.inner.emitter);
             mapper.close_open_tools_as_cancelled(
                 &self.inner.emitter,

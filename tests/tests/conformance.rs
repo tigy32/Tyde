@@ -526,10 +526,11 @@ fn real_tool_type_mappings() {
         // assertions are gated. Each is checked before the next turn runs — both
         // read the file to decide whether the work happened, and the edit turn
         // overwrites what the create turn is judged against.
+        let backend = host.backend();
         let create = ask(
             &mut host,
             &agent,
-            mapping_create_prompt(&workspace, &created),
+            mapping_create_prompt(&workspace, &created, backend),
         )
         .await;
         assert_final_text_contains(&create, MAPPED_CREATE_MARKER);
@@ -1944,6 +1945,9 @@ fn real_subscription_capacity() {
                         CapacitySource::CodexAccountRateLimitsUpdated
                     )
                     | (BackendKind::Grok, CapacitySource::GrokBilling)
+                    // The live Antigravity /usage report identifies its source
+                    // as AntigravityUsageCommand; it is valid only for this backend.
+                    | (BackendKind::Antigravity, CapacitySource::AntigravityUsageCommand)
             );
             assert!(
                 source_matches_backend,
@@ -2983,11 +2987,17 @@ fn reread_prompt(workspace: &Path) -> String {
 /// Three lines, because the edit that follows has to change one of them and
 /// leave the others as diff context. A one-line file cannot tell a targeted edit
 /// from a whole-file rewrite.
-fn mapping_create_prompt(workspace: &Path, payload: &str) -> String {
+fn mapping_create_prompt(workspace: &Path, payload: &str, backend: BackendKind) -> String {
+    let retry = if backend == BackendKind::Antigravity {
+        " If the write is rejected as an invalid artifact path, retry write_to_file without \
+         ArtifactMetadata. The workspace file is not an artifact. Do not switch to the shell."
+    } else {
+        ""
+    };
     format!(
         "Use your file-editing tool — not the shell — to create {MAPPING_FILE} in {} \
          with exactly these three lines:\nalpha\n{payload}\nomega\nThen reply with exactly \
-         {MAPPED_CREATE_MARKER} and nothing else.",
+         {MAPPED_CREATE_MARKER} and nothing else.{retry}",
         workspace_root(workspace)
     )
 }
@@ -4273,6 +4283,17 @@ fn assert_create_maps_to_a_diff(turn: &Turn, workspace: &Path, payload: &str) {
          diffs `before` against `after` verbatim, so a created file renders as a modification of \
          text that was never there.",
         turn.label()
+    );
+
+    let declaration = turn
+        .tool_declarations()
+        .find(|call| call.tool_call_id == *tool_call_id)
+        .expect("the successful write must retain its tool declaration");
+    assert!(
+        declaration.arguments.to_string().contains(payload),
+        "{}: the successful write lost its content in the persisted tool arguments: {:?}",
+        turn.label(),
+        declaration.arguments
     );
 
     let result = result_for(turn, tool_call_id);
