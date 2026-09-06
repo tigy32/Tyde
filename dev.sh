@@ -770,6 +770,7 @@ check() {
         env CARGO_TARGET_DIR="$WASM_CARGO_TARGET_DIR" tools/run-wasm-tests.sh
     run_stage "web loader tests" "$repetitions" \
         bash -c 'cd web/loader && exec node --test test/*.test.js'
+    run_stage "customer documentation" 1 python3 docs/build.py --check
     run_stage "dev check contract tests" 1 python3 tools/test_dev_check.py
 
     refreshed_inputs="$(cache_inputs)"

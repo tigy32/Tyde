@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Make expertise reusable — The Tyde Book</title><meta name="description" content="Define your specialists once. Give them instructions, skills, and tools that can be used across supported backends on a host.">
+<meta name="color-scheme" content="light dark"><link rel="icon" href="assets/icon.png"><link rel="stylesheet" href="assets/book.css">
+<script src="assets/search-index.js" defer></script><script src="assets/book.js" defer></script></head>
+<body><a class="skip" href="#main">Skip to content</a>
+<header class="topbar"><a class="brand" href="index.html"><img src="assets/icon.png" alt="" width="28" height="28">tyde<span class="brand-divider">/</span><span class="book-label">The Book</span></a>
+<div class="top-actions"><button class="search-open" hidden>Search the book <kbd>/</kbd></button><button class="theme-toggle" hidden aria-label="Switch color theme">◐</button><a class="download" href="https://tycode.dev/tyde.html">Get Tyde <span aria-hidden="true">↗</span></a></div></header>
+<div class="layout"><details class="chapter-menu" open><summary>Chapters</summary><nav aria-label="Chapters"><p class="nav-group">Start here</p><a href="index.html"><span>01</span>Room for all your agents.</a><a href="first-agent.html"><span>02</span>Your first agent</a><p class="nav-group">Your daily workspace</p><a href="projects.html"><span>03</span>Bring your projects</a><a href="review.html"><span>04</span>Review the work</a><a href="concurrency.html"><span>05</span>Keep many agents in view</a><a href="sessions.html"><span>06</span>Pick up where you left off</a><p class="nav-group">Expand your studio</p><a href="remote.html"><span>07</span>Your laptop. Your servers.</a><a href="delegation.html"><span>08</span>Let agents work together</a><a href="agents-skills.html" aria-current="page"><span>09</span>Make expertise reusable</a><a href="workbenches.html"><span>10</span>Give parallel work its space</a><p class="nav-group">Put it together</p><a href="workflows.html"><span>11</span>A day in your studio</a><p class="nav-group">Reference</p><a href="settings.html"><span>12</span>Configure your studio</a><a href="troubleshooting.html"><span>13</span>Find your way back</a></nav><p class="nav-foot">THE TYDE BOOK<br><span>Room for all your agents.</span></p></details>
+<main id="main"><div class="eyebrow">Expand your studio <span>/ 09</span></div><h1>Make expertise reusable</h1><p class="lede">Define your specialists once. Give them instructions, skills, and tools that can be used across supported backends on a host.</p><h2 id="definitions">Define a reusable specialist</h2>
+<p>A custom agent is a preset: instructions, skills, MCP servers, and tool policy. Give it a role that you will use repeatedly, such as an accessibility reviewer or a maintainer familiar with your project conventions.</p>
+<ol><li>Open <strong>Settings → Custom Agents</strong> and confirm the selected host.</li><li>Create a definition with a recognizable name and a short description.</li><li>Write instructions describing its responsibility, expected output, and boundaries.</li><li>Select the skills and MCP servers it should receive, and review its tool policy.</li><li>Save the definition and choose it when launching a new conversation.</li></ol>
+<blockquote><p>You review user-facing changes for accessibility. Explain the impact on keyboard and screen-reader users. Cite the relevant file and location for every finding. Propose concrete corrections and do not edit files unless asked.</p></blockquote>
+<h2 id="skills">Add a skill on the host</h2>
+<p>Skills are discovered from the filesystem. On the host where your agents run, create a folder under <code>~/.tyde/skills/</code> and put its instructions in <code>SKILL.md</code>. Open <strong>Settings → Skills</strong> and choose <strong>Refresh</strong> to re-scan.</p>
+<pre><code>~/.tyde/skills/
+└── project-review/
+    └── SKILL.md</code></pre>
+<p>A small skill can capture a review procedure:</p>
+<pre><code>---
+name: project-review
+description: Review this project's user-facing changes
+---
+
+Read the project instructions before reviewing.
+Explain each finding with its user impact and file location.
+Check loading, empty, error, and keyboard-interaction states.
+Return findings in priority order, with a proposed correction.</code></pre>
+<p>Refresh the list, then assign the skill to the custom agents that need it. The default agent uses all host skills; a custom definition lets you choose its skill set.</p>
+<h2 id="shared">Share intent across backends</h2>
+<p>Tyde makes host skills and agent definitions available through its backend integrations. This lets you maintain common instructions while choosing different harnesses for different tasks.</p>
+<p>Shared configuration does not mean every harness has identical tools, model options, permissions, or skill behavior. Check the session’s backend and capabilities, and keep instructions clear about the desired outcome.</p>
+<h2 id="scope">Keep configuration in the right place</h2>
+<p>Custom agent changes are saved on the selected host. Adding a skill to your laptop does not add it to a remote host. If you want the same specialist on two servers, maintain the definitions and skill files on both.</p>
+<p>MCP servers add tools or resources to the agent. Configure them under <strong>Settings → MCP Servers</strong>, then choose which ones a custom agent should receive. Configure executable paths and credentials for the host that runs them.</p>
+
+<nav class="pagination" aria-label="Chapter pagination"><a href="delegation.html"><small>Previous chapter</small>Let agents work together <span aria-hidden="true">↗</span></a><a href="workbenches.html"><small>Next chapter</small>Give parallel work its space <span aria-hidden="true">↗</span></a></nav><footer>Tyde · Agent Studio <a href="https://github.com/tigy32/Tyde/issues">Report a documentation issue ↗</a></footer></main>
+<aside class="on-page"><p>IN THIS CHAPTER</p><a href="#definitions">Define a reusable specialist</a><a href="#skills">Add a skill on the host</a><a href="#shared">Share intent across backends</a><a href="#scope">Keep configuration in the right place</a><div class="aside-note">Start small.<br>Make room for more.</div></aside></div>
+<dialog id="search-dialog" aria-labelledby="search-title"><div class="search-heading"><h2 id="search-title">Search the book</h2><button class="search-close" aria-label="Close search">Close</button></div><label class="sr-only" for="search-input">Search chapters and content</label><input id="search-input" type="search" placeholder="Try remote hosts, skills, or review…" autocomplete="off"><p id="search-status" role="status"></p><div id="search-results"></div></dialog>
+</body></html>

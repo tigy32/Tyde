@@ -1,0 +1,26 @@
+<h2 id="definitions">Define a reusable specialist</h2>
+<p>A custom agent is a preset: instructions, skills, MCP servers, and tool policy. Give it a role that you will use repeatedly, such as an accessibility reviewer or a maintainer familiar with your project conventions.</p>
+<ol><li>Open <strong>Settings → Custom Agents</strong> and confirm the selected host.</li><li>Create a definition with a recognizable name and a short description.</li><li>Write instructions describing its responsibility, expected output, and boundaries.</li><li>Select the skills and MCP servers it should receive, and review its tool policy.</li><li>Save the definition and choose it when launching a new conversation.</li></ol>
+<blockquote><p>You review user-facing changes for accessibility. Explain the impact on keyboard and screen-reader users. Cite the relevant file and location for every finding. Propose concrete corrections and do not edit files unless asked.</p></blockquote>
+<h2 id="skills">Add a skill on the host</h2>
+<p>Skills are discovered from the filesystem. On the host where your agents run, create a folder under <code>~/.tyde/skills/</code> and put its instructions in <code>SKILL.md</code>. Open <strong>Settings → Skills</strong> and choose <strong>Refresh</strong> to re-scan.</p>
+<pre><code>~/.tyde/skills/
+└── project-review/
+    └── SKILL.md</code></pre>
+<p>A small skill can capture a review procedure:</p>
+<pre><code>---
+name: project-review
+description: Review this project's user-facing changes
+---
+
+Read the project instructions before reviewing.
+Explain each finding with its user impact and file location.
+Check loading, empty, error, and keyboard-interaction states.
+Return findings in priority order, with a proposed correction.</code></pre>
+<p>Refresh the list, then assign the skill to the custom agents that need it. The default agent uses all host skills; a custom definition lets you choose its skill set.</p>
+<h2 id="shared">Share intent across backends</h2>
+<p>Tyde makes host skills and agent definitions available through its backend integrations. This lets you maintain common instructions while choosing different harnesses for different tasks.</p>
+<p>Shared configuration does not mean every harness has identical tools, model options, permissions, or skill behavior. Check the session’s backend and capabilities, and keep instructions clear about the desired outcome.</p>
+<h2 id="scope">Keep configuration in the right place</h2>
+<p>Custom agent changes are saved on the selected host. Adding a skill to your laptop does not add it to a remote host. If you want the same specialist on two servers, maintain the definitions and skill files on both.</p>
+<p>MCP servers add tools or resources to the agent. Configure them under <strong>Settings → MCP Servers</strong>, then choose which ones a custom agent should receive. Configure executable paths and credentials for the host that runs them.</p>

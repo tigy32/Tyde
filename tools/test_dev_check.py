@@ -1326,6 +1326,7 @@ class DevCheckCacheTests(unittest.TestCase):
         self.bin.mkdir()
 
         shutil.copy2(REPO_ROOT / "dev.sh", self.root / "dev.sh")
+        shutil.copytree(REPO_ROOT / "docs", self.root / "docs")
         shutil.copy2(
             REPO_ROOT / "rust-toolchain.toml", self.root / "rust-toolchain.toml"
         )

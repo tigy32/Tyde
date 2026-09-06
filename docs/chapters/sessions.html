@@ -1,0 +1,12 @@
+<h2 id="agent-session">An agent and its session</h2>
+<p>An agent is the live conversation you interact with. Its session is the saved conversation that lets you find and reopen earlier work. A saved session can exist when no agent is actively working on it.</p>
+<p>Disconnecting from a remote host is a third case: the agent may still be running on that host. Reconnect to inspect it rather than immediately launching a replacement.</p>
+<h2 id="resume">Resume from History</h2>
+<ol><li>Connect to the host where the original conversation ran.</li><li>Open <strong>History</strong> and locate the conversation using its preview, project, backend, and last-active information.</li><li>Use the resume action to reopen it.</li><li>Read the restored conversation before sending a new request.</li><li>Send a follow-up that states what you want to do next.</li></ol>
+<blockquote><p>Continue from the approach we chose yesterday. First check the current files and tell me whether anything has changed that affects the plan.</p></blockquote>
+<p>Reopening a session should not be confused with asking it to do more work. The next message supplies that instruction. Files may have changed since the conversation was saved, so give the agent room to inspect their current state.</p>
+<h2 id="context">Keep continuity useful</h2>
+<p>Use meaningful names and close a task with a concise decision: what was completed, what remains, and where the changes live. This makes it easier for you to choose the right conversation later.</p>
+<p>Context limits, compaction, and resume behavior depend on the harness. Tyde presents the session through a shared interface, but a long conversation still operates within its backend’s capabilities.</p>
+<h2 id="missing">If a conversation seems missing</h2>
+<p>Check the selected host and any History filters first. Work performed on a home server belongs to that host; switching to the laptop’s local host does not move its sessions. See <a href="troubleshooting.html#history">History and reconnect recovery</a> before starting the task again.</p>

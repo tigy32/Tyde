@@ -1,0 +1,20 @@
+<h2 id="backend">Backend unavailable</h2>
+<ol><li>Check the selected host. A CLI installed locally may be missing remotely.</li><li>Open <strong>Settings → Backends</strong> and read the setup status and diagnostic.</li><li>Confirm the CLI can run and is authenticated under the account used by that host.</li><li>Use the displayed install or repair controls, then refresh or reconnect as appropriate.</li><li>Start a small conversation before returning to a larger task.</li></ol>
+<p>Keep the exact error message when reporting a problem. “Installed but unavailable” is a different situation from “not installed,” and the diagnostic helps identify the next step.</p>
+<h2 id="connection">Host disconnected or reconnecting</h2>
+<p>Open <strong>Settings → Hosts</strong> and inspect the connection state. Confirm that the machine is reachable and that SSH works for the configured destination. If you use a custom remote command, check that it is valid on the remote machine.</p>
+<p>A reconnecting state does not prove the agent has stopped. Reconnect and inspect the existing agent before starting a duplicate task. If the server itself restarted or stopped, check the restored session and current process state before continuing.</p>
+<h2 id="history">History or agents seem missing</h2>
+<p>Select the original host and check filters in the Agents or History view. If the agent is still running remotely, reconnect to it. If you want an earlier saved conversation, resume it from History.</p>
+<p>Check the project and backend details before reopening a similarly named conversation. When resuming old work, ask the agent to inspect current files before relying on its earlier assumptions.</p>
+<h2 id="skills">A skill is not available</h2>
+<ol><li>Confirm the skill file is on the host where the agent runs, under <code>~/.tyde/skills/&lt;name&gt;/SKILL.md</code>.</li><li>Open Skills settings on that host and choose Refresh.</li><li>Confirm the skill appears in the list.</li><li>Check that the custom agent definition includes the skill.</li><li>Start a new conversation with the intended definition to evaluate the updated configuration.</li></ol>
+<h2 id="navigation">Code navigation is missing</h2>
+<p>Check that the file is Rust or Python and belongs to a recognized project. Open code-intelligence settings on the host and inspect language-server availability. Verify the configured executable path if one is set.</p>
+<p>Opening a file and highlighting its syntax can work even when the language server is unavailable. Report the provider diagnostic, file type, and project marker when asking for help.</p>
+<h2 id="review">A review will not submit</h2>
+<p>Check whether the review is still a draft, whether it contains comments, and whether AI suggestions still need a decision. Accept or reject pending suggestions, choose the feedback target, and inspect any error shown when you submit.</p>
+<p>Confirm you are looking at the intended source: working changes and a historical commit are different review contexts.</p>
+<h2 id="report">Report a useful issue</h2>
+<p>Open an issue in the <a href="https://github.com/tigy32/Tyde/issues">Tyde repository</a>. Include the Tyde version, operating system, backend and CLI version, whether the host is local or remote, the steps you took, and what you expected to happen.</p>
+<p>Add a screenshot or exact error when it helps explain the problem. Remove credentials, private code, and personal paths from anything you publish.</p>

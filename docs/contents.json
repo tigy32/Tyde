@@ -1,0 +1,15 @@
+[
+ {"slug":"index","title":"Room for all your agents.","part":"Start here","description":"One studio for coding agents across projects, backends, and machines. Start with a conversation. Grow into a workspace for everything you’re building."},
+ {"slug":"first-agent","title":"Your first agent","part":"Start here","description":"Go from a fresh installation to a useful conversation. You don’t need a project or a remote server to begin."},
+ {"slug":"projects","title":"Bring your projects","part":"Your daily workspace","description":"Give your agents a place to work, and give yourself the code context to follow along. A project can bring several repository roots together."},
+ {"slug":"review","title":"Review the work","part":"Your daily workspace","description":"Read the code, understand the change, and leave feedback exactly where it belongs. Keep the conversation connected to the work."},
+ {"slug":"concurrency","title":"Keep many agents in view","part":"Your daily workspace","description":"Move between projects without losing track of who is working, who needs you, and what is ready to review."},
+ {"slug":"sessions","title":"Pick up where you left off","part":"Your daily workspace","description":"Find earlier conversations and resume their context. Understand the difference between an active agent and its saved session."},
+ {"slug":"remote","title":"Your laptop. Your servers.","part":"Expand your studio","description":"Run agents where your projects live. Connect to a home server and a work server, leave work running, and reconnect when you’re ready."},
+ {"slug":"delegation","title":"Let agents work together","part":"Expand your studio","description":"Use Tyde subagents to delegate across CLI backends. Give each agent a clear role and follow the work in the same studio."},
+ {"slug":"agents-skills","title":"Make expertise reusable","part":"Expand your studio","description":"Define your specialists once. Give them instructions, skills, and tools that can be used across supported backends on a host."},
+ {"slug":"workbenches","title":"Give parallel work its space","part":"Expand your studio","description":"Use workbenches to keep independent changes on separate branches and working trees, while keeping them connected to their parent project."},
+ {"slug":"workflows","title":"A day in your studio","part":"Put it together","description":"Three complete ways to work: several projects on remote servers, implementation with a second reviewer, and a reusable project specialist."},
+ {"slug":"settings","title":"Configure your studio","part":"Reference","description":"Know which machine a setting changes, how backend options relate to Tyde, and where to configure code intelligence and integrations."},
+ {"slug":"troubleshooting","title":"Find your way back","part":"Reference","description":"Practical recovery steps for unavailable backends, disconnected hosts, missing sessions, and code navigation that needs attention."}
+]

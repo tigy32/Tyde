@@ -1,0 +1,15 @@
+<h2 id="tyde-subagents">A subagent in the studio</h2>
+<p>Some CLI harnesses have their own subagent mechanisms. A <strong>Tyde subagent</strong> is created through Tyde’s agent-control tools and appears as a managed agent in the studio. It can use a different supported backend from its parent.</p>
+<p>For example, a Codex agent can delegate an investigation to a Claude agent. The agents still run through their respective harnesses; Tyde provides the coordination and visibility around them.</p>
+<h2 id="prepare">Prepare for delegation</h2>
+<ol><li>On the selected host, configure the backends you want available for delegated work.</li><li>Review your custom agent’s tool configuration so it can use Tyde’s agent-control capabilities.</li><li>Check the host’s launch profiles and delegation preferences. These help determine which configured backend and cost profile a child uses.</li><li>Start the parent in the appropriate project or workbench.</li></ol>
+<p>Delegation does not create credentials or install missing harnesses. A requested child needs an available configuration on the host where it will run.</p>
+<h2 id="delegate">Give the parent a bounded task</h2>
+<blockquote><p>Investigate this issue. Use a Tyde subagent on another available backend to independently review the relevant code. Give it a read-only task with a clear question. Compare the findings and propose a fix before editing.</p></blockquote>
+<p>Follow the child agent in Tyde. Open its conversation when you need to inspect its assumptions or results. Ask the parent to reconcile disagreements rather than treating two agent responses as automatic agreement.</p>
+<p>For implementation, specify file ownership or use workbenches. Cross-backend delegation does not isolate working files by itself.</p>
+<h2 id="teams">Use teams for recurring collaboration</h2>
+<p>Teams group a manager and members with assigned roles. Use a team when you repeatedly want the same collaborators across projects. Talk to the manager about the outcome and let it coordinate the members’ work.</p>
+<p>Keep the distinction clear: a custom agent definition is a reusable configuration; a team is an organization of members; a subagent is an agent created for delegated work. Start with a single delegation before building a larger team.</p>
+<h2 id="evaluate">Evaluate the result</h2>
+<p>Ask for concrete evidence, inspect the resulting changes, and verify the outcome using your project’s normal checks. Delegation increases the amount of work you can run concurrently; your acceptance criteria still determine when it is finished.</p>
