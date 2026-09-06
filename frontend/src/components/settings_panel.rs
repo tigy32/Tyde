@@ -6046,7 +6046,7 @@ fn MobileTab() -> impl IntoView {
                         title=title
                         on:click=on_start_pairing_click.clone()
                     >
-                        "Start pairing"
+                        "Pair via cloud"
                     </button>
                 }
             }}
@@ -6387,7 +6387,7 @@ fn MobileDirectSection() -> AnyView {
                     title=title
                     on:click=on_start_direct_pairing_click.clone()
                 >
-                    "Pair over this host"
+                    "Pair via local server"
                 </button>
             }
         }}
@@ -9641,7 +9641,7 @@ mod wasm_tests {
         next_tick().await;
 
         let pair_button = || {
-            find_button_by_text(&container, "Pair over this host")
+            find_button_by_text(&container, "Pair via local server")
                 .expect("the direct pairing button must always render")
                 .dyn_into::<web_sys::HtmlButtonElement>()
                 .unwrap()
@@ -10130,7 +10130,7 @@ mod wasm_tests {
     }
 
     /// When mobile is enabled and the broker is Online, the
-    /// `Start pairing` button is rendered enabled and clicking it
+    /// `Pair via cloud` button is rendered enabled and clicking it
     /// fires exactly one `MobilePairingStart` frame on the host
     /// stream.
     #[wasm_bindgen_test]
@@ -10149,11 +10149,11 @@ mod wasm_tests {
         click_tab(&container, "Mobile");
         next_tick().await;
 
-        let btn = find_button_by_text(&container, "Start pairing")
-            .expect("Start pairing button must render on the Mobile tab");
+        let btn = find_button_by_text(&container, "Pair via cloud")
+            .expect("Pair via cloud button must render on the Mobile tab");
         assert!(
             !btn.has_attribute("disabled"),
-            "Start pairing must be enabled when mobile is on and broker is Online"
+            "Pair via cloud must be enabled when mobile is on and broker is Online"
         );
         btn.click();
         for _ in 0..4 {
@@ -10193,11 +10193,11 @@ mod wasm_tests {
         click_tab(&container, "Mobile");
         next_tick().await;
 
-        let btn = find_button_by_text(&container, "Start pairing")
-            .expect("Start pairing button must still render so users can see the affordance");
+        let btn = find_button_by_text(&container, "Pair via cloud")
+            .expect("Pair via cloud button must still render so users can see the affordance");
         assert!(
             btn.has_attribute("disabled"),
-            "Start pairing must be disabled when mobile is not enabled"
+            "Pair via cloud must be disabled when mobile is not enabled"
         );
     }
 
@@ -10363,7 +10363,7 @@ mod wasm_tests {
     }
 
     /// When the managed broker is in Error state, the pairing card surfaces the
-    /// server error message via the broker status pill AND keeps Start pairing
+    /// server error message via the broker status pill AND keeps Pair via cloud
     /// enabled: in the managed flow, (re-)pairing is exactly how the user
     /// recovers from a broker error, so gating Start on broker health would only
     /// block the fix. (Starting is server-owned, so it can't pick an
@@ -10396,11 +10396,11 @@ mod wasm_tests {
         click_tab(&container, "Mobile");
         next_tick().await;
 
-        let btn = find_button_by_text(&container, "Start pairing")
-            .expect("Start pairing button must render even on broker error");
+        let btn = find_button_by_text(&container, "Pair via cloud")
+            .expect("Pair via cloud button must render even on broker error");
         assert!(
             !btn.has_attribute("disabled"),
-            "Start pairing must stay enabled on broker error so the user can re-pair"
+            "Pair via cloud must stay enabled on broker error so the user can re-pair"
         );
         let text = container.text_content().unwrap_or_default();
         assert!(
@@ -10411,7 +10411,7 @@ mod wasm_tests {
 
     /// First managed pairing: before any pairing exists the server reports
     /// `MobileBrokerStatus::RepairRequired` (there is no `Online` broker yet).
-    /// Start pairing MUST be enabled in this state — otherwise the user can
+    /// Pair via cloud MUST be enabled in this state — otherwise the user can
     /// never start their first managed pairing — and the repair message must
     /// surface so the state is self-explanatory.
     #[wasm_bindgen_test]
@@ -10443,11 +10443,11 @@ mod wasm_tests {
         click_tab(&container, "Mobile");
         next_tick().await;
 
-        let btn = find_button_by_text(&container, "Start pairing")
-            .expect("Start pairing button must render when a managed pairing is required");
+        let btn = find_button_by_text(&container, "Pair via cloud")
+            .expect("Pair via cloud button must render when a managed pairing is required");
         assert!(
             !btn.has_attribute("disabled"),
-            "Start pairing must be enabled so the first managed pairing can begin"
+            "Pair via cloud must be enabled so the first managed pairing can begin"
         );
         let text = container.text_content().unwrap_or_default();
         assert!(

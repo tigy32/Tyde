@@ -96,7 +96,7 @@ not the managed one:
 
 Only hashes are stored on the host — never the plaintext secret or token.
 
-"Pair over this host" stays disabled until the origin reports itself serving
+"Pair via local server" stays disabled until the origin reports itself serving
 *and* a public URL is set. A QR built without both sends the phone to a dead
 address, where the failure surfaces away from the settings that caused it.
 
