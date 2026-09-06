@@ -6087,13 +6087,15 @@ math merror {
 .agent-card {
     display: flex;
     flex-direction: column;
-    gap: var(--space-1);
+    gap: 0;
     width: 100%;
     text-align: left;
-    padding: var(--space-2) var(--space-3);
+    padding: 5px 8px;
+    min-height: 36px;
+    justify-content: center;
     background: var(--surface-2);
     border: 1px solid var(--border-primary);
-    border-radius: 6px;
+    border-radius: 4px;
     transition: border-color 0.15s, background 0.15s, box-shadow 0.15s;
 }
 
@@ -6310,13 +6312,15 @@ math merror {
 .session-card {
     display: flex;
     flex-direction: column;
-    gap: var(--space-1);
+    gap: 0;
     width: 100%;
     text-align: left;
-    padding: var(--space-2) var(--space-3);
+    padding: 5px 8px;
+    min-height: 36px;
+    justify-content: center;
     background: var(--surface-2);
     border: 1px solid var(--border-primary);
-    border-radius: 6px;
+    border-radius: 4px;
     cursor: pointer;
     transition: border-color 0.15s, background 0.15s, box-shadow 0.15s;
 }
@@ -6354,6 +6358,74 @@ math merror {
     align-items: center;
     gap: var(--space-2);
     flex-wrap: wrap;
+}
+
+/* Backend identity and activity use separate colors. */
+[data-sidebar-backend="Claude"] { --sidebar-backend-color: #e8a832; }
+[data-sidebar-backend="Codex"] { --sidebar-backend-color: #6199f0; }
+[data-sidebar-backend="Tycode"] { --sidebar-backend-color: #9a9a9a; }
+[data-sidebar-backend="Kiro"] { --sidebar-backend-color: #b794f6; }
+[data-sidebar-backend="Antigravity"] { --sidebar-backend-color: #34a853; }
+[data-sidebar-backend="Hermes"] { --sidebar-backend-color: #2dd4bf; }
+[data-sidebar-backend="Grok"] { --sidebar-backend-color: #db7fa8; }
+[data-sidebar-backend="OpenCode"] { --sidebar-backend-color: #db8657; }
+
+.agent-card[data-sidebar-backend],
+.session-card[data-sidebar-backend] {
+    border-left: 2px solid var(--sidebar-backend-color);
+}
+
+.backend-badge.sidebar-backend-label {
+    flex-shrink: 0;
+    font-size: 0.77rem;
+    line-height: 1.5;
+    padding: 1px 5px;
+    color: var(--sidebar-backend-color);
+    background: color-mix(in srgb, var(--sidebar-backend-color) 15%, transparent);
+}
+
+.session-card-status {
+    color: var(--text-tertiary);
+    flex-shrink: 0;
+}
+
+.sidebar-card-details {
+    position: fixed;
+    z-index: 1200;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    opacity: 0;
+    pointer-events: none;
+    white-space: normal;
+}
+
+.agent-card:not([data-details-dismissed="true"]):is(:hover, :focus-within) > .sidebar-card-details,
+.session-card:not([data-details-dismissed="true"]):is(:hover, :focus-within) > .sidebar-card-details {
+    height: auto;
+    max-height: min(280px, calc(100vh - 16px));
+    overflow: auto;
+    clip-path: none;
+    opacity: 1;
+    pointer-events: auto;
+    padding: 12px;
+    background: var(--surface-2);
+    color: var(--text-primary);
+    border: 1px solid var(--border-secondary);
+    border-radius: 6px;
+    box-shadow: 0 6px 22px rgba(0, 0, 0, 0.3);
+}
+
+.sidebar-card-details > * + * { margin-top: 8px; }
+.sidebar-card-details strong { display: block; overflow-wrap: anywhere; }
+.sidebar-card-details .agent-card-top-actions { justify-content: flex-end; }
+.sidebar-card-details .agent-card-error,
+.sidebar-card-details .session-card-id,
+.sidebar-card-details .session-card-workspace {
+    white-space: normal;
+    overflow-wrap: anywhere;
+    max-width: 100%;
 }
 
 /* Reaches the history the server has advertised but nothing could request. */

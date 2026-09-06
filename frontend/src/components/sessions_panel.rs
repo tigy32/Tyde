@@ -53,10 +53,6 @@ pub(crate) fn format_date(ms: u64) -> String {
     format!("{year}-{month:02}-{day:02} {hours:02}:{mins:02}")
 }
 
-fn last_path_component(path: &str) -> &str {
-    path.rsplit('/').next().unwrap_or(path)
-}
-
 fn session_title(s: &SessionInfo) -> String {
     if let Some(ref ua) = s.summary.user_alias
         && !ua.is_empty()
@@ -70,10 +66,6 @@ fn session_title(s: &SessionInfo) -> String {
     }
     let id_str = s.summary.id.0.clone();
     id_str.chars().take(50).collect()
-}
-
-fn session_id_short(s: &SessionInfo) -> String {
-    s.summary.id.0.chars().take(8).collect()
 }
 
 /// Pure predicate used by the Sessions/History panel filter memo. Extracted
@@ -573,16 +565,11 @@ fn format_turn_count(turns: u32) -> String {
 
 fn session_card(state: AppState, session: SessionInfo) -> impl IntoView {
     let title = session_title(&session);
-    let short_id = session_id_short(&session);
+
     let full_id = session.summary.id.0.clone();
     let backend = session.summary.backend_kind;
     let last_active = format_date(session.summary.updated_at_ms);
-    let workspace = session
-        .summary
-        .workspace_roots
-        .first()
-        .map(|w| last_path_component(w).to_string())
-        .unwrap_or_default();
+    let workspace = session.summary.workspace_roots.join(" · ");
     // The store increments this once per persisted assistant stream (a
     // StreamEnd), never for the user's own message, so it counts responses and
     // not messages. Labelled for what it is rather than inheriting a name that
@@ -660,6 +647,12 @@ fn session_card(state: AppState, session: SessionInfo) -> impl IntoView {
         }
     };
 
+    let card_anchor = NodeRef::<leptos::html::Div>::new();
+    let details_style = RwSignal::new(String::new());
+    let details_dismissed = RwSignal::new(false);
+    let show_backend_labels = state.sidebar_backend_labels;
+    let settings_open = state.settings_open;
+    let details_title = title.clone();
     let disabled_class = move || {
         if !is_connected.get() || !resumable {
             "session-card disabled"
@@ -671,14 +664,57 @@ fn session_card(state: AppState, session: SessionInfo) -> impl IntoView {
     view! {
         <div
             class=disabled_class
-            title=full_id
+            node_ref=card_anchor
+            data-sidebar-backend=backend_label(backend)
+            data-details-dismissed=move || (details_dismissed.get() || settings_open.get()).to_string()
+            on:mouseenter=move |_| {
+                details_style.set(crate::components::hover_popover::sidebar_card_details_style(card_anchor));
+                details_dismissed.set(false);
+            }
+            on:focusin=move |_| {
+                details_style.set(crate::components::hover_popover::sidebar_card_details_style(card_anchor));
+                details_dismissed.set(false);
+            }
             tabindex="0"
             role="button"
             on:click=on_click
-            on:keydown=on_keydown_card
+            on:keydown=move |ev: web_sys::KeyboardEvent| {
+                if ev.key() == "Escape" {
+                    details_dismissed.set(true);
+                    ev.stop_propagation();
+                } else {
+                    on_keydown_card(ev);
+                }
+            }
         >
             <div class="session-card-top">
+                <span class="session-card-status" aria-label="Saved conversation">"◷"</span>
                 <span class="session-card-title">{title}</span>
+                <Show when=move || show_backend_labels.get()>
+                    <span class={format!("{} sidebar-backend-label", backend_class(backend))}>{backend_label(backend)}</span>
+                </Show>
+            </div>
+            <div class="sidebar-card-details" style=move || details_style.get()
+                on:click=|ev: web_sys::MouseEvent| ev.stop_propagation()
+                on:keydown=|ev: web_sys::KeyboardEvent| { if ev.key() != "Escape" { ev.stop_propagation(); } }
+            >
+                <strong>{details_title}</strong>
+                <div>{backend_label(backend)}</div>
+            <div class="session-card-meta">
+                <span class="session-card-date" title="Last active">{last_active}</span>
+                {move || project_name().map(|n| view! {
+                    <span class="session-card-project">{n}</span>
+                })}
+                {(!workspace.is_empty()).then(|| view! {
+                    <span class="session-card-workspace">{workspace}</span>
+                })}
+                <span
+                    class="session-card-msgs"
+                    title="Assistant responses persisted for this session, including \
+                           any that were cancelled or failed part-way"
+                >{format_turn_count(turn_count)}</span>
+            </div>
+            <div class="session-card-id">{full_id}</div>
                 <div>
                     {move || {
                         if !is_connected.get() {
@@ -714,24 +750,9 @@ fn session_card(state: AppState, session: SessionInfo) -> impl IntoView {
                             </button>
                         })
                     }}
-                    <span class={backend_class(backend)}>{backend_label(backend)}</span>
+
                 </div>
             </div>
-            <div class="session-card-meta">
-                <span class="session-card-date" title="Last active">{last_active}</span>
-                {move || project_name().map(|n| view! {
-                    <span class="session-card-project">{n}</span>
-                })}
-                {(!workspace.is_empty()).then(|| view! {
-                    <span class="session-card-workspace">{workspace}</span>
-                })}
-                <span
-                    class="session-card-msgs"
-                    title="Assistant responses persisted for this session, including \
-                           any that were cancelled or failed part-way"
-                >{format_turn_count(turn_count)}</span>
-            </div>
-            <div class="session-card-id">{short_id}</div>
         </div>
     }
 }

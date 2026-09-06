@@ -239,6 +239,7 @@ const STORAGE_THEME: &str = "tyde-theme";
 const STORAGE_FONT_SIZE: &str = "tyde-font-size";
 const STORAGE_FONT_FAMILY: &str = "tyde-font-family";
 const STORAGE_SYNTAX_THEME: &str = "tyde-syntax-theme";
+const STORAGE_SIDEBAR_BACKEND_LABELS: &str = "tyde-sidebar-backend-labels";
 const STORAGE_TABS_ENABLED: &str = "tyde-tabs-enabled";
 const STORAGE_DIFF_VIEW_MODE: &str = "tyde-diff-view-mode";
 const STORAGE_DIFF_CONTEXT_MODE: &str = "tyde-diff-context-mode";
@@ -425,6 +426,10 @@ pub fn restore_appearance(state: &AppState) {
         state.syntax_theme.set(theme_name);
     }
 
+    if let Ok(Some(value)) = storage.get_item(STORAGE_SIDEBAR_BACKEND_LABELS) {
+        state.sidebar_backend_labels.set(value != "false");
+    }
+
     if let Ok(Some(tabs_str)) = storage.get_item(STORAGE_TABS_ENABLED) {
         let enabled = tabs_str != "false";
         state.tabs_enabled.set(enabled);
@@ -576,6 +581,10 @@ impl SettingsTab {
                 "Font Family",
                 "Select the font family for UI text",
                 "Monospace",
+                "Backend labels on cards",
+                "Claude",
+                "Codex",
+                "Card colors",
                 "Tab Bar",
                 "Show a tab bar for managing multiple open views",
             ],
@@ -1865,8 +1874,31 @@ fn AppearanceTab() -> impl IntoView {
         <h2 class="settings-panel-title">"Appearance"</h2>
 
         <p class="settings-description settings-panel-intro">
-            "How the Tyde window itself looks: colors, text size, and whether the center area is tabbed. These are stored in this installation's local storage, so they follow the app on this machine and are the same no matter which host you are connected to."
+            "How the Tyde window itself looks: colors, text size, card labels, and whether the center area is tabbed. These are stored in this installation's local storage, so they follow the app on this machine and are the same no matter which host you are connected to."
         </p>
+
+        <div class="settings-field">
+            <div class="settings-toggle-row">
+                <div>
+                    <label class="settings-label" for="sidebar-backend-labels">"Backend labels on cards"</label>
+                    <p class="settings-description">"Show backend names alongside the matching colored edge on agent and history cards. Turn off for color-only rows; full names remain available in card details."</p>
+                </div>
+                <label class="settings-toggle">
+                    <input id="sidebar-backend-labels" type="checkbox"
+                        prop:checked=move || state.sidebar_backend_labels.get()
+                        on:change=move |ev: web_sys::Event| {
+                            let input: web_sys::HtmlInputElement = ev.target().unwrap().unchecked_into();
+                            let enabled = input.checked();
+                            state.sidebar_backend_labels.set(enabled);
+                            if let Some(storage) = local_storage() {
+                                let _ = storage.set_item(STORAGE_SIDEBAR_BACKEND_LABELS, if enabled { "true" } else { "false" });
+                            }
+                        }
+                    />
+                    <span class="settings-toggle-slider"></span>
+                </label>
+            </div>
+        </div>
 
         <div class="settings-field">
             <label class="settings-label">"Color Theme"</label>

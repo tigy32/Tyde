@@ -1470,10 +1470,7 @@ fn agent_card(
         })
     };
 
-    let error_msg = agent.fatal_error.as_ref().map(|msg| {
-        let truncated: String = msg.chars().take(80).collect();
-        truncated
-    });
+    let error_msg = agent.fatal_error.clone();
 
     let click_state = state.clone();
     let click_agent = agent.clone();
@@ -1768,6 +1765,15 @@ fn agent_card(
     };
 
     let agent_id_for_editing_block = agent_id.clone();
+    let card_anchor = NodeRef::<leptos::html::Div>::new();
+    let details_style = RwSignal::new(String::new());
+    let details_dismissed = RwSignal::new(false);
+    let show_backend_labels = state.sidebar_backend_labels;
+    let settings_open = state.settings_open;
+    let details_name = name.clone();
+    let details_host = agent.host_id.clone();
+    let details_workspace = agent.workspace_roots.join(" · ");
+    let details_status = derived.clone();
 
     view! {
         <div
@@ -1778,18 +1784,47 @@ fn agent_card(
                     "agent-card"
                 }
             }
+            node_ref=card_anchor
+            data-sidebar-backend=backend_label(backend)
+            data-details-dismissed=move || (details_dismissed.get() || settings_open.get()).to_string()
+            on:mouseenter=move |_| {
+                details_style.set(crate::components::hover_popover::sidebar_card_details_style(card_anchor));
+                details_dismissed.set(false);
+            }
+            on:focusin=move |_| {
+                details_style.set(crate::components::hover_popover::sidebar_card_details_style(card_anchor));
+                details_dismissed.set(false);
+            }
             tabindex="0"
             role="button"
             draggable="true"
             aria-dropeffect=move || if keyboard_agent.get().is_some() { "move" } else { "none" }
             on:click=on_click
-            on:keydown=on_keydown_card
+            on:keydown=move |ev: web_sys::KeyboardEvent| {
+                if ev.key() == "Escape" {
+                    details_dismissed.set(true);
+                    ev.stop_propagation();
+                } else {
+                    on_keydown_card(ev);
+                }
+            }
             on:dragstart=on_dragstart
             on:dragover=on_dragover_agent
             on:drop=on_drop_agent
             on:dragend=on_dragend
         >
             <div class="agent-card-top">
+                <span class=status_class_sig title=status_title_sig>
+                    <span aria-hidden="true">{status_icon_sig}</span>
+                    <span class=move || {
+                        if status_label_visible_sig() {
+                            "agent-card-status-text"
+                        } else {
+                            "visually-hidden"
+                        }
+                    }>{status_label_sig}</span>
+                </span>
+
                 <div class="agent-card-top-main">
                 {move || {
                     if editing_agent.with(|e| e.as_ref() == Some(&agent_id_for_editing_block)) {
@@ -1909,6 +1944,37 @@ fn agent_card(
                     }
                 })}
                 </div>
+                <Show when=move || show_backend_labels.get()>
+                    <span class={format!("{} agent-card-backend sidebar-backend-label", backend_class(backend))}>{backend_label(backend)}</span>
+                </Show>
+            </div>
+            {error_msg.map(|msg| view! {
+                <div class="agent-card-error">{msg}</div>
+            })}
+            {move || compaction_error_msg().map(|msg| view! {
+                <div class="agent-card-error agent-card-error-compaction">{msg}</div>
+            })}
+            <div class="sidebar-card-details" style=move || details_style.get()
+                on:click=|ev: web_sys::MouseEvent| ev.stop_propagation()
+                on:keydown=|ev: web_sys::KeyboardEvent| { if ev.key() != "Escape" { ev.stop_propagation(); } }
+            >
+                <strong>{details_name}</strong>
+                <div>{backend_label(backend)}" · "{move || status_label(&details_status())}</div>
+                <div>{details_host}</div>
+                <div class="sidebar-card-workspace">{details_workspace}</div>
+            <div class="agent-card-bottom">
+                <span class="agent-card-time">{relative_time(created)}</span>
+                {move || custom_agent_name().map(|n| {
+                    let title = format!("Custom agent: {n}");
+                    view! {
+                        <span class="agent-card-custom-agent" title=title>{n}</span>
+                    }
+                })}
+                {workflow_badge_title.map(|title| view! {
+                    <span class="agent-card-workflow-badge" title=title>"Workflow"</span>
+                })}
+
+            </div>
                 <div class="agent-card-top-actions">
                     <button
                         type="button"
@@ -1997,35 +2063,6 @@ fn agent_card(
                     </button>
                 </div>
             </div>
-            <div class="agent-card-bottom">
-                <span class=status_class_sig title=status_title_sig>
-                    <span aria-hidden="true">{status_icon_sig}</span>
-                    <span class=move || {
-                        if status_label_visible_sig() {
-                            "agent-card-status-text"
-                        } else {
-                            "visually-hidden"
-                        }
-                    }>{status_label_sig}</span>
-                </span>
-                <span class="agent-card-time">{relative_time(created)}</span>
-                {move || custom_agent_name().map(|n| {
-                    let title = format!("Custom agent: {n}");
-                    view! {
-                        <span class="agent-card-custom-agent" title=title>{n}</span>
-                    }
-                })}
-                {workflow_badge_title.map(|title| view! {
-                    <span class="agent-card-workflow-badge" title=title>"Workflow"</span>
-                })}
-                <span class={format!("{} agent-card-backend", backend_class(backend))}>{backend_label(backend)}</span>
-            </div>
-            {error_msg.map(|msg| view! {
-                <div class="agent-card-error">{msg}</div>
-            })}
-            {move || compaction_error_msg().map(|msg| view! {
-                <div class="agent-card-error agent-card-error-compaction">{msg}</div>
-            })}
         </div>
     }
 }
@@ -2469,6 +2506,218 @@ mod wasm_tests {
             provide_context(state_for_mount.clone());
             view! { <AgentsPanel /> }
         })
+    }
+
+    #[wasm_bindgen_test]
+    async fn compact_cards_keep_identity_and_offer_persistent_color_only_mode() {
+        use crate::components::sessions_panel::SessionsPanel;
+        use crate::components::settings_panel::{SettingsPanel, restore_appearance};
+        use crate::state::SessionInfo;
+        use protocol::{SessionId, SessionSummary};
+
+        install_send_stub_with_dialog_ok();
+        let container = make_container();
+        let state = make_app_state("local");
+        push_agent(
+            &state,
+            "local",
+            "compact-card",
+            "Review authentication flow",
+            true,
+        );
+        state.sessions.set(vec![SessionInfo {
+            host_id: "local".to_owned(),
+            summary: SessionSummary {
+                id: SessionId("saved-card-full-id".to_owned()),
+                backend_kind: BackendKind::Codex,
+                launch_profile_id: None,
+                workspace_roots: vec!["/workspace/tyde".to_owned()],
+                project_id: None,
+                alias: Some("Fix history sorting".to_owned()),
+                user_alias: None,
+                parent_id: None,
+                created_at_ms: 0,
+                updated_at_ms: 100,
+                message_count: 12,
+                token_count: None,
+                resumable: true,
+                compacted_from_session_id: None,
+                compacted_to_session_id: None,
+                compacted_at_ms: None,
+                compaction_summary_preview: None,
+            },
+        }]);
+        CenterWorkspaceWidth::forget_measurement();
+        let mounted_state = state.clone();
+        let handle = mount_to(container.clone(), move || {
+            provide_context(mounted_state.clone());
+            view! {
+                <style>{include_str!("../../styles.css")}</style>
+                <div style="width:320px;height:260px"><AgentsPanel /></div>
+                <div style="width:320px;height:260px"><SessionsPanel /></div>
+                <SettingsPanel />
+            }
+        });
+        for _ in 0..4 {
+            next_tick().await;
+        }
+        let agent = agent_card_el(&container, "compact-card");
+        let history: HtmlElement = container
+            .query_selector(".session-card")
+            .unwrap()
+            .unwrap()
+            .dyn_into()
+            .unwrap();
+        for card in [&agent, &history] {
+            let height = card.get_bounding_client_rect().height();
+            assert!(
+                (30.0..=40.0).contains(&height),
+                "a normal row must fit on one compact line, got {height}px"
+            );
+            let label = card.query_selector(".backend-badge").unwrap().unwrap();
+            let window = web_sys::window().unwrap();
+            let edge = window
+                .get_computed_style(card)
+                .unwrap()
+                .unwrap()
+                .get_property_value("border-left-color")
+                .unwrap();
+            let ink = window
+                .get_computed_style(&label)
+                .unwrap()
+                .unwrap()
+                .get_property_value("color")
+                .unwrap();
+            assert_eq!(
+                edge, ink,
+                "the backend label must teach the matching edge color"
+            );
+        }
+        let height = agent.get_bounding_client_rect().height();
+        agent
+            .clone()
+            .dyn_into::<HtmlElement>()
+            .unwrap()
+            .focus()
+            .unwrap();
+        next_tick().await;
+        let details = agent
+            .query_selector(".sidebar-card-details")
+            .unwrap()
+            .unwrap();
+        assert!(details.text_content().unwrap().contains("Claude"));
+        assert!(
+            details.get_bounding_client_rect().height() > 40.0,
+            "keyboard focus exposes readable details"
+        );
+        assert_eq!(
+            agent.get_bounding_client_rect().height(),
+            height,
+            "details must not shift the list"
+        );
+        let escape = web_sys::KeyboardEventInit::new();
+        escape.set_key("Escape");
+        escape.set_bubbles(true);
+        agent
+            .dispatch_event(
+                &web_sys::KeyboardEvent::new_with_keyboard_event_init_dict("keydown", &escape)
+                    .unwrap(),
+            )
+            .unwrap();
+        next_tick().await;
+        assert_eq!(
+            web_sys::window()
+                .unwrap()
+                .get_computed_style(&details)
+                .unwrap()
+                .unwrap()
+                .get_property_value("opacity")
+                .unwrap(),
+            "0"
+        );
+
+        agent.style().set_property("position", "fixed").unwrap();
+        agent
+            .style()
+            .set_property("top", "calc(100vh - 44px)")
+            .unwrap();
+        agent.style().set_property("left", "400px").unwrap();
+        agent.style().set_property("width", "300px").unwrap();
+        agent.blur().unwrap();
+        agent.focus().unwrap();
+        next_tick().await;
+        let row_rect = agent.get_bounding_client_rect();
+        let popup_rect = details.get_bounding_client_rect();
+        assert!(
+            popup_rect.bottom() >= row_rect.top() && popup_rect.top() <= row_rect.bottom(),
+            "bottom-row details must touch the row so the pointer can reach them"
+        );
+        assert!(
+            popup_rect.right() <= row_rect.left(),
+            "details sit beside the row"
+        );
+        agent.remove_attribute("style").unwrap();
+
+        state.settings_open.set(true);
+        next_tick().await;
+        assert_eq!(
+            web_sys::window()
+                .unwrap()
+                .get_computed_style(&details)
+                .unwrap()
+                .unwrap()
+                .get_property_value("opacity")
+                .unwrap(),
+            "0",
+            "card details must not cover Appearance when the row keeps keyboard focus"
+        );
+        let toggle = container
+            .query_selector("#sidebar-backend-labels")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<web_sys::HtmlInputElement>()
+            .unwrap();
+        assert!(toggle.checked(), "backend labels are visible by default");
+        toggle.click();
+        next_tick().await;
+        for card in [&agent, &history] {
+            assert!(
+                card.query_selector(".backend-badge").unwrap().is_none(),
+                "color-only mode removes the inline label"
+            );
+            assert!(card.get_bounding_client_rect().height() <= 40.0);
+        }
+        let restored = AppState::new();
+        restore_appearance(&restored);
+        restored.settings_open.set(true);
+        let reopened = make_container();
+        let reopened_handle = mount_to(reopened.clone(), move || {
+            provide_context(restored.clone());
+            view! { <SettingsPanel /> }
+        });
+        next_tick().await;
+        let saved_toggle = reopened
+            .query_selector("#sidebar-backend-labels")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<web_sys::HtmlInputElement>()
+            .unwrap();
+        assert!(
+            !saved_toggle.checked(),
+            "reopened Appearance keeps labels off"
+        );
+        drop(reopened_handle);
+        reopened.remove();
+        toggle.click();
+        next_tick().await;
+        for card in [&agent, &history] {
+            assert!(
+                card.query_selector(".backend-badge").unwrap().is_some(),
+                "turning labels back on restores both lists immediately"
+            );
+        }
+        drop(handle);
+        container.remove();
     }
 
     /// F-06: the cancelled outcome must be reactively visible on the card, and
