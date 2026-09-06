@@ -149,6 +149,9 @@ html, body {
 }
 
 body {
+    /* The recovered app can exceed iOS’s percentage-height containing block.
+       Grow this clipping ancestor with it so the composer stays paintable. */
+    height: auto;
     background: var(--bg-base);
     color: var(--text-primary);
 }

@@ -1262,7 +1262,34 @@ mod wasm_tests {
 
     #[wasm_bindgen_test]
     async fn one_chat_mount_preserves_transcript_and_composer_draft() {
-        let container = make_container();
+        let document = web_sys::window().unwrap().document().unwrap();
+        let frame = document
+            .create_element("iframe")
+            .unwrap()
+            .dyn_into::<web_sys::HtmlIFrameElement>()
+            .unwrap();
+        frame
+            .set_attribute("style", "width:393px;height:852px;border:0")
+            .unwrap();
+        document.body().unwrap().append_child(&frame).unwrap();
+        let frame_document = frame.content_document().unwrap();
+        let style = frame_document.create_element("style").unwrap();
+        style.set_text_content(Some(concat!(
+            include_str!("../styles.css"),
+            "\nhtml {height:793px; --app-height:852px;}"
+        )));
+        frame_document.body().unwrap().append_child(&style).unwrap();
+        let container = document
+            .create_element("div")
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap();
+        container.set_class_name("mobile-app");
+        frame_document
+            .body()
+            .unwrap()
+            .append_child(&container)
+            .unwrap();
         let host = LocalHostId("composer-host".to_owned());
         let agent_id = protocol::AgentId("composer-agent".to_owned());
         let agent_ref = crate::state::AgentRef {
@@ -1345,8 +1372,55 @@ mod wasm_tests {
             .unwrap();
         assert_eq!(input.value(), "preserved draft");
 
+        let send = container
+            .query_selector("[data-mobile-test='chat-send']")
+            .unwrap()
+            .unwrap();
+        let reachable = || {
+            let rect = send.get_bounding_client_rect();
+            frame_document
+                .element_from_point(
+                    (rect.x() + rect.width() / 2.0) as f32,
+                    (rect.y() + rect.height() / 2.0) as f32,
+                )
+                .is_some_and(|hit| send.contains(Some(&hit)))
+        };
+        // Reproduce the old clipping ancestor: geometry alone still says the
+        // button is on screen, but hit testing proves it cannot be reached.
+        let body = frame_document.body().unwrap();
+        body.style().set_property("height", "100%").unwrap();
+        assert!(
+            !reachable(),
+            "the short body must reproduce the blocked composer"
+        );
+        body.style().remove_property("height").unwrap();
+        assert!(
+            reachable(),
+            "the recovered composer must be visible and reachable"
+        );
+
+        // The iframe root is an HTMLElement from a different JS realm;
+        // parent-window instanceof checks reject that valid element.
+        let root: HtmlElement = frame_document.document_element().unwrap().unchecked_into();
+        root.set_attribute("data-keyboard-open", "").unwrap();
+        root.style().set_property("--app-height", "516px").unwrap();
+        next_tick().await;
+        assert!(
+            reachable(),
+            "the composer stays reachable above the keyboard"
+        );
+        assert!(send.get_bounding_client_rect().bottom() <= 516.0);
+        root.remove_attribute("data-keyboard-open").unwrap();
+        root.style().set_property("--app-height", "852px").unwrap();
+        next_tick().await;
+        assert!(
+            reachable(),
+            "closing the keyboard must not restore the clipping"
+        );
+        assert_eq!(input.value(), "preserved draft");
+
         drop(mount);
-        container.remove();
+        frame.remove();
     }
 
     /// **The real disconnect lifecycle must leave the user somewhere they can act.**
