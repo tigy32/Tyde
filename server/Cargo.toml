@@ -8,6 +8,7 @@ full-backends = []
 test-support = []
 
 [dependencies]
+tyde-process-env = { path = "../process-env" }
 tyde-agent-adapter = { path = "../agent-adapter" }
 aes-gcm = "0.10"
 anyhow = "1"

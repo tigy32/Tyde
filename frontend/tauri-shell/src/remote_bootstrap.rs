@@ -7,7 +7,6 @@ use host_config::{
     TydeReleaseVersion,
 };
 use tauri::{AppHandle, Emitter};
-use tokio::process::Command;
 
 use crate::bridge::HOST_LIFECYCLE_EVENT;
 
@@ -687,7 +686,7 @@ exit 1
 }
 
 async fn ssh_capture(ssh_destination: &str, remote_command: &str) -> Result<String, String> {
-    let output = Command::new("ssh")
+    let output = server::process_env::command("ssh")?
         .arg("-T")
         .arg(ssh_destination)
         .arg(remote_command)

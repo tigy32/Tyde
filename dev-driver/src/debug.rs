@@ -1139,52 +1139,20 @@ fn dev_instance_config_path(instance_id: &str) -> PathBuf {
 
 fn tauri_dev_command(config_path: &Path) -> Result<Command, String> {
     let cargo_tauri = resolve_cargo_tauri().ok_or_else(|| {
-        "cargo-tauri was not found in PATH or the Cargo bin directory; install the Tauri CLI and ensure cargo-tauri is available before starting a Tyde dev instance (the launcher does not use npx or install packages)".to_string()
+        "cargo-tauri was not found in the login-shell PATH; install the Tauri CLI and ensure cargo-tauri is available before starting a Tyde dev instance (the launcher does not use npx or install packages)".to_string()
     })?;
-    Ok(tauri_dev_command_with_cli(config_path, &cargo_tauri))
+    tauri_dev_command_with_cli(config_path, &cargo_tauri)
 }
 
-fn tauri_dev_command_with_cli(config_path: &Path, cargo_tauri: &Path) -> Command {
-    let mut command = Command::new(cargo_tauri);
+fn tauri_dev_command_with_cli(config_path: &Path, cargo_tauri: &Path) -> Result<Command, String> {
+    let mut command = crate::process_env::command(cargo_tauri)?;
     command.arg("dev");
     command.arg("--config").arg(config_path).arg("--no-watch");
-    command
+    Ok(command)
 }
 
 fn resolve_cargo_tauri() -> Option<PathBuf> {
-    let mut dirs = std::env::var_os("PATH")
-        .map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
-        .unwrap_or_default();
-    if let Some(cargo_home) = std::env::var_os("CARGO_HOME") {
-        dirs.push(PathBuf::from(cargo_home).join("bin"));
-    } else if let Some(home) = std::env::var_os("HOME") {
-        dirs.push(PathBuf::from(home).join(".cargo/bin"));
-    }
-    find_cargo_tauri_in_dirs(dirs)
-}
-
-fn find_cargo_tauri_in_dirs(dirs: impl IntoIterator<Item = PathBuf>) -> Option<PathBuf> {
-    dirs.into_iter()
-        .map(|dir| dir.join(format!("cargo-tauri{}", std::env::consts::EXE_SUFFIX)))
-        .find(|candidate| is_executable_file(candidate))
-}
-
-fn is_executable_file(path: &Path) -> bool {
-    let Ok(metadata) = path.metadata() else {
-        return false;
-    };
-    if !metadata.is_file() {
-        return false;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        metadata.permissions().mode() & 0o111 != 0
-    }
-    #[cfg(not(unix))]
-    {
-        true
-    }
+    crate::process_env::find_executable_in_path("cargo-tauri")
 }
 
 async fn capture_startup_output(

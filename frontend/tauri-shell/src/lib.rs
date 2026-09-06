@@ -738,7 +738,7 @@ fn spawn_system_url_handler(url: &str) -> Result<(), String> {
 
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     {
-        let mut command = system_url_handler_command(url);
+        let mut command = system_url_handler_command(url)?;
         command
             .spawn()
             .map(|_| ())
@@ -747,17 +747,17 @@ fn spawn_system_url_handler(url: &str) -> Result<(), String> {
 }
 
 #[cfg(target_os = "macos")]
-fn system_url_handler_command(url: &str) -> Command {
-    let mut command = Command::new("open");
+fn system_url_handler_command(url: &str) -> Result<Command, String> {
+    let mut command = server::process_env::std_command("open")?;
     command.arg(url);
-    command
+    Ok(command)
 }
 
 #[cfg(target_os = "windows")]
-fn system_url_handler_command(url: &str) -> Command {
-    let mut command = Command::new("rundll32.exe");
+fn system_url_handler_command(url: &str) -> Result<Command, String> {
+    let mut command = server::process_env::std_command("rundll32.exe")?;
     command.arg("url.dll,FileProtocolHandler").arg(url);
-    command
+    Ok(command)
 }
 
 #[cfg(all(
@@ -765,10 +765,10 @@ fn system_url_handler_command(url: &str) -> Command {
     not(target_os = "windows"),
     not(any(target_os = "android", target_os = "ios"))
 ))]
-fn system_url_handler_command(url: &str) -> Command {
-    let mut command = Command::new("xdg-open");
+fn system_url_handler_command(url: &str) -> Result<Command, String> {
+    let mut command = server::process_env::std_command("xdg-open")?;
     command.arg(url);
-    command
+    Ok(command)
 }
 
 #[tauri::command]

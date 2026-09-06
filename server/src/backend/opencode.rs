@@ -57,7 +57,7 @@ pub(crate) fn capabilities() -> BackendCapabilities {
 }
 
 pub(crate) async fn list_sessions() -> Result<Vec<crate::backend::BackendSession>, String> {
-    let output = tokio::process::Command::new("opencode")
+    let output = crate::process_env::command("opencode")?
         .args(["session", "list", "--format", "json", "--max-count", "1000"])
         .output()
         .await

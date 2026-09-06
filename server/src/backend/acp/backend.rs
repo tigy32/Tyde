@@ -6,7 +6,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
-use tokio::process::Command;
 use tokio::sync::{Mutex, mpsc, oneshot, watch};
 
 use protocol::{
@@ -821,7 +820,14 @@ impl KiroInner {
             .map_err(|_| CapacityUnavailableReason::SourceTimedOut)
             .and_then(|result| result.map_err(|_| CapacityUnavailableReason::SourceUnreachable))
         } else {
-            let mut command = Command::new(&spec.local_program);
+            let mut command = match crate::process_env::command(&spec.local_program) {
+                Ok(command) => command,
+                Err(_) => {
+                    return BackendCapacityState::Unavailable {
+                        reason: CapacityUnavailableReason::SourceUnreachable,
+                    };
+                }
+            };
             command.args(&spec.local_args);
             if let Some(cwd) = spec.local_cwd.as_deref() {
                 command.current_dir(cwd);
@@ -4722,7 +4728,10 @@ fn numeric_tokens(input: &str) -> Vec<String> {
 
 #[cfg(unix)]
 fn is_pid_alive(pid: u32) -> bool {
-    std::process::Command::new("kill")
+    let Ok(mut command) = crate::process_env::std_command("kill") else {
+        return false;
+    };
+    command
         .args(["-0", &pid.to_string()])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -4733,7 +4742,10 @@ fn is_pid_alive(pid: u32) -> bool {
 
 #[cfg(windows)]
 fn is_pid_alive(pid: u32) -> bool {
-    std::process::Command::new("cmd")
+    let Ok(mut command) = crate::process_env::std_command("cmd") else {
+        return false;
+    };
+    command
         .args([
             "/C",
             &format!("tasklist /FI \"PID eq {pid}\" /NH | findstr {pid}"),

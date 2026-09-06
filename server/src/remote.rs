@@ -1,7 +1,6 @@
 use std::process::Output;
 
 use command_group::{AsyncCommandGroup, AsyncGroupChild};
-use tokio::process::Command;
 
 pub fn parse_remote_workspace_roots(
     workspace_roots: &[String],
@@ -51,7 +50,7 @@ pub fn ssh_control_args() -> Result<Vec<String>, String> {
 }
 
 pub async fn run_ssh_raw(host: &str, command: &str) -> Result<Output, String> {
-    Command::new("ssh")
+    crate::process_env::command("ssh")?
         .arg("-T")
         .arg(host)
         .arg(command)
@@ -96,7 +95,7 @@ pub async fn spawn_remote_process_with_env(
     }
     let remote_cmd = remote_parts.join(" ");
 
-    Command::new("ssh")
+    crate::process_env::command("ssh")?
         .arg("-T")
         .arg(host)
         .arg(remote_cmd)

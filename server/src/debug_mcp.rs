@@ -1071,17 +1071,17 @@ fn tauri_dev_command(config_path: &Path) -> Result<Command, String> {
     let cargo_tauri = process_env::find_executable_in_path("cargo-tauri").ok_or_else(|| {
         "cargo-tauri was not found in the resolved child-process PATH; install the Tauri CLI and ensure cargo-tauri is available before starting a Tyde dev instance (the launcher does not use npx or install packages)".to_string()
     })?;
-    Ok(tauri_dev_command_with_cli(config_path, &cargo_tauri))
+    tauri_dev_command_with_cli(config_path, &cargo_tauri)
 }
 
-fn tauri_dev_command_with_cli(config_path: &Path, cargo_tauri: &Path) -> Command {
-    let mut command = Command::new(cargo_tauri);
+fn tauri_dev_command_with_cli(config_path: &Path, cargo_tauri: &Path) -> Result<Command, String> {
+    let mut command = crate::process_env::command(cargo_tauri)?;
     command.arg("dev");
     command.arg("--config").arg(config_path).arg("--no-watch");
     if let Some(path) = process_env::resolved_child_process_path() {
         command.env("PATH", path);
     }
-    command
+    Ok(command)
 }
 
 async fn capture_startup_output(

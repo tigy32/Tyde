@@ -470,6 +470,28 @@ fn real_session_settings() {
 #[test]
 #[ignore = "paid real-backend suite; use --run-ignored all with TYDE_RUN_REAL_AI_TESTS=1"]
 fn real_tool_type_mappings() {
+    #[cfg(unix)]
+    if std::env::var_os("TYDE_CONFORMANCE_LOGIN_PATH_CHILD").is_none() {
+        // Desktop hosts inherit a minimal PATH. Run the real provider flow in
+        // a separate process so login-shell resolution, tool arguments, and
+        // completions are tested without mutating this process's environment.
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "real_tool_type_mappings",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+            .env("TYDE_CONFORMANCE_LOGIN_PATH_CHILD", "1")
+            .status()
+            .expect("start real provider regression with a minimal inherited PATH");
+        assert!(
+            status.success(),
+            "login-shell PATH conformance failed: {status}"
+        );
+        return;
+    }
     run_scenario(&[], |mut host| async move {
         let workspace = host.workspace().to_path_buf();
         let created = unique_payload();
@@ -480,8 +502,15 @@ fn real_tool_type_mappings() {
         let web_search = host.declares(BackendCapability::GenericWebSearch);
         let view_image = host.declares(BackendCapability::GenericViewImage);
 
-        let agent = spawn_agent(&mut host, &launch_prompt()).await;
-        let launched = collect_turn(&mut host, &agent, &launch_prompt()).await;
+        // Keep provider exports above the pipe buffer size: OpenCode used to
+        // return successful but truncated JSON once a conversation grew.
+        let launch = format!(
+            "Fixture padding; do not repeat it: {}\n\n{}",
+            "transcript-padding ".repeat(4096),
+            launch_prompt()
+        );
+        let agent = spawn_agent(&mut host, &launch).await;
+        let launched = collect_turn(&mut host, &agent, &launch).await;
         assert_ready_handshake(&launched);
 
         if !diffs {

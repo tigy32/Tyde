@@ -31,7 +31,6 @@ use std::time::Duration;
 use command_group::{AsyncCommandGroup, AsyncGroupChild};
 use serde_json::{Value, json};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::process::Command;
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
@@ -328,7 +327,7 @@ impl LspClient {
         cwd: &Path,
         env_path: Option<&OsStr>,
     ) -> Result<(Self, mpsc::UnboundedReceiver<LspEvent>), String> {
-        let mut cmd = Command::new(binary);
+        let mut cmd = crate::process_env::command(binary)?;
         cmd.args(args)
             .current_dir(cwd)
             .stdin(Stdio::piped())

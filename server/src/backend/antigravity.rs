@@ -19,7 +19,7 @@ use protocol::{
 };
 use serde_json::{Map, Value, json, to_value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{ChildStdin, Command};
+use tokio::process::ChildStdin;
 use tokio::sync::{Mutex, mpsc, oneshot};
 use uuid::Uuid;
 
@@ -261,7 +261,7 @@ impl AgyProcess {
         resume: Option<&str>,
         emitter: Arc<TurnEmitter>,
     ) -> Result<Self, String> {
-        let mut command = Command::new("agy");
+        let mut command = crate::process_env::command("agy")?;
         command.args(launch.args(resume));
         if let Some(path) = process_env::resolved_child_process_path() {
             command.env("PATH", path);
@@ -1315,7 +1315,8 @@ fn tool_execution_result(
 async fn read_antigravity_capacity(
     model: &str,
 ) -> Result<CapacityReport, CapacityUnavailableReason> {
-    let mut command = Command::new("agy");
+    let mut command = crate::process_env::command("agy")
+        .map_err(|_| CapacityUnavailableReason::SourceUnreachable)?;
     command.args([
         "--output-format",
         "stream-json",

@@ -158,7 +158,7 @@ impl AcpAgentAdapter for GrokAdapter {
             if ssh_host.is_some() {
                 return Err("Grok does not yet support Tyde SSH sessions".to_owned());
             }
-            let output = tokio::process::Command::new("grok")
+            let output = crate::process_env::command("grok")?
                 .args(["sessions", "delete", session_id])
                 .output()
                 .await

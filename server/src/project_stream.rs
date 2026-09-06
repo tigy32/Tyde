@@ -2324,7 +2324,7 @@ fn project_path_command(
     opener_program: Option<&Path>,
 ) -> Result<Command, String> {
     if let Some(program) = opener_program {
-        let mut command = Command::new(program);
+        let mut command = crate::process_env::std_command(program)?;
         command
             .arg(match action {
                 ProjectOpenPathAction::OpenExternally => "open",
@@ -2336,7 +2336,7 @@ fn project_path_command(
 
     #[cfg(target_os = "macos")]
     {
-        let mut command = Command::new("open");
+        let mut command = crate::process_env::std_command("open")?;
         if matches!(action, ProjectOpenPathAction::Reveal) {
             command.arg("-R");
         }
@@ -2348,14 +2348,14 @@ fn project_path_command(
         use std::ffi::OsString;
         match action {
             ProjectOpenPathAction::OpenExternally => {
-                let mut command = Command::new("rundll32.exe");
+                let mut command = crate::process_env::std_command("rundll32.exe")?;
                 command.arg("url.dll,FileProtocolHandler").arg(path);
                 Ok(command)
             }
             ProjectOpenPathAction::Reveal => {
                 let mut argument = OsString::from("/select,");
                 argument.push(path);
-                let mut command = Command::new("explorer.exe");
+                let mut command = crate::process_env::std_command("explorer.exe")?;
                 command.arg(argument);
                 Ok(command)
             }
@@ -2363,7 +2363,7 @@ fn project_path_command(
     }
     #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
     {
-        let mut command = Command::new("xdg-open");
+        let mut command = crate::process_env::std_command("xdg-open")?;
         command.arg(match action {
             ProjectOpenPathAction::OpenExternally => path,
             ProjectOpenPathAction::Reveal => path.parent().ok_or_else(|| {
@@ -3460,7 +3460,7 @@ fn run_git_lossy_mode(
     args: &[&str],
     access_mode: GitAccessMode,
 ) -> Result<String, String> {
-    let output = git_command("git", root, args, access_mode)
+    let output = git_command("git", root, args, access_mode)?
         .output()
         .map_err(|err| format!("Failed to run git in '{}': {err}", root))?;
     if !output.status.success() {
@@ -3480,7 +3480,7 @@ fn run_git_mode_with_binary(
     args: &[&str],
     access_mode: GitAccessMode,
 ) -> Result<String, String> {
-    let output = git_command(git_binary, root, args, access_mode)
+    let output = git_command(git_binary, root, args, access_mode)?
         .output()
         .map_err(|err| format!("Failed to run git in '{}': {err}", root))?;
     if !output.status.success() {
@@ -3511,7 +3511,7 @@ fn run_git_with_stdin_mode_with_binary(
     stdin: &str,
     access_mode: GitAccessMode,
 ) -> Result<String, String> {
-    let mut child = git_command(git_binary, root, args, access_mode)
+    let mut child = git_command(git_binary, root, args, access_mode)?
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -3548,14 +3548,14 @@ fn git_command(
     root: &str,
     args: &[&str],
     access_mode: GitAccessMode,
-) -> Command {
-    let mut command = Command::new(git_binary);
+) -> Result<Command, String> {
+    let mut command = crate::process_env::std_command(git_binary)?;
     command.env("LC_ALL", "C");
     if matches!(access_mode, GitAccessMode::ReadOnly) {
         command.arg("--no-optional-locks");
     }
     command.arg("-C").arg(root).args(args);
-    command
+    Ok(command)
 }
 
 fn parse_change_kind(status: char) -> Option<ProjectGitChangeKind> {

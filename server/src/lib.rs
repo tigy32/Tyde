@@ -14,7 +14,7 @@ pub(crate) mod mobile_access;
 pub(crate) mod mobile_http;
 pub(crate) mod mobile_push;
 pub mod paths;
-pub(crate) mod process_env;
+pub use tyde_process_env as process_env;
 pub(crate) mod project_stream;
 pub mod recovery;
 pub mod remote;

@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::io::{AsyncBufRead, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
-use tokio::process::{Child, Command};
+use tokio::process::Child;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
@@ -1012,7 +1012,7 @@ async fn setup_connection_transport(
                 }
                 RemoteHostLifecycleConfig::ManagedTyde => managed_remote_bridge_command(),
             }?;
-            let mut child = Command::new("ssh");
+            let mut child = server::process_env::command("ssh")?;
             child
                 .arg("-T")
                 .args([
@@ -1112,7 +1112,8 @@ mod tests {
     use super::*;
 
     async fn diagnostic_process(script: &str) -> (SshChild, Arc<Mutex<Vec<String>>>) {
-        let mut process = Command::new("/bin/sh");
+        let mut process =
+            server::process_env::command("/bin/sh").expect("resolve login-shell PATH");
         process
             .arg("-c")
             .arg(script)

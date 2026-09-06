@@ -3,6 +3,7 @@ name = "tyde-dev-driver"
 edition.workspace = true
 
 [dependencies]
+tyde-process-env = { path = "../process-env" }
 client = { path = "../client" }
 command-group = { version = "5", features = ["with-tokio"] }
 devtools-protocol = { path = "../devtools-protocol" }

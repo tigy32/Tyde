@@ -12,7 +12,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::fs as tokio_fs;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{ChildStderr, ChildStdin, ChildStdout, Command};
+use tokio::process::{ChildStderr, ChildStdin, ChildStdout};
 use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
@@ -3530,7 +3530,7 @@ impl ClaudeInner {
             .await
             .map_err(|err| format!("Failed to start Claude CLI over SSH: {err}"))?
         } else {
-            let mut cmd = Command::new(claude_binary());
+            let mut cmd = crate::process_env::command(claude_binary())?;
             for arg in &cli_args {
                 cmd.arg(arg);
             }
@@ -5111,7 +5111,7 @@ fn claude_binary() -> String {
 /// neither can carry a gate. Per-skill verification therefore happens later,
 /// against the `init` frame.
 async fn claude_verify_plugin_loaded(root: &Path, workspace_root: &str) -> Result<(), String> {
-    let mut cmd = Command::new(claude_binary());
+    let mut cmd = crate::process_env::command(claude_binary())?;
     cmd.arg(CLAUDE_PLUGIN_DIR_FLAG)
         .arg(root)
         .arg("plugin")
@@ -5157,7 +5157,9 @@ async fn claude_supports_plugin_dir() -> bool {
 }
 
 async fn probe_plugin_dir_support() -> bool {
-    let mut cmd = Command::new(claude_binary());
+    let Ok(mut cmd) = crate::process_env::command(claude_binary()) else {
+        return false;
+    };
     cmd.arg("--help");
     if let Some(path) = process_env::resolved_child_process_path() {
         cmd.env("PATH", path);

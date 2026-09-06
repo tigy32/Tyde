@@ -21,7 +21,7 @@ pub fn init_process_env() -> Result<(), String> {
     initialize_process_env().map(|_| ())
 }
 
-pub(crate) fn initialize_process_env() -> Result<&'static OsStr, String> {
+pub fn initialize_process_env() -> Result<&'static OsStr, String> {
     if let Some(cached) = RESOLVED_CHILD_PROCESS_PATH.get() {
         return match cached {
             Some(path) => Ok(path.as_os_str()),
@@ -44,11 +44,23 @@ pub(crate) fn initialize_process_env() -> Result<&'static OsStr, String> {
     }
 }
 
-pub(crate) fn resolved_child_process_path() -> Option<&'static OsStr> {
+pub fn command(program: impl AsRef<OsStr>) -> Result<tokio::process::Command, String> {
+    let mut command = tokio::process::Command::new(program);
+    command.env("PATH", initialize_process_env()?);
+    Ok(command)
+}
+
+pub fn std_command(program: impl AsRef<OsStr>) -> Result<std::process::Command, String> {
+    let mut command = std::process::Command::new(program);
+    command.env("PATH", initialize_process_env()?);
+    Ok(command)
+}
+
+pub fn resolved_child_process_path() -> Option<&'static OsStr> {
     initialize_process_env().ok()
 }
 
-pub(crate) fn find_executable_in_path(binary: &str) -> Option<PathBuf> {
+pub fn find_executable_in_path(binary: &str) -> Option<PathBuf> {
     let trimmed = binary.trim();
     if trimmed.is_empty() {
         return None;

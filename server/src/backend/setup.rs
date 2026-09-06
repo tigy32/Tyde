@@ -13,7 +13,6 @@ use protocol::{
     HostPlatform,
 };
 use tokio::io::AsyncReadExt;
-use tokio::process::Command;
 
 use crate::browse_stream::host_platform;
 use crate::process_env;
@@ -674,7 +673,7 @@ async fn run_version_command_with_child_path(
 ) -> Result<VersionCommandOutput, VersionCommandFailure> {
     let started = Instant::now();
     trace_version_probe_stage(started, command, "function_started");
-    let mut command = Command::new(command);
+    let mut command = crate::process_env::command(command).map_err(VersionCommandFailure::Start)?;
     command
         .arg("--version")
         .stdin(Stdio::null())

@@ -22,7 +22,7 @@ use std::time::Duration;
 use command_group::{AsyncCommandGroup, AsyncGroupChild};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{ChildStdin, Command};
+use tokio::process::ChildStdin;
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
@@ -383,7 +383,7 @@ impl AcpBridge {
             .unwrap_or(ACP_DEFAULT_TERMINAL_OUTPUT_LIMIT)
             .max(1);
 
-        let mut cmd = Command::new(command);
+        let mut cmd = crate::process_env::command(command)?;
         cmd.args(&args)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
@@ -1146,7 +1146,7 @@ impl AcpRpc {
             .await
             .map_err(|err| format!("Failed to spawn {} over SSH: {err}", spec.display_name))?
         } else {
-            let mut cmd = Command::new(&spec.local_program);
+            let mut cmd = crate::process_env::command(&spec.local_program)?;
             cmd.args(&spec.local_args)
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())

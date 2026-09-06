@@ -334,7 +334,7 @@ fn create_terminal_session(launch: &TerminalLaunchInfo) -> Result<CreatedTermina
         })
         .map_err(|err| format!("failed to allocate PTY: {err}"))?;
 
-    let (command, shell) = build_terminal_command(launch);
+    let (command, shell) = build_terminal_command(launch)?;
     let child = pair
         .slave
         .spawn_command(command)
@@ -482,7 +482,7 @@ fn unix_time_ms() -> u64 {
         .as_millis() as u64
 }
 
-fn build_terminal_command(launch: &TerminalLaunchInfo) -> (CommandBuilder, String) {
+fn build_terminal_command(launch: &TerminalLaunchInfo) -> Result<(CommandBuilder, String), String> {
     let (mut command, program) = match &launch.command {
         TerminalLaunchCommand::DefaultShell => {
             let shell = default_shell();
@@ -499,11 +499,9 @@ fn build_terminal_command(launch: &TerminalLaunchInfo) -> (CommandBuilder, Strin
         }
     };
     command.env("TERM", "xterm-256color");
-    if let Some(path) = process_env::resolved_child_process_path() {
-        command.env("PATH", path);
-    }
+    command.env("PATH", process_env::initialize_process_env()?);
     command.cwd(&launch.cwd);
-    (command, program)
+    Ok((command, program))
 }
 
 fn default_shell() -> String {

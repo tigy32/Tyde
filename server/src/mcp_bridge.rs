@@ -498,7 +498,7 @@ async fn connect(server: &BridgeServerConfig) -> Result<RunningService<RoleClien
             ().serve(transport).await.map_err(|error| error.to_string())
         }
         BridgeTransport::Stdio { command, args, env } => {
-            let mut child = tokio::process::Command::new(command);
+            let mut child = crate::process_env::command(command)?;
             child.args(args).envs(env);
             let transport = TokioChildProcess::new(child)
                 .map_err(|error| format!("failed to spawn '{command}': {error}"))?;

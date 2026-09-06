@@ -113,7 +113,7 @@ pub fn launch() -> Result<(), String> {
             shell_quote_path(&exe),
             shell_quote_path(&log_path)
         );
-        let status = std::process::Command::new("sh")
+        let status = server::process_env::std_command("sh")?
             .arg("-lc")
             .arg(command)
             .status()

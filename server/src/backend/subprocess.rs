@@ -7,7 +7,7 @@ use command_group::{AsyncCommandGroup, AsyncGroupChild};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{ChildStdin, Command};
+use tokio::process::ChildStdin;
 use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
 
@@ -138,7 +138,7 @@ impl SubprocessBridge {
             }
             crate::remote::spawn_remote_process(&host, &remote_binary, &remote_args, None).await?
         } else {
-            let mut cmd = Command::new(subprocess_path);
+            let mut cmd = crate::process_env::command(subprocess_path)?;
             cmd.arg("--workspace-roots").arg(&roots_json);
             if let Some(mcp_servers_json) = mcp_servers_json {
                 cmd.arg("--mcp-servers").arg(mcp_servers_json);

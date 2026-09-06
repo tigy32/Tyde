@@ -170,7 +170,12 @@ fn is_custom_toolchain_rustup_proxy_failure(stderr: Option<&str>) -> bool {
 }
 
 fn probe_rust_analyzer(path: &Path, workspace_root: &Path) -> Result<(), ProbeFailure> {
-    let mut command = Command::new(path);
+    let mut command = crate::process_env::std_command(path).map_err(|reason| ProbeFailure {
+        binary: path.to_path_buf(),
+        reason,
+        exit_status: None,
+        stderr: None,
+    })?;
     command
         .arg("--version")
         .current_dir(workspace_root)
@@ -201,7 +206,7 @@ fn probe_rust_analyzer(path: &Path, workspace_root: &Path) -> Result<(), ProbeFa
 /// toolchain.
 fn rustup_which_rust_analyzer(workspace_root: &Path) -> Option<PathBuf> {
     let rustup = process_env::find_executable_in_path("rustup")?;
-    let mut command = Command::new(rustup);
+    let mut command = crate::process_env::std_command(rustup).ok()?;
     command
         .args(["which", "rust-analyzer"])
         .current_dir(workspace_root)

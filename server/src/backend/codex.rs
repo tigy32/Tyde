@@ -97,8 +97,8 @@ fn emit_codex_raw_events_warning_if_needed(emitter: &TurnEmitter, strict: bool) 
     }
 }
 
-fn codex_command() -> Command {
-    Command::new("codex")
+fn codex_command() -> Result<Command, String> {
+    crate::process_env::command("codex")
 }
 
 #[derive(Clone)]
@@ -18418,8 +18418,8 @@ impl CodexRpc {
             crate::remote::spawn_remote_process(host, "codex", &remote_args, None).await?
         } else {
             let mut cmd = match local_program {
-                Some(program) => Command::new(program),
-                None => codex_command(),
+                Some(program) => crate::process_env::command(program)?,
+                None => codex_command()?,
             };
             for arg in codex_app_server_args(access_mode, execution_mode, &config_overrides) {
                 cmd.arg(arg);

@@ -7251,6 +7251,7 @@ dependencies = [
  "tracing-subscriber",
  "tyde-agent-adapter",
  "tyde-dev-driver",
+ "tyde-process-env",
  "url",
  "uuid",
 ]
@@ -8817,7 +8818,16 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+ "tyde-process-env",
  "uuid",
+]
+
+[[package]]
+name = "tyde-process-env"
+version = "0.0.0"
+dependencies = [
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

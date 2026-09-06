@@ -12,6 +12,7 @@ members = [
     "devtools-protocol",
     "dev-driver",
     "host-config",
+    "process-env",
     "tyde-server",
     "mqtt-transport",
     "mobile-shell-types",

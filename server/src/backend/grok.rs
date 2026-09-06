@@ -52,7 +52,7 @@ pub(crate) fn capabilities() -> BackendCapabilities {
 }
 
 pub(crate) async fn list_sessions() -> Result<Vec<BackendSession>, String> {
-    let output = tokio::process::Command::new("grok")
+    let output = crate::process_env::command("grok")?
         .args(["sessions", "list", "--limit", "1000"])
         .output()
         .await

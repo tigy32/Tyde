@@ -47,6 +47,40 @@ impl OpenCodeAdapter {
             .map_err(|error| format!("failed to serialize OpenCode configuration: {error}"))
     }
 
+    async fn export_session(
+        &self,
+        session_id: &str,
+        workspace_root: &str,
+    ) -> Result<Value, String> {
+        // OpenCode can exit before a piped stdout drains (the live session
+        // export stopped at 64 KiB). A file receives the complete JSON.
+        let capture = tempfile::NamedTempFile::new().map_err(|error| error.to_string())?;
+        let stdout = capture.reopen().map_err(|error| error.to_string())?;
+        let mut command = crate::process_env::command(self.command())?;
+        command
+            .args(["export", session_id])
+            .current_dir(workspace_root)
+            .stdout(stdout)
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
+        let child = command
+            .spawn()
+            .map_err(|error| format!("Failed to execute OpenCode export: {error}"))?;
+        let output =
+            tokio::time::timeout(std::time::Duration::from_secs(5), child.wait_with_output())
+                .await
+                .map_err(|error| format!("OpenCode export timed out: {error}"))?
+                .map_err(|error| format!("Failed to execute OpenCode export: {error}"))?;
+        if !output.status.success() {
+            return Err(format!("OpenCode export failed: {}", output.status));
+        }
+        let bytes = tokio::fs::read(capture.path())
+            .await
+            .map_err(|error| format!("Failed to read OpenCode export: {error}"))?;
+        serde_json::from_slice(&bytes)
+            .map_err(|error| format!("Invalid OpenCode export JSON: {error}"))
+    }
+
     async fn exported_tool(
         &self,
         session_id: &str,
@@ -58,16 +92,11 @@ impl OpenCodeAdapter {
     ) -> Option<(Value, Value)> {
         const EXPORT_ATTEMPTS: usize = 30;
         for attempt in 0..EXPORT_ATTEMPTS {
-            let mut command = tokio::process::Command::new(self.command());
-            command
-                .args(["export", session_id])
-                .current_dir(workspace_root)
-                .kill_on_drop(true);
-            let output =
-                tokio::time::timeout(std::time::Duration::from_secs(5), command.output()).await;
-            if let Ok(Ok(output)) = output
-                && output.status.success()
-                && let Ok(export) = serde_json::from_slice::<Value>(&output.stdout)
+            let export = self.export_session(session_id, workspace_root).await;
+            if let Err(error) = &export {
+                tracing::warn!(session_id, tool_call_id, attempt, %error, "OpenCode export lookup failed");
+            }
+            if let Ok(export) = export
                 && let Some(messages) = export.get("messages").and_then(Value::as_array)
                 && let Some(found) = messages.iter().find_map(|message| {
                     message
@@ -187,7 +216,7 @@ impl AcpAgentAdapter for OpenCodeAdapter {
             if ssh_host.is_some() {
                 return Err("OpenCode does not yet support Tyde SSH sessions".to_owned());
             }
-            let output = tokio::process::Command::new("opencode")
+            let output = crate::process_env::command("opencode")?
                 .args(["session", "delete", session_id])
                 .output()
                 .await

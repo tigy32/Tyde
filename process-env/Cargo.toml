@@ -1,0 +1,7 @@
+[package]
+name = "tyde-process-env"
+edition.workspace = true
+
+[dependencies]
+tokio.workspace = true
+tracing.workspace = true

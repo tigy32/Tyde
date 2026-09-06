@@ -13390,7 +13390,7 @@ fn append_rollback_message(error: String, rollback_message: Option<String>) -> S
 }
 
 async fn run_git(root: &ProjectRootPath, args: &[&str]) -> Result<std::process::Output, String> {
-    tokio::process::Command::new("git")
+    crate::process_env::command("git")?
         .arg("-C")
         .arg(&root.0)
         .args(args)

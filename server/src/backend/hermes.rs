@@ -20,7 +20,7 @@ use protocol::{
 };
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{ChildStderr, ChildStdout, Command};
+use tokio::process::{ChildStderr, ChildStdout};
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
@@ -4287,7 +4287,7 @@ async fn register_hermes_mcp_bridge(
     bridge_program: &str,
     supports_parallel_tool_calls: bool,
 ) -> Result<Option<Vec<String>>, String> {
-    let mut command = Command::new(&target.program);
+    let mut command = crate::process_env::command(&target.program)?;
     command.args([
         "-c",
         HERMES_BRIDGE_REGISTRATION,
@@ -4381,7 +4381,7 @@ async fn register_hermes_skill_dir(
     skills_root: &Path,
 ) -> Result<(), String> {
     let skills_root = skills_root.to_string_lossy().to_string();
-    let mut command = Command::new(&target.program);
+    let mut command = crate::process_env::command(&target.program)?;
     command.args(["-c", HERMES_SKILLS_DIR_REGISTRATION, &skills_root]);
     // Same reason the MCP bridge registration does this: `target.env` carries
     // the selected profile's HERMES_HOME, and without it the script would edit
@@ -4557,7 +4557,7 @@ async fn spawn_gateway_child(target: &HermesSpawnTarget) -> Result<AsyncGroupChi
         "TYDE HERMES SPAWN ENV https_proxy={:?}",
         std::env::var("HTTPS_PROXY")
     );
-    let mut command = Command::new(&target.program);
+    let mut command = crate::process_env::command(&target.program)?;
     command.args(&target.args);
     command.env_remove(TYDE_HERMES_SYSTEM_PROMPT_ENV);
     command.envs(&target.env);
@@ -7700,7 +7700,9 @@ fn split_shell_words(input: &str) -> Option<Vec<String>> {
 async fn run_hermes_version_command(
     command: &str,
 ) -> Result<HermesVersionOutput, HermesProbeFailure> {
-    let mut command_proc = Command::new(command);
+    let mut command_proc = crate::process_env::command(command).map_err(|error| {
+        HermesProbeFailure::new(BackendSetupDiagnosticCode::CommandFailed, error)
+    })?;
     command_proc
         .arg("--version")
         .stdout(Stdio::piped())
@@ -7882,7 +7884,9 @@ pub(crate) async fn probe_hermes_python_gateway_import(
         "import importlib.util\nimport sys\ntry:\n    spec = importlib.util.find_spec({module:?})\nexcept Exception:\n    spec = None\nsys.exit(0 if spec else 1)\n",
         module = HERMES_PYTHON_MODULE
     );
-    let mut command_proc = Command::new(command);
+    let mut command_proc = crate::process_env::command(command).map_err(|error| {
+        HermesProbeFailure::new(BackendSetupDiagnosticCode::CommandFailed, error)
+    })?;
     command_proc
         .arg("-c")
         .arg(script)

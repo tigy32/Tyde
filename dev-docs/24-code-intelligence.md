@@ -141,9 +141,9 @@ server/src/code_intel/lsp_codec.rs     // Content-Length framing codec
 
 Reuse:
 
-- `server/src/process_env.rs` for binary discovery and login-shell `PATH`
+- `process-env/src/lib.rs` for binary discovery and login-shell `PATH`
   (including `~/.cargo/bin`) — `find_executable_in_path` is at
-  `server/src/process_env.rs:26`.
+  `process-env/src/lib.rs`.
 - `server/src/backend/subprocess.rs` for process-group spawn and lifecycle.
 
 Do **not** reuse the subprocess NDJSON reader: LSP is not newline-delimited. It
@@ -821,3 +821,10 @@ wrong and ask first. Routing around these tests defeats their purpose.
   a multi-root project should instead use one RA with multiple `workspaceFolders`
   is an open nuance to revisit if process count or cross-root navigation
   pressure it.
+
+All local subprocesses use `process_env::command` or
+`process_env::std_command`, which require the cached login-shell PATH before
+constructing a child command. This includes backend launches, session export
+and listing, MCP bridges, SSH clients, Git, and desktop utility commands. PTY
+commands apply the same required PATH. The shell probe itself is the only
+bootstrap exception: it starts the login shell to obtain that PATH.
