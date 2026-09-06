@@ -86,6 +86,45 @@ before replacing it. Keep text legible at chapter width and link to full-size
 images. Never invent agent transcripts or use generated imagery as a product
 screenshot.
 
+### Full studio hero
+
+`docs/assets/studio.png` shows the desktop frontend from `07895ebd` with
+three disposable Git projects: Garden (a static publishing site), Atlas API
+(a small Python service), and Field Notes (article drafts). Eight actual Codex
+agents ran bounded tasks using `gpt-5.4-mini`: accessibility, mobile layout,
+editorial guidelines, search behavior, API contracts, request validation, an
+article outline, and a remote-work introduction. Each agent read real example
+files and returned its own response. Their names were changed through the UI
+to begin with `Demo ·`, and the sidebar is filtered to those demo agents with
+other projects visible. These are real conversations, not scripted responses.
+
+The selected search conversation first inspected `scripts/search.js` and
+`index.html`, then received this follow-up:
+
+> Please implement a friendly empty state for search. Show ‘No notes found’
+> with a Clear search button, keep it keyboard accessible, and match the
+> existing design. Check the result and explain what changed.
+
+The DOM was captured while its sidebar status was Thinking and its composer
+showed Cancel. The visible command cards are completed file inspections during
+that still-active turn; the other seven displayed agents were idle. This image
+does not imply that all eight agents were executing simultaneously or that the
+implementation had passed verification. The capture was rendered with the
+original application styles at 1680×1050, 2× scale (3360×2100 PNG), using the same
+DOM-export method as the initial images. Viewport and scroll positioning are
+presentation choices; transcript text and activity state were not altered.
+
+The initial Claude setup attempt encountered expired OAuth credentials. The
+successful demo used Codex instead. Its failed setup chat was excluded by the
+Demo filter and its tab was closed. The protocol-57 installed launcher still
+could not attest readiness against protocol 58, so capture used the matching
+built binary with all mutable paths redirected to a fresh disposable directory
+according to `DEV_INSTANCE_MUTABLE_PATHS`. Before launching demo chats, the
+paths were checked for containment and the projects/session stores contained
+no production records. This was screenshot production, not backend conformance
+certification. Demo processes and their temporary stores were cleaned up after
+capture. No backend implementation was changed.
+
 The animated host diagram is explicitly labeled an interactive concept diagram.
 Its example agents are illustrative. Disconnect changes only the diagram's
 client state; its host agents continue pulsing. Pause and reduced-motion support

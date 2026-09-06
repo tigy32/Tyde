@@ -6,6 +6,7 @@ Manage coding agents across projects, backends, and machines.
 <h2 id="index">Room for all your agents.</h2>
 
 <p><a class="action-link" href="#first-agent">Start your first agent ↗</a><a class="text-link" href="#remote">Explore remote work →</a></p>
+<figure><a href="assets/studio.png"><img src="assets/studio.png" width="3360" height="2100" alt="Tyde desktop with Garden, Atlas API, and Field Notes projects, an expanded file tree, eight named demo agents, and a Codex conversation working on a search improvement."></a><figcaption>Eight open demo agents across three projects. The selected conversation is working on a search improvement. Open the image for a closer look.</figcaption></figure>
 <div class="studio-map" aria-label="Illustration of a laptop connected to two agent hosts">
 <div class="map-label">One studio · wherever the work lives</div>
 <div class="map-client">Your laptop<small>Connected to both hosts</small></div><div class="map-branches" aria-hidden="true"></div>
@@ -82,6 +83,7 @@ Manage coding agents across projects, backends, and machines.
 
 <h2 id="concurrency">Keep many agents in view</h2>
 
+<figure><a href="assets/studio.png"><img src="assets/studio.png" width="3360" height="2100" alt="Tyde desktop with Garden, Atlas API, and Field Notes projects, an expanded file tree, eight named demo agents, and a Codex conversation working on a search improvement."></a><figcaption>Eight open demo agents across three projects. The selected conversation is working on a search improvement. Open the image for a closer look.</figcaption></figure>
 <h2 id="concurrency-organize">Organize around the work</h2>
 <p>Use projects to group code context, and name agents after the outcome they own. “Investigate sign-in failure” is easier to recognize in a busy workspace than several identical “New Chat” entries.</p>
 <p>Keep separate conversations for independent tasks. An investigation, an implementation, and a review can each have their own agent. Choose the project and host before launching each one.</p>

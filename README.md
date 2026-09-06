@@ -11,9 +11,9 @@ Start an agent locally without creating a project. Add projects when you want
 code context. Connect your servers when you want agents to keep working after
 your laptop disconnects.
 
-![Tyde showing a Git diff and a saved review comment](docs/assets/review.png)
+[![Tyde showing three projects, an expanded file explorer, eight demo agents, and an active coding conversation](docs/assets/studio.png)](docs/assets/studio.png)
 
-*Reviewing the Garden example project in Tyde. [How these images were captured](dev-docs/customer-documentation.md#product-captures).*
+*Eight open demo agents across three projects, with the selected agent working on a search improvement. [How these images were captured](dev-docs/customer-documentation.md#product-captures).*
 
 ## Your agents. One workspace.
 
