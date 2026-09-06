@@ -298,13 +298,15 @@ pub fn ChatMessageView(
             role=move || card_meta.with(|(_, _, _, _, is_error)| is_error.then_some("alert"))
             aria-label=move || card_meta.with(|(_, _, _, _, is_error)| is_error.then_some("Error message"))
         >
-            <div class="chat-card-header">
-                <span class="chat-card-sender">{move || card_meta.with(|(_, s, _, _, _)| s.clone())}</span>
-                {move || model_memo.get().map(|m| view! {
-                    <span class="chat-card-model">{m}</span>
-                })}
-                <span class="chat-card-time">{move || format_relative_time(timestamp_memo.get())}</span>
-            </div>
+            <Show when=move || card_meta.with(|(_, _, _, is_assistant, _)| !*is_assistant)>
+                <div class="chat-card-header">
+                    <span class="chat-card-sender">{move || card_meta.with(|(_, s, _, _, _)| s.clone())}</span>
+                    {move || model_memo.get().map(|m| view! {
+                        <span class="chat-card-model">{m}</span>
+                    })}
+                    <span class="chat-card-time">{move || format_relative_time(timestamp_memo.get())}</span>
+                </div>
+            </Show>
 
             // Reasoning (collapsible)
             {move || {
