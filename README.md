@@ -1,7 +1,7 @@
 <p align="center"><img src="docs/assets/icon.png" width="64" alt="Tyde"></p>
 <h1 align="center">Tyde — Agent Studio</h1>
 <p align="center"><strong>Manage coding agents across harnesses, projects, and servers.</strong></p>
-<p align="center"><a href="https://tycode.dev/tyde.html">Download Tyde</a> · <a href="docs/book.md">Tyde User Guide</a> · <a href="https://github.com/tigy32/Tyde/releases">Releases</a> · <a href="https://github.com/tigy32/Tyde/issues">Issues</a></p>
+<p align="center"><a href="https://tycode.dev/tyde.html">Download Tyde</a> · <a href="https://tycode.dev/tyde-guide/">Tyde User Guide</a> · <a href="https://github.com/tigy32/Tyde/releases">Releases</a> · <a href="https://github.com/tigy32/Tyde/issues">Issues</a></p>
 
 Tyde brings the CLI coding agents you already use—Claude Code, Codex,
 Antigravity, Grok, and more—into one desktop application. Run agents
@@ -65,7 +65,7 @@ hosting configured.
 
 <p align="center"><a href="docs/assets/mobile-chat.png"><img src="docs/assets/mobile-chat.png" width="320" alt="Tyde mobile showing an agent conversation and a follow-up draft in the composer"></a></p>
 
-[Learn how to use Tyde on your phone](docs/book.md#mobile).
+[Learn how to use Tyde on your phone](https://tycode.dev/tyde-guide/mobile.html).
 
 ## Review the work where it happens.
 
@@ -99,16 +99,16 @@ Individual harness capabilities and provider limits still apply.
 
 Already installed Tyde? The user guide explains the interface and gives step-by-step instructions for its features:
 
-- [Your first agent](docs/book.md#first-agent)
-- [Projects and multiple roots](docs/book.md#projects)
-- [Code review and Git](docs/book.md#review)
-- [Concurrent agents](docs/book.md#concurrency) and [session history](docs/book.md#sessions)
-- [Remote hosts](docs/book.md#remote) and [mobile access](docs/book.md#mobile)
-- [Cross-harness delegation](docs/book.md#delegation)
-- [Custom agents and skills](docs/book.md#agents-skills)
-- [Workbenches](docs/book.md#workbenches)
-- [Complete workflows](docs/book.md#workflows)
-- [Settings](docs/book.md#settings) and [troubleshooting](docs/book.md#troubleshooting)
+- [Your first agent](https://tycode.dev/tyde-guide/first-agent.html)
+- [Projects and multiple roots](https://tycode.dev/tyde-guide/projects.html)
+- [Code review and Git](https://tycode.dev/tyde-guide/review.html)
+- [Concurrent agents](https://tycode.dev/tyde-guide/concurrency.html) and [session history](https://tycode.dev/tyde-guide/sessions.html)
+- [Remote hosts](https://tycode.dev/tyde-guide/remote.html) and [mobile access](https://tycode.dev/tyde-guide/mobile.html)
+- [Cross-harness delegation](https://tycode.dev/tyde-guide/delegation.html)
+- [Custom agents and skills](https://tycode.dev/tyde-guide/agents-skills.html)
+- [Workbenches](https://tycode.dev/tyde-guide/workbenches.html)
+- [Complete workflows](https://tycode.dev/tyde-guide/workflows.html)
+- [Settings](https://tycode.dev/tyde-guide/settings.html) and [troubleshooting](https://tycode.dev/tyde-guide/troubleshooting.html)
 
-For the designed reading experience, open `docs/index.html` in a browser or serve
-`docs/` with a static server. The links above open the repository edition of the book.
+Read the [Tyde User Guide](https://tycode.dev/tyde-guide/) online, or browse the
+[repository edition](docs/book.md).

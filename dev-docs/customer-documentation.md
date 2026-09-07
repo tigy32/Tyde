@@ -30,11 +30,25 @@ animation should explain behavior, such as disconnecting from a remote host.
 - Run repository validation only through `./dev.sh check`, before landing and
   again on clean main, as required by AGENTS.md.
 
-Publication is a separate, explicitly authorized action. This change does not
-modify the existing marketing site, mobile loader, or deployment workflows.
-A static host can serve this directory at any prefix: chapter and asset links
-are relative. Publish the rendered root HTML files and `assets/`; chapter
-fragments, the builder, and contents manifest are authoring files.
+## Publishing
+
+The public guide is https://tycode.dev/tyde-guide/. Its source remains here;
+the Tyde download page is maintained in the sibling TycodeWebsite repository.
+
+After the required checks pass and publication is authorized, stage only the
+rendered root HTML pages and assets, then upload to the guide prefix:
+
+```sh
+stage_dir="$(mktemp -d)"
+cp docs/*.html "$stage_dir/"
+cp -R docs/assets "$stage_dir/"
+aws s3 sync "$stage_dir/" s3://tycode-static/tyde-guide/ --cache-control 'public, max-age=300' --only-show-errors
+aws cloudfront create-invalidation --distribution-id E3JJ1OF4I8TP6U --paths '/tyde-guide*'
+```
+
+Verify the public landing page, chapter navigation, search, and screenshots.
+Do not upload authoring files or sync with deletion at the bucket root: the
+bucket also holds the website, mobile app, and independently published content.
 
 ## Content evidence
 
