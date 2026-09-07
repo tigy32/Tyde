@@ -6278,40 +6278,13 @@ math merror {
     margin-left: auto;
 }
 
-/* `display: none` removed this control from the accessibility tree entirely, so a
-   screen reader in *browse* mode — which walks the rendered document, not the
-   focus order — never found "Open to the Side" at all. (The `:focus` rule below
-   could never match either: a `display: none` element cannot be focused.)
-
-   It is now visually hidden rather than structurally absent: clipped to a 1px
-   box so it costs no space and no ink in the sighted UI, while remaining in the
-   document, in the a11y tree, and focusable. Hover or keyboard focus restores it
-   to a normal control. */
+/* Reached by expanding the row, or by right-clicking it. Nothing hides these
+   once the panel they live in is open: a control that appears on hover is
+   invisible to a keyboard or screen-reader user in browse mode, which is what
+   the old clipped-until-hover treatment amounted to. */
 .agent-card-action {
-    position: absolute;
-    width: 1px;
-    height: 1px;
-    padding: 0;
-    margin: -1px;
-    overflow: hidden;
-    clip-path: inset(50%);
-    white-space: nowrap;
-    opacity: 0;
-}
-
-.agent-card:hover .agent-card-action,
-.agent-card:focus-within .agent-card-action,
-.agent-card-action:focus,
-.agent-card-action:focus-visible {
-    position: static;
-    width: auto;
-    height: auto;
     min-width: 24px;
     min-height: 24px;
-    margin: 0;
-    overflow: visible;
-    clip-path: none;
-    opacity: 1;
     display: inline-flex;
     align-items: center;
     justify-content: center;
@@ -6507,32 +6480,48 @@ math merror {
     flex-shrink: 0;
 }
 
+/* The chevron on a sidebar row. Quiet until the row is hovered or focused, but
+   always present: it is the only affordance that says the row has more. */
+.sidebar-card-expand {
+    flex-shrink: 0;
+    width: 14px;
+    padding: 0;
+    border: none;
+    background: transparent;
+    color: var(--text-tertiary);
+    font-size: 0.7rem;
+    line-height: 1;
+    cursor: pointer;
+}
+
+.sidebar-card-expand:hover,
+.agent-card:hover .sidebar-card-expand,
+.session-card:hover .sidebar-card-expand,
+.agent-card:focus-within .sidebar-card-expand,
+.session-card:focus-within .sidebar-card-expand {
+    color: var(--text-primary);
+}
+
 .sidebar-card-details {
-    position: fixed;
-    z-index: 1200;
-    width: 1px;
-    height: 1px;
-    overflow: hidden;
-    clip-path: inset(50%);
-    opacity: 0;
-    pointer-events: none;
+    display: none;
     white-space: normal;
 }
 
-.agent-card:not([data-details-dismissed="true"]):is(:hover, :focus-within) > .sidebar-card-details,
-.session-card:not([data-details-dismissed="true"]):is(:hover, :focus-within) > .sidebar-card-details {
-    height: auto;
-    max-height: min(280px, calc(100vh - 16px));
-    overflow: auto;
-    clip-path: none;
-    opacity: 1;
-    pointer-events: auto;
-    padding: 12px;
-    background: var(--surface-2);
-    color: var(--text-primary);
-    border: 1px solid var(--border-secondary);
-    border-radius: 6px;
-    box-shadow: 0 6px 22px rgba(0, 0, 0, 0.3);
+.agent-card[data-expanded="true"] > .sidebar-card-details,
+.session-card[data-expanded="true"] > .sidebar-card-details {
+    display: block;
+    margin-top: 6px;
+    padding: 8px 2px 2px 22px;
+    border-top: 1px solid var(--border-subtle);
+    color: var(--text-secondary);
+    font-size: 0.78rem;
+}
+
+/* Catches the press that dismisses an open card menu. */
+.card-menu-backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 1000;
 }
 
 .sidebar-card-details > * + * { margin-top: 8px; }

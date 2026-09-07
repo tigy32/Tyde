@@ -10,6 +10,7 @@ use protocol::{
     FrameKind, HostFilterId, ProjectId, SetAgentNamePayload,
 };
 
+use crate::components::card_menu::{CardContextMenu, CardMenuPosition, open_card_menu};
 use crate::send::{close_agent, send_frame};
 use crate::state::{
     ActiveAgentRef, ActiveProjectRef, AgentInfo, AgentsPanelFilters, AppState, CompactionOldInfo,
@@ -1766,10 +1767,32 @@ fn agent_card(
 
     let agent_id_for_editing_block = agent_id.clone();
     let card_anchor = NodeRef::<leptos::html::Div>::new();
-    let details_style = RwSignal::new(String::new());
-    let details_dismissed = RwSignal::new(false);
+    // The row is one line until the reader asks for more. Details and actions
+    // live behind the chevron and behind right-click; neither appears on hover,
+    // which used to cover the list while the pointer merely crossed it.
+    let expanded = RwSignal::new(false);
+    let card_menu: CardMenuPosition = RwSignal::new(None);
+    let menu_rename = on_rename.clone();
+    let menu_close = on_close.clone();
+    let menu_compact = on_compact.clone();
+    let menu_compaction_control = compaction_control.clone();
+    let menu_move_ref = drag_ref.clone();
+    let menu_move_name = name.clone();
+    let on_menu_move = move |_: web_sys::MouseEvent| {
+        if keyboard_agent.get_untracked().as_ref() == Some(&menu_move_ref) {
+            keyboard_agent.set(None);
+            keyboard_target.set(None);
+            group_live_status.set("Move cancelled".to_owned());
+        } else {
+            keyboard_agent.set(Some(menu_move_ref.clone()));
+            keyboard_target.set(Some(SidebarKeyboardTarget::Agent(menu_move_ref.clone())));
+            group_live_status.set(format!(
+                "Picked up {}. Move focus to a group, agent, or Ungroup and press Space or Enter.",
+                menu_move_name
+            ));
+        }
+    };
     let show_backend_labels = state.sidebar_backend_labels;
-    let settings_open = state.settings_open;
     let details_name = name.clone();
     let details_host = agent.host_id.clone();
     let details_workspace = agent.workspace_roots.join(" · ");
@@ -1786,23 +1809,16 @@ fn agent_card(
             }
             node_ref=card_anchor
             data-sidebar-backend=backend_label(backend)
-            data-details-dismissed=move || (details_dismissed.get() || settings_open.get()).to_string()
-            on:mouseenter=move |_| {
-                details_style.set(crate::components::hover_popover::sidebar_card_details_style(card_anchor));
-                details_dismissed.set(false);
-            }
-            on:focusin=move |_| {
-                details_style.set(crate::components::hover_popover::sidebar_card_details_style(card_anchor));
-                details_dismissed.set(false);
-            }
+            data-expanded=move || expanded.get().to_string()
             tabindex="0"
             role="button"
             draggable="true"
             aria-dropeffect=move || if keyboard_agent.get().is_some() { "move" } else { "none" }
             on:click=on_click
+            on:contextmenu=move |ev: web_sys::MouseEvent| open_card_menu(card_menu, &ev)
             on:keydown=move |ev: web_sys::KeyboardEvent| {
                 if ev.key() == "Escape" {
-                    details_dismissed.set(true);
+                    expanded.set(false);
                     ev.stop_propagation();
                 } else {
                     on_keydown_card(ev);
@@ -1814,6 +1830,20 @@ fn agent_card(
             on:dragend=on_dragend
         >
             <div class="agent-card-top">
+                <button
+                    type="button"
+                    class="sidebar-card-expand"
+                    aria-expanded=move || expanded.get().to_string()
+                    title=move || if expanded.get() { "Hide details" } else { "Show details and actions" }
+                    aria-label=move || if expanded.get() { "Hide agent details" } else { "Show agent details" }
+                    on:click=move |ev: web_sys::MouseEvent| {
+                        ev.stop_propagation();
+                        expanded.update(|open| *open = !*open);
+                    }
+                    on:keydown=|ev: web_sys::KeyboardEvent| ev.stop_propagation()
+                >
+                    {move || if expanded.get() { "\u{25BE}" } else { "\u{25B8}" }}
+                </button>
                 <span class=status_class_sig title=status_title_sig>
                     <span aria-hidden="true">{status_icon_sig}</span>
                     <span class=move || {
@@ -1954,7 +1984,7 @@ fn agent_card(
             {move || compaction_error_msg().map(|msg| view! {
                 <div class="agent-card-error agent-card-error-compaction">{msg}</div>
             })}
-            <div class="sidebar-card-details" style=move || details_style.get()
+            <div class="sidebar-card-details"
                 on:click=|ev: web_sys::MouseEvent| ev.stop_propagation()
                 on:keydown=|ev: web_sys::KeyboardEvent| { if ev.key() != "Escape" { ev.stop_propagation(); } }
             >
@@ -2063,6 +2093,82 @@ fn agent_card(
                     </button>
                 </div>
             </div>
+            <CardContextMenu menu=card_menu label="Agent actions" anchor=card_anchor>
+                <button
+                    type="button"
+                    class="context-menu-item"
+                    role="menuitem"
+                    on:click={
+                        let rename = menu_rename.clone();
+                        move |ev: web_sys::MouseEvent| {
+                            card_menu.set(None);
+                            rename(ev);
+                        }
+                    }
+                >
+                    "Rename agent"
+                </button>
+                <button
+                    type="button"
+                    class="context-menu-item"
+                    role="menuitem"
+                    on:click={
+                        let pick_up = on_menu_move.clone();
+                        move |ev: web_sys::MouseEvent| {
+                            card_menu.set(None);
+                            pick_up(ev);
+                        }
+                    }
+                >
+                    "Move to group"
+                </button>
+                {
+                    let control = menu_compaction_control.clone();
+                    let compact = menu_compact.clone();
+                    move || {
+                        let control = control();
+                        let enabled = control.is_enabled();
+                        // Unavailable stays visible and says why, the same way
+                        // the button in the expanded panel does.
+                        let label = match control.reason() {
+                            None => "Compact context".to_owned(),
+                            Some(reason) => format!("Compact context — unavailable: {reason}"),
+                        };
+                        let compact = compact.clone();
+                        let title = label.clone();
+                        view! {
+                            <button
+                                type="button"
+                                class="context-menu-item"
+                                role="menuitem"
+                                data-test="agent-menu-compact"
+                                aria-disabled=move || if enabled { "false" } else { "true" }
+                                title=title
+                                on:click=move |ev: web_sys::MouseEvent| {
+                                    card_menu.set(None);
+                                    compact(ev);
+                                }
+                            >
+                                {label}
+                            </button>
+                        }
+                    }
+                }
+                <button
+                    type="button"
+                    class="context-menu-item"
+                    role="menuitem"
+                    on:click={
+                        let close = menu_close.clone();
+                        move |ev: web_sys::MouseEvent| {
+                            card_menu.set(None);
+                            close(ev);
+                        }
+                    }
+                >
+                    "Close agent"
+                </button>
+            </CardContextMenu>
         </div>
     }
 }
@@ -2230,6 +2336,47 @@ mod wasm_tests {
     fn dispatch_drag_event(element: &HtmlElement, event_name: &str) {
         let event = web_sys::DragEvent::new(event_name).expect("drag event");
         element.dispatch_event(&event).expect("dispatch drag event");
+    }
+
+    /// A real right-click, at a real point in the viewport.
+    fn dispatch_context_menu(element: &HtmlElement, x: f64, y: f64) {
+        let event: web_sys::Event = js_sys::eval(&format!(
+            "new MouseEvent('contextmenu', {{ bubbles: true, cancelable: true, \
+             clientX: {x}, clientY: {y} }})"
+        ))
+        .expect("mouse event")
+        .dyn_into()
+        .expect("MouseEvent is an Event");
+        element
+            .dispatch_event(&event)
+            .expect("dispatch contextmenu event");
+    }
+
+    /// Open a row's details panel, where its actions live.
+    fn expand_row(container: &HtmlElement, agent_id: &str) {
+        container
+            .query_selector(&format!(
+                "[data-agent-id='{agent_id}'] .sidebar-card-expand"
+            ))
+            .unwrap()
+            .unwrap_or_else(|| panic!("row {agent_id} should offer a chevron"))
+            .dyn_into::<HtmlElement>()
+            .unwrap()
+            .click();
+    }
+
+    /// The open card menu's item with this label.
+    fn menu_item(container: &HtmlElement, label: &str) -> HtmlElement {
+        let items = container
+            .query_selector_all(".sidebar-card-menu .context-menu-item")
+            .unwrap();
+        for index in 0..items.length() {
+            let item: HtmlElement = items.item(index).unwrap().dyn_into().unwrap();
+            if item.text_content().unwrap_or_default().contains(label) {
+                return item;
+            }
+        }
+        panic!("the open menu offers no {label:?} item");
     }
 
     fn dispatch_key(element: &HtmlElement, key: &str) {
@@ -2593,28 +2740,79 @@ mod wasm_tests {
                 "the backend label must teach the matching edge color"
             );
         }
-        let height = agent.get_bounding_client_rect().height();
-        agent
-            .clone()
-            .dyn_into::<HtmlElement>()
-            .unwrap()
-            .focus()
-            .unwrap();
+        // Nothing opens on hover or on focus any more: a row stays one line
+        // until the reader asks it for more. The hover popover this replaces
+        // covered the rows underneath whenever the pointer merely crossed the
+        // list, and a click left it stranded over the view it had just opened.
+        let collapsed_height = agent.get_bounding_client_rect().height();
+        agent.focus().unwrap();
         next_tick().await;
         let details = agent
             .query_selector(".sidebar-card-details")
             .unwrap()
             .unwrap();
-        assert!(details.text_content().unwrap().contains("Claude"));
-        assert!(
-            details.get_bounding_client_rect().height() > 40.0,
-            "keyboard focus exposes readable details"
+        assert_eq!(
+            details.get_bounding_client_rect().height(),
+            0.0,
+            "focusing a row must not open anything over the list"
         );
         assert_eq!(
             agent.get_bounding_client_rect().height(),
-            height,
-            "details must not shift the list"
+            collapsed_height,
+            "and it must not grow the row"
         );
+
+        // The chevron is the affordance that says the row has more, and the
+        // expansion opens inside the row rather than over its neighbours.
+        let chevron: HtmlElement = agent
+            .query_selector(".sidebar-card-expand")
+            .unwrap()
+            .expect("every row offers a chevron")
+            .dyn_into()
+            .unwrap();
+        assert_eq!(
+            chevron.get_attribute("aria-expanded").as_deref(),
+            Some("false"),
+            "a collapsed row says so"
+        );
+        chevron.click();
+        next_tick().await;
+        assert_eq!(
+            chevron.get_attribute("aria-expanded").as_deref(),
+            Some("true")
+        );
+        let details_text = details.text_content().unwrap_or_default();
+        assert!(
+            details_text.contains("Claude"),
+            "the expanded row names its backend, got: {details_text:?}"
+        );
+        assert!(
+            details.get_bounding_client_rect().height() > 40.0,
+            "the expanded details are readable, not a sliver"
+        );
+        assert!(
+            agent.get_bounding_client_rect().height() > collapsed_height,
+            "the details belong to the row: expanding grows it"
+        );
+        // The same actions right-click offers are here too, because right-click
+        // is not an affordance anyone can see.
+        for action in [
+            ".agent-card-move",
+            ".agent-card-compact",
+            ".agent-card-close",
+        ] {
+            let button: HtmlElement = details
+                .query_selector(action)
+                .unwrap()
+                .unwrap_or_else(|| panic!("{action} must live in the expanded row"))
+                .dyn_into()
+                .unwrap();
+            assert!(
+                button.get_bounding_client_rect().height() > 0.0,
+                "{action} must be visible once the row is expanded"
+            );
+        }
+
         let escape = web_sys::KeyboardEventInit::new();
         escape.set_key("Escape");
         escape.set_bubbles(true);
@@ -2626,51 +2824,146 @@ mod wasm_tests {
             .unwrap();
         next_tick().await;
         assert_eq!(
-            web_sys::window()
-                .unwrap()
-                .get_computed_style(&details)
-                .unwrap()
-                .unwrap()
-                .get_property_value("opacity")
-                .unwrap(),
-            "0"
+            agent.get_bounding_client_rect().height(),
+            collapsed_height,
+            "Escape puts the row back to one line"
         );
 
-        agent.style().set_property("position", "fixed").unwrap();
-        agent
-            .style()
-            .set_property("top", "calc(100vh - 44px)")
-            .unwrap();
-        agent.style().set_property("left", "400px").unwrap();
-        agent.style().set_property("width", "300px").unwrap();
-        agent.blur().unwrap();
-        agent.focus().unwrap();
+        // Right-click is the fast path to the same actions. It has to be, since
+        // the chevron is the only visible affordance and a menu the pointer
+        // user expects must still be there.
+        assert!(
+            container
+                .query_selector(".sidebar-card-menu")
+                .unwrap()
+                .is_none(),
+            "no menu until it is asked for"
+        );
+        dispatch_context_menu(&agent, 40.0, 60.0);
         next_tick().await;
-        let row_rect = agent.get_bounding_client_rect();
-        let popup_rect = details.get_bounding_client_rect();
+        let menu = container
+            .query_selector(".sidebar-card-menu")
+            .unwrap()
+            .expect("right-clicking a row opens its actions");
+        let menu_text = menu.text_content().unwrap_or_default();
+        for item in [
+            "Rename agent",
+            "Move to group",
+            "Compact context",
+            "Close agent",
+        ] {
+            assert!(
+                menu_text.contains(item),
+                "the menu must offer {item}, got: {menu_text:?}"
+            );
+        }
+        dispatch_key(&menu.clone().dyn_into::<HtmlElement>().unwrap(), "Escape");
+        next_tick().await;
         assert!(
-            popup_rect.bottom() >= row_rect.top() && popup_rect.top() <= row_rect.bottom(),
-            "bottom-row details must touch the row so the pointer can reach them"
+            container
+                .query_selector(".sidebar-card-menu")
+                .unwrap()
+                .is_none(),
+            "Escape closes the menu"
+        );
+        assert_eq!(
+            document()
+                .active_element()
+                .map(|el| el.is_same_node(Some(&agent))),
+            Some(true),
+            "dismissing the menu returns the keyboard to the row it came from"
+        );
+
+        // A menu item does the row's own action, then gets out of the way.
+        dispatch_context_menu(&agent, 40.0, 60.0);
+        next_tick().await;
+        menu_item(&container, "Rename agent").click();
+        next_tick().await;
+        assert!(
+            container
+                .query_selector(".agent-card-name-input")
+                .unwrap()
+                .is_some(),
+            "Rename from the menu opens the row's own name editor"
         );
         assert!(
-            popup_rect.right() <= row_rect.left(),
-            "details sit beside the row"
+            container
+                .query_selector(".sidebar-card-menu")
+                .unwrap()
+                .is_none(),
+            "choosing an action closes the menu"
         );
-        agent.remove_attribute("style").unwrap();
+        dispatch_key(
+            &container
+                .query_selector(".agent-card-name-input")
+                .unwrap()
+                .unwrap()
+                .dyn_into::<HtmlElement>()
+                .unwrap(),
+            "Escape",
+        );
+        next_tick().await;
+
+        // A saved conversation is the same row shape, with its own actions.
+        let history_chevron: HtmlElement = history
+            .query_selector(".sidebar-card-expand")
+            .unwrap()
+            .expect("a saved conversation offers a chevron too")
+            .dyn_into()
+            .unwrap();
+        let history_collapsed = history.get_bounding_client_rect().height();
+        history_chevron.click();
+        next_tick().await;
+        let history_details = history
+            .query_selector(".sidebar-card-details")
+            .unwrap()
+            .unwrap();
+        assert!(
+            history_details
+                .text_content()
+                .unwrap_or_default()
+                .contains("saved-card-full-id"),
+            "the expanded conversation shows the session it will resume"
+        );
+        let delete: HtmlElement = history_details
+            .query_selector("button")
+            .unwrap()
+            .expect("the expanded conversation offers Delete")
+            .dyn_into()
+            .unwrap();
+        assert_eq!(delete.text_content().unwrap_or_default(), "Delete");
+        assert!(
+            delete.get_bounding_client_rect().height() > 0.0,
+            "Delete is visible once the row is expanded"
+        );
+        history_chevron.click();
+        next_tick().await;
+        assert_eq!(
+            history.get_bounding_client_rect().height(),
+            history_collapsed,
+            "the chevron closes what it opened"
+        );
+        dispatch_context_menu(&history, 40.0, 120.0);
+        next_tick().await;
+        let history_menu = container
+            .query_selector(".session-card .sidebar-card-menu")
+            .unwrap()
+            .expect("right-clicking a saved conversation opens its actions");
+        let history_menu_text = history_menu.text_content().unwrap_or_default();
+        for item in ["Resume conversation", "Delete conversation"] {
+            assert!(
+                history_menu_text.contains(item),
+                "the conversation menu must offer {item}, got: {history_menu_text:?}"
+            );
+        }
+        dispatch_key(
+            &history_menu.clone().dyn_into::<HtmlElement>().unwrap(),
+            "Escape",
+        );
+        next_tick().await;
 
         state.settings_open.set(true);
         next_tick().await;
-        assert_eq!(
-            web_sys::window()
-                .unwrap()
-                .get_computed_style(&details)
-                .unwrap()
-                .unwrap()
-                .get_property_value("opacity")
-                .unwrap(),
-            "0",
-            "card details must not cover Appearance when the row keeps keyboard focus"
-        );
         let toggle = container
             .query_selector("#sidebar-backend-labels")
             .unwrap()
@@ -3013,6 +3306,9 @@ mod wasm_tests {
             "Ungroup target should not clutter the sidebar before keyboard pickup"
         );
 
+        // The handle lives in the row's expanded panel, which is where a
+        // keyboard user reaches it.
+        expand_row(&container, "beta-agent");
         let move_button: HtmlElement = container
             .query_selector("[data-agent-id='beta-agent'] .agent-card-move")
             .unwrap()
@@ -3056,6 +3352,9 @@ mod wasm_tests {
             "Ungroup target should stay hidden when groups exist but no move is active"
         );
 
+        // The handle lives in the row's expanded panel, which is where a
+        // keyboard user reaches it.
+        expand_row(&container, "beta-agent");
         let move_button: HtmlElement = container
             .query_selector("[data-agent-id='beta-agent'] .agent-card-move")
             .unwrap()
@@ -3157,6 +3456,7 @@ mod wasm_tests {
         for _ in 0..4 {
             next_tick().await;
         }
+        expand_row(&container_no_groups, "beta-agent");
         let move_button: HtmlElement = container_no_groups
             .query_selector("[data-agent-id='beta-agent'] .agent-card-move")
             .unwrap()

@@ -7,6 +7,7 @@ use protocol::{
 };
 
 use crate::actions::resume_session;
+use crate::components::card_menu::{CardContextMenu, CardMenuPosition, open_card_menu};
 use crate::send::send_frame;
 use std::collections::HashSet;
 
@@ -613,6 +614,25 @@ fn session_card(state: AppState, session: SessionInfo) -> impl IntoView {
     let delete_host_id = session_host_id.clone();
     let delete_session_id = session_id.clone();
     let state_for_delete = state.clone();
+    // One delete action, shared by the expanded panel and the right-click menu.
+    let do_delete = move || {
+        let state = state_for_delete.clone();
+        let host_id = delete_host_id.clone();
+        let sid = delete_session_id.clone();
+        spawn_local(async move {
+            if let Some(host_stream) = state.host_stream_untracked(&host_id)
+                && let Err(e) = send_frame(
+                    &host_id,
+                    host_stream,
+                    FrameKind::DeleteSession,
+                    &DeleteSessionPayload { session_id: sid },
+                )
+                .await
+            {
+                log::error!("failed to send DeleteSession: {e}");
+            }
+        });
+    };
 
     // Shared resume action used by both click and keydown handlers.
     let resume_state = state.clone();
@@ -648,10 +668,25 @@ fn session_card(state: AppState, session: SessionInfo) -> impl IntoView {
     };
 
     let card_anchor = NodeRef::<leptos::html::Div>::new();
-    let details_style = RwSignal::new(String::new());
-    let details_dismissed = RwSignal::new(false);
+    // Same shape as an agent row: one line, with details and actions behind the
+    // chevron and behind right-click. Nothing opens on hover.
+    let expanded = RwSignal::new(false);
+    let card_menu: CardMenuPosition = RwSignal::new(None);
+    let menu_delete = do_delete.clone();
+    let menu_resume_state = state.clone();
+    let menu_resume_host = session_host_id.clone();
+    let menu_resume_sid = session_id.clone();
+    let menu_resume_project = session_project_id.clone();
+    let menu_resume = move || {
+        resume_session(
+            &menu_resume_state,
+            menu_resume_host.clone(),
+            backend,
+            menu_resume_sid.clone(),
+            menu_resume_project.clone(),
+        );
+    };
     let show_backend_labels = state.sidebar_backend_labels;
-    let settings_open = state.settings_open;
     let details_title = title.clone();
     let disabled_class = move || {
         if !is_connected.get() || !resumable {
@@ -666,21 +701,14 @@ fn session_card(state: AppState, session: SessionInfo) -> impl IntoView {
             class=disabled_class
             node_ref=card_anchor
             data-sidebar-backend=backend_label(backend)
-            data-details-dismissed=move || (details_dismissed.get() || settings_open.get()).to_string()
-            on:mouseenter=move |_| {
-                details_style.set(crate::components::hover_popover::sidebar_card_details_style(card_anchor));
-                details_dismissed.set(false);
-            }
-            on:focusin=move |_| {
-                details_style.set(crate::components::hover_popover::sidebar_card_details_style(card_anchor));
-                details_dismissed.set(false);
-            }
+            data-expanded=move || expanded.get().to_string()
             tabindex="0"
             role="button"
             on:click=on_click
+            on:contextmenu=move |ev: web_sys::MouseEvent| open_card_menu(card_menu, &ev)
             on:keydown=move |ev: web_sys::KeyboardEvent| {
                 if ev.key() == "Escape" {
-                    details_dismissed.set(true);
+                    expanded.set(false);
                     ev.stop_propagation();
                 } else {
                     on_keydown_card(ev);
@@ -688,13 +716,31 @@ fn session_card(state: AppState, session: SessionInfo) -> impl IntoView {
             }
         >
             <div class="session-card-top">
+                <button
+                    type="button"
+                    class="sidebar-card-expand"
+                    aria-expanded=move || expanded.get().to_string()
+                    title=move || if expanded.get() { "Hide details" } else { "Show details and actions" }
+                    aria-label=move || if expanded.get() {
+                        "Hide conversation details"
+                    } else {
+                        "Show conversation details"
+                    }
+                    on:click=move |ev: web_sys::MouseEvent| {
+                        ev.stop_propagation();
+                        expanded.update(|open| *open = !*open);
+                    }
+                    on:keydown=|ev: web_sys::KeyboardEvent| ev.stop_propagation()
+                >
+                    {move || if expanded.get() { "\u{25BE}" } else { "\u{25B8}" }}
+                </button>
                 <span class="session-card-status" aria-label="Saved conversation">"◷"</span>
                 <span class="session-card-title">{title}</span>
                 <Show when=move || show_backend_labels.get()>
                     <span class={format!("{} sidebar-backend-label", backend_class(backend))}>{backend_label(backend)}</span>
                 </Show>
             </div>
-            <div class="sidebar-card-details" style=move || details_style.get()
+            <div class="sidebar-card-details"
                 on:click=|ev: web_sys::MouseEvent| ev.stop_propagation()
                 on:keydown=|ev: web_sys::KeyboardEvent| { if ev.key() != "Escape" { ev.stop_propagation(); } }
             >
@@ -720,29 +766,12 @@ fn session_card(state: AppState, session: SessionInfo) -> impl IntoView {
                         if !is_connected.get() {
                             return None;
                         }
-                        // Create the handler fresh each time so the move closure
-                        // doesn't exhaust its captured values across invocations.
-                        let state = state_for_delete.clone();
-                        let host_id = delete_host_id.clone();
-                        let sid = delete_session_id.clone();
+                        // Fresh each time so the move closure doesn't exhaust
+                        // its captured handle across invocations.
+                        let delete = do_delete.clone();
                         let on_delete = move |ev: web_sys::MouseEvent| {
                             ev.stop_propagation();
-                            let state = state.clone();
-                            let host_id = host_id.clone();
-                            let sid = sid.clone();
-                            spawn_local(async move {
-                                if let Some(host_stream) = state.host_stream_untracked(&host_id)
-                                    && let Err(e) = send_frame(
-                                        &host_id,
-                                        host_stream,
-                                        FrameKind::DeleteSession,
-                                        &DeleteSessionPayload { session_id: sid },
-                                    )
-                                    .await
-                                {
-                                    log::error!("failed to send DeleteSession: {e}");
-                                }
-                            });
+                            delete();
                         };
                         Some(view! {
                             <button type="button" class="filter-toggle" on:click=on_delete>
@@ -753,6 +782,46 @@ fn session_card(state: AppState, session: SessionInfo) -> impl IntoView {
 
                 </div>
             </div>
+            <CardContextMenu menu=card_menu label="Conversation actions" anchor=card_anchor>
+                {
+                    let resume = menu_resume.clone();
+                    move || {
+                        let resume = resume.clone();
+                        (is_connected.get() && resumable).then(|| view! {
+                            <button
+                                type="button"
+                                class="context-menu-item"
+                                role="menuitem"
+                                on:click=move |_| {
+                                    card_menu.set(None);
+                                    resume();
+                                }
+                            >
+                                "Resume conversation"
+                            </button>
+                        })
+                    }
+                }
+                {
+                    let delete = menu_delete.clone();
+                    move || {
+                        let delete = delete.clone();
+                        is_connected.get().then(|| view! {
+                            <button
+                                type="button"
+                                class="context-menu-item"
+                                role="menuitem"
+                                on:click=move |_| {
+                                    card_menu.set(None);
+                                    delete();
+                                }
+                            >
+                                "Delete conversation"
+                            </button>
+                        })
+                    }
+                }
+            </CardContextMenu>
         </div>
     }
 }

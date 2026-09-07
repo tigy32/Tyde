@@ -23,40 +23,6 @@ use protocol::CodeIntelSeverity;
 use crate::markdown::render_markdown;
 use crate::state::{AppState, CodeIntelKey};
 
-pub(crate) fn sidebar_card_details_style(anchor: NodeRef<leptos::html::Div>) -> String {
-    let Some(anchor) = anchor.get() else {
-        return String::new();
-    };
-    let Some(window) = web_sys::window() else {
-        return String::new();
-    };
-    let width = window
-        .inner_width()
-        .ok()
-        .and_then(|v| v.as_f64())
-        .unwrap_or(320.0);
-    let height = window
-        .inner_height()
-        .ok()
-        .and_then(|v| v.as_f64())
-        .unwrap_or(280.0);
-    let rect = anchor.get_bounding_client_rect();
-    let panel_width = 320.0_f64.min((width - 16.0).max(0.0));
-    let left = if rect.left() >= panel_width + 8.0 {
-        rect.left() - panel_width
-    } else {
-        rect.right().min(width - panel_width - 8.0).max(8.0)
-    };
-    // Anchor short popovers to the row even when they grow upward; reserving
-    // an estimated height can leave a gap the pointer cannot cross.
-    let vertical = if rect.top() + 280.0 > height {
-        format!("bottom:{}px", (height - rect.bottom()).max(8.0))
-    } else {
-        format!("top:{}px", rect.top().max(8.0))
-    };
-    format!("left:{left}px;{vertical};width:{panel_width}px")
-}
-
 /// Approximate popover height budget used to decide whether to place the
 /// popover above or below the hovered span. Purely a placement heuristic; the
 /// box itself is sized by its content + CSS `max-height`.
