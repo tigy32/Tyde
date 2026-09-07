@@ -13,6 +13,123 @@ struct Wire {
     attachment: tokio::task::JoinHandle<std::io::Result<()>>,
 }
 
+#[tokio::test]
+async fn fresh_reconnect_pages_large_agent_history_without_losing_messages() {
+    use protocol::{AgentBootstrapEvent, AgentBootstrapPayload, ChatEvent, HostBootstrapPayload};
+    use server::backend::mock::{MockScript, MockTurn};
+
+    let mut fixture = Fixture::new().await;
+    let responses = (0..8)
+        .map(|index| format!("large-response-{index}:{}", "x".repeat(1280 * 1024)))
+        .collect::<Vec<_>>();
+    let agent = fixture
+        .spawn_scripted(
+            "large-history",
+            MockScript::one(MockTurn::text(responses[0].clone())),
+        )
+        .await;
+    fixture.finish_turn(&agent).await;
+    for response in &responses[1..] {
+        fixture
+            .mock(&agent)
+            .await
+            .enqueue(MockTurn::text(response.clone()))
+            .await;
+        fixture
+            .client
+            .send_message(&agent.stream, "next".into())
+            .await
+            .unwrap();
+        fixture.finish_turn(&agent).await;
+    }
+
+    let registry = Registry::default();
+    let (session, logical) = Session::new();
+    let (id, wire) = attach(&fixture, &registry, &session, None).await;
+    let mut client = client::connect(&client::ClientConfig::current(), logical)
+        .await
+        .unwrap();
+    let host: HostBootstrapPayload = next_frame_matching_on(&mut client, "reconnected host", |e| {
+        e.kind == FrameKind::HostBootstrap
+    })
+    .await
+    .parse_payload()
+    .unwrap();
+    let descriptor = host
+        .agents
+        .iter()
+        .find(|item| item.agent_id == agent.new_agent.agent_id)
+        .unwrap();
+    let stream = descriptor.instance_stream.clone();
+    let bootstrap: AgentBootstrapPayload =
+        next_frame_matching_on(&mut client, "large agent bootstrap", |e| {
+            e.kind == FrameKind::AgentBootstrap && e.stream == stream
+        })
+        .await
+        .parse_payload()
+        .unwrap();
+    let mut seen = Vec::new();
+    let mut before = None;
+    for event in bootstrap.events {
+        match event {
+            AgentBootstrapEvent::ChatEvent(ChatEvent::StreamEnd(end)) => {
+                seen.push(end.message.content)
+            }
+            AgentBootstrapEvent::HasPriorHistory { before_seq, .. } => before = Some(before_seq),
+            _ => {}
+        }
+    }
+    assert!(
+        before.is_some(),
+        "large histories must advertise earlier pages"
+    );
+    wire.drop_transport().await;
+    let (resumed_id, wire) = attach(&fixture, &registry, &session, Some(id)).await;
+    assert_eq!(resumed_id, id);
+    for _ in 0..12 {
+        client
+            .fetch_session_history(
+                &stream,
+                protocol::FetchSessionHistoryPayload {
+                    agent_id: agent.new_agent.agent_id.clone(),
+                    request_id: protocol::HistoryPageRequestId(uuid::Uuid::new_v4().to_string()),
+                    before_seq: before,
+                    limit: 100,
+                },
+            )
+            .await
+            .unwrap();
+        let page: protocol::SessionHistoryPayload =
+            next_frame_matching_on(&mut client, "large history page", |e| {
+                e.kind == FrameKind::SessionHistory && e.stream == stream
+            })
+            .await
+            .parse_payload()
+            .unwrap();
+        for event in page.events {
+            if let ChatEvent::StreamEnd(end) = event {
+                seen.push(end.message.content);
+            }
+        }
+        if !page.has_more_before {
+            break;
+        }
+        let oldest = page.oldest_seq.expect("earlier history cursor");
+        assert!(
+            before.is_none_or(|previous| oldest < previous),
+            "paging must advance"
+        );
+        before = Some(oldest);
+    }
+    seen.sort();
+    assert!(
+        seen == responses,
+        "reconnect and paging must preserve every large response exactly once"
+    );
+    wire.drop_transport().await;
+    session.close();
+}
+
 impl Wire {
     async fn drop_transport(self) {
         self.relay.abort();

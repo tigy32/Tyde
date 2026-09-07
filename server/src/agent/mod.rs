@@ -12549,6 +12549,47 @@ fn history_start_for_message_limit(
     end: usize,
     limit: usize,
 ) -> usize {
+    let message_start = history_start_for_message_count(entries, end, limit);
+    let mut cursor = end;
+    let mut bytes = 0usize;
+    while cursor > message_start {
+        let start = entries[message_start..cursor]
+            .iter()
+            .rposition(|(_, event)| history_message_terminal(event))
+            .map(|index| history_message_start(entries, message_start + index))
+            .unwrap_or(message_start)
+            .max(message_start);
+        let group_bytes = entries[start..cursor]
+            .iter()
+            .map(|(_, event)| {
+                serde_json::to_vec(event)
+                    .expect("serialize history event")
+                    .len()
+                    + 256
+            })
+            .sum::<usize>();
+        // Keep complete messages and leave room for bootstrap metadata and
+        // latest_output within the transport's 16 MiB envelope limit.
+        if cursor < end && bytes.saturating_add(group_bytes) > 8 * 1024 * 1024 {
+            tracing::info!(
+                history_bytes = bytes,
+                retained_events = end - cursor,
+                deferred_events = cursor - message_start,
+                "paging large reconnect history"
+            );
+            return cursor;
+        }
+        bytes = bytes.saturating_add(group_bytes);
+        cursor = start;
+    }
+    message_start
+}
+
+fn history_start_for_message_count(
+    entries: &[(u64, ChatEvent)],
+    end: usize,
+    limit: usize,
+) -> usize {
     let message_count = entries[..end]
         .iter()
         .filter(|(_, event)| history_message_terminal(event))

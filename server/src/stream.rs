@@ -219,6 +219,10 @@ impl OutputQueue {
             OutputLane::Audio => unreachable!(),
         };
         if Self::lane_bytes(&queues, output.lane).saturating_add(output.bytes) > byte_limit {
+            tracing::warn!(stream = %output.frame.envelope.stream, kind = %output.frame.envelope.kind,
+                lane = ?output.lane, frame_bytes = output.bytes,
+                queued_bytes = Self::lane_bytes(&queues, output.lane), byte_limit,
+                "closing connection after output byte limit exceeded");
             if output.lane == OutputLane::Control {
                 queues.fatal_overflow = true;
             } else {
@@ -230,6 +234,8 @@ impl OutputQueue {
         let lane = output.lane;
         let bytes = output.bytes;
         if Self::queue_mut(&mut queues, lane).len() >= limit {
+            tracing::warn!(stream = %output.frame.envelope.stream, kind = %output.frame.envelope.kind,
+                ?lane, limit, "closing connection after output frame limit exceeded");
             if lane == OutputLane::Control {
                 queues.fatal_overflow = true;
             } else {

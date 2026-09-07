@@ -464,7 +464,11 @@ where
                 let interleaved = !pending_records.is_empty();
                 assign_sequence(&mut outgoing_seq, &mut queued.frame.envelope);
                 log_outgoing(&queued.frame.envelope);
-                let mut records = encode_frame(&queued.frame, message_id)?;
+                let mut records = encode_frame(&queued.frame, message_id).inspect_err(|error| {
+                    tracing::error!(stream = %queued.frame.envelope.stream,
+                        kind = %queued.frame.envelope.kind, %error,
+                        "failed to encode outgoing connection frame");
+                })?;
                 message_id = message_id.wrapping_add(1).max(1);
                 let first = records.remove(0);
                 writer.write_all(&first.bytes).await?;
