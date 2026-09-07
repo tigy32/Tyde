@@ -964,6 +964,7 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
         }
         FrameKind::BackendCapacity => match envelope.parse_payload::<BackendCapacityPayload>() {
             Ok(payload) => {
+                crate::backend_statistics::observe_capacity(state, host_id, &payload.snapshots);
                 // Full replacement for this host: the server owns the canonical
                 // per-(host, backend) snapshot and re-emits it on every change,
                 // so the frontend holds no history and merges nothing.
@@ -4644,6 +4645,7 @@ fn settle_fatal_agent_ui(state: &AppState, agent_id: &AgentId) {
 fn apply_agent_error(state: &AppState, host_id: &str, payload: AgentErrorPayload) {
     let agent_id = payload.agent_id.clone();
     if payload.fatal {
+        crate::backend_statistics::observe_agent_failure(state, host_id, &agent_id);
         state.agents.update(|agents| {
             if let Some(agent) = agents
                 .iter_mut()
@@ -4962,6 +4964,7 @@ fn dispatch_chat_event(state: &AppState, host_id: &str, stream: &StreamPath, env
         }
     };
 
+    crate::backend_statistics::observe_chat_event(state, host_id, &agent_id, &event);
     apply_chat_event(state, host_id, &agent_id, event);
 }
 
