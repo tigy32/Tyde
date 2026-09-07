@@ -13,9 +13,7 @@ Start an agent locally without creating a project. Add projects when you want
 code context. Connect your servers when you want agents to keep working after
 your laptop disconnects.
 
-[![Tyde showing three projects, an expanded file explorer, eight demo agents, and an active coding conversation](docs/assets/studio.png)](docs/assets/studio.png)
-
-*Eight open demo agents across three projects, with the selected agent working on a search improvement. [How these images were captured](dev-docs/customer-documentation.md#product-captures).*
+[![Tyde showing three projects, an expanded file explorer, eight agents, and an active coding conversation](docs/assets/studio.png)](docs/assets/studio.png)
 
 ## Your agents. One workspace.
 
@@ -67,8 +65,7 @@ hosting configured.
 
 <p align="center"><a href="docs/assets/mobile-chat.png"><img src="docs/assets/mobile-chat.png" width="320" alt="Tyde mobile showing an agent conversation and a follow-up draft in the composer"></a></p>
 
-*The mobile conversation view with demo data. [Mobile user guide](docs/book.md#mobile)
-· [Screenshot details](dev-docs/customer-documentation.md#mobile-capture).*
+[Learn how to use Tyde on your phone](docs/book.md#mobile).
 
 ## Review the work where it happens.
 
@@ -114,5 +111,4 @@ Already installed Tyde? The user guide explains the interface and gives step-by-
 - [Settings](docs/book.md#settings) and [troubleshooting](docs/book.md#troubleshooting)
 
 For the designed reading experience, open `docs/index.html` in a browser or serve
-`docs/` with a static server. The links above open the repository edition of the book. See [documentation maintenance](dev-docs/customer-documentation.md)
-for rendering and capture instructions.
+`docs/` with a static server. The links above open the repository edition of the book.
