@@ -1,11 +1,12 @@
 <p align="center"><img src="docs/assets/icon.png" width="64" alt="Tyde"></p>
 <h1 align="center">Tyde — Agent Studio</h1>
-<p align="center"><strong>Manage coding agents across projects, backends, and machines.</strong></p>
+<p align="center"><strong>Manage coding agents across harnesses, projects, and servers.</strong></p>
 <p align="center"><a href="https://tycode.dev/tyde.html">Download Tyde</a> · <a href="docs/book.md">Tyde User Guide</a> · <a href="https://github.com/tigy32/Tyde/releases">Releases</a> · <a href="https://github.com/tigy32/Tyde/issues">Issues</a></p>
 
-Tyde brings CLI coding agents into one workspace. Run agents concurrently,
-organize work across repositories, review their changes, and coordinate agents
-using different backends.
+Tyde brings the CLI coding agents you already use—Claude Code, Codex,
+Antigravity, Grok, and more—into one desktop application. Run agents
+concurrently, organize work across repositories, review their changes, and
+coordinate agents using different harnesses.
 
 Start an agent locally without creating a project. Add projects when you want
 code context. Connect your servers when you want agents to keep working after
@@ -17,9 +18,20 @@ your laptop disconnects.
 
 ## Your agents. One workspace.
 
-Use Claude, Codex, OpenCode, Grok, Antigravity, Hermes, and Kiro integrations
-through a shared studio. Backend availability depends on the CLI setup on each
-host; Tyde shows installation and readiness information in Settings → Backends.
+Tyde is a graphical interface over CLI coding harnesses: Claude Code, Codex,
+OpenCode, Grok, Antigravity, Hermes, and Kiro. A Claude Code agent in Tyde runs
+Claude Code itself; a Codex agent runs Codex. The harness supplies the agent
+implementation, models, and native tools, with Tyde providing the interface
+for conversations, organization, and review.
+
+If a harness is already installed and signed in on the selected host, use that
+existing setup in Tyde. You do not need a separate Tyde API key or a second
+model-provider setup for it. If the harness needs installation or authentication,
+check **Settings → Backends** for its readiness status and setup controls.
+“Backends” is the settings label for these harness integrations.
+
+Agents use the harness’s own authentication and provider account. The provider’s
+usage limits and account policies continue to apply.
 
 Give independent tasks their own conversations. Keep agents working across
 projects, find the ones that need your attention, and return to earlier work
@@ -45,18 +57,19 @@ symbols and references with Rust and Python language-server integrations.
 
 ## Let different agents work together.
 
-An agent can use Tyde’s tools to create subagents on other available backends.
+An agent can use Tyde’s tools to create subagents on other available harnesses.
 Delegate an investigation, ask for an independent review, or coordinate several
 bounded tasks. Follow the parent and its children in the same studio.
 
 Define reusable agents with instructions, skills, MCP servers, and tool policy.
-Manage those definitions on each host and reuse them across supported backends.
+Manage those definitions on each host and reuse them across supported harnesses.
 Individual harness capabilities and provider limits still apply.
 
 ## Get started
 
 1. [Download and install Tyde](https://tycode.dev/tyde.html).
-2. Open **Settings → Backends** on the local host and configure your CLI backend.
+2. Open **Settings → Backends** on the local host and check your harness’s readiness.
+   If it is already installed and signed in, use your existing setup.
 3. Start **New Chat**. You do not need a project for your first conversation.
 4. Open a project to browse code and review changes, or add a remote host under
    **Settings → Hosts**.
@@ -70,7 +83,7 @@ Already installed Tyde? The user guide explains the interface and gives step-by-
 - [Code review and Git](docs/book.md#review)
 - [Concurrent agents](docs/book.md#concurrency) and [session history](docs/book.md#sessions)
 - [Remote hosts](docs/book.md#remote)
-- [Cross-backend delegation](docs/book.md#delegation)
+- [Cross-harness delegation](docs/book.md#delegation)
 - [Custom agents and skills](docs/book.md#agents-skills)
 - [Workbenches](docs/book.md#workbenches)
 - [Complete workflows](docs/book.md#workflows)
