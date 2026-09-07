@@ -1,15 +1,80 @@
 [
- {"slug":"index","title":"Room for all your agents.","part":"Start here","description":"One studio for coding agents across projects, backends, and machines. Start with a conversation. Grow into a workspace for everything you’re building."},
- {"slug":"first-agent","title":"Your first agent","part":"Start here","description":"Go from a fresh installation to a useful conversation. You don’t need a project or a remote server to begin."},
- {"slug":"projects","title":"Bring your projects","part":"Your daily workspace","description":"Give your agents a place to work, and give yourself the code context to follow along. A project can bring several repository roots together."},
- {"slug":"review","title":"Review the work","part":"Your daily workspace","description":"Read the code, understand the change, and leave feedback exactly where it belongs. Keep the conversation connected to the work."},
- {"slug":"concurrency","title":"Keep many agents in view","part":"Your daily workspace","description":"Move between projects without losing track of who is working, who needs you, and what is ready to review."},
- {"slug":"sessions","title":"Pick up where you left off","part":"Your daily workspace","description":"Find earlier conversations and resume their context. Understand the difference between an active agent and its saved session."},
- {"slug":"remote","title":"Your laptop. Your servers.","part":"Expand your studio","description":"Run agents where your projects live. Connect to a home server and a work server, leave work running, and reconnect when you’re ready."},
- {"slug":"delegation","title":"Let agents work together","part":"Expand your studio","description":"Use Tyde subagents to delegate across CLI backends. Give each agent a clear role and follow the work in the same studio."},
- {"slug":"agents-skills","title":"Make expertise reusable","part":"Expand your studio","description":"Define your specialists once. Give them instructions, skills, and tools that can be used across supported backends on a host."},
- {"slug":"workbenches","title":"Give parallel work its space","part":"Expand your studio","description":"Use workbenches to keep independent changes on separate branches and working trees, while keeping them connected to their parent project."},
- {"slug":"workflows","title":"A day in your studio","part":"Put it together","description":"Three complete ways to work: several projects on remote servers, implementation with a second reviewer, and a reusable project specialist."},
- {"slug":"settings","title":"Configure your studio","part":"Reference","description":"Know which machine a setting changes, how backend options relate to Tyde, and where to configure code intelligence and integrations."},
- {"slug":"troubleshooting","title":"Find your way back","part":"Reference","description":"Practical recovery steps for unavailable backends, disconnected hosts, missing sessions, and code navigation that needs attention."}
+  {
+    "slug": "index",
+    "title": "Using Tyde",
+    "part": "Getting started",
+    "description": "Learn the interface and the terms used in this guide. Start here with Tyde installed and open."
+  },
+  {
+    "slug": "first-agent",
+    "title": "Start and manage a conversation",
+    "part": "Getting started",
+    "description": "Choose a backend, start an agent, read its responses and tool activity, and send follow-up instructions."
+  },
+  {
+    "slug": "projects",
+    "title": "Projects and files",
+    "part": "Projects and agents",
+    "description": "Open a project, add repository roots, browse files, and start agents in the selected project."
+  },
+  {
+    "slug": "review",
+    "title": "Git changes and review comments",
+    "part": "Projects and agents",
+    "description": "Inspect working changes and commits, add file or inline comments, and submit feedback to an agent."
+  },
+  {
+    "slug": "concurrency",
+    "title": "Organize active agents",
+    "part": "Projects and agents",
+    "description": "Find conversations, filter the agent list, and follow agents working in different projects."
+  },
+  {
+    "slug": "sessions",
+    "title": "History and saved sessions",
+    "part": "Projects and agents",
+    "description": "Find and reopen an earlier conversation on the host where it ran."
+  },
+  {
+    "slug": "workbenches",
+    "title": "Workbenches",
+    "part": "Projects and agents",
+    "description": "Create a separate branch and working tree for a project task, then integrate and remove the finished workbench."
+  },
+  {
+    "slug": "remote",
+    "title": "Connect remote hosts",
+    "part": "Hosts and configuration",
+    "description": "Add an SSH host, configure its backends, open its projects, and reconnect to its running agents."
+  },
+  {
+    "slug": "agents-skills",
+    "title": "Custom agents, skills, and tools",
+    "part": "Hosts and configuration",
+    "description": "Create reusable agent configurations, add skill files, and choose the tools each custom agent receives."
+  },
+  {
+    "slug": "delegation",
+    "title": "Subagents and teams",
+    "part": "Hosts and configuration",
+    "description": "Configure delegation, ask an agent to create a Tyde subagent, and inspect the delegated conversation."
+  },
+  {
+    "slug": "workflows",
+    "title": "Step-by-step examples",
+    "part": "Examples and reference",
+    "description": "Follow complete examples that combine projects, remote hosts, review, workbenches, and custom agents."
+  },
+  {
+    "slug": "settings",
+    "title": "Settings reference",
+    "part": "Examples and reference",
+    "description": "Find host and session settings, backend setup, code intelligence, keyboard shortcuts, and mobile pairing."
+  },
+  {
+    "slug": "troubleshooting",
+    "title": "Troubleshooting",
+    "part": "Examples and reference",
+    "description": "Resolve backend setup, connection, session, skill, navigation, and review-submission problems."
+  }
 ]

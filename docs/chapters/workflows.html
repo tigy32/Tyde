@@ -1,4 +1,4 @@
-<h2 id="two-host-day">A laptop, two servers, a day’s work</h2>
+<h2 id="two-host-day">Work on projects on two remote hosts</h2>
 <p><strong>Outcome:</strong> keep personal and work projects running on their respective machines while using one laptop to direct and review them.</p>
 <ol><li><a href="remote.html#connect">Connect Home server and Work server</a>. Configure the desired backends on each.</li><li>Open your personal website on Home server. On Work server, open the application project and add its API repository as a second root if the task spans both.</li><li>Start a website agent on Home server and an API investigation agent on Work server. Give each a separate deliverable.</li><li>Move between the projects and check their conversations. Respond to questions and review completed work.</li><li>Disconnect the laptop while the remote hosts remain running.</li><li>Reconnect later and open the original agents. Inspect their results before assigning more work.</li></ol>
 <p><strong>What to notice:</strong> the laptop is your connection to the work. Project files, backend authentication, and agent execution belong to each host.</p>
@@ -6,7 +6,7 @@
 <p><strong>Outcome:</strong> get an independent reading of a change before accepting it.</p>
 <ol><li>Create a workbench for the change and launch an implementation agent inside it.</li><li>Describe the expected behavior and your acceptance criteria. Ask the agent to report when the change is ready for review.</li><li>Once the files are stable, ask for a Tyde subagent using another available backend to review the implementation without editing.</li><li>Compare the review findings with the actual diff. Add your own inline comments.</li><li>Submit the review to the implementation agent, then inspect the revision.</li><li>Run the project’s required checks, commit, and integrate the finished work.</li></ol>
 <blockquote><p>Review the completed change independently. Focus on empty input, failed requests, and keyboard navigation. Cite concrete locations. Do not edit files or start another implementation.</p></blockquote>
-<h2 id="specialist">Build a specialist you will use again</h2>
+<h2 id="specialist">Create and use a custom reviewer</h2>
 <p><strong>Outcome:</strong> reuse your review standards without retyping them for every conversation.</p>
 <ol><li>Create a <a href="agents-skills.html#skills">project-review skill</a> on the host.</li><li>Refresh Skills in settings.</li><li>Create a custom reviewer definition and assign the skill. Give it a clear output format and appropriate tool access.</li><li>Launch the reviewer in a project and give it a specific change to inspect.</li><li>Refine the instructions based on the usefulness of its findings. Use the same definition when launching later reviews on that host.</li></ol>
-<p>These workflows combine the same small set of concepts. Add complexity when you need it: another project, another host, another agent, or a separate workbench.</p>
+<p>Use the chapter links in each example for the individual controls and their settings.</p>

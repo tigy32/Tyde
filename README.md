@@ -1,7 +1,7 @@
 <p align="center"><img src="docs/assets/icon.png" width="64" alt="Tyde"></p>
 <h1 align="center">Tyde — Agent Studio</h1>
 <p align="center"><strong>Manage coding agents across projects, backends, and machines.</strong></p>
-<p align="center"><a href="https://tycode.dev/tyde.html">Download Tyde</a> · <a href="docs/book.md">The Tyde Book</a> · <a href="https://github.com/tigy32/Tyde/releases">Releases</a> · <a href="https://github.com/tigy32/Tyde/issues">Issues</a></p>
+<p align="center"><a href="https://tycode.dev/tyde.html">Download Tyde</a> · <a href="docs/book.md">Tyde User Guide</a> · <a href="https://github.com/tigy32/Tyde/releases">Releases</a> · <a href="https://github.com/tigy32/Tyde/issues">Issues</a></p>
 
 Tyde brings CLI coding agents into one workspace. Run agents concurrently,
 organize work across repositories, review their changes, and coordinate agents
@@ -61,9 +61,9 @@ Individual harness capabilities and provider limits still apply.
 4. Open a project to browse code and review changes, or add a remote host under
    **Settings → Hosts**.
 
-## Read the Tyde Book
+## Read the user guide
 
-The book walks from one local agent to a studio spanning projects and servers:
+Already installed Tyde? The user guide explains the interface and gives step-by-step instructions for its features:
 
 - [Your first agent](docs/book.md#first-agent)
 - [Projects and multiple roots](docs/book.md#projects)

@@ -15,7 +15,7 @@ check = sys.argv[1:] == ['--check']
 outputs = {}
 pages = json.loads((ROOT / 'contents.json').read_text())
 search = []
-repository_book = ['# The Tyde Book\n\nManage coding agents across projects, backends, and machines.\n']
+repository_book = ['# Tyde User Guide\n\nInstructions for using Tyde after installation.\n']
 for index, page in enumerate(pages):
     slug, title = page['slug'], page['title']
     body = (ROOT / 'chapters' / f'{slug}.html').read_text()
@@ -39,17 +39,17 @@ for index, page in enumerate(pages):
     toc = ''.join(f'<a href="#{anchor}">{heading}</a>' for anchor, heading in sections)
     document = f'''<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>{html.escape(title)} — The Tyde Book</title><meta name="description" content="{html.escape(page['description'], quote=True)}">
+<title>{html.escape(title)} — Tyde User Guide</title><meta name="description" content="{html.escape(page['description'], quote=True)}">
 <meta name="color-scheme" content="light dark"><link rel="icon" href="assets/icon.png"><link rel="stylesheet" href="assets/book.css">
 <script src="assets/search-index.js" defer></script><script src="assets/book.js" defer></script></head>
 <body><a class="skip" href="#main">Skip to content</a>
-<header class="topbar"><a class="brand" href="index.html"><img src="assets/icon.png" alt="" width="28" height="28">tyde<span class="brand-divider">/</span><span class="book-label">The Book</span></a>
-<div class="top-actions"><button class="search-open" hidden>Search the book <kbd>/</kbd></button><button class="theme-toggle" hidden aria-label="Switch color theme">◐</button><a class="download" href="https://tycode.dev/tyde.html">Get Tyde <span aria-hidden="true">↗</span></a></div></header>
-<div class="layout"><details class="chapter-menu" open><summary>Chapters</summary><nav aria-label="Chapters">{navigation}</nav><p class="nav-foot">THE TYDE BOOK<br><span>Room for all your agents.</span></p></details>
+<header class="topbar"><a class="brand" href="index.html"><img src="assets/icon.png" alt="" width="28" height="28">tyde<span class="brand-divider">/</span><span class="book-label">User Guide</span></a>
+<div class="top-actions"><button class="search-open" hidden>Search the guide <kbd>/</kbd></button><button class="theme-toggle" hidden aria-label="Switch color theme">◐</button><a class="download" href="https://tycode.dev/tyde.html">Downloads <span aria-hidden="true">↗</span></a></div></header>
+<div class="layout"><details class="chapter-menu" open><summary>Chapters</summary><nav aria-label="Chapters">{navigation}</nav><p class="nav-foot">TYDE USER GUIDE<br><span>Features and instructions.</span></p></details>
 <main id="main"><div class="eyebrow">{html.escape(page['part'])} <span>/ {index + 1:02}</span></div><h1>{html.escape(title)}</h1><p class="lede">{html.escape(page['description'])}</p>{body}
-<nav class="pagination" aria-label="Chapter pagination">{adjacent}</nav><footer>Tyde · Agent Studio <a href="https://github.com/tigy32/Tyde/issues">Report a documentation issue ↗</a></footer></main>
-<aside class="on-page"><p>IN THIS CHAPTER</p>{toc}<div class="aside-note">Start small.<br>Make room for more.</div></aside></div>
-<dialog id="search-dialog" aria-labelledby="search-title"><div class="search-heading"><h2 id="search-title">Search the book</h2><button class="search-close" aria-label="Close search">Close</button></div><label class="sr-only" for="search-input">Search chapters and content</label><input id="search-input" type="search" placeholder="Try remote hosts, skills, or review…" autocomplete="off"><p id="search-status" role="status"></p><div id="search-results"></div></dialog>
+<nav class="pagination" aria-label="Chapter pagination">{adjacent}</nav><footer>Tyde User Guide <a href="https://github.com/tigy32/Tyde/issues">Report a documentation issue ↗</a></footer></main>
+<aside class="on-page"><p>IN THIS CHAPTER</p>{toc}<div class="aside-note">Use the chapter list to find a feature.<br>Search for a control or task.</div></aside></div>
+<dialog id="search-dialog" aria-labelledby="search-title"><div class="search-heading"><h2 id="search-title">Search the guide</h2><button class="search-close" aria-label="Close search">Close</button></div><label class="sr-only" for="search-input">Search chapters and content</label><input id="search-input" type="search" placeholder="Try remote hosts, skills, or review…" autocomplete="off"><p id="search-status" role="status"></p><div id="search-results"></div></dialog>
 </body></html>'''
     outputs[ROOT / f'{slug}.html'] = document
     repository_body = re.sub(r'id="([^"]+)"', lambda match: f'id="{slug}-{match[1]}"', body)

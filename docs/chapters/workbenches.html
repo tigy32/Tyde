@@ -1,12 +1,12 @@
-<h2 id="why">Separate working trees for separate changes</h2>
+<h2 id="why">What a workbench contains</h2>
 <p>A workbench is a project connected to a parent project’s Git roots, with its own branch and working trees. It gives an independent change room to develop without mixing its edits into the parent checkout.</p>
 <p>Use one for a feature, a bug fix, or another bounded task. For a multi-root project, the workbench follows the parent’s roots so related repository work stays together.</p>
 <h2 id="create">Create and open a workbench</h2>
-<ol><li>Select a project with Git roots and open its context menu.</li><li>Choose the workbench creation action.</li><li>Provide a new branch name that describes the change, such as <code>feature/search-empty-state</code>.</li><li>Wait for creation to complete, then open the workbench.</li><li>Start the implementation agent from the workbench context.</li></ol>
+<ol><li>Select a project with Git roots and open its context menu.</li><li>Choose <strong>New Workbench</strong>.</li><li>Provide a new branch name that describes the change, such as <code>feature/search-empty-state</code>.</li><li>Select <strong>Create Workbench</strong>, wait for creation to complete, then open it.</li><li>Start the implementation agent from the workbench context.</li></ol>
 <p>The new workbench starts from committed repository state. Uncommitted and untracked changes in the parent are not copied into it. Commit any prerequisites you intend the workbench to contain before creating it.</p>
 <h2 id="work">Work and review inside it</h2>
 <p>Keep implementation, project checks, and review in the workbench. Check its branch and Git changes before committing. If several agents share a workbench, they still share that workbench’s files; agree on responsibilities.</p>
 <p>For two independent features, create two workbenches. This makes it easier to review each diff and decide when each change is ready.</p>
 <h2 id="finish">Integrate, then remove</h2>
-<ol><li>Review the result and run the checks required by your project.</li><li>Commit the completed change on the workbench branch.</li><li>Integrate the commits using your repository’s normal Git workflow. Creating a workbench does not automatically merge its changes.</li><li>Confirm the intended commits are present in the destination branch.</li><li>Remove the finished workbench through Tyde.</li></ol>
+<ol><li>Review the result and run the checks required by your project.</li><li>Commit the completed change on the workbench branch.</li><li>Integrate the commits using your repository’s normal Git workflow. Creating a workbench does not automatically merge its changes.</li><li>Confirm the intended commits are present in the destination branch.</li><li>Open the workbench’s context menu and choose <strong>Remove Workbench</strong>.</li></ol>
 <div class="callout"><p><strong>Removal is a cleanup action.</strong> Finish the work and preserve its commits first. Removing a workbench also removes its associated active workspace resources. Do not force removal to get past uncommitted work you still need.</p></div>

@@ -1,6 +1,13 @@
-<h2 id="where-work-runs">Your client connects. Your hosts work.</h2>
+<h2 id="where-work-runs">Where files and agents run</h2>
 <p>A remote host runs Tyde’s server, the CLI backends, and the agents that use them. Your desktop client connects to that host to display state and send your actions. You can connect to more than one host from the same laptop.</p>
 <p>When you disconnect the client, agents can continue on the remote host. When you reconnect, Tyde receives the host’s current workspace state. This depends on the host and its processes staying running; disconnecting your laptop is different from shutting down the server.</p>
+<div class="studio-map" aria-label="Illustration of a laptop connected to two agent hosts">
+<div class="map-label">Client and remote hosts</div>
+<div class="map-client">Your laptop<small>Connected to both hosts</small></div><div class="map-branches" aria-hidden="true"></div>
+<div class="map-hosts"><div class="map-host">Home server<small>Personal projects</small><div class="map-agent">Website · Claude<span><i></i>Working</span></div><div class="map-agent">Tools · Codex<span><i></i>Working</span></div></div><div class="map-host">Work server<small>Work projects</small><div class="map-agent">API · OpenCode<span><i></i>Working</span></div><div class="map-agent">Dashboard · Hermes<span><i></i>Working</span></div></div></div>
+<div class="map-controls"><button class="connection-toggle" hidden>Disconnect laptop</button><button class="motion-toggle" aria-pressed="false" hidden>Pause motion</button><p class="map-status" role="status">Agents run on their hosts. Your laptop connects you to their work.</p></div>
+</div>
+<p class="figure-note"><small>Interactive concept diagram. These example agents illustrate where work runs.</small></p>
 <h2 id="connect">Connect your first server</h2>
 <ol><li>Make sure you can access the server through SSH. Use the account that should own the projects and agent processes.</li><li>Open <strong>Settings → Hosts → Add Remote Host</strong>.</li><li>Give the host a recognizable label, such as <strong>Home server</strong>, and enter its <strong>SSH destination</strong>, such as <code>developer@home-server</code>.</li><li>Leave <strong>Remote command</strong> blank for managed installation and launch of the matching Tyde release. Use a custom command only when you manage the bridge yourself.</li><li>Choose whether to auto-connect on launch, then select <strong>Add Host</strong>. Connect and wait for the connected state.</li><li>Select this host in settings. Open Backends and install or authenticate the harnesses you want to run there.</li></ol>
 <div class="callout"><p><strong>Keep the host selector in view.</strong> Backend installation, skills, custom agents, and host settings apply to the selected machine. Your laptop’s CLI login and filesystem paths are not the remote server’s configuration.</p></div>

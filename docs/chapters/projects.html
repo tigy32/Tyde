@@ -1,14 +1,15 @@
 <h2 id="open-project">Open a project on the right host</h2>
 <ol><li>Use the project-opening control on Home or in the project rail.</li><li>In the folder browser, choose the host that contains your code. The browser lists that host’s filesystem.</li><li>Navigate to the folder you want and choose <strong>Open Project Here</strong>.</li><li>Select the project in the rail. Open a new agent from that context so it works with the project’s roots.</li></ol>
 <p>For example, open <code>~/projects/garden</code> on your home server. You can browse that project from your laptop without maintaining a second checkout on the laptop.</p>
-<h2 id="multiple-roots">Bring related roots together</h2>
+<h2 id="multiple-roots">Add another root to a project</h2>
 <p>A project can contain more than one root. This is useful when one task spans an application repository and a related service repository. Choose <strong>+ root</strong> in the file explorer header, then select the additional folder in the browser and choose <strong>Add Root</strong>.</p>
 <p>Each Git root retains its own repository state. Check which root a change belongs to when staging, committing, or reviewing work. A multi-root project does not turn separate repositories into one repository.</p>
 <div class="callout"><p><strong>Roots and workbenches.</strong> Tyde prevents changing the folders of a workbench, or of a parent project that currently has workbenches. Finish and remove those workbenches before reorganizing the parent’s roots.</p></div>
-<h2 id="find-code">Find your way through the code</h2>
-<p>Use the file explorer to open files and the search tools to find relevant code. File tabs let you inspect the source while keeping the agent conversation close. For supported languages, code intelligence adds symbol information, navigation, and references.</p>
+<h2 id="find-code">Browse files and Git history</h2>
+<ol><li>Select the project, then open <strong>Files</strong> in the sidebar.</li><li>Expand a root and its folders, then select a file to open it in a file tab.</li><li>Use the file explorer’s hidden-files control if the file is not shown. Right-click a folder to search within it.</li><li>Use <strong>Search</strong> to locate relevant code, or return to the conversation tab to ask the agent about a file.</li></ol>
+<p>For supported languages, code intelligence adds symbol information, navigation, and references. See <a href="settings.html#code-intelligence">Code intelligence</a> for setup and language support.</p>
 <p>The Git panel gives you a second way into the project: select a changed file to understand what is different. Use <strong>Recent commits</strong> to inspect work already committed.</p>
-<h2 id="first-task">Give the project a first task</h2>
+<h2 id="first-task">Start a project agent</h2>
 <p>Begin with a request you can evaluate. Name the area of the project, describe the expected outcome, and tell the agent whether you want investigation or implementation.</p>
 <blockquote><p>Read this project and explain how the home page is assembled. Identify the files involved and suggest one small accessibility improvement. Wait for my decision before editing.</p></blockquote>
-<p>Follow the file references in the response. When you ask for a change, inspect the result in the Git panel and continue to <a href="review.html">Review the work</a>.</p>
+<p>Follow the file references in the response. When you ask for a change, inspect the result in the Git panel and continue to <a href="review.html">Git changes and review comments</a>.</p>

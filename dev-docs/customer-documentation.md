@@ -1,9 +1,19 @@
 # Customer documentation
 
-The customer entry points are `README.md` and the Tyde Book under `docs/`.
+The customer entry points are `README.md` and the Tyde User Guide under `docs/`.
 The book is a static site: no framework installation, third-party scripts,
 external fonts, or network-dependent content rendering. The repository edition
 is `docs/book.md`; the designed edition begins at `docs/index.html`.
+
+## Editorial scope
+
+The README introduces the product and explains why someone might choose it.
+The book is a user guide for someone who has already installed and opened Tyde.
+Explain what a feature does, where its controls are, how to use it, and what
+result to expect. Use exact UI labels, numbered procedures, and task examples.
+Do not lead chapters with benefits, slogans, installation instructions, or
+reasons to adopt the product. Screenshots should identify controls and state;
+animation should explain behavior, such as disconnecting from a remote host.
 
 ## Editing and rendering
 
