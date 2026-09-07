@@ -196,6 +196,35 @@ fn usable(value: &f64) -> bool {
     value.is_finite() && *value > 0.0
 }
 
+/// The tallest shell the root element can actually paint. `html` carries
+/// `overflow: hidden`, and CSS propagates a root overflow to the viewport, so
+/// the clip lands at the layout viewport no matter how tall the boxes beneath
+/// it grow — `body { height: auto }` makes the shell paintable *within* that
+/// box, it does not extend it. `clientHeight` is that box.
+fn paintable_height(root: &web_sys::HtmlElement) -> Option<f64> {
+    let height = f64::from(root.client_height());
+    usable(&height).then_some(height)
+}
+
+/// A published height past the root's clip box does not push the shell down to
+/// the screen edge; it pushes the shell's bottom chrome *out of the app*. The
+/// tab dock is the first casualty: it floats a fixed inset above the shell's
+/// bottom edge, so a shell that overshoots by more than that inset leaves the
+/// dock cut in half, with the root background showing through below it. The
+/// visual viewport reads taller than the layout viewport after a software
+/// keyboard closes, which is when the overshoot happens.
+///
+/// Clamping costs the standalone recovery nothing: a launch that lays out short
+/// only in `100dvh` still reports the full screen here, so the recovered height
+/// survives. Where the root box is short too, the recovered height was never
+/// paintable in the first place.
+fn clamp_to_paintable(published: f64, paintable: Option<f64>) -> f64 {
+    match paintable {
+        Some(limit) => published.min(limit),
+        None => published,
+    }
+}
+
 fn apply_app_height(window: &web_sys::Window) {
     let viewport = window.visual_viewport();
     let measured = viewport
@@ -245,12 +274,13 @@ fn apply_app_height(window: &web_sys::Window) {
     // standalone reason; in a browser the missing height belongs to chrome the
     // app must stay clear of, and with the keyboard up the measurement is the
     // whole point of this probe.
-    let published = match screen_size(window) {
+    let measured_or_recovered = match screen_size(window) {
         Some((screen_width, screen_height)) if !keyboard && is_standalone_display(window) => {
             recovered_standalone_height(height, width, screen_width, screen_height)
         }
         _ => height,
     };
+    let published = clamp_to_paintable(measured_or_recovered, paintable_height(&root));
     let _ = root
         .style()
         .set_property("--app-height", &format!("{published}px"));
@@ -304,6 +334,16 @@ fn viewport_metrics() -> String {
         .ok()
         .and_then(|screen| screen.height().ok())
         .unwrap_or(-1);
+    // The root's clip box. The one number that says which of the two viewport
+    // divergences a phone is actually hitting: equal to the screen means only
+    // `100dvh` measured short (the standalone defect, recovery survives the
+    // clamp), short of it means the layout viewport itself is short and the
+    // clamp is what keeps the tab dock on screen.
+    let client_height = window
+        .document()
+        .and_then(|document| document.document_element())
+        .map(|root| root.client_height())
+        .unwrap_or(-1);
     let standalone = is_standalone_display(&window);
     // What the shell was actually sized to, so a report from a phone says
     // whether the standalone recovery above fired and by how much.
@@ -315,7 +355,7 @@ fn viewport_metrics() -> String {
         .unwrap_or_default();
     format!(
         "viewport: inner_h={inner_height} visual_h={visual_height} screen_h={screen_height} \
-         standalone={standalone} app_height={app_height}"
+         client_h={client_height} standalone={standalone} app_height={app_height}"
     )
 }
 
@@ -361,6 +401,16 @@ mod wasm_tests {
     use wasm_bindgen_test::wasm_bindgen_test;
 
     wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
+
+    async fn next_tick() {
+        let promise = js_sys::Promise::new(&mut |resolve, _reject| {
+            web_sys::window()
+                .unwrap()
+                .set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, 0)
+                .unwrap();
+        });
+        let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+    }
 
     /// iPhone-ish numbers: a 393x852 portrait viewport and a ~336px keyboard.
     const WIDTH: f64 = 393.0;
@@ -491,5 +541,126 @@ mod wasm_tests {
             !keyboard_is_open(baseline, TALL),
             "the shell must return to full height once the keyboard closes"
         );
+    }
+
+    /// A measurement the root cannot paint is worse than useless: the shell
+    /// lays out past the clip and the bottom chrome leaves the app. Whatever
+    /// the standalone recovery asked for, the clip is the ceiling.
+    #[wasm_bindgen_test]
+    fn an_unpaintable_height_is_clamped_to_the_root() {
+        const CLIP: f64 = 793.0;
+        assert_eq!(
+            clamp_to_paintable(TALL, Some(CLIP)),
+            CLIP,
+            "a height past the root's clip must come back to the clip"
+        );
+        assert_eq!(
+            clamp_to_paintable(WITH_KEYBOARD, Some(CLIP)),
+            WITH_KEYBOARD,
+            "a height the root can paint must pass through untouched"
+        );
+        assert_eq!(
+            clamp_to_paintable(TALL, None),
+            TALL,
+            "a root that reports no usable box must not shrink the shell to nothing"
+        );
+    }
+
+    /// **A keyboard cycle must not leave the tab dock cut in half.**
+    ///
+    /// Closing the software keyboard can leave the visual viewport reading
+    /// taller than the box the root element can paint. The probe published that
+    /// measurement verbatim, the shell laid out past the root's clip, and the
+    /// dock — which floats a fixed inset above the shell's bottom edge — was
+    /// sliced through the middle, with root background showing below it.
+    ///
+    /// This proves the geometry, against the production stylesheet: overshoot
+    /// the root's clip and the dock cannot be reached; publish a height the
+    /// root can paint and all of it comes back. The arithmetic that keeps
+    /// `apply_app_height` on the paintable side is covered separately by
+    /// `an_unpaintable_height_is_clamped_to_the_root`.
+    ///
+    /// It deliberately stops short of driving `apply_app_height` itself. That
+    /// needs a document whose measured viewport exceeds its clip, and no
+    /// browser here can produce one: in standards mode `documentElement`'s
+    /// `clientHeight` *is* the viewport, so the two are equal by construction,
+    /// and the iframe that could be posed otherwise cannot be passed to the
+    /// probe at all — `dyn_into::<HtmlElement>` is an `instanceof` check
+    /// against the calling realm's constructor, and an iframe's
+    /// `documentElement` belongs to another realm. Only a device shows the
+    /// divergence this guards.
+    #[wasm_bindgen_test]
+    async fn an_overshooting_height_never_reaches_the_shell() {
+        // ── The defect, against the real stylesheet ──────────────────────
+        const CLIP: f64 = 700.0;
+        let document = web_sys::window().unwrap().document().unwrap();
+        let frame = document
+            .create_element("iframe")
+            .unwrap()
+            .dyn_into::<web_sys::HtmlIFrameElement>()
+            .unwrap();
+        frame
+            .set_attribute("style", "width:393px;height:793px;border:0")
+            .unwrap();
+        document.body().unwrap().append_child(&frame).unwrap();
+        let frame_document = frame.content_document().unwrap();
+        let style = frame_document.create_element("style").unwrap();
+        style.set_text_content(Some(&format!(
+            "{}\nhtml {{ height: {CLIP}px; }}",
+            include_str!("../styles.css")
+        )));
+        frame_document.head().unwrap().append_child(&style).unwrap();
+        let frame_root: web_sys::HtmlElement =
+            frame_document.document_element().unwrap().unchecked_into();
+        frame_root.set_attribute("data-theme", "dark").unwrap();
+        frame_document.body().unwrap().set_inner_html(
+            "<div class=\"mobile-app\">\
+               <div class=\"mobile-content\"><div class=\"view\"></div></div>\
+               <nav class=\"bottom-nav\" data-mobile-test=\"bottom-nav\">\
+                 <button class=\"nav-tab\">\
+                   <span class=\"nav-icon\">H</span><span class=\"nav-label\">Home</span>\
+                 </button>\
+               </nav>\
+             </div>",
+        );
+        next_tick().await;
+
+        let dock = frame_document
+            .query_selector("[data-mobile-test='bottom-nav']")
+            .unwrap()
+            .unwrap();
+        // Geometry alone still claims the dock is on screen; hit testing is
+        // what proves the lower half was clipped away.
+        let dock_is_reachable = || {
+            let rect = dock.get_bounding_client_rect();
+            frame_document
+                .element_from_point(
+                    (rect.x() + rect.width() / 2.0) as f32,
+                    (rect.bottom() - 6.0) as f32,
+                )
+                .is_some_and(|hit| dock.contains(Some(&hit)))
+        };
+
+        let frame_viewport = f64::from(frame_root.client_height());
+        frame_root
+            .style()
+            .set_property("--app-height", "852px")
+            .unwrap();
+        next_tick().await;
+        assert!(
+            !dock_is_reachable(),
+            "an overshooting height must reproduce the cut-off tab dock"
+        );
+
+        frame_root
+            .style()
+            .set_property("--app-height", &format!("{frame_viewport}px"))
+            .unwrap();
+        next_tick().await;
+        assert!(
+            dock_is_reachable(),
+            "a height the root can paint must put the whole dock back"
+        );
+        frame.remove();
     }
 }
