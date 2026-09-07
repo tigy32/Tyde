@@ -14322,21 +14322,11 @@ pre.tool-error-pre {
     padding: var(--space-3);
     background: var(--surface-1);
     border: 1px solid var(--border-primary);
-    border-left: 3px solid var(--border-secondary);
+    /* The edge names the backend, matching the sidebar rows, so a card is
+       identified by the same colour everywhere. Freshness and failure are
+       carried by the state word and its colour, not by this edge. */
+    border-left: 3px solid var(--sidebar-backend-color, var(--border-secondary));
     border-radius: 6px;
-}
-
-.capacity-card[data-capacity-state="known"] {
-    border-left-color: var(--success);
-}
-
-.capacity-card[data-capacity-state="stale"] {
-    border-left-color: var(--warning);
-}
-
-.capacity-card[data-capacity-state="auth-error"],
-.capacity-card[data-capacity-state="rate-limited"] {
-    border-left-color: var(--error);
 }
 
 .capacity-card-head {

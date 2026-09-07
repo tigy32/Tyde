@@ -624,6 +624,7 @@ fn snapshot_card(snapshot: &BackendCapacitySnapshot) -> AnyView {
         <div
             class="capacity-card"
             data-capacity-backend=format!("{kind:?}").to_lowercase()
+            data-sidebar-backend=backend_label(kind)
             data-capacity-state=slug
         >
             <div class="capacity-card-head">
@@ -1257,6 +1258,119 @@ mod wasm_tests {
             provide_context(state.clone());
             view! { <SubscriptionCapacitySection /> }
         })
+    }
+
+    /// A Usage card's left edge names its backend — the same colour the
+    /// sidebar paints that backend's rows — so one backend reads as one colour
+    /// everywhere in the app. The edge used to encode freshness instead (green
+    /// for a current read, orange once it aged), which taught a second colour
+    /// language on a page whose rows are one per backend, and duplicated
+    /// something the card already says in words.
+    #[wasm_bindgen_test]
+    async fn usage_card_edge_names_the_backend_not_the_freshness() {
+        let container = make_container();
+        let state = state_with_host("h-cap-color");
+        dispatch_capacity(
+            &state,
+            "h-cap-color",
+            0,
+            vec![codex_known(), claude_known()],
+        );
+        let mounted = state.clone();
+        let handle = mount_to(container.clone(), move || {
+            provide_context(mounted.clone());
+            view! {
+                <style>{include_str!("../../styles.css")}</style>
+                // The sidebar's own backend swatches: the colours the cards
+                // have to match, read from the same stylesheet the app ships.
+                <span
+                    class="backend-badge sidebar-backend-label swatch-codex"
+                    data-sidebar-backend="Codex"
+                >"Codex"</span>
+                <span
+                    class="backend-badge sidebar-backend-label swatch-claude"
+                    data-sidebar-backend="Claude"
+                >"Claude"</span>
+                <SubscriptionCapacitySection />
+            }
+        });
+        for _ in 0..4 {
+            next_tick().await;
+        }
+
+        let css = web_sys::window().unwrap();
+        let computed = |el: &HtmlElement, property: &str| -> String {
+            css.get_computed_style(el)
+                .unwrap()
+                .unwrap()
+                .get_property_value(property)
+                .unwrap()
+        };
+        let edge = |backend: &str| -> String {
+            let card = query(
+                &container,
+                &format!(".capacity-card[data-capacity-backend=\"{backend}\"]"),
+            )
+            .unwrap_or_else(|| panic!("{backend} must render a Usage card"));
+            computed(&card, "border-left-color")
+        };
+        let swatch = |backend: &str| -> String {
+            computed(
+                &query(&container, &format!(".swatch-{backend}")).unwrap(),
+                "color",
+            )
+        };
+
+        assert_eq!(
+            edge("codex"),
+            swatch("codex"),
+            "the Usage card edge must be the sidebar's colour for that backend"
+        );
+        assert_eq!(edge("claude"), swatch("claude"), "and for every backend");
+        assert_ne!(
+            edge("codex"),
+            edge("claude"),
+            "two backends must not share an edge colour"
+        );
+
+        // The same account, read an hour later. Freshness is what changed, so
+        // the words change and the identity colour does not.
+        let fresh_edge = edge("claude");
+        let mut aged = claude_known();
+        let BackendCapacityState::Known { report } = aged.state.clone() else {
+            unreachable!("claude_known is a Known report");
+        };
+        aged.state = BackendCapacityState::Stale {
+            report,
+            stale_since_ms: now_ms() - FRESHNESS_THRESHOLD_MS,
+            last_error: None,
+        };
+        aged.freshness = CapacityFreshness::Stale {
+            age_ms: FRESHNESS_THRESHOLD_MS + 60_000,
+            threshold_ms: FRESHNESS_THRESHOLD_MS,
+        };
+        dispatch_capacity(&state, "h-cap-color", 1, vec![codex_known(), aged]);
+        for _ in 0..4 {
+            next_tick().await;
+        }
+        assert!(
+            text_of(&container).to_lowercase().contains("stale"),
+            "the aged read must say so in words, got: {}",
+            text_of(&container)
+        );
+        assert_eq!(
+            edge("claude"),
+            fresh_edge,
+            "ageing a report must not repaint the backend's edge"
+        );
+        assert_eq!(
+            edge("claude"),
+            swatch("claude"),
+            "a stale card still carries its backend colour"
+        );
+
+        drop(handle);
+        container.remove();
     }
 
     /// The refresh action exists only where the server says this host can
