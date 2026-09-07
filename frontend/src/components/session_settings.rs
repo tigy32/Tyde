@@ -2533,6 +2533,7 @@ mod wasm_tests {
             },
             retrieved_at_ms: 0,
             freshness: protocol::CapacityFreshness::Fresh { age_ms: 0 },
+            refreshable: true,
         };
         let envelope = Envelope::from_payload(
             StreamPath(format!("/host/{host_id}")),

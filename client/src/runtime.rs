@@ -331,6 +331,13 @@ impl HostCommands {
         self.send(FrameKind::TeamMemberShuffle, &payload).await
     }
 
+    pub async fn backend_capacity_refresh(
+        &self,
+        payload: protocol::BackendCapacityRefreshPayload,
+    ) -> Result<(), ClientError> {
+        self.send(FrameKind::BackendCapacityRefresh, &payload).await
+    }
+
     pub async fn workflow_refresh(&self) -> Result<(), ClientError> {
         self.send(
             FrameKind::WorkflowRefresh,

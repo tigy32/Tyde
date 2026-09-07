@@ -706,6 +706,80 @@ pub(crate) struct KiroToolContext {
     pending_completion: Option<PendingToolCompletion>,
 }
 
+/// Runs an ACP agent's read-only usage command as a standalone process.
+///
+/// The command prints subscription usage and exits; it starts no session and no
+/// model turn, so this is safe to call with no live agent.
+pub(crate) async fn read_capacity_from_spec(
+    spec: &AcpSpawnSpec,
+    ssh_host: Option<&str>,
+) -> BackendCapacityState {
+    let output = if let Some(host) = ssh_host {
+        let mut parts = Vec::new();
+        if let Some(cwd) = spec.remote_cwd.as_deref() {
+            parts.push(format!("cd {} &&", crate::remote::shell_quote_arg(cwd)));
+        }
+        parts.push(crate::remote::shell_quote_command(&spec.remote_args));
+        tokio::time::timeout(
+            ACP_CAPACITY_TIMEOUT,
+            crate::remote::run_ssh_raw(host, &parts.join(" ")),
+        )
+        .await
+        .map_err(|_| CapacityUnavailableReason::SourceTimedOut)
+        .and_then(|result| result.map_err(|_| CapacityUnavailableReason::SourceUnreachable))
+    } else {
+        let mut command = match crate::process_env::command(&spec.local_program) {
+            Ok(command) => command,
+            Err(_) => {
+                return BackendCapacityState::Unavailable {
+                    reason: CapacityUnavailableReason::SourceUnreachable,
+                };
+            }
+        };
+        command.args(&spec.local_args);
+        if let Some(cwd) = spec.local_cwd.as_deref() {
+            command.current_dir(cwd);
+        }
+        if let Some(path) = process_env::resolved_child_process_path() {
+            command.env("PATH", path);
+        }
+        command
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            // A timeout drops the `output()` future, which does not reap the
+            // child unless it is killed on drop. Without this a hung usage
+            // command outlives every probe that gives up on it, and the poll
+            // runs on a timer.
+            .kill_on_drop(true);
+        tokio::time::timeout(ACP_CAPACITY_TIMEOUT, command.output())
+            .await
+            .map_err(|_| CapacityUnavailableReason::SourceTimedOut)
+            .and_then(|result| result.map_err(|_| CapacityUnavailableReason::SourceUnreachable))
+    };
+    let output = match output {
+        Ok(output) => output,
+        Err(reason) => return BackendCapacityState::Unavailable { reason },
+    };
+    let mut capture = String::from_utf8_lossy(&output.stdout).into_owned();
+    capture.push('\n');
+    capture.push_str(&String::from_utf8_lossy(&output.stderr));
+    tracing::debug!(
+        success = output.status.success(),
+        output_bytes = capture.len(),
+        "Kiro usage probe completed"
+    );
+    if !output.status.success() {
+        return BackendCapacityState::Unavailable {
+            reason: CapacityUnavailableReason::SourceUnreachable,
+        };
+    }
+    match map_kiro_capacity(&capture) {
+        Ok(report) => BackendCapacityState::Known { report },
+        Err(reason) => BackendCapacityState::Unavailable { reason },
+    }
+}
+
 fn kiro_is_startup_mcp_tool(tool_name: &str, servers: &[StartupMcpServer]) -> bool {
     servers.iter().any(|server| {
         let marker = format!("@{}/", server.name);
@@ -806,65 +880,7 @@ impl KiroInner {
                 reason: protocol::CapacityUnsupportedReason::ExternalProvider,
             };
         };
-        let output = if let Some(host) = self.ssh_host.as_deref() {
-            let mut parts = Vec::new();
-            if let Some(cwd) = spec.remote_cwd.as_deref() {
-                parts.push(format!("cd {} &&", crate::remote::shell_quote_arg(cwd)));
-            }
-            parts.push(crate::remote::shell_quote_command(&spec.remote_args));
-            tokio::time::timeout(
-                ACP_CAPACITY_TIMEOUT,
-                crate::remote::run_ssh_raw(host, &parts.join(" ")),
-            )
-            .await
-            .map_err(|_| CapacityUnavailableReason::SourceTimedOut)
-            .and_then(|result| result.map_err(|_| CapacityUnavailableReason::SourceUnreachable))
-        } else {
-            let mut command = match crate::process_env::command(&spec.local_program) {
-                Ok(command) => command,
-                Err(_) => {
-                    return BackendCapacityState::Unavailable {
-                        reason: CapacityUnavailableReason::SourceUnreachable,
-                    };
-                }
-            };
-            command.args(&spec.local_args);
-            if let Some(cwd) = spec.local_cwd.as_deref() {
-                command.current_dir(cwd);
-            }
-            if let Some(path) = process_env::resolved_child_process_path() {
-                command.env("PATH", path);
-            }
-            command
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped());
-            tokio::time::timeout(ACP_CAPACITY_TIMEOUT, command.output())
-                .await
-                .map_err(|_| CapacityUnavailableReason::SourceTimedOut)
-                .and_then(|result| result.map_err(|_| CapacityUnavailableReason::SourceUnreachable))
-        };
-        let output = match output {
-            Ok(output) => output,
-            Err(reason) => return BackendCapacityState::Unavailable { reason },
-        };
-        let mut capture = String::from_utf8_lossy(&output.stdout).into_owned();
-        capture.push('\n');
-        capture.push_str(&String::from_utf8_lossy(&output.stderr));
-        tracing::debug!(
-            success = output.status.success(),
-            output_bytes = capture.len(),
-            "Kiro usage probe completed"
-        );
-        if !output.status.success() {
-            return BackendCapacityState::Unavailable {
-                reason: CapacityUnavailableReason::SourceUnreachable,
-            };
-        }
-        match map_kiro_capacity(&capture) {
-            Ok(report) => BackendCapacityState::Known { report },
-            Err(reason) => BackendCapacityState::Unavailable { reason },
-        }
+        read_capacity_from_spec(spec, self.ssh_host.as_deref()).await
     }
 
     async fn read_grok_capacity(&self) -> BackendCapacityState {
@@ -4320,6 +4336,82 @@ fn session_settings_schema_from_known_options(
 /// has to be probed separately — `agent` selects which one. `None` probes the
 /// built-in Kiro agent, optionally with `program_override` pointing at a
 /// different binary (used by tests and the Kiro probe-path setting).
+/// Reads Kiro's account capacity with no conversation and no live agent.
+///
+/// `kiro-cli-chat … /usage` prints subscription credits and exits without
+/// starting a model turn, so this only needs a working directory to run in.
+pub(crate) async fn read_kiro_capacity_out_of_band(
+    workspace_roots: &[String],
+    agent: Option<&protocol::AcpAgentSpec>,
+    program_override: Option<String>,
+) -> BackendCapacityState {
+    let adapter = match agent {
+        Some(spec) => adapter_for_spec(spec),
+        None => kiro_adapter(program_override),
+    };
+    let roots = match adapter
+        .resolve_roots(
+            workspace_roots,
+            None,
+            AcpSessionKind {
+                admin_session: true,
+                ephemeral: true,
+            },
+        )
+        .await
+    {
+        Ok(roots) => roots,
+        Err(error) => {
+            tracing::debug!("Kiro capacity probe could not resolve a working directory: {error}");
+            return BackendCapacityState::Unavailable {
+                reason: CapacityUnavailableReason::SourceUnreachable,
+            };
+        }
+    };
+    let Some(spec) = adapter.capacity_probe_spec(&roots) else {
+        return BackendCapacityState::Unsupported {
+            reason: protocol::CapacityUnsupportedReason::ExternalProvider,
+        };
+    };
+    read_capacity_from_spec(&spec, None).await
+}
+
+/// Reads Grok's account capacity with no conversation and no live agent.
+///
+/// `_x.ai/billing` takes no `sessionId` — it is a connection-scoped account
+/// read, unlike `_x.ai/session/usage` — so an ephemeral admin connection
+/// answers it. Admin sessions are excluded from `session/list`, so the probe
+/// never surfaces as a user-visible conversation, and it sends no prompt, so it
+/// spends no tokens.
+pub(crate) async fn read_grok_capacity_out_of_band(
+    workspace_roots: &[String],
+    agent: Option<&protocol::AcpAgentSpec>,
+) -> BackendCapacityState {
+    let adapter = match agent {
+        Some(spec) => adapter_for_spec(spec),
+        None => adapter_for_spec(&crate::backend::grok::agent_spec()),
+    };
+    let deadline = tokio::time::Instant::now() + KIRO_SCHEMA_PROBE_TIMEOUT;
+    let (session, _raw_events) =
+        match KiroSession::spawn_schema_probe(workspace_roots, adapter, deadline).await {
+            Ok(spawned) => spawned,
+            Err(error) => {
+                tracing::debug!("Grok capacity probe failed to start: {error}");
+                return BackendCapacityState::Unavailable {
+                    reason: CapacityUnavailableReason::SourceUnreachable,
+                };
+            }
+        };
+    let capacity = session.inner.read_grok_capacity().await;
+    if tokio::time::timeout(KIRO_SCHEMA_PROBE_SHUTDOWN_TIMEOUT, session.shutdown())
+        .await
+        .is_err()
+    {
+        tracing::debug!("Grok capacity probe shutdown timed out");
+    }
+    capacity
+}
+
 pub(crate) async fn probe_session_settings_schema(
     workspace_roots: &[String],
     program_override: Option<String>,
@@ -5072,6 +5164,7 @@ impl Backend for KiroBackend {
             tyde_agent_adapter::BackendCapability::GenericWebSearch,
             tyde_agent_adapter::BackendCapability::GenericViewImage,
             tyde_agent_adapter::BackendCapability::CapacityTelemetry,
+            tyde_agent_adapter::BackendCapability::OutOfBandCapacity,
         ]
         .into()
     }

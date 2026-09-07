@@ -4,7 +4,10 @@
 //! Everything here is a pure projection of `state.backend_capacity`, which the
 //! server replays on host-stream subscribe and re-emits on every change. The
 //! frontend runs no freshness clock (staleness is `CapacityFreshness`, computed
-//! server-side), keeps no cache, infers nothing, and offers no refresh action.
+//! server-side), keeps no cache, and infers nothing. The refresh action asks the
+//! server to collect now; it never reads a provider itself, and it is offered
+//! only where the server says this host has an out-of-band source
+//! (`BackendCapacitySnapshot::refreshable`), so there is never a dead button.
 //!
 //! Two rules keep this honest and are load-bearing:
 //!
@@ -21,6 +24,7 @@
 //!    accessible text never combines the two.
 
 use leptos::prelude::*;
+use leptos::task::spawn_local;
 use protocol::{
     BackendCapacitySnapshot, BackendCapacityState, BackendKind, CapacityBucket, CapacityBucketId,
     CapacityBucketStatus, CapacityCoverage, CapacityErrorCode, CapacityFreshness, CapacityMeasure,
@@ -281,9 +285,22 @@ fn state_explanation(state: &BackendCapacityState, kind: BackendKind) -> Option<
     let vendor = backend_label(kind);
     match state {
         BackendCapacityState::Known { .. } => None,
-        BackendCapacityState::Stale { .. } => Some(format!(
-            "This {vendor} figure is stale and will update when the backend reports capacity again."
-        )),
+        // A stale report that carries an error is a *failed refresh*, not an
+        // aged-out one, and saying so is the difference between "this number is
+        // old" and "this number is old because collection is broken". The
+        // figures stay on screen either way: erasing them on a failed poll
+        // would render as no capacity data at all.
+        BackendCapacityState::Stale { last_error, .. } => Some(match last_error {
+            Some(detail) => format!(
+                "This {vendor} figure is the last successful report. Refreshing it failed: {} ({}).",
+                detail.summary,
+                error_code_text(detail.code)
+            ),
+            None => format!(
+                "This {vendor} figure is stale and will update when the backend reports capacity \
+                 again."
+            ),
+        }),
         BackendCapacityState::Unavailable { reason } => Some(match reason {
             CapacityUnavailableReason::AwaitingFirstReport => format!(
                 "No report from {vendor} yet. This is not zero usage \u{2014} nothing has been reported."
@@ -303,6 +320,9 @@ fn state_explanation(state: &BackendCapacityState, kind: BackendKind) -> Option<
             }
         }),
         BackendCapacityState::Unsupported { reason } => Some(match reason {
+            CapacityUnsupportedReason::BackendNotInstalled => format!(
+                "{vendor} is not installed on this host, so there is no account to read quota from."
+            ),
             CapacityUnsupportedReason::BackendHasNoCapacitySource => {
                 format!("{vendor} exposes no capacity source, so no quota can be shown.")
             }
@@ -346,6 +366,8 @@ fn error_code_text(code: CapacityErrorCode) -> &'static str {
         CapacityErrorCode::SourceRejected => "source rejected the request",
         CapacityErrorCode::RateLimited => "rate limited",
         CapacityErrorCode::MalformedResponse => "malformed response",
+        CapacityErrorCode::SourceUnreachable => "source unreachable",
+        CapacityErrorCode::SourceTimedOut => "source timed out",
     }
 }
 
@@ -596,6 +618,7 @@ fn snapshot_card(snapshot: &BackendCapacitySnapshot) -> AnyView {
     let freshness = freshness_text(&snapshot.freshness);
     let retrieved = format_absolute_utc(snapshot.retrieved_at_ms);
     let slug = state_slug(state);
+    let refreshable = snapshot.refreshable;
 
     view! {
         <div
@@ -606,6 +629,16 @@ fn snapshot_card(snapshot: &BackendCapacitySnapshot) -> AnyView {
             <div class="capacity-card-head">
                 <span class="capacity-backend">{backend_label(kind)}</span>
                 <span class="capacity-state" data-capacity-state=slug>{headline}</span>
+                {refreshable.then(|| view! {
+                    <button
+                        class="capacity-refresh"
+                        type="button"
+                        title="Read this backend's account quota now"
+                        on:click=move |_| request_capacity_refresh(kind)
+                    >
+                        "Refresh"
+                    </button>
+                })}
             </div>
 
             <div class="capacity-card-meta">
@@ -645,6 +678,28 @@ fn snapshot_card(snapshot: &BackendCapacitySnapshot) -> AnyView {
         </div>
     }
     .into_any()
+}
+
+/// Asks the server to collect this backend's capacity now.
+///
+/// The server owns collection entirely: this sends a request and renders
+/// whatever snapshot comes back. A refresh landing while a poll is already in
+/// flight coalesces into it server-side rather than starting a second provider
+/// process, so repeated clicking cannot stack up work.
+fn request_capacity_refresh(kind: BackendKind) {
+    let state = expect_context::<AppState>();
+    let Some(host_id) = state.selected_host_id.get_untracked() else {
+        return;
+    };
+    let Some(host_stream) = state.host_stream_untracked(&host_id) else {
+        return;
+    };
+    spawn_local(async move {
+        if let Err(error) = crate::send::backend_capacity_refresh(&host_id, host_stream, kind).await
+        {
+            log::error!("failed to send BackendCapacityRefresh for {kind:?}: {error}");
+        }
+    });
 }
 
 /// The full authoritative Settings view: every backend the selected host
@@ -1061,6 +1116,7 @@ mod wasm_tests {
             },
             retrieved_at_ms: now_ms(),
             freshness: fresh(),
+            refreshable: true,
         }
     }
 
@@ -1098,6 +1154,7 @@ mod wasm_tests {
             },
             retrieved_at_ms: now_ms(),
             freshness: fresh(),
+            refreshable: true,
         }
     }
 
@@ -1177,6 +1234,7 @@ mod wasm_tests {
             },
             retrieved_at_ms: now_ms(),
             freshness: fresh(),
+            refreshable: true,
         }
     }
 
@@ -1190,6 +1248,7 @@ mod wasm_tests {
             state,
             retrieved_at_ms: now_ms(),
             freshness,
+            refreshable: true,
         }
     }
 
@@ -1198,6 +1257,101 @@ mod wasm_tests {
             provide_context(state.clone());
             view! { <SubscriptionCapacitySection /> }
         })
+    }
+
+    /// The refresh action exists only where the server says this host can
+    /// actually collect. A button that cannot do anything is worse than no
+    /// button: it invites a click and then reports nothing.
+    #[wasm_bindgen_test]
+    async fn refresh_is_offered_only_where_the_server_can_collect() {
+        let container = make_container();
+        let state = state_with_host("h-cap-refresh");
+        let mut pollable = codex_known();
+        pollable.refreshable = true;
+        let mut silent = snapshot_with_state(
+            BackendKind::Hermes,
+            BackendCapacityState::Unsupported {
+                reason: CapacityUnsupportedReason::BackendHasNoCapacitySource,
+            },
+            fresh(),
+        );
+        silent.refreshable = false;
+        dispatch_capacity(&state, "h-cap-refresh", 0, vec![pollable, silent]);
+        let _handle = mount_settings(&container, state);
+        for _ in 0..4 {
+            next_tick().await;
+        }
+
+        assert_eq!(
+            count(
+                &container,
+                ".capacity-card[data-capacity-backend=\"codex\"] .capacity-refresh"
+            ),
+            1,
+            "a backend the host can read must offer refresh"
+        );
+        assert_eq!(
+            count(
+                &container,
+                ".capacity-card[data-capacity-backend=\"hermes\"] .capacity-refresh"
+            ),
+            0,
+            "a backend with no source must not offer a dead refresh button"
+        );
+    }
+
+    /// A failed refresh keeps the figures on screen and says what went wrong.
+    ///
+    /// The failure mode this guards is the reverse: dropping to a state with no
+    /// report, which renders as "no capacity data" even though the host still
+    /// holds a real, recent reading. It must also read as a *failure*, not as
+    /// the ordinary ageing a stale report without an error describes.
+    #[wasm_bindgen_test]
+    async fn a_failed_refresh_keeps_the_figures_and_names_the_error() {
+        let container = make_container();
+        let state = state_with_host("h-cap-refresh-failed");
+        let BackendCapacityState::Known { report } = claude_known().state else {
+            unreachable!("claude_known is Known")
+        };
+        dispatch_capacity(
+            &state,
+            "h-cap-refresh-failed",
+            0,
+            vec![snapshot_with_state(
+                BackendKind::Claude,
+                BackendCapacityState::Stale {
+                    report,
+                    stale_since_ms: now_ms(),
+                    last_error: Some(protocol::CapacityErrorDetail {
+                        summary: "The provider status source timed out".to_owned(),
+                        code: CapacityErrorCode::SourceTimedOut,
+                    }),
+                },
+                CapacityFreshness::Stale {
+                    age_ms: 2 * FRESHNESS_THRESHOLD_MS,
+                    threshold_ms: FRESHNESS_THRESHOLD_MS,
+                },
+            )],
+        );
+        let _handle = mount_settings(&container, state);
+        for _ in 0..4 {
+            next_tick().await;
+        }
+
+        let text = text_of(&container);
+        assert!(
+            text.contains("82% used"),
+            "a failed refresh must keep the last good figure: {text}"
+        );
+        assert!(
+            text.contains("The provider status source timed out")
+                && text.contains("source timed out"),
+            "a failed refresh must say what failed: {text}"
+        );
+        assert!(
+            text.contains("last successful report"),
+            "the figure must read as the last good one, not a current reading: {text}"
+        );
     }
 
     /// Settings renders one row per vendor bucket, with each bucket's own unit,
@@ -1730,6 +1884,7 @@ mod wasm_tests {
                 BackendCapacityState::Stale {
                     report,
                     stale_since_ms: now_ms(),
+                    last_error: None,
                 },
                 CapacityFreshness::Stale {
                     age_ms: 2 * FRESHNESS_THRESHOLD_MS,
@@ -1883,11 +2038,21 @@ mod wasm_tests {
             !text.contains("82% used"),
             "the superseded figure must be gone, got: {text}"
         );
-        // Capacity refresh is backend-owned; the frontend never invents a
-        // refresh action or fetch path of its own.
+        // Collection stays server-owned. The refresh control exists now, but it
+        // only *asks* the server to collect — the frontend has no fetch path of
+        // its own and cannot produce a figure the server did not send. Clicking
+        // it must therefore change nothing on screen until a frame arrives,
+        // which is a stronger statement than the button simply being absent.
+        let refresh = query(&container, ".capacity-refresh")
+            .expect("a refreshable backend offers the control");
+        refresh.click();
+        for _ in 0..4 {
+            next_tick().await;
+        }
+        let after_click = text_of(&container);
         assert!(
-            query(&container, "button").is_none(),
-            "the frontend must not offer its own refresh button"
+            after_click.contains("95% used") && !after_click.contains("82% used"),
+            "a refresh click must not invent or roll back a figure, got: {after_click}"
         );
     }
 }

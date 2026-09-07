@@ -216,6 +216,7 @@ exhaustive_certification_cases! {
     AgentInitiatedTurnIsDistinct,
     AgentInitiatedResultDelivered,
     CapacityLifecycleMatrix,
+    CapacityWithoutConversation,
     BackendSetupDiscoveryMatrix,
     DynamicSessionDiscoveryMatrix,
     BackendNativeConfigDiscoveryMatrix,
@@ -433,6 +434,7 @@ impl CertificationCase {
             Self::AgentInitiatedTurnIsDistinct => "agent_initiated_turn_is_distinct",
             Self::AgentInitiatedResultDelivered => "agent_initiated_result_delivered",
             Self::CapacityLifecycleMatrix => "capacity_lifecycle_matrix",
+            Self::CapacityWithoutConversation => "capacity_without_conversation",
             Self::BackendSetupDiscoveryMatrix => "backend_setup_discovery_matrix",
             Self::DynamicSessionDiscoveryMatrix => "dynamic_session_discovery_matrix",
             Self::BackendNativeConfigDiscoveryMatrix => "backend_native_config_discovery_matrix",
@@ -568,6 +570,7 @@ impl CertificationCase {
             | Self::LiveCustomizationMatrix
             | Self::SkillLifecycleMatrix
             | Self::CapacityLifecycleMatrix
+            | Self::CapacityWithoutConversation
             | Self::BackendSetupDiscoveryMatrix
             | Self::DynamicSessionDiscoveryMatrix
             | Self::BackendNativeConfigDiscoveryMatrix => CertificationTier::StatefulLive,
@@ -800,6 +803,7 @@ impl CertificationCase {
                 &[Capability::AgentInitiatedTurns, Capability::BackgroundTasks]
             }
             Self::CapacityLifecycleMatrix => &[Capability::CapacityTelemetry],
+            Self::CapacityWithoutConversation => &[Capability::OutOfBandCapacity],
             _ => &[],
         }
     }

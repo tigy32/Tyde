@@ -743,6 +743,13 @@ pub(crate) struct HostState {
     backend_config_snapshots: Vec<BackendConfigSnapshot>,
     backend_native_settings_snapshots: Vec<BackendNativeSettingsSnapshot>,
     backend_capacity: HashMap<BackendKind, BackendCapacitySnapshot>,
+    /// Backends with a capacity poll in flight. Single-flight is what keeps a
+    /// manual refresh from spawning a second provider process alongside a
+    /// scheduled poll already running.
+    capacity_polls_in_flight: HashSet<BackendKind>,
+    /// Set once the capacity poll loops have been started, so repeat host-stream
+    /// registrations do not start a second set.
+    capacity_polling_started: bool,
     backend_setup: BackendSetupPayload,
     antigravity_conversations_dir: PathBuf,
     codex_probe_program: Option<String>,
@@ -993,7 +1000,7 @@ impl SpawnOperationTerminalClaim {
     }
 }
 
-struct WeakHostHandle {
+pub(crate) struct WeakHostHandle {
     state: Weak<Mutex<HostState>>,
     workflow_save_lock: Weak<Mutex<()>>,
     backend_setup_refresh_lock: Weak<Mutex<()>>,
@@ -1003,7 +1010,18 @@ struct WeakHostHandle {
 }
 
 impl WeakHostHandle {
-    fn upgrade(&self) -> Option<HostHandle> {
+    pub(crate) fn downgrade(host: &HostHandle) -> Self {
+        Self {
+            state: Arc::downgrade(&host.state),
+            workflow_save_lock: Arc::downgrade(&host.workflow_save_lock),
+            backend_setup_refresh_lock: Arc::downgrade(&host.backend_setup_refresh_lock),
+            session_schema_refresh_lock: Arc::downgrade(&host.session_schema_refresh_lock),
+            settings_apply_lock: Arc::downgrade(&host.settings_apply_lock),
+            spawn_operations: host.spawn_operations.clone(),
+        }
+    }
+
+    pub(crate) fn upgrade(&self) -> Option<HostHandle> {
         Some(HostHandle {
             state: self.state.upgrade()?,
             workflow_save_lock: self.workflow_save_lock.upgrade()?,
@@ -2344,6 +2362,13 @@ impl HostHandle {
         let backend_setup = self.collect_backend_setup_respecting_probe().await;
         let mut state = self.state.lock().await;
         state.backend_setup = backend_setup.clone();
+        // Backend discovery has now run at least once, which is the earliest
+        // point the poller can tell an installed backend from a missing one.
+        if !std::mem::replace(&mut state.capacity_polling_started, true) {
+            // Non-blocking: the spawned task takes the state lock itself, after
+            // this one is released.
+            spawn_capacity_poll_loops(self.clone());
+        }
         let host_path = host_stream.path().clone();
 
         let previous = state.host_streams.insert(
@@ -13960,6 +13985,8 @@ fn spawn_host_inner(
             backend_config_snapshots: Vec::new(),
             backend_native_settings_snapshots: Vec::new(),
             backend_capacity: initial_backend_capacity_snapshots(),
+            capacity_polls_in_flight: HashSet::new(),
+            capacity_polling_started: false,
             backend_setup: setup::stub_backend_setup(),
             antigravity_conversations_dir,
             codex_probe_program: runtime_config.codex_probe_program.clone(),
@@ -14827,6 +14854,59 @@ async fn finish_activity_summary_call(
                 .await;
         }
     }
+}
+
+/// Starts one capacity poll loop per installed pollable backend.
+///
+/// Runs whether or not any agent exists: a backend nobody has talked to is
+/// exactly the case this exists to cover. Discovery is deferred into the task
+/// because `collect_backend_setup` probes real CLIs and must not block startup.
+/// Starts one capacity poll loop per installed pollable backend.
+///
+/// Called once backend discovery has actually run, not at host construction:
+/// `backend_setup` is populated when the first host stream registers, and a
+/// poller that reads it earlier sees an empty list and concludes nothing is
+/// installed. Runs whether or not any agent exists — a backend nobody has
+/// talked to is exactly the case this covers.
+fn spawn_capacity_poll_loops(host: HostHandle) {
+    tokio::spawn(async move {
+        // A host configured not to run real backend processes cannot learn what
+        // is installed, so it must not poll and must not claim anything is
+        // missing. The seeded `AwaitingFirstReport` is the honest state there.
+        if host.capacity_probe_context().await.is_none() {
+            tracing::debug!("backend probing is disabled; capacity polling is off");
+            return;
+        }
+        let installed = host.installed_backend_kinds().await;
+        // A backend that reports capacity when installed, but is not installed
+        // here, is neither awaiting a first report nor sourceless. Saying so
+        // keeps the UI from showing a permanent "no report yet" for a CLI the
+        // user has never installed.
+        for backend_kind in crate::capacity_poll::uninstalled_capacity_backends(&installed) {
+            host.record_backend_capacity(
+                backend_kind,
+                BackendCapacityState::Unsupported {
+                    reason: protocol::CapacityUnsupportedReason::BackendNotInstalled,
+                },
+            )
+            .await;
+        }
+        let pollable = crate::capacity_poll::pollable_backends(&installed);
+        if pollable.is_empty() {
+            tracing::debug!("no installed backend can report capacity out of band");
+            return;
+        }
+        tracing::info!(?pollable, "starting subscription capacity polling");
+        for backend_kind in pollable {
+            // Weak on purpose. A poll loop runs for the life of the host, so a
+            // strong handle would keep every host it ever started alive — and
+            // keep spawning provider processes for hosts nobody is using.
+            tokio::spawn(crate::capacity_poll::run_backend_poll_loop(
+                WeakHostHandle::downgrade(&host),
+                backend_kind,
+            ));
+        }
+    });
 }
 
 fn spawn_host_capacity_task(host: HostHandle, mut rx: HostCapacityRx) {
@@ -17957,6 +18037,98 @@ async fn fan_out_backend_config_snapshots(state: &mut HostState, force_emit: boo
     }
 }
 
+/// The server's freshness verdict is the only one; clients render it verbatim.
+pub(crate) const CAPACITY_FRESHNESS_THRESHOLD_MS: u64 = 60 * 60 * 1000;
+
+/// Decides what a newly collected capacity state actually becomes.
+///
+/// A failed refresh over a report we already hold degrades to `Stale` carrying
+/// that report and the error, rather than replacing it with `Unavailable`. The
+/// stored `retrieved_at_ms` stays at the original collection time, so a backend
+/// failing every retry reports its true age instead of resetting to "just now"
+/// on each failure.
+///
+/// `Unsupported` is never absorbed this way: it is a real retraction of the
+/// source, not a transient failure, and hiding it behind an old report would
+/// keep showing numbers for a backend that has stopped reporting.
+fn resolve_recorded_capacity(
+    current: Option<&BackendCapacitySnapshot>,
+    incoming: BackendCapacityState,
+    now_ms: u64,
+) -> (BackendCapacityState, u64, protocol::CapacityFreshness) {
+    let fresh = (
+        incoming.clone(),
+        now_ms,
+        protocol::CapacityFreshness::Fresh { age_ms: 0 },
+    );
+    let Some(detail) = transient_capacity_failure(&incoming) else {
+        return fresh;
+    };
+    let Some(current) = current else {
+        return fresh;
+    };
+    let held = match &current.state {
+        BackendCapacityState::Known { report } => report.clone(),
+        BackendCapacityState::Stale { report, .. } => report.clone(),
+        _ => return fresh,
+    };
+    let stale_since_ms = match &current.state {
+        BackendCapacityState::Stale { stale_since_ms, .. } => *stale_since_ms,
+        _ => now_ms,
+    };
+    (
+        BackendCapacityState::Stale {
+            report: held,
+            stale_since_ms,
+            last_error: Some(detail),
+        },
+        current.retrieved_at_ms,
+        protocol::CapacityFreshness::Stale {
+            age_ms: now_ms.saturating_sub(current.retrieved_at_ms),
+            threshold_ms: CAPACITY_FRESHNESS_THRESHOLD_MS,
+        },
+    )
+}
+
+/// A failure that says "could not read right now", as opposed to a report, an
+/// uninterpretable answer, or a statement that this backend has no source.
+/// Summaries are curated here rather than echoed from a provider, so vendor
+/// error text cannot reach a UI.
+fn transient_capacity_failure(
+    state: &BackendCapacityState,
+) -> Option<protocol::CapacityErrorDetail> {
+    match state {
+        BackendCapacityState::Unavailable { reason } => match reason {
+            protocol::CapacityUnavailableReason::SourceUnreachable => {
+                Some(protocol::CapacityErrorDetail {
+                    summary: "The provider status source could not be reached".to_owned(),
+                    code: protocol::CapacityErrorCode::SourceUnreachable,
+                })
+            }
+            protocol::CapacityUnavailableReason::SourceTimedOut => {
+                Some(protocol::CapacityErrorDetail {
+                    summary: "The provider status source timed out".to_owned(),
+                    code: protocol::CapacityErrorCode::SourceTimedOut,
+                })
+            }
+            // Deliberately *not* absorbed. Unreachable and timed-out mean no
+            // answer arrived, so the last good number is still the best
+            // available. Malformed means an answer arrived and could not be
+            // interpreted — evidence the source itself has changed under us.
+            // Keeping an older figure alive on top of that would hide a real
+            // breakage behind a number that still looks like a reading.
+            protocol::CapacityUnavailableReason::MalformedReport => None,
+            // Not a failure: nothing has been collected yet.
+            protocol::CapacityUnavailableReason::AwaitingFirstReport => None,
+        },
+        BackendCapacityState::AuthError { detail } => Some(detail.clone()),
+        BackendCapacityState::RateLimited { detail, .. } => Some(detail.clone()),
+        BackendCapacityState::Known { .. }
+        | BackendCapacityState::Stale { .. }
+        | BackendCapacityState::Unsupported { .. } => None,
+    }
+}
+
 fn initial_backend_capacity_snapshots() -> HashMap<BackendKind, BackendCapacitySnapshot> {
     const BACKENDS: [BackendKind; 7] = [
         BackendKind::Kiro,
@@ -17970,15 +18142,20 @@ fn initial_backend_capacity_snapshots() -> HashMap<BackendKind, BackendCapacityS
     BACKENDS
         .into_iter()
         .map(|backend_kind| {
-            let state = match backend_kind {
-                BackendKind::Kiro | BackendKind::Claude | BackendKind::Codex => {
-                    BackendCapacityState::Unavailable {
-                        reason: protocol::CapacityUnavailableReason::AwaitingFirstReport,
-                    }
+            // Derived from the declared capability, not a hardcoded list: a
+            // backend that reports capacity must never seed as `Unsupported`,
+            // which renders as "this backend has no source" and is a lie the
+            // first poll would then have to undo.
+            let state = if crate::backend::capabilities_for_backend_kind(backend_kind)
+                .contains(tyde_agent_adapter::BackendCapability::CapacityTelemetry)
+            {
+                BackendCapacityState::Unavailable {
+                    reason: protocol::CapacityUnavailableReason::AwaitingFirstReport,
                 }
-                _ => BackendCapacityState::Unsupported {
+            } else {
+                BackendCapacityState::Unsupported {
                     reason: protocol::CapacityUnsupportedReason::BackendHasNoCapacitySource,
-                },
+                }
             };
             (
                 backend_kind,
@@ -17987,6 +18164,7 @@ fn initial_backend_capacity_snapshots() -> HashMap<BackendKind, BackendCapacityS
                     state,
                     retrieved_at_ms: capacity_now_ms(),
                     freshness: protocol::CapacityFreshness::Fresh { age_ms: 0 },
+                    refreshable: crate::backend::supports_out_of_band_capacity(backend_kind),
                 },
             )
         })
@@ -18002,14 +18180,19 @@ fn backend_capacity_snapshots(state: &HostState) -> Vec<BackendCapacitySnapshot>
         .map(|mut snapshot| {
             let age_ms = now.saturating_sub(snapshot.retrieved_at_ms);
             match &snapshot.state {
-                BackendCapacityState::Known { report } if age_ms >= 60 * 60 * 1000 => {
+                BackendCapacityState::Known { report }
+                    if age_ms >= CAPACITY_FRESHNESS_THRESHOLD_MS =>
+                {
                     snapshot.state = BackendCapacityState::Stale {
                         report: report.clone(),
-                        stale_since_ms: snapshot.retrieved_at_ms.saturating_add(60 * 60 * 1000),
+                        stale_since_ms: snapshot
+                            .retrieved_at_ms
+                            .saturating_add(CAPACITY_FRESHNESS_THRESHOLD_MS),
+                        last_error: None,
                     };
                     snapshot.freshness = protocol::CapacityFreshness::Stale {
                         age_ms,
-                        threshold_ms: 60 * 60 * 1000,
+                        threshold_ms: CAPACITY_FRESHNESS_THRESHOLD_MS,
                     };
                 }
                 BackendCapacityState::Known { .. } => {
@@ -19175,17 +19358,124 @@ fn send_team_context_compaction_notify(
 impl HostHandle {
     /// Record a passive backend capacity update. The host is the sole owner of
     /// this account-wide state; agent connections never retain capacity state.
+    /// Collects one backend's capacity now, on user request.
+    ///
+    /// Refuses backends with no out-of-band source rather than starting a
+    /// process that cannot answer, and coalesces into any poll already running.
+    pub(crate) async fn refresh_backend_capacity(
+        &self,
+        backend_kind: BackendKind,
+    ) -> AppResult<()> {
+        if !crate::backend::supports_out_of_band_capacity(backend_kind) {
+            return Err(AppError::invalid(
+                "backend_capacity_refresh",
+                format!("{backend_kind:?} cannot report capacity without a running agent"),
+            ));
+        }
+        let host = self.clone();
+        tokio::spawn(async move {
+            crate::capacity_poll::poll_once(
+                &host,
+                backend_kind,
+                crate::capacity_poll::CapacityPollTrigger::Manual,
+            )
+            .await;
+        });
+        Ok(())
+    }
+
+    pub(crate) async fn installed_backend_kinds(&self) -> Vec<BackendKind> {
+        self.state
+            .lock()
+            .await
+            .backend_setup
+            .backends
+            .iter()
+            .filter(|info| info.status == protocol::BackendSetupStatus::Installed)
+            .map(|info| info.backend_kind)
+            .collect()
+    }
+
+    /// Claims the poll slot for `backend_kind`, or reports it already taken.
+    pub(crate) async fn begin_capacity_poll(&self, backend_kind: BackendKind) -> bool {
+        self.state
+            .lock()
+            .await
+            .capacity_polls_in_flight
+            .insert(backend_kind)
+    }
+
+    pub(crate) async fn end_capacity_poll(&self, backend_kind: BackendKind) {
+        self.state
+            .lock()
+            .await
+            .capacity_polls_in_flight
+            .remove(&backend_kind);
+    }
+
+    /// What the poller needs to reach a provider, or `None` on a host that is
+    /// configured not to run real backend processes.
+    pub(crate) async fn capacity_probe_context(
+        &self,
+    ) -> Option<crate::backend::CapacityProbeContext> {
+        let state = self.state.lock().await;
+        if state.skip_real_backend_probe {
+            return None;
+        }
+        // The same root the session-schema probe uses. An empty list makes the
+        // ACP adapter resolve no working directory, which the Kiro usage
+        // command then fails in — the probe needs somewhere to run, not a
+        // meaningful workspace.
+        let workspace_roots = kiro_probe_workspace_root(state.kiro_probe_workspace_root.as_deref())
+            .map(|root| vec![root])
+            .unwrap_or_default();
+        Some(crate::backend::CapacityProbeContext {
+            workspace_roots,
+            codex_program: state.codex_probe_program.clone(),
+            kiro_program: state.kiro_probe_program.clone(),
+            acp_agent: None,
+        })
+    }
+
     pub(crate) async fn record_backend_capacity(
         &self,
         backend_kind: BackendKind,
         state: BackendCapacityState,
     ) {
-        let retrieved_at_ms = capacity_now_ms();
+        self.record_backend_capacity_with_emit(backend_kind, state, false)
+            .await;
+    }
+
+    /// Records a reading, optionally forcing a broadcast even when the state is
+    /// unchanged.
+    ///
+    /// Identical repeats are normally swallowed: a passive report arriving again
+    /// with the same numbers is an observation, not a state change, and fanning
+    /// it out is pure churn. A **user-requested refresh is different** — if the
+    /// quota genuinely has not moved, suppressing the frame leaves the age
+    /// frozen and the click indistinguishable from a broken button. So the
+    /// manual path forces the emit and the UI can show it was just re-read.
+    pub(crate) async fn record_backend_capacity_with_emit(
+        &self,
+        backend_kind: BackendKind,
+        state: BackendCapacityState,
+        force_emit: bool,
+    ) {
+        let now_ms = capacity_now_ms();
+        let (state, retrieved_at_ms, freshness) = {
+            let host_state = self.state.lock().await;
+            resolve_recorded_capacity(
+                host_state.backend_capacity.get(&backend_kind),
+                state,
+                now_ms,
+            )
+        };
         let snapshot = BackendCapacitySnapshot {
             backend_kind,
             state,
             retrieved_at_ms,
-            freshness: protocol::CapacityFreshness::Fresh { age_ms: 0 },
+            freshness,
+            refreshable: crate::backend::supports_out_of_band_capacity(backend_kind),
         };
         let repeated = {
             let mut host_state = self.state.lock().await;
@@ -19199,7 +19489,10 @@ impl HostHandle {
                     .get_mut(&backend_kind)
                     .expect("checked capacity snapshot must exist");
                 current.retrieved_at_ms = retrieved_at_ms;
-                current.freshness = protocol::CapacityFreshness::Fresh { age_ms: 0 };
+                current.freshness = snapshot.freshness;
+                if force_emit {
+                    fan_out_backend_capacity(&mut host_state);
+                }
                 true
             } else {
                 host_state.backend_capacity.insert(backend_kind, snapshot);
@@ -19233,10 +19526,12 @@ impl HostHandle {
         snapshot.state = BackendCapacityState::Stale {
             report: report.clone(),
             stale_since_ms: now,
+            // Aged out on its own; nothing failed.
+            last_error: None,
         };
         snapshot.freshness = protocol::CapacityFreshness::Stale {
             age_ms: now.saturating_sub(retrieved_at_ms),
-            threshold_ms: 60 * 60 * 1000,
+            threshold_ms: CAPACITY_FRESHNESS_THRESHOLD_MS,
         };
         fan_out_backend_capacity(&mut state);
     }

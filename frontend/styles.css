@@ -14352,6 +14352,23 @@ pre.tool-error-pre {
     color: var(--text-primary);
 }
 
+.capacity-refresh {
+    margin-left: auto;
+    padding: 2px 10px;
+    font-size: 12px;
+    font-weight: 500;
+    color: var(--text-secondary);
+    background: var(--surface-raised);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-sm);
+    cursor: pointer;
+}
+
+.capacity-refresh:hover {
+    color: var(--text-primary);
+    border-color: var(--border-strong);
+}
+
 .capacity-state {
     font-size: 0.78rem;
     color: var(--text-secondary);

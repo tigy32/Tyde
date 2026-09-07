@@ -10,16 +10,17 @@ use crate::types::{
 use crate::{
     AgentActivityStatsPayload, AgentActivitySummaryPayload, AgentClosedPayload, AgentOrigin,
     AgentStartPayload, AgentTurnStateNotifyPayload, AgentsViewPreferencesNotifyPayload,
-    BackendCapacityPayload, BackendConfigSchemasPayload, BackendConfigSnapshotsPayload,
-    BackendKind, BackendNativeSettingsWritePayload, BackendSettingsRefreshPayload,
-    BackendSetupPayload, CancelWorkflowPayload, ChatEvent, ClientErrorPayload,
-    CodeIntelDiagnosticsPayload, CodeIntelErrorPayload, CodeIntelFileModelPayload,
-    CodeIntelHoverResultPayload, CodeIntelNavigateResultPayload, CodeIntelOverviewPayload,
-    CodeIntelReferencesCompletePayload, CodeIntelReferencesResultsPayload, CodeIntelStatusPayload,
-    CommandErrorPayload, ContextCompactionCapabilityPayload, ContextCompactionNotifyPayload,
-    CustomAgentDeletePayload, CustomAgentNotifyPayload, CustomAgentUpsertPayload,
-    DeleteSessionPayload, Envelope, FetchSessionHistoryPayload, FrameKind, HeartbeatPayload,
-    HostBootstrapPayload, HostBrowseClosePayload, HostBrowseEntriesPayload, HostBrowseErrorPayload,
+    BackendCapacityPayload, BackendCapacityRefreshPayload, BackendConfigSchemasPayload,
+    BackendConfigSnapshotsPayload, BackendKind, BackendNativeSettingsWritePayload,
+    BackendSettingsRefreshPayload, BackendSetupPayload, CancelWorkflowPayload, ChatEvent,
+    ClientErrorPayload, CodeIntelDiagnosticsPayload, CodeIntelErrorPayload,
+    CodeIntelFileModelPayload, CodeIntelHoverResultPayload, CodeIntelNavigateResultPayload,
+    CodeIntelOverviewPayload, CodeIntelReferencesCompletePayload,
+    CodeIntelReferencesResultsPayload, CodeIntelStatusPayload, CommandErrorPayload,
+    ContextCompactionCapabilityPayload, ContextCompactionNotifyPayload, CustomAgentDeletePayload,
+    CustomAgentNotifyPayload, CustomAgentUpsertPayload, DeleteSessionPayload, Envelope,
+    FetchSessionHistoryPayload, FrameKind, HeartbeatPayload, HostBootstrapPayload,
+    HostBrowseClosePayload, HostBrowseEntriesPayload, HostBrowseErrorPayload,
     HostBrowseListPayload, HostBrowseOpenedPayload, HostBrowseStartPayload, HostSettingsPayload,
     InvokeSettingsActionPayload, LaunchProfileCatalogPayload, ListSessionsPayload,
     LoadAgentPayload, McpServerDeletePayload, McpServerNotifyPayload, McpServerUpsertPayload,
@@ -864,6 +865,13 @@ impl ProtocolValidator {
                     self,
                     envelope,
                     "BackendSettingsRefresh",
+                )
+            }
+            FrameKind::BackendCapacityRefresh => {
+                parse_host_payload::<BackendCapacityRefreshPayload>(
+                    self,
+                    envelope,
+                    "BackendCapacityRefresh",
                 )
             }
             FrameKind::McpServerUpsert => {

@@ -11,21 +11,21 @@ use protocol::{
     AgentActivityStatsPayload, AgentActivitySummaryPayload, AgentBootstrapPayload,
     AgentErrorPayload, AgentId, AgentRenamedPayload, AgentStartPayload,
     AgentTurnStateNotifyPayload, AgentsViewPreferencesNotifyPayload, BackendCapacityPayload,
-    BackendConfigSchemasPayload, BackendConfigSnapshotsPayload, BackendSettingsRefreshPayload,
-    BackendSetupPayload, BrowseBootstrapPayload, CancelBackgroundTaskPayload,
-    CancelQueuedMessagePayload, CancelWorkflowPayload, CodeIntelDiagnosticsPayload,
-    CodeIntelErrorPayload, CodeIntelFileModelPayload, CodeIntelHoverResultPayload,
-    CodeIntelNavigateResultPayload, CodeIntelOverviewPayload, CodeIntelReferencesCompletePayload,
-    CodeIntelReferencesResultsPayload, CodeIntelStatusPayload, CommandErrorPayload,
-    ContextCompactionCapabilityPayload, ContextCompactionNotifyPayload, CustomAgentDeletePayload,
-    CustomAgentNotifyPayload, CustomAgentUpsertPayload, DeleteSessionPayload,
-    EditQueuedMessagePayload, Envelope, FetchSessionHistoryPayload, FrameError, FrameKind,
-    FrameReader, HelloPayload, HostBootstrapPayload, HostBrowseStartPayload, HostSettingsPayload,
-    InterruptPayload, LaunchProfileCatalogPayload, ListSessionsPayload, McpServerDeletePayload,
-    McpServerNotifyPayload, McpServerUpsertPayload, MobileAccessStatePayload,
-    MobilePairingOfferPayload, NewAgentPayload, NewTerminalPayload, PROTOCOL_VERSION,
-    ProjectAccessedPayload, ProjectAddRootPayload, ProjectBootstrapPayload, ProjectCreatePayload,
-    ProjectDeletePayload, ProjectDeleteRootPayload, ProjectEventPayload,
+    BackendCapacityRefreshPayload, BackendConfigSchemasPayload, BackendConfigSnapshotsPayload,
+    BackendSettingsRefreshPayload, BackendSetupPayload, BrowseBootstrapPayload,
+    CancelBackgroundTaskPayload, CancelQueuedMessagePayload, CancelWorkflowPayload,
+    CodeIntelDiagnosticsPayload, CodeIntelErrorPayload, CodeIntelFileModelPayload,
+    CodeIntelHoverResultPayload, CodeIntelNavigateResultPayload, CodeIntelOverviewPayload,
+    CodeIntelReferencesCompletePayload, CodeIntelReferencesResultsPayload, CodeIntelStatusPayload,
+    CommandErrorPayload, ContextCompactionCapabilityPayload, ContextCompactionNotifyPayload,
+    CustomAgentDeletePayload, CustomAgentNotifyPayload, CustomAgentUpsertPayload,
+    DeleteSessionPayload, EditQueuedMessagePayload, Envelope, FetchSessionHistoryPayload,
+    FrameError, FrameKind, FrameReader, HelloPayload, HostBootstrapPayload, HostBrowseStartPayload,
+    HostSettingsPayload, InterruptPayload, LaunchProfileCatalogPayload, ListSessionsPayload,
+    McpServerDeletePayload, McpServerNotifyPayload, McpServerUpsertPayload,
+    MobileAccessStatePayload, MobilePairingOfferPayload, NewAgentPayload, NewTerminalPayload,
+    PROTOCOL_VERSION, ProjectAccessedPayload, ProjectAddRootPayload, ProjectBootstrapPayload,
+    ProjectCreatePayload, ProjectDeletePayload, ProjectDeleteRootPayload, ProjectEventPayload,
     ProjectFileContentsPayload, ProjectFileListPayload, ProjectGitDiffPayload,
     ProjectGitStatusPayload, ProjectId, ProjectListDirPayload, ProjectNotifyPayload,
     ProjectOpenPathPayload, ProjectReadDiffPayload, ProjectReadFilePayload, ProjectRenamePayload,
@@ -569,6 +569,14 @@ impl Connection {
         payload: BackendSettingsRefreshPayload,
     ) -> Result<(), FrameError> {
         self.send_host_payload(FrameKind::BackendSettingsRefresh, &payload)
+            .await
+    }
+
+    pub async fn backend_capacity_refresh(
+        &mut self,
+        payload: BackendCapacityRefreshPayload,
+    ) -> Result<(), FrameError> {
+        self.send_host_payload(FrameKind::BackendCapacityRefresh, &payload)
             .await
     }
 

@@ -38,7 +38,7 @@ use protocol::{
 use serde_json::Value;
 use settings_model::BackendTierConfig;
 use tokio::sync::{mpsc, oneshot};
-use tyde_agent_adapter::BackendCapabilities;
+use tyde_agent_adapter::{BackendCapabilities, BackendCapability};
 
 use self::subprocess::ImageAttachment;
 use crate::agent::customization::ResolvedSpawnConfig;
@@ -1129,6 +1129,59 @@ pub trait Backend: Send + Sync + 'static {
     fn shutdown(self) -> impl std::future::Future<Output = ()> + Send
     where
         Self: Sized;
+}
+
+/// Whether this backend can report account capacity with no conversation.
+///
+/// Static per backend, because the poller has to decide before any session
+/// exists — which is the whole point of the capability.
+pub(crate) fn supports_out_of_band_capacity(kind: BackendKind) -> bool {
+    capabilities_for_backend_kind(kind).contains(BackendCapability::OutOfBandCapacity)
+}
+
+/// What a host-owned capacity poll needs to reach a provider.
+pub(crate) struct CapacityProbeContext {
+    pub workspace_roots: Vec<String>,
+    pub codex_program: Option<String>,
+    pub kiro_program: Option<String>,
+    pub acp_agent: Option<protocol::AcpAgentSpec>,
+}
+
+/// Reads one backend's account capacity without starting a conversation.
+///
+/// Every arm is a read-only provider status call answered by a short-lived
+/// process or connection: no prompt is sent, no turn starts, and no model
+/// tokens are spent. Backends without an out-of-band source are reported as
+/// such rather than probed.
+pub(crate) async fn read_capacity_out_of_band(
+    kind: BackendKind,
+    ctx: &CapacityProbeContext,
+) -> protocol::BackendCapacityState {
+    match kind {
+        BackendKind::Claude => claude::read_capacity_out_of_band().await,
+        BackendKind::Codex => codex::read_capacity_out_of_band(ctx.codex_program.as_deref()).await,
+        BackendKind::Antigravity => antigravity::read_capacity_out_of_band().await,
+        BackendKind::Kiro => {
+            acp::backend::read_kiro_capacity_out_of_band(
+                &ctx.workspace_roots,
+                ctx.acp_agent.as_ref(),
+                ctx.kiro_program.clone(),
+            )
+            .await
+        }
+        BackendKind::Grok => {
+            acp::backend::read_grok_capacity_out_of_band(
+                &ctx.workspace_roots,
+                ctx.acp_agent.as_ref(),
+            )
+            .await
+        }
+        BackendKind::Hermes | BackendKind::Opencode | BackendKind::Tycode => {
+            protocol::BackendCapacityState::Unsupported {
+                reason: protocol::CapacityUnsupportedReason::BackendHasNoCapacitySource,
+            }
+        }
+    }
 }
 
 pub fn capabilities_for_backend_kind(kind: BackendKind) -> BackendCapabilities {

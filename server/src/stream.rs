@@ -719,6 +719,7 @@ pub(crate) fn classify(kind: FrameKind) -> OutputLane {
         | FrameKind::SteeringDelete
         | FrameKind::SkillRefresh
         | FrameKind::BackendSettingsRefresh
+        | FrameKind::BackendCapacityRefresh
         | FrameKind::McpServerUpsert
         | FrameKind::McpServerDelete
         | FrameKind::TeamCreate

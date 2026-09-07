@@ -13974,6 +13974,141 @@ pub(crate) fn map_passive_rate_limit_event(
     })
 }
 
+/// How long the whole out-of-band probe may take, spawn through response.
+const CLAUDE_CAPACITY_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Reads account capacity with no conversation and no live agent.
+///
+/// The CLI answers `get_usage` on the control channel as soon as it starts, so
+/// this never sends a user message, never starts a turn, and spends no tokens.
+/// `--no-session-persistence` keeps the probe out of the user's session list.
+///
+/// Measured on claude 2.1.x: the control response arrives ~1.1s after spawn and
+/// carries every bucket plus `subscription_type`, which is strictly more than
+/// the single binding bucket the passive `rate_limit_event` reports.
+pub(crate) async fn read_capacity_out_of_band() -> protocol::BackendCapacityState {
+    claude_capacity_probe().await
+}
+
+async fn claude_capacity_probe() -> protocol::BackendCapacityState {
+    let unreachable = protocol::BackendCapacityState::Unavailable {
+        reason: CapacityUnavailableReason::SourceUnreachable,
+    };
+    let mut command = match crate::process_env::command(claude_binary()) {
+        Ok(command) => command,
+        Err(error) => {
+            tracing::debug!("Claude capacity probe could not resolve the CLI: {error}");
+            return unreachable;
+        }
+    };
+    command.args([
+        "--print",
+        "--verbose",
+        "--output-format",
+        "stream-json",
+        "--input-format",
+        "stream-json",
+        "--no-session-persistence",
+    ]);
+    if let Some(path) = process_env::resolved_child_process_path() {
+        command.env("PATH", path);
+    }
+    command
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+
+    let mut child = match command.group_spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            tracing::debug!("Claude capacity probe failed to spawn: {error}");
+            return unreachable;
+        }
+    };
+    // The timeout wraps only the exchange, never the teardown below. Timing out
+    // around the whole function would drop this future mid-read and leak the CLI
+    // process, which is exactly the kind of orphan a poll running every 45
+    // minutes would accumulate.
+    let state = match tokio::time::timeout(
+        CLAUDE_CAPACITY_PROBE_TIMEOUT,
+        claude_capacity_probe_exchange(&mut child),
+    )
+    .await
+    {
+        Ok(state) => state,
+        Err(_) => protocol::BackendCapacityState::Unavailable {
+            reason: CapacityUnavailableReason::SourceTimedOut,
+        },
+    };
+    // The CLI holds stdin open waiting for a user message that never comes, so
+    // the probe must tear the group down rather than wait for a clean exit.
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+    state
+}
+
+async fn claude_capacity_probe_exchange(
+    child: &mut AsyncGroupChild,
+) -> protocol::BackendCapacityState {
+    let unreachable = protocol::BackendCapacityState::Unavailable {
+        reason: CapacityUnavailableReason::SourceUnreachable,
+    };
+    let Some(mut stdin) = child.inner().stdin.take() else {
+        return unreachable;
+    };
+    let Some(stdout) = child.inner().stdout.take() else {
+        return unreachable;
+    };
+
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let request = json!({
+        "type": "control_request",
+        "request_id": request_id,
+        "request": { "subtype": "get_usage" },
+    });
+    let mut line = request.to_string();
+    line.push('\n');
+    if stdin.write_all(line.as_bytes()).await.is_err() || stdin.flush().await.is_err() {
+        return unreachable;
+    }
+
+    let mut reader = BufReader::new(stdout).lines();
+    while let Ok(Some(line)) = reader.next_line().await {
+        let Ok(frame) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        if frame.get("type").and_then(Value::as_str) != Some("control_response") {
+            continue;
+        }
+        let response = frame.get("response").unwrap_or(&Value::Null);
+        if response.get("request_id").and_then(Value::as_str) != Some(request_id.as_str()) {
+            continue;
+        }
+        if response.get("subtype").and_then(Value::as_str) != Some("success") {
+            return unreachable;
+        }
+        let Some(payload) = response.get("response") else {
+            return unreachable;
+        };
+        // `rate_limits_available: false` is an authenticated API-key or
+        // external-provider account, not a failed read.
+        if payload
+            .get("rate_limits_available")
+            .and_then(Value::as_bool)
+            == Some(false)
+        {
+            return protocol::BackendCapacityState::Unsupported {
+                reason: protocol::CapacityUnsupportedReason::AccountTypeNotReported,
+            };
+        }
+        return match map_claude_control_usage(payload) {
+            Ok(report) => protocol::BackendCapacityState::Known { report },
+            Err(reason) => protocol::BackendCapacityState::Unavailable { reason },
+        };
+    }
+    unreachable
+}
+
 /// Route only Claude's existing stream-json capacity event through the
 /// session-owned emitter. It intentionally performs no read, refresh, or
 /// credential access.
@@ -14024,6 +14159,7 @@ impl Backend for ClaudeBackend {
             tyde_agent_adapter::BackendCapability::GenericReadFiles,
             tyde_agent_adapter::BackendCapability::GenericOtherTool,
             tyde_agent_adapter::BackendCapability::CapacityTelemetry,
+            tyde_agent_adapter::BackendCapability::OutOfBandCapacity,
             tyde_agent_adapter::BackendCapability::RetryTelemetry,
             // Occupancy only. Claude reports how full the window is, in
             // `result.modelUsage[model].contextWindow`, and never reports what

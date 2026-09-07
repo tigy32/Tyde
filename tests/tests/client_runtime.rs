@@ -337,6 +337,214 @@ async fn passive_capacity_replays_deduplicates_and_stales_over_public_client() {
     );
 }
 
+/// A failed reading must not erase the numbers a good one produced.
+///
+/// Before polling existed, every failure replaced the report outright, which
+/// renders as "no capacity data" — the worst answer available, because the host
+/// still knows a real figure and simply stops showing it. A transient failure
+/// now degrades to `Stale` carrying that report plus the error, and holds the
+/// *original* collection time so a backend failing every retry reports its true
+/// age instead of resetting to "just now" on each failure.
+#[tokio::test]
+async fn failed_capacity_reading_keeps_the_last_good_report() {
+    init_tracing();
+    let directory = tempfile::tempdir().expect("create capacity failure tempdir");
+    let host = server::spawn_host_with_mock_backend(
+        directory.path().join("sessions.json"),
+        directory.path().join("projects.json"),
+        directory.path().join("settings.json"),
+    )
+    .expect("initialize mock host");
+    let HostEndpoint {
+        mut events,
+        commands: _,
+    } = connect_runtime(host.clone()).await;
+    assert!(matches!(
+        next_host_event(&mut events, "bootstrap").await,
+        HostEvent::HostBootstrap(_)
+    ));
+    assert!(matches!(
+        next_host_event(&mut events, "initial capacity replay").await,
+        HostEvent::BackendCapacity(_)
+    ));
+
+    assert!(
+        host.ingest_passive_adapter_notification_for_test(
+            BackendKind::Codex,
+            codex_rate_limits_notification(64),
+        )
+        .await
+    );
+    let known = next_backend_capacity_event(&mut events, "known capacity").await;
+    let known = codex_snapshot(&known);
+    assert!(matches!(known.state, BackendCapacityState::Known { .. }));
+    assert!(
+        known.refreshable,
+        "Codex has an out-of-band source, so the host must offer refresh"
+    );
+    let collected_at_ms = known.retrieved_at_ms;
+
+    // Age the report so a preserved snapshot has a distinguishable, nonzero age
+    // to report. A failure must not reset that age to zero.
+    host.age_backend_capacity_for_test(BackendKind::Codex, 10 * 60 * 1000)
+        .await;
+
+    host.record_backend_capacity_for_test(
+        BackendKind::Codex,
+        BackendCapacityState::Unavailable {
+            reason: protocol::CapacityUnavailableReason::SourceUnreachable,
+        },
+    )
+    .await;
+    let after_failure = next_backend_capacity_event(&mut events, "failed reading").await;
+    let after_failure = codex_snapshot(&after_failure);
+    let BackendCapacityState::Stale {
+        report, last_error, ..
+    } = &after_failure.state
+    else {
+        panic!(
+            "a failed reading must keep the report, got {:?}",
+            after_failure.state
+        )
+    };
+    assert!(
+        matches!(
+            &report.buckets[0].measure,
+            protocol::CapacityMeasure::UsedPercent {
+                used_percent: 64,
+                ..
+            }
+        ),
+        "the preserved report must be the last good one: {:?}",
+        report.buckets[0].measure
+    );
+    let detail = last_error
+        .as_ref()
+        .expect("a preserved report must say why refreshing failed");
+    assert_eq!(detail.code, protocol::CapacityErrorCode::SourceUnreachable);
+    assert!(
+        matches!(
+            after_failure.freshness,
+            protocol::CapacityFreshness::Stale { age_ms, .. } if age_ms >= 10 * 60 * 1000
+        ),
+        "a failure must not reset the report's age: {:?}",
+        after_failure.freshness
+    );
+    assert!(
+        after_failure.retrieved_at_ms < collected_at_ms,
+        "the preserved report keeps its original collection time"
+    );
+
+    // A malformed answer is not absorbed: the source produced something Tyde
+    // cannot interpret, so no figure is shown rather than an older one dressed
+    // up as a current reading.
+    host.record_backend_capacity_for_test(
+        BackendKind::Codex,
+        BackendCapacityState::Unavailable {
+            reason: protocol::CapacityUnavailableReason::MalformedReport,
+        },
+    )
+    .await;
+    let malformed = next_backend_capacity_event(&mut events, "malformed reading").await;
+    assert!(
+        matches!(
+            codex_snapshot(&malformed).state,
+            BackendCapacityState::Unavailable {
+                reason: protocol::CapacityUnavailableReason::MalformedReport
+            }
+        ),
+        "a malformed answer must replace the report, not hide behind it"
+    );
+}
+
+/// A backend with no out-of-band source must not advertise a refresh action,
+/// and asking for one anyway must be refused rather than silently ignored.
+#[tokio::test]
+async fn capacity_refresh_is_offered_only_where_it_can_work() {
+    init_tracing();
+    let directory = tempfile::tempdir().expect("create capacity refresh tempdir");
+    let host = server::spawn_host_with_mock_backend(
+        directory.path().join("sessions.json"),
+        directory.path().join("projects.json"),
+        directory.path().join("settings.json"),
+    )
+    .expect("initialize mock host");
+    let HostEndpoint {
+        mut events,
+        commands,
+    } = connect_runtime(host.clone()).await;
+    assert!(matches!(
+        next_host_event(&mut events, "bootstrap").await,
+        HostEvent::HostBootstrap(_)
+    ));
+    let replay = match next_host_event(&mut events, "initial capacity replay").await {
+        HostEvent::BackendCapacity(payload) => payload,
+        _ => panic!("expected BackendCapacity replay"),
+    };
+
+    for snapshot in &replay.snapshots {
+        let expected = matches!(
+            snapshot.backend_kind,
+            BackendKind::Claude
+                | BackendKind::Codex
+                | BackendKind::Kiro
+                | BackendKind::Antigravity
+                | BackendKind::Grok
+        );
+        assert_eq!(
+            snapshot.refreshable, expected,
+            "{:?} advertises the wrong refresh affordance",
+            snapshot.backend_kind
+        );
+        // A backend that reports capacity must never seed as "no source": that
+        // renders as a permanent "this backend cannot report quota" for a
+        // backend that simply has not been read yet.
+        if expected {
+            assert!(
+                !matches!(
+                    snapshot.state,
+                    BackendCapacityState::Unsupported {
+                        reason: protocol::CapacityUnsupportedReason::BackendHasNoCapacitySource
+                    }
+                ),
+                "{:?} reports capacity but seeded as having no source",
+                snapshot.backend_kind
+            );
+        }
+    }
+
+    commands
+        .backend_capacity_refresh(protocol::BackendCapacityRefreshPayload {
+            backend: BackendKind::Hermes,
+        })
+        .await
+        .expect("the request itself is well-formed and reaches the server");
+    let error = timeout(Duration::from_secs(5), async {
+        loop {
+            if let HostEvent::CommandError(error) = events.recv().await.expect("host event stream")
+            {
+                return error;
+            }
+        }
+    })
+    .await
+    .expect("refreshing a backend with no out-of-band source must be refused");
+    assert!(
+        error.message.contains("Hermes"),
+        "the refusal must name the backend it refused: {}",
+        error.message
+    );
+}
+
+fn codex_snapshot(payload: &protocol::BackendCapacityPayload) -> protocol::BackendCapacitySnapshot {
+    payload
+        .snapshots
+        .iter()
+        .find(|snapshot| snapshot.backend_kind == BackendKind::Codex)
+        .expect("Codex snapshot")
+        .clone()
+}
+
 #[tokio::test]
 async fn runtime_accepts_backend_config_schema_catalog() {
     init_tracing();

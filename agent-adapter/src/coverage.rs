@@ -1163,6 +1163,8 @@ exhaustive_enum! {
         ConcurrentClientReplay,
         ProviderRefreshBroadcast,
         RepeatedRefreshConverges,
+        PollWithoutConversation,
+        ManualRefresh,
         ProviderIsolation,
         ZeroClientReconnectReplay,
         HostRestartResets,

@@ -146,6 +146,12 @@ exhaustive_capabilities! {
     GenericSleep,
     GenericOtherTool,
     CapacityTelemetry,
+    // The backend can report account capacity without a conversation: a
+    // short-lived provider process or connection answers a read-only status
+    // request and exits. Zero model tokens, no turn, no session. This is what
+    // makes host-owned polling possible; `CapacityTelemetry` alone only
+    // promises a report while an agent happens to be running.
+    OutOfBandCapacity,
 }
 
 /// The capabilities declared by a live backend session.
@@ -213,6 +219,10 @@ impl BackendCapabilities {
         self.require(
             BackendCapability::CancelsBackgroundTasks,
             BackendCapability::BackgroundTasks,
+        )?;
+        self.require(
+            BackendCapability::OutOfBandCapacity,
+            BackendCapability::CapacityTelemetry,
         )?;
         Ok(())
     }

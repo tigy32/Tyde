@@ -2459,6 +2459,124 @@ fn codex_capacity_account_mode(account_response: &Value) -> CodexCapacityAccount
     }
 }
 
+/// Reads account capacity over an already-open app-server connection.
+///
+/// Both calls are read-only account status. `refreshToken: false` keeps the
+/// read from rotating stored credentials.
+async fn read_capacity_over_rpc(rpc: &CodexRpc) -> protocol::BackendCapacityState {
+    let account = match rpc
+        .request("account/read", json!({ "refreshToken": false }))
+        .await
+    {
+        Ok(account) => account,
+        Err(_) => {
+            return protocol::BackendCapacityState::Unavailable {
+                reason: protocol::CapacityUnavailableReason::SourceUnreachable,
+            };
+        }
+    };
+    match codex_capacity_account_mode(&account) {
+        CodexCapacityAccountMode::ChatGpt => {}
+        CodexCapacityAccountMode::Unsupported => {
+            return protocol::BackendCapacityState::Unsupported {
+                reason: protocol::CapacityUnsupportedReason::AccountTypeNotReported,
+            };
+        }
+        CodexCapacityAccountMode::Unauthenticated => {
+            return protocol::BackendCapacityState::AuthError {
+                detail: protocol::CapacityErrorDetail {
+                    summary: "Codex account information is unavailable".to_string(),
+                    code: protocol::CapacityErrorCode::NotAuthenticated,
+                },
+            };
+        }
+    }
+
+    match rpc.request("account/rateLimits/read", json!({})).await {
+        Ok(snapshot) => match map_passive_rate_limits_updated(&snapshot) {
+            Ok(report) => protocol::BackendCapacityState::Known { report },
+            Err(reason) => protocol::BackendCapacityState::Unavailable { reason },
+        },
+        Err(_) => protocol::BackendCapacityState::Unavailable {
+            reason: protocol::CapacityUnavailableReason::SourceUnreachable,
+        },
+    }
+}
+
+/// How long each leg of the out-of-band probe may take.
+const CODEX_CAPACITY_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Reads account capacity with no conversation and no live agent.
+///
+/// Spawns a short-lived app-server, initializes it, reads account status, and
+/// terminates. `account/read` and `account/rateLimits/read` are status RPCs, so
+/// this starts no thread and spends no model tokens.
+pub(crate) async fn read_capacity_out_of_band(
+    program: Option<&str>,
+) -> protocol::BackendCapacityState {
+    let (rpc, _inbound_rx) = match CodexRpc::spawn_with_local_program(
+        None,
+        &[],
+        None,
+        BackendAccessMode::Unrestricted,
+        BackendExecutionMode::Agent,
+        program,
+    )
+    .await
+    {
+        Ok(spawned) => spawned,
+        Err(error) => {
+            tracing::debug!("Codex capacity probe failed to spawn app-server: {error}");
+            return protocol::BackendCapacityState::Unavailable {
+                reason: protocol::CapacityUnavailableReason::SourceUnreachable,
+            };
+        }
+    };
+
+    // `CodexRpc::request` deliberately has no timeout: for a live session a
+    // slow app-server is still a working one. A background poll is different —
+    // an unbounded wait would hold the single-flight slot forever and silently
+    // stop this backend from ever refreshing again. The bound covers only the
+    // exchange, so the app-server is terminated either way.
+    let state = match tokio::time::timeout(CODEX_CAPACITY_PROBE_TIMEOUT, async {
+        rpc.request(
+            "initialize",
+            json!({
+                "clientInfo": { "name": "tyde", "title": Value::Null, "version": "0.1" },
+                "capabilities": { "experimentalApi": true }
+            }),
+        )
+        .await
+        .map(|_| ())
+    })
+    .await
+    {
+        Ok(Ok(())) => {
+            match tokio::time::timeout(CODEX_CAPACITY_PROBE_TIMEOUT, read_capacity_over_rpc(&rpc))
+                .await
+            {
+                Ok(state) => state,
+                Err(_) => protocol::BackendCapacityState::Unavailable {
+                    reason: protocol::CapacityUnavailableReason::SourceTimedOut,
+                },
+            }
+        }
+        Ok(Err(error)) => {
+            tracing::debug!("Codex capacity probe initialize failed: {error}");
+            protocol::BackendCapacityState::Unavailable {
+                reason: protocol::CapacityUnavailableReason::SourceUnreachable,
+            }
+        }
+        Err(_) => protocol::BackendCapacityState::Unavailable {
+            reason: protocol::CapacityUnavailableReason::SourceTimedOut,
+        },
+    };
+    if let Err(error) = rpc.terminate().await {
+        tracing::debug!("Codex capacity probe app-server cleanup failed: {error}");
+    }
+    state
+}
+
 pub(crate) async fn probe_session_settings_schema(
     program: Option<&str>,
 ) -> Result<SessionSettingsSchema, String> {
@@ -6071,44 +6189,7 @@ impl CodexInner {
     }
 
     async fn read_backend_capacity(&self) -> protocol::BackendCapacityState {
-        let account = match self
-            .rpc
-            .request("account/read", json!({ "refreshToken": false }))
-            .await
-        {
-            Ok(account) => account,
-            Err(_) => {
-                return protocol::BackendCapacityState::Unavailable {
-                    reason: protocol::CapacityUnavailableReason::SourceUnreachable,
-                };
-            }
-        };
-        match codex_capacity_account_mode(&account) {
-            CodexCapacityAccountMode::ChatGpt => {}
-            CodexCapacityAccountMode::Unsupported => {
-                return protocol::BackendCapacityState::Unsupported {
-                    reason: protocol::CapacityUnsupportedReason::AccountTypeNotReported,
-                };
-            }
-            CodexCapacityAccountMode::Unauthenticated => {
-                return protocol::BackendCapacityState::AuthError {
-                    detail: protocol::CapacityErrorDetail {
-                        summary: "Codex account information is unavailable".to_string(),
-                        code: protocol::CapacityErrorCode::NotAuthenticated,
-                    },
-                };
-            }
-        }
-
-        match self.rpc.request("account/rateLimits/read", json!({})).await {
-            Ok(snapshot) => match map_passive_rate_limits_updated(&snapshot) {
-                Ok(report) => protocol::BackendCapacityState::Known { report },
-                Err(reason) => protocol::BackendCapacityState::Unavailable { reason },
-            },
-            Err(_) => protocol::BackendCapacityState::Unavailable {
-                reason: protocol::CapacityUnavailableReason::SourceUnreachable,
-            },
-        }
+        read_capacity_over_rpc(&self.rpc).await
     }
 
     async fn apply_local_settings(&self, settings: &Value) {
@@ -20195,6 +20276,7 @@ impl Backend for CodexBackend {
             tyde_agent_adapter::BackendCapability::GenericViewImage,
             tyde_agent_adapter::BackendCapability::GenericOtherTool,
             tyde_agent_adapter::BackendCapability::CapacityTelemetry,
+            tyde_agent_adapter::BackendCapability::OutOfBandCapacity,
             tyde_agent_adapter::BackendCapability::RetryTelemetry,
         ]
         .into()

@@ -5,11 +5,11 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use protocol::types::{AgentCompactPayload, CloseAgentPayload};
 use protocol::{
-    AgentErrorCode, AgentErrorPayload, AgentId, AgentInput, BackendNativeSettingsWritePayload,
-    BackendSettingsRefreshPayload, CancelBackgroundTaskPayload, CancelQueuedMessagePayload,
-    CancelWorkflowPayload, ClientErrorCode, ClientErrorPayload, CodeIntelCancelReferencesPayload,
-    CodeIntelFindReferencesPayload, CodeIntelHoverPayload, CodeIntelNavigatePayload,
-    CodeIntelSetVisibleRangePayload, CodeIntelSubscribeFilePayload,
+    AgentErrorCode, AgentErrorPayload, AgentId, AgentInput, BackendCapacityRefreshPayload,
+    BackendNativeSettingsWritePayload, BackendSettingsRefreshPayload, CancelBackgroundTaskPayload,
+    CancelQueuedMessagePayload, CancelWorkflowPayload, ClientErrorCode, ClientErrorPayload,
+    CodeIntelCancelReferencesPayload, CodeIntelFindReferencesPayload, CodeIntelHoverPayload,
+    CodeIntelNavigatePayload, CodeIntelSetVisibleRangePayload, CodeIntelSubscribeFilePayload,
     CodeIntelUnsubscribeFilePayload, CustomAgentDeletePayload, CustomAgentUpsertPayload,
     DeleteSessionPayload, EditQueuedMessagePayload, Envelope, FetchSessionHistoryPayload,
     FrameKind, HeartbeatPayload, HostBrowseClosePayload, HostBrowseInitial, HostBrowseListPayload,
@@ -315,6 +315,11 @@ pub(crate) async fn route_client_envelope(
                 let payload: BackendSettingsRefreshPayload =
                     parse_payload(&envelope, "backend_settings_refresh")?;
                 host.refresh_backend_settings(payload).await?;
+            }
+            FrameKind::BackendCapacityRefresh => {
+                let payload: BackendCapacityRefreshPayload =
+                    parse_payload(&envelope, "backend_capacity_refresh")?;
+                host.refresh_backend_capacity(payload.backend).await?;
             }
             FrameKind::TriggerWorkflow => {
                 let payload: TriggerWorkflowPayload = parse_payload(&envelope, "trigger_workflow")?;

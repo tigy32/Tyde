@@ -670,6 +670,22 @@ impl Host {
         }
     }
 
+    /// Asks the server to collect capacity now and waits for the report that
+    /// request produces.
+    ///
+    /// Drops the currently held snapshot first, so the returned report is one
+    /// the refresh actually caused rather than the one already on file.
+    pub async fn refresh_capacity_and_await_report(&mut self) -> BackendCapacitySnapshot {
+        self.latest_capacity.remove(&self.backend_kind);
+        self.client
+            .backend_capacity_refresh(protocol::BackendCapacityRefreshPayload {
+                backend: self.backend_kind,
+            })
+            .await
+            .expect("backend_capacity_refresh failed");
+        self.await_known_capacity().await
+    }
+
     pub async fn await_known_capacity(&mut self) -> BackendCapacitySnapshot {
         let deadline = tokio::time::Instant::now() + CONTROL_TIMEOUT;
         loop {

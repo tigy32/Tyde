@@ -13,7 +13,7 @@ use serde_json::Value;
 /// `protocol::TydeReleaseVersion`.
 pub use host_config::{LOCAL_HOST_ID, TydeReleaseVersion};
 
-pub const PROTOCOL_VERSION: u32 = 58;
+pub const PROTOCOL_VERSION: u32 = 59;
 pub const TYDE_VERSION: Version = Version {
     major: 0,
     minor: 8,
@@ -1093,6 +1093,7 @@ pub enum FrameKind {
     SteeringDelete,
     SkillRefresh,
     BackendSettingsRefresh,
+    BackendCapacityRefresh,
     McpServerUpsert,
     McpServerDelete,
     TeamCreate,
@@ -1290,6 +1291,7 @@ impl fmt::Display for FrameKind {
             Self::SteeringDelete => f.write_str("steering_delete"),
             Self::SkillRefresh => f.write_str("skill_refresh"),
             Self::BackendSettingsRefresh => f.write_str("backend_settings_refresh"),
+            Self::BackendCapacityRefresh => f.write_str("backend_capacity_refresh"),
             Self::McpServerUpsert => f.write_str("mcp_server_upsert"),
             Self::McpServerDelete => f.write_str("mcp_server_delete"),
             Self::TeamCreate => f.write_str("team_create"),
@@ -2692,6 +2694,12 @@ pub struct BackendCapacitySnapshot {
     /// Host time when the server received the current report or state.
     pub retrieved_at_ms: u64,
     pub freshness: CapacityFreshness,
+    /// Whether this host can collect capacity for this backend on demand. The
+    /// server owns the answer because it depends on what is installed here, so
+    /// a UI never has to guess which backends have an out-of-band source — and
+    /// never offers a refresh action that cannot do anything.
+    #[serde(default)]
+    pub refreshable: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2703,6 +2711,13 @@ pub enum BackendCapacityState {
     Stale {
         report: CapacityReport,
         stale_since_ms: u64,
+        /// Why refreshing stopped, when a poll failed after a good report was
+        /// already held. Absent when the report simply aged past the freshness
+        /// threshold with no failure. A failed poll must never erase the last
+        /// good numbers: a marked-stale figure is more useful than none, and
+        /// dropping to `Unavailable` would render as "no capacity data".
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        last_error: Option<CapacityErrorDetail>,
     },
     Unavailable {
         reason: CapacityUnavailableReason,
@@ -2732,6 +2747,7 @@ pub enum CapacityUnavailableReason {
 #[serde(rename_all = "snake_case")]
 pub enum CapacityUnsupportedReason {
     BackendHasNoCapacitySource,
+    BackendNotInstalled,
     BackendVersionTooOld,
     AccountTypeNotReported,
     ExternalProvider,
@@ -2750,6 +2766,8 @@ pub enum CapacityErrorCode {
     SourceRejected,
     RateLimited,
     MalformedResponse,
+    SourceUnreachable,
+    SourceTimedOut,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -4622,6 +4640,15 @@ pub struct SkillRefreshPayload {}
 /// next save. Carries no values — the server republishes whatever it finds.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BackendSettingsRefreshPayload {
+    pub backend: BackendKind,
+}
+
+/// Re-read one backend's subscription capacity now, instead of waiting for the
+/// next scheduled poll. Carries no values — the server republishes whatever the
+/// provider reports. A refresh arriving while a poll is already in flight
+/// coalesces into it rather than starting a second provider process.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackendCapacityRefreshPayload {
     pub backend: BackendKind,
 }
 

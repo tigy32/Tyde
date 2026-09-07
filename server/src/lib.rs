@@ -3,6 +3,7 @@ mod agent;
 pub(crate) mod agent_control_mcp;
 pub mod backend;
 pub(crate) mod browse_stream;
+pub(crate) mod capacity_poll;
 pub(crate) mod code_intel;
 pub(crate) mod config_mcp;
 pub(crate) mod connection;

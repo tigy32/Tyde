@@ -8,11 +8,13 @@ subscription.
 downgrades, or falls back between backends, accounts, or models. It never makes
 a paid model call. It never guesses a number.
 
-Collection is bounded and backend-native. Claude and Codex use their existing
-provider control channels; Kiro and Antigravity run their documented read-only
-`/usage` commands. The command probes never start a model turn or spend model
-tokens, are rate-limited to once per two minutes, and have hard timeouts. There
-is no free-running polling loop or manual refresh action.
+Collection is bounded and backend-native, and it does not require a
+conversation. Every backend with a capacity source has an **out-of-band** one: a
+short-lived provider process or connection that answers a read-only status call
+and exits. The host polls those on its own schedule, so a backend nobody has
+talked to still shows a real figure. No probe starts a model turn or spends
+model tokens, every probe has a hard timeout, and a poll never overlaps another
+for the same backend.
 
 ---
 
@@ -35,26 +37,45 @@ arithmetic.
 
 ## 2. Where the data comes from
 
-| Backend | Source | Cost | Coverage |
+| Backend | Source | Out-of-band probe | Coverage |
 |---|---|---|---|
-| **Claude** | `get_usage` on the existing control channel, with `rate_limit_event` as an early fallback | zero | vendor-dependent |
-| **Codex** | `account/rateLimits/read` on the existing app-server connection | zero | `AllVendorBuckets` |
-| **Kiro** | `kiro-cli-chat chat --agent-engine v1 --no-interactive /usage` | zero model turns | `RepresentativeBucketOnly` |
-| **Antigravity** | `agy -p /usage` | zero model turns | `AllVendorBuckets` |
-| Hermes, custom ACP agents, Tycode | — | — | `Unsupported { BackendHasNoCapacitySource }` |
+| **Claude** | `get_usage` control request, with `rate_limit_event` as an early fallback | short-lived CLI in stream-json control mode | `AllVendorBuckets` |
+| **Codex** | `account/read` + `account/rateLimits/read` | short-lived app-server | `AllVendorBuckets` |
+| **Kiro** | `kiro-cli-chat chat --agent-engine v1 --no-interactive /usage` | the command itself | `RepresentativeBucketOnly` |
+| **Antigravity** | `agy -p /usage` | the command itself | `AllVendorBuckets` |
+| **Grok** | `_x.ai/billing` ACP extension | ephemeral admin ACP connection | `RepresentativeBucketOnly` |
+| Hermes, Opencode, custom ACP agents, Tycode | — | — | `Unsupported { BackendHasNoCapacitySource }` |
 
-The control-channel sources reuse already-open processes. The command sources
-start short-lived read-only processes and rely on the provider CLI's existing
-login; Tyde does not open credential files or copy credentials onto the wire.
+Every probe relies on the provider's own existing login; Tyde does not open
+credential files or copy credentials onto the wire. When a live session happens
+to be running, its already-open channel is still used — the poll is the floor,
+not the only path.
+
+`_x.ai/billing` takes no `sessionId`, unlike `_x.ai/session/usage`: it is a
+connection-scoped account read, which is what makes an ephemeral connection
+sufficient. Grok's ephemeral connection is an admin session, and admin sessions
+are excluded from `session/list`, so the probe never appears as a conversation.
+
+**Which backends can be polled is a declared capability**, not a hardcoded list.
+`BackendCapability::OutOfBandCapacity` (which requires `CapacityTelemetry`) is
+what the poller, the seeded initial state, and
+`BackendCapacitySnapshot::refreshable` all read. A backend that gains or loses an
+out-of-band source changes one declaration and everything follows.
 
 ### Coverage is load-bearing, not a footnote
 
-Codex reports every bucket it tracks. **Claude reports only the single limit
-that is currently binding** — its other limits still exist, and their
-utilization is *unknown, not zero*. Without `CapacityCoverage` on the wire, a
-one-bucket Claude report and a complete Codex report would render identically,
-and a user looking at a healthy Claude row would have no way to know a
-*different* Claude limit sits at 98%.
+Coverage depends on the *source*, not only on the vendor, and Claude is the
+reason it exists. Its passive `rate_limit_event` reports only the single limit
+that is currently binding — the other limits still exist, and their utilization
+is *unknown, not zero*, so that path is `RepresentativeBucketOnly`. Its
+`get_usage` control read returns the complete `limits` array and is
+`AllVendorBuckets`. Since the host polls `get_usage`, the complete report is now
+the normal case and the representative one is the fallback.
+
+Without `CapacityCoverage` on the wire a one-bucket report and a complete one
+would render identically, and a user looking at a healthy row would have no way
+to know a *different* limit sits at 98%. Grok reports one subscription period
+and stays `RepresentativeBucketOnly`.
 
 So **every UI surface renders coverage as text** — Settings and the
 popup. Capacity has no MCP or agent-control exposure in this phase.
@@ -140,8 +161,11 @@ Three rules follow, all enforced in code:
 ### What Claude does and does not report
 
 Worth stating because it is easy to assume otherwise, and because UI fixtures
-must not invent it: Claude's adapter emits **no scope and no window, ever**
-(both `NotReported`), **no plan label**, and **always** a vendor status. Codex
+must not invent it. Claude's **passive** path emits no scope, no window, no plan
+label, and always a vendor status. Claude's **`get_usage`** path emits
+`Account` scope, rolling windows, a plan label taken from the vendor's own
+`subscription_type`, and no status. The two are different shapes from the same
+backend, which is why fixtures must say which source they model. Codex
 emits rolling windows on its two percentage buckets, **never** a status, and a
 credits bucket with no window or reset. Codex's window buckets are scoped
 `Individual` when the vendor sets `individualLimit`, and `Account` otherwise; the
@@ -164,10 +188,10 @@ totals and is marked accordingly.
   process; Tyde runs it as a subprocess and never sees them. (`rate_limit_event`
   is Claude's own forwarding of this data, which is exactly why only the
   representative bucket survives.)
-- **Claude's plan label** — lives in `~/.claude/.credentials.json`, a
-  secret-bearing file Tyde has never opened (and on some installs the data is in
-  the Keychain instead, so a file read would be silently machine-dependent).
-  Claude's plan is therefore reported as **absent**, not guessed.
+- **`~/.claude/.credentials.json` for the plan label** — a secret-bearing file
+  Tyde has never opened (and on some installs the data is in the Keychain
+  instead, so a file read would be silently machine-dependent). Unnecessary
+  anyway: `get_usage` reports `subscription_type` directly.
 - **ACP `/usage`** — Kiro's ACP implementation reduces the response to a plan
   name and bucket count, discarding the numeric values. The V1 non-interactive
   CLI command is therefore the numeric source.
@@ -181,7 +205,7 @@ Six states, no more (`BackendCapacityState` in `protocol/src/types.rs`):
 | State | Meaning |
 |---|---|
 | `Known` | Supported data retrieved and understood. |
-| `Stale` | Last known report, past its freshness threshold. **The report is carried** — a stale number with an explicit stale marker beats no number, provided the UI says so. |
+| `Stale` | Last known report, past its freshness threshold **or kept alive through a failed refresh**. **The report is carried** — a stale number with an explicit stale marker beats no number, provided the UI says so. `last_error` says which of the two it is. |
 | `Unavailable` | Supported source, no usable data right now. |
 | `Unsupported` | This backend/version/account exposes no capacity source at all. |
 | `AuthError` | Local credentials cannot authorize the status source. |
@@ -200,6 +224,31 @@ no figure is shown.
 
 **`Stale` is the normal steady state, not an error.** An idle account's data
 simply ages. That is designed for and labelled, not hidden.
+
+### A failed reading does not erase a good one
+
+When a poll fails over a report the host already holds, the snapshot degrades to
+`Stale` carrying that report plus `last_error`, rather than being replaced by
+`Unavailable`. Replacing it renders as "no capacity data" while the host still
+knows a real, recent figure — the worst available answer.
+
+Two details are load-bearing:
+
+- **The stored `retrieved_at_ms` stays at the original collection time.** A
+  backend failing every retry must report its true age, not reset to "just now"
+  on each failure. Freshness is recomputed from that original instant.
+- **`MalformedReport` is deliberately *not* absorbed.** Unreachable and timed-out
+  mean no answer arrived, so the last good number is still the best available.
+  Malformed means an answer arrived and could not be interpreted — evidence the
+  source has changed under us. Keeping an older figure alive on top of that hides
+  a real breakage behind something that still looks like a reading. `Unsupported`
+  is likewise never absorbed: it is a real retraction of the source.
+
+`Unsupported { BackendNotInstalled }` is separate from
+`BackendHasNoCapacitySource`: a backend that reports quota when installed, but is
+not installed here, has a source — there is just no account to read. A host that
+is configured not to probe real backends claims neither, and leaves the honest
+`AwaitingFirstReport`.
 
 None of `Unavailable`, `Unsupported`, `Stale`, `AuthError`, or `RateLimited` may
 ever render as "has capacity". A hidden row reads as "fine", and an empty
@@ -246,6 +295,38 @@ released after the first routed client request when one arrives during bootstrap
 or after a bounded idle grace for an otherwise idle client, so a required browse
 or terminal bootstrap cannot be interleaved behind capacity.
 
+### The polling schedule
+
+One task per installed pollable backend, so a slow or wedged provider delays only
+its own next reading:
+
+- **First poll shortly after startup**, staggered per backend by up to 4 seconds.
+  Deliberately small — showing capacity without starting a conversation is the
+  point, so the first reading must not sit behind interval-scale jitter.
+- **Then every 45 minutes**, plus up to 10% deterministic jitter. Under the
+  60-minute freshness threshold on purpose: a healthy backend refreshes before
+  its snapshot ages out, instead of flickering between fresh and stale.
+- **On failure, retry from 5 minutes**, doubling to at most the base interval.
+- **Never two polls at once for one backend.** A manual refresh arriving while a
+  poll is in flight coalesces into it rather than starting a second provider
+  process, so repeated clicking cannot stack up work.
+- **`Unsupported` is an answer, not a failure.** An account that cannot report
+  quota gets a full interval, not the failure backoff — otherwise the host would
+  respawn a provider process every few minutes to be told the same thing.
+- **The loop holds a weak host handle** and stops when the host is dropped.
+  A strong one would keep every host that ever started polling alive, still
+  spawning provider processes for hosts nobody is using.
+- **Every probe bounds its own exchange and then tears down regardless.** The
+  timeout wraps the read, never the cleanup: a timeout that dropped the whole
+  future would orphan the provider process, and a poll on a timer would
+  accumulate those.
+
+A host configured not to probe real backends (`skip_real_backend_probe`) does not
+poll at all and claims nothing about what is installed.
+
+`BackendCapacityRefresh` is the client's on-demand request. It is refused for a
+backend with no out-of-band source rather than silently ignored.
+
 ### Nothing is persisted
 
 Snapshots are memory-only and recollected after restart. A rehydrated snapshot
@@ -281,7 +362,14 @@ disconnect, and the server replays the current snapshot on the next subscribe.
 ## 6. What the UI must do
 
 The frontends are a pure projection of the server snapshot. They keep no cache,
-run no freshness timer, infer nothing, and offer no refresh button.
+run no freshness timer, and infer nothing. The refresh button asks the *server*
+to collect; a frontend never reads a provider itself.
+
+**The refresh button is rendered only where `BackendCapacitySnapshot.refreshable`
+is true.** That flag is the server's answer to "can this host collect for this
+backend", and it depends on what is installed here — which a frontend cannot
+know. A UI must never derive the affordance from the backend kind, or it will
+offer a dead button on a host where that CLI is absent.
 
 **Desktop** — `frontend/src/components/backend_capacity.rs`:
 
@@ -363,23 +451,17 @@ backend or model selection, no fallback, no downgrade, no reroute.
 
 Stated plainly so none of it is mistaken for a gap to be quietly filled later.
 
-- **Any free-running background polling.** Command probes run only when a live
-  backend session supplies the host-owned emitter and at bounded turn
-  boundaries.
+- **Probes that cost tokens.** Every source above is a read-only status call. An
+  opt-in "monitor limits" mode that spends quota to discover quota has no
+  qualifying backend — every backend with a source already has a free one — and
+  would contradict the rule that this feature never makes a paid model call.
 - **A separate capacity MCP tool or routing policy.** See §7; list-options is a
   factual advisory projection only.
-- **A refresh action.** Nothing to refresh; the UI says so rather than showing a
-  dead button.
-- **Claude multi-bucket capacity.** Claude reports one binding bucket;
-  everything else is `RepresentativeBucketOnly`. `/api/oauth/usage` is out of
-  scope — it is undocumented, would require Tyde to hold the user's OAuth token,
+- **Claude capacity from `/api/oauth/usage`.** Out of scope — it is undocumented, would require Tyde to hold the user's OAuth token,
   and its `refreshOAuth: true` means a "status read" can *rotate stored
   credentials*.
 - **Capacity before the first successful provider read** — represented as
   `AwaitingFirstReport`, never 0%.
-- **Claude plan/limit label** — would require reading a secret-bearing file.
-- **Fresh capacity with no backend agent running** — there is no provider
-  connection or CLI trigger.
 - **Dollar amounts for Claude** — never reported by these sources.
 - **Cross-vendor comparison, or any merged percentage.**
 - **Org/workspace/seat disambiguation beyond what the vendor states** —

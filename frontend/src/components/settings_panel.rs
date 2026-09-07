@@ -12547,6 +12547,7 @@ mod wasm_tests {
                         },
                         retrieved_at_ms: js_sys::Date::now() as u64,
                         freshness: protocol::CapacityFreshness::Fresh { age_ms: 0 },
+                        refreshable: true,
                     },
                 );
                 snapshots.insert(
@@ -12558,6 +12559,7 @@ mod wasm_tests {
                         },
                         retrieved_at_ms: js_sys::Date::now() as u64,
                         freshness: protocol::CapacityFreshness::Fresh { age_ms: 0 },
+                        refreshable: true,
                     },
                 );
             });

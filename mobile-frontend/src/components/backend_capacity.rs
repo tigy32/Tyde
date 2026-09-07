@@ -247,6 +247,8 @@ fn error_code_text(code: CapacityErrorCode) -> &'static str {
         CapacityErrorCode::SourceRejected => "source rejected the request",
         CapacityErrorCode::RateLimited => "rate limited",
         CapacityErrorCode::MalformedResponse => "malformed response",
+        CapacityErrorCode::SourceUnreachable => "source unreachable",
+        CapacityErrorCode::SourceTimedOut => "source timed out",
     }
 }
 
@@ -284,14 +286,25 @@ fn state_explanation(state: &BackendCapacityState, kind: BackendKind) -> Option<
     let vendor = backend_label(kind);
     match state {
         BackendCapacityState::Known { .. } => None,
-        BackendCapacityState::Stale { .. } => Some(format!(
-            "{vendor} reports capacity passively, so this figure ages while the account is idle. \
-             Run a turn to refresh it."
-        )),
+        // A stale report that carries an error is a *failed refresh*, not an
+        // aged-out one, and saying so is the difference between "this number is
+        // old" and "this number is old because collection is broken". The
+        // figures stay on screen either way: erasing them on a failed poll
+        // would render as no capacity data at all.
+        BackendCapacityState::Stale { last_error, .. } => Some(match last_error {
+            Some(detail) => format!(
+                "This {vendor} figure is the last successful report. Refreshing it failed: {} ({}).",
+                detail.summary,
+                error_code_text(detail.code)
+            ),
+            None => format!(
+                "This {vendor} figure is stale and will update on the next successful reading."
+            ),
+        }),
         BackendCapacityState::Unavailable { reason } => Some(match reason {
             CapacityUnavailableReason::AwaitingFirstReport => format!(
-                "No report from {vendor} yet. It reports capacity passively, only after a turn \
-                 completes. This is not zero usage \u{2014} nothing has been reported."
+                "No report from {vendor} yet. This is not zero usage \u{2014} nothing has been \
+                 reported."
             ),
             // Covers both a vendor payload that failed validation and a Codex
             // notification that arrived without the complete snapshot: the
@@ -308,6 +321,9 @@ fn state_explanation(state: &BackendCapacityState, kind: BackendKind) -> Option<
             }
         }),
         BackendCapacityState::Unsupported { reason } => Some(match reason {
+            CapacityUnsupportedReason::BackendNotInstalled => format!(
+                "{vendor} is not installed on this host, so there is no account to read quota from."
+            ),
             CapacityUnsupportedReason::BackendHasNoCapacitySource => {
                 format!("{vendor} exposes no capacity source, so no quota can be shown.")
             }
@@ -534,6 +550,7 @@ fn snapshot_card(snapshot: &BackendCapacitySnapshot) -> AnyView {
     let report = state_report(state);
     let freshness = freshness_text(&snapshot.freshness);
     let retrieved = format_absolute_utc(snapshot.retrieved_at_ms);
+    let refreshable = snapshot.refreshable;
 
     view! {
         <div
@@ -544,6 +561,16 @@ fn snapshot_card(snapshot: &BackendCapacitySnapshot) -> AnyView {
             <div class="capacity-card-head">
                 <span class="capacity-backend">{backend_label(kind)}</span>
                 <span class="capacity-state" data-capacity-state=slug>{headline}</span>
+                {refreshable.then(|| view! {
+                    <button
+                        class="capacity-refresh"
+                        type="button"
+                        title="Read this backend's account quota now"
+                        on:click=move |_| request_capacity_refresh(kind)
+                    >
+                        "Refresh"
+                    </button>
+                })}
             </div>
             <div class="capacity-card-meta">
                 <span class="capacity-meta-item">{freshness}</span>
@@ -661,6 +688,33 @@ fn compact_row(snapshot: &BackendCapacitySnapshot) -> AnyView {
         </div>
     }
     .into_any()
+}
+
+/// Asks the server to collect this backend's capacity now.
+///
+/// The server owns collection: this sends a request and renders whatever
+/// snapshot comes back. A refresh landing while a poll is already in flight
+/// coalesces into it server-side rather than starting a second provider process.
+fn request_capacity_refresh(kind: BackendKind) {
+    let state = use_context::<AppState>().expect("AppState");
+    let Some(host) = state.active_local_host_id.get_untracked() else {
+        return;
+    };
+    let Some(host_stream) = state.host_stream_untracked(&host) else {
+        return;
+    };
+    leptos::task::spawn_local(async move {
+        if let Err(error) = crate::send::send_frame(
+            &host,
+            host_stream,
+            protocol::FrameKind::BackendCapacityRefresh,
+            &protocol::BackendCapacityRefreshPayload { backend: kind },
+        )
+        .await
+        {
+            log::error!("failed to send BackendCapacityRefresh for {kind:?}: {error}");
+        }
+    });
 }
 
 /// Mobile Settings: the same authoritative view as desktop, stacked. Every
@@ -875,6 +929,7 @@ mod wasm_tests {
             },
             retrieved_at_ms: now_ms(),
             freshness: fresh(),
+            refreshable: true,
         }
     }
 
@@ -912,6 +967,7 @@ mod wasm_tests {
             },
             retrieved_at_ms: now_ms(),
             freshness: fresh(),
+            refreshable: true,
         }
     }
 
@@ -959,6 +1015,7 @@ mod wasm_tests {
             },
             retrieved_at_ms: now_ms(),
             freshness: fresh(),
+            refreshable: true,
         }
     }
 
@@ -1139,6 +1196,7 @@ mod wasm_tests {
                     state: capacity_state,
                     retrieved_at_ms: now_ms(),
                     freshness: fresh(),
+                    refreshable: true,
                 }],
             );
             for _ in 0..4 {
@@ -1218,12 +1276,14 @@ mod wasm_tests {
                 state: BackendCapacityState::Stale {
                     report,
                     stale_since_ms: now_ms(),
+                    last_error: None,
                 },
                 retrieved_at_ms: now_ms(),
                 freshness: CapacityFreshness::Stale {
                     age_ms: 2 * FRESHNESS_THRESHOLD_MS,
                     threshold_ms: FRESHNESS_THRESHOLD_MS,
                 },
+                refreshable: true,
             }],
         );
         for _ in 0..4 {

@@ -1996,6 +1996,123 @@ fn real_subscription_capacity() {
     );
 }
 
+/// Capacity with no conversation: the whole point of polling.
+///
+/// This spawns **no agent**. A backend declaring `OutOfBandCapacity` promises
+/// its account quota can be read by a short-lived provider process or
+/// connection, so a host that has just started — with nothing running and
+/// nobody having talked to the provider — must still publish a real report.
+/// Before polling existed this was unreachable by construction: collection was
+/// installed on a live session's emitter, so a backend nobody had used sat at
+/// `AwaitingFirstReport` forever.
+///
+/// Spawning an agent here would make the test pass for the wrong reason, so it
+/// deliberately never does. `assert_clean_close` is likewise absent: there is
+/// no agent to close.
+#[test]
+#[ignore = "paid real-backend suite; use --run-ignored all with TYDE_RUN_REAL_AI_TESTS=1"]
+fn real_capacity_without_a_conversation() {
+    run_scenario(
+        &[BackendCapability::OutOfBandCapacity],
+        |mut host| async move {
+            let snapshot = host.await_known_capacity().await;
+            assert_eq!(snapshot.backend_kind, host.backend());
+            assert!(
+                snapshot.refreshable,
+                "{:?}: a backend polled without a conversation must offer refresh",
+                host.backend()
+            );
+            let BackendCapacityState::Known { report } = snapshot.state.clone() else {
+                unreachable!("await_known_capacity returns only Known")
+            };
+            let source_matches_backend = matches!(
+                (host.backend(), report.source),
+                (BackendKind::Kiro, CapacitySource::KiroUsageCommand)
+                    | (BackendKind::Claude, CapacitySource::ClaudeControlUsage)
+                    | (
+                        BackendKind::Codex,
+                        CapacitySource::CodexAccountRateLimitsUpdated
+                    )
+                    | (BackendKind::Grok, CapacitySource::GrokBilling)
+                    | (
+                        BackendKind::Antigravity,
+                        CapacitySource::AntigravityUsageCommand
+                    )
+            );
+            assert!(
+                source_matches_backend,
+                "{:?}: out-of-band capacity came from the wrong source: {:?}",
+                host.backend(),
+                report.source
+            );
+            // `ClaudeRateLimitEvent` is the passive stream event and is only
+            // reachable from a running turn, so seeing it here would mean the
+            // report did not come from the poll this test exists to prove.
+            assert_ne!(
+                report.source,
+                CapacitySource::ClaudeRateLimitEvent,
+                "{:?}: report came from conversation traffic, not an out-of-band read",
+                host.backend()
+            );
+            assert!(
+                !report.buckets.is_empty(),
+                "{:?}: polled capacity carried no buckets",
+                host.backend()
+            );
+            assert!(
+                report.buckets.iter().any(|bucket| match &bucket.measure {
+                    CapacityMeasure::UsedPercent {
+                        used_percent,
+                        remaining_percent,
+                        ..
+                    } => u16::from(*used_percent) + u16::from(*remaining_percent) == 100,
+                    CapacityMeasure::CreditUsage {
+                        used,
+                        limit,
+                        used_percent,
+                        remaining_percent,
+                        ..
+                    } => {
+                        !used.is_empty()
+                            && !limit.is_empty()
+                            && u16::from(*used_percent) + u16::from(*remaining_percent) == 100
+                    }
+                    CapacityMeasure::Credits {
+                        has_credits,
+                        unlimited,
+                        balance,
+                    } => *has_credits || *unlimited || balance.is_some(),
+                    CapacityMeasure::ReportedWithoutMagnitude => false,
+                }),
+                "{:?}: polled capacity carried no usable numeric magnitude: {:?}",
+                host.backend(),
+                report.buckets
+            );
+
+            // A manual refresh must reach the same source and produce another
+            // real report, not a cached echo of the first.
+            let refreshed = host.refresh_capacity_and_await_report().await;
+            let BackendCapacityState::Known { report: refreshed } = refreshed.state else {
+                panic!(
+                    "{:?}: manual refresh did not produce a Known report",
+                    host.backend()
+                )
+            };
+            assert_eq!(
+                refreshed.source,
+                report.source,
+                "{:?}: manual refresh changed the reporting source",
+                host.backend()
+            );
+            assert!(
+                !refreshed.buckets.is_empty(),
+                "{:?}: manually refreshed capacity carried no buckets",
+                host.backend()
+            );
+        },
+    );
+}
+
 /// The model's own plan, as a strongly-typed `TaskUpdate`.
 ///
 /// Ungated on purpose, unlike every other capability-sensitive scenario here. A

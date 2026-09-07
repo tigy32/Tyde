@@ -47,6 +47,7 @@ pub(crate) fn capabilities() -> BackendCapabilities {
         BackendCapability::TaskListReplacement,
         BackendCapability::TaskListClear,
         BackendCapability::CapacityTelemetry,
+        BackendCapability::OutOfBandCapacity,
     ]
     .into()
 }

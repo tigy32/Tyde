@@ -5,6 +5,12 @@ multiplexing, connection handshake, and version negotiation.
 
 See `01-philosophy.md` for the design decisions that shaped this spec.
 
+Protocol version 59 adds host-owned subscription-capacity polling: the
+`backend_capacity_refresh` request, `BackendCapacitySnapshot::refreshable`,
+`BackendCapacityState::Stale::last_error` so a failed reading keeps the last good
+report instead of erasing it, and the `BackendNotInstalled`,
+`SourceUnreachable`, and `SourceTimedOut` reason/code variants.
+
 Protocol version 58 adds typed binary file metadata and the
 `project_open_path` request used for host-side open and reveal actions.
 

@@ -1374,6 +1374,17 @@ fn tool_execution_result(
     }
 }
 
+/// Reads the account's remaining quota with no conversation and no live agent.
+///
+/// `/usage` is answered by print mode without a model request, so the probe
+/// only needs a model name for the launch flag — it never reaches the model.
+pub(crate) async fn read_capacity_out_of_band() -> protocol::BackendCapacityState {
+    match read_antigravity_capacity(ANTIGRAVITY_DEFAULT_MODEL).await {
+        Ok(report) => protocol::BackendCapacityState::Known { report },
+        Err(reason) => protocol::BackendCapacityState::Unavailable { reason },
+    }
+}
+
 /// Reads the account's remaining quota without starting a turn.
 ///
 /// `/usage` is answered by print mode directly — no model request, no turn,
@@ -1397,7 +1408,11 @@ async fn read_antigravity_capacity(
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null());
+        .stderr(Stdio::null())
+        // A timeout drops the `output()` future, which does not reap the child
+        // unless it is killed on drop. Without this a hung `agy` outlives every
+        // probe that gives up on it, and the poll runs on a timer.
+        .kill_on_drop(true);
 
     let output = tokio::time::timeout(ANTIGRAVITY_CAPACITY_TIMEOUT, command.output())
         .await
@@ -1631,6 +1646,7 @@ impl Backend for AntigravityBackend {
             Cap::StartupMcpServers,
             Cap::AgentControlTools,
             Cap::CapacityTelemetry,
+            Cap::OutOfBandCapacity,
             Cap::ListSessions,
             Cap::WorkspaceInstructions,
             Cap::Customization,
