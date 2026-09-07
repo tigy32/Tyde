@@ -1390,6 +1390,7 @@ fn HostsTab() -> impl IntoView {
     let remote_command_sig = RwSignal::new(String::new());
     let auto_connect_sig = RwSignal::new(true);
     let error_sig: RwSignal<Option<String>> = RwSignal::new(None);
+    let disconnecting_hosts = RwSignal::new(std::collections::HashSet::<String>::new());
 
     let on_add = {
         let state = state.clone();
@@ -1513,7 +1514,8 @@ fn HostsTab() -> impl IntoView {
                         crate::state::ConnectionStatus::Disconnected => ("disconnected", "Disconnected".to_string()),
                         crate::state::ConnectionStatus::Error(message) => ("error", format!("Error: {message}")),
                     };
-                    let is_connected = matches!(status, crate::state::ConnectionStatus::Connected | crate::state::ConnectionStatus::Connecting | crate::state::ConnectionStatus::Reconnecting { .. });
+                    let is_disconnecting = disconnecting_hosts.with(|hosts| hosts.contains(&host_id));
+                    let is_connected = is_disconnecting || !matches!(status, crate::state::ConnectionStatus::Disconnected);
                     let is_reconnecting = matches!(status, crate::state::ConnectionStatus::Reconnecting { .. });
                     let retry_host_id = host_id.clone();
                     let retry_state = state.clone();
@@ -1565,7 +1567,12 @@ fn HostsTab() -> impl IntoView {
                                         let host_id = retry_host_id.clone();
                                         let state = retry_state.clone();
                                         spawn_local(async move {
-                                            if bridge::retry_host(host_id.clone()).await.is_err() {
+                                            let epoch = state.host_connection_epochs.get_untracked().get(&host_id).copied();
+                                            let result = bridge::retry_host(host_id.clone()).await;
+                                            if state.host_connection_epochs.get_untracked().get(&host_id).copied() != epoch {
+                                                return;
+                                            }
+                                            if result.is_err() {
                                                 connect_one_host(state, host_id).await;
                                             }
                                         });
@@ -1580,32 +1587,30 @@ fn HostsTab() -> impl IntoView {
                                         view! {
                                             <button
                                                 class="settings-btn"
+                                                disabled=is_disconnecting
+                                                title="Clear this host’s projects, agents, and tabs. Connect again to load a fresh snapshot."
                                                 on:click=move |_| {
                                                     let host_id = host_id_for_disconnect.clone();
                                                     let state = disconnect_state.clone();
+                                                    disconnecting_hosts.update(|hosts| { hosts.insert(host_id.clone()); });
                                                     spawn_local(async move {
-                                                        state.cancel_host_connect(&host_id);
-                                                        if let Err(e) = bridge::disconnect_host(host_id.clone()).await {
+                                                        if let Err(e) = crate::app::disconnect_one_host(state, host_id.clone()).await {
                                                             error_sig.set(Some(format!("Failed to disconnect host: {e}")));
                                                         }
-                                                        state.connection_statuses.update(|statuses| {
-                                                            statuses.insert(host_id.clone(), crate::state::ConnectionStatus::Disconnected);
-                                                        });
-                                                        // Explicit user disconnect ends the connection
-                                                        // lifecycle, so release the one-shot forced-upgrade
-                                                        // guard: a later manual reconnect can attempt the
-                                                        // auto-upgrade once more. Only cleared here (not on
-                                                        // transport-drop) to preserve the no-loop invariant.
-                                                        state.clear_upgrade_attempted(&host_id);
+                                                        disconnecting_hosts.update(|hosts| { hosts.remove(&host_id); });
                                                     });
                                                 }
                                             >
-                                                "Disconnect"
+                                                {if is_disconnecting { "Disconnecting…" } else { "Disconnect" }}
                                             </button>
                                         }.into_any()
                                     } else if is_managed_remote {
                                         let lifecycle_status = lifecycle_status.clone();
-                                        let label = managed_lifecycle_button_label(&lifecycle_status);
+                                        let label = if matches!(status, crate::state::ConnectionStatus::Disconnected) {
+                                            "Connect".to_string()
+                                        } else {
+                                            managed_lifecycle_button_label(&lifecycle_status)
+                                        };
                                         let disabled = is_connecting || managed_lifecycle_button_disabled(&lifecycle_status);
                                         view! {
                                             <button
@@ -12974,6 +12979,228 @@ mod wasm_tests {
                 lifecycle: Default::default(),
             },
             auto_connect: false,
+        }
+    }
+
+    #[wasm_bindgen_test]
+    async fn disconnect_clears_host_ui_and_connect_starts_a_fresh_snapshot() {
+        use crate::components::agent_monitor_view::AgentMonitorView;
+        use crate::components::center_zone::CenterZone;
+        use crate::components::project_rail::ProjectRail;
+        use crate::state::{AgentInfo, ConnectionStatus, ProjectInfo};
+
+        js_sys::eval(
+            r#"
+            window.__manual_host_events = {};
+            window.__manual_host_calls = [];
+            window.__TAURI__ = window.__TAURI__ || {};
+            window.__TAURI__.event = { listen: (name, callback) => {
+                window.__manual_host_events[name] = callback;
+                return Promise.resolve(() => delete window.__manual_host_events[name]);
+            }};
+            window.__TAURI__.core = { invoke: (cmd, args) => {
+                window.__manual_host_calls.push({cmd, args});
+                if (cmd === 'retry_host') return new Promise((resolve, reject) => {
+                    window.__reject_manual_host_retry = reject;
+                });
+                if (cmd === 'disconnect_host') return new Promise(resolve => {
+                    window.__finish_manual_host_disconnect = resolve;
+                });
+                return Promise.resolve();
+            }};
+        "#,
+        )
+        .unwrap();
+        let state = AppState::new();
+        let mut host = settings_host("manual-host", "Remote machine");
+        host.transport = bridge::HostTransportConfig::SshStdio {
+            ssh_destination: "remote".into(),
+            remote_command: Some("manual-bridge".into()),
+            lifecycle: bridge::RemoteHostLifecycleConfig::Manual,
+        };
+        state.configured_hosts.set(vec![host]);
+        state.selected_host_id.set(Some("manual-host".into()));
+        state.connection_statuses.update(|statuses| {
+            statuses.insert(
+                "manual-host".into(),
+                ConnectionStatus::Reconnecting {
+                    attempt: 2,
+                    retry_in_seconds: 5,
+                    message: "Connection lost".into(),
+                },
+            );
+        });
+        let old_stream = protocol::StreamPath("/host/old-manual-session".into());
+        state.host_streams.update(|streams| {
+            streams.insert("manual-host".into(), old_stream.clone());
+        });
+        let project = protocol::Project {
+            id: protocol::ProjectId("manual-project".into()),
+            name: "Remote project".into(),
+            sort_order: 0,
+            source: protocol::ProjectSource::Standalone {
+                roots: vec![protocol::ProjectRootPath("/remote/project".into())],
+            },
+        };
+        state.projects.set(vec![ProjectInfo {
+            host_id: "manual-host".into(),
+            project: project.clone(),
+        }]);
+        state.agents.set(vec![AgentInfo {
+            host_id: "manual-host".into(),
+            agent_id: protocol::AgentId("manual-agent".into()),
+            name: "Remote worker".into(),
+            origin: protocol::AgentOrigin::User,
+            backend_kind: protocol::BackendKind::Claude,
+            workspace_roots: vec![],
+            project_id: None,
+            parent_agent_id: None,
+            team_member_id: None,
+            session_id: None,
+            custom_agent_id: None,
+            workflow: None,
+            created_at_ms: 1,
+            instance_stream: protocol::StreamPath("/agent/manual-agent/old".into()),
+            started: true,
+            fatal_error: None,
+            activity_summary: Default::default(),
+        }]);
+        state.tabs_enabled.set(true);
+        state.open_tab(
+            crate::state::TabContent::File {
+                key: crate::state::FileResourceKey {
+                    host_id: "manual-host".into(),
+                    project_id: project.id.clone(),
+                    path: protocol::ProjectPath {
+                        root: protocol::ProjectRootPath("/remote/project".into()),
+                        relative_path: "stale-file.rs".into(),
+                    },
+                },
+            },
+            "stale-file.rs".into(),
+            true,
+        );
+        wasm_bindgen_test::console_log!("manual disconnect: install listeners");
+        let listeners = crate::app::install_host_listeners(state.clone())
+            .await
+            .unwrap();
+        let container = make_container();
+        let mount_state = state.clone();
+        wasm_bindgen_test::console_log!("manual disconnect: mount UI");
+        let handle = mount_to(container.clone(), move || {
+            provide_context(mount_state.clone());
+            view! {
+                {view! { <HostsTab /> }.into_any()}
+                {view! { <ProjectRail /> }.into_any()}
+                {view! { <AgentMonitorView /> }.into_any()}
+                {view! { <CenterZone /> }.into_any()}
+            }
+        });
+        next_tick().await;
+        wasm_bindgen_test::console_log!("manual disconnect: UI mounted");
+        let visible = container.text_content().unwrap_or_default();
+        assert!(visible.contains("Remote project") && visible.contains("Remote worker"));
+        assert!(visible.contains("stale-file.rs"));
+        find_button_by_text(&container, "Retry now")
+            .unwrap()
+            .click();
+        next_tick().await;
+        find_button_by_text(&container, "Disconnect")
+            .unwrap()
+            .click();
+        next_tick().await;
+        let visible = container.text_content().unwrap_or_default();
+        assert!(
+            !visible.contains("Remote project"),
+            "Disconnect must remove the host's project rail immediately"
+        );
+        assert!(
+            !visible.contains("Remote worker"),
+            "Disconnect must remove the host's agents immediately"
+        );
+        assert!(
+            !visible.contains("stale-file.rs"),
+            "Disconnect must close host file tabs"
+        );
+        assert!(
+            visible.contains("Remote machine"),
+            "the saved host must remain available for Connect"
+        );
+        assert!(
+            find_button_by_text(&container, "Connect").is_none(),
+            "wait for transport teardown before allowing Connect"
+        );
+        js_sys::eval(r#"
+            window.__reject_manual_host_retry('old retry failed');
+            window.__manual_host_events['tyde://host-error']({payload: {hostId: 'manual-host', message: 'old transport error'}});
+            window.__manual_host_events['tyde://host-recovery']({payload: {hostId: 'manual-host', connected: true, attempt: 0, retryInSeconds: 0, message: 'old recovery'}});
+            window.__manual_host_events['tyde://host-disconnected']({payload: {hostId: 'manual-host'}});
+            window.__manual_host_events['tyde://host-line']({payload: {hostId: 'manual-host', line: JSON.stringify({
+                stream: '/host/old-manual-session', kind: 'welcome', seq: 0,
+                payload: {protocol_version: 59, tyde_version: {major: 0, minor: 8, patch: 14}}
+            })}});
+            window.__finish_manual_host_disconnect();
+        "#).unwrap();
+        next_tick().await;
+        next_tick().await;
+        assert!(find_button_by_text(&container, "Connect").is_some());
+        assert!(
+            !container
+                .text_content()
+                .unwrap_or_default()
+                .contains("Remote project")
+        );
+        assert_eq!(
+            js_sys::eval("window.__manual_host_calls.filter(c => c.cmd === 'connect_host').length")
+                .unwrap()
+                .as_f64(),
+            Some(0.0),
+            "late retries must not reconnect after Disconnect"
+        );
+        find_button_by_text(&container, "Connect").unwrap().click();
+        next_tick().await;
+        next_tick().await;
+        let frames: Vec<protocol::Envelope> = serde_json::from_str(&js_sys::eval("JSON.stringify(window.__manual_host_calls.filter(c => c.cmd === 'send_host_line').map(c => JSON.parse(c.args.line)))").unwrap().as_string().unwrap()).unwrap();
+        let hello = frames
+            .iter()
+            .find(|frame| frame.kind == protocol::FrameKind::Hello)
+            .expect("manual Connect must send a new Hello");
+        assert_ne!(hello.stream, old_stream);
+        assert_eq!(hello.seq, 0);
+        let welcome = protocol::Envelope::from_payload(
+            hello.stream.clone(),
+            protocol::FrameKind::Welcome,
+            0,
+            &protocol::WelcomePayload {
+                protocol_version: protocol::PROTOCOL_VERSION,
+                tyde_version: protocol::TYDE_VERSION,
+                release_version: None,
+            },
+        )
+        .unwrap();
+        let line = serde_json::to_string(&welcome).unwrap();
+        js_sys::eval(&format!("window.__manual_host_events['tyde://host-line']({{payload: {{hostId: 'manual-host', line: {}}}}});", serde_json::to_string(&line).unwrap())).unwrap();
+        let notify = protocol::Envelope::from_payload(
+            hello.stream.clone(),
+            protocol::FrameKind::ProjectNotify,
+            1,
+            &protocol::ProjectNotifyPayload::Upsert { project },
+        )
+        .unwrap();
+        let line = serde_json::to_string(&notify).unwrap();
+        js_sys::eval(&format!("window.__manual_host_events['tyde://host-line']({{payload: {{hostId: 'manual-host', line: {}}}}});", serde_json::to_string(&line).unwrap())).unwrap();
+        next_tick().await;
+        assert!(
+            container
+                .text_content()
+                .unwrap_or_default()
+                .contains("Remote project"),
+            "fresh server state must repopulate the project rail"
+        );
+        drop(handle);
+        container.remove();
+        for listener in listeners {
+            listener.remove();
         }
     }
 

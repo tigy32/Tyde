@@ -462,8 +462,24 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                     let state = state.clone();
                     let host_id = host_id.to_string();
                     let reject_message = payload.message;
+                    let epoch = state
+                        .host_connection_epochs
+                        .get_untracked()
+                        .get(&host_id)
+                        .copied();
                     wasm_bindgen_futures::spawn_local(async move {
-                        match crate::bridge::force_upgrade_managed_host(host_id.clone()).await {
+                        let result =
+                            crate::bridge::force_upgrade_managed_host(host_id.clone()).await;
+                        if state
+                            .host_connection_epochs
+                            .get_untracked()
+                            .get(&host_id)
+                            .copied()
+                            != epoch
+                        {
+                            return;
+                        }
+                        match result {
                             Ok(snapshot) => {
                                 state.host_lifecycle_statuses.update(|statuses| {
                                     statuses.insert(

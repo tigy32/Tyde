@@ -3160,7 +3160,8 @@ fn close_host_runtime_tabs_in_cz(
                 host_id: tab_host, ..
             } => tab_host == host_id,
             TabContent::Workflow { agent_ref, .. } => agent_ref.host_id == host_id,
-            TabContent::Home | TabContent::AgentMonitor | TabContent::File { .. } => false,
+            TabContent::File { key } => key.host_id == host_id,
+            TabContent::Home | TabContent::AgentMonitor => false,
         })
         .map(|(_, tab)| tab.id)
         .collect();
@@ -6404,6 +6405,7 @@ impl AppState {
                     memory.needs_refresh = true;
                 }
                 memory.diff_contents.retain(|key, _| key.host_id != host_id);
+                memory.open_files.retain(|key, _| key.host_id != host_id);
             }
         });
         self.terminals.update(|terminals| {

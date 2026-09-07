@@ -1042,12 +1042,17 @@ fn reported_host_error_message(label: Option<&str>, error: &str) -> String {
     }
 }
 
-async fn install_host_listeners(state: AppState) -> Result<Vec<bridge::UnlistenHandle>, String> {
+pub(crate) async fn install_host_listeners(
+    state: AppState,
+) -> Result<Vec<bridge::UnlistenHandle>, String> {
     let mut handles = Vec::with_capacity(5);
 
     let line_state = state.clone();
     handles.push(
         bridge::listen_host_line(move |event| {
+            if host_is_manually_disconnected(&line_state, &event.host_id) {
+                return;
+            }
             match serde_json::from_str::<Envelope>(&event.line) {
                 Ok(envelope) => {
                     log::trace!(
@@ -1184,6 +1189,9 @@ async fn install_host_listeners(state: AppState) -> Result<Vec<bridge::UnlistenH
     let error_state = state.clone();
     handles.push(
         bridge::listen_host_error(move |event| {
+            if host_is_manually_disconnected(&error_state, &event.host_id) {
+                return;
+            }
             log::error!("host {} error: {}", event.host_id, event.message);
             let label = configured_host_label(&error_state, &event.host_id);
             crate::components::header::report_user_error(reported_host_error_message(
@@ -1200,6 +1208,9 @@ async fn install_host_listeners(state: AppState) -> Result<Vec<bridge::UnlistenH
     let warning_state = state.clone();
     handles.push(
         bridge::listen_host_warning(move |event| {
+            if host_is_manually_disconnected(&warning_state, &event.host_id) {
+                return;
+            }
             if matches!(
                 warning_state
                     .connection_statuses
@@ -1228,6 +1239,9 @@ async fn install_host_listeners(state: AppState) -> Result<Vec<bridge::UnlistenH
     let lifecycle_state = state.clone();
     handles.push(
         bridge::listen_host_lifecycle(move |event| {
+            if host_is_manually_disconnected(&lifecycle_state, &event.host_id) {
+                return;
+            }
             lifecycle_state.host_lifecycle_statuses.update(|statuses| {
                 statuses.insert(event.host_id, event.status);
             });
@@ -1262,6 +1276,25 @@ pub async fn refresh_configured_hosts(state: &AppState) {
             ));
         }
     }
+}
+
+fn host_is_manually_disconnected(state: &AppState, host_id: &str) -> bool {
+    state.connection_statuses.with_untracked(|statuses| {
+        matches!(statuses.get(host_id), Some(ConnectionStatus::Disconnected))
+    })
+}
+
+pub(crate) async fn disconnect_one_host(state: AppState, host_id: String) -> Result<(), String> {
+    log::info!("host.disconnect.manual host={host_id}");
+    batch(|| {
+        state.cancel_host_connect(&host_id);
+        state.connection_statuses.update(|statuses| {
+            statuses.insert(host_id.clone(), ConnectionStatus::Disconnected);
+        });
+        state.clear_host_runtime(&host_id);
+        state.clear_upgrade_attempted(&host_id);
+    });
+    bridge::disconnect_host(host_id).await
 }
 
 pub async fn connect_one_host(state: AppState, host_id: String) {
