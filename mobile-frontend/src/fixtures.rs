@@ -3,7 +3,8 @@ use std::cell::Cell;
 use leptos::prelude::*;
 use protocol::{
     AgentId, AgentOrigin, BackendKind, ChatMessage, ChatMessageId, CustomAgent, CustomAgentId,
-    MessageSender, SessionId, StreamPath, ToolPolicy,
+    MessageSender, Project, ProjectId, ProjectRootPath, ProjectSource, SessionId, StreamPath,
+    ToolPolicy,
 };
 use settings_model::HostSettings;
 use wasm_bindgen::JsValue;
@@ -11,7 +12,7 @@ use wasm_bindgen::JsValue;
 use crate::bridge::{Accepted, LocalSubmissionId};
 use crate::state::{
     ActiveAgentRef, AgentInfo, AppMode, AppState, ChatMessageEntry, ConnectionStatus, LocalHostId,
-    MobileShellError, MobileTab,
+    MobileShellError, MobileTab, ProjectInfo,
 };
 
 const FIXTURE_QUERY_KEY: &str = "tyde-fixture";
@@ -139,22 +140,83 @@ pub fn seed_state(state: &AppState) {
             },
         );
     });
-    state.agents.set(vec![AgentInfo {
-        local_host_id: host.clone(),
-        agent_id: agent_id.clone(),
-        name: "Mira".to_owned(),
-        origin: AgentOrigin::User,
-        backend_kind: BackendKind::Codex,
-        workspace_roots: vec!["/Users/mike/Tyggs/Tyde".to_owned()],
-        project_id: None,
-        parent_agent_id: None,
-        session_id: Some(SessionId("fixture-session".to_owned())),
-        custom_agent_id: None,
-        created_at_ms: 1_721_000_000_000,
-        instance_stream: stream,
-        started: true,
-        fatal_error: None,
-    }]);
+    // Two projects and a workbench under one of them: the agent list groups by
+    // project and the new-chat sheet lists them, so a fixture with no projects
+    // would leave both surfaces impossible to look at.
+    state.projects.set(vec![
+        ProjectInfo {
+            local_host_id: host.clone(),
+            project: Project {
+                id: ProjectId("fixture-tyde".to_owned()),
+                name: "Tyde".to_owned(),
+                sort_order: 0,
+                source: ProjectSource::Standalone {
+                    roots: vec![ProjectRootPath("/Users/mike/Tyggs/Tyde".to_owned())],
+                },
+            },
+        },
+        ProjectInfo {
+            local_host_id: host.clone(),
+            project: Project {
+                id: ProjectId("fixture-tychat".to_owned()),
+                name: "Tychat".to_owned(),
+                sort_order: 1,
+                source: ProjectSource::Standalone {
+                    roots: vec![ProjectRootPath("/Users/mike/Tyggs/Tychat".to_owned())],
+                },
+            },
+        },
+    ]);
+    state.agents.set(vec![
+        AgentInfo {
+            local_host_id: host.clone(),
+            agent_id: agent_id.clone(),
+            name: "Mira".to_owned(),
+            origin: AgentOrigin::User,
+            backend_kind: BackendKind::Codex,
+            workspace_roots: vec!["/Users/mike/Tyggs/Tyde".to_owned()],
+            project_id: Some(ProjectId("fixture-tyde".to_owned())),
+            parent_agent_id: None,
+            session_id: Some(SessionId("fixture-session".to_owned())),
+            custom_agent_id: None,
+            created_at_ms: 1_721_000_000_000,
+            instance_stream: stream,
+            started: true,
+            fatal_error: None,
+        },
+        AgentInfo {
+            local_host_id: host.clone(),
+            agent_id: AgentId("fixture-agent-tychat".to_owned()),
+            name: "Read-state sync".to_owned(),
+            origin: AgentOrigin::User,
+            backend_kind: BackendKind::Claude,
+            workspace_roots: vec!["/Users/mike/Tyggs/Tychat".to_owned()],
+            project_id: Some(ProjectId("fixture-tychat".to_owned())),
+            parent_agent_id: None,
+            session_id: None,
+            custom_agent_id: None,
+            created_at_ms: 1_721_000_100_000,
+            instance_stream: StreamPath("/agent/fixture-agent-tychat/instance".to_owned()),
+            started: true,
+            fatal_error: None,
+        },
+        AgentInfo {
+            local_host_id: host.clone(),
+            agent_id: AgentId("fixture-agent-loose".to_owned()),
+            name: "What does dvh do on iOS?".to_owned(),
+            origin: AgentOrigin::User,
+            backend_kind: BackendKind::Codex,
+            workspace_roots: Vec::new(),
+            project_id: None,
+            parent_agent_id: None,
+            session_id: None,
+            custom_agent_id: None,
+            created_at_ms: 1_721_000_200_000,
+            instance_stream: StreamPath("/agent/fixture-agent-loose/instance".to_owned()),
+            started: true,
+            fatal_error: None,
+        },
+    ]);
     state.active_agent.set(Some(ActiveAgentRef {
         local_host_id: host.clone(),
         agent_id,

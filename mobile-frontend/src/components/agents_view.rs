@@ -5,9 +5,11 @@ use crate::components::ui::{
     Button, ButtonSize, ButtonVariant, Card, EmptyState, Pill, PillTone, Spinner, StatusDot,
     StatusTone,
 };
-use crate::state::{ActiveAgentRef, AgentInfo, AgentRef, AppState};
+use crate::state::{
+    ActiveAgentRef, AgentInfo, AgentRef, AppState, ProjectInfo, sort_project_infos,
+};
 use leptos::prelude::*;
-use protocol::AgentId;
+use protocol::{AgentId, ProjectId};
 
 const STORAGE_HIDE_SUB_AGENTS: &str = "tyde-mobile-agents-hide-sub-agents";
 const BOOL_TRUE: &str = "true";
@@ -173,6 +175,68 @@ fn group_agents(agents: Vec<AgentInfo>) -> Vec<(AgentInfo, Vec<AgentInfo>)> {
     grouped
 }
 
+/// One project's worth of the agent list: the heading the user reads and the
+/// parent/child groups filed under it.
+struct ProjectSection {
+    label: String,
+    groups: Vec<(AgentInfo, Vec<AgentInfo>)>,
+}
+
+/// File the host's agents under the project each one was spawned in, in the
+/// order the project list itself is in, with unscoped agents last under
+/// "No project".
+///
+/// Desktop has had this in its agents sidebar since it had a sidebar; mobile
+/// rendered one flat list, so a phone with agents across four repositories gave
+/// no way to tell which was which. `AgentInfo::project_id` was already on the
+/// wire — nothing read it.
+///
+/// A project id an agent carries that the project list does not know about
+/// still gets a section, keyed by the raw id: dropping those agents on the
+/// floor would hide running work.
+fn project_sections(agents: Vec<AgentInfo>, projects: &[ProjectInfo]) -> Vec<ProjectSection> {
+    let labels: HashMap<ProjectId, String> = projects
+        .iter()
+        .map(|info| (info.project.id.clone(), info.project.name.clone()))
+        .collect();
+
+    let mut order: Vec<Option<ProjectId>> = projects
+        .iter()
+        .map(|info| Some(info.project.id.clone()))
+        .collect();
+    for agent in &agents {
+        let key = agent.project_id.clone();
+        if key.is_some() && !order.contains(&key) {
+            order.push(key);
+        }
+    }
+    // Unscoped agents read as the leftovers of the list, not its headline.
+    order.push(None);
+
+    let mut by_project: HashMap<Option<ProjectId>, Vec<AgentInfo>> = HashMap::new();
+    for agent in agents {
+        by_project
+            .entry(agent.project_id.clone())
+            .or_default()
+            .push(agent);
+    }
+
+    order
+        .into_iter()
+        .filter_map(|project_id| {
+            let members = by_project.remove(&project_id)?;
+            let label = match &project_id {
+                None => "No project".to_owned(),
+                Some(id) => labels.get(id).cloned().unwrap_or_else(|| id.0.clone()),
+            };
+            Some(ProjectSection {
+                label,
+                groups: group_agents(members),
+            })
+        })
+        .collect()
+}
+
 fn render_agents_body(
     state: &AppState,
     hide_sub_agents: RwSignal<bool>,
@@ -236,7 +300,20 @@ fn render_agents_body(
                     } else {
                         agents
                     };
-                    let groups = group_agents(visible_agents);
+                    let projects: Vec<ProjectInfo> = active_host
+                        .as_ref()
+                        .map(|host| {
+                            let mut projects: Vec<ProjectInfo> = state
+                                .projects
+                                .get()
+                                .into_iter()
+                                .filter(|info| info.local_host_id == *host)
+                                .collect();
+                            sort_project_infos(&mut projects);
+                            projects
+                        })
+                        .unwrap_or_default();
+                    let sections = project_sections(visible_agents, &projects);
 
                     view! {
                         <div>
@@ -268,28 +345,48 @@ fn render_agents_body(
                                 }.into_any()
                             }}
                             <div class="agent-list" data-mobile-test="agents-list">
-                                {groups.into_iter().map(|(parent, children)| {
-                                    let parent_id = parent.agent_id.clone();
-                                    let child_count = children.len();
-                                    let parent_row = agent_row(
-                                        &state,
-                                        parent,
-                                        false,
-                                        child_count,
-                                        collapsed_parents,
-                                    );
-                                    let children_visible = !collapsed_parents.with(|collapsed| collapsed.contains(&parent_id));
+                                {sections.into_iter().map(|section| {
+                                    let agent_count = section.groups.iter()
+                                        .map(|(_, children)| 1 + children.len())
+                                        .sum::<usize>();
+                                    let label = section.label;
+                                    let aria_label = format!("{label} agents");
+                                    let rows = section.groups.into_iter().map(|(parent, children)| {
+                                        let parent_id = parent.agent_id.clone();
+                                        let child_count = children.len();
+                                        let parent_row = agent_row(
+                                            &state,
+                                            parent,
+                                            false,
+                                            child_count,
+                                            collapsed_parents,
+                                        );
+                                        let children_visible = !collapsed_parents.with(|collapsed| collapsed.contains(&parent_id));
+                                        view! {
+                                            <div class="agent-row-group" data-mobile-test="agent-row-group">
+                                                {parent_row}
+                                                {if children_visible {
+                                                    children.into_iter().map(|child| {
+                                                        agent_row(&state, child, true, 0, collapsed_parents)
+                                                    }).collect::<Vec<_>>().into_any()
+                                                } else {
+                                                    view! { <div></div> }.into_any()
+                                                }}
+                                            </div>
+                                        }
+                                    }).collect::<Vec<_>>();
                                     view! {
-                                        <div class="agent-row-group" data-mobile-test="agent-row-group">
-                                            {parent_row}
-                                            {if children_visible {
-                                                children.into_iter().map(|child| {
-                                                    agent_row(&state, child, true, 0, collapsed_parents)
-                                                }).collect::<Vec<_>>().into_any()
-                                            } else {
-                                                view! { <div></div> }.into_any()
-                                            }}
-                                        </div>
+                                        <section
+                                            class="agent-project-section"
+                                            data-mobile-test="agent-project-section"
+                                            aria-label=aria_label
+                                        >
+                                            <h2 class="agent-project-heading" data-mobile-test="agent-project-heading">
+                                                <span class="agent-project-name">{label}</span>
+                                                <span class="agent-project-count">{agent_count.to_string()}</span>
+                                            </h2>
+                                            {rows}
+                                        </section>
                                     }
                                 }).collect::<Vec<_>>()}
                             </div>
@@ -955,5 +1052,127 @@ mod wasm_tests {
                 && !collapsed_text.contains("Child Beta"),
             "collapse should remove child rows but keep parent: {collapsed_text}"
         );
+    }
+
+    /// **The list says which project each agent is running in.**
+    ///
+    /// Mobile rendered one flat list, so agents from four repositories were
+    /// indistinguishable — `AgentInfo::project_id` arrived on the wire and
+    /// nothing read it. Sections follow the project list's own order, an
+    /// unrecognised project id still gets a section rather than dropping its
+    /// agents, and unscoped agents land under "No project" last.
+    ///
+    /// Sub-agents stay nested inside their section: grouping by project must
+    /// not flatten the parent/child tree it sits on top of.
+    #[wasm_bindgen_test]
+    async fn agents_are_filed_under_the_project_they_run_in() {
+        set_hide_sub_agents_pref(false);
+        let host = LocalHostId("host-1".to_owned());
+        let container = make_container();
+        let mount_host = host.clone();
+        let _mount = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            state.active_local_host_id.set(Some(mount_host.clone()));
+            state.projects.set(vec![
+                ProjectInfo {
+                    local_host_id: mount_host.clone(),
+                    project: protocol::Project {
+                        id: ProjectId("tyde".to_owned()),
+                        name: "Tyde".to_owned(),
+                        sort_order: 0,
+                        source: protocol::ProjectSource::Standalone { roots: Vec::new() },
+                    },
+                },
+                ProjectInfo {
+                    local_host_id: mount_host.clone(),
+                    project: protocol::Project {
+                        id: ProjectId("tychat".to_owned()),
+                        name: "Tychat".to_owned(),
+                        sort_order: 1,
+                        source: protocol::ProjectSource::Standalone { roots: Vec::new() },
+                    },
+                },
+            ]);
+
+            let mut scoped = fixture(&mount_host, "scoped", "Tychat agent", None);
+            scoped.project_id = Some(ProjectId("tychat".to_owned()));
+            let mut parent = fixture(&mount_host, "parent", "Tyde parent", None);
+            parent.project_id = Some(ProjectId("tyde".to_owned()));
+            let mut child = child_fixture(&mount_host, "child", "Tyde child", "parent");
+            child.project_id = Some(ProjectId("tyde".to_owned()));
+            let mut stranger = fixture(&mount_host, "stranger", "Unknown project agent", None);
+            stranger.project_id = Some(ProjectId("not-in-the-list".to_owned()));
+            let loose = fixture(&mount_host, "loose", "Unscoped agent", None);
+
+            state
+                .agents
+                .set(vec![loose, stranger, child, parent, scoped]);
+            provide_context(state);
+            view! { <AgentsView /> }
+        });
+        next_tick().await;
+
+        let headings = container
+            .query_selector_all("[data-mobile-test='agent-project-heading']")
+            .unwrap();
+        let heading_names: Vec<String> = (0..headings.length())
+            .map(|index| {
+                headings
+                    .item(index)
+                    .unwrap()
+                    .text_content()
+                    .unwrap_or_default()
+            })
+            .collect();
+        assert_eq!(
+            heading_names.len(),
+            4,
+            "one heading per project the host is running agents in: {heading_names:?}"
+        );
+        assert!(
+            heading_names[0].contains("Tyde") && heading_names[0].contains('2'),
+            "sections follow the project list's order, and count the agents in them: {heading_names:?}"
+        );
+        assert!(
+            heading_names[1].contains("Tychat"),
+            "the second project keeps its place in the list: {heading_names:?}"
+        );
+        assert!(
+            heading_names[2].contains("not-in-the-list"),
+            "an unrecognised project id still gets a section: {heading_names:?}"
+        );
+        assert!(
+            heading_names[3].contains("No project"),
+            "unscoped agents come last, under their own heading: {heading_names:?}"
+        );
+
+        // Every agent survived the regrouping, and the parent/child tree did
+        // too: the child is nested in the same row group as its parent.
+        let text = container.text_content().unwrap_or_default();
+        for name in [
+            "Tychat agent",
+            "Tyde parent",
+            "Tyde child",
+            "Unknown project agent",
+            "Unscoped agent",
+        ] {
+            assert!(text.contains(name), "{name} must still be listed: {text}");
+        }
+        let sections = container
+            .query_selector_all("[data-mobile-test='agent-project-section']")
+            .unwrap();
+        let tyde_section = sections.item(0).unwrap();
+        let tyde_groups = tyde_section
+            .dyn_ref::<web_sys::Element>()
+            .unwrap()
+            .query_selector_all("[data-mobile-test='agent-row-group']")
+            .unwrap();
+        assert_eq!(
+            tyde_groups.length(),
+            1,
+            "the sub-agent stays nested under its parent inside the section"
+        );
+
+        clear_hide_sub_agents_pref();
     }
 }
