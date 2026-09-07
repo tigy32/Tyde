@@ -508,6 +508,7 @@ impl ClaudeSession {
                 ephemeral: mode.no_session_persistence,
                 model: None,
                 effort: Some(ClaudeEffort::High),
+                fast_mode: None,
                 permission_mode: Some(
                     claude_permission_mode_for_access_mode(mode.access_mode).to_string(),
                 ),
@@ -723,6 +724,7 @@ struct ClaudeState {
     ephemeral: bool,
     model: Option<String>,
     effort: Option<ClaudeEffort>,
+    fast_mode: Option<bool>,
     permission_mode: Option<String>,
     startup_mcp_config_json: Option<String>,
     steering_content: Option<String>,
@@ -784,6 +786,7 @@ impl Default for ClaudeState {
             ephemeral: false,
             model: None,
             effort: None,
+            fast_mode: None,
             permission_mode: None,
             startup_mcp_config_json: None,
             steering_content: None,
@@ -1653,6 +1656,7 @@ struct ClaudeProcessSpawnConfig {
     ephemeral: bool,
     model: Option<String>,
     effort: Option<ClaudeEffort>,
+    fast_mode: Option<bool>,
     permission_mode: Option<String>,
     startup_mcp_config_json: Option<String>,
     steering_content: Option<String>,
@@ -1796,7 +1800,20 @@ impl ClaudeInner {
                         .or_else(|| obj.get("reasoning_effort"))
                         .map(parse_claude_effort_setting)
                         .transpose()?;
+                    let speed_update = obj
+                        .get("speed")
+                        .map(|value| match value {
+                            Value::Null => Ok(None),
+                            Value::String(speed) if speed == "standard" => Ok(Some(false)),
+                            Value::String(speed) if speed == "fast" => Ok(Some(true)),
+                            _ => Err("Claude speed must be standard, fast, or null".to_owned()),
+                        })
+                        .transpose()?;
                     let mut state = this.state.lock().await;
+                    if let Some(next) = speed_update {
+                        changed_process_setting |= state.fast_mode != next;
+                        state.fast_mode = next;
+                    }
                     if let Some(model_value) = obj.get("model") {
                         let next = normalize_optional_string(model_value);
                         changed_process_setting |= state.model != next;
@@ -3095,6 +3112,7 @@ impl ClaudeInner {
                 ephemeral: state.ephemeral,
                 model: state.model.clone(),
                 effort: state.effort,
+                fast_mode: state.fast_mode,
                 permission_mode: state.permission_mode.clone(),
                 startup_mcp_config_json: state.startup_mcp_config_json.clone(),
                 steering_content: state.steering_content.clone(),
@@ -4383,11 +4401,12 @@ impl ClaudeInner {
     }
 
     async fn emit_settings(&self) {
-        let (model, effort, permission_mode) = {
+        let (model, effort, fast_mode, permission_mode) = {
             let state = self.state.lock().await;
             (
                 state.model.clone(),
                 state.effort.map(ClaudeEffort::as_str),
+                state.fast_mode,
                 state.permission_mode.clone(),
             )
         };
@@ -4395,6 +4414,7 @@ impl ClaudeInner {
         self.emitter.settings(json!({
             "model": model,
             "effort": effort,
+            "speed": fast_mode.map(|fast| if fast { "fast" } else { "standard" }),
             // Alias for existing settings UI consumers.
             "reasoning_effort": effort,
             "permission_mode": permission_mode,
@@ -5236,11 +5256,18 @@ fn build_claude_cli_args(config: &ClaudeProcessSpawnConfig) -> Vec<String> {
         cli_args.push("--dangerously-skip-permissions".to_string());
     }
 
+    let mut cli_settings = serde_json::Map::new();
     if let Some(model_name) = config.model.as_deref().and_then(normalize_nonempty) {
         cli_args.push("--model".to_string());
         cli_args.push(model_name.clone());
-        cli_args.push("--settings".to_string());
-        cli_args.push(serde_json::json!({ "availableModels": [model_name] }).to_string());
+        cli_settings.insert("availableModels".to_owned(), json!([model_name]));
+    }
+    if let Some(fast_mode) = config.fast_mode {
+        cli_settings.insert("fastMode".to_owned(), json!(fast_mode));
+    }
+    if !cli_settings.is_empty() {
+        cli_args.push("--settings".to_owned());
+        cli_args.push(Value::Object(cli_settings).to_string());
     }
 
     if let Some(plugin_root) = config
@@ -13279,14 +13306,21 @@ impl ClaudeBackend {
                 Some(SessionSettingValue::String(value)) => Some(value.clone()),
                 _ => None,
             };
-            if model_override.is_some() || effort_override.is_some() {
-                let settings = json!({
+            if model_override.is_some()
+                || effort_override.is_some()
+                || resolved_settings.0.contains_key("speed")
+            {
+                let mut settings = json!({
                     "model": model_override,
                     "effort": effort_override,
                     "permission_mode": claude_permission_mode_for_access_mode(
                         config.resolved_spawn_config.access_mode,
                     ),
                 });
+                if resolved_settings.0.contains_key("speed") {
+                    settings["speed"] =
+                        session_settings_to_json(&resolved_settings)["speed"].clone();
+                }
                 if let Err(err) = handle
                     .execute(SessionCommand::UpdateSettings {
                         settings,
@@ -13474,6 +13508,20 @@ pub(crate) fn claude_cost_hint_defaults(
         );
     }
     values
+}
+
+fn claude_speed_options(supports_fast: bool) -> Vec<SelectOption> {
+    let mut options = vec![SelectOption {
+        value: "standard".to_owned(),
+        label: "Standard".to_owned(),
+    }];
+    if supports_fast {
+        options.push(SelectOption {
+            value: "fast".to_owned(),
+            label: "Fast".to_owned(),
+        });
+    }
+    options
 }
 
 pub(crate) fn resolve_session_settings(
@@ -14147,6 +14195,7 @@ impl Backend for ClaudeBackend {
             tyde_agent_adapter::BackendCapability::ImageInput,
             tyde_agent_adapter::BackendCapability::Interrupt,
             tyde_agent_adapter::BackendCapability::SessionSettings,
+            tyde_agent_adapter::BackendCapability::SessionSpeed,
             tyde_agent_adapter::BackendCapability::StartupMcpServers,
             tyde_agent_adapter::BackendCapability::AgentControlTools,
             tyde_agent_adapter::BackendCapability::TurnUsageReported,
@@ -14210,6 +14259,26 @@ impl Backend for ClaudeBackend {
                                 label: "Fable".to_string(),
                             },
                         ],
+                        default: None,
+                        nullable: true,
+                    },
+                },
+                SessionSettingField {
+                    key: "speed".to_owned(),
+                    label: "Speed".to_owned(),
+                    description: Some("Fast requires a supported Opus model and account access, uses additional credits, and applies from the next turn.".to_owned()),
+                    use_slider: false,
+                    select_options_by_setting: Some(protocol::SelectOptionsBySetting {
+                        setting_key: "model".to_owned(),
+                        values: ["haiku", "sonnet", "opus", "fable"].into_iter().map(|model| {
+                            protocol::SelectOptionsForValue {
+                                setting_value: model.to_owned(),
+                                options: claude_speed_options(model == "opus"),
+                            }
+                        }).collect(),
+                    }),
+                    field_type: SessionSettingFieldType::Select {
+                        options: claude_speed_options(true),
                         default: None,
                         nullable: true,
                     },
@@ -14302,14 +14371,20 @@ impl Backend for ClaudeBackend {
             Some(SessionSettingValue::String(value)) => Some(value.clone()),
             _ => None,
         };
-        if model_override.is_some() || effort_override.is_some() {
-            let settings = json!({
+        if model_override.is_some()
+            || effort_override.is_some()
+            || resolved_settings.0.contains_key("speed")
+        {
+            let mut settings = json!({
                 "model": model_override,
                 "effort": effort_override,
                 "permission_mode": claude_permission_mode_for_access_mode(
                     config.resolved_spawn_config.access_mode,
                 ),
             });
+            if resolved_settings.0.contains_key("speed") {
+                settings["speed"] = session_settings_to_json(&resolved_settings)["speed"].clone();
+            }
             if let Err(err) = handle
                 .execute(SessionCommand::UpdateSettings {
                     settings,

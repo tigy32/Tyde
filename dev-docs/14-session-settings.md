@@ -292,12 +292,24 @@ pub trait Backend: Send + 'static {
 Each backend implements this to declare its supported settings. Examples:
 
 **Claude:**
+- `speed`: Select — Standard or Fast, with Fast offered for Opus. Unset
+  uses the CLI default. Fast requires provider account access and uses
+  additional credits. Tyde passes `fastMode` in the session's `--settings`
+  JSON, without editing user settings. Changes restart the persistent process
+  after the current turn and resume the same conversation on the next turn.
 - `model`: Select — haiku, sonnet, opus (default: sonnet, nullable: true)
 - `effort`: Select — low, medium, high, xhigh, max (nullable: true).
   `xhigh` and `max` are distinct Claude-native levels; Tyde preserves the
   selected level and does not invent aliases or normalize one level to another.
 
 **Codex:**
+- `speed`: Dynamic Select — Standard plus the selected model's `serviceTiers`
+  from `model/list`, preserving provider IDs and display names. This includes
+  Fast and Ultrafast only when advertised. Unset uses the CLI default.
+  Tyde sends `serviceTier` through `thread/settings/update` for creation,
+  resume, fork, and live changes; subsequent turns inherit the thread's tier.
+  Standard maps to `default`; null clears the override. Faster tiers may use
+  more credits and require account access.
 - `model`: Dynamic Select from Codex `model/list` metadata.
 - `reasoning_effort`: Dynamic Select from the selected model's ordered
   `supportedReasoningEfforts` metadata (nullable: true). Values such as `max`

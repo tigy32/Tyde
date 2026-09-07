@@ -89,6 +89,7 @@ exhaustive_capabilities! {
     ImageInput,
     Interrupt,
     SessionSettings,
+    SessionSpeed,
     StartupMcpServers,
     AgentControlTools,
     TurnUsageReported,

@@ -452,6 +452,105 @@ fn real_session_settings() {
     );
 }
 
+#[test]
+#[ignore = "paid real-backend suite; use --run-ignored all with TYDE_RUN_REAL_AI_TESTS=1"]
+fn real_session_speed() {
+    run_scenario(
+        &[
+            BackendCapability::SessionSpeed,
+            BackendCapability::ResumeSession,
+        ],
+        |mut host| async move {
+            let schema = await_session_schema(&mut host).await;
+            let speed = schema
+                .fields
+                .iter()
+                .find(|field| field.key == "speed")
+                .expect("speed-capable backend must expose Speed in session settings");
+            let model = schema
+                .fields
+                .iter()
+                .find(|field| field.key == "model")
+                .expect("speed selection requires a model selector");
+            let mut settings = SessionSettingsValues::default();
+            let model_options = model
+                .select_options(&settings)
+                .expect("model choices")
+                .to_vec();
+            let fast_options = model_options
+                .iter()
+                .find_map(|model| {
+                    let mut values = SessionSettingsValues::default();
+                    values.0.insert(
+                        "model".to_owned(),
+                        protocol::SessionSettingValue::String(model.value.clone()),
+                    );
+                    let options = speed.select_options(&values)?;
+                    let fast = options
+                        .iter()
+                        .filter(|option| option.value != "standard")
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    if fast.is_empty() {
+                        return None;
+                    }
+                    assert!(
+                        options.iter().any(|option| option.value == "standard"),
+                        "must be able to disable fast speed"
+                    );
+                    settings = values;
+                    Some(fast)
+                })
+                .expect("a speed-capable model must advertise at least one accelerated tier");
+            let selected_model = match settings.0.get("model") {
+                Some(protocol::SessionSettingValue::String(model)) => model.clone(),
+                _ => panic!("speed scenario must pin its selected model"),
+            };
+            let expected_models = model_setting_aliases(&selected_model);
+            let fast = &fast_options[0].value;
+            settings.0.insert(
+                "speed".to_owned(),
+                protocol::SessionSettingValue::String(fast.clone()),
+            );
+            let prompt = "Reply with exactly TYDE_SPEED_READY. Do not use tools.";
+            let agent = spawn_agent_with_settings(&mut host, prompt, Some(settings)).await;
+            let launched = collect_turn(&mut host, &agent, prompt).await;
+            assert_final_text_contains(&launched, "TYDE_SPEED_READY");
+            let mut turns = vec![launched];
+            set_session_setting(&mut host, &agent, "speed", "standard").await;
+            let standard = ask(&mut host, &agent, prompt).await;
+            assert_final_text_contains(&standard, "TYDE_SPEED_READY");
+            turns.push(standard);
+            for option in &fast_options {
+                set_session_setting(&mut host, &agent, "speed", &option.value).await;
+                let accelerated = ask(&mut host, &agent, prompt).await;
+                assert_final_text_contains(&accelerated, "TYDE_SPEED_READY");
+                turns.push(accelerated);
+            }
+            assert_clean_close(&mut host, &agent).await;
+            let session = stored_session(&mut host).await;
+            let resumed = resume_agent(&mut host, &session.id).await;
+            let continued = ask(&mut host, &resumed, prompt).await;
+            assert_final_text_contains(&continued, "TYDE_SPEED_READY");
+            turns.push(continued);
+            set_session_setting_value(
+                &mut host,
+                &resumed,
+                "speed",
+                protocol::SessionSettingValue::Null,
+            )
+            .await;
+            let reset = ask(&mut host, &resumed, prompt).await;
+            assert_final_text_contains(&reset, "TYDE_SPEED_READY");
+            turns.push(reset);
+            // The CLI reports claude-opus-5 for the selected opus alias. The
+            // shared Haiku pin rejects that correct explicit model selection.
+            assert_universal_contract_with_models(&turns, &expected_models);
+            assert_clean_close(&mut host, &resumed).await;
+        },
+    );
+}
+
 /// What the tool cards are made of, not just that they exist.
 ///
 /// Every other scenario in this suite counts tool requests and consults the
@@ -3633,6 +3732,11 @@ fn unique_payload() -> String {
 /// reader after the wrong thing.
 fn assert_universal_contract(turns: &[Turn]) {
     assert!(!turns.is_empty(), "conversation produced no turns at all");
+    assert_universal_contract_with_models(turns, &pinned_models(turns[0].backend()));
+}
+
+fn assert_universal_contract_with_models(turns: &[Turn], expected_models: &[String]) {
+    assert!(!turns.is_empty(), "conversation produced no turns at all");
     for turn in turns {
         assert_no_error_message(&turn.label(), turn.events());
         assert_no_unknown_backend_event(turn);
@@ -3648,7 +3752,7 @@ fn assert_universal_contract(turns: &[Turn]) {
     }
     assert_text_was_streamed(turns);
     assert_tool_call_ids_are_unique(turns);
-    assert_reported_model_is_pinned(turns);
+    assert_reported_model_is_pinned(turns, expected_models);
 }
 
 fn assert_no_unknown_backend_event(turn: &Turn) {
@@ -4087,8 +4191,7 @@ fn assert_tool_call_ids_are_unique(turns: &[Turn]) {
 }
 
 /// A run that quietly escalates to an expensive model is a bill, not a result.
-fn assert_reported_model_is_pinned(turns: &[Turn]) {
-    let expected = pinned_models(turns[0].backend());
+fn assert_reported_model_is_pinned(turns: &[Turn], expected: &[String]) {
     if expected.is_empty() {
         eprintln!(
             "COVERAGE: {:?} pins no model in the fixture, so this run asserts nothing about the \

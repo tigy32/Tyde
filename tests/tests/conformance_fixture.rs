@@ -81,6 +81,13 @@ pub fn pinned_models(backend: BackendKind) -> Vec<String> {
     }
 }
 
+pub fn model_setting_aliases(model: &str) -> Vec<String> {
+    match model {
+        "opus" => vec!["opus".to_owned(), "claude-opus-5".to_owned()],
+        _ => vec![model.to_owned()],
+    }
+}
+
 /// Hermes takes its model as a per-spawn session setting, not a complexity-tier
 /// config, and the value must be the *exact* string the schema publishes as a
 /// select option — `validate_session_setting` compares `Select` values by
@@ -752,11 +759,23 @@ pub async fn set_session_setting(
     key: &str,
     value: &str,
 ) -> SessionSettingsValues {
+    set_session_setting_value(
+        host,
+        agent,
+        key,
+        SessionSettingValue::String(value.to_owned()),
+    )
+    .await
+}
+
+pub async fn set_session_setting_value(
+    host: &mut Host,
+    agent: &Agent,
+    key: &str,
+    value: SessionSettingValue,
+) -> SessionSettingsValues {
     let mut update = SessionSettingsValues::default();
-    update.0.insert(
-        key.to_string(),
-        SessionSettingValue::String(value.to_string()),
-    );
+    update.0.insert(key.to_owned(), value.clone());
     host.client
         .set_session_settings(&agent.stream, SetSessionSettingsPayload { values: update })
         .await
@@ -771,7 +790,15 @@ pub async fn set_session_setting(
         let payload: SessionSettingsPayload = envelope
             .parse_payload()
             .expect("parse SessionSettingsPayload");
-        if payload.values.0.get(key) == Some(&SessionSettingValue::String(value.to_string())) {
+        let matches = match value {
+            SessionSettingValue::Null => payload
+                .values
+                .0
+                .get(key)
+                .is_none_or(|current| *current == SessionSettingValue::Null),
+            _ => payload.values.0.get(key) == Some(&value),
+        };
+        if matches {
             return payload.values;
         }
     }
@@ -910,6 +937,15 @@ impl Agent {
 }
 
 pub async fn spawn_agent(host: &mut Host, prompt: &str) -> Agent {
+    let settings = (host.backend_kind == BackendKind::Hermes).then(hermes_session_settings);
+    spawn_agent_with_settings(host, prompt, settings).await
+}
+
+pub async fn spawn_agent_with_settings(
+    host: &mut Host,
+    prompt: &str,
+    session_settings: Option<SessionSettingsValues>,
+) -> Agent {
     let backend_kind = host.backend_kind;
     let workspace_roots = host.workspace_roots();
     host.client
@@ -926,8 +962,7 @@ pub async fn spawn_agent(host: &mut Host, prompt: &str) -> Agent {
                 launch_profile_id: None,
                 cost_hint: Some(SpawnCostHint::Low),
                 access_mode: Default::default(),
-                session_settings: (backend_kind == BackendKind::Hermes)
-                    .then(hermes_session_settings),
+                session_settings,
             },
         })
         .await

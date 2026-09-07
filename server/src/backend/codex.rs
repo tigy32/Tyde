@@ -2651,6 +2651,7 @@ fn codex_probe_result_with_cleanup<T>(
 struct CodexModelMetadata {
     option: protocol::SelectOption,
     reasoning_options: Vec<protocol::SelectOption>,
+    speed_options: Vec<protocol::SelectOption>,
     is_default: bool,
 }
 
@@ -2694,6 +2695,29 @@ fn codex_model_metadata_entry_from_raw(model: &Value) -> Option<CodexModelMetada
             label: codex_model_label_from_id(id),
         },
         reasoning_options,
+        speed_options: std::iter::once(protocol::SelectOption {
+            value: "standard".to_owned(),
+            label: "Standard".to_owned(),
+        })
+        .chain(
+            model
+                .get("serviceTiers")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|tier| {
+                    let id = tier.get("id")?.as_str()?.trim();
+                    let name = tier.get("name")?.as_str()?.trim();
+                    if id.is_empty() || name.is_empty() || id == "default" {
+                        return None;
+                    }
+                    Some(protocol::SelectOption {
+                        value: id.to_owned(),
+                        label: name.to_owned(),
+                    })
+                }),
+        )
+        .collect(),
         is_default: model
             .get("isDefault")
             .and_then(Value::as_bool)
@@ -17860,6 +17884,15 @@ fn codex_thread_settings_update_params(thread_id: &str, settings: &Value) -> Res
     {
         params.insert("effort".to_owned(), effort.clone());
     }
+    if let Some(speed) = settings.get("speed") {
+        let tier = match speed {
+            Value::Null => Value::Null,
+            Value::String(value) if value == "standard" => Value::String("default".to_owned()),
+            Value::String(value) => Value::String(value.clone()),
+            _ => return Err("Codex speed must be a string or null".to_owned()),
+        };
+        params.insert("serviceTier".to_owned(), tier);
+    }
     if let Some(approval_policy) = settings
         .get("approval_policy")
         .or_else(|| settings.get("approvalPolicy"))
@@ -19075,13 +19108,20 @@ impl CodexBackend {
             );
             let mut normalization_failures = HashMap::new();
             let mut pending_initial_input_cancelled = false;
-            if model_override.is_some() || effort_override.is_some() {
+            if model_override.is_some()
+                || effort_override.is_some()
+                || resolved_settings.0.contains_key("speed")
+            {
                 tracing::debug!("Codex startup dispatching thread/settings/update");
-                let settings = json!({
+                let mut settings = json!({
                     "model": model_override,
                     "reasoning_effort": effort_override,
                     "approval_policy": CODEX_FORCED_APPROVAL_POLICY,
                 });
+                if resolved_settings.0.contains_key("speed") {
+                    settings["speed"] =
+                        session_settings_to_json(&resolved_settings)["speed"].clone();
+                }
                 let settings_handle = handle.clone();
                 let settings_request = settings_handle.update_runtime_settings(settings);
                 tokio::pin!(settings_request);
@@ -19347,6 +19387,26 @@ fn codex_session_settings_schema(models: Vec<CodexModelMetadata>) -> SessionSett
         .find(|model| model.is_default)
         .map(|model| model.reasoning_options.clone())
         .unwrap_or_default();
+    let default_speed_options = models
+        .iter()
+        .find(|model| model.is_default)
+        .map(|model| model.speed_options.clone())
+        .unwrap_or_else(|| {
+            vec![protocol::SelectOption {
+                value: "standard".to_owned(),
+                label: "Standard".to_owned(),
+            }]
+        });
+    let speed_options_by_model = protocol::SelectOptionsBySetting {
+        setting_key: "model".to_owned(),
+        values: models
+            .iter()
+            .map(|model| protocol::SelectOptionsForValue {
+                setting_value: model.option.value.clone(),
+                options: model.speed_options.clone(),
+            })
+            .collect(),
+    };
     let model_options = models.iter().map(|model| model.option.clone()).collect();
     let reasoning_options_by_model = protocol::SelectOptionsBySetting {
         setting_key: "model".to_string(),
@@ -19369,6 +19429,18 @@ fn codex_session_settings_schema(models: Vec<CodexModelMetadata>) -> SessionSett
                 select_options_by_setting: None,
                 field_type: SessionSettingFieldType::Select {
                     options: model_options,
+                    default: None,
+                    nullable: true,
+                },
+            },
+            SessionSettingField {
+                key: "speed".to_owned(),
+                label: "Speed".to_owned(),
+                description: Some("Faster tiers increase usage. Choices depend on the model and account. Changes apply to subsequent turns.".to_owned()),
+                use_slider: false,
+                select_options_by_setting: Some(speed_options_by_model),
+                field_type: SessionSettingFieldType::Select {
+                    options: default_speed_options,
                     default: None,
                     nullable: true,
                 },
@@ -20250,6 +20322,7 @@ impl Backend for CodexBackend {
             tyde_agent_adapter::BackendCapability::ImageInput,
             tyde_agent_adapter::BackendCapability::Interrupt,
             tyde_agent_adapter::BackendCapability::SessionSettings,
+            tyde_agent_adapter::BackendCapability::SessionSpeed,
             tyde_agent_adapter::BackendCapability::StartupMcpServers,
             tyde_agent_adapter::BackendCapability::AgentControlTools,
             tyde_agent_adapter::BackendCapability::TurnUsageReported,
@@ -20383,12 +20456,19 @@ impl Backend for CodexBackend {
                 session.shutdown().await;
                 return;
             }
-            if model_override.is_some() || effort_override.is_some() {
-                let settings = json!({
+            if model_override.is_some()
+                || effort_override.is_some()
+                || resolved_settings.0.contains_key("speed")
+            {
+                let mut settings = json!({
                     "model": model_override,
                     "reasoning_effort": effort_override,
                     "approval_policy": CODEX_FORCED_APPROVAL_POLICY,
                 });
+                if resolved_settings.0.contains_key("speed") {
+                    settings["speed"] =
+                        session_settings_to_json(&resolved_settings)["speed"].clone();
+                }
                 if let Err(err) = handle
                     .execute(SessionCommand::UpdateSettings {
                         settings,
@@ -20629,12 +20709,19 @@ impl Backend for CodexBackend {
                 Some(SessionSettingValue::String(value)) => Some(value.clone()),
                 _ => None,
             };
-            if model_override.is_some() || effort_override.is_some() {
-                let settings = json!({
+            if model_override.is_some()
+                || effort_override.is_some()
+                || resolved_settings.0.contains_key("speed")
+            {
+                let mut settings = json!({
                     "model": model_override,
                     "reasoning_effort": effort_override,
                     "approval_policy": CODEX_FORCED_APPROVAL_POLICY,
                 });
+                if resolved_settings.0.contains_key("speed") {
+                    settings["speed"] =
+                        session_settings_to_json(&resolved_settings)["speed"].clone();
+                }
                 if let Err(err) = handle
                     .execute(SessionCommand::UpdateSettings {
                         settings,
