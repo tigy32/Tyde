@@ -1,5 +1,6 @@
 mod actions;
 mod app;
+mod appearance;
 mod bridge;
 mod code_intel_dom;
 mod components;

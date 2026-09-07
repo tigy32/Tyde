@@ -33,6 +33,7 @@
     --text-secondary: #a0a0a0;
     --text-tertiary: #6e6e6e;
     --text-bright: #ffffff;
+    --text-on-accent: #ffffff;
 
     --border-primary: #333;
     --border-secondary: #444;
@@ -40,7 +41,7 @@
     --accent-primary: #007acc;
     --accent-hover: #1a8ad4;
     --accent-link: #569cd6;
-    --accent-subtle: rgba(0, 122, 204, 0.12);
+    --accent-subtle: color-mix(in srgb, var(--accent-primary) 12%, transparent);
 
     --success: #4ec9b0;
     --warning: #e8c56a;
@@ -52,7 +53,7 @@
 
     --scrollbar-thumb: rgba(255, 255, 255, 0.1);
     --scrollbar-thumb-hover: rgba(255, 255, 255, 0.18);
-    --selection-bg: rgba(0, 122, 204, 0.35);
+    --selection-bg: color-mix(in srgb, var(--accent-primary) 35%, transparent);
 }
 
 /* --- Light theme --- */
@@ -70,6 +71,7 @@
     --text-secondary: #616161;
     --text-tertiary: #9e9e9e;
     --text-bright: #000000;
+    --text-on-accent: #ffffff;
 
     --border-primary: #d4d4d4;
     --border-secondary: #c0c0c0;
@@ -90,6 +92,122 @@
     --scrollbar-thumb: rgba(0, 0, 0, 0.15);
     --scrollbar-thumb-hover: rgba(0, 0, 0, 0.25);
     --selection-bg: rgba(0, 102, 184, 0.25);
+}
+
+/* Named palettes change colors only. Sources and extension guide:
+   dev-docs/appearance-themes.md. */
+[data-appearance-theme="github-light"] {
+    --surface-base: #ffffff;
+    --surface-0: #f6f8fa;
+    --surface-1: #f6f8fa;
+    --surface-2: #eaeef2;
+    --surface-3: #d8dee4;
+    --text-primary: #1f2328;
+    --text-secondary: #656d76;
+    --text-tertiary: #656d76;
+    --text-bright: #1f2328;
+    --border-primary: #d0d7de;
+    --border-secondary: #afb8c1;
+    --accent-primary: #0969da;
+    --accent-hover: #0550ae;
+    --accent-link: #0969da;
+    --text-on-accent: #ffffff;
+    --success: #1a7f37;
+    --warning: #9a6700;
+    --error: #cf222e;
+    --info: #0969da;
+}
+
+[data-appearance-theme="github-dark"] {
+    --surface-base: #0d1117;
+    --surface-0: #010409;
+    --surface-1: #161b22;
+    --surface-2: #21262d;
+    --surface-3: #30363d;
+    --text-primary: #e6edf3;
+    --text-secondary: #8b949e;
+    --text-tertiary: #8b949e;
+    --text-bright: #ffffff;
+    --border-primary: #30363d;
+    --border-secondary: #484f58;
+    --accent-primary: #1f6feb;
+    --accent-hover: #388bfd;
+    --accent-link: #58a6ff;
+    --text-on-accent: #ffffff;
+    --success: #3fb950;
+    --warning: #d29922;
+    --error: #f85149;
+    --info: #58a6ff;
+}
+
+[data-appearance-theme="catppuccin-latte"] {
+    --surface-base: #eff1f5;
+    --surface-0: #e6e9ef;
+    --surface-1: #e6e9ef;
+    --surface-2: #dce0e8;
+    --surface-3: #ccd0da;
+    --text-primary: #4c4f69;
+    --text-secondary: #5c5f77;
+    --text-tertiary: #6c6f85;
+    --text-bright: #4c4f69;
+    --border-primary: #ccd0da;
+    --border-secondary: #acb0be;
+    --accent-primary: #1e66f5;
+    --accent-hover: #1555d5;
+    --accent-link: #1e66f5;
+    --text-on-accent: #ffffff;
+    --success: #287d1c;
+    --warning: #98600b;
+    --error: #d20f39;
+    --info: #1e66f5;
+}
+
+[data-appearance-theme="catppuccin-mocha"] {
+    --surface-base: #1e1e2e;
+    --surface-0: #181825;
+    --surface-1: #181825;
+    --surface-2: #313244;
+    --surface-3: #45475a;
+    --text-primary: #cdd6f4;
+    --text-secondary: #bac2de;
+    --text-tertiary: #a6adc8;
+    --text-bright: #cdd6f4;
+    --border-primary: #45475a;
+    --border-secondary: #585b70;
+    --accent-primary: #89b4fa;
+    --accent-hover: #b4befe;
+    --accent-link: #89b4fa;
+    --text-on-accent: #1e1e2e;
+    --success: #a6e3a1;
+    --warning: #f9e2af;
+    --error: #f38ba8;
+    --info: #89b4fa;
+}
+
+[data-appearance-theme]:not([data-appearance-theme="dark"]):not([data-appearance-theme="light"]) {
+    --surface-hover: color-mix(in srgb, var(--text-primary) 5%, transparent);
+    --accent-subtle: color-mix(in srgb, var(--accent-primary) 12%, transparent);
+    --selection-bg: color-mix(in srgb, var(--accent-primary) 25%, transparent);
+    --scrollbar-thumb: color-mix(in srgb, var(--text-primary) 20%, transparent);
+    --scrollbar-thumb-hover: color-mix(in srgb, var(--text-primary) 35%, transparent);
+
+    /* Older component tokens must resolve to the selected palette too. */
+    --accent: var(--accent-primary);
+    --accent-secondary: var(--accent-link);
+    --bg-elevated: var(--surface-1);
+    --bg-secondary: var(--surface-2);
+    --surface-raised: var(--surface-1);
+    --surface-secondary: var(--surface-2);
+    --border: var(--border-primary);
+    --border-subtle: var(--border-primary);
+    --border-strong: var(--border-secondary);
+    --border-focus: var(--accent-primary);
+    --text-muted: var(--text-secondary);
+    --danger: var(--error);
+    --status-error: var(--error);
+    --status-success: var(--success);
+    --diff-added-bg: color-mix(in srgb, var(--success) 12%, transparent);
+    --diff-removed-bg: color-mix(in srgb, var(--error) 12%, transparent);
 }
 
 /* ===== Reset ===== */
@@ -952,7 +1070,7 @@ details summary:focus:not(:focus-visible) {
 
 .browser-btn-primary {
     background: var(--accent-primary);
-    color: white;
+    color: var(--text-on-accent);
     border-color: var(--accent-primary);
 }
 
@@ -1653,7 +1771,7 @@ kbd {
 .action-btn.primary {
     background: var(--accent-primary);
     border-color: var(--accent-primary);
-    color: var(--text-bright);
+    color: var(--text-on-accent);
 }
 
 .action-btn.primary:hover:not(:disabled) {
@@ -1732,7 +1850,7 @@ kbd {
 }
 
 .home-getstarted-step.done .home-getstarted-marker {
-    color: var(--text-bright);
+    color: var(--text-on-accent);
     background: var(--accent-primary);
     border-color: var(--accent-primary);
 }
@@ -2401,7 +2519,7 @@ kbd {
 .chat-welcome-btn {
     padding: 10px 24px;
     background: var(--accent-primary);
-    color: var(--text-bright);
+    color: var(--text-on-accent);
     border-radius: 8px;
     font-size: 1.077rem;
     font-weight: 500;
@@ -3179,8 +3297,8 @@ kbd {
     flex-direction: column;
     gap: 3px;
     margin-top: var(--space-2);
-    border-left: 2px solid rgba(0, 122, 204, 0.5);
-    background: rgba(0, 122, 204, 0.03);
+    border-left: 2px solid color-mix(in srgb, var(--accent-primary) 50%, transparent);
+    background: color-mix(in srgb, var(--accent-primary) 3%, transparent);
     border-radius: 4px;
     padding: 3px 0 3px 4px;
 }
@@ -4015,7 +4133,7 @@ kbd {
     justify-content: center;
     border: 2px dashed var(--accent-primary);
     border-radius: 8px;
-    background: rgba(0, 122, 204, 0.1);
+    background: color-mix(in srgb, var(--accent-primary) 10%, transparent);
     backdrop-filter: blur(2px);
     pointer-events: none;
     z-index: 2;
@@ -4133,7 +4251,7 @@ kbd {
     flex: 0 0 auto;
     font-size: 0.846rem;
     font-weight: 500;
-    color: var(--text-bright);
+    color: var(--text-on-accent);
     background: var(--accent-primary);
     border: 1px solid var(--accent-primary);
     border-radius: 6px;
@@ -4786,7 +4904,7 @@ math merror {
 
 .task-item-row.status-in_progress {
     border-left-color: var(--accent-primary);
-    background: rgba(0, 122, 204, 0.06);
+    background: color-mix(in srgb, var(--accent-primary) 6%, transparent);
 }
 
 .task-item-row.status-failed {
@@ -4848,7 +4966,7 @@ math merror {
     margin-left: auto;
     padding: 1px 8px;
     border-radius: 10px;
-    background: rgba(0, 122, 204, 0.12);
+    background: color-mix(in srgb, var(--accent-primary) 12%, transparent);
     color: var(--accent-primary);
     font-size: 0.769rem;
     font-weight: 500;
@@ -4910,7 +5028,7 @@ math merror {
 .orch-phase-chip {
     padding: 0 6px;
     border-radius: 8px;
-    background: rgba(0, 122, 204, 0.12);
+    background: color-mix(in srgb, var(--accent-primary) 12%, transparent);
     color: var(--accent-primary);
     font-size: 0.723rem;
 }
@@ -5306,7 +5424,7 @@ math merror {
 }
 
 .filter-toggle.active {
-    color: var(--text-bright);
+    color: var(--text-on-accent);
     background: var(--accent-primary);
     border-color: var(--accent-primary);
 }
@@ -5816,7 +5934,7 @@ math merror {
 
 .agent-monitor-pin-btn.pinned {
     opacity: 1;
-    color: var(--text-bright);
+    color: var(--text-on-accent);
     background: var(--accent-primary);
     border-color: var(--accent-primary);
 }
@@ -6924,15 +7042,15 @@ math merror {
     font-weight: 600;
     color: var(--accent-link);
     background: var(--accent-subtle);
-    border: 1px solid rgba(0, 122, 204, 0.42);
+    border: 1px solid color-mix(in srgb, var(--accent-primary) 42%, transparent);
     border-radius: 999px;
     cursor: pointer;
     transition: background 0.12s ease, color 0.12s ease, border-color 0.12s ease;
 }
 
 .gp-review-open-btn:hover:not(:disabled) {
-    background: rgba(0, 122, 204, 0.24);
-    border-color: rgba(0, 122, 204, 0.62);
+    background: color-mix(in srgb, var(--accent-primary) 24%, transparent);
+    border-color: color-mix(in srgb, var(--accent-primary) 62%, transparent);
     color: #ffffff;
 }
 
@@ -7501,7 +7619,7 @@ math merror {
 
 .gp-commit-btn:hover:not(:disabled) {
     background: var(--accent-primary);
-    color: var(--text-bright);
+    color: var(--text-on-accent);
     border-color: var(--accent-primary);
 }
 
@@ -7843,14 +7961,14 @@ math merror {
     font-size: 0.769rem;
     font-weight: 600;
     color: var(--accent-primary);
-    background: rgba(0, 122, 204, 0.10);
-    border: 1px solid rgba(0, 122, 204, 0.42);
+    background: color-mix(in srgb, var(--accent-primary) 10%, transparent);
+    border: 1px solid color-mix(in srgb, var(--accent-primary) 42%, transparent);
     border-radius: 6px;
     cursor: pointer;
 }
 
 .reviewable-diff-banner-btn:hover:not(:disabled) {
-    background: rgba(0, 122, 204, 0.20);
+    background: color-mix(in srgb, var(--accent-primary) 20%, transparent);
     color: #ffffff;
 }
 
@@ -7956,7 +8074,7 @@ math merror {
     font-weight: 600;
     padding: 1px 8px;
     border-radius: 3px;
-    background: rgba(0, 122, 204, 0.15);
+    background: color-mix(in srgb, var(--accent-primary) 15%, transparent);
     color: var(--accent-primary);
     text-transform: uppercase;
     letter-spacing: 0.5px;
@@ -7988,7 +8106,7 @@ math merror {
     font-family: var(--font-mono);
     font-size: 0.846rem;
     color: var(--text-tertiary);
-    background: rgba(0, 122, 204, 0.06);
+    background: color-mix(in srgb, var(--accent-primary) 6%, transparent);
     padding: 2px var(--space-4);
     border-bottom: 1px solid var(--border-primary);
 }
@@ -8807,7 +8925,7 @@ math merror {
 
 .settings-nav-item.active {
     color: var(--text-primary);
-    background: rgba(var(--accent-primary-rgb, 99, 102, 241), 0.12);
+    background: var(--accent-subtle);
     border-left-color: var(--accent-primary);
 }
 
@@ -8876,7 +8994,7 @@ math merror {
 
 .settings-segmented-control .segment.active {
     background: var(--accent-primary);
-    color: var(--text-bright);
+    color: var(--text-on-accent);
 }
 
 .settings-segmented-control .segment:disabled {
@@ -10770,7 +10888,7 @@ math merror {
 .settings-btn-primary {
     background: var(--accent-primary);
     border-color: var(--accent-primary);
-    color: var(--text-bright);
+    color: var(--text-on-accent);
 }
 
 .settings-btn-primary:hover:not(:disabled) {
@@ -11520,7 +11638,7 @@ math merror {
 .feedback-btn-primary {
     background: var(--accent-primary);
     border-color: var(--accent-primary);
-    color: #fff;
+    color: var(--text-on-accent);
 }
 
 .feedback-btn-primary:hover:not(:disabled) {
@@ -11899,7 +12017,7 @@ pre.tool-error-pre {
     border-radius: 3px;
     text-transform: uppercase;
     letter-spacing: 0.5px;
-    background: rgba(0, 122, 204, 0.15);
+    background: color-mix(in srgb, var(--accent-primary) 15%, transparent);
     color: var(--accent-primary);
 }
 
@@ -11907,10 +12025,10 @@ pre.tool-error-pre {
     margin-left: auto;
 }
 
-.review-status-badge { background: rgba(0, 122, 204, 0.15); color: var(--accent-primary); }
+.review-status-badge { background: color-mix(in srgb, var(--accent-primary) 15%, transparent); color: var(--accent-primary); }
 .review-status-badge.draft,
 .review-status-badge[data-status="draft"]
-    { background: rgba(0, 122, 204, 0.15); color: var(--accent-primary); }
+    { background: color-mix(in srgb, var(--accent-primary) 15%, transparent); color: var(--accent-primary); }
 .review-status-badge.submitted,
 .review-status-badge[data-status="submitted"]
     { background: rgba(220, 170, 60, 0.18); color: #e0b34a; }
@@ -12040,7 +12158,7 @@ pre.tool-error-pre {
 
 .review-file-row.active,
 .review-file-row[aria-current="true"] {
-    background: rgba(0, 122, 204, 0.18);
+    background: color-mix(in srgb, var(--accent-primary) 18%, transparent);
     color: var(--text-primary);
 }
 
@@ -12069,13 +12187,13 @@ pre.tool-error-pre {
     font-weight: 600;
     padding: 1px 6px;
     border-radius: 8px;
-    background: rgba(0, 122, 204, 0.18);
+    background: color-mix(in srgb, var(--accent-primary) 18%, transparent);
     color: var(--accent-primary);
     line-height: 1.4;
 }
 
 .review-count-badge.user {
-    background: rgba(0, 122, 204, 0.18);
+    background: color-mix(in srgb, var(--accent-primary) 18%, transparent);
     color: var(--accent-primary);
 }
 
@@ -12246,14 +12364,14 @@ pre.tool-error-pre {
 
 .review-ai-status.status-running .review-ai-status-dot {
     background: var(--accent-primary);
-    box-shadow: 0 0 0 0 rgba(0, 122, 204, 0.45);
+    box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent-primary) 45%, transparent);
     animation: review-ai-pulse 1.6s ease-out infinite;
 }
 .review-ai-status.status-completed .review-ai-status-dot { background: var(--success); }
 .review-ai-status.status-failed .review-ai-status-dot { background: var(--error); }
 
 @keyframes review-ai-pulse {
-    0%   { box-shadow: 0 0 0 0 rgba(0, 122, 204, 0.45); }
+    0%   { box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent-primary) 45%, transparent); }
     70%  { box-shadow: 0 0 0 8px rgba(0, 122, 204, 0); }
     100% { box-shadow: 0 0 0 0 rgba(0, 122, 204, 0); }
 }
@@ -12353,7 +12471,7 @@ pre.tool-error-pre {
 }
 
 .review-ai-agent-link:hover {
-    background: var(--surface-2, rgba(0, 122, 204, 0.08));
+    background: var(--surface-2, color-mix(in srgb, var(--accent-primary) 8%, transparent));
 }
 
 .review-btn {
@@ -12419,7 +12537,7 @@ pre.tool-error-pre {
     background: linear-gradient(180deg, var(--accent-hover), var(--accent-hover));
     border-color: var(--accent-hover);
     box-shadow: 0 1px 0 rgba(255, 255, 255, 0.10) inset,
-                0 2px 8px rgba(0, 122, 204, 0.30);
+                0 2px 8px color-mix(in srgb, var(--accent-primary) 30%, transparent);
 }
 
 .review-btn.destructive {
@@ -12443,9 +12561,9 @@ pre.tool-error-pre {
     font-weight: 600;
     color: var(--accent-primary);
     background: linear-gradient(180deg,
-        rgba(0, 122, 204, 0.16) 0%,
-        rgba(0, 122, 204, 0.10) 100%);
-    border: 1px solid rgba(0, 122, 204, 0.42);
+        color-mix(in srgb, var(--accent-primary) 16%, transparent) 0%,
+        color-mix(in srgb, var(--accent-primary) 10%, transparent) 100%);
+    border: 1px solid color-mix(in srgb, var(--accent-primary) 42%, transparent);
     border-radius: 6px;
     cursor: pointer;
     box-shadow: 0 1px 0 rgba(255, 255, 255, 0.04) inset,
@@ -12460,18 +12578,18 @@ pre.tool-error-pre {
 
 .chat-review-btn:hover:not(:disabled) {
     background: linear-gradient(180deg,
-        rgba(0, 122, 204, 0.28) 0%,
-        rgba(0, 122, 204, 0.18) 100%);
-    border-color: rgba(0, 122, 204, 0.62);
+        color-mix(in srgb, var(--accent-primary) 28%, transparent) 0%,
+        color-mix(in srgb, var(--accent-primary) 18%, transparent) 100%);
+    border-color: color-mix(in srgb, var(--accent-primary) 62%, transparent);
     color: #ffffff;
     box-shadow: 0 1px 0 rgba(255, 255, 255, 0.06) inset,
-                0 2px 8px rgba(0, 122, 204, 0.30);
+                0 2px 8px color-mix(in srgb, var(--accent-primary) 30%, transparent);
 }
 
 .chat-review-btn:active:not(:disabled) {
     transform: translateY(1px);
     box-shadow: 0 0 0 rgba(0, 0, 0, 0) inset,
-                0 1px 2px rgba(0, 122, 204, 0.20);
+                0 1px 2px color-mix(in srgb, var(--accent-primary) 20%, transparent);
 }
 
 .chat-review-btn:focus-visible {
@@ -12510,9 +12628,9 @@ pre.tool-error-pre {
     font-weight: 600;
     color: var(--accent-primary);
     background: linear-gradient(180deg,
-        rgba(0, 122, 204, 0.16) 0%,
-        rgba(0, 122, 204, 0.10) 100%);
-    border: 1px solid rgba(0, 122, 204, 0.42);
+        color-mix(in srgb, var(--accent-primary) 16%, transparent) 0%,
+        color-mix(in srgb, var(--accent-primary) 10%, transparent) 100%);
+    border: 1px solid color-mix(in srgb, var(--accent-primary) 42%, transparent);
     border-radius: 6px;
     cursor: pointer;
     transition:
@@ -12524,11 +12642,11 @@ pre.tool-error-pre {
 
 .gp-review-indicator:hover {
     background: linear-gradient(180deg,
-        rgba(0, 122, 204, 0.28) 0%,
-        rgba(0, 122, 204, 0.18) 100%);
-    border-color: rgba(0, 122, 204, 0.62);
+        color-mix(in srgb, var(--accent-primary) 28%, transparent) 0%,
+        color-mix(in srgb, var(--accent-primary) 18%, transparent) 100%);
+    border-color: color-mix(in srgb, var(--accent-primary) 62%, transparent);
     color: #ffffff;
-    box-shadow: 0 2px 8px rgba(0, 122, 204, 0.30);
+    box-shadow: 0 2px 8px color-mix(in srgb, var(--accent-primary) 30%, transparent);
 }
 
 .gp-review-indicator-icon {
@@ -12562,7 +12680,7 @@ pre.tool-error-pre {
 }
 
 .diff-gutter.diff-gutter-clickable:hover {
-    background: rgba(0, 122, 204, 0.12);
+    background: color-mix(in srgb, var(--accent-primary) 12%, transparent);
 }
 
 /* Highlight applied to every row whose anchor falls within the active
@@ -12570,7 +12688,7 @@ pre.tool-error-pre {
  * diff-line-removed background tints (which are themselves rgba) so
  * the underlying row state remains visible through the selection. */
 .diff-line.diff-line-selected {
-    background: rgba(0, 122, 204, 0.2);
+    background: color-mix(in srgb, var(--accent-primary) 20%, transparent);
 }
 
 /* Small inline `+` button rendered next to the path label inside
@@ -12768,11 +12886,11 @@ pre.tool-error-pre {
     letter-spacing: 0.5px;
     padding: 1px 6px;
     border-radius: 3px;
-    background: rgba(0, 122, 204, 0.18);
+    background: color-mix(in srgb, var(--accent-primary) 18%, transparent);
     color: var(--accent-primary);
 }
 
-.review-source-pill.user          { background: rgba(0, 122, 204, 0.18); color: var(--accent-primary); }
+.review-source-pill.user          { background: color-mix(in srgb, var(--accent-primary) 18%, transparent); color: var(--accent-primary); }
 .review-source-pill.ai            { background: rgba(184, 138, 255, 0.18); color: #b88aff; }
 .review-source-pill.ai-pending    { background: rgba(224, 179, 74, 0.18); color: #e0b34a; }
 .review-source-pill.ai-rejected   { background: rgba(160, 160, 160, 0.18); color: var(--text-tertiary); }
@@ -13015,7 +13133,7 @@ pre.tool-error-pre {
 .workbench-create-modal .modal-button.primary {
     background: var(--accent-primary);
     border-color: var(--accent-primary);
-    color: #ffffff;
+    color: var(--text-on-accent);
 }
 
 .workbench-create-modal .modal-button.primary:hover:not(:disabled) {
@@ -13974,7 +14092,7 @@ pre.tool-error-pre {
     border: 1px solid var(--accent-primary);
     border-radius: 6px;
     background: var(--accent-primary);
-    color: var(--text-bright);
+    color: var(--text-on-accent);
     padding: var(--space-2) var(--space-3);
     font-size: 0.85rem;
     font-weight: 600;

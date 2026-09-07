@@ -358,13 +358,16 @@ fn document_element() -> Option<web_sys::HtmlElement> {
 }
 
 /// Apply theme to the DOM and persist to localStorage.
-fn apply_theme(theme: &str) {
+fn apply_theme(id: &str) -> &'static str {
+    let theme = crate::appearance::resolve(id);
     if let Some(el) = document_element() {
-        let _ = el.set_attribute("data-theme", theme);
+        let _ = el.set_attribute("data-theme", theme.color_scheme);
+        let _ = el.set_attribute("data-appearance-theme", theme.id);
     }
     if let Some(storage) = local_storage() {
-        let _ = storage.set_item(STORAGE_THEME, theme);
+        let _ = storage.set_item(STORAGE_THEME, theme.id);
     }
+    theme.id
 }
 
 /// Apply font size to the DOM and persist to localStorage.
@@ -398,15 +401,19 @@ fn apply_font_family(key: &str) {
 /// Restore appearance settings from localStorage into AppState and apply to DOM.
 /// Called once at startup.
 pub fn restore_appearance(state: &AppState) {
-    let storage = match local_storage() {
-        Some(s) => s,
-        None => return,
+    let storage = local_storage();
+    let saved_theme = storage
+        .as_ref()
+        .and_then(|storage| storage.get_item(STORAGE_THEME).ok().flatten());
+    let theme = apply_theme(
+        saved_theme
+            .as_deref()
+            .unwrap_or(crate::appearance::DEFAULT_THEME_ID),
+    );
+    state.theme.set(theme.to_owned());
+    let Some(storage) = storage else {
+        return;
     };
-
-    if let Ok(Some(theme)) = storage.get_item(STORAGE_THEME) {
-        apply_theme(&theme);
-        state.theme.set(theme);
-    }
 
     if let Ok(Some(size_str)) = storage.get_item(STORAGE_FONT_SIZE)
         && let Ok(size) = size_str.parse::<u32>()
@@ -1836,21 +1843,10 @@ fn managed_lifecycle_button_disabled(status: &bridge::RemoteHostLifecycleStatus)
 fn AppearanceTab() -> impl IntoView {
     let state = expect_context::<AppState>();
 
-    let set_theme = move |theme: &'static str| {
-        move |_| {
-            state.theme.set(theme.to_owned());
-            apply_theme(theme);
-        }
-    };
-
-    let theme_class = move |target: &'static str| {
-        move || {
-            if state.theme.get() == target {
-                "segment active"
-            } else {
-                "segment"
-            }
-        }
+    let on_theme = move |ev: web_sys::Event| {
+        let select: web_sys::HtmlSelectElement = ev.target().unwrap().unchecked_into();
+        let id = apply_theme(&select.value());
+        state.theme.set(id.to_owned());
     };
 
     let on_font_size = move |ev: web_sys::Event| {
@@ -1901,12 +1897,19 @@ fn AppearanceTab() -> impl IntoView {
         </div>
 
         <div class="settings-field">
-            <label class="settings-label">"Color Theme"</label>
-            <p class="settings-description">"The color scheme for the whole interface. Changes apply immediately and are remembered the next time you open Tyde."</p>
-            <div class="settings-segmented-control">
-                <button class=theme_class("dark") on:click=set_theme("dark")>"Dark"</button>
-                <button class=theme_class("light") on:click=set_theme("light")>"Light"</button>
-            </div>
+            <label class="settings-label" for="appearance-theme">"Appearance theme"</label>
+            <p class="settings-description">"Colors for the interface, without changing its layout or text size. Applies immediately and is remembered on this device. Syntax highlighting is selected separately in Code & Output Display."</p>
+            <select
+                id="appearance-theme"
+                aria-label="Appearance theme"
+                class="settings-select"
+                prop:value=move || state.theme.get()
+                on:change=on_theme
+            >
+                {crate::appearance::THEMES.iter().map(|theme| {
+                    view! { <option value=theme.id>{theme.label}</option> }
+                }).collect::<Vec<_>>()}
+            </select>
         </div>
 
         <div class="settings-field">
@@ -8881,6 +8884,175 @@ mod wasm_tests {
             "expected >=20 themes in dropdown, got {}: {options:?}",
             options.len()
         );
+    }
+
+    #[wasm_bindgen_test]
+    async fn appearance_themes_recolor_without_relayout_and_survive_reopen() {
+        let window = web_sys::window().unwrap();
+        let document = window.document().unwrap();
+        let root = document.document_element().unwrap();
+        let storage = window.local_storage().unwrap().unwrap();
+        let previous_theme = storage.get_item(STORAGE_THEME).unwrap();
+        let previous_mode = root.get_attribute("data-theme");
+        let previous_appearance = root.get_attribute("data-appearance-theme");
+        let style = document.create_element("style").unwrap();
+        style.set_text_content(Some(include_str!("../../styles.css")));
+        document.head().unwrap().append_child(&style).unwrap();
+
+        let container = make_container();
+        let state = AppState::new();
+        let mounted_state = state.clone();
+        let handle = mount_to(container.clone(), move || {
+            provide_context(mounted_state);
+            view! { <AppearanceTab /> }
+        });
+        next_tick().await;
+        let select: HtmlSelectElement = container
+            .query_selector("select[aria-label='Appearance theme']")
+            .unwrap()
+            .expect("Appearance must let users choose named interface themes")
+            .dyn_into()
+            .unwrap();
+        let title = container
+            .query_selector("label[for='sidebar-backend-labels']")
+            .unwrap()
+            .unwrap();
+        let font_slider = container
+            .query_selector("input[type='range']")
+            .unwrap()
+            .unwrap();
+        let before = font_slider.get_bounding_client_rect();
+        let initial_text = container.text_content().unwrap();
+        let initial_font = window
+            .get_computed_style(&title)
+            .unwrap()
+            .unwrap()
+            .get_property_value("font-size")
+            .unwrap();
+
+        for (id, label, ink, scheme) in [
+            ("github-light", "GitHub Light", "rgb(31, 35, 40)", "light"),
+            ("github-dark", "GitHub Dark", "rgb(230, 237, 243)", "dark"),
+            (
+                "catppuccin-latte",
+                "Catppuccin Latte",
+                "rgb(76, 79, 105)",
+                "light",
+            ),
+            (
+                "catppuccin-mocha",
+                "Catppuccin Mocha",
+                "rgb(205, 214, 244)",
+                "dark",
+            ),
+            ("light", "Tyde Light", "rgb(30, 30, 30)", "light"),
+            ("dark", "Tyde Dark", "rgb(232, 232, 232)", "dark"),
+        ] {
+            select.set_value(id);
+            select
+                .dispatch_event(&web_sys::Event::new("change").unwrap())
+                .unwrap();
+            next_tick().await;
+            assert_eq!(select.value(), id, "{label} must be selectable");
+            assert!(select.text_content().unwrap().contains(label));
+            let computed = window.get_computed_style(&title).unwrap().unwrap();
+            assert_eq!(
+                computed.get_property_value("color").unwrap(),
+                ink,
+                "{label} must change the rendered interface text"
+            );
+            assert_eq!(computed.get_property_value("color-scheme").unwrap(), scheme);
+            assert_eq!(
+                computed.get_property_value("font-size").unwrap(),
+                initial_font
+            );
+            let after = font_slider.get_bounding_client_rect();
+            assert_eq!(
+                (after.x(), after.y(), after.width(), after.height()),
+                (before.x(), before.y(), before.width(), before.height()),
+                "theme changes must preserve control positions and sizes"
+            );
+            assert_eq!(container.text_content().unwrap(), initial_text);
+            assert_eq!(
+                storage.get_item(STORAGE_THEME).unwrap().as_deref(),
+                Some(id)
+            );
+        }
+        select.set_value("catppuccin-latte");
+        select
+            .dispatch_event(&web_sys::Event::new("change").unwrap())
+            .unwrap();
+        next_tick().await;
+        drop(handle);
+        container.remove();
+        let reopened = make_container();
+        let reopened_handle = mount_to(reopened.clone(), move || {
+            let state = AppState::new();
+            restore_appearance(&state);
+            provide_context(state);
+            view! { <AppearanceTab /> }
+        });
+        next_tick().await;
+        let restored: HtmlSelectElement = reopened
+            .query_selector("select[aria-label='Appearance theme']")
+            .unwrap()
+            .unwrap()
+            .dyn_into()
+            .unwrap();
+        assert_eq!(restored.value(), "catppuccin-latte");
+        assert_eq!(
+            window
+                .get_computed_style(
+                    &reopened
+                        .query_selector("label[for='sidebar-backend-labels']")
+                        .unwrap()
+                        .unwrap()
+                )
+                .unwrap()
+                .unwrap()
+                .get_property_value("color")
+                .unwrap(),
+            "rgb(76, 79, 105)"
+        );
+        drop(reopened_handle);
+        reopened.remove();
+
+        storage.set_item(STORAGE_THEME, "removed-theme").unwrap();
+        let fallback = make_container();
+        let fallback_handle = mount_to(fallback.clone(), move || {
+            let state = AppState::new();
+            restore_appearance(&state);
+            provide_context(state);
+            view! { <AppearanceTab /> }
+        });
+        next_tick().await;
+        let fallback_select: HtmlSelectElement = fallback
+            .query_selector("select[aria-label='Appearance theme']")
+            .unwrap()
+            .unwrap()
+            .dyn_into()
+            .unwrap();
+        assert_eq!(
+            fallback_select.value(),
+            "dark",
+            "unknown saved themes must remain usable"
+        );
+        drop(fallback_handle);
+        fallback.remove();
+        match previous_theme {
+            Some(value) => storage.set_item(STORAGE_THEME, &value).unwrap(),
+            None => storage.remove_item(STORAGE_THEME).unwrap(),
+        }
+        for (name, value) in [
+            ("data-theme", previous_mode),
+            ("data-appearance-theme", previous_appearance),
+        ] {
+            match value {
+                Some(value) => root.set_attribute(name, &value).unwrap(),
+                None => root.remove_attribute(name).unwrap(),
+            }
+        }
+        style.remove();
     }
 
     // ---- Mobile tab ----

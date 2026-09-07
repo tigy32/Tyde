@@ -4215,7 +4215,7 @@ impl AppState {
             pending_agent_session_settings: RwSignal::new(HashMap::new()),
             next_pending_agent_session_settings_id: RwSignal::new(0),
             font_size: RwSignal::new(13),
-            theme: RwSignal::new("dark".to_owned()),
+            theme: RwSignal::new(crate::appearance::DEFAULT_THEME_ID.to_owned()),
             font_family: RwSignal::new("system".to_owned()),
             syntax_theme: RwSignal::new(crate::syntax_highlight::DEFAULT_THEME_NAME.to_owned()),
             diff_view_mode: RwSignal::new(DiffViewMode::Unified),
