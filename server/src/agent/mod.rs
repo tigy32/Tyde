@@ -846,6 +846,9 @@ impl AgentActivityStatsTracker {
             ChatEvent::TypingStatusChanged(_)
             | ChatEvent::ToolProgress(_)
             | ChatEvent::ToolExecutionCompleted(_)
+            | ChatEvent::GoalCapabilities(_)
+            | ChatEvent::GoalChanged(_)
+            | ChatEvent::GoalCompleted(_)
             | ChatEvent::TaskUpdate(_)
             | ChatEvent::OperationCancelled(_)
             | ChatEvent::RetryAttempt(_)
@@ -3732,8 +3735,12 @@ pub(crate) fn spawn_agent_actor(
                 !replay_state.active_background_progress.is_empty(),
                 Instant::now(),
             );
-            let supervisor_deadline = supervisor_state
-                .next_deadline(supervisor_settings.settings, supervisor_settings.epoch);
+            let supervisor_deadline = if supervisor_status.goal.is_some() {
+                None
+            } else {
+                supervisor_state
+                    .next_deadline(supervisor_settings.settings, supervisor_settings.epoch)
+            };
             let stall_timeout = Duration::from_secs(u64::from(
                 supervisor_settings.settings.stall_timeout_seconds,
             ));
@@ -3741,7 +3748,8 @@ pub(crate) fn spawn_agent_actor(
             // silent immediately is measured from when it began rather than
             // from an older event. One interrupt per window: a backend that
             // swallows the first gets another a full window later, not a loop.
-            let stall_deadline = (supervisor_settings.settings.enabled
+            let stall_deadline = (supervisor_status.goal.is_none()
+                && supervisor_settings.settings.enabled
                 && supervisor_settings.settings.stall_timeout_enabled
                 && in_turn)
                 .then(|| {
@@ -3919,6 +3927,7 @@ pub(crate) fn spawn_agent_actor(
                     } else {
                         match result {
                             Ok(supervisor::SupervisionVerdict::Continue { message }) => {
+                                if status_handle.snapshot().await.goal.is_some() { continue; }
                                 supervisor_state.settle(now);
                                 let payload = SendMessagePayload {
                                     message: format!("{SUPERVISOR_MESSAGE_PREFIX}{message}"),
@@ -4231,6 +4240,14 @@ pub(crate) fn spawn_agent_actor(
                         .await;
                         return;
                     };
+                    if resume_replay_gate_pending
+                        && restore_native_goal_snapshot(&event, &status_handle).await
+                    {
+                        if let BackendEvent::Chat(event) = event {
+                            append_chat_event(&canonical_stream, &mut event_log, &mut subscribers, &mut replay_state, &event).await;
+                        }
+                        continue;
+                    }
                     if resume_replay_gate_pending && resume_uses_authoritative_transcript {
                         // The backend owns this barrier and closes it before it
                         // accepts live conversation work. Chat events on its
@@ -4528,6 +4545,20 @@ pub(crate) fn spawn_agent_actor(
                                 s.activity_counter = s.activity_counter.saturating_add(1);
                             }).await;
                         }
+                        ChatEvent::GoalCapabilities(capabilities) => {
+                            status_handle.update(|s| s.goal_capabilities = Some(capabilities.clone())).await;
+                        }
+                        ChatEvent::GoalChanged(goal) => {
+                            let previous = status_handle.snapshot().await.goal;
+                            if let Some(goal) = goal
+                                && goal.status == protocol::GoalStatus::Complete
+                                && previous.as_ref().is_some_and(|previous| previous.status != protocol::GoalStatus::Complete)
+                            {
+                                append_chat_event(&canonical_stream, &mut event_log, &mut subscribers, &mut replay_state, &ChatEvent::GoalCompleted(goal.clone())).await;
+                            }
+                            status_handle.update(|s| s.goal = goal.clone()).await;
+                        }
+                        ChatEvent::GoalCompleted(_) => {}
                         ChatEvent::TypingStatusChanged(typing) => {
                             let typing = *typing;
                             backend_typing = typing;
@@ -5064,6 +5095,12 @@ pub(crate) fn spawn_agent_actor(
                             // now-ungated `events.recv()`) keeps the full resume
                             // transcript off the live broadcast path.
                             while let Ok(event) = events.try_recv_backend() {
+                                if restore_native_goal_snapshot(&event, &status_handle).await {
+                                    if let BackendEvent::Chat(event) = event {
+                                        append_chat_event(&canonical_stream, &mut event_log, &mut subscribers, &mut replay_state, &event).await;
+                                    }
+                                    continue;
+                                }
                                 if resume_uses_authoritative_transcript {
                                     // See the gated receive path above: the
                                     // barrier, not event serialization, is the
@@ -6352,6 +6389,28 @@ pub(crate) fn spawn_agent_actor(
                                                 .await;
                                             }
                                         }
+                                    }
+                                }
+                                AgentInput::GoalControl(control) => {
+                                    let status = status_handle.snapshot().await;
+                                    let supported = status.goal_capabilities.as_ref().is_some_and(|caps| match &control {
+                                        protocol::GoalControl::Set { .. } => caps.set,
+                                        protocol::GoalControl::Pause => caps.pause,
+                                        protocol::GoalControl::Resume => caps.resume,
+                                        protocol::GoalControl::Clear => caps.clear,
+                                    });
+                                    let error = if !supported {
+                                        Some("This session does not support that native goal control".to_owned())
+                                    } else {
+                                        match backend.as_ref().expect("running actor has backend").send_with_outcome(AgentInput::GoalControl(control)).await {
+                                            SendOutcome::Accepted => None,
+                                            SendOutcome::Busy(_) => Some("Native goal control could not be delivered while busy".to_owned()),
+                                            SendOutcome::Closed => Some("Backend closed before accepting native goal control".to_owned()),
+                                        }
+                                    };
+                                    if let Some(message) = error {
+                                        let payload = AgentErrorPayload { agent_id: current_start.agent_id.clone(), code: AgentErrorCode::Unsupported, message, fatal: false };
+                                        append_event(&canonical_stream, &mut event_log, &mut subscribers, FrameKind::AgentError, &payload).await;
                                     }
                                 }
                                 AgentInput::UpdateSessionSettings(update) => {
@@ -10732,6 +10791,33 @@ async fn terminalize_closed_queue_dispatch(context: QueueDispatchTerminalContext
     .await;
 }
 
+// Goal reads describe current provider state, even while transcript replay is gated.
+// Discarding them with historical chat leaves resumed controls unsupported.
+async fn restore_native_goal_snapshot(
+    event: &BackendEvent,
+    status_handle: &registry::AgentStatusHandle,
+) -> bool {
+    match event {
+        BackendEvent::Chat(ChatEvent::GoalCapabilities(capabilities)) => {
+            tracing::info!(
+                ?capabilities,
+                "restoring native goal capabilities during replay"
+            );
+            status_handle
+                .update(|status| status.goal_capabilities = Some(capabilities.clone()))
+                .await;
+        }
+        BackendEvent::Chat(ChatEvent::GoalChanged(goal)) => {
+            tracing::info!(goal_status = ?goal.as_ref().map(|goal| goal.status), "restoring native goal state during replay");
+            status_handle
+                .update(|status| status.goal = goal.clone())
+                .await;
+        }
+        _ => return false,
+    }
+    true
+}
+
 async fn mark_agent_turn_active(status_handle: &registry::AgentStatusHandle) {
     status_handle
         .update(|status| {
@@ -11024,6 +11110,9 @@ fn record_chat_event_for_replay(
             push_chat_event_to_replay_log(canonical_stream, event_log, event);
         }
         ChatEvent::MessageAdded(_)
+        | ChatEvent::GoalCapabilities(_)
+        | ChatEvent::GoalChanged(_)
+        | ChatEvent::GoalCompleted(_)
         | ChatEvent::TaskUpdate(_)
         | ChatEvent::RetryAttempt(_)
         | ChatEvent::Orchestration(_)
@@ -11423,6 +11512,9 @@ fn render_activity_chat_event(event: &ChatEvent) -> Option<String> {
                 ToolExecutionOutcome::Cancelled { .. } => "was cancelled",
             }
         )),
+        ChatEvent::GoalCapabilities(_)
+        | ChatEvent::GoalChanged(_)
+        | ChatEvent::GoalCompleted(_) => None,
         ChatEvent::TaskUpdate(tasks) => {
             let title = tasks.title.trim();
             if title.is_empty() {

@@ -1356,7 +1356,8 @@ impl Backend for HermesBackend {
                 .command_tx
                 .send(HermesBackendCommand::Input(input))
                 .is_ok(),
-            AgentInput::EditQueuedMessage(_)
+            AgentInput::GoalControl(_)
+            | AgentInput::EditQueuedMessage(_)
             | AgentInput::CancelQueuedMessage(_)
             | AgentInput::SendQueuedMessageNow(_) => {
                 tracing::error!("queued-message inputs reached Hermes backend");
@@ -2571,7 +2572,8 @@ impl HermesSessionActor {
                     self.emit_error(error);
                 }
             }
-            AgentInput::EditQueuedMessage(_)
+            AgentInput::GoalControl(_)
+            | AgentInput::EditQueuedMessage(_)
             | AgentInput::CancelQueuedMessage(_)
             | AgentInput::SendQueuedMessageNow(_) => {
                 self.emit_error("queued-message inputs reached Hermes backend");

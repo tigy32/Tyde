@@ -1183,6 +1183,57 @@ pub fn ChatInput() -> impl IntoView {
         }
     };
 
+    let goal_state = state.clone();
+    let can_set_goal = Memo::new(move |_| {
+        let Some(active) = goal_state.active_agent.get() else {
+            return false;
+        };
+        !loading_photos.get()
+            && !composer.submitting.get()
+            && !active_agent_is_terminated(&goal_state)
+            && !goal_state.chat_input.get().trim().is_empty()
+            && composer.images.get().is_empty()
+            && goal_state.goal_capabilities.with(|caps| {
+                caps.get(&active.as_agent_ref())
+                    .is_some_and(|caps| caps.set)
+            })
+    });
+    let goal_state = state.clone();
+    let on_goal = Callback::new(move |()| {
+        if composer.is_busy() || !can_set_goal.get_untracked() {
+            return;
+        }
+        let Some(active) = goal_state.active_agent.get_untracked() else {
+            return;
+        };
+        let Some(stream) = active_agent_stream(&goal_state, &active) else {
+            return;
+        };
+        let state = goal_state.clone();
+        let objective = state.chat_input.get_untracked();
+        composer.begin();
+        spawn_local(async move {
+            match crate::send::send_frame(
+                &active.local_host_id,
+                stream,
+                protocol::FrameKind::GoalControl,
+                &protocol::GoalControl::Set {
+                    objective: objective.clone(),
+                },
+            )
+            .await
+            {
+                Ok(_) => {
+                    if state.chat_input.get_untracked() == objective {
+                        state.chat_input.set(String::new());
+                    }
+                }
+                Err(error) => report_send_error(&state, format!("Failed to set goal: {error}")),
+            }
+            composer.finish();
+        });
+    });
+
     let do_steer = {
         let state = state.clone();
         move || {
@@ -1869,6 +1920,9 @@ pub fn ChatInput() -> impl IntoView {
                                 <crate::voice::MobileVoiceComposerMenuItems
                                     on_select=Callback::new(move |_| menu_open.set(false))
                                 />
+                                <Show when=move || can_set_goal.get()>
+                                    <button type="button" class="chat-send-menu-item" role="menuitem" data-mobile-test="chat-send-menu-goal" on:click=move |_| { menu_open.set(false); on_goal.run(()); }>"Send as goal"</button>
+                                </Show>
                                 {show_steer.then(|| view! {
                                     <button
                                         type="button"

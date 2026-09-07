@@ -709,6 +709,7 @@ pub struct StreamingState {
 
 #[derive(Clone, Debug)]
 pub enum TransientEvent {
+    GoalCompleted(protocol::NativeGoal),
     OperationCancelled {
         message: String,
     },
@@ -1003,6 +1004,8 @@ pub struct AppState {
     /// Monotonic source of [`SubmissionOriginId`]s. Client-local; never on the wire.
     next_submission_origin: RwSignal<u64>,
     pub task_lists: RwSignal<HashMap<AgentRef, TaskList>>,
+    pub native_goals: RwSignal<HashMap<AgentRef, protocol::NativeGoal>>,
+    pub goal_capabilities: RwSignal<HashMap<AgentRef, protocol::GoalCapabilities>>,
     pub agent_message_queue: RwSignal<HashMap<AgentRef, Vec<QueuedMessageEntry>>>,
     pub agent_turn_active: RwSignal<HashMap<AgentRef, bool>>,
     /// The server's per-agent activity stats — the same `AgentActivityStats`
@@ -1113,6 +1116,8 @@ impl AppState {
             withdrawn_submissions: RwSignal::new(HashMap::new()),
             next_submission_origin: RwSignal::new(0),
             task_lists: RwSignal::new(HashMap::new()),
+            native_goals: RwSignal::new(HashMap::new()),
+            goal_capabilities: RwSignal::new(HashMap::new()),
             agent_message_queue: RwSignal::new(HashMap::new()),
             agent_turn_active: RwSignal::new(HashMap::new()),
             agent_activity_stats: RwSignal::new(HashMap::new()),

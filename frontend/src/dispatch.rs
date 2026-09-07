@@ -4595,6 +4595,12 @@ fn apply_agent_closed(state: &AppState, host_id: &str, agent_id: AgentId) {
     state.last_turn_cancelled.update(|set| {
         set.remove(&agent_id);
     });
+    state.native_goals.update(|map| {
+        map.remove(&agent_id);
+    });
+    state.goal_capabilities.update(|map| {
+        map.remove(&agent_id);
+    });
     state.task_lists.update(|map| {
         map.remove(&agent_id);
     });
@@ -4660,6 +4666,9 @@ fn settle_fatal_agent_ui(state: &AppState, agent_id: &AgentId) {
 fn apply_agent_error(state: &AppState, host_id: &str, payload: AgentErrorPayload) {
     let agent_id = payload.agent_id.clone();
     if payload.fatal {
+        state.goal_capabilities.update(|caps| {
+            caps.remove(&agent_id);
+        });
         state.agents.update(|agents| {
             if let Some(agent) = agents
                 .iter_mut()
@@ -5434,7 +5443,14 @@ impl HistoryReplay {
             // replaying it here would resurrect stale prior-turn workers. Leave
             // orchestration untouched; the current turn's panel comes from the
             // live stream and the authoritative agent bootstrap.
-            ChatEvent::TypingStatusChanged(_)
+            ChatEvent::GoalCompleted(goal) => {
+                self.rows.push(crate::state::ChatRowHandle::notice(
+                    crate::state::ChatNotice::GoalCompleted(goal),
+                ));
+            }
+            ChatEvent::GoalChanged(_)
+            | ChatEvent::GoalCapabilities(_)
+            | ChatEvent::TypingStatusChanged(_)
             | ChatEvent::StreamStart(_)
             | ChatEvent::StreamDelta(_)
             | ChatEvent::StreamReasoningDelta(_)
@@ -5534,6 +5550,27 @@ pub fn apply_chat_event_from(
 ) {
     let agent_id = agent_id.clone();
     match event {
+        ChatEvent::GoalCompleted(goal) => {
+            state.push_chat_notice(
+                agent_id.clone(),
+                crate::state::ChatNotice::GoalCompleted(goal),
+            );
+        }
+        ChatEvent::GoalCapabilities(capabilities) => {
+            state.goal_capabilities.update(|map| {
+                map.insert(agent_id.clone(), capabilities);
+            });
+        }
+        ChatEvent::GoalChanged(goal) => {
+            state.native_goals.update(|map| match goal {
+                Some(goal) => {
+                    map.insert(agent_id.clone(), goal);
+                }
+                None => {
+                    map.remove(&agent_id);
+                }
+            });
+        }
         ChatEvent::TypingStatusChanged(typing) => {
             log::trace!(
                 "dispatch chat_event host={} agent_id={} type=typing active={}",
@@ -6696,6 +6733,12 @@ fn apply_agent_bootstrap(
     });
     state.last_turn_cancelled.update(|set| {
         set.remove(&agent_id);
+    });
+    state.native_goals.update(|map| {
+        map.remove(&agent_id);
+    });
+    state.goal_capabilities.update(|map| {
+        map.remove(&agent_id);
     });
     state.task_lists.update(|map| {
         map.remove(&agent_id);

@@ -1188,6 +1188,41 @@ pub async fn send_prompt(host: &mut Host, agent: &Agent, prompt: &str) {
         .expect("send_message failed");
 }
 
+pub async fn control_native_goal(host: &mut Host, agent: &Agent, control: protocol::GoalControl) {
+    host.client
+        .control_goal(&agent.stream, control)
+        .await
+        .expect("send native goal control");
+}
+
+pub async fn wait_native_goal(
+    host: &mut Host,
+    agent: &Agent,
+    expected: Option<protocol::GoalStatus>,
+) -> Vec<ChatEvent> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+    let mut events = Vec::new();
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "native goal did not reach {expected:?}"
+        );
+        let envelope = host.next_envelope(remaining, "native goal state").await;
+        fail_on_agent_error(&envelope, "native goal state");
+        if envelope.stream != agent.stream {
+            continue;
+        }
+        for event in chat_events_in(&envelope) {
+            let reached = matches!(&event, ChatEvent::GoalChanged(goal) if goal.as_ref().map(|goal| goal.status) == expected);
+            events.push(event);
+            if reached {
+                return events;
+            }
+        }
+    }
+}
+
 pub async fn ask(host: &mut Host, agent: &Agent, prompt: impl AsRef<str>) -> Turn {
     let prompt = prompt.as_ref();
     host.client

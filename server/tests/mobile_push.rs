@@ -270,7 +270,7 @@ async fn idle_agent_delivers_an_encrypted_push_to_the_paired_device() {
     let mut mobile = connect_mobile(fixture.host_for_test()).await;
     register_subscription(&mut mobile, keys.subscription(endpoint)).await;
 
-    fixture
+    let agent = fixture
         .spawn_scripted(
             "push-idle",
             MockScript::one(MockTurn::text("mock backend response to: push idle")),
@@ -303,6 +303,68 @@ async fn idle_agent_delivers_an_encrypted_push_to_the_paired_device() {
         serde_json::from_slice(&plaintext).expect("decrypted push body is a notification");
     assert_eq!(notification.agent_name, "push-idle");
     assert_eq!(notification.reason, MobilePushReason::TurnComplete);
+
+    let active = protocol::NativeGoal {
+        objective: "Produce the native goal output".to_owned(),
+        status: protocol::GoalStatus::Active,
+        token_budget: None,
+        tokens_used: None,
+        time_used_seconds: None,
+    };
+    let mut complete = active.clone();
+    complete.status = protocol::GoalStatus::Complete;
+    fixture
+        .mock_by_id(&agent.new_agent.agent_id)
+        .await
+        .enqueue(
+            MockTurn::text("Native goal output")
+                .starting_with_goal(active)
+                .with_goal_state(Some(complete.clone()))
+                .with_goal_state(Some(complete)),
+        )
+        .await;
+    fixture
+        .client
+        .send_message(&agent.stream, "Finish the native goal".to_owned())
+        .await
+        .expect("send goal turn");
+    let captured = tokio::time::timeout(PUSH_WAIT, pushes.recv())
+        .await
+        .expect("native goal completion push")
+        .expect("push endpoint remains open");
+    let notification: MobilePushNotification =
+        serde_json::from_slice(&keys.decrypt(&captured.body)).expect("native goal push payload");
+    assert_eq!(
+        notification.reason,
+        MobilePushReason::GoalComplete,
+        "native goal completion replaces the intermediate idle notification"
+    );
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_secs(1), pushes.recv())
+            .await
+            .is_err(),
+        "repeated native completion must not send a duplicate push"
+    );
+    fixture
+        .spawn_scripted(
+            "already-complete-goal",
+            MockScript::one(MockTurn::text("Restored goal snapshot").starting_with_goal(
+                protocol::NativeGoal {
+                    objective: "Previously completed output".to_owned(),
+                    status: protocol::GoalStatus::Complete,
+                    token_budget: None,
+                    tokens_used: None,
+                    time_used_seconds: None,
+                },
+            )),
+        )
+        .await;
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_secs(1), pushes.recv())
+            .await
+            .is_err(),
+        "an initial complete snapshot must not announce a new completion"
+    );
 }
 
 #[tokio::test]

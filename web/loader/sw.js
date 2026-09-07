@@ -146,6 +146,12 @@ function notificationFor(payload) {
         title: payload.agent_name,
         body: `Waiting for plan approval \u00b7 ${host}`,
       };
+    case "goal_complete":
+      return { title: payload.agent_name, body: `Goal completed · ${host}` };
+    case "goal_blocked":
+      return { title: payload.agent_name, body: `Goal blocked · ${host}` };
+    case "goal_limit_reached":
+      return { title: payload.agent_name, body: `Goal reached its limit · ${host}` };
     case "turn_complete":
       return { title: payload.agent_name, body: `Finished \u00b7 ${host}` };
     default:

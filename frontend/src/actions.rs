@@ -2305,3 +2305,20 @@ pub async fn request_context_compaction(
         state.abandon_compaction_request(&agent.agent_id, error);
     }
 }
+
+pub async fn control_native_goal(
+    state: &AppState,
+    agent: ActiveAgentRef,
+    control: protocol::GoalControl,
+) -> Result<(), String> {
+    let stream = state
+        .agents
+        .with_untracked(|agents| {
+            agents
+                .iter()
+                .find(|entry| entry.agent_id == agent.agent_id && entry.host_id == agent.host_id)
+                .map(|entry| entry.instance_stream.clone())
+        })
+        .ok_or_else(|| "Agent is no longer connected".to_owned())?;
+    send_frame(&agent.host_id, stream, FrameKind::GoalControl, &control).await
+}

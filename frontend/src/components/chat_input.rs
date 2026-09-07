@@ -961,7 +961,22 @@ pub fn ChatInput(
     // The dropdown holds items only in specific states (see state matrix):
     // - Fork + send: idle or thinking + input + session
     // - Steer + Cancel: thinking + input (with or without session)
-    let menu_has_items = Memo::new(move |_| can_btw.get() || (can_interrupt() && is_steer.get()));
+    let goal_text = composer.text.clone();
+    let can_set_goal = Memo::new(move |_| {
+        let Some(agent) = agent_ref.get() else {
+            return false;
+        };
+        can_send()
+            && !is_terminated.get()
+            && !goal_text.get().trim().is_empty()
+            && pending_images.get().is_empty()
+            && state
+                .goal_capabilities
+                .with(|map| map.get(&agent.agent_id).is_some_and(|caps| caps.set))
+    });
+    let menu_has_items = Memo::new(move |_| {
+        can_set_goal.get() || can_btw.get() || (can_interrupt() && is_steer.get())
+    });
     let menu_open = RwSignal::new(false);
     // Auto-dismiss a stale-open menu when its items disappear.
     Effect::new(move |_| {
@@ -1101,6 +1116,35 @@ pub fn ChatInput(
             submit_side_question(state, composer, agent_ref, menu_images)
         });
     };
+    let goal_action_state = state.clone();
+    let goal_composer = composer.clone();
+    let on_menu_goal = Callback::new(move |(): ()| {
+        let composer = goal_composer.clone();
+        menu_open.set(false);
+        let Some(agent) = agent_ref.get_untracked() else {
+            return;
+        };
+        let objective = composer.text.get_untracked();
+        let goal_state = goal_action_state.clone();
+        spawn_local(async move {
+            match crate::actions::control_native_goal(
+                &goal_state,
+                agent,
+                protocol::GoalControl::Set {
+                    objective: objective.clone(),
+                },
+            )
+            .await
+            {
+                Ok(()) => {
+                    if composer.text.get_untracked() == objective {
+                        composer.text.set(String::new());
+                    }
+                }
+                Err(error) => crate::components::header::report_user_error(&error),
+            }
+        });
+    });
     let on_menu_steer = move |_| {
         menu_open.set(false);
         menu_state.with_value(|(state, composer)| {
@@ -1529,6 +1573,11 @@ pub fn ChatInput(
                             aria-label="Send actions"
                             data-test="chat-send-menu"
                         >
+                            <Show when=move || can_set_goal.get()>
+                                <button type="button" class="chat-send-menu-item" role="menuitem" data-test="chat-send-menu-goal" on:click=move |_| on_menu_goal.run(())>
+                                    <span class="chat-send-menu-label">"Send as goal"</span>
+                                </button>
+                            </Show>
                             <Show when=move || can_interrupt() && is_steer.get()>
                                 <button
                                     type="button"
@@ -1810,6 +1859,83 @@ mod wasm_tests {
     /// R-03: the disabled attribute is reactive and may not be applied when a
     /// second click arrives, so single-submit has to hold in the commit path.
     /// Two clicks must produce one Interrupt frame.
+    #[wasm_bindgen_test]
+    async fn native_goal_menu_requires_capability_and_keeps_normal_send() {
+        let container = make_container();
+        let state = AppState::new();
+        configure(&state, true, false, "Finish the output");
+        let state_for_mount = state.clone();
+        let _handle = mount_to(container.clone(), move || {
+            provide_context(state_for_mount.clone());
+            view! { <ChatInput /> }
+        });
+        next_tick().await;
+        query(&container, "[data-test='chat-send-menu-toggle']")
+            .expect("send menu")
+            .dyn_into::<HtmlElement>()
+            .unwrap()
+            .click();
+        next_tick().await;
+        assert!(query(&container, "[data-test='chat-send-menu-goal']").is_none());
+        let agent_id = AgentId(AGENT.to_owned());
+        state.goal_capabilities.update(|caps| {
+            caps.insert(
+                agent_id.clone(),
+                protocol::GoalCapabilities {
+                    set: true,
+                    pause: true,
+                    resume: true,
+                    clear: true,
+                },
+            );
+        });
+        next_tick().await;
+        let calls = stub_send_recording();
+        query(&container, "[data-test='chat-send-menu-goal']")
+            .expect("native goal menu item")
+            .dyn_into::<HtmlElement>()
+            .unwrap()
+            .click();
+        next_tick().await;
+        next_tick().await;
+        assert_eq!(calls.length(), 1);
+        let args: JsonValue = serde_json::from_str(&calls.get(0).as_string().unwrap()).unwrap();
+        let envelope: JsonValue =
+            serde_json::from_str(args["line"].as_str().expect("outgoing frame")).unwrap();
+        assert_eq!(envelope["kind"], "goal_control");
+        assert_eq!(envelope["payload"]["objective"], "Finish the output");
+        state.native_goals.update(|goals| {
+            goals.insert(
+                agent_id,
+                protocol::NativeGoal {
+                    objective: "Finish the output".to_owned(),
+                    status: protocol::GoalStatus::Active,
+                    token_budget: None,
+                    tokens_used: None,
+                    time_used_seconds: None,
+                },
+            );
+        });
+        state
+            .composer_untracked()
+            .text
+            .set("Apply this correction".to_owned());
+        next_tick().await;
+        let send = primary(&container);
+        assert!(!send.has_attribute("disabled"));
+        assert_eq!(send.text_content().unwrap().trim(), "Send");
+        send.dyn_into::<HtmlElement>().unwrap().click();
+        next_tick().await;
+        next_tick().await;
+        assert_eq!(calls.length(), 2);
+        let args: JsonValue = serde_json::from_str(&calls.get(1).as_string().unwrap()).unwrap();
+        let envelope: JsonValue =
+            serde_json::from_str(args["line"].as_str().expect("normal frame")).unwrap();
+        assert_eq!(envelope["kind"], "send_message");
+        stub_send_host_line();
+        container.remove();
+    }
+
     #[wasm_bindgen_test]
     async fn repeated_cancel_clicks_send_one_interrupt() {
         let container = make_container();

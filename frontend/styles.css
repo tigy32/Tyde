@@ -14854,3 +14854,9 @@ pre.tool-error-pre {
         animation: none;
     }
 }
+
+.summary-goal { border-bottom: 1px solid var(--border-primary); padding: 8px 12px; }
+.summary-goal-header { width: 100%; border: 0; background: transparent; color: inherit; text-align: left; padding: 0; display: flex; align-items: center; gap: 12px; cursor: pointer; font-size: 12px; }
+.summary-goal-objective { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.summary-goal-body { padding-top: 8px; font-size: 12px; overflow-wrap: anywhere; }
+.summary-goal-controls { display: flex; gap: 8px; padding-top: 8px; }

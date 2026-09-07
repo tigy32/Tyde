@@ -13,7 +13,7 @@ use serde_json::Value;
 /// `protocol::TydeReleaseVersion`.
 pub use host_config::{LOCAL_HOST_ID, TydeReleaseVersion};
 
-pub const PROTOCOL_VERSION: u32 = 59;
+pub const PROTOCOL_VERSION: u32 = 60;
 pub const TYDE_VERSION: Version = Version {
     major: 0,
     minor: 8,
@@ -1070,6 +1070,7 @@ pub enum FrameKind {
     ListSessions,
     DeleteSession,
     SendMessage,
+    GoalControl,
     EditQueuedMessage,
     CancelQueuedMessage,
     CancelBackgroundTask,
@@ -1268,6 +1269,7 @@ impl fmt::Display for FrameKind {
             Self::ListSessions => f.write_str("list_sessions"),
             Self::DeleteSession => f.write_str("delete_session"),
             Self::SendMessage => f.write_str("send_message"),
+            Self::GoalControl => f.write_str("goal_control"),
             Self::EditQueuedMessage => f.write_str("edit_queued_message"),
             Self::CancelQueuedMessage => f.write_str("cancel_queued_message"),
             Self::CancelBackgroundTask => f.write_str("cancel_background_task"),
@@ -3163,6 +3165,9 @@ pub struct MobilePushNotification {
 #[serde(rename_all = "snake_case")]
 pub enum MobilePushReason {
     TurnComplete,
+    GoalComplete,
+    GoalBlocked,
+    GoalLimitReached,
     QuestionPending,
     PlanApproval,
 }
@@ -4053,10 +4058,48 @@ pub struct SessionSummaryCountUpdatedPayload {
 #[derive(Debug, Clone)]
 pub enum AgentInput {
     SendMessage(SendMessagePayload),
+    GoalControl(GoalControl),
     EditQueuedMessage(EditQueuedMessagePayload),
     CancelQueuedMessage(CancelQueuedMessagePayload),
     SendQueuedMessageNow(SendQueuedMessageNowPayload),
     UpdateSessionSettings(SetSessionSettingsPayload),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum GoalControl {
+    Set { objective: String },
+    Pause,
+    Resume,
+    Clear,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GoalStatus {
+    Active,
+    Paused,
+    Blocked,
+    UsageLimited,
+    BudgetLimited,
+    Complete,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeGoal {
+    pub objective: String,
+    pub status: GoalStatus,
+    pub token_budget: Option<u64>,
+    pub tokens_used: Option<u64>,
+    pub time_used_seconds: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GoalCapabilities {
+    pub set: bool,
+    pub pause: bool,
+    pub resume: bool,
+    pub clear: bool,
 }
 
 // ── Session settings ───────────────────────────────────────────────────
@@ -7618,6 +7661,9 @@ pub enum OrchestrationWorkflowPhase {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "data")]
 pub enum ChatEvent {
+    GoalCapabilities(GoalCapabilities),
+    GoalChanged(Option<NativeGoal>),
+    GoalCompleted(NativeGoal),
     MessageAdded(ChatMessage),
     MessageMetadataUpdated(MessageMetadataUpdateData),
     TypingStatusChanged(bool),

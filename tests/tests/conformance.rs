@@ -5154,6 +5154,9 @@ fn describe_event(event: &ChatEvent) -> String {
         ChatEvent::ToolExecutionCompleted(completion) => {
             format!("ToolExecutionCompleted({})", completion.tool_call_id)
         }
+        ChatEvent::GoalCapabilities(_) => "GoalCapabilities".to_owned(),
+        ChatEvent::GoalChanged(_) => "GoalChanged".to_owned(),
+        ChatEvent::GoalCompleted(_) => "GoalCompleted".to_owned(),
         ChatEvent::TaskUpdate(_) => "TaskUpdate".to_owned(),
         ChatEvent::OperationCancelled(_) => "OperationCancelled".to_owned(),
         ChatEvent::RetryAttempt(_) => "RetryAttempt".to_owned(),
@@ -6929,5 +6932,101 @@ fn assert_replayed_history_is_not_empty(agent: &Agent, backend_kind: BackendKind
          ({user_messages} user message(s), {responses} message event(s) in {} replayed events). \
          A resumed session that renders blank has lost the user's history.",
         agent.replayed_history.len()
+    );
+}
+
+#[test]
+#[ignore = "paid real-backend conformance"]
+fn real_native_goal_lifecycle() {
+    run_scenario(
+        &[
+            BackendCapability::NativeGoals,
+            BackendCapability::ResumeSession,
+        ],
+        |mut host| async move {
+            let ready = "Reply READY and wait for the next instruction.";
+            let agent = spawn_agent(&mut host, ready).await;
+            collect_turn(&mut host, &agent, ready).await;
+            let objective = "The completed output state is goal-result.txt containing exactly corrected. At the start of each turn, use the shell to sleep for 3 seconds. Only produce goal-result.txt after BOTH goal-release.txt and goal-correction.txt exist; copy the contents of goal-correction.txt to goal-result.txt. While either prerequisite is missing, report what is missing and end that turn without marking the goal complete or blocked. Follow ordinary user corrections while this goal is active.";
+            control_native_goal(
+                &mut host,
+                &agent,
+                protocol::GoalControl::Set {
+                    objective: objective.to_owned(),
+                },
+            )
+            .await;
+            wait_native_goal(&mut host, &agent, Some(protocol::GoalStatus::Active)).await;
+            let correction = "Write exactly corrected to goal-correction.txt, then report CORRECTION_RECORDED. Do not create goal-result.txt yet and do not change the goal status.";
+            send_prompt(&mut host, &agent, correction).await;
+            tokio::time::timeout(
+                Duration::from_secs(120),
+                collect_turn(&mut host, &agent, correction),
+            )
+            .await
+            .expect("native goal must not starve ordinary input");
+            control_native_goal(&mut host, &agent, protocol::GoalControl::Pause).await;
+            wait_native_goal(&mut host, &agent, Some(protocol::GoalStatus::Paused)).await;
+            close_agent(&mut host, &agent).await;
+            let session = stored_session(&mut host).await;
+            let agent = resume_agent(&mut host, &session.id).await;
+            let replayed_goal = agent
+                .replayed_history
+                .iter()
+                .rev()
+                .find_map(|event| match event {
+                    ChatEvent::GoalChanged(goal) => Some(goal),
+                    _ => None,
+                });
+            if !matches!(replayed_goal, Some(Some(goal)) if goal.status == protocol::GoalStatus::Paused)
+            {
+                wait_native_goal(&mut host, &agent, Some(protocol::GoalStatus::Paused)).await;
+            }
+            assert!(
+                !agent
+                    .replayed_history
+                    .iter()
+                    .any(|event| matches!(event, ChatEvent::GoalCompleted(_))),
+                "resuming a paused goal must not invent completion"
+            );
+            assert_eq!(
+                std::fs::read_to_string(host.workspace().join("goal-correction.txt"))
+                    .expect("ordinary input must execute during an unfinished native goal")
+                    .trim(),
+                "corrected"
+            );
+            std::fs::write(host.workspace().join("goal-release.txt"), "ready")
+                .expect("release native goal prerequisite");
+            control_native_goal(&mut host, &agent, protocol::GoalControl::Resume).await;
+            wait_native_goal(&mut host, &agent, Some(protocol::GoalStatus::Active)).await;
+            let events =
+                wait_native_goal(&mut host, &agent, Some(protocol::GoalStatus::Complete)).await;
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event, ChatEvent::GoalCompleted(_)))
+                    .count(),
+                1,
+                "one native completion must produce one completion notice"
+            );
+            assert_eq!(
+                std::fs::read_to_string(host.workspace().join("goal-result.txt"))
+                    .expect("native goal must accomplish its output state")
+                    .trim(),
+                "corrected"
+            );
+            control_native_goal(&mut host, &agent, protocol::GoalControl::Clear).await;
+            wait_native_goal(&mut host, &agent, None).await;
+            let turn = ask(
+                &mut host,
+                &agent,
+                "Read goal-result.txt and report its contents.",
+            )
+            .await;
+            assert!(
+                turn.assistant_messages()
+                    .any(|message| message.content.contains("corrected"))
+            );
+        },
     );
 }

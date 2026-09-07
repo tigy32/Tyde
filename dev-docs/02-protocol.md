@@ -453,3 +453,35 @@ These are explicitly deferred until the features that need them:
 - Post-handshake event kinds
 - Stream creation and teardown protocol
 - Per-stream error handling
+
+
+## Native goals on agent streams
+
+`GoalControl` is an input event on the existing agent instance stream. Its
+payload is the Rust `GoalControl` enum: `set { objective }`, `pause`, `resume`,
+or `clear`. It uses the stream sequence and has no request ID or result RPC.
+`SendMessage` remains the ordinary message path during a goal, including the
+existing busy-turn queue. Goal controls bypass that message queue.
+
+Adapters publish `ChatEvent::GoalCapabilities` and
+`ChatEvent::GoalChanged(Option<NativeGoal>)` from native provider state. Missing
+capabilities hide the send-menu option. Goal state reports the objective,
+native status, and optional native usage/budget values. The server publishes a
+durable `GoalCompleted` notice on a transition from an unfinished goal to
+complete; repeated complete snapshots do not create duplicate notices.
+Bootstrap/replay restores the goal section alongside the existing task list
+and context state. Clients do not infer completion from an idle turn.
+
+The first native adapter is Codex app-server's `thread/goal/get`,
+`thread/goal/set`, `thread/goal/clear`, and `thread/goal/updated` /
+`thread/goal/cleared` notifications. Capabilities are advertised only after the
+installed runtime accepts the native goal read. Existing sessions expose
+“Send as goal”; a new chat first establishes its backend session. Other
+adapters, including OpenCode, do not advertise goal controls. There is no
+prompt-emulated goal or Tyde continuation loop. Native goals, until cleared,
+suspend Tyde's idle supervisor and stall nudges so two runtimes cannot compete.
+
+Pause and clear change the native goal; the existing Cancel action remains the
+control for interrupting an in-flight turn. Native completion, blocked, and
+limit transitions use the existing mobile push delivery path. Intermediate
+idle turns with a goal do not produce ordinary completion pushes.

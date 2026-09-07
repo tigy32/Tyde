@@ -973,6 +973,23 @@ impl Connection {
         .await
     }
 
+    pub async fn control_goal(
+        &mut self,
+        stream: &StreamPath,
+        control: protocol::GoalControl,
+    ) -> Result<(), FrameError> {
+        let seq = self
+            .outgoing_seq
+            .get(stream)
+            .copied()
+            .expect("goal_control on unknown agent stream");
+        let envelope =
+            Envelope::from_payload(stream.clone(), FrameKind::GoalControl, seq, &control)
+                .map_err(FrameError::Json)?;
+        self.outgoing_seq.insert(stream.clone(), seq + 1);
+        write_envelope(&mut self.writer, &envelope).await
+    }
+
     pub async fn send_message(
         &mut self,
         stream: &StreamPath,

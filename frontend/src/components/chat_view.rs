@@ -268,6 +268,21 @@ pub fn ChatView(
         state.streaming_text.with(|m| m.get(&agent_id).cloned())
     };
 
+    let native_goals = state.native_goals;
+    let native_goal_capabilities = state.goal_capabilities;
+    let goal_action_state = state.clone();
+    let on_goal_control = Callback::new(move |control: protocol::GoalControl| {
+        if let Some(agent) = agent_ref.get_untracked() {
+            let state = goal_action_state.clone();
+            wasm_bindgen_futures::spawn_local(async move {
+                if let Err(error) =
+                    crate::actions::control_native_goal(&state, agent, control).await
+                {
+                    crate::components::header::report_user_error(&error);
+                }
+            });
+        }
+    });
     let task_list: Signal<Option<protocol::TaskList>> = Signal::derive(move || {
         let agent_id = agent_ref.get()?.agent_id;
         state.task_lists.with(|m| m.get(&agent_id).cloned())
@@ -944,6 +959,9 @@ pub fn ChatView(
                     agent_id=Signal::derive(move || {
                         agent_ref.get().map(|active| active.agent_id)
                     })
+                    goal=Signal::derive(move || agent_ref.get().and_then(|agent| native_goals.with(|map| map.get(&agent.agent_id).cloned())))
+                    goal_capabilities=Signal::derive(move || agent_ref.get().and_then(|agent| native_goal_capabilities.with(|map| map.get(&agent.agent_id).cloned())))
+                    on_goal_control=on_goal_control
                     task_list=task_list
                     context_breakdown=context_breakdown
                     current_context_usage=current_context_usage
@@ -1483,6 +1501,12 @@ fn context_compaction_marker_view(event: &ContextCompactionTimelineEvent) -> imp
 fn ChatNoticeView(notice: ArcRwSignal<ChatNotice>) -> impl IntoView {
     view! {
         {move || match notice.get() {
+            ChatNotice::GoalCompleted(goal) => view! {
+                <div class="chat-card chat-card-system" data-test="goal-completed">
+                    <div class="chat-card-header"><span class="chat-card-sender">"Goal completed"</span></div>
+                    <div class="chat-card-body"><p>{goal.objective}</p></div>
+                </div>
+            }.into_any(),
             ChatNotice::OperationCancelled { message } => view! {
                 <div class="chat-card chat-card-system chat-card-cancelled" data-test="chat-notice-cancelled">
                     <div class="chat-card-header">

@@ -46,6 +46,8 @@ pub(crate) struct AgentRegistry {
 pub(crate) struct AgentStatusTransition {
     pub agent_id: AgentId,
     pub from: AgentControlStatus,
+    pub goal: Option<protocol::NativeGoal>,
+    pub goal_status_changed: bool,
     pub to: AgentControlStatus,
     pub pending_user_response: Option<PendingUserResponseKind>,
     pub has_queued_messages: bool,
@@ -58,6 +60,8 @@ pub(crate) struct AgentStatus {
     pub terminated: bool,
     pub is_thinking: bool,
     pub turn_completed: bool,
+    pub goal: Option<protocol::NativeGoal>,
+    pub goal_capabilities: Option<protocol::GoalCapabilities>,
     pub pending_user_response: Option<PendingUserResponseKind>,
     pub last_error: Option<String>,
     pub activity_counter: u64,
@@ -136,15 +140,19 @@ impl AgentStatusHandle {
         let mut status = self.status.lock().await;
         let from = status.status();
         let was_active = status.is_active();
+        let prior_goal_status = status.goal.as_ref().map(|goal| goal.status);
         update(&mut status);
         let to = status.status();
         let turn_active = status.is_active();
         let pending_user_response = status.pending_user_response;
         let has_queued_messages = status.has_queued_messages;
         let restored_without_live_turn = status.restored_without_live_turn;
+        let goal = status.goal.clone();
+        let goal_status_changed = prior_goal_status.is_some()
+            && prior_goal_status != goal.as_ref().map(|goal| goal.status);
         drop(status);
 
-        if from != to || was_active != turn_active {
+        if from != to || was_active != turn_active || goal_status_changed {
             // A send fails only with no live receivers, which is the normal
             // state; a receiver that falls behind learns about it from its own
             // `Lagged` error rather than from here.
@@ -152,6 +160,8 @@ impl AgentStatusHandle {
                 agent_id: self.agent_id.clone(),
                 from,
                 to,
+                goal,
+                goal_status_changed,
                 pending_user_response,
                 has_queued_messages,
                 restored_without_live_turn,

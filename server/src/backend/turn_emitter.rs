@@ -435,6 +435,15 @@ impl TurnEmitter {
         state.typing_active = typing;
     }
 
+    pub fn goal_changed(&self, goal: Option<protocol::NativeGoal>) {
+        self.lock().send_chat(ChatEvent::GoalChanged(goal));
+    }
+
+    pub fn goal_capabilities(&self, capabilities: protocol::GoalCapabilities) {
+        self.lock()
+            .send_chat(ChatEvent::GoalCapabilities(capabilities));
+    }
+
     pub fn task_update(&self, tasks: &TaskList) {
         self.lock().send_chat(ChatEvent::TaskUpdate(tasks.clone()));
     }

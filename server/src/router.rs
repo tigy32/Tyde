@@ -590,6 +590,19 @@ pub(crate) async fn route_client_envelope(
                 )
                 .await;
             }
+            FrameKind::GoalControl => {
+                let stream_path = envelope.stream.clone();
+                let agent_id = parse_agent_id(&stream_path)?;
+                let payload: protocol::GoalControl = parse_payload(&envelope, "goal_control")?;
+                deliver_agent_input(
+                    host,
+                    agent_id,
+                    AgentInput::GoalControl(payload),
+                    stream_path,
+                    host_output_stream,
+                )
+                .await;
+            }
             FrameKind::EditQueuedMessage => {
                 let stream_path = envelope.stream.clone();
                 let agent_id = parse_agent_id(&stream_path)?;

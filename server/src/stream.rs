@@ -702,6 +702,7 @@ pub(crate) fn classify(kind: FrameKind) -> OutputLane {
         | FrameKind::ListSessions
         | FrameKind::DeleteSession
         | FrameKind::SendMessage
+        | FrameKind::GoalControl
         | FrameKind::EditQueuedMessage
         | FrameKind::CancelQueuedMessage
         | FrameKind::CancelBackgroundTask

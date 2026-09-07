@@ -123,6 +123,7 @@ exhaustive_capabilities! {
     // Hermes background work and check on it, but a foreground command blocks
     // them, so "continuing a command is a second action" asserts nothing there.
     YieldsRunningCommands,
+    NativeGoals,
     AgentInitiatedTurns,
     MidTurnSteering,
     ReasoningDeltas,

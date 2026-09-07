@@ -1508,6 +1508,14 @@ async fn drain_prepared_binding_bootstrap(
                         activity: format!("tool progress {:?}", progress.update),
                     });
                 }
+                BackendEvent::Chat(
+                    ChatEvent::GoalChanged(Some(_)) | ChatEvent::GoalCompleted(_),
+                ) => {
+                    return Err(BackendBindingPrepareError::BootstrapUnsafeActivity {
+                        backend_kind: kind,
+                        activity: "native goal event".to_owned(),
+                    });
+                }
                 BackendEvent::Chat(ChatEvent::TaskUpdate(_)) => {
                     return Err(BackendBindingPrepareError::BootstrapUnsafeActivity {
                         backend_kind: kind,
@@ -1567,7 +1575,10 @@ fn drain_prepared_binding_replay(
                     activity: format!("replayed tool progress {:?}", progress.update),
                 });
             }
-            Ok(BackendEvent::Chat(ChatEvent::TaskUpdate(_)))
+            Ok(BackendEvent::Chat(
+                ChatEvent::GoalChanged(Some(_)) | ChatEvent::GoalCompleted(_),
+            ))
+            | Ok(BackendEvent::Chat(ChatEvent::TaskUpdate(_)))
             | Ok(BackendEvent::Chat(ChatEvent::Orchestration(_))) => {
                 return Err(BackendBindingPrepareError::BootstrapUnsafeActivity {
                     backend_kind: kind,

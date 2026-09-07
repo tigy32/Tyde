@@ -5342,7 +5342,7 @@ impl Backend for KiroBackend {
                                     break;
                                 }
                             }
-                            AgentInput::EditQueuedMessage(_)
+                            AgentInput::GoalControl(_) | AgentInput::EditQueuedMessage(_)
                             | AgentInput::CancelQueuedMessage(_)
                             | AgentInput::SendQueuedMessageNow(_) => {
                                 panic!(
@@ -5538,7 +5538,7 @@ impl Backend for KiroBackend {
                                     break;
                                 }
                             }
-                            AgentInput::EditQueuedMessage(_)
+                            AgentInput::GoalControl(_) | AgentInput::EditQueuedMessage(_)
                             | AgentInput::CancelQueuedMessage(_)
                             | AgentInput::SendQueuedMessageNow(_) => {
                                 panic!(
@@ -5613,7 +5613,8 @@ impl Backend for KiroBackend {
             input @ AgentInput::SendMessage(_) | input @ AgentInput::UpdateSessionSettings(_) => {
                 self.input_tx.send(input).is_ok()
             }
-            AgentInput::EditQueuedMessage(_)
+            AgentInput::GoalControl(_)
+            | AgentInput::EditQueuedMessage(_)
             | AgentInput::CancelQueuedMessage(_)
             | AgentInput::SendQueuedMessageNow(_) => {
                 panic!(

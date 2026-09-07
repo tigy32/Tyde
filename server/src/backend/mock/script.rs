@@ -350,6 +350,27 @@ impl MockTurn {
         ])
     }
 
+    pub fn starting_with_goal(mut self, goal: protocol::NativeGoal) -> Self {
+        match &mut self.body {
+            MockTurnBody::Steps(steps) => steps.insert(
+                0,
+                MockStep::emit(crate::backend::BackendEvent::Chat(
+                    protocol::ChatEvent::GoalChanged(Some(goal)),
+                )),
+            ),
+            MockTurnBody::RenderedEcho | MockTurnBody::RenderedHistoryJoin => {
+                panic!("goal state requires a frozen turn")
+            }
+        }
+        self
+    }
+
+    pub fn with_goal_state(self, goal: Option<protocol::NativeGoal>) -> Self {
+        self.with_appended_steps(vec![MockStep::emit(crate::backend::BackendEvent::Chat(
+            protocol::ChatEvent::GoalChanged(goal),
+        ))])
+    }
+
     pub fn with_duplicate_idle(self) -> Self {
         self.with_appended_steps(vec![MockStep::emit(emit::typing(false))])
     }

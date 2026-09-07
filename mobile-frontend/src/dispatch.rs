@@ -1214,6 +1214,9 @@ fn agent_is_fatal(state: &AppState, agent_ref: &AgentRef) -> bool {
 /// payload naming some other agent cannot retarget the snapshot.
 fn apply_agent_error(state: &AppState, agent_ref: &AgentRef, payload: &AgentErrorPayload) {
     if payload.fatal {
+        state.goal_capabilities.update(|caps| {
+            caps.remove(agent_ref);
+        });
         state.agents.update(|agents| {
             if let Some(agent) = agents.iter_mut().find(|a| {
                 a.local_host_id == agent_ref.local_host_id && a.agent_id == agent_ref.agent_id
@@ -1282,6 +1285,12 @@ fn drop_agent_state(state: &AppState, agent_ref: &AgentRef) {
         m.remove(agent_ref);
     });
     state.task_lists.update(|m| {
+        m.remove(agent_ref);
+    });
+    state.native_goals.update(|m| {
+        m.remove(agent_ref);
+    });
+    state.goal_capabilities.update(|m| {
         m.remove(agent_ref);
     });
     state.agent_message_queue.update(|m| {
@@ -2052,6 +2061,28 @@ pub fn apply_chat_event(state: &AppState, agent_ref: &AgentRef, event: ChatEvent
                 }
             });
         }
+        ChatEvent::GoalCapabilities(capabilities) => {
+            state.goal_capabilities.update(|goals| {
+                goals.insert(agent_ref, capabilities);
+            });
+        }
+        ChatEvent::GoalChanged(goal) => {
+            state.native_goals.update(|goals| {
+                if let Some(goal) = goal {
+                    goals.insert(agent_ref, goal);
+                } else {
+                    goals.remove(&agent_ref);
+                }
+            });
+        }
+        ChatEvent::GoalCompleted(goal) => {
+            state.transient_events.update(|events| {
+                events
+                    .entry(agent_ref)
+                    .or_default()
+                    .push(TransientEvent::GoalCompleted(goal));
+            });
+        }
         ChatEvent::TaskUpdate(task_list) => {
             state.task_lists.update(|task_lists| {
                 task_lists.insert(agent_ref.clone(), task_list);
@@ -2324,6 +2355,9 @@ impl MobileHistoryReplay {
             | ChatEvent::StreamDelta(_)
             | ChatEvent::StreamReasoningDelta(_)
             | ChatEvent::ToolProgress(_)
+            | ChatEvent::GoalCapabilities(_)
+            | ChatEvent::GoalChanged(_)
+            | ChatEvent::GoalCompleted(_)
             | ChatEvent::TaskUpdate(_)
             | ChatEvent::OperationCancelled(_)
             | ChatEvent::RetryAttempt(_)
@@ -2882,6 +2916,12 @@ fn apply_agent_bootstrap(
     state.task_lists.update(|m| {
         m.remove(&agent_ref);
     });
+    state.native_goals.update(|m| {
+        m.remove(&agent_ref);
+    });
+    state.goal_capabilities.update(|m| {
+        m.remove(&agent_ref);
+    });
     state.agent_message_queue.update(|m| {
         m.remove(&agent_ref);
     });
@@ -3124,6 +3164,9 @@ fn chat_event_label(event: &ChatEvent) -> &'static str {
         ChatEvent::ToolRequest(_) => "ToolRequest",
         ChatEvent::ToolProgress(_) => "ToolProgress",
         ChatEvent::ToolExecutionCompleted(_) => "ToolExecutionCompleted",
+        ChatEvent::GoalCapabilities(_) => "GoalCapabilities",
+        ChatEvent::GoalChanged(_) => "GoalChanged",
+        ChatEvent::GoalCompleted(_) => "GoalCompleted",
         ChatEvent::TaskUpdate(_) => "TaskUpdate",
         ChatEvent::OperationCancelled(_) => "OperationCancelled",
         ChatEvent::RetryAttempt(_) => "RetryAttempt",

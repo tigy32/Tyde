@@ -1539,3 +1539,134 @@ async fn auto_compaction_waits_for_background_tasks_to_drain() {
     )
     .await;
 }
+
+#[tokio::test]
+async fn native_goal_keeps_normal_input_and_emits_one_completion() {
+    let mut fixture = Fixture::new().await;
+    apply_supervisor_setting(&mut fixture, "/supervisor/enabled", true, false).await;
+    let goal = protocol::NativeGoal {
+        objective: "Finish the requested output".to_owned(),
+        status: protocol::GoalStatus::Active,
+        token_budget: None,
+        tokens_used: None,
+        time_used_seconds: None,
+    };
+    let agent = spawn_supervised_agent_with_verdict(
+        &mut fixture,
+        "native-goal",
+        false,
+        MOCK_SUPERVISOR_CONTINUE,
+    )
+    .await;
+    fixture
+        .client
+        .control_goal(
+            &agent.instance_stream,
+            protocol::GoalControl::Set {
+                objective: "Unsupported native operation".to_owned(),
+            },
+        )
+        .await
+        .expect("send unsupported goal control");
+    fixture
+        .next_frame_matching(
+            "unsupported native goals fail without closing the agent",
+            |env| {
+                env.stream == agent.instance_stream
+                    && env.kind == FrameKind::AgentError
+                    && env
+                        .parse_payload::<protocol::AgentErrorPayload>()
+                        .is_ok_and(|error| {
+                            error.code == protocol::AgentErrorCode::Unsupported && !error.fatal
+                        })
+            },
+        )
+        .await;
+    let control = fixture.mock_by_id(&agent.agent_id).await;
+    control
+        .enqueue(MockTurn::text("Goal started").with_goal_state(Some(goal.clone())))
+        .await;
+    fixture
+        .client
+        .send_message(&agent.instance_stream, "Start the native goal".to_owned())
+        .await
+        .expect("start goal scenario");
+    fixture.next_frame_matching("active native goal", |env| {
+        env.stream == agent.instance_stream && env.kind == FrameKind::ChatEvent && matches!(env.parse_payload::<ChatEvent>(), Ok(ChatEvent::GoalChanged(Some(goal))) if goal.status == protocol::GoalStatus::Active)
+    }).await;
+    assert_no_envelope(
+        &mut fixture.client,
+        QUIET_WAIT,
+        "supervisor kick during native goal",
+        |env| is_supervisor_kick(env, &agent.instance_stream),
+    )
+    .await;
+    let mut completed = goal;
+    completed.status = protocol::GoalStatus::Complete;
+    control
+        .enqueue(
+            MockTurn::text("Applied the user's correction")
+                .with_goal_state(Some(completed.clone()))
+                .with_goal_state(Some(completed)),
+        )
+        .await;
+    fixture
+        .client
+        .send_message(&agent.instance_stream, "Include the correction".to_owned())
+        .await
+        .expect("send normal input while goal is active");
+    fixture.next_frame_matching("normal message handled during native goal", |env| {
+        env.stream == agent.instance_stream && env.kind == FrameKind::ChatEvent && matches!(env.parse_payload::<ChatEvent>(), Ok(ChatEvent::StreamEnd(end)) if end.message.content == "Applied the user's correction")
+    }).await;
+    fixture.next_frame_matching("native goal completion", |env| {
+        env.stream == agent.instance_stream && env.kind == FrameKind::ChatEvent && matches!(env.parse_payload::<ChatEvent>(), Ok(ChatEvent::GoalCompleted(goal)) if goal.status == protocol::GoalStatus::Complete)
+    }).await;
+    let mut completed_updates = 0;
+    fixture
+        .next_frame_matching("both native completion snapshots", |env| {
+            if env.stream == agent.instance_stream && env.kind == FrameKind::ChatEvent {
+                match env.parse_payload::<ChatEvent>().expect("chat event") {
+                    ChatEvent::GoalCompleted(_) => panic!("duplicate native goal completion"),
+                    ChatEvent::GoalChanged(Some(goal))
+                        if goal.status == protocol::GoalStatus::Complete =>
+                    {
+                        completed_updates += 1
+                    }
+                    _ => {}
+                }
+            }
+            completed_updates == 2
+        })
+        .await;
+    let (mut second_client, host_bootstrap) = fixture.connect_with_bootstrap().await;
+    // The observed bootstrap uses the new connection's advertised stream,
+    // which has a different instance UUID from the first client's stream.
+    let replay_stream = &host_bootstrap
+        .agents
+        .iter()
+        .find(|entry| entry.agent_id == agent.agent_id)
+        .expect("goal agent on second connection")
+        .instance_stream;
+    let replay =
+        fixture::next_frame_matching_on(&mut second_client, "native goal bootstrap", |env| {
+            env.stream == *replay_stream && env.kind == FrameKind::AgentBootstrap
+        })
+        .await;
+    let bootstrap: AgentBootstrapPayload = replay
+        .parse_payload()
+        .expect("native goal bootstrap payload");
+    assert_eq!(
+        bootstrap
+            .events
+            .iter()
+            .filter(|event| matches!(
+                event,
+                AgentBootstrapEvent::ChatEvent(ChatEvent::GoalCompleted(_))
+            ))
+            .count(),
+        1
+    );
+    assert!(
+        matches!(bootstrap.events.iter().rev().find_map(|event| match event { AgentBootstrapEvent::ChatEvent(ChatEvent::GoalChanged(goal)) => Some(goal), _ => None }), Some(Some(goal)) if goal.status == protocol::GoalStatus::Complete)
+    );
+}

@@ -2506,28 +2506,41 @@ impl MobileAccessActor {
                     Err(broadcast::error::RecvError::Closed) => return,
                 };
 
-                if transition.from != AgentControlStatus::Thinking
-                    || transition.to != AgentControlStatus::Idle
-                {
-                    continue;
-                }
-                // Another message is already queued behind this turn, so the
-                // agent resumes immediately and is not really idle.
-                if transition.has_queued_messages {
-                    continue;
-                }
-                // Reopening a saved session lands on Idle without the agent
-                // having done anything.
                 if transition.restored_without_live_turn {
                     continue;
                 }
-
-                let reason = match transition.pending_user_response {
-                    Some(PendingUserResponseKind::UserQuestion) => {
-                        MobilePushReason::QuestionPending
+                let goal_reason = if transition.goal_status_changed {
+                    transition.goal.as_ref().and_then(|goal| match goal.status {
+                        protocol::GoalStatus::Complete => Some(MobilePushReason::GoalComplete),
+                        protocol::GoalStatus::Blocked => Some(MobilePushReason::GoalBlocked),
+                        protocol::GoalStatus::UsageLimited
+                        | protocol::GoalStatus::BudgetLimited => {
+                            Some(MobilePushReason::GoalLimitReached)
+                        }
+                        protocol::GoalStatus::Active | protocol::GoalStatus::Paused => None,
+                    })
+                } else {
+                    None
+                };
+                let reason = if let Some(reason) = goal_reason {
+                    reason
+                } else {
+                    if transition.from != AgentControlStatus::Thinking
+                        || transition.to != AgentControlStatus::Idle
+                        || transition.has_queued_messages
+                    {
+                        continue;
                     }
-                    Some(PendingUserResponseKind::PlanApproval) => MobilePushReason::PlanApproval,
-                    None => MobilePushReason::TurnComplete,
+                    match transition.pending_user_response {
+                        Some(PendingUserResponseKind::UserQuestion) => {
+                            MobilePushReason::QuestionPending
+                        }
+                        Some(PendingUserResponseKind::PlanApproval) => {
+                            MobilePushReason::PlanApproval
+                        }
+                        None if transition.goal.is_some() => continue,
+                        None => MobilePushReason::TurnComplete,
+                    }
                 };
                 let Some(start) = host.agent_start_snapshot(&transition.agent_id).await else {
                     // The agent was removed between the edge and this lookup.

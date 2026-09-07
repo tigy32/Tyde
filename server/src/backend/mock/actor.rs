@@ -200,6 +200,7 @@ impl MockActor {
                             self.handle_send_message(payload, control).await
                         }
                         MockCommand::Input(AgentInput::UpdateSessionSettings(_)) => true,
+                        MockCommand::Input(AgentInput::GoalControl(_)) => false,
                         MockCommand::Input(AgentInput::EditQueuedMessage(_))
                         | MockCommand::Input(AgentInput::CancelQueuedMessage(_))
                         | MockCommand::Input(AgentInput::SendQueuedMessageNow(_)) => {

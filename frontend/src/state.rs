@@ -3048,6 +3048,7 @@ pub struct TerminalInfo {
 /// honest projection is a row at the point they occurred.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ChatNotice {
+    GoalCompleted(protocol::NativeGoal),
     OperationCancelled {
         message: String,
     },
@@ -3599,6 +3600,8 @@ pub struct AppState {
     #[cfg(target_arch = "wasm32")]
     composer_draft_persistence_failure_notified: RwSignal<bool>,
     pub task_lists: RwSignal<HashMap<AgentId, TaskList>>,
+    pub native_goals: RwSignal<HashMap<AgentId, protocol::NativeGoal>>,
+    pub goal_capabilities: RwSignal<HashMap<AgentId, protocol::GoalCapabilities>>,
     /// Per-agent Tycode orchestration event log (sub-agent/workflow progress),
     /// chronological. Appended to as `ChatEvent::Orchestration` events arrive
     /// and as history replays; the orchestration panel folds it into a compact
@@ -4150,6 +4153,8 @@ impl AppState {
             #[cfg(target_arch = "wasm32")]
             composer_draft_persistence_failure_notified: RwSignal::new(false),
             task_lists: RwSignal::new(HashMap::new()),
+            native_goals: RwSignal::new(HashMap::new()),
+            goal_capabilities: RwSignal::new(HashMap::new()),
             orchestration: RwSignal::new(HashMap::new()),
             center_zone,
             center_split_ratio: RwSignal::new(SplitRatio::default()),
@@ -4762,6 +4767,12 @@ impl AppState {
         });
         self.last_turn_cancelled.update(|set| {
             set.remove(agent_id);
+        });
+        self.native_goals.update(|map| {
+            map.remove(agent_id);
+        });
+        self.goal_capabilities.update(|map| {
+            map.remove(agent_id);
         });
         self.task_lists.update(|map| {
             map.remove(agent_id);
@@ -6593,6 +6604,12 @@ impl AppState {
                 map.retain(|(host, _), _| host != host_id);
             });
             self.task_lists.update(|map| {
+                map.retain(|id, _| !drop_set.contains(id));
+            });
+            self.native_goals.update(|map| {
+                map.retain(|id, _| !drop_set.contains(id));
+            });
+            self.goal_capabilities.update(|map| {
                 map.retain(|id, _| !drop_set.contains(id));
             });
             self.orchestration.update(|map| {

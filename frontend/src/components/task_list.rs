@@ -32,12 +32,18 @@ pub fn TaskListView(
     task_list: Signal<Option<TaskList>>,
     context_breakdown: Memo<Option<ContextBreakdown>>,
     current_context_usage: Signal<Option<CurrentContextUsage>>,
+    #[prop(default = Signal::derive(|| None))] goal: Signal<Option<protocol::NativeGoal>>,
+    #[prop(default = Signal::derive(|| None))] goal_capabilities: Signal<
+        Option<protocol::GoalCapabilities>,
+    >,
+    #[prop(optional)] on_goal_control: Option<Callback<protocol::GoalControl>>,
 ) -> impl IntoView {
     // `None` is "the user has not chosen", not "Context". The distinction is
     // the whole point: an unchosen view may follow what data exists, a chosen
     // one may not be taken away from the user by arriving or departing data.
     let preferred_view = RwSignal::new(None::<SummaryView>);
     let collapsed = RwSignal::new(false);
+    let goal_expanded = RwSignal::new(false);
     let last_agent_id = RwSignal::new(agent_id.get_untracked());
     let summary_id = NEXT_SUMMARY_ID.fetch_add(1, Ordering::Relaxed);
     let context_panel_id = format!("conversation-summary-{summary_id}-context-panel");
@@ -63,14 +69,17 @@ pub fn TaskListView(
             last_agent_id.set(current_agent_id);
             preferred_view.set(None);
             collapsed.set(false);
+            goal_expanded.set(false);
         }
     });
 
     view! {
         <div class=move || {
-            let show = has_context.get() || has_tasks.get();
+            let show = has_context.get() || has_tasks.get() || goal.get().is_some();
             if show { "task-list-panel" } else { "task-list-panel hidden" }
         }>
+            {move || goal.get().map(|goal| render_goal_view(goal, goal_capabilities.get(), on_goal_control, goal_expanded))}
+            <div hidden=move || !(has_context.get() || has_tasks.get())>
             {move || {
                 let has_context_now = has_context.get();
                 let has_tasks_now = has_tasks.get();
@@ -136,6 +145,51 @@ pub fn TaskListView(
                 }
                 .into_any()
             }}
+            </div>
+        </div>
+    }
+}
+
+fn render_goal_view(
+    goal: protocol::NativeGoal,
+    capabilities: Option<protocol::GoalCapabilities>,
+    on_control: Option<Callback<protocol::GoalControl>>,
+    expanded: RwSignal<bool>,
+) -> impl IntoView {
+    let label = match goal.status {
+        protocol::GoalStatus::Active => "Active",
+        protocol::GoalStatus::Paused => "Paused",
+        protocol::GoalStatus::Blocked => "Blocked",
+        protocol::GoalStatus::UsageLimited => "Usage limit reached",
+        protocol::GoalStatus::BudgetLimited => "Budget reached",
+        protocol::GoalStatus::Complete => "Completed",
+    };
+    let pause = capabilities.as_ref().is_some_and(|caps| caps.pause)
+        && goal.status == protocol::GoalStatus::Active;
+    let resume = capabilities.as_ref().is_some_and(|caps| caps.resume)
+        && matches!(
+            goal.status,
+            protocol::GoalStatus::Paused
+                | protocol::GoalStatus::Blocked
+                | protocol::GoalStatus::BudgetLimited
+                | protocol::GoalStatus::UsageLimited
+        );
+    let clear = capabilities.as_ref().is_some_and(|caps| caps.clear);
+    view! {
+        <div class="summary-goal" data-test="native-goal">
+            <button type="button" class="summary-goal-header" aria-expanded=move || expanded.get().to_string() on:click=move |_| expanded.update(|open| *open = !*open)>
+                <span>"Goal"</span><span class="summary-goal-objective">{goal.objective.clone()}</span><span>{label}</span>
+            </button>
+            <div class="summary-goal-body" hidden=move || !expanded.get()>
+                <p>{goal.objective}</p>
+                {goal.tokens_used.map(|used| view! { <span>{format!("{used} tokens used")}</span> })}
+                {goal.token_budget.map(|budget| view! { <span>{format!(" · {budget} token budget")}</span> })}
+                <div class="summary-goal-controls">
+                    {pause.then(|| view! { <button type="button" on:click=move |_| { if let Some(callback) = on_control { callback.run(protocol::GoalControl::Pause); } }>"Pause goal"</button> })}
+                    {resume.then(|| view! { <button type="button" on:click=move |_| { if let Some(callback) = on_control { callback.run(protocol::GoalControl::Resume); } }>"Resume goal"</button> })}
+                    {clear.then(|| view! { <button type="button" on:click=move |_| { if let Some(callback) = on_control { callback.run(protocol::GoalControl::Clear); } }>"Clear goal"</button> })}
+                </div>
+            </div>
         </div>
     }
 }
@@ -860,6 +914,109 @@ mod wasm_tests {
             .has_attribute("hidden")
     }
 
+    #[wasm_bindgen_test]
+    async fn native_goal_controls_follow_server_state_and_preserve_expansion() {
+        ensure_styles_loaded();
+        let container = make_container();
+        let slots = Rc::new(RefCell::new(None));
+        let capture = slots.clone();
+        let operations = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = operations.clone();
+        let _handle = mount_to(container.clone(), move || {
+            let goal = RwSignal::new(None::<protocol::NativeGoal>);
+            *capture.borrow_mut() = Some(goal);
+            view! {
+                <TaskListView
+                    agent_id=Signal::derive(|| Some(AgentId("goal-test".to_owned())))
+                    task_list=Signal::derive(|| None)
+                    context_breakdown=Memo::new(|_| None)
+                    current_context_usage=Signal::derive(|| None)
+                    goal=goal.into()
+                    goal_capabilities=Signal::derive(|| Some(protocol::GoalCapabilities {set: true, pause: true, resume: true, clear: true}))
+                    on_goal_control=Callback::new(move |control| recorded.lock().unwrap().push(control))
+                />
+            }
+        });
+        next_tick().await;
+        assert!(
+            container
+                .query_selector("[data-test='native-goal']")
+                .unwrap()
+                .is_none()
+        );
+        let goal = slots.borrow().expect("goal signal");
+        let snapshot = protocol::NativeGoal {
+            objective: "Finish the requested output".to_owned(),
+            status: protocol::GoalStatus::Active,
+            token_budget: None,
+            tokens_used: Some(10),
+            time_used_seconds: None,
+        };
+        goal.set(Some(snapshot.clone()));
+        next_tick().await;
+        let header = button(&container, ".summary-goal-header");
+        assert!(header.text_content().unwrap().contains("Active"));
+        assert!(header.get_bounding_client_rect().height() > 0.0);
+        header.click();
+        next_tick().await;
+        button(&container, ".summary-goal-controls button").click();
+        assert_eq!(
+            *operations.lock().unwrap(),
+            vec![protocol::GoalControl::Pause]
+        );
+        assert!(
+            button(&container, ".summary-goal-header")
+                .text_content()
+                .unwrap()
+                .contains("Active"),
+            "clicking a control must wait for native state"
+        );
+        let mut paused = snapshot.clone();
+        paused.status = protocol::GoalStatus::Paused;
+        paused.tokens_used = Some(20);
+        goal.set(Some(paused));
+        next_tick().await;
+        assert_eq!(
+            button(&container, ".summary-goal-header")
+                .get_attribute("aria-expanded")
+                .as_deref(),
+            Some("true")
+        );
+        let resume = button(&container, ".summary-goal-controls button");
+        assert_eq!(resume.text_content().as_deref(), Some("Resume goal"));
+        assert!(resume.get_bounding_client_rect().height() > 0.0);
+        resume.click();
+        assert_eq!(
+            *operations.lock().unwrap(),
+            vec![protocol::GoalControl::Pause, protocol::GoalControl::Resume]
+        );
+        let mut completed = snapshot;
+        completed.status = protocol::GoalStatus::Complete;
+        goal.set(Some(completed));
+        next_tick().await;
+        assert!(
+            button(&container, ".summary-goal-header")
+                .text_content()
+                .unwrap()
+                .contains("Completed")
+        );
+        let clear = button(&container, ".summary-goal-controls button");
+        assert_eq!(clear.text_content().as_deref(), Some("Clear goal"));
+        clear.click();
+        assert_eq!(
+            operations.lock().unwrap().last(),
+            Some(&protocol::GoalControl::Clear)
+        );
+        goal.set(None);
+        next_tick().await;
+        assert!(
+            container
+                .query_selector("[data-test='native-goal']")
+                .unwrap()
+                .is_none()
+        );
+        container.remove();
+    }
     #[wasm_bindgen_test]
     async fn compact_controls_switch_both_directions() {
         let container = make_container();

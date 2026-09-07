@@ -2092,6 +2092,11 @@ fn summarize_chat_event(event: &ChatEvent) -> String {
             "event=tool_execution_completed tool_call_id={} outcome={:?}",
             data.tool_call_id, data.outcome
         ),
+        ChatEvent::GoalCapabilities(capabilities) => {
+            format!("event=goal_capabilities {capabilities:?}")
+        }
+        ChatEvent::GoalChanged(goal) => format!("event=goal_changed {goal:?}"),
+        ChatEvent::GoalCompleted(goal) => format!("event=goal_completed {goal:?}"),
         ChatEvent::TaskUpdate(tasks) => {
             format!(
                 "event=task_update title={:?} tasks={}",

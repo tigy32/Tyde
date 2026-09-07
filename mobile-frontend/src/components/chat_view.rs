@@ -965,6 +965,10 @@ pub fn ChatView() -> impl IntoView {
                     };
                     let streaming = s_body.streaming_text.with(|m| m.get(&key).cloned());
                     let task_list = s_body.task_lists.with(|m| m.get(&key).cloned());
+                    let goal = s_body.native_goals.with(|m| m.get(&key).cloned());
+                    let goal_capabilities = s_body.goal_capabilities.with(|m| m.get(&key).cloned());
+                    let goal_owner = key.clone();
+                    let goal_state = s_body.clone();
                     let transient = s_body.transient_events.with(|m| m.get(&key).cloned().unwrap_or_default());
 
                     let no_content = messages.is_empty()
@@ -972,6 +976,7 @@ pub fn ChatView() -> impl IntoView {
                         && prior_history.is_none()
                         && streaming.is_none()
                         && task_list.is_none()
+                        && goal.is_none()
                         && transient.is_empty();
 
                     if no_content {
@@ -1089,6 +1094,8 @@ pub fn ChatView() -> impl IntoView {
                                 </div>
                                 }
                             })}
+
+                            {goal.map(|goal| render_native_goal(&goal_state, &goal_owner, goal, goal_capabilities))}
 
                             // Task list
                             {task_list.map(|tl| {
@@ -1209,6 +1216,7 @@ pub fn ChatView() -> impl IntoView {
                             // Transient events
                             {transient.into_iter().map(|event| {
                                 match event {
+                                    crate::state::TransientEvent::GoalCompleted(goal) => view! { <div class="task-list-card" data-mobile-test="goal-completed">{format!("Goal completed: {}", goal.objective)}</div> }.into_any(),
                                     crate::state::TransientEvent::OperationCancelled { message } => {
                                         view! {
                                             <div class="transient-event cancelled" data-mobile-test="chat-transient-cancelled" role="status">
@@ -1332,6 +1340,66 @@ fn chat_is_near_bottom(el: &web_sys::HtmlElement) -> bool {
 
 fn scroll_chat_to_bottom(el: &web_sys::HtmlElement) {
     el.set_scroll_top(el.scroll_height());
+}
+
+fn render_native_goal(
+    state: &crate::state::AppState,
+    owner: &crate::state::AgentRef,
+    goal: protocol::NativeGoal,
+    capabilities: Option<protocol::GoalCapabilities>,
+) -> impl IntoView {
+    let status = match goal.status {
+        protocol::GoalStatus::Active => "Active",
+        protocol::GoalStatus::Paused => "Paused",
+        protocol::GoalStatus::Blocked => "Blocked",
+        protocol::GoalStatus::UsageLimited => "Usage limit reached",
+        protocol::GoalStatus::BudgetLimited => "Budget reached",
+        protocol::GoalStatus::Complete => "Completed",
+    };
+    let mut controls = Vec::new();
+    if let Some(caps) = capabilities {
+        if caps.pause && goal.status == protocol::GoalStatus::Active {
+            controls.push(("Pause goal", protocol::GoalControl::Pause));
+        }
+        if caps.resume
+            && matches!(
+                goal.status,
+                protocol::GoalStatus::Paused
+                    | protocol::GoalStatus::Blocked
+                    | protocol::GoalStatus::UsageLimited
+                    | protocol::GoalStatus::BudgetLimited
+            )
+        {
+            controls.push(("Resume goal", protocol::GoalControl::Resume));
+        }
+        if caps.clear {
+            controls.push(("Clear goal", protocol::GoalControl::Clear));
+        }
+    }
+    let state = state.clone();
+    let owner = owner.clone();
+    view! {
+        <div class="task-list-card" data-mobile-test="native-goal">
+            <strong>{format!("Goal · {status}")}</strong>
+            <p>{goal.objective}</p>
+            {controls.into_iter().map(|(label, control)| {
+                let state = state.clone();
+                let owner = owner.clone();
+                view! { <button type="button" on:click=move |_| {
+                    let stream = state.agents.with(|agents| agents.iter().find(|agent| agent.local_host_id == owner.local_host_id && agent.agent_id == owner.agent_id).map(|agent| agent.instance_stream.clone()));
+                    let Some(stream) = stream else { return; };
+                    let host = owner.local_host_id.clone();
+                    let control = control.clone();
+                    let state = state.clone();
+                    spawn_local(async move {
+                        if let Err(error) = crate::send::send_frame(&host, stream, protocol::FrameKind::GoalControl, &control).await {
+                            state.set_command_error(&host, format!("Goal control failed: {error}"));
+                        }
+                    });
+                }>{label}</button> }
+            }).collect::<Vec<_>>()}
+        </div>
+    }
 }
 
 #[cfg(all(test, target_arch = "wasm32"))]
@@ -1464,6 +1532,113 @@ mod wasm_tests {
             .expect("the stop control must render while a turn is running")
             .dyn_into()
             .unwrap()
+    }
+
+    #[wasm_bindgen_test]
+    async fn native_goal_state_controls_the_summary_and_send_menu() {
+        let container = make_container();
+        let state = mount_active_chat(container.clone());
+        let owner = state
+            .active_agent
+            .get_untracked()
+            .expect("active agent")
+            .as_agent_ref();
+        state.chat_input.set("Apply my correction".to_owned());
+        next_tick().await;
+        container
+            .query_selector("[data-mobile-test='chat-send-menu-toggle']")
+            .unwrap()
+            .expect("send menu")
+            .dyn_into::<HtmlElement>()
+            .unwrap()
+            .click();
+        next_tick().await;
+        assert!(
+            container
+                .query_selector("[data-mobile-test='chat-send-menu-goal']")
+                .unwrap()
+                .is_none()
+        );
+        state.goal_capabilities.update(|caps| {
+            caps.insert(
+                owner.clone(),
+                protocol::GoalCapabilities {
+                    set: true,
+                    pause: true,
+                    resume: true,
+                    clear: true,
+                },
+            );
+        });
+        let mut goal = protocol::NativeGoal {
+            objective: "Finish the requested output".to_owned(),
+            status: protocol::GoalStatus::Active,
+            token_budget: None,
+            tokens_used: None,
+            time_used_seconds: None,
+        };
+        state.native_goals.update(|goals| {
+            goals.insert(owner.clone(), goal.clone());
+        });
+        next_tick().await;
+        assert!(
+            container
+                .query_selector("[data-mobile-test='chat-send-menu-goal']")
+                .unwrap()
+                .is_some()
+        );
+        let summary = container
+            .query_selector("[data-mobile-test='native-goal']")
+            .unwrap()
+            .expect("native goal summary");
+        assert!(summary.text_content().unwrap().contains("Active"));
+        assert!(summary.text_content().unwrap().contains("Pause goal"));
+        let send = container
+            .query_selector("[data-mobile-test='chat-send']")
+            .unwrap()
+            .expect("ordinary send");
+        assert!(!send.has_attribute("disabled"));
+        goal.status = protocol::GoalStatus::Paused;
+        state.native_goals.update(|goals| {
+            goals.insert(owner.clone(), goal.clone());
+        });
+        next_tick().await;
+        let summary = container
+            .query_selector("[data-mobile-test='native-goal']")
+            .unwrap()
+            .expect("paused goal");
+        assert!(summary.text_content().unwrap().contains("Resume goal"));
+        goal.status = protocol::GoalStatus::Complete;
+        state.native_goals.update(|goals| {
+            goals.insert(owner.clone(), goal.clone());
+        });
+        state.transient_events.update(|events| {
+            events
+                .entry(owner.clone())
+                .or_default()
+                .push(TransientEvent::GoalCompleted(goal));
+        });
+        next_tick().await;
+        assert!(
+            container
+                .query_selector("[data-mobile-test='goal-completed']")
+                .unwrap()
+                .expect("completion notice")
+                .text_content()
+                .unwrap()
+                .contains("Finish the requested output")
+        );
+        state.native_goals.update(|goals| {
+            goals.remove(&owner);
+        });
+        next_tick().await;
+        assert!(
+            container
+                .query_selector("[data-mobile-test='native-goal']")
+                .unwrap()
+                .is_none()
+        );
+        container.remove();
     }
 
     #[wasm_bindgen_test]

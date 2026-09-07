@@ -101,6 +101,36 @@ fn emit_codex_raw_events_warning_if_needed(emitter: &TurnEmitter, strict: bool) 
     }
 }
 
+fn parse_codex_goal(value: &Value) -> Result<protocol::NativeGoal, String> {
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct ProviderGoal {
+        objective: String,
+        status: String,
+        token_budget: Option<u64>,
+        tokens_used: u64,
+        time_used_seconds: u64,
+    }
+    let goal: ProviderGoal = serde_json::from_value(value.clone())
+        .map_err(|error| format!("Invalid Codex goal state: {error}"))?;
+    let status = match goal.status.as_str() {
+        "active" => protocol::GoalStatus::Active,
+        "paused" => protocol::GoalStatus::Paused,
+        "blocked" => protocol::GoalStatus::Blocked,
+        "usageLimited" => protocol::GoalStatus::UsageLimited,
+        "budgetLimited" => protocol::GoalStatus::BudgetLimited,
+        "complete" => protocol::GoalStatus::Complete,
+        other => return Err(format!("Unknown Codex goal status: {other}")),
+    };
+    Ok(protocol::NativeGoal {
+        objective: goal.objective,
+        status,
+        token_budget: goal.token_budget,
+        tokens_used: Some(goal.tokens_used),
+        time_used_seconds: Some(goal.time_used_seconds),
+    })
+}
+
 fn codex_command() -> Result<Command, String> {
     crate::process_env::command("codex")
 }
@@ -113,6 +143,33 @@ pub struct CodexCommandHandle {
 impl CodexCommandHandle {
     pub async fn execute(&self, command: SessionCommand) -> Result<(), String> {
         self.inner.execute(command).await
+    }
+
+    async fn control_goal(&self, control: protocol::GoalControl) -> Result<(), String> {
+        let thread_id = self.inner.state.lock().await.thread_id.clone();
+        let mut params = json!({"threadId": thread_id});
+        let method = match control {
+            protocol::GoalControl::Set { objective } => {
+                if objective.trim().is_empty() {
+                    return Err("Goal objective must not be empty".to_owned());
+                }
+                params["objective"] = json!(objective);
+                params["status"] = json!("active");
+                "thread/goal/set"
+            }
+            protocol::GoalControl::Pause => {
+                params["status"] = json!("paused");
+                "thread/goal/set"
+            }
+            protocol::GoalControl::Resume => {
+                params["status"] = json!("active");
+                "thread/goal/set"
+            }
+            protocol::GoalControl::Clear => "thread/goal/clear",
+        };
+        tracing::info!(method, "dispatching native Codex goal control");
+        self.inner.rpc.request(method, params).await?;
+        Ok(())
     }
 
     async fn update_runtime_settings(&self, settings: Value) -> Result<(), String> {
@@ -2056,6 +2113,43 @@ impl CodexSession {
             steering_tempfile,
             skill_projection: std::sync::Mutex::new(skill_projection),
         });
+
+        if config.execution_mode == BackendExecutionMode::Agent {
+            match inner
+                .rpc
+                .request("thread/goal/get", json!({"threadId": session_id.0}))
+                .await
+            {
+                Ok(response) => {
+                    let goal = response
+                        .get("goal")
+                        .ok_or_else(|| "Codex goal read omitted goal".to_owned())?;
+                    inner.emitter.goal_changed(if goal.is_null() {
+                        None
+                    } else {
+                        Some(parse_codex_goal(goal)?)
+                    });
+                    inner.emitter.goal_capabilities(protocol::GoalCapabilities {
+                        set: true,
+                        pause: true,
+                        resume: true,
+                        clear: true,
+                    });
+                }
+                Err(error) => {
+                    inner.emitter.goal_capabilities(protocol::GoalCapabilities {
+                        set: false,
+                        pause: false,
+                        resume: false,
+                        clear: false,
+                    });
+                    tracing::warn!(%error, "Codex native goal capability unavailable");
+                    inner
+                        .emitter
+                        .warning_message(&format!("Native goals unavailable: {error}"));
+                }
+            }
+        }
 
         if !skill_setup.exposed_names.is_empty() {
             tracing::debug!(
@@ -9710,6 +9804,25 @@ impl CodexInner {
     }
 
     async fn handle_notification(self: &Arc<Self>, method: &str, params: &Value) {
+        if method == "thread/goal/updated" || method == "thread/goal/cleared" {
+            let thread_id = self.state.lock().await.thread_id.clone();
+            if params.get("threadId").and_then(Value::as_str) != Some(thread_id.as_str()) {
+                return;
+            }
+            if method == "thread/goal/cleared" {
+                self.emitter.goal_changed(None);
+            } else {
+                match params
+                    .get("goal")
+                    .ok_or_else(|| "Codex goal update omitted goal".to_owned())
+                    .and_then(parse_codex_goal)
+                {
+                    Ok(goal) => self.emitter.goal_changed(Some(goal)),
+                    Err(error) => self.emitter.backend_error(&error),
+                }
+            }
+            return;
+        }
         self.observe_codex_notification_contract(method).await;
         if matches!(method, "turn/started" | "turn/completed" | "error") {
             let state = self.state.lock().await;
@@ -19303,6 +19416,12 @@ impl CodexBackend {
                                     break;
                                 }
                             }
+                            AgentInput::GoalControl(control) => {
+                                if let Err(error) = handle.control_goal(control).await {
+                                    tracing::error!(%error, "Codex goal control failed");
+                                    let _ = events_tx.send(BackendEvent::Chat(backend_error_message(format!("Codex goal control failed: {error}"))));
+                                }
+                            }
                             AgentInput::UpdateSessionSettings(_) => {}
                             AgentInput::EditQueuedMessage(_)
                             | AgentInput::CancelQueuedMessage(_)
@@ -20147,6 +20266,9 @@ fn codex_transcript_provider_event_id(event: &ChatEvent) -> Option<String> {
             provider_id(completion.tool_call_id.as_str())?,
         ),
         ChatEvent::TypingStatusChanged(_)
+        | ChatEvent::GoalCapabilities(_)
+        | ChatEvent::GoalChanged(_)
+        | ChatEvent::GoalCompleted(_)
         | ChatEvent::TaskUpdate(_)
         | ChatEvent::OperationCancelled(_)
         | ChatEvent::RetryAttempt(_)
@@ -20340,6 +20462,7 @@ impl Backend for CodexBackend {
             tyde_agent_adapter::BackendCapability::BackgroundTasks,
             tyde_agent_adapter::BackendCapability::CancelsBackgroundTasks,
             tyde_agent_adapter::BackendCapability::YieldsRunningCommands,
+            tyde_agent_adapter::BackendCapability::NativeGoals,
             tyde_agent_adapter::BackendCapability::AgentInitiatedTurns,
             tyde_agent_adapter::BackendCapability::ReasoningDeltas,
             tyde_agent_adapter::BackendCapability::TaskUpdates,
@@ -20545,6 +20668,12 @@ impl Backend for CodexBackend {
                                 if let Err(err) = result {
                                     tracing::error!("Failed to send Codex resume follow-up: {err}");
                                     break;
+                                }
+                            }
+                            AgentInput::GoalControl(control) => {
+                                if let Err(error) = handle.control_goal(control).await {
+                                    tracing::error!(%error, "Codex goal control failed");
+                                    let _ = events_tx.send(BackendEvent::Chat(backend_error_message(format!("Codex goal control failed: {error}"))));
                                 }
                             }
                             AgentInput::UpdateSessionSettings(_) => {}
@@ -20817,6 +20946,12 @@ impl Backend for CodexBackend {
                                 if let Err(err) = result {
                                     tracing::error!("Failed to send Codex fork follow-up: {err}");
                                     break;
+                                }
+                            }
+                            AgentInput::GoalControl(control) => {
+                                if let Err(error) = handle.control_goal(control).await {
+                                    tracing::error!(%error, "Codex goal control failed");
+                                    let _ = events_tx.send(BackendEvent::Chat(backend_error_message(format!("Codex goal control failed: {error}"))));
                                 }
                             }
                             AgentInput::UpdateSessionSettings(_) => {}

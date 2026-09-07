@@ -13431,7 +13431,7 @@ impl ClaudeBackend {
                                     break;
                                 }
                             }
-                            AgentInput::EditQueuedMessage(_)
+                            AgentInput::GoalControl(_) | AgentInput::EditQueuedMessage(_)
                             | AgentInput::CancelQueuedMessage(_)
                             | AgentInput::SendQueuedMessageNow(_) => {
                                 panic!(
@@ -14511,7 +14511,7 @@ impl Backend for ClaudeBackend {
                                     break;
                                 }
                             }
-                            AgentInput::EditQueuedMessage(_)
+                            AgentInput::GoalControl(_) | AgentInput::EditQueuedMessage(_)
                             | AgentInput::CancelQueuedMessage(_)
                             | AgentInput::SendQueuedMessageNow(_) => {
                                 panic!(
