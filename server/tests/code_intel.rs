@@ -423,6 +423,7 @@ async fn wait_for_code_intel_status_matching(
             FrameKind::CodeIntelStatus => {
                 let payload: CodeIntelStatusPayload =
                     env.parse_payload().expect("parse CodeIntelStatusPayload");
+                eprintln!("TYDE CODE INTEL WAIT context={context} status={payload:?}");
                 if predicate(&payload) {
                     found = Some(payload);
                     return true;

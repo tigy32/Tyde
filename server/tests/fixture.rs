@@ -541,6 +541,9 @@ pub async fn next_frame_matching_on(
         if env.kind == FrameKind::CustomAgentNotify {
             let _ = is_builtin_team_custom_agent_notify(&env);
         }
+        if env.kind == FrameKind::AgentStart {
+            eprintln!("TYDE FIXTURE SKIPPED AGENT START context={context} envelope={env:?}");
+        }
         skipped.push(format!("{:?} on {:?}", env.kind, env.stream));
     }
 }
@@ -606,6 +609,9 @@ async fn next_frame_matching_strict_inner(
             env.kind,
             env.stream
         );
+        if env.kind == FrameKind::AgentStart {
+            eprintln!("TYDE FIXTURE SKIPPED AGENT START context={context} envelope={env:?}");
+        }
         skipped.push(format!("{:?} on {:?}", env.kind, env.stream));
     }
 }
@@ -859,6 +865,9 @@ pub async fn next_logical_frame_matching_on(
         }
         if env.kind == FrameKind::CustomAgentNotify {
             let _ = is_builtin_team_custom_agent_notify(&env);
+        }
+        if env.kind == FrameKind::AgentStart {
+            eprintln!("TYDE FIXTURE SKIPPED AGENT START context={context} envelope={env:?}");
         }
         skipped.push(format!("{:?} on {:?}", env.kind, env.stream));
     }

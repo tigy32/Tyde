@@ -554,6 +554,7 @@ async fn expect_promoted_group_assignment(
             _ => {}
         }
 
+        eprintln!("TYDE GROUP PROMOTION WAIT session={session_id:?} notify={latest_notify:?}");
         if let (Some(session_id), Some(notify)) = (session_id.clone(), latest_notify.as_ref()) {
             let target = local_session_target(session_id.clone());
             if notify
