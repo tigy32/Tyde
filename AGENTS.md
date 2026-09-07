@@ -138,28 +138,52 @@ Setup, event collection, and assertions must be identical for every backend
 eligible under the case's capability requirements; never substitute a different
 scenario or oracle for one provider.
 
-Real-backend tests are expensive, so prefer targeted conformance tests while
-iterating.
+Real-backend tests cost real money on every run, so prefer targeted conformance
+tests while iterating.
 
-**Running them is pre-authorized when one of these criteria is hit, and you do
-not need to ask first:**
+**Always ask the user before running any real-backend test, and wait for an
+answer.** There is no pre-authorized case. "I changed a backend file" is not
+authorization, and neither is a rule elsewhere in this document saying a run is
+required — that rule tells you what to propose, not what to run unasked.
 
-- You changed a backend, or anything below the backend boundary it goes
-  through.
-- You added or changed a conformance test.
-- You are chasing a backend bug that the suite is the only way to observe.
+The request must contain both of these, or it is not a request:
 
-Before shipping a backend-provider change, the complete conformance suite must
-pass for each changed backend. If a conformance test is added or changed, it
-must pass against every supported backend.
+1. **What changed**, described by behavior rather than by file list. Name the
+   code paths the change actually alters, and say plainly which existing
+   behavior is untouched. "I edited `claude.rs` and `codex.rs`" says nothing;
+   "I added a new out-of-band read function and extracted an existing one, and
+   no turn, streaming, or tool-mapping path changed" is the actual claim.
+2. **What you propose to run**, spelled out: which scenarios, which backends,
+   and why that set and not a smaller one. Justify the *scope*, not just the
+   run. If you are proposing more than the scenarios that cover the changed
+   behavior, say what the extra ones would establish that the targeted ones
+   would not.
 
-**Do not run them when no criterion is hit.** In particular, cutting a release
-is not a criterion: the suite does not run as part of a release, on a schedule,
-or as a routine "just to be safe" check. It runs because something it covers
-actually changed.
+Propose the smallest set that covers the change. The default proposal is the
+scenarios exercising the changed behavior, against the backends whose behavior
+changed — not the complete suite, and not every backend. Reach for the complete
+suite only when the change can plausibly affect scenarios beyond the ones it
+targets, and say what that mechanism is when you ask.
 
-A backend fix is incomplete until its regression test, `./dev.sh check`, and
-the required real-backend conformance runs pass.
+Scope the run to what you asked for. Approval covers the scenarios and backends
+in the request; a broader run needs a new request. If the results make a wider
+run look warranted — a failure you cannot attribute, say — that is a new
+request too, with what you learned in it.
+
+A backend-provider change still needs real coverage of the behavior it changed
+before it ships: propose the scenarios that exercise that behavior on each
+affected backend. A conformance case you add or change must be written to run
+on every backend eligible under its capability gate, and you should propose it
+against all of them — a case that only works on the provider you developed it
+against is a broken case, not a passing one.
+
+**Never run the suite speculatively.** Cutting a release is not a reason. Nor
+is a schedule, nor "just to be safe", nor confirming something you already have
+evidence for.
+
+A backend fix is incomplete until its regression test and `./dev.sh check`
+pass, and the user has approved and seen the results of the conformance runs
+that cover it.
 
 ### 4. Local commits only
 
@@ -266,8 +290,8 @@ Where they live and run:
 
 - **Backend conformance** — implemented as coarse real-provider scenarios in
   `tests/tests/conformance.rs`, opt-in via `TYDE_RUN_REAL_AI_TESTS=1
-  TYDE_REAL_BACKENDS=<kind>`. Required when a backend changes (§3); run
-  deliberately — think first, run once.
+  TYDE_REAL_BACKENDS=<kind>`. Never run without asking the user first (§3);
+  propose the narrowest set that covers the change, then run once.
 - **Server sim tests** — `server/tests/`, one file per server feature
   (agents, settings, projects, teams, queue, …), each driving the real server
   through the protocol on the shared fixture (`server/tests/fixture.rs`) with
