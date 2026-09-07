@@ -2,7 +2,7 @@ const root = document.documentElement;
 const themeButton = document.querySelector('.theme-toggle');
 let savedTheme;
 try { savedTheme = localStorage.getItem('tyde-book-theme'); } catch {}
-root.dataset.theme = savedTheme || (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+root.dataset.theme = savedTheme === 'light' ? 'light' : 'dark';
 themeButton.hidden = false;
 themeButton.addEventListener('click', () => {
   root.dataset.theme = root.dataset.theme === 'dark' ? 'light' : 'dark';
