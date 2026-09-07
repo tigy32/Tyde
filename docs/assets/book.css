@@ -8,3 +8,5 @@
 @media print{.topbar,.chapter-menu,.on-page,.pagination,footer,.map-controls{display:none}.layout{display:block;padding:0}main{padding:0}h1{font-size:36px}h2{break-after:avoid}figure,.studio-map{break-inside:avoid}:root{--paper:white;--ink:black;--muted:#444;--surface:white}a{color:inherit}}
 
 .studio-map[data-paused=true] .map-agent i{animation-play-state:paused}.map-controls{flex-wrap:wrap}.map-controls p{flex:1;min-width:160px}.figure-note{font-size:11px!important;color:var(--muted)}
+
+.mobile-capture { max-width: 360px; margin-inline: auto; }

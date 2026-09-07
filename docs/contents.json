@@ -48,6 +48,12 @@
     "description": "Add an SSH host, configure its backends, open its projects, and reconnect to its running agents."
   },
   {
+    "slug": "mobile",
+    "title": "Use Tyde on your phone",
+    "part": "Hosts and configuration",
+    "description": "Pair your phone with a host, continue the same agent conversations, start chats, resume sessions, and manage notifications."
+  },
+  {
     "slug": "agents-skills",
     "title": "Custom agents, skills, and tools",
     "part": "Hosts and configuration",

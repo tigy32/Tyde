@@ -6,7 +6,8 @@
 Tyde brings the CLI coding agents you already use—Claude Code, Codex,
 Antigravity, Grok, and more—into one desktop application. Run agents
 concurrently, organize work across repositories, review their changes, and
-coordinate agents using different harnesses.
+coordinate agents using different harnesses. Access those same agents from your
+phone to follow their work and reply while you’re away from your computer.
 
 Start an agent locally without creating a project. Add projects when you want
 code context. Connect your servers when you want agents to keep working after
@@ -46,6 +47,29 @@ host’s current workspace and pick up where you left off.
 Your laptop can be the interface while your servers hold the projects and run
 the agents. The remote hosts must remain running for their work to continue.
 
+## The same agents, on your phone.
+
+Open [Tyde mobile](https://tycode.dev/tyde/) to access agents running on your
+computer or servers. Read their conversations and tool activity, answer
+questions, send follow-ups, stop a turn, or start a new chat on the paired host.
+You can also resume saved sessions and enable notifications when an agent
+finishes a turn or asks you something.
+
+Tyde mobile is a web app you can add to your Home Screen. The agents and project
+files stay on the host; the phone connects to the same work you see on desktop.
+Keep that host running and connected while you use mobile.
+
+On desktop, open **Settings → Mobile**, select the host, enable mobile
+connections, and choose **Pair via cloud**. Open Tyde mobile on your phone,
+scan the pairing QR, and complete the Tyggs Pass sign-in flow. For access through
+your own network, Tyde also supports **Pair via local server** with direct
+hosting configured.
+
+<p align="center"><a href="docs/assets/mobile-chat.png"><img src="docs/assets/mobile-chat.png" width="320" alt="Tyde mobile showing an agent conversation and a follow-up draft in the composer"></a></p>
+
+*The mobile conversation view with demo data. [Mobile user guide](docs/book.md#mobile)
+· [Screenshot details](dev-docs/customer-documentation.md#mobile-capture).*
+
 ## Review the work where it happens.
 
 Open projects with one or more repository roots. Browse files, inspect working
@@ -82,7 +106,7 @@ Already installed Tyde? The user guide explains the interface and gives step-by-
 - [Projects and multiple roots](docs/book.md#projects)
 - [Code review and Git](docs/book.md#review)
 - [Concurrent agents](docs/book.md#concurrency) and [session history](docs/book.md#sessions)
-- [Remote hosts](docs/book.md#remote)
+- [Remote hosts](docs/book.md#remote) and [mobile access](docs/book.md#mobile)
 - [Cross-harness delegation](docs/book.md#delegation)
 - [Custom agents and skills](docs/book.md#agents-skills)
 - [Workbenches](docs/book.md#workbenches)

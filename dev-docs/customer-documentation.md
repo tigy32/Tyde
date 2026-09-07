@@ -152,3 +152,22 @@ When adding a major feature, update its chapter, relevant reference material,
 and screenshots in the same change. Capture long-form narrated videos from
 real workflows only after their UI and scripts are stable; the initial book
 uses static product captures and an interactive animated explanation.
+
+## Mobile capture
+
+`docs/assets/mobile-chat.png` is a WebKit capture of the real Leptos mobile
+conversation UI, built with the repository's `ui-fixtures` development feature.
+It uses the existing `chat` fixture with demo agent Mira and sample conversation
+text. The follow-up was typed into the composer and left unsent. It is not a
+live host pairing, provider response, or backend conformance result.
+
+Capture at 393 × 680 CSS pixels with device scale 3 (1179 × 2040 PNG), using the
+fixture route `?tyde-fixture=chat`. Wait for the composer, type the follow-up,
+blur the input, and capture the viewport. The browser image does not include
+iOS system chrome or an on-screen keyboard. Do not add fictional device status
+or describe demo content as live work.
+
+The mobile chapter was checked against the host Mobile settings, mobile
+navigation, conversation, session, notification, and pairing components, plus
+`dev-docs/35-mobile-direct-hosting.md`. It distinguishes cloud pairing from
+direct hosting and desktop History from mobile Sessions.
