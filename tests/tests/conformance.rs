@@ -4768,10 +4768,18 @@ fn assert_web_search_maps_to_web_search(turn: &Turn) {
         "{}: WebSearch card lost the requested Rust query: {query:?}",
         turn.label()
     );
-    let result = result_for(turn, tool_call_id);
+    let outcome = turn
+        .tool_completions()
+        .find(|completion| completion.tool_call_id == *tool_call_id)
+        .map(|completion| &completion.outcome);
     assert!(
-        matches!(result, Some(ToolExecutionResult::WebSearch)),
-        "{}: completed web search reported {result:?}, not WebSearch",
+        matches!(
+            outcome,
+            Some(ToolExecutionOutcome::Succeeded {
+                result: ToolExecutionResult::WebSearch
+            })
+        ),
+        "{}: web search must succeed with WebSearch; actual outcome: {outcome:?}",
         turn.label()
     );
 }

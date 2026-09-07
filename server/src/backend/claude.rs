@@ -5218,6 +5218,10 @@ fn build_claude_cli_args(config: &ClaudeProcessSpawnConfig) -> Vec<String> {
         "--input-format".to_string(),
         "stream-json".to_string(),
         "--include-partial-messages".to_string(),
+        // Request summaries explicitly: the CLI may omit thinking text while
+        // still reporting thinking_tokens, leaving the reasoning UI empty.
+        "--thinking-display".to_string(),
+        "summarized".to_string(),
         "--permission-prompt-tool".to_string(),
         "stdio".to_string(),
         "--permission-mode".to_string(),
@@ -8764,9 +8768,17 @@ fn finalize_subagent_stream(mut stream: SubAgentStream, outcome: SubAgentFinalOu
         .map(str::trim)
         .filter(|text| !text.is_empty())
     {
-        // The phase machinery prefers streamed text over `assistant_text`,
-        // so if a future CLI starts forwarding the final turn on the
-        // correlated stream this stays render-once.
+        // The terminal payload follows execution of the child's tools. Some
+        // CLI paths omit that response's correlated frames, leaving the earlier
+        // tool response open when the parent's result supplies the final text.
+        if !stream.summary.tool_calls.is_empty() {
+            tracing::info!(
+                provider_message_id = ?stream.segment.current_claude_message_id,
+                tool_count = stream.summary.tool_calls.len(),
+                "Closing Claude child tool response before terminal reply"
+            );
+            close_current_phase(&mut stream.summary, &mut stream.segment, &stream.inner);
+        }
         stream.summary.assistant_text = Some(text.to_owned());
     }
     if let Some(usage) = outcome.usage {
