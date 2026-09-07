@@ -109,12 +109,7 @@ pub fn HomeView() -> impl IntoView {
             }
         });
 
-    let s_new_chat = state.clone();
-    let on_new_chat = Callback::new(move |_: ()| {
-        s_new_chat.active_agent.set(None);
-        s_new_chat.chat_input.set(String::new());
-        s_new_chat.viewing_chat.set(true);
-    });
+    let on_new_chat = crate::components::new_chat_callback(&state);
 
     let s_nav_agents = state.clone();
     let on_view_agents = Callback::new(move |_: ()| {

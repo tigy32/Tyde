@@ -912,6 +912,10 @@ pub struct AppState {
     // Projects
     pub projects: RwSignal<Vec<ProjectInfo>>,
     pub active_project: RwSignal<Option<ActiveProjectRef>>,
+    /// Whether the new-chat project sheet is up. Mobile has no project rail to
+    /// carry a persistent scope, so the choice is made per chat, at the one
+    /// moment it decides anything: the agent about to be spawned.
+    pub project_picker_open: RwSignal<bool>,
     pub git_status: RwSignal<HashMap<(LocalHostId, ProjectId), Vec<ProjectRootGitStatus>>>,
     pub project_file_contents: RwSignal<HashMap<ProjectFileRef, ProjectFileState>>,
     pub project_diffs: RwSignal<HashMap<ProjectDiffRef, ProjectDiffState>>,
@@ -1084,6 +1088,7 @@ impl AppState {
 
             projects: RwSignal::new(Vec::new()),
             active_project: RwSignal::new(None),
+            project_picker_open: RwSignal::new(false),
             git_status: RwSignal::new(HashMap::new()),
             project_file_contents: RwSignal::new(HashMap::new()),
             project_diffs: RwSignal::new(HashMap::new()),

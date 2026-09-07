@@ -365,6 +365,31 @@ pub fn select_project(state: &AppState, project: crate::state::ActiveProjectRef)
     });
 }
 
+/// Clear the active project so the next spawn goes out unscoped. "No project"
+/// is a real answer on mobile, not the absence of one: a quick question that
+/// should not be rooted in any workspace is the common case on a phone.
+pub fn clear_active_project(state: &AppState) {
+    state.active_project.set(None);
+}
+
+/// Start a new chat by asking which project it belongs to. Every new-chat
+/// affordance routes here so the question is asked exactly once, in one place,
+/// and no surface can quietly spawn into whatever project happened to be
+/// selected last.
+pub fn begin_new_chat(state: &AppState) {
+    state.project_picker_open.set(true);
+}
+
+/// Open the composer for a chat that has no agent yet. Called once the project
+/// question is answered; `spawn_new_chat` reads `active_project` when the first
+/// message is actually sent.
+pub fn open_new_chat(state: &AppState) {
+    state.project_picker_open.set(false);
+    state.active_agent.set(None);
+    state.chat_input.set(String::new());
+    state.viewing_chat.set(true);
+}
+
 pub async fn request_project_file(
     project: &crate::state::ActiveProjectRef,
     path: protocol::ProjectPath,

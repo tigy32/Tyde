@@ -975,8 +975,46 @@ fn NewChatOptions() -> impl IntoView {
             .unwrap_or_else(|| "Use this custom agent for the new chat.".to_owned())
     };
 
+    // The project the sheet already settled. Shown rather than re-asked: the
+    // user answered on the way in, and a composer that does not say which
+    // workspace it is about to spawn into is the same silence that let every
+    // mobile agent go out unscoped.
+    let project_state = state.clone();
+    let project_label = move || {
+        let Some(active) = project_state.active_project.get() else {
+            return "No project".to_owned();
+        };
+        project_state
+            .projects
+            .with(|projects| {
+                projects
+                    .iter()
+                    .find(|info| {
+                        info.local_host_id == active.local_host_id
+                            && info.project.id == active.project_id
+                    })
+                    .map(|info| info.project.name.clone())
+            })
+            .unwrap_or_else(|| active.project_id.0.clone())
+    };
+    let reopen_state = state.clone();
+    let on_change_project = move |_| crate::actions::begin_new_chat(&reopen_state);
+
     view! {
         <section class="new-chat-options" data-mobile-test="new-chat-options" aria-label="New chat options">
+            <div class="new-chat-option new-chat-option-wide">
+                <span class="new-chat-option-label">"Project"</span>
+                <button
+                    type="button"
+                    class="new-chat-option-project"
+                    data-mobile-test="new-chat-project"
+                    aria-label="Change the project for this chat"
+                    on:click=on_change_project
+                >
+                    <span class="new-chat-option-project-name">{project_label}</span>
+                    <span class="new-chat-option-project-change">"Change"</span>
+                </button>
+            </div>
             <label class="new-chat-option">
                 <span class="new-chat-option-label">"Backend"</span>
                 <select

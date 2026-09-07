@@ -317,6 +317,9 @@ fn ActiveHostShell() -> impl IntoView {
         <Show when=move || !state.viewing_chat.get()>
             <components::BottomNav />
         </Show>
+        // Outside the content column so the sheet covers the tab dock too: a
+        // modal the user can navigate out from underneath is not modal.
+        <components::ProjectPicker />
     }
 }
 

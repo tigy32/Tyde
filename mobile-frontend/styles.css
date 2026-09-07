@@ -2234,6 +2234,41 @@ html[data-keyboard-open] .mobile-app {
     font-size: 11px;
     line-height: 1.35;
 }
+/* The chat's project scope. Full width above the two half-width selects: it is
+   the answer the user already gave on the way in, restated so the composer is
+   never silent about which workspace it is about to spawn into. */
+.new-chat-option-wide {
+    grid-column: 1 / -1;
+}
+
+.new-chat-option-project {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-2);
+    width: 100%;
+    min-height: 36px;
+    padding: 0 var(--space-2);
+    background: var(--bg-surface-2);
+    border: 1px solid var(--border-default);
+    border-radius: var(--radius-button);
+    text-align: left;
+}
+
+.new-chat-option-project-name {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--text-primary);
+    font-size: 15px;
+}
+
+.new-chat-option-project-change {
+    flex-shrink: 0;
+    color: var(--accent-primary);
+    font-size: 13px;
+    font-weight: 500;
+}
 
 .chat-input-container {
     position: relative;
@@ -4373,6 +4408,88 @@ html[data-keyboard-open] .mobile-app {
     display: flex;
     flex-direction: column;
     gap: 0.5rem;
+}
+/* New-chat project sheet (ProjectPicker). Bottom-anchored rather than centred
+   like ConfirmModal: this is a list the user picks from with a thumb, so it
+   belongs in reach at the bottom of the screen, and it can be long enough to
+   scroll. It clears the home indicator on its own — the tab dock underneath is
+   covered by the backdrop and cannot be relied on for that inset. */
+.project-sheet-backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 1000;
+    display: flex;
+    align-items: flex-end;
+    justify-content: center;
+    padding: var(--space-3);
+    padding-bottom: max(var(--space-3), var(--safe-area-bottom));
+    background: rgba(0, 0, 0, 0.55);
+    backdrop-filter: blur(4px);
+    -webkit-backdrop-filter: blur(4px);
+}
+
+.project-sheet {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+    width: 100%;
+    max-width: 32rem;
+    max-height: 70vh;
+    padding: var(--space-4);
+    border-radius: var(--radius-lg);
+    background: var(--surface-float);
+    box-shadow: var(--rim-float), var(--shadow-float);
+}
+
+.project-sheet-title {
+    margin: 0;
+    font-size: 1.05rem;
+    font-weight: 600;
+    color: var(--text-primary);
+}
+
+.project-sheet-list {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+    overflow-y: auto;
+    -webkit-overflow-scrolling: touch;
+}
+
+.project-sheet-row {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 2px;
+    /* Comfortably past the 44px touch target minimum with two lines of text. */
+    min-height: 52px;
+    padding: var(--space-2) var(--space-3);
+    border-radius: var(--radius-md);
+    text-align: left;
+    background: var(--bg-surface-2);
+}
+
+.project-sheet-row.workbench {
+    margin-left: var(--space-4);
+}
+
+.project-sheet-row.selected {
+    background: var(--accent-soft);
+}
+
+.project-sheet-row-name {
+    font-size: 15px;
+    font-weight: 500;
+    color: var(--text-primary);
+}
+
+.project-sheet-row-hint {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    max-width: 100%;
+    font-size: 12px;
+    color: var(--text-tertiary);
 }
 
 /* ── Subscription capacity ───────────────────────────────────────────────────

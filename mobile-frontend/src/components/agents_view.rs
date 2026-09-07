@@ -85,12 +85,7 @@ pub fn AgentsView() -> impl IntoView {
     let hide_sub_agents = RwSignal::new(restore_hide_sub_agents());
     let collapsed_parents: RwSignal<HashSet<AgentId>> = RwSignal::new(HashSet::new());
 
-    let s_new_chat = state.clone();
-    let on_new_chat = Callback::new(move |_: ()| {
-        s_new_chat.active_agent.set(None);
-        s_new_chat.chat_input.set(String::new());
-        s_new_chat.viewing_chat.set(true);
-    });
+    let on_new_chat = crate::components::new_chat_callback(&state);
 
     view! {
         <div class="view agents-view" data-mobile-test="agents-view">
@@ -184,15 +179,6 @@ fn render_agents_body(
     collapsed_parents: RwSignal<HashSet<AgentId>>,
 ) -> AnyView {
     let state = state.clone();
-    let on_new_chat = {
-        let state = state.clone();
-        Callback::new(move |_: ()| {
-            state.active_agent.set(None);
-            state.chat_input.set(String::new());
-            state.viewing_chat.set(true);
-        })
-    };
-    let _ = on_new_chat;
     view! {
         <div data-mobile-test="agents-body">
             {move || {
@@ -224,12 +210,7 @@ fn render_agents_body(
                                 </div>
                             }.into_any();
                         }
-                        let s_empty = state.clone();
-                        let on_cta = Callback::new(move |_: ()| {
-                            s_empty.active_agent.set(None);
-                            s_empty.chat_input.set(String::new());
-                            s_empty.viewing_chat.set(true);
-                        });
+                        let on_cta = crate::components::new_chat_callback(&state);
                         return view! {
                             <EmptyState
                                 title="No agents running"
