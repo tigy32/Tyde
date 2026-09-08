@@ -16,6 +16,7 @@
 //! `dev-docs/12-remote-hosts.md`; they are not NDJSON frame payloads for a
 //! connected host.
 
+use std::cmp::Ordering;
 use std::fmt;
 use std::str::FromStr;
 
@@ -58,6 +59,66 @@ impl TydeReleaseVersion {
 impl fmt::Display for TydeReleaseVersion {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
+    }
+}
+
+impl PartialOrd for TydeReleaseVersion {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for TydeReleaseVersion {
+    /// Semantic-version precedence: numeric `major.minor.patch` first, a
+    /// prerelease sorts below its own release, and prerelease identifiers
+    /// compare numerically when both are numeric and lexically otherwise.
+    fn cmp(&self, other: &Self) -> Ordering {
+        let (self_core, self_prerelease) = split_release_version(&self.0);
+        let (other_core, other_prerelease) = split_release_version(&other.0);
+        self_core
+            .cmp(&other_core)
+            .then_with(|| match (self_prerelease, other_prerelease) {
+                (None, None) => Ordering::Equal,
+                (None, Some(_)) => Ordering::Greater,
+                (Some(_), None) => Ordering::Less,
+                (Some(left), Some(right)) => compare_prerelease(left, right),
+            })
+            .then_with(|| self.0.cmp(&other.0))
+    }
+}
+
+fn split_release_version(value: &str) -> ([u64; 3], Option<&str>) {
+    let (core, prerelease) = value
+        .split_once('-')
+        .map_or((value, None), |(core, prerelease)| (core, Some(prerelease)));
+    let core = core
+        .split('.')
+        .map(|part| part.parse::<u64>())
+        .collect::<Result<Vec<_>, _>>()
+        .ok()
+        .and_then(|parts| <[u64; 3]>::try_from(parts).ok())
+        .expect("release version core is validated as numeric major.minor.patch at construction");
+    (core, prerelease)
+}
+
+fn compare_prerelease(left: &str, right: &str) -> Ordering {
+    let mut left_parts = left.split('.');
+    let mut right_parts = right.split('.');
+    loop {
+        let ordering = match (left_parts.next(), right_parts.next()) {
+            (None, None) => return Ordering::Equal,
+            (None, Some(_)) => return Ordering::Less,
+            (Some(_), None) => return Ordering::Greater,
+            (Some(left), Some(right)) => match (left.parse::<u64>(), right.parse::<u64>()) {
+                (Ok(left), Ok(right)) => left.cmp(&right),
+                (Ok(_), Err(_)) => Ordering::Less,
+                (Err(_), Ok(_)) => Ordering::Greater,
+                (Err(_), Err(_)) => left.cmp(right),
+            },
+        };
+        if ordering != Ordering::Equal {
+            return ordering;
+        }
     }
 }
 
@@ -122,7 +183,7 @@ fn validate_release_version(value: &str) -> Result<(), String> {
     if parts.len() != 3
         || parts
             .iter()
-            .any(|part| part.is_empty() || !part.chars().all(|ch| ch.is_ascii_digit()))
+            .any(|part| part.is_empty() || part.parse::<u64>().is_err())
     {
         return Err("release version must start with numeric major.minor.patch".to_string());
     }

@@ -1772,6 +1772,10 @@ fn lifecycle_status_text(status: &bridge::RemoteHostLifecycleStatus) -> String {
         },
         bridge::RemoteHostLifecycleStatus::Snapshot { snapshot } => {
             let target = &snapshot.target_version;
+            if let Some((remote, running)) = remote_ahead_of_app(snapshot) {
+                let state = if running { "running" } else { "installed" };
+                return format!("v{remote} {state}; newer than this app (v{target}), update Tyde");
+            }
             match &snapshot.running {
                 bridge::RemoteTydeRunningState::Managed { version } if version == target => {
                     format!("v{version} running")
@@ -1808,10 +1812,36 @@ fn lifecycle_step_label(step: bridge::RemoteHostLifecycleStep) -> &'static str {
     }
 }
 
+/// The remote release this app is behind, if any. Tyde never moves a managed
+/// host backwards, so the only way forward is updating the app.
+fn remote_ahead_of_app(
+    snapshot: &bridge::RemoteHostLifecycleSnapshot,
+) -> Option<(&bridge::TydeReleaseVersion, bool)> {
+    match &snapshot.running {
+        bridge::RemoteTydeRunningState::Managed { version }
+            if version > &snapshot.target_version =>
+        {
+            Some((version, true))
+        }
+        bridge::RemoteTydeRunningState::NotRunning => snapshot
+            .current_link_version
+            .as_ref()
+            .filter(|version| *version > &snapshot.target_version)
+            .map(|version| (version, false)),
+        bridge::RemoteTydeRunningState::Managed { .. }
+        | bridge::RemoteTydeRunningState::UnknownSocket => None,
+    }
+}
+
 fn managed_lifecycle_button_label(status: &bridge::RemoteHostLifecycleStatus) -> String {
     match status {
         bridge::RemoteHostLifecycleStatus::Running { step, .. } => {
             lifecycle_step_label(*step).to_string()
+        }
+        bridge::RemoteHostLifecycleStatus::Snapshot { snapshot }
+            if remote_ahead_of_app(snapshot).is_some() =>
+        {
+            "Update This App".to_string()
         }
         bridge::RemoteHostLifecycleStatus::Snapshot { snapshot } => match &snapshot.running {
             bridge::RemoteTydeRunningState::Managed { version }
@@ -1832,16 +1862,18 @@ fn managed_lifecycle_button_label(status: &bridge::RemoteHostLifecycleStatus) ->
 }
 
 fn managed_lifecycle_button_disabled(status: &bridge::RemoteHostLifecycleStatus) -> bool {
-    matches!(
-        status,
-        bridge::RemoteHostLifecycleStatus::Running { .. }
-            | bridge::RemoteHostLifecycleStatus::Snapshot {
-                snapshot: bridge::RemoteHostLifecycleSnapshot {
-                    running: bridge::RemoteTydeRunningState::UnknownSocket,
-                    ..
-                }
-            }
-    )
+    match status {
+        bridge::RemoteHostLifecycleStatus::Running { .. } => true,
+        bridge::RemoteHostLifecycleStatus::Snapshot { snapshot } => {
+            remote_ahead_of_app(snapshot).is_some()
+                || matches!(
+                    snapshot.running,
+                    bridge::RemoteTydeRunningState::UnknownSocket
+                )
+        }
+        bridge::RemoteHostLifecycleStatus::Error { .. }
+        | bridge::RemoteHostLifecycleStatus::Idle => false,
+    }
 }
 
 #[component]

@@ -83,6 +83,11 @@ pub async fn ensure_configured_host_ready(
             )
             .await
         }
+        LifecycleAction::RemoteAhead { remote, running } => lifecycle_error(
+            &app,
+            &host.id,
+            remote_ahead_message(&snapshot.target_version, &remote, running),
+        ),
         LifecycleAction::MissingTargetBinary => lifecycle_error(
             &app,
             &host.id,
@@ -106,6 +111,13 @@ pub async fn force_upgrade_managed_host(
     if matches!(snapshot.running, RemoteTydeRunningState::UnknownSocket) {
         let message = "remote Tyde socket exists, but it was not launched by Tyde's managed lifecycle; stop it manually or use a manual host configuration".to_string();
         return lifecycle_error(&app, &host.id, message);
+    }
+    if let Some((remote, running)) = remote_ahead_of_app(&snapshot) {
+        return lifecycle_error(
+            &app,
+            &host.id,
+            remote_ahead_message(&snapshot.target_version, remote, running),
+        );
     }
 
     if !snapshot.installed_target {
@@ -146,16 +158,32 @@ pub async fn force_upgrade_managed_host(
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum LifecycleAction {
     ServeAsIs,
-    Launch { needs_install: bool },
-    Upgrade { needs_install: bool },
+    Launch {
+        needs_install: bool,
+    },
+    Upgrade {
+        needs_install: bool,
+    },
+    /// The remote runs, or last ran, a release newer than this app. A managed
+    /// host only ever moves forward, so the app has to update instead.
+    RemoteAhead {
+        remote: TydeReleaseVersion,
+        running: bool,
+    },
     MissingTargetBinary,
     UnknownSocket,
 }
 
 fn plan_lifecycle_action(snapshot: &RemoteHostLifecycleSnapshot) -> LifecycleAction {
+    if let Some((remote, running)) = remote_ahead_of_app(snapshot) {
+        return LifecycleAction::RemoteAhead {
+            remote: remote.clone(),
+            running,
+        };
+    }
     match &snapshot.running {
         RemoteTydeRunningState::Managed { version } if version == &snapshot.target_version => {
             if snapshot.installed_target {
@@ -172,6 +200,36 @@ fn plan_lifecycle_action(snapshot: &RemoteHostLifecycleSnapshot) -> LifecycleAct
         },
         RemoteTydeRunningState::UnknownSocket => LifecycleAction::UnknownSocket,
     }
+}
+
+/// The remote release this app must not move backwards from, if any: the
+/// running managed host, or when nothing runs, the release the host last
+/// launched (its `current` link). Returns whether that release is running.
+fn remote_ahead_of_app(
+    snapshot: &RemoteHostLifecycleSnapshot,
+) -> Option<(&TydeReleaseVersion, bool)> {
+    match &snapshot.running {
+        RemoteTydeRunningState::Managed { version } if version > &snapshot.target_version => {
+            Some((version, true))
+        }
+        RemoteTydeRunningState::NotRunning => snapshot
+            .current_link_version
+            .as_ref()
+            .filter(|version| *version > &snapshot.target_version)
+            .map(|version| (version, false)),
+        RemoteTydeRunningState::Managed { .. } | RemoteTydeRunningState::UnknownSocket => None,
+    }
+}
+
+fn remote_ahead_message(
+    app: &TydeReleaseVersion,
+    remote: &TydeReleaseVersion,
+    running: bool,
+) -> String {
+    let state = if running { "is running" } else { "last ran" };
+    format!(
+        "the remote host {state} Tyde {remote}, which is newer than this app ({app}); Tyde never downgrades a managed host, so update this app to connect"
+    )
 }
 
 struct ManagedSshHost {

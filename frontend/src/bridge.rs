@@ -11,7 +11,7 @@ pub use host_config::{
     HostLifecycleEvent, HostLineEvent, HostRecoveryEvent, HostTransportConfig, HostWarningEvent,
     RemoteHostLifecycleConfig, RemoteHostLifecycleSnapshot, RemoteHostLifecycleStatus,
     RemoteHostLifecycleStep, RemoteTydeRunningState, SendHostLineRequest, SetSelectedHostRequest,
-    UpsertConfiguredHostRequest,
+    TydeReleaseVersion, UpsertConfiguredHostRequest,
 };
 
 // --- Tauri JS bindings ---
