@@ -105,7 +105,12 @@ pub fn model_setting_aliases(model: &str) -> Vec<String> {
 /// handshakes over two full runs and costs a sixth as much.
 fn hermes_session_settings() -> SessionSettingsValues {
     let provider = env_or("TYDE_HERMES_TEST_PROVIDER", "openrouter");
-    let model = env_or("TYDE_HERMES_TEST_MODEL", "deepseek/deepseek-v4-flash");
+    // Dated because the undated alias stopped being published: OpenRouter now
+    // offers only `-0731`, and Hermes validates the value against its live
+    // option list, so the old spelling failed every scenario at spawn — before
+    // a token was spent, which is why it read as a Tyde bug rather than a
+    // renamed model.
+    let model = env_or("TYDE_HERMES_TEST_MODEL", "deepseek/deepseek-v4-flash-0731");
     let mut values = SessionSettingsValues::default();
     values.0.insert(
         "model".to_owned(),

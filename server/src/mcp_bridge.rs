@@ -3,7 +3,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
+use tokio::sync::Mutex as TokioMutex;
 
+use futures_util::future::{BoxFuture, FutureExt, Shared};
 use rmcp::model::{
     CallToolRequestParams, CallToolResult, ListToolsResult, PaginatedRequestParams,
     ServerCapabilities, ServerInfo, Tool,
@@ -87,12 +89,28 @@ struct Downstream {
     peer: Peer<RoleClient>,
 }
 
+/// Everything that depends on the configured servers having answered.
+struct BridgeContents {
+    downstreams: Vec<Downstream>,
+    tools: Vec<Tool>,
+    tool_owners: HashMap<String, usize>,
+    startup_error: Option<Arc<str>>,
+    /// Held for the process's lifetime: dropping a `RunningService` ends the
+    /// session with the server it owns.
+    clients: TokioMutex<Vec<RunningService<RoleClient, ()>>>,
+}
+
+/// The bridge answers `initialize` without waiting for a single configured
+/// server.
+///
+/// It used to connect them all first, which made its own handshake as slow as
+/// the slowest third-party server — measured, `agy` tolerates roughly a second
+/// of that and then drops the bridge with zero tools, so one slow server cost
+/// the session every other server's tools as well. Only the requests that
+/// genuinely need a downstream wait for one.
 #[derive(Clone)]
 struct McpBridge {
-    downstreams: Arc<Vec<Downstream>>,
-    tools: Arc<Vec<Tool>>,
-    tool_owners: Arc<HashMap<String, usize>>,
-    startup_error: Option<Arc<str>>,
+    connected: Shared<BoxFuture<'static, Arc<BridgeContents>>>,
     ready_path: Option<Arc<PathBuf>>,
 }
 
@@ -113,9 +131,10 @@ impl ServerHandler for McpBridge {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
+        let contents = self.connected.clone().await;
         if let Some(path) = &self.ready_path {
             let path = Arc::clone(path);
-            let status = match &self.startup_error {
+            let status = match &contents.startup_error {
                 Some(error) => serde_json::json!({ "ok": false, "error": error }),
                 None => serde_json::json!({ "ok": true }),
             };
@@ -138,11 +157,11 @@ impl ServerHandler for McpBridge {
                 }
             });
         }
-        if let Some(error) = &self.startup_error {
+        if let Some(error) = &contents.startup_error {
             return Err(McpError::internal_error(error.to_string(), None));
         }
         Ok(ListToolsResult {
-            tools: self.tools.as_ref().clone(),
+            tools: contents.tools.clone(),
             next_cursor: None,
             meta: None,
         })
@@ -153,16 +172,17 @@ impl ServerHandler for McpBridge {
         request: CallToolRequestParams,
         _context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        if let Some(error) = &self.startup_error {
+        let contents = self.connected.clone().await;
+        if let Some(error) = &contents.startup_error {
             return Err(McpError::internal_error(error.to_string(), None));
         }
-        let Some(index) = self.tool_owners.get(request.name.as_ref()).copied() else {
+        let Some(index) = contents.tool_owners.get(request.name.as_ref()).copied() else {
             return Err(McpError::invalid_params(
                 format!("unknown Tyde bridge tool '{}'", request.name),
                 None,
             ));
         };
-        let mut result = self.downstreams[index]
+        let mut result = contents.downstreams[index]
             .peer
             .call_tool(request)
             .await
@@ -170,7 +190,7 @@ impl ServerHandler for McpBridge {
                 McpError::internal_error(
                     format!(
                         "MCP server '{}' failed tool call: {error}",
-                        self.downstreams[index].name
+                        contents.downstreams[index].name
                     ),
                     None,
                 )
@@ -315,20 +335,39 @@ fn classify_pre_handshake(line: &str) -> PreHandshake {
 
 pub async fn run() -> Result<(), String> {
     let descriptor = load_descriptor()?;
-    let (mut bridge, mut clients) = build_bridge(descriptor).await;
-    bridge.ready_path = std::env::var_os("TMPDIR")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .map(|directory| Arc::new(directory.join(READY_FILE_NAME)));
+    // Before connecting anything. `build_bridge` waits on every configured
+    // server's handshake, which for a stdio server with an interpreter to boot
+    // is seconds — and `agy` sends its `server/discover` probe immediately on
+    // spawn. Building first meant nothing was reading stdin for as long as the
+    // slowest downstream took, so the probe went unanswered and `agy` dropped
+    // the bridge with zero tools: a slow server cost the session every *other*
+    // server's tools too. The shim buffers whatever else arrives until `serve`
+    // takes over below.
+    let transport = stdio_answering_discover_probe();
+    let connected: Shared<BoxFuture<'static, Arc<BridgeContents>>> =
+        async move { Arc::new(build_bridge(descriptor).await) }
+            .boxed()
+            .shared();
+    // Connect eagerly rather than on the first `tools/list`: the servers should
+    // be warming up while the client finishes its handshake, not starting from
+    // cold once it asks.
+    tokio::spawn(connected.clone());
+    let bridge = McpBridge {
+        connected: connected.clone(),
+        ready_path: std::env::var_os("TMPDIR")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .map(|directory| Arc::new(directory.join(READY_FILE_NAME))),
+    };
     let service = bridge
-        .serve(stdio_answering_discover_probe())
+        .serve(transport)
         .await
         .map_err(|error| format!("Tyde MCP bridge handshake failed: {error}"))?;
     service
         .waiting()
         .await
         .map_err(|error| format!("Tyde MCP bridge task failed: {error}"))?;
-    for client in &mut clients {
+    for client in connected.await.clients.lock().await.iter_mut() {
         let _ = client.close_with_timeout(Duration::from_secs(1)).await;
     }
     Ok(())
@@ -367,11 +406,9 @@ fn load_descriptor() -> Result<Option<BridgeDescriptor>, String> {
         .map_err(|error| format!("invalid Tyde MCP bridge descriptor: {error}"))
 }
 
-async fn build_bridge(
-    descriptor: Option<BridgeDescriptor>,
-) -> (McpBridge, Vec<RunningService<RoleClient, ()>>) {
+async fn build_bridge(descriptor: Option<BridgeDescriptor>) -> BridgeContents {
     let Some(descriptor) = descriptor else {
-        return (empty_bridge(None), Vec::new());
+        return empty_contents(None, Vec::new());
     };
     let mut downstreams = Vec::new();
     let mut clients = Vec::new();
@@ -395,10 +432,10 @@ async fn build_bridge(
         for tool in server_tools {
             let name = tool.name.to_string();
             if tool_owners.insert(name.clone(), owner).is_some() {
-                return (
-                    empty_bridge(Some(format!(
+                return empty_contents(
+                    Some(format!(
                         "duplicate MCP tool name '{name}' across configured servers"
-                    ))),
+                    )),
                     clients,
                 );
             }
@@ -414,22 +451,19 @@ async fn build_bridge(
     if tools.is_empty() && !startup_errors.is_empty() {
         let error = startup_errors.join("; ");
         eprintln!("Tyde MCP bridge failed: {error}");
-        return (empty_bridge(Some(error)), clients);
+        return empty_contents(Some(error), clients);
     }
     for error in startup_errors {
         eprintln!("Tyde MCP bridge warning: {error}");
     }
 
-    (
-        McpBridge {
-            downstreams: Arc::new(downstreams),
-            tools: Arc::new(tools),
-            tool_owners: Arc::new(tool_owners),
-            startup_error: None,
-            ready_path: None,
-        },
-        clients,
-    )
+    BridgeContents {
+        downstreams,
+        tools,
+        tool_owners,
+        startup_error: None,
+        clients: TokioMutex::new(clients),
+    }
 }
 
 async fn start_downstream(
@@ -466,13 +500,16 @@ async fn start_downstream(
     (name, result)
 }
 
-fn empty_bridge(error: Option<String>) -> McpBridge {
-    McpBridge {
-        downstreams: Arc::new(Vec::new()),
-        tools: Arc::new(Vec::new()),
-        tool_owners: Arc::new(HashMap::new()),
+fn empty_contents(
+    error: Option<String>,
+    clients: Vec<RunningService<RoleClient, ()>>,
+) -> BridgeContents {
+    BridgeContents {
+        downstreams: Vec::new(),
+        tools: Vec::new(),
+        tool_owners: HashMap::new(),
         startup_error: error.map(Arc::from),
-        ready_path: None,
+        clients: TokioMutex::new(clients),
     }
 }
 

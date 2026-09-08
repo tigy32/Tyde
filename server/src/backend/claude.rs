@@ -106,6 +106,10 @@ const CLAUDE_DEFAULT_PERMISSION_MODE: &str = "bypassPermissions";
 const CLAUDE_WAKE_QUIESCE_WAIT: Duration = Duration::from_secs(5);
 // Claude plan mode blocks build/test Bash; ReadOnly is advisory in Tyde.
 const CLAUDE_INITIALIZE_TIMEOUT: Duration = Duration::from_secs(30);
+/// How often a startup MCP server that was still connecting is looked at again.
+/// Far coarser than the startup gate's 25ms because nothing waits on the answer
+/// — the session is already running by the time this polls.
+const CLAUDE_MCP_RECHECK_INTERVAL: Duration = Duration::from_millis(500);
 /// How long a session will hold its output waiting for the CLI to report which
 /// skills it loaded. Matches the provider-process handshake timeout.
 const CLAUDE_SKILL_VERIFICATION_TIMEOUT: Duration = CLAUDE_INITIALIZE_TIMEOUT;
@@ -3188,7 +3192,9 @@ impl ClaudeInner {
                 self.configure_capacity_from_initialize(&response).await;
                 self.schedule_capacity_refresh().await;
                 if !startup_mcp_names.is_empty()
-                    && let Err(error) = self.await_startup_mcp_ready(&startup_mcp_names).await
+                    && let Err(error) = self
+                        .await_startup_mcp_ready(&startup_mcp_names, process_generation)
+                        .await
                 {
                     self.shutdown_process().await;
                     return Err(error);
@@ -3208,8 +3214,9 @@ impl ClaudeInner {
     }
 
     async fn await_startup_mcp_ready(
-        &self,
+        self: &Arc<Self>,
         expected_names: &HashSet<String>,
+        process_generation: u64,
     ) -> Result<(), String> {
         let required_names = expected_names
             .iter()
@@ -3273,19 +3280,34 @@ impl ClaudeInner {
                         .is_some_and(|status| status.eq_ignore_ascii_case("connected"))
                 })
             {
+                // Startup waits only on Tyde's own servers, so the others are
+                // whatever they happen to be at this instant — and for a stdio
+                // server with an interpreter to boot, that is reliably "still
+                // connecting" while Tyde's loopback HTTP servers are already up.
+                // Reporting that as a verdict is what made this warning fire on
+                // servers that went on to work for the whole session, so only a
+                // terminal status is reported here and anything still connecting
+                // is handed to a watcher that looks again.
+                let mut connecting = HashSet::new();
                 for server in configured {
                     let Some(name) = server.get("name").and_then(Value::as_str) else {
                         continue;
                     };
-                    let status = server
-                        .get("status")
-                        .and_then(Value::as_str)
-                        .unwrap_or("unknown");
-                    if !required_names.contains(name) && !status.eq_ignore_ascii_case("connected") {
-                        self.emitter.warning_message(&format!(
-                            "Claude custom MCP server '{name}' is {status}; continuing without it"
-                        ));
+                    if required_names.contains(name) {
+                        continue;
                     }
+                    match claude_startup_mcp_verdict(server) {
+                        ClaudeStartupMcpVerdict::Connected => {}
+                        ClaudeStartupMcpVerdict::Connecting => {
+                            connecting.insert(name.to_owned());
+                        }
+                        ClaudeStartupMcpVerdict::Unusable(report) => {
+                            self.emitter.warning_message(&report);
+                        }
+                    }
+                }
+                if !connecting.is_empty() {
+                    self.watch_connecting_startup_mcp(connecting, process_generation, deadline);
                 }
                 return Ok(());
             }
@@ -3296,6 +3318,83 @@ impl ClaudeInner {
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
+    }
+
+    /// Keeps looking at the servers that were still connecting when startup
+    /// stopped waiting, and reports one only once it has actually settled.
+    ///
+    /// Runs detached because the alternative is blocking the user's first turn
+    /// on someone else's MCP server: the whole reason startup gates on Tyde's
+    /// own servers is that a third-party one may take seconds, and waiting for
+    /// it here would trade a false warning for a slow session. Bounded by the
+    /// same deadline the gate used, so a server that never settles is reported
+    /// once rather than polled forever.
+    fn watch_connecting_startup_mcp(
+        self: &Arc<Self>,
+        mut connecting: HashSet<String>,
+        process_generation: u64,
+        deadline: tokio::time::Instant,
+    ) {
+        let this = Arc::clone(self);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(CLAUDE_MCP_RECHECK_INTERVAL).await;
+                // A restart replaces every server this watcher was asked about,
+                // and the new process runs its own gate. Without this the old
+                // watcher reports against a process that no longer exists.
+                if this.state.lock().await.process_generation != process_generation {
+                    return;
+                }
+                let expired = tokio::time::Instant::now() >= deadline;
+                let Ok(response) = this
+                    .send_control_request_with_timeout("mcp_status", CLAUDE_INITIALIZE_TIMEOUT)
+                    .await
+                else {
+                    // The process is gone or not answering. Startup already
+                    // succeeded, so this is not the place to report that.
+                    return;
+                };
+                let servers = response
+                    .get("mcpServers")
+                    .and_then(Value::as_array)
+                    .map(Vec::as_slice)
+                    .unwrap_or_default();
+                for server in servers {
+                    let Some(name) = server.get("name").and_then(Value::as_str) else {
+                        continue;
+                    };
+                    if !connecting.contains(name) {
+                        continue;
+                    }
+                    match claude_startup_mcp_verdict(server) {
+                        ClaudeStartupMcpVerdict::Connected => {
+                            connecting.remove(name);
+                        }
+                        ClaudeStartupMcpVerdict::Unusable(report) => {
+                            connecting.remove(name);
+                            this.emitter.warning_message(&report);
+                        }
+                        ClaudeStartupMcpVerdict::Connecting => {}
+                    }
+                }
+                if connecting.is_empty() {
+                    return;
+                }
+                if expired {
+                    for name in &connecting {
+                        // Deliberately says only what was observed. Whether the
+                        // CLI connects it a second later is not knowable here,
+                        // and claiming it was dropped is the false report this
+                        // change removes.
+                        this.emitter.warning_message(&format!(
+                            "MCP server '{name}' has not become available after {}s.",
+                            CLAUDE_INITIALIZE_TIMEOUT.as_secs()
+                        ));
+                    }
+                    return;
+                }
+            }
+        });
     }
 
     async fn quarantine_resume_bootstrap_frame(
@@ -5448,6 +5547,59 @@ fn build_claude_mcp_config_json(startup_mcp_servers: &[StartupMcpServer]) -> Opt
         })
         .to_string(),
     )
+}
+
+/// What a configured MCP server's `mcp_status` entry justifies telling the user.
+enum ClaudeStartupMcpVerdict {
+    Connected,
+    /// Not settled. Says nothing about whether the server will work, so it must
+    /// not reach the user as a report — this is the state the old code treated
+    /// as a verdict.
+    Connecting,
+    Unusable(String),
+}
+
+/// The CLI's vocabulary is `connected` / `pending` / `failed` / `needs-auth` /
+/// `disabled`. An unrecognized value is read as still connecting rather than as
+/// a failure: a status this does not know about is far more likely to be a new
+/// transient one than a new terminal one, and guessing "broken" is what this
+/// whole change exists to stop. Nothing is lost by waiting — a server that never
+/// settles is reported when the watcher's deadline expires.
+fn claude_startup_mcp_verdict(server: &Value) -> ClaudeStartupMcpVerdict {
+    let name = server
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or("<unnamed>");
+    let status = server
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if status.eq_ignore_ascii_case("connected") {
+        return ClaudeStartupMcpVerdict::Connected;
+    }
+    let detail = ["error", "message", "failureReason"]
+        .into_iter()
+        .find_map(|key| server.get(key).and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|detail| !detail.is_empty());
+    if status.eq_ignore_ascii_case("failed") {
+        return ClaudeStartupMcpVerdict::Unusable(match detail {
+            Some(detail) => format!("MCP server '{name}' failed to start: {detail}"),
+            None => format!("MCP server '{name}' failed to start."),
+        });
+    }
+    if status.eq_ignore_ascii_case("needs-auth") {
+        return ClaudeStartupMcpVerdict::Unusable(format!(
+            "MCP server '{name}' needs to be authorized before its tools can be used."
+        ));
+    }
+    if status.eq_ignore_ascii_case("disabled") {
+        return ClaudeStartupMcpVerdict::Unusable(format!(
+            "MCP server '{name}' is configured in Tyde but disabled in Claude Code, so its tools \
+             are not available."
+        ));
+    }
+    ClaudeStartupMcpVerdict::Connecting
 }
 
 fn claude_startup_mcp_is_required(name: &str) -> bool {
