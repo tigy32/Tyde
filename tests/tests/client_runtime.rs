@@ -329,11 +329,29 @@ async fn passive_capacity_replays_deduplicates_and_stales_over_public_client() {
         next_host_event(&mut restarted_events, "restart bootstrap").await,
         HostEvent::HostBootstrap(_)
     ));
+    // A restarted host now also reconstructs the agents this test left open, so
+    // NewAgent frames legitimately interleave with the capacity replay. The
+    // contract here is the replayed capacity *state*, not its position in the
+    // stream.
+    let restart_capacity = loop {
+        match next_host_event(&mut restarted_events, "restart capacity replay").await {
+            HostEvent::BackendCapacity(payload) => break payload,
+            HostEvent::NewAgent(_)
+            | HostEvent::AgentsViewPreferencesNotify(_)
+            | HostEvent::TaskTokenUsage(_)
+            | HostEvent::SessionList(_) => {}
+            event => panic!(
+                "expected BackendCapacity during restart replay; got {:?}",
+                std::mem::discriminant(&event)
+            ),
+        }
+    };
     assert!(
-        matches!(next_host_event(&mut restarted_events, "restart capacity replay").await,
-        HostEvent::BackendCapacity(payload) if payload.snapshots.iter().any(|snapshot|
-            matches!((snapshot.backend_kind, &snapshot.state),
-                (BackendKind::Codex, BackendCapacityState::Unavailable { .. })) ))
+        restart_capacity.snapshots.iter().any(|snapshot| matches!(
+            (snapshot.backend_kind, &snapshot.state),
+            (BackendKind::Codex, BackendCapacityState::Unavailable { .. })
+        )),
+        "restarted host must replay awaiting-first-report capacity, got {restart_capacity:?}"
     );
 }
 

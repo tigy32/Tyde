@@ -5,8 +5,8 @@ use protocol::{
     AgentBootstrapEvent, AgentBootstrapPayload, AgentStartPayload, BackendKind, ChatEvent,
     DeleteSessionPayload, Envelope, FetchSessionHistoryPayload, FrameKind, ListSessionsPayload,
     NewAgentPayload, Project, ProjectCreatePayload, ProjectNotifyPayload, ProjectRootPath,
-    SessionHistoryPayload, SessionId, SessionListPayload, SpawnAgentParams, SpawnAgentPayload,
-    StreamPath,
+    SessionHistoryPayload, SessionId, SessionListPayload, SessionSettingValue,
+    SessionSettingsValues, SpawnAgentParams, SpawnAgentPayload, StreamPath,
 };
 use server::backend::mock::{MockScript, MockTurn};
 use std::time::Duration;
@@ -511,6 +511,253 @@ async fn list_sessions_and_resume_agent() {
     );
     assert_eq!(list.sessions[0].id, session.id);
     assert_eq!(list.sessions[0].message_count, 2);
+}
+
+/// Collects what a restart replayed for `sessions`: the reconstructed
+/// `NewAgent` for each, plus the `AgentBootstrap` that follows on its instance
+/// stream. One scan for all of it — the frame readers discard what they skip,
+/// so searching per session or per frame kind throws away the frame the next
+/// search is waiting for.
+async fn collect_restart_replay(
+    fixture: &mut Fixture,
+    bootstrap: &settings_model::HostBootstrapPayload,
+    sessions: &[SessionId],
+) -> (
+    std::collections::HashMap<SessionId, NewAgentPayload>,
+    std::collections::HashMap<StreamPath, AgentBootstrapPayload>,
+) {
+    let mut agents = std::collections::HashMap::new();
+    let mut bootstraps = std::collections::HashMap::<StreamPath, AgentBootstrapPayload>::new();
+    for agent in &bootstrap.agents {
+        if let Some(session_id) = agent.session_id.as_ref()
+            && sessions.contains(session_id)
+        {
+            agents.insert(session_id.clone(), agent.clone());
+        }
+    }
+    loop {
+        let have_all = agents.len() == sessions.len()
+            && agents
+                .values()
+                .all(|agent| bootstraps.contains_key(&agent.instance_stream));
+        if have_all {
+            return (agents, bootstraps);
+        }
+        let env = fixture::next_frame_matching_on(&mut fixture.client, "restart replay", |env| {
+            matches!(env.kind, FrameKind::NewAgent | FrameKind::AgentBootstrap)
+        })
+        .await;
+        match env.kind {
+            FrameKind::NewAgent => {
+                let agent: NewAgentPayload = env.parse_payload().expect("parse restored NewAgent");
+                if let Some(session_id) = agent.session_id.as_ref()
+                    && sessions.contains(session_id)
+                {
+                    agents.insert(session_id.clone(), agent);
+                }
+            }
+            FrameKind::AgentBootstrap => {
+                let payload: AgentBootstrapPayload =
+                    env.parse_payload().expect("parse restored AgentBootstrap");
+                bootstraps.insert(env.stream.clone(), payload);
+            }
+            kind => unreachable!("unexpected restart replay frame {kind:?}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn restart_restores_open_agents_and_preserves_settings() {
+    let mut fixture = Fixture::new().await;
+    let mut settings = SessionSettingsValues::default();
+    settings.0.insert(
+        "effort".to_owned(),
+        SessionSettingValue::String("high".to_owned()),
+    );
+
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            name: Some("survives restart".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::New {
+                workspace_roots: vec!["/tmp/restart-survivor".to_owned()],
+                prompt: "remember this turn".to_owned(),
+                images: None,
+                backend_kind: BackendKind::Claude,
+                launch_profile_id: None,
+                cost_hint: None,
+                access_mode: Default::default(),
+                session_settings: Some(settings.clone()),
+            },
+        })
+        .await
+        .expect("spawn restart survivor");
+    let survivor: NewAgentPayload = expect_next_event(&mut fixture.client, "survivor NewAgent")
+        .await
+        .parse_payload()
+        .expect("parse survivor NewAgent");
+    let survivor_start = expect_agent_start_on_stream(
+        &mut fixture.client,
+        &survivor.instance_stream,
+        "survivor start",
+    )
+    .await;
+    let survivor_session = survivor_start.session_id.expect("survivor session id");
+    expect_turn_on_stream(
+        &mut fixture.client,
+        &survivor.instance_stream,
+        "mock backend response to: remember this turn",
+    )
+    .await;
+
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            name: Some("child survives restart".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: Some(survivor.agent_id.clone()),
+            project_id: None,
+            params: SpawnAgentParams::New {
+                workspace_roots: vec!["/tmp/restart-survivor-child".to_owned()],
+                prompt: "child turn".to_owned(),
+                images: None,
+                backend_kind: BackendKind::Claude,
+                launch_profile_id: None,
+                cost_hint: None,
+                access_mode: Default::default(),
+                session_settings: None,
+            },
+        })
+        .await
+        .expect("spawn restart survivor child");
+    let survivor_child: NewAgentPayload =
+        expect_next_event(&mut fixture.client, "survivor child NewAgent")
+            .await
+            .parse_payload()
+            .expect("parse survivor child NewAgent");
+    let survivor_child_start = expect_agent_start_on_stream(
+        &mut fixture.client,
+        &survivor_child.instance_stream,
+        "survivor child start",
+    )
+    .await;
+    let survivor_child_session = survivor_child_start
+        .session_id
+        .expect("survivor child session id");
+    expect_turn_on_stream(
+        &mut fixture.client,
+        &survivor_child.instance_stream,
+        "mock backend response to: child turn",
+    )
+    .await;
+
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            name: Some("closed before restart".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::New {
+                workspace_roots: vec!["/tmp/restart-closed".to_owned()],
+                prompt: "do not restore me".to_owned(),
+                images: None,
+                backend_kind: BackendKind::Claude,
+                launch_profile_id: None,
+                cost_hint: None,
+                access_mode: Default::default(),
+                session_settings: None,
+            },
+        })
+        .await
+        .expect("spawn agent that will be closed");
+    let closed: NewAgentPayload = expect_next_event(&mut fixture.client, "closed NewAgent")
+        .await
+        .parse_payload()
+        .expect("parse closed NewAgent");
+    let _ = expect_agent_start_on_stream(
+        &mut fixture.client,
+        &closed.instance_stream,
+        "closed agent start",
+    )
+    .await;
+    expect_turn_on_stream(
+        &mut fixture.client,
+        &closed.instance_stream,
+        "mock backend response to: do not restore me",
+    )
+    .await;
+    fixture
+        .client
+        .close_agent(&closed.instance_stream)
+        .await
+        .expect("close second agent");
+    fixture::next_frame_matching_on(&mut fixture.client, "closed AgentClosed", |env| {
+        env.kind == FrameKind::AgentClosed
+            && env
+                .parse_payload::<protocol::AgentClosedPayload>()
+                .is_ok_and(|payload| payload.agent_id == closed.agent_id)
+    })
+    .await;
+
+    let bootstrap = fixture.restart_host().await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if fixture.agent_ids().await.len() == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("both open agents should be reconstructed after restart");
+
+    let (mut restored_by_session, restored_bootstraps) = collect_restart_replay(
+        &mut fixture,
+        &bootstrap,
+        &[survivor_session.clone(), survivor_child_session.clone()],
+    )
+    .await;
+    let restored = restored_by_session
+        .remove(&survivor_session)
+        .expect("restored parent");
+    let restored_child = restored_by_session
+        .remove(&survivor_child_session)
+        .expect("restored child");
+    assert_ne!(restored.agent_id, survivor.agent_id);
+    assert_ne!(restored_child.agent_id, survivor_child.agent_id);
+    assert_eq!(restored_child.name, "child survives restart");
+    // The durable parent session id is the only lineage that survives a
+    // restart; the restored child must hang off the parent's *new* agent id.
+    assert_eq!(
+        restored_child.parent_agent_id.as_ref(),
+        Some(&restored.agent_id),
+        "restored child must be re-parented onto the restored parent agent",
+    );
+    assert_eq!(restored.name, "survives restart");
+    assert_eq!(restored.workspace_roots, vec!["/tmp/restart-survivor"]);
+    assert_eq!(restored.session_id.as_ref(), Some(&survivor_session));
+
+    let restored_bootstrap = restored_bootstraps
+        .get(&restored.instance_stream)
+        .expect("restored parent AgentBootstrap");
+    assert_bootstrap_tail_messages(restored_bootstrap, &["remember this turn"]);
+    let restored_child_bootstrap = restored_bootstraps
+        .get(&restored_child.instance_stream)
+        .expect("restored child AgentBootstrap");
+    assert_bootstrap_tail_messages(restored_child_bootstrap, &["child turn"]);
+    let restored_settings = restored_bootstrap
+        .events
+        .iter()
+        .find_map(|event| match event {
+            AgentBootstrapEvent::SessionSettings(payload) => Some(&payload.values),
+            _ => None,
+        })
+        .expect("restored bootstrap includes session settings");
+    assert_eq!(restored_settings, &settings);
 }
 
 #[tokio::test]
@@ -1641,5 +1888,118 @@ async fn delete_nonexistent_session_is_graceful() {
     assert!(
         list.sessions.is_empty(),
         "session list should be empty; deleting a nonexistent session must be a no-op"
+    );
+}
+
+/// A backend-native child is a relay over its parent's sub-agent stream, not an
+/// independently resumable session. Marking it for restoration made every
+/// restart reconstruct it through the resume path, which rejects it and leaves
+/// the user a failed card to dismiss. The parent still comes back; the child
+/// must not come back at all.
+#[tokio::test]
+async fn restart_does_not_resurrect_backend_native_children() {
+    let mut fixture = Fixture::new().await;
+    let reservation = fixture
+        .reserve_next_mock_launch(
+            "parent-with-native-child",
+            MockScript::one(
+                MockTurn::text("mock backend response to: parent prompt")
+                    .with_native_child("mock-native-child", "parent prompt"),
+            ),
+        )
+        .await;
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            name: Some("parent-with-native-child".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::New {
+                workspace_roots: vec!["/tmp/restart-native-parent".to_owned()],
+                prompt: "parent prompt".to_owned(),
+                images: None,
+                backend_kind: BackendKind::Claude,
+                launch_profile_id: None,
+                cost_hint: None,
+                access_mode: Default::default(),
+                session_settings: None,
+            },
+        })
+        .await
+        .expect("spawn parent with native child");
+
+    let parent: NewAgentPayload = expect_next_event(&mut fixture.client, "parent NewAgent")
+        .await
+        .parse_payload()
+        .expect("parse parent NewAgent");
+    let parent_start =
+        expect_agent_start_on_stream(&mut fixture.client, &parent.instance_stream, "parent start")
+            .await;
+    let parent_session = parent_start.session_id.expect("parent session id");
+    drop(reservation);
+    expect_turn_on_stream(
+        &mut fixture.client,
+        &parent.instance_stream,
+        "mock backend response to: parent prompt",
+    )
+    .await;
+
+    let child =
+        fixture::next_frame_matching_on(&mut fixture.client, "native child NewAgent", |env| {
+            env.kind == FrameKind::NewAgent
+                && env
+                    .parse_payload::<NewAgentPayload>()
+                    .is_ok_and(|agent| agent.parent_agent_id.as_ref() == Some(&parent.agent_id))
+        })
+        .await
+        .parse_payload::<NewAgentPayload>()
+        .expect("parse native child NewAgent");
+    let child_start = expect_agent_start_on_stream(
+        &mut fixture.client,
+        &child.instance_stream,
+        "native child start",
+    )
+    .await;
+    let child_session = child_start.session_id.expect("native child session id");
+    assert_eq!(child_start.origin, protocol::AgentOrigin::BackendNative);
+    assert_ne!(child_session, parent_session);
+
+    let bootstrap = fixture.restart_host().await;
+    let (mut restored, _) = collect_restart_replay(
+        &mut fixture,
+        &bootstrap,
+        std::slice::from_ref(&parent_session),
+    )
+    .await;
+    let restored_parent = restored.remove(&parent_session).expect("restored parent");
+    assert_ne!(restored_parent.agent_id, parent.agent_id);
+
+    // Restoration is one sequential pass, so the child would be reconstructed
+    // moments after the parent. Give the pass room to do it and require that
+    // the agent count never grows past the parent.
+    let resurrected = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if fixture.agent_ids().await.len() > 1 {
+                return fixture.agent_session_ids().await;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert!(
+        resurrected.is_err(),
+        "backend-native child must not be reconstructed after restart, live sessions: {:?}",
+        resurrected.unwrap_or_default()
+    );
+    let live_sessions = fixture.agent_session_ids().await;
+    assert_eq!(
+        live_sessions,
+        vec![parent_session.clone()],
+        "only the parent session should be live after restart"
+    );
+    assert!(
+        !live_sessions.contains(&child_session),
+        "backend-native child session must not be reconstructed after restart"
     );
 }
