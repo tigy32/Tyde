@@ -18061,6 +18061,9 @@ pub(crate) const CAPACITY_FRESHNESS_THRESHOLD_MS: u64 = 60 * 60 * 1000;
 /// `Unsupported` is never absorbed this way: it is a real retraction of the
 /// source, not a transient failure, and hiding it behind an old report would
 /// keep showing numbers for a backend that has stopped reporting.
+///
+/// A reading that covers fewer buckets than the one already held is folded into
+/// it rather than replacing it. See `merge_narrower_capacity_report`.
 fn resolve_recorded_capacity(
     current: Option<&BackendCapacitySnapshot>,
     incoming: BackendCapacityState,
@@ -18071,16 +18074,32 @@ fn resolve_recorded_capacity(
         now_ms,
         protocol::CapacityFreshness::Fresh { age_ms: 0 },
     );
+    if let BackendCapacityState::Known { report } = &incoming {
+        let Some(current) = current else {
+            return fresh;
+        };
+        let Some(held) = held_capacity_report(&current.state) else {
+            return fresh;
+        };
+        if report.buckets.len() >= held.buckets.len() {
+            return fresh;
+        }
+        return (
+            BackendCapacityState::Known {
+                report: merge_narrower_capacity_report(held, report),
+            },
+            current.retrieved_at_ms,
+            capacity_freshness_at(current.retrieved_at_ms, now_ms),
+        );
+    }
     let Some(detail) = transient_capacity_failure(&incoming) else {
         return fresh;
     };
     let Some(current) = current else {
         return fresh;
     };
-    let held = match &current.state {
-        BackendCapacityState::Known { report } => report.clone(),
-        BackendCapacityState::Stale { report, .. } => report.clone(),
-        _ => return fresh,
+    let Some(held) = held_capacity_report(&current.state).cloned() else {
+        return fresh;
     };
     let stale_since_ms = match &current.state {
         BackendCapacityState::Stale { stale_since_ms, .. } => *stale_since_ms,
@@ -18098,6 +18117,69 @@ fn resolve_recorded_capacity(
             threshold_ms: CAPACITY_FRESHNESS_THRESHOLD_MS,
         },
     )
+}
+
+/// The report a snapshot still carries, if any. `Stale` keeps its last good
+/// numbers, so both states answer this.
+fn held_capacity_report(state: &BackendCapacityState) -> Option<&protocol::CapacityReport> {
+    match state {
+        BackendCapacityState::Known { report } | BackendCapacityState::Stale { report, .. } => {
+            Some(report)
+        }
+        BackendCapacityState::Unavailable { .. }
+        | BackendCapacityState::Unsupported { .. }
+        | BackendCapacityState::AuthError { .. }
+        | BackendCapacityState::RateLimited { .. } => None,
+    }
+}
+
+fn capacity_freshness_at(retrieved_at_ms: u64, now_ms: u64) -> protocol::CapacityFreshness {
+    let age_ms = now_ms.saturating_sub(retrieved_at_ms);
+    if age_ms >= CAPACITY_FRESHNESS_THRESHOLD_MS {
+        protocol::CapacityFreshness::Stale {
+            age_ms,
+            threshold_ms: CAPACITY_FRESHNESS_THRESHOLD_MS,
+        }
+    } else {
+        protocol::CapacityFreshness::Fresh { age_ms }
+    }
+}
+
+/// Folds a reading that covers fewer buckets than the held one into it.
+///
+/// A narrower reading is not a retraction of the buckets it leaves out: their
+/// utilization is unknown, not zero. Claude's `get_usage` answers a session
+/// running a model-scoped weekly limit with that one bucket and no
+/// `subscription_type`, and its passive `rate_limit_event` reports only the
+/// single currently-binding bucket. Replacing the complete report with either
+/// drops the session and weekly bars, so the usage view flips between three
+/// bars and one every time an agent refreshes.
+///
+/// The merged report is presented as the held reading with the narrower one's
+/// values folded in: `source`, `coverage`, `observed_at_ms` and the snapshot's
+/// `retrieved_at_ms` all stay the held report's. Attributing the whole thing to
+/// the narrower source would claim its coverage for buckets it never mentioned.
+/// Holding the collection time also keeps the buckets it did not refresh from
+/// resetting to "just now", so a stream of partial reads can never keep a
+/// snapshot fresh past the staleness threshold.
+fn merge_narrower_capacity_report(
+    held: &protocol::CapacityReport,
+    narrower: &protocol::CapacityReport,
+) -> protocol::CapacityReport {
+    let mut buckets = held.buckets.clone();
+    for bucket in &narrower.buckets {
+        match buckets.iter_mut().find(|held| held.id == bucket.id) {
+            Some(slot) => *slot = bucket.clone(),
+            None => buckets.push(bucket.clone()),
+        }
+    }
+    protocol::CapacityReport {
+        source: held.source,
+        observed_at_ms: held.observed_at_ms,
+        plan: narrower.plan.clone().or_else(|| held.plan.clone()),
+        buckets,
+        coverage: held.coverage,
+    }
 }
 
 /// A failure that says "could not read right now", as opposed to a report, an
