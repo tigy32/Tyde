@@ -1,3 +1,4 @@
+mod app_update;
 mod bridge;
 mod dev_host;
 mod devtools;
@@ -778,6 +779,13 @@ fn open_external_url(app: tauri::AppHandle, url: String) -> Result<(), String> {
 }
 
 #[tauri::command]
+async fn check_for_app_update(
+    app: tauri::AppHandle,
+) -> Result<app_update::UpdateCheckResult, String> {
+    app_update::check(app).await
+}
+
+#[tauri::command]
 async fn connect_host(
     app: tauri::AppHandle,
     state: tauri::State<'_, ShellState>,
@@ -1117,6 +1125,7 @@ macro_rules! other_production_invoke_handler {
             report_frontend_lifecycle,
             submit_ui_debug_response,
             submit_feedback,
+            check_for_app_update,
             open_external_url
         ]
     };
@@ -1144,6 +1153,7 @@ macro_rules! other_production_invoke_handler {
             report_frontend_lifecycle,
             submit_ui_debug_response,
             submit_feedback,
+            check_for_app_update,
             open_external_url
         ]
     };
