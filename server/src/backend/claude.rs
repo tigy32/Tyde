@@ -4772,8 +4772,7 @@ impl ClaudeInner {
             } else if entry.terminal_notification_received {
                 match entry.execution_mode {
                     Some(ToolExecutionMode::Background) => {
-                        emit_background_task_completion(&owner, entry);
-                        completion_emitted = true;
+                        completion_emitted = emit_background_task_completion(&owner, entry);
                     }
                     Some(ToolExecutionMode::Foreground) => completion_emitted = true,
                     None => {}
@@ -8053,10 +8052,10 @@ fn refresh_unresolved_background_tasks(
                 && execution_mode == ToolExecutionMode::Background
             {
                 emit_background_task_snapshot(owner, entry);
-            } else if entry.terminal_notification_received {
-                if execution_mode == ToolExecutionMode::Background {
-                    emit_background_task_completion(owner, entry);
-                }
+            } else if entry.terminal_notification_received
+                && (execution_mode != ToolExecutionMode::Background
+                    || emit_background_task_completion(owner, entry))
+            {
                 resolved_terminals.push(entry.state.task_id.clone());
             }
         }
@@ -8196,9 +8195,17 @@ fn emit_background_task_snapshot(emitter: &TurnEmitter, entry: &BackgroundTaskEn
     });
 }
 
-fn emit_background_task_completion(emitter: &TurnEmitter, entry: &BackgroundTaskEntry) {
+/// Report a finished background command on its card.
+///
+/// Returns whether the entry has been dealt with and the caller may drop it.
+/// Every caller drops it once this has run, so a `false` mistaken for a
+/// completion strands the card open with nothing left that could ever close
+/// it — which is exactly how a finished command kept a "Running" row in the
+/// in-flight tray forever.
+#[must_use]
+fn emit_background_task_completion(emitter: &TurnEmitter, entry: &BackgroundTaskEntry) -> bool {
     let Some(tool_name) = entry.tool_name.as_deref() else {
-        return;
+        return false;
     };
     let outcome = if let Some(result) = entry.output.as_ref()
         && entry.state.status != BackgroundTaskStatus::Stopped
@@ -8228,16 +8235,16 @@ fn emit_background_task_completion(emitter: &TurnEmitter, entry: &BackgroundTask
             // stdout for a command whose output was never read, and renders
             // identically to a command that really did print nothing — which
             // is how the output of every background command was lost without
-            // anyone ever seeing an error.
-            BackgroundTaskStatus::Completed => match &entry.state.output_unavailable {
-                Some(reason) => ToolExecutionOutcome::Failed {
-                    message: "Tyde could not read this command's output".to_owned(),
-                    details: Some(reason.clone()),
-                    normalization_failure: None,
-                },
-                // Nothing was reported to complete the card with; whoever owns
-                // the result completes it.
-                None => return,
+            // anyone ever seeing an error. Staying silent is no better: a
+            // terminal notification is the last thing the CLI ever says about
+            // this command, so deferring to whoever owns the result defers to
+            // nobody, and the card stays open forever.
+            BackgroundTaskStatus::Completed => ToolExecutionOutcome::Failed {
+                message: "Tyde could not read this command's output".to_owned(),
+                details: Some(entry.state.output_unavailable.clone().unwrap_or_else(|| {
+                    "the completion notification named no output file".to_owned()
+                })),
+                normalization_failure: None,
             },
             BackgroundTaskStatus::Stopped => ToolExecutionOutcome::Cancelled {
                 message: "Background command stopped".to_owned(),
@@ -8255,10 +8262,14 @@ fn emit_background_task_completion(emitter: &TurnEmitter, entry: &BackgroundTask
                     normalization_failure: None,
                 }
             }
-            BackgroundTaskStatus::Running => return,
+            BackgroundTaskStatus::Running => return false,
         }
     };
+    // A false here means the card is already closed or the emitter never knew
+    // the request, and it has surfaced that itself. Neither is fixed by
+    // holding the entry back.
     let _ = emit_tool_completion_for_known_request(emitter, &entry.tool_use_id, tool_name, outcome);
+    true
 }
 
 fn emit_tool_completion_for_known_request(
@@ -8328,7 +8339,7 @@ fn drain_background_task_entries(registry: &mut BackgroundTaskRegistry) {
             entry.state.output_unavailable =
                 Some("Background command output unavailable after Claude process exit".to_string());
         }
-        emit_background_task_completion(owner, &entry);
+        let _ = emit_background_task_completion(owner, &entry);
     }
     command_modes.clear();
 }
@@ -8542,10 +8553,11 @@ fn handle_background_bash_task_frame_with_owners(
                 && entry.tool_name.is_some()
                 && let Some(execution_mode) = entry.execution_mode
             {
-                if execution_mode == ToolExecutionMode::Background {
-                    emit_background_task_completion(owner, entry);
-                }
-                completion_emitted = true;
+                // A foreground `Bash` is mirrored as a task too, and its own
+                // `tool_result` closes the card, so there is nothing to emit
+                // for one here.
+                completion_emitted = execution_mode != ToolExecutionMode::Background
+                    || emit_background_task_completion(owner, entry);
             } else {
                 tracing::error!(
                     task_id,
