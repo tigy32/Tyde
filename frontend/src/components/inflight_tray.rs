@@ -319,8 +319,11 @@ fn derive_child_status(state: &AppState, agent: &crate::state::AgentInfo) -> Chi
         }
         DerivedAgentState::Thinking | DerivedAgentState::Cancelling => ChildAgentStatus::Running,
         // The tray tracks whether work is in flight, not how the last turn
-        // ended; a cancelled child is idle for its purposes.
-        DerivedAgentState::Idle | DerivedAgentState::Cancelled => ChildAgentStatus::Idle,
+        // ended; a cancelled child is idle for its purposes. A child's own
+        // background work is the child's tray to show, not the parent's.
+        DerivedAgentState::Idle
+        | DerivedAgentState::Cancelled
+        | DerivedAgentState::BackgroundWork => ChildAgentStatus::Idle,
         DerivedAgentState::Terminated => ChildAgentStatus::Failed(
             agent
                 .fatal_error
@@ -458,6 +461,14 @@ fn compute_snapshot(state: &AppState, parent: &ActiveAgentRef) -> TraySnapshot {
     });
     snapshot.counts.queued = snapshot.queued.len();
     snapshot
+}
+
+/// Whether the tray would show any running work for this agent: child
+/// agents, workflows, native sub-agents, or backgrounded commands. The
+/// sidebar uses the same answer so its status and the tray never disagree
+/// about what is still in flight.
+pub(crate) fn has_running_background_work(state: &AppState, agent: &ActiveAgentRef) -> bool {
+    compute_snapshot(state, agent).counts.running > 0
 }
 
 #[component]

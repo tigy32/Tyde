@@ -181,6 +181,10 @@ pub(crate) enum DerivedAgentState {
     /// needs to see that their cancel was heard.
     Cancelling,
     Idle,
+    /// The turn is over but the agent still has work running: a backgrounded
+    /// command, a child agent, a workflow. It will be woken when that work
+    /// finishes, so the success check would wrongly say it needs the user.
+    BackgroundWork,
     /// The last turn ended because the user cancelled it. Distinct from `Idle`:
     /// a cancelled turn is *not* a completed one, and rendering it with the
     /// success check told users their interrupt had produced a finished result.
@@ -247,6 +251,48 @@ pub(crate) fn derive_agent_state(
     }
 }
 
+/// [`derive_agent_state`] plus the one input it cannot see: whether the
+/// in-flight tray still has running work for this agent. An idle agent
+/// waiting on that work is reported as [`DerivedAgentState::BackgroundWork`].
+pub(crate) fn derive_agent_state_with_background(
+    state: &AppState,
+    agent: &AgentInfo,
+) -> DerivedAgentState {
+    let derived = state.compaction_in_progress.with(|compaction| {
+        state.context_compactions.with(|context_compaction| {
+            state.agent_turn_active.with(|turn_active| {
+                state.streaming_text.with(|streaming| {
+                    state.last_turn_cancelled.with(|cancelled| {
+                        state.interrupt_pending.with(|interrupt_pending| {
+                            derive_agent_state(
+                                agent,
+                                streaming,
+                                turn_active,
+                                compaction,
+                                context_compaction,
+                                cancelled,
+                                interrupt_pending,
+                            )
+                        })
+                    })
+                })
+            })
+        })
+    });
+    if derived != DerivedAgentState::Idle {
+        return derived;
+    }
+    let agent_ref = ActiveAgentRef {
+        host_id: agent.host_id.clone(),
+        agent_id: agent.agent_id.clone(),
+    };
+    if crate::components::inflight_tray::has_running_background_work(state, &agent_ref) {
+        DerivedAgentState::BackgroundWork
+    } else {
+        DerivedAgentState::Idle
+    }
+}
+
 pub(crate) fn status_label(derived: &DerivedAgentState) -> &'static str {
     match derived {
         DerivedAgentState::Initializing => "Initializing",
@@ -255,6 +301,7 @@ pub(crate) fn status_label(derived: &DerivedAgentState) -> &'static str {
         DerivedAgentState::CompactionQueued => "Compaction queued",
         DerivedAgentState::Compacting => "Compacting context",
         DerivedAgentState::Idle => "Idle",
+        DerivedAgentState::BackgroundWork => "Background work",
         DerivedAgentState::Cancelled => "Cancelled",
         DerivedAgentState::Terminated => "Terminated",
     }
@@ -268,6 +315,7 @@ pub(crate) fn status_icon(derived: &DerivedAgentState) -> &'static str {
         DerivedAgentState::CompactionQueued => "\u{27F2}", // ⟲ counter-clockwise gapped circle
         DerivedAgentState::Compacting => "\u{27F2}",   // ⟲ counter-clockwise gapped circle
         DerivedAgentState::Idle => "\u{2713}",         // ✓
+        DerivedAgentState::BackgroundWork => "\u{29D7}", // ⧗ hourglass
         DerivedAgentState::Cancelled => "\u{2298}",    // ⊘ circled division slash
         DerivedAgentState::Terminated => "\u{2022}",   // •
     }
@@ -281,6 +329,7 @@ pub(crate) fn status_class(derived: &DerivedAgentState) -> &'static str {
         DerivedAgentState::CompactionQueued => "agent-card-status running",
         DerivedAgentState::Compacting => "agent-card-status running",
         DerivedAgentState::Idle => "agent-card-status completed",
+        DerivedAgentState::BackgroundWork => "agent-card-status background",
         DerivedAgentState::Cancelled => "agent-card-status cancelled",
         DerivedAgentState::Terminated => "agent-card-status error",
     }
@@ -1646,55 +1695,19 @@ fn agent_card(
         });
     };
 
+    // A Memo rather than a plain closure: every status closure below would
+    // otherwise carry its own copy of `AppState`, and that per-card weight is
+    // enough to overflow the wasm stack while the sidebar view is built.
     let agent_for_derived = agent.clone();
     let derived = {
-        let streaming = state.streaming_text;
-        let turn_active = state.agent_turn_active;
-        let compaction = state.compaction_in_progress;
-        let context_compaction = state.context_compactions;
-        let cancelled = state.last_turn_cancelled;
-        let interrupt_pending = state.interrupt_pending;
-        move || {
-            compaction.with(|compaction| {
-                context_compaction.with(|context_compaction| {
-                    turn_active.with(|turn_active| {
-                        streaming.with(|streaming| {
-                            cancelled.with(|cancelled| {
-                                interrupt_pending.with(|interrupt_pending| {
-                                    derive_agent_state(
-                                        &agent_for_derived,
-                                        streaming,
-                                        turn_active,
-                                        compaction,
-                                        context_compaction,
-                                        cancelled,
-                                        interrupt_pending,
-                                    )
-                                })
-                            })
-                        })
-                    })
-                })
-            })
-        }
+        let state = state.clone();
+        Memo::new(move |_| derive_agent_state_with_background(&state, &agent_for_derived))
     };
 
-    let status_class_sig = {
-        let derived = derived.clone();
-        move || status_class(&derived())
-    };
-    let status_icon_sig = {
-        let derived = derived.clone();
-        move || status_icon(&derived())
-    };
-    let status_title_sig = {
-        let derived = derived.clone();
-        move || status_label(&derived())
-    };
-    let status_label_sig = {
-        let derived = derived.clone();
-        move || status_label(&derived())
-    };
+    let status_class_sig = move || status_class(&derived.get());
+    let status_icon_sig = move || status_icon(&derived.get());
+    let status_title_sig = move || status_label(&derived.get());
+    let status_label_sig = move || status_label(&derived.get());
     // Running and idle states are conventional enough to read from their glyph
     // alone. A cancelled or cancelling turn is not: `⊘` is ambiguous, and
     // "your work was stopped" is exactly the outcome a user must not have to
@@ -1703,15 +1716,18 @@ fn agent_card(
     // is in it: `⟲` is not self-explanatory, and "your context is being
     // rewritten for the next few minutes" is not an outcome a user should have
     // to hover or use a screen reader to discover.
+    // Background work is spelled out because the hourglass on its own reads
+    // as "still busy", and the useful fact is that the turn is over and
+    // nothing is needed from the user yet.
     let status_label_visible_sig = {
-        let derived = derived.clone();
         move || {
             matches!(
-                derived(),
+                derived.get(),
                 DerivedAgentState::Cancelled
                     | DerivedAgentState::Cancelling
                     | DerivedAgentState::CompactionQueued
                     | DerivedAgentState::Compacting
+                    | DerivedAgentState::BackgroundWork
             )
         }
     };
@@ -1796,7 +1812,6 @@ fn agent_card(
     let details_name = name.clone();
     let details_host = agent.host_id.clone();
     let details_workspace = agent.workspace_roots.join(" · ");
-    let details_status = derived.clone();
 
     view! {
         <div
@@ -1989,7 +2004,7 @@ fn agent_card(
                 on:keydown=|ev: web_sys::KeyboardEvent| { if ev.key() != "Escape" { ev.stop_propagation(); } }
             >
                 <strong>{details_name}</strong>
-                <div>{backend_label(backend)}" · "{move || status_label(&details_status())}</div>
+                <div>{backend_label(backend)}" · "{move || status_label(&derived.get())}</div>
                 <div>{details_host}</div>
                 <div class="sidebar-card-workspace">{details_workspace}</div>
             <div class="agent-card-bottom">
@@ -3109,6 +3124,166 @@ mod wasm_tests {
                 .contains("Cancelled"),
             "the cancelled outcome describes the last turn only and must reset"
         );
+    }
+
+    /// A turn that ends with a backgrounded command still running is not a
+    /// finished result: the backend wakes the agent when the command exits.
+    /// Rendering the success check there told users the agent was waiting on
+    /// them. The card must show a distinct "background work" status until the
+    /// command completes, and a new turn takes precedence over it.
+    #[wasm_bindgen_test]
+    async fn idle_card_with_running_background_command_is_not_shown_as_done() {
+        let container = make_container();
+        let state = make_app_state("local");
+        push_agent(&state, "local", "a1", "Background Runner", true);
+        let agent_id = AgentId("a1".to_owned());
+        let _handle = mount_panel(&container, state.clone());
+        for _ in 0..4 {
+            next_tick().await;
+        }
+
+        let status_of = |container: &HtmlElement| {
+            let card = agent_card_el(container, "a1");
+            let status = card
+                .query_selector(".agent-card-status")
+                .unwrap()
+                .expect("the card renders a status element");
+            (
+                status.get_attribute("title").unwrap_or_default(),
+                status.get_attribute("class").unwrap_or_default(),
+                card.text_content().unwrap_or_default(),
+            )
+        };
+
+        let (title, class, text) = status_of(&container);
+        assert_eq!(title, "Idle");
+        assert!(
+            text.contains('\u{2713}'),
+            "an idle agent shows the check: {text:?}"
+        );
+        assert!(
+            class.contains("completed"),
+            "idle uses the completed style: {class}"
+        );
+
+        // The model runs a command in the background and ends its turn.
+        let apply = |event: protocol::ChatEvent| {
+            crate::dispatch::apply_chat_event(&state, "local", &agent_id, event);
+        };
+        apply(protocol::ChatEvent::TypingStatusChanged(true));
+        apply(protocol::ChatEvent::StreamStart(
+            protocol::StreamStartData {
+                agent: "claude".to_owned(),
+                model: None,
+            },
+        ));
+        apply(protocol::ChatEvent::StreamEnd(protocol::StreamEndData {
+            message: protocol::ChatMessage {
+                message_id: None,
+                timestamp: 1,
+                sender: protocol::MessageSender::Assistant {
+                    agent: "claude".to_owned(),
+                },
+                content: "running the check in the background".to_owned(),
+                reasoning: None,
+                tool_calls: vec![protocol::ToolUseData {
+                    tool_call_id: "toolu_bg".to_owned(),
+                    name: "run_command".to_owned(),
+                    arguments: JsonValue::Object(Default::default()),
+                    content_offset: None,
+                }],
+                model_info: None,
+                token_usage: None,
+                context_breakdown: None,
+                images: None,
+            },
+        }));
+        apply(protocol::ChatEvent::ToolRequest(protocol::ToolRequest {
+            tool_call_id: "toolu_bg".to_owned(),
+            tool_name: "run_command".to_owned(),
+            tool_type: protocol::ToolRequestType::RunCommand {
+                command: "./dev.sh check".to_owned(),
+                working_directory: "/tmp/work".to_owned(),
+            },
+        }));
+        apply(protocol::ChatEvent::ToolProgress(
+            protocol::ToolProgressData {
+                tool_call_id: "toolu_bg".to_owned(),
+                execution_mode: protocol::ToolExecutionMode::Background,
+                cancellable: false,
+                update: protocol::ToolProgressUpdate::Other {
+                    payload: serde_json::json!({
+                        "task_id": "task-bg",
+                        "description": "./dev.sh check",
+                    }),
+                },
+            },
+        ));
+        apply(protocol::ChatEvent::TypingStatusChanged(false));
+        for _ in 0..3 {
+            next_tick().await;
+        }
+
+        let (title, class, text) = status_of(&container);
+        assert_eq!(title, "Background work");
+        assert!(
+            text.contains("Background work"),
+            "the reason the agent is not done must be visible without hovering: {text:?}"
+        );
+        assert!(
+            !text.contains('\u{2713}'),
+            "an agent waiting on background work must not show the success check: {text:?}"
+        );
+        assert!(
+            !text.contains('\u{25F7}'),
+            "background work is not a running turn and must not reuse the clock: {text:?}"
+        );
+        assert!(
+            !class.contains("completed") && !class.contains("running"),
+            "background work must not reuse the completed or running style: {class}"
+        );
+
+        // The command exits; the agent is genuinely idle again.
+        apply(protocol::ChatEvent::ToolExecutionCompleted(
+            crate::components::tool_card::test_utils::succeeded_completion(
+                "toolu_bg",
+                protocol::ToolExecutionResult::RunCommand {
+                    exit_code: 0,
+                    stdout: "done".to_owned(),
+                    stderr: String::new(),
+                },
+            ),
+        ));
+        for _ in 0..3 {
+            next_tick().await;
+        }
+        let (title, _, text) = status_of(&container);
+        assert_eq!(title, "Idle");
+        assert!(
+            text.contains('\u{2713}') && !text.contains("Background work"),
+            "a completed command returns the card to the idle check: {text:?}"
+        );
+
+        // A new turn while another background command runs reads as Thinking.
+        apply(protocol::ChatEvent::ToolProgress(
+            protocol::ToolProgressData {
+                tool_call_id: "toolu_bg_2".to_owned(),
+                execution_mode: protocol::ToolExecutionMode::Background,
+                cancellable: false,
+                update: protocol::ToolProgressUpdate::Other {
+                    payload: serde_json::json!({
+                        "task_id": "task-bg-2",
+                        "description": "sleep 30",
+                    }),
+                },
+            },
+        ));
+        apply(protocol::ChatEvent::TypingStatusChanged(true));
+        for _ in 0..3 {
+            next_tick().await;
+        }
+        let (title, _, _) = status_of(&container);
+        assert_eq!(title, "Thinking", "a live turn outranks background work");
     }
 
     fn text_position(text: &str, needle: &str) -> usize {

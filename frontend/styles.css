@@ -6310,6 +6310,12 @@ math merror {
     color: var(--text-tertiary);
 }
 
+/* The turn is over but work is still running in the background; the agent
+   will be woken by it, so this must not read as "done, needs you". */
+.agent-card-status.background {
+    color: var(--warning);
+}
+
 /* Spelled-out status, shown for outcomes whose glyph alone is ambiguous. */
 .agent-card-status-text {
     margin-left: 4px;

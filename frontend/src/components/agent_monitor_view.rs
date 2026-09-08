@@ -13,8 +13,8 @@ use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::spawn_local;
 
 use crate::components::agents_panel::{
-    DerivedAgentState, backend_class, backend_label, derive_agent_state, relative_time,
-    status_class, status_icon, status_label,
+    DerivedAgentState, backend_class, backend_label, derive_agent_state_with_background,
+    relative_time, status_class, status_icon, status_label,
 };
 use crate::state::{AgentInfo, AgentMonitorKey, AppState, ProjectInfo};
 
@@ -182,7 +182,11 @@ pub(crate) fn status_to_filter(status: DerivedAgentState) -> AgentStatusFilter {
         // someone filtering for it wants. Only the card's own presentation
         // distinguishes cancelled from completed; the filter vocabulary is
         // persisted in user preferences and is deliberately left unchanged.
-        DerivedAgentState::Idle | DerivedAgentState::Cancelled => AgentStatusFilter::Idle,
+        // Waiting on background work is idle from the agent's side: no turn
+        // is running, and the filter vocabulary is persisted, so it stays.
+        DerivedAgentState::Idle
+        | DerivedAgentState::Cancelled
+        | DerivedAgentState::BackgroundWork => AgentStatusFilter::Idle,
         DerivedAgentState::Terminated => AgentStatusFilter::Terminated,
     }
 }
@@ -304,7 +308,9 @@ fn monitor_status_rank(status: DerivedAgentState) -> u8 {
         | DerivedAgentState::Cancelling
         | DerivedAgentState::CompactionQueued
         | DerivedAgentState::Compacting => 0,
-        DerivedAgentState::Idle | DerivedAgentState::Cancelled => 1,
+        DerivedAgentState::Idle
+        | DerivedAgentState::Cancelled
+        | DerivedAgentState::BackgroundWork => 1,
         DerivedAgentState::Terminated => 2,
     }
 }
@@ -961,84 +967,59 @@ pub fn AgentMonitorView() -> impl IntoView {
             .map(|host| (host.id, host.label))
             .collect();
 
-        rows_state.streaming_text.with(|streaming| {
-            rows_state.agent_turn_active.with(|turn_active| {
-                rows_state.compaction_in_progress.with(|compaction| {
-                    rows_state.context_compactions.with(|context_compaction| {
-                        let mut pinned_rows: Vec<AgentMonitorRow> = Vec::new();
-                        let mut normal_rows: Vec<AgentMonitorRow> = Vec::new();
-                        for agent in agents.iter() {
-                            let status = rows_state.last_turn_cancelled.with(|cancelled| {
-                                rows_state.interrupt_pending.with(|interrupt_pending| {
-                                    derive_agent_state(
-                                        agent,
-                                        streaming,
-                                        turn_active,
-                                        compaction,
-                                        context_compaction,
-                                        cancelled,
-                                        interrupt_pending,
-                                    )
-                                })
-                            });
-                            if !agent_passes_view_filters(
-                                agent,
-                                status,
-                                &preferences.filters,
-                                &query,
-                            ) {
-                                continue;
-                            }
-                            let target = agent_annotation_target(agent);
-                            let tag_refs = agent_tag_refs(&target, &tags);
-                            if !agent_passes_tag_filter(&tag_refs, &preferences.filters.tags) {
-                                continue;
-                            }
-                            let row = AgentMonitorRow {
-                                key: AgentMonitorKey::from_agent(agent),
-                                status,
-                                host_label: host_label(&host_labels, &agent.host_id),
-                                project_label: project_label(&projects, agent),
-                                agent: agent.clone(),
-                            };
-                            // Pinned rows still passed the active filters/search
-                            // above; a filtered-out pin is never force-shown.
-                            if pinned_targets.contains(&target) {
-                                pinned_rows.push(row);
-                            } else {
-                                normal_rows.push(row);
-                            }
-                        }
-                        // The Pinned section is a flat list ordered by the active
-                        // sort; the normal projection keeps the active grouping.
-                        sort_rows(
-                            &mut pinned_rows,
-                            preferences.sort_mode,
-                            &preferences.manual_order,
-                        );
-                        let groups = if matches!(preferences.group_mode, AgentGroupMode::Tag) {
-                            build_tag_groups(
-                                normal_rows,
-                                preferences.sort_mode,
-                                &preferences.manual_order,
-                                &tags,
-                            )
-                        } else {
-                            build_groups(
-                                normal_rows,
-                                preferences.sort_mode,
-                                preferences.group_mode,
-                                &preferences.manual_order,
-                            )
-                        };
-                        AgentMonitorSections {
-                            pinned: pinned_rows,
-                            groups,
-                        }
-                    })
-                })
-            })
-        })
+        let mut pinned_rows: Vec<AgentMonitorRow> = Vec::new();
+        let mut normal_rows: Vec<AgentMonitorRow> = Vec::new();
+        for agent in agents.iter() {
+            let status = derive_agent_state_with_background(&rows_state, agent);
+            if !agent_passes_view_filters(agent, status, &preferences.filters, &query) {
+                continue;
+            }
+            let target = agent_annotation_target(agent);
+            let tag_refs = agent_tag_refs(&target, &tags);
+            if !agent_passes_tag_filter(&tag_refs, &preferences.filters.tags) {
+                continue;
+            }
+            let row = AgentMonitorRow {
+                key: AgentMonitorKey::from_agent(agent),
+                status,
+                host_label: host_label(&host_labels, &agent.host_id),
+                project_label: project_label(&projects, agent),
+                agent: agent.clone(),
+            };
+            // Pinned rows still passed the active filters/search
+            // above; a filtered-out pin is never force-shown.
+            if pinned_targets.contains(&target) {
+                pinned_rows.push(row);
+            } else {
+                normal_rows.push(row);
+            }
+        }
+        // The Pinned section is a flat list ordered by the active
+        // sort; the normal projection keeps the active grouping.
+        sort_rows(
+            &mut pinned_rows,
+            preferences.sort_mode,
+            &preferences.manual_order,
+        );
+        let groups = if matches!(preferences.group_mode, AgentGroupMode::Tag) {
+            build_tag_groups(
+                normal_rows,
+                preferences.sort_mode,
+                &preferences.manual_order,
+                &tags,
+            )
+        } else {
+            build_groups(
+                normal_rows,
+                preferences.sort_mode,
+                preferences.group_mode,
+                &preferences.manual_order,
+            )
+        };
+        AgentMonitorSections {
+            pinned: pinned_rows,
+            groups,
+        }
     });
 
     // Flat key order across the pinned section and all groups, for drag /
