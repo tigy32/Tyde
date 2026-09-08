@@ -898,6 +898,8 @@ fn parse_backend(value: &str) -> Option<protocol::BackendKind> {
         "codex" => Some(protocol::BackendKind::Codex),
         "antigravity" => Some(protocol::BackendKind::Antigravity),
         "hermes" => Some(protocol::BackendKind::Hermes),
+        "grok" => Some(protocol::BackendKind::Grok),
+        "opencode" => Some(protocol::BackendKind::Opencode),
         _ => None,
     }
 }
@@ -932,9 +934,9 @@ fn NewChatOptions() -> impl IntoView {
     let change_backend_state = state.clone();
     let on_backend_change = move |event| {
         let value = event_target_value(&event);
-        change_backend_state
-            .draft_backend_override
-            .set(parse_backend(&value));
+        let backend = parse_backend(&value);
+        log::debug!("Mobile backend selection: value={value:?}, backend={backend:?}");
+        change_backend_state.draft_backend_override.set(backend);
     };
 
     let custom_agents_state = state.clone();
@@ -2617,7 +2619,15 @@ mod wasm_tests {
                 settings.insert(
                     host.clone(),
                     HostSettings {
-                        enabled_backends: vec![BackendKind::Codex, BackendKind::Claude],
+                        enabled_backends: vec![
+                            BackendKind::Codex,
+                            BackendKind::Claude,
+                            BackendKind::Kiro,
+                            BackendKind::Antigravity,
+                            BackendKind::Hermes,
+                            BackendKind::Grok,
+                            BackendKind::Opencode,
+                        ],
                         default_backend: Some(BackendKind::Codex),
                         ..HostSettings::default()
                     },
@@ -2658,6 +2668,30 @@ mod wasm_tests {
                     .contains("Claude"),
             "every enabled backend should be offered"
         );
+        let state = handle.borrow().as_ref().unwrap().clone();
+        for (value, label, expected) in [
+            ("codex", "Codex", Some(BackendKind::Codex)),
+            ("kiro", "Kiro", Some(BackendKind::Kiro)),
+            ("antigravity", "Antigravity", Some(BackendKind::Antigravity)),
+            ("hermes", "Hermes", Some(BackendKind::Hermes)),
+            ("grok", "Grok", Some(BackendKind::Grok)),
+            ("opencode", "OpenCode", Some(BackendKind::Opencode)),
+            ("", "Host default (Codex)", None),
+        ] {
+            backend.set_value(value);
+            backend
+                .dispatch_event(&web_sys::Event::new("change").unwrap())
+                .unwrap();
+            next_tick().await;
+            assert_eq!(
+                state.draft_backend_override.get_untracked(),
+                expected,
+                "choosing {label} must preserve the backend override"
+            );
+            assert_eq!(backend.value(), value, "{label} must remain selected");
+            let selected = backend.query_selector("option:checked").unwrap().unwrap();
+            assert_eq!(selected.text_content().unwrap_or_default(), label);
+        }
         backend.set_value("claude");
         backend
             .dispatch_event(&web_sys::Event::new("change").unwrap())
