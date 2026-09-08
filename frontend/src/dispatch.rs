@@ -5159,23 +5159,14 @@ fn apply_session_history(
         state.chat_tool_rows.update(|map| {
             let agent_index = map.entry(agent_id.clone()).or_default();
             for (tool_call_id, row_id) in replay.tool_rows {
-                agent_index.insert(tool_call_id, row_id);
+                // `or_insert`, matching `message_rows` above: a page can carry
+                // a card the live stream already rendered, and only the live
+                // row holds its completion. Re-pointing the index at the paged
+                // copy makes a finished tool look pending forever, because the
+                // page ends before the completion that closed it.
+                agent_index.entry(tool_call_id).or_insert(row_id);
             }
         });
-    }
-
-    for (tool_call_id, progress) in replay.tool_progress {
-        let key = (agent_id.clone(), tool_call_id);
-        let existing = state
-            .tool_progress
-            .with_untracked(|map| map.get(&key).cloned());
-        if let Some(signal) = existing {
-            signal.set(progress);
-        } else {
-            state.tool_progress.update(|map| {
-                map.insert(key, leptos::prelude::ArcRwSignal::new(progress));
-            });
-        }
     }
 
     state.session_history.update(|map| {
@@ -5316,7 +5307,6 @@ struct HistoryReplay {
     rows: Vec<crate::state::ChatRowHandle>,
     message_rows: HashMap<protocol::ChatMessageId, crate::state::ChatRowId>,
     tool_rows: HashMap<ToolCallId, crate::state::ChatRowId>,
-    tool_progress: HashMap<ToolCallId, protocol::ToolProgressData>,
 }
 
 impl HistoryReplay {
@@ -5433,10 +5423,16 @@ impl HistoryReplay {
                     }
                 });
             }
-            ChatEvent::ToolProgress(data) => {
-                self.tool_progress
-                    .insert(ToolCallId(data.tool_call_id.clone()), data);
-            }
+            // Progress is a liveness snapshot, and a page is strictly older
+            // turns: the tool it describes may have finished in a turn newer
+            // than the page, whose completion the page therefore cannot
+            // contain. Seeding the live progress store from here resurrects
+            // finished work — a background command reappears in the in-flight
+            // tray as "Running" and never leaves, because nothing will emit
+            // its completion a second time. Anything genuinely still in flight
+            // is already in the store from the agent bootstrap, which carries
+            // the authoritative active set.
+            ChatEvent::ToolProgress(_) => {}
             // Paged "load earlier messages" history is strictly older turns.
             // Orchestration is scoped to the current turn (a live session would
             // have already pruned these on each subsequent user message), so

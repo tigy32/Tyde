@@ -46,8 +46,9 @@ use crate::backend::turn_emitter::{
     AgentName, ResponseHandle, RetryAttemptPayload, StreamEndPayload, TurnEmitter,
 };
 use crate::backend::{
-    BackendExecutionMode, BackendStartupError, SessionCommand, StartupMcpServer,
-    StartupMcpTransport, normalize_mcp_call_tool_result, render_combined_spawn_instructions,
+    BackendExecutionMode, BackendStartupError, CancelBackgroundTaskOutcome, SessionCommand,
+    StartupMcpServer, StartupMcpTransport, normalize_mcp_call_tool_result,
+    render_combined_spawn_instructions,
 };
 use crate::process_env;
 use crate::review_mcp::REVIEW_FEEDBACK_MCP_SERVER_NAME;
@@ -143,6 +144,10 @@ pub struct CodexCommandHandle {
 impl CodexCommandHandle {
     pub async fn execute(&self, command: SessionCommand) -> Result<(), String> {
         self.inner.execute(command).await
+    }
+
+    async fn cancel_background_task(&self, tool_call_id: &str) -> CancelBackgroundTaskOutcome {
+        self.inner.cancel_background_task(tool_call_id).await
     }
 
     async fn control_goal(&self, control: protocol::GoalControl) -> Result<(), String> {
@@ -5859,7 +5864,7 @@ impl CodexInner {
     /// tracked either as a task (`background_commands`, keyed by its Codex task
     /// id) or as a still-running execution (`outstanding_command_executions`,
     /// keyed by its process id); both are addressed by the same terminate RPC.
-    async fn cancel_background_task(&self, tool_call_id: &str) -> bool {
+    async fn cancel_background_task(&self, tool_call_id: &str) -> CancelBackgroundTaskOutcome {
         let target = {
             let state = self.state.lock().await;
             state
@@ -5885,7 +5890,7 @@ impl CodexInner {
                 tool_call_id,
                 "no running Codex background command matches the cancelled card"
             );
-            return false;
+            return CancelBackgroundTaskOutcome::NotTracked;
         };
         if let Err(error) = self
             .rpc
@@ -5902,7 +5907,9 @@ impl CodexInner {
                 error = %error,
                 "failed to terminate a cancelled Codex background command"
             );
-            return false;
+            return CancelBackgroundTaskOutcome::Failed(format!(
+                "Codex could not stop the background command: {error}"
+            ));
         }
         // Killing the process makes Codex report the exec as failed, which
         // would blame the command for what the user did. Close the card as
@@ -5914,7 +5921,7 @@ impl CodexInner {
         state
             .cancelled_tool_call_ids
             .insert(tool_call_id.to_owned());
-        true
+        CancelBackgroundTaskOutcome::Cancelled
     }
 
     async fn terminate_background_terminals(&self) {
@@ -7972,12 +7979,10 @@ impl CodexInner {
                 Ok(())
             }
             SessionCommand::CancelBackgroundTask { tool_call_id } => {
-                if self.cancel_background_task(&tool_call_id).await {
-                    Ok(())
-                } else {
-                    Err(format!(
-                        "no running Codex background command for card {tool_call_id}"
-                    ))
+                match self.cancel_background_task(&tool_call_id).await {
+                    CancelBackgroundTaskOutcome::Cancelled
+                    | CancelBackgroundTaskOutcome::NotTracked => Ok(()),
+                    CancelBackgroundTaskOutcome::Failed(error) => Err(error),
                 }
             }
             SessionCommand::GetSettings => {
@@ -19091,7 +19096,7 @@ struct CodexSettingsUpdate {
 
 struct CodexCancelBackgroundTask {
     tool_call_id: String,
-    reply: oneshot::Sender<bool>,
+    reply: oneshot::Sender<CancelBackgroundTaskOutcome>,
 }
 
 struct CodexInterrupt {
@@ -19432,13 +19437,10 @@ impl CodexBackend {
                     }
                     cancel = cancel_task_rx.recv() => {
                         let Some(cancel) = cancel else { break; };
-                        let cancelled = handle
-                            .execute(SessionCommand::CancelBackgroundTask {
-                                tool_call_id: cancel.tool_call_id,
-                            })
-                            .await
-                            .is_ok();
-                        let _ = cancel.reply.send(cancelled);
+                        let outcome = handle
+                            .cancel_background_task(&cancel.tool_call_id)
+                            .await;
+                        let _ = cancel.reply.send(outcome);
                     }
                     update = settings_rx.recv() => {
                         let Some(update) = update else { break; };
@@ -20688,13 +20690,10 @@ impl Backend for CodexBackend {
                     }
                     cancel = cancel_task_rx.recv() => {
                         let Some(cancel) = cancel else { break; };
-                        let cancelled = handle
-                            .execute(SessionCommand::CancelBackgroundTask {
-                                tool_call_id: cancel.tool_call_id,
-                            })
-                            .await
-                            .is_ok();
-                        let _ = cancel.reply.send(cancelled);
+                        let outcome = handle
+                            .cancel_background_task(&cancel.tool_call_id)
+                            .await;
+                        let _ = cancel.reply.send(outcome);
                     }
                     update = settings_rx.recv() => {
                         let Some(update) = update else { break };
@@ -20966,13 +20965,10 @@ impl Backend for CodexBackend {
                     }
                     cancel = cancel_task_rx.recv() => {
                         let Some(cancel) = cancel else { break; };
-                        let cancelled = handle
-                            .execute(SessionCommand::CancelBackgroundTask {
-                                tool_call_id: cancel.tool_call_id,
-                            })
-                            .await
-                            .is_ok();
-                        let _ = cancel.reply.send(cancelled);
+                        let outcome = handle
+                            .cancel_background_task(&cancel.tool_call_id)
+                            .await;
+                        let _ = cancel.reply.send(outcome);
                     }
                     update = settings_rx.recv() => {
                         let Some(update) = update else { break };
@@ -21144,7 +21140,7 @@ impl Backend for CodexBackend {
         accepted && done.await.unwrap_or(false)
     }
 
-    async fn cancel_background_task(&self, tool_call_id: &str) -> bool {
+    async fn cancel_background_task(&self, tool_call_id: &str) -> CancelBackgroundTaskOutcome {
         let (reply, done) = oneshot::channel();
         if self
             .cancel_task_tx
@@ -21154,9 +21150,10 @@ impl Backend for CodexBackend {
             })
             .is_err()
         {
-            return false;
+            return CancelBackgroundTaskOutcome::NotTracked;
         }
-        done.await.unwrap_or(false)
+        done.await
+            .unwrap_or(CancelBackgroundTaskOutcome::NotTracked)
     }
 
     async fn shutdown(self) {

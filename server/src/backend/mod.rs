@@ -954,6 +954,28 @@ pub enum SendOutcome {
     Closed,
 }
 
+/// What came of asking a backend to stop one background command.
+///
+/// The three answers are not interchangeable, and collapsing them to a boolean
+/// is what left dead commands stuck in the in-flight tray: a card the backend
+/// has never heard of and a kill that failed both reported "false", so the only
+/// safe response was to leave the row up, including for the case where the row
+/// is provably wrong.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CancelBackgroundTaskOutcome {
+    /// The backend addressed a live command and asked it to stop. The card is
+    /// closed by the backend's own terminal reporting, as it is for a command
+    /// that ends on its own.
+    Cancelled,
+    /// The backend owns no live command for this card. Nothing is running, so
+    /// nothing can report it finished; the card is closed here or it stays open
+    /// for the rest of the session.
+    NotTracked,
+    /// A live command was addressed and the attempt to stop it failed. The
+    /// command may well still be running, so the card stays open and says so.
+    Failed(String),
+}
+
 /// A coding agent backend session handle.
 ///
 /// Created via `Backend::spawn()` which returns `(Self, EventStream)`.
@@ -1103,14 +1125,12 @@ pub trait Backend: Send + Sync + 'static {
     /// Stop one still-running background command, named by the card it runs on.
     ///
     /// This is the user pressing cancel on a specific card, not an interrupt of
-    /// the turn: other background work keeps running. Returns false when the
-    /// backend cannot address a single background command, which is what keeps
-    /// the cancel affordance off cards that cannot honour it.
+    /// the turn: other background work keeps running.
     fn cancel_background_task(
         &self,
         _tool_call_id: &str,
-    ) -> impl std::future::Future<Output = bool> + Send {
-        std::future::ready(false)
+    ) -> impl std::future::Future<Output = CancelBackgroundTaskOutcome> + Send {
+        std::future::ready(CancelBackgroundTaskOutcome::NotTracked)
     }
 
     /// Shut down the live backend session and release any subprocess resources.

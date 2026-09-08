@@ -9303,14 +9303,14 @@ impl HostHandle {
         &self,
         agent_id: &AgentId,
         tool_call_id: &str,
-    ) -> bool {
+    ) -> crate::backend::CancelBackgroundTaskOutcome {
         let agent_handle = {
             let state = self.state.lock().await;
             state.registry.agent_handle(agent_id)
         };
         match agent_handle {
             Some(handle) => handle.cancel_background_task(tool_call_id).await,
-            None => false,
+            None => crate::backend::CancelBackgroundTaskOutcome::NotTracked,
         }
     }
 

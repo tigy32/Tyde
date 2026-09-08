@@ -9127,3 +9127,109 @@ async fn per_character_streaming_reaches_the_client_coalesced() {
         ANSWER.chars().count()
     );
 }
+
+/// Pressing stop on a background command the backend no longer tracks closes
+/// its card, so its in-flight tray row goes away.
+///
+/// A background card is opened by a progress snapshot and closed only by the
+/// command's own terminal report. When the provider loses the command — its
+/// process exited with the session, its task registry was drained, the CLI was
+/// replaced — that report is never coming, and the card stays open forever:
+/// the tray shows a row reading "Running" with a stop button that reports
+/// nothing back, for a command that is not running. The stop button is the
+/// user's way out of that state, so it has to be the thing that ends it.
+///
+/// The mock backend tracks no background commands at all, which is exactly the
+/// state under test: a card is open and the backend can say nothing about it.
+#[tokio::test]
+async fn stopping_an_untracked_background_command_closes_its_card() {
+    const CARD: &str = "mock-orphaned-background-command";
+
+    let mut fixture = Fixture::new().await;
+    let agent = fixture
+        .spawn_scripted(
+            "orphaned-background-agent",
+            MockScript::one(
+                MockTurn::text("mock backend response to: scripted launch")
+                    .with_open_background_task(CARD),
+            )
+            .with_unbounded_echo(),
+        )
+        .await;
+
+    // The card the tray offers a stop button on is the one whose progress says
+    // it is cancellable and still running. Reaching for it any other way would
+    // test something the button never does.
+    let progress = fixture
+        .next_chat_event_matching(&agent, "background command progress", |event| {
+            matches!(
+                event,
+                ChatEvent::ToolProgress(progress)
+                    if progress.tool_call_id == CARD
+                        && progress.execution_mode == protocol::ToolExecutionMode::Background
+                        && progress.cancellable
+            )
+        })
+        .await;
+    assert!(matches!(progress, ChatEvent::ToolProgress(_)));
+
+    fixture
+        .client
+        .cancel_background_task(
+            &agent.stream,
+            protocol::CancelBackgroundTaskPayload {
+                tool_call_id: CARD.to_owned(),
+            },
+        )
+        .await
+        .expect("cancel_background_task frame");
+
+    let completion = fixture
+        .next_chat_event_matching(&agent, "background card closed after stop", |event| {
+            matches!(
+                event,
+                ChatEvent::ToolExecutionCompleted(completion)
+                    if completion.tool_call_id == CARD
+            )
+        })
+        .await;
+    let ChatEvent::ToolExecutionCompleted(completion) = completion else {
+        unreachable!("matched a ToolExecutionCompleted");
+    };
+    assert!(
+        matches!(completion.outcome, ToolExecutionOutcome::Cancelled { .. }),
+        "a command that was already gone must close as cancelled, not as a result nobody \
+         observed: {:?}",
+        completion.outcome
+    );
+
+    // Stopping the same card again must not manufacture a second outcome: the
+    // card is closed, so there is nothing left to close.
+    fixture
+        .client
+        .cancel_background_task(
+            &agent.stream,
+            protocol::CancelBackgroundTaskPayload {
+                tool_call_id: CARD.to_owned(),
+            },
+        )
+        .await
+        .expect("second cancel_background_task frame");
+    fixture
+        .client
+        .send_message(&agent.stream, "after the stop".to_owned())
+        .await
+        .expect("send follow-up after stopping the background card");
+    let next = fixture
+        .next_chat_event_matching(&agent, "next event after a repeated stop", |event| {
+            matches!(
+                event,
+                ChatEvent::ToolExecutionCompleted(completion) if completion.tool_call_id == CARD
+            ) || matches!(event, ChatEvent::StreamEnd(_))
+        })
+        .await;
+    assert!(
+        matches!(next, ChatEvent::StreamEnd(_)),
+        "a repeated stop closed the card twice: {next:?}"
+    );
+}

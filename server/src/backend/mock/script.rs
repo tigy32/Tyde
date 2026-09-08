@@ -406,6 +406,19 @@ impl MockTurn {
         })])
     }
 
+    /// Leave a background tool call in flight and end the turn without ever
+    /// collecting it: the request and a background-mode progress snapshot go
+    /// out, and no completion follows. This is the state a provider leaves
+    /// behind when it loses track of a command it started — the card stays
+    /// open and its in-flight tray row has nothing left that could close it.
+    pub fn with_open_background_task(self, tool_call_id: impl Into<String>) -> Self {
+        let steps = emit::background_task_started_frames(&tool_call_id.into(), true)
+            .into_iter()
+            .map(MockStep::emit)
+            .collect();
+        self.with_appended_steps(steps)
+    }
+
     /// Leave a background tool call in flight once the turn has gone idle, and
     /// drain it when `drain` is released. An agent parked like this reads as
     /// inactive — no turn, no output, nothing on the stream — while still
@@ -416,7 +429,7 @@ impl MockTurn {
         drain: &MockGateHandle,
     ) -> Self {
         let tool_call_id = tool_call_id.into();
-        let mut steps: Vec<MockStep> = emit::background_task_started_frames(&tool_call_id)
+        let mut steps: Vec<MockStep> = emit::background_task_started_frames(&tool_call_id, false)
             .into_iter()
             .map(MockStep::emit)
             .collect();

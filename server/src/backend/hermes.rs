@@ -40,10 +40,11 @@ use crate::backend::{
     BackendCompactionStart, BackendCompactionSuccess, BackendCompactionTerminalEvidence,
     BackendCompactionUnavailableReason, BackendCompactionUserFocus,
     BackendCompactionUserFocusProvenance, BackendEvent, BackendObservedCompaction, BackendSession,
-    BackendSpawnConfig, BackendStartupError, EventStream, PostCompactionTokenCount,
-    StartupMcpServer, StartupMcpTransport, backend_fork_unsupported_message,
-    normalize_mcp_call_tool_result, render_combined_spawn_instructions,
-    resolve_settings as resolve_backend_settings, tyde_owned_no_root_cwd,
+    BackendSpawnConfig, BackendStartupError, CancelBackgroundTaskOutcome, EventStream,
+    PostCompactionTokenCount, StartupMcpServer, StartupMcpTransport,
+    backend_fork_unsupported_message, normalize_mcp_call_tool_result,
+    render_combined_spawn_instructions, resolve_settings as resolve_backend_settings,
+    tyde_owned_no_root_cwd,
 };
 use crate::mcp_bridge::{
     BridgeDescriptor, BridgeServerConfig, BridgeTransport, DESCRIPTOR_ENV, DESCRIPTOR_FILE_NAME,
@@ -424,7 +425,7 @@ enum HermesBackendCommand {
     Interrupt(oneshot::Sender<bool>),
     CancelBackgroundTask {
         tool_call_id: String,
-        reply: oneshot::Sender<bool>,
+        reply: oneshot::Sender<CancelBackgroundTaskOutcome>,
     },
     Compact(
         BackendCompactionRequest,
@@ -1396,7 +1397,7 @@ impl Backend for HermesBackend {
         }
     }
 
-    async fn cancel_background_task(&self, tool_call_id: &str) -> bool {
+    async fn cancel_background_task(&self, tool_call_id: &str) -> CancelBackgroundTaskOutcome {
         let (reply, reply_rx) = oneshot::channel();
         if self
             .command_tx
@@ -1406,9 +1407,11 @@ impl Backend for HermesBackend {
             })
             .is_err()
         {
-            return false;
+            return CancelBackgroundTaskOutcome::NotTracked;
         }
-        reply_rx.await.unwrap_or(false)
+        reply_rx
+            .await
+            .unwrap_or(CancelBackgroundTaskOutcome::NotTracked)
     }
 
     async fn shutdown(self) {
@@ -2386,8 +2389,8 @@ impl HermesSessionActor {
                             tool_call_id,
                             reply,
                         } => {
-                            let ok = self.handle_cancel_background_task(&tool_call_id).await;
-                            let _ = reply.send(ok);
+                            let outcome = self.handle_cancel_background_task(&tool_call_id).await;
+                            let _ = reply.send(outcome);
                         }
                         HermesBackendCommand::Compact(request, reply) => {
                             let start = self.handle_compaction(request).await;
@@ -2923,7 +2926,10 @@ impl HermesSessionActor {
     /// window's work. The card is closed here rather than left to the
     /// `process.list` poll: the poll would see a non-zero exit and report the
     /// command as failed, blaming it for what the user did.
-    async fn handle_cancel_background_task(&mut self, tool_call_id: &str) -> bool {
+    async fn handle_cancel_background_task(
+        &mut self,
+        tool_call_id: &str,
+    ) -> CancelBackgroundTaskOutcome {
         let Some(task_id) = self
             .mapper
             .background_tasks
@@ -2935,7 +2941,7 @@ impl HermesSessionActor {
                 tool_call_id,
                 "no running Hermes background task matches the cancelled card"
             );
-            return false;
+            return CancelBackgroundTaskOutcome::NotTracked;
         };
         if let Err(error) = self
             .gateway
@@ -2946,10 +2952,12 @@ impl HermesSessionActor {
             .await
         {
             self.emit_error(format!("Hermes process.kill failed: {error}"));
-            return false;
+            return CancelBackgroundTaskOutcome::Failed(format!(
+                "Hermes could not stop the background command: {error}"
+            ));
         }
         let Some(background) = self.mapper.background_tasks.remove(&task_id) else {
-            return false;
+            return CancelBackgroundTaskOutcome::NotTracked;
         };
         for event in self.mapper.background_terminal_events(
             &background,
@@ -2961,7 +2969,7 @@ impl HermesSessionActor {
         ) {
             self.emit(event);
         }
-        true
+        CancelBackgroundTaskOutcome::Cancelled
     }
 
     async fn handle_gateway_event(&mut self, event: HermesGatewayEvent) -> bool {

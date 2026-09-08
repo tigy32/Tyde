@@ -686,17 +686,30 @@ pub(crate) async fn route_client_envelope(
                 let payload: CancelBackgroundTaskPayload =
                     parse_payload(&envelope, "cancel_background_task")?;
 
-                // The card stays open when this fails, which is the honest
-                // report: the command is still running.
-                if !host
+                // The card stays open only when the stop itself failed, which
+                // is the honest report: the command may still be running. A
+                // card the backend does not track is closed by the backend, so
+                // the row it left in the in-flight tray goes away.
+                match host
                     .cancel_background_task(&agent_id, &payload.tool_call_id)
                     .await
                 {
-                    tracing::warn!(
-                        agent_id = %agent_id,
-                        tool_call_id = payload.tool_call_id,
-                        "background task cancel did not reach a running command"
-                    );
+                    crate::backend::CancelBackgroundTaskOutcome::Cancelled => {}
+                    crate::backend::CancelBackgroundTaskOutcome::NotTracked => {
+                        tracing::info!(
+                            agent_id = %agent_id,
+                            tool_call_id = payload.tool_call_id,
+                            "background task cancel found no running command; closing its card"
+                        );
+                    }
+                    crate::backend::CancelBackgroundTaskOutcome::Failed(error) => {
+                        tracing::warn!(
+                            agent_id = %agent_id,
+                            tool_call_id = payload.tool_call_id,
+                            error,
+                            "background task cancel failed; leaving the card open"
+                        );
+                    }
                 }
             }
             FrameKind::Interrupt => {

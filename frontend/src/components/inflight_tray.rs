@@ -2847,6 +2847,121 @@ mod wasm_tests {
         );
     }
 
+    /// Deliver a "load earlier messages" page, exactly as the server answers a
+    /// `FetchSessionHistory`: correlated against the request this client is
+    /// waiting for, carrying older turns only.
+    fn apply_history_page(state: &AppState, events: Vec<ChatEvent>) {
+        let agent_id = parent_ref().agent_id;
+        let request_id = protocol::HistoryPageRequestId("tray-page".to_owned());
+        state.session_history.update(|map| {
+            map.insert(
+                agent_id.clone(),
+                crate::state::SessionHistoryState {
+                    message_count: 1,
+                    oldest_seq: Some(20),
+                    has_more_before: true,
+                    pending_request: Some(crate::state::PendingHistoryRequest {
+                        request_id: request_id.clone(),
+                        before_seq: Some(20),
+                    }),
+                },
+            );
+        });
+        let envelope = Envelope::from_payload(
+            StreamPath("/agent/agent-parent/instance-1".to_owned()),
+            protocol::FrameKind::SessionHistory,
+            0,
+            &protocol::SessionHistoryPayload {
+                agent_id,
+                request_id,
+                request_before_seq: Some(20),
+                events,
+                has_more_before: false,
+                oldest_seq: Some(1),
+            },
+        )
+        .expect("session history envelope");
+        crate::dispatch::dispatch_envelope(state, "host-1", envelope);
+    }
+
+    /// Scrolling back must not restart a command that already finished.
+    ///
+    /// A page is strictly older turns, so it carries the request and the
+    /// progress snapshot that opened a background card but not the completion
+    /// that closed it — that landed in a newer turn than the page covers.
+    /// Replaying the snapshot as live state put the command back in the tray as
+    /// "Running" with no event left that could ever remove it: the row stayed
+    /// for the rest of the session, and its stop button had nothing to stop.
+    #[wasm_bindgen_test]
+    async fn history_page_does_not_resurrect_a_finished_background_command() {
+        let (container, state) = mount_tray(seed_command_response);
+        apply_live(
+            &state,
+            ChatEvent::ToolProgress(background_command_progress()),
+        );
+        next_tick().await;
+        assert_eq!(
+            count(&container, ".inflight-tray"),
+            1,
+            "the running background command is in the tray to begin with"
+        );
+
+        apply_live(
+            &state,
+            command_completion(ToolExecutionResult::RunCommand {
+                exit_code: 0,
+                stdout: "done".to_owned(),
+                stderr: String::new(),
+            }),
+        );
+        next_tick().await;
+        assert_eq!(
+            count(&container, ".inflight-tray"),
+            0,
+            "the finished command leaves the tray"
+        );
+
+        apply_history_page(
+            &state,
+            vec![
+                ChatEvent::StreamEnd(protocol::StreamEndData {
+                    message: protocol::ChatMessage {
+                        message_id: None,
+                        timestamp: 1,
+                        sender: protocol::MessageSender::Assistant {
+                            agent: "claude".to_owned(),
+                        },
+                        content: "running command".to_owned(),
+                        reasoning: None,
+                        tool_calls: vec![protocol::ToolUseData {
+                            tool_call_id: "toolu_bg_bash".to_owned(),
+                            name: "run_command".to_owned(),
+                            arguments: serde_json::json!({}),
+                            content_offset: None,
+                        }],
+                        model_info: None,
+                        token_usage: None,
+                        context_breakdown: None,
+                        images: None,
+                    },
+                }),
+                command_request(),
+                ChatEvent::ToolProgress(background_command_progress()),
+            ],
+        );
+        next_tick().await;
+
+        assert_eq!(
+            count(&container, ".inflight-tray"),
+            0,
+            "an older page must not put a finished background command back in the tray"
+        );
+        assert!(
+            state.tool_progress.with_untracked(|map| map.is_empty()),
+            "an older page must not seed live progress state"
+        );
+    }
+
     #[wasm_bindgen_test]
     async fn foreground_command_never_creates_tray_held_or_after_replay() {
         let (container, state) = mount_tray(seed_command_response);

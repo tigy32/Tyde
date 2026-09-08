@@ -362,7 +362,7 @@ enum AgentCommand {
     },
     CancelBackgroundTask {
         tool_call_id: String,
-        reply: oneshot::Sender<bool>,
+        reply: oneshot::Sender<crate::backend::CancelBackgroundTaskOutcome>,
     },
     Close {
         reply: oneshot::Sender<()>,
@@ -1599,7 +1599,10 @@ impl AgentHandle {
         reply_rx.await.unwrap_or(InterruptOutcome::NotRunning)
     }
 
-    pub async fn cancel_background_task(&self, tool_call_id: &str) -> bool {
+    pub async fn cancel_background_task(
+        &self,
+        tool_call_id: &str,
+    ) -> crate::backend::CancelBackgroundTaskOutcome {
         let (reply_tx, reply_rx) = oneshot::channel();
         if self
             .tx
@@ -1609,9 +1612,11 @@ impl AgentHandle {
             })
             .is_err()
         {
-            return false;
+            return crate::backend::CancelBackgroundTaskOutcome::NotTracked;
         }
-        reply_rx.await.unwrap_or(false)
+        reply_rx
+            .await
+            .unwrap_or(crate::backend::CancelBackgroundTaskOutcome::NotTracked)
     }
 
     pub async fn close(&self) -> bool {
@@ -2485,7 +2490,13 @@ trait BackendSender: Send + Sync + 'static {
     fn cancel_background_task<'a>(
         &'a self,
         tool_call_id: &'a str,
-    ) -> Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>>;
+    ) -> Pin<
+        Box<
+            dyn std::future::Future<Output = crate::backend::CancelBackgroundTaskOutcome>
+                + Send
+                + 'a,
+        >,
+    >;
     fn shutdown(self: Box<Self>) -> Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
     #[cfg(feature = "test-support")]
     fn mock_control(&self) -> Option<crate::backend::mock::MockControl>;
@@ -2526,7 +2537,13 @@ impl<B: Backend> BackendSender for B {
     fn cancel_background_task<'a>(
         &'a self,
         tool_call_id: &'a str,
-    ) -> Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
+    ) -> Pin<
+        Box<
+            dyn std::future::Future<Output = crate::backend::CancelBackgroundTaskOutcome>
+                + Send
+                + 'a,
+        >,
+    > {
         Box::pin(Backend::cancel_background_task(self, tool_call_id))
     }
 
@@ -3225,7 +3242,8 @@ pub(crate) fn spawn_agent_actor(
                     };
                     match command {
                         AgentCommand::CancelBackgroundTask { reply, .. } => {
-                            let _ = reply.send(false);
+                            let _ =
+                                reply.send(crate::backend::CancelBackgroundTaskOutcome::NotTracked);
                         }
                         AgentCommand::Interrupt { reply } => {
                             tracing::debug!(
@@ -7831,13 +7849,28 @@ pub(crate) fn spawn_agent_actor(
                             tool_call_id,
                             reply,
                         } => {
-                            let cancelled = match backend.as_ref() {
+                            let outcome = match backend.as_ref() {
                                 Some(backend) => {
                                     backend.cancel_background_task(&tool_call_id).await
                                 }
-                                None => false,
+                                // No backend means no process, so nothing can
+                                // be running under that card.
+                                None => crate::backend::CancelBackgroundTaskOutcome::NotTracked,
                             };
-                            let _ = reply.send(cancelled);
+                            if outcome == crate::backend::CancelBackgroundTaskOutcome::NotTracked {
+                                close_untracked_background_card(
+                                    &canonical_stream,
+                                    &mut event_log,
+                                    &mut subscribers,
+                                    &mut replay_state,
+                                    &mut completed_tool_call_ids,
+                                    &mut open_tool_call_ids,
+                                    &mut open_tool_requests,
+                                    &tool_call_id,
+                                )
+                                .await;
+                            }
+                            let _ = reply.send(outcome);
                         }
                         AgentCommand::Interrupt { reply } => {
                             tracing::debug!(
@@ -8598,7 +8631,8 @@ pub(crate) fn spawn_relay_agent_actor(
                     };
                     match command {
                         AgentCommand::CancelBackgroundTask { reply, .. } => {
-                            let _ = reply.send(false);
+                            let _ =
+                                reply.send(crate::backend::CancelBackgroundTaskOutcome::NotTracked);
                         }
                         AgentCommand::ResumeReplayBarrier { .. } => {}
                         AgentCommand::Compact { reply, .. } => {
@@ -9389,7 +9423,7 @@ async fn park_terminal_agent(
         };
         match command {
             AgentCommand::CancelBackgroundTask { reply, .. } => {
-                let _ = reply.send(false);
+                let _ = reply.send(crate::backend::CancelBackgroundTaskOutcome::NotTracked);
             }
             AgentCommand::ResumeReplayBarrier { .. } => {}
             AgentCommand::SetName {
@@ -9583,7 +9617,7 @@ async fn park_relay_terminal_agent(
         };
         match command {
             AgentCommand::CancelBackgroundTask { reply, .. } => {
-                let _ = reply.send(false);
+                let _ = reply.send(crate::backend::CancelBackgroundTaskOutcome::NotTracked);
             }
             AgentCommand::ResumeReplayBarrier { .. } => {}
             AgentCommand::SetName {
@@ -10182,6 +10216,62 @@ async fn append_event<T: serde::Serialize>(
     let event = replay_envelope(canonical_stream, event_log.len() as u64, kind, payload);
     event_log.push(event.clone());
     broadcast_event(subscribers, &event);
+}
+
+/// Close a background card the backend no longer owns.
+///
+/// A backend that reports `NotTracked` is saying the command behind this card
+/// is gone. Nothing is left to report it finished, so without this the card
+/// stays open for the rest of the session and its row sits in the in-flight
+/// tray as "Running" with a stop button that can never do anything — which is
+/// exactly the state the user presses the stop button to get out of.
+///
+/// `active_background_progress` is the same state that puts the row there, and
+/// it is cleared by the card's completion, so a card that is already closed is
+/// left alone rather than completed twice. A backend that failed to *stop* a
+/// live command reports `Failed` instead and keeps its card, because that
+/// command may well still be running.
+#[allow(clippy::too_many_arguments)]
+async fn close_untracked_background_card(
+    canonical_stream: &str,
+    event_log: &mut Vec<Envelope>,
+    subscribers: &mut Vec<Stream>,
+    replay_state: &mut AgentReplayState,
+    completed_tool_call_ids: &mut HashSet<String>,
+    open_tool_call_ids: &mut HashSet<String>,
+    open_tool_requests: &mut HashMap<String, protocol::ToolRequest>,
+    tool_call_id: &str,
+) {
+    if !replay_state
+        .active_background_progress
+        .contains_key(tool_call_id)
+    {
+        return;
+    }
+    tracing::info!(
+        tool_call_id,
+        "closing a background card the backend no longer tracks"
+    );
+    append_chat_event(
+        canonical_stream,
+        event_log,
+        subscribers,
+        replay_state,
+        &ChatEvent::ToolExecutionCompleted(protocol::ToolExecutionCompletedData {
+            tool_call_id: tool_call_id.to_owned(),
+            outcome: protocol::ToolExecutionOutcome::Cancelled {
+                message: "Background command is no longer running".to_owned(),
+            },
+        }),
+    )
+    .await;
+    // The same bookkeeping a provider-sent completion does, or the actor still
+    // believes this card is open and closes it a second time when the backend
+    // exits. A background command's card is never an ask/plan/await card, so
+    // the response-pending sets cannot hold it.
+    completed_tool_call_ids.insert(tool_call_id.to_owned());
+    open_tool_call_ids.remove(tool_call_id);
+    open_tool_requests.remove(tool_call_id);
 }
 
 async fn append_chat_event(

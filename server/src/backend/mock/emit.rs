@@ -423,7 +423,10 @@ pub(super) fn codex_internal_error_tail_frames() -> Vec<BackendEvent> {
 /// is the shape a background `Bash` leaves behind — the task keeps running
 /// while the agent itself goes idle, so nothing further arrives on the stream
 /// until it finishes.
-pub(super) fn background_task_started_frames(tool_call_id: &str) -> Vec<BackendEvent> {
+pub(super) fn background_task_started_frames(
+    tool_call_id: &str,
+    cancellable: bool,
+) -> Vec<BackendEvent> {
     vec![
         tool_request(ToolRequest {
             tool_call_id: tool_call_id.to_owned(),
@@ -436,7 +439,7 @@ pub(super) fn background_task_started_frames(tool_call_id: &str) -> Vec<BackendE
         tool_progress(ToolProgressData {
             tool_call_id: tool_call_id.to_owned(),
             execution_mode: protocol::ToolExecutionMode::Background,
-            cancellable: false,
+            cancellable,
             update: protocol::ToolProgressUpdate::Other {
                 payload: json!({ "status": "running" }),
             },

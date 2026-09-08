@@ -38,8 +38,8 @@ use crate::backend::turn_emitter::{
     TurnEmitter,
 };
 use crate::backend::{
-    AgentIdentity, READ_ONLY_ACCESS_MODE_INSTRUCTIONS, SessionCommand, StartupMcpServer,
-    StartupMcpTransport, normalize_mcp_call_tool_result,
+    AgentIdentity, CancelBackgroundTaskOutcome, READ_ONLY_ACCESS_MODE_INSTRUCTIONS, SessionCommand,
+    StartupMcpServer, StartupMcpTransport, normalize_mcp_call_tool_result,
 };
 use crate::process_env;
 use crate::sub_agent::SubAgentEmitter;
@@ -137,6 +137,10 @@ pub struct ClaudeCommandHandle {
 impl ClaudeCommandHandle {
     pub async fn execute(&self, command: SessionCommand) -> Result<(), String> {
         ClaudeInner::execute_arc(Arc::clone(&self.inner), command).await
+    }
+
+    async fn cancel_background_task(&self, tool_call_id: &str) -> CancelBackgroundTaskOutcome {
+        ClaudeInner::cancel_background_task_arc(Arc::clone(&self.inner), tool_call_id).await
     }
 
     async fn send_message_payload(
@@ -1710,51 +1714,65 @@ struct CommittedSkillFailure {
 }
 
 impl ClaudeInner {
+    /// Stop one background command this process owns, named by its card.
+    ///
+    /// The CLI owns the process, so it does the killing: `stop_task` takes the
+    /// task id from `task_started` and runs the same kill the model's own
+    /// KillShell tool would. Measured against 2.1.241 — the CLI answers
+    /// `success` and then reports the task `stopped`, which is already mapped
+    /// to a cancelled card, so the success path does not have to close it.
+    async fn cancel_background_task_arc(
+        this: Arc<Self>,
+        tool_call_id: &str,
+    ) -> CancelBackgroundTaskOutcome {
+        let task_id = {
+            let registry = this
+                .background_tasks
+                .lock()
+                .expect("background task registry mutex poisoned");
+            registry
+                .entries
+                .values()
+                .find(|entry| {
+                    entry.tool_use_id == tool_call_id
+                        && entry.state.status == BackgroundTaskStatus::Running
+                        && entry.execution_mode == Some(ToolExecutionMode::Background)
+                })
+                .map(|entry| entry.state.task_id.clone())
+        };
+        let Some(task_id) = task_id else {
+            // The registry is the record of what this process owns; it saying
+            // nothing means nothing is running under this card. Closing the
+            // card is the agent actor's job, which knows whether one is still
+            // open.
+            return CancelBackgroundTaskOutcome::NotTracked;
+        };
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let request = json!({
+            "type": "control_request",
+            "request_id": request_id,
+            "request": {
+                "subtype": "stop_task",
+                "task_id": task_id,
+            },
+        });
+        match this
+            .send_control_request_value(request_id, request, CLAUDE_CONTROL_RESPONSE_TIMEOUT)
+            .await
+        {
+            Ok(_) => CancelBackgroundTaskOutcome::Cancelled,
+            Err(error) => CancelBackgroundTaskOutcome::Failed(error),
+        }
+    }
+
     async fn execute_arc(this: Arc<Self>, command: SessionCommand) -> Result<(), String> {
         match command {
             SessionCommand::CancelBackgroundTask { tool_call_id } => {
-                // The CLI owns the process, so it does the killing: `stop_task`
-                // takes the task id from `task_started` and runs the same kill
-                // the model's own KillShell tool would. Measured against 2.1.241
-                // — the CLI answers `success` and then reports the task
-                // `stopped`, which is already mapped to a cancelled card, so
-                // nothing here has to close it.
-                let task_id = {
-                    let registry = this
-                        .background_tasks
-                        .lock()
-                        .expect("background task registry mutex poisoned");
-                    registry
-                        .entries
-                        .values()
-                        .find(|entry| {
-                            entry.tool_use_id == tool_call_id
-                                && entry.state.status == BackgroundTaskStatus::Running
-                                && entry.execution_mode == Some(ToolExecutionMode::Background)
-                        })
-                        .map(|entry| entry.state.task_id.clone())
-                };
-                let Some(task_id) = task_id else {
-                    return Err(format!(
-                        "no running Claude background command for card {tool_call_id}"
-                    ));
-                };
-                let request_id = uuid::Uuid::new_v4().to_string();
-                let request = json!({
-                    "type": "control_request",
-                    "request_id": request_id,
-                    "request": {
-                        "subtype": "stop_task",
-                        "task_id": task_id,
-                    },
-                });
-                this.send_control_request_value(
-                    request_id,
-                    request,
-                    CLAUDE_CONTROL_RESPONSE_TIMEOUT,
-                )
-                .await
-                .map(|_| ())
+                match Self::cancel_background_task_arc(this, &tool_call_id).await {
+                    CancelBackgroundTaskOutcome::Cancelled
+                    | CancelBackgroundTaskOutcome::NotTracked => Ok(()),
+                    CancelBackgroundTaskOutcome::Failed(error) => Err(error),
+                }
             }
             SessionCommand::SendMessage { message, images } => {
                 match Self::send_message(this.clone(), message, images, None).await? {
@@ -14825,7 +14843,7 @@ impl Backend for ClaudeBackend {
         }
     }
 
-    async fn cancel_background_task(&self, tool_call_id: &str) -> bool {
+    async fn cancel_background_task(&self, tool_call_id: &str) -> CancelBackgroundTaskOutcome {
         let handle = {
             let handle = self
                 .command_handle
@@ -14834,14 +14852,9 @@ impl Backend for ClaudeBackend {
             handle.clone()
         };
         let Some(handle) = handle else {
-            return false;
+            return CancelBackgroundTaskOutcome::NotTracked;
         };
-        handle
-            .execute(SessionCommand::CancelBackgroundTask {
-                tool_call_id: tool_call_id.to_owned(),
-            })
-            .await
-            .is_ok()
+        handle.cancel_background_task(tool_call_id).await
     }
 
     async fn interrupt(&self) -> bool {
