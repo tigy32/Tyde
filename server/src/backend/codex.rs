@@ -1,3 +1,7 @@
+mod settings;
+
+pub(crate) use settings::{native_settings_snapshot, persist_native_settings};
+
 use std::collections::{HashMap, HashSet, VecDeque, hash_map::Entry};
 use std::ffi::OsString;
 use std::io::{Read, SeekFrom};

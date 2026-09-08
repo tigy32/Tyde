@@ -713,6 +713,138 @@ impl Host {
     }
 }
 
+pub fn run_codex_settings_scenario<F, Fut>(scenario: F)
+where
+    F: Fn(Host) -> Fut + Send + 'static,
+    Fut: Future<Output = ()> + 'static,
+{
+    run_scenario_where(
+        &[],
+        |kind| kind == BackendKind::Codex,
+        false,
+        false,
+        scenario,
+    );
+}
+
+pub fn isolated_codex_settings_process() -> bool {
+    assert!(
+        enabled_backends().contains(&BackendKind::Codex),
+        "this scenario requires Codex"
+    );
+    if std::env::var_os("TYDE_CODEX_SETTINGS_ISOLATED").is_some() {
+        return true;
+    }
+    let home = tempfile::tempdir().expect("isolated Codex home");
+    std::fs::set_permissions(
+        home.path(),
+        std::os::unix::fs::PermissionsExt::from_mode(0o700),
+    )
+    .expect("restrict isolated home");
+    let source = std::env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").expect("home")).join(".codex"));
+    for name in ["config.toml", "auth.json", "models_cache.json"] {
+        let file = source.join(name);
+        if file.is_file() {
+            std::fs::copy(file, home.path().join(name)).expect("copy isolated Codex state");
+        }
+    }
+    let config = home.path().join("config.toml");
+    let mut content = std::fs::read_to_string(&config).unwrap_or_default();
+    content.push_str("\n# TYDE_CONFIG_PRESERVATION_SENTINEL\n");
+    std::fs::write(&config, content).expect("seed isolated config");
+    let status = std::process::Command::new(std::env::current_exe().expect("test executable"))
+        .args([
+            "--exact",
+            "real_codex_global_settings",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env("CODEX_HOME", home.path())
+        .env("TYDE_CODEX_SETTINGS_ISOLATED", "1")
+        .status()
+        .expect("run isolated settings scenario");
+    assert!(status.success(), "isolated Codex settings scenario failed");
+    false
+}
+
+pub async fn await_native_settings(host: &mut Host) -> protocol::BackendNativeSettingsSnapshot {
+    let deadline = tokio::time::Instant::now() + CONTROL_TIMEOUT;
+    loop {
+        let env = host
+            .next_envelope(
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
+                "native settings",
+            )
+            .await;
+        let snapshots = match env.kind {
+            FrameKind::BackendConfigSnapshots => {
+                env.parse_payload::<protocol::BackendConfigSnapshotsPayload>()
+                    .expect("native snapshots")
+                    .native_settings
+            }
+            _ => continue,
+        };
+        if let Some(snapshot) = snapshots
+            .into_iter()
+            .find(|snapshot| snapshot.backend_kind == host.backend())
+        {
+            assert_eq!(
+                snapshot.status,
+                protocol::BackendConfigSnapshotStatus::Ready,
+                "native settings unavailable: {:?}",
+                snapshot.message
+            );
+            return snapshot;
+        }
+    }
+}
+
+pub async fn save_native_settings(
+    host: &mut Host,
+    document: serde_json::Value,
+) -> (
+    protocol::SettingsWriteResultPayload,
+    protocol::BackendNativeSettingsSnapshot,
+) {
+    let backend = host.backend();
+    let write_id = host
+        .client
+        .backend_native_settings_write(backend, document)
+        .await
+        .expect("save native settings");
+    let mut snapshot = None;
+    let deadline = tokio::time::Instant::now() + CONTROL_TIMEOUT;
+    loop {
+        let env = host
+            .next_envelope(
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
+                "native settings save result",
+            )
+            .await;
+        if env.kind == FrameKind::BackendConfigSnapshots {
+            snapshot = env
+                .parse_payload::<protocol::BackendConfigSnapshotsPayload>()
+                .expect("snapshots")
+                .native_settings
+                .into_iter()
+                .find(|snapshot| snapshot.backend_kind == host.backend());
+        }
+        if env.kind == FrameKind::SettingsWriteResult {
+            let result = env
+                .parse_payload::<protocol::SettingsWriteResultPayload>()
+                .expect("write result");
+            if result.write_id == write_id {
+                return (
+                    result,
+                    snapshot.expect("save refreshes native settings before acknowledging"),
+                );
+            }
+        }
+    }
+}
+
 pub async fn await_session_schema(host: &mut Host) -> SessionSettingsSchema {
     loop {
         let envelope = host

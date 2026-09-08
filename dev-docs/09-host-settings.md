@@ -254,3 +254,29 @@ Natural extensions add typed fields to `HostSettings`, expose primitive rows
 through its schema annotations, and keep complex editors in Rust. No new wire
 enum is needed for ordinary fields. Settings remain server-owned, and schema
 validation on the client is advisory; the server is authoritative.
+
+## Codex native settings
+
+The Codex page uses grouped `BackendNativeSettingsSnapshot` documents. It
+reads the installed app-server's `config/read` user layer and effective
+configuration, plus `model/list` for model and speed choices. Only an allowlist
+of non-secret fields enters the client snapshot; no credentials, MCP
+configuration, or raw configuration layers are sent.
+
+Saves diff the editable values, then use `config/batchWrite` with the user
+layer's expected version and server-resolved file path. Null removes a user
+override. Unknown fields and invalid edited values are rejected before the
+write; the CLI also validates the native configuration. Unrelated fields and
+comments remain owned by Codex. A save refreshes the snapshot even on conflict.
+
+`reloadUserConfig` is false: saves never reconfigure running threads. New
+threads inherit defaults, while startup-level controls apply to new Codex
+processes, including processes used to resume threads. Session model/effort/
+speed overrides remain authoritative. Tyde's own agent-control depth settings
+are independent of native Codex subagent concurrency.
+
+Coverage: the native UI flow exercises section switching, editing, save
+locking and reset. The opt-in `real_codex_global_settings` conformance case
+runs the real host and Codex CLI in an isolated `CODEX_HOME`, checking native
+read/write/reset, stale-version rejection, invalid-value rejection and
+preservation. It creates no model conversations.

@@ -7585,6 +7585,13 @@ impl HostHandle {
         const OPERATION: &str = "backend_native_settings_write";
         let _settings_apply_guard = self.settings_apply_lock.lock().await;
         let outcome = match payload.backend {
+            BackendKind::Codex => {
+                let result = crate::backend::codex::persist_native_settings(payload.settings).await;
+                self.refresh_backend_config_snapshots_after_native_save()
+                    .await;
+                self.refresh_session_schemas_with_fanout(true).await;
+                result
+            }
             BackendKind::Hermes => {
                 let result = match hermes_probe_workspace_root() {
                     Ok(workspace_root) => crate::backend::hermes::persist_native_settings(
@@ -17984,6 +17991,9 @@ async fn backend_config_snapshots_for_enabled_backends(
     snapshots
         .native_settings
         .push(crate::backend::hermes::native_settings_snapshot(&workspace_roots).await);
+    snapshots
+        .native_settings
+        .push(crate::backend::codex::native_settings_snapshot().await);
     snapshots
 }
 

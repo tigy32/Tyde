@@ -48,6 +48,107 @@ use uuid::Uuid;
 
 use conformance_fixture::*;
 
+#[test]
+#[ignore = "real Codex configuration suite; requires explicit approval and TYDE_RUN_REAL_AI_TESTS=1"]
+fn real_codex_global_settings() {
+    if !isolated_codex_settings_process() {
+        return;
+    }
+    run_codex_settings_scenario(|mut host| async move {
+        let initial = await_native_settings(&mut host).await;
+        assert_eq!(
+            initial
+                .groups
+                .iter()
+                .map(|group| group.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["defaults", "subagents", "responses", "memory", "advanced"]
+        );
+        let original = initial.settings.clone().expect("settings document");
+        let model = initial.groups[0].schema["properties"]["model"]["enum"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|value| value.is_string())
+            .unwrap()
+            .clone();
+        let mut edited = original.clone();
+        let changes = serde_json::json!({
+            "model":model,
+            "service_tier":"default",
+            "agents.default_subagent_model":model,
+            "agents.default_subagent_reasoning_effort":"low",
+            "model_reasoning_summary":"auto",
+            "features.memories":false,
+            "memories.disable_on_external_context":true,
+            "agents.enabled": false,
+            "agents.max_concurrent_threads_per_session": 1,
+            "personality": "pragmatic",
+            "model_verbosity": "low",
+            "memories.generate_memories": false,
+            "memories.use_memories": false,
+            "web_search": "cached",
+            "model_auto_compact_token_limit": 100000,
+            "tool_output_token_limit": 1000,
+            "allow_login_shell": false
+        });
+        for (key, value) in changes.as_object().unwrap() {
+            edited["values"][key] = value.clone();
+        }
+        let (result, saved) = save_native_settings(&mut host, edited).await;
+        assert!(
+            result.applied,
+            "settings rejected: {:?}",
+            result.field_errors
+        );
+        let saved = saved.settings.expect("saved config");
+        for (key, value) in changes.as_object().unwrap() {
+            assert_eq!(
+                &saved["values"][key], value,
+                "Codex must read back {key} from a fresh process"
+            );
+        }
+        let config_path =
+            std::path::PathBuf::from(std::env::var_os("CODEX_HOME").unwrap()).join("config.toml");
+        let on_disk = std::fs::read_to_string(&config_path).expect("read native config");
+        assert!(
+            on_disk.contains("TYDE_CONFIG_PRESERVATION_SENTINEL"),
+            "unrelated config comments must survive"
+        );
+        let mut stale = saved.clone();
+        stale["version"] = serde_json::json!("stale-version");
+        let (result, _) = save_native_settings(&mut host, stale).await;
+        assert!(!result.applied, "stale config edits must be rejected");
+        assert_eq!(std::fs::read_to_string(&config_path).unwrap(), on_disk);
+        let mut invalid = saved.clone();
+        invalid["values"]["agents.max_concurrent_threads_per_session"] = serde_json::json!(-1);
+        let (result, _) = save_native_settings(&mut host, invalid).await;
+        assert!(!result.applied, "invalid limits must be rejected");
+        assert_eq!(std::fs::read_to_string(&config_path).unwrap(), on_disk);
+        let mut reset = saved;
+        for key in changes.as_object().unwrap().keys() {
+            reset["values"][key] = Value::Null;
+        }
+        let (result, cleared) = save_native_settings(&mut host, reset).await;
+        assert!(result.applied, "reset rejected: {:?}", result.field_errors);
+        let cleared = cleared.settings.expect("cleared settings");
+        for key in changes.as_object().unwrap().keys() {
+            assert!(
+                cleared["values"].get(key).is_none(),
+                "reset must remove {key} from native user config"
+            );
+        }
+        for (key, value) in original["values"].as_object().unwrap() {
+            if changes.get(key).is_none() {
+                assert_eq!(
+                    &cleared["values"][key], value,
+                    "unedited setting must survive: {key}"
+                );
+            }
+        }
+    });
+}
+
 const READY_MARKER: &str = "TYDE_READY";
 const WROTE_MARKER: &str = "TYDE_WROTE";
 const INTERIM_MARKER: &str = "TYDE_INTERIM_WORKING";

@@ -4656,6 +4656,12 @@ fn native_settings_groups_form(
             .unwrap_or_else(|| default_id.clone())
     });
 
+    let show_group_badges = groups
+        .iter()
+        .any(|group| group.kind == BackendNativeSettingsGroupKind::Core)
+        && groups
+            .iter()
+            .any(|group| group.kind == BackendNativeSettingsGroupKind::Module);
     let tabs = ordered
         .iter()
         .map(|group| {
@@ -4683,9 +4689,9 @@ fn native_settings_groups_form(
                     on:click=on_click
                 >
                     <span class="settings-native-tab-label">{group.title.clone()}</span>
-                    <span class="settings-native-tab-badge">
-                        {native_group_badge(group.kind)}
-                    </span>
+                    {show_group_badges.then(|| view! {
+                        <span class="settings-native-tab-badge">{native_group_badge(group.kind)}</span>
+                    })}
                 </button>
             }
         })
@@ -5011,8 +5017,15 @@ fn native_settings_group_content(
                     </p>
                 }
             });
-            let fields = properties
-                .iter()
+            let mut ordered_properties = properties.iter().collect::<Vec<_>>();
+            ordered_properties.sort_by_key(|(_, schema)| {
+                schema
+                    .get("x-tyde-order")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(u64::MAX)
+            });
+            let fields = ordered_properties
+                .into_iter()
                 .map(|(key, prop_schema)| {
                     schema_settings_field(
                         SchemaEditTarget::Native {
@@ -5232,7 +5245,14 @@ fn schema_settings_field(
             .to_owned();
         let option_views = enum_values
             .iter()
-            .map(|value| view! { <option value=value.clone()>{value.clone()}</option> })
+            .map(|value| {
+                let label = prop_schema
+                    .get("x-tyde-enum-labels")
+                    .and_then(|labels| labels.get(value))
+                    .and_then(Value::as_str)
+                    .unwrap_or(value);
+                view! { <option value=value.clone()>{label.to_owned()}</option> }
+            })
             .collect::<Vec<_>>();
         let target = target.clone();
         let aria_label = schema_field_aria_label(&target, &label);
@@ -5409,6 +5429,24 @@ fn schema_settings_field(
     let unset_caption =
         (!present).then(|| view! { <span class="settings-native-unset">"Unset"</span> });
 
+    let reset = (present
+        && prop_schema
+            .get("x-tyde-reset-label")
+            .and_then(Value::as_str)
+            .is_some())
+    .then(|| {
+        let label = prop_schema["x-tyde-reset-label"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let target = target.clone();
+        view! {
+            <button class="settings-btn" disabled=disabled on:click=move |_| {
+                if !disabled { target.commit(Value::Null); }
+            }>{label}</button>
+        }
+    });
+
     if schema_type == Some("boolean") {
         view! {
             <div class="settings-native-field settings-field">
@@ -5422,6 +5460,7 @@ fn schema_settings_field(
                     {control}
                 </div>
                 {unset_caption}
+                {reset}
             </div>
         }
         .into_any()
@@ -5432,6 +5471,7 @@ fn schema_settings_field(
                 {description.map(|text| view! { <p class="settings-description">{text}</p> })}
                 {control}
                 {unset_caption}
+                {reset}
             </div>
         }
         .into_any()
@@ -13834,6 +13874,7 @@ mod wasm_tests {
     /// schema, plus a caller-supplied backend-native settings snapshot, and
     /// select it — the setup for exercising the Tycode native settings page.
     fn install_tycode_native_host(state: &AppState, snapshot: BackendNativeSettingsSnapshot) {
+        let kind = snapshot.backend_kind;
         let host_id = "host-tyc-native".to_owned();
         state.selected_host_id.set(Some(host_id.clone()));
         state.host_streams.update(|m| {
@@ -13848,25 +13889,17 @@ mod wasm_tests {
         state.host_settings_by_host.update(|m| {
             m.insert(
                 host_id.clone(),
-                host_settings_with_hermes_config(
-                    std::collections::HashMap::new(),
-                    vec![BackendKind::Tycode],
-                ),
+                host_settings_with_hermes_config(std::collections::HashMap::new(), vec![kind]),
             );
         });
         state.backend_setup_by_host.update(|m| {
             m.insert(
                 host_id.clone(),
-                vec![backend_setup_info(
-                    BackendKind::Tycode,
-                    BackendSetupStatus::Installed,
-                )],
+                vec![backend_setup_info(kind, BackendSetupStatus::Installed)],
             );
         });
         state.backend_native_settings.update(|m| {
-            m.entry(host_id)
-                .or_default()
-                .insert(BackendKind::Tycode, snapshot);
+            m.entry(host_id).or_default().insert(kind, snapshot);
         });
     }
 
@@ -14257,6 +14290,111 @@ mod wasm_tests {
                 .then(|| envelope.get("payload").cloned())
                 .flatten()
         })
+    }
+
+    #[wasm_bindgen_test]
+    async fn codex_global_settings_edit_and_reset_preserve_document() {
+        let calls = install_settings_send_stub();
+        let container = make_container();
+        let state = AppState::new();
+        let document = serde_json::json!({"version":"config-version", "values":{
+            "model":"gpt-5.6-sol", "agents.max_concurrent_threads_per_session":3,
+            "features.memories":true
+        }});
+        let groups = [
+            ("defaults", "Defaults", "model", serde_json::json!({"title":"Default model","type":["string","null"],"enum":["gpt-5.6-sol"]})),
+            ("subagents", "Subagents", "agents.max_concurrent_threads_per_session", serde_json::json!({"title":"Maximum concurrent subagents","type":["integer","null"],"minimum":1})),
+            ("responses", "Responses", "personality", serde_json::json!({"title":"Communication style","type":["string","null"],"enum":["friendly","pragmatic"]})),
+            ("memory", "Memory", "features.memories", serde_json::json!({"title":"Enable Codex memory","type":["boolean","null"]})),
+            ("advanced", "Advanced", "allow_login_shell", serde_json::json!({"title":"Allow login shells","type":["boolean","null"]})),
+        ].into_iter().map(|(id,title,key,mut property)| {
+            property["x-tyde-reset-label"] = serde_json::json!("Use CLI default");
+            BackendNativeSettingsGroup { id:id.to_owned(),title:title.to_owned(),kind:BackendNativeSettingsGroupKind::Core,
+                settings_path:vec!["values".to_owned()],description:None,
+                schema:serde_json::json!({"properties":{key:property}}) }
+        }).collect();
+        let snapshot = BackendNativeSettingsSnapshot {
+            backend_kind: BackendKind::Codex,
+            status: BackendConfigSnapshotStatus::Ready,
+            settings: Some(document.clone()),
+            groups,
+            message: None,
+            advisories: vec![],
+        };
+        install_tycode_native_host(&state, snapshot.clone());
+        let mounted_state = state.clone();
+        let _handle = mount_to(container.clone(), move || {
+            provide_context(mounted_state.clone());
+            view! { <BackendSettingsPage kind=BackendKind::Codex /> }
+        });
+        next_tick().await;
+        assert_eq!(
+            native_tab_labels(&container),
+            vec!["Defaults", "Subagents", "Responses", "Memory", "Advanced"]
+        );
+        native_tab_by_label(&container, "Subagents").click();
+        next_tick().await;
+        let limit: HtmlInputElement = container
+            .query_selector("input[type=number]")
+            .unwrap()
+            .unwrap()
+            .dyn_into()
+            .unwrap();
+        assert_eq!(limit.value(), "3");
+        set_and_change(&limit, "5");
+        for _ in 0..3 {
+            next_tick().await;
+        }
+        let sent = last_native_settings(&calls).expect("Codex settings save");
+        assert_eq!(sent["backend"], "codex");
+        assert_eq!(sent["settings"]["version"], "config-version");
+        assert_eq!(
+            sent["settings"]["values"]["agents.max_concurrent_threads_per_session"],
+            5
+        );
+        assert_eq!(
+            sent["settings"]["values"]["model"],
+            document["values"]["model"]
+        );
+        let rendered_limit: HtmlInputElement = container
+            .query_selector("input[type=number]")
+            .unwrap()
+            .unwrap()
+            .dyn_into()
+            .unwrap();
+        assert!(
+            rendered_limit.disabled(),
+            "editing must lock the rendered field until the server responds"
+        );
+        let mut refreshed = snapshot;
+        refreshed.settings = Some(sent["settings"].clone());
+        state.native_settings_save_state.set(Default::default());
+        state.backend_native_settings.update(|hosts| {
+            hosts
+                .get_mut(TYCODE_HOST)
+                .unwrap()
+                .insert(BackendKind::Codex, refreshed);
+        });
+        for _ in 0..3 {
+            next_tick().await;
+        }
+        assert!(
+            !native_panels(&container)[1].hidden(),
+            "selected section survives a save"
+        );
+        let panel = &native_panels(&container)[1];
+        let buttons = panel.query_selector_all("button").unwrap();
+        let reset = (0..buttons.length())
+            .filter_map(|i| buttons.item(i))
+            .find(|button| button.text_content().as_deref() == Some("Use CLI default"))
+            .expect("reset control");
+        reset.dyn_into::<HtmlElement>().unwrap().click();
+        for _ in 0..3 {
+            next_tick().await;
+        }
+        let sent = last_native_settings(&calls).expect("Codex reset");
+        assert!(sent["settings"]["values"]["agents.max_concurrent_threads_per_session"].is_null());
+        assert_eq!(sent["settings"]["values"]["features.memories"], true);
     }
 
     /// A Ready snapshot renders each server-provided group with its current
