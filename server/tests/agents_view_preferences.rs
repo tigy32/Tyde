@@ -528,15 +528,15 @@ async fn expect_promoted_manual_assignment(
 
 async fn expect_promoted_group_assignment(
     client: &mut client::Connection,
-    agent_stream: &StreamPath,
-    group_id: &AgentGroupId,
-) -> (SessionId, AgentsViewPreferencesNotifyPayload) {
-    let mut session_id = None;
+    agent: &NewAgentPayload,
+    group_name: &str,
+) -> (SessionId, AgentGroupId, AgentsViewPreferencesNotifyPayload) {
+    let mut session_id = agent.session_id.clone();
     let mut latest_notify: Option<AgentsViewPreferencesNotifyPayload> = None;
     let mut promoted = None;
     fixture::next_logical_frame_matching_on(client, "promoted group assignment", |env| {
         match env.kind {
-            FrameKind::AgentStart if env.stream == *agent_stream => {
+            FrameKind::AgentStart if env.stream == agent.instance_stream => {
                 let start: AgentStartPayload =
                     env.parse_payload().expect("parse AgentStartPayload");
                 session_id = start.session_id;
@@ -556,15 +556,24 @@ async fn expect_promoted_group_assignment(
 
         eprintln!("TYDE GROUP PROMOTION WAIT session={session_id:?} notify={latest_notify:?}");
         if let (Some(session_id), Some(notify)) = (session_id.clone(), latest_notify.as_ref()) {
+            let Some(group) = notify
+                .snapshot
+                .groups
+                .groups
+                .iter()
+                .find(|group| group.name == group_name)
+            else {
+                return false;
+            };
             let target = local_session_target(session_id.clone());
             if notify
                 .snapshot
                 .groups
                 .assignments
                 .iter()
-                .any(|assignment| assignment.target == target && assignment.group_id == *group_id)
+                .any(|assignment| assignment.target == target && assignment.group_id == group.id)
             {
-                promoted = Some((session_id, notify.clone()));
+                promoted = Some((session_id, group.id.clone(), notify.clone()));
                 return true;
             }
         }
@@ -1399,25 +1408,12 @@ async fn agents_view_preferences_agent_groups_promote_and_cleanup_targets() {
         },
     )
     .await;
-    let create_notify =
-        expect_non_empty_group_notify(&mut fixture.client, "create transient group").await;
-    let group_id = create_notify.snapshot.groups.groups[0].id.clone();
-    let already_promoted_session_id = create_notify
-        .snapshot
-        .groups
-        .assignments
-        .iter()
-        .find(|assignment| assignment.group_id == group_id)
-        .and_then(|assignment| match &assignment.target {
-            AgentAnnotationTarget::Session { session_id, .. } => Some(session_id.clone()),
-            AgentAnnotationTarget::TransientAgent { .. } => None,
-        });
-    let (session_id, promoted_notify) = if let Some(session_id) = already_promoted_session_id {
-        (session_id, create_notify)
-    } else {
-        expect_promoted_group_assignment(&mut fixture.client, &agent.instance_stream, &group_id)
-            .await
-    };
+    // The failure trace contained the promoted session assignment but no session
+    // ID in the waiter: the preceding raw notification wait discarded the
+    // AgentBootstrap carrying AgentStart. Collect both in one logical-frame
+    // wait, retaining the assertion that the group targets this agent's session.
+    let (session_id, group_id, promoted_notify) =
+        expect_promoted_group_assignment(&mut fixture.client, &agent, "Promotion").await;
     let session_target = local_session_target(session_id.clone());
     assert_eq!(
         promoted_notify.snapshot.groups.assignments,
