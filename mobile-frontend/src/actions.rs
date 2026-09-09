@@ -254,6 +254,25 @@ pub async fn rename_agent(
     .await
 }
 
+/// Push edited session settings to a live agent. The server validates them,
+/// applies them, and echoes the effective `SessionSettings` back, which the
+/// dispatcher stores — the client never computes effective settings itself.
+pub async fn set_session_settings(
+    state: &AppState,
+    agent_ref: &AgentRef,
+    values: protocol::SessionSettingsValues,
+) -> Result<(), String> {
+    let stream = agent_instance_stream(state, agent_ref).ok_or("agent not found")?;
+    let payload = protocol::SetSessionSettingsPayload { values };
+    send_action(
+        &agent_ref.local_host_id,
+        stream,
+        protocol::FrameKind::SetSessionSettings,
+        &payload,
+    )
+    .await
+}
+
 /// Close (but don't delete) an agent. Server replies with `AgentClosed`,
 /// which the dispatcher consumes and clears UI state.
 pub async fn close_agent(state: &AppState, agent_ref: &AgentRef) -> Result<(), String> {

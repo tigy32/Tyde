@@ -30,14 +30,13 @@ use serde_json::{Map, Value};
 use std::collections::{HashMap, HashSet};
 
 use crate::components::backend_capacity::SubscriptionCapacitySection;
-use crate::components::session_settings::{
-    SessionSettingsControls, clear_invalid_dependent_select_values,
-};
+use crate::components::session_settings::SessionSettingsControls;
 use crate::send::{
     custom_agent_delete, custom_agent_upsert, mcp_server_delete, mcp_server_upsert,
     mobile_device_revoke, mobile_pairing_cancel, mobile_pairing_start, skill_refresh,
     steering_delete, steering_upsert,
 };
+use protocol::clear_invalid_dependent_select_values;
 
 const RESERVED_MCP_NAMES: &[&str] = &["tyde-debug", "tyde-agent-control", "tyde-review-feedback"];
 

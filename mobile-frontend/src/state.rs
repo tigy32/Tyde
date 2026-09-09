@@ -1014,6 +1014,11 @@ pub struct AppState {
     pub agent_activity_stats: RwSignal<HashMap<AgentRef, protocol::AgentActivityStats>>,
     pub transient_events: RwSignal<HashMap<AgentRef, Vec<TransientEvent>>>,
     pub agent_session_settings: RwSignal<HashMap<AgentRef, SessionSettingsValues>>,
+    /// Whether the session-settings sheet is up. Model and reasoning effort are
+    /// changed rarely and cost real money when changed by accident, so mobile
+    /// keeps them off the chat surface and behind the header's overflow menu
+    /// (and, before a chat exists, behind the new-chat options row).
+    pub session_settings_open: RwSignal<bool>,
     pub agent_compactions: RwSignal<HashMap<AgentRef, AgentCompactNotifyPayload>>,
     pub context_compaction_operations: RwSignal<HashMap<AgentRef, ContextCompactionNotifyPayload>>,
     pub context_compaction_capabilities:
@@ -1123,6 +1128,7 @@ impl AppState {
             agent_activity_stats: RwSignal::new(HashMap::new()),
             transient_events: RwSignal::new(HashMap::new()),
             agent_session_settings: RwSignal::new(HashMap::new()),
+            session_settings_open: RwSignal::new(false),
             agent_compactions: RwSignal::new(HashMap::new()),
             context_compaction_operations: RwSignal::new(HashMap::new()),
             context_compaction_capabilities: RwSignal::new(HashMap::new()),

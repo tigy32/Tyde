@@ -496,6 +496,12 @@ pub fn ChatView() -> impl IntoView {
         rename_editing.set(false);
     });
 
+    let s_session_settings = state.clone();
+    let on_open_session_settings = Callback::new(move |_: ()| {
+        more_open.set(false);
+        s_session_settings.session_settings_open.set(true);
+    });
+
     let s_close = state.clone();
     let on_close_agent = Callback::new(move |_: ()| {
         more_open.set(false);
@@ -774,6 +780,7 @@ pub fn ChatView() -> impl IntoView {
                                     } else if has_active_agent() {
                                         let rename_cb = on_rename_open;
                                         let close_cb = on_close_agent;
+                                        let settings_cb = on_open_session_settings;
                                         view! {
                                             <div class="chat-more-menu-wrap">
                                                 <button
@@ -796,6 +803,15 @@ pub fn ChatView() -> impl IntoView {
                                                             on:click=move |_| rename_cb.run(())
                                                         >
                                                             "Rename"
+                                                        </button>
+                                                        <button
+                                                            type="button"
+                                                            class="chat-action-menu-item"
+                                                            role="menuitem"
+                                                            data-mobile-test="chat-menu-session-settings"
+                                                            on:click=move |_| settings_cb.run(())
+                                                        >
+                                                            "Session Settings"
                                                         </button>
                                                         <button
                                                             type="button"

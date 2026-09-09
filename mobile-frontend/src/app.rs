@@ -320,6 +320,7 @@ fn ActiveHostShell() -> impl IntoView {
         // Outside the content column so the sheet covers the tab dock too: a
         // modal the user can navigate out from underneath is not modal.
         <components::ProjectPicker />
+        <components::SessionSettingsSheet />
     }
 }
 

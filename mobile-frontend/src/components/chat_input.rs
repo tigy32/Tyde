@@ -876,7 +876,7 @@ fn backend_value(backend: protocol::BackendKind) -> &'static str {
     }
 }
 
-fn backend_label(backend: protocol::BackendKind) -> &'static str {
+pub(crate) fn backend_label(backend: protocol::BackendKind) -> &'static str {
     match backend {
         protocol::BackendKind::Tycode => "Tycode",
         protocol::BackendKind::Kiro => "Kiro",
@@ -937,6 +937,12 @@ fn NewChatOptions() -> impl IntoView {
         let backend = parse_backend(&value);
         log::debug!("Mobile backend selection: value={value:?}, backend={backend:?}");
         change_backend_state.draft_backend_override.set(backend);
+        // Session settings are keyed by the backend's own schema, so a draft
+        // carrying the previous backend's model name is not a preference the
+        // new backend can honour — it is a spawn the server would reject.
+        change_backend_state
+            .draft_session_settings
+            .set(protocol::SessionSettingsValues::default());
     };
 
     let custom_agents_state = state.clone();
@@ -1002,6 +1008,57 @@ fn NewChatOptions() -> impl IntoView {
     let reopen_state = state.clone();
     let on_change_project = move |_| crate::actions::begin_new_chat(&reopen_state);
 
+    // What the spawn will actually carry, in the schema's own words. Values the
+    // user has not touched are the backend's defaults and are named as such
+    // rather than listed, so the row says something true at a glance instead of
+    // enumerating settings nobody chose.
+    let summary_state = state.clone();
+    let draft_settings_summary = move || {
+        let values = summary_state.draft_session_settings.get();
+        let chosen: Vec<String> = selected_backend_kind(&summary_state)
+            .and_then(|backend| {
+                summary_state.session_schemas_by_host.with(|by_host| {
+                    let host = summary_state.active_local_host_id.get()?;
+                    by_host
+                        .get(&host)?
+                        .get(&backend)?
+                        .ready_schema()
+                        .map(|schema| schema.fields.clone())
+                })
+            })
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|field| {
+                let value = values.0.get(&field.key)?;
+                let rendered = match value {
+                    protocol::SessionSettingValue::String(selected) => field
+                        .select_options(&values)
+                        .and_then(|options| {
+                            options
+                                .iter()
+                                .find(|option| option.value == *selected)
+                                .map(|option| option.label.clone())
+                        })
+                        .unwrap_or_else(|| selected.clone()),
+                    protocol::SessionSettingValue::Bool(flag) => {
+                        if *flag { "on" } else { "off" }.to_owned()
+                    }
+                    protocol::SessionSettingValue::Integer(number) => number.to_string(),
+                    protocol::SessionSettingValue::Null => return None,
+                };
+                Some(format!("{}: {rendered}", field.label))
+            })
+            .collect();
+        if chosen.is_empty() {
+            "Backend defaults".to_owned()
+        } else {
+            chosen.join(" \u{00b7} ")
+        }
+    };
+
+    let open_settings_state = state.clone();
+    let on_open_session_settings = move |_| open_settings_state.session_settings_open.set(true);
+
     view! {
         <section class="new-chat-options" data-mobile-test="new-chat-options" aria-label="New chat options">
             <div class="new-chat-option new-chat-option-wide">
@@ -1050,6 +1107,19 @@ fn NewChatOptions() -> impl IntoView {
                 </select>
             </label>
             <p id="new-chat-agent-hint" class="new-chat-option-hint">{agent_hint}</p>
+            <div class="new-chat-option new-chat-option-wide">
+                <span class="new-chat-option-label">"Session settings"</span>
+                <button
+                    type="button"
+                    class="new-chat-option-project"
+                    data-mobile-test="new-chat-session-settings"
+                    aria-label="Change session settings for this chat"
+                    on:click=on_open_session_settings
+                >
+                    <span class="new-chat-option-project-name">{draft_settings_summary}</span>
+                    <span class="new-chat-option-project-change">"Change"</span>
+                </button>
+            </div>
         </section>
     }
 }

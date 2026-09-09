@@ -2,111 +2,16 @@ use leptos::prelude::*;
 use wasm_bindgen::JsCast;
 
 use protocol::{
-    BackendKind, SelectOption, SessionSchemaEntry, SessionSettingFieldType, SessionSettingValue,
+    BackendKind, ControlOption, SessionSchemaEntry, SessionSettingFieldType, SessionSettingValue,
     SessionSettingsSchema, SessionSettingsValues, TaskTokenUsageAmount, TaskTokenUsagePayload,
     TaskTokenUsageScope, TaskTokenUsageStatus, TaskTokenUsageUnavailableReason,
+    clear_invalid_dependent_select_values, options_including_current,
 };
 
 use crate::components::agents_panel::backend_label;
 use crate::components::backend_capacity::CapacityCompactRow;
 use crate::components::chat_message::{format_compact, token_badge_data};
 use crate::state::{ActiveAgentRef, AppState, ComposerHandle};
-
-pub(crate) fn clear_invalid_dependent_select_values(
-    fields: &[protocol::SessionSettingField],
-    values: &mut SessionSettingsValues,
-) {
-    for field in fields {
-        if field.select_options_by_setting.is_none() {
-            continue;
-        }
-        let Some(SessionSettingValue::String(selected)) = values.0.get(&field.key) else {
-            continue;
-        };
-        let selected = selected.clone();
-        let valid = field
-            .select_options(values)
-            .is_some_and(|options| options.iter().any(|option| option.value == selected));
-        if !valid
-            && matches!(
-                &field.field_type,
-                SessionSettingFieldType::Select { nullable: true, .. }
-            )
-        {
-            values
-                .0
-                .insert(field.key.clone(), SessionSettingValue::Null);
-        }
-    }
-}
-
-/// Suffix marking a value the session carries but the schema no longer offers.
-pub(crate) const UNAVAILABLE_OPTION_SUFFIX: &str = " (unavailable)";
-
-/// Marker a backend puts in an option's **label** for a choice it deliberately
-/// retained but cannot currently serve — the Hermes profile schema emits
-/// `"<name> — Unavailable: <error>"` for a profile whose gateway probe failed,
-/// so the option stays visible with its reason instead of vanishing.
-///
-/// Matching on the label is not a preference. [`SelectOption`] carries only
-/// `value` and `label`, so this is the sole channel the protocol offers; a
-/// typed availability field on `SelectOption` is the durable fix and is tracked
-/// as a protocol dependency. Retaining an option the backend has already said
-/// it cannot serve, while leaving it selectable, would be worse than either.
-pub(crate) const SCHEMA_UNAVAILABLE_MARKER: &str = "Unavailable:";
-
-/// One entry of a select-like control.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ControlOption {
-    pub value: String,
-    pub label: String,
-    /// True for the synthetic entry standing in for a value the schema no
-    /// longer offers. Display-only: the control must render it as selected but
-    /// non-actionable, and no commit path may submit it as a user edit.
-    pub unavailable: bool,
-}
-
-/// The entries a select-like control should render, given the value the session
-/// actually carries.
-///
-/// A value the schema does not offer is still the truth about this session, so
-/// it is appended as an explicitly-labelled entry instead of being dropped.
-/// Dropping it makes the control display some *other* option — the schema
-/// default, or whichever the browser picks first — and silently misreport the
-/// session's real setting. That is the Hermes named-profile case: a profile
-/// whose gateway probe failed leaves the schema, and the Profile control then
-/// claims the session is on `default` when it is not.
-///
-/// The injected entry is display-only, and its `unavailable` flag is what the
-/// commit paths check to keep it that way. Offering it as a selectable value
-/// would invite the user to "set" a setting the backend has already said it
-/// cannot serve.
-pub(crate) fn options_including_current(
-    options: &[SelectOption],
-    current: &str,
-) -> Vec<ControlOption> {
-    let mut entries: Vec<ControlOption> = options
-        .iter()
-        .map(|option| ControlOption {
-            value: option.value.clone(),
-            // A schema option can itself be unavailable: the backend retains a
-            // failed choice so its reason stays visible. Such an option must
-            // read as non-actionable for exactly the same reason the synthetic
-            // one below does.
-            unavailable: option.label.contains(SCHEMA_UNAVAILABLE_MARKER),
-            label: option.label.clone(),
-        })
-        .collect();
-    if current.is_empty() || entries.iter().any(|entry| entry.value == current) {
-        return entries;
-    }
-    entries.push(ControlOption {
-        value: current.to_owned(),
-        label: format!("{current}{UNAVAILABLE_OPTION_SUFFIX}"),
-        unavailable: true,
-    });
-    entries
-}
 
 #[component]
 pub fn SessionSettingsControls(

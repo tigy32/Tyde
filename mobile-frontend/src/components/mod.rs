@@ -13,6 +13,7 @@ mod paired_hosts_picker;
 mod pairing_flow;
 pub mod pending_submissions;
 mod project_picker;
+mod session_settings;
 mod sessions_view;
 pub mod settings_view;
 mod teams_view;
@@ -35,6 +36,7 @@ pub use pairing_flow::PairingFlow;
 // dead.
 pub use pending_submissions::PendingSubmissions;
 pub use project_picker::{ProjectPicker, new_chat_callback};
+pub use session_settings::SessionSettingsSheet;
 pub use sessions_view::SessionsView;
 pub use settings_view::SettingsView;
 

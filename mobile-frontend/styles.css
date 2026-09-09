@@ -4537,6 +4537,134 @@ html[data-keyboard-open] .mobile-app {
     color: var(--text-tertiary);
 }
 
+/* ── Session settings sheet ──────────────────────────────────────────────────
+   Same bottom-sheet geometry as the project sheet: these are rare, deliberate
+   edits reached from an overflow menu, so they get the full sheet rather than
+   a cramped popover anchored to a 44px button. */
+.session-settings-backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 1000;
+    display: flex;
+    align-items: flex-end;
+    justify-content: center;
+    padding: var(--space-3);
+    padding-bottom: max(var(--space-3), var(--safe-area-bottom));
+    background: rgba(0, 0, 0, 0.55);
+    backdrop-filter: blur(4px);
+    -webkit-backdrop-filter: blur(4px);
+}
+
+.session-settings-sheet {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+    width: 100%;
+    max-width: 32rem;
+    max-height: 70vh;
+    padding: var(--space-4);
+    border-radius: var(--radius-lg);
+    background: var(--surface-float);
+    box-shadow: var(--rim-float), var(--shadow-float);
+}
+
+.session-settings-sheet-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-2);
+}
+
+.session-settings-sheet-title {
+    margin: 0;
+    font-size: 1.05rem;
+    font-weight: 600;
+    color: var(--text-primary);
+}
+
+.session-settings-done {
+    min-height: 44px;
+    padding: 0 var(--space-2);
+    color: var(--accent-primary);
+    background: transparent;
+    font-size: 16px;
+    font-weight: 600;
+}
+
+.session-settings-scope {
+    margin: 0;
+    color: var(--text-tertiary);
+    font-size: 12px;
+    line-height: 1.35;
+}
+
+.session-settings-sheet-body {
+    overflow-y: auto;
+    -webkit-overflow-scrolling: touch;
+}
+
+.session-settings-status {
+    margin: var(--space-2) 0;
+    color: var(--text-secondary);
+    font-size: 14px;
+    line-height: 1.4;
+}
+
+.session-settings-fields {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-3);
+    padding: var(--space-1) 0;
+}
+
+.session-setting {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+}
+
+.session-setting-label {
+    color: var(--text-secondary);
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+}
+
+.session-setting-hint {
+    margin: 0;
+    color: var(--text-tertiary);
+    font-size: 12px;
+    line-height: 1.35;
+}
+
+.session-setting-select,
+.session-setting-number {
+    width: 100%;
+    /* 16px keeps iOS Safari from zooming the viewport on focus. */
+    min-height: 44px;
+    padding: 0 var(--space-2);
+    color: var(--text-primary);
+    background: var(--bg-surface-2);
+    border: 1px solid var(--border-default);
+    border-radius: var(--radius-button);
+    font-size: 16px;
+}
+
+.session-setting-select:focus,
+.session-setting-number:focus {
+    border-color: var(--accent-primary);
+    outline: none;
+}
+
+.session-setting-toggle {
+    /* A native checkbox is 13px by default — well under the touch minimum. */
+    width: 44px;
+    height: 28px;
+    align-self: flex-start;
+    accent-color: var(--accent-primary);
+}
+
 /* ── Subscription capacity ───────────────────────────────────────────────────
    Mobile parity with desktop: same states, same coverage caveat, same absolute
    timestamps. Stacked rather than a wide row so nothing clips at phone width.
