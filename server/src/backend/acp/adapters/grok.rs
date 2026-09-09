@@ -455,6 +455,14 @@ pub(crate) fn exit_plan_mode_ext_response(
     }
 }
 
+pub(crate) fn plan_from_tool_args(args: &Value) -> Option<String> {
+    plan_from_args(args)
+}
+
+pub(crate) fn plan_path_from_tool_args(args: &Value) -> Option<String> {
+    plan_path_from_args(args)
+}
+
 fn plan_from_args(args: &Value) -> Option<String> {
     ["plan", "planContent", "plan_content"]
         .iter()

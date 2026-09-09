@@ -1619,11 +1619,16 @@ impl KiroInner {
                 self.handle_notification(&method, &params).await;
             }
             AcpInbound::ServerRequest { id, method, params } => {
-                if method == "x.ai/exit_plan_mode"
-                    && self.adapter.backend_kind() == protocol::BackendKind::Grok
+                if self.adapter.backend_kind() == protocol::BackendKind::Grok
+                    && is_grok_exit_plan_mode_method(&method)
                 {
                     self.handle_grok_exit_plan_mode(id, params).await;
                     return;
+                }
+                if self.adapter.backend_kind() == protocol::BackendKind::Grok
+                    && (method.starts_with("x.ai/") || method.starts_with("_x.ai/"))
+                {
+                    eprintln!("TYDE ACP GROK SERVER REQUEST method={method} params={params}");
                 }
                 match self
                     .bridge
@@ -1932,11 +1937,20 @@ impl KiroInner {
     /// payload is agent-defined, which is why the adapter decides.
     async fn map_tool_request(&self, params: &Value, args: &Value, workspace_root: &str) -> Value {
         let wire_kind = params.get("kind").and_then(Value::as_str).unwrap_or("");
-        let normalized_kind = if wire_kind == "other"
+        let title = params
+            .get("title")
+            .and_then(Value::as_str)
+            .unwrap_or(wire_kind);
+        let normalized_kind = if self.adapter.backend_kind() == protocol::BackendKind::Grok
+            && super::adapters::grok::is_exit_plan_mode_tool(title)
+        {
+            title.to_owned()
+        } else if wire_kind == "other"
             && matches!(
                 self.adapter.backend_kind(),
                 protocol::BackendKind::Opencode | protocol::BackendKind::Grok
-            ) {
+            )
+        {
             self.adapter
                 .normalize_tool_name(
                     params
@@ -2580,9 +2594,15 @@ impl KiroInner {
                 &raw_tool_call_id,
             );
             let duplicate_request = state.active_tool_contexts.contains_key(&canonical_id);
-            let tool_type = self
+            let mut tool_type = self
                 .map_tool_request(params, &request.args, &workspace_root)
                 .await;
+            if super::adapters::grok::is_exit_plan_mode_tool(&request.tool_name) {
+                tool_type = super::adapters::grok::exit_plan_mode_tool_type(
+                    super::adapters::grok::plan_from_tool_args(&request.args),
+                    super::adapters::grok::plan_path_from_tool_args(&request.args),
+                );
+            }
 
             let context = state
                 .active_tool_contexts
@@ -2709,6 +2729,15 @@ impl KiroInner {
         let Some(resolved_tool_call_id) = resolved_tool_call_id else {
             return;
         };
+        if self
+            .state
+            .lock()
+            .await
+            .completed_tool_call_ids
+            .contains(&resolved_tool_call_id)
+        {
+            return;
+        }
         let Some(mut completion) = parse_tool_call_completion(params, fallback_name) else {
             return;
         };
@@ -3505,6 +3534,7 @@ impl KiroInner {
             (canonical_id, emit_request)
         };
 
+        self.flush_pending_grok_response_end().await;
         if emit_request {
             self.emitter
                 .tool_request(&canonical_id, kiro_tool_request_type(tool_type));
@@ -3546,9 +3576,46 @@ impl KiroInner {
         self.bridge
             .respond(
                 pending.rpc_id,
-                super::adapters::grok::exit_plan_mode_ext_response(decision, feedback),
+                super::adapters::grok::exit_plan_mode_ext_response(decision, feedback.clone()),
             )
             .await?;
+        let plan_info = self
+            .state
+            .lock()
+            .await
+            .active_tool_contexts
+            .get(&pending.tool_call_id)
+            .map(|context| context.tool_type.clone());
+        let mut result = serde_json::Map::new();
+        result.insert(
+            "decision".to_owned(),
+            json!(match decision {
+                ExitPlanModeDecision::Approve => "approved",
+                ExitPlanModeDecision::Reject => "rejected",
+            }),
+        );
+        if let Some(feedback) = feedback.filter(|text| !text.trim().is_empty()) {
+            result.insert("feedback".to_owned(), json!(feedback));
+        }
+        if let Some(tool_type) = plan_info {
+            if let Some(plan) = tool_type.get("plan").and_then(Value::as_str) {
+                result.insert("plan".to_owned(), json!(plan));
+            }
+            if let Some(plan_path) = tool_type.get("plan_path").and_then(Value::as_str) {
+                result.insert("plan_path".to_owned(), json!(plan_path));
+            }
+        }
+        {
+            let mut state = self.state.lock().await;
+            state
+                .completed_tool_call_ids
+                .insert(pending.tool_call_id.clone());
+            state.active_tool_contexts.remove(&pending.tool_call_id);
+        }
+        self.emitter.tool_completed(
+            &pending.tool_call_id,
+            kiro_tool_execution_outcome(json!({ "kind": "Other", "result": result }), true, None),
+        );
         self.emitter.typing_status_changed(true);
         Ok(())
     }
@@ -3881,6 +3948,12 @@ fn kiro_tool_execution_outcome(
 fn kiro_message_token_usage(value: &Value) -> MessageTokenUsage {
     let usage = serde_json::from_value::<TokenUsage>(value.clone()).unwrap_or_default();
     MessageTokenUsage::request_and_turn_known(usage.clone(), usage)
+}
+
+fn is_grok_exit_plan_mode_method(method: &str) -> bool {
+    method == "x.ai/exit_plan_mode"
+        || method == "_x.ai/exit_plan_mode"
+        || method.ends_with("/exit_plan_mode")
 }
 
 fn normalize_tool_call_id_fragment(raw: &str) -> String {
