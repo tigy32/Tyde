@@ -63,7 +63,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-use crate::agent::customization::{ResolvedSkill, SkillSelection};
+use crate::backend::customization::{ResolvedSkill, SkillSelection};
 use crate::backend::skill_projection::{
     DescriptionPolicy, InspectedSkill, ProjectionPolicy, SkillRefusal, create_private_dir,
     create_private_root, discard_wrapper, inspect_skill, write_private_file, write_wrapper,

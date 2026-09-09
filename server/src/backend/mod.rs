@@ -9,10 +9,10 @@ pub mod antigravity_stream;
 pub mod claude;
 pub mod claude_skills;
 pub mod codex;
-// Trait-facing compaction types are nominally public inside this crate-private
-// module so the public Backend trait does not export the internal contract.
-pub(crate) mod compaction;
+pub mod compaction;
+pub mod customization;
 pub mod grok;
+pub(crate) mod handle;
 pub mod hermes;
 pub mod hermes_config;
 pub mod mock;
@@ -41,7 +41,8 @@ use tokio::sync::{mpsc, oneshot};
 use tyde_agent_adapter::{BackendCapabilities, BackendCapability};
 
 use self::subprocess::ImageAttachment;
-use crate::agent::customization::ResolvedSpawnConfig;
+pub use crate::sub_agent::{SubAgentEmitter, SubAgentHandle};
+pub use customization::{ResolvedSkill, ResolvedSpawnConfig, SkillDelivery, SkillSelection};
 
 pub(crate) use compaction::{
     BackendAcceptedCompaction, BackendBindingPrepareError, BackendBindingReadyEvidence,
@@ -374,6 +375,50 @@ pub struct BackendSession {
     pub resumable: bool,
 }
 
+fn session_from_metadata(value: &Value, backend_kind: BackendKind) -> Option<BackendSession> {
+    Some(BackendSession {
+        id: SessionId(value.get("id")?.as_str()?.to_owned()),
+        backend_kind,
+        workspace_roots: value
+            .get("workspace_root")
+            .and_then(Value::as_str)
+            .filter(|root| !root.is_empty())
+            .map(|root| vec![root.to_owned()])
+            .unwrap_or_default(),
+        title: value
+            .get("title")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        token_count: value.get("token_count").and_then(Value::as_u64),
+        created_at_ms: value.get("created_at").and_then(Value::as_u64),
+        updated_at_ms: value.get("last_modified").and_then(Value::as_u64),
+        resumable: true,
+    })
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct BackendStorage {
+    roots: HashMap<BackendKind, PathBuf>,
+}
+
+impl BackendStorage {
+    pub fn new(overrides: HashMap<BackendKind, PathBuf>) -> Result<Self, String> {
+        let mut roots = HashMap::new();
+        for kind in SUPPORTED_BACKENDS {
+            if let Some(root) =
+                resolve_storage_root(kind, overrides.get(&kind).map(PathBuf::as_path))?
+            {
+                roots.insert(kind, root);
+            }
+        }
+        Ok(Self { roots })
+    }
+
+    pub(crate) fn root(&self, kind: BackendKind) -> Option<&std::path::Path> {
+        self.roots.get(&kind).map(PathBuf::as_path)
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct BackendSpawnConfig {
     pub execution_mode: BackendExecutionMode,
@@ -385,7 +430,7 @@ pub struct BackendSpawnConfig {
     pub provider_version: Option<String>,
     /// Resolved Antigravity conversation store used by both ordinary and
     /// prepared replacement bindings.
-    pub antigravity_conversations_dir: Option<PathBuf>,
+    pub backend_storage: BackendStorage,
     /// Host-level deep configuration for this backend (see
     /// [`protocol::BackendConfigSchema`]). Empty when unconfigured.
     pub backend_config: BackendConfigValues,
@@ -394,6 +439,12 @@ pub struct BackendSpawnConfig {
     /// built-in Kiro agent, which keeps sessions recorded before ACP profiles
     /// existed working.
     pub acp_agent: Option<protocol::AcpAgentSpec>,
+    /// Where this session's sub-agent spawns and capacity reports go. It is
+    /// part of the spawn config so it is live before the launch turn starts.
+    pub subagent_emitter: Option<Arc<dyn crate::sub_agent::SubAgentEmitter>>,
+    /// Test support: the scripted launch the host reserved for this start of
+    /// the mock backend. Real backends ignore it.
+    pub(crate) mock_launch: Option<mock::MockLaunch>,
     pub resolved_spawn_config: ResolvedSpawnConfig,
 }
 
@@ -401,7 +452,7 @@ pub struct BackendSpawnConfig {
 /// events and backend-only accounting events while independently sending
 /// AgentInput through the Backend handle.
 #[derive(Debug, Clone)]
-pub(crate) enum BackendEvent {
+pub enum BackendEvent {
     Chat(ChatEvent),
     ModelRequestTokenUsage(ModelRequestTokenUsage),
     Compaction(BackendCompactionEvent),
@@ -651,7 +702,7 @@ impl EventStream {
     /// event is folded into `self` by a synchronous step before the next one.
     /// The caller selects on this future, so anything held only in a local
     /// would be lost when another branch wins.
-    pub(crate) async fn recv_backend(&mut self) -> Option<BackendEvent> {
+    pub async fn recv_backend(&mut self) -> Option<BackendEvent> {
         loop {
             if let Some(event) = self.buffered.pop_front() {
                 return Some(event);
@@ -856,7 +907,7 @@ impl EventStream {
         Some(rebuild_delta(pending.reasoning, pending.text))
     }
 
-    pub(crate) fn try_recv_backend(&mut self) -> Result<BackendEvent, mpsc::error::TryRecvError> {
+    pub fn try_recv_backend(&mut self) -> Result<BackendEvent, mpsc::error::TryRecvError> {
         // Held-back text first, for the same ordering reason as the async path:
         // a caller draining this stream must not see a later event before the
         // deltas that came before it.
@@ -976,6 +1027,66 @@ pub enum CancelBackgroundTaskOutcome {
     Failed(String),
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct BackendProbeContext {
+    #[cfg(any(test, feature = "test-support"))]
+    pub mock_discovery: Option<mock::MockDiscovery>,
+    pub program: Option<String>,
+    pub workspace_roots: Vec<String>,
+    pub launch: Option<protocol::AcpAgentSpec>,
+    pub disabled_providers: HashMap<String, Vec<String>>,
+}
+
+impl BackendProbeContext {
+    pub(crate) fn has_mock_discovery(&self) -> bool {
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            self.mock_discovery.is_some()
+        }
+        #[cfg(not(any(test, feature = "test-support")))]
+        {
+            false
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct BackendDiscovery {
+    pub schema: SessionSettingsSchema,
+    pub launch_profiles: Vec<protocol::LaunchProfileEntry>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum TokenUsageTrackingMode {
+    #[default]
+    Messages,
+    ModelRequests,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct DiscoveryPolicy {
+    pub can_refresh_native_settings: bool,
+    pub schema_uses_provider_filters: bool,
+    pub profile_scope: Option<protocol::LaunchProfileId>,
+    pub refresh_on_connect: bool,
+    pub retain_last_good: bool,
+}
+
+pub struct NativeSettingsWriteOutcome {
+    pub result: Result<(), String>,
+    pub refresh_required: bool,
+}
+
+pub const SUPPORTED_BACKENDS: [BackendKind; 7] = [
+    BackendKind::Kiro,
+    BackendKind::Claude,
+    BackendKind::Codex,
+    BackendKind::Antigravity,
+    BackendKind::Hermes,
+    BackendKind::Grok,
+    BackendKind::Opencode,
+];
+
 /// A coding agent backend session handle.
 ///
 /// Created via `Backend::spawn()` which returns `(Self, EventStream)`.
@@ -990,6 +1101,253 @@ pub trait Backend: Send + Sync + 'static {
     fn session_settings_schema() -> SessionSettingsSchema
     where
         Self: Sized;
+
+    fn native_settings_snapshot(
+        _context: &BackendProbeContext,
+    ) -> impl std::future::Future<Output = Option<protocol::BackendNativeSettingsSnapshot>> + Send
+    where
+        Self: Sized,
+    {
+        std::future::ready(None)
+    }
+
+    fn write_native_settings(
+        _settings: Value,
+        _context: &BackendProbeContext,
+    ) -> impl std::future::Future<Output = NativeSettingsWriteOutcome> + Send
+    where
+        Self: Sized,
+    {
+        std::future::ready(NativeSettingsWriteOutcome {
+            result: Err(format!(
+                "{:?} does not support backend-native settings saves",
+                Self::session_settings_schema().backend_kind
+            )),
+            refresh_required: false,
+        })
+    }
+
+    fn default_child_workspace_roots(_parent_roots: &[String]) -> Vec<String>
+    where
+        Self: Sized,
+    {
+        Vec::new()
+    }
+
+    fn default_launch_profile() -> protocol::LaunchProfile
+    where
+        Self: Sized,
+    {
+        let kind = Self::session_settings_schema().backend_kind;
+        let label = backend_launch_profile_label(kind);
+        protocol::LaunchProfile {
+            id: protocol::LaunchProfileId(format!("{}:default", backend_slug(kind))),
+            kind: protocol::LaunchProfileKind::BackendDefault,
+            label: label.to_owned(),
+            description: Some(format!("Launch {label} with its backend defaults.")),
+            backend_kind: kind,
+            session_settings: SessionSettingsValues::default(),
+        }
+    }
+
+    fn reserved_launch_profile_error(_id: &protocol::LaunchProfileId) -> Option<String>
+    where
+        Self: Sized,
+    {
+        None
+    }
+
+    fn validate_launch_config(
+        id: &protocol::LaunchProfileId,
+        config: Option<&protocol::AcpAgentSpec>,
+    ) -> Result<(), String>
+    where
+        Self: Sized,
+    {
+        if config.is_some() {
+            let kind = Self::session_settings_schema().backend_kind;
+            return Err(format!(
+                "launch profile {id} configures an ACP agent but targets {kind:?}"
+            ));
+        }
+        Ok(())
+    }
+
+    fn default_launch_config() -> Option<protocol::AcpAgentSpec>
+    where
+        Self: Sized,
+    {
+        None
+    }
+
+    fn discovery_policy() -> DiscoveryPolicy
+    where
+        Self: Sized,
+    {
+        DiscoveryPolicy::default()
+    }
+
+    fn has_dynamic_session_schema() -> bool
+    where
+        Self: Sized,
+    {
+        false
+    }
+
+    fn discover(
+        context: &BackendProbeContext,
+    ) -> impl std::future::Future<Output = Result<BackendDiscovery, String>> + Send
+    where
+        Self: Sized,
+    {
+        let _ = context;
+        std::future::ready(Ok(BackendDiscovery {
+            schema: Self::session_settings_schema(),
+            launch_profiles: Vec::new(),
+        }))
+    }
+
+    fn token_usage_tracking_mode() -> TokenUsageTrackingMode
+    where
+        Self: Sized,
+    {
+        TokenUsageTrackingMode::Messages
+    }
+
+    fn resolve_session_settings(config: &BackendSpawnConfig) -> SessionSettingsValues
+    where
+        Self: Sized,
+    {
+        resolve_settings(config, &Self::session_settings_schema(), |_| {
+            SessionSettingsValues::default()
+        })
+    }
+
+    fn validate_runtime_session_settings_update(
+        _current: &SessionSettingsValues,
+        _update: &SessionSettingsValues,
+    ) -> Result<(), String>
+    where
+        Self: Sized,
+    {
+        Ok(())
+    }
+
+    fn startup_drop_cancels_workers() -> bool
+    where
+        Self: Sized,
+    {
+        true
+    }
+
+    fn resolve_storage_root(configured: Option<&std::path::Path>) -> Result<Option<PathBuf>, String>
+    where
+        Self: Sized,
+    {
+        Ok(configured.map(std::path::Path::to_path_buf))
+    }
+
+    fn native_session_id_is_valid(_session_id: &SessionId) -> bool
+    where
+        Self: Sized,
+    {
+        true
+    }
+
+    fn stored_session_is_resumable(
+        _session_id: &SessionId,
+        stored_resumable: bool,
+        _has_parent: bool,
+        _superseded: bool,
+        _storage: &BackendStorage,
+    ) -> bool
+    where
+        Self: Sized,
+    {
+        stored_resumable && Self::capabilities().contains(BackendCapability::ResumeSession)
+    }
+
+    fn session_is_resumable(
+        _session_id: &SessionId,
+        _workspace_roots: &[String],
+        _resolved: &ResolvedSpawnConfig,
+    ) -> bool
+    where
+        Self: Sized,
+    {
+        Self::capabilities().contains(BackendCapability::ResumeSession)
+    }
+
+    fn helper_session_settings(
+        _session_settings: Option<&SessionSettingsValues>,
+    ) -> Option<SessionSettingsValues>
+    where
+        Self: Sized,
+    {
+        None
+    }
+
+    fn validate_tool_policy(policy: &protocol::ToolPolicy) -> Result<(), String>
+    where
+        Self: Sized,
+    {
+        match policy {
+            protocol::ToolPolicy::Unrestricted => Ok(()),
+            _ => Err(format!(
+                "backend {:?} does not support tool policy {policy:?}",
+                Self::session_settings_schema().backend_kind
+            )),
+        }
+    }
+
+    fn terminal_errors_are_retryable() -> bool
+    where
+        Self: Sized,
+    {
+        true
+    }
+
+    fn resolve_tier_config(
+        _schema: Option<&SessionSettingsSchema>,
+        _selected_values: &SessionSettingsValues,
+    ) -> Result<Option<BackendTierConfig>, String>
+    where
+        Self: Sized,
+    {
+        Ok(None)
+    }
+
+    fn default_persisted_tier_config() -> Option<BackendTierConfig>
+    where
+        Self: Sized,
+    {
+        Some(Self::builtin_tier_config())
+    }
+
+    fn skill_delivery() -> crate::backend::customization::SkillDelivery
+    where
+        Self: Sized,
+    {
+        crate::backend::customization::SkillDelivery::NamesOnly
+    }
+
+    fn builtin_tier_config() -> BackendTierConfig
+    where
+        Self: Sized,
+    {
+        BackendTierConfig::default()
+    }
+
+    fn read_capacity_out_of_band(
+        _context: &BackendProbeContext,
+    ) -> impl std::future::Future<Output = protocol::BackendCapacityState> + Send
+    where
+        Self: Sized,
+    {
+        std::future::ready(protocol::BackendCapacityState::Unsupported {
+            reason: protocol::CapacityUnsupportedReason::BackendHasNoCapacitySource,
+        })
+    }
 
     /// Optional host-level deep configuration schema for this backend, rendered
     /// in the settings panel (distinct from the per-session settings bar).
@@ -1034,8 +1392,9 @@ pub trait Backend: Send + Sync + 'static {
         Self: Sized;
 
     /// Enumerate resumable sessions known to this backend.
-    fn list_sessions()
-    -> impl std::future::Future<Output = Result<Vec<BackendSession>, String>> + Send
+    fn list_sessions(
+        context: &BackendProbeContext,
+    ) -> impl std::future::Future<Output = Result<Vec<BackendSession>, String>> + Send
     where
         Self: Sized;
 
@@ -1073,6 +1432,30 @@ pub trait Backend: Send + Sync + 'static {
         }
     }
 
+    fn prepare_context_replacement(
+        config: BackendSpawnConfig,
+        seed: compaction::BackendContextSeed,
+    ) -> impl std::future::Future<
+        Output = Result<
+            (
+                Self,
+                EventStream,
+                SessionId,
+                compaction::BackendBindingReadyEvidence,
+            ),
+            compaction::BackendBindingPrepareError,
+        >,
+    > + Send
+    where
+        Self: Sized,
+    {
+        prepare_concrete_backend_binding::<Self>(
+            Self::session_settings_schema().backend_kind,
+            config,
+            seed,
+        )
+    }
+
     fn compaction_capability(&self) -> BackendCompactionCapability {
         BackendCompactionCapability::legacy_unavailable(
             BackendCompactionUnavailableReason::AdapterHasNoManualTransport,
@@ -1091,6 +1474,14 @@ pub trait Backend: Send + Sync + 'static {
                 fallback_safe: true,
             }
         }
+    }
+
+    fn read_session_settings(
+        &self,
+    ) -> impl std::future::Future<Output = Result<SessionSettingsValues, String>> + Send {
+        std::future::ready(Err(
+            "backend does not expose live session settings".to_owned()
+        ))
     }
 
     fn update_session_settings(
@@ -1151,20 +1542,50 @@ pub trait Backend: Send + Sync + 'static {
         Self: Sized;
 }
 
+/// Resolve a `BackendKind` to its concrete [`Backend`] type.
+macro_rules! with_backend_type {
+    ($kind:expr, |$B:ident| $body:expr, removed => $removed:expr) => {
+        match $kind {
+            protocol::BackendKind::Tycode => $removed,
+            protocol::BackendKind::Kiro => {
+                type $B = $crate::backend::kiro::KiroBackend;
+                $body
+            }
+            protocol::BackendKind::Claude => {
+                type $B = $crate::backend::claude::ClaudeBackend;
+                $body
+            }
+            protocol::BackendKind::Codex => {
+                type $B = $crate::backend::codex::CodexBackend;
+                $body
+            }
+            protocol::BackendKind::Antigravity => {
+                type $B = $crate::backend::antigravity::AntigravityBackend;
+                $body
+            }
+            protocol::BackendKind::Hermes => {
+                type $B = $crate::backend::hermes::HermesBackend;
+                $body
+            }
+            protocol::BackendKind::Grok => {
+                type $B = $crate::backend::grok::GrokBackend;
+                $body
+            }
+            protocol::BackendKind::Opencode => {
+                type $B = $crate::backend::opencode::OpencodeBackend;
+                $body
+            }
+        }
+    };
+}
+pub(crate) use with_backend_type;
+
 /// Whether this backend can report account capacity with no conversation.
 ///
 /// Static per backend, because the poller has to decide before any session
 /// exists — which is the whole point of the capability.
 pub(crate) fn supports_out_of_band_capacity(kind: BackendKind) -> bool {
     capabilities_for_backend_kind(kind).contains(BackendCapability::OutOfBandCapacity)
-}
-
-/// What a host-owned capacity poll needs to reach a provider.
-pub(crate) struct CapacityProbeContext {
-    pub workspace_roots: Vec<String>,
-    pub codex_program: Option<String>,
-    pub kiro_program: Option<String>,
-    pub acp_agent: Option<protocol::AcpAgentSpec>,
 }
 
 /// Reads one backend's account capacity without starting a conversation.
@@ -1175,53 +1596,23 @@ pub(crate) struct CapacityProbeContext {
 /// such rather than probed.
 pub(crate) async fn read_capacity_out_of_band(
     kind: BackendKind,
-    ctx: &CapacityProbeContext,
+    ctx: &BackendProbeContext,
 ) -> protocol::BackendCapacityState {
-    match kind {
-        BackendKind::Claude => claude::read_capacity_out_of_band().await,
-        BackendKind::Codex => codex::read_capacity_out_of_band(ctx.codex_program.as_deref()).await,
-        BackendKind::Antigravity => antigravity::read_capacity_out_of_band().await,
-        BackendKind::Kiro => {
-            acp::backend::read_kiro_capacity_out_of_band(
-                &ctx.workspace_roots,
-                ctx.acp_agent.as_ref(),
-                ctx.kiro_program.clone(),
-            )
-            .await
-        }
-        BackendKind::Grok => {
-            acp::backend::read_grok_capacity_out_of_band(
-                &ctx.workspace_roots,
-                ctx.acp_agent.as_ref(),
-            )
-            .await
-        }
-        BackendKind::Hermes | BackendKind::Opencode | BackendKind::Tycode => {
-            protocol::BackendCapacityState::Unsupported {
-                reason: protocol::CapacityUnsupportedReason::BackendHasNoCapacitySource,
-            }
-        }
-    }
+    with_backend_type!(kind, |B| B::read_capacity_out_of_band(ctx).await,
+    removed => protocol::BackendCapacityState::Unsupported {
+        reason: protocol::CapacityUnsupportedReason::BackendHasNoCapacitySource,
+    })
 }
 
 pub fn capabilities_for_backend_kind(kind: BackendKind) -> BackendCapabilities {
-    match kind {
-        BackendKind::Tycode => BackendCapabilities::default(),
-        BackendKind::Kiro => kiro::KiroBackend::capabilities(),
-        BackendKind::Claude => claude::ClaudeBackend::capabilities(),
-        BackendKind::Codex => codex::CodexBackend::capabilities(),
-        BackendKind::Antigravity => antigravity::AntigravityBackend::capabilities(),
-        BackendKind::Hermes => hermes::HermesBackend::capabilities(),
-        BackendKind::Grok => grok::capabilities(),
-        BackendKind::Opencode => opencode::capabilities(),
-    }
+    with_backend_type!(kind, |B| B::capabilities(), removed => BackendCapabilities::default())
 }
 
 #[cfg(feature = "test-support")]
 pub fn discovers_skills_natively(kind: BackendKind) -> bool {
     matches!(
-        crate::agent::customization::SkillDelivery::for_backend(kind),
-        crate::agent::customization::SkillDelivery::NativeDiscovery
+        skill_delivery(kind),
+        crate::backend::customization::SkillDelivery::NativeDiscovery
     )
 }
 
@@ -1236,46 +1627,16 @@ pub fn compaction_capability_is_native(capability: &BackendCompactionCapability)
 #[cfg(feature = "test-support")]
 pub async fn list_sessions_for_backend_kind(
     kind: BackendKind,
+    context: &BackendProbeContext,
 ) -> Result<Vec<BackendSession>, String> {
-    match kind {
-        BackendKind::Tycode => Err("Tycode backend has been removed".to_owned()),
-        BackendKind::Kiro => kiro::KiroBackend::list_sessions().await,
-        BackendKind::Claude => claude::ClaudeBackend::list_sessions().await,
-        BackendKind::Codex => codex::CodexBackend::list_sessions().await,
-        BackendKind::Antigravity => antigravity::AntigravityBackend::list_sessions().await,
-        BackendKind::Hermes => hermes::HermesBackend::list_sessions().await,
-        BackendKind::Grok => grok::list_sessions().await,
-        BackendKind::Opencode => opencode::list_sessions().await,
-    }
-}
-
-pub(crate) enum PreparedBackendHandle {
-    Acp(Box<kiro::KiroBackend>),
-    Claude(Box<claude::ClaudeBackend>),
-    Codex(Box<codex::CodexBackend>),
-    Antigravity(Box<antigravity::AntigravityBackend>),
-    Hermes(Box<hermes::HermesBackend>),
-    Mock { backend: Box<mock::MockBackend> },
+    with_backend_type!(kind, |B| B::list_sessions(context).await, removed => Err("Tycode backend has been removed".to_owned()))
 }
 
 pub(crate) struct PreparedBackendBinding {
-    pub backend: PreparedBackendHandle,
+    pub backend: handle::BackendHandle,
     pub events: EventStream,
     pub provider_session_id: SessionId,
     pub ready: BackendBindingReadyEvidence,
-}
-
-impl PreparedBackendHandle {
-    pub(crate) async fn shutdown(self) {
-        match self {
-            Self::Acp(backend) => Backend::shutdown(*backend).await,
-            Self::Claude(backend) => Backend::shutdown(*backend).await,
-            Self::Codex(backend) => Backend::shutdown(*backend).await,
-            Self::Antigravity(backend) => Backend::shutdown(*backend).await,
-            Self::Hermes(backend) => Backend::shutdown(*backend).await,
-            Self::Mock { backend, .. } => Backend::shutdown(*backend).await,
-        }
-    }
 }
 
 pub(crate) async fn prepare_compacted_backend_binding(
@@ -1283,74 +1644,19 @@ pub(crate) async fn prepare_compacted_backend_binding(
     spawn: BackendSpawnConfig,
     seed: BackendContextSeed,
 ) -> Result<PreparedBackendBinding, BackendBindingPrepareError> {
-    match kind {
-        BackendKind::Tycode => Err(BackendBindingPrepareError::SpawnFailed {
-            backend_kind: kind,
-            message: "Tycode backend has been removed".to_owned(),
-        }),
-        BackendKind::Kiro => {
-            let (backend, events, provider_session_id, ready) =
-                prepare_concrete_backend_binding::<kiro::KiroBackend>(kind, spawn, seed).await?;
-            Ok(PreparedBackendBinding {
-                backend: PreparedBackendHandle::Acp(Box::new(backend)),
-                events,
-                provider_session_id,
-                ready,
-            })
-        }
-        BackendKind::Claude => {
-            let (backend, events, provider_session_id, ready) =
-                prepare_concrete_backend_binding::<claude::ClaudeBackend>(kind, spawn, seed)
-                    .await?;
-            Ok(PreparedBackendBinding {
-                backend: PreparedBackendHandle::Claude(Box::new(backend)),
-                events,
-                provider_session_id,
-                ready,
-            })
-        }
-        BackendKind::Codex => {
-            let (backend, events, provider_session_id, ready) =
-                prepare_concrete_backend_binding::<codex::CodexBackend>(kind, spawn, seed).await?;
-            Ok(PreparedBackendBinding {
-                backend: PreparedBackendHandle::Codex(Box::new(backend)),
-                events,
-                provider_session_id,
-                ready,
-            })
-        }
-        BackendKind::Antigravity => {
-            let (backend, events, provider_session_id, ready) = prepare_concrete_backend_binding::<
-                antigravity::AntigravityBackend,
-            >(kind, spawn, seed)
-            .await?;
-            Ok(PreparedBackendBinding {
-                backend: PreparedBackendHandle::Antigravity(Box::new(backend)),
-                events,
-                provider_session_id,
-                ready,
-            })
-        }
-        BackendKind::Hermes => {
-            let (backend, events, provider_session_id, ready) =
-                prepare_concrete_backend_binding::<hermes::HermesBackend>(kind, spawn, seed)
-                    .await?;
-            Ok(PreparedBackendBinding {
-                backend: PreparedBackendHandle::Hermes(Box::new(backend)),
-                events,
-                provider_session_id,
-                ready,
-            })
-        }
-        BackendKind::Grok => Err(BackendBindingPrepareError::SpawnFailed {
-            backend_kind: kind,
-            message: "Grok does not expose manual compaction through ACP".to_owned(),
-        }),
-        BackendKind::Opencode => Err(BackendBindingPrepareError::SpawnFailed {
-            backend_kind: kind,
-            message: "OpenCode does not expose manual compaction through ACP".to_owned(),
-        }),
-    }
+    with_backend_type!(kind, |B| {
+        let (backend, events, provider_session_id, ready) =
+            B::prepare_context_replacement(spawn, seed).await?;
+        Ok(PreparedBackendBinding {
+            backend: Box::new(backend),
+            events,
+            provider_session_id,
+            ready,
+        })
+    }, removed => Err(BackendBindingPrepareError::SpawnFailed {
+        backend_kind: kind,
+        message: "Tycode backend has been removed".to_owned(),
+    }))
 }
 
 pub(crate) async fn prepare_mock_compacted_backend_binding(
@@ -1361,9 +1667,7 @@ pub(crate) async fn prepare_mock_compacted_backend_binding(
     let (backend, events, provider_session_id, ready) =
         prepare_concrete_backend_binding::<mock::MockBackend>(kind, spawn, seed).await?;
     Ok(PreparedBackendBinding {
-        backend: PreparedBackendHandle::Mock {
-            backend: Box::new(backend),
-        },
+        backend: Box::new(backend),
         events,
         provider_session_id,
         ready,
@@ -1632,49 +1936,23 @@ pub(crate) fn empty_session_settings_schema(backend_kind: BackendKind) -> Sessio
 pub(crate) fn session_settings_schema_for_backend(
     backend_kind: BackendKind,
 ) -> SessionSettingsSchema {
-    match backend_kind {
-        BackendKind::Tycode => empty_session_settings_schema(backend_kind),
-        BackendKind::Kiro => kiro::KiroBackend::session_settings_schema(),
-        BackendKind::Claude => claude::ClaudeBackend::session_settings_schema(),
-        BackendKind::Codex => codex::CodexBackend::session_settings_schema(),
-        BackendKind::Antigravity => antigravity::AntigravityBackend::session_settings_schema(),
-        BackendKind::Hermes => hermes::HermesBackend::session_settings_schema(),
-        BackendKind::Grok => grok::session_settings_schema(),
-        BackendKind::Opencode => opencode::session_settings_schema(),
-    }
+    with_backend_type!(backend_kind, |B| B::session_settings_schema(), removed => empty_session_settings_schema(backend_kind))
 }
 
 /// The host-level deep-configuration schema for a backend, if it exposes one.
 pub(crate) fn backend_config_schema_for_backend(
     backend_kind: BackendKind,
 ) -> Option<BackendConfigSchema> {
-    match backend_kind {
-        BackendKind::Tycode => None,
-        BackendKind::Kiro => kiro::KiroBackend::backend_config_schema(),
-        BackendKind::Claude => claude::ClaudeBackend::backend_config_schema(),
-        BackendKind::Codex => codex::CodexBackend::backend_config_schema(),
-        BackendKind::Antigravity => antigravity::AntigravityBackend::backend_config_schema(),
-        BackendKind::Hermes => hermes::HermesBackend::backend_config_schema(),
-        BackendKind::Grok => None,
-        BackendKind::Opencode => None,
-    }
+    with_backend_type!(backend_kind, |B| B::backend_config_schema(), removed => None)
 }
 
 /// Host/build-level backend config schemas. This is a catalog of configurable
 /// backends, not a projection of the current enabled-backend list.
 pub(crate) fn backend_config_schema_catalog() -> Vec<BackendConfigSchema> {
-    [
-        BackendKind::Kiro,
-        BackendKind::Claude,
-        BackendKind::Codex,
-        BackendKind::Antigravity,
-        BackendKind::Hermes,
-        BackendKind::Grok,
-        BackendKind::Opencode,
-    ]
-    .into_iter()
-    .filter_map(backend_config_schema_for_backend)
-    .collect()
+    SUPPORTED_BACKENDS
+        .into_iter()
+        .filter_map(backend_config_schema_for_backend)
+        .collect()
 }
 
 /// Drop keys/values that the backend's config schema does not accept. A backend
@@ -1786,16 +2064,7 @@ pub(crate) fn resolve_backend_session_settings(
     backend_kind: BackendKind,
     config: &BackendSpawnConfig,
 ) -> SessionSettingsValues {
-    match backend_kind {
-        BackendKind::Tycode => SessionSettingsValues::default(),
-        BackendKind::Kiro => kiro::resolve_session_settings(config),
-        BackendKind::Claude => claude::resolve_session_settings(config),
-        BackendKind::Codex => codex::resolve_session_settings(config),
-        BackendKind::Antigravity => antigravity::resolve_session_settings(config),
-        BackendKind::Hermes => hermes::resolve_session_settings(config),
-        BackendKind::Grok => grok::resolve_session_settings(config),
-        BackendKind::Opencode => opencode::resolve_session_settings(config),
-    }
+    with_backend_type!(backend_kind, |B| B::resolve_session_settings(config), removed => SessionSettingsValues::default())
 }
 
 pub(crate) fn validate_session_settings_values(
@@ -1826,16 +2095,7 @@ pub(crate) fn validate_runtime_session_settings_update(
     current: &SessionSettingsValues,
     update: &SessionSettingsValues,
 ) -> Result<(), String> {
-    match backend_kind {
-        BackendKind::Tycode => Err("Tycode backend has been removed".to_owned()),
-        BackendKind::Hermes => hermes::validate_runtime_session_settings_update(current, update),
-        BackendKind::Kiro
-        | BackendKind::Claude
-        | BackendKind::Codex
-        | BackendKind::Antigravity
-        | BackendKind::Grok => Ok(()),
-        BackendKind::Opencode => Ok(()),
-    }
+    with_backend_type!(backend_kind, |B| B::validate_runtime_session_settings_update(current, update), removed => Err("Tycode backend has been removed".to_owned()))
 }
 
 pub(crate) fn sanitize_session_settings_values(
@@ -1870,23 +2130,13 @@ pub(crate) fn apply_session_settings_update(
     }
 }
 
-/// Static Low/High tier mappings. Dynamic Codex tiers are resolved from its
-/// live session schema by the host.
 pub(crate) fn builtin_tier_config(kind: BackendKind) -> BackendTierConfig {
-    let defaults: fn(SpawnCostHint) -> SessionSettingsValues = match kind {
-        BackendKind::Claude => claude::claude_cost_hint_defaults,
-        BackendKind::Codex
-        | BackendKind::Hermes
-        | BackendKind::Tycode
-        | BackendKind::Grok
-        | BackendKind::Opencode => |_| SessionSettingsValues::default(),
-        BackendKind::Antigravity => antigravity::antigravity_cost_hint_defaults,
-        BackendKind::Kiro => kiro::kiro_cost_hint_defaults,
-    };
-    BackendTierConfig {
-        low: defaults(SpawnCostHint::Low),
-        high: defaults(SpawnCostHint::High),
-    }
+    with_backend_type!(kind, |B| B::builtin_tier_config(), removed => BackendTierConfig::default())
+}
+
+pub(crate) fn skill_delivery(kind: BackendKind) -> crate::backend::customization::SkillDelivery {
+    with_backend_type!(kind, |B| B::skill_delivery(),
+        removed => crate::backend::customization::SkillDelivery::NamesOnly)
 }
 
 pub(crate) fn resolve_settings<F>(
@@ -1916,6 +2166,28 @@ where
     }
 
     resolved
+}
+
+fn session_settings_from_json(value: Value) -> Result<SessionSettingsValues, String> {
+    let Value::Object(values) = value else {
+        return Err("backend settings must be an object".to_owned());
+    };
+    values
+        .into_iter()
+        .map(|(key, value)| {
+            let value = match value {
+                Value::String(value) => SessionSettingValue::String(value),
+                Value::Bool(value) => SessionSettingValue::Bool(value),
+                Value::Null => SessionSettingValue::Null,
+                Value::Number(value) if value.is_i64() => {
+                    SessionSettingValue::Integer(value.as_i64().expect("integer checked"))
+                }
+                _ => return Err(format!("unsupported backend setting value for {key}")),
+            };
+            Ok((key, value))
+        })
+        .collect::<Result<_, _>>()
+        .map(SessionSettingsValues)
 }
 
 pub(crate) fn session_settings_to_json(values: &SessionSettingsValues) -> Value {
@@ -2059,4 +2331,173 @@ pub(crate) fn estimate_line_delta(before: &str, after: &str) -> (u64, u64) {
         end_after.saturating_sub(start) as u64,
         end_before.saturating_sub(start) as u64,
     )
+}
+
+pub(crate) fn startup_drop_cancels_workers(kind: BackendKind) -> bool {
+    with_backend_type!(kind, |B| B::startup_drop_cancels_workers(), removed => false)
+}
+
+pub(crate) fn session_is_resumable(
+    kind: BackendKind,
+    session_id: &SessionId,
+    workspace_roots: &[String],
+    resolved: &ResolvedSpawnConfig,
+) -> bool {
+    with_backend_type!(kind, |B| B::session_is_resumable(session_id, workspace_roots, resolved), removed => false)
+}
+
+pub(crate) fn helper_session_settings(
+    kind: BackendKind,
+    settings: Option<&SessionSettingsValues>,
+) -> Option<SessionSettingsValues> {
+    with_backend_type!(kind, |B| B::helper_session_settings(settings), removed => None)
+}
+
+pub(crate) async fn discover(
+    kind: BackendKind,
+    context: &BackendProbeContext,
+) -> Result<BackendDiscovery, String> {
+    #[cfg(any(test, feature = "test-support"))]
+    if context.has_mock_discovery() {
+        return mock::MockBackend::discover(context).await;
+    }
+    with_backend_type!(kind, |B| B::discover(context).await, removed => Err("Tycode backend has been removed".to_owned()))
+}
+
+pub(crate) fn has_dynamic_session_schema(kind: BackendKind) -> bool {
+    with_backend_type!(kind, |B| B::has_dynamic_session_schema(), removed => false)
+}
+
+pub(crate) fn token_usage_tracking_mode(kind: BackendKind) -> TokenUsageTrackingMode {
+    with_backend_type!(kind, |B| B::token_usage_tracking_mode(), removed => TokenUsageTrackingMode::Messages)
+}
+
+pub(crate) async fn native_settings_snapshot(
+    kind: BackendKind,
+    context: &BackendProbeContext,
+) -> Option<protocol::BackendNativeSettingsSnapshot> {
+    with_backend_type!(kind, |B| B::native_settings_snapshot(context).await, removed => None)
+}
+
+pub(crate) async fn write_native_settings(
+    kind: BackendKind,
+    settings: Value,
+    context: &BackendProbeContext,
+) -> NativeSettingsWriteOutcome {
+    with_backend_type!(kind, |B| B::write_native_settings(settings, context).await, removed => NativeSettingsWriteOutcome {
+        result: Err("Tycode backend has been removed".to_owned()),
+        refresh_required: false,
+    })
+}
+
+pub(crate) fn validate_tool_policy(
+    kind: BackendKind,
+    policy: &protocol::ToolPolicy,
+) -> Result<(), String> {
+    with_backend_type!(kind, |B| B::validate_tool_policy(policy), removed => match policy {
+        protocol::ToolPolicy::Unrestricted => Ok(()),
+        _ => Err(format!("backend {kind:?} does not support tool policy {policy:?}")),
+    })
+}
+
+pub(crate) fn terminal_errors_are_retryable(kind: BackendKind) -> bool {
+    with_backend_type!(kind, |B| B::terminal_errors_are_retryable(), removed => false)
+}
+
+pub(crate) fn resolve_tier_config(
+    kind: BackendKind,
+    schema: Option<&SessionSettingsSchema>,
+    values: &SessionSettingsValues,
+) -> Result<Option<BackendTierConfig>, String> {
+    with_backend_type!(kind, |B| B::resolve_tier_config(schema, values), removed => Ok(None))
+}
+
+pub(crate) fn default_persisted_tier_config(kind: BackendKind) -> Option<BackendTierConfig> {
+    with_backend_type!(kind, |B| B::default_persisted_tier_config(), removed => None)
+}
+
+pub(crate) fn discovery_policy(kind: BackendKind) -> DiscoveryPolicy {
+    with_backend_type!(kind, |B| B::discovery_policy(), removed => DiscoveryPolicy::default())
+}
+
+fn resolve_storage_root(
+    kind: BackendKind,
+    configured: Option<&std::path::Path>,
+) -> Result<Option<PathBuf>, String> {
+    with_backend_type!(kind, |B| B::resolve_storage_root(configured), removed => Ok(None))
+}
+
+pub(crate) fn native_session_id_is_valid(kind: BackendKind, session_id: &SessionId) -> bool {
+    with_backend_type!(kind, |B| B::native_session_id_is_valid(session_id), removed => true)
+}
+
+pub(crate) fn stored_session_is_resumable(
+    kind: BackendKind,
+    id: &SessionId,
+    stored_resumable: bool,
+    has_parent: bool,
+    superseded: bool,
+    storage: &BackendStorage,
+) -> bool {
+    with_backend_type!(kind, |B| B::stored_session_is_resumable(id, stored_resumable, has_parent, superseded, storage), removed => false)
+}
+
+pub(crate) fn default_child_workspace_roots(
+    kind: BackendKind,
+    parent_roots: &[String],
+) -> Vec<String> {
+    with_backend_type!(kind, |B| B::default_child_workspace_roots(parent_roots), removed => Vec::new())
+}
+
+pub(crate) fn default_launch_profile(kind: BackendKind) -> protocol::LaunchProfile {
+    with_backend_type!(kind, |B| B::default_launch_profile(), removed => protocol::LaunchProfile {
+        id: protocol::LaunchProfileId("tycode:default".to_owned()),
+        kind: protocol::LaunchProfileKind::BackendDefault,
+        label: "Tycode".to_owned(),
+        description: None,
+        backend_kind: kind,
+        session_settings: SessionSettingsValues::default(),
+    })
+}
+
+pub(crate) fn default_launch_config(kind: BackendKind) -> Option<protocol::AcpAgentSpec> {
+    with_backend_type!(kind, |B| B::default_launch_config(), removed => None)
+}
+
+pub(crate) fn backend_slug(backend_kind: protocol::BackendKind) -> &'static str {
+    match backend_kind {
+        protocol::BackendKind::Tycode => "tycode",
+        protocol::BackendKind::Kiro => "kiro",
+        protocol::BackendKind::Claude => "claude",
+        protocol::BackendKind::Codex => "codex",
+        protocol::BackendKind::Antigravity => "antigravity",
+        protocol::BackendKind::Hermes => "hermes",
+        protocol::BackendKind::Grok => "grok",
+        protocol::BackendKind::Opencode => "opencode",
+    }
+}
+
+pub(crate) fn backend_launch_profile_label(backend_kind: protocol::BackendKind) -> &'static str {
+    match backend_kind {
+        protocol::BackendKind::Tycode => "Tycode",
+        protocol::BackendKind::Kiro => "Kiro",
+        protocol::BackendKind::Claude => "Claude",
+        protocol::BackendKind::Codex => "Codex",
+        protocol::BackendKind::Antigravity => "Antigravity",
+        protocol::BackendKind::Hermes => "Hermes",
+        protocol::BackendKind::Grok => "Grok",
+        protocol::BackendKind::Opencode => "OpenCode",
+    }
+}
+
+pub(crate) fn validate_custom_launch_profile(
+    profile: &settings_model::HostLaunchProfileConfig,
+) -> Result<(), String> {
+    for kind in SUPPORTED_BACKENDS {
+        if let Some(error) = with_backend_type!(kind, |B| B::reserved_launch_profile_error(&profile.id), removed => None)
+        {
+            return Err(error);
+        }
+    }
+    with_backend_type!(profile.backend_kind, |B| B::validate_launch_config(&profile.id, profile.acp.as_ref()), removed => Err("Tycode has been removed".to_owned()))
 }

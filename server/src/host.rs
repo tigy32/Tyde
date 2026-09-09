@@ -81,7 +81,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::agent::customization::{
-    ResolveSpawnConfigRequest, ResolvedSpawnConfig, SkillDelivery, SkillSelection,
+    ResolveSpawnConfigRequest, ResolvedSpawnConfig, SkillSelection,
     protocol_mcp_servers_to_startup, resolve_spawn_config,
 };
 use crate::agent::registry::{
@@ -361,16 +361,15 @@ pub struct HostRuntimeConfig {
     pub agent_control_mcp_bind_addr: Option<std::net::SocketAddr>,
     pub review_mcp_bind_addr: Option<std::net::SocketAddr>,
     pub workflow_mcp_bind_addr: Option<std::net::SocketAddr>,
-    pub antigravity_conversations_dir: Option<PathBuf>,
-    pub codex_probe_program: Option<String>,
-    pub kiro_probe_program: Option<String>,
-    pub kiro_probe_workspace_root: Option<PathBuf>,
+    pub backend_storage_roots: HashMap<BackendKind, PathBuf>,
+    pub backend_probe_programs: HashMap<BackendKind, String>,
+    #[cfg(any(test, feature = "test-support"))]
+    pub mock_backend_discovery: HashMap<BackendKind, crate::backend::mock::MockDiscovery>,
+    pub backend_probe_workspace_root: Option<PathBuf>,
     pub mobile_pairing_ttl: Option<std::time::Duration>,
     pub mobile_managed_service_base_url: Option<String>,
-    /// Skip probing real backend CLIs and Codex model metadata. Tests set this
-    /// so backend setup returns an empty stub and Codex's dynamic session
-    /// schema becomes explicitly unavailable unless `codex_probe_program` is
-    /// supplied. Defaults to `false` so production startup is unaffected.
+    /// Disable automatic real-provider discovery for server simulations.
+    /// Explicit per-backend probe programs remain available to the fixture.
     pub skip_real_backend_probe: bool,
     pub agents_view_preferences_primary: bool,
     #[cfg(any(test, feature = "test-support"))]
@@ -390,10 +389,11 @@ impl Default for HostRuntimeConfig {
             agent_control_mcp_bind_addr: None,
             review_mcp_bind_addr: None,
             workflow_mcp_bind_addr: None,
-            antigravity_conversations_dir: None,
-            codex_probe_program: None,
-            kiro_probe_program: None,
-            kiro_probe_workspace_root: None,
+            backend_storage_roots: HashMap::new(),
+            backend_probe_programs: HashMap::new(),
+            #[cfg(any(test, feature = "test-support"))]
+            mock_backend_discovery: HashMap::new(),
+            backend_probe_workspace_root: None,
             mobile_pairing_ttl: None,
             mobile_managed_service_base_url: None,
             skip_real_backend_probe: false,
@@ -659,36 +659,14 @@ struct AgentCompaction {
     summary_rx: oneshot::Receiver<Result<CompactionSummary, String>>,
 }
 
-/// Per-ACP-agent session schema. Unlike the other backends there is no single
-/// ACP schema: the models and modes come from probing the agent itself, so two
-/// configured agents legitimately expose different settings. State is therefore
-/// keyed by launch profile rather than living in one field.
 #[derive(Clone, Debug)]
-enum AcpSessionSchemaState {
-    Pending,
-    Ready(SessionSettingsSchema),
-    Unavailable(String),
-}
-
-#[derive(Clone, Debug)]
-enum CodexSessionSchemaState {
-    Pending,
-    Ready(SessionSettingsSchema),
-    Unavailable(String),
-}
-
-#[derive(Clone, Debug)]
-enum HermesSessionSchemaState {
-    Pending,
-    Ready(SessionSettingsSchema),
-    Unavailable(String),
-}
-
 enum SessionSchemaResolution {
     Pending,
     Ready(SessionSettingsSchema),
     Unavailable(String),
 }
+
+type DiscoveryKey = (BackendKind, Option<LaunchProfileId>);
 
 pub(crate) struct HostState {
     pub registry: AgentRegistry,
@@ -732,14 +710,8 @@ pub(crate) struct HostState {
     pub workflow_locations: Vec<WorkflowCatalogLocation>,
     pub workflow_run_store: WorkflowRunStore,
     pub mobile_access: MobileAccessHandle,
-    codex_session_schema: CodexSessionSchemaState,
-    /// One entry per configured ACP launch profile. A missing key means the
-    /// profile has not been probed yet and reads as `Pending`.
-    acp_session_schemas: HashMap<LaunchProfileId, AcpSessionSchemaState>,
-    hermes_session_schema: HermesSessionSchemaState,
-    /// Hermes profiles discovered by the last session-schema probe; drives
-    /// the synthesized "Hermes — <profile>" launch-profile entries.
-    hermes_launch_profiles: Vec<crate::backend::hermes::HermesLaunchProfileInfo>,
+    session_schemas: HashMap<DiscoveryKey, SessionSchemaResolution>,
+    discovered_launch_profiles: HashMap<BackendKind, Vec<LaunchProfileEntry>>,
     backend_config_snapshots: Vec<BackendConfigSnapshot>,
     backend_native_settings_snapshots: Vec<BackendNativeSettingsSnapshot>,
     backend_capacity: HashMap<BackendKind, BackendCapacitySnapshot>,
@@ -751,10 +723,11 @@ pub(crate) struct HostState {
     /// registrations do not start a second set.
     capacity_polling_started: bool,
     backend_setup: BackendSetupPayload,
-    antigravity_conversations_dir: PathBuf,
-    codex_probe_program: Option<String>,
-    kiro_probe_program: Option<String>,
-    kiro_probe_workspace_root: Option<PathBuf>,
+    backend_storage: crate::backend::BackendStorage,
+    backend_probe_programs: HashMap<BackendKind, String>,
+    #[cfg(any(test, feature = "test-support"))]
+    mock_backend_discovery: HashMap<BackendKind, crate::backend::mock::MockDiscovery>,
+    backend_probe_workspace_root: Option<PathBuf>,
     skip_real_backend_probe: bool,
     force_project_watch_limit: bool,
     #[cfg(any(test, feature = "test-support"))]
@@ -1657,12 +1630,10 @@ impl Drop for InstalledWorkbenchRemoveHook {
 
 #[cfg(feature = "test-support")]
 impl HostHandle {
-    /// Drives the same passive adapter ingress used by a live agent, while
-    /// keeping the test fixture deterministic and host-scoped.
-    pub async fn ingest_passive_adapter_notification_for_test(
+    pub async fn ingest_backend_capacity_for_test(
         &self,
         backend_kind: BackendKind,
-        payload: serde_json::Value,
+        report: BackendCapacityState,
     ) -> bool {
         let emitter = {
             let state = self.state.lock().await;
@@ -1673,19 +1644,7 @@ impl HostHandle {
                 Vec::new(),
             )
         };
-        let forwarded = match backend_kind {
-            BackendKind::Claude => {
-                crate::backend::claude::forward_passive_rate_limit_event(&payload, &emitter)
-            }
-            BackendKind::Codex => {
-                crate::backend::codex::forward_passive_rate_limits_updated(&payload, &emitter);
-                true
-            }
-            _ => false,
-        };
-        if !forwarded {
-            return false;
-        }
+        crate::sub_agent::SubAgentEmitter::on_backend_capacity(&emitter, backend_kind, report);
         let (barrier_tx, barrier_rx) = oneshot::channel();
         let capacity_tx = self.state.lock().await.capacity_tx.clone();
         if capacity_tx
@@ -2013,62 +1972,29 @@ impl HostHandle {
     }
 }
 
-/// Session-schema probe helpers, kept separate from the `test-support`-only
-/// impl above because this crate's own `cfg(test)` unit tests drive them (see
-/// `host_reload_reprobes_ready_dynamic_session_schemas`). The workspace-wide
-/// build unifies `test-support` on via the `tests` crate, so a feature-only
-/// gate here still compiles under `./dev.sh check` while breaking the
-/// package-scoped `cargo test -p server` builds that AGENTS.md documents for
-/// the live backend tests.
-///
-/// These helpers depend on nothing from the `test-support`-only surface — only
-/// on `session_schema_refresh_lock`, the three `*SessionSchemaState` enums, and
-/// `session_settings_schema_for_backend`, all of which are unconditional — so
-/// widening them pulls in no further gates.
 #[cfg(any(test, feature = "test-support"))]
 impl HostHandle {
     pub async fn set_session_schema_ready_for_test(&self, backend_kind: BackendKind) {
         let schema = session_settings_schema_for_backend(backend_kind);
         let _refresh_guard = self.session_schema_refresh_lock.lock().await;
         let mut state = self.state.lock().await;
-        match backend_kind {
-            BackendKind::Codex => {
-                state.codex_session_schema = CodexSessionSchemaState::Ready(schema)
+        assert!(backend_has_dynamic_session_schema(backend_kind));
+        state.session_schemas.insert(
+            discovery_key(backend_kind, None),
+            SessionSchemaResolution::Ready(schema),
+        );
+        for kind in crate::backend::SUPPORTED_BACKENDS
+            .into_iter()
+            .filter(|kind| backend_has_dynamic_session_schema(*kind))
+        {
+            let entry = state
+                .session_schemas
+                .entry(discovery_key(kind, None))
+                .or_insert(SessionSchemaResolution::Pending);
+            if matches!(entry, SessionSchemaResolution::Pending) {
+                *entry =
+                    SessionSchemaResolution::Unavailable("test schema not configured".to_owned());
             }
-            BackendKind::Kiro => {
-                // Tests drive the built-in agent; per-profile schemas are set
-                // by the real probe loop.
-                state.acp_session_schemas.insert(
-                    LaunchProfileId(protocol::KIRO_LAUNCH_PROFILE_ID.to_owned()),
-                    AcpSessionSchemaState::Ready(schema),
-                );
-            }
-            BackendKind::Hermes => {
-                state.hermes_session_schema = HermesSessionSchemaState::Ready(schema)
-            }
-            _ => panic!("backend {backend_kind:?} does not have a dynamic session schema"),
-        }
-        if matches!(
-            &state.codex_session_schema,
-            CodexSessionSchemaState::Pending
-        ) {
-            state.codex_session_schema =
-                CodexSessionSchemaState::Unavailable("test schema not configured".to_owned());
-        }
-        let builtin_acp = state
-            .acp_session_schemas
-            .entry(LaunchProfileId(protocol::KIRO_LAUNCH_PROFILE_ID.to_owned()))
-            .or_insert(AcpSessionSchemaState::Pending);
-        if matches!(builtin_acp, AcpSessionSchemaState::Pending) {
-            *builtin_acp =
-                AcpSessionSchemaState::Unavailable("test schema not configured".to_owned());
-        }
-        if matches!(
-            &state.hermes_session_schema,
-            HermesSessionSchemaState::Pending
-        ) {
-            state.hermes_session_schema =
-                HermesSessionSchemaState::Unavailable("test schema not configured".to_owned());
         }
     }
 
@@ -2079,53 +2005,15 @@ impl HostHandle {
     ) {
         let _refresh_guard = self.session_schema_refresh_lock.lock().await;
         let mut state = self.state.lock().await;
-        match backend_kind {
-            BackendKind::Codex => {
-                state.codex_session_schema =
-                    CodexSessionSchemaState::Unavailable(message.to_owned())
-            }
-            BackendKind::Kiro => {
-                state.acp_session_schemas.insert(
-                    LaunchProfileId(protocol::KIRO_LAUNCH_PROFILE_ID.to_owned()),
-                    AcpSessionSchemaState::Unavailable(message.to_owned()),
-                );
-            }
-            BackendKind::Hermes => {
-                state.hermes_session_schema =
-                    HermesSessionSchemaState::Unavailable(message.to_owned())
-            }
-            _ => panic!("backend {backend_kind:?} does not have a dynamic session schema"),
-        }
+        assert!(backend_has_dynamic_session_schema(backend_kind));
+        state.session_schemas.insert(
+            discovery_key(backend_kind, None),
+            SessionSchemaResolution::Unavailable(message.to_owned()),
+        );
     }
 
     pub async fn session_schema_probe_count_for_test(&self) -> u64 {
         self.state.lock().await.session_schema_probe_count
-    }
-
-    /// Sets one ACP agent's schema. Unlike the per-kind helpers above this is
-    /// profile-scoped, because two configured ACP agents legitimately expose
-    /// different settings.
-    pub async fn set_acp_session_schema_for_test(
-        &self,
-        profile_id: &LaunchProfileId,
-        schema: SessionSettingsSchema,
-    ) {
-        let _refresh_guard = self.session_schema_refresh_lock.lock().await;
-        let mut state = self.state.lock().await;
-        state
-            .acp_session_schemas
-            .insert(profile_id.clone(), AcpSessionSchemaState::Ready(schema));
-    }
-
-    pub async fn acp_session_schema_for_test(
-        &self,
-        profile_id: &LaunchProfileId,
-    ) -> Option<SessionSettingsSchema> {
-        let state = self.state.lock().await;
-        match acp_schema_state(&state.acp_session_schemas, Some(profile_id)) {
-            AcpSessionSchemaState::Ready(schema) => Some(schema.clone()),
-            AcpSessionSchemaState::Pending | AcpSessionSchemaState::Unavailable(_) => None,
-        }
     }
 }
 
@@ -2529,10 +2417,7 @@ impl HostHandle {
             .session_store
             .lock()
             .await
-            .summaries_for_scope_with_antigravity_conversations_dir(
-                session_list_scope,
-                &state.antigravity_conversations_dir,
-            )
+            .summaries_for_scope_with_backend_storage(session_list_scope, &state.backend_storage)
             .unwrap_or_else(|err| panic!("failed to list sessions for host registration: {err}"));
         let (sessions, session_list) = {
             let subscriber = state.host_streams.get_mut(&host_path).unwrap_or_else(|| {
@@ -4179,7 +4064,7 @@ impl HostHandle {
             removing_projects,
             parent_session_id,
             parent_agent_depth,
-            antigravity_conversations_dir,
+            backend_storage,
         ) = {
             let state = self.state.lock().await;
             (
@@ -4217,7 +4102,7 @@ impl HostHandle {
                     .parent_agent_id
                     .as_ref()
                     .and_then(|agent_id| state.registry.agent_depth(agent_id)),
-                state.antigravity_conversations_dir.clone(),
+                state.backend_storage.clone(),
             )
         };
         let parent_session_id = match parent_session_id {
@@ -4371,7 +4256,7 @@ impl HostHandle {
                             generated_name_request = Some(GenerateAgentNameRequest {
                                 backend_kind,
                                 prompt: prompt.clone(),
-                                session_settings: hidden_helper_session_settings(
+                                session_settings: crate::backend::helper_session_settings(
                                     backend_kind,
                                     session_settings.as_ref(),
                                 ),
@@ -4481,7 +4366,7 @@ impl HostHandle {
                         })
                         .await);
                 };
-                if !session_record_is_resumable(&record, &antigravity_conversations_dir) {
+                if !session_record_is_resumable(&record, &backend_storage) {
                     let resolved_name = payload
                         .name
                         .clone()
@@ -4951,24 +4836,20 @@ impl HostHandle {
                 let startup_mcp_servers =
                     protocol_mcp_servers_to_startup(&resolved_spawn_config.mcp_servers);
                 let backend_support_failure = (!use_mock_backend
-                    && !matches!(
-                        backend_kind,
-                        protocol::BackendKind::Claude | protocol::BackendKind::Codex
-                    ))
+                    && !crate::backend::capabilities_for_backend_kind(backend_kind)
+                        .contains(tyde_agent_adapter::BackendCapability::ForkSession))
                 .then(|| {
                     AgentStartupFailure::unsupported(
                         crate::backend::backend_fork_unsupported_message(backend_kind),
                     )
                 });
                 let non_resumable_failure =
-                    (!session_record_is_resumable(&record, &antigravity_conversations_dir)).then(
-                        || {
-                            AgentStartupFailure::unsupported(format!(
-                                "cannot fork non-resumable session {}",
-                                from_session_id
-                            ))
-                        },
-                    );
+                    (!session_record_is_resumable(&record, &backend_storage)).then(|| {
+                        AgentStartupFailure::unsupported(format!(
+                            "cannot fork non-resumable session {}",
+                            from_session_id
+                        ))
+                    });
                 // Resolving the schema can probe the backend, which is wasted
                 // work for a fork that is already doomed — and the doomed case
                 // is exactly the one whose backend may not be installed. Fall
@@ -5074,7 +4955,7 @@ impl HostHandle {
         };
 
         let request = self.apply_complexity_tier_settings(request).await;
-        let request = self.resolve_acp_agent(request).await;
+        let request = self.resolve_backend_launch(request).await;
         let diagnose_side_question_fanout = request.fork_from_session_id.is_some();
         tracing::info!(
             backend_kind = ?request.backend_kind,
@@ -5116,7 +4997,7 @@ impl HostHandle {
             let agent_control_mcp = state.agent_control_mcp.clone();
             let provider_version =
                 installed_backend_version(&state.backend_setup, request.backend_kind);
-            let antigravity_conversations_dir = state.antigravity_conversations_dir.clone();
+            let backend_storage = state.backend_storage.clone();
             let transcript_store = state.transcript_store.clone();
             #[cfg(feature = "test-support")]
             let request = consume_mock_launch_reservation(&state, request);
@@ -5137,7 +5018,7 @@ impl HostHandle {
                     session_summary_count_tx: session_summary_count_tx.clone(),
                     review_registry,
                     provider_version,
-                    antigravity_conversations_dir,
+                    backend_storage,
                 },
             );
             if let Some(terminal_claim) = operation_terminal_claim.as_ref() {
@@ -5383,50 +5264,30 @@ impl HostHandle {
         Ok(((!merged.0.is_empty()).then_some(merged), source))
     }
 
-    /// Resolve which ACP agent a spawn should run.
-    ///
-    /// The agent lives on the session's launch profile. A profile that Tyde
-    /// synthesizes (the built-in `acp:kiro`) and one the user configured are
-    /// treated identically here — both just carry an `AcpAgentSpec`.
-    ///
-    /// A session with no profile, or one naming a profile that no longer
-    /// exists, falls back to the built-in Kiro agent. That keeps sessions
-    /// recorded before ACP profiles existed resumable; it is not a silent
-    /// substitution for a *user-configured* agent, because those always carry
-    /// a profile id.
-    async fn resolve_acp_agent(&self, mut request: ResolvedSpawnRequest) -> ResolvedSpawnRequest {
-        if request.backend_kind != protocol::BackendKind::Kiro {
+    async fn resolve_backend_launch(
+        &self,
+        mut request: ResolvedSpawnRequest,
+    ) -> ResolvedSpawnRequest {
+        let Some(default_config) = crate::backend::default_launch_config(request.backend_kind)
+        else {
             return request;
-        }
-
-        let settings_store = {
-            let state = self.state.lock().await;
-            Arc::clone(&state.settings_store)
         };
+        let settings_store = Arc::clone(&self.state.lock().await.settings_store);
         let settings = match settings_store.lock().await.get() {
             Ok(settings) => settings,
             Err(error) => {
-                tracing::warn!(%error, "failed to read host settings while resolving ACP agent");
-                request.acp_agent = Some(builtin_kiro_agent_spec());
+                tracing::warn!(%error, "failed to read host settings while resolving backend launch");
+                request.acp_agent = Some(default_config);
                 return request;
             }
         };
-
-        let profile_id = request
-            .launch_profile_id
-            .clone()
-            .unwrap_or_else(|| LaunchProfileId(protocol::KIRO_LAUNCH_PROFILE_ID.to_owned()));
-
         request.acp_agent = Some(
-            acp_agent_for_profile(&settings, &profile_id).unwrap_or_else(|| {
-                if profile_id.0 != protocol::KIRO_LAUNCH_PROFILE_ID {
-                    tracing::warn!(
-                        profile = %profile_id,
-                        "launch profile not found; falling back to the built-in Kiro agent"
-                    );
-                }
-                builtin_kiro_agent_spec()
-            }),
+            request
+                .launch_profile_id
+                .as_ref()
+                .and_then(|id| settings.launch_profiles.get(id))
+                .and_then(|profile| profile.acp.clone())
+                .unwrap_or(default_config),
         );
         request
     }
@@ -5469,56 +5330,43 @@ impl HostHandle {
                 request.cost_hint = None;
                 return request;
             }
-            (_, None) if request.backend_kind == protocol::BackendKind::Codex => {
-                let Some(schema) = request.session_settings_schema.as_ref() else {
-                    request.startup_failure = request.startup_failure.or_else(|| {
-                        Some(AgentStartupFailure::backend_failed(
-                            "Codex session settings schema unavailable; cannot resolve complexity tier",
-                        ))
-                    });
-                    request.cost_hint = None;
-                    return request;
-                };
+            (_, None) => {
                 let selected_values = request.session_settings.clone().unwrap_or_default();
-                let config = match crate::backend::codex::codex_tier_config_from_schema(
-                    schema,
+                match crate::backend::resolve_tier_config(
+                    request.backend_kind,
+                    request.session_settings_schema.as_ref(),
                     &selected_values,
                 ) {
-                    Ok(config) => config,
+                    Ok(Some(config)) => tier_values_for_hint(hint, &config),
                     Err(error) => {
-                        request.startup_failure = request.startup_failure.or_else(|| {
-                            Some(AgentStartupFailure::backend_failed(format!(
-                                "failed to resolve Codex complexity tier from model metadata: {error}"
-                            )))
-                        });
+                        request.startup_failure = request
+                            .startup_failure
+                            .or_else(|| Some(AgentStartupFailure::backend_failed(error)));
                         request.cost_hint = None;
                         return request;
                     }
-                };
-                tier_values_for_hint(hint, &config)
-            }
-            // No user config for this backend: the backend's built-in
-            // tier mapping applies via the cost hint as before.
-            (_, None) => {
-                if backend_has_dynamic_session_schema(request.backend_kind)
-                    && request.session_settings_schema.is_none()
-                {
-                    let builtin = crate::backend::builtin_tier_config(request.backend_kind);
-                    let tier_values = tier_values_for_hint(hint, &builtin);
-                    if !tier_values.0.is_empty() {
-                        request.startup_failure = request.startup_failure.or_else(|| {
-                            session_settings_startup_failure(
-                                request.backend_kind,
-                                None,
-                                &tier_values,
-                                "complexity-tier",
-                            )
-                        });
-                        request.session_settings = None;
-                        request.cost_hint = None;
+                    Ok(None) => {
+                        if backend_has_dynamic_session_schema(request.backend_kind)
+                            && request.session_settings_schema.is_none()
+                        {
+                            let builtin = crate::backend::builtin_tier_config(request.backend_kind);
+                            let tier_values = tier_values_for_hint(hint, &builtin);
+                            if !tier_values.0.is_empty() {
+                                request.startup_failure = request.startup_failure.or_else(|| {
+                                    session_settings_startup_failure(
+                                        request.backend_kind,
+                                        None,
+                                        &tier_values,
+                                        "complexity-tier",
+                                    )
+                                });
+                                request.session_settings = None;
+                                request.cost_hint = None;
+                            }
+                        }
+                        return request;
                     }
                 }
-                return request;
             }
             (protocol::SpawnCostHint::Low, Some(config)) => config.low.clone(),
             (protocol::SpawnCostHint::High, Some(config)) => config.high.clone(),
@@ -5565,7 +5413,7 @@ impl HostHandle {
 
     async fn spawn_resolved_agent(&self, request: ResolvedSpawnRequest) -> AgentId {
         let request = self.apply_complexity_tier_settings(request).await;
-        let request = self.resolve_acp_agent(request).await;
+        let request = self.resolve_backend_launch(request).await;
         tracing::info!(
             backend_kind = ?request.backend_kind,
             workspace_roots = ?request.workspace_roots,
@@ -5588,7 +5436,7 @@ impl HostHandle {
             let agent_control_mcp = state.agent_control_mcp.clone();
             let provider_version =
                 installed_backend_version(&state.backend_setup, request.backend_kind);
-            let antigravity_conversations_dir = state.antigravity_conversations_dir.clone();
+            let backend_storage = state.backend_storage.clone();
             let transcript_store = state.transcript_store.clone();
             #[cfg(feature = "test-support")]
             let request = consume_mock_launch_reservation(&state, request);
@@ -5609,7 +5457,7 @@ impl HostHandle {
                     session_summary_count_tx: session_summary_count_tx.clone(),
                     review_registry,
                     provider_version,
-                    antigravity_conversations_dir,
+                    backend_storage,
                 },
             );
             (
@@ -6654,7 +6502,7 @@ impl HostHandle {
         payload: BackendSettingsRefreshPayload,
     ) -> AppResult<()> {
         const OPERATION: &str = "backend_settings_refresh";
-        if payload.backend != BackendKind::Hermes {
+        if !crate::backend::discovery_policy(payload.backend).can_refresh_native_settings {
             return Err(AppError::invalid(
                 OPERATION,
                 format!(
@@ -7171,11 +7019,11 @@ impl HostHandle {
     }
 
     async fn ensure_team_resume_session(&self, session_id: &SessionId) -> Result<(), String> {
-        let (session_store, antigravity_conversations_dir) = {
+        let (session_store, backend_storage) = {
             let state = self.state.lock().await;
             (
                 Arc::clone(&state.session_store),
-                state.antigravity_conversations_dir.clone(),
+                state.backend_storage.clone(),
             )
         };
         let record = session_store
@@ -7186,7 +7034,7 @@ impl HostHandle {
             .into_iter()
             .find(|record| record.id == *session_id)
             .ok_or_else(|| format!("cannot resume missing session {session_id}"))?;
-        if !session_record_is_resumable(&record, &antigravity_conversations_dir) {
+        if !session_record_is_resumable(&record, &backend_storage) {
             return Err(format!("cannot resume non-resumable session {session_id}"));
         }
         Ok(())
@@ -7478,10 +7326,7 @@ impl HostHandle {
                 .session_store
                 .lock()
                 .await
-                .summaries_for_scope_with_antigravity_conversations_dir(
-                    scope,
-                    &state.antigravity_conversations_dir,
-                )
+                .summaries_for_scope_with_backend_storage(scope, &state.backend_storage)
                 .map_err(|error| AppError::internal(OPERATION, anyhow!(error)))?;
             let subscriber = state
                 .host_streams
@@ -7584,38 +7429,18 @@ impl HostHandle {
     ) -> AppResult<()> {
         const OPERATION: &str = "backend_native_settings_write";
         let _settings_apply_guard = self.settings_apply_lock.lock().await;
-        let outcome = match payload.backend {
-            BackendKind::Codex => {
-                let result = crate::backend::codex::persist_native_settings(payload.settings).await;
-                self.refresh_backend_config_snapshots_after_native_save()
-                    .await;
-                self.refresh_session_schemas_with_fanout(true).await;
-                result
-            }
-            BackendKind::Hermes => {
-                let result = match hermes_probe_workspace_root() {
-                    Ok(workspace_root) => crate::backend::hermes::persist_native_settings(
-                        payload.settings,
-                        &[workspace_root],
-                    )
-                    .await
-                    .map_err(|error| error.to_string()),
-                    Err(error) => Err(error.to_string()),
-                };
-                match result {
-                    Ok(outcome) => {
-                        self.refresh_backend_config_snapshots_after_native_save()
-                            .await;
-                        self.refresh_session_schemas_with_fanout(true).await;
-                        outcome.partial_error_message().map_or(Ok(()), Err)
-                    }
-                    Err(error) => Err(error),
-                }
-            }
-            backend => Err(format!(
-                "{backend:?} does not support backend-native settings saves"
-            )),
-        };
+        let outcome = crate::backend::write_native_settings(
+            payload.backend,
+            payload.settings,
+            &crate::backend::BackendProbeContext::default(),
+        )
+        .await;
+        if outcome.refresh_required {
+            self.refresh_backend_config_snapshots_after_native_save()
+                .await;
+            self.refresh_session_schemas_with_fanout(true).await;
+        }
+        let outcome = outcome.result;
 
         let current_etag = {
             let state = self.state.lock().await;
@@ -7725,15 +7550,14 @@ impl HostHandle {
         fan_out_launch_profile_catalog(&mut state).await;
         if effects.refresh_session_schemas
             || effects.refresh_backend_config_snapshots
-            || effects.refresh_hermes_schema
+            || !effects.refresh_schema_backends.is_empty()
         {
             drop(state);
             if effects.refresh_session_schemas {
                 self.refresh_session_schemas().await;
             }
-            if effects.refresh_hermes_schema {
-                self.refresh_session_schema_for_backend(BackendKind::Hermes)
-                    .await;
+            for kind in effects.refresh_schema_backends {
+                self.refresh_session_schema_for_backend(kind).await;
             }
             if effects.refresh_backend_config_snapshots {
                 self.refresh_backend_config_snapshots().await;
@@ -8007,21 +7831,13 @@ impl HostHandle {
         candidate.enabled_backends =
             crate::store::settings::normalize_backend_list(candidate.enabled_backends);
         if !current.complexity_tiers_enabled && candidate.complexity_tiers_enabled {
-            for kind in [
-                BackendKind::Kiro,
-                BackendKind::Claude,
-                BackendKind::Codex,
-                BackendKind::Antigravity,
-                BackendKind::Hermes,
-            ] {
-                if kind != BackendKind::Codex {
-                    candidate
-                        .backend_tier_configs
-                        .entry(kind)
-                        .or_insert_with(|| crate::backend::builtin_tier_config(kind));
+            for kind in crate::backend::SUPPORTED_BACKENDS {
+                if let Some(config) = crate::backend::default_persisted_tier_config(kind) {
+                    candidate.backend_tier_configs.entry(kind).or_insert(config);
                 }
             }
         }
+
         let default_orphaned = candidate
             .default_backend
             .is_some_and(|kind| !candidate.enabled_backends.contains(&kind));
@@ -8477,7 +8293,7 @@ impl HostHandle {
         let settings = settings_store.lock().await.get().ok();
         let acp_agents = settings
             .as_ref()
-            .map(configured_acp_setup_agents)
+            .map(setup::configured_acp_setup_agents)
             .unwrap_or_default();
         setup::collect_backend_setup(&acp_agents).await
     }
@@ -8485,8 +8301,7 @@ impl HostHandle {
     fn schedule_session_schema_refresh(&self) {
         let host = self.clone();
         tokio::spawn(async move {
-            host.refresh_pending_session_schemas_and_hermes_catalog()
-                .await;
+            host.refresh_pending_session_discovery().await;
         });
     }
 
@@ -8522,25 +8337,11 @@ impl HostHandle {
         force_emit: bool,
         _tombstones: &[String],
     ) {
-        let (settings_store, skip_real_backend_probe) = {
-            let state = self.state.lock().await;
-            (
-                Arc::clone(&state.settings_store),
-                state.skip_real_backend_probe,
-            )
-        };
-        let enabled_backends = settings_store
-            .lock()
-            .await
-            .get()
-            .unwrap_or_else(|err| {
-                panic!("failed to load host settings for backend config snapshots: {err}")
-            })
-            .enabled_backends;
+        let skip_real_backend_probe = self.state.lock().await.skip_real_backend_probe;
         let snapshots = if skip_real_backend_probe {
             BackendSettingsSnapshots::default()
         } else {
-            backend_config_snapshots_for_enabled_backends(&enabled_backends).await
+            backend_config_snapshots().await
         };
         let mut state = self.state.lock().await;
         state.backend_config_snapshots = snapshots.backend_config;
@@ -8601,44 +8402,40 @@ impl HostHandle {
             .await;
     }
 
-    async fn refresh_pending_session_schemas_and_hermes_catalog(&self) {
+    async fn refresh_pending_session_discovery(&self) {
         let _refresh_guard = self.session_schema_refresh_lock.lock().await;
-        let (settings_store, codex_pending, kiro_pending, hermes_state) = {
+        let (enabled, pending) = {
             let state = self.state.lock().await;
-            (
-                Arc::clone(&state.settings_store),
-                matches!(
-                    &state.codex_session_schema,
-                    CodexSessionSchemaState::Pending
-                ),
-                matches!(
-                    acp_schema_state(&state.acp_session_schemas, None),
-                    AcpSessionSchemaState::Pending
-                ),
-                state.hermes_session_schema.clone(),
-            )
+            let settings = state
+                .settings_store
+                .lock()
+                .await
+                .get()
+                .expect("load settings for discovery");
+            let pending = settings
+                .enabled_backends
+                .iter()
+                .copied()
+                .filter(|kind| backend_has_dynamic_session_schema(*kind))
+                .filter(|kind| {
+                    matches!(
+                        session_schema_resolution_for_backend(&state, *kind, None),
+                        SessionSchemaResolution::Pending
+                    )
+                })
+                .collect::<HashSet<_>>();
+            (settings.enabled_backends, pending)
         };
-        let enabled = settings_store
-            .lock()
-            .await
-            .get()
-            .unwrap_or_else(|err| panic!("failed to load host settings for session schemas: {err}"))
-            .enabled_backends;
-        let hermes_enabled = enabled.contains(&protocol::BackendKind::Hermes);
-        let any_pending = (codex_pending && enabled.contains(&protocol::BackendKind::Codex))
-            || (kiro_pending && enabled.contains(&protocol::BackendKind::Kiro))
-            || (matches!(&hermes_state, HermesSessionSchemaState::Pending) && hermes_enabled);
-        if any_pending {
+        if !pending.is_empty() {
             self.refresh_session_schemas_with_fanout_unlocked(false, false, None)
                 .await;
         }
-        if hermes_enabled && !matches!(hermes_state, HermesSessionSchemaState::Pending) {
-            self.refresh_session_schemas_with_fanout_unlocked(
-                false,
-                true,
-                Some(protocol::BackendKind::Hermes),
-            )
-            .await;
+        for kind in enabled {
+            if !pending.contains(&kind) && crate::backend::discovery_policy(kind).refresh_on_connect
+            {
+                self.refresh_session_schemas_with_fanout_unlocked(false, true, Some(kind))
+                    .await;
+            }
         }
     }
 
@@ -8646,220 +8443,137 @@ impl HostHandle {
         &self,
         force_emit: bool,
         retry_unavailable: bool,
-        only: Option<protocol::BackendKind>,
+        only: Option<BackendKind>,
     ) {
-        let probe = |kind: protocol::BackendKind| only.is_none_or(|scoped| scoped == kind);
-        let (
-            settings_store,
-            codex_probe_program,
-            kiro_probe_program,
-            configured_kiro_probe_workspace_root,
-            skip_real_backend_probe,
-            previous_codex,
-            previous_acp,
-            previous_hermes,
-            prev_hermes_ready,
-        ) = {
+        let (settings_store, programs, root, disabled, previous, previous_profiles) = {
             let mut state = self.state.lock().await;
             #[cfg(any(test, feature = "test-support"))]
             {
                 state.session_schema_probe_count =
                     state.session_schema_probe_count.saturating_add(1);
             }
-            let prev_hermes_ready = match &state.hermes_session_schema {
-                HermesSessionSchemaState::Ready(schema) => Some(schema.clone()),
-                HermesSessionSchemaState::Pending | HermesSessionSchemaState::Unavailable(_) => {
-                    None
-                }
-            };
-            let previous_codex = state.codex_session_schema.clone();
-            let previous_acp = state.acp_session_schemas.clone();
-            let previous_hermes = state.hermes_session_schema.clone();
+            let previous = state.session_schemas.clone();
             if retry_unavailable {
-                if probe(protocol::BackendKind::Codex) {
-                    state.codex_session_schema = CodexSessionSchemaState::Pending;
-                }
-                if probe(protocol::BackendKind::Kiro) {
-                    state.acp_session_schemas.clear();
-                }
-                if probe(protocol::BackendKind::Hermes) {
-                    state.hermes_session_schema = HermesSessionSchemaState::Pending;
-                }
+                state
+                    .session_schemas
+                    .retain(|(kind, _), _| only.is_some_and(|scoped| scoped != *kind));
             }
             (
                 Arc::clone(&state.settings_store),
-                state.codex_probe_program.clone(),
-                state.kiro_probe_program.clone(),
-                state.kiro_probe_workspace_root.clone(),
+                state.backend_probe_programs.clone(),
+                state.backend_probe_workspace_root.clone(),
                 state.skip_real_backend_probe,
-                previous_codex,
-                previous_acp,
-                previous_hermes,
-                prev_hermes_ready,
+                previous,
+                state.discovered_launch_profiles.clone(),
             )
         };
-        let host_settings = settings_store.lock().await.get().unwrap_or_else(|err| {
-            panic!("failed to load host settings for session schemas: {err}")
-        });
-        let acp_profile_ids = configured_acp_profile_ids(&host_settings);
-        let acp_agents_by_profile = acp_profile_ids
-            .iter()
-            .filter_map(|id| {
-                acp_agent_for_profile(&host_settings, id).map(|agent| (id.clone(), agent))
-            })
-            .collect::<HashMap<_, _>>();
-        let enabled_backends = host_settings.enabled_backends.clone();
-        let hermes_disabled_providers = host_settings.hermes_disabled_providers.clone();
-
-        let codex_session_schema = if !probe(protocol::BackendKind::Codex)
-            || (!retry_unavailable && !matches!(&previous_codex, CodexSessionSchemaState::Pending))
-        {
-            previous_codex
-        } else if enabled_backends.contains(&protocol::BackendKind::Codex) {
-            if skip_real_backend_probe && codex_probe_program.is_none() {
-                CodexSessionSchemaState::Unavailable(
-                    "Codex model discovery is unavailable because backend probing is disabled"
-                        .to_string(),
-                )
-            } else {
-                match crate::backend::codex::probe_session_settings_schema(
-                    codex_probe_program.as_deref(),
-                )
-                .await
-                {
-                    Ok(schema) => CodexSessionSchemaState::Ready(schema),
-                    Err(err) => {
-                        tracing::error!("failed to refresh Codex session schema: {err}");
-                        CodexSessionSchemaState::Unavailable(err)
-                    }
-                }
+        let settings = settings_store
+            .lock()
+            .await
+            .get()
+            .expect("load settings for discovery");
+        let root = backend_probe_workspace_root(root.as_deref());
+        let mut schemas = previous.clone();
+        let mut profiles = previous_profiles;
+        for kind in crate::backend::SUPPORTED_BACKENDS {
+            if !backend_has_dynamic_session_schema(kind)
+                || only.is_some_and(|scoped| scoped != kind)
+            {
+                continue;
             }
-        } else {
-            CodexSessionSchemaState::Pending
-        };
-
-        // One probe per configured ACP agent: the schema comes from the agent's
-        // own model list, so a user-added agent must not inherit Kiro's.
-        let acp_session_schemas = if !probe(protocol::BackendKind::Kiro) {
-            previous_acp
-        } else if enabled_backends.contains(&protocol::BackendKind::Kiro) {
-            let mut schemas = HashMap::new();
-            let workspace_root =
-                kiro_probe_workspace_root(configured_kiro_probe_workspace_root.as_deref());
-            for profile_id in &acp_profile_ids {
-                let previous = previous_acp.get(profile_id);
-                // Skip agents already resolved, unless this is an explicit retry
-                // of the failures.
-                if !retry_unavailable
-                    && let Some(previous) = previous
-                    && !matches!(previous, AcpSessionSchemaState::Pending)
-                {
-                    schemas.insert(profile_id.clone(), previous.clone());
+            if !settings.enabled_backends.contains(&kind) {
+                schemas.retain(|(stored, _), _| *stored != kind);
+                profiles.remove(&kind);
+                continue;
+            }
+            let policy = crate::backend::discovery_policy(kind);
+            let mut keys = vec![discovery_key(kind, None)];
+            if policy.profile_scope.is_some() {
+                keys.extend(
+                    settings
+                        .launch_profiles
+                        .values()
+                        .filter(|profile| {
+                            profile.backend_kind == kind
+                                && Some(&profile.id) != policy.profile_scope.as_ref()
+                        })
+                        .map(|profile| discovery_key(kind, Some(&profile.id))),
+                );
+            }
+            schemas.retain(|key, _| key.0 != kind || keys.contains(key));
+            for key in keys {
+                let prior = previous
+                    .get(&key)
+                    .cloned()
+                    .unwrap_or(SessionSchemaResolution::Pending);
+                if !retry_unavailable && !matches!(prior, SessionSchemaResolution::Pending) {
                     continue;
                 }
-                let is_builtin_kiro = profile_id.0 == protocol::KIRO_LAUNCH_PROFILE_ID;
-                let agent = acp_agents_by_profile.get(profile_id);
-                let workspace_root = match &workspace_root {
-                    Ok(root) => root.clone(),
-                    Err(err) => {
-                        tracing::error!("failed to resolve ACP probe workspace root: {err}");
-                        schemas.insert(
-                            profile_id.clone(),
-                            AcpSessionSchemaState::Unavailable(err.clone()),
-                        );
-                        continue;
-                    }
-                };
-                let state = match crate::backend::kiro::probe_session_settings_schema(
-                    &[workspace_root],
-                    is_builtin_kiro
-                        .then(|| kiro_probe_program.clone())
-                        .flatten(),
-                    (!is_builtin_kiro).then_some(agent).flatten(),
-                )
-                .await
-                {
-                    Ok(schema) => AcpSessionSchemaState::Ready(schema),
-                    Err(err) => {
-                        tracing::error!(
-                            profile = %profile_id.0,
-                            "failed to refresh ACP session schema: {err}"
-                        );
-                        AcpSessionSchemaState::Unavailable(err)
-                    }
-                };
-                schemas.insert(profile_id.clone(), state);
-            }
-            schemas
-        } else {
-            HashMap::new()
-        };
-
-        // `None` keeps the previously discovered Hermes profiles (when the
-        // schema itself is kept); `Some` replaces them alongside the schema.
-        let (hermes_session_schema, hermes_profiles) = if !probe(protocol::BackendKind::Hermes)
-            || (!retry_unavailable
-                && !matches!(&previous_hermes, HermesSessionSchemaState::Pending))
-        {
-            (previous_hermes, None)
-        } else if enabled_backends.contains(&protocol::BackendKind::Hermes) {
-            if skip_real_backend_probe {
-                // The mock probe is settings-dependent (it applies the same
-                // disabled-provider filter as the real one) so sims can
-                // observe the provider-disable coupling's published effect.
-                (
-                    HermesSessionSchemaState::Ready(
-                        crate::backend::hermes::mock_probe_session_settings_schema(
-                            &hermes_disabled_providers,
-                        ),
-                    ),
-                    Some(Vec::new()),
-                )
-            } else {
-                let hermes_schema_or_last_good = |err: String| match prev_hermes_ready.clone() {
-                    Some(schema) => {
-                        tracing::warn!(
-                            "Hermes session schema probe failed ({err}); keeping last-known-good schema"
-                        );
-                        (HermesSessionSchemaState::Ready(schema), None)
-                    }
-                    None => (HermesSessionSchemaState::Unavailable(err), Some(Vec::new())),
-                };
-                match hermes_probe_workspace_root() {
-                    Ok(workspace_root) => {
-                        match crate::backend::hermes::probe_session_settings_schema(
-                            &[workspace_root],
-                            &hermes_disabled_providers,
-                        )
+                let custom_profile = key
+                    .1
+                    .as_ref()
+                    .filter(|id| Some(*id) != policy.profile_scope.as_ref());
+                let context = crate::backend::BackendProbeContext {
+                    #[cfg(any(test, feature = "test-support"))]
+                    mock_discovery: self
+                        .state
+                        .lock()
                         .await
+                        .mock_backend_discovery
+                        .get(&kind)
+                        .cloned(),
+                    workspace_roots: root
+                        .as_ref()
+                        .map(|root| vec![root.clone()])
+                        .unwrap_or_default(),
+                    program: custom_profile
+                        .is_none()
+                        .then(|| programs.get(&kind).cloned())
+                        .flatten(),
+                    launch: custom_profile
+                        .and_then(|id| settings.launch_profiles.get(id))
+                        .and_then(|profile| profile.acp.clone()),
+                    disabled_providers: settings.hermes_disabled_providers.clone(),
+                };
+                let is_default_profile = custom_profile.is_none();
+                let result = match &root {
+                    Err(error) => Err(error.clone()),
+                    Ok(_)
+                        if disabled
+                            && context.program.is_none()
+                            && context.launch.is_none()
+                            && !context.has_mock_discovery() =>
+                    {
+                        crate::backend::mock::disabled_discovery(kind, &context)
+                    }
+                    Ok(_) => crate::backend::discover(kind, &context).await,
+                };
+                match result {
+                    Ok(discovery) => {
+                        schemas.insert(key, SessionSchemaResolution::Ready(discovery.schema));
+                        if is_default_profile {
+                            profiles.insert(kind, discovery.launch_profiles);
+                        }
+                    }
+                    Err(error) => {
+                        tracing::error!(?kind, profile = ?key.1, %error, "backend session discovery failed");
+                        if policy.retain_last_good
+                            && matches!(prior, SessionSchemaResolution::Ready(_))
                         {
-                            Ok(probe) => (
-                                HermesSessionSchemaState::Ready(probe.schema),
-                                Some(probe.profiles),
-                            ),
-                            Err(err) => {
-                                tracing::error!("failed to refresh Hermes session schema: {err}");
-                                hermes_schema_or_last_good(err)
+                            schemas.insert(key, prior);
+                        } else {
+                            schemas.insert(key, SessionSchemaResolution::Unavailable(error));
+                            if is_default_profile {
+                                profiles.remove(&kind);
                             }
                         }
                     }
-                    Err(err) => {
-                        tracing::error!("failed to resolve Hermes probe workspace root: {err}");
-                        hermes_schema_or_last_good(err)
-                    }
                 }
             }
-        } else {
-            (HermesSessionSchemaState::Pending, Some(Vec::new()))
-        };
-
-        let mut state = self.state.lock().await;
-        state.codex_session_schema = codex_session_schema;
-        state.acp_session_schemas = acp_session_schemas;
-        state.hermes_session_schema = hermes_session_schema;
-        if let Some(hermes_profiles) = hermes_profiles {
-            state.hermes_launch_profiles = hermes_profiles;
         }
+        let mut state = self.state.lock().await;
+        state.session_schemas = schemas;
+        state.discovered_launch_profiles = profiles;
         fan_out_session_schemas(&mut state, force_emit).await;
         fan_out_backend_config_schemas(&mut state).await;
         fan_out_launch_profile_catalog(&mut state).await;
@@ -12824,7 +12538,7 @@ impl HostHandle {
             steering_body: String::new(),
             skills: Vec::new(),
             skill_selection: SkillSelection::Explicit,
-            skill_delivery: SkillDelivery::for_backend(backend_kind),
+            skill_delivery: crate::backend::skill_delivery(backend_kind),
             mcp_servers: vec![McpServerConfig {
                 id: McpServerId("tyde-review-feedback".to_owned()),
                 name: REVIEW_FEEDBACK_MCP_SERVER_NAME.to_owned(),
@@ -13835,10 +13549,9 @@ fn spawn_host_inner(
             paths.session.with_file_name("transcripts")
         };
     let transcript_store = TranscriptStore::new(transcript_root);
-    let antigravity_conversations_dir =
-        crate::backend::antigravity::resolve_antigravity_conversations_dir(
-            runtime_config.antigravity_conversations_dir.as_deref(),
-        )?;
+    let backend_storage =
+        crate::backend::BackendStorage::new(runtime_config.backend_storage_roots.clone())?;
+
     let (session_store, purged_gemini_session_ids) =
         SessionStore::load_with_migration(paths.session)?;
     let project_store = ProjectStore::load(paths.project)?;
@@ -14005,20 +13718,19 @@ fn spawn_host_inner(
             workflow_locations,
             workflow_run_store,
             mobile_access: mobile_access.clone(),
-            codex_session_schema: CodexSessionSchemaState::Pending,
-            acp_session_schemas: HashMap::new(),
-            hermes_session_schema: HermesSessionSchemaState::Pending,
-            hermes_launch_profiles: Default::default(),
+            session_schemas: HashMap::new(),
+            discovered_launch_profiles: HashMap::new(),
             backend_config_snapshots: Vec::new(),
             backend_native_settings_snapshots: Vec::new(),
             backend_capacity: initial_backend_capacity_snapshots(),
             capacity_polls_in_flight: HashSet::new(),
             capacity_polling_started: false,
             backend_setup: setup::stub_backend_setup(),
-            antigravity_conversations_dir,
-            codex_probe_program: runtime_config.codex_probe_program.clone(),
-            kiro_probe_program: runtime_config.kiro_probe_program.clone(),
-            kiro_probe_workspace_root: runtime_config.kiro_probe_workspace_root.clone(),
+            backend_storage,
+            backend_probe_programs: runtime_config.backend_probe_programs.clone(),
+            #[cfg(any(test, feature = "test-support"))]
+            mock_backend_discovery: runtime_config.mock_backend_discovery.clone(),
+            backend_probe_workspace_root: runtime_config.backend_probe_workspace_root.clone(),
             skip_real_backend_probe: runtime_config.skip_real_backend_probe,
             force_project_watch_limit: {
                 #[cfg(any(test, feature = "test-support"))]
@@ -14679,17 +14391,13 @@ async fn start_due_activity_summary_calls(
         let previous_text = previous_summary
             .as_ref()
             .map(|summary| summary.text.clone());
-        let source_session_settings = if context.start.backend_kind == BackendKind::Hermes {
-            match context.start.session_id.as_ref() {
-                Some(session_id) => {
-                    let session_store = { Arc::clone(&host.state.lock().await.session_store) };
-                    let record = session_store.lock().await.get(session_id);
-                    record.and_then(|record| record.session_settings)
-                }
-                None => None,
+        let source_session_settings = match context.start.session_id.as_ref() {
+            Some(session_id) => {
+                let session_store = { Arc::clone(&host.state.lock().await.session_store) };
+                let record = session_store.lock().await.get(session_id);
+                record.and_then(|record| record.session_settings)
             }
-        } else {
-            None
+            None => None,
         };
         let transient_agent_id = AgentId(Uuid::new_v4().to_string());
         debug_assert!(
@@ -14710,7 +14418,7 @@ async fn start_due_activity_summary_calls(
             previous_summary: previous_text,
             source_from_seq: history.from_seq,
             source_through_seq: history.through_seq,
-            session_settings: hidden_helper_session_settings(
+            session_settings: crate::backend::helper_session_settings(
                 context.start.backend_kind,
                 source_session_settings.as_ref(),
             ),
@@ -14900,7 +14608,7 @@ fn spawn_capacity_poll_loops(host: HostHandle) {
         // A host configured not to run real backend processes cannot learn what
         // is installed, so it must not poll and must not claim anything is
         // missing. The seeded `AwaitingFirstReport` is the honest state there.
-        if host.capacity_probe_context().await.is_none() {
+        if host.state.lock().await.skip_real_backend_probe {
             tracing::debug!("backend probing is disabled; capacity polling is off");
             return;
         }
@@ -16224,40 +15932,13 @@ fn origin_system_tag(origin: AgentOrigin) -> (AgentSystemTagId, String) {
 }
 
 fn backend_system_tag(backend: BackendKind) -> (AgentSystemTagId, String) {
-    match backend {
-        BackendKind::Tycode => (
-            AgentSystemTagId("system:backend:tycode".to_owned()),
-            "Tycode".to_owned(),
-        ),
-        BackendKind::Kiro => (
-            AgentSystemTagId("system:backend:kiro".to_owned()),
-            "Kiro".to_owned(),
-        ),
-        BackendKind::Claude => (
-            AgentSystemTagId("system:backend:claude".to_owned()),
-            "Claude".to_owned(),
-        ),
-        BackendKind::Codex => (
-            AgentSystemTagId("system:backend:codex".to_owned()),
-            "Codex".to_owned(),
-        ),
-        BackendKind::Antigravity => (
-            AgentSystemTagId("system:backend:antigravity".to_owned()),
-            "Antigravity".to_owned(),
-        ),
-        BackendKind::Hermes => (
-            AgentSystemTagId("system:backend:hermes".to_owned()),
-            "Hermes".to_owned(),
-        ),
-        BackendKind::Grok => (
-            AgentSystemTagId("system:backend:grok".to_owned()),
-            "Grok".to_owned(),
-        ),
-        BackendKind::Opencode => (
-            AgentSystemTagId("system:backend:opencode".to_owned()),
-            "OpenCode".to_owned(),
-        ),
-    }
+    (
+        AgentSystemTagId(format!(
+            "system:backend:{}",
+            crate::backend::backend_slug(backend)
+        )),
+        crate::backend::backend_launch_profile_label(backend).to_owned(),
+    )
 }
 
 fn project_system_tag(
@@ -16674,9 +16355,9 @@ async fn fan_out_session_lists(state: &mut HostState) {
         .session_store
         .lock()
         .await
-        .summaries_for_scope_with_antigravity_conversations_dir(
+        .summaries_for_scope_with_backend_storage(
             SessionListScope::AllSessions,
-            &state.antigravity_conversations_dir,
+            &state.backend_storage,
         )
         .unwrap_or_else(|err| panic!("failed to list sessions for fanout: {err}"));
 
@@ -17631,10 +17312,10 @@ async fn emit_review_list_changed_for_project(
 /// derives them from an old/new typed diff. Both feed the same
 /// `finish_settings_apply`, so a coupling cannot exist on one path and be
 /// silently missing from the other.
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone)]
 struct SettingsApplyEffects {
     refresh_session_schemas: bool,
-    refresh_hermes_schema: bool,
+    refresh_schema_backends: Vec<BackendKind>,
     refresh_backend_config_snapshots: bool,
     refresh_voice_capabilities: bool,
 }
@@ -17644,9 +17325,14 @@ impl SettingsApplyEffects {
         let enabled_backends_changed = old.enabled_backends != new.enabled_backends;
         Self {
             refresh_session_schemas: enabled_backends_changed,
-            // Hermes provider-disable must re-probe the Hermes session
-            // schema (named side-effect requirement (a)).
-            refresh_hermes_schema: old.hermes_disabled_providers != new.hermes_disabled_providers,
+            refresh_schema_backends: crate::backend::SUPPORTED_BACKENDS
+                .into_iter()
+                .filter(|kind| {
+                    !enabled_backends_changed
+                        && old.hermes_disabled_providers != new.hermes_disabled_providers
+                        && crate::backend::discovery_policy(*kind).schema_uses_provider_filters
+                })
+                .collect(),
             // EnabledBackends must refresh config snapshots + session
             // schemas (named side-effect requirement (b)).
             refresh_backend_config_snapshots: enabled_backends_changed,
@@ -17979,41 +17665,25 @@ struct BackendSettingsSnapshots {
     native_settings: Vec<BackendNativeSettingsSnapshot>,
 }
 
-async fn backend_config_snapshots_for_enabled_backends(
-    enabled_backends: &[protocol::BackendKind],
-) -> BackendSettingsSnapshots {
-    let workspace_roots = match hermes_probe_workspace_root() {
-        Ok(root) => vec![root],
-        Err(err) => {
+async fn backend_config_snapshots() -> BackendSettingsSnapshots {
+    let workspace_roots = crate::paths::home_dir()
+        .map(|root| vec![root.to_string_lossy().into_owned()])
+        .unwrap_or_else(|error| {
             tracing::error!(
-                "failed to resolve backend config snapshot probe workspace root: {err}"
+                "failed to resolve backend config snapshot probe workspace root: {error}"
             );
             Vec::new()
-        }
+        });
+    let context = crate::backend::BackendProbeContext {
+        workspace_roots,
+        ..Default::default()
     };
     let mut snapshots = BackendSettingsSnapshots::default();
-    for kind in enabled_backends {
-        match kind {
-            BackendKind::Tycode
-            | BackendKind::Hermes
-            | BackendKind::Kiro
-            | BackendKind::Claude
-            | BackendKind::Codex
-            | BackendKind::Antigravity
-            | BackendKind::Grok
-            | BackendKind::Opencode => {}
+    for kind in crate::backend::SUPPORTED_BACKENDS {
+        if let Some(snapshot) = crate::backend::native_settings_snapshot(kind, &context).await {
+            snapshots.native_settings.push(snapshot);
         }
     }
-    // The Hermes snapshot is published regardless of enablement, like the
-    // deep-config schema catalog: its settings page edits Hermes's own
-    // config, which users legitimately configure before enabling the
-    // backend. An uninstalled Hermes yields a visible Unavailable snapshot.
-    snapshots
-        .native_settings
-        .push(crate::backend::hermes::native_settings_snapshot(&workspace_roots).await);
-    snapshots
-        .native_settings
-        .push(crate::backend::codex::native_settings_snapshot().await);
     snapshots
 }
 
@@ -18242,16 +17912,7 @@ fn transient_capacity_failure(
 }
 
 fn initial_backend_capacity_snapshots() -> HashMap<BackendKind, BackendCapacitySnapshot> {
-    const BACKENDS: [BackendKind; 7] = [
-        BackendKind::Kiro,
-        BackendKind::Claude,
-        BackendKind::Codex,
-        BackendKind::Antigravity,
-        BackendKind::Hermes,
-        BackendKind::Grok,
-        BackendKind::Opencode,
-    ];
-    BACKENDS
+    crate::backend::SUPPORTED_BACKENDS
         .into_iter()
         .map(|backend_kind| {
             // Derived from the declared capability, not a hardcoded list: a
@@ -18321,15 +17982,11 @@ fn backend_capacity_snapshots(state: &HostState) -> Vec<BackendCapacitySnapshot>
             snapshot
         })
         .collect::<Vec<_>>();
-    snapshots.sort_by_key(|snapshot| match snapshot.backend_kind {
-        BackendKind::Kiro => 0,
-        BackendKind::Claude => 1,
-        BackendKind::Codex => 2,
-        BackendKind::Antigravity => 3,
-        BackendKind::Hermes => 4,
-        BackendKind::Grok => 5,
-        BackendKind::Opencode => 6,
-        BackendKind::Tycode => 7,
+    snapshots.sort_by_key(|snapshot| {
+        crate::backend::SUPPORTED_BACKENDS
+            .iter()
+            .position(|kind| *kind == snapshot.backend_kind)
+            .unwrap_or(crate::backend::SUPPORTED_BACKENDS.len())
     });
     snapshots
 }
@@ -18772,67 +18429,38 @@ fn resolve_backend_config_for_spawn(
         .unwrap_or_default()
 }
 
+fn discovery_key(kind: BackendKind, profile_id: Option<&LaunchProfileId>) -> DiscoveryKey {
+    let scope = crate::backend::discovery_policy(kind).profile_scope;
+    (
+        kind,
+        scope.map(|default| profile_id.cloned().unwrap_or(default)),
+    )
+}
+
 fn session_schema_for_backend(
     state: &HostState,
-    backend_kind: protocol::BackendKind,
+    kind: BackendKind,
     profile_id: Option<&LaunchProfileId>,
 ) -> Option<SessionSettingsSchema> {
-    match backend_kind {
-        protocol::BackendKind::Codex => match &state.codex_session_schema {
-            CodexSessionSchemaState::Ready(schema) => Some(schema.clone()),
-            CodexSessionSchemaState::Pending | CodexSessionSchemaState::Unavailable(_) => None,
-        },
-        protocol::BackendKind::Kiro => {
-            match acp_schema_state(&state.acp_session_schemas, profile_id) {
-                AcpSessionSchemaState::Ready(schema) => Some(schema.clone()),
-                AcpSessionSchemaState::Pending | AcpSessionSchemaState::Unavailable(_) => None,
-            }
-        }
-        protocol::BackendKind::Grok => Some(session_settings_schema_for_backend(backend_kind)),
-        protocol::BackendKind::Hermes => match &state.hermes_session_schema {
-            HermesSessionSchemaState::Ready(schema) => Some(schema.clone()),
-            HermesSessionSchemaState::Pending | HermesSessionSchemaState::Unavailable(_) => None,
-        },
-        _ => Some(session_settings_schema_for_backend(backend_kind)),
+    match session_schema_resolution_for_backend(state, kind, profile_id) {
+        SessionSchemaResolution::Ready(schema) => Some(schema),
+        SessionSchemaResolution::Pending | SessionSchemaResolution::Unavailable(_) => None,
     }
 }
 
 fn session_schema_resolution_for_backend(
     state: &HostState,
-    backend_kind: protocol::BackendKind,
+    kind: BackendKind,
     profile_id: Option<&LaunchProfileId>,
 ) -> SessionSchemaResolution {
-    match backend_kind {
-        protocol::BackendKind::Codex => match &state.codex_session_schema {
-            CodexSessionSchemaState::Pending => SessionSchemaResolution::Pending,
-            CodexSessionSchemaState::Ready(schema) => {
-                SessionSchemaResolution::Ready(schema.clone())
-            }
-            CodexSessionSchemaState::Unavailable(message) => {
-                SessionSchemaResolution::Unavailable(message.clone())
-            }
-        },
-        protocol::BackendKind::Kiro => {
-            match acp_schema_state(&state.acp_session_schemas, profile_id) {
-                AcpSessionSchemaState::Pending => SessionSchemaResolution::Pending,
-                AcpSessionSchemaState::Ready(schema) => {
-                    SessionSchemaResolution::Ready(schema.clone())
-                }
-                AcpSessionSchemaState::Unavailable(message) => {
-                    SessionSchemaResolution::Unavailable(message.clone())
-                }
-            }
-        }
-        protocol::BackendKind::Hermes => match &state.hermes_session_schema {
-            HermesSessionSchemaState::Pending => SessionSchemaResolution::Pending,
-            HermesSessionSchemaState::Ready(schema) => {
-                SessionSchemaResolution::Ready(schema.clone())
-            }
-            HermesSessionSchemaState::Unavailable(message) => {
-                SessionSchemaResolution::Unavailable(message.clone())
-            }
-        },
-        _ => SessionSchemaResolution::Ready(session_settings_schema_for_backend(backend_kind)),
+    if backend_has_dynamic_session_schema(kind) {
+        state
+            .session_schemas
+            .get(&discovery_key(kind, profile_id))
+            .cloned()
+            .unwrap_or(SessionSchemaResolution::Pending)
+    } else {
+        SessionSchemaResolution::Ready(session_settings_schema_for_backend(kind))
     }
 }
 
@@ -18907,96 +18535,20 @@ fn sanitize_stored_session_settings(
 }
 
 fn backend_has_dynamic_session_schema(backend_kind: protocol::BackendKind) -> bool {
-    matches!(
-        backend_kind,
-        protocol::BackendKind::Kiro | protocol::BackendKind::Codex | protocol::BackendKind::Hermes
-    )
-}
-
-pub(crate) fn hidden_helper_session_settings(
-    backend_kind: BackendKind,
-    session_settings: Option<&protocol::SessionSettingsValues>,
-) -> Option<protocol::SessionSettingsValues> {
-    if backend_kind != BackendKind::Hermes {
-        return None;
-    }
-
-    let mut helper_settings = protocol::SessionSettingsValues::default();
-    if let Some(session_settings) = session_settings {
-        for key in [crate::backend::hermes::HERMES_PROFILE_SETTING, "model"] {
-            if let Some(value) = session_settings.0.get(key) {
-                helper_settings.0.insert(key.to_owned(), value.clone());
-            }
-        }
-    }
-    // Hermes cost hints supply no defaults. Preserve already-cheap explicit
-    // effort, cap higher effort at `low`, and use the schema's minimum for
-    // profile-default or invalid values.
-    helper_settings.0.insert(
-        "reasoning_effort".to_owned(),
-        protocol::SessionSettingValue::String(
-            hidden_helper_reasoning_effort(session_settings).to_owned(),
-        ),
-    );
-    Some(helper_settings)
-}
-
-fn hidden_helper_reasoning_effort(
-    session_settings: Option<&protocol::SessionSettingsValues>,
-) -> &'static str {
-    match session_settings
-        .and_then(|settings| settings.0.get("reasoning_effort"))
-        .and_then(|value| match value {
-            protocol::SessionSettingValue::String(value) => Some(value.as_str()),
-            _ => None,
-        }) {
-        Some("none") => "none",
-        Some("minimal") => "minimal",
-        Some("low") | Some("medium") | Some("high") | Some("xhigh") => "low",
-        Some(_) | None => "none",
-    }
+    crate::backend::has_dynamic_session_schema(backend_kind)
 }
 
 fn session_schema_entry_for_backend(
     state: &HostState,
-    backend_kind: protocol::BackendKind,
+    backend_kind: BackendKind,
     profile_id: Option<&LaunchProfileId>,
 ) -> SessionSchemaEntry {
-    match backend_kind {
-        protocol::BackendKind::Codex => match &state.codex_session_schema {
-            CodexSessionSchemaState::Ready(schema) => SessionSchemaEntry::Ready {
-                schema: schema.clone(),
-            },
-            CodexSessionSchemaState::Pending => SessionSchemaEntry::Pending { backend_kind },
-            CodexSessionSchemaState::Unavailable(message) => SessionSchemaEntry::Unavailable {
-                backend_kind,
-                message: message.clone(),
-            },
-        },
-        protocol::BackendKind::Kiro => {
-            match acp_schema_state(&state.acp_session_schemas, profile_id) {
-                AcpSessionSchemaState::Ready(schema) => SessionSchemaEntry::Ready {
-                    schema: schema.clone(),
-                },
-                AcpSessionSchemaState::Pending => SessionSchemaEntry::Pending { backend_kind },
-                AcpSessionSchemaState::Unavailable(message) => SessionSchemaEntry::Unavailable {
-                    backend_kind,
-                    message: message.clone(),
-                },
-            }
-        }
-        protocol::BackendKind::Hermes => match &state.hermes_session_schema {
-            HermesSessionSchemaState::Ready(schema) => SessionSchemaEntry::Ready {
-                schema: schema.clone(),
-            },
-            HermesSessionSchemaState::Pending => SessionSchemaEntry::Pending { backend_kind },
-            HermesSessionSchemaState::Unavailable(message) => SessionSchemaEntry::Unavailable {
-                backend_kind,
-                message: message.clone(),
-            },
-        },
-        _ => SessionSchemaEntry::Ready {
-            schema: session_settings_schema_for_backend(backend_kind),
+    match session_schema_resolution_for_backend(state, backend_kind, profile_id) {
+        SessionSchemaResolution::Ready(schema) => SessionSchemaEntry::Ready { schema },
+        SessionSchemaResolution::Pending => SessionSchemaEntry::Pending { backend_kind },
+        SessionSchemaResolution::Unavailable(message) => SessionSchemaEntry::Unavailable {
+            backend_kind,
+            message,
         },
     }
 }
@@ -19018,46 +18570,15 @@ fn launch_profile_catalog_for_settings(
 ) -> LaunchProfileCatalog {
     let mut entries = Vec::new();
     for backend_kind in settings.enabled_backends.iter().copied() {
-        // ACP has no meaningful "backend default": a session is defined by
-        // which agent it runs, so every ACP entry is a named agent profile.
-        if backend_kind == protocol::BackendKind::Kiro {
-            continue;
+        entries.push(LaunchProfileEntry::Ready {
+            profile: crate::backend::default_launch_profile(backend_kind),
+        });
+    }
+
+    for kind in &settings.enabled_backends {
+        if let Some(profiles) = state.discovered_launch_profiles.get(kind) {
+            entries.extend(profiles.iter().cloned());
         }
-        entries.push(LaunchProfileEntry::Ready {
-            profile: LaunchProfile {
-                id: default_launch_profile_id(backend_kind),
-                kind: LaunchProfileKind::BackendDefault,
-                label: backend_launch_profile_label(backend_kind).to_owned(),
-                description: Some(format!(
-                    "Launch {} with its backend defaults.",
-                    backend_launch_profile_label(backend_kind)
-                )),
-                backend_kind,
-                session_settings: protocol::SessionSettingsValues::default(),
-            },
-        });
-    }
-
-    // One synthesized entry per named Hermes profile, derived from the last
-    // schema probe's discovery. The default profile is already covered by the
-    // "hermes:default" backend-default entry above.
-    if settings
-        .enabled_backends
-        .contains(&protocol::BackendKind::Hermes)
-    {
-        synthesize_hermes_profile_entries(&state.hermes_launch_profiles, &mut entries);
-    }
-
-    // The built-in Kiro agent. Every other ACP agent is a user-configured
-    // launch profile; this one ships with Tyde, so it is synthesized rather
-    // than persisted.
-    if settings
-        .enabled_backends
-        .contains(&protocol::BackendKind::Kiro)
-    {
-        entries.push(LaunchProfileEntry::Ready {
-            profile: builtin_kiro_launch_profile(),
-        });
     }
 
     for config in settings.launch_profiles.values() {
@@ -19072,198 +18593,11 @@ fn launch_profile_catalog_for_settings(
     }
 }
 
-/// Id namespace for launch profiles synthesized from Hermes profiles. Also
-/// reserved against user-configured launch-profile ids.
-/// The built-in Kiro agent.
-///
-/// A blank command is deliberate: the Kiro adapter resolves `kiro-cli-chat` as
-/// a sibling of `kiro-cli`, which survives version upgrades and toolbox
-/// wrappers that an absolute path would not.
-pub(crate) fn builtin_kiro_agent_spec() -> protocol::AcpAgentSpec {
-    protocol::AcpAgentSpec {
-        command: String::new(),
-        args: vec!["acp".to_owned()],
-        cwd: None,
-        env: Default::default(),
-        adapter: protocol::AcpAdapterId::Kiro,
-    }
-}
-
-/// The launch-profile entry Tyde synthesizes for the built-in Kiro agent.
-///
-/// Synthesized rather than seeded into user settings so it cannot be deleted
-/// or left stale, matching how named Hermes profiles are handled.
-pub(crate) fn builtin_kiro_launch_profile() -> LaunchProfile {
-    LaunchProfile {
-        id: LaunchProfileId(protocol::KIRO_LAUNCH_PROFILE_ID.to_owned()),
-        kind: LaunchProfileKind::BackendDefault,
-        label: "Kiro (ACP)".to_owned(),
-        description: Some("Kiro, over the Agent Client Protocol.".to_owned()),
-        backend_kind: protocol::BackendKind::Kiro,
-        session_settings: protocol::SessionSettingsValues::default(),
-    }
-}
-
-/// Find the ACP agent a launch profile runs.
-///
-/// Checks the synthesized built-in first, then the user's configured
-/// profiles. Returns `None` when the id is unknown so the caller decides what
-/// an unresolvable profile means.
-pub(crate) fn acp_agent_for_profile(
-    settings: &settings_model::HostSettings,
-    profile_id: &LaunchProfileId,
-) -> Option<protocol::AcpAgentSpec> {
-    if profile_id.0 == protocol::KIRO_LAUNCH_PROFILE_ID {
-        return Some(builtin_kiro_agent_spec());
-    }
-    settings
-        .launch_profiles
-        .get(profile_id)
-        .and_then(|profile| profile.acp.clone())
-}
-
-/// Every ACP launch profile the host knows about: the built-in Kiro agent plus
-/// any the user configured. Probing and schema lookup both key off this, so a
-/// user-added agent gets its own schema rather than inheriting Kiro's.
-pub(crate) fn configured_acp_profile_ids(
-    settings: &settings_model::HostSettings,
-) -> Vec<LaunchProfileId> {
-    let mut ids = vec![LaunchProfileId(protocol::KIRO_LAUNCH_PROFILE_ID.to_owned())];
-    for profile in settings.launch_profiles.values() {
-        if profile.backend_kind == protocol::BackendKind::Kiro
-            && profile.id.0 != protocol::KIRO_LAUNCH_PROFILE_ID
-        {
-            ids.push(profile.id.clone());
-        }
-    }
-    ids
-}
-
-/// Resolves the ACP schema slot for a profile, defaulting to the built-in Kiro
-/// agent.
-///
-/// Some surfaces are keyed by `BackendKind` and have no profile in hand —
-/// `backend_tier_configs` is per-kind by product design, not per-agent. Those
-/// resolve against the built-in profile, which preserves the behaviour ACP had
-/// when Kiro was the only possible agent. Surfaces that *do* know their profile
-/// (launch-profile validation, session spawn) pass it and get that agent's own
-/// schema.
-fn acp_schema_state<'a>(
-    schemas: &'a HashMap<LaunchProfileId, AcpSessionSchemaState>,
-    profile_id: Option<&LaunchProfileId>,
-) -> &'a AcpSessionSchemaState {
-    const PENDING: &AcpSessionSchemaState = &AcpSessionSchemaState::Pending;
-    let key = profile_id
-        .cloned()
-        .unwrap_or(LaunchProfileId(protocol::KIRO_LAUNCH_PROFILE_ID.to_owned()));
-    schemas.get(&key).unwrap_or(PENDING)
-}
-
-/// The configured ACP agents as the setup probe wants them: one per launch
-/// profile, labelled the way the user sees it in Settings.
-pub(crate) fn configured_acp_setup_agents(
-    settings: &settings_model::HostSettings,
-) -> Vec<crate::backend::setup::ConfiguredAcpAgent> {
-    configured_acp_profile_ids(settings)
-        .into_iter()
-        .filter_map(|id| {
-            let agent = acp_agent_for_profile(settings, &id)?;
-            let label = if id.0 == protocol::KIRO_LAUNCH_PROFILE_ID {
-                builtin_kiro_launch_profile().label
-            } else {
-                settings
-                    .launch_profiles
-                    .get(&id)
-                    .map(|profile| profile.label.clone())
-                    .unwrap_or_else(|| id.0.clone())
-            };
-            Some(crate::backend::setup::ConfiguredAcpAgent {
-                label,
-                command: agent.command,
-                adapter: agent.adapter,
-            })
-        })
-        .collect()
-}
-
-pub(crate) const HERMES_PROFILE_LAUNCH_ID_PREFIX: &str = "hermes:profile:";
-
-/// Append one launch-profile entry per named Hermes profile: ready entries
-/// carry `{profile: <name>}` session settings; profiles whose gateway probe
-/// failed stay visible as unavailable entries with the probe error.
-fn synthesize_hermes_profile_entries(
-    infos: &[crate::backend::hermes::HermesLaunchProfileInfo],
-    entries: &mut Vec<LaunchProfileEntry>,
-) {
-    for info in infos {
-        if info.name == protocol::hermes_config::HERMES_DEFAULT_PROFILE {
-            continue;
-        }
-        let id = LaunchProfileId(format!("{HERMES_PROFILE_LAUNCH_ID_PREFIX}{}", info.name));
-        let label = format!("Hermes — {}", info.name);
-        match &info.error {
-            None => {
-                let mut session_settings = protocol::SessionSettingsValues::default();
-                session_settings.0.insert(
-                    crate::backend::hermes::HERMES_PROFILE_SETTING.to_owned(),
-                    protocol::SessionSettingValue::String(info.name.clone()),
-                );
-                entries.push(LaunchProfileEntry::Ready {
-                    profile: LaunchProfile {
-                        id,
-                        kind: LaunchProfileKind::BackendDefault,
-                        label,
-                        description: Some(match &info.summary {
-                            Some(summary) => format!(
-                                "Launch Hermes with its '{}' profile ({summary}).",
-                                info.name
-                            ),
-                            None => format!("Launch Hermes with its '{}' profile.", info.name),
-                        }),
-                        backend_kind: protocol::BackendKind::Hermes,
-                        session_settings,
-                    },
-                });
-            }
-            Some(error) => entries.push(LaunchProfileEntry::Unavailable {
-                id,
-                kind: LaunchProfileKind::BackendDefault,
-                backend_kind: protocol::BackendKind::Hermes,
-                label,
-                message: error.clone(),
-            }),
-        }
-    }
-}
-
 fn default_launch_profile_id(backend_kind: protocol::BackendKind) -> LaunchProfileId {
-    LaunchProfileId(format!("{}:default", backend_slug(backend_kind)))
-}
-
-fn backend_slug(backend_kind: protocol::BackendKind) -> &'static str {
-    match backend_kind {
-        protocol::BackendKind::Tycode => "tycode",
-        protocol::BackendKind::Kiro => "kiro",
-        protocol::BackendKind::Claude => "claude",
-        protocol::BackendKind::Codex => "codex",
-        protocol::BackendKind::Antigravity => "antigravity",
-        protocol::BackendKind::Hermes => "hermes",
-        protocol::BackendKind::Grok => "grok",
-        protocol::BackendKind::Opencode => "opencode",
-    }
-}
-
-fn backend_launch_profile_label(backend_kind: protocol::BackendKind) -> &'static str {
-    match backend_kind {
-        protocol::BackendKind::Tycode => "Tycode",
-        protocol::BackendKind::Kiro => "Kiro",
-        protocol::BackendKind::Claude => "Claude",
-        protocol::BackendKind::Codex => "Codex",
-        protocol::BackendKind::Antigravity => "Antigravity",
-        protocol::BackendKind::Hermes => "Hermes",
-        protocol::BackendKind::Grok => "Grok",
-        protocol::BackendKind::Opencode => "OpenCode",
-    }
+    LaunchProfileId(format!(
+        "{}:default",
+        crate::backend::backend_slug(backend_kind)
+    ))
 }
 
 fn launch_profile_entry_for_config(
@@ -19349,15 +18683,11 @@ fn resolve_launch_profile_from_catalog(
     }
 }
 
-fn kiro_probe_workspace_root(configured_root: Option<&Path>) -> Result<String, String> {
+fn backend_probe_workspace_root(configured_root: Option<&Path>) -> Result<String, String> {
     match configured_root {
         Some(root) => Ok(root.to_string_lossy().into_owned()),
         None => Ok(crate::paths::home_dir()?.to_string_lossy().into_owned()),
     }
-}
-
-fn hermes_probe_workspace_root() -> Result<String, String> {
-    Ok(crate::paths::home_dir()?.to_string_lossy().into_owned())
 }
 
 fn new_instance_stream(agent_id: &AgentId) -> StreamPath {
@@ -19529,7 +18859,8 @@ impl HostHandle {
     /// configured not to run real backend processes.
     pub(crate) async fn capacity_probe_context(
         &self,
-    ) -> Option<crate::backend::CapacityProbeContext> {
+        backend_kind: BackendKind,
+    ) -> Option<crate::backend::BackendProbeContext> {
         let state = self.state.lock().await;
         if state.skip_real_backend_probe {
             return None;
@@ -19538,14 +18869,14 @@ impl HostHandle {
         // ACP adapter resolve no working directory, which the Kiro usage
         // command then fails in — the probe needs somewhere to run, not a
         // meaningful workspace.
-        let workspace_roots = kiro_probe_workspace_root(state.kiro_probe_workspace_root.as_deref())
-            .map(|root| vec![root])
-            .unwrap_or_default();
-        Some(crate::backend::CapacityProbeContext {
+        let workspace_roots =
+            backend_probe_workspace_root(state.backend_probe_workspace_root.as_deref())
+                .map(|root| vec![root])
+                .unwrap_or_default();
+        Some(crate::backend::BackendProbeContext {
             workspace_roots,
-            codex_program: state.codex_probe_program.clone(),
-            kiro_program: state.kiro_probe_program.clone(),
-            acp_agent: None,
+            program: state.backend_probe_programs.get(&backend_kind).cloned(),
+            ..Default::default()
         })
     }
 

@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
-use tokio::sync::{Mutex, mpsc, oneshot, watch};
+use tokio::sync::{Mutex, mpsc, oneshot};
 
 use protocol::{
     BackendCapacityState, CapacityBucket, CapacityBucketId, CapacityCoverage, CapacityMeasure,
@@ -545,12 +545,17 @@ impl KiroSession {
         let inner = Arc::new(KiroInner {
             adapter,
             capabilities,
-            bridge,
+            bridge: Arc::new(bridge),
             emitter: Arc::new(TurnEmitter::new_for_agent(event_tx, AgentName(&agent_name))),
             shutting_down: AtomicBool::new(false),
             ssh_host: mode.ssh_host,
             capacity_probe,
             capacity_state: Mutex::new(KiroCapacityState::default()),
+            prompt_lock: Mutex::new(()),
+            native_child_sessions: Mutex::new(HashSet::new()),
+            native_sessions: Arc::new(NativeSessionRoutes::default()),
+            native_owned_children: Mutex::new(Vec::new()),
+            native_relay_tasks: Mutex::new(tokio::task::JoinSet::new()),
             state: Mutex::new(KiroState {
                 session_id,
                 workspace_root: roots.scope_root,
@@ -578,6 +583,7 @@ impl KiroSession {
                 replay_assistant_message_emitted_since_user: false,
                 replay_error: None,
                 grok_turn_sequence: 0,
+                native_child: false,
                 grok_request_usages: Vec::new(),
                 grok_last_message_id: None,
                 grok_pending_response_end: None,
@@ -624,6 +630,7 @@ impl KiroSession {
     }
 }
 
+#[derive(Default)]
 struct KiroState {
     session_id: String,
     workspace_root: String,
@@ -658,6 +665,7 @@ struct KiroState {
     replay_assistant_message_emitted_since_user: bool,
     replay_error: Option<String>,
     grok_turn_sequence: u64,
+    native_child: bool,
     grok_request_usages: Vec<GrokRequestUsage>,
     grok_last_message_id: Option<ChatMessageId>,
     grok_pending_response_end: Option<Value>,
@@ -809,16 +817,27 @@ fn kiro_is_startup_mcp_tool(tool_name: &str, servers: &[StartupMcpServer]) -> bo
     })
 }
 
+#[derive(Default)]
+struct NativeSessionRoutes {
+    children: Mutex<HashMap<String, std::sync::Weak<KiroInner>>>,
+    pending: Mutex<HashMap<String, Vec<(String, Value)>>>,
+}
+
 struct KiroInner {
     adapter: Arc<dyn AcpAgentAdapter>,
     capabilities: AcpCapabilities,
-    bridge: AcpBridge,
+    bridge: Arc<AcpBridge>,
     emitter: Arc<TurnEmitter>,
     state: Mutex<KiroState>,
     shutting_down: AtomicBool,
     ssh_host: Option<String>,
     capacity_probe: Option<AcpSpawnSpec>,
     capacity_state: Mutex<KiroCapacityState>,
+    prompt_lock: Mutex<()>,
+    native_child_sessions: Mutex<HashSet<String>>,
+    native_sessions: Arc<NativeSessionRoutes>,
+    native_owned_children: Mutex<Vec<Arc<KiroInner>>>,
+    native_relay_tasks: Mutex<tokio::task::JoinSet<()>>,
 }
 
 #[derive(Default)]
@@ -957,6 +976,13 @@ impl KiroInner {
                 "this backend cannot cancel background command {tool_call_id}"
             )),
             SessionCommand::SendMessage { message, images } => {
+                // ACP notifications carry a session id, not a prompt id. Drain
+                // the preceding prompt before admitting another into that stream.
+                let prompt_guard = self.prompt_lock.lock().await;
+                eprintln!(
+                    "TYDE ACP PROMPT ADMITTED cancelled={}",
+                    self.state.lock().await.cancelled
+                );
                 {
                     let mut state = self.state.lock().await;
                     state.provider_turn_quarantined = false;
@@ -1034,9 +1060,10 @@ impl KiroInner {
                         // session/cancel. If the prompt error is just the stale
                         // rejection of a cancelled request, swallow it — the cancel
                         // handler already emitted OperationCancelled + TypingStatusChanged.
-                        let mut state = self.state.lock().await;
+                        let state = self.state.lock().await;
                         if state.cancelled {
-                            state.cancelled = false;
+                            drop(state);
+                            self.bridge.sync_inbound().await?;
                             return Ok(());
                         }
                         drop(state);
@@ -1088,12 +1115,7 @@ impl KiroInner {
                 if stop_reason == "cancelled" {
                     // If the user initiated the cancel, `CancelConversation` already
                     // fired OperationCancelled + TypingStatusChanged — don't double-emit.
-                    let user_initiated = {
-                        let mut state = self.state.lock().await;
-                        let was = state.cancelled;
-                        state.cancelled = false;
-                        was
-                    };
+                    let user_initiated = { self.state.lock().await.cancelled };
                     if !user_initiated {
                         self.abort_active_turn("Operation cancelled").await;
                     }
@@ -1125,6 +1147,7 @@ impl KiroInner {
                         .await;
                 }
                 self.spawn_capacity_refresh(false).await;
+                drop(prompt_guard);
                 Ok(())
             }
             SessionCommand::CancelConversation => {
@@ -1521,6 +1544,38 @@ impl KiroInner {
         }
 
         self.bridge.shutdown().await;
+        let mut children = self
+            .native_owned_children
+            .lock()
+            .await
+            .drain(..)
+            .collect::<Vec<_>>();
+        self.native_sessions.children.lock().await.clear();
+        let mut relays = Vec::new();
+        while let Some(child) = children.pop() {
+            children.extend(child.native_owned_children.lock().await.drain(..));
+            child.emitter.close("ACP parent session closed");
+            relays.push(child);
+        }
+        for child in relays {
+            while child
+                .native_relay_tasks
+                .lock()
+                .await
+                .join_next()
+                .await
+                .is_some()
+            {}
+        }
+        while self
+            .native_relay_tasks
+            .lock()
+            .await
+            .join_next()
+            .await
+            .is_some()
+        {}
+        self.native_sessions.pending.lock().await.clear();
         self.emitter.close("ACP session closed");
     }
 
@@ -1563,7 +1618,53 @@ impl KiroInner {
             }
         }
     }
-    async fn handle_notification(&self, method: &str, params: &Value) {
+    fn handle_notification<'a>(
+        &'a self,
+        method: &'a str,
+        params: &'a Value,
+    ) -> futures_util::future::BoxFuture<'a, ()> {
+        Box::pin(async move {
+            let actual = params
+                .get("sessionId")
+                .or_else(|| params.get("session_id"))
+                .and_then(Value::as_str);
+            let foreign = {
+                let state = self.state.lock().await;
+                actual
+                    .filter(|actual| {
+                        *actual != state.session_id
+                            && !(state.replaying_history
+                                && state.replay_session_id.as_deref() == Some(*actual))
+                    })
+                    .map(str::to_owned)
+            };
+            if let Some(session_id) = foreign {
+                let child = self
+                    .native_sessions
+                    .children
+                    .lock()
+                    .await
+                    .get(&session_id)
+                    .and_then(std::sync::Weak::upgrade);
+                if let Some(child) = child {
+                    child.handle_notification(method, params).await;
+                } else {
+                    eprintln!("TYDE ACP BUFFER CHILD session={session_id} method={method}");
+                    self.native_sessions
+                        .pending
+                        .lock()
+                        .await
+                        .entry(session_id)
+                        .or_default()
+                        .push((method.to_owned(), params.clone()));
+                }
+                return;
+            }
+            self.handle_local_notification(method, params).await;
+        })
+    }
+
+    async fn handle_local_notification(&self, method: &str, params: &Value) {
         match method {
             "session/update" => {
                 tracing::debug!(?params, "ACP session/update notification");
@@ -1605,6 +1706,152 @@ impl KiroInner {
                 self.handle_normalized_update(normalized.session_update, &normalized_params)
                     .await;
             }
+        }
+    }
+
+    async fn register_native_child(
+        &self,
+        session_id: protocol::SessionId,
+        name: String,
+        tool_call_id: &str,
+    ) {
+        let Some(subagents) = self.capacity_state.lock().await.emitter.clone() else {
+            return;
+        };
+        if self
+            .native_sessions
+            .children
+            .lock()
+            .await
+            .get(&session_id.0)
+            .and_then(std::sync::Weak::upgrade)
+            .is_some()
+        {
+            return;
+        }
+        let handle = match subagents
+            .on_subagent_spawned(
+                tool_call_id.to_owned(),
+                name.clone(),
+                String::new(),
+                self.adapter.agent_name().to_owned(),
+                Some(session_id.clone()),
+            )
+            .await
+        {
+            Ok(handle) => handle,
+            Err(error) => {
+                self.emitter.backend_error(&error);
+                return;
+            }
+        };
+        let state = {
+            let parent = self.state.lock().await;
+            KiroState {
+                session_id: session_id.0.clone(),
+                workspace_root: parent.workspace_root.clone(),
+                model: parent.model.clone(),
+                mode: parent.mode.clone(),
+                startup_mcp_servers: parent.startup_mcp_servers.clone(),
+                grok_turn_sequence: 1,
+                native_child: true,
+                ..Default::default()
+            }
+        };
+        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+        let child = Arc::new(KiroInner {
+            adapter: Arc::clone(&self.adapter),
+            capabilities: self.capabilities.clone(),
+            bridge: Arc::clone(&self.bridge),
+            emitter: Arc::new(TurnEmitter::new_for_agent(
+                events_tx,
+                AgentName(self.adapter.agent_name()),
+            )),
+            state: Mutex::new(state),
+            shutting_down: AtomicBool::new(false),
+            ssh_host: self.ssh_host.clone(),
+            capacity_probe: None,
+            capacity_state: Mutex::new(KiroCapacityState {
+                emitter: Some(subagents),
+                ..Default::default()
+            }),
+            prompt_lock: Mutex::new(()),
+            native_child_sessions: Mutex::new(HashSet::new()),
+            native_sessions: Arc::clone(&self.native_sessions),
+            native_owned_children: Mutex::new(Vec::new()),
+            native_relay_tasks: Mutex::new(tokio::task::JoinSet::new()),
+        });
+        self.native_sessions
+            .children
+            .lock()
+            .await
+            .insert(session_id.0.clone(), Arc::downgrade(&child));
+        self.native_owned_children
+            .lock()
+            .await
+            .push(Arc::clone(&child));
+        let progress = protocol::ToolProgressData {
+            tool_call_id: tool_call_id.to_owned(),
+            execution_mode: protocol::ToolExecutionMode::Background,
+            cancellable: false,
+            update: protocol::ToolProgressUpdate::SubAgent(protocol::SubAgentProgress {
+                agent_id: handle.agent_id.clone(),
+                agent_name: name,
+                last_tool_name: None,
+                tool_calls: 0,
+                completed: false,
+                status: protocol::SubAgentProgressStatus::Running,
+            }),
+        };
+        self.emitter.tool_progress(&progress);
+        let parent_emitter = Arc::clone(&self.emitter);
+        self.native_relay_tasks.lock().await.spawn(async move {
+            let mut progress = progress;
+            while let Some(raw) = events_rx.recv().await {
+                if raw.get("kind").and_then(Value::as_str) == Some("ModelRequestTokenUsage") {
+                    if let Some(data) = raw.get("data")
+                        && let Ok(usage) = serde_json::from_value(data.clone())
+                    {
+                        let _ = handle.model_usage_tx.send(usage);
+                    }
+                    continue;
+                }
+                if let Some(event) = map_kiro_value_to_chat_event(&raw) {
+                    if let protocol::ToolProgressUpdate::SubAgent(details) = &mut progress.update {
+                        match &event {
+                            protocol::ChatEvent::ToolRequest(request) => {
+                                details.tool_calls += 1;
+                                details.last_tool_name = Some(request.tool_name.clone());
+                            }
+                            protocol::ChatEvent::TypingStatusChanged(active) => {
+                                details.completed = !active;
+                                details.status = if *active {
+                                    protocol::SubAgentProgressStatus::Running
+                                } else {
+                                    protocol::SubAgentProgressStatus::Completed
+                                };
+                            }
+                            _ => {}
+                        }
+                    }
+                    let _ = handle.event_tx.send(event);
+                    parent_emitter.tool_progress(&progress);
+                }
+            }
+        });
+        eprintln!(
+            "TYDE ACP NATIVE SESSION ROUTE session={} tool={tool_call_id}",
+            session_id.0
+        );
+        let pending = self
+            .native_sessions
+            .pending
+            .lock()
+            .await
+            .remove(&session_id.0)
+            .unwrap_or_default();
+        for (method, params) in pending {
+            child.handle_notification(&method, &params).await;
         }
     }
 
@@ -1718,7 +1965,12 @@ impl KiroInner {
             return false;
         }
         let state = self.state.lock().await;
-        !state.replaying_history && state.provider_turn_quarantined
+        let suppressed =
+            !state.replaying_history && (state.provider_turn_quarantined || state.cancelled);
+        if suppressed && state.cancelled {
+            eprintln!("TYDE ACP DROP CANCELLED UPDATE type={update_type}");
+        }
+        suppressed
     }
 
     /// The one place a `session/update` discriminant is turned into behavior.
@@ -2527,6 +2779,102 @@ impl KiroInner {
             None
         };
 
+        let (parent_session_id, workspace_root, native_tool_name) = {
+            let state = self.state.lock().await;
+            let name = state
+                .active_tool_contexts
+                .get(&completion.tool_call_id)
+                .map(|context| context.tool_name.clone())
+                .unwrap_or_else(|| completion.tool_name.clone());
+            (state.session_id.clone(), state.workspace_root.clone(), name)
+        };
+        eprintln!(
+            "TYDE ACP NATIVE CHILD LOOKUP id={} declared={} title={}",
+            completion.tool_call_id, native_tool_name, completion.tool_name
+        );
+        if let Some((session_id, name)) = self
+            .adapter
+            .native_child_session(&completion, &native_tool_name)
+        {
+            self.register_native_child(session_id, name, &completion.tool_call_id)
+                .await;
+        }
+        match self
+            .adapter
+            .native_child_transcript(
+                &parent_session_id,
+                &workspace_root,
+                &completion.tool_call_id,
+                &native_tool_name,
+            )
+            .await
+        {
+            Ok(Some(child)) => {
+                let emitter = self.capacity_state.lock().await.emitter.clone();
+                if let Some(emitter) = emitter
+                    && self
+                        .native_child_sessions
+                        .lock()
+                        .await
+                        .insert(child.session_id.0.clone())
+                {
+                    match emitter
+                        .on_subagent_spawned(
+                            completion.tool_call_id.clone(),
+                            child.name.clone(),
+                            String::new(),
+                            "native".to_owned(),
+                            Some(child.session_id),
+                        )
+                        .await
+                    {
+                        Ok(handle) => {
+                            eprintln!(
+                                "TYDE ACP NATIVE CHILD tool={} agent={} events={}",
+                                completion.tool_call_id,
+                                handle.agent_id.0,
+                                child.events.len()
+                            );
+                            let progress = |completed| protocol::ToolProgressData {
+                                tool_call_id: completion.tool_call_id.clone(),
+                                execution_mode: protocol::ToolExecutionMode::Foreground,
+                                cancellable: false,
+                                update: protocol::ToolProgressUpdate::SubAgent(
+                                    protocol::SubAgentProgress {
+                                        agent_id: handle.agent_id.clone(),
+                                        agent_name: child.name.clone(),
+                                        last_tool_name: None,
+                                        tool_calls: child
+                                            .events
+                                            .iter()
+                                            .filter(|event| {
+                                                matches!(event, protocol::ChatEvent::ToolRequest(_))
+                                            })
+                                            .count()
+                                            as u64,
+                                        completed,
+                                        status: if completed {
+                                            protocol::SubAgentProgressStatus::Completed
+                                        } else {
+                                            protocol::SubAgentProgressStatus::Running
+                                        },
+                                    },
+                                ),
+                            };
+                            self.emitter.tool_progress(&progress(false));
+                            for event in &child.events {
+                                let _ = handle.event_tx.send(event.clone());
+                            }
+                            self.emitter.tool_progress(&progress(true));
+                        }
+                        Err(error) => self.emitter.backend_error(&error),
+                    }
+                }
+            }
+            Ok(None) => {}
+            Err(error) => self.emitter.backend_error(&error),
+        }
+
         let mut emit_request_now: Option<(String, Value)> = None;
         let mut emit_completion_now: Option<(String, PendingToolCompletion)> = None;
         {
@@ -2824,6 +3172,9 @@ impl KiroInner {
         let (turn_id, requests, last_message_id, model) = {
             let mut state = self.state.lock().await;
             let turn_id = ModelTurnId(format!("{}:{}", state.session_id, state.grok_turn_sequence));
+            if state.native_child {
+                state.grok_turn_sequence = state.grok_turn_sequence.saturating_add(1);
+            }
             (
                 turn_id,
                 std::mem::take(&mut state.grok_request_usages),
@@ -3345,7 +3696,7 @@ fn has_visible_text(input: &str) -> bool {
     input.chars().any(|ch| !ch.is_whitespace())
 }
 
-fn kiro_tool_request_type(value: Value) -> ToolRequestType {
+pub(crate) fn kiro_tool_request_type(value: Value) -> ToolRequestType {
     serde_json::from_value(value.clone()).unwrap_or(ToolRequestType::Other { args: value })
 }
 
@@ -5066,16 +5417,10 @@ use crate::backend::{
 const BACKEND_AGENT_NAME: &str = "kiro";
 
 pub struct KiroBackend {
+    command_handle: KiroCommandHandle,
     input_tx: mpsc::UnboundedSender<AgentInput>,
     interrupt_tx: mpsc::UnboundedSender<()>,
     session_id: Arc<std::sync::Mutex<Option<SessionId>>>,
-    subagent_emitter_tx: watch::Sender<Option<Arc<dyn SubAgentEmitter>>>,
-}
-
-impl KiroBackend {
-    pub(crate) async fn set_subagent_emitter(&self, emitter: Arc<dyn SubAgentEmitter>) {
-        let _ = self.subagent_emitter_tx.send(Some(emitter));
-    }
 }
 
 struct KiroStartupTaskGuard(Option<tokio::task::AbortHandle>);
@@ -5142,6 +5487,85 @@ fn resolve_agent_session_settings(config: &BackendSpawnConfig) -> protocol::Sess
 }
 
 impl Backend for KiroBackend {
+    fn reserved_launch_profile_error(id: &protocol::LaunchProfileId) -> Option<String> {
+        (id.0 == protocol::KIRO_LAUNCH_PROFILE_ID)
+            .then(|| format!("launch profile {id} conflicts with the built-in Kiro agent profile"))
+    }
+
+    fn validate_launch_config(
+        id: &protocol::LaunchProfileId,
+        config: Option<&protocol::AcpAgentSpec>,
+    ) -> Result<(), String> {
+        let Some(spec) = config else {
+            return Err(format!(
+                "launch profile {id} targets the ACP backend but has no agent command configured"
+            ));
+        };
+        if spec.adapter == protocol::AcpAdapterId::Stock && spec.command.trim().is_empty() {
+            return Err(format!(
+                "launch profile {id} must specify the ACP agent command to run"
+            ));
+        }
+        Ok(())
+    }
+
+    fn default_launch_profile() -> protocol::LaunchProfile {
+        builtin_kiro_launch_profile()
+    }
+
+    fn default_launch_config() -> Option<protocol::AcpAgentSpec> {
+        Some(builtin_kiro_agent_spec())
+    }
+
+    fn discovery_policy() -> crate::backend::DiscoveryPolicy {
+        crate::backend::DiscoveryPolicy {
+            profile_scope: Some(protocol::LaunchProfileId(
+                protocol::KIRO_LAUNCH_PROFILE_ID.to_owned(),
+            )),
+            ..Default::default()
+        }
+    }
+
+    fn has_dynamic_session_schema() -> bool {
+        true
+    }
+
+    async fn discover(
+        context: &crate::backend::BackendProbeContext,
+    ) -> Result<crate::backend::BackendDiscovery, String> {
+        Ok(crate::backend::BackendDiscovery {
+            schema: probe_session_settings_schema(
+                &context.workspace_roots,
+                context.program.clone(),
+                context.launch.as_ref(),
+            )
+            .await?,
+            launch_profiles: Vec::new(),
+        })
+    }
+
+    fn resolve_session_settings(config: &BackendSpawnConfig) -> protocol::SessionSettingsValues {
+        resolve_session_settings(config)
+    }
+
+    fn builtin_tier_config() -> settings_model::BackendTierConfig {
+        settings_model::BackendTierConfig {
+            low: kiro_cost_hint_defaults(SpawnCostHint::Low),
+            high: kiro_cost_hint_defaults(SpawnCostHint::High),
+        }
+    }
+
+    async fn read_capacity_out_of_band(
+        context: &crate::backend::BackendProbeContext,
+    ) -> protocol::BackendCapacityState {
+        read_kiro_capacity_out_of_band(
+            &context.workspace_roots,
+            context.launch.as_ref(),
+            context.program.clone(),
+        )
+        .await
+    }
+
     fn capabilities() -> tyde_agent_adapter::BackendCapabilities {
         // Kiro 2.20.1 acknowledges session/cancel but lets an active shell
         // command finish, so it does not satisfy the interrupt contract.
@@ -5209,12 +5633,12 @@ impl Backend for KiroBackend {
         let events_tx_task = events_tx.clone();
         let session_id = Arc::new(std::sync::Mutex::new(None));
         let session_id_task = Arc::clone(&session_id);
-        let (ready_tx, ready_rx) = oneshot::channel::<Result<(), String>>();
-        let (subagent_emitter_tx, mut subagent_emitter_rx) =
-            watch::channel::<Option<Arc<dyn SubAgentEmitter>>>(None);
+        let (ready_tx, ready_rx) = oneshot::channel::<Result<KiroCommandHandle, String>>();
+        let initial_emitter = config.subagent_emitter.clone();
 
         let startup_task = tokio::spawn(async move {
-            let mut ready_tx: Option<oneshot::Sender<Result<(), String>>> = Some(ready_tx);
+            let mut ready_tx: Option<oneshot::Sender<Result<KiroCommandHandle, String>>> =
+                Some(ready_tx);
             let combined_instructions =
                 render_combined_spawn_instructions(&config.resolved_spawn_config);
             let (session, mut raw_events) = match KiroSession::spawn_for_agent(
@@ -5259,8 +5683,11 @@ impl Backend for KiroBackend {
                 session.shutdown().await;
                 return;
             }
+            if let Some(emitter) = initial_emitter {
+                session.set_subagent_emitter(emitter).await;
+            }
             if let Some(tx) = ready_tx.take() {
-                let _ = tx.send(Ok(()));
+                let _ = tx.send(Ok(handle.clone()));
             }
 
             let events_tx_forward = events_tx_task.clone();
@@ -5292,15 +5719,6 @@ impl Backend for KiroBackend {
 
             loop {
                 tokio::select! {
-                    changed = subagent_emitter_rx.changed() => {
-                        if changed.is_err() {
-                            break;
-                        }
-                        let emitter = { subagent_emitter_rx.borrow().clone() };
-                        if let Some(emitter) = emitter {
-                            session.set_subagent_emitter(emitter).await;
-                        }
-                    }
                     maybe_error = command_error_rx.recv() => {
                         let Some(error) = maybe_error else {
                             break;
@@ -5366,19 +5784,19 @@ impl Backend for KiroBackend {
         });
 
         let mut startup_guard = KiroStartupTaskGuard::new(&startup_task);
-        match ready_rx.await {
-            Ok(Ok(())) => {}
+        let command_handle = match ready_rx.await {
+            Ok(Ok(handle)) => handle,
             Ok(Err(err)) => return Err(err),
             Err(_) => return Err("Kiro spawn initialization task ended early".to_string()),
-        }
+        };
         startup_guard.disarm();
 
         Ok((
             Self {
+                command_handle,
                 input_tx,
                 interrupt_tx,
                 session_id,
-                subagent_emitter_tx,
             },
             EventStream::new_backend(events_rx),
         ))
@@ -5397,12 +5815,12 @@ impl Backend for KiroBackend {
         let events_tx_task = events_tx.clone();
         let known_session_id = Arc::new(std::sync::Mutex::new(Some(session_id.clone())));
         let known_session_id_task = Arc::clone(&known_session_id);
-        let (ready_tx, ready_rx) = oneshot::channel::<Result<(), String>>();
-        let (subagent_emitter_tx, mut subagent_emitter_rx) =
-            watch::channel::<Option<Arc<dyn SubAgentEmitter>>>(None);
+        let (ready_tx, ready_rx) = oneshot::channel::<Result<KiroCommandHandle, String>>();
+        let initial_emitter = config.subagent_emitter.clone();
 
         let startup_task = tokio::spawn(async move {
-            let mut ready_tx: Option<oneshot::Sender<Result<(), String>>> = Some(ready_tx);
+            let mut ready_tx: Option<oneshot::Sender<Result<KiroCommandHandle, String>>> =
+                Some(ready_tx);
             let combined_instructions =
                 render_combined_spawn_instructions(&config.resolved_spawn_config);
             let (session, mut raw_events) = match KiroSession::spawn_for_agent(
@@ -5461,6 +5879,9 @@ impl Backend for KiroBackend {
                 session.shutdown().await;
                 return;
             }
+            if let Some(emitter) = initial_emitter {
+                session.set_subagent_emitter(emitter).await;
+            }
             while let Ok(raw) = raw_events.try_recv() {
                 if let Some(event) = map_kiro_value_to_backend_event(&raw)
                     && events_tx_task.send(event).is_err()
@@ -5472,7 +5893,7 @@ impl Backend for KiroBackend {
             let _ = resume_replay_complete_tx.send(());
 
             if let Some(tx) = ready_tx.take() {
-                let _ = tx.send(Ok(()));
+                let _ = tx.send(Ok(handle.clone()));
             }
 
             let events_tx_forward = events_tx_task.clone();
@@ -5489,15 +5910,6 @@ impl Backend for KiroBackend {
             let (command_error_tx, mut command_error_rx) = mpsc::unbounded_channel::<String>();
             loop {
                 tokio::select! {
-                    changed = subagent_emitter_rx.changed() => {
-                        if changed.is_err() {
-                            break;
-                        }
-                        let emitter = { subagent_emitter_rx.borrow().clone() };
-                        if let Some(emitter) = emitter {
-                            session.set_subagent_emitter(emitter).await;
-                        }
-                    }
                     maybe_error = command_error_rx.recv() => {
                         let Some(error) = maybe_error else {
                             break;
@@ -5562,19 +5974,19 @@ impl Backend for KiroBackend {
         });
 
         let mut startup_guard = KiroStartupTaskGuard::new(&startup_task);
-        match ready_rx.await {
-            Ok(Ok(())) => {}
+        let command_handle = match ready_rx.await {
+            Ok(Ok(handle)) => handle,
             Ok(Err(err)) => return Err(err),
             Err(_) => return Err("Kiro resume initialization task ended early".to_string()),
-        }
+        };
         startup_guard.disarm();
 
         Ok((
             Self {
+                command_handle,
                 input_tx,
                 interrupt_tx,
                 session_id: known_session_id,
-                subagent_emitter_tx,
             },
             EventStream::new_backend_with_resume_replay_barrier(
                 events_rx,
@@ -5594,18 +6006,35 @@ impl Backend for KiroBackend {
         ))
     }
 
-    /// `Backend::list_sessions` is static, so there is no adapter instance to
-    /// ask and no way to know which configured agent the caller meant. It
-    /// therefore lists the built-in Kiro agent's sessions, which is what this
-    /// did when Kiro was the only ACP agent. Per-agent listing needs
-    /// `Backend::list_sessions` to carry the agent, which is a wider change to
-    /// the backend trait than this refactor makes; the instance-level
-    /// `list_sessions` above is already adapter-driven and is the path a
-    /// running session uses.
-    async fn list_sessions() -> Result<Vec<BackendSession>, String> {
-        let mut sessions = kiro_adapter(None).list_sessions(None).await?;
+    async fn list_sessions(
+        context: &crate::backend::BackendProbeContext,
+    ) -> Result<Vec<BackendSession>, String> {
+        let adapter = context
+            .launch
+            .as_ref()
+            .map_or_else(|| kiro_adapter(context.program.clone()), adapter_for_spec);
+        let mut sessions = adapter.list_sessions(None).await?;
         sessions.sort_by_key(|session| std::cmp::Reverse(session.updated_at_ms));
         Ok(sessions)
+    }
+
+    async fn update_session_settings(
+        &mut self,
+        payload: protocol::SetSessionSettingsPayload,
+    ) -> Result<(), String> {
+        self.command_handle
+            .execute(SessionCommand::UpdateSettings {
+                settings: session_settings_to_json(&payload.values),
+                persist: false,
+            })
+            .await
+    }
+
+    async fn read_session_settings(&self) -> Result<protocol::SessionSettingsValues, String> {
+        let state = self.command_handle.inner.state.lock().await;
+        crate::backend::session_settings_from_json(
+            json!({"model": state.model, "mode": state.mode}),
+        )
     }
 
     async fn send(&self, input: AgentInput) -> bool {
@@ -5727,4 +6156,29 @@ fn map_kiro_value_to_backend_event(value: &Value) -> Option<BackendEvent> {
             .map(BackendEvent::ModelRequestTokenUsage);
     }
     map_kiro_value_to_chat_event(value).map(BackendEvent::Chat)
+}
+
+pub(crate) fn builtin_kiro_agent_spec() -> protocol::AcpAgentSpec {
+    protocol::AcpAgentSpec {
+        command: String::new(),
+        args: vec!["acp".to_owned()],
+        cwd: None,
+        env: Default::default(),
+        adapter: protocol::AcpAdapterId::Kiro,
+    }
+}
+
+/// The launch-profile entry Tyde synthesizes for the built-in Kiro agent.
+///
+/// Synthesized rather than seeded into user settings so it cannot be deleted
+/// or left stale, matching how named Hermes profiles are handled.
+pub(crate) fn builtin_kiro_launch_profile() -> protocol::LaunchProfile {
+    protocol::LaunchProfile {
+        id: protocol::LaunchProfileId(protocol::KIRO_LAUNCH_PROFILE_ID.to_owned()),
+        kind: protocol::LaunchProfileKind::BackendDefault,
+        label: "Kiro (ACP)".to_owned(),
+        description: Some("Kiro, over the Agent Client Protocol.".to_owned()),
+        backend_kind: protocol::BackendKind::Kiro,
+        session_settings: protocol::SessionSettingsValues::default(),
+    }
 }

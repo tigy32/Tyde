@@ -27,44 +27,32 @@ fn env_lock() -> &'static Mutex<()> {
     LOCK.get_or_init(|| Mutex::new(()))
 }
 
-fn write_fake_codex_model_probe_program(dir: &Path) -> PathBuf {
-    let binary = dir.join("fake-codex-model-probe.py");
-    let script = r#"#!/usr/bin/env python3
-import json
-import sys
-
-def send(value):
-    sys.stdout.write(json.dumps(value, separators=(",", ":")) + "\n")
-    sys.stdout.flush()
-
-for line in sys.stdin:
-    request = json.loads(line)
-    request_id = request.get("id")
-    method = request.get("method")
-    if method == "initialize":
-        send({"jsonrpc": "2.0", "id": request_id, "result": {}})
-    elif method == "model/list":
-        send({
-            "jsonrpc": "2.0",
-            "id": request_id,
-            "result": {"data": [{
-                "model": "gpt-test",
-                "isDefault": True,
-                "supportedReasoningEfforts": [{"reasoningEffort": "medium"}]
-            }]}
-        })
-"#;
-    std::fs::write(&binary, script).expect("write fake Codex model probe");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut permissions = std::fs::metadata(&binary)
-            .expect("fake Codex model probe metadata")
-            .permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&binary, permissions).expect("chmod fake Codex model probe");
+fn mock_model_discovery(model: &str, efforts: &[&str]) -> server::backend::BackendDiscovery {
+    let field = |key: &str, values: &[&str]| protocol::SessionSettingField {
+        key: key.to_owned(),
+        label: key.to_owned(),
+        description: None,
+        use_slider: false,
+        select_options_by_setting: None,
+        field_type: protocol::SessionSettingFieldType::Select {
+            options: values
+                .iter()
+                .map(|value| protocol::SelectOption {
+                    value: (*value).to_owned(),
+                    label: (*value).to_owned(),
+                })
+                .collect(),
+            default: None,
+            nullable: true,
+        },
+    };
+    server::backend::BackendDiscovery {
+        schema: protocol::SessionSettingsSchema {
+            backend_kind: BackendKind::Codex,
+            fields: vec![field("model", &[model]), field("reasoning_effort", efforts)],
+        },
+        launch_profiles: Vec::new(),
     }
-    binary
 }
 
 struct EnvVarGuard {
@@ -1626,11 +1614,17 @@ async fn settings_write_enabled_backends_refreshes_schemas_and_config_snapshots(
     let _hermes_python =
         EnvVarGuard::set("HERMES_PYTHON", "/definitely/not/hermes-python".to_string());
 
-    let fake_codex = write_fake_codex_model_probe_program(temp_home.path());
-
     let mut fixture = Fixture::new_with_runtime_config_and_real_backend_probe_for_enabled_backends(
         server::HostRuntimeConfig {
-            codex_probe_program: Some(fake_codex.to_string_lossy().into_owned()),
+            mock_backend_discovery: [(
+                BackendKind::Codex,
+                server::backend::mock::MockDiscovery::new(vec![Ok(mock_model_discovery(
+                    "gpt-test",
+                    &["medium"],
+                ))]),
+            )]
+            .into_iter()
+            .collect(),
             ..Default::default()
         },
         Vec::new(),

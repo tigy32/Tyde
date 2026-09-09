@@ -81,6 +81,165 @@ impl OpenCodeAdapter {
             .map_err(|error| format!("Invalid OpenCode export JSON: {error}"))
     }
 
+    async fn child_transcript_events(
+        &self,
+        export: &Value,
+        workspace_root: &str,
+    ) -> Result<Vec<protocol::ChatEvent>, String> {
+        use protocol::*;
+        let messages = export
+            .get("messages")
+            .and_then(Value::as_array)
+            .ok_or("OpenCode child export omitted messages")?;
+        let mut events = Vec::new();
+        for entry in messages {
+            let info = entry
+                .get("info")
+                .ok_or("OpenCode child message omitted info")?;
+            let parts = entry
+                .get("parts")
+                .and_then(Value::as_array)
+                .ok_or("OpenCode child message omitted parts")?;
+            let text_for = |kind| {
+                parts
+                    .iter()
+                    .filter(|part| part.get("type").and_then(Value::as_str) == Some(kind))
+                    .filter_map(|part| part.get("text").and_then(Value::as_str))
+                    .collect::<Vec<_>>()
+                    .join("")
+            };
+            let role = info
+                .get("role")
+                .and_then(Value::as_str)
+                .ok_or("OpenCode child message omitted role")?;
+            let sender = match role {
+                "user" => MessageSender::User,
+                "assistant" => MessageSender::Assistant {
+                    agent: "opencode".to_owned(),
+                },
+                _ => {
+                    return Err(format!(
+                        "OpenCode child export has unsupported message role {role}"
+                    ));
+                }
+            };
+            let mut calls = Vec::new();
+            let mut requests = Vec::new();
+            let mut completed = Vec::new();
+            for part in parts
+                .iter()
+                .filter(|part| part.get("type").and_then(Value::as_str) == Some("tool"))
+            {
+                let id = part
+                    .get("callID")
+                    .and_then(Value::as_str)
+                    .ok_or("OpenCode child tool omitted callID")?
+                    .to_owned();
+                let provider_name = part
+                    .get("tool")
+                    .and_then(Value::as_str)
+                    .ok_or("OpenCode child tool omitted name")?;
+                let state = part
+                    .get("state")
+                    .ok_or("OpenCode child tool omitted state")?;
+                let args = state.get("input").cloned().unwrap_or(Value::Null);
+                let name = self
+                    .normalize_tool_name(provider_name, &args, part)
+                    .into_owned();
+                let mapped = self.map_tool_request(&name, &args, workspace_root).await;
+                requests.push(ChatEvent::ToolRequest(ToolRequest {
+                    tool_call_id: id.clone(),
+                    tool_name: name.clone(),
+                    tool_type: super::super::backend::kiro_tool_request_type(mapped),
+                }));
+                calls.push(ToolUseData {
+                    tool_call_id: id.clone(),
+                    name,
+                    arguments: args,
+                    content_offset: None,
+                });
+                let outcome = match state.get("status").and_then(Value::as_str) {
+                    Some("completed") => ToolExecutionOutcome::Succeeded {
+                        result: ToolExecutionResult::Other {
+                            result: state.get("output").cloned().unwrap_or(Value::Null),
+                        },
+                    },
+                    Some("error") => ToolExecutionOutcome::Failed {
+                        message: state
+                            .get("error")
+                            .and_then(Value::as_str)
+                            .unwrap_or("OpenCode child tool failed")
+                            .to_owned(),
+                        details: None,
+                        normalization_failure: None,
+                    },
+                    other => {
+                        return Err(format!(
+                            "OpenCode completed child contains unfinished tool {id}: {other:?}"
+                        ));
+                    }
+                };
+                completed.push(ChatEvent::ToolExecutionCompleted(
+                    ToolExecutionCompletedData {
+                        tool_call_id: id,
+                        outcome,
+                    },
+                ));
+            }
+            let reasoning = text_for("reasoning");
+            let model = info.get("modelID").and_then(Value::as_str).map(|model| {
+                format!(
+                    "{}/{model}",
+                    info.get("providerID")
+                        .and_then(Value::as_str)
+                        .unwrap_or("opencode")
+                )
+            });
+            let message = ChatMessage {
+                message_id: info
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .map(|id| ChatMessageId(id.to_owned())),
+                timestamp: info
+                    .pointer("/time/created")
+                    .and_then(Value::as_u64)
+                    .unwrap_or_default(),
+                sender,
+                content: text_for("text"),
+                reasoning: (!reasoning.is_empty()).then_some(ReasoningData {
+                    text: reasoning,
+                    tokens: None,
+                    signature: None,
+                    blob: None,
+                }),
+                tool_calls: calls,
+                model_info: model.clone().map(|model| ModelInfo { model }),
+                token_usage: opencode_token_usage(info).map(MessageTokenUsage::request_known),
+                context_breakdown: None,
+                images: None,
+            };
+            if role == "user" {
+                events.push(ChatEvent::MessageAdded(message));
+                events.push(ChatEvent::TypingStatusChanged(true));
+            } else {
+                events.push(ChatEvent::StreamStart(StreamStartData {
+                    agent: "opencode".to_owned(),
+                    model,
+                }));
+                if !message.content.is_empty() {
+                    events.push(ChatEvent::StreamDelta(StreamTextDeltaData {
+                        text: message.content.clone(),
+                    }));
+                }
+                events.extend(requests);
+                events.push(ChatEvent::StreamEnd(StreamEndData { message }));
+                events.extend(completed);
+            }
+        }
+        events.push(protocol::ChatEvent::TypingStatusChanged(false));
+        Ok(events)
+    }
+
     async fn exported_tool(
         &self,
         session_id: &str,
@@ -371,6 +530,53 @@ impl AcpAgentAdapter for OpenCodeAdapter {
         Some(MessageTokenUsage::request_known(opencode_token_usage(
             raw?,
         )?))
+    }
+
+    fn native_child_transcript<'a>(
+        &'a self,
+        parent_session_id: &'a str,
+        workspace_root: &'a str,
+        tool_call_id: &'a str,
+        tool_name: &'a str,
+    ) -> BoxFuture<'a, Result<Option<super::super::adapter::NativeChildTranscript>, String>> {
+        Box::pin(async move {
+            if tool_name != "task" {
+                return Ok(None);
+            }
+            let (_, part) = self
+                .exported_tool(
+                    parent_session_id,
+                    workspace_root,
+                    tool_call_id,
+                    false,
+                    false,
+                    true,
+                )
+                .await
+                .ok_or_else(|| {
+                    format!("OpenCode task {tool_call_id} omitted its native child record")
+                })?;
+            let Some(id) = part
+                .pointer("/state/metadata/sessionId")
+                .and_then(Value::as_str)
+            else {
+                return Ok(None);
+            };
+            let export = self.export_session(id, workspace_root).await?;
+            let name = export
+                .pointer("/info/title")
+                .and_then(Value::as_str)
+                .unwrap_or("OpenCode child")
+                .to_owned();
+            let events = self
+                .child_transcript_events(&export, workspace_root)
+                .await?;
+            Ok(Some(super::super::adapter::NativeChildTranscript {
+                session_id: protocol::SessionId(id.to_owned()),
+                name,
+                events,
+            }))
+        })
     }
 
     fn usage_for_tool_completion<'a>(

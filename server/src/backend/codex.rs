@@ -18,7 +18,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader};
 use tokio::process::{ChildStdin, Command};
-use tokio::sync::{Mutex, mpsc, oneshot, watch};
+use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use protocol::{
@@ -33,7 +33,6 @@ use protocol::{
     ToolRequestType, ToolUseData, ValueProvenance,
 };
 
-use crate::agent::customization::{ResolvedSkill, SkillSelection};
 use crate::agent_control_mcp::{
     AGENT_CONTROL_AWAIT_MCP_SERVER_NAME, AGENT_CONTROL_MCP_SERVER_NAME,
 };
@@ -42,6 +41,7 @@ use crate::backend::agent_control_progress::{
     is_tyde_agent_control_send_message_tool_name, is_tyde_agent_control_spawn_tool_name,
     normalize_tyde_chat_event, tyde_tool_result,
 };
+use crate::backend::customization::{ResolvedSkill, SkillSelection};
 use crate::backend::turn_emitter::{
     AgentName, ResponseHandle, RetryAttemptPayload, StreamEndPayload, TurnEmitter,
 };
@@ -186,6 +186,7 @@ impl CodexCommandHandle {
         if state.active_turn_id.is_some()
             || state.awaiting_root_turn_start
             || state.background_wake_request_in_flight
+            || state.pending_compaction.is_some()
         {
             return false;
         }
@@ -2532,16 +2533,6 @@ pub(crate) fn map_passive_rate_limits_updated(
     })
 }
 
-/// Route the verified passive notification through the emitter supplied by the
-/// owning agent session. The adapter never discovers a host globally.
-pub(crate) fn forward_passive_rate_limits_updated(params: &Value, emitter: &dyn SubAgentEmitter) {
-    let state = match map_passive_rate_limits_updated(params) {
-        Ok(report) => protocol::BackendCapacityState::Known { report },
-        Err(reason) => protocol::BackendCapacityState::Unavailable { reason },
-    };
-    emitter.on_backend_capacity(protocol::BackendKind::Codex, state);
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CodexCapacityAccountMode {
     ChatGpt,
@@ -4298,6 +4289,7 @@ struct CodexState {
     effective_model: Option<String>,
     model_override: Option<String>,
     reasoning_effort_override: Option<String>,
+    speed_override: Option<String>,
     approval_policy: Option<String>,
     access_mode: BackendAccessMode,
     execution_mode: BackendExecutionMode,
@@ -4396,6 +4388,7 @@ fn initial_codex_state(
         effective_model: model,
         model_override: None,
         reasoning_effort_override: None,
+        speed_override: None,
         approval_policy: None,
         access_mode,
         execution_mode,
@@ -4637,9 +4630,17 @@ impl CodexInner {
                 };
             }
             if state.active_turn_id.is_some()
+                || state.awaiting_root_turn_start
+                || state.background_wake_request_in_flight
                 || state.active_stream.is_some()
                 || state.pending_request.is_some()
             {
+                eprintln!(
+                    "TYDE CODEX COMPACTION DEFERRED active_turn={:?} reserved={} background_wake={}",
+                    state.active_turn_id,
+                    state.awaiting_root_turn_start,
+                    state.background_wake_request_in_flight
+                );
                 return BackendCompactionStart::Deferred {
                     reason: BackendCompactionDeferredReason::ActiveTurn,
                 };
@@ -6354,6 +6355,10 @@ impl CodexInner {
             }
         }
 
+        if let Some(speed) = obj.get("speed") {
+            state.speed_override = speed.as_str().map(str::to_owned);
+        }
+
         if obj.contains_key("approval_policy") || obj.contains_key("approvalPolicy") {
             state.approval_policy = Some(CODEX_FORCED_APPROVAL_POLICY.to_string());
         }
@@ -8016,43 +8021,8 @@ impl CodexInner {
     }
 
     async fn list_sessions(&self) -> Result<(), String> {
-        let mut cursor: Option<String> = None;
-        let mut sessions: Vec<Value> = Vec::new();
-
-        for _ in 0..20 {
-            let mut params = json!({ "limit": 100 });
-            if let Some(cur) = cursor.as_ref() {
-                params["cursor"] = Value::String(cur.clone());
-            }
-
-            let response = self.rpc.request("thread/list", params).await?;
-            let page = response
-                .get("data")
-                .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_default();
-
-            if page.is_empty() {
-                break;
-            }
-
-            for thread in page {
-                if let Some(metadata) = codex_thread_to_session_metadata(&thread) {
-                    sessions.push(metadata);
-                }
-            }
-
-            cursor = response
-                .get("nextCursor")
-                .and_then(Value::as_str)
-                .map(|s| s.to_string());
-
-            if cursor.is_none() || sessions.len() >= 1000 {
-                break;
-            }
-        }
-
-        self.emitter.sessions_list(sessions);
+        self.emitter
+            .sessions_list(list_codex_sessions(&self.rpc).await?);
         Ok(())
     }
 
@@ -10461,11 +10431,11 @@ impl CodexInner {
     /// ```text
     /// TYDE_RUN_REAL_AI_TESTS=1 TYDE_REAL_BACKENDS=codex \
     ///   RUST_LOG=server::backend::codex=trace \
-    ///   cargo nextest run -p tests --test conformance --run-ignored all \
-    ///     -E 'test(=real_conversation)' --no-capture
+    ///   "$CONFORMANCE_BIN" --ignored --exact real_conversation::codex --nocapture
     /// ```
     ///
-    /// `tests/tests/conformance.rs` installs a subscriber over
+    /// Build CONFORMANCE_BIN through `./dev.sh check`; see agent-adapter/README.md.
+    /// `tests/tests/conformance2/mod.rs` installs a subscriber over
     /// `EnvFilter::from_default_env()`, so `RUST_LOG` is all that is required —
     /// without it the events are compiled in but discarded.
     ///
@@ -16017,6 +15987,46 @@ fn codex_plan_update_task_list_from_params(params: &Value) -> Option<protocol::T
     Some(protocol::TaskList { title, tasks })
 }
 
+async fn list_codex_sessions(rpc: &CodexRpc) -> Result<Vec<Value>, String> {
+    let mut cursor: Option<String> = None;
+    let mut sessions: Vec<Value> = Vec::new();
+
+    for _ in 0..20 {
+        let mut params = json!({ "limit": 100 });
+        if let Some(cur) = cursor.as_ref() {
+            params["cursor"] = Value::String(cur.clone());
+        }
+
+        let response = rpc.request("thread/list", params).await?;
+        let page = response
+            .get("data")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+
+        if page.is_empty() {
+            break;
+        }
+
+        for thread in page {
+            if let Some(metadata) = codex_thread_to_session_metadata(&thread) {
+                sessions.push(metadata);
+            }
+        }
+
+        cursor = response
+            .get("nextCursor")
+            .and_then(Value::as_str)
+            .map(|s| s.to_string());
+
+        if cursor.is_none() || sessions.len() >= 1000 {
+            break;
+        }
+    }
+
+    Ok(sessions)
+}
+
 fn codex_thread_to_session_metadata(thread: &Value) -> Option<Value> {
     let session_id = thread.get("id").and_then(Value::as_str)?;
     let preview = thread
@@ -19085,7 +19095,6 @@ pub struct CodexBackend {
     interrupt_tx: mpsc::UnboundedSender<CodexInterrupt>,
     cancel_task_tx: mpsc::UnboundedSender<CodexCancelBackgroundTask>,
     session_id: Arc<std::sync::Mutex<Option<SessionId>>>,
-    subagent_emitter_tx: watch::Sender<Option<Arc<dyn SubAgentEmitter>>>,
     compaction_handle: Arc<std::sync::Mutex<Option<CodexCommandHandle>>>,
 }
 
@@ -19104,44 +19113,24 @@ struct CodexInterrupt {
 }
 
 impl CodexBackend {
-    pub(crate) async fn set_subagent_emitter(
-        &self,
-        emitter: Arc<dyn SubAgentEmitter>,
-    ) -> Result<(), String> {
-        self.subagent_emitter_tx.send(Some(emitter)).map_err(|_| {
-            "Codex sub-agent emitter update failed: backend event loop is not running".to_string()
-        })
-    }
-
-    pub(crate) async fn spawn_with_subagent_emitter(
+    async fn start_session(
         workspace_roots: Vec<String>,
         config: BackendSpawnConfig,
         initial_input: protocol::SendMessagePayload,
-        emitter: Arc<dyn SubAgentEmitter>,
-    ) -> Result<(Self, EventStream), String> {
-        Self::spawn_with_initial_emitter(workspace_roots, config, initial_input, Some(emitter))
-            .await
-    }
-
-    async fn spawn_with_initial_emitter(
-        workspace_roots: Vec<String>,
-        config: BackendSpawnConfig,
-        initial_input: protocol::SendMessagePayload,
-        initial_emitter: Option<Arc<dyn SubAgentEmitter>>,
     ) -> Result<(Self, EventStream), String> {
         let inference_only = config.execution_mode == BackendExecutionMode::InferenceOnly;
         // No remote-skill guard here: a remote session drops its skills with a
         // notice when it starts (`codex_remote_skill_notice`), rather than
         // refusing to start at all.
-        let initial_emitter = (!inference_only).then_some(initial_emitter).flatten();
+        let initial_emitter = (!inference_only)
+            .then(|| config.subagent_emitter.clone())
+            .flatten();
         let (input_tx, mut input_rx) = mpsc::unbounded_channel::<AgentInput>();
         let (settings_tx, mut settings_rx) = mpsc::unbounded_channel::<CodexSettingsUpdate>();
         let (cancel_task_tx, mut cancel_task_rx) =
             mpsc::unbounded_channel::<CodexCancelBackgroundTask>();
         let (interrupt_tx, mut interrupt_rx) = mpsc::unbounded_channel::<CodexInterrupt>();
         let (events_tx, events_rx) = mpsc::unbounded_channel::<BackendEvent>();
-        let (subagent_emitter_tx, mut subagent_emitter_rx) =
-            watch::channel::<Option<Arc<dyn SubAgentEmitter>>>(initial_emitter.clone());
         let (ready_tx, ready_rx) = oneshot::channel::<Result<SessionId, String>>();
         let (startup_cancel_tx, startup_cancel_rx) = oneshot::channel();
         let mut startup_cancel_guard = CodexStartupCancelGuard(Some(startup_cancel_tx));
@@ -19314,19 +19303,6 @@ impl CodexBackend {
                                 break StartupSettingsPhase::Terminated;
                             }
                         }
-                        changed = subagent_emitter_rx.changed() => {
-                            if changed.is_err() {
-                                break StartupSettingsPhase::Terminated;
-                            }
-                            let maybe_emitter = subagent_emitter_rx.borrow().clone();
-                            if let Some(emitter) = maybe_emitter
-                                && let Err(err) = session.set_subagent_emitter(emitter).await
-                            {
-                                break StartupSettingsPhase::Failed(format!(
-                                    "Codex sub-agent emitter update failed while applying startup settings: {err}"
-                                ));
-                            }
-                        }
                     }
                 };
 
@@ -19462,18 +19438,6 @@ impl CodexBackend {
                             break;
                         }
                     }
-                    changed = subagent_emitter_rx.changed() => {
-                        if changed.is_err() {
-                            break;
-                        }
-                        let maybe_emitter = subagent_emitter_rx.borrow().clone();
-                        if let Some(emitter) = maybe_emitter
-                            && let Err(err) = session.set_subagent_emitter(emitter).await
-                        {
-                            tracing::error!(%err, "Codex sub-agent emitter update failed");
-                            break;
-                        }
-                    }
                 }
             }
 
@@ -19496,7 +19460,6 @@ impl CodexBackend {
                 interrupt_tx,
                 cancel_task_tx,
                 session_id: backend_session_id,
-                subagent_emitter_tx,
                 compaction_handle,
             },
             EventStream::new_backend_with_transcript_metadata(events_rx, move |event| {
@@ -20443,6 +20406,71 @@ fn codex_raw_event_message(value: &Value, default_message: &str) -> String {
 }
 
 impl Backend for CodexBackend {
+    fn resolve_tier_config(
+        schema: Option<&SessionSettingsSchema>,
+        selected_values: &protocol::SessionSettingsValues,
+    ) -> Result<Option<settings_model::BackendTierConfig>, String> {
+        let schema = schema.ok_or_else(|| {
+            "Codex session settings schema unavailable; cannot resolve complexity tier".to_owned()
+        })?;
+        codex_tier_config_from_schema(schema, selected_values)
+            .map(Some)
+            .map_err(|error| {
+                format!("failed to resolve Codex complexity tier from model metadata: {error}")
+            })
+    }
+
+    fn default_persisted_tier_config() -> Option<settings_model::BackendTierConfig> {
+        None
+    }
+
+    async fn native_settings_snapshot(
+        _context: &crate::backend::BackendProbeContext,
+    ) -> Option<protocol::BackendNativeSettingsSnapshot> {
+        Some(native_settings_snapshot().await)
+    }
+
+    async fn write_native_settings(
+        settings: Value,
+        _context: &crate::backend::BackendProbeContext,
+    ) -> crate::backend::NativeSettingsWriteOutcome {
+        crate::backend::NativeSettingsWriteOutcome {
+            result: persist_native_settings(settings).await,
+            refresh_required: true,
+        }
+    }
+
+    fn token_usage_tracking_mode() -> crate::backend::TokenUsageTrackingMode {
+        crate::backend::TokenUsageTrackingMode::ModelRequests
+    }
+
+    fn has_dynamic_session_schema() -> bool {
+        true
+    }
+
+    async fn discover(
+        context: &crate::backend::BackendProbeContext,
+    ) -> Result<crate::backend::BackendDiscovery, String> {
+        Ok(crate::backend::BackendDiscovery {
+            schema: probe_session_settings_schema(context.program.as_deref()).await?,
+            launch_profiles: Vec::new(),
+        })
+    }
+
+    fn resolve_session_settings(config: &BackendSpawnConfig) -> protocol::SessionSettingsValues {
+        resolve_session_settings(config)
+    }
+
+    fn skill_delivery() -> crate::backend::customization::SkillDelivery {
+        crate::backend::customization::SkillDelivery::NativeDiscovery
+    }
+
+    async fn read_capacity_out_of_band(
+        context: &crate::backend::BackendProbeContext,
+    ) -> protocol::BackendCapacityState {
+        read_capacity_out_of_band(context.program.as_deref()).await
+    }
+
     fn capabilities() -> tyde_agent_adapter::BackendCapabilities {
         [
             tyde_agent_adapter::BackendCapability::ResumeSession,
@@ -20493,7 +20521,7 @@ impl Backend for CodexBackend {
         config: BackendSpawnConfig,
         initial_input: protocol::SendMessagePayload,
     ) -> Result<(Self, EventStream), String> {
-        Self::spawn_with_initial_emitter(workspace_roots, config, initial_input, None).await
+        Self::start_session(workspace_roots, config, initial_input).await
     }
 
     async fn resume(
@@ -20509,8 +20537,7 @@ impl Backend for CodexBackend {
         let (events_tx, events_rx) = mpsc::unbounded_channel::<BackendEvent>();
         let (resume_replay_complete_tx, resume_replay_complete_rx) =
             tokio::sync::oneshot::channel();
-        let (subagent_emitter_tx, mut subagent_emitter_rx) =
-            watch::channel::<Option<Arc<dyn SubAgentEmitter>>>(None);
+        let initial_emitter = config.subagent_emitter.clone();
         let compaction_handle = Arc::new(std::sync::Mutex::new(None::<CodexCommandHandle>));
         let task_compaction_handle = Arc::clone(&compaction_handle);
 
@@ -20552,7 +20579,7 @@ impl Backend for CodexBackend {
             };
 
             let handle = session.command_handle();
-            let maybe_emitter = subagent_emitter_rx.borrow().clone();
+            let maybe_emitter = initial_emitter;
             if let Some(emitter) = maybe_emitter
                 && let Err(err) = session.set_subagent_emitter(emitter).await
             {
@@ -20714,18 +20741,6 @@ impl Backend for CodexBackend {
                             break;
                         }
                     }
-                    changed = subagent_emitter_rx.changed() => {
-                        if changed.is_err() {
-                            break;
-                        }
-                        let maybe_emitter = subagent_emitter_rx.borrow().clone();
-                        if let Some(emitter) = maybe_emitter
-                            && let Err(err) = session.set_subagent_emitter(emitter).await
-                        {
-                            tracing::error!(%err, "Failed to update Codex sub-agent emitter for resumed session");
-                            break;
-                        }
-                    }
                 }
             }
 
@@ -20739,7 +20754,6 @@ impl Backend for CodexBackend {
                 interrupt_tx,
                 cancel_task_tx,
                 session_id: backend_session_id,
-                subagent_emitter_tx,
                 compaction_handle,
             },
             EventStream::new_backend_with_resume_replay_barrier_and_transcript_metadata(
@@ -20766,8 +20780,7 @@ impl Backend for CodexBackend {
             mpsc::unbounded_channel::<CodexCancelBackgroundTask>();
         let (interrupt_tx, mut interrupt_rx) = mpsc::unbounded_channel::<CodexInterrupt>();
         let (events_tx, events_rx) = mpsc::unbounded_channel::<BackendEvent>();
-        let (subagent_emitter_tx, mut subagent_emitter_rx) =
-            watch::channel::<Option<Arc<dyn SubAgentEmitter>>>(None);
+        let initial_emitter = config.subagent_emitter.clone();
         let compaction_handle = Arc::new(std::sync::Mutex::new(None::<CodexCommandHandle>));
         let task_compaction_handle = Arc::clone(&compaction_handle);
 
@@ -20819,7 +20832,7 @@ impl Backend for CodexBackend {
             *task_compaction_handle
                 .lock()
                 .expect("Codex compaction handle mutex poisoned") = Some(handle.clone());
-            let maybe_emitter = subagent_emitter_rx.borrow().clone();
+            let maybe_emitter = initial_emitter;
             if let Some(emitter) = maybe_emitter
                 && let Err(err) = session.set_subagent_emitter(emitter).await
             {
@@ -20989,18 +21002,6 @@ impl Backend for CodexBackend {
                             break;
                         }
                     }
-                    changed = subagent_emitter_rx.changed() => {
-                        if changed.is_err() {
-                            break;
-                        }
-                        let maybe_emitter = subagent_emitter_rx.borrow().clone();
-                        if let Some(emitter) = maybe_emitter
-                            && let Err(err) = session.set_subagent_emitter(emitter).await
-                        {
-                            tracing::error!(%err, "Failed to update Codex sub-agent emitter for forked session");
-                            break;
-                        }
-                    }
                 }
             }
 
@@ -21027,7 +21028,6 @@ impl Backend for CodexBackend {
                 interrupt_tx,
                 cancel_task_tx,
                 session_id: backend_session_id,
-                subagent_emitter_tx,
                 compaction_handle,
             },
             EventStream::new_backend_with_transcript_metadata(events_rx, move |event| {
@@ -21036,8 +21036,39 @@ impl Backend for CodexBackend {
         ))
     }
 
-    async fn list_sessions() -> Result<Vec<BackendSession>, String> {
-        Err("CodexBackend::list_sessions requires a live Codex RPC session".to_string())
+    async fn list_sessions(
+        context: &crate::backend::BackendProbeContext,
+    ) -> Result<Vec<BackendSession>, String> {
+        let (rpc, _inbound_rx) = CodexRpc::spawn_with_local_program(
+            None,
+            &[],
+            None,
+            BackendAccessMode::Unrestricted,
+            BackendExecutionMode::Agent,
+            context.program.as_deref(),
+        )
+        .await?;
+        let listed = tokio::time::timeout(CODEX_CAPACITY_PROBE_TIMEOUT, async {
+            initialize_codex_rpc(&rpc, None).await?;
+            list_codex_sessions(&rpc).await
+        })
+        .await
+        .map_err(|_| "Codex session discovery timed out".to_owned())
+        .and_then(|result| result);
+        let listed = codex_probe_result_with_cleanup(listed, rpc.terminate().await)?;
+        Ok(listed
+            .iter()
+            .filter_map(|metadata| {
+                crate::backend::session_from_metadata(metadata, protocol::BackendKind::Codex)
+            })
+            .filter(|session| {
+                context.workspace_roots.is_empty()
+                    || session
+                        .workspace_roots
+                        .iter()
+                        .any(|root| context.workspace_roots.contains(root))
+            })
+            .collect())
     }
 
     fn compaction_capability(&self) -> BackendCompactionCapability {
@@ -21118,6 +21149,21 @@ impl Backend for CodexBackend {
                 SendOutcome::Closed
             }
         }
+    }
+
+    async fn read_session_settings(&self) -> Result<protocol::SessionSettingsValues, String> {
+        let handle = self
+            .compaction_handle
+            .lock()
+            .expect("Codex command handle slot poisoned")
+            .clone()
+            .ok_or_else(|| "Codex session has closed".to_owned())?;
+        let state = handle.inner.state.lock().await;
+        crate::backend::session_settings_from_json(json!({
+            "model": state.model_override,
+            "reasoning_effort": state.reasoning_effort_override,
+            "speed": state.speed_override,
+        }))
     }
 
     async fn update_session_settings(

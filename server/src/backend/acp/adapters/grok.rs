@@ -79,6 +79,29 @@ impl AcpAgentAdapter for GrokAdapter {
         Ok(AcpSpawnSpec::new("Grok ACP", program, &args).with_local_cwd(roots.session_cwd.clone()))
     }
 
+    fn native_child_session(
+        &self,
+        completion: &super::super::AcpToolCallCompletion,
+        tool_name: &str,
+    ) -> Option<(protocol::SessionId, String)> {
+        if tool_name != "spawn_subagent" || !completion.success {
+            return None;
+        }
+        let text =
+            find_string(&completion.tool_result, &["text", "Text", "output"]).unwrap_or_default();
+        let session = find_string(&completion.tool_result, &["subagent_id"]).or_else(|| {
+            text.lines().find_map(|line| {
+                line.strip_prefix("subagent_id:")
+                    .map(|id| id.trim().to_owned())
+            })
+        })?;
+        let name = text
+            .lines()
+            .find_map(|line| line.strip_prefix("description:").map(str::trim))
+            .unwrap_or("Grok subagent");
+        Some((protocol::SessionId(session), name.to_owned()))
+    }
+
     fn normalize_notification(&self, method: &str, params: &Value) -> Option<NormalizedUpdate> {
         if method != "_x.ai/session_notification" {
             return None;

@@ -56,8 +56,34 @@ pub(crate) fn capabilities() -> BackendCapabilities {
     .into()
 }
 
-pub(crate) async fn list_sessions() -> Result<Vec<crate::backend::BackendSession>, String> {
-    let output = crate::process_env::command("opencode")?
+pub(crate) async fn list_sessions(
+    context: &crate::backend::BackendProbeContext,
+) -> Result<Vec<crate::backend::BackendSession>, String> {
+    let mut sessions = std::collections::BTreeMap::new();
+    let roots = if context.workspace_roots.is_empty() {
+        vec![None]
+    } else {
+        context.workspace_roots.iter().map(Some).collect()
+    };
+    for root in roots {
+        for session in
+            list_workspace_sessions(context.program.as_deref().unwrap_or("opencode"), root).await?
+        {
+            sessions.insert(session.id.0.clone(), session);
+        }
+    }
+    Ok(sessions.into_values().collect())
+}
+
+async fn list_workspace_sessions(
+    program: &str,
+    root: Option<&String>,
+) -> Result<Vec<crate::backend::BackendSession>, String> {
+    let mut command = crate::process_env::command(program)?;
+    if let Some(root) = root {
+        command.current_dir(root);
+    }
+    let output = command
         .args(["session", "list", "--format", "json", "--max-count", "1000"])
         .output()
         .await
@@ -167,4 +193,121 @@ pub(crate) fn resolve_session_settings(
         .entry("model".to_owned())
         .or_insert_with(|| SessionSettingValue::String(DEFAULT_FREE_MODEL.to_owned()));
     resolved
+}
+
+pub struct OpencodeBackend(crate::backend::acp::backend::KiroBackend);
+
+impl crate::backend::Backend for OpencodeBackend {
+    fn default_child_workspace_roots(parent_roots: &[String]) -> Vec<String> {
+        // OpenCode's native task calls omit Tyde's explicit workspace arguments.
+        parent_roots.to_vec()
+    }
+
+    async fn prepare_context_replacement(
+        _config: BackendSpawnConfig,
+        _seed: crate::backend::compaction::BackendContextSeed,
+    ) -> Result<
+        (
+            Self,
+            crate::backend::EventStream,
+            SessionId,
+            crate::backend::compaction::BackendBindingReadyEvidence,
+        ),
+        crate::backend::compaction::BackendBindingPrepareError,
+    > {
+        Err(
+            crate::backend::compaction::BackendBindingPrepareError::SpawnFailed {
+                backend_kind: BackendKind::Opencode,
+                message: "OpenCode does not expose manual compaction through ACP".to_owned(),
+            },
+        )
+    }
+
+    fn resolve_session_settings(config: &BackendSpawnConfig) -> protocol::SessionSettingsValues {
+        resolve_session_settings(config)
+    }
+
+    fn capabilities() -> BackendCapabilities {
+        capabilities()
+    }
+
+    fn session_settings_schema() -> protocol::SessionSettingsSchema {
+        session_settings_schema()
+    }
+
+    async fn spawn(
+        workspace_roots: Vec<String>,
+        config: BackendSpawnConfig,
+        initial_input: protocol::SendMessagePayload,
+    ) -> Result<(Self, crate::backend::EventStream), String> {
+        let (backend, events) = crate::backend::acp::backend::KiroBackend::spawn(
+            workspace_roots,
+            configure(config),
+            initial_input,
+        )
+        .await?;
+        Ok((Self(backend), events))
+    }
+
+    async fn resume(
+        workspace_roots: Vec<String>,
+        config: BackendSpawnConfig,
+        session_id: SessionId,
+    ) -> Result<(Self, crate::backend::EventStream), String> {
+        let (backend, events) = crate::backend::acp::backend::KiroBackend::resume(
+            workspace_roots,
+            configure(config),
+            session_id,
+        )
+        .await?;
+        Ok((Self(backend), events))
+    }
+
+    async fn fork(
+        _workspace_roots: Vec<String>,
+        _config: BackendSpawnConfig,
+        _from_session_id: SessionId,
+        _initial_input: protocol::SendMessagePayload,
+    ) -> Result<(Self, crate::backend::EventStream), crate::backend::BackendStartupError> {
+        Err(crate::backend::BackendStartupError::unsupported(
+            crate::backend::backend_fork_unsupported_message(BackendKind::Opencode),
+        ))
+    }
+
+    async fn list_sessions(
+        context: &crate::backend::BackendProbeContext,
+    ) -> Result<Vec<crate::backend::BackendSession>, String> {
+        list_sessions(context).await
+    }
+
+    fn session_id(&self) -> SessionId {
+        self.0.session_id()
+    }
+
+    async fn update_session_settings(
+        &mut self,
+        payload: protocol::SetSessionSettingsPayload,
+    ) -> Result<(), String> {
+        self.0.update_session_settings(payload).await
+    }
+
+    async fn read_session_settings(&self) -> Result<protocol::SessionSettingsValues, String> {
+        self.0.read_session_settings().await
+    }
+
+    async fn send(&self, input: protocol::AgentInput) -> bool {
+        self.0.send(input).await
+    }
+
+    fn compaction_capability(&self) -> crate::backend::BackendCompactionCapability {
+        self.0.compaction_capability()
+    }
+
+    async fn interrupt(&self) -> bool {
+        self.0.interrupt().await
+    }
+
+    async fn shutdown(self) {
+        self.0.shutdown().await;
+    }
 }

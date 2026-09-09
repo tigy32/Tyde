@@ -135,7 +135,7 @@ pub enum BackendCompactionCapabilityEvidence {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub(crate) struct BackendContextSeed {
+pub struct BackendContextSeed {
     pub workspace_roots: Vec<String>,
     pub summary: String,
 }
@@ -158,7 +158,7 @@ impl BackendContextSeed {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct BackendBindingReadyEvidence {
+pub struct BackendBindingReadyEvidence {
     pub backend_kind: BackendKind,
     pub provider_session_id: SessionId,
     pub bootstrap_terminal_seen: bool,
@@ -168,7 +168,7 @@ pub(crate) struct BackendBindingReadyEvidence {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) enum BackendBindingPrepareError {
+pub enum BackendBindingPrepareError {
     InvalidSeed {
         message: String,
     },
@@ -423,20 +423,20 @@ impl BackendCompactionTerminalEvidence {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) enum BackendCompactionEvent {
+pub enum BackendCompactionEvent {
     Progress(BackendCompactionProgress),
     Observed(Box<BackendObservedCompaction>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct BackendCompactionProgress {
+pub struct BackendCompactionProgress {
     pub operation_id: CompactionOperationId,
     pub stage: CompactionStage,
     pub elapsed_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct BackendObservedCompaction {
+pub struct BackendObservedCompaction {
     pub observation_id: CompactionObservationId,
     pub trigger: CompactionTrigger,
     pub method: CompactionMethod,
@@ -447,7 +447,7 @@ pub(crate) struct BackendObservedCompaction {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) enum BackendCompactionObservationSource {
+pub enum BackendCompactionObservationSource {
     ClaudeBoundary {
         boundary_uuid: String,
     },
@@ -468,13 +468,13 @@ pub(crate) enum BackendCompactionObservationSource {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct BackendCompactionUserFocus {
+pub struct BackendCompactionUserFocus {
     pub text: String,
     pub provenance: BackendCompactionUserFocusProvenance,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) enum BackendCompactionUserFocusProvenance {
+pub enum BackendCompactionUserFocusProvenance {
     TydeRequest,
     ProviderEcho,
 }

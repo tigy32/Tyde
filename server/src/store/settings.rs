@@ -920,54 +920,7 @@ fn validate_launch_profile_configs(
                 profile.id
             ));
         }
-        if profile.id.0 == protocol::KIRO_LAUNCH_PROFILE_ID {
-            return Err(format!(
-                "launch profile {} conflicts with the built-in Kiro agent profile",
-                profile.id
-            ));
-        }
-        if profile
-            .id
-            .0
-            .starts_with(crate::host::HERMES_PROFILE_LAUNCH_ID_PREFIX)
-        {
-            return Err(format!(
-                "launch profile {} conflicts with the server-synthesized Hermes profile namespace",
-                profile.id
-            ));
-        }
-        // An ACP profile is nothing without a command to run, and an agent spec
-        // on a non-ACP profile would be silently ignored. Reject both rather
-        // than persisting a profile that can't launch or that lies about what
-        // it does.
-        match (profile.backend_kind, profile.acp.as_ref()) {
-            (BackendKind::Kiro, None) => {
-                return Err(format!(
-                    "launch profile {} targets the ACP backend but has no agent command configured",
-                    profile.id
-                ));
-            }
-            // A named adapter knows how to find its own binary (the Kiro
-            // adapter resolves `kiro-cli-chat` as a sibling of `kiro-cli`), so
-            // it may leave the command blank. A stock agent cannot be
-            // discovered, so its command is required.
-            (BackendKind::Kiro, Some(spec))
-                if spec.adapter == protocol::AcpAdapterId::Stock
-                    && spec.command.trim().is_empty() =>
-            {
-                return Err(format!(
-                    "launch profile {} must specify the ACP agent command to run",
-                    profile.id
-                ));
-            }
-            (kind, Some(_)) if kind != BackendKind::Kiro => {
-                return Err(format!(
-                    "launch profile {} configures an ACP agent but targets {kind:?}",
-                    profile.id
-                ));
-            }
-            _ => {}
-        }
+        crate::backend::validate_custom_launch_profile(&profile)?;
         validated.insert(id, profile);
     }
     Ok(validated)

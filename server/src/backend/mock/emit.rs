@@ -12,7 +12,7 @@ use protocol::{
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use crate::backend::agent_control_progress::{await_progress_data_for_tool, tyde_tool_result};
@@ -485,13 +485,15 @@ pub(super) fn tool_failure_without_idle_frames(tool_call_id: &str) -> Vec<Backen
 
 pub(super) async fn spawn_native_child(
     events_tx: &MockEventSender,
-    subagent_emitter_rx: &mut watch::Receiver<Option<Arc<dyn SubAgentEmitter>>>,
+    subagent_emitter: Option<&Arc<dyn SubAgentEmitter>>,
     active_subagents: &mut Vec<SubAgentHandle>,
     child: MockNativeChild,
 ) {
     let live = child.lifecycle == MockChildLifecycle::LiveUntilInterrupt;
 
-    let emitter = wait_for_subagent_emitter(subagent_emitter_rx).await;
+    let emitter = subagent_emitter
+        .expect("mock native child requires a sub-agent emitter in the spawn config")
+        .clone();
     let tool_use_id = if live {
         format!("mock-live-tool-use-{}", Uuid::new_v4())
     } else {
@@ -543,20 +545,6 @@ pub(super) async fn spawn_native_child(
             // events.recv() == None and must park instead of exiting.
             drop(handle);
         }
-    }
-}
-
-async fn wait_for_subagent_emitter(
-    subagent_emitter_rx: &mut watch::Receiver<Option<Arc<dyn SubAgentEmitter>>>,
-) -> Arc<dyn SubAgentEmitter> {
-    loop {
-        if let Some(emitter) = subagent_emitter_rx.borrow().clone() {
-            return emitter;
-        }
-        subagent_emitter_rx
-            .changed()
-            .await
-            .expect("mock sub-agent emitter sender dropped before registration");
     }
 }
 

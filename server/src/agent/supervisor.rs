@@ -7,6 +7,7 @@
 //! throwaway unregistered agent id with an isolated tempdir workspace, no
 //! tools, and inference-only backend hardening.
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use protocol::{
@@ -767,7 +768,7 @@ pub(crate) async fn generate_supervision_verdict(
     }
 
     let prompt = build_supervision_prompt(&request);
-    let spawn_config =
+    let mut spawn_config =
         supervision_spawn_config(request.cost_hint, request.session_settings.clone());
     let isolated_workspace = tempfile::tempdir().map_err(|err| {
         SupervisionFailure::new(
@@ -783,17 +784,19 @@ pub(crate) async fn generate_supervision_verdict(
         tool_response: None,
     };
     let (host_sub_agent_spawn_tx, _host_sub_agent_spawn_rx) = mpsc::unbounded_channel();
+    spawn_config.subagent_emitter = Some(Arc::new(
+        HostSubAgentEmitterContext {
+            host_sub_agent_spawn_tx,
+            capacity_tx: request.capacity_tx.clone(),
+        }
+        .emitter(request.verdict_agent_id.clone(), workspace_roots.clone()),
+    ));
     let (_backend, mut events, _session_id) = match spawn_backend(
-        &request.verdict_agent_id,
+        false,
         request.backend_kind,
         workspace_roots,
         spawn_config,
         initial_input,
-        HostSubAgentEmitterContext {
-            host_sub_agent_spawn_tx,
-            capacity_tx: request.capacity_tx.clone(),
-        },
-        None,
     )
     .await
     {
@@ -833,8 +836,10 @@ fn supervision_spawn_config(
         startup_mcp_servers: Vec::new(),
         session_settings,
         provider_version: None,
-        antigravity_conversations_dir: None,
+        backend_storage: crate::backend::BackendStorage::default(),
         backend_config: Default::default(),
+        subagent_emitter: None,
+        mock_launch: None,
         resolved_spawn_config: super::customization::ResolvedSpawnConfig {
             tool_policy: ToolPolicy::AllowList { tools: Vec::new() },
             access_mode: BackendAccessMode::ReadOnly,
@@ -890,14 +895,10 @@ async fn collect_supervision_events(
 }
 
 fn supervision_backend_error_kind(backend_kind: BackendKind) -> SupervisionFailureKind {
-    if backend_kind == BackendKind::Hermes {
-        // Hermes exposes terminal gateway errors without a machine-readable
-        // retry disposition. Fail closed so permanent auth/entitlement faults
-        // cannot multiply paid supervisor calls; transient faults also stop
-        // until user activity until Hermes adds structured error taxonomy.
-        SupervisionFailureKind::BackendTerminal
-    } else {
+    if crate::backend::terminal_errors_are_retryable(backend_kind) {
         SupervisionFailureKind::BackendStream
+    } else {
+        SupervisionFailureKind::BackendTerminal
     }
 }
 

@@ -14,6 +14,7 @@ use std::time::Duration;
 async fn expect_next_event(client: &mut client::Connection, context: &str) -> Envelope {
     loop {
         let env = fixture::next_logical_frame_on(client, context).await;
+        eprintln!("TYDE SESSION RESUME WAIT context={context} frame={env:?}");
         if fixture::is_routine_control_plane_frame(&env)
             || matches!(
                 env.kind,
@@ -1225,6 +1226,20 @@ async fn agent_bootstrap_keeps_active_stream_while_recent_history_loads() {
 #[tokio::test]
 async fn session_listing_covers_empty_parent_child_and_resume_without_prompt() {
     let mut fixture = Fixture::new().await;
+    // A completed bootstrap reports turn_active=false instead of replaying a
+    // live idle event. Hold these turns until subscription so expect_turn
+    // always checks live streaming, even when the mock finishes immediately.
+    let parent_gate = server::backend::mock::MockGateHandle::new();
+    let child_gate = server::backend::mock::MockGateHandle::new();
+    let parent_reservation = fixture
+        .reserve_next_mock_launch(
+            "parent",
+            MockScript::one(MockTurn::text_after_gate(
+                "mock backend response to: parent hello",
+                &parent_gate,
+            )),
+        )
+        .await;
 
     fixture
         .client
@@ -1262,11 +1277,23 @@ async fn session_listing_covers_empty_parent_child_and_resume_without_prompt() {
     let env = expect_next_event(&mut fixture.client, "parent NewAgent").await;
     let parent_new_agent: NewAgentPayload = env.parse_payload().expect("parse parent NewAgent");
     let _ = expect_next_event(&mut fixture.client, "parent AgentStart").await;
+    parent_gate.release_one();
+    drop(parent_reservation);
     expect_turn(
         &mut fixture.client,
         "mock backend response to: parent hello",
     )
     .await;
+
+    let child_reservation = fixture
+        .reserve_next_mock_launch(
+            "child",
+            MockScript::one(MockTurn::text_after_gate(
+                "mock backend response to: child hello",
+                &child_gate,
+            )),
+        )
+        .await;
 
     fixture
         .client
@@ -1291,6 +1318,8 @@ async fn session_listing_covers_empty_parent_child_and_resume_without_prompt() {
 
     let _ = expect_next_event(&mut fixture.client, "child NewAgent").await;
     let _ = expect_next_event(&mut fixture.client, "child AgentStart").await;
+    child_gate.release_one();
+    drop(child_reservation);
     expect_turn(&mut fixture.client, "mock backend response to: child hello").await;
 
     fixture
@@ -1647,4 +1676,170 @@ async fn delete_nonexistent_session_is_graceful() {
         list.sessions.is_empty(),
         "session list should be empty; deleting a nonexistent session must be a no-op"
     );
+}
+
+#[tokio::test]
+async fn requested_compactions_keep_one_row_when_observed_after_completion() {
+    use protocol::{
+        CompactionTrigger, ContextCompactionNotifyPayload, ContextCompactionStatus,
+        ContextCompactionTimelineStatus,
+    };
+    use server::backend::mock::MockGateHandle;
+
+    let mut fixture = Fixture::new().await;
+    let observation_release = MockGateHandle::new();
+    let observation_sent = MockGateHandle::new();
+    let busy_turn = MockGateHandle::new();
+    let script = MockScript::one(MockTurn::text("ready"))
+        .then(MockTurn::text("after idle compaction"))
+        .then(MockTurn::gated_text("busy turn finished", &busy_turn))
+        .then(MockTurn::text("after busy compaction"))
+        .with_late_compaction_observation(&observation_release, &observation_sent);
+    let agent = fixture
+        .spawn_scripted("compaction correlation", script)
+        .await;
+    fixture.finish_turn(&agent).await;
+    let mut operations = Vec::new();
+
+    for busy in [false, true] {
+        if busy {
+            fixture
+                .client
+                .send_message(&agent.stream, "work before compacting".to_owned())
+                .await
+                .expect("start busy turn");
+            busy_turn.wait_until_entered().await;
+        }
+        fixture
+            .client
+            .compact_agent(&agent.stream, protocol::AgentCompactPayload::default())
+            .await
+            .expect("request compaction");
+        let mut saw_deferred = false;
+        let terminal = loop {
+            let frame = fixture::next_frame_matching_on(
+                &mut fixture.client,
+                "requested compaction status",
+                |frame| {
+                    frame.stream == agent.stream && frame.kind == FrameKind::ContextCompactionNotify
+                },
+            )
+            .await;
+            let notification: ContextCompactionNotifyPayload =
+                frame.parse_payload().expect("compaction notification");
+            match notification.status {
+                ContextCompactionStatus::Deferred { stage } => {
+                    assert_eq!(stage, protocol::CompactionStage::WaitingForIdle);
+                    if busy && !saw_deferred {
+                        busy_turn.release_one();
+                    }
+                    saw_deferred = true;
+                }
+                ContextCompactionStatus::Completed => break notification,
+                ContextCompactionStatus::Failed { .. } => {
+                    panic!("compaction failed: {notification:?}")
+                }
+                _ => {}
+            }
+        };
+        // Admission publishes WaitingForIdle for every request before dispatch,
+        // including requests received while idle.
+        assert!(saw_deferred);
+        operations.push(terminal.operation_id);
+        observation_release.wait_until_entered().await;
+        observation_release.release_one();
+        observation_sent.wait_until_entered().await;
+        observation_sent.release_one();
+        fixture
+            .client
+            .send_message(&agent.stream, "continue after compaction".to_owned())
+            .await
+            .expect("send follow-up");
+        fixture.finish_turn(&agent).await;
+
+        let history = fetch_history_page(
+            &mut fixture.client,
+            &agent.stream,
+            agent.new_agent.agent_id.clone(),
+            None,
+            100,
+        )
+        .await;
+        let markers: Vec<_> = history
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                ChatEvent::ContextCompaction(marker) => Some(marker),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            markers.len(),
+            operations.len(),
+            "one persisted row per requested compaction: {markers:?}"
+        );
+        for operation in &operations {
+            let matching: Vec<_> = markers
+                .iter()
+                .filter(|marker| marker.operation_id.as_ref() == Some(operation))
+                .collect();
+            assert_eq!(matching.len(), 1);
+            assert_eq!(matching[0].trigger, CompactionTrigger::UserRequested);
+            assert_eq!(
+                matching[0].status,
+                ContextCompactionTimelineStatus::Completed
+            );
+        }
+    }
+
+    fixture
+        .client
+        .list_sessions(ListSessionsPayload::default())
+        .await
+        .expect("list compacted session");
+    let sessions = wait_for_session_list(&mut fixture.client, "compacted session").await;
+    assert_eq!(sessions.sessions.len(), 1);
+    let session = &sessions.sessions[0];
+    let (resumed, _) = fixture
+        .spawn_with(SpawnAgentPayload {
+            name: Some("resumed compacted session".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::Resume {
+                session_id: session.id.clone(),
+                prompt: None,
+            },
+        })
+        .await;
+    let history = fetch_history_page(
+        &mut fixture.client,
+        &resumed.stream,
+        resumed.new_agent.agent_id.clone(),
+        None,
+        100,
+    )
+    .await;
+    let markers: Vec<_> = history
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            ChatEvent::ContextCompaction(marker) => Some(marker),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        markers.len(),
+        operations.len(),
+        "resume must preserve each compaction exactly once"
+    );
+    for operation in &operations {
+        assert_eq!(
+            markers
+                .iter()
+                .filter(|marker| marker.operation_id.as_ref() == Some(operation))
+                .count(),
+            1
+        );
+    }
 }

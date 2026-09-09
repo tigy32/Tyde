@@ -28,7 +28,7 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-use crate::agent::customization::ResolvedSkill;
+use crate::backend::customization::ResolvedSkill;
 
 /// Upper bound on a synthesized skill name.
 ///

@@ -302,14 +302,14 @@ instance — it does not get written.
 
 | Layer | The only permitted tests |
 |---|---|
-| **Agent backends** | Real e2e conformance tests (`real_cert_*`): a real provider, a real CLI, real money. Nothing else counts as backend coverage — no fakes, no scripted providers, no canned events. |
+| **Agent backends** | Real e2e conformance tests (`real_*`): a real provider, a real CLI, real money. Nothing else counts as backend coverage — no fakes, no scripted providers, no canned events. |
 | **tyde-server** | E2e "sim" tests at the protocol level: spawn the real server with the mock backend, drive it over the real protocol (handshake, envelopes, seq), assert on the events a client receives. Never test server internals directly. |
 | **Frontend** | Wasm tests only: real Leptos components mounted in a real DOM in headless Chrome, asserting on what the user perceives. No native frontend tests. |
 
 Where they live and run:
 
 - **Backend conformance** — implemented as coarse real-provider scenarios in
-  `tests/tests/conformance.rs`, opt-in via `TYDE_RUN_REAL_AI_TESTS=1
+  `tests/tests/conformance2.rs`, directly through the production `Backend` trait, opt-in via `TYDE_RUN_REAL_AI_TESTS=1
   TYDE_REAL_BACKENDS=<kind>`. Never run without asking the user first (§3);
   propose the narrowest set that covers the change, then run once.
 - **Server sim tests** — `server/tests/`, one file per server feature

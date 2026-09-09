@@ -297,353 +297,32 @@ fn hermes_claude_launch_profile() -> HostLaunchProfileConfig {
     }
 }
 
-fn write_fake_codex_model_probe_program(dir: &tempfile::TempDir) -> std::path::PathBuf {
-    let binary = dir.path().join("fake-codex-model-probe.py");
-    let counter = dir.path().join("model-list-count");
-    let script = format!(
-        r#"#!/usr/bin/env python3
-import json
-import os
-import sys
-
-COUNTER = {}
-
-def send(value):
-    sys.stdout.write(json.dumps(value, separators=(",", ":")) + "\n")
-    sys.stdout.flush()
-
-for line in sys.stdin:
-    request = json.loads(line)
-    request_id = request.get("id")
-    method = request.get("method")
-    if method == "initialize":
-        send({{"jsonrpc": "2.0", "id": request_id, "result": {{}}}})
-    elif method == "model/list":
-        count = 0
-        if os.path.exists(COUNTER):
-            with open(COUNTER, "r", encoding="utf-8") as counter_file:
-                count = int(counter_file.read())
-        with open(COUNTER, "w", encoding="utf-8") as counter_file:
-            counter_file.write(str(count + 1))
-        if count == 0:
-            send({{
-                "jsonrpc": "2.0",
-                "id": request_id,
-                "result": {{"data": [{{
-                    "model": "gpt-5.5",
-                    "isDefault": True,
-                    "supportedReasoningEfforts": [
-                        {{"reasoningEffort": "low"}},
-                        {{"reasoningEffort": "high"}}
-                    ]
-                }}]}}
-            }})
-        elif count == 1:
-            send({{
-                "jsonrpc": "2.0",
-                "id": request_id,
-                "result": {{"data": [{{
-                    "model": "gpt-5.6",
-                    "isDefault": True,
-                    "supportedReasoningEfforts": [
-                        {{"reasoningEffort": "low"}},
-                        {{"reasoningEffort": "xhigh"}},
-                        {{"reasoningEffort": "max"}}
-                    ]
-                }}]}}
-            }})
-        else:
-            send({{
-                "jsonrpc": "2.0",
-                "id": request_id,
-                "error": {{"code": -32000, "message": "model metadata unavailable"}}
-            }})
-"#,
-        serde_json::to_string(&counter.to_string_lossy()).expect("counter path JSON")
-    );
-    install_fake_program(&binary, &script);
-    binary
-}
-
-fn install_fake_program(binary: &std::path::Path, script: &str) {
-    std::fs::write(binary, script).expect("write fake Codex model probe");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut permissions = std::fs::metadata(binary)
-            .expect("fake Codex model probe metadata")
-            .permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(binary, permissions).expect("chmod fake Codex model probe");
-    }
-}
-
-/// Longer than the 45s deadline Tyde used to put on every local Codex RPC, so
-/// only a client that has no deadline at all can satisfy this fixture.
-const CODEX_SLOWER_THAN_OLD_DEADLINE: Duration = Duration::from_secs(50);
-
-/// A fake app-server that answers `initialize` only after a long stall.
-///
-/// Real ones do this: `initialize` opens four WAL SQLite databases under
-/// `CODEX_HOME`, so a home directory on a slow or networked filesystem pushes
-/// the handshake far past anything a constant could sensibly bound.
-fn write_slow_fake_codex_model_probe_program(
-    dir: &tempfile::TempDir,
-    initialize_delay: Duration,
-) -> std::path::PathBuf {
-    let binary = dir.path().join("slow-fake-codex-model-probe.py");
-    let script = format!(
-        r#"#!/usr/bin/env python3
-import json
-import sys
-import time
-
-def send(value):
-    sys.stdout.write(json.dumps(value, separators=(",", ":")) + "\n")
-    sys.stdout.flush()
-
-for line in sys.stdin:
-    request = json.loads(line)
-    request_id = request.get("id")
-    method = request.get("method")
-    if method == "initialize":
-        time.sleep({delay})
-        send({{"jsonrpc": "2.0", "id": request_id, "result": {{}}}})
-    elif method == "model/list":
-        send({{
-            "jsonrpc": "2.0",
-            "id": request_id,
-            "result": {{"data": [{{
-                "model": "gpt-5.6",
-                "isDefault": True,
-                "supportedReasoningEfforts": [{{"reasoningEffort": "low"}}]
-            }}]}}
-        }})
-"#,
-        delay = initialize_delay.as_secs_f64()
-    );
-    install_fake_program(&binary, &script);
-    binary
-}
-
-/// A fake app-server that reads `initialize` and dies without answering it.
-fn write_dying_fake_codex_model_probe_program(dir: &tempfile::TempDir) -> std::path::PathBuf {
-    let binary = dir.path().join("dying-fake-codex-model-probe.py");
-    let script = r#"#!/usr/bin/env python3
-import sys
-
-sys.stdin.readline()
-sys.exit(1)
-"#;
-    install_fake_program(&binary, script);
-    binary
-}
-
-/// [`next_kind`] with a caller-chosen bound, for flows that outlast the 5s one.
-async fn next_kind_within(
-    client: &mut client::Connection,
-    kind: FrameKind,
-    within: Duration,
-    context: &str,
-) -> protocol::Envelope {
-    let deadline = tokio::time::Instant::now() + within;
-    loop {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        assert!(!remaining.is_zero(), "timed out waiting for {context}");
-        match tokio::time::timeout(remaining, client.next_event()).await {
-            Ok(Ok(Some(env))) if env.kind == kind => return env,
-            Ok(Ok(Some(_))) => continue,
-            Ok(Ok(None)) => panic!("connection closed before {context}"),
-            Ok(Err(err)) => panic!("next_event failed before {context}: {err:?}"),
-            Err(_) => panic!("timed out waiting for {context}"),
-        }
-    }
-}
-
-fn spawn_host_with_codex_probe_program(
-    dir: &tempfile::TempDir,
-    settings_path: std::path::PathBuf,
-    probe_program: &std::path::Path,
-) -> server::HostHandle {
-    server::spawn_host_with_mock_backend_and_runtime_config(
-        dir.path().join("sessions.json"),
-        dir.path().join("projects.json"),
-        settings_path,
-        server::HostRuntimeConfig {
-            codex_probe_program: Some(probe_program.to_string_lossy().into_owned()),
-            skip_real_backend_probe: true,
-            ..Default::default()
+fn mock_model_discovery(model: &str, efforts: &[&str]) -> server::backend::BackendDiscovery {
+    let field = |key: &str, values: &[&str]| protocol::SessionSettingField {
+        key: key.to_owned(),
+        label: key.to_owned(),
+        description: None,
+        use_slider: false,
+        select_options_by_setting: None,
+        field_type: protocol::SessionSettingFieldType::Select {
+            options: values
+                .iter()
+                .map(|value| protocol::SelectOption {
+                    value: (*value).to_owned(),
+                    label: (*value).to_owned(),
+                })
+                .collect(),
+            default: None,
+            nullable: true,
         },
-    )
-    .expect("spawn host")
-}
-
-/// Codex model discovery must wait out a slow app-server rather than give up on
-/// it. Tyde used to cap every local RPC at 45s, which turned a healthy CLI doing
-/// slow startup work into "Codex model discovery initialize failed: Codex
-/// request timed out for method 'initialize'" — and then discarded the reply
-/// when it did arrive, because the timeout had already dropped the pending slot.
-#[tokio::test]
-async fn codex_schema_waits_out_an_app_server_slower_than_the_old_deadline() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let settings_path = dir.path().join("settings.json");
-    write_enabled_backends_settings(&settings_path, &[BackendKind::Codex]);
-    let fake_codex =
-        write_slow_fake_codex_model_probe_program(&dir, CODEX_SLOWER_THAN_OLD_DEADLINE);
-    let host = spawn_host_with_codex_probe_program(&dir, settings_path, &fake_codex);
-    let mut client = connect_raw(host).await;
-
-    let schemas_env = next_kind_within(
-        &mut client,
-        FrameKind::SessionSchemas,
-        CODEX_SLOWER_THAN_OLD_DEADLINE + Duration::from_secs(30),
-        "Codex model schema from a slow app-server",
-    )
-    .await;
-    let schemas: SessionSchemasPayload = schemas_env
-        .parse_payload()
-        .expect("slow Codex SessionSchemas");
-
-    let [protocol::SessionSchemaEntry::Ready { schema }] = schemas.schemas.as_slice() else {
-        panic!("slow Codex app-server must still produce a schema: {schemas:?}");
     };
-    let model_field = schema
-        .fields
-        .iter()
-        .find(|field| field.key == "model")
-        .expect("slow Codex model field");
-    let protocol::SessionSettingFieldType::Select { options, .. } = &model_field.field_type else {
-        panic!("Codex model field should be a select");
-    };
-    assert_eq!(
-        options
-            .iter()
-            .map(|option| option.value.as_str())
-            .collect::<Vec<_>>(),
-        vec!["gpt-5.6"],
-        "the reply that arrived after the old deadline must be the one used"
-    );
-}
-
-/// The guarantee that lets the deadline go: a request ends when the app-server
-/// answers *or* when it can no longer answer. Without the second half, dropping
-/// the timeout would trade a spurious failure for a permanent hang.
-#[tokio::test]
-async fn codex_schema_reports_an_app_server_that_dies_without_answering() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let settings_path = dir.path().join("settings.json");
-    write_enabled_backends_settings(&settings_path, &[BackendKind::Codex]);
-    let fake_codex = write_dying_fake_codex_model_probe_program(&dir);
-    let host = spawn_host_with_codex_probe_program(&dir, settings_path, &fake_codex);
-    let mut client = connect_raw(host).await;
-
-    // The 5s bound is the assertion: process death is observed directly, so it
-    // must surface immediately rather than after any deadline.
-    let schemas_env = next_kind_within(
-        &mut client,
-        FrameKind::SessionSchemas,
-        Duration::from_secs(5),
-        "Codex model schema from a dead app-server",
-    )
-    .await;
-    let schemas: SessionSchemasPayload = schemas_env.parse_payload().expect("dead Codex schemas");
-
-    assert!(
-        matches!(
-            schemas.schemas.as_slice(),
-            [protocol::SessionSchemaEntry::Unavailable {
-                backend_kind: BackendKind::Codex,
-                message,
-            }] if message.contains("exited before response")
-        ),
-        "a dead app-server must be reported as dead, not as slow: {schemas:?}"
-    );
-}
-
-/// A fake app-server that records having been allowed to exit on its own.
-///
-/// The marker is written after the read loop ends, and stdin EOF is the only
-/// thing that can end it — so the file exists if and only if Tyde closed stdin
-/// and waited, and never if the app-server's first news of teardown is SIGKILL.
-fn write_graceful_fake_codex_model_probe_program(
-    dir: &tempfile::TempDir,
-    marker: &std::path::Path,
-) -> std::path::PathBuf {
-    let binary = dir.path().join("graceful-fake-codex-model-probe.py");
-    let script = format!(
-        r#"#!/usr/bin/env python3
-import json
-import sys
-
-MARKER = {}
-
-def send(value):
-    sys.stdout.write(json.dumps(value, separators=(",", ":")) + "\n")
-    sys.stdout.flush()
-
-for line in sys.stdin:
-    request = json.loads(line)
-    request_id = request.get("id")
-    method = request.get("method")
-    if method == "initialize":
-        send({{"jsonrpc": "2.0", "id": request_id, "result": {{}}}})
-    elif method == "model/list":
-        send({{
-            "jsonrpc": "2.0",
-            "id": request_id,
-            "result": {{"data": [{{
-                "model": "gpt-5.6",
-                "isDefault": True,
-                "supportedReasoningEfforts": [{{"reasoningEffort": "low"}}]
-            }}]}}
-        }})
-
-with open(MARKER, "w", encoding="utf-8") as marker:
-    marker.write("closed by stdin EOF")
-"#,
-        serde_json::to_string(&marker.to_string_lossy()).expect("marker path JSON")
-    );
-    install_fake_program(&binary, &script);
-    binary
-}
-
-/// Teardown must ask the app-server to leave before it kills it.
-///
-/// `codex app-server` exposes no shutdown request, so closing stdin is the only
-/// way to say so; it answers by exiting 0 and closing sqlite databases that
-/// SIGKILL would leave open with their `-wal`/`-shm` files stranded. Tyde used
-/// to open teardown with SIGKILL, so it never asked.
-#[tokio::test]
-async fn codex_teardown_lets_the_app_server_close_itself() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let settings_path = dir.path().join("settings.json");
-    write_enabled_backends_settings(&settings_path, &[BackendKind::Codex]);
-    let marker = dir.path().join("graceful-exit-marker");
-    let fake_codex = write_graceful_fake_codex_model_probe_program(&dir, &marker);
-    let host = spawn_host_with_codex_probe_program(&dir, settings_path, &fake_codex);
-    let mut client = connect_raw(host).await;
-
-    let schemas_env = next_kind_within(
-        &mut client,
-        FrameKind::SessionSchemas,
-        Duration::from_secs(30),
-        "Codex model schema before teardown",
-    )
-    .await;
-    let schemas: SessionSchemasPayload = schemas_env
-        .parse_payload()
-        .expect("graceful Codex SessionSchemas");
-    let [protocol::SessionSchemaEntry::Ready { .. }] = schemas.schemas.as_slice() else {
-        panic!("the probe must have succeeded for its teardown to mean anything: {schemas:?}");
-    };
-
-    // No polling: the probe tears the app-server down and waits for it to exit
-    // before it can produce the schema above, so the marker is already on disk.
-    assert_eq!(
-        std::fs::read_to_string(&marker).ok().as_deref(),
-        Some("closed by stdin EOF"),
-        "teardown must close stdin and let the app-server exit, not open with SIGKILL"
-    );
+    server::backend::BackendDiscovery {
+        schema: protocol::SessionSettingsSchema {
+            backend_kind: BackendKind::Codex,
+            fields: vec![field("model", &[model]), field("reasoning_effort", efforts)],
+        },
+        launch_profiles: Vec::new(),
+    }
 }
 
 #[tokio::test]
@@ -1369,8 +1048,13 @@ async fn stable_reconnect_does_not_emit_unchanged_session_schemas_after_bootstra
         dir.path().join("projects.json"),
         settings_path,
         server::HostRuntimeConfig {
-            kiro_probe_program: Some(missing_kiro.to_string_lossy().into_owned()),
-            kiro_probe_workspace_root: Some(kiro_workspace.path().to_path_buf()),
+            backend_probe_programs: [(
+                protocol::BackendKind::Kiro,
+                missing_kiro.to_string_lossy().into_owned(),
+            )]
+            .into_iter()
+            .collect(),
+            backend_probe_workspace_root: Some(kiro_workspace.path().to_path_buf()),
             skip_real_backend_probe: true,
             ..Default::default()
         },
@@ -1427,7 +1111,7 @@ async fn stable_reconnect_does_not_emit_unchanged_session_schemas_after_bootstra
 }
 
 #[tokio::test]
-async fn codex_session_schema_refresh_replaces_models_and_surfaces_errors() {
+async fn session_schema_refresh_replaces_models_and_surfaces_errors() {
     let dir = tempfile::tempdir().expect("tempdir");
     let settings_path = dir.path().join("settings.json");
     let mut profile_settings = SessionSettingsValues::default();
@@ -1448,13 +1132,17 @@ async fn codex_session_schema_refresh_replaces_models_and_surfaces_errors() {
             acp: None,
         }],
     );
-    let fake_codex = write_fake_codex_model_probe_program(&dir);
+    let discovery = server::backend::mock::MockDiscovery::new(vec![
+        Ok(mock_model_discovery("gpt-5.5", &["low", "high"])),
+        Ok(mock_model_discovery("gpt-5.6", &["low", "xhigh", "max"])),
+        Err("Codex model/list RPC failed: model metadata unavailable".to_owned()),
+    ]);
     let host = server::spawn_host_with_mock_backend_and_runtime_config(
         dir.path().join("sessions.json"),
         dir.path().join("projects.json"),
         settings_path,
         server::HostRuntimeConfig {
-            codex_probe_program: Some(fake_codex.to_string_lossy().into_owned()),
+            mock_backend_discovery: [(BackendKind::Codex, discovery)].into_iter().collect(),
             skip_real_backend_probe: true,
             ..Default::default()
         },

@@ -7,7 +7,7 @@ use protocol::{
 use tokio::sync::{mpsc, oneshot};
 
 #[derive(Clone)]
-pub(crate) struct SubAgentHandle {
+pub struct SubAgentHandle {
     pub event_tx: mpsc::UnboundedSender<ChatEvent>,
     /// Accounting stays backend-only so authoritative per-request usage never
     /// becomes a public ChatEvent merely to cross the native-child relay.
@@ -47,7 +47,7 @@ fn child_name_quality(name: &str) -> u8 {
     2
 }
 
-pub(crate) trait SubAgentEmitter: Send + Sync {
+pub trait SubAgentEmitter: Send + Sync {
     fn on_backend_capacity(&self, _backend_kind: BackendKind, _state: BackendCapacityState) {}
     fn on_subagent_spawned(
         &self,
@@ -57,6 +57,12 @@ pub(crate) trait SubAgentEmitter: Send + Sync {
         agent_type: String,
         session_id_hint: Option<SessionId>,
     ) -> Pin<Box<dyn Future<Output = Result<SubAgentHandle, String>> + Send + '_>>;
+}
+
+impl std::fmt::Debug for dyn SubAgentEmitter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SubAgentEmitter")
+    }
 }
 
 pub(crate) type HostSubAgentSpawnTx = mpsc::UnboundedSender<HostSubAgentSpawnRequest>;

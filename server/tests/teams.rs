@@ -23,49 +23,32 @@ use rmcp::transport::StreamableHttpClientTransport;
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
 use serde_json::{Value, json};
 
-fn write_fake_codex_model_probe_program(dir: &tempfile::TempDir) -> std::path::PathBuf {
-    let binary = dir.path().join("fake-codex-model-probe.py");
-    let script = r#"#!/usr/bin/env python3
-import json
-import sys
-
-def send(value):
-    sys.stdout.write(json.dumps(value, separators=(",", ":")) + "\n")
-    sys.stdout.flush()
-
-for line in sys.stdin:
-    request = json.loads(line)
-    request_id = request.get("id")
-    method = request.get("method")
-    if method == "initialize":
-        send({"jsonrpc": "2.0", "id": request_id, "result": {}})
-    elif method == "model/list":
-        send({
-            "jsonrpc": "2.0",
-            "id": request_id,
-            "result": {"data": [{
-                "model": "gpt-5.4-mini",
-                "isDefault": True,
-                "supportedReasoningEfforts": [
-                    {"reasoningEffort": "low"},
-                    {"reasoningEffort": "medium"},
-                    {"reasoningEffort": "high"},
-                    {"reasoningEffort": "max"}
-                ]
-            }]}
-        })
-"#;
-    std::fs::write(&binary, script).expect("write fake Codex model probe");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut permissions = std::fs::metadata(&binary)
-            .expect("fake Codex model probe metadata")
-            .permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&binary, permissions).expect("chmod fake Codex model probe");
+fn mock_model_discovery(model: &str, efforts: &[&str]) -> server::backend::BackendDiscovery {
+    let field = |key: &str, values: &[&str]| protocol::SessionSettingField {
+        key: key.to_owned(),
+        label: key.to_owned(),
+        description: None,
+        use_slider: false,
+        select_options_by_setting: None,
+        field_type: protocol::SessionSettingFieldType::Select {
+            options: values
+                .iter()
+                .map(|value| protocol::SelectOption {
+                    value: (*value).to_owned(),
+                    label: (*value).to_owned(),
+                })
+                .collect(),
+            default: None,
+            nullable: true,
+        },
+    };
+    server::backend::BackendDiscovery {
+        schema: protocol::SessionSettingsSchema {
+            backend_kind: BackendKind::Codex,
+            fields: vec![field("model", &[model]), field("reasoning_effort", efforts)],
+        },
+        launch_profiles: Vec::new(),
     }
-    binary
 }
 
 async fn expect_kind(client: &mut client::Connection, kind: FrameKind, context: &str) -> Envelope {
@@ -1004,15 +987,18 @@ async fn team_member_create_rejects_unknown_custom_agent() {
     );
 }
 
-// Real time: this test runs the fake Codex model-probe program as a real
-// subprocess; paused time auto-advances past deadlines while waiting on
-// external process I/O.
 #[tokio::test]
 async fn team_create_allows_default_agent_with_backend_and_cost() {
-    let probe_dir = tempfile::tempdir().expect("Codex probe tempdir");
-    let fake_codex = write_fake_codex_model_probe_program(&probe_dir);
     let mut fixture = Fixture::new_with_runtime_config(server::HostRuntimeConfig {
-        codex_probe_program: Some(fake_codex.to_string_lossy().into_owned()),
+        mock_backend_discovery: [(
+            BackendKind::Codex,
+            server::backend::mock::MockDiscovery::new(vec![Ok(mock_model_discovery(
+                "gpt-5.4-mini",
+                &["low", "medium", "high", "max"],
+            ))]),
+        )]
+        .into_iter()
+        .collect(),
         ..Default::default()
     })
     .await;

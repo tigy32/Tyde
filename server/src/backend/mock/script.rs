@@ -18,6 +18,7 @@ pub struct MockScript {
     pub(super) user_bubbles: bool,
     pub(super) busy_self_turn_once: bool,
     pub(super) shutdown_gate: Option<MockGate>,
+    pub(super) compaction_observation_gates: Option<(MockGate, MockGate)>,
 }
 
 impl MockScript {
@@ -54,6 +55,15 @@ impl MockScript {
 
     /// Park the backend inside `Backend::shutdown` until the gate is released,
     /// so a test can observe what a close does while teardown is still running.
+    pub fn with_late_compaction_observation(
+        mut self,
+        release: &MockGateHandle,
+        sent: &MockGateHandle,
+    ) -> Self {
+        self.compaction_observation_gates = Some((release.gate(), sent.gate()));
+        self
+    }
+
     pub fn with_shutdown_gate(mut self, gate: &MockGateHandle) -> Self {
         self.shutdown_gate = Some(gate.gate());
         self
@@ -91,6 +101,12 @@ impl MockTurn {
 
     pub fn text(text: impl Into<String>) -> Self {
         Self::done(text_steps(text.into(), TextShape::default()))
+    }
+
+    pub fn text_after_gate(text: impl Into<String>, gate: &MockGateHandle) -> Self {
+        let mut steps = vec![MockStep::Gate(gate.gate())];
+        steps.extend(text_steps(text.into(), TextShape::default()));
+        Self::done(steps)
     }
 
     pub fn gated_text(text: impl Into<String>, gate: &MockGateHandle) -> Self {

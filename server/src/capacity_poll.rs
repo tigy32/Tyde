@@ -140,7 +140,7 @@ pub(crate) async fn poll_once(
         );
         return PollOutcome::Coalesced;
     }
-    let context = host.capacity_probe_context().await;
+    let context = host.capacity_probe_context(backend_kind).await;
     let state = match context {
         Some(context) => read_capacity_out_of_band(backend_kind, &context).await,
         // Backend probing is disabled on this host, so there is no source to
@@ -184,19 +184,10 @@ pub(crate) fn pollable_backends(installed: &[BackendKind]) -> Vec<BackendKind> {
 
 /// Backends that report capacity when installed, but are not installed here.
 pub(crate) fn uninstalled_capacity_backends(installed: &[BackendKind]) -> Vec<BackendKind> {
-    [
-        BackendKind::Claude,
-        BackendKind::Codex,
-        BackendKind::Kiro,
-        BackendKind::Antigravity,
-        BackendKind::Grok,
-        BackendKind::Hermes,
-        BackendKind::Opencode,
-        BackendKind::Tycode,
-    ]
-    .into_iter()
-    .filter(|kind| {
-        crate::backend::supports_out_of_band_capacity(*kind) && !installed.contains(kind)
-    })
-    .collect()
+    crate::backend::SUPPORTED_BACKENDS
+        .into_iter()
+        .filter(|kind| {
+            crate::backend::supports_out_of_band_capacity(*kind) && !installed.contains(kind)
+        })
+        .collect()
 }

@@ -86,6 +86,8 @@ static ANTIGRAVITY_MCP_CONFIG_MUTEX: LazyLock<Mutex<()>> = LazyLock::new(|| Mute
 
 #[derive(Clone)]
 pub struct AntigravityBackend {
+    settings_tx:
+        mpsc::UnboundedSender<(SessionSettingsValues, oneshot::Sender<Result<(), String>>)>,
     input_tx: mpsc::UnboundedSender<AgentInput>,
     interrupt_tx: mpsc::UnboundedSender<()>,
     session_id: SessionId,
@@ -96,12 +98,6 @@ pub struct AntigravityBackend {
 struct AntigravityInner {
     emitter: Arc<TurnEmitter>,
     state: Mutex<AntigravityState>,
-}
-
-impl AntigravityBackend {
-    pub(crate) async fn set_subagent_emitter(&self, emitter: Arc<dyn SubAgentEmitter>) {
-        self.inner.state.lock().await.subagent_emitter = Some(emitter);
-    }
 }
 
 struct AntigravityState {
@@ -147,7 +143,7 @@ struct AntigravitySkillSetup {
 }
 
 fn prepare_antigravity_skills(
-    skills: &[crate::agent::customization::ResolvedSkill],
+    skills: &[crate::backend::customization::ResolvedSkill],
 ) -> Result<AntigravitySkillSetup, String> {
     if skills.is_empty() {
         return Ok(AntigravitySkillSetup::default());
@@ -959,6 +955,10 @@ struct Supervisor {
     /// a probe per turn.
     capacity_read_at: Option<std::time::Instant>,
     shutdown_complete: oneshot::Sender<()>,
+    native_pending: BTreeMap<u64, (String, String, String)>,
+    native_sessions: BTreeSet<String>,
+    native_children: tokio::task::JoinSet<()>,
+    session_id: String,
 }
 
 struct InitialTurn {
@@ -970,6 +970,10 @@ impl Supervisor {
     async fn run(
         mut self,
         mut process: AgyProcess,
+        mut settings_rx: mpsc::UnboundedReceiver<(
+            SessionSettingsValues,
+            oneshot::Sender<Result<(), String>>,
+        )>,
         mut input_rx: mpsc::UnboundedReceiver<AgentInput>,
         mut interrupt_rx: mpsc::UnboundedReceiver<()>,
         initial_turn: Option<InitialTurn>,
@@ -1029,6 +1033,21 @@ impl Supervisor {
                             mapper.handle_tool_like(&emitter, step).await;
                         }
                     }
+                }
+
+                () = tokio::time::sleep(Duration::from_millis(100)), if !self.native_pending.is_empty() => {
+                    self.discover_native_children().await;
+                }
+
+                Some(result) = self.native_children.join_next(), if !self.native_children.is_empty() => {
+                    if let Err(error) = result {
+                        emitter.backend_error(&format!("Antigravity native child relay failed: {error}"));
+                    }
+                }
+
+                update = settings_rx.recv() => {
+                    let Some((values, reply)) = update else { break };
+                    let _ = reply.send(self.apply_settings(&mut process, values).await);
                 }
 
                 incoming = input_rx.recv() => {
@@ -1188,9 +1207,38 @@ impl Supervisor {
     async fn handle_frame(&mut self, frame: AgyFrame) {
         match frame {
             AgyFrame::Step(step) => {
+                let native_spawn = step.step_type == STEP_SUBAGENT
+                    || step.tool_name.as_deref() == Some("invoke_subagent");
                 if let Some(mapper) = self.mapper.as_mut() {
+                    if native_spawn && !matches!(step.state.as_str(), STATE_ERROR | STATE_CANCELLED)
+                    {
+                        let child = step
+                            .subagent_info
+                            .as_ref()
+                            .and_then(|info| info.subagents.first());
+                        self.native_pending
+                            .entry(step.step_index)
+                            .or_insert_with(|| {
+                                (
+                                    format!("agy-{}-{}", mapper.turn_id.0, step.step_index),
+                                    child
+                                        .and_then(|child| {
+                                            child.role.clone().or_else(|| child.type_name.clone())
+                                        })
+                                        .unwrap_or_else(|| "Antigravity subagent".to_owned()),
+                                    child
+                                        .and_then(|child| child.initial_prompt.clone())
+                                        .unwrap_or_default(),
+                                )
+                            });
+                        eprintln!(
+                            "TYDE ANTIGRAVITY NATIVE SPAWN step={} state={} info={:?}",
+                            step.step_index, step.state, step.subagent_info
+                        );
+                    }
                     mapper.handle_step(&self.inner.emitter, step).await;
                 }
+                self.discover_native_children().await;
             }
             AgyFrame::Result(result) => {
                 if let Some(mapper) = self.mapper.as_ref() {
@@ -1216,7 +1264,103 @@ impl Supervisor {
         }
     }
 
+    async fn discover_native_children(&mut self) {
+        let Some(subagents) = self.inner.state.lock().await.subagent_emitter.clone() else {
+            self.native_pending.clear();
+            return;
+        };
+        let mut transcript = TranscriptReader::new(&self.brain_dir, &self.session_id);
+        transcript.refresh();
+        for (step, (tool_id, name, description)) in self.native_pending.clone() {
+            let Some(output) = transcript.result_for_tool_step(step) else {
+                continue;
+            };
+            let Some((_, objects)) = output.split_once("Created the following subagents:") else {
+                continue;
+            };
+            let mut ids = Vec::new();
+            for item in serde_json::Deserializer::from_str(objects.trim()).into_iter::<Value>() {
+                let Ok(object) = item else {
+                    break;
+                };
+                if let Some(id) = object.get("conversationId").and_then(Value::as_str) {
+                    ids.push(id.to_owned());
+                }
+            }
+            if ids.is_empty() {
+                continue;
+            }
+            self.native_pending.remove(&step);
+            for id in ids {
+                if !self.native_sessions.insert(id.clone()) {
+                    continue;
+                }
+                match subagents
+                    .on_subagent_spawned(
+                        tool_id.clone(),
+                        name.clone(),
+                        description.clone(),
+                        ANTIGRAVITY_AGENT_NAME.to_owned(),
+                        Some(SessionId(id.clone())),
+                    )
+                    .await
+                {
+                    Ok(child) => {
+                        eprintln!(
+                            "TYDE ANTIGRAVITY NATIVE CHILD session={id} agent={}",
+                            child.agent_id.0
+                        );
+                        self.inner
+                            .emitter
+                            .tool_progress(&protocol::ToolProgressData {
+                                tool_call_id: tool_id.clone(),
+                                execution_mode: protocol::ToolExecutionMode::Background,
+                                cancellable: false,
+                                update: protocol::ToolProgressUpdate::SubAgent(
+                                    protocol::SubAgentProgress {
+                                        agent_id: child.agent_id.clone(),
+                                        agent_name: name.clone(),
+                                        last_tool_name: None,
+                                        tool_calls: 0,
+                                        completed: false,
+                                        status: protocol::SubAgentProgressStatus::Running,
+                                    },
+                                ),
+                            });
+                        let brain_dir = self.brain_dir.clone();
+                        let emitter = Arc::clone(&self.inner.emitter);
+                        let tool_id = tool_id.clone();
+                        let name = name.clone();
+                        self.native_children.spawn(async move {
+                            relay_antigravity_child(brain_dir, id, tool_id, name, child, emitter)
+                                .await;
+                        });
+                    }
+                    Err(error) => self
+                        .inner
+                        .emitter
+                        .backend_error(&format!("Antigravity child registration failed: {error}")),
+                }
+            }
+        }
+    }
+
     async fn finish_turn(&mut self) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        while !self.native_pending.is_empty() {
+            self.discover_native_children().await;
+            if self.native_pending.is_empty() {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                self.inner.emitter.backend_error(
+                    "Antigravity omitted native child session metadata at turn completion",
+                );
+                self.native_pending.clear();
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
         if let Some(mut mapper) = self.mapper.take() {
             for (_, mut step) in std::mem::take(&mut mapper.deferred_tools) {
                 step.state = STATE_CANCELLED.to_string();
@@ -1292,6 +1436,8 @@ impl Supervisor {
     }
 
     async fn shutdown(mut self, mut process: AgyProcess) {
+        self.native_children.abort_all();
+        while self.native_children.join_next().await.is_some() {}
         process.terminate().await;
         // Nothing to unregister: the shared config holds only the static,
         // credential-free bridge entry. Dropping the descriptor directory
@@ -1511,9 +1657,71 @@ fn antigravity_capacity_bucket(group: &str, bucket: &AgyUsageBucket) -> Capacity
 /// requires `<id>.db` to exist, which is exactly what
 /// `ensure_antigravity_conversation_exists` checks — so this enumerates it
 /// directly and enriches each entry from the transcript beside it.
-fn list_antigravity_sessions(conversations_dir: &Path, brain_dir: &Path) -> Vec<BackendSession> {
+#[derive(Clone, PartialEq, prost::Message)]
+struct AntigravityTrajectoryMetadata {
+    #[prost(message, repeated, tag = "1")]
+    workspaces: Vec<AntigravityWorkspace>,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct AntigravityWorkspace {
+    #[prost(string, tag = "1")]
+    uri: String,
+}
+
+fn antigravity_session_workspace_roots(path: &Path) -> Result<Vec<String>, String> {
+    use prost::Message;
+    let connection =
+        rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(|error| {
+                format!(
+                    "Cannot open Antigravity session {}: {error}",
+                    path.display()
+                )
+            })?;
+    let bytes: Vec<u8> = connection
+        .query_row(
+            "SELECT data FROM trajectory_metadata_blob WHERE id = 'main'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| {
+            format!(
+                "Cannot read Antigravity workspace metadata {}: {error}",
+                path.display()
+            )
+        })?;
+    let metadata = AntigravityTrajectoryMetadata::decode(bytes.as_slice()).map_err(|error| {
+        format!(
+            "Invalid Antigravity workspace metadata {}: {error}",
+            path.display()
+        )
+    })?;
+    metadata
+        .workspaces
+        .into_iter()
+        .map(|workspace| {
+            let uri = url::Url::parse(&workspace.uri)
+                .map_err(|error| format!("Invalid Antigravity workspace URI: {error}"))?;
+            let path = uri.to_file_path().map_err(|()| {
+                format!(
+                    "Antigravity workspace is not a local file URI: {}",
+                    workspace.uri
+                )
+            })?;
+            path.into_os_string()
+                .into_string()
+                .map_err(|_| "Antigravity workspace path is not UTF-8".to_owned())
+        })
+        .collect()
+}
+
+fn list_antigravity_sessions(
+    conversations_dir: &Path,
+    brain_dir: &Path,
+) -> Result<Vec<BackendSession>, String> {
     let Ok(entries) = fs::read_dir(conversations_dir) else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
     let mut sessions = entries
         .flatten()
@@ -1535,26 +1743,23 @@ fn list_antigravity_sessions(conversations_dir: &Path, brain_dir: &Path) -> Vec<
                 .and_then(|metadata| metadata.modified().ok())
                 .and_then(system_time_to_ms);
             let opening = antigravity_transcript_opening(brain_dir, id);
-            Some(BackendSession {
-                id: session_id,
-                backend_kind: BackendKind::Antigravity,
-                // Not recoverable. The store records no workspace, and the
-                // transcript mentions directories only inside tool arguments,
-                // which is where a command ran rather than where the
-                // conversation was rooted. Resume takes its roots from the
-                // caller, so this is display-only.
-                workspace_roots: Vec::new(),
-                title: opening.as_ref().and_then(|opening| opening.title.clone()),
-                token_count: None,
-                created_at_ms: opening.as_ref().and_then(|opening| opening.created_at_ms),
-                updated_at_ms,
-                resumable: true,
-            })
+            Some(
+                antigravity_session_workspace_roots(&path).map(|workspace_roots| BackendSession {
+                    id: session_id,
+                    backend_kind: BackendKind::Antigravity,
+                    workspace_roots,
+                    title: opening.as_ref().and_then(|opening| opening.title.clone()),
+                    token_count: None,
+                    created_at_ms: opening.as_ref().and_then(|opening| opening.created_at_ms),
+                    updated_at_ms,
+                    resumable: true,
+                }),
+            )
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>, _>>()?;
     // Most recently touched first, which is the order a resume picker wants.
     sessions.sort_by_key(|session| std::cmp::Reverse(session.updated_at_ms));
-    sessions
+    Ok(sessions)
 }
 
 struct AntigravityTranscriptOpening {
@@ -1562,7 +1767,242 @@ struct AntigravityTranscriptOpening {
     created_at_ms: Option<u64>,
 }
 
-/// The first step of a conversation, which is what names it.
+async fn relay_antigravity_child(
+    brain_dir: PathBuf,
+    session_id: String,
+    tool_call_id: String,
+    name: String,
+    child: crate::backend::SubAgentHandle,
+    emitter: Arc<TurnEmitter>,
+) {
+    use protocol::{
+        MessageSender, StreamEndData, StreamStartData, SubAgentProgress, SubAgentProgressStatus,
+        ToolExecutionMode, ToolProgressData, ToolProgressUpdate,
+    };
+    let path = TranscriptReader::new(&brain_dir, &session_id)
+        .path()
+        .to_path_buf();
+    let mut forwarded = 0;
+    loop {
+        tokio::select! {
+            () = child.event_tx.closed() => return,
+            () = tokio::time::sleep(Duration::from_millis(100)) => {}
+        }
+        if !path.exists() {
+            continue;
+        }
+        let events = match antigravity_history(&brain_dir, &session_id) {
+            Ok(events) => events,
+            Err(error) => {
+                emitter.backend_error(&error);
+                return;
+            }
+        };
+        if events.len() <= forwarded {
+            continue;
+        }
+        let complete = matches!(events.last(), Some(ChatEvent::MessageAdded(message)) if matches!(message.sender, MessageSender::Assistant { .. }) && message.tool_calls.is_empty());
+        let tool_calls = events
+            .iter()
+            .filter(|event| matches!(event, ChatEvent::ToolRequest(_)))
+            .count() as u64;
+        let _ = child.event_tx.send(ChatEvent::TypingStatusChanged(true));
+        for event in events.iter().skip(forwarded).cloned() {
+            match event {
+                ChatEvent::MessageAdded(message)
+                    if matches!(message.sender, MessageSender::Assistant { .. }) =>
+                {
+                    let _ = child.event_tx.send(ChatEvent::StreamStart(StreamStartData {
+                        agent: ANTIGRAVITY_AGENT_NAME.to_owned(),
+                        model: message.model_info.as_ref().map(|info| info.model.clone()),
+                    }));
+                    let _ = child
+                        .event_tx
+                        .send(ChatEvent::StreamEnd(StreamEndData { message }));
+                }
+                event => {
+                    let _ = child.event_tx.send(event);
+                }
+            }
+        }
+        forwarded = events.len();
+        if complete {
+            let _ = child.event_tx.send(ChatEvent::TypingStatusChanged(false));
+        }
+        emitter.tool_progress(&ToolProgressData {
+            tool_call_id: tool_call_id.clone(),
+            execution_mode: ToolExecutionMode::Background,
+            cancellable: false,
+            update: ToolProgressUpdate::SubAgent(SubAgentProgress {
+                agent_id: child.agent_id.clone(),
+                agent_name: name.clone(),
+                last_tool_name: None,
+                tool_calls,
+                completed: complete,
+                status: if complete {
+                    SubAgentProgressStatus::Completed
+                } else {
+                    SubAgentProgressStatus::Running
+                },
+            }),
+        });
+    }
+}
+
+fn antigravity_history(brain_dir: &Path, session_id: &str) -> Result<Vec<ChatEvent>, String> {
+    use protocol::{
+        ChatMessage, ChatMessageId, MessageSender, ReasoningData, ToolExecutionCompletedData,
+        ToolRequest,
+    };
+    let path = TranscriptReader::new(brain_dir, session_id)
+        .path()
+        .to_path_buf();
+    let text = fs::read_to_string(&path).map_err(|error| {
+        format!(
+            "Cannot read Antigravity history {}: {error}",
+            path.display()
+        )
+    })?;
+    let mut events = Vec::new();
+    let mut pending = BTreeMap::new();
+    let mut turn = 0;
+    // Native JSONL appends can be observed before the final record is flushed.
+    let complete = text
+        .rsplit_once('\n')
+        .map(|(complete, _)| complete)
+        .unwrap_or("");
+    for line in complete.lines().filter(|line| !line.trim().is_empty()) {
+        let row: Value = serde_json::from_str(line)
+            .map_err(|error| format!("Invalid Antigravity history {}: {error}", path.display()))?;
+        let index = row
+            .get("step_index")
+            .and_then(Value::as_u64)
+            .ok_or("Antigravity history omitted step_index")?;
+        let kind = row.get("type").and_then(Value::as_str).unwrap_or_default();
+        let content = row
+            .get("content")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if kind == "GENERIC" {
+            if let Some((tool_call_id, tool_type, is_mcp)) = pending.remove(&index) {
+                let outcome = if row.get("status").and_then(Value::as_str) == Some("ERROR") {
+                    ToolExecutionOutcome::Failed {
+                        message: content.to_owned(),
+                        details: None,
+                        normalization_failure: None,
+                    }
+                } else {
+                    let output = content
+                        .lines()
+                        .skip_while(|line| {
+                            line.starts_with("Created At:") || line.starts_with("Completed At:")
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    ToolExecutionOutcome::Succeeded {
+                        result: tool_execution_result(&tool_type, &output, Some(content), is_mcp),
+                    }
+                };
+                events.push(ChatEvent::ToolExecutionCompleted(
+                    ToolExecutionCompletedData {
+                        tool_call_id,
+                        outcome,
+                    },
+                ));
+            }
+            continue;
+        }
+        let sender = match kind {
+            "USER_INPUT" => {
+                turn += 1;
+                MessageSender::User
+            }
+            "PLANNER_RESPONSE" => MessageSender::Assistant {
+                agent: ANTIGRAVITY_AGENT_NAME.to_owned(),
+            },
+            _ => continue,
+        };
+        let content = if kind == "USER_INPUT" {
+            content
+                .split_once("<USER_REQUEST>")
+                .and_then(|(_, rest)| rest.split_once("</USER_REQUEST>"))
+                .map(|(request, _)| request.trim())
+                .unwrap_or(content)
+        } else {
+            content
+        };
+        let mut declarations = Vec::new();
+        let mut requests = Vec::new();
+        if let Some(calls) = row.get("tool_calls").and_then(Value::as_array) {
+            for (offset, call) in calls.iter().enumerate() {
+                let name = call
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .ok_or("Antigravity history tool omitted name")?;
+                let args = call.get("args").cloned().unwrap_or(Value::Null);
+                let tool_index = index + offset as u64 + 1;
+                let id = format!("agy-{session_id}-{turn}-{tool_index}");
+                let tool_type = tool_request_type(name, &args, true);
+                let (name, args) = if name == MCP_DISPATCH_TOOL {
+                    mcp_inner_call(&args)
+                } else {
+                    (name.to_owned(), args)
+                };
+                pending.insert(
+                    tool_index,
+                    (
+                        id.clone(),
+                        tool_type.clone(),
+                        call.get("name").and_then(Value::as_str) == Some(MCP_DISPATCH_TOOL),
+                    ),
+                );
+                requests.push(ChatEvent::ToolRequest(ToolRequest {
+                    tool_call_id: id.clone(),
+                    tool_name: name.clone(),
+                    tool_type,
+                }));
+                declarations.push(ToolUseData {
+                    tool_call_id: id,
+                    name,
+                    arguments: args,
+                    content_offset: None,
+                });
+            }
+        }
+        if content.is_empty() && declarations.is_empty() {
+            continue;
+        }
+        let reasoning = row
+            .get("thinking")
+            .and_then(Value::as_str)
+            .filter(|text| !text.is_empty());
+        events.push(ChatEvent::MessageAdded(ChatMessage {
+            message_id: Some(ChatMessageId(format!("agy-{session_id}-step-{index}"))),
+            timestamp: row
+                .get("created_at")
+                .and_then(Value::as_str)
+                .and_then(|stamp| chrono::DateTime::parse_from_rfc3339(stamp).ok())
+                .map(|stamp| stamp.timestamp_millis().max(0) as u64)
+                .unwrap_or_default(),
+            sender,
+            content: content.to_owned(),
+            reasoning: reasoning.map(|text| ReasoningData {
+                text: text.to_owned(),
+                tokens: None,
+                signature: None,
+                blob: None,
+            }),
+            tool_calls: declarations,
+            model_info: None,
+            token_usage: None,
+            context_breakdown: None,
+            images: None,
+        }));
+        events.extend(requests);
+    }
+    Ok(events)
+}
+
 fn antigravity_transcript_opening(
     brain_dir: &Path,
     conversation_id: &str,
@@ -1622,6 +2062,61 @@ fn antigravity_brain_dir(conversations_dir: &Path) -> PathBuf {
 }
 
 impl Backend for AntigravityBackend {
+    fn native_session_id_is_valid(session_id: &SessionId) -> bool {
+        is_antigravity_native_session_id(session_id)
+    }
+
+    fn resolve_storage_root(configured: Option<&Path>) -> Result<Option<PathBuf>, String> {
+        resolve_antigravity_conversations_dir(configured).map(Some)
+    }
+
+    fn stored_session_is_resumable(
+        session_id: &SessionId,
+        stored_resumable: bool,
+        has_parent: bool,
+        superseded: bool,
+        storage: &crate::backend::BackendStorage,
+    ) -> bool {
+        if superseded || (!stored_resumable && has_parent) {
+            return false;
+        }
+        resolve_antigravity_conversations_dir(storage.root(BackendKind::Antigravity))
+            .is_ok_and(|root| is_antigravity_session_resumable(session_id, &root))
+    }
+
+    fn resolve_session_settings(config: &BackendSpawnConfig) -> protocol::SessionSettingsValues {
+        resolve_session_settings(config)
+    }
+
+    fn startup_drop_cancels_workers() -> bool {
+        false
+    }
+
+    fn session_is_resumable(
+        session_id: &SessionId,
+        _workspace_roots: &[String],
+        _resolved: &crate::backend::customization::ResolvedSpawnConfig,
+    ) -> bool {
+        is_antigravity_native_session_id(session_id)
+    }
+
+    fn skill_delivery() -> crate::backend::customization::SkillDelivery {
+        crate::backend::customization::SkillDelivery::NativeDiscovery
+    }
+
+    fn builtin_tier_config() -> settings_model::BackendTierConfig {
+        settings_model::BackendTierConfig {
+            low: antigravity_cost_hint_defaults(SpawnCostHint::Low),
+            high: antigravity_cost_hint_defaults(SpawnCostHint::High),
+        }
+    }
+
+    async fn read_capacity_out_of_band(
+        _context: &crate::backend::BackendProbeContext,
+    ) -> protocol::BackendCapacityState {
+        read_capacity_out_of_band().await
+    }
+
     /// What this backend measurably emits, and nothing else.
     ///
     /// Several capabilities are deliberately absent because headless `agy`
@@ -1702,13 +2197,15 @@ impl Backend for AntigravityBackend {
         config: BackendSpawnConfig,
         initial_input: protocol::SendMessagePayload,
     ) -> Result<(Self, EventStream), String> {
-        let conversations_dir =
-            resolve_antigravity_conversations_dir(config.antigravity_conversations_dir.as_deref())?;
-        Self::spawn_with_conversations_dir(
+        let conversations_dir = resolve_antigravity_conversations_dir(
+            config.backend_storage.root(BackendKind::Antigravity),
+        )?;
+        Self::start(
             workspace_roots,
             config,
-            initial_input,
-            conversations_dir,
+            Some(initial_input),
+            None,
+            &conversations_dir,
         )
         .await
     }
@@ -1718,10 +2215,18 @@ impl Backend for AntigravityBackend {
         config: BackendSpawnConfig,
         session_id: SessionId,
     ) -> Result<(Self, EventStream), String> {
-        let conversations_dir =
-            resolve_antigravity_conversations_dir(config.antigravity_conversations_dir.as_deref())?;
-        Self::resume_with_conversations_dir(workspace_roots, config, session_id, conversations_dir)
-            .await
+        let conversations_dir = resolve_antigravity_conversations_dir(
+            config.backend_storage.root(BackendKind::Antigravity),
+        )?;
+        ensure_antigravity_conversation_exists(&session_id, &conversations_dir)?;
+        Self::start(
+            workspace_roots,
+            config,
+            None,
+            Some(session_id),
+            &conversations_dir,
+        )
+        .await
     }
 
     async fn fork(
@@ -1735,16 +2240,36 @@ impl Backend for AntigravityBackend {
         ))
     }
 
-    async fn list_sessions() -> Result<Vec<BackendSession>, String> {
+    async fn list_sessions(
+        _context: &crate::backend::BackendProbeContext,
+    ) -> Result<Vec<BackendSession>, String> {
         let conversations_dir = resolve_antigravity_conversations_dir(None)?;
-        Ok(list_antigravity_sessions(
+        list_antigravity_sessions(
             &conversations_dir,
             &antigravity_brain_dir(&conversations_dir),
-        ))
+        )
     }
 
     fn session_id(&self) -> SessionId {
         self.session_id.clone()
+    }
+
+    async fn update_session_settings(
+        &mut self,
+        payload: protocol::SetSessionSettingsPayload,
+    ) -> Result<(), String> {
+        let (reply, result) = oneshot::channel();
+        self.settings_tx
+            .send((payload.values, reply))
+            .map_err(|_| "Antigravity session has closed".to_owned())?;
+        result
+            .await
+            .map_err(|_| "Antigravity settings update channel closed".to_owned())?
+    }
+
+    async fn read_session_settings(&self) -> Result<SessionSettingsValues, String> {
+        let state = self.inner.state.lock().await;
+        crate::backend::session_settings_from_json(json!({"model": state.model}))
     }
 
     async fn send(&self, input: AgentInput) -> bool {
@@ -1785,6 +2310,7 @@ impl Backend for AntigravityBackend {
             state.closing = true;
             state.shutdown_complete.take()
         };
+        drop(self.settings_tx);
         drop(self.input_tx);
         drop(self.interrupt_tx);
         if let Some(done) = done {
@@ -1794,39 +2320,6 @@ impl Backend for AntigravityBackend {
 }
 
 impl AntigravityBackend {
-    pub(crate) async fn spawn_with_conversations_dir(
-        workspace_roots: Vec<String>,
-        config: BackendSpawnConfig,
-        initial_input: protocol::SendMessagePayload,
-        conversations_dir: PathBuf,
-    ) -> Result<(Self, EventStream), String> {
-        Self::start(
-            workspace_roots,
-            config,
-            Some(initial_input),
-            None,
-            &conversations_dir,
-        )
-        .await
-    }
-
-    pub(crate) async fn resume_with_conversations_dir(
-        workspace_roots: Vec<String>,
-        config: BackendSpawnConfig,
-        session_id: SessionId,
-        conversations_dir: PathBuf,
-    ) -> Result<(Self, EventStream), String> {
-        ensure_antigravity_conversation_exists(&session_id, &conversations_dir)?;
-        Self::start(
-            workspace_roots,
-            config,
-            None,
-            Some(session_id),
-            &conversations_dir,
-        )
-        .await
-    }
-
     async fn start(
         workspace_roots: Vec<String>,
         config: BackendSpawnConfig,
@@ -1890,6 +2383,11 @@ impl AntigravityBackend {
             emitter.warning_message(&notice);
         }
 
+        let replay = match resume.as_ref() {
+            Some(id) => antigravity_history(&antigravity_brain_dir(conversations_dir), &id.0)?,
+            None => Vec::new(),
+        };
+
         let process = match AgyProcess::start(
             &launch,
             resume.as_ref().map(|id| id.0.as_str()),
@@ -1908,7 +2406,7 @@ impl AntigravityBackend {
                 model,
                 turn_active: false,
                 closing: false,
-                subagent_emitter: None,
+                subagent_emitter: config.subagent_emitter.clone(),
                 shutdown_complete: None,
             }),
         });
@@ -1929,6 +2427,7 @@ impl AntigravityBackend {
             }
         });
 
+        let (settings_tx, settings_rx) = mpsc::unbounded_channel();
         let (input_tx, input_rx) = mpsc::unbounded_channel::<AgentInput>();
         let (interrupt_tx, interrupt_rx) = mpsc::unbounded_channel::<()>();
 
@@ -1946,14 +2445,25 @@ impl AntigravityBackend {
             pending_questions: Vec::new(),
             capacity_read_at: None,
             shutdown_complete: shutdown_complete_tx,
+            native_pending: BTreeMap::new(),
+            native_sessions: BTreeSet::new(),
+            native_children: tokio::task::JoinSet::new(),
+            session_id: session_id.0.clone(),
         };
         tokio::spawn(async move {
             supervisor
-                .run(process, input_rx, interrupt_rx, initial_turn)
+                .run(process, settings_rx, input_rx, interrupt_rx, initial_turn)
                 .await;
         });
 
         let (backend_tx, backend_rx) = mpsc::unbounded_channel::<BackendEvent>();
+        {
+            for event in replay {
+                backend_tx
+                    .send(BackendEvent::Chat(event))
+                    .map_err(|_| "Antigravity replay receiver closed")?;
+            }
+        }
         tokio::spawn(async move {
             let mut event_rx = event_rx;
             while let Some(raw) = event_rx.recv().await {
@@ -1968,6 +2478,7 @@ impl AntigravityBackend {
 
         Ok((
             Self {
+                settings_tx,
                 input_tx,
                 interrupt_tx,
                 session_id,

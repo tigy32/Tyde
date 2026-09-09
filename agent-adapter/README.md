@@ -23,21 +23,11 @@ idle. `AgentInitiatedTurns` permits a backend to start a new turn without a new
 caller input, such as Claude resuming a parent when a background subagent
 finishes.
 
-The built-in adapter declarations are:
-
-| Backend | Sessions | Input/control | Configuration | Usage | Agents/work |
-| --- | --- | --- | --- | --- | --- |
-| ACP | list, resume | interrupt | MCP, workspace, customization | — | — |
-| Claude | resume, fork | image, interrupt | session, MCP, workspace, customization | turn | subagents, background, initiated turns |
-| Codex | resume, fork | image, interrupt | session, MCP, workspace, customization | turn, request, context | subagents, background, initiated turns |
-| Antigravity | resume | interrupt | session, MCP, workspace, customization | — | — |
-| Hermes | list, resume | interrupt | session, MCP, workspace, customization | turn, context | subagents, background |
-| Grok | list, resume | image, interrupt | session, MCP, workspace, customization | turn, request, cumulative, context, breakdown, subscription | subagents |
-| OpenCode | list, resume | image | session, MCP, workspace, customization | turn, request, cumulative, context | subagents |
-
-Grok reports authoritative context breakdowns. No built-in adapter currently
-claims mid-turn steering. Background support does not imply autonomous
-continuation; Claude and Codex currently declare agent-initiated turns.
+Backend kinds identify agents: Kiro, Claude, Codex, Antigravity, Hermes,
+Grok and OpenCode. ACP is shared transport machinery behind concrete backend
+implementations. Production capabilities come from each `Backend` implementation;
+the [conformance coverage map](../dev-docs/backend-conformance.md) records the
+eligible scenarios for each one.
 
 ## Conformance validation
 
@@ -61,31 +51,27 @@ run.
 
 ## Paid qualification suite
 
-Each case in `tests/tests/conformance.rs` is an independent ignored test, so an
-adapter can iterate on one flow before running the complete file. Capability-
-gated cases cover lifecycle and stream identity, follow-up turns, usage and
-context, tools, interrupts, resume, workspace instructions, steering, skills,
-MCP, images, native subagents, background work, and agent-initiated
-continuation.
+Each case in `tests/tests/conformance2.rs` runs directly against the production
+`Backend` trait and has an independent ignored test per backend. Capability
+gates cover lifecycle and stream identity, follow-up turns, usage and context,
+tools, interrupts, resume, workspace instructions, steering, skills, MCP,
+images, native subagents, background work and agent-initiated continuation.
 
-It never runs as part of ordinary repository validation. Explicitly authorize
-real calls and select backends with:
+Run `./dev.sh check` to build and validate the repository. It also builds the
+MCP bridge and the conformance executable, but does not run paid scenarios.
+Set `CONFORMANCE_BIN` to the resulting executable under
+`target/debug/deps/conformance2-<hash>` (not its `.d` dependency file).
 
-```sh
-TYDE_RUN_REAL_AI_TESTS=1 \
-TYDE_REAL_BACKENDS=claude,codex,kiro,hermes,grok \
-cargo test -p tests --test conformance -- --ignored --nocapture
-```
-
-Run one narrow case while iterating:
+After authorizing the real calls under `AGENTS.md`, run a narrow case:
 
 ```sh
 TYDE_RUN_REAL_AI_TESTS=1 TYDE_REAL_BACKENDS=codex \
-cargo test -p tests --test conformance real_usage_accounting \
-  -- --ignored --nocapture --exact
+TYDE_HERMES_BRIDGE_EXECUTABLE="$PWD/target/debug/tyde-server" \
+"$CONFORMANCE_BIN" --ignored --exact real_usage_accounting::codex --nocapture
 ```
 
 `TYDE_REAL_BACKENDS` accepts `claude`, `codex`, `antigravity`, `kiro`, `hermes`,
-and `grok`. A selected backend that is missing or unrunnable is a qualification
-failure, not a silent skip. Each backend is pinned to the suite's low-cost model
-and effort settings rather than inheriting potentially expensive local defaults.
+`grok` and `opencode`. A selected eligible backend that is missing or unrunnable
+is a qualification failure. Capability exclusions are reported separately and
+are not backend coverage. Suite profiles choose explicit models and effort;
+provider-specific model overrides are available for investigating model drift.

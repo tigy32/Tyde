@@ -115,6 +115,12 @@ pub struct NormalizedUpdate {
     pub params: Value,
 }
 
+pub struct NativeChildTranscript {
+    pub session_id: protocol::SessionId,
+    pub name: String,
+    pub events: Vec<protocol::ChatEvent>,
+}
+
 /// Agent-specific behavior. See the module docs for the division of labor.
 pub trait AcpAgentAdapter: Send + Sync + 'static {
     /// Stable identifier, for diagnostics and error messages.
@@ -309,6 +315,24 @@ pub trait AcpAgentAdapter: Send + Sync + 'static {
     /// number from another scope. Default: report nothing.
     fn map_usage(&self, _raw: Option<&Value>) -> Option<protocol::MessageTokenUsage> {
         None
+    }
+
+    fn native_child_session(
+        &self,
+        _completion: &super::AcpToolCallCompletion,
+        _tool_name: &str,
+    ) -> Option<(protocol::SessionId, String)> {
+        None
+    }
+
+    fn native_child_transcript<'a>(
+        &'a self,
+        _parent_session_id: &'a str,
+        _workspace_root: &'a str,
+        _tool_call_id: &'a str,
+        _tool_name: &'a str,
+    ) -> BoxFuture<'a, Result<Option<NativeChildTranscript>, String>> {
+        Box::pin(async { Ok(None) })
     }
 
     fn usage_for_tool_completion<'a>(

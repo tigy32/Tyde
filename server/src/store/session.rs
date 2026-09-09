@@ -12,7 +12,6 @@ use protocol::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use uuid::Uuid;
 
 use crate::backend::BackendSession;
 
@@ -749,25 +748,21 @@ impl SessionStore {
         &self,
         scope: SessionListScope,
     ) -> Result<Vec<SessionSummary>, String> {
-        let antigravity_conversations_dir =
-            crate::backend::antigravity::resolve_antigravity_conversations_dir(None)?;
-        self.summaries_for_scope_with_antigravity_conversations_dir(
-            scope,
-            &antigravity_conversations_dir,
-        )
+        let backend_storage = crate::backend::BackendStorage::new(HashMap::new())?;
+        self.summaries_for_scope_with_backend_storage(scope, &backend_storage)
     }
 
-    pub(crate) fn summaries_for_scope_with_antigravity_conversations_dir(
+    pub(crate) fn summaries_for_scope_with_backend_storage(
         &self,
         scope: SessionListScope,
-        antigravity_conversations_dir: &Path,
+        backend_storage: &crate::backend::BackendStorage,
     ) -> Result<Vec<SessionSummary>, String> {
         let records = self.list()?;
         Ok(records
             .into_iter()
             .filter(|record| session_record_matches_scope(record, scope))
             .map(|record| {
-                let resumable = session_record_is_resumable(&record, antigravity_conversations_dir);
+                let resumable = session_record_is_resumable(&record, backend_storage);
                 SessionSummary {
                     id: record.id,
                     backend_kind: record.backend_kind,
@@ -944,11 +939,16 @@ impl SessionStore {
                     path.display()
                 ));
             };
-            let is_antigravity =
-                record.get("backend_kind").and_then(Value::as_str) == Some("antigravity");
-            if is_antigravity
-                && !is_native_antigravity_session_id(session_id)
-                && record.get("resumable").and_then(Value::as_bool) != Some(false)
+            let invalid_native_id = record
+                .get("backend_kind")
+                .and_then(|kind| serde_json::from_value::<BackendKind>(kind.clone()).ok())
+                .is_some_and(|kind| {
+                    !crate::backend::native_session_id_is_valid(
+                        kind,
+                        &SessionId(session_id.clone()),
+                    )
+                });
+            if invalid_native_id && record.get("resumable").and_then(Value::as_bool) != Some(false)
             {
                 record.insert("resumable".to_string(), Value::Bool(false));
                 changed = true;
@@ -1078,20 +1078,18 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
-fn is_native_antigravity_session_id(session_id: &str) -> bool {
-    session_id.len() == 36 && Uuid::parse_str(session_id).is_ok()
-}
-
 pub(crate) fn session_record_is_resumable(
     record: &SessionRecord,
-    antigravity_conversations_dir: &Path,
+    backend_storage: &crate::backend::BackendStorage,
 ) -> bool {
-    session_record_is_resumable_with(record, |session_id| {
-        crate::backend::antigravity::is_antigravity_session_resumable(
-            session_id,
-            antigravity_conversations_dir,
-        )
-    })
+    crate::backend::stored_session_is_resumable(
+        record.backend_kind,
+        &record.id,
+        record.resumable,
+        record.parent_id.is_some(),
+        record.compacted_to_session_id.is_some(),
+        backend_storage,
+    )
 }
 
 pub(crate) fn session_summary_matches_scope(
@@ -1109,27 +1107,4 @@ fn session_record_matches_scope(record: &SessionRecord, scope: SessionListScope)
         SessionListScope::RootSessions => record.parent_id.is_none(),
         SessionListScope::AllSessions => true,
     }
-}
-
-fn session_record_is_resumable_with<F>(record: &SessionRecord, is_antigravity_resumable: F) -> bool
-where
-    F: Fn(&SessionId) -> bool,
-{
-    match record.backend_kind {
-        BackendKind::Tycode => false,
-        BackendKind::Antigravity => {
-            !antigravity_record_is_permanently_non_resumable(record)
-                && is_antigravity_resumable(&record.id)
-        }
-        BackendKind::Kiro
-        | BackendKind::Claude
-        | BackendKind::Codex
-        | BackendKind::Hermes
-        | BackendKind::Grok
-        | BackendKind::Opencode => record.resumable,
-    }
-}
-
-fn antigravity_record_is_permanently_non_resumable(record: &SessionRecord) -> bool {
-    record.compacted_to_session_id.is_some() || (!record.resumable && record.parent_id.is_some())
 }

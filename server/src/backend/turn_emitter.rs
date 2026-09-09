@@ -34,6 +34,7 @@ struct TurnEmitterState {
     agent: String,
     surface_protocol_violations: bool,
     typing_active: bool,
+    goal_status: Option<protocol::GoalStatus>,
     current_response: Option<OpenResponse>,
     declared_tools: HashMap<String, DeclaredTool>,
     open_tool_requests: IndexMap<String, EmittedToolRequest>,
@@ -139,6 +140,7 @@ impl TurnEmitter {
                 agent: agent.0.to_owned(),
                 surface_protocol_violations,
                 typing_active: false,
+                goal_status: None,
                 current_response: None,
                 declared_tools: HashMap::new(),
                 open_tool_requests: IndexMap::new(),
@@ -436,7 +438,17 @@ impl TurnEmitter {
     }
 
     pub fn goal_changed(&self, goal: Option<protocol::NativeGoal>) {
-        self.lock().send_chat(ChatEvent::GoalChanged(goal));
+        let mut state = self.lock();
+        if let Some(goal) = &goal
+            && goal.status == protocol::GoalStatus::Complete
+            && state
+                .goal_status
+                .is_some_and(|previous| previous != protocol::GoalStatus::Complete)
+        {
+            state.send_chat(ChatEvent::GoalCompleted(goal.clone()));
+        }
+        state.goal_status = goal.as_ref().map(|goal| goal.status);
+        state.send_chat(ChatEvent::GoalChanged(goal));
     }
 
     pub fn goal_capabilities(&self, capabilities: protocol::GoalCapabilities) {

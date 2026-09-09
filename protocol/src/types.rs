@@ -2808,6 +2808,18 @@ pub enum CapacitySource {
     GrokBilling,
 }
 
+impl CapacitySource {
+    pub fn backend_kind(self) -> BackendKind {
+        match self {
+            Self::CodexAccountRateLimitsUpdated => BackendKind::Codex,
+            Self::ClaudeRateLimitEvent | Self::ClaudeControlUsage => BackendKind::Claude,
+            Self::AntigravityUsageCommand => BackendKind::Antigravity,
+            Self::KiroUsageCommand => BackendKind::Kiro,
+            Self::GrokBilling => BackendKind::Grok,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CapacityCoverage {

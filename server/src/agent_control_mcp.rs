@@ -1378,16 +1378,17 @@ async fn do_spawn_agent(
         && project_id.is_none()
         && let Some(caller_agent_id) = caller_agent_id.as_ref()
     {
-        // OpenCode's native task tool omits Tyde-specific root arguments. Its
-        // authenticated child must still remain inside the caller's roots.
         input.workspace_roots = host
             .list_agents()
             .await
             .into_iter()
-            .find(|agent| {
-                &agent.agent_id == caller_agent_id && agent.backend_kind == BackendKind::Opencode
+            .find(|agent| &agent.agent_id == caller_agent_id)
+            .map(|agent| {
+                crate::backend::default_child_workspace_roots(
+                    agent.backend_kind,
+                    &agent.workspace_roots,
+                )
             })
-            .map(|agent| agent.workspace_roots)
             .unwrap_or_default();
     }
     let requested_name = input.name.filter(|value| !value.trim().is_empty());

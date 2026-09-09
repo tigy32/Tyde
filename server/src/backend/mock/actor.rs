@@ -4,7 +4,7 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 
 use protocol::{AgentInput, SendMessagePayload, SessionId};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::mpsc;
 
 use crate::sub_agent::{SubAgentEmitter, SubAgentHandle};
 
@@ -28,7 +28,7 @@ pub(super) fn start_mock_command_loop(
     session_id: SessionId,
     command_rx: mpsc::UnboundedReceiver<MockCommand>,
     events_tx: MockEventSender,
-    subagent_emitter_rx: watch::Receiver<Option<Arc<dyn SubAgentEmitter>>>,
+    subagent_emitter: Option<Arc<dyn SubAgentEmitter>>,
     control_rx: mpsc::UnboundedReceiver<MockControlCommand>,
     terminal_report: MockTerminalReportSlot,
     config: MockLoopConfig,
@@ -46,7 +46,7 @@ pub(super) fn start_mock_command_loop(
         session_id,
         command_rx,
         events_tx,
-        subagent_emitter_rx,
+        subagent_emitter,
         agent_control_await_mcp,
         active_subagents: Vec::new(),
         initial_message,
@@ -54,6 +54,7 @@ pub(super) fn start_mock_command_loop(
         unbounded_echo,
         user_bubbles,
         phase: TurnPhase::Idle,
+        goal_status: None,
         violations: Vec::new(),
         requests: Vec::new(),
         parked_at_gate: false,
@@ -101,7 +102,7 @@ struct MockActor {
     session_id: SessionId,
     command_rx: mpsc::UnboundedReceiver<MockCommand>,
     events_tx: MockEventSender,
-    subagent_emitter_rx: watch::Receiver<Option<Arc<dyn SubAgentEmitter>>>,
+    subagent_emitter: Option<Arc<dyn SubAgentEmitter>>,
     agent_control_await_mcp: Option<MockAgentControlAwaitMcp>,
     active_subagents: Vec<SubAgentHandle>,
     initial_message: Option<String>,
@@ -109,6 +110,7 @@ struct MockActor {
     unbounded_echo: bool,
     user_bubbles: bool,
     phase: TurnPhase,
+    goal_status: Option<protocol::GoalStatus>,
     violations: Vec<MockViolation>,
     requests: Vec<MockRequest>,
     parked_at_gate: bool,
@@ -395,7 +397,27 @@ impl MockActor {
 
     async fn run_step(&mut self, step: MockStep, control: &mut ControlPlane) -> bool {
         match step {
-            MockStep::Emit(event) => self.events_tx.send_event(*event),
+            MockStep::Emit(event) => {
+                if let crate::backend::BackendEvent::Chat(protocol::ChatEvent::GoalChanged(goal)) =
+                    &*event
+                {
+                    if let Some(goal) = goal
+                        && goal.status == protocol::GoalStatus::Complete
+                        && self
+                            .goal_status
+                            .is_some_and(|previous| previous != protocol::GoalStatus::Complete)
+                        && !self
+                            .events_tx
+                            .send_event(crate::backend::BackendEvent::Chat(
+                                protocol::ChatEvent::GoalCompleted(goal.clone()),
+                            ))
+                    {
+                        return false;
+                    }
+                    self.goal_status = goal.as_ref().map(|goal| goal.status);
+                }
+                self.events_tx.send_event(*event)
+            }
             MockStep::Gate(gate) => {
                 self.park_at_gate(&gate, control).await;
                 true
@@ -403,7 +425,7 @@ impl MockActor {
             MockStep::SpawnNativeChild(child) => {
                 emit::spawn_native_child(
                     &self.events_tx,
-                    &mut self.subagent_emitter_rx,
+                    self.subagent_emitter.as_ref(),
                     &mut self.active_subagents,
                     child,
                 )

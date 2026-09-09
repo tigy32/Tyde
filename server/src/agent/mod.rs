@@ -1,6 +1,5 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ops::{Deref, DerefMut};
-use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -27,18 +26,12 @@ use protocol::{
 use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use uuid::Uuid;
 
-use crate::backend::antigravity::AntigravityBackend;
-use crate::backend::antigravity::is_antigravity_native_session_id;
-use crate::backend::claude::ClaudeBackend;
-use crate::backend::codex::CodexBackend;
-use crate::backend::hermes::HermesBackend;
-use crate::backend::kiro::KiroBackend;
 use crate::backend::mock::MockBackend;
 use crate::backend::{
     Backend, BackendEvent, BackendExecutionMode, BackendSession, BackendSpawnConfig,
     BackendStartupError, EventStream, SendOutcome, apply_session_settings_update,
     resolve_backend_session_settings, validate_runtime_session_settings_update,
-    validate_session_settings_values, validate_startup_mcp_configuration,
+    validate_session_settings_values, validate_startup_mcp_configuration, with_backend_type,
 };
 use crate::host::{
     HostCapacityTx, HostSessionSummaryCountEvent, HostSessionSummaryCountTx,
@@ -103,11 +96,10 @@ pub(crate) const MAX_COMPACTION_SUMMARY_BYTES: usize = 128 * 1024;
 const COMPACTION_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(100);
 const COMPACTION_RETRY_MAX_DELAY: Duration = Duration::from_secs(5);
 
-type BackendHandle = Box<dyn BackendSender>;
+use crate::backend::handle::{BackendHandle, BackendSender};
 type BackendSpawnResult = Result<(BackendHandle, EventStream, SessionId), String>;
 type BackendForkResult = Result<(BackendHandle, EventStream, SessionId), BackendStartupError>;
 type BackendResumeResult = Result<(BackendHandle, EventStream), String>;
-type BackendFuture<T> = Pin<Box<dyn std::future::Future<Output = T> + Send>>;
 
 #[derive(Clone)]
 struct HostSubAgentEmitterContext {
@@ -224,7 +216,7 @@ pub(crate) struct AgentActorRuntimeContext {
     pub(crate) use_mock_backend: bool,
     pub(crate) supervisor_compaction_tx: crate::host::SupervisorCompactionTx,
     pub(crate) provider_version: Option<String>,
-    pub(crate) antigravity_conversations_dir: PathBuf,
+    pub(crate) backend_storage: crate::backend::BackendStorage,
 }
 
 pub(crate) struct AgentActorRuntimeResources {
@@ -240,7 +232,7 @@ pub(crate) struct AgentActorRuntimeResources {
     pub(crate) use_mock_backend: bool,
     pub(crate) supervisor_compaction_tx: crate::host::SupervisorCompactionTx,
     pub(crate) provider_version: Option<String>,
-    pub(crate) antigravity_conversations_dir: PathBuf,
+    pub(crate) backend_storage: crate::backend::BackendStorage,
 }
 
 impl AgentActorRuntimeResources {
@@ -260,7 +252,7 @@ impl AgentActorRuntimeResources {
             use_mock_backend: self.use_mock_backend,
             supervisor_compaction_tx: self.supervisor_compaction_tx,
             provider_version: self.provider_version,
-            antigravity_conversations_dir: self.antigravity_conversations_dir,
+            backend_storage: self.backend_storage,
         }
     }
 }
@@ -663,12 +655,7 @@ enum TokenUsageSource {
     PromotedRequests,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-enum TokenUsageTrackingMode {
-    #[default]
-    Messages,
-    ModelRequests,
-}
+use crate::backend::TokenUsageTrackingMode;
 
 fn context_estimate_matches(
     estimate: &ContextBreakdown,
@@ -698,14 +685,10 @@ struct AgentActivityStatsTracker {
 impl AgentActivityStatsTracker {
     fn for_backend(backend_kind: BackendKind) -> Self {
         let mut tracker = Self {
-            token_usage_tracking_mode: if backend_kind == BackendKind::Codex {
-                TokenUsageTrackingMode::ModelRequests
-            } else {
-                TokenUsageTrackingMode::Messages
-            },
+            token_usage_tracking_mode: crate::backend::token_usage_tracking_mode(backend_kind),
             ..Self::default()
         };
-        if backend_kind == BackendKind::Codex {
+        if tracker.token_usage_tracking_mode == TokenUsageTrackingMode::ModelRequests {
             tracker.stats.current_context_usage = Some(protocol::CurrentContextUsage::Unknown);
         }
         tracker
@@ -1902,7 +1885,7 @@ struct PrepareContextFallbackRequest {
     spawn_config: BackendSpawnConfig,
     use_mock_backend: bool,
     capacity_tx: HostCapacityTx,
-    antigravity_conversations_dir: PathBuf,
+    backend_storage: crate::backend::BackendStorage,
 }
 
 /// Starts one Tyde naming-helper turn. A backend may satisfy that turn with
@@ -1926,7 +1909,7 @@ pub(crate) async fn generate_agent_name(
 
     let name_prompt = build_name_generation_prompt(prompt);
     let logged_name_prompt = name_prompt.clone();
-    let spawn_config = agent_name_generation_spawn_config(request.session_settings.clone());
+    let mut spawn_config = agent_name_generation_spawn_config(request.session_settings.clone());
     let isolated_workspace = tempfile::tempdir()
         .map_err(|err| format!("failed to create isolated agent naming workspace: {err}"))?;
     let workspace_roots = vec![isolated_workspace.path().to_string_lossy().into_owned()];
@@ -1938,17 +1921,19 @@ pub(crate) async fn generate_agent_name(
     };
     let name_agent_id = AgentId(Uuid::new_v4().to_string());
     let (host_sub_agent_spawn_tx, _host_sub_agent_spawn_rx) = mpsc::unbounded_channel();
+    spawn_config.subagent_emitter = Some(Arc::new(
+        HostSubAgentEmitterContext {
+            host_sub_agent_spawn_tx,
+            capacity_tx: request.capacity_tx.clone(),
+        }
+        .emitter(name_agent_id, workspace_roots.clone()),
+    ));
     let (_backend, mut events, _session_id) = match spawn_backend(
-        &name_agent_id,
+        false,
         request.backend_kind,
         workspace_roots,
         spawn_config,
         initial_input,
-        HostSubAgentEmitterContext {
-            host_sub_agent_spawn_tx,
-            capacity_tx: request.capacity_tx.clone(),
-        },
-        None,
     )
     .await
     {
@@ -1985,9 +1970,11 @@ pub(crate) fn agent_name_generation_spawn_config(
         startup_mcp_servers: Vec::new(),
         session_settings,
         provider_version: None,
-        antigravity_conversations_dir: None,
+        backend_storage: crate::backend::BackendStorage::default(),
         backend_config: Default::default(),
         acp_agent: None,
+        subagent_emitter: None,
+        mock_launch: None,
         resolved_spawn_config: customization::ResolvedSpawnConfig {
             tool_policy: ToolPolicy::AllowList { tools: Vec::new() },
             access_mode: BackendAccessMode::ReadOnly,
@@ -2061,7 +2048,7 @@ pub(crate) async fn generate_agent_activity_summary(
         build_activity_summary_prompt(rendered_history, request.previous_summary.as_deref());
     let logged_prompt_len = prompt.len();
     let target_workspace_root_count = request.workspace_roots.len();
-    let spawn_config = agent_name_generation_spawn_config(request.session_settings.clone());
+    let mut spawn_config = agent_name_generation_spawn_config(request.session_settings.clone());
     let initial_input = SendMessagePayload {
         message: prompt,
         images: None,
@@ -2072,17 +2059,19 @@ pub(crate) async fn generate_agent_activity_summary(
     let isolated_workspace = tempfile::tempdir()
         .map_err(|err| format!("failed to create isolated activity summary workspace: {err}"))?;
     let workspace_roots = vec![isolated_workspace.path().to_string_lossy().into_owned()];
+    spawn_config.subagent_emitter = Some(Arc::new(
+        HostSubAgentEmitterContext {
+            host_sub_agent_spawn_tx,
+            capacity_tx: request.capacity_tx.clone(),
+        }
+        .emitter(request.summary_agent_id.clone(), workspace_roots.clone()),
+    ));
     let (_backend, mut events, _session_id) = match spawn_backend(
-        &request.summary_agent_id,
+        false,
         request.backend_kind,
         workspace_roots,
         spawn_config,
         initial_input,
-        HostSubAgentEmitterContext {
-            host_sub_agent_spawn_tx,
-            capacity_tx: request.capacity_tx.clone(),
-        },
-        None,
     )
     .await
     {
@@ -2125,7 +2114,7 @@ async fn prepare_context_fallback(
         request.spawn_config.session_settings.clone(),
         request.use_mock_backend,
         request.capacity_tx,
-        request.antigravity_conversations_dir.clone(),
+        request.backend_storage.clone(),
     )
     .await?;
 
@@ -2219,7 +2208,7 @@ async fn generate_fallback_compaction_summary(
     session_settings: Option<SessionSettingsValues>,
     use_mock_backend: bool,
     capacity_tx: HostCapacityTx,
-    antigravity_conversations_dir: PathBuf,
+    backend_storage: crate::backend::BackendStorage,
 ) -> Result<String, String> {
     if use_mock_backend {
         return Ok(format!(
@@ -2237,7 +2226,8 @@ Return only the handoff, with no preamble. Preserve active tasks, decisions, con
 identifiers, unresolved failures, and concrete next steps. Do not call tools. Requested focus: \
 {focus}\n\nCanonical transcript:\n{rendered_transcript}"
     );
-    let spawn_config = agent_name_generation_spawn_config(session_settings);
+    let mut spawn_config = agent_name_generation_spawn_config(session_settings);
+    spawn_config.backend_storage = backend_storage;
     let initial_input = SendMessagePayload {
         message: prompt,
         images: None,
@@ -2250,17 +2240,19 @@ identifiers, unresolved failures, and concrete next steps. Do not call tools. Re
     let workspace_roots = vec![isolated_workspace.path().to_string_lossy().into_owned()];
     let (host_sub_agent_spawn_tx, _host_sub_agent_spawn_rx) = mpsc::unbounded_channel();
     let summary_agent_id = AgentId(Uuid::new_v4().to_string());
+    spawn_config.subagent_emitter = Some(Arc::new(
+        HostSubAgentEmitterContext {
+            host_sub_agent_spawn_tx,
+            capacity_tx,
+        }
+        .emitter(summary_agent_id, workspace_roots.clone()),
+    ));
     let (_backend, mut events, _session_id) = spawn_backend(
-        &summary_agent_id,
+        false,
         backend_kind,
         workspace_roots,
         spawn_config,
         initial_input,
-        HostSubAgentEmitterContext {
-            host_sub_agent_spawn_tx,
-            capacity_tx,
-        },
-        Some(antigravity_conversations_dir),
     )
     .await
     .map_err(|error| format!("fallback summary generator failed to start: {error}"))?;
@@ -2469,480 +2461,97 @@ fn activity_summary_attempted_tool_labels(
         .join(", ")
 }
 
-/// Type-erased backend handle for agent input and acknowledged settings edits.
-trait BackendSender: Send + Sync + 'static {
-    fn compaction_capability(&self) -> crate::backend::BackendCompactionCapability;
-    fn begin_compaction<'a>(
-        &'a self,
-        request: crate::backend::BackendCompactionRequest,
-    ) -> Pin<
-        Box<dyn std::future::Future<Output = crate::backend::BackendCompactionStart> + Send + 'a>,
-    >;
-    fn send_with_outcome<'a>(
-        &'a self,
-        input: AgentInput,
-    ) -> Pin<Box<dyn std::future::Future<Output = SendOutcome> + Send + 'a>>;
-    fn update_session_settings<'a>(
-        &'a mut self,
-        payload: protocol::SetSessionSettingsPayload,
-    ) -> Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>>;
-    fn interrupt<'a>(&'a self) -> Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>>;
-    fn cancel_background_task<'a>(
-        &'a self,
-        tool_call_id: &'a str,
-    ) -> Pin<
-        Box<
-            dyn std::future::Future<Output = crate::backend::CancelBackgroundTaskOutcome>
-                + Send
-                + 'a,
-        >,
-    >;
-    fn shutdown(self: Box<Self>) -> Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
-    #[cfg(feature = "test-support")]
-    fn mock_control(&self) -> Option<crate::backend::mock::MockControl>;
-}
-
-impl<B: Backend> BackendSender for B {
-    fn compaction_capability(&self) -> crate::backend::BackendCompactionCapability {
-        Backend::compaction_capability(self)
-    }
-
-    fn begin_compaction<'a>(
-        &'a self,
-        request: crate::backend::BackendCompactionRequest,
-    ) -> Pin<
-        Box<dyn std::future::Future<Output = crate::backend::BackendCompactionStart> + Send + 'a>,
-    > {
-        Box::pin(Backend::begin_compaction(self, request))
-    }
-
-    fn send_with_outcome<'a>(
-        &'a self,
-        input: AgentInput,
-    ) -> Pin<Box<dyn std::future::Future<Output = SendOutcome> + Send + 'a>> {
-        Box::pin(Backend::send_with_outcome(self, input))
-    }
-
-    fn update_session_settings<'a>(
-        &'a mut self,
-        payload: protocol::SetSessionSettingsPayload,
-    ) -> Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>> {
-        Box::pin(Backend::update_session_settings(self, payload))
-    }
-
-    fn interrupt<'a>(&'a self) -> Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
-        Box::pin(Backend::interrupt(self))
-    }
-
-    fn cancel_background_task<'a>(
-        &'a self,
-        tool_call_id: &'a str,
-    ) -> Pin<
-        Box<
-            dyn std::future::Future<Output = crate::backend::CancelBackgroundTaskOutcome>
-                + Send
-                + 'a,
-        >,
-    > {
-        Box::pin(Backend::cancel_background_task(self, tool_call_id))
-    }
-
-    fn shutdown(self: Box<Self>) -> Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
-        Box::pin(async move {
-            Backend::shutdown(*self).await;
-        })
-    }
-
-    #[cfg(feature = "test-support")]
-    fn mock_control(&self) -> Option<crate::backend::mock::MockControl> {
-        Backend::mock_control(self)
-    }
-}
-
-async fn prepare_backend_handle_for_adoption(
-    handle: crate::backend::PreparedBackendHandle,
-    start: &AgentStartPayload,
-    sub_agent_context: &HostSubAgentEmitterContext,
-) -> Result<BackendHandle, String> {
-    let emitter = || {
-        Arc::new(
-            sub_agent_context
-                .clone()
-                .emitter(start.agent_id.clone(), start.workspace_roots.clone()),
-        )
-    };
-    match handle {
-        crate::backend::PreparedBackendHandle::Acp(backend) => {
-            backend.set_subagent_emitter(emitter()).await;
-            Ok(backend)
-        }
-        crate::backend::PreparedBackendHandle::Claude(backend) => {
-            backend.set_subagent_emitter(emitter()).await;
-            Ok(backend)
-        }
-        crate::backend::PreparedBackendHandle::Codex(backend) => {
-            if let Err(error) = backend.set_subagent_emitter(emitter()).await {
-                Backend::shutdown(*backend).await;
-                return Err(format!(
-                    "failed to install Codex sub-agent emitter on prepared binding: {error}"
-                ));
-            }
-            Ok(backend)
-        }
-        crate::backend::PreparedBackendHandle::Antigravity(backend) => {
-            backend.set_subagent_emitter(emitter()).await;
-            Ok(backend)
-        }
-        crate::backend::PreparedBackendHandle::Hermes(backend) => {
-            backend.set_subagent_emitter(emitter()).await;
-            Ok(backend)
-        }
-        crate::backend::PreparedBackendHandle::Mock { backend, .. } => {
-            backend.set_subagent_emitter(emitter()).await;
-            Ok(backend)
-        }
-    }
-}
-
-/// Spawn the correct backend based on `backend_kind`.
-/// Return the live backend session ID. Some backends mint Tyde-owned IDs for non-resumable sessions.
+/// Start `backend_kind` through `Backend::spawn`. The mock stands in for every
+/// kind when the host runs on the mock backend.
 async fn spawn_backend(
-    agent_id: &AgentId,
+    use_mock_backend: bool,
     backend_kind: BackendKind,
     workspace_roots: Vec<String>,
     config: BackendSpawnConfig,
     initial_input: SendMessagePayload,
-    sub_agent_context: HostSubAgentEmitterContext,
-    antigravity_conversations_dir: Option<PathBuf>,
 ) -> BackendSpawnResult {
-    match backend_kind {
-        BackendKind::Tycode => Err("Tycode backend has been removed".to_owned()),
-        BackendKind::Kiro => {
-            let (b, events) =
-                KiroBackend::spawn(workspace_roots.clone(), config, initial_input).await?;
-            b.set_subagent_emitter(Arc::new(
-                sub_agent_context.emitter(agent_id.clone(), workspace_roots),
-            ))
-            .await;
-            let session_id = Backend::session_id(&b);
-            Ok((Box::new(b), events, session_id))
-        }
-        BackendKind::Claude => {
-            let emitter =
-                Arc::new(sub_agent_context.emitter(agent_id.clone(), workspace_roots.clone()));
-            let (b, events) = ClaudeBackend::spawn_with_subagent_emitter(
-                workspace_roots,
-                config,
-                initial_input,
-                emitter,
-            )
-            .await?;
-            let session_id = Backend::session_id(&b);
-            Ok((Box::new(b), events, session_id))
-        }
-        BackendKind::Codex => {
-            let emitter =
-                Arc::new(sub_agent_context.emitter(agent_id.clone(), workspace_roots.clone()));
-            let (b, events) = CodexBackend::spawn_with_subagent_emitter(
-                workspace_roots,
-                config,
-                initial_input,
-                emitter,
-            )
-            .await?;
-            let session_id = Backend::session_id(&b);
-            Ok((Box::new(b), events, session_id))
-        }
-        BackendKind::Antigravity => {
-            let conversations_dir =
-                crate::backend::antigravity::resolve_antigravity_conversations_dir(
-                    antigravity_conversations_dir.as_deref(),
-                )?;
-            let (b, events) = AntigravityBackend::spawn_with_conversations_dir(
-                workspace_roots.clone(),
-                config,
-                initial_input,
-                conversations_dir,
-            )
-            .await?;
-            b.set_subagent_emitter(Arc::new(
-                sub_agent_context.emitter(agent_id.clone(), workspace_roots),
-            ))
-            .await;
-            let session_id = Backend::session_id(&b);
-            Ok((Box::new(b), events, session_id))
-        }
-        BackendKind::Hermes => {
-            let (b, events) =
-                HermesBackend::spawn(workspace_roots.clone(), config, initial_input).await?;
-            b.set_subagent_emitter(Arc::new(
-                sub_agent_context.emitter(agent_id.clone(), workspace_roots),
-            ))
-            .await;
-            let session_id = Backend::session_id(&b);
-            Ok((Box::new(b), events, session_id))
-        }
-        BackendKind::Grok => {
-            let config = crate::backend::grok::configure(config);
-            let (b, events) =
-                KiroBackend::spawn(workspace_roots.clone(), config, initial_input).await?;
-            b.set_subagent_emitter(Arc::new(
-                sub_agent_context.emitter(agent_id.clone(), workspace_roots),
-            ))
-            .await;
-            let session_id = Backend::session_id(&b);
-            Ok((Box::new(b), events, session_id))
-        }
-        BackendKind::Opencode => {
-            let config = crate::backend::opencode::configure(config);
-            let (b, events) =
-                KiroBackend::spawn(workspace_roots.clone(), config, initial_input).await?;
-            b.set_subagent_emitter(Arc::new(
-                sub_agent_context.emitter(agent_id.clone(), workspace_roots),
-            ))
-            .await;
-            let session_id = Backend::session_id(&b);
-            Ok((Box::new(b), events, session_id))
-        }
+    if use_mock_backend {
+        return spawn_through_trait::<MockBackend>(workspace_roots, config, initial_input).await;
     }
+    with_backend_type!(
+        backend_kind,
+        |B| spawn_through_trait::<B>(workspace_roots, config, initial_input).await,
+        removed => Err("Tycode backend has been removed".to_owned())
+    )
+}
+
+async fn spawn_through_trait<B: Backend>(
+    workspace_roots: Vec<String>,
+    config: BackendSpawnConfig,
+    initial_input: SendMessagePayload,
+) -> BackendSpawnResult {
+    let (backend, events) = B::spawn(workspace_roots, config, initial_input).await?;
+    let session_id = Backend::session_id(&backend);
+    Ok((Box::new(backend), events, session_id))
 }
 
 async fn resume_backend(
-    agent_id: &AgentId,
+    use_mock_backend: bool,
     backend_kind: BackendKind,
     workspace_roots: Vec<String>,
     config: BackendSpawnConfig,
     session_id: SessionId,
-    sub_agent_context: HostSubAgentEmitterContext,
-    antigravity_conversations_dir: Option<PathBuf>,
 ) -> BackendResumeResult {
-    let (backend, events): (BackendHandle, EventStream) = match backend_kind {
-        BackendKind::Tycode => return Err("Tycode backend has been removed".to_owned()),
-        BackendKind::Kiro => {
-            let (b, events) =
-                KiroBackend::resume(workspace_roots.clone(), config, session_id).await?;
-            b.set_subagent_emitter(Arc::new(
-                sub_agent_context.emitter(agent_id.clone(), workspace_roots),
-            ))
-            .await;
-            (Box::new(b), events)
-        }
-        BackendKind::Claude => {
-            let (b, events) =
-                ClaudeBackend::resume(workspace_roots.clone(), config, session_id.clone()).await?;
-            b.set_subagent_emitter(Arc::new(
-                sub_agent_context.emitter(agent_id.clone(), workspace_roots),
-            ))
-            .await;
-            (Box::new(b), events)
-        }
-        BackendKind::Codex => {
-            let (b, events) =
-                CodexBackend::resume(workspace_roots.clone(), config, session_id.clone()).await?;
-            b.set_subagent_emitter(Arc::new(
-                sub_agent_context.emitter(agent_id.clone(), workspace_roots),
-            ))
-            .await
-            .map_err(|err| format!("Failed to install Codex sub-agent emitter: {err}"))?;
-            (Box::new(b), events)
-        }
-        BackendKind::Antigravity => {
-            let conversations_dir =
-                crate::backend::antigravity::resolve_antigravity_conversations_dir(
-                    antigravity_conversations_dir.as_deref(),
-                )?;
-            let (b, events) = AntigravityBackend::resume_with_conversations_dir(
-                workspace_roots.clone(),
-                config,
-                session_id,
-                conversations_dir,
-            )
-            .await?;
-            b.set_subagent_emitter(Arc::new(
-                sub_agent_context.emitter(agent_id.clone(), workspace_roots),
-            ))
-            .await;
-            (Box::new(b), events)
-        }
-        BackendKind::Hermes => {
-            let (b, events) =
-                HermesBackend::resume(workspace_roots.clone(), config, session_id).await?;
-            b.set_subagent_emitter(Arc::new(
-                sub_agent_context.emitter(agent_id.clone(), workspace_roots),
-            ))
-            .await;
-            (Box::new(b), events)
-        }
-        BackendKind::Grok => {
-            let config = crate::backend::grok::configure(config);
-            let (b, events) =
-                KiroBackend::resume(workspace_roots.clone(), config, session_id).await?;
-            b.set_subagent_emitter(Arc::new(
-                sub_agent_context.emitter(agent_id.clone(), workspace_roots),
-            ))
-            .await;
-            (Box::new(b), events)
-        }
-        BackendKind::Opencode => {
-            let config = crate::backend::opencode::configure(config);
-            let (b, events) =
-                KiroBackend::resume(workspace_roots.clone(), config, session_id).await?;
-            b.set_subagent_emitter(Arc::new(
-                sub_agent_context.emitter(agent_id.clone(), workspace_roots),
-            ))
-            .await;
-            (Box::new(b), events)
-        }
-    };
-    Ok((backend, events))
+    if use_mock_backend {
+        return resume_through_trait::<MockBackend>(workspace_roots, config, session_id).await;
+    }
+    with_backend_type!(
+        backend_kind,
+        |B| resume_through_trait::<B>(workspace_roots, config, session_id).await,
+        removed => Err("Tycode backend has been removed".to_owned())
+    )
+}
+
+async fn resume_through_trait<B: Backend>(
+    workspace_roots: Vec<String>,
+    config: BackendSpawnConfig,
+    session_id: SessionId,
+) -> BackendResumeResult {
+    let (backend, events) = B::resume(workspace_roots, config, session_id).await?;
+    Ok((Box::new(backend), events))
 }
 
 async fn fork_backend(
-    agent_id: &AgentId,
+    use_mock_backend: bool,
     backend_kind: BackendKind,
     workspace_roots: Vec<String>,
     config: BackendSpawnConfig,
     from_session_id: SessionId,
     initial_input: SendMessagePayload,
-    sub_agent_context: HostSubAgentEmitterContext,
 ) -> BackendForkResult {
-    match backend_kind {
-        BackendKind::Tycode => Err(BackendStartupError::backend_failed(
-            "Tycode backend has been removed",
-        )),
-        BackendKind::Kiro => {
-            let (b, events) =
-                KiroBackend::fork(workspace_roots, config, from_session_id, initial_input).await?;
-            let session_id = Backend::session_id(&b);
-            Ok((Box::new(b), events, session_id))
-        }
-        BackendKind::Claude => {
-            let (b, events) = ClaudeBackend::fork(
-                workspace_roots.clone(),
-                config,
-                from_session_id,
-                initial_input,
-            )
-            .await?;
-            b.set_subagent_emitter(Arc::new(
-                sub_agent_context.emitter(agent_id.clone(), workspace_roots),
-            ))
-            .await;
-            let session_id = Backend::session_id(&b);
-            Ok((Box::new(b), events, session_id))
-        }
-        BackendKind::Codex => {
-            let (b, events) = CodexBackend::fork(
-                workspace_roots.clone(),
-                config,
-                from_session_id,
-                initial_input,
-            )
-            .await?;
-            let session_id = Backend::session_id(&b);
-            b.set_subagent_emitter(Arc::new(
-                sub_agent_context.emitter(agent_id.clone(), workspace_roots),
-            ))
-            .await
-            .map_err(|err| {
-                BackendStartupError::backend_failed(format!(
-                    "Failed to install Codex sub-agent emitter: {err}"
-                ))
-            })?;
-            Ok((Box::new(b), events, session_id))
-        }
-        BackendKind::Antigravity => {
-            let (b, events) =
-                AntigravityBackend::fork(workspace_roots, config, from_session_id, initial_input)
-                    .await?;
-            let session_id = Backend::session_id(&b);
-            Ok((Box::new(b), events, session_id))
-        }
-        BackendKind::Hermes => {
-            let (b, events) =
-                HermesBackend::fork(workspace_roots, config, from_session_id, initial_input)
-                    .await?;
-            let session_id = Backend::session_id(&b);
-            Ok((Box::new(b), events, session_id))
-        }
-        BackendKind::Grok => Err(BackendStartupError::unsupported(
-            crate::backend::backend_fork_unsupported_message(BackendKind::Grok),
-        )),
-        BackendKind::Opencode => Err(BackendStartupError::unsupported(
-            crate::backend::backend_fork_unsupported_message(BackendKind::Opencode),
-        )),
-    }
-}
-
-fn spawn_mock(
-    agent_id: AgentId,
-    workspace_roots: Vec<String>,
-    config: BackendSpawnConfig,
-    initial_input: SendMessagePayload,
-    sub_agent_context: HostSubAgentEmitterContext,
-    launch: Option<crate::backend::mock::MockLaunch>,
-) -> BackendFuture<BackendSpawnResult> {
-    Box::pin(async move {
-        let (b, events) =
-            MockBackend::spawn_with_launch(workspace_roots.clone(), config, initial_input, launch)
-                .await?;
-        let sid = Backend::session_id(&b);
-        b.set_subagent_emitter(Arc::new(
-            sub_agent_context.emitter(agent_id, workspace_roots),
-        ))
-        .await;
-        Ok((Box::new(b) as BackendHandle, events, sid))
-    })
-}
-
-fn resume_mock(
-    agent_id: AgentId,
-    workspace_roots: Vec<String>,
-    session_id: SessionId,
-    sub_agent_context: HostSubAgentEmitterContext,
-    launch: Option<crate::backend::mock::MockLaunch>,
-) -> BackendFuture<BackendResumeResult> {
-    Box::pin(async move {
-        let (b, events) = MockBackend::resume_with_launch(
-            workspace_roots.clone(),
-            BackendSpawnConfig::default(),
-            session_id.clone(),
-            launch,
+    if use_mock_backend {
+        return fork_through_trait::<MockBackend>(
+            workspace_roots,
+            config,
+            from_session_id,
+            initial_input,
         )
-        .await?;
-        b.set_subagent_emitter(Arc::new(
-            sub_agent_context.emitter(agent_id, workspace_roots),
-        ))
         .await;
-        Ok((Box::new(b) as BackendHandle, events))
-    })
+    }
+    with_backend_type!(
+        backend_kind,
+        |B| fork_through_trait::<B>(workspace_roots, config, from_session_id, initial_input).await,
+        removed => Err(BackendStartupError::backend_failed(
+            "Tycode backend has been removed",
+        ))
+    )
 }
 
-fn fork_mock(
-    agent_id: AgentId,
+async fn fork_through_trait<B: Backend>(
     workspace_roots: Vec<String>,
     config: BackendSpawnConfig,
     from_session_id: SessionId,
     initial_input: SendMessagePayload,
-    sub_agent_context: HostSubAgentEmitterContext,
-    launch: Option<crate::backend::mock::MockLaunch>,
-) -> BackendFuture<BackendForkResult> {
-    Box::pin(async move {
-        let (b, events) = MockBackend::fork_with_launch(
-            workspace_roots.clone(),
-            config,
-            from_session_id,
-            initial_input,
-            launch,
-        )
-        .await?;
-        let sid = Backend::session_id(&b);
-        b.set_subagent_emitter(Arc::new(
-            sub_agent_context.emitter(agent_id, workspace_roots),
-        ))
-        .await;
-        Ok((Box::new(b) as BackendHandle, events, sid))
-    })
+) -> BackendForkResult {
+    let (backend, events) =
+        B::fork(workspace_roots, config, from_session_id, initial_input).await?;
+    let session_id = Backend::session_id(&backend);
+    Ok((Box::new(backend), events, session_id))
 }
 
 pub(crate) fn spawn_agent_actor(
@@ -2963,16 +2572,15 @@ pub(crate) fn spawn_agent_actor(
         review_registry,
         status_handle,
         provider_version,
-        antigravity_conversations_dir,
+        backend_storage,
     } = runtime;
     let supervisor_capacity_tx = capacity_tx.clone();
     let sub_agent_context = HostSubAgentEmitterContext {
         host_sub_agent_spawn_tx,
         capacity_tx,
     };
-    let compaction_sub_agent_context = sub_agent_context.clone();
     let compaction_capacity_tx = sub_agent_context.capacity_tx.clone();
-    let compaction_antigravity_conversations_dir = antigravity_conversations_dir.clone();
+    let compaction_backend_storage = backend_storage.clone();
     let (tx, mut rx) = mpsc::unbounded_channel::<AgentCommand>();
     // A supervisor follow-up is an ordinary message, so it re-enters through
     // this actor's own mailbox instead of getting a private delivery path.
@@ -3015,10 +2623,13 @@ pub(crate) fn spawn_agent_actor(
             startup_mcp_servers,
             session_settings,
             provider_version: provider_version.clone(),
-            antigravity_conversations_dir: (backend_kind == BackendKind::Antigravity)
-                .then(|| antigravity_conversations_dir.clone()),
+            backend_storage,
             backend_config: backend_config.clone(),
             acp_agent: acp_agent.clone(),
+            subagent_emitter: Some(Arc::new(
+                sub_agent_context.emitter(agent_id.clone(), workspace_roots.clone()),
+            )),
+            mock_launch: None,
             resolved_spawn_config: resolved_spawn_config.clone(),
         };
         let initial_cost_hint = spawn_config.cost_hint;
@@ -3044,10 +2655,12 @@ pub(crate) fn spawn_agent_actor(
                 cost_hint: initial_cost_hint,
                 custom_agent_id: current_start.custom_agent_id.clone(),
                 acp_agent: None,
+                subagent_emitter: None,
+                mock_launch: None,
                 startup_mcp_servers: Vec::new(),
                 session_settings: initial_session_settings,
                 provider_version: spawn_config.provider_version.clone(),
-                antigravity_conversations_dir: spawn_config.antigravity_conversations_dir.clone(),
+                backend_storage: spawn_config.backend_storage.clone(),
                 backend_config,
                 resolved_spawn_config,
             },
@@ -3126,29 +2739,20 @@ pub(crate) fn spawn_agent_actor(
             } else if let Some(err) = startup_failure {
                 Err(err)
             } else {
+                let launch_config = BackendSpawnConfig {
+                    mock_launch,
+                    ..spawn_config
+                };
                 match resume_session_id {
                     Some(session_id) => {
-                        let resumed = if use_mock_backend {
-                            resume_mock(
-                                agent_id.clone(),
-                                workspace_roots.clone(),
-                                session_id.clone(),
-                                sub_agent_context.clone(),
-                                mock_launch,
-                            )
-                            .await
-                        } else {
-                            resume_backend(
-                                &agent_id,
-                                backend_kind,
-                                workspace_roots.clone(),
-                                spawn_config.clone(),
-                                session_id.clone(),
-                                sub_agent_context.clone(),
-                                Some(antigravity_conversations_dir.clone()),
-                            )
-                            .await
-                        };
+                        let resumed = resume_backend(
+                            use_mock_backend,
+                            backend_kind,
+                            workspace_roots.clone(),
+                            launch_config,
+                            session_id.clone(),
+                        )
+                        .await;
                         resumed
                             .map(|(backend, events)| (backend, events, session_id, initial_input))
                             .map_err(AgentStartupFailure::backend_failed)
@@ -3157,29 +2761,15 @@ pub(crate) fn spawn_agent_actor(
                         if let Some(from_session_id) = fork_from_session_id {
                             let first_input =
                                 initial_input.expect("fork spawn requires initial_input");
-                            let forked = if use_mock_backend {
-                                fork_mock(
-                                    agent_id.clone(),
-                                    workspace_roots.clone(),
-                                    spawn_config,
-                                    from_session_id,
-                                    first_input,
-                                    sub_agent_context.clone(),
-                                    mock_launch,
-                                )
-                                .await
-                            } else {
-                                fork_backend(
-                                    &agent_id,
-                                    backend_kind,
-                                    workspace_roots.clone(),
-                                    spawn_config,
-                                    from_session_id,
-                                    first_input,
-                                    sub_agent_context.clone(),
-                                )
-                                .await
-                            };
+                            let forked = fork_backend(
+                                use_mock_backend,
+                                backend_kind,
+                                workspace_roots.clone(),
+                                launch_config,
+                                from_session_id,
+                                first_input,
+                            )
+                            .await;
                             forked
                                 .map(|(backend, events, session_id)| {
                                     (backend, events, session_id, None)
@@ -3188,28 +2778,14 @@ pub(crate) fn spawn_agent_actor(
                         } else {
                             let first_input =
                                 initial_input.expect("new spawn requires initial_input");
-                            let spawned = if use_mock_backend {
-                                spawn_mock(
-                                    agent_id.clone(),
-                                    workspace_roots.clone(),
-                                    spawn_config,
-                                    first_input,
-                                    sub_agent_context.clone(),
-                                    mock_launch,
-                                )
-                                .await
-                            } else {
-                                spawn_backend(
-                                    &agent_id,
-                                    backend_kind,
-                                    workspace_roots.clone(),
-                                    spawn_config,
-                                    first_input,
-                                    sub_agent_context,
-                                    Some(antigravity_conversations_dir),
-                                )
-                                .await
-                            };
+                            let spawned = spawn_backend(
+                                use_mock_backend,
+                                backend_kind,
+                                workspace_roots.clone(),
+                                launch_config,
+                                first_input,
+                            )
+                            .await;
                             spawned
                                 .map(|(backend, events, session_id)| {
                                     (backend, events, session_id, None)
@@ -3225,7 +2801,8 @@ pub(crate) fn spawn_agent_actor(
             }
             startup_result
         });
-        let startup_cancellation_supported = backend_startup_drop_cancels_workers(backend_kind);
+        let startup_cancellation_supported =
+            crate::backend::startup_drop_cancels_workers(backend_kind);
         let mut pending_startup_attaches: Vec<(Stream, oneshot::Sender<bool>)> = Vec::new();
         let startup_result = loop {
             match next_agent_startup_event(
@@ -3852,7 +3429,7 @@ pub(crate) fn spawn_agent_actor(
                                     last_kick_message: context.last_kick_message.clone(),
                                     last_reply_to_kick: context.last_reply_to_kick.clone(),
                                     cost_hint: supervisor_settings.settings.cost_tier.as_cost_hint(),
-                                    session_settings: crate::host::hidden_helper_session_settings(
+                                    session_settings: crate::backend::helper_session_settings(
                                         backend_kind,
                                         record
                                             .as_ref()
@@ -4567,13 +4144,6 @@ pub(crate) fn spawn_agent_actor(
                             status_handle.update(|s| s.goal_capabilities = Some(capabilities.clone())).await;
                         }
                         ChatEvent::GoalChanged(goal) => {
-                            let previous = status_handle.snapshot().await.goal;
-                            if let Some(goal) = goal
-                                && goal.status == protocol::GoalStatus::Complete
-                                && previous.as_ref().is_some_and(|previous| previous.status != protocol::GoalStatus::Complete)
-                            {
-                                append_chat_event(&canonical_stream, &mut event_log, &mut subscribers, &mut replay_state, &ChatEvent::GoalCompleted(goal.clone())).await;
-                            }
                             status_handle.update(|s| s.goal = goal.clone()).await;
                         }
                         ChatEvent::GoalCompleted(_) => {}
@@ -4886,8 +4456,8 @@ pub(crate) fn spawn_agent_actor(
                                 spawn_config: &compaction_spawn_config,
                                 use_mock_backend,
                                 capacity_tx: &compaction_capacity_tx,
-                                antigravity_conversations_dir:
-                                    &compaction_antigravity_conversations_dir,
+                                backend_storage:
+                                    &compaction_backend_storage,
                             },
                             &mut context_compaction,
                             ContextCompactionDispatchReadiness {
@@ -5955,67 +5525,6 @@ pub(crate) fn spawn_agent_actor(
                                                     ..
                                                 } => tool_call_id.clone(),
                                             };
-                                            let request = open_tool_requests
-                                                .remove(&tool_call_id)
-                                                .unwrap_or_else(|| {
-                                                    panic!(
-                                                        "admitted tool response lost request {tool_call_id}"
-                                                    )
-                                                });
-                                            let result = match (&tool_response, &request.tool_type) {
-                                                (
-                                                    protocol::SendMessageToolResponse::AskUserQuestion {
-                                                        answer,
-                                                        ..
-                                                    },
-                                                    protocol::ToolRequestType::AskUserQuestion { .. },
-                                                ) => serde_json::json!({ "answer": answer }),
-                                                (
-                                                    protocol::SendMessageToolResponse::ExitPlanMode {
-                                                        decision,
-                                                        feedback,
-                                                        ..
-                                                    },
-                                                    protocol::ToolRequestType::ExitPlanMode {
-                                                        plan,
-                                                        plan_path,
-                                                    },
-                                                ) => {
-                                                    let mut result = serde_json::Map::new();
-                                                    result.insert(
-                                                        "decision".to_owned(),
-                                                        serde_json::Value::String(
-                                                            match decision {
-                                                                protocol::ExitPlanModeDecision::Approve => "approved",
-                                                                protocol::ExitPlanModeDecision::Reject => "rejected",
-                                                            }
-                                                            .to_owned(),
-                                                        ),
-                                                    );
-                                                    if let Some(feedback) = feedback {
-                                                        result.insert(
-                                                            "feedback".to_owned(),
-                                                            serde_json::Value::String(feedback.clone()),
-                                                        );
-                                                    }
-                                                    if let Some(plan) = plan {
-                                                        result.insert(
-                                                            "plan".to_owned(),
-                                                            serde_json::Value::String(plan.clone()),
-                                                        );
-                                                    }
-                                                    if let Some(plan_path) = plan_path {
-                                                        result.insert(
-                                                            "plan_path".to_owned(),
-                                                            serde_json::Value::String(plan_path.clone()),
-                                                        );
-                                                    }
-                                                    serde_json::Value::Object(result)
-                                                }
-                                                _ => panic!(
-                                                    "tool response kind did not match request {request:?}"
-                                                ),
-                                            };
                                             append_chat_event(
                                                 &canonical_stream,
                                                 &mut event_log,
@@ -6035,24 +5544,6 @@ pub(crate) fn spawn_agent_actor(
                                                 }),
                                             )
                                             .await;
-                                            append_chat_event(
-                                                &canonical_stream,
-                                                &mut event_log,
-                                                &mut subscribers,
-                                                &mut replay_state,
-                                                &ChatEvent::ToolExecutionCompleted(
-                                                    ToolExecutionCompletedData {
-                                                        tool_call_id: tool_call_id.clone(),
-                                                        outcome: ToolExecutionOutcome::Succeeded {
-                                                            result: ToolExecutionResult::Other {
-                                                                result,
-                                                            },
-                                                        },
-                                                    },
-                                                ),
-                                            )
-                                            .await;
-                                            completed_tool_call_ids.insert(tool_call_id.clone());
                                             mark_transcript_authoritative(
                                                 &transcript_store,
                                                 current_session_id.as_ref().expect(
@@ -6065,15 +5556,6 @@ pub(crate) fn spawn_agent_actor(
                                                 tool_call_id,
                                                 event_log.len(),
                                             );
-                                            open_tool_call_ids.remove(&tool_call_id);
-                                            let completed_pending_response =
-                                                pending_tool_response_ids.remove(&tool_call_id);
-                                            if completed_pending_response
-                                                && pending_tool_response_ids.is_empty()
-                                                && in_turn
-                                            {
-                                                idle_transition_armed = true;
-                                            }
                                         }
                                         if let Some(clear_pending_response) = clear_pending_response {
                                             status_handle
@@ -6516,17 +5998,10 @@ pub(crate) fn spawn_agent_actor(
                                         .await;
                                         continue;
                                     }
-                                    let mut backend_update = update.clone();
-                                    if current_start.backend_kind == BackendKind::Hermes {
-                                        backend_update
-                                            .values
-                                            .0
-                                            .remove(crate::backend::hermes::HERMES_PROFILE_SETTING);
-                                    }
                                     if let Err(err) = backend
                                         .as_mut()
                                         .expect("backend must exist while actor is running")
-                                        .update_session_settings(backend_update)
+                                        .update_session_settings(update.clone())
                                         .await
                                     {
                                         let payload = AgentErrorPayload {
@@ -6833,8 +6308,8 @@ pub(crate) fn spawn_agent_actor(
                                     spawn_config: &compaction_spawn_config,
                                     use_mock_backend,
                                     capacity_tx: &compaction_capacity_tx,
-                                    antigravity_conversations_dir:
-                                        &compaction_antigravity_conversations_dir,
+                                    backend_storage:
+                                        &compaction_backend_storage,
                                 },
                                 &mut context_compaction,
                                 ContextCompactionDispatchReadiness {
@@ -6902,8 +6377,8 @@ pub(crate) fn spawn_agent_actor(
                                     spawn_config: &compaction_spawn_config,
                                     use_mock_backend,
                                     capacity_tx: &compaction_capacity_tx,
-                                    antigravity_conversations_dir:
-                                        &compaction_antigravity_conversations_dir,
+                                    backend_storage:
+                                        &compaction_backend_storage,
                                 },
                                 &mut context_compaction,
                                 ContextCompactionDispatchReadiness {
@@ -7040,24 +6515,7 @@ pub(crate) fn spawn_agent_actor(
                                 ..
                             } = prepared.binding;
                             let prepared_backend =
-                                match prepare_backend_handle_for_adoption(
-                                    prepared_handle,
-                                    &current_start,
-                                    &compaction_sub_agent_context,
-                                )
-                                .await
-                                {
-                                    Ok(backend) => backend,
-                                    Err(error) => {
-                                        let _ = actor_tx.send(
-                                            AgentCommand::ContextCompactionTerminal {
-                                                operation_id,
-                                                result: Err(error),
-                                            },
-                                        );
-                                        continue;
-                                    }
-                                };
+                                prepared_handle;
                             let expected_generation =
                                 active.binding_generation_before;
                             let session_id_for_commit = session_id.clone();
@@ -7276,8 +6734,8 @@ pub(crate) fn spawn_agent_actor(
                                     spawn_config: &compaction_spawn_config,
                                     use_mock_backend,
                                     capacity_tx: &compaction_capacity_tx,
-                                    antigravity_conversations_dir:
-                                        &compaction_antigravity_conversations_dir,
+                                    backend_storage:
+                                        &compaction_backend_storage,
                                 };
                                 let fallback_result = begin_inline_context_fallback(
                                     &mut fallback_context,
@@ -8213,20 +7671,6 @@ pub(crate) fn spawn_agent_actor(
 enum AgentStartupEvent<T> {
     Completed(T),
     Command(Box<Option<AgentCommand>>),
-}
-
-fn backend_startup_drop_cancels_workers(backend_kind: BackendKind) -> bool {
-    // Enabling the command race is safe only when every startup path for the
-    // backend explicitly cancels or reaps work after its returned future drops.
-    matches!(
-        backend_kind,
-        BackendKind::Claude
-            | BackendKind::Codex
-            | BackendKind::Kiro
-            | BackendKind::Hermes
-            | BackendKind::Grok
-            | BackendKind::Opencode
-    )
 }
 
 async fn wait_for_compact_if_inactive_test_gate(_agent_id: &AgentId) {}
@@ -10130,7 +9574,7 @@ async fn persist_agent_session(
         created_at_ms: Some(current_start.created_at_ms),
         updated_at_ms: Some(current_start.created_at_ms),
         resumable: current_start.origin != AgentOrigin::BackendNative
-            && backend_session_is_resumable(
+            && crate::backend::session_is_resumable(
                 current_start.backend_kind,
                 session_id,
                 &current_start.workspace_roots,
@@ -10162,27 +9606,6 @@ async fn persist_agent_session(
     }
 
     Ok(())
-}
-
-fn backend_session_is_resumable(
-    backend_kind: BackendKind,
-    session_id: &SessionId,
-    workspace_roots: &[String],
-    resolved_spawn_config: &customization::ResolvedSpawnConfig,
-) -> bool {
-    match backend_kind {
-        BackendKind::Tycode => false,
-        BackendKind::Antigravity => is_antigravity_native_session_id(session_id),
-        BackendKind::Hermes => crate::backend::hermes::session_is_resumable_for_workspace_roots(
-            workspace_roots,
-            resolved_spawn_config,
-        ),
-        BackendKind::Kiro
-        | BackendKind::Claude
-        | BackendKind::Codex
-        | BackendKind::Grok
-        | BackendKind::Opencode => true,
-    }
 }
 
 fn interrupted_tool_completion(completion: &ToolExecutionCompletedData) -> bool {
@@ -11441,7 +10864,7 @@ fn agent_usage_snapshot_from_log(
             model: tracker.latest_model,
         };
     }
-    if start.backend_kind == BackendKind::Codex
+    if tracker.token_usage_tracking_mode == TokenUsageTrackingMode::ModelRequests
         && let Some(stats) = latest_stats.as_ref()
         && stats.token_usage.total_tokens > 0
     {
@@ -11721,7 +11144,7 @@ struct ContextCompactionDispatchContext<'a> {
     spawn_config: &'a BackendSpawnConfig,
     use_mock_backend: bool,
     capacity_tx: &'a HostCapacityTx,
-    antigravity_conversations_dir: &'a PathBuf,
+    backend_storage: &'a crate::backend::BackendStorage,
 }
 
 struct ContextCompactionDispatchReadiness<'a> {
@@ -12091,7 +11514,7 @@ async fn begin_inline_context_fallback(
         spawn_config: context.spawn_config.clone(),
         use_mock_backend: context.use_mock_backend,
         capacity_tx: context.capacity_tx.clone(),
-        antigravity_conversations_dir: context.antigravity_conversations_dir.clone(),
+        backend_storage: context.backend_storage.clone(),
     };
     let operation_id = active.operation_id.clone();
     let tx = context.actor_tx.clone();

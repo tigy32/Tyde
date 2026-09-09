@@ -196,8 +196,10 @@ impl Fixture {
 
         let antigravity_conversations_dir =
             tempfile::tempdir().expect("create Antigravity conversations tempdir");
-        runtime_config.antigravity_conversations_dir =
-            Some(antigravity_conversations_dir.path().to_path_buf());
+        runtime_config.backend_storage_roots.insert(
+            BackendKind::Antigravity,
+            antigravity_conversations_dir.path().to_path_buf(),
+        );
         let session_store_dir = tempfile::tempdir().expect("create session tempdir");
         let session_path = session_store_dir.path().join("sessions.json");
         let project_path = session_store_dir.path().join("projects.json");
@@ -435,9 +437,12 @@ impl Fixture {
 
     fn fresh_host_runtime_config(&self) -> server::HostRuntimeConfig {
         server::HostRuntimeConfig {
-            antigravity_conversations_dir: Some(
+            backend_storage_roots: [(
+                BackendKind::Antigravity,
                 self.antigravity_conversations_dir.path().to_path_buf(),
-            ),
+            )]
+            .into_iter()
+            .collect(),
             skip_real_backend_probe: true,
             ..server::HostRuntimeConfig::default()
         }

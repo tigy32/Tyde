@@ -310,7 +310,7 @@ fn err_text(message: impl Into<String>) -> CallToolResult {
 fn backend_status_acp_agents(
     settings: &settings_model::HostSettings,
 ) -> Vec<setup::ConfiguredAcpAgent> {
-    crate::host::configured_acp_setup_agents(settings)
+    crate::backend::setup::configured_acp_setup_agents(settings)
 }
 
 fn backend_status_response(payload: &protocol::BackendSetupPayload) -> Vec<Value> {

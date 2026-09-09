@@ -1676,6 +1676,7 @@ exec "$DEV_CHECK_REAL_PYTHON" "$@"
         # coverage.
         self.assertEqual(sum(line.startswith("cargo check ") for line in lines), 0)
         self.assertEqual(sum(line.startswith("cargo clippy ") for line in lines), 1)
+        self.assertEqual(sum(line.startswith("cargo build -p tyde-server --bin tyde-server ") for line in lines), 1)
         self.assertEqual(sum(line.startswith("cargo nextest run ") for line in lines), 1)
         self.assertEqual(lines.count("native-tools-prepare"), 1)
         self.assertEqual(lines.count("wasm-prepare"), 1)

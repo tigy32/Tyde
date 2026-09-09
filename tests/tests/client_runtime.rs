@@ -6,7 +6,6 @@ use protocol::{
     AgentBootstrapEvent, BackendCapacityState, BackendKind, ChatEvent, ProjectRootPath,
     ReviewSummaryScope, SendMessagePayload, SpawnAgentParams, SpawnAgentPayload,
 };
-use serde_json::json;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::timeout;
 
@@ -23,14 +22,101 @@ fn init_tracing() {
         .try_init();
 }
 
-fn codex_rate_limits_notification(used_percent: u8) -> serde_json::Value {
-    json!({"rateLimits": {
-        "limitId": "subscription", "limitName": "subscription",
-        "primary": {"usedPercent": used_percent, "windowDurationMins": 300, "resetsAt": 1_700_000_000},
-        "secondary": {"usedPercent": 17, "windowDurationMins": 10_080, "resetsAt": 1_700_100_000},
-        "credits": {"hasCredits": true, "unlimited": false, "balance": "12.50"},
-        "individualLimit": true, "planType": "pro", "rateLimitReachedType": null
-    }})
+// Provider normalization is exercised by real conformance. This client flow
+// starts at the typed backend boundary and verifies replay and freshness.
+fn codex_capacity_state(used_percent: u8) -> BackendCapacityState {
+    use protocol::*;
+    let rolling = |slot, label: &str, percent, minutes, reset| CapacityBucket {
+        id: CapacityBucketId::Codex { slot },
+        label: label.to_owned(),
+        measure: CapacityMeasure::UsedPercent {
+            used_percent: percent,
+            remaining_percent: 100 - percent,
+            provenance: ValueProvenance {
+                vendor_reported: true,
+            },
+        },
+        scope: CapacityScope::Individual,
+        window: CapacityWindow::Rolling {
+            duration_minutes: minutes,
+        },
+        reset: CapacityReset::At { at_ms: reset },
+        status: None,
+    };
+    BackendCapacityState::Known {
+        report: CapacityReport {
+            source: CapacitySource::CodexAccountRateLimitsUpdated,
+            observed_at_ms: None,
+            plan: Some(CapacityPlanLabel {
+                label: "pro".to_owned(),
+            }),
+            coverage: CapacityCoverage::AllVendorBuckets,
+            buckets: vec![
+                rolling(
+                    CodexLimitSlot::Primary,
+                    "5-hour limit",
+                    used_percent,
+                    300,
+                    1_700_000_000_000,
+                ),
+                rolling(
+                    CodexLimitSlot::Secondary,
+                    "Weekly limit",
+                    17,
+                    10_080,
+                    1_700_100_000_000,
+                ),
+                CapacityBucket {
+                    id: CapacityBucketId::Codex {
+                        slot: CodexLimitSlot::Credits,
+                    },
+                    label: "Credits".to_owned(),
+                    measure: CapacityMeasure::Credits {
+                        has_credits: true,
+                        unlimited: false,
+                        balance: Some("12.50".to_owned()),
+                    },
+                    scope: CapacityScope::Account,
+                    window: CapacityWindow::NotReported,
+                    reset: CapacityReset::NotReported,
+                    status: None,
+                },
+            ],
+        },
+    }
+}
+
+fn claude_capacity_state() -> BackendCapacityState {
+    use protocol::*;
+    BackendCapacityState::Known {
+        report: CapacityReport {
+            source: CapacitySource::ClaudeRateLimitEvent,
+            observed_at_ms: None,
+            plan: None,
+            coverage: CapacityCoverage::RepresentativeBucketOnly,
+            buckets: vec![CapacityBucket {
+                id: CapacityBucketId::Claude {
+                    limit: ClaudeLimitType::SevenDayOverageIncluded,
+                },
+                label: "Fable 5 limit".to_owned(),
+                measure: CapacityMeasure::UsedPercent {
+                    used_percent: 82,
+                    remaining_percent: 18,
+                    provenance: ValueProvenance {
+                        vendor_reported: true,
+                    },
+                },
+                scope: CapacityScope::Account,
+                window: CapacityWindow::Rolling {
+                    duration_minutes: 10_080,
+                },
+                reset: CapacityReset::At {
+                    at_ms: 1_700_000_000_000,
+                },
+                status: Some(CapacityBucketStatus::AllowedWarning),
+            }],
+        },
+    }
 }
 
 #[tokio::test]
@@ -102,11 +188,8 @@ async fn passive_capacity_replays_deduplicates_and_stales_over_public_client() {
     )));
 
     assert!(
-        host.ingest_passive_adapter_notification_for_test(
-            BackendKind::Codex,
-            codex_rate_limits_notification(82),
-        )
-        .await
+        host.ingest_backend_capacity_for_test(BackendKind::Codex, codex_capacity_state(82),)
+            .await
     );
     let updated = next_host_event(&mut events, "known passive capacity").await;
     let HostEvent::BackendCapacity(updated) = updated else {
@@ -137,7 +220,7 @@ async fn passive_capacity_replays_deduplicates_and_stales_over_public_client() {
     ));
     assert!(initial_bootstrap.agents.is_empty());
 
-    // The adapter ingress is bound to this host's sender. A separate host
+    // The backend ingress is bound to this host's sender. A separate host
     // starts honestly awaiting its own first passive notification.
     let isolated_directory = tempfile::tempdir().expect("create isolated capacity tempdir");
     let isolated_host = server::spawn_host_with_mock_backend(
@@ -172,11 +255,8 @@ async fn passive_capacity_replays_deduplicates_and_stales_over_public_client() {
     // A second agent seeing the same account-wide push does not fan out a
     // duplicate event or create a second per-agent capacity snapshot.
     assert!(
-        host.ingest_passive_adapter_notification_for_test(
-            BackendKind::Codex,
-            codex_rate_limits_notification(82),
-        )
-        .await
+        host.ingest_backend_capacity_for_test(BackendKind::Codex, codex_capacity_state(82),)
+            .await
     );
     assert!(
         timeout(Duration::from_millis(50), events.recv())
@@ -201,11 +281,8 @@ async fn passive_capacity_replays_deduplicates_and_stales_over_public_client() {
     // A later report from another agent connection replaces the account-wide
     // value; capacity is not keyed by agent or session.
     assert!(
-        host.ingest_passive_adapter_notification_for_test(
-            BackendKind::Codex,
-            codex_rate_limits_notification(90),
-        )
-        .await
+        host.ingest_backend_capacity_for_test(BackendKind::Codex, codex_capacity_state(90),)
+            .await
     );
     assert!(
         matches!(next_host_event(&mut events, "last writer capacity").await,
@@ -238,14 +315,8 @@ async fn passive_capacity_replays_deduplicates_and_stales_over_public_client() {
     );
 
     assert!(
-        host.ingest_passive_adapter_notification_for_test(
-            BackendKind::Claude,
-            json!({"type":"rate_limit_event","rate_limit_info":{
-                "status":"allowed_warning", "rateLimitType":"seven_day_overage_included",
-                "utilization":0.82, "resetsAt":1_700_000_000
-            }}),
-        )
-        .await
+        host.ingest_backend_capacity_for_test(BackendKind::Claude, claude_capacity_state(),)
+            .await
     );
     assert!(
         matches!(next_host_event(&mut events, "Claude passive capacity").await,
@@ -292,9 +363,11 @@ async fn passive_capacity_replays_deduplicates_and_stales_over_public_client() {
     );
 
     assert!(
-        host.ingest_passive_adapter_notification_for_test(
+        host.ingest_backend_capacity_for_test(
             BackendKind::Codex,
-            json!({"rateLimits": {}}),
+            BackendCapacityState::Unavailable {
+                reason: protocol::CapacityUnavailableReason::MalformedReport
+            },
         )
         .await
     );
@@ -369,11 +442,8 @@ async fn failed_capacity_reading_keeps_the_last_good_report() {
     ));
 
     assert!(
-        host.ingest_passive_adapter_notification_for_test(
-            BackendKind::Codex,
-            codex_rate_limits_notification(64),
-        )
-        .await
+        host.ingest_backend_capacity_for_test(BackendKind::Codex, codex_capacity_state(64),)
+            .await
     );
     let known = next_backend_capacity_event(&mut events, "known capacity").await;
     let known = codex_snapshot(&known);

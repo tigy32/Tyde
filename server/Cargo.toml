@@ -32,6 +32,8 @@ grep-searcher = "0.1"
 ignore = "0.4"
 indexmap = "2"
 regex = "1"
+rusqlite = { version = "0.40", features = ["bundled"] }
+prost = "0.14"
 same-file = "1"
 notify = "8"
 p256 = { version = "0.13", features = ["ecdh", "ecdsa"] }

@@ -27,12 +27,12 @@ use protocol::{
     ValueProvenance, WorkflowAgentState, WorkflowAgentStatus, WorkflowRunState, WorkflowRunStatus,
 };
 
-use crate::agent::customization::SkillSelection;
 use crate::backend::claude_skills::{
     CLAUDE_PLUGIN_DIR_FLAG, ClaudeSkillPlugin, InitFrameVerdict, PreparedSkill,
     degraded_default_notice, help_text_supports_plugin_dir, native_skill_overlay,
     unsupported_plugin_dir_notice, verify_init_frame, verify_plugin_inventory,
 };
+use crate::backend::customization::SkillSelection;
 use crate::backend::turn_emitter::{
     AgentName, AssistantMessagePayload, ResponseHandle, RetryAttemptPayload, StreamEndPayload,
     TurnEmitter,
@@ -2925,6 +2925,13 @@ impl ClaudeInner {
             return Ok(true);
         };
 
+        self.emit_tool_execution_completed(
+            &pending.tool_call_id,
+            &pending.tool_name,
+            true,
+            json!({"kind": "Other", "result": {"answer": message}}),
+            None,
+        );
         self.emit_typing_status(true);
         Ok(true)
     }
@@ -2959,6 +2966,7 @@ impl ClaudeInner {
         }
 
         let normalized_feedback = feedback
+            .clone()
             .and_then(|value| normalize_nonempty(&value))
             .or_else(|| normalize_nonempty(&message))
             .unwrap_or_else(|| "Plan rejected by user.".to_string());
@@ -2995,6 +3003,31 @@ impl ClaudeInner {
             return Ok(true);
         };
 
+        let plan = exit_plan_mode_plan_info_from_arguments(&pending.input);
+        let mut result = serde_json::Map::new();
+        result.insert(
+            "decision".to_owned(),
+            json!(match decision {
+                ExitPlanModeDecision::Approve => "approved",
+                ExitPlanModeDecision::Reject => "rejected",
+            }),
+        );
+        for (key, value) in [
+            ("feedback", feedback),
+            ("plan", plan.plan),
+            ("plan_path", plan.plan_path),
+        ] {
+            if let Some(value) = value {
+                result.insert(key.to_owned(), json!(value));
+            }
+        }
+        self.emit_tool_execution_completed(
+            &pending.tool_call_id,
+            &pending.tool_name,
+            true,
+            json!({"kind": "Other", "result": result}),
+            None,
+        );
         self.emit_typing_status(true);
         Ok(true)
     }
@@ -13325,7 +13358,6 @@ pub struct ClaudeBackend {
     interrupt_tx: mpsc::UnboundedSender<ClaudeInterrupt>,
     startup_cancel_tx: Option<oneshot::Sender<()>>,
     session_id: Arc<std::sync::Mutex<Option<SessionId>>>,
-    subagent_emitter_tx: watch::Sender<Option<Arc<dyn SubAgentEmitter>>>,
     /// Direct handle to the live session, populated once the spawn task has
     /// created it. `send_with_outcome` uses it to run turn admission
     /// synchronously so a busy backend can hand the message back instead of
@@ -13338,66 +13370,18 @@ struct ClaudeInterrupt {
 }
 
 impl ClaudeBackend {
-    pub(crate) async fn set_subagent_emitter(&self, emitter: Arc<dyn SubAgentEmitter>) {
-        let _ = self.subagent_emitter_tx.send(Some(emitter));
-    }
-
-    pub(crate) async fn spawn_with_subagent_emitter(
-        workspace_roots: Vec<String>,
-        config: BackendSpawnConfig,
-        initial_input: protocol::SendMessagePayload,
-        emitter: Arc<dyn SubAgentEmitter>,
-    ) -> Result<(Self, EventStream), String> {
-        Self::spawn_with_initial_emitter(workspace_roots, config, initial_input, Some(emitter))
-            .await
-    }
-
-    async fn spawn_with_initial_emitter(
-        workspace_roots: Vec<String>,
-        config: BackendSpawnConfig,
-        initial_input: protocol::SendMessagePayload,
-        initial_emitter: Option<Arc<dyn SubAgentEmitter>>,
-    ) -> Result<(Self, EventStream), String> {
-        Self::spawn_or_fork_with_initial_emitter(
-            workspace_roots,
-            config,
-            None,
-            initial_input,
-            initial_emitter,
-        )
-        .await
-    }
-
-    async fn fork_with_initial_emitter(
-        workspace_roots: Vec<String>,
-        config: BackendSpawnConfig,
-        from_session_id: SessionId,
-        initial_input: protocol::SendMessagePayload,
-        initial_emitter: Option<Arc<dyn SubAgentEmitter>>,
-    ) -> Result<(Self, EventStream), String> {
-        Self::spawn_or_fork_with_initial_emitter(
-            workspace_roots,
-            config,
-            Some(from_session_id),
-            initial_input,
-            initial_emitter,
-        )
-        .await
-    }
-
-    async fn spawn_or_fork_with_initial_emitter(
+    async fn spawn_or_fork(
         workspace_roots: Vec<String>,
         config: BackendSpawnConfig,
         fork_from_session_id: Option<SessionId>,
         initial_input: protocol::SendMessagePayload,
-        initial_emitter: Option<Arc<dyn SubAgentEmitter>>,
     ) -> Result<(Self, EventStream), String> {
         let (input_tx, mut input_rx) = mpsc::unbounded_channel::<AgentInput>();
         let (interrupt_tx, mut interrupt_rx) = mpsc::unbounded_channel::<ClaudeInterrupt>();
         let (events_tx, events_rx) = mpsc::unbounded_channel::<BackendEvent>();
         let session_id = Arc::new(std::sync::Mutex::new(None));
         let session_id_task = Arc::clone(&session_id);
-        let (subagent_emitter_tx, mut subagent_emitter_rx) = watch::channel(initial_emitter);
+        let initial_emitter = config.subagent_emitter.clone();
         let (ready_tx, ready_rx) = oneshot::channel::<Result<(), String>>();
         let (startup_cancel_tx, mut startup_cancel_rx) = oneshot::channel();
         let mut startup_cancel_guard = ClaudeDetachedStartupCancelGuard(Some(startup_cancel_tx));
@@ -13518,8 +13502,7 @@ impl ClaudeBackend {
                 }
             }
 
-            let maybe_emitter = subagent_emitter_rx.borrow().clone();
-            if let Some(emitter) = maybe_emitter {
+            if let Some(emitter) = initial_emitter {
                 session.set_subagent_emitter(emitter).await;
             }
 
@@ -13622,15 +13605,6 @@ impl ClaudeBackend {
                             }
                         }
                     }
-                    changed = subagent_emitter_rx.changed() => {
-                        if changed.is_err() {
-                            break;
-                        }
-                        let maybe_emitter = subagent_emitter_rx.borrow().clone();
-                        if let Some(emitter) = maybe_emitter {
-                            session.set_subagent_emitter(emitter).await;
-                        }
-                    }
                 }
             }
 
@@ -13652,7 +13626,6 @@ impl ClaudeBackend {
                 interrupt_tx,
                 startup_cancel_tx: Some(startup_cancel_tx),
                 session_id,
-                subagent_emitter_tx,
                 command_handle,
             },
             EventStream::new_backend(events_rx),
@@ -14370,6 +14343,31 @@ pub(crate) fn forward_passive_rate_limit_event(
 }
 
 impl Backend for ClaudeBackend {
+    fn validate_tool_policy(_policy: &protocol::ToolPolicy) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn resolve_session_settings(config: &BackendSpawnConfig) -> protocol::SessionSettingsValues {
+        resolve_session_settings(config)
+    }
+
+    fn skill_delivery() -> crate::backend::customization::SkillDelivery {
+        crate::backend::customization::SkillDelivery::NativeDiscovery
+    }
+
+    fn builtin_tier_config() -> settings_model::BackendTierConfig {
+        settings_model::BackendTierConfig {
+            low: claude_cost_hint_defaults(SpawnCostHint::Low),
+            high: claude_cost_hint_defaults(SpawnCostHint::High),
+        }
+    }
+
+    async fn read_capacity_out_of_band(
+        _context: &crate::backend::BackendProbeContext,
+    ) -> protocol::BackendCapacityState {
+        read_capacity_out_of_band().await
+    }
+
     fn capabilities() -> tyde_agent_adapter::BackendCapabilities {
         [
             tyde_agent_adapter::BackendCapability::ResumeSession,
@@ -14492,7 +14490,7 @@ impl Backend for ClaudeBackend {
         config: BackendSpawnConfig,
         initial_input: protocol::SendMessagePayload,
     ) -> Result<(Self, EventStream), String> {
-        Self::spawn_with_initial_emitter(workspace_roots, config, initial_input, None).await
+        Self::spawn_or_fork(workspace_roots, config, None, initial_input).await
     }
 
     async fn resume(
@@ -14505,9 +14503,6 @@ impl Backend for ClaudeBackend {
         let (events_tx, events_rx) = mpsc::unbounded_channel::<BackendEvent>();
         let (resume_replay_complete_tx, resume_replay_complete_rx) =
             tokio::sync::oneshot::channel();
-        let (subagent_emitter_tx, mut subagent_emitter_rx) =
-            watch::channel::<Option<Arc<dyn SubAgentEmitter>>>(None);
-
         let session_id = session_id.0;
         let backend_session_id =
             Arc::new(std::sync::Mutex::new(Some(SessionId(session_id.clone()))));
@@ -14540,8 +14535,7 @@ impl Backend for ClaudeBackend {
 
         let handle = session.command_handle();
         let backend_command_handle = handle.clone();
-        let maybe_emitter = subagent_emitter_rx.borrow().clone();
-        if let Some(emitter) = maybe_emitter {
+        if let Some(emitter) = config.subagent_emitter.clone() {
             session.set_subagent_emitter(emitter).await;
         }
         let resolved_settings = resolve_session_settings(&config);
@@ -14702,15 +14696,6 @@ impl Backend for ClaudeBackend {
                             }
                         }
                     }
-                    changed = subagent_emitter_rx.changed() => {
-                        if changed.is_err() {
-                            break;
-                        }
-                        let maybe_emitter = subagent_emitter_rx.borrow().clone();
-                        if let Some(emitter) = maybe_emitter {
-                            session.set_subagent_emitter(emitter).await;
-                        }
-                    }
                 }
             }
 
@@ -14723,7 +14708,6 @@ impl Backend for ClaudeBackend {
                 interrupt_tx,
                 startup_cancel_tx: None,
                 session_id: backend_session_id,
-                subagent_emitter_tx,
                 command_handle: Arc::new(StdMutex::new(Some(backend_command_handle))),
             },
             EventStream::new_backend_with_resume_replay_barrier(
@@ -14739,19 +14723,33 @@ impl Backend for ClaudeBackend {
         from_session_id: protocol::SessionId,
         initial_input: protocol::SendMessagePayload,
     ) -> Result<(Self, EventStream), BackendStartupError> {
-        Self::fork_with_initial_emitter(
+        Self::spawn_or_fork(
             workspace_roots,
             config,
-            from_session_id,
+            Some(from_session_id),
             initial_input,
-            None,
         )
         .await
         .map_err(BackendStartupError::backend_failed)
     }
 
-    async fn list_sessions() -> Result<Vec<BackendSession>, String> {
-        Err("ClaudeBackend::list_sessions is not supported without workspace context".to_string())
+    async fn list_sessions(
+        context: &crate::backend::BackendProbeContext,
+    ) -> Result<Vec<BackendSession>, String> {
+        let mut sessions = Vec::new();
+        for root in &context.workspace_roots {
+            sessions.extend(
+                list_claude_sessions(root)
+                    .await?
+                    .iter()
+                    .filter_map(|metadata| {
+                        crate::backend::session_from_metadata(metadata, BackendKind::Claude)
+                    }),
+            );
+        }
+        sessions.sort_by_key(|session| std::cmp::Reverse(session.updated_at_ms));
+        sessions.dedup_by(|a, b| a.id == b.id);
+        Ok(sessions)
     }
 
     fn session_id(&self) -> SessionId {
@@ -14824,6 +14822,21 @@ impl Backend for ClaudeBackend {
                 SendOutcome::Closed
             }
         }
+    }
+
+    async fn read_session_settings(&self) -> Result<protocol::SessionSettingsValues, String> {
+        let handle = self
+            .command_handle
+            .lock()
+            .expect("Claude command handle slot poisoned")
+            .clone()
+            .ok_or_else(|| "Claude session has closed".to_owned())?;
+        let state = handle.inner.state.lock().await;
+        crate::backend::session_settings_from_json(json!({
+            "model": state.model,
+            "reasoning_effort": state.effort.map(ClaudeEffort::as_str),
+            "speed": state.fast_mode.map(|fast| if fast { "fast" } else { "standard" }),
+        }))
     }
 
     async fn update_session_settings(

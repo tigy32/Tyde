@@ -45,6 +45,7 @@ async fn expect_next_event(client: &mut client::Connection, context: &str) -> En
                     | FrameKind::ProjectGitStatus
                     | FrameKind::CodeIntelOverview
                     | FrameKind::ChatEvent
+                    | FrameKind::ContextCompactionCapability
                     | FrameKind::AgentBootstrap
                     | FrameKind::AgentStart
                     | FrameKind::NewAgent
@@ -1164,6 +1165,10 @@ async fn workbench_remove_cascades_agents_terminals_sessions_and_steering() {
 async fn agent_control_creates_lists_and_spawns_workbenches() {
     let repo = init_git_repo("agent-control-workbench");
     let mut fixture = Fixture::new().await;
+    fixture
+        .host_for_test()
+        .set_session_schema_ready_for_test(BackendKind::Codex)
+        .await;
     let parent = create_project(&mut fixture.client, vec![repo.path()]).await;
     fixture
         .client

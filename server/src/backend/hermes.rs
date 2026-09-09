@@ -24,11 +24,11 @@ use tokio::process::{ChildStderr, ChildStdout};
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
-use crate::agent::customization::{ResolvedSpawnConfig, SkillSelection};
 use crate::backend::agent_control_progress::{
     PendingToolNormalizationFailure, is_tyde_agent_control_spawn_tool_name,
     normalize_tyde_chat_event,
 };
+use crate::backend::customization::{ResolvedSpawnConfig, SkillSelection};
 use crate::backend::hermes_config::{self, HermesProfileRef};
 use crate::backend::{
     Backend, BackendAcceptedCompaction, BackendCompactionCapability,
@@ -87,20 +87,6 @@ from hermes_cli.env_loader import load_hermes_dotenv
 
 load_hermes_dotenv()
 from agent.process_bootstrap import _get_proxy_for_base_url
-import run_agent as _tyde_run_agent
-_tyde_original_parallel_gate = _tyde_run_agent._should_parallelize_tool_batch
-def _tyde_parallel_gate(tool_calls):
-    result = _tyde_original_parallel_gate(tool_calls)
-    names = [getattr(getattr(call, "function", None), "name", "") for call in tool_calls]
-    from tools.mcp_tool import is_mcp_tool_parallel_safe
-    safety = [is_mcp_tool_parallel_safe(name) for name in names]
-    print(
-        f"TYDE HERMES PARALLEL GATE names={names!r} safety={safety!r} result={result}",
-        file=sys.stderr,
-        flush=True,
-    )
-    return result
-_tyde_run_agent._should_parallelize_tool_batch = _tyde_parallel_gate
 print(
     "TYDE HERMES TRANSPORT "
     f"https_proxy={bool(os.environ.get('HTTPS_PROXY') or os.environ.get('https_proxy'))} "
@@ -192,6 +178,19 @@ def _tyde_make_agent(*args, **kwargs):
                     {"iteration": int(iteration), "usage": _tyde_get_usage(agent)},
                 )
     agent.step_callback = _tyde_step_callback
+    from functools import wraps
+    original_run_conversation = agent.run_conversation
+    @wraps(original_run_conversation)
+    def _tyde_run_conversation(*run_args, **run_kwargs):
+        message = run_args[0] if run_args else run_kwargs.get("user_message", "")
+        history = run_kwargs.get("conversation_history") or []
+        print(
+            f"TYDE HERMES TURN INPUT chars={len(str(message))} "
+            f"history_roles={[entry.get('role') for entry in history if isinstance(entry, dict)]}",
+            file=sys.stderr, flush=True,
+        )
+        return original_run_conversation(*run_args, **run_kwargs)
+    agent.run_conversation = _tyde_run_conversation
     original_buffer_status = getattr(agent, "_buffer_status", None)
     original_buffer_vprint = getattr(agent, "_buffer_vprint", None)
     retry_failures = {}
@@ -243,6 +242,24 @@ def _tyde_make_agent(*args, **kwargs):
 
 def _tyde_emit(event_type, session_id, payload=None):
     if event_type == "subagent.complete" and isinstance(payload, dict):
+        payload = dict(payload)
+        child_key = str(payload.get("child_session_id") or "")
+        if child_key:
+            try:
+                parent = _tyde_gateway_server._sessions.get(session_id) or {}
+                with _tyde_gateway_server._session_db(parent) as db:
+                    if db is None:
+                        raise RuntimeError("native child session database is unavailable")
+                    history = db.get_messages_as_conversation(
+                        child_key, include_ancestors=False, include_row_ids=True,
+                        repair_alternation=False,
+                    )
+                    if not history:
+                        raise RuntimeError("native child history is empty")
+                    payload["_tyde_messages"] = _tyde_gateway_server._history_to_messages(history)
+                    print(f"TYDE HERMES CHILD HISTORY child={child_key} messages={len(history)}", file=sys.stderr, flush=True)
+            except Exception as error:
+                payload["_tyde_history_error"] = str(error)
         summary = str(payload.get("summary") or payload.get("text") or "")
         if payload.get("status") == "completed" and summary.startswith(
             ("API call failed after ", "Billing or credits exhausted:")
@@ -263,6 +280,12 @@ def _tyde_emit(event_type, session_id, payload=None):
             payload = dict(payload) if isinstance(payload, dict) else {}
             payload["_tyde_turn_generation"] = generation
     if event_type == "message.complete":
+        session = _tyde_gateway_server._sessions.get(session_id) or {}
+        print(
+            f"TYDE HERMES TURN COMPLETE running={session.get('running')} "
+            f"history_roles={[entry.get('role') for entry in session.get('history', []) if isinstance(entry, dict)]}",
+            file=sys.stderr, flush=True,
+        )
         with _tyde_message_condition:
             active = _tyde_open_messages.get(session_id)
             if active is not None:
@@ -299,6 +322,14 @@ def _tyde_on_tool_start(session_id, tool_call_id, name, args):
         _tyde_tool_start_args[(session_id, str(tool_call_id))] = args
     _tyde_original_tool_start(session_id, tool_call_id, name, args)
 
+_tyde_original_session_row_summary = _tyde_gateway_server._session_row_summary
+
+def _tyde_session_row_summary(row, *, tip_row=None, resolved_id=None):
+    summary = _tyde_original_session_row_summary(row, tip_row=tip_row, resolved_id=resolved_id)
+    summary["cwd"] = (tip_row or row).get("cwd") or row.get("cwd")
+    return summary
+
+_tyde_gateway_server._session_row_summary = _tyde_session_row_summary
 _tyde_gateway_server._emit = _tyde_emit
 _tyde_gateway_server._get_usage = _tyde_get_usage
 _tyde_gateway_server._make_agent = _tyde_make_agent
@@ -408,6 +439,7 @@ print(json.dumps(skills.get("external_dirs", [])))
 
 #[derive(Clone)]
 pub struct HermesBackend {
+    session_settings: SessionSettingsValues,
     command_tx: mpsc::UnboundedSender<HermesBackendCommand>,
     session_id: Arc<std::sync::Mutex<SessionId>>,
     compaction_capability: Arc<std::sync::Mutex<BackendCompactionCapability>>,
@@ -416,12 +448,12 @@ pub struct HermesBackend {
 }
 
 enum HermesBackendCommand {
+    ReadSessionSettings(oneshot::Sender<Result<SessionSettingsValues, String>>),
     Input(AgentInput),
     UpdateSessionSettings(
         protocol::SetSessionSettingsPayload,
         oneshot::Sender<Result<(), String>>,
     ),
-    SetSubagentEmitter(Arc<dyn SubAgentEmitter>, oneshot::Sender<()>),
     Interrupt(oneshot::Sender<bool>),
     CancelBackgroundTask {
         tool_call_id: String,
@@ -869,6 +901,7 @@ struct HermesEventMapper {
     pending_tools: HashMap<String, String>,
     pending_tool_arguments: HashMap<String, Value>,
     turn_tools: HashMap<String, HermesTurnTool>,
+    tool_call_ids: HashMap<String, String>,
     next_turn_tool_order: u64,
     cancelled_tools: HashSet<String>,
     opaque_progress_tools: HashSet<String>,
@@ -997,6 +1030,104 @@ fn hermes_base_session_fields() -> Vec<SessionSettingField> {
 }
 
 impl Backend for HermesBackend {
+    fn reserved_launch_profile_error(id: &protocol::LaunchProfileId) -> Option<String> {
+        id.0.starts_with(HERMES_PROFILE_LAUNCH_ID_PREFIX).then(|| {
+            format!(
+                "launch profile {id} conflicts with the server-synthesized Hermes profile namespace"
+            )
+        })
+    }
+
+    fn discovery_policy() -> crate::backend::DiscoveryPolicy {
+        crate::backend::DiscoveryPolicy {
+            can_refresh_native_settings: true,
+            schema_uses_provider_filters: true,
+            refresh_on_connect: true,
+            retain_last_good: true,
+            ..Default::default()
+        }
+    }
+
+    fn terminal_errors_are_retryable() -> bool {
+        // The gateway does not classify terminal faults; retrying may repeat a
+        // permanent auth failure and multiply paid helper calls.
+        false
+    }
+
+    async fn native_settings_snapshot(
+        context: &crate::backend::BackendProbeContext,
+    ) -> Option<protocol::BackendNativeSettingsSnapshot> {
+        Some(native_settings_snapshot(&context.workspace_roots).await)
+    }
+
+    async fn write_native_settings(
+        settings: Value,
+        context: &crate::backend::BackendProbeContext,
+    ) -> crate::backend::NativeSettingsWriteOutcome {
+        let result = async {
+            let roots = if context.workspace_roots.is_empty() {
+                vec![crate::paths::home_dir()?.to_string_lossy().into_owned()]
+            } else {
+                context.workspace_roots.clone()
+            };
+            persist_native_settings(settings, &roots).await
+        }
+        .await;
+        match result {
+            Ok(outcome) => crate::backend::NativeSettingsWriteOutcome {
+                result: outcome.partial_error_message().map_or(Ok(()), Err),
+                refresh_required: true,
+            },
+            Err(error) => crate::backend::NativeSettingsWriteOutcome {
+                result: Err(error),
+                refresh_required: false,
+            },
+        }
+    }
+
+    fn has_dynamic_session_schema() -> bool {
+        true
+    }
+
+    async fn discover(
+        context: &crate::backend::BackendProbeContext,
+    ) -> Result<crate::backend::BackendDiscovery, String> {
+        let probe =
+            probe_session_settings_schema(&context.workspace_roots, &context.disabled_providers)
+                .await?;
+        let mut launch_profiles = Vec::new();
+        synthesize_profile_entries(&probe.profiles, &mut launch_profiles);
+        Ok(crate::backend::BackendDiscovery {
+            schema: probe.schema,
+            launch_profiles,
+        })
+    }
+
+    fn validate_runtime_session_settings_update(
+        current: &SessionSettingsValues,
+        update: &SessionSettingsValues,
+    ) -> Result<(), String> {
+        validate_runtime_session_settings_update(current, update)
+    }
+
+    fn resolve_session_settings(config: &BackendSpawnConfig) -> protocol::SessionSettingsValues {
+        resolve_session_settings(config)
+    }
+
+    fn session_is_resumable(
+        _session_id: &SessionId,
+        workspace_roots: &[String],
+        resolved: &ResolvedSpawnConfig,
+    ) -> bool {
+        session_is_resumable_for_workspace_roots(workspace_roots, resolved)
+    }
+
+    fn helper_session_settings(
+        settings: Option<&SessionSettingsValues>,
+    ) -> Option<SessionSettingsValues> {
+        helper_session_settings(settings)
+    }
+
     fn capabilities() -> tyde_agent_adapter::BackendCapabilities {
         [
             tyde_agent_adapter::BackendCapability::ListSessions,
@@ -1116,7 +1247,7 @@ impl Backend for HermesBackend {
             active_compaction: Arc::clone(&active_compaction),
             command_rx,
             gateway_events_rx,
-            subagent_emitter: None,
+            subagent_emitter: config.subagent_emitter.clone(),
             native_subagents: HashMap::new(),
             native_delegations: HashMap::new(),
             synthetic_subagent_ids: HashMap::new(),
@@ -1127,6 +1258,7 @@ impl Backend for HermesBackend {
         Ok((
             Self {
                 command_tx,
+                session_settings: resolved_settings,
                 session_id: stored_session_id,
                 compaction_capability,
                 active_compaction,
@@ -1241,7 +1373,7 @@ impl Backend for HermesBackend {
             active_compaction: Arc::clone(&active_compaction),
             command_rx,
             gateway_events_rx,
-            subagent_emitter: None,
+            subagent_emitter: config.subagent_emitter.clone(),
             native_subagents: HashMap::new(),
             native_delegations: HashMap::new(),
             synthetic_subagent_ids: HashMap::new(),
@@ -1256,6 +1388,7 @@ impl Backend for HermesBackend {
         Ok((
             Self {
                 command_tx,
+                session_settings: resolved_settings,
                 session_id: stored_session_id,
                 compaction_capability,
                 active_compaction,
@@ -1278,7 +1411,9 @@ impl Backend for HermesBackend {
         ))
     }
 
-    async fn list_sessions() -> Result<Vec<BackendSession>, String> {
+    async fn list_sessions(
+        _context: &crate::backend::BackendProbeContext,
+    ) -> Result<Vec<BackendSession>, String> {
         let profile = hermes_config::resolve_profile_ref(None)?;
         let (gateway, _gateway_events_rx) = HermesGatewayHandle::spawn(
             &[],
@@ -1367,10 +1502,22 @@ impl Backend for HermesBackend {
         }
     }
 
+    async fn read_session_settings(&self) -> Result<SessionSettingsValues, String> {
+        let (reply, result) = oneshot::channel();
+        self.command_tx
+            .send(HermesBackendCommand::ReadSessionSettings(reply))
+            .map_err(|_| "Hermes session has closed".to_owned())?;
+        result
+            .await
+            .map_err(|_| "Hermes settings read channel closed".to_owned())?
+    }
+
     async fn update_session_settings(
         &mut self,
-        payload: protocol::SetSessionSettingsPayload,
+        mut payload: protocol::SetSessionSettingsPayload,
     ) -> Result<(), String> {
+        Self::validate_runtime_session_settings_update(&self.session_settings, &payload.values)?;
+        payload.values.0.remove(HERMES_PROFILE_SETTING);
         let (reply_tx, reply_rx) = oneshot::channel();
         self.command_tx
             .send(HermesBackendCommand::UpdateSessionSettings(
@@ -1422,19 +1569,6 @@ impl Backend for HermesBackend {
             .is_ok()
         {
             let _ = tokio::time::timeout(HERMES_SHUTDOWN_TIMEOUT, reply_rx).await;
-        }
-    }
-}
-
-impl HermesBackend {
-    pub(crate) async fn set_subagent_emitter(&self, emitter: Arc<dyn SubAgentEmitter>) {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        if self
-            .command_tx
-            .send(HermesBackendCommand::SetSubagentEmitter(emitter, reply_tx))
-            .is_ok()
-        {
-            let _ = reply_rx.await;
         }
     }
 }
@@ -1941,6 +2075,54 @@ async fn run_credential_actions_for_profile(
     }
 }
 
+const HERMES_PROFILE_LAUNCH_ID_PREFIX: &str = "hermes:profile:";
+
+fn synthesize_profile_entries(
+    infos: &[HermesLaunchProfileInfo],
+    entries: &mut Vec<protocol::LaunchProfileEntry>,
+) {
+    for info in infos {
+        if info.name == protocol::hermes_config::HERMES_DEFAULT_PROFILE {
+            continue;
+        }
+        let id =
+            protocol::LaunchProfileId(format!("{HERMES_PROFILE_LAUNCH_ID_PREFIX}{}", info.name));
+        let label = format!("Hermes — {}", info.name);
+        match &info.error {
+            None => {
+                let mut session_settings = protocol::SessionSettingsValues::default();
+                session_settings.0.insert(
+                    HERMES_PROFILE_SETTING.to_owned(),
+                    protocol::SessionSettingValue::String(info.name.clone()),
+                );
+                entries.push(protocol::LaunchProfileEntry::Ready {
+                    profile: protocol::LaunchProfile {
+                        id,
+                        kind: protocol::LaunchProfileKind::BackendDefault,
+                        label,
+                        description: Some(match &info.summary {
+                            Some(summary) => format!(
+                                "Launch Hermes with its '{}' profile ({summary}).",
+                                info.name
+                            ),
+                            None => format!("Launch Hermes with its '{}' profile.", info.name),
+                        }),
+                        backend_kind: protocol::BackendKind::Hermes,
+                        session_settings,
+                    },
+                });
+            }
+            Some(error) => entries.push(protocol::LaunchProfileEntry::Unavailable {
+                id,
+                kind: protocol::LaunchProfileKind::BackendDefault,
+                backend_kind: protocol::BackendKind::Hermes,
+                label,
+                message: error.clone(),
+            }),
+        }
+    }
+}
+
 /// One discovered Hermes profile as the launch-profile catalog sees it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct HermesLaunchProfileInfo {
@@ -2102,60 +2284,6 @@ fn hermes_config_default_profile() -> &'static str {
     protocol::hermes_config::HERMES_DEFAULT_PROFILE
 }
 
-/// Settings-dependent stand-in for [`probe_session_settings_schema`] used
-/// when real backend probing is disabled (test fixtures): a fixed
-/// two-provider model catalog run through the SAME parsing/filtering as a
-/// real `model.options` payload, including `hermes_disabled_providers`. This
-/// makes the provider-disable → session-schema re-probe coupling observable
-/// at the protocol level in sims — disabling `mock-openai` visibly removes
-/// its model option from the published `SessionSchemas` frame — instead of
-/// only proving that a refresh routine was entered.
-pub(crate) fn mock_probe_session_settings_schema(
-    disabled_providers: &HashMap<String, Vec<String>>,
-) -> SessionSettingsSchema {
-    let payload = serde_json::json!({
-        "providers": [
-            {
-                "slug": "mock-anthropic",
-                "name": "Mock Anthropic",
-                "authenticated": true,
-                "models": ["mock-claude"],
-            },
-            {
-                "slug": "mock-openai",
-                "name": "Mock OpenAI",
-                "authenticated": true,
-                "models": ["mock-gpt"],
-            },
-        ],
-    });
-    let disabled = disabled_providers
-        .get(hermes_config_default_profile())
-        .map(Vec::as_slice)
-        .unwrap_or_default();
-    let (options, default) = model_select_options_from_payload(&payload, disabled)
-        .expect("static mock Hermes model catalog parses");
-    let mut fields = vec![SessionSettingField {
-        key: "model".to_string(),
-        label: "Model".to_string(),
-        description: Some(
-            "Hermes model from authenticated providers reported by model.options.".to_string(),
-        ),
-        use_slider: false,
-        select_options_by_setting: None,
-        field_type: SessionSettingFieldType::Select {
-            options,
-            default,
-            nullable: true,
-        },
-    }];
-    fields.extend(hermes_base_session_fields());
-    SessionSettingsSchema {
-        backend_kind: BackendKind::Hermes,
-        fields,
-    }
-}
-
 /// The profile's currently effective `provider/model` from a `model.options`
 /// payload, for display.
 fn model_summary_from_payload(value: &Value) -> Option<String> {
@@ -2191,7 +2319,8 @@ impl HermesSessionActor {
                 reason: BackendCompactionDeferredReason::AnotherCompactionActive,
             };
         }
-        if self.mapper.current_message_id.is_some()
+        if self.mapper.typing_active
+            || self.mapper.current_message_id.is_some()
             || self.mapper.current_reasoning_seen
             || !self.mapper.pending_tools.is_empty()
             || self.mapper.pending_approval_tool_id.is_some()
@@ -2373,13 +2502,12 @@ impl HermesSessionActor {
                     let Some(command) = maybe_command else { break; };
                     match command {
                         HermesBackendCommand::Input(input) => self.handle_input(input).await,
+                        HermesBackendCommand::ReadSessionSettings(reply) => {
+                            let _ = reply.send(self.read_session_settings().await);
+                        }
                         HermesBackendCommand::UpdateSessionSettings(payload, reply) => {
                             let result = self.handle_settings_update(payload.values).await;
                             let _ = reply.send(result);
-                        }
-                        HermesBackendCommand::SetSubagentEmitter(emitter, reply) => {
-                            self.subagent_emitter = Some(emitter);
-                            let _ = reply.send(());
                         }
                         HermesBackendCommand::Interrupt(reply) => {
                             let ok = self.handle_interrupt().await;
@@ -2521,20 +2649,26 @@ impl HermesSessionActor {
             .iter()
             .filter_map(|process| {
                 let task_id = process.get("session_id")?.as_str()?;
+                let output = process.get("output_tail").and_then(Value::as_str)?;
                 (process.get("status").and_then(Value::as_str) == Some("exited")
                     && self.mapper.background_tasks.contains_key(task_id))
                 .then(|| {
                     (
                         task_id.to_owned(),
                         process.get("exit_code").and_then(Value::as_i64),
+                        output.to_owned(),
                     )
                 })
             })
             .collect::<Vec<_>>();
-        for (task_id, exit_code) in terminals {
+        for (task_id, exit_code, output) in terminals {
             let Some(background) = self.mapper.background_tasks.remove(&task_id) else {
                 continue;
             };
+            eprintln!(
+                "TYDE HERMES BACKGROUND POLL TERMINAL task_id={task_id} exit_code={exit_code:?} output_bytes={}",
+                output.len()
+            );
             let status = if exit_code == Some(0) {
                 BackgroundTaskTerminalStatus::Completed
             } else {
@@ -2553,7 +2687,7 @@ impl HermesSessionActor {
                 exit_code
                     .and_then(|code| i32::try_from(code).ok())
                     .unwrap_or(-1),
-                String::new(),
+                output,
                 exit_code.map(|code| format!("Exited with code {code}")),
             ) {
                 self.emit(event);
@@ -2800,6 +2934,28 @@ impl HermesSessionActor {
                 }
             }
         }
+    }
+
+    async fn read_session_settings(&self) -> Result<SessionSettingsValues, String> {
+        let reasoning = self
+            .gateway
+            .request(
+                "config.get",
+                json!({"session_id": self.live_session_id, "key": "reasoning"}),
+            )
+            .await?;
+        let fast = self
+            .gateway
+            .request(
+                "config.get",
+                json!({"session_id": self.live_session_id, "key": "fast"}),
+            )
+            .await?;
+        crate::backend::session_settings_from_json(json!({
+            "model": self.mapper.model.as_ref().map(|model| encode_model_option_value(model, self.mapper.provider.as_deref())),
+            "reasoning_effort": reasoning.get("value"),
+            "fast": fast.get("value").and_then(Value::as_str) == Some("fast"),
+        }))
     }
 
     async fn handle_settings_update(
@@ -3194,7 +3350,7 @@ impl HermesSessionActor {
             );
         }
 
-        let mut child_event = None;
+        let mut child_events = Vec::new();
         let mut parent_progress = None;
         let mut settled_child = None;
         if let Some(child) = self.native_subagents.get_mut(&subagent_id) {
@@ -3240,31 +3396,47 @@ impl HermesSessionActor {
                 if let Some(usage) = token_usage.as_ref() {
                     let _ = child.handle.total_usage_tx.send(usage.total_tokens);
                 }
-                child_event = Some(ChatEvent::MessageAdded(ChatMessage {
-                    message_id: None,
-                    timestamp: unix_now_ms(),
-                    sender: MessageSender::Assistant {
-                        agent: HERMES_AGENT_NAME.to_string(),
-                    },
-                    content,
-                    reasoning: None,
-                    tool_calls: Vec::new(),
-                    model_info: optional_string(&payload, &["model"])
-                        .map(|model| ModelInfo { model }),
-                    token_usage: token_usage.map(|usage| MessageTokenUsage {
-                        request: TokenUsageScope::Unavailable {
-                            reason: TokenUsageUnavailableReason::ProviderScopeAmbiguous,
+                if let Some(messages) = payload.get("_tyde_messages") {
+                    match hermes_native_child_history(messages) {
+                        Ok(events) => child_events = events,
+                        Err(error) => {
+                            child_events.push(ChatEvent::MessageAdded(error_message(error)))
+                        }
+                    }
+                } else if let Some(error) =
+                    payload.get("_tyde_history_error").and_then(Value::as_str)
+                {
+                    child_events.push(ChatEvent::MessageAdded(error_message(format!(
+                        "Hermes child history: {error}"
+                    ))));
+                } else {
+                    child_events.push(ChatEvent::MessageAdded(ChatMessage {
+                        message_id: None,
+                        timestamp: unix_now_ms(),
+                        sender: MessageSender::Assistant {
+                            agent: HERMES_AGENT_NAME.to_string(),
                         },
-                        turn: TokenUsageScope::Known {
-                            usage: Box::new(usage.clone()),
-                        },
-                        cumulative: TokenUsageScope::Known {
-                            usage: Box::new(usage),
-                        },
-                    }),
-                    context_breakdown: None,
-                    images: None,
-                }));
+                        content,
+                        reasoning: None,
+                        tool_calls: Vec::new(),
+                        model_info: optional_string(&payload, &["model"])
+                            .map(|model| ModelInfo { model }),
+                        token_usage: token_usage.map(|usage| MessageTokenUsage {
+                            request: TokenUsageScope::Unavailable {
+                                reason: TokenUsageUnavailableReason::ProviderScopeAmbiguous,
+                            },
+                            turn: TokenUsageScope::Known {
+                                usage: Box::new(usage.clone()),
+                            },
+                            cumulative: TokenUsageScope::Known {
+                                usage: Box::new(usage),
+                            },
+                        }),
+                        context_breakdown: None,
+                        images: None,
+                    }));
+                }
+                child_events.push(ChatEvent::TypingStatusChanged(false));
                 if let Some(anchor) = child.parent_anchor.as_ref() {
                     settled_child = Some((anchor.clone(), status, payload.clone()));
                 }
@@ -3273,10 +3445,10 @@ impl HermesSessionActor {
         if let Some(progress) = parent_progress {
             self.emit(ChatEvent::ToolProgress(progress));
         }
-        if let Some(event) = child_event
-            && let Some(child) = self.native_subagents.get(&subagent_id)
-        {
-            let _ = child.handle.event_tx.send(event);
+        if let Some(child) = self.native_subagents.get(&subagent_id) {
+            for event in child_events {
+                let _ = child.handle.event_tx.send(event);
+            }
         }
         if let Some((anchor, status, payload)) = settled_child {
             let delegation = self
@@ -3335,7 +3507,7 @@ impl HermesSessionActor {
             ),
         )
         .await;
-        let context_breakdown = match context_result {
+        let mut context_breakdown = match context_result {
             Ok(Ok(value)) => match context_breakdown_from_hermes(&value) {
                 Some(context_breakdown) => Some(context_breakdown),
                 None => {
@@ -3367,6 +3539,16 @@ impl HermesSessionActor {
             if let Some(session_usage) = turn_usage {
                 let (turn_usage, cumulative_usage) =
                     self.mapper.record_session_usage(session_usage);
+                if let Some(breakdown) = context_breakdown.as_mut() {
+                    // Native context_used includes the just-generated response;
+                    // a message breakdown describes this request's input only.
+                    eprintln!(
+                        "TYDE HERMES CONTEXT INPUT native={} request={}",
+                        breakdown.input_tokens,
+                        turn_usage.prompt_tokens()
+                    );
+                    breakdown.input_tokens = turn_usage.prompt_tokens();
+                }
                 object.insert(
                     "usage".to_string(),
                     token_usage_to_gateway_value(&turn_usage),
@@ -4455,7 +4637,7 @@ async fn register_hermes_skill_dir(
 
 async fn register_hermes_skill_dirs(
     target: &HermesSpawnTarget,
-    skills: &[crate::agent::customization::ResolvedSkill],
+    skills: &[crate::backend::customization::ResolvedSkill],
 ) -> Result<(), String> {
     for root in hermes_skill_roots(skills)? {
         register_hermes_skill_dir(target, &root).await?;
@@ -4464,7 +4646,7 @@ async fn register_hermes_skill_dirs(
 }
 
 fn hermes_skill_roots(
-    skills: &[crate::agent::customization::ResolvedSkill],
+    skills: &[crate::backend::customization::ResolvedSkill],
 ) -> Result<Vec<PathBuf>, String> {
     let mut roots = Vec::new();
     for skill in skills {
@@ -4637,6 +4819,13 @@ impl HermesEventMapper {
             }
             "tool.start" => self.map_tool_start(payload),
             "tool.progress" => self.map_tool_progress(payload),
+            "todo.updated" => payload
+                .as_ref()
+                .and_then(|value| {
+                    hermes_task_list_from_value(value, &mut self.task_ids, &mut self.next_task_id)
+                })
+                .map(|tasks| vec![ChatEvent::TaskUpdate(tasks)])
+                .ok_or_else(|| "Hermes todo.updated omitted its task snapshot".to_owned()),
             "tool.complete" => self.map_tool_complete(payload),
             "tool.output_risk" => self.map_tool_output_risk(payload),
             "clarify.request" => self.map_clarify_request(payload),
@@ -5188,8 +5377,16 @@ impl HermesEventMapper {
 
     fn map_tool_start(&mut self, payload: Option<Value>) -> Result<Vec<ChatEvent>, String> {
         let payload = required_payload(payload, "tool.start")?;
-        let tool_call_id =
+        let provider_tool_id =
             required_string_any(&payload, &["tool_id", "tool_call_id"], "tool.start")?;
+        let response_id = self
+            .current_message_id
+            .as_ref()
+            .ok_or_else(|| "Hermes tool started without a provider response".to_owned())?;
+        let tool_call_id = format!("hermes:{response_id}:{provider_tool_id}");
+        self.tool_call_ids
+            .insert(provider_tool_id.clone(), tool_call_id.clone());
+        eprintln!("TYDE HERMES TOOL ID provider={provider_tool_id} presentation={tool_call_id}");
         let tool_name = required_string_any(&payload, &["name", "tool_name"], "tool.start")?;
         if self.pending_tools.contains_key(&tool_call_id) {
             return Err(format!(
@@ -5298,6 +5495,11 @@ impl HermesEventMapper {
         let payload = required_payload(payload, "tool.progress")?;
         let tool_call_id =
             required_string_any(&payload, &["tool_id", "tool_call_id"], "tool.progress")?;
+        let tool_call_id = self
+            .tool_call_ids
+            .get(&tool_call_id)
+            .cloned()
+            .unwrap_or(tool_call_id);
         self.opaque_progress_tools.insert(tool_call_id.clone());
         Ok(vec![ChatEvent::ToolProgress(ToolProgressData {
             tool_call_id,
@@ -5349,6 +5551,11 @@ impl HermesEventMapper {
         eprintln!("TYDE HERMES TOOL COMPLETE RAW payload={payload}");
         let tool_call_id =
             required_string_any(&payload, &["tool_id", "tool_call_id"], "tool.complete")?;
+        let tool_call_id = self
+            .tool_call_ids
+            .get(&tool_call_id)
+            .cloned()
+            .unwrap_or(tool_call_id);
         let tool_name = required_string_any(&payload, &["name", "tool_name"], "tool.complete")?;
         let Some(expected_name) = self.pending_tools.get(&tool_call_id).cloned() else {
             if self.cancelled_tools.remove(&tool_call_id) {
@@ -6031,12 +6238,12 @@ fn is_hermes_delegate_tool(tool_name: &str) -> bool {
 }
 
 fn is_hermes_todo_tool(tool_name: &str) -> bool {
-    tool_name
+    let normalized = tool_name
         .chars()
         .filter(|ch| ch.is_ascii_alphanumeric())
         .map(|ch| ch.to_ascii_lowercase())
-        .collect::<String>()
-        == "todo"
+        .collect::<String>();
+    matches!(normalized.as_str(), "todo" | "todolist")
 }
 
 fn hermes_task_list_from_value(
@@ -7036,7 +7243,7 @@ fn parse_session_list(value: &Value, resumable: bool) -> Result<Vec<BackendSessi
         out.push(BackendSession {
             id: SessionId(id),
             backend_kind: BackendKind::Hermes,
-            workspace_roots: Vec::new(),
+            workspace_roots: optional_string(session, &["cwd"]).into_iter().collect(),
             title: optional_string(session, &["title"]),
             token_count: None,
             created_at_ms: timestamp,
@@ -7045,6 +7252,26 @@ fn parse_session_list(value: &Value, resumable: bool) -> Result<Vec<BackendSessi
         });
     }
     Ok(out)
+}
+
+fn hermes_native_child_history(messages: &Value) -> Result<Vec<ChatEvent>, String> {
+    let history = hermes_history_to_chat_events(&json!({"messages": messages}))?;
+    let mut events = Vec::new();
+    for event in history {
+        match event {
+            ChatEvent::MessageAdded(message)
+                if matches!(message.sender, MessageSender::Assistant { .. }) =>
+            {
+                events.push(ChatEvent::StreamStart(StreamStartData {
+                    agent: HERMES_AGENT_NAME.to_owned(),
+                    model: message.model_info.as_ref().map(|info| info.model.clone()),
+                }));
+                events.push(ChatEvent::StreamEnd(StreamEndData { message }));
+            }
+            event => events.push(event),
+        }
+    }
+    Ok(events)
 }
 
 fn hermes_history_to_chat_events(value: &Value) -> Result<Vec<ChatEvent>, String> {
@@ -7058,7 +7285,8 @@ fn hermes_history_to_chat_events(value: &Value) -> Result<Vec<ChatEvent>, String
     // The assistant record's tool_calls become the replayed ToolRequests, so
     // their names are the authority for each tool_call_id's completion.
     let mut requested_tool_names: HashMap<String, String> = HashMap::new();
-    for message in messages {
+    let mut tool_call_ids = HashMap::new();
+    for (message_index, message) in messages.iter().enumerate() {
         let role = required_string(message, &["role"], "session.history message")?;
         let text = message
             .get("text")
@@ -7067,7 +7295,13 @@ fn hermes_history_to_chat_events(value: &Value) -> Result<Vec<ChatEvent>, String
             .unwrap_or_default()
             .to_string();
         let content_offset = u32::try_from(text.chars().count()).unwrap_or(u32::MAX);
-        let tool_calls = hermes_history_tool_calls(message, content_offset)?;
+        let mut tool_calls = hermes_history_tool_calls(message, content_offset)?;
+        for tool_call in &mut tool_calls {
+            let provider_id = tool_call.tool_call_id.clone();
+            let id = format!("hermes:history:{message_index}:{provider_id}");
+            tool_call.tool_call_id = id.clone();
+            tool_call_ids.insert(provider_id, id);
+        }
         for tool_call in &tool_calls {
             requested_tool_names.insert(tool_call.tool_call_id.clone(), tool_call.name.clone());
         }
@@ -7090,6 +7324,10 @@ fn hermes_history_to_chat_events(value: &Value) -> Result<Vec<ChatEvent>, String
                     events.push(ChatEvent::MessageAdded(system_message(content)));
                     continue;
                 };
+                let tool_call_id = tool_call_ids
+                    .get(&tool_call_id)
+                    .cloned()
+                    .unwrap_or(tool_call_id);
                 let tool_name = requested_tool_names
                     .get(&tool_call_id)
                     .cloned()
@@ -8421,6 +8659,45 @@ fn duration_from_env_ms(key: &str, default: Duration) -> Duration {
         .filter(|millis| *millis > 0)
         .map(Duration::from_millis)
         .unwrap_or(default)
+}
+
+fn helper_session_settings(
+    session_settings: Option<&protocol::SessionSettingsValues>,
+) -> Option<protocol::SessionSettingsValues> {
+    let mut helper_settings = protocol::SessionSettingsValues::default();
+    if let Some(session_settings) = session_settings {
+        for key in [HERMES_PROFILE_SETTING, "model"] {
+            if let Some(value) = session_settings.0.get(key) {
+                helper_settings.0.insert(key.to_owned(), value.clone());
+            }
+        }
+    }
+    // Hermes cost hints supply no defaults. Preserve already-cheap explicit
+    // effort, cap higher effort at `low`, and use the schema's minimum for
+    // profile-default or invalid values.
+    helper_settings.0.insert(
+        "reasoning_effort".to_owned(),
+        protocol::SessionSettingValue::String(
+            hidden_helper_reasoning_effort(session_settings).to_owned(),
+        ),
+    );
+    Some(helper_settings)
+}
+
+fn hidden_helper_reasoning_effort(
+    session_settings: Option<&protocol::SessionSettingsValues>,
+) -> &'static str {
+    match session_settings
+        .and_then(|settings| settings.0.get("reasoning_effort"))
+        .and_then(|value| match value {
+            protocol::SessionSettingValue::String(value) => Some(value.as_str()),
+            _ => None,
+        }) {
+        Some("none") => "none",
+        Some("minimal") => "minimal",
+        Some("low") | Some("medium") | Some("high") | Some("xhigh") => "low",
+        Some(_) | None => "none",
+    }
 }
 
 #[cfg(test)]

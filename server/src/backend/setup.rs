@@ -1016,3 +1016,31 @@ fn sign_in_command(
 fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
+
+pub(crate) fn configured_acp_setup_agents(
+    settings: &settings_model::HostSettings,
+) -> Vec<ConfiguredAcpAgent> {
+    let mut agents = Vec::new();
+    for kind in super::SUPPORTED_BACKENDS {
+        if let Some(agent) = super::default_launch_config(kind) {
+            agents.push(ConfiguredAcpAgent {
+                label: super::default_launch_profile(kind).label,
+                command: agent.command,
+                adapter: agent.adapter,
+            });
+        }
+    }
+    for profile in settings.launch_profiles.values() {
+        if profile.id == super::default_launch_profile(profile.backend_kind).id {
+            continue;
+        }
+        if let Some(agent) = profile.acp.as_ref() {
+            agents.push(ConfiguredAcpAgent {
+                label: profile.label.clone(),
+                command: agent.command.clone(),
+                adapter: agent.adapter,
+            });
+        }
+    }
+    agents
+}
