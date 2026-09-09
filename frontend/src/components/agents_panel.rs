@@ -1708,17 +1708,15 @@ fn agent_card(
     let status_icon_sig = move || status_icon(&derived.get());
     let status_title_sig = move || status_label(&derived.get());
     let status_label_sig = move || status_label(&derived.get());
-    // Running and idle states are conventional enough to read from their glyph
-    // alone. A cancelled or cancelling turn is not: `⊘` is ambiguous, and
-    // "your work was stopped" is exactly the outcome a user must not have to
-    // hover or use a screen reader to discover.
+    // Running, idle, and background-work states are conventional enough to
+    // read from their glyph and color alone. A cancelled or cancelling turn
+    // is not: `⊘` is ambiguous, and "your work was stopped" is exactly the
+    // outcome a user must not have to hover or use a screen reader to
+    // discover.
     // Compaction joins the visible-label set for the same reason cancellation
     // is in it: `⟲` is not self-explanatory, and "your context is being
     // rewritten for the next few minutes" is not an outcome a user should have
     // to hover or use a screen reader to discover.
-    // Background work is spelled out because the hourglass on its own reads
-    // as "still busy", and the useful fact is that the turn is over and
-    // nothing is needed from the user yet.
     let status_label_visible_sig = {
         move || {
             matches!(
@@ -1727,7 +1725,6 @@ fn agent_card(
                     | DerivedAgentState::Cancelling
                     | DerivedAgentState::CompactionQueued
                     | DerivedAgentState::Compacting
-                    | DerivedAgentState::BackgroundWork
             )
         }
     };
@@ -3227,8 +3224,8 @@ mod wasm_tests {
         let (title, class, text) = status_of(&container);
         assert_eq!(title, "Background work");
         assert!(
-            text.contains("Background work"),
-            "the reason the agent is not done must be visible without hovering: {text:?}"
+            text.contains('\u{29D7}'),
+            "background work must show the hourglass: {text:?}"
         );
         assert!(
             !text.contains('\u{2713}'),
@@ -3239,8 +3236,29 @@ mod wasm_tests {
             "background work is not a running turn and must not reuse the clock: {text:?}"
         );
         assert!(
-            !class.contains("completed") && !class.contains("running"),
-            "background work must not reuse the completed or running style: {class}"
+            class.contains("background")
+                && !class.contains("completed")
+                && !class.contains("running"),
+            "background work uses the warning style, not completed or running: {class}"
+        );
+        let status = agent_card_el(&container, "a1")
+            .query_selector(".agent-card-status")
+            .unwrap()
+            .expect("the card renders a status element");
+        let hidden_label = status
+            .query_selector(".visually-hidden")
+            .unwrap()
+            .expect("background-work label stays available to screen readers");
+        assert_eq!(
+            hidden_label.text_content().as_deref(),
+            Some("Background work")
+        );
+        let label_box = hidden_label.get_bounding_client_rect();
+        assert!(
+            label_box.width() <= 1.0 && label_box.height() <= 1.0,
+            "the hourglass and yellow are enough; the label must not take visible space: {}x{}",
+            label_box.width(),
+            label_box.height()
         );
 
         // The command exits; the agent is genuinely idle again.
