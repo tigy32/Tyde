@@ -21,7 +21,7 @@ Passing real runs recorded on 2026-09-09. A dash means the backend does not decl
 | `real_interrupt_after_background_response` | Pass | Pass | — | — | — | — | Pass |
 | `real_conversation_on_resumed_session` | Pass | Pass | Pass | Pass | Pass | Pass | Pass |
 | `real_resumed_session_groups_parallel_tool_calls` | Pass | Pass | Pass | Pass | Pass | Pass | Pass |
-| `real_steering_compaction_and_resume` | Pass | Pass | — | — | — | — | Pass |
+| `real_steering_compaction_and_resume` | Pass | Pass | — | — | Pass | — | Pass |
 | `real_user_question` | Pass | — | — | Pass | — | — | Pass |
 | `real_watched_command_shows_every_interaction` | — | Pass | — | — | — | — | — |
 | `real_background_task_outlives_its_turn` | Pass | Pass | — | — | — | — | Pass |

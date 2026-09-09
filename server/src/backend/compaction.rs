@@ -384,6 +384,11 @@ pub enum BackendCompactionTerminalEvidence {
         response_status: Option<String>,
         rpc_code: Option<i64>,
     },
+    Grok {
+        session_id: String,
+        operation_id: CompactionOperationId,
+        used_rpc: bool,
+    },
     DispatchUncertain,
     None,
 }
@@ -416,6 +421,11 @@ impl BackendCompactionTerminalEvidence {
                 thread_id,
                 &format!("{turn_id}:{item_id}"),
             )),
+            Self::Grok {
+                session_id,
+                operation_id,
+                ..
+            } => Some(stable_observation_id("grok", session_id, &operation_id.0)),
             _ => None,
         }
     }
@@ -459,6 +469,10 @@ pub enum BackendCompactionObservationSource {
         event_id: String,
     },
     HermesRpc {
+        operation_id: CompactionOperationId,
+    },
+    GrokCommand {
+        session_id: String,
         operation_id: CompactionOperationId,
     },
     MockEvent {

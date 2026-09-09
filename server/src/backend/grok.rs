@@ -49,6 +49,7 @@ pub(crate) fn capabilities() -> BackendCapabilities {
         BackendCapability::TaskListClear,
         BackendCapability::CapacityTelemetry,
         BackendCapability::OutOfBandCapacity,
+        BackendCapability::CompactionReported,
     ]
     .into()
 }
@@ -282,6 +283,13 @@ impl crate::backend::Backend for GrokBackend {
 
     fn compaction_capability(&self) -> crate::backend::BackendCompactionCapability {
         self.0.compaction_capability()
+    }
+
+    async fn begin_compaction(
+        &self,
+        request: crate::backend::compaction::BackendCompactionRequest,
+    ) -> crate::backend::compaction::BackendCompactionStart {
+        self.0.begin_compaction(request).await
     }
 
     async fn interrupt(&self) -> bool {

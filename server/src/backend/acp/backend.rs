@@ -2,8 +2,8 @@ use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, mpsc, oneshot};
@@ -46,6 +46,7 @@ const KIRO_SCHEMA_PROBE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 const KIRO_PROMPT_MAX_RETRIES: u64 = 5;
 const ACP_CAPACITY_TIMEOUT: Duration = Duration::from_secs(20);
 const ACP_CAPACITY_REFRESH_INTERVAL: Duration = Duration::from_secs(120);
+const GROK_COMPACTION_TIMEOUT: Duration = Duration::from_secs(300);
 
 fn kiro_prompt_error_is_retryable(error: &str) -> bool {
     let error = error.to_ascii_lowercase();
@@ -563,7 +564,8 @@ impl KiroSession {
             ssh_host: mode.ssh_host,
             capacity_probe,
             capacity_state: Mutex::new(KiroCapacityState::default()),
-            prompt_lock: Mutex::new(()),
+            prompt_lock: Arc::new(Mutex::new(())),
+            in_flight_prompts: AtomicUsize::new(0),
             native_child_sessions: Mutex::new(HashSet::new()),
             native_sessions: Arc::new(NativeSessionRoutes::default()),
             native_owned_children: Mutex::new(Vec::new()),
@@ -608,6 +610,7 @@ impl KiroSession {
                 opencode_pending_response_usage: None,
                 opencode_cumulative_usage: TokenUsage::default(),
                 opencode_current_context_usage: None,
+                pending_compaction: None,
             }),
         });
 
@@ -694,6 +697,13 @@ struct KiroState {
     opencode_pending_response_usage: Option<Value>,
     opencode_cumulative_usage: TokenUsage,
     opencode_current_context_usage: Option<CurrentContextUsage>,
+    pending_compaction: Option<PendingGrokCompaction>,
+}
+
+struct PendingGrokCompaction {
+    tokens_before: Option<u64>,
+    tokens_after: Option<u64>,
+    failed_message: Option<String>,
 }
 
 struct GrokRequestUsage {
@@ -855,7 +865,8 @@ struct KiroInner {
     ssh_host: Option<String>,
     capacity_probe: Option<AcpSpawnSpec>,
     capacity_state: Mutex<KiroCapacityState>,
-    prompt_lock: Mutex<()>,
+    prompt_lock: Arc<Mutex<()>>,
+    in_flight_prompts: AtomicUsize,
     native_child_sessions: Mutex<HashSet<String>>,
     native_sessions: Arc<NativeSessionRoutes>,
     native_owned_children: Mutex<Vec<Arc<KiroInner>>>,
@@ -1572,6 +1583,363 @@ impl KiroInner {
         Ok(())
     }
 
+    fn compaction_capability(&self) -> crate::backend::BackendCompactionCapability {
+        if self.adapter.backend_kind() == protocol::BackendKind::Grok {
+            crate::backend::BackendCompactionCapability::native(
+                crate::backend::BackendCompactionMechanism::InterceptedTextCommand,
+                None,
+                crate::backend::BackendCompactionCapabilityEvidence::AdapterContract,
+            )
+        } else {
+            crate::backend::BackendCompactionCapability::context_unavailable(
+                crate::backend::BackendCompactionUnavailableReason::AdapterHasNoManualTransport,
+            )
+        }
+    }
+
+    async fn begin_compaction(
+        self: &Arc<Self>,
+        request: crate::backend::BackendCompactionRequest,
+    ) -> crate::backend::BackendCompactionStart {
+        use crate::backend::{
+            BackendCompactionDeferredReason, BackendCompactionNotDispatchedReason,
+            BackendCompactionStart, BackendCompactionUnavailableReason,
+        };
+
+        if self.adapter.backend_kind() != protocol::BackendKind::Grok {
+            return BackendCompactionStart::NotDispatched {
+                reason: BackendCompactionNotDispatchedReason::NativeUnavailable(
+                    BackendCompactionUnavailableReason::AdapterHasNoManualTransport,
+                ),
+            };
+        }
+        if self.shutting_down.load(Ordering::Acquire) {
+            return BackendCompactionStart::NotDispatched {
+                reason: BackendCompactionNotDispatchedReason::BackendClosed,
+            };
+        }
+        if self.in_flight_prompts.load(Ordering::SeqCst) > 0 {
+            return BackendCompactionStart::Deferred {
+                reason: BackendCompactionDeferredReason::ActiveTurn,
+            };
+        }
+        if !request.transcript_authoritative {
+            return BackendCompactionStart::NotDispatched {
+                reason: BackendCompactionNotDispatchedReason::NativeUnavailable(
+                    BackendCompactionUnavailableReason::TranscriptNotAuthoritative,
+                ),
+            };
+        }
+        {
+            let state = self.state.lock().await;
+            if state.pending_compaction.is_some() {
+                return BackendCompactionStart::Deferred {
+                    reason: BackendCompactionDeferredReason::AnotherCompactionActive,
+                };
+            }
+            if state.replaying_history {
+                return BackendCompactionStart::Deferred {
+                    reason: BackendCompactionDeferredReason::SessionInitializing,
+                };
+            }
+        }
+        let Ok(prompt_guard) = Arc::clone(&self.prompt_lock).try_lock_owned() else {
+            return BackendCompactionStart::Deferred {
+                reason: BackendCompactionDeferredReason::ActiveTurn,
+            };
+        };
+        if self.in_flight_prompts.load(Ordering::SeqCst) > 0 {
+            drop(prompt_guard);
+            return BackendCompactionStart::Deferred {
+                reason: BackendCompactionDeferredReason::ActiveTurn,
+            };
+        }
+
+        let (terminal_tx, terminal_rx) = oneshot::channel();
+        {
+            let mut state = self.state.lock().await;
+            if state.pending_compaction.is_some() {
+                return BackendCompactionStart::Deferred {
+                    reason: BackendCompactionDeferredReason::AnotherCompactionActive,
+                };
+            }
+            state.pending_compaction = Some(PendingGrokCompaction {
+                tokens_before: None,
+                tokens_after: None,
+                failed_message: None,
+            });
+        }
+
+        let inner = Arc::clone(self);
+        let operation_id = request.operation_id.clone();
+        tokio::spawn(async move {
+            let _prompt_guard = prompt_guard;
+            inner.run_grok_compact(request, terminal_tx).await;
+        });
+        crate::backend::BackendCompactionStart::Accepted(
+            crate::backend::BackendAcceptedCompaction {
+                operation_id,
+                terminal: terminal_rx,
+            },
+        )
+    }
+
+    async fn run_grok_compact(
+        self: Arc<Self>,
+        request: crate::backend::BackendCompactionRequest,
+        terminal_tx: oneshot::Sender<crate::backend::BackendCompactionResult>,
+    ) {
+        use crate::backend::{
+            BackendCompactionDispatchState, BackendCompactionEvent, BackendCompactionFailure,
+            BackendCompactionFailureKind, BackendCompactionMutationState,
+            BackendCompactionObservationSource, BackendCompactionProgress, BackendCompactionResult,
+            BackendCompactionSuccess, BackendCompactionTerminalEvidence,
+            BackendCompactionUserFocus, BackendCompactionUserFocusProvenance,
+            BackendObservedCompaction, PostCompactionTokenCount,
+        };
+        use protocol::{CompactionMethod, CompactionMetrics, CompactionStage, CompactionTrigger};
+
+        self.emitter
+            .compaction_event(&BackendCompactionEvent::Progress(
+                BackendCompactionProgress {
+                    operation_id: request.operation_id.clone(),
+                    stage: CompactionStage::Dispatching,
+                    elapsed_ms: None,
+                },
+            ));
+
+        let focus = request
+            .focus
+            .as_deref()
+            .map(str::trim)
+            .filter(|focus| !focus.is_empty())
+            .map(|focus| focus.split_whitespace().collect::<Vec<_>>().join(" "));
+        let started_at = Instant::now();
+        let outcome = tokio::time::timeout(
+            GROK_COMPACTION_TIMEOUT,
+            self.dispatch_grok_compact(focus.as_deref()),
+        )
+        .await;
+        let elapsed_ms = started_at.elapsed().as_millis() as u64;
+
+        self.emitter
+            .compaction_event(&BackendCompactionEvent::Progress(
+                BackendCompactionProgress {
+                    operation_id: request.operation_id.clone(),
+                    stage: CompactionStage::Finalizing,
+                    elapsed_ms: Some(elapsed_ms),
+                },
+            ));
+
+        let pending = self.state.lock().await.pending_compaction.take();
+        let session_id = protocol::SessionId(self.state.lock().await.session_id.clone());
+        let (tokens_before, tokens_after, failed_message) = match pending {
+            Some(pending) => (
+                pending.tokens_before,
+                pending.tokens_after,
+                pending.failed_message,
+            ),
+            None => (None, None, None),
+        };
+        let metrics = CompactionMetrics {
+            before_tokens: tokens_before,
+            after_tokens: tokens_after,
+            duration_ms: Some(elapsed_ms),
+            ..CompactionMetrics::default()
+        };
+
+        let timed_out = outcome.is_err();
+        let (used_rpc, dispatch_error) = match outcome {
+            Ok(Ok(used_rpc)) => (used_rpc, None),
+            Ok(Err(error)) => (false, Some(error)),
+            Err(_) => (
+                false,
+                Some("Timed out waiting for Grok compaction to finish".to_owned()),
+            ),
+        };
+        let provider_failed = failed_message.clone();
+        let error = dispatch_error.or(provider_failed);
+        let completed = error.is_none();
+        let result = BackendCompactionResult {
+            operation_id: request.operation_id.clone(),
+            dispatch: BackendCompactionDispatchState::Accepted,
+            mutation: if completed {
+                BackendCompactionMutationState::Completed
+            } else {
+                BackendCompactionMutationState::MayHaveMutated
+            },
+            outcome: if completed {
+                Ok(BackendCompactionSuccess {
+                    mechanism: if used_rpc {
+                        CompactionMethod::NativeRpc
+                    } else {
+                        CompactionMethod::NativeTextCommand
+                    },
+                })
+            } else {
+                Err(BackendCompactionFailure {
+                    kind: if timed_out {
+                        BackendCompactionFailureKind::TimedOut
+                    } else {
+                        BackendCompactionFailureKind::ProviderFailed
+                    },
+                    message: error.clone().unwrap_or_else(|| {
+                        "Grok compaction failed without a provider message".to_owned()
+                    }),
+                })
+            },
+            provider_session_id: Some(session_id.clone()),
+            metrics: metrics.clone(),
+            post_context_tokens: tokens_after
+                .map(PostCompactionTokenCount::Trusted)
+                .unwrap_or(PostCompactionTokenCount::Unknown),
+            evidence: BackendCompactionTerminalEvidence::Grok {
+                session_id: session_id.0.clone(),
+                operation_id: request.operation_id.clone(),
+                used_rpc,
+            },
+        };
+        if completed {
+            self.emitter
+                .compaction_event(&BackendCompactionEvent::Observed(Box::new(
+                    BackendObservedCompaction {
+                        observation_id: crate::backend::compaction::stable_observation_id(
+                            "grok",
+                            &session_id.0,
+                            &request.operation_id.0,
+                        ),
+                        trigger: CompactionTrigger::BackendObservedManual,
+                        method: if used_rpc {
+                            CompactionMethod::NativeRpc
+                        } else {
+                            CompactionMethod::NativeTextCommand
+                        },
+                        provider_session_id: Some(session_id),
+                        metrics,
+                        source: BackendCompactionObservationSource::GrokCommand {
+                            session_id: result
+                                .provider_session_id
+                                .as_ref()
+                                .map(|id| id.0.clone())
+                                .unwrap_or_default(),
+                            operation_id: request.operation_id.clone(),
+                        },
+                        user_focus: focus.map(|text| BackendCompactionUserFocus {
+                            text,
+                            provenance: BackendCompactionUserFocusProvenance::TydeRequest,
+                        }),
+                    },
+                )));
+        }
+        let _ = terminal_tx.send(result);
+    }
+
+    async fn dispatch_grok_compact(&self, focus: Option<&str>) -> Result<bool, String> {
+        let session_id = self.state.lock().await.session_id.clone();
+        let mut params = json!({ "sessionId": session_id });
+        if let Some(focus) = focus {
+            params["userContext"] = json!(focus);
+        }
+        match self
+            .bridge
+            .request("_x.ai/compact_conversation", params)
+            .await
+        {
+            Ok(_) => {
+                self.bridge.sync_inbound().await?;
+                return Ok(true);
+            }
+            Err(error) if grok_compact_method_missing(&error) => {}
+            Err(error) => return Err(error),
+        }
+
+        let prompt = match focus {
+            Some(focus) => format!("/compact {focus}"),
+            None => "/compact".to_owned(),
+        };
+        self.emitter.typing_status_changed(true);
+        {
+            let mut state = self.state.lock().await;
+            state.provider_turn_quarantined = false;
+            state.cancelled = false;
+        }
+        let params = json!({
+            "sessionId": session_id,
+            "prompt": [{ "type": "text", "text": prompt }],
+        });
+        let response = match self.request_prompt_with_retry(params).await {
+            Ok(value) => value,
+            Err(error) => {
+                if self.state.lock().await.cancelled {
+                    self.bridge.sync_inbound().await?;
+                    self.emitter.typing_status_changed(false);
+                    return Err("Grok compaction was cancelled".to_owned());
+                }
+                self.emitter.typing_status_changed(false);
+                return Err(error.to_string());
+            }
+        };
+        self.bridge.sync_inbound().await?;
+        if self.state.lock().await.provider_turn_quarantined {
+            self.emitter.typing_status_changed(false);
+            return Err("Grok compaction was quarantined after a provider error".to_owned());
+        }
+        let stop_reason = response
+            .get("stopReason")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if stop_reason == "cancelled" {
+            self.emitter.typing_status_changed(false);
+            return Err("Grok compaction was cancelled".to_owned());
+        }
+        if stop_reason == "failed" || stop_reason == "error" {
+            let message = response
+                .get("error")
+                .and_then(|value| value.get("message"))
+                .and_then(Value::as_str)
+                .or_else(|| response.get("message").and_then(Value::as_str))
+                .unwrap_or("Grok compact prompt failed")
+                .to_owned();
+            self.emitter.typing_status_changed(false);
+            return Err(message);
+        }
+        self.finalize_active_stream_if_any(Some(response), true)
+            .await;
+        Ok(false)
+    }
+
+    async fn record_grok_compact_started(&self, update: &Value) {
+        let tokens = json_u64(update, &["tokens_used", "tokensUsed"]);
+        let mut state = self.state.lock().await;
+        if let Some(pending) = state.pending_compaction.as_mut() {
+            pending.tokens_before = tokens.or(pending.tokens_before);
+        }
+    }
+
+    async fn record_grok_compact_completed(&self, update: &Value) {
+        let before = json_u64(update, &["tokens_before", "tokensBefore"]);
+        let after = json_u64(update, &["tokens_after", "tokensAfter"]);
+        let mut state = self.state.lock().await;
+        if let Some(pending) = state.pending_compaction.as_mut() {
+            pending.tokens_before = before.or(pending.tokens_before);
+            pending.tokens_after = after.or(pending.tokens_after);
+        }
+    }
+
+    async fn record_grok_compact_failed(&self, update: &Value) {
+        let message = update
+            .get("error")
+            .and_then(Value::as_str)
+            .or_else(|| update.get("reason").and_then(Value::as_str))
+            .unwrap_or("Grok compaction failed")
+            .to_owned();
+        let mut state = self.state.lock().await;
+        if let Some(pending) = state.pending_compaction.as_mut() {
+            pending.failed_message = Some(message);
+        }
+    }
+
     async fn shutdown(&self) {
         self.shutting_down.store(true, Ordering::Release);
 
@@ -1833,7 +2201,8 @@ impl KiroInner {
                 emitter: Some(subagents),
                 ..Default::default()
             }),
-            prompt_lock: Mutex::new(()),
+            prompt_lock: Arc::new(Mutex::new(())),
+            in_flight_prompts: AtomicUsize::new(0),
             native_child_sessions: Mutex::new(HashSet::new()),
             native_sessions: Arc::clone(&self.native_sessions),
             native_owned_children: Mutex::new(Vec::new()),
@@ -2089,6 +2458,10 @@ impl KiroInner {
                         .await;
                 }
             }
+            "grok_compact_started" => self.record_grok_compact_started(update).await,
+            "grok_compact_completed" => self.record_grok_compact_completed(update).await,
+            "grok_compact_failed" => self.record_grok_compact_failed(update).await,
+            "grok_compact_cancelled" => self.record_grok_compact_failed(update).await,
             "current_mode_update" => {
                 if let Some(mode) = extract_current_mode(update) {
                     let mut state = self.state.lock().await;
@@ -5681,9 +6054,9 @@ use protocol::{
 };
 
 use crate::backend::{
-    Backend, BackendCompactionCapability, BackendCompactionUnavailableReason, BackendEvent,
-    BackendSession, BackendSpawnConfig, EventStream, protocol_images_to_attachments,
-    resolve_settings as resolve_backend_settings, session_settings_to_json,
+    Backend, BackendCompactionCapability, BackendEvent, BackendSession, BackendSpawnConfig,
+    EventStream, protocol_images_to_attachments, resolve_settings as resolve_backend_settings,
+    session_settings_to_json,
 };
 
 const BACKEND_AGENT_NAME: &str = "kiro";
@@ -5887,9 +6260,14 @@ impl Backend for KiroBackend {
     }
 
     fn compaction_capability(&self) -> BackendCompactionCapability {
-        BackendCompactionCapability::context_unavailable(
-            BackendCompactionUnavailableReason::AdapterHasNoManualTransport,
-        )
+        self.command_handle.inner.compaction_capability()
+    }
+
+    async fn begin_compaction(
+        &self,
+        request: crate::backend::BackendCompactionRequest,
+    ) -> crate::backend::BackendCompactionStart {
+        self.command_handle.inner.begin_compaction(request).await
     }
 
     async fn spawn(
@@ -6005,7 +6383,12 @@ impl Backend for KiroBackend {
                                 let handle = handle.clone();
                                 let command_error_tx = command_error_tx.clone();
                                 tokio::spawn(async move {
-                                    if let Err(err) = handle.handle_follow_up(payload).await {
+                                    let result = handle.handle_follow_up(payload).await;
+                                    handle
+                                        .inner
+                                        .in_flight_prompts
+                                        .fetch_sub(1, Ordering::SeqCst);
+                                    if let Err(err) = result {
                                         let _ = command_error_tx.send(format!(
                                             "Failed to send ACP follow-up prompt: {err}"
                                         ));
@@ -6188,7 +6571,12 @@ impl Backend for KiroBackend {
                                 let handle = handle.clone();
                                 let command_error_tx = command_error_tx.clone();
                                 tokio::spawn(async move {
-                                    if let Err(err) = handle.handle_follow_up(payload).await {
+                                    let result = handle.handle_follow_up(payload).await;
+                                    handle
+                                        .inner
+                                        .in_flight_prompts
+                                        .fetch_sub(1, Ordering::SeqCst);
+                                    if let Err(err) = result {
                                         let _ = command_error_tx.send(format!(
                                             "Failed to send resumed ACP follow-up prompt: {err}"
                                         ));
@@ -6296,9 +6684,22 @@ impl Backend for KiroBackend {
 
     async fn send(&self, input: AgentInput) -> bool {
         match input {
-            input @ AgentInput::SendMessage(_) | input @ AgentInput::UpdateSessionSettings(_) => {
-                self.input_tx.send(input).is_ok()
+            input @ AgentInput::SendMessage(_) => {
+                self.command_handle
+                    .inner
+                    .in_flight_prompts
+                    .fetch_add(1, Ordering::SeqCst);
+                if self.input_tx.send(input).is_ok() {
+                    true
+                } else {
+                    self.command_handle
+                        .inner
+                        .in_flight_prompts
+                        .fetch_sub(1, Ordering::SeqCst);
+                    false
+                }
             }
+            input @ AgentInput::UpdateSessionSettings(_) => self.input_tx.send(input).is_ok(),
             AgentInput::GoalControl(_)
             | AgentInput::EditQueuedMessage(_)
             | AgentInput::CancelQueuedMessage(_)
@@ -6406,13 +6807,26 @@ fn map_kiro_value_to_chat_event(value: &Value) -> Option<ChatEvent> {
     }
 }
 
+fn grok_compact_method_missing(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    error.contains("method not found") || error.contains("(code -32601)")
+}
+
+fn json_u64(value: &Value, keys: &[&str]) -> Option<u64> {
+    keys.iter()
+        .find_map(|key| value.get(*key).and_then(Value::as_u64))
+}
+
 fn map_kiro_value_to_backend_event(value: &Value) -> Option<BackendEvent> {
-    if value.get("kind").and_then(Value::as_str) == Some("ModelRequestTokenUsage") {
-        return serde_json::from_value(value.get("data")?.clone())
+    match value.get("kind").and_then(Value::as_str) {
+        Some("ModelRequestTokenUsage") => serde_json::from_value(value.get("data")?.clone())
             .ok()
-            .map(BackendEvent::ModelRequestTokenUsage);
+            .map(BackendEvent::ModelRequestTokenUsage),
+        Some("BackendCompaction") => serde_json::from_value(value.get("data")?.clone())
+            .ok()
+            .map(BackendEvent::Compaction),
+        _ => map_kiro_value_to_chat_event(value).map(BackendEvent::Chat),
     }
-    map_kiro_value_to_chat_event(value).map(BackendEvent::Chat)
 }
 
 pub(crate) fn builtin_kiro_agent_spec() -> protocol::AcpAgentSpec {

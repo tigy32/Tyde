@@ -110,6 +110,10 @@ impl AcpAgentAdapter for GrokAdapter {
         let session_update = match update.get("sessionUpdate").and_then(Value::as_str)? {
             "response_completed" => "response_end",
             "turn_completed" => "turn_end",
+            "auto_compact_started" | "autoCompactStarted" => "grok_compact_started",
+            "auto_compact_completed" | "autoCompactCompleted" => "grok_compact_completed",
+            "auto_compact_failed" | "autoCompactFailed" => "grok_compact_failed",
+            "auto_compact_cancelled" | "autoCompactCancelled" => "grok_compact_cancelled",
             _ => return None,
         };
         Some(NormalizedUpdate {
