@@ -8433,6 +8433,26 @@ impl HostHandle {
         mobile_access.unregister_push(device_id).await
     }
 
+    pub(crate) async fn refresh_backend_setup(&self) {
+        let Ok(refresh_guard) = self.backend_setup_refresh_lock.try_lock() else {
+            return;
+        };
+        let payload = self.collect_backend_setup_respecting_probe().await;
+        let changed = {
+            let mut state = self.state.lock().await;
+            let changed = state.backend_setup != payload;
+            tracing::info!(changed, "refreshed backend installation state for new chat");
+            fan_out_backend_setup(&mut state, payload).await;
+            changed
+        };
+        if changed {
+            self.refresh_session_schemas_with_fanout(true).await;
+            self.refresh_backend_config_snapshots_with_fanout(true)
+                .await;
+        }
+        drop(refresh_guard);
+    }
+
     pub(crate) async fn fan_out_backend_setup(&self) {
         let payload = self.collect_backend_setup_respecting_probe().await;
         let mut state = self.state.lock().await;

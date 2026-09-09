@@ -1079,6 +1079,7 @@ pub enum FrameKind {
     AgentCompact,
     Interrupt,
     CloseAgent,
+    BackendSetupRefresh,
     RunBackendSetup,
     ProjectCreate,
     ProjectRename,
@@ -1278,6 +1279,7 @@ impl fmt::Display for FrameKind {
             Self::AgentCompact => f.write_str("agent_compact"),
             Self::Interrupt => f.write_str("interrupt"),
             Self::CloseAgent => f.write_str("close_agent"),
+            Self::BackendSetupRefresh => f.write_str("backend_setup_refresh"),
             Self::RunBackendSetup => f.write_str("run_backend_setup"),
             Self::ProjectCreate => f.write_str("project_create"),
             Self::ProjectRename => f.write_str("project_rename"),
@@ -3500,6 +3502,9 @@ pub struct BackendSetupInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sign_in_command: Option<BackendSetupCommand>,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackendSetupRefreshPayload {}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BackendSetupPayload {

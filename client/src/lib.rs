@@ -564,6 +564,14 @@ impl Connection {
             .await
     }
 
+    pub async fn backend_setup_refresh(&mut self) -> Result<(), FrameError> {
+        self.send_host_payload(
+            FrameKind::BackendSetupRefresh,
+            &protocol::BackendSetupRefreshPayload {},
+        )
+        .await
+    }
+
     pub async fn backend_settings_refresh(
         &mut self,
         payload: BackendSettingsRefreshPayload,

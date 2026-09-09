@@ -311,6 +311,11 @@ pub(crate) async fn route_client_envelope(
                 let _: WorkflowRefreshPayload = parse_payload(&envelope, "workflow_refresh")?;
                 host.refresh_workflows().await?;
             }
+            FrameKind::BackendSetupRefresh => {
+                let _: protocol::BackendSetupRefreshPayload =
+                    parse_payload(&envelope, "backend_setup_refresh")?;
+                host.refresh_backend_setup().await;
+            }
             FrameKind::BackendSettingsRefresh => {
                 let payload: BackendSettingsRefreshPayload =
                     parse_payload(&envelope, "backend_settings_refresh")?;

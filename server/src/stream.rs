@@ -711,6 +711,7 @@ pub(crate) fn classify(kind: FrameKind) -> OutputLane {
         | FrameKind::AgentCompact
         | FrameKind::Interrupt
         | FrameKind::CloseAgent
+        | FrameKind::BackendSetupRefresh
         | FrameKind::RunBackendSetup
         | FrameKind::ProjectCreate
         | FrameKind::ProjectRename

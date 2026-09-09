@@ -875,6 +875,40 @@ pub fn ChatInput(
         })
     });
     let composer = composer.unwrap_or_else(|| state.composer_untracked());
+    let refresh_state = state.clone();
+    let refresh_composer = composer.clone();
+    let draft_host = Memo::new(move |_| {
+        if agent_ref.get().is_some() {
+            return None;
+        }
+        let host_id = refresh_composer
+            .selection_host
+            .get()
+            .or_else(|| refresh_state.chat_context_host_id())?;
+        if refresh_state.connection_status_for_host(&host_id) != ConnectionStatus::Connected {
+            return None;
+        }
+        let stream = refresh_state
+            .host_streams
+            .with(|streams| streams.get(&host_id).cloned())?;
+        Some((host_id, stream))
+    });
+    Effect::new(move |_| {
+        if let Some((host_id, stream)) = draft_host.get() {
+            spawn_local(async move {
+                if let Err(error) = send_frame(
+                    &host_id,
+                    stream,
+                    FrameKind::BackendSetupRefresh,
+                    &protocol::BackendSetupRefreshPayload {},
+                )
+                .await
+                {
+                    log::warn!("failed to refresh backend installation state: {error}");
+                }
+            });
+        }
+    });
     let pending_images = RwSignal::new(Vec::<PendingImage>::new());
     let attachment_error = RwSignal::new(None::<String>);
     let drag_depth = RwSignal::new(0u32);
@@ -2166,6 +2200,88 @@ mod wasm_tests {
             query(&container, "[data-test='chat-send-menu']").is_none(),
             "no menu should be open"
         );
+    }
+
+    #[wasm_bindgen_test]
+    async fn draft_refreshes_installation_and_clears_stale_notice() {
+        let state = AppState::new();
+        configure(&state, false, false, "");
+        state.selected_host_id.set(Some(HOST.to_owned()));
+        crate::actions::begin_new_chat(&state, Some(BackendKind::Codex));
+        state.host_settings_by_host.update(|settings| {
+            settings.insert(
+                HOST.to_owned(),
+                settings_model::HostSettings {
+                    enabled_backends: vec![BackendKind::Codex],
+                    default_backend: Some(BackendKind::Codex),
+                    ..Default::default()
+                },
+            );
+        });
+        let mut info = protocol::BackendSetupInfo {
+            backend_kind: BackendKind::Codex,
+            status: BackendSetupStatus::NotInstalled,
+            installed_version: None,
+            docs_url: String::new(),
+            install_command: None,
+            diagnostic: None,
+            sign_in_command: None,
+        };
+        state.backend_setup_by_host.update(|setup| {
+            setup.insert(HOST.to_owned(), vec![info.clone()]);
+        });
+        let calls = stub_send_recording();
+        let container = make_container();
+        let mounted_state = state.clone();
+        let handle = mount_to(container.clone(), move || {
+            provide_context(mounted_state);
+            view! { <ChatInput /> }
+        });
+        next_tick().await;
+        assert!(
+            container
+                .text_content()
+                .unwrap()
+                .contains("isn't installed")
+        );
+        let refresh_count = || {
+            calls
+                .iter()
+                .filter_map(|entry| entry.as_string())
+                .filter(|entry| entry.contains("backend_setup_refresh"))
+                .count()
+        };
+        assert_eq!(
+            refresh_count(),
+            1,
+            "opening a draft must request fresh installation state"
+        );
+        info.status = BackendSetupStatus::Installed;
+        state.backend_setup_by_host.update(|setup| {
+            setup.insert(HOST.to_owned(), vec![info]);
+        });
+        state.composer_untracked().text.set("hello".to_owned());
+        next_tick().await;
+        assert!(
+            !container
+                .text_content()
+                .unwrap()
+                .contains("isn't installed")
+        );
+        assert!(!primary(&container).has_attribute("disabled"));
+        assert_eq!(
+            refresh_count(),
+            1,
+            "typing and refresh replies must not trigger more probes"
+        );
+        drop(handle);
+        let handle = mount_to(container.clone(), move || {
+            provide_context(state);
+            view! { <ChatInput /> }
+        });
+        next_tick().await;
+        assert_eq!(refresh_count(), 2, "reopening a draft must recheck");
+        drop(handle);
     }
 
     // ── State matrix row 2: Idle + input, no session ──────────────────────────

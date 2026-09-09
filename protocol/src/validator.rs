@@ -860,6 +860,13 @@ impl ProtocolValidator {
             FrameKind::SkillRefresh => {
                 parse_host_payload::<SkillRefreshPayload>(self, envelope, "SkillRefresh")
             }
+            FrameKind::BackendSetupRefresh => {
+                parse_host_payload::<crate::BackendSetupRefreshPayload>(
+                    self,
+                    envelope,
+                    "BackendSetupRefresh",
+                )
+            }
             FrameKind::BackendSettingsRefresh => {
                 parse_host_payload::<BackendSettingsRefreshPayload>(
                     self,

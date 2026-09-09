@@ -756,6 +756,27 @@ fn generated_alias_never_overrides_user_alias() {
 }
 
 #[tokio::test]
+async fn backend_setup_refresh_republishes_without_reconnecting() {
+    let mut fixture = Fixture::new().await;
+    for _ in 0..2 {
+        fixture
+            .client
+            .backend_setup_refresh()
+            .await
+            .expect("request setup refresh");
+        let envelope = next_frame_matching_on(
+            &mut fixture.client,
+            "fresh backend installation state",
+            |env| env.kind == FrameKind::BackendSetup,
+        )
+        .await;
+        let payload: protocol::BackendSetupPayload =
+            envelope.parse_payload().expect("backend setup");
+        assert_eq!(payload, fixture.bootstrap.backend_setup);
+    }
+}
+
+#[tokio::test]
 async fn backend_setup_payload_reports_found_unusable_hermes_cli() {
     let _env_guard = env_lock().lock().await;
     let temp_home = tempfile::tempdir().expect("create temp HOME");
