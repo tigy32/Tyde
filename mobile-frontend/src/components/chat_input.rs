@@ -10,7 +10,7 @@ use crate::state::{
     AgentRef, AppState, LocalHostId, PendingSubmission, PendingSubmissionState, SubmissionTarget,
 };
 
-const CHAT_INPUT_MIN_HEIGHT_PX: i32 = 36;
+const CHAT_INPUT_MIN_HEIGHT_PX: i32 = 40;
 const CHAT_INPUT_MAX_HEIGHT_PX: i32 = 132;
 const QUEUED_EDIT_MIN_HEIGHT_PX: i32 = 39;
 const QUEUED_EDIT_MAX_HEIGHT_PX: i32 = 240;
@@ -1820,7 +1820,7 @@ pub fn ChatInput() -> impl IntoView {
                 >
                     <button
                         type="button"
-                        class="send-button chat-send-split-primary"
+                        class="send-button"
                         aria-label={move || {
                             if is_terminated.get() { TERMINATED_COMPOSER_LABEL }
                             else if is_running.get() && !has_input.get() { "Cancel current turn" }
@@ -2475,6 +2475,28 @@ mod wasm_tests {
             rect(&split).width() <= 110.0,
             "the compact send split must preserve textarea width, got {}px",
             rect(&split).width()
+        );
+        let field = container
+            .query_selector("[data-mobile-test='chat-input']")
+            .unwrap()
+            .expect("the draft field renders");
+        let send = container
+            .query_selector("[data-mobile-test='chat-send']")
+            .unwrap()
+            .expect("the send action renders");
+        let field_box = rect(&field);
+        let send_box = rect(&send);
+        assert!(
+            (field_box.height() - send_box.height()).abs() < 1.0,
+            "an empty draft field and the send action are one control height, got {}px vs {}px",
+            field_box.height(),
+            send_box.height()
+        );
+        let field_mid = field_box.top() + field_box.height() / 2.0;
+        let send_mid = send_box.top() + send_box.height() / 2.0;
+        assert!(
+            (field_mid - send_mid).abs() < 1.0,
+            "the draft line sits on the send label's midline, got {field_mid} vs {send_mid}"
         );
         assert!(
             container

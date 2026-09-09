@@ -2444,16 +2444,20 @@ html[data-keyboard-open] .mobile-app {
     font-size: var(--text-xs);
 }
 
+/* One line of text fills exactly --composer-control-height: 22px of line box
+   plus 9px above and below. The field and the send cluster are then the same
+   height, so the placeholder sits on the send label's midline instead of
+   riding low against a taller button. */
 .chat-input-field {
     flex: 1;
-    min-height: 36px;
+    min-height: var(--composer-control-height);
     max-height: 132px;
-    padding: var(--space-2) var(--space-3);
+    padding: 9px var(--space-3);
     background: transparent;
     border: none;
     resize: none;
     font-size: 16px;
-    line-height: 1.4;
+    line-height: 22px;
     outline: none;
     overflow-y: hidden;
 }
@@ -2463,14 +2467,14 @@ html[data-keyboard-open] .mobile-app {
 }
 
 .send-button {
-    min-width: var(--button-height);
-    height: var(--button-height);
-    padding: 0 10px;
-    border-radius: var(--radius-lg);
+    min-width: 0;
+    height: var(--composer-control-height);
+    padding: 0 var(--space-3);
+    border-radius: var(--radius-full);
     background: var(--accent-primary);
     color: white;
     font-size: 14px;
-    font-weight: 700;
+    font-weight: var(--weight-semibold);
     display: flex;
     align-items: center;
     justify-content: center;
@@ -2492,26 +2496,23 @@ html[data-keyboard-open] .mobile-app {
 .chat-send-split {
     position: relative;
     display: flex;
-    align-items: stretch;
+    align-items: center;
     flex-shrink: 0;
 }
 
-.chat-send-split-primary {
-    border-top-right-radius: 0;
-    border-bottom-right-radius: 0;
-}
-
+/* The caret is an affordance on the send action, not a second button of equal
+   weight: a bare glyph beside the filled pill, so the composer's right end
+   reads as one control rather than two competing slabs. */
 .send-menu-toggle {
-    min-width: 40px;
-    width: 40px;
-    height: var(--button-height);
-    padding: 0 var(--space-2);
-    margin-left: -1px;
-    border-radius: 0 var(--radius-lg) var(--radius-lg) 0;
-    background: var(--bg-surface-2);
-    color: var(--text-primary);
-    border: 1px solid var(--border-default);
-    font-size: 13px;
+    min-width: 30px;
+    width: 30px;
+    height: var(--composer-control-height);
+    padding: 0;
+    border: none;
+    border-radius: var(--radius-full);
+    background: transparent;
+    color: var(--text-secondary);
+    font-size: 15px;
     font-weight: 700;
     display: flex;
     align-items: center;
@@ -3098,6 +3099,9 @@ html[data-keyboard-open] .mobile-app {
     --button-disabled-opacity: 0.5;
     --button-height: 44px;           /* standard tap target (Apple HIG 44pt / Material 48dp) */
     --button-height-compact: 40px;
+    /* The composer's field and send cluster share one height so a single line
+       of draft text is centred against the send label. */
+    --composer-control-height: 40px;
     --button-height-icon: 44px;
     --button-pad-x: var(--space-4);          /* 16px */
     --button-pad-x-compact: var(--space-3);  /* 12px */
