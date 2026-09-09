@@ -1007,15 +1007,20 @@ probe. Claude preserves the trimmed raw provider version line, including any
 product suffix, rather than treating an extracted semver as capability
 evidence.
 
-Inline fallback is authorized before dispatch when a backend explicitly
-reports a fallback-safe non-dispatch, or after a native attempt only for the
-conclusive structured outcome `Rejected + NotObserved`. Both routes require an
-authoritative transcript because fallback reconstructs context from that
-transcript. The second route keeps the original operation ID, persists
-`FallbackPreparing` with method `InlineFallback` and native acceptance cleared
-before launching one fallback, and retains the input barrier throughout.
-Accepted, ambiguous, possibly mutated, or malformed native outcomes fail closed
-and never start another compaction.
+Compaction selects one route when accepting the request and keeps that route
+through deferred retries. A backend advertising native
+compaction uses native compaction only: non-dispatch, rejection, provider
+errors, and uncertain outcomes are reported as failures and never start
+built-in compaction. The protocol retains the historical `native_preferred`
+wire spelling for compatibility; its route is now `NativeOnly`.
+
+Built-in compaction is selected directly for backends advertising unavailable
+manual compaction or automatic-only compaction, subject to routing policy and
+an authoritative transcript. It does not attempt native compaction first.
+Supervisor requests remain prohibited from using built-in compaction for an
+automatic-only backend. Preparation persists `FallbackPreparing` with method
+`InlineFallback` before launching the summarizer and retains the input barrier
+until the operation finishes.
 
 The implementation guarantees only that compaction **starts no earlier than**
 the configured inactivity delay. This repository defines no provider cache

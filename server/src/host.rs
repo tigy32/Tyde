@@ -493,7 +493,7 @@ pub(crate) fn requested_compaction_availability(
 
     match &capability.availability {
         Availability::Native { .. } => RequestedCompactionAvailability::Available {
-            route: RequestedCompactionRoute::NativePreferred,
+            route: RequestedCompactionRoute::NativeOnly,
         },
         Availability::AutomaticOnly { .. } | Availability::Unavailable { .. }
             if !transcript_authoritative =>

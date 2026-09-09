@@ -283,7 +283,6 @@ pub enum BackendCompactionStart {
     },
     NotDispatched {
         reason: BackendCompactionNotDispatchedReason,
-        fallback_safe: bool,
     },
     DispatchUncertain(Box<BackendCompactionResult>),
 }
@@ -488,13 +487,11 @@ pub(crate) fn not_dispatched_for_capability(
         | BackendCompactionAvailability::Unavailable { reason } => {
             Some(BackendCompactionStart::NotDispatched {
                 reason: BackendCompactionNotDispatchedReason::NativeUnavailable(reason.clone()),
-                fallback_safe: true,
             })
         }
         BackendCompactionAvailability::Unknown { reason } => {
             Some(BackendCompactionStart::NotDispatched {
                 reason: BackendCompactionNotDispatchedReason::CapabilityUnknown(reason.clone()),
-                fallback_safe: false,
             })
         }
     }

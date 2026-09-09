@@ -35,7 +35,7 @@ use emit::{MockEventSender, WeakMockEventSender};
 
 pub use control::{MockControl, MockRequest, MockViolation};
 pub use gate::MockGateHandle;
-pub use script::{MockLaunch, MockScript, MockTurn};
+pub use script::{MockCompactionFailure, MockLaunch, MockScript, MockTurn};
 
 #[cfg(any(test, feature = "test-support"))]
 #[derive(Debug, Clone)]
@@ -106,6 +106,7 @@ pub struct MockBackend {
     scripted_busy_self_turn: bool,
     shutdown_gate: Option<gate::MockGate>,
     compaction_observation_gates: Option<(gate::MockGate, gate::MockGate)>,
+    compaction_failure: Option<MockCompactionFailure>,
     resume_replay_guard: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
@@ -137,13 +138,17 @@ impl MockBackend {
         let scripted_busy_self_turn = launch_script.busy_self_turn_once;
         let shutdown_gate = launch_script.shutdown_gate.clone();
         let compaction_observation_gates = launch_script.compaction_observation_gates.clone();
+        let compaction_failure = launch_script.compaction_failure;
         let initial_message = initial_input.message;
         let agent_control_await_mcp = emit::agent_control_await_mcp(&config.startup_mcp_servers);
         let startup_mcp_servers = summarize_startup_mcp_servers(&config);
         let session_id = SessionId(Uuid::new_v4().to_string());
         let now = now_ms();
         let resolved_spawn_config = config.resolved_spawn_config.clone();
-        let compaction_capability = native_mock_compaction_capability();
+        let mut compaction_capability = native_mock_compaction_capability();
+        if let Some(availability) = launch_script.compaction_availability.clone() {
+            compaction_capability.availability = availability;
+        }
 
         {
             let mut store = session_store()
@@ -206,6 +211,7 @@ impl MockBackend {
                 scripted_busy_self_turn,
                 shutdown_gate: shutdown_gate.clone(),
                 compaction_observation_gates: compaction_observation_gates.clone(),
+                compaction_failure,
                 resume_replay_guard: None,
             },
             EventStream::new_backend(events_rx),
@@ -228,6 +234,7 @@ impl MockBackend {
         let scripted_busy_self_turn = launch_script.busy_self_turn_once;
         let shutdown_gate = launch_script.shutdown_gate.clone();
         let compaction_observation_gates = launch_script.compaction_observation_gates.clone();
+        let compaction_failure = launch_script.compaction_failure;
         let agent_control_await_mcp = emit::agent_control_await_mcp(&config.startup_mcp_servers);
         let startup_mcp_servers = summarize_startup_mcp_servers(&config);
         let resolved_spawn_config = config.resolved_spawn_config.clone();
@@ -282,6 +289,7 @@ impl MockBackend {
                     scripted_busy_self_turn,
                     shutdown_gate: shutdown_gate.clone(),
                     compaction_observation_gates: compaction_observation_gates.clone(),
+                    compaction_failure,
                     resume_replay_guard: Some(resume_replay_complete_tx),
                 },
                 EventStream::new_backend_with_resume_replay_barrier(
@@ -326,6 +334,7 @@ impl MockBackend {
                 scripted_busy_self_turn,
                 shutdown_gate: shutdown_gate.clone(),
                 compaction_observation_gates: compaction_observation_gates.clone(),
+                compaction_failure,
                 resume_replay_guard: None,
             },
             EventStream::new_backend_with_resume_replay_barrier(
@@ -355,6 +364,7 @@ impl MockBackend {
         let scripted_busy_self_turn = launch_script.busy_self_turn_once;
         let shutdown_gate = launch_script.shutdown_gate.clone();
         let compaction_observation_gates = launch_script.compaction_observation_gates.clone();
+        let compaction_failure = launch_script.compaction_failure;
         let initial_message = initial_input.message;
         let agent_control_await_mcp = emit::agent_control_await_mcp(&config.startup_mcp_servers);
         let startup_mcp_servers = summarize_startup_mcp_servers(&config);
@@ -430,6 +440,7 @@ impl MockBackend {
                 scripted_busy_self_turn,
                 shutdown_gate: shutdown_gate.clone(),
                 compaction_observation_gates: compaction_observation_gates.clone(),
+                compaction_failure,
                 resume_replay_guard: None,
             },
             EventStream::new_backend(events_rx),
@@ -559,7 +570,6 @@ impl Backend for MockBackend {
         else {
             return BackendCompactionStart::NotDispatched {
                 reason: BackendCompactionNotDispatchedReason::BackendClosed,
-                fallback_safe: false,
             };
         };
         if events_tx.is_active() {
@@ -576,6 +586,32 @@ impl Backend for MockBackend {
             return BackendCompactionStart::Deferred {
                 reason: BackendCompactionDeferredReason::AnotherCompactionActive,
             };
+        }
+        if let Some(failure) = self.compaction_failure {
+            if matches!(failure, MockCompactionFailure::NotDispatched) {
+                return BackendCompactionStart::NotDispatched {
+                    reason: BackendCompactionNotDispatchedReason::InvalidFocus,
+                };
+            }
+            let (terminal_tx, terminal) = tokio::sync::oneshot::channel();
+            let operation_id = request.operation_id;
+            let _ = terminal_tx.send(BackendCompactionResult {
+                operation_id: operation_id.clone(),
+                dispatch: BackendCompactionDispatchState::Rejected,
+                mutation: BackendCompactionMutationState::NotObserved,
+                outcome: Err(super::BackendCompactionFailure {
+                    kind: super::BackendCompactionFailureKind::ProviderRejected,
+                    message: "mock native compaction rejected".to_owned(),
+                }),
+                provider_session_id: Some(self.session_id.clone()),
+                metrics: CompactionMetrics::default(),
+                post_context_tokens: PostCompactionTokenCount::Unknown,
+                evidence: BackendCompactionTerminalEvidence::None,
+            });
+            return BackendCompactionStart::Accepted(BackendAcceptedCompaction {
+                operation_id,
+                terminal,
+            });
         }
         let (terminal_tx, terminal) = tokio::sync::oneshot::channel();
         let operation_id = request.operation_id.clone();

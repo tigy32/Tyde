@@ -1991,7 +1991,6 @@ impl ClaudeInner {
             Err(()) => {
                 return BackendCompactionStart::NotDispatched {
                     reason: BackendCompactionNotDispatchedReason::InvalidFocus,
-                    fallback_safe: false,
                 };
             }
             Ok(focus) => focus,
@@ -2001,7 +2000,6 @@ impl ClaudeInner {
             if state.closing {
                 return BackendCompactionStart::NotDispatched {
                     reason: BackendCompactionNotDispatchedReason::BackendClosed,
-                    fallback_safe: false,
                 };
             }
             if state.pending_compaction.is_some() {
@@ -2056,7 +2054,6 @@ impl ClaudeInner {
                 reason: BackendCompactionNotDispatchedReason::CapabilityUnknown(
                     BackendCompactionUnknownReason::CapabilityProbeFailed(error),
                 ),
-                fallback_safe: false,
             };
         }
         {

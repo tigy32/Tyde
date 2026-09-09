@@ -446,6 +446,7 @@ struct ActiveCompaction {
 
 struct CompactionFlight {
     operation_id: CompactionOperationId,
+    route: protocol::RequestedCompactionRoute,
     trigger: CompactionTrigger,
     focus: Option<String>,
     queue_watermark: u64,
@@ -496,38 +497,6 @@ fn context_compaction_fallback_allowed(
         || !matches!(
             &capability.availability,
             crate::backend::BackendCompactionAvailability::AutomaticOnly { .. }
-        )
-}
-
-fn backend_compaction_result_allows_inline_fallback(
-    operation_id: &CompactionOperationId,
-    result: &crate::backend::BackendCompactionResult,
-) -> bool {
-    result.operation_id == *operation_id
-        && result.dispatch == crate::backend::BackendCompactionDispatchState::Rejected
-        && result.mutation == crate::backend::BackendCompactionMutationState::NotObserved
-        && result.outcome.is_err()
-}
-
-fn compaction_flight_can_enter_rejected_fallback(flight: &CompactionFlight) -> bool {
-    flight.state == StoredCompactionState::NativeAccepted
-        && flight.terminal_taken
-        && flight.method != Some(CompactionMethod::InlineFallback)
-        && flight.fallback_task.is_none()
-}
-
-fn inline_fallback_owns_structured_native_terminal(
-    flight: &CompactionFlight,
-    operation_id: &CompactionOperationId,
-    result: &Result<crate::backend::BackendCompactionResult, String>,
-) -> bool {
-    matches!(
-        flight.state,
-        StoredCompactionState::FallbackPreparing | StoredCompactionState::FallbackCommitPending
-    ) && flight.method == Some(CompactionMethod::InlineFallback)
-        && matches!(
-            result,
-            Ok(result) if result.operation_id == *operation_id
         )
 }
 
@@ -6166,7 +6135,7 @@ pub(crate) fn spawn_agent_actor(
                                 .as_ref()
                                 .expect("backend must exist while actor is running")
                                 .compaction_capability();
-                            if let Err(error) = crate::host::requested_context_compaction_route(
+                            let route = match crate::host::requested_context_compaction_route(
                                 &capability,
                                 trigger,
                                 transcript_is_authoritative(
@@ -6175,9 +6144,12 @@ pub(crate) fn spawn_agent_actor(
                                 )
                                 .await,
                             ) {
-                                let _ = reply.send(Err(error));
-                                continue;
-                            }
+                                Ok(route) => route,
+                                Err(error) => {
+                                    let _ = reply.send(Err(error));
+                                    continue;
+                                }
+                            };
                             let operation_id =
                                 CompactionOperationId(Uuid::new_v4().to_string());
                             let session_id_for_read = session_id.clone();
@@ -6242,6 +6214,7 @@ pub(crate) fn spawn_agent_actor(
                             let queue_watermark = next_queue_sequence.saturating_sub(1);
                             context_compaction = Some(CompactionFlight {
                                 operation_id: operation_id.clone(),
+                                route,
                                 trigger,
                                 focus,
                                 queue_watermark,
@@ -6663,7 +6636,7 @@ pub(crate) fn spawn_agent_actor(
                             operation_id,
                             result,
                         } => {
-                            let Some(mut flight) = context_compaction.take() else {
+                            let Some(flight) = context_compaction.take() else {
                                 continue;
                             };
                             if flight.operation_id != operation_id {
@@ -6684,158 +6657,6 @@ pub(crate) fn spawn_agent_actor(
                             let session_id = current_session_id
                                 .as_ref()
                                 .expect("live agent must have session_id");
-                            if inline_fallback_owns_structured_native_terminal(
-                                &flight,
-                                &operation_id,
-                                &result,
-                            ) {
-                                context_compaction = Some(flight);
-                                continue;
-                            }
-                            let rejected_without_mutation = result
-                                .as_ref()
-                                .ok()
-                                .is_some_and(|result| {
-                                    backend_compaction_result_allows_inline_fallback(
-                                        &operation_id,
-                                        result,
-                                    )
-                                });
-                            if rejected_without_mutation
-                                && compaction_flight_can_enter_rejected_fallback(&flight)
-                            {
-                                let rejection_message = result
-                                    .as_ref()
-                                    .ok()
-                                    .and_then(|result| result.outcome.as_ref().err())
-                                    .map(|failure| failure.message.clone())
-                                    .unwrap_or_else(|| {
-                                        "native compaction was rejected before mutation".to_owned()
-                                    });
-                                let capability = backend
-                                    .as_ref()
-                                    .expect("backend must exist while starting fallback")
-                                    .compaction_capability();
-                                let mut fallback_context = ContextCompactionDispatchContext {
-                                    actor_tx: &actor_tx,
-                                    backend: backend
-                                        .as_ref()
-                                        .expect("backend must exist while starting fallback")
-                                        .as_ref(),
-                                    session_store: &session_store,
-                                    transcript_store: &transcript_store,
-                                    session_id,
-                                    start: &current_start,
-                                    status_handle: &status_handle,
-                                    current_session_settings: &current_session_settings,
-                                    canonical_stream: &canonical_stream,
-                                    event_log: &mut event_log,
-                                    subscribers: &mut subscribers,
-                                    spawn_config: &compaction_spawn_config,
-                                    use_mock_backend,
-                                    capacity_tx: &compaction_capacity_tx,
-                                    backend_storage:
-                                        &compaction_backend_storage,
-                                };
-                                let fallback_result = begin_inline_context_fallback(
-                                    &mut fallback_context,
-                                    &mut flight,
-                                    &capability,
-                                    format!(
-                                        "native compaction was rejected before mutation ({rejection_message}); preparing inline fallback"
-                                    ),
-                                )
-                                .await;
-                                in_turn = false;
-                                idle_transition_armed = false;
-                                match fallback_result {
-                                    Ok(()) => {
-                                        context_compaction = Some(flight);
-                                        continue;
-                                    }
-                                    Err(error) => {
-                                        let terminal = ContextCompactionTerminalRecord {
-                                            accepted: false,
-                                            mutation: CompactionMutation::NotObserved,
-                                            method: flight.method,
-                                            metrics: CompactionMetrics::default(),
-                                            provider_session_id: None,
-                                            status: ContextCompactionTimelineStatus::Failed,
-                                            message: Some(error),
-                                            trusted_post_context_tokens: None,
-                                        };
-                                        record_context_compaction_terminal(
-                                            flight,
-                                            terminal,
-                                            &session_store,
-                                            session_id,
-                                            &current_start,
-                                            &canonical_stream,
-                                            &mut event_log,
-                                            &mut replay_state,
-                                            &mut subscribers,
-                                            &mut activity_stats,
-                                            Some(&mut activity_event_seq),
-                                        )
-                                        .await;
-                                        if matches!(lifecycle, ActorLifecycle::Running) {
-                                            let dispatch = release_context_compaction_barrier(
-                                                backend.as_ref().expect(
-                                                    "backend must exist while releasing compaction",
-                                                ),
-                                                &mut queue,
-                                                &mut in_turn,
-                                                &mut idle_transition_armed,
-                                                &canonical_stream,
-                                                &mut event_log,
-                                                &mut subscribers,
-                                                &current_start.agent_id,
-                                                &session_store,
-                                                &status_handle,
-                                                &review_registry,
-                                            )
-                                            .await;
-                                            if dispatch
-                                                == QueuedMessageDispatchOutcome::Closed
-                                            {
-                                                terminalize_closed_queue_dispatch(
-                                                    QueueDispatchTerminalContext {
-                                                        accepting_input: &accepting_input_task,
-                                                        status_handle: &status_handle,
-                                                        canonical_stream: &canonical_stream,
-                                                        event_log: &mut event_log,
-                                                        replay_state: &mut replay_state,
-                                                        subscribers: &mut subscribers,
-                                                        queue: &mut queue,
-                                                        session_store: &session_store,
-                                                        transcript_store: &transcript_store,
-                                                        context_compaction:
-                                                            &mut context_compaction,
-                                                        activity_stats: &mut activity_stats,
-                                                        current_session_id:
-                                                            current_session_id.as_ref(),
-                                                        pending_alias: &mut pending_alias,
-                                                        current_start: &mut current_start,
-                                                        start_tx: &start_tx,
-                                                        latest_output: &mut latest_output,
-                                                        pending_inputs: &mut pending_inputs,
-                                                        rx: &mut rx,
-                                                        open_tool_call_ids:
-                                                            &mut open_tool_call_ids,
-                                                        pending_tool_response_ids:
-                                                            &mut pending_tool_response_ids,
-                                                        active_agent_await_ids:
-                                                            &mut active_agent_await_ids,
-                                                    },
-                                                )
-                                                .await;
-                                                return;
-                                            }
-                                        }
-                                        continue;
-                                    }
-                                }
-                            }
                             let accepted_before_terminal = matches!(
                                 flight.state,
                                 StoredCompactionState::NativeAccepted
@@ -11550,6 +11371,26 @@ async fn try_dispatch_context_compaction(
     }
 
     let capability = context.backend.compaction_capability();
+    if active.route == protocol::RequestedCompactionRoute::InlineFallbackOnly {
+        if let Err(error) = begin_inline_context_fallback(
+            &mut context,
+            active,
+            &capability,
+            "preparing built-in compaction for a backend without manual native compaction"
+                .to_owned(),
+        )
+        .await
+        {
+            let _ = context
+                .actor_tx
+                .send(AgentCommand::ContextCompactionTerminal {
+                    operation_id: active.operation_id.clone(),
+                    result: Err(error),
+                });
+        }
+        return;
+    }
+
     if let Some(method) = compaction_method_for_capability(&capability) {
         active.method = Some(method);
     }
@@ -11641,15 +11482,13 @@ async fn try_dispatch_context_compaction(
     )
     .await;
 
+    let transcript_authoritative =
+        transcript_is_authoritative(context.transcript_store, context.session_id).await;
     let request = crate::backend::BackendCompactionRequest {
         operation_id: active.operation_id.clone(),
         trigger: active.trigger,
         focus: active.focus.clone(),
-        transcript_authoritative: transcript_is_authoritative(
-            context.transcript_store,
-            context.session_id,
-        )
-        .await,
+        transcript_authoritative,
     };
     match context.backend.begin_compaction(request).await {
         crate::backend::BackendCompactionStart::Accepted(accepted) => {
@@ -11719,38 +11558,13 @@ async fn try_dispatch_context_compaction(
             .await;
             arm_context_compaction_retry(active, context.actor_tx);
         }
-        crate::backend::BackendCompactionStart::NotDispatched {
-            reason,
-            fallback_safe,
-        } => {
-            if !fallback_safe {
-                let _ = context
-                    .actor_tx
-                    .send(AgentCommand::ContextCompactionTerminal {
-                        operation_id: active.operation_id.clone(),
-                        result: Err(format!(
-                            "native compaction was not safely dispatched: {reason:?}"
-                        )),
-                    });
-                return;
-            }
-            if let Err(error) = begin_inline_context_fallback(
-                &mut context,
-                active,
-                &capability,
-                format!(
-                    "native compaction was not dispatched ({reason:?}); preparing inline fallback"
-                ),
-            )
-            .await
-            {
-                let _ = context
-                    .actor_tx
-                    .send(AgentCommand::ContextCompactionTerminal {
-                        operation_id: active.operation_id.clone(),
-                        result: Err(error),
-                    });
-            }
+        crate::backend::BackendCompactionStart::NotDispatched { reason } => {
+            let _ = context
+                .actor_tx
+                .send(AgentCommand::ContextCompactionTerminal {
+                    operation_id: active.operation_id.clone(),
+                    result: Err(format!("native compaction was not dispatched: {reason:?}")),
+                });
         }
         crate::backend::BackendCompactionStart::DispatchUncertain(result) => {
             active.state = StoredCompactionState::NativeAccepted;

@@ -2627,7 +2627,7 @@ mod wasm_tests {
                 crate::state::CompactionCapabilitySnapshot {
                     logical_session_id: protocol::SessionId(String::new()),
                     availability: protocol::RequestedCompactionAvailability::Available {
-                        route: protocol::RequestedCompactionRoute::NativePreferred,
+                        route: protocol::RequestedCompactionRoute::NativeOnly,
                     },
                 },
             );

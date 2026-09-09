@@ -2188,7 +2188,6 @@ impl Backend for AntigravityBackend {
             reason: BackendCompactionNotDispatchedReason::NativeUnavailable(
                 BackendCompactionUnavailableReason::ManualTriggerAbsent,
             ),
-            fallback_safe: true,
         }
     }
 

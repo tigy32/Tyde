@@ -3826,7 +3826,9 @@ pub struct ContextCompactionNotifyPayload {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RequestedCompactionRoute {
-    NativePreferred,
+    // Preserve the wire spelling for older clients. Native failures never fall back.
+    #[serde(rename = "native_preferred")]
+    NativeOnly,
     InlineFallbackOnly,
 }
 

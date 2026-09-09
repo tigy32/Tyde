@@ -11,8 +11,16 @@ use super::emit;
 use super::gate::{MockGate, MockGateHandle};
 use super::{mock_prompt_history, startup_mcp_response_prefix};
 
+#[derive(Debug, Clone, Copy)]
+pub enum MockCompactionFailure {
+    NotDispatched,
+    Rejected,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct MockScript {
+    pub(super) compaction_availability: Option<crate::backend::BackendCompactionAvailability>,
+    pub(super) compaction_failure: Option<MockCompactionFailure>,
     pub(super) turns: Vec<MockTurn>,
     pub(super) unbounded_echo: bool,
     pub(super) user_bubbles: bool,
@@ -35,6 +43,19 @@ impl MockScript {
 
     pub fn then(mut self, turn: MockTurn) -> Self {
         self.turns.push(turn);
+        self
+    }
+
+    pub fn with_compaction_availability(
+        mut self,
+        availability: crate::backend::BackendCompactionAvailability,
+    ) -> Self {
+        self.compaction_availability = Some(availability);
+        self
+    }
+
+    pub fn with_compaction_failure(mut self, failure: MockCompactionFailure) -> Self {
+        self.compaction_failure = Some(failure);
         self
     }
 

@@ -1471,7 +1471,6 @@ pub trait Backend: Send + Sync + 'static {
                 reason: BackendCompactionNotDispatchedReason::NativeUnavailable(
                     BackendCompactionUnavailableReason::AdapterHasNoManualTransport,
                 ),
-                fallback_safe: true,
             }
         }
     }

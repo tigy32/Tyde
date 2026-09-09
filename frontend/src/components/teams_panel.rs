@@ -3048,7 +3048,7 @@ mod wasm_tests {
                 crate::state::CompactionCapabilitySnapshot {
                     logical_session_id: protocol::SessionId("s-mgr".to_owned()),
                     availability: protocol::RequestedCompactionAvailability::Available {
-                        route: protocol::RequestedCompactionRoute::NativePreferred,
+                        route: protocol::RequestedCompactionRoute::NativeOnly,
                     },
                 },
             );
@@ -5393,7 +5393,7 @@ mod wasm_tests {
         let available = || crate::state::CompactionCapabilitySnapshot {
             logical_session_id: protocol::SessionId(String::new()),
             availability: protocol::RequestedCompactionAvailability::Available {
-                route: protocol::RequestedCompactionRoute::NativePreferred,
+                route: protocol::RequestedCompactionRoute::NativeOnly,
             },
         };
         state.compaction_capability.update(|m| {
@@ -5593,7 +5593,7 @@ mod wasm_tests {
                     crate::state::CompactionCapabilitySnapshot {
                         logical_session_id: protocol::SessionId(String::new()),
                         availability: protocol::RequestedCompactionAvailability::Available {
-                            route: protocol::RequestedCompactionRoute::NativePreferred,
+                            route: protocol::RequestedCompactionRoute::NativeOnly,
                         },
                     },
                 );
@@ -5774,7 +5774,7 @@ mod wasm_tests {
                 crate::state::CompactionCapabilitySnapshot {
                     logical_session_id: protocol::SessionId(String::new()),
                     availability: protocol::RequestedCompactionAvailability::Available {
-                        route: protocol::RequestedCompactionRoute::NativePreferred,
+                        route: protocol::RequestedCompactionRoute::NativeOnly,
                     },
                 },
             );

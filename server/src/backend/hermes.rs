@@ -607,7 +607,6 @@ fn hermes_compaction_pre_dispatch(
             reason: BackendCompactionNotDispatchedReason::NativeUnavailable(
                 BackendCompactionUnavailableReason::TranscriptNotAuthoritative,
             ),
-            fallback_safe: true,
         });
     }
     crate::backend::compaction::not_dispatched_for_capability(capability)
@@ -1475,14 +1474,12 @@ impl Backend for HermesBackend {
         {
             return BackendCompactionStart::NotDispatched {
                 reason: BackendCompactionNotDispatchedReason::BackendClosed,
-                fallback_safe: false,
             };
         }
         reply_rx
             .await
             .unwrap_or(BackendCompactionStart::NotDispatched {
                 reason: BackendCompactionNotDispatchedReason::BackendClosed,
-                fallback_safe: false,
             })
     }
 
@@ -2306,7 +2303,6 @@ impl HermesSessionActor {
                 reason: BackendCompactionNotDispatchedReason::NativeUnavailable(
                     BackendCompactionUnavailableReason::TranscriptNotAuthoritative,
                 ),
-                fallback_safe: true,
             };
         }
         if self
@@ -2355,7 +2351,6 @@ impl HermesSessionActor {
             Err(HermesDispatchError::NotSent) => {
                 return BackendCompactionStart::NotDispatched {
                     reason: BackendCompactionNotDispatchedReason::BackendClosed,
-                    fallback_safe: false,
                 };
             }
             Err(HermesDispatchError::Uncertain(error)) => {

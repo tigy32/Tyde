@@ -217,7 +217,7 @@ fn native_capability_matches(
         && matches!(
             &payload.availability,
             RequestedCompactionAvailability::Available {
-                route: RequestedCompactionRoute::NativePreferred
+                route: RequestedCompactionRoute::NativeOnly
             }
         )
 }
@@ -1669,4 +1669,194 @@ async fn native_goal_keeps_normal_input_and_emits_one_completion() {
     assert!(
         matches!(bootstrap.events.iter().rev().find_map(|event| match event { AgentBootstrapEvent::ChatEvent(ChatEvent::GoalChanged(goal)) => Some(goal), _ => None }), Some(Some(goal)) if goal.status == protocol::GoalStatus::Complete)
     );
+}
+
+async fn compaction_session_id(fixture: &mut Fixture, name: &str) -> protocol::SessionId {
+    // NewAgent precedes session binding and has no session ID. Read the bound
+    // identity after the first turn so compaction must preserve that exact ID.
+    fixture
+        .client
+        .list_sessions(ListSessionsPayload::default())
+        .await
+        .expect("list bound session");
+    let sessions = fixture
+        .next_frame_matching("bound session list", |env| {
+            env.kind == FrameKind::SessionList
+        })
+        .await
+        .parse_payload::<SessionListPayload>()
+        .expect("session list");
+    sessions
+        .sessions
+        .iter()
+        .find(|session| session.user_alias.as_deref() == Some(name))
+        .expect("bound compaction session")
+        .id
+        .clone()
+}
+
+async fn assert_native_compaction_failure_stays_native(
+    failure: server::backend::mock::MockCompactionFailure,
+    expected_message: &str,
+) {
+    let mut fixture = Fixture::new().await;
+    let agent = fixture
+        .spawn_scripted(
+            "native-compaction-failure",
+            MockScript::new()
+                .with_unbounded_echo()
+                .with_compaction_failure(failure),
+        )
+        .await;
+    fixture.finish_turn(&agent).await;
+    let session_id = compaction_session_id(&mut fixture, "native-compaction-failure").await;
+    for _ in 0..2 {
+        fixture
+            .client
+            .compact_agent(&agent.stream, protocol::AgentCompactPayload::default())
+            .await
+            .expect("request native compaction");
+        let terminal = fixture
+            .next_frame_matching("native compaction failure", |env| {
+                assert_ne!(
+                    env.kind,
+                    FrameKind::NewAgent,
+                    "failed native compaction must not replace the agent"
+                );
+                assert_ne!(
+                    env.kind,
+                    FrameKind::AgentClosed,
+                    "failed native compaction must leave the agent live"
+                );
+                let Some(payload) = context_compaction_on(env, &agent.new_agent) else {
+                    return false;
+                };
+                assert_ne!(
+                    payload.method,
+                    Some(CompactionMethod::InlineFallback),
+                    "native errors must not start built-in compaction: {payload:?}"
+                );
+                payload.status.is_terminal()
+            })
+            .await
+            .parse_payload::<ContextCompactionNotifyPayload>()
+            .expect("compaction terminal");
+        assert!(
+            matches!(
+                terminal.status,
+                ContextCompactionStatus::Failed {
+                    mutation: protocol::CompactionMutation::NotObserved,
+                    ..
+                }
+            ),
+            "native failure must report unchanged context: {terminal:?}"
+        );
+        assert_eq!(terminal.method, Some(CompactionMethod::NativeRpc));
+        assert!(
+            terminal
+                .message
+                .as_deref()
+                .is_some_and(|message| message.contains(expected_message)),
+            "preserve the native error: {terminal:?}"
+        );
+        assert_eq!(terminal.logical_session_id, session_id);
+        fixture
+            .client
+            .send_message(&agent.stream, "continue after failed compact".to_owned())
+            .await
+            .expect("send after native failure");
+        let continuation = fixture.finish_turn(&agent).await;
+        continuation.assert_stream_end_contains("continue after failed compact");
+        assert!(
+            continuation
+                .frames
+                .iter()
+                .all(|env| env.kind != FrameKind::NewAgent),
+            "continuation must use the original agent"
+        );
+    }
+}
+
+#[tokio::test]
+async fn native_non_dispatch_reports_failure_without_builtin_compaction() {
+    assert_native_compaction_failure_stays_native(
+        server::backend::mock::MockCompactionFailure::NotDispatched,
+        "InvalidFocus",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn native_rejection_reports_failure_without_builtin_compaction() {
+    assert_native_compaction_failure_stays_native(
+        server::backend::mock::MockCompactionFailure::Rejected,
+        "mock native compaction rejected",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn builtin_compaction_remains_available_without_native_support() {
+    use server::backend::compaction::{
+        BackendCompactionAvailability, BackendCompactionUnavailableReason,
+    };
+
+    for availability in [
+        BackendCompactionAvailability::Unavailable {
+            reason: BackendCompactionUnavailableReason::AdapterHasNoManualTransport,
+        },
+        BackendCompactionAvailability::AutomaticOnly {
+            reason: BackendCompactionUnavailableReason::AdapterHasNoManualTransport,
+        },
+    ] {
+        let mut fixture = Fixture::new().await;
+        let agent = fixture
+            .spawn_scripted(
+                "builtin-compaction",
+                MockScript::new()
+                    .with_unbounded_echo()
+                    .with_compaction_availability(availability),
+            )
+            .await;
+        fixture.finish_turn(&agent).await;
+        let session_id = compaction_session_id(&mut fixture, "builtin-compaction").await;
+        fixture
+            .client
+            .compact_agent(&agent.stream, protocol::AgentCompactPayload::default())
+            .await
+            .expect("request built-in compaction");
+        let terminal = fixture
+            .next_frame_matching("built-in compaction completion", |env| {
+                let Some(payload) = context_compaction_on(env, &agent.new_agent) else {
+                    return false;
+                };
+                assert!(
+                    !matches!(
+                        payload.method,
+                        Some(CompactionMethod::NativeRpc | CompactionMethod::NativeTextCommand)
+                    ),
+                    "built-in route must not attempt native compaction: {payload:?}"
+                );
+                payload.status.is_terminal()
+            })
+            .await
+            .parse_payload::<ContextCompactionNotifyPayload>()
+            .expect("compaction terminal");
+        assert_eq!(
+            terminal.status,
+            ContextCompactionStatus::Completed,
+            "{terminal:?}"
+        );
+        assert_eq!(terminal.method, Some(CompactionMethod::InlineFallback));
+        assert_eq!(terminal.logical_session_id, session_id);
+        fixture
+            .client
+            .send_message(&agent.stream, "continue after built-in compact".to_owned())
+            .await
+            .expect("send after built-in compaction");
+        fixture
+            .finish_turn(&agent)
+            .await
+            .assert_stream_end_contains("continue after built-in compact");
+    }
 }
