@@ -133,6 +133,16 @@ impl AcpBridge {
     }
 
     pub async fn request(&self, method: &str, params: Value) -> Result<Value, String> {
+        self.request_typed(method, params)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub(crate) async fn request_typed(
+        &self,
+        method: &str,
+        params: Value,
+    ) -> Result<Value, AcpRequestError> {
         self.rpc.request(method, params).await
     }
 
@@ -1113,7 +1123,21 @@ fn select_permission_option(options: &[Value]) -> Option<String> {
         })
 }
 
-type PendingRpcMap = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, String>>>>>;
+#[derive(Debug)]
+pub(crate) enum AcpRequestError {
+    Rejected(String),
+    Transport(String),
+}
+
+impl std::fmt::Display for AcpRequestError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Rejected(message) | Self::Transport(message) => formatter.write_str(message),
+        }
+    }
+}
+
+type PendingRpcMap = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, AcpRequestError>>>>>;
 
 struct AcpRpc {
     stdin: Arc<Mutex<ChildStdin>>,
@@ -1236,7 +1260,7 @@ impl AcpRpc {
                                 message = format!("{message}: {details}");
                             }
 
-                            Err(message)
+                            Err(AcpRequestError::Rejected(message))
                         };
 
                         if let Some(tx) = stdout_pending.lock().await.remove(&id) {
@@ -1274,7 +1298,9 @@ impl AcpRpc {
 
             let mut pending = stdout_pending.lock().await;
             for (_, tx) in pending.drain() {
-                let _ = tx.send(Err("ACP process exited before response".to_string()));
+                let _ = tx.send(Err(AcpRequestError::Transport(
+                    "ACP process exited before response".to_string(),
+                )));
             }
             drop(pending);
 
@@ -1303,7 +1329,7 @@ impl AcpRpc {
         ))
     }
 
-    async fn request(&self, method: &str, params: Value) -> Result<Value, String> {
+    async fn request(&self, method: &str, params: Value) -> Result<Value, AcpRequestError> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let payload = json!({
             "jsonrpc": "2.0",
@@ -1317,12 +1343,14 @@ impl AcpRpc {
 
         if let Err(err) = self.send_json(&payload).await {
             let _ = self.pending.lock().await.remove(&id);
-            return Err(err);
+            return Err(AcpRequestError::Transport(err));
         }
 
         match rx.await {
             Ok(result) => result,
-            Err(_) => Err("ACP response channel closed".to_string()),
+            Err(_) => Err(AcpRequestError::Transport(
+                "ACP response channel closed".to_string(),
+            )),
         }
     }
 

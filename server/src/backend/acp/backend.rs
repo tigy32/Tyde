@@ -23,7 +23,7 @@ use crate::acp::adapter::{
     AcpSessionKind, adapter_for_spec,
 };
 use crate::acp::{
-    AcpBridge, AcpInbound, AcpSpawnSpec, acp_mcp_servers_json, extract_message_id,
+    AcpBridge, AcpInbound, AcpRequestError, AcpSpawnSpec, acp_mcp_servers_json, extract_message_id,
     extract_text_from_update, extract_tool_call_id, map_plan_status, parse_tool_call_completion,
     parse_tool_call_request,
 };
@@ -128,7 +128,7 @@ async fn await_kiro_stage<T>(
     } else {
         future
             .await
-            .map_err(|err| format!("Kiro {} failed: {err}", stage.label()))
+            .map_err(|err| format!("ACP {} failed: {err}", stage.label()))
     }
 }
 
@@ -935,14 +935,18 @@ impl KiroInner {
         }
     }
 
-    async fn request_prompt_with_retry(&self, params: Value) -> Result<Value, String> {
+    async fn request_prompt_with_retry(&self, params: Value) -> Result<Value, AcpRequestError> {
         let mut attempt = 0u64;
         loop {
-            match self.bridge.request("session/prompt", params.clone()).await {
+            match self
+                .bridge
+                .request_typed("session/prompt", params.clone())
+                .await
+            {
                 Ok(response) => return Ok(response),
                 Err(error)
                     if attempt < KIRO_PROMPT_MAX_RETRIES
-                        && kiro_prompt_error_is_retryable(&error) =>
+                        && kiro_prompt_error_is_retryable(&error.to_string()) =>
                 {
                     if self.state.lock().await.cancelled {
                         return Err(error);
@@ -952,12 +956,12 @@ impl KiroInner {
                         .saturating_mul(1u64 << attempt.saturating_sub(1))
                         .min(2_000);
                     eprintln!(
-                        "TYDE KIRO PROMPT RETRY attempt={attempt} max_retries={KIRO_PROMPT_MAX_RETRIES} backoff_ms={backoff_ms} error={error}"
+                        "TYDE ACP PROMPT RETRY attempt={attempt} max_retries={KIRO_PROMPT_MAX_RETRIES} backoff_ms={backoff_ms} error={error}"
                     );
                     self.emitter.retry_attempt(RetryAttemptPayload {
                         attempt,
                         max_retries: KIRO_PROMPT_MAX_RETRIES,
-                        error: &error,
+                        error: &error.to_string(),
                         backoff_ms,
                     });
                     tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
@@ -1067,18 +1071,38 @@ impl KiroInner {
                             return Ok(());
                         }
                         drop(state);
-                        if !self.shutting_down.load(Ordering::Acquire) {
-                            self.abort_active_turn(&format!("Kiro request failed: {err}"))
-                                .await;
+                        let rejected = matches!(err, AcpRequestError::Rejected(_));
+                        tracing::warn!(
+                            backend = self.adapter.display_name(),
+                            rejected,
+                            error = %err,
+                            "ACP prompt failed"
+                        );
+                        if rejected {
+                            self.bridge.sync_inbound().await?;
                         }
-                        return Err(err);
+                        if !self.shutting_down.load(Ordering::Acquire) {
+                            self.abort_active_turn(&format!(
+                                "{} request failed: {err}",
+                                self.adapter.display_name()
+                            ))
+                            .await;
+                        }
+                        return if rejected {
+                            Ok(())
+                        } else {
+                            Err(err.to_string())
+                        };
                     }
                 };
 
                 if let Err(err) = self.bridge.sync_inbound().await {
                     if !self.shutting_down.load(Ordering::Acquire) {
-                        self.abort_active_turn(&format!("Kiro response stream failed: {err}"))
-                            .await;
+                        self.abort_active_turn(&format!(
+                            "{} response stream failed: {err}",
+                            self.adapter.display_name()
+                        ))
+                        .await;
                     }
                     return Err(err);
                 }
@@ -1128,7 +1152,7 @@ impl KiroInner {
                         .and_then(|v| v.get("message"))
                         .and_then(Value::as_str)
                         .or_else(|| response.get("message").and_then(Value::as_str))
-                        .unwrap_or("Kiro prompt failed")
+                        .unwrap_or("Agent prompt failed")
                         .to_string();
                     self.abort_active_turn(&message).await;
                     self.emitter.backend_error(&message);
@@ -1439,7 +1463,7 @@ impl KiroInner {
             state.replay_assistant_message_emitted_since_user = false;
             state.replay_error = None;
             self.emitter.typing_status_changed(false);
-            return Err(format!("Failed to finish Kiro session replay: {err}"));
+            return Err(format!("Failed to finish ACP session replay: {err}"));
         }
 
         if self.adapter.backend_kind() == protocol::BackendKind::Grok {
@@ -1496,7 +1520,7 @@ impl KiroInner {
                 state.tool_call_aliases.clear();
                 self.emitter.typing_status_changed(false);
                 return Err(format!(
-                    "Kiro session replay ended with unresolved tool calls: {pending}"
+                    "ACP session replay ended with unresolved tool calls: {pending}"
                 ));
             }
             state.session_id = session_id;
@@ -1881,10 +1905,10 @@ impl KiroInner {
                     self.adapter.display_name()
                 )),
                 (Some(_), None) => {
-                    Some("Kiro session replay event omitted its session identity".to_string())
+                    Some("ACP session replay event omitted its session identity".to_string())
                 }
                 (None, _) => {
-                    Some("Kiro session replay received an event outside session/load".to_string())
+                    Some("ACP session replay received an event outside session/load".to_string())
                 }
             }
         };
@@ -2099,7 +2123,10 @@ impl KiroInner {
                 return;
             }
             let started = state.active_response.is_none();
-            let model = state.model.clone().unwrap_or_else(|| "kiro".to_string());
+            let model = state
+                .model
+                .clone()
+                .unwrap_or_else(|| self.adapter.display_name().to_string());
             if started {
                 self.emitter.typing_status_changed(true);
                 let response = self.emitter.stream_start(Some(&model));
@@ -2190,7 +2217,10 @@ impl KiroInner {
         let response = {
             let mut state = self.state.lock().await;
             if state.active_response.is_none() {
-                let model = state.model.clone().unwrap_or_else(|| "kiro".to_string());
+                let model = state
+                    .model
+                    .clone()
+                    .unwrap_or_else(|| self.adapter.display_name().to_string());
                 self.emitter.typing_status_changed(true);
                 state.active_response = Some(self.emitter.stream_start(Some(&model)));
                 state.active_stream_text.clear();
@@ -2242,7 +2272,7 @@ impl KiroInner {
 
         let Some(mut request) = parse_tool_call_request(params) else {
             self.set_replay_error(format!(
-                "Kiro session replay contained tool_call without toolCallId: {params}"
+                "ACP session replay contained tool_call without toolCallId: {params}"
             ))
             .await;
             return;
@@ -2285,7 +2315,7 @@ impl KiroInner {
         let identity = { self.state.lock().await.replay_assistant_identity.clone() };
         let Some(identity) = identity else {
             self.set_replay_error(
-                "Kiro replay tool identity was not retained at the decode boundary".to_string(),
+                "ACP replay tool identity was not retained at the decode boundary".to_string(),
             )
             .await;
             return;
@@ -2306,7 +2336,7 @@ impl KiroInner {
             let mut state = self.state.lock().await;
             if state.active_tool_contexts.contains_key(&canonical_id) {
                 state.replay_error = Some(format!(
-                    "Kiro session replay contained duplicate tool_call id {canonical_id}"
+                    "ACP session replay contained duplicate tool_call id {canonical_id}"
                 ));
                 return;
             }
@@ -2376,7 +2406,7 @@ impl KiroInner {
 
         let Some(resolved_tool_call_id) = resolved_tool_call_id else {
             self.set_replay_error(format!(
-                "Kiro session replay contained tool_call_update for unknown toolCallId: {params}"
+                "ACP session replay contained tool_call_update for unknown toolCallId: {params}"
             ))
             .await;
             return;
@@ -2414,7 +2444,7 @@ impl KiroInner {
             let mut state = self.state.lock().await;
             let Some(context) = state.active_tool_contexts.get(&completion.tool_call_id) else {
                 state.replay_error = Some(format!(
-                    "Kiro session replay lost context for tool_call_update id {}",
+                    "ACP session replay lost context for tool_call_update id {}",
                     completion.tool_call_id
                 ));
                 return;
@@ -2597,7 +2627,10 @@ impl KiroInner {
                 if state.active_response.is_none() {
                     state.active_stream_text.clear();
                     state.active_stream_tool_calls.clear();
-                    let model = state.model.clone().unwrap_or_else(|| "kiro".to_string());
+                    let model = state
+                        .model
+                        .clone()
+                        .unwrap_or_else(|| self.adapter.display_name().to_string());
                     start_event = Some(model);
                 }
 
@@ -3031,12 +3064,15 @@ impl KiroInner {
             .get("message")
             .or_else(|| params.get("error").and_then(|v| v.get("message")))
             .and_then(Value::as_str)
-            .unwrap_or("Kiro error")
+            .unwrap_or("Agent error")
             .to_string();
 
         if self.state.lock().await.replaying_history {
-            self.set_replay_error(format!("Kiro session replay failed: {message}"))
-                .await;
+            self.set_replay_error(format!(
+                "{} session replay failed: {message}",
+                self.adapter.display_name()
+            ))
+            .await;
             return;
         }
 
@@ -3083,7 +3119,7 @@ impl KiroInner {
                 .await
                 .model
                 .clone()
-                .unwrap_or_else(|| "kiro".to_string())
+                .unwrap_or_else(|| self.adapter.display_name().to_string())
         };
         self.emitter.replay_assistant_message(
             crate::backend::turn_emitter::AssistantMessagePayload {
@@ -3423,14 +3459,17 @@ impl KiroInner {
             let state = self.state.lock().await;
             (
                 state.session_id.clone(),
-                state.model.clone().unwrap_or_else(|| "kiro".to_string()),
+                state
+                    .model
+                    .clone()
+                    .unwrap_or_else(|| self.adapter.display_name().to_string()),
             )
         };
         tracing::debug!(
             session_id,
             text_bytes = cleaned_text.len(),
             tool_call_count = tool_calls.len(),
-            "Finalizing Kiro response stream"
+            "Finalizing ACP response stream"
         );
         let normalized_usage = normalize_token_usage(token_usage.as_ref());
         let context_breakdown = if self.adapter.backend_kind() == protocol::BackendKind::Grok {
@@ -5653,9 +5692,9 @@ impl Backend for KiroBackend {
             {
                 Ok(v) => v,
                 Err(err) => {
-                    tracing::error!("Failed to spawn Kiro session: {err}");
+                    tracing::error!("Failed to spawn ACP session: {err}");
                     if let Some(tx) = ready_tx.take() {
-                        let _ = tx.send(Err(format!("Failed to spawn Kiro session: {err}")));
+                        let _ = tx.send(Err(format!("Failed to spawn ACP session: {err}")));
                     }
                     return;
                 }
@@ -5676,9 +5715,9 @@ impl Backend for KiroBackend {
                     })
                     .await
             {
-                tracing::error!("Failed to configure Kiro session: {err}");
+                tracing::error!("Failed to configure ACP session: {err}");
                 if let Some(tx) = ready_tx.take() {
-                    let _ = tx.send(Err(format!("Failed to configure Kiro session: {err}")));
+                    let _ = tx.send(Err(format!("Failed to configure ACP session: {err}")));
                 }
                 session.shutdown().await;
                 return;
@@ -5713,7 +5752,7 @@ impl Backend for KiroBackend {
                     .await
                 {
                     let _ = initial_command_error_tx
-                        .send(format!("Failed to send initial Kiro prompt: {err}"));
+                        .send(format!("Failed to send initial ACP prompt: {err}"));
                 }
             });
 
@@ -5743,7 +5782,7 @@ impl Backend for KiroBackend {
                                         .await
                                     {
                                         let _ = command_error_tx.send(format!(
-                                            "Failed to send Kiro follow-up prompt: {err}"
+                                            "Failed to send ACP follow-up prompt: {err}"
                                         ));
                                     }
                                 });
@@ -5756,7 +5795,7 @@ impl Backend for KiroBackend {
                                     })
                                     .await
                                 {
-                                    tracing::error!("Failed to update Kiro session settings: {err}");
+                                    tracing::error!("Failed to update ACP session settings: {err}");
                                     break;
                                 }
                             }
@@ -5772,7 +5811,7 @@ impl Backend for KiroBackend {
                     interrupt = interrupt_rx.recv() => {
                         let Some(()) = interrupt else { break };
                         if let Err(err) = handle.execute(SessionCommand::CancelConversation).await {
-                            tracing::error!("Failed to interrupt Kiro turn: {err}");
+                            tracing::error!("Failed to interrupt ACP turn: {err}");
                             break;
                         }
                     }
@@ -5787,7 +5826,7 @@ impl Backend for KiroBackend {
         let command_handle = match ready_rx.await {
             Ok(Ok(handle)) => handle,
             Ok(Err(err)) => return Err(err),
-            Err(_) => return Err("Kiro spawn initialization task ended early".to_string()),
+            Err(_) => return Err("ACP spawn initialization task ended early".to_string()),
         };
         startup_guard.disarm();
 
@@ -5835,9 +5874,9 @@ impl Backend for KiroBackend {
             {
                 Ok(v) => v,
                 Err(err) => {
-                    tracing::error!("Failed to spawn Kiro resume session: {err}");
+                    tracing::error!("Failed to spawn ACP resume session: {err}");
                     if let Some(tx) = ready_tx.take() {
-                        let _ = tx.send(Err(format!("Failed to spawn Kiro resume session: {err}")));
+                        let _ = tx.send(Err(format!("Failed to spawn ACP resume session: {err}")));
                     }
                     return;
                 }
@@ -5850,9 +5889,9 @@ impl Backend for KiroBackend {
                 })
                 .await
             {
-                tracing::error!("Failed to resume Kiro session: {err}");
+                tracing::error!("Failed to resume ACP session: {err}");
                 if let Some(tx) = ready_tx.take() {
-                    let _ = tx.send(Err(format!("Failed to resume Kiro session: {err}")));
+                    let _ = tx.send(Err(format!("Failed to resume ACP session: {err}")));
                 }
                 session.shutdown().await;
                 return;
@@ -5870,10 +5909,10 @@ impl Backend for KiroBackend {
                     })
                     .await
             {
-                tracing::error!("Failed to configure resumed Kiro session: {err}");
+                tracing::error!("Failed to configure resumed ACP session: {err}");
                 if let Some(tx) = ready_tx.take() {
                     let _ = tx.send(Err(format!(
-                        "Failed to configure resumed Kiro session: {err}"
+                        "Failed to configure resumed ACP session: {err}"
                     )));
                 }
                 session.shutdown().await;
@@ -5933,7 +5972,7 @@ impl Backend for KiroBackend {
                                         .await
                                     {
                                         let _ = command_error_tx.send(format!(
-                                            "Failed to send resumed Kiro follow-up prompt: {err}"
+                                            "Failed to send resumed ACP follow-up prompt: {err}"
                                         ));
                                     }
                                 });
@@ -5946,7 +5985,7 @@ impl Backend for KiroBackend {
                                     })
                                     .await
                                 {
-                                    tracing::error!("Failed to update resumed Kiro session settings: {err}");
+                                    tracing::error!("Failed to update resumed ACP session settings: {err}");
                                     break;
                                 }
                             }
@@ -5962,7 +6001,7 @@ impl Backend for KiroBackend {
                     interrupt = interrupt_rx.recv() => {
                         let Some(()) = interrupt else { break };
                         if let Err(err) = handle.execute(SessionCommand::CancelConversation).await {
-                            tracing::error!("Failed to interrupt resumed Kiro turn: {err}");
+                            tracing::error!("Failed to interrupt resumed ACP turn: {err}");
                             break;
                         }
                     }
@@ -5977,7 +6016,7 @@ impl Backend for KiroBackend {
         let command_handle = match ready_rx.await {
             Ok(Ok(handle)) => handle,
             Ok(Err(err)) => return Err(err),
-            Err(_) => return Err("Kiro resume initialization task ended early".to_string()),
+            Err(_) => return Err("ACP resume initialization task ended early".to_string()),
         };
         startup_guard.disarm();
 

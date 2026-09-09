@@ -45,3 +45,15 @@ Additional real regressions cover Claude’s native session location, Codex’s 
 Server-only guarantees remain in `server/tests/session_resume.rs`: history paging and bootstrap barriers, server session-list metadata, and idle/busy compaction admission with a single correlated timeline entry. Catalog refresh and error propagation remain in `tests/tests/bootstrap.rs`, driven by typed `MockBackend::discover` results.
 
 Normal validation is `./dev.sh check`; it builds the test binary and MCP bridge without running paid cases. Real cases are ignored and additionally require `TYDE_RUN_REAL_AI_TESTS=1`; `TYDE_REAL_BACKENDS` selects providers. Follow the authorization rules in `AGENTS.md` before running them.
+
+## Exhausted-account regression
+
+`real_exhausted_account_stays_open` requires an authenticated real account
+whose balance or usage quota is already exhausted for the selected model.
+Set `TYDE_REAL_ACCOUNT_EXHAUSTED=1` in addition to the normal paid-run opt-in.
+Missing exhaustion is a failure; this scenario never spends down an account
+or injects a provider error. It submits two small prompts in the same session,
+requires a capacity rejection and idle state for each, and checks that the
+backend event stream remains open after each rejection. The scenario is
+registered for every supported backend with identical setup and assertions.
+Real runs, including a baseline run without the fix, still require approval.

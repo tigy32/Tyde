@@ -2334,6 +2334,59 @@ async fn real_background_task_cancel<B: Backend>(host: &mut Harness<B>) {
     assert_clean_close(host, &agent).await;
 }
 
+async fn real_exhausted_account_stays_open<B: Backend>(host: &mut Harness<B>) {
+    assert_eq!(
+        std::env::var("TYDE_REAL_ACCOUNT_EXHAUSTED").as_deref(),
+        Ok("1"),
+        "requires a real account with an already exhausted balance or usage quota"
+    );
+    let prompt = "Reply with exactly TYDE_QUOTA_PROBE. Do not use tools.";
+    let agent = spawn_agent(host, prompt).await;
+    for attempt in 0..2 {
+        if attempt > 0 {
+            send_prompt(host, &agent, prompt).await;
+        }
+        let events = collect_rejected_turn(host).await;
+        let errors: Vec<&str> = events
+            .iter()
+            .filter_map(|event| match event {
+                ChatEvent::OperationCancelled(data) => Some(data.message.as_str()),
+                ChatEvent::MessageAdded(message)
+                    if matches!(message.sender, MessageSender::Error) =>
+                {
+                    Some(message.content.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        let detail = errors.join("\n").to_ascii_lowercase();
+        assert!(
+            [
+                "balance exhausted",
+                "quota",
+                "usage limit",
+                "rate limit",
+                "credit",
+                "payment required"
+            ]
+            .iter()
+            .any(|marker| detail.contains(marker)),
+            "expected a real capacity rejection, received {events:?}"
+        );
+        assert!(
+            !events.iter().any(|event| matches!(event,
+                ChatEvent::MessageAdded(message)
+                    if matches!(message.sender, MessageSender::Assistant { .. })
+                        && message.content.contains("TYDE_QUOTA_PROBE")
+            )),
+            "account was not exhausted: {events:?}"
+        );
+        drain_events_for(host, Duration::from_secs(1)).await;
+    }
+}
+
+conformance2_scenario!(real_exhausted_account_stays_open, []);
+
 async fn real_interruption<B: Backend>(host: &mut Harness<B>) {
     let workspace = host.workspace().to_path_buf();
     let agent = spawn_agent(host, &launch_prompt()).await;

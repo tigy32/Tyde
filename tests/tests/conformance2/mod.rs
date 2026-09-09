@@ -589,6 +589,22 @@ pub async fn collect_turn<B: Backend>(host: &mut Harness<B>, _agent: &Agent, pro
     }
 }
 
+pub async fn collect_rejected_turn<B: Backend>(host: &mut Harness<B>) -> Vec<ChatEvent> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(240);
+    let mut events = Vec::new();
+    loop {
+        let event = host
+            .next_chat(deadline)
+            .await
+            .expect("rejected turn must settle");
+        let idle = matches!(event, ChatEvent::TypingStatusChanged(false));
+        events.push(event);
+        if idle {
+            return events;
+        }
+    }
+}
+
 pub async fn ask_with_images<B: Backend>(
     host: &mut Harness<B>,
     agent: &Agent,
