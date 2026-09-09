@@ -6648,10 +6648,29 @@ async fn generated_name_publishes_provisionally_then_renames_authoritatively() {
     let renamed: AgentRenamedPayload = env.parse_payload().expect("parse generated rename");
     assert_eq!(renamed.agent_id, new_agent.agent_id);
     assert_eq!(renamed.name, "Generated Async Name");
-    let env = expect_kind(
+    // The control-lane rename can overtake bulk-lane startup/ListSessions
+    // snapshots: the failing run received the correct rename followed by
+    // "Review Logs Mock-async-generated-name". Validate those provisional
+    // snapshots and still require the generated alias within the deadline.
+    let env = fixture::next_logical_frame_matching_on(
         &mut fixture.client,
-        FrameKind::SessionList,
         "generated SessionList",
+        |env| {
+            if env.kind != FrameKind::SessionList {
+                return false;
+            }
+            let list: SessionListPayload = env.parse_payload().expect("parse rename snapshot");
+            eprintln!("generated-name session snapshot: {list:?}");
+            assert_eq!(list.sessions.len(), 1);
+            assert_eq!(Some(&list.sessions[0].id), start.session_id.as_ref());
+            assert_eq!(list.sessions[0].user_alias, None);
+            let alias = list.sessions[0].alias.as_deref();
+            if alias == Some("Generated Async Name") {
+                return true;
+            }
+            assert_eq!(alias, Some(new_agent.name.as_str()));
+            false
+        },
     )
     .await;
     let list: SessionListPayload = env.parse_payload().expect("parse generated SessionList");
