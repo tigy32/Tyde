@@ -415,6 +415,10 @@ fn render_task_view(
         task_list.title.clone()
     };
     let metrics = context.breakdown.as_ref().map(compute_context_metrics);
+    let has_detailed_breakdown = context
+        .breakdown
+        .as_ref()
+        .is_some_and(has_detailed_breakdown);
     view! {
         <div
             class="summary-task-view"
@@ -470,17 +474,12 @@ fn render_task_view(
                     aria-controls=context.panel_id
                     on:click=move |_| context.preferred_view.set(Some(SummaryView::Context))
                 >
-                    {metrics.as_ref().map(|m| {
-                        m.categories.iter().filter(|cat| cat.percent > 0.0).map(|cat| {
-                            view! {
-                                <span
-                                    class=format!("summary-context-segment {}", cat.css_class)
-                                    aria-hidden="true"
-                                    style=format!("width: {:.2}%", cat.percent)
-                                ></span>
-                            }
-                        }).collect::<Vec<_>>()
-                    })}
+                    // Same fill as the full panel, including the neutral
+                    // occupancy bar for backends that report how full the
+                    // window is but never what fills it. Drawing only
+                    // attributed categories left this control permanently
+                    // empty on those sessions, which reads as an empty context.
+                    {metrics.as_ref().map(|m| render_bar_fill(m, has_detailed_breakdown))}
                 </button>
             })}
         </div>
@@ -1587,6 +1586,52 @@ mod wasm_tests {
                 .unwrap_or_default()
                 .contains("tokens"),
             "the readable occupancy must survive the missing breakdown"
+        );
+    }
+
+    /// The task view's mini bar is the same measurement as the full panel and
+    /// must draw the same fill. Backends that report occupancy without
+    /// attribution (Codex, among others) left every category at zero, and the
+    /// mini bar drew only categories — so a half-full window rendered as an
+    /// empty track under the task list, which reads as "no context used".
+    #[wasm_bindgen_test]
+    async fn task_view_mini_bar_draws_unattributed_occupancy() {
+        ensure_styles_loaded();
+        let container = make_container();
+        let slots = Rc::new(RefCell::new(None));
+        let _handle = mount_summary(&container, slots.clone());
+        next_tick().await;
+
+        signals(&slots).breakdown.set(Some(ContextBreakdown {
+            system_prompt_bytes: 0,
+            tool_io_bytes: 0,
+            conversation_history_bytes: 0,
+            reasoning_bytes: 0,
+            context_injection_bytes: 0,
+            input_tokens: 5_000,
+            context_window: 10_000,
+        }));
+        next_tick().await;
+        button(&container, "[data-summary-action='tasks']").click();
+        next_tick().await;
+        assert!(panel_is_active(&container, ".summary-task-view"));
+
+        let mini = button(&container, "[data-summary-action='context']");
+        let fill = mini
+            .query_selector(".summary-context-segment")
+            .unwrap()
+            .expect("the mini bar must draw the occupancy it measures");
+        assert!(
+            fill.class_name().contains("segment-occupied"),
+            "unattributed occupancy must use the neutral fill, not a category colour, got: {}",
+            fill.class_name()
+        );
+        let track = mini.get_bounding_client_rect().width();
+        let drawn = fill.get_bounding_client_rect().width();
+        assert!(track > 0.0, "the mini bar must be laid out to be readable");
+        assert!(
+            (drawn - track * 0.5).abs() <= 2.0,
+            "a 50%-full window must fill half the mini bar: {drawn}px drawn of {track}px"
         );
     }
 }
