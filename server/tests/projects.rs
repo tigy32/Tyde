@@ -15,6 +15,7 @@ use protocol::{
     SteeringNotifyPayload, SteeringScope, SteeringUpsertPayload, StreamPath,
     WorkbenchCreatePayload,
 };
+use server::store::project::ProjectStore;
 use std::fs;
 use std::io::Write;
 use std::path::Path;
@@ -524,6 +525,92 @@ async fn rename_project_emits_updated_upsert() {
         }
         other => panic!("expected upsert project notification, got {other:?}"),
     }
+}
+
+fn rewrite_projects_json_with_foreign_record(path: &Path, foreign_id: &str) {
+    let contents = std::fs::read_to_string(path).expect("read projects.json");
+    let value: serde_json::Value = serde_json::from_str(&contents).expect("parse projects.json");
+    let write_seq = value
+        .get("write_seq")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let version = value
+        .get("version")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(2);
+    let Some(serde_json::Value::Object(mut records)) = value.get("records").cloned() else {
+        panic!("projects.json records must be an object");
+    };
+    records.insert(
+        foreign_id.to_owned(),
+        serde_json::json!({
+            "id": foreign_id,
+            "name": "Foreign",
+            "sort_order": 99,
+            "source": {
+                "kind": "standalone",
+                "roots": ["/tmp/foreign-project"]
+            }
+        }),
+    );
+    #[derive(serde::Serialize)]
+    struct ProjectsFile<'a> {
+        write_seq: u64,
+        version: u64,
+        records: &'a serde_json::Map<String, serde_json::Value>,
+    }
+    let body = serde_json::to_string_pretty(&ProjectsFile {
+        write_seq: write_seq + 1,
+        version,
+        records: &records,
+    })
+    .expect("serialize foreign projects.json");
+    std::fs::write(path, body).expect("write projects.json");
+}
+
+#[tokio::test]
+async fn project_store_keeps_foreign_records_across_rename() {
+    let mut fixture = Fixture::new().await;
+    let project = create_project(
+        &mut fixture.client,
+        "Original",
+        vec!["/tmp/original".to_owned()],
+    )
+    .await;
+
+    let projects_path = fixture.store_dir().join("projects.json");
+    rewrite_projects_json_with_foreign_record(&projects_path, "foreign-project");
+
+    fixture
+        .client
+        .project_rename(ProjectRenamePayload {
+            id: project.id.clone(),
+            name: "Renamed".to_owned(),
+        })
+        .await
+        .expect("project_rename failed");
+
+    match expect_project_notify(&mut fixture.client, "project rename").await {
+        ProjectNotifyPayload::Upsert { project: renamed } => {
+            assert_eq!(renamed.id, project.id);
+            assert_eq!(renamed.name, "Renamed");
+        }
+        other => panic!("expected upsert project notification, got {other:?}"),
+    }
+
+    let store = ProjectStore::load(projects_path).expect("load project store");
+    let projects = store.list().expect("list projects");
+    assert_eq!(projects.len(), 2, "rename must keep the foreign project");
+    let renamed = projects
+        .iter()
+        .find(|candidate| candidate.id == project.id)
+        .expect("renamed project");
+    assert_eq!(renamed.name, "Renamed");
+    let foreign = projects
+        .iter()
+        .find(|candidate| candidate.id.0 == "foreign-project")
+        .expect("foreign project");
+    assert_eq!(foreign.name, "Foreign");
 }
 
 #[tokio::test]

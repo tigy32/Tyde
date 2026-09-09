@@ -1,8 +1,11 @@
+use std::cell::{Cell, RefCell};
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+use super::write_seq::{CAS_ATTEMPTS, peek_write_seq};
 
 use protocol::{
     BackendKind, CompactionMethod, CompactionMetrics, CompactionMutation, CompactionOperationId,
@@ -145,9 +148,17 @@ pub struct SessionRecord {
     pub(crate) compaction_operations: Vec<CompactionOperationRecord>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Deserialize)]
 struct StoreFile {
+    #[serde(default)]
+    write_seq: u64,
     records: HashMap<String, SessionRecord>,
+}
+
+#[derive(Debug, Serialize)]
+struct StoreFileRef<'a> {
+    write_seq: u64,
+    records: &'a HashMap<String, SessionRecord>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -158,6 +169,8 @@ struct TaskStateFile {
 #[derive(Debug)]
 pub struct SessionStore {
     path: PathBuf,
+    records: RefCell<HashMap<String, SessionRecord>>,
+    write_seq: Cell<u64>,
 }
 
 impl SessionStore {
@@ -169,8 +182,12 @@ impl SessionStore {
         let purged_gemini_session_ids = Self::purge_legacy_gemini_sessions(&path)?;
         Self::mark_non_native_antigravity_sessions_non_resumable(&path)?;
         Self::migrate_legacy_kiro_sessions(&path)?;
-        let _ = Self::read_from_disk(&path)?;
-        let store = Self { path };
+        let (write_seq, records) = Self::read_from_disk(&path)?;
+        let store = Self {
+            path,
+            records: RefCell::new(records),
+            write_seq: Cell::new(write_seq),
+        };
         let _ = store.reconcile_incomplete_compactions()?;
         Ok((store, purged_gemini_session_ids))
     }
@@ -189,16 +206,15 @@ impl SessionStore {
     }
 
     pub fn list(&self) -> Result<Vec<SessionRecord>, String> {
-        let records = Self::read_from_disk(&self.path)?;
-        let mut out: Vec<_> = records.into_values().collect();
+        self.refresh_if_stale()?;
+        let mut out: Vec<_> = self.records.borrow().values().cloned().collect();
         out.sort_by_key(|record| Reverse(record.updated_at_ms));
         Ok(out)
     }
 
     pub fn get(&self, id: &SessionId) -> Option<SessionRecord> {
-        Self::read_from_disk(&self.path)
-            .ok()
-            .and_then(|records| records.get(&id.0).cloned())
+        self.refresh_if_stale().ok()?;
+        self.records.borrow().get(&id.0).cloned()
     }
 
     pub fn get_task_list(&self, id: &SessionId) -> Option<TaskList> {
@@ -280,16 +296,16 @@ impl SessionStore {
 
             entry.backend_kind = session.backend_kind;
             if launch_profile_id.is_some() {
-                entry.launch_profile_id = launch_profile_id;
+                entry.launch_profile_id = launch_profile_id.clone();
             }
             entry.workspace_roots = session.workspace_roots.clone();
-            entry.project_id = project_id;
-            entry.custom_agent_id = custom_agent_id;
+            entry.project_id = project_id.clone();
+            entry.custom_agent_id = custom_agent_id.clone();
             if entry.alias.is_none() {
                 entry.alias = session.title.clone();
             }
             if entry.parent_id.is_none() {
-                entry.parent_id = parent_id;
+                entry.parent_id = parent_id.clone();
             }
             if let Some(created) = session.created_at_ms {
                 entry.created_at_ms = created;
@@ -317,23 +333,34 @@ impl SessionStore {
         session_id: &SessionId,
         access_mode: protocol::BackendAccessMode,
     ) -> Result<(), String> {
-        self.read_modify_write(|records| {
-            let record = records
-                .get_mut(&session_id.0)
-                .ok_or_else(|| format!("Session not found: {}", session_id.0))?;
+        self.cas(|records| {
+            let Some(record) = records.get_mut(&session_id.0) else {
+                return Err(format!("Session not found: {}", session_id.0));
+            };
             record.access_mode = access_mode;
-            Ok(())
-        })?
+            Ok(((), true))
+        })
     }
 
     pub fn update<F>(&self, session_id: &SessionId, update: F) -> Result<(), String>
     where
         F: FnOnce(&mut SessionRecord),
     {
-        self.read_modify_write(|records| {
-            if let Some(record) = records.get_mut(&session_id.0) {
+        let mut update = Some(update);
+        let mut snapshot: Option<SessionRecord> = None;
+        self.cas(|records| {
+            if let Some(existing) = snapshot.as_ref() {
+                records.insert(session_id.0.clone(), existing.clone());
+                return Ok(((), true));
+            }
+            let Some(record) = records.get_mut(&session_id.0) else {
+                return Ok(((), false));
+            };
+            if let Some(update) = update.take() {
                 update(record);
             }
+            snapshot = Some(record.clone());
+            Ok(((), true))
         })
     }
 
@@ -369,19 +396,22 @@ impl SessionStore {
         session_id: &SessionId,
         alias: String,
     ) -> Result<bool, String> {
-        self.read_modify_write(|records| {
+        self.cas(|records| {
             let Some(record) = records.get_mut(&session_id.0) else {
-                return false;
+                return Ok((false, false));
             };
             if record.user_alias.is_some() {
-                return false;
+                return Ok((false, false));
             }
 
-            if record.alias.as_deref() != Some(alias.as_str()) {
-                record.alias = Some(alias);
+            let changed = if record.alias.as_deref() != Some(alias.as_str()) {
+                record.alias = Some(alias.clone());
                 record.updated_at_ms = now_ms();
-            }
-            true
+                true
+            } else {
+                false
+            };
+            Ok((true, changed))
         })
     }
 
@@ -397,35 +427,41 @@ impl SessionStore {
     }
 
     pub fn detach_project(&self, project_id: &ProjectId) -> Result<Vec<SessionId>, String> {
-        let mut records = Self::read_from_disk(&self.path)?;
-        let mut detached = Vec::new();
-        for record in records.values_mut() {
-            if record.project_id.as_ref() == Some(project_id) {
-                record.project_id = None;
-                detached.push(record.id.clone());
+        self.cas(|records| {
+            let mut detached = Vec::new();
+            for record in records.values_mut() {
+                if record.project_id.as_ref() == Some(project_id) {
+                    record.project_id = None;
+                    detached.push(record.id.clone());
+                }
             }
-        }
-        if !detached.is_empty() {
-            Self::save(&self.path, &records)?;
+            if detached.is_empty() {
+                return Ok((detached, false));
+            }
             detached.sort_by(|left, right| left.0.cmp(&right.0));
-        }
-        Ok(detached)
+            Ok((detached, true))
+        })
     }
 
     pub fn delete_for_project(&self, project_id: &ProjectId) -> Result<Vec<SessionId>, String> {
-        let mut records = Self::read_from_disk(&self.path)?;
-        let mut deleted = records
-            .values()
-            .filter(|record| record.project_id.as_ref() == Some(project_id))
-            .map(|record| record.id.clone())
-            .collect::<Vec<_>>();
+        let deleted = self.cas(|records| {
+            let mut deleted = records
+                .values()
+                .filter(|record| record.project_id.as_ref() == Some(project_id))
+                .map(|record| record.id.clone())
+                .collect::<Vec<_>>();
+            if deleted.is_empty() {
+                return Ok((deleted, false));
+            }
+            for id in &deleted {
+                records.remove(&id.0);
+            }
+            deleted.sort_by(|left, right| left.0.cmp(&right.0));
+            Ok((deleted, true))
+        })?;
         if deleted.is_empty() {
             return Ok(deleted);
         }
-        for id in &deleted {
-            records.remove(&id.0);
-        }
-        Self::save(&self.path, &records)?;
 
         let mut task_state = self.read_task_state()?;
         let original_task_count = task_state.records.len();
@@ -437,13 +473,13 @@ impl SessionStore {
                 .map_err(|err| format!("Failed to serialize task state: {err}"))?;
             write_json_value_atomically(&self.task_state_path(), &value)?;
         }
-        deleted.sort_by(|left, right| left.0.cmp(&right.0));
         Ok(deleted)
     }
 
     pub fn delete(&self, session_id: &SessionId) -> Result<(), String> {
-        self.read_modify_write(|records| {
-            records.remove(&session_id.0);
+        self.cas(|records| {
+            let changed = records.remove(&session_id.0).is_some();
+            Ok(((), changed))
         })
     }
 
@@ -485,7 +521,7 @@ impl SessionStore {
                 .expect("new session existence checked before compaction mark");
             new_record.compacted_from_session_id = Some(old_session_id.clone());
             new_record.compacted_at_ms = Some(now);
-            new_record.compaction_summary_preview = Some(summary_preview);
+            new_record.compaction_summary_preview = Some(summary_preview.clone());
             new_record.updated_at_ms = now;
             Ok(())
         })?
@@ -524,9 +560,9 @@ impl SessionStore {
                         operation.operation_id.0
                     ));
                 }
-                *existing = operation;
+                *existing = operation.clone();
             } else {
-                record.compaction_operations.push(operation);
+                record.compaction_operations.push(operation.clone());
             }
             record.updated_at_ms = now_ms();
             Ok(())
@@ -569,8 +605,8 @@ impl SessionStore {
             operation.accepted = accepted;
             operation.mutation = mutation;
             operation.method = method;
-            operation.metrics = metrics;
-            operation.message = message;
+            operation.metrics = metrics.clone();
+            operation.message = message.clone();
             operation.finished_at_ms = Some(now_ms());
             record.compaction_epoch = record.compaction_epoch.saturating_add(1);
             record.updated_at_ms = now_ms();
@@ -617,9 +653,9 @@ impl SessionStore {
             let binding = BackendSessionBinding {
                 generation,
                 backend_kind,
-                provider_session_id,
+                provider_session_id: provider_session_id.clone(),
                 created_at_ms: now_ms(),
-                created_by_compaction: Some(operation_id),
+                created_by_compaction: Some(operation_id.clone()),
             };
             record.backend_bindings.push(binding.clone());
             record.active_backend_binding_generation = generation;
@@ -633,8 +669,8 @@ impl SessionStore {
             operation.mutation = CompactionMutation::Completed;
             operation.method = Some(CompactionMethod::InlineFallback);
             operation.binding_generation_after = Some(generation);
-            operation.metrics = metrics;
-            operation.message = message;
+            operation.metrics = metrics.clone();
+            operation.message = message.clone();
             operation.finished_at_ms = Some(now_ms());
             Ok((binding, operation.clone()))
         })?
@@ -643,10 +679,15 @@ impl SessionStore {
     pub(crate) fn reconcile_incomplete_compactions(
         &self,
     ) -> Result<Vec<CompactionOperationRecord>, String> {
-        self.read_modify_write(|records| {
+        self.cas(|records| {
             let mut reconciled = Vec::new();
+            let mut changed = false;
             for record in records.values_mut() {
+                let binding_count = record.backend_bindings.len();
                 ensure_backend_binding(record);
+                if record.backend_bindings.len() != binding_count {
+                    changed = true;
+                }
                 let mut record_reconciled = false;
                 for operation in &mut record.compaction_operations {
                     if operation.is_terminal() {
@@ -676,9 +717,10 @@ impl SessionStore {
                 if record_reconciled {
                     record.compaction_epoch = record.compaction_epoch.saturating_add(1);
                     record.updated_at_ms = now_ms();
+                    changed = true;
                 }
             }
-            reconciled
+            Ok((reconciled, changed))
         })
     }
 
@@ -686,7 +728,8 @@ impl SessionStore {
         &self,
         session_id: &SessionId,
     ) -> Result<Vec<SessionId>, String> {
-        let records = Self::read_from_disk(&self.path)?;
+        self.refresh_if_stale()?;
+        let records = self.records.borrow();
         let mut out = Vec::new();
         let mut current = session_id.clone();
         let mut seen = std::collections::HashSet::new();
@@ -711,7 +754,8 @@ impl SessionStore {
         &self,
         session_id: &SessionId,
     ) -> Result<Vec<SessionId>, String> {
-        let records = Self::read_from_disk(&self.path)?;
+        self.refresh_if_stale()?;
+        let records = self.records.borrow();
         let mut out = Vec::new();
         let mut current = session_id.clone();
         let mut seen = std::collections::HashSet::new();
@@ -757,33 +801,36 @@ impl SessionStore {
         scope: SessionListScope,
         backend_storage: &crate::backend::BackendStorage,
     ) -> Result<Vec<SessionSummary>, String> {
-        let records = self.list()?;
-        Ok(records
-            .into_iter()
+        self.refresh_if_stale()?;
+        let records = self.records.borrow();
+        let mut summaries: Vec<SessionSummary> = records
+            .values()
             .filter(|record| session_record_matches_scope(record, scope))
             .map(|record| {
-                let resumable = session_record_is_resumable(&record, backend_storage);
+                let resumable = session_record_is_resumable(record, backend_storage);
                 SessionSummary {
-                    id: record.id,
+                    id: record.id.clone(),
                     backend_kind: record.backend_kind,
-                    launch_profile_id: record.launch_profile_id,
-                    workspace_roots: record.workspace_roots,
-                    project_id: record.project_id,
-                    alias: record.alias,
-                    user_alias: record.user_alias,
-                    parent_id: record.parent_id,
+                    launch_profile_id: record.launch_profile_id.clone(),
+                    workspace_roots: record.workspace_roots.clone(),
+                    project_id: record.project_id.clone(),
+                    alias: record.alias.clone(),
+                    user_alias: record.user_alias.clone(),
+                    parent_id: record.parent_id.clone(),
                     created_at_ms: record.created_at_ms,
                     updated_at_ms: record.updated_at_ms,
                     message_count: record.message_count,
                     token_count: record.token_count,
                     resumable,
-                    compacted_from_session_id: record.compacted_from_session_id,
-                    compacted_to_session_id: record.compacted_to_session_id,
+                    compacted_from_session_id: record.compacted_from_session_id.clone(),
+                    compacted_to_session_id: record.compacted_to_session_id.clone(),
                     compacted_at_ms: record.compacted_at_ms,
-                    compaction_summary_preview: record.compaction_summary_preview,
+                    compaction_summary_preview: record.compaction_summary_preview.clone(),
                 }
             })
-            .collect())
+            .collect();
+        summaries.sort_by_key(|summary| Reverse(summary.updated_at_ms));
+        Ok(summaries)
     }
 
     fn purge_legacy_gemini_sessions(path: &Path) -> Result<HashSet<SessionId>, String> {
@@ -966,17 +1013,17 @@ impl SessionStore {
         Ok(())
     }
 
-    fn read_from_disk(path: &Path) -> Result<HashMap<String, SessionRecord>, String> {
+    fn read_from_disk(path: &Path) -> Result<(u64, HashMap<String, SessionRecord>), String> {
         match std::fs::read_to_string(path) {
             Ok(contents) => serde_json::from_str::<StoreFile>(&contents)
                 .map(|mut store| {
                     for record in store.records.values_mut() {
                         ensure_backend_binding(record);
                     }
-                    store.records
+                    (store.write_seq, store.records)
                 })
                 .map_err(|err| format!("Failed to parse session store {}: {err}", path.display())),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(HashMap::new()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok((0, HashMap::new())),
             Err(err) => Err(format!(
                 "Failed to read session store {}: {err}",
                 path.display()
@@ -984,21 +1031,68 @@ impl SessionStore {
         }
     }
 
-    fn read_modify_write<T, F>(&self, modify: F) -> Result<T, String>
-    where
-        F: FnOnce(&mut HashMap<String, SessionRecord>) -> T,
-    {
-        let mut records = Self::read_from_disk(&self.path)?;
-        let result = modify(&mut records);
-        Self::save(&self.path, &records)?;
-        Ok(result)
+    fn refresh_if_stale(&self) -> Result<(), String> {
+        let disk_seq = peek_write_seq(&self.path)?;
+        if disk_seq == self.write_seq.get() {
+            return Ok(());
+        }
+        self.reload()
     }
 
-    fn save(path: &Path, records: &HashMap<String, SessionRecord>) -> Result<(), String> {
-        let json = serde_json::to_string_pretty(&StoreFile {
-            records: records.clone(),
-        })
-        .map_err(|err| format!("Failed to serialize session store: {err}"))?;
+    fn reload(&self) -> Result<(), String> {
+        let (write_seq, records) = Self::read_from_disk(&self.path)?;
+        self.records.replace(records);
+        self.write_seq.set(write_seq);
+        Ok(())
+    }
+
+    fn read_modify_write<T, F>(&self, mut modify: F) -> Result<T, String>
+    where
+        F: FnMut(&mut HashMap<String, SessionRecord>) -> T,
+    {
+        self.cas(|records| Ok((modify(records), true)))
+    }
+
+    fn cas<T, F>(&self, mut body: F) -> Result<T, String>
+    where
+        F: FnMut(&mut HashMap<String, SessionRecord>) -> Result<(T, bool), String>,
+    {
+        for _ in 0..CAS_ATTEMPTS {
+            self.refresh_if_stale()?;
+            let seq = peek_write_seq(&self.path)?;
+            if seq != self.write_seq.get() {
+                continue;
+            }
+
+            let (result, changed) = {
+                let mut records = self.records.borrow_mut();
+                body(&mut records)?
+            };
+
+            let peeked = peek_write_seq(&self.path)?;
+            if peeked != seq {
+                self.reload()?;
+                continue;
+            }
+            if !changed {
+                return Ok(result);
+            }
+
+            let new_seq = seq.saturating_add(1);
+            Self::save(&self.path, new_seq, &self.records.borrow())?;
+            self.write_seq.set(new_seq);
+            return Ok(result);
+        }
+        Err("session store write_seq changed during save".to_owned())
+    }
+
+    fn save(
+        path: &Path,
+        write_seq: u64,
+        records: &HashMap<String, SessionRecord>,
+    ) -> Result<(), String> {
+        let json = serde_json::to_string(&StoreFileRef { write_seq, records })
+            .map_err(|err| format!("Failed to serialize session store: {err}"))?;
 
         let parent = path
             .parent()

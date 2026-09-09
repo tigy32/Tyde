@@ -9,6 +9,8 @@ use protocol::{
     StreamPath,
 };
 use server::backend::mock::{MockScript, MockTurn};
+use server::store::session::SessionStore;
+use std::path::Path;
 use std::time::Duration;
 
 async fn expect_next_event(client: &mut client::Connection, context: &str) -> Envelope {
@@ -517,6 +519,110 @@ async fn list_sessions_and_resume_agent() {
     );
     assert_eq!(list.sessions[0].id, session.id);
     assert_eq!(list.sessions[0].message_count, 2);
+}
+
+fn rewrite_sessions_json_with_foreign_record(path: &Path, foreign_id: &str) {
+    let contents = std::fs::read_to_string(path).expect("read sessions.json");
+    let value: serde_json::Value = serde_json::from_str(&contents).expect("parse sessions.json");
+    let write_seq = value
+        .get("write_seq")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let Some(serde_json::Value::Object(mut records)) = value.get("records").cloned() else {
+        panic!("sessions.json records must be an object");
+    };
+    records.insert(
+        foreign_id.to_owned(),
+        serde_json::json!({
+            "id": foreign_id,
+            "backend_kind": "claude",
+            "workspace_roots": ["/tmp/foreign"],
+            "created_at_ms": 1,
+            "updated_at_ms": 1,
+        }),
+    );
+    #[derive(serde::Serialize)]
+    struct SessionsFile<'a> {
+        write_seq: u64,
+        records: &'a serde_json::Map<String, serde_json::Value>,
+    }
+    let body = serde_json::to_string(&SessionsFile {
+        write_seq: write_seq + 1,
+        records: &records,
+    })
+    .expect("serialize foreign sessions.json");
+    std::fs::write(path, body).expect("write sessions.json");
+}
+
+#[tokio::test]
+async fn session_store_keeps_foreign_records_across_turn() {
+    let mut fixture = Fixture::new().await;
+
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            name: Some("live-session".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::New {
+                workspace_roots: vec!["/tmp/test".to_owned()],
+                prompt: "hello".to_owned(),
+                images: None,
+                backend_kind: BackendKind::Claude,
+                launch_profile_id: None,
+                cost_hint: None,
+                access_mode: Default::default(),
+                session_settings: None,
+            },
+        })
+        .await
+        .expect("spawn live session failed");
+
+    let env = expect_next_event(&mut fixture.client, "NewAgent").await;
+    let new_agent: NewAgentPayload = env.parse_payload().expect("parse NewAgent");
+
+    let _ = expect_next_event(&mut fixture.client, "AgentStart").await;
+    expect_turn(&mut fixture.client, "mock backend response to: hello").await;
+
+    fixture
+        .client
+        .list_sessions(ListSessionsPayload::default())
+        .await
+        .expect("list_sessions failed");
+    let list = wait_for_session_list(&mut fixture.client, "SessionList").await;
+    assert_eq!(list.sessions.len(), 1, "expected one stored session");
+    let session_id = list.sessions[0].id.clone();
+    assert_eq!(list.sessions[0].message_count, 1);
+
+    let sessions_path = fixture.store_dir().join("sessions.json");
+    rewrite_sessions_json_with_foreign_record(&sessions_path, "foreign-session");
+
+    fixture
+        .client
+        .send_message(&new_agent.instance_stream, "follow-up".to_owned())
+        .await
+        .expect("send follow-up failed");
+    expect_turn(&mut fixture.client, "mock backend response to: follow-up").await;
+
+    let store = SessionStore::load(sessions_path).expect("load session store");
+    let records = store.list().expect("list session records");
+    assert_eq!(records.len(), 2, "live write must keep the foreign record");
+    let live = records
+        .iter()
+        .find(|record| record.id == session_id)
+        .expect("live session record");
+    assert_eq!(live.message_count, 2);
+    assert!(
+        records
+            .iter()
+            .any(|record| record.id.0 == "foreign-session"),
+        "foreign session record missing after live turn: {:?}",
+        records
+            .iter()
+            .map(|record| record.id.0.as_str())
+            .collect::<Vec<_>>()
+    );
 }
 
 #[tokio::test]

@@ -13,3 +13,4 @@ pub mod settings;
 pub mod skills;
 pub mod steering;
 pub(crate) mod transcript;
+pub(crate) mod write_seq;

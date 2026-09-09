@@ -11101,10 +11101,11 @@ async fn update_queued_messages_snapshot(
             .and_then(|start| start.session_id)
     }) {
         let messages = payload.messages.clone();
-        if let Err(error) = session_store
-            .lock()
-            .await
-            .update(&session_id, |record| record.queued_messages = messages)
+        let persist_id = session_id.clone();
+        if let Err(error) = run_session_store_io(session_store, move |store| {
+            store.update(&persist_id, |record| record.queued_messages = messages)
+        })
+        .await
         {
             tracing::error!(%session_id, %error, "failed to persist queued messages");
         }
@@ -12485,63 +12486,88 @@ async fn apply_runtime_session_updates(
     session_id: &SessionId,
     event: &ChatEvent,
 ) -> Option<SessionSummaryCountUpdatedPayload> {
-    let mut count_update = None;
-    let result = {
-        let store = session_store.lock().await;
-        match event {
-            ChatEvent::StreamEnd(data) => store.update(session_id, |record| {
-                record.updated_at_ms = now_ms();
-                record.message_count += 1;
-                count_update = Some(SessionSummaryCountUpdatedPayload {
-                    session_id: session_id.clone(),
-                    assistant_turn_count: record.message_count,
-                    updated_at_ms: record.updated_at_ms,
-                });
-                if let Some(delta) =
-                    known_turn_usage(&data.message.token_usage).map(|usage| usage.total_tokens)
-                {
-                    record.token_count =
-                        Some(record.token_count.unwrap_or(0).saturating_add(delta));
+    match event {
+        ChatEvent::StreamEnd(data) => {
+            let persist_id = session_id.clone();
+            let token_delta =
+                known_turn_usage(&data.message.token_usage).map(|usage| usage.total_tokens);
+            match run_session_store_io(session_store, move |store| {
+                let mut count_update = None;
+                store.update(&persist_id, |record| {
+                    record.updated_at_ms = now_ms();
+                    record.message_count += 1;
+                    count_update = Some(SessionSummaryCountUpdatedPayload {
+                        session_id: persist_id.clone(),
+                        assistant_turn_count: record.message_count,
+                        updated_at_ms: record.updated_at_ms,
+                    });
+                    if let Some(delta) = token_delta {
+                        record.token_count =
+                            Some(record.token_count.unwrap_or(0).saturating_add(delta));
+                    }
+                })?;
+                Ok(count_update)
+            })
+            .await
+            {
+                Ok(update) => update,
+                Err(err) => {
+                    tracing::error!("failed to update session store for {}: {}", session_id, err);
+                    None
                 }
-            }),
-            ChatEvent::MessageMetadataUpdated(data) => store.update(session_id, |record| {
-                record.updated_at_ms = now_ms();
-                if let Some(delta) =
-                    known_turn_usage(&data.token_usage).map(|usage| usage.total_tokens)
-                {
-                    record.token_count =
-                        Some(record.token_count.unwrap_or(0).saturating_add(delta));
-                }
-            }),
-            ChatEvent::TaskUpdate(tasks) => {
-                let title = tasks.title.trim();
-                tracing::info!(
-                    session_id = %session_id,
-                    task_count = tasks.tasks.len(),
-                    "persisting typed task state"
-                );
-                store
-                    .set_task_list(session_id, tasks.clone())
-                    .and_then(|()| {
-                        store.update(session_id, |record| {
-                            record.updated_at_ms = now_ms();
-                            if !title.is_empty() && record.alias.is_none() {
-                                record.alias = Some(title.to_string());
-                            }
-                        })
-                    })
             }
-            _ => store.update(session_id, |record| {
-                record.updated_at_ms = now_ms();
-            }),
         }
-    };
-
-    if let Err(err) = result {
-        tracing::error!("failed to update session store for {}: {}", session_id, err);
-        return None;
+        ChatEvent::MessageMetadataUpdated(data) => {
+            let delta = known_turn_usage(&data.token_usage).map(|usage| usage.total_tokens)?;
+            let persist_id = session_id.clone();
+            if let Err(err) = run_session_store_io(session_store, move |store| {
+                store.update(&persist_id, |record| {
+                    record.updated_at_ms = now_ms();
+                    record.token_count =
+                        Some(record.token_count.unwrap_or(0).saturating_add(delta));
+                })
+            })
+            .await
+            {
+                tracing::error!("failed to update session store for {}: {}", session_id, err);
+            }
+            None
+        }
+        ChatEvent::TaskUpdate(tasks) => {
+            let title = tasks.title.trim().to_string();
+            tracing::info!(
+                session_id = %session_id,
+                task_count = tasks.tasks.len(),
+                "persisting typed task state"
+            );
+            let persist_id = session_id.clone();
+            let tasks = tasks.clone();
+            if let Err(err) = run_session_store_io(session_store, move |store| {
+                store.set_task_list(&persist_id, tasks)?;
+                if title.is_empty() {
+                    return Ok(());
+                }
+                let needs_alias = store
+                    .get(&persist_id)
+                    .is_some_and(|record| record.alias.is_none());
+                if !needs_alias {
+                    return Ok(());
+                }
+                store.update(&persist_id, |record| {
+                    if record.alias.is_none() {
+                        record.alias = Some(title.clone());
+                        record.updated_at_ms = now_ms();
+                    }
+                })
+            })
+            .await
+            {
+                tracing::error!("failed to update session store for {}: {}", session_id, err);
+            }
+            None
+        }
+        _ => None,
     }
-    count_update
 }
 
 pub(crate) fn build_name_generation_prompt(prompt: &str) -> String {

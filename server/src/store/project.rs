@@ -9,12 +9,22 @@ use protocol::{
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use super::write_seq::peek_write_seq;
+
 const STORE_VERSION: u32 = 2;
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Deserialize)]
 struct StoreFile {
-    version: u32,
+    #[serde(default)]
+    write_seq: u64,
     records: HashMap<String, Project>,
+}
+
+#[derive(Debug, Serialize)]
+struct StoreFileRef<'a> {
+    write_seq: u64,
+    version: u32,
+    records: &'a HashMap<String, Project>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -97,11 +107,12 @@ impl From<ProjectStoreError> for String {
 pub struct ProjectStore {
     path: PathBuf,
     records: HashMap<String, Project>,
+    write_seq: u64,
 }
 
 impl ProjectStore {
     pub fn load(path: PathBuf) -> Result<Self, ProjectStoreError> {
-        let (mut records, migrated) = Self::read_from_disk(&path)?;
+        let (write_seq, mut records, migrated) = Self::read_from_disk(&path)?;
         let heal_actions = heal_duplicate_standalone_roots(&mut records);
         for action in &heal_actions {
             tracing::warn!("project store heal: {action}");
@@ -118,7 +129,11 @@ impl ProjectStore {
             tracing::warn!("project store load: {warning}");
         }
         let quarantined_records = records.len() != record_count_before;
-        let store = Self { path, records };
+        let mut store = Self {
+            path,
+            records,
+            write_seq,
+        };
         if migrated || !heal_actions.is_empty() || quarantined_records {
             store.save_current()?;
         }
@@ -152,6 +167,7 @@ impl ProjectStore {
         name: String,
         roots: Vec<ProjectRootPath>,
     ) -> Result<Project, ProjectStoreError> {
+        self.refresh_if_stale()?;
         validate_project_name(&name).map_err(ProjectStoreError::invalid_input)?;
         validate_standalone_roots_for_input(&roots).map_err(ProjectStoreError::invalid_input)?;
         for root in &roots {
@@ -177,6 +193,7 @@ impl ProjectStore {
     }
 
     pub fn rename(&mut self, id: &ProjectId, name: String) -> Result<Project, ProjectStoreError> {
+        self.refresh_if_stale()?;
         validate_project_name(&name).map_err(ProjectStoreError::invalid_input)?;
         let mut records = self.records.clone();
         let Some(project) = records.get_mut(&id.0) else {
@@ -196,6 +213,7 @@ impl ProjectStore {
         scope: ProjectReorderScope,
         project_ids: Vec<ProjectId>,
     ) -> Result<Vec<Project>, ProjectStoreError> {
+        self.refresh_if_stale()?;
         let scope_projects = self.projects_in_scope(&scope)?;
         let scope_ids = scope_projects
             .iter()
@@ -252,6 +270,7 @@ impl ProjectStore {
         id: &ProjectId,
         root: ProjectRootPath,
     ) -> Result<Project, ProjectStoreError> {
+        self.refresh_if_stale()?;
         validate_project_root(&root).map_err(ProjectStoreError::invalid_input)?;
         let children = self.list_children(id);
         if let Some(child) = children.first() {
@@ -301,6 +320,7 @@ impl ProjectStore {
         id: &ProjectId,
         root: &ProjectRootPath,
     ) -> Result<Project, ProjectStoreError> {
+        self.refresh_if_stale()?;
         let children = self.list_children(id);
         if let Some(child) = children.first() {
             return Err(ProjectStoreError::conflict(format!(
@@ -346,6 +366,7 @@ impl ProjectStore {
     }
 
     pub fn delete(&mut self, id: &ProjectId) -> Result<Project, ProjectStoreError> {
+        self.refresh_if_stale()?;
         let Some(existing) = self.records.get(&id.0) else {
             return Err(ProjectStoreError::not_found(format!(
                 "cannot delete missing project {}",
@@ -384,6 +405,7 @@ impl ProjectStore {
         branch: GitBranchName,
         roots: Vec<WorkbenchRoot>,
     ) -> Result<Project, ProjectStoreError> {
+        self.refresh_if_stale()?;
         validate_project_name(&name).map_err(ProjectStoreError::invalid_input)?;
         if branch.0.trim().is_empty() {
             return Err(ProjectStoreError::invalid_input(
@@ -434,6 +456,7 @@ impl ProjectStore {
     }
 
     pub fn delete_workbench(&mut self, id: &ProjectId) -> Result<Project, ProjectStoreError> {
+        self.refresh_if_stale()?;
         let Some(existing) = self.records.get(&id.0) else {
             return Err(ProjectStoreError::not_found(format!(
                 "cannot delete missing workbench project {}",
@@ -469,10 +492,14 @@ impl ProjectStore {
         children.into_iter().map(|project| project.id).collect()
     }
 
-    fn read_from_disk(path: &Path) -> Result<(HashMap<String, Project>, bool), ProjectStoreError> {
+    fn read_from_disk(
+        path: &Path,
+    ) -> Result<(u64, HashMap<String, Project>, bool), ProjectStoreError> {
         match std::fs::read_to_string(path) {
             Ok(contents) => Self::parse_store_file(path, &contents),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok((HashMap::new(), false)),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                Ok((0, HashMap::new(), false))
+            }
             Err(err) => Err(ProjectStoreError::internal(format!(
                 "Failed to read project store {}: {err}",
                 path.display()
@@ -483,7 +510,7 @@ impl ProjectStore {
     fn parse_store_file(
         path: &Path,
         contents: &str,
-    ) -> Result<(HashMap<String, Project>, bool), ProjectStoreError> {
+    ) -> Result<(u64, HashMap<String, Project>, bool), ProjectStoreError> {
         let value = serde_json::from_str::<serde_json::Value>(contents).map_err(|err| {
             ProjectStoreError::internal(format!(
                 "Failed to parse project store {}: {err}",
@@ -499,7 +526,7 @@ impl ProjectStore {
                         path.display()
                     ))
                 })?;
-                Ok((store.records, false))
+                Ok((store.write_seq, store.records, false))
             }
             Some(version) => Err(ProjectStoreError::internal(format!(
                 "Unsupported project store version {} in {}",
@@ -530,9 +557,24 @@ impl ProjectStore {
                         )
                     })
                     .collect::<HashMap<_, _>>();
-                Ok((records, true))
+                Ok((0, records, true))
             }
         }
+    }
+
+    fn refresh_if_stale(&mut self) -> Result<(), ProjectStoreError> {
+        let disk_seq = peek_write_seq(&self.path).map_err(ProjectStoreError::internal)?;
+        if disk_seq == self.write_seq {
+            return Ok(());
+        }
+        self.reload()
+    }
+
+    fn reload(&mut self) -> Result<(), ProjectStoreError> {
+        let (write_seq, records, _) = Self::read_from_disk(&self.path)?;
+        self.records = records;
+        self.write_seq = write_seq;
+        Ok(())
     }
 
     fn persist_candidate(
@@ -540,22 +582,36 @@ impl ProjectStore {
         records: HashMap<String, Project>,
     ) -> Result<(), ProjectStoreError> {
         validate_records(&records).map_err(ProjectStoreError::invalid_store)?;
-        Self::save_to_path(&self.path, &records)?;
+        let disk_seq = peek_write_seq(&self.path).map_err(ProjectStoreError::internal)?;
+        if disk_seq != self.write_seq {
+            self.reload()?;
+            return Err(ProjectStoreError::internal(
+                "project store was updated by another writer",
+            ));
+        }
+        let new_seq = self.write_seq.saturating_add(1);
+        Self::save_to_path(&self.path, new_seq, &records)?;
         self.records = records;
+        self.write_seq = new_seq;
         Ok(())
     }
 
-    fn save_current(&self) -> Result<(), ProjectStoreError> {
-        Self::save_to_path(&self.path, &self.records)
+    fn save_current(&mut self) -> Result<(), ProjectStoreError> {
+        let new_seq = self.write_seq.saturating_add(1);
+        Self::save_to_path(&self.path, new_seq, &self.records)?;
+        self.write_seq = new_seq;
+        Ok(())
     }
 
     fn save_to_path(
         path: &Path,
+        write_seq: u64,
         records: &HashMap<String, Project>,
     ) -> Result<(), ProjectStoreError> {
-        let json = serde_json::to_string_pretty(&StoreFile {
+        let json = serde_json::to_string_pretty(&StoreFileRef {
+            write_seq,
             version: STORE_VERSION,
-            records: records.clone(),
+            records,
         })
         .map_err(|err| {
             ProjectStoreError::internal(format!("Failed to serialize project store: {err}"))
