@@ -146,6 +146,37 @@ fn real_codex_global_settings() {
                 );
             }
         }
+
+        // A model the catalog does not describe — a custom provider model, or
+        // one the catalog retired — still has to leave every model-scoped
+        // choice selectable. Codex only reports the efforts it knows a listed
+        // model supports, so an unlisted model must fall back to the full set
+        // rather than rendering an empty, unusable list.
+        let restore = std::fs::read_to_string(&config_path).expect("read native config");
+        std::fs::write(
+            &config_path,
+            format!("model = \"tyde-uncatalogued-model\"\n{restore}"),
+        )
+        .expect("seed an uncatalogued model");
+        let mut refresh = cleared.clone();
+        refresh["version"] = serde_json::json!("stale-version");
+        let (_, refreshed) = save_native_settings(&mut host, refresh).await;
+        let effort = refreshed.groups[0].schema["properties"]["model_reasoning_effort"]["enum"]
+            .as_array()
+            .expect("reasoning effort options");
+        assert!(
+            effort.iter().any(Value::is_string),
+            "an uncatalogued model must still offer reasoning efforts, got {effort:?}"
+        );
+        assert!(
+            refreshed.groups[0].schema["properties"]["model"]["enum"]
+                .as_array()
+                .expect("model options")
+                .iter()
+                .any(|value| value == "tyde-uncatalogued-model"),
+            "the configured model must remain selectable even when unlisted"
+        );
+        std::fs::write(&config_path, restore).expect("restore native config");
     });
 }
 

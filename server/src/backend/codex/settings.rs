@@ -12,6 +12,11 @@ struct SettingsDocument {
     values: serde_json::Map<String, Value>,
 }
 
+/// Every reasoning effort Codex's configuration accepts, independent of model.
+/// The model catalog reports the subset a given model supports; this is the
+/// superset used where no catalog entry applies.
+const REASONING_EFFORTS: [&str; 7] = ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
+
 struct Field {
     key: &'static str,
     title: &'static str,
@@ -46,6 +51,10 @@ fn fields(models: &[Value], config: &Value) -> Vec<Field> {
                 .filter(|id| *id != "default"),
         );
     }
+    // The catalog reports the efforts a known model supports. A model absent
+    // from the catalog — a custom provider model, or one the catalog retired —
+    // resolves to no entry, which would otherwise leave this field with an
+    // empty, unselectable list; fall back to every effort Codex accepts.
     let effort = selected
         .and_then(|entry| entry.get("supportedReasoningEfforts"))
         .and_then(Value::as_array)
@@ -55,7 +64,8 @@ fn fields(models: &[Value], config: &Value) -> Vec<Field> {
                 .filter_map(|option| option.get("reasoningEffort").and_then(Value::as_str))
                 .collect::<Vec<_>>()
         })
-        .unwrap_or_default();
+        .filter(|options| !options.is_empty())
+        .unwrap_or_else(|| REASONING_EFFORTS.to_vec());
     let choices = |options: Vec<&str>| {
         let mut options = options
             .into_iter()
@@ -114,9 +124,7 @@ fn fields(models: &[Value], config: &Value) -> Vec<Field> {
             title: "Default subagent reasoning effort",
             group: "subagents",
             description: "Default effort for native subagents; the selected subagent model must support it.",
-            schema: choices(vec![
-                "none", "minimal", "low", "medium", "high", "xhigh", "max",
-            ]),
+            schema: choices(REASONING_EFFORTS.to_vec()),
         },
         Field {
             key: "personality",
@@ -136,7 +144,7 @@ fn fields(models: &[Value], config: &Value) -> Vec<Field> {
             key: "model_reasoning_summary",
             title: "Reasoning summaries",
             group: "responses",
-            description: "Preferred detail for supported reasoning summaries.",
+            description: "Preferred detail for supported reasoning summaries. Tyde requests automatic summaries for its own chats, so this applies to Codex used outside Tyde.",
             schema: choices(vec!["auto", "concise", "detailed", "none"]),
         },
         Field {
@@ -203,6 +211,98 @@ fn config_value<'a>(config: &'a Value, key: &str) -> Option<&'a Value> {
         .try_fold(config, |value, part| value.get(part))
 }
 
+/// Codex's raw model catalog, keyed by model slug.
+///
+/// `model/list` reports a curated view that omits the per-model default
+/// verbosity and reasoning summary, so those come from `codex debug models`
+/// instead. Best effort by design: a missing binary, a failed run, or an
+/// unrecognized shape yields no entries, and the affected fields then report no
+/// default rather than a guessed one.
+async fn raw_model_catalog() -> serde_json::Map<String, Value> {
+    let Ok(mut command) = codex_command() else {
+        return serde_json::Map::new();
+    };
+    command.arg("debug").arg("models");
+    if let Some(path) = process_env::resolved_child_process_path() {
+        command.env("PATH", path);
+    }
+    let Ok(Ok(output)) = tokio::time::timeout(CODEX_CAPACITY_PROBE_TIMEOUT, command.output()).await
+    else {
+        return serde_json::Map::new();
+    };
+    if !output.status.success() {
+        return serde_json::Map::new();
+    }
+    let Ok(entries) = serde_json::from_slice::<Vec<Value>>(&output.stdout) else {
+        return serde_json::Map::new();
+    };
+    entries
+        .into_iter()
+        .filter_map(|entry| {
+            let slug = entry.get("slug").and_then(Value::as_str)?.to_owned();
+            Some((slug, entry))
+        })
+        .collect()
+}
+
+/// The value Codex applies to `key` when the user's configuration does not set
+/// it, read from Codex itself — never assumed.
+///
+/// Two sources report a real default. Codex resolves some fields in its
+/// effective configuration, where a value present without a user override is
+/// the default in force. The rest of Codex's defaults are per-model and appear
+/// only in the model catalog. Fields Codex reports nowhere get no default here;
+/// the page states that instead of inventing one.
+fn field_default(
+    key: &str,
+    config: &Value,
+    raw: &Value,
+    models: &[Value],
+    selected: Option<&Value>,
+    catalog: &serde_json::Map<String, Value>,
+) -> Option<Value> {
+    // A user's own override is not a default, including one still written
+    // under the legacy subagent key this page reads it from.
+    let overridden = config_value(raw, key).or_else(|| {
+        (key == "agents.max_concurrent_threads_per_session")
+            .then(|| config_value(raw, "agents.max_threads"))
+            .flatten()
+    });
+    if overridden.is_some_and(|value| !value.is_null()) {
+        return None;
+    }
+    let catalog_entry = || {
+        selected
+            .and_then(|entry| entry.get("id"))
+            .and_then(Value::as_str)
+            .and_then(|slug| catalog.get(slug))
+    };
+    let catalog_value = |field: &str| {
+        catalog_entry()
+            .and_then(|entry| entry.get(field))
+            .filter(|value| !value.is_null())
+            .cloned()
+    };
+    match key {
+        "model" => models
+            .iter()
+            .find(|entry| entry.get("isDefault") == Some(&Value::Bool(true)))
+            .and_then(|entry| entry.get("id"))
+            .cloned(),
+        "model_reasoning_effort" => selected
+            .and_then(|entry| entry.get("defaultReasoningEffort"))
+            .filter(|value| !value.is_null())
+            .cloned(),
+        "model_verbosity" => catalog_value("default_verbosity"),
+        "model_reasoning_summary" => catalog_value("default_reasoning_summary"),
+        // Whatever Codex resolved without a user override — its own default, or
+        // one an administrator set in the system configuration layer.
+        _ => config_value(config, key)
+            .filter(|value| !value.is_null())
+            .cloned(),
+    }
+}
+
 fn user_layer(response: &Value) -> Result<&Value, String> {
     response
         .get("layers")
@@ -251,7 +351,11 @@ async fn read_config(rpc: &CodexRpc) -> Result<(Value, Vec<Value>), String> {
     Ok((response, models))
 }
 
-fn snapshot(response: &Value, models: &[Value]) -> Result<BackendNativeSettingsSnapshot, String> {
+fn snapshot(
+    response: &Value,
+    models: &[Value],
+    catalog: &serde_json::Map<String, Value>,
+) -> Result<BackendNativeSettingsSnapshot, String> {
     let layer = user_layer(response)?;
     let version = layer
         .get("version")
@@ -263,6 +367,17 @@ fn snapshot(response: &Value, models: &[Value]) -> Result<BackendNativeSettingsS
         .ok_or("Codex effective config is missing")?;
     let raw = layer.get("config").ok_or("Codex user config is missing")?;
     let fields = fields(models, config);
+    // The model whose per-model defaults apply: the configured one, or the
+    // catalog's default when no model is configured.
+    let configured = config.get("model").and_then(Value::as_str);
+    let selected = models
+        .iter()
+        .find(|entry| entry.get("id").and_then(Value::as_str) == configured)
+        .or_else(|| {
+            models.iter().find(|entry| {
+                configured.is_none() && entry.get("isDefault") == Some(&Value::Bool(true))
+            })
+        });
     let mut values = serde_json::Map::new();
     for field in &fields {
         let value = config_value(raw, field.key).or_else(|| {
@@ -311,13 +426,22 @@ fn snapshot(response: &Value, models: &[Value]) -> Result<BackendNativeSettingsS
             {
                 options.push(value.clone());
             }
+            let default = field_default(field.key, config, raw, models, selected, catalog);
+            if let Some(default) = &default {
+                schema["x-tyde-default"] = default.clone();
+                schema["x-tyde-default-label"] = json!("Codex default");
+            }
             let inherited = config_value(config, field.key).filter(|value| !value.is_null());
-            schema["description"] = json!(match inherited {
-                Some(value) => format!(
+            schema["description"] = json!(match (&default, inherited) {
+                // The control renders the default itself, so the description
+                // only has to say what leaving the field unset means.
+                (Some(_), _) => format!("{} Unset uses Codex's default.", field.description),
+                (None, Some(value)) => format!(
                     "{} Current effective CLI value: {value}. Unset removes your user override.",
                     field.description
                 ),
-                None => format!("{} Unset lets Codex choose its default.", field.description),
+                (None, None) =>
+                    format!("{} Unset lets Codex choose its default.", field.description),
             });
             properties.insert(field.key.to_owned(), schema);
         }
@@ -344,9 +468,12 @@ fn snapshot(response: &Value, models: &[Value]) -> Result<BackendNativeSettingsS
 pub(crate) async fn native_settings_snapshot() -> BackendNativeSettingsSnapshot {
     let result = async {
         let rpc = open_config().await?;
+        // Only the snapshot needs the raw catalog; saving reads the same
+        // configuration without it, so a save never pays for this.
+        let catalog = raw_model_catalog().await;
         let result = tokio::time::timeout(CODEX_CAPACITY_PROBE_TIMEOUT, async {
             let (response, models) = read_config(&rpc).await?;
-            snapshot(&response, &models)
+            snapshot(&response, &models, &catalog)
         })
         .await
         .map_err(|_| "Codex settings read timed out".to_owned())

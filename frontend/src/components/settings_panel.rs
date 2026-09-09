@@ -5239,6 +5239,24 @@ fn schema_settings_field(
 
     let present = current.is_some_and(|value| !value.is_null());
 
+    // The value the backend applies while this field is unset, when the backend
+    // could actually read it. Shown as a hint only: it is never committed, so
+    // leaving a field alone keeps it unset and the backend keeps choosing.
+    let default_hint = prop_schema
+        .get("x-tyde-default")
+        .filter(|value| !value.is_null() && !present);
+    let default_hint_label = prop_schema
+        .get("x-tyde-default-label")
+        .and_then(Value::as_str)
+        .unwrap_or("Default");
+    let default_display = default_hint.map(|value| {
+        let text = match value.as_str() {
+            Some(text) => text.to_owned(),
+            None => value.to_string(),
+        };
+        format!("{default_hint_label} · {text}")
+    });
+
     let control = if secret {
         let has_value = current
             .and_then(Value::as_str)
@@ -5303,7 +5321,15 @@ fn schema_settings_field(
                 aria-label=aria_label
                 on:change=on_change
             >
-                {(!present).then(|| view! { <option value="">"Not set"</option> })}
+                {(!present)
+                    .then(|| {
+                        // Selected while unset, so the backend's default is
+                        // visible without the field claiming to be set.
+                        let label = default_display
+                            .clone()
+                            .unwrap_or_else(|| "Not set".to_owned());
+                        view! { <option value="">{label}</option> }
+                    })}
                 {option_views}
             </select>
         }
@@ -5311,7 +5337,13 @@ fn schema_settings_field(
     } else {
         match schema_type {
             Some("boolean") => {
-                let current = current.and_then(Value::as_bool).unwrap_or(false);
+                // An unset toggle shows the default in force rather than a bare
+                // off state, which would misreport any setting the backend
+                // defaults on. The caption says it is not a user setting.
+                let current = current
+                    .and_then(Value::as_bool)
+                    .or_else(|| default_hint.and_then(Value::as_bool))
+                    .unwrap_or(false);
                 let target = target.clone();
                 let on_change = move |ev: web_sys::Event| {
                     if disabled && !target.is_host() {
@@ -5365,7 +5397,8 @@ fn schema_settings_field(
                             step=step
                             class="settings-input settings-native-input settings-supervisor-number-input"
                             prop:value=move || current.map(|n| n.to_string()).unwrap_or_default()
-                            placeholder=(!present).then(|| "Not set".to_owned())
+                            placeholder=(!present)
+                            .then(|| default_display.clone().unwrap_or_else(|| "Not set".to_owned()))
                             autocomplete="off"
                             disabled=disabled
                             aria-label=aria_label
@@ -5409,7 +5442,8 @@ fn schema_settings_field(
                         step=step
                         class="settings-input settings-native-input"
                         prop:value=move || current.map(|n| n.to_string()).unwrap_or_default()
-                        placeholder=(!present).then(|| "Not set".to_owned())
+                        placeholder=(!present)
+                            .then(|| default_display.clone().unwrap_or_else(|| "Not set".to_owned()))
                         autocomplete="off"
                         disabled=disabled
                         aria-label=aria_label
@@ -5436,7 +5470,8 @@ fn schema_settings_field(
                         type="text"
                         class="settings-input settings-native-input"
                         prop:value=current
-                        placeholder=(!present).then(|| "Not set".to_owned())
+                        placeholder=(!present)
+                            .then(|| default_display.clone().unwrap_or_else(|| "Not set".to_owned()))
                         autocomplete="off"
                         spellcheck="false"
                         disabled=disabled
@@ -5457,9 +5492,15 @@ fn schema_settings_field(
         }
     };
 
-    // Explicit unset marker so a blank control is never read as a real value.
-    let unset_caption =
-        (!present).then(|| view! { <span class="settings-native-unset">"Unset"</span> });
+    // Explicit unset marker so neither a blank control nor a rendered default
+    // is ever read as a value this field is actually set to.
+    let unset_caption = (!present).then(|| {
+        let caption = match &default_display {
+            Some(_) => format!("Unset · {default_hint_label}"),
+            None => "Unset".to_owned(),
+        };
+        view! { <span class="settings-native-unset">{caption}</span> }
+    });
 
     let reset = (present
         && prop_schema
@@ -14336,9 +14377,11 @@ mod wasm_tests {
         let groups = [
             ("defaults", "Defaults", "model", serde_json::json!({"title":"Default model","type":["string","null"],"enum":["gpt-5.6-sol"]})),
             ("subagents", "Subagents", "agents.max_concurrent_threads_per_session", serde_json::json!({"title":"Maximum concurrent subagents","type":["integer","null"],"minimum":1})),
-            ("responses", "Responses", "personality", serde_json::json!({"title":"Communication style","type":["string","null"],"enum":["friendly","pragmatic"]})),
+            // Unset, and the backend reported the default in force for each:
+            // the page must show those without claiming the field is set.
+            ("responses", "Responses", "personality", serde_json::json!({"title":"Communication style","type":["string","null"],"enum":["friendly","pragmatic"],"x-tyde-default":"pragmatic","x-tyde-default-label":"Codex default"})),
             ("memory", "Memory", "features.memories", serde_json::json!({"title":"Enable Codex memory","type":["boolean","null"]})),
-            ("advanced", "Advanced", "allow_login_shell", serde_json::json!({"title":"Allow login shells","type":["boolean","null"]})),
+            ("advanced", "Advanced", "allow_login_shell", serde_json::json!({"title":"Allow login shells","type":["boolean","null"],"x-tyde-default":true,"x-tyde-default-label":"Codex default"})),
         ].into_iter().map(|(id,title,key,mut property)| {
             property["x-tyde-reset-label"] = serde_json::json!("Use CLI default");
             BackendNativeSettingsGroup { id:id.to_owned(),title:title.to_owned(),kind:BackendNativeSettingsGroupKind::Core,
@@ -14364,6 +14407,60 @@ mod wasm_tests {
             native_tab_labels(&container),
             vec!["Defaults", "Subagents", "Responses", "Memory", "Advanced"]
         );
+
+        // An unset boolean shows the default in force, not a bare off state
+        // that would misreport a setting the backend defaults on.
+        native_tab_by_label(&container, "Advanced").click();
+        next_tick().await;
+        let advanced = &native_panels(&container)[4];
+        let login_shell: HtmlInputElement = advanced
+            .query_selector("input[type=checkbox]")
+            .unwrap()
+            .expect("the login-shell toggle must render")
+            .dyn_into()
+            .unwrap();
+        assert!(
+            login_shell.checked(),
+            "an unset toggle must show the reported default, not off"
+        );
+        assert!(
+            advanced
+                .text_content()
+                .unwrap_or_default()
+                .contains("Unset · Codex default"),
+            "the rendered default must be captioned as unset, not as a set value"
+        );
+
+        // An unset enum keeps its empty selection while naming the default.
+        native_tab_by_label(&container, "Responses").click();
+        next_tick().await;
+        let responses = &native_panels(&container)[2];
+        let personality: HtmlSelectElement = responses
+            .query_selector("select")
+            .unwrap()
+            .expect("the personality control must render")
+            .dyn_into()
+            .unwrap();
+        assert_eq!(
+            personality.value(),
+            "",
+            "a reported default must not select a value the user never set"
+        );
+        assert!(
+            responses
+                .text_content()
+                .unwrap_or_default()
+                .contains("Codex default · pragmatic"),
+            "the unset option must name the default in force"
+        );
+
+        // Rendering defaults must not write them: the document is untouched
+        // until the user edits a field.
+        assert!(
+            last_native_settings(&calls).is_none(),
+            "showing defaults must never save them as overrides"
+        );
+
         native_tab_by_label(&container, "Subagents").click();
         next_tick().await;
         let limit: HtmlInputElement = container
