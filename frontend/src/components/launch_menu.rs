@@ -1039,10 +1039,19 @@ mod wasm_tests {
         // Narrow menu pinned to the right edge → no room on the right.
         let (row_left, row_right, submenu_left, viewport_width, text) =
             auto_hover_geometry("position:fixed;top:0;right:0;width:160px;").await;
+        // Linux Chrome places right:0 at 765px in a 780px window with a 15px
+        // scrollbar. Compare against the layout width, excluding that scrollbar.
+        let layout_width = web_sys::window()
+            .unwrap()
+            .document()
+            .unwrap()
+            .document_element()
+            .unwrap()
+            .client_width() as f64;
         assert!(
-            (viewport_width - row_right).abs() < 1.0,
+            (layout_width - row_right).abs() < 1.0,
             "fixture row must hug the viewport's right edge before testing Auto \
-             (viewport_width={viewport_width}, row_right={row_right})"
+             (layout_width={layout_width}, viewport_width={viewport_width}, row_right={row_right})"
         );
         assert!(
             submenu_left < row_left,

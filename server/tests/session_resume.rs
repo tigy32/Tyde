@@ -306,6 +306,11 @@ async fn wait_for_session_list(
         if env.kind == FrameKind::AgentBootstrap {
             return false;
         }
+        // A live capability update can arrive after deletion, before SessionList.
+        // It does not change whether the deleted session remains in that list.
+        if env.kind == FrameKind::ContextCompactionCapability {
+            return false;
+        }
         if matches!(
             env.kind,
             FrameKind::HostSettings

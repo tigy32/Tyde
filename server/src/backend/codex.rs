@@ -67,7 +67,7 @@ const CODEX_INFERENCE_APPROVAL_POLICY: &str = "untrusted";
 const CODEX_UNRESTRICTED_SANDBOX: &str = "danger-full-access";
 const CODEX_INFERENCE_SANDBOX: &str = "read-only";
 const CODEX_ENABLE_EXPERIMENTAL_RAW_EVENTS: bool = true;
-const CODEX_REASONING_SUMMARY_LEVEL: &str = "detailed";
+const CODEX_REASONING_SUMMARY_LEVEL: &str = "auto";
 const CODEX_MAX_GENERATED_IMAGE_BYTES: usize = 25 * 1024 * 1024;
 /// How often a thread is asked which of its command executions are still
 /// running as background terminals. A matched yielded-session raw result
