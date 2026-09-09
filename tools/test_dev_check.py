@@ -1551,19 +1551,40 @@ case "$*" in
     [[ "${DEV_CHECK_BAD_SCCACHE:-0}" == 1 ]] && cache_dir="/wrong-cache"
     python3 - "$cache_dir" <<'PY'
 import json
+import os
+import pathlib
 import sys
 
+stats = {
+    "compile_requests": 0,
+    "cache_hits": {"counts": {}},
+    "cache_misses": {"counts": {}},
+    "cache_errors": {"counts": {}},
+    "cache_writes": 0,
+}
+cache_size = 0
+if counter_path := os.environ.get("DEV_CHECK_SCCACHE_COUNTER_FILE"):
+    counter = pathlib.Path(counter_path)
+    calls = int(counter.read_text()) + 1 if counter.exists() else 1
+    counter.write_text(str(calls))
+    final = calls >= 3
+    cache_size = 4096 if final else None
+    stats.update({
+        "compile_requests": 20 if final else 10,
+        "cache_hits": {"counts": {"Rust": 6 if final else 2}},
+        "cache_misses": {"counts": {"Rust": 3 if final else 1, "C/C++": 2 if final else 0}},
+        "cache_writes": 5 if final else 1,
+        "not_cached": {"crate-type": 5 if final else 3},
+    })
+
 print(json.dumps({
-    "stats": {
-        "compile_requests": 0,
-        "cache_hits": {"counts": {}},
-        "cache_misses": {"counts": {}},
-        "cache_errors": {"counts": {}},
-        "cache_writes": 0,
-    },
+    "stats": stats,
     "cache_location": f'Local disk: "{sys.argv[1]}"',
-    "cache_size": 0,
-    "max_cache_size": 10737418240,
+    "cache_size": cache_size,
+    "max_cache_size": int(os.environ.get(
+        "DEV_CHECK_FAKE_CACHE_SIZE_BYTES",
+        str(int(os.environ["SCCACHE_CACHE_SIZE"].removesuffix("G")) * 1024**3),
+    )),
 }))
 PY
     ;;
@@ -2628,7 +2649,12 @@ exec "$DEV_CHECK_REAL_PYTHON" "$@"
     # so the failure path that test pinned no longer exists by design.
 
     def test_sccache_root_override_keeps_cache_out_of_the_home_cache(self) -> None:
-        self._run()
+        self._git("config", "--local", "tyde.sccacheSizeGiB", "100")
+        env = self.env.copy()
+        env["DEV_CHECK_SCCACHE_COUNTER_FILE"] = str(
+            pathlib.Path(self.temp.name) / "sccache-calls"
+        )
+        self._run(env=env)
 
         run_dir = max((self.root / "target" / "dev-check-logs").glob("run-*"))
         metadata = (run_dir / "metadata.txt").read_text(encoding="utf-8")
@@ -2642,6 +2668,52 @@ exec "$DEV_CHECK_REAL_PYTHON" "$@"
             directory.startswith(self.env["DEV_CHECK_SCCACHE_ROOT"]),
             f"a temporary fixture wrote its sccache cache to {directory}",
         )
+        self.assertIn("sccache.max_bytes=107374182400\n", metadata)
+        metrics = (run_dir / "sccache-metrics.txt").read_text(encoding="utf-8")
+        self.assertIn("max_cache_size=107374182400\n", metrics)
+        self.assertIn("scope=shared-daemon\n", metrics)
+        for metric in (
+            "requests=10", "rust_hits=4", "rust_misses=2", "c_cpp_misses=2",
+            "non_cacheable=2", "non_cacheable_crate_type=2",
+            "cache_size=4096", "cache_size_before=unknown", "cache_growth_bytes=unknown",
+        ):
+            self.assertIn(f"{metric}\n", metrics)
+
+        # Changing capacity must not change the source-based validation key.
+        key = self._explain_key()
+        self._git("config", "--local", "tyde.sccacheSizeGiB", "200")
+        self.assertEqual(self._explain_key(), key)
+        wrong_daemon = self.env.copy()
+        wrong_daemon["DEV_CHECK_FAKE_CACHE_SIZE_BYTES"] = str(100 * 1024**3)
+        rejected = self._run(env=wrong_daemon, check=False)
+        self.assertEqual(rejected.returncode, 1)
+        self.assertIn("expected 214748364800", rejected.stderr)
+        self.assertIn("Let all repository builds finish", rejected.stderr)
+
+        self._git("config", "--local", "tyde.sccacheNamespace", "large-cache")
+        self.assertEqual(self._explain_key(), key)
+        self._run()
+        migrated_run = max((self.root / "target" / "dev-check-logs").glob("run-*"))
+        migrated = dict(
+            line.split("=", 1)
+            for line in (migrated_run / "metadata.txt").read_text(encoding="utf-8").splitlines()
+        )
+        original = dict(line.split("=", 1) for line in metadata.splitlines())
+        self.assertNotEqual(migrated["sccache.directory"], directory)
+        self.assertNotEqual(migrated["sccache.server_port"], original["sccache.server_port"])
+        self.assertIn("sccache.max_bytes=214748364800", (migrated_run / "metadata.txt").read_text())
+        self._git("config", "--local", "tyde.sccacheNamespace", "../invalid")
+        rejected = self._run(check=False)
+        self.assertEqual(rejected.returncode, 1)
+        self.assertIn("tyde.sccacheNamespace must contain", rejected.stderr)
+        self._git("config", "--local", "--unset", "tyde.sccacheNamespace")
+
+        for invalid in ("0", "-1", "100G", "1.5", "10000"):
+            with self.subTest(size=invalid):
+                self._git("config", "--local", "tyde.sccacheSizeGiB", invalid)
+                rejected = self._run(check=False)
+                self.assertEqual(rejected.returncode, 1)
+                self.assertIn("must be an integer from 1 to 9999", rejected.stderr)
 
     def test_sccache_validation_failure_has_log_and_failure_stats(self) -> None:
         env = self.env.copy()

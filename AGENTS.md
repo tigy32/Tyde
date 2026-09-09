@@ -83,8 +83,22 @@ local, release, or CI validation.
 Checks are single-instance per repository and fail immediately if the local
 check lock is held. The wrapper pins repository-local sccache configuration,
 disables Cargo incremental compilation for the check, records cache metrics,
-and never falls back when sccache setup is invalid. It may clean only bounded
-check logs, obsolete check cache records, and regenerable nextest test-binary
+and never falls back when sccache setup is invalid. The shared compiler cache
+has a 10 GiB default cap. Set a persistent machine-local cap for this repository
+with `git config --local tyde.sccacheSizeGiB 100`; it applies to all workbenches
+and allocates disk only as entries are written. Before changing the live daemon's
+cap, let every repository build finish and stop its sccache server using the
+`SCCACHE_SERVER_PORT` recorded in the check logs. The next check starts it with
+the configured cap; a mismatched running daemon fails validation rather than
+being stopped underneath other builds. Per-language hits and misses, uncacheable
+calls, and cache growth are retained in `sccache-metrics.txt`. Size and growth
+remain `unknown` until the daemon reports its initialized cache index. Counters belong to
+the shared daemon and can include concurrent workbench builds. An optional
+`git config --local tyde.sccacheNamespace <name>` selects a separate cache and
+daemon for a migration without stopping builds on the old namespace. Names
+contain 1–64 letters, digits, underscores, or hyphens. Seed a new namespace only
+before starting its daemon; each cache directory must have exactly one writer.
+The wrapper may clean only bounded check logs, obsolete check cache records, and regenerable nextest test-binary
 clones for the same repository. It must never recursively scan or automatically
 clean shared Cargo targets.
 

@@ -13,8 +13,6 @@ readonly DEV_CHECK_LOG_RETENTION=8
 readonly DEV_CHECK_CACHE_RETENTION=16
 readonly DEV_CHECK_SCCACHE_ROOT="${DEV_CHECK_SCCACHE_ROOT:-${XDG_CACHE_HOME:-$HOME/.cache}/tyde-dev-check-sccache}"
 readonly DEV_CHECK_SCCACHE_VERSION="0.16.0"
-readonly DEV_CHECK_SCCACHE_SIZE="10G"
-readonly DEV_CHECK_SCCACHE_SIZE_BYTES=10737418240
 
 RUN_DIR=""
 RUN_METADATA=""
@@ -436,19 +434,42 @@ prepare_rust_toolchain() {
 }
 
 set_sccache_environment() {
-    local executable repository_hash port name common_dir
+    local executable repository_hash port name common_dir size_gib status namespace
+
+    if size_gib="$(git config --local --get tyde.sccacheSizeGiB)"; then
+        [[ "$size_gib" =~ ^[1-9][0-9]{0,3}$ ]] ||
+            die "tyde.sccacheSizeGiB must be an integer from 1 to 9999 (GiB)"
+    else
+        status=$?
+        [[ "$status" == 1 ]] || die "could not read repository sccache size"
+        size_gib=10
+    fi
+    if namespace="$(git config --local --get tyde.sccacheNamespace)"; then
+        [[ "$namespace" =~ ^[a-zA-Z0-9_-]{1,64}$ ]] ||
+            die "tyde.sccacheNamespace must contain 1 to 64 letters, digits, underscores, or hyphens"
+    else
+        status=$?
+        [[ "$status" == 1 ]] || die "could not read repository sccache namespace"
+        namespace=""
+    fi
+    readonly DEV_CHECK_SCCACHE_SIZE="${size_gib}G"
+    readonly DEV_CHECK_SCCACHE_SIZE_BYTES=$((size_gib * 1073741824))
 
     command -v sccache >/dev/null 2>&1 ||
         die "sccache $DEV_CHECK_SCCACHE_VERSION is required in PATH. Install it with: cargo install sccache --version $DEV_CHECK_SCCACHE_VERSION --locked"
     executable="$(command -v sccache)"
     # Key the cache by the repository rather than the worktree. sccache is
-    # content-addressed, so every worktree can share one cache; keying by $PWD
-    # instead made each fresh workbench pay a full cold build and multiplied the
-    # size cap by the number of live worktrees.
+    # content-addressed, so worktrees can reuse matching entries and share one
+    # size cap. Rust still hashes its working directory: sharing storage does
+    # not make workspace crates cache-compatible across checkout paths.
     common_dir="$(git rev-parse --git-common-dir 2>/dev/null)" ||
         die "dev.sh check must run inside a Git repository"
     common_dir="$(cd "$common_dir" && pwd)"
-    repository_hash="$(printf '%s' "$common_dir" | hash_text)"
+    if [[ -n "$namespace" ]]; then
+        repository_hash="$(printf '%s\n%s' "$common_dir" "$namespace" | hash_text)"
+    else
+        repository_hash="$(printf '%s' "$common_dir" | hash_text)"
+    fi
     port=$((20000 + 16#${repository_hash:0:8} % 30000))
 
     while IFS= read -r name; do
@@ -468,6 +489,8 @@ configure_sccache() {
     executable="$RUSTC_WRAPPER"
     mkdir -p "$SCCACHE_DIR"
 
+    printf 'sccache.server_port=%s\n' "$SCCACHE_SERVER_PORT" >>"$RUN_METADATA"
+    printf 'sccache.requested_max_bytes=%s\n' "$DEV_CHECK_SCCACHE_SIZE_BYTES" >>"$RUN_METADATA"
     run_stage "Verify pinned sccache" 1 bash -c \
         'actual="$(sccache --version 2>&1)"; [[ "$actual" == "sccache $1" ]] || { printf "required sccache %s; found %s. Install with: cargo install sccache --version %s --locked\n" "$1" "$actual" "$1" >&2; exit 1; }' \
         _ "$DEV_CHECK_SCCACHE_VERSION"
@@ -493,7 +516,9 @@ if data.get("cache_location") != expected_location:
     )
 if data.get("max_cache_size") != int(expected_size):
     raise SystemExit(
-        f"sccache cache limit is {data.get('max_cache_size')!r}, expected {expected_size}"
+        f"sccache cache limit is {data.get('max_cache_size')!r}, expected {expected_size}. "
+        "Let all repository builds finish, then stop the repository's sccache "
+        "server using the SCCACHE_SERVER_PORT in this run's logs and retry."
     )
 PY
 SCRIPT
@@ -505,7 +530,6 @@ SCRIPT
     printf 'sccache.executable=%s\n' "$executable" >>"$RUN_METADATA"
     printf 'sccache.directory=%s\n' "$SCCACHE_DIR" >>"$RUN_METADATA"
     printf 'sccache.max_bytes=%s\n' "$DEV_CHECK_SCCACHE_SIZE_BYTES" >>"$RUN_METADATA"
-    printf 'sccache.server_port=%s\n' "$SCCACHE_SERVER_PORT" >>"$RUN_METADATA"
     printf 'cargo.incremental=%s\n' "$CARGO_INCREMENTAL" >>"$RUN_METADATA"
 }
 
@@ -655,8 +679,25 @@ old = values(before)
 new = values(after)
 for name in ("requests", "hits", "misses", "errors", "writes"):
     print(f"{name}={new[name] - old[name]}")
-print(f"cache_size={after.get('cache_size') or 0}")
+old_size = before.get("cache_size")
+new_size = after.get("cache_size")
+growth = new_size - old_size if old_size is not None and new_size is not None else "unknown"
+print(f"cache_size={new_size if new_size is not None else 'unknown'}")
 print(f"max_cache_size={after['max_cache_size']}")
+print(f"cache_size_before={old_size if old_size is not None else 'unknown'}")
+print(f"cache_growth_bytes={growth}")
+print("scope=shared-daemon")
+for language, label in (("Rust", "rust"), ("C/C++", "c_cpp"), ("Assembler", "assembler")):
+    for counter, suffix in (("cache_hits", "hits"), ("cache_misses", "misses")):
+        delta = (
+            after["stats"][counter]["counts"].get(language, 0)
+            - before["stats"][counter]["counts"].get(language, 0)
+        )
+        print(f"{label}_{suffix}={delta}")
+old_uncacheable = before["stats"].get("not_cached", {})
+new_uncacheable = after["stats"].get("not_cached", {})
+print(f"non_cacheable={sum(new_uncacheable.values()) - sum(old_uncacheable.values())}")
+print(f"non_cacheable_crate_type={new_uncacheable.get('crate-type', 0) - old_uncacheable.get('crate-type', 0)}")
 PY
     then
         printf 'FAIL  Parse final sccache statistics\n' >&2
