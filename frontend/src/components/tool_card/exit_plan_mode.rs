@@ -1,8 +1,9 @@
-//! Interactive renderer for Claude's `ExitPlanMode` tool call.
+//! Interactive renderer for a backend `ExitPlanMode` tool call.
 //!
-//! Claude emits `ExitPlanMode` when it has finished planning and wants approval
-//! before acting. The backend pauses the turn while the request is pending and
-//! resumes once the user decides. Rather than dumping the raw plan JSON, this
+//! Claude and Grok emit `ExitPlanMode` when they have finished planning and
+//! want approval before acting. The backend pauses the turn while the request
+//! is pending and resumes once the user decides. Rather than dumping the raw
+//! plan JSON, this
 //! card renders the plan text (and optional plan path) plus one-click Approve /
 //! Reject controls. Reject carries optional feedback.
 //!

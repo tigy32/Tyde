@@ -157,7 +157,9 @@ impl AcpAgentAdapter for GrokAdapter {
     }
 
     fn defer_tool_request(&self, kind: &str, args: &Value) -> bool {
-        kind == "search" || args.get("variant").and_then(Value::as_str) == Some("WebSearch")
+        is_exit_plan_mode_tool(kind)
+            || kind == "search"
+            || args.get("variant").and_then(Value::as_str) == Some("WebSearch")
     }
 
     fn refine_tool_request(
@@ -204,6 +206,9 @@ impl AcpAgentAdapter for GrokAdapter {
         workspace_root: &'a str,
     ) -> BoxFuture<'a, Value> {
         Box::pin(async move {
+            if is_exit_plan_mode_tool(kind) {
+                return exit_plan_mode_tool_type(plan_from_args(args), plan_path_from_args(args));
+            }
             let agent_control_name = if args.get("agent_ids").is_some() {
                 Some("tyde_await_agents")
             } else if args.get("agent_id").is_some() && args.get("message").is_some() {
@@ -420,6 +425,58 @@ impl AcpAgentAdapter for GrokAdapter {
             _ => None,
         }
     }
+}
+
+pub(crate) fn is_exit_plan_mode_tool(name: &str) -> bool {
+    matches!(name, "exit_plan_mode" | "ExitPlanMode")
+}
+
+pub(crate) fn exit_plan_mode_tool_type(plan: Option<String>, plan_path: Option<String>) -> Value {
+    serde_json::to_value(protocol::ToolRequestType::ExitPlanMode { plan, plan_path })
+        .expect("serialize Grok ExitPlanMode request")
+}
+
+pub(crate) fn exit_plan_mode_ext_response(
+    decision: protocol::ExitPlanModeDecision,
+    feedback: Option<String>,
+) -> Value {
+    match decision {
+        protocol::ExitPlanModeDecision::Approve => json!({ "outcome": "approved" }),
+        protocol::ExitPlanModeDecision::Reject => {
+            let feedback = feedback.filter(|text| !text.trim().is_empty());
+            match feedback {
+                Some(feedback) => json!({
+                    "outcome": "cancelled",
+                    "feedback": feedback,
+                }),
+                None => json!({ "outcome": "cancelled" }),
+            }
+        }
+    }
+}
+
+fn plan_from_args(args: &Value) -> Option<String> {
+    ["plan", "planContent", "plan_content"]
+        .iter()
+        .find_map(|key| {
+            args.get(*key)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|plan| !plan.is_empty())
+                .map(str::to_owned)
+        })
+}
+
+fn plan_path_from_args(args: &Value) -> Option<String> {
+    ["plan_path", "planPath", "planFilePath", "plan_file_path"]
+        .iter()
+        .find_map(|key| {
+            args.get(*key)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|path| !path.is_empty())
+                .map(str::to_owned)
+        })
 }
 
 fn find_string(value: &Value, keys: &[&str]) -> Option<String> {
