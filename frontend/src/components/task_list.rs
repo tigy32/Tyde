@@ -156,14 +156,7 @@ fn render_goal_view(
     on_control: Option<Callback<protocol::GoalControl>>,
     expanded: RwSignal<bool>,
 ) -> impl IntoView {
-    let label = match goal.status {
-        protocol::GoalStatus::Active => "Active",
-        protocol::GoalStatus::Paused => "Paused",
-        protocol::GoalStatus::Blocked => "Blocked",
-        protocol::GoalStatus::UsageLimited => "Usage limit reached",
-        protocol::GoalStatus::BudgetLimited => "Budget reached",
-        protocol::GoalStatus::Complete => "Completed",
-    };
+    let (label, status_class) = goal_status_display(goal.status);
     let pause = capabilities.as_ref().is_some_and(|caps| caps.pause)
         && goal.status == protocol::GoalStatus::Active;
     let resume = capabilities.as_ref().is_some_and(|caps| caps.resume)
@@ -175,22 +168,160 @@ fn render_goal_view(
                 | protocol::GoalStatus::UsageLimited
         );
     let clear = capabilities.as_ref().is_some_and(|caps| caps.clear);
+
+    // A budget of zero cannot be drawn as a fraction, and dividing by it would
+    // report every goal as over budget.
+    let budget = goal
+        .token_budget
+        .filter(|budget| *budget > 0)
+        .map(|budget| {
+            let used = goal.tokens_used.unwrap_or(0);
+            let pct = (used as f64 / budget as f64 * 100.0).clamp(0.0, 100.0);
+            (used, budget, pct)
+        });
+    // With a budget the meter already states the spend; the bare count would
+    // repeat it a second time in a weaker form.
+    let bare_tokens = goal.tokens_used.filter(|_| budget.is_none());
+    let elapsed = goal.time_used_seconds.map(format_goal_elapsed);
+    let objective = goal.objective;
+
     view! {
-        <div class="summary-goal" data-test="native-goal">
-            <button type="button" class="summary-goal-header" aria-expanded=move || expanded.get().to_string() on:click=move |_| expanded.update(|open| *open = !*open)>
-                <span>"Goal"</span><span class="summary-goal-objective">{goal.objective.clone()}</span><span>{label}</span>
+        <div class=format!("summary-goal {status_class}") data-test="native-goal">
+            <button
+                type="button"
+                class="summary-goal-header"
+                aria-expanded=move || expanded.get().to_string()
+                on:click=move |_| expanded.update(|open| *open = !*open)
+            >
+                <span class="summary-goal-caret" aria-hidden="true">
+                    {move || if expanded.get() { "\u{25be}" } else { "\u{25b8}" }}
+                </span>
+                <span class="summary-goal-eyebrow">"Goal"</span>
+                <span class="summary-goal-objective" title=objective.clone()>
+                    {objective.clone()}
+                </span>
+                <span class="summary-goal-status">
+                    <span class="summary-goal-dot" aria-hidden="true"></span>
+                    {label}
+                </span>
             </button>
             <div class="summary-goal-body" hidden=move || !expanded.get()>
-                <p>{goal.objective}</p>
-                {goal.tokens_used.map(|used| view! { <span>{format!("{used} tokens used")}</span> })}
-                {goal.token_budget.map(|budget| view! { <span>{format!(" · {budget} token budget")}</span> })}
-                <div class="summary-goal-controls">
-                    {pause.then(|| view! { <button type="button" on:click=move |_| { if let Some(callback) = on_control { callback.run(protocol::GoalControl::Pause); } }>"Pause goal"</button> })}
-                    {resume.then(|| view! { <button type="button" on:click=move |_| { if let Some(callback) = on_control { callback.run(protocol::GoalControl::Resume); } }>"Resume goal"</button> })}
-                    {clear.then(|| view! { <button type="button" on:click=move |_| { if let Some(callback) = on_control { callback.run(protocol::GoalControl::Clear); } }>"Clear goal"</button> })}
-                </div>
+                <p class="summary-goal-detail">{objective}</p>
+                {budget.map(|(used, budget, pct)| {
+                    let severity = if pct > 95.0 {
+                        " context-danger"
+                    } else if pct > 80.0 {
+                        " context-warning"
+                    } else {
+                        ""
+                    };
+                    view! {
+                        <div class="summary-goal-meter">
+                            <div class="summary-goal-meter-head">
+                                <span class="summary-goal-meter-label">"Token budget"</span>
+                                <span class=format!("summary-goal-meter-value{severity}")>
+                                    {format!(
+                                        "{} / {} ({:.0}%)",
+                                        format_token_count(used),
+                                        format_token_count(budget),
+                                        pct,
+                                    )}
+                                </span>
+                            </div>
+                            <div
+                                class="summary-goal-meter-track"
+                                role="progressbar"
+                                aria-label="Goal token budget"
+                                aria-valuemin="0"
+                                aria-valuemax="100"
+                                aria-valuenow=format!("{}", pct.round() as i32)
+                            >
+                                <span
+                                    class=format!("summary-goal-meter-fill{severity}")
+                                    style=format!("width: {pct:.1}%")
+                                ></span>
+                            </div>
+                        </div>
+                    }
+                })}
+                {(bare_tokens.is_some() || elapsed.is_some()).then(|| view! {
+                    <div class="summary-goal-stats">
+                        {bare_tokens.map(|used| view! {
+                            <span class="summary-goal-stat">
+                                <span class="summary-goal-stat-label">"Tokens"</span>
+                                <span class="summary-goal-stat-value">
+                                    {format_token_count(used)}
+                                </span>
+                            </span>
+                        })}
+                        {elapsed.map(|text| view! {
+                            <span class="summary-goal-stat">
+                                <span class="summary-goal-stat-label">"Elapsed"</span>
+                                <span class="summary-goal-stat-value">{text}</span>
+                            </span>
+                        })}
+                    </div>
+                })}
+                {(pause || resume || clear).then(|| view! {
+                    <div class="summary-goal-controls">
+                        {pause.then(|| view! {
+                            <button
+                                type="button"
+                                class="summary-goal-button"
+                                on:click=move |_| {
+                                    if let Some(callback) = on_control {
+                                        callback.run(protocol::GoalControl::Pause);
+                                    }
+                                }
+                            >"Pause goal"</button>
+                        })}
+                        {resume.then(|| view! {
+                            <button
+                                type="button"
+                                class="summary-goal-button summary-goal-button-primary"
+                                on:click=move |_| {
+                                    if let Some(callback) = on_control {
+                                        callback.run(protocol::GoalControl::Resume);
+                                    }
+                                }
+                            >"Resume goal"</button>
+                        })}
+                        {clear.then(|| view! {
+                            <button
+                                type="button"
+                                class="summary-goal-button summary-goal-button-quiet"
+                                on:click=move |_| {
+                                    if let Some(callback) = on_control {
+                                        callback.run(protocol::GoalControl::Clear);
+                                    }
+                                }
+                            >"Clear goal"</button>
+                        })}
+                    </div>
+                })}
             </div>
         </div>
+    }
+}
+
+fn goal_status_display(status: protocol::GoalStatus) -> (&'static str, &'static str) {
+    match status {
+        protocol::GoalStatus::Active => ("Active", "goal-active"),
+        protocol::GoalStatus::Paused => ("Paused", "goal-paused"),
+        protocol::GoalStatus::Blocked => ("Blocked", "goal-blocked"),
+        protocol::GoalStatus::UsageLimited => ("Usage limit reached", "goal-limited"),
+        protocol::GoalStatus::BudgetLimited => ("Budget reached", "goal-limited"),
+        protocol::GoalStatus::Complete => ("Completed", "goal-complete"),
+    }
+}
+
+fn format_goal_elapsed(seconds: u64) -> String {
+    if seconds >= 3600 {
+        format!("{}h {:02}m", seconds / 3600, (seconds % 3600) / 60)
+    } else if seconds >= 60 {
+        format!("{}m {:02}s", seconds / 60, seconds % 60)
+    } else {
+        format!("{seconds}s")
     }
 }
 
@@ -859,6 +990,13 @@ mod wasm_tests {
             .unwrap()
     }
 
+    fn find(container: &HtmlElement, selector: &str) -> web_sys::Element {
+        container
+            .query_selector(selector)
+            .unwrap()
+            .unwrap_or_else(|| panic!("missing element: {selector}"))
+    }
+
     fn computed_display(element: &web_sys::Element) -> String {
         web_sys::window()
             .unwrap()
@@ -956,8 +1094,33 @@ mod wasm_tests {
         let header = button(&container, ".summary-goal-header");
         assert!(header.text_content().unwrap().contains("Active"));
         assert!(header.get_bounding_client_rect().height() > 0.0);
+        // Collapsed, the header is the only place the objective appears, so it
+        // has to render it.
+        assert!(
+            find(&container, ".summary-goal-header .summary-goal-objective")
+                .get_bounding_client_rect()
+                .width()
+                > 0.0,
+            "the collapsed header must show the objective"
+        );
         header.click();
         next_tick().await;
+        // Expanded, the body states the objective in full and the header's
+        // truncated copy would sit directly above it saying the same thing.
+        assert_eq!(
+            find(&container, ".summary-goal-detail")
+                .text_content()
+                .as_deref(),
+            Some("Finish the requested output"),
+            "the expanded body must state the objective in full"
+        );
+        assert_eq!(
+            find(&container, ".summary-goal-header .summary-goal-objective")
+                .get_bounding_client_rect()
+                .width(),
+            0.0,
+            "the expanded header must not repeat the objective"
+        );
         button(&container, ".summary-goal-controls button").click();
         assert_eq!(
             *operations.lock().unwrap(),
@@ -991,7 +1154,7 @@ mod wasm_tests {
         );
         let mut completed = snapshot;
         completed.status = protocol::GoalStatus::Complete;
-        goal.set(Some(completed));
+        goal.set(Some(completed.clone()));
         next_tick().await;
         assert!(
             button(&container, ".summary-goal-header")
@@ -1006,6 +1169,42 @@ mod wasm_tests {
             operations.lock().unwrap().last(),
             Some(&protocol::GoalControl::Clear)
         );
+
+        // Spend the backend reports has to be legible as spend: a budgeted goal
+        // draws the fraction it has burned, and elapsed time is stated in units
+        // rather than as a raw second count.
+        let mut budgeted = completed;
+        budgeted.status = protocol::GoalStatus::Active;
+        budgeted.token_budget = Some(200_000);
+        budgeted.tokens_used = Some(100_000);
+        budgeted.time_used_seconds = Some(3_725);
+        goal.set(Some(budgeted));
+        next_tick().await;
+        let track = find(&container, ".summary-goal-meter-track");
+        let fill = find(&container, ".summary-goal-meter-fill");
+        let track_width = track.get_bounding_client_rect().width();
+        assert!(track_width > 0.0, "the budget meter must be laid out");
+        let burned = fill.get_bounding_client_rect().width() / track_width;
+        assert!(
+            (burned - 0.5).abs() < 0.02,
+            "half of a 200K budget must draw a half-full meter, drew {burned}"
+        );
+        assert_eq!(track.get_attribute("aria-valuenow").as_deref(), Some("50"));
+        assert!(
+            find(&container, ".summary-goal-meter-value")
+                .text_content()
+                .unwrap()
+                .contains("100.0K / 200.0K"),
+            "the meter must state the spend against the budget"
+        );
+        let stats = find(&container, ".summary-goal-stats")
+            .text_content()
+            .unwrap();
+        assert!(
+            stats.contains("1h 02m"),
+            "3725 seconds must read as 1h 02m, read {stats}"
+        );
+
         goal.set(None);
         next_tick().await;
         assert!(
