@@ -42,6 +42,7 @@ pub(crate) fn capabilities() -> BackendCapabilities {
         BackendCapability::GenericModifyFile,
         BackendCapability::GenericReadFiles,
         BackendCapability::GenericWebSearch,
+        BackendCapability::PlanApprovalRequests,
         BackendCapability::GenericOtherTool,
         BackendCapability::TaskUpdates,
         BackendCapability::TaskListReplacement,
