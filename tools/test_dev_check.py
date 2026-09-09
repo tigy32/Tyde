@@ -1374,6 +1374,17 @@ if [[ -n "${DEV_CHECK_EXPECT_WASM_TARGET:-}" ]]; then
   [[ -L "${CARGO_TARGET_DIR:-}" ]]
   [[ "$(readlink "$CARGO_TARGET_DIR")" == "$DEV_CHECK_EXPECT_WASM_TARGET" ]]
 fi
+if [[ -n "${DEV_CHECK_WASM_RELEASE:-}" ]]; then
+  waited=0
+  while [[ ! -e "$DEV_CHECK_WASM_RELEASE" ]]; do
+    if ((waited >= 600)); then
+      echo "web loader stage never ran alongside the wasm suite" >&2
+      exit 9
+    fi
+    sleep 0.05
+    waited=$((waited + 1))
+  done
+fi
 echo "wasm" >> "$DEV_CHECK_TEST_LOG"
 if [[ "${DEV_CHECK_FAIL_COMMAND:-}" == "wasm" ]]; then exit 9; fi
 """,
@@ -1524,6 +1535,7 @@ esac
 set -euo pipefail
 if [[ "${1:-}" == "--version" ]]; then echo "v22.0.0"; exit 0; fi
 echo "node $*" >> "$DEV_CHECK_TEST_LOG"
+if [[ -n "${DEV_CHECK_WASM_RELEASE:-}" ]]; then : > "$DEV_CHECK_WASM_RELEASE"; fi
 if [[ "${DEV_CHECK_FAIL_COMMAND:-}" == "node" ]]; then exit 9; fi
 """,
         )
@@ -1638,7 +1650,10 @@ exec "$DEV_CHECK_REAL_PYTHON" "$@"
         lines = self._log_lines()
         self.assertEqual(lines[:2], [TOOLCHAIN_UPDATE_LOG, TOOLCHAIN_INSTALL_LOG])
         self.assertEqual(sum(line.startswith("cargo fmt ") for line in lines), 1)
-        self.assertEqual(sum(line.startswith("cargo check ") for line in lines), 1)
+        # `cargo clippy` runs the same rustc analysis and denies the same rustc
+        # lints, so a separate `cargo check` pass is duplicated work, not extra
+        # coverage.
+        self.assertEqual(sum(line.startswith("cargo check ") for line in lines), 0)
         self.assertEqual(sum(line.startswith("cargo clippy ") for line in lines), 1)
         self.assertEqual(sum(line.startswith("cargo nextest run ") for line in lines), 1)
         self.assertEqual(lines.count("native-tools-prepare"), 1)
@@ -1665,7 +1680,7 @@ exec "$DEV_CHECK_REAL_PYTHON" "$@"
         records = list((self.root / "target" / "dev-check-cache").glob("*.success"))
         self.assertEqual(len(records), 1)
         record = records[0].read_text(encoding="utf-8")
-        self.assertIn("schema=4", record)
+        self.assertIn("schema=5", record)
         self.assertIn("complete=true", record)
         self.assertTrue(record.endswith("record.end=true\n"))
         self.assertEqual(
@@ -1799,6 +1814,59 @@ exec "$DEV_CHECK_REAL_PYTHON" "$@"
         changed_python = self.env.copy()
         changed_python["DEV_CHECK_FAKE_PYTHON_VERSION"] = "3.changed"
         self.assertEqual(self._explain_key(changed_python), base_key)
+
+    def test_stages_after_the_native_run_overlap_the_wasm_suite(self) -> None:
+        # The wasm stub blocks until the web loader stage has run, so the run
+        # only completes if the two overlap. Serialize the stages again and the
+        # stub waits out its deadline and fails the run.
+        env = self.env.copy()
+        env["DEV_CHECK_WASM_RELEASE"] = str(
+            pathlib.Path(self.temp.name) / "wasm-release"
+        )
+
+        result = self._run(env=env)
+
+        lines = self._log_lines()
+        self.assertEqual(lines.count("wasm"), 1)
+        self.assertEqual(sum(line.startswith("node --test ") for line in lines), 1)
+        self.assertEqual(lines.count("contract"), 1)
+        self.assertIn("PASS  wasm browser tests (1/1", result.stdout)
+        self.assertIn("PASS  web loader tests (1/1", result.stdout)
+        self.assertIn("PASS  dev check contract tests (1/1", result.stdout)
+
+        for command, label, other_label in (
+            ("wasm", "wasm browser tests", "dev check contract tests"),
+            ("node", "web loader tests", "wasm browser tests"),
+        ):
+            with self.subTest(failure=command):
+                (self.root / "failure.txt").write_text(command, encoding="utf-8")
+                failing_env = self.env.copy()
+                failing_env["DEV_CHECK_FAIL_COMMAND"] = command
+                records = set((self.root / "target/dev-check-cache").glob("*.success"))
+
+                failed = self._run(env=failing_env, check=False)
+
+                self.assertEqual(failed.returncode, 9)
+                self.assertIn(f"FAIL  {label} (1/1", failed.stderr)
+                self.assertIn("Complete stage log:", failed.stderr)
+                self.assertIn(f"PASS  {other_label} (1/1", failed.stdout)
+                self.assertEqual(
+                    set((self.root / "target/dev-check-cache").glob("*.success")),
+                    records,
+                )
+                run_dir = max((self.root / "target/dev-check-logs").glob("run-*"))
+                metadata = (run_dir / "metadata.txt").read_text(encoding="utf-8")
+                self.assertIn("overall.result=FAIL", metadata)
+                fields = dict(line.split("=", 1) for line in metadata.splitlines())
+                stage = next(
+                    key.removesuffix(".label")
+                    for key, value in fields.items()
+                    if key.endswith(".label") and value == label
+                )
+                self.assertEqual(fields[f"{stage}.result"], "FAIL")
+                self.assertTrue(pathlib.Path(fields[f"{stage}.failure_log"]).is_file())
+                summary = (run_dir / "summary.txt").read_text(encoding="utf-8")
+                self.assertIn(f"PASS  {other_label} (1/1", summary)
 
     def test_environment_and_failures_obey_cache_contract(self) -> None:
         self._run()
@@ -3449,10 +3517,8 @@ profile = "minimal"
         self.assertIn("Resource timing parser failure", source)
         self.assertIn("unset DEV_CHECK_CONTRACT_CHILD", source)
         self.assertNotIn('if [[ "${DEV_CHECK_CONTRACT_CHILD', source)
-        self.assertIn(
-            'run_stage "dev check contract tests" 1 python3 tools/test_dev_check.py',
-            source,
-        )
+        self.assertIn('"dev check contract tests" 1 \\\n', source)
+        self.assertIn("python3 tools/test_dev_check.py", source)
 
 
 if __name__ == "__main__":

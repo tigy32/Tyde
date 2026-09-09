@@ -1950,7 +1950,22 @@ async fn project_subscription_starts_with_project_bootstrap() {
     assert_eq!(host_bootstrap.projects.len(), 1);
     assert_eq!(host_bootstrap.projects[0].id, project.id);
 
-    let env = next_env(&mut client, "project bootstrap").await;
+    // BackendCapacity replay on the host stream can precede project output.
+    // The protocol requires bootstrap first per stream, not per connection.
+    let env = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let env = next_env(&mut client, "project bootstrap").await;
+            eprintln!(
+                "project bootstrap reception: kind={} stream={} seq={}",
+                env.kind, env.stream, env.seq
+            );
+            if env.stream.0 == format!("/project/{}", project.id.0) {
+                break env;
+            }
+        }
+    })
+    .await
+    .expect("project stream must bootstrap within five seconds");
     assert_eq!(env.kind, FrameKind::ProjectBootstrap);
     assert_eq!(env.stream.0, format!("/project/{}", project.id.0));
     assert_eq!(env.seq, 0);

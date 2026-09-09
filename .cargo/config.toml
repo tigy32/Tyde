@@ -36,3 +36,7 @@ rustflags = [
     '-C',
     'link-arg=-zstack-size=16777216',
 ]
+
+# GNU Linux builds require mold (apt: mold). Keep musl's static link order.
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "link-arg=-fuse-ld=mold"]

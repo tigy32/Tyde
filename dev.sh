@@ -5,7 +5,7 @@ export PYTHONDONTWRITEBYTECODE=1
 
 cd "$(dirname "$0")"
 
-readonly DEV_CHECK_CACHE_SCHEMA="4"
+readonly DEV_CHECK_CACHE_SCHEMA="5"
 readonly DEV_CHECK_CACHE_DIR="target/dev-check-cache"
 readonly DEV_CHECK_LOG_DIR="target/dev-check-logs"
 readonly DEV_CHECK_LOCK_DIR="target/dev-check.lock"
@@ -267,25 +267,56 @@ timing_peak_rss_bytes() {
     fi
 }
 
-run_stage() {
-    local label="$1"
-    local repetitions="$2"
-    shift 2
+stage_record_path() {
+    printf '%s/.stage-%s-%02d' "$RUN_DIR" "$1" "$2"
+}
+
+# Replays the per-stage records left by run_stage_at into the shared run files,
+# in stage order, and prints any failure dumps. Concurrent lanes cannot append
+# to the shared files directly without interleaving, so they buffer instead and
+# the joining caller orders the result.
+merge_stage_records() {
+    local stage_number meta summary failure
+    for stage_number in "$@"; do
+        meta="$(stage_record_path meta "$stage_number")"
+        summary="$(stage_record_path summary "$stage_number")"
+        failure="$(stage_record_path failure "$stage_number")"
+        [[ -s "$meta" ]] && cat "$meta" >>"$RUN_METADATA"
+        [[ -s "$summary" ]] && cat "$summary" >>"$RUN_SUMMARY"
+        [[ -s "$failure" ]] && cat "$failure" >&2
+        rm -f "$meta" "$summary" "$failure"
+    done
+    return 0
+}
+
+# Runs one stage under a pre-assigned number so concurrent lanes never race for
+# it. Everything destined for the shared run files is buffered per stage; the
+# caller merges it with merge_stage_records once the lanes have joined.
+run_stage_at() {
+    local stage_number="$1"
+    local label="$2"
+    local repetitions="$3"
+    shift 3
     local run status duration peak_rss timing_file repetition_log parse_error
     local total_duration="0"
     local max_peak_rss=0
-    local stage_log stage_slug
+    local stage_log stage_slug stage_meta stage_summary stage_failure
 
-    STAGE_NUMBER=$((STAGE_NUMBER + 1))
     stage_slug="$(printf '%s' "$label" | tr -cs '[:alnum:]' '-' | sed 's/^-//; s/-$//' | tr '[:upper:]' '[:lower:]')"
-    stage_log="$RUN_DIR/$(printf '%02d' "$STAGE_NUMBER")-$stage_slug.log"
+    stage_log="$RUN_DIR/$(printf '%02d' "$stage_number")-$stage_slug.log"
+    stage_meta="$(stage_record_path meta "$stage_number")"
+    stage_summary="$(stage_record_path summary "$stage_number")"
+    stage_failure="$(stage_record_path failure "$stage_number")"
     : >"$stage_log"
+    : >"$stage_meta"
+    : >"$stage_summary"
+    rm -f "$stage_failure"
     printf 'START %s (%s run%s)\n' "$label" "$repetitions" \
         "$([[ "$repetitions" == 1 ]] || printf 's')"
 
     for ((run = 1; run <= repetitions; run++)); do
-        timing_file="$RUN_DIR/.timing-$STAGE_NUMBER-$run"
-        repetition_log="$RUN_DIR/.repetition-$STAGE_NUMBER-$run.log"
+        timing_file="$RUN_DIR/.timing-$stage_number-$run"
+        repetition_log="$RUN_DIR/.repetition-$stage_number-$run.log"
         if ((repetitions > 1)); then
             printf 'RUN   %s (%s/%s)\n' "$label" "$run" "$repetitions"
         fi
@@ -325,20 +356,23 @@ run_stage() {
         ((peak_rss > max_peak_rss)) && max_peak_rss="$peak_rss"
 
         if ((status != 0)); then
-            printf 'FAIL  %s (%s/%s, %ss, peak RSS %s)\n' "$label" "$run" \
-                "$repetitions" "$total_duration" "$(format_bytes "$max_peak_rss")" >&2
-            printf 'Failing repetition diagnostics: %s\n' "$PWD/$repetition_log" >&2
-            printf 'Complete stage log: %s\n' "$PWD/$stage_log" >&2
-            cat "$repetition_log" >&2
-            printf 'stage.%02d.result=FAIL\n' "$STAGE_NUMBER" >>"$RUN_METADATA"
-            printf 'stage.%02d.label=%s\n' "$STAGE_NUMBER" "$label" >>"$RUN_METADATA"
-            printf 'stage.%02d.completed_runs=%s\n' "$STAGE_NUMBER" "$run" >>"$RUN_METADATA"
-            printf 'stage.%02d.requested_runs=%s\n' "$STAGE_NUMBER" "$repetitions" >>"$RUN_METADATA"
-            printf 'stage.%02d.duration_seconds=%s\n' "$STAGE_NUMBER" "$total_duration" >>"$RUN_METADATA"
-            printf 'stage.%02d.peak_rss_bytes=%s\n' "$STAGE_NUMBER" "$max_peak_rss" >>"$RUN_METADATA"
-            printf 'stage.%02d.log=%s\n' "$STAGE_NUMBER" "$PWD/$stage_log" >>"$RUN_METADATA"
-            printf 'stage.%02d.failure_log=%s\n' "$STAGE_NUMBER" \
-                "$PWD/$repetition_log" >>"$RUN_METADATA"
+            {
+                printf 'FAIL  %s (%s/%s, %ss, peak RSS %s)\n' "$label" "$run" \
+                    "$repetitions" "$total_duration" "$(format_bytes "$max_peak_rss")"
+                printf 'Failing repetition diagnostics: %s\n' "$PWD/$repetition_log"
+                printf 'Complete stage log: %s\n' "$PWD/$stage_log"
+                cat "$repetition_log"
+            } >"$stage_failure"
+            {
+                printf 'stage.%02d.result=FAIL\n' "$stage_number"
+                printf 'stage.%02d.label=%s\n' "$stage_number" "$label"
+                printf 'stage.%02d.completed_runs=%s\n' "$stage_number" "$run"
+                printf 'stage.%02d.requested_runs=%s\n' "$stage_number" "$repetitions"
+                printf 'stage.%02d.duration_seconds=%s\n' "$stage_number" "$total_duration"
+                printf 'stage.%02d.peak_rss_bytes=%s\n' "$stage_number" "$max_peak_rss"
+                printf 'stage.%02d.log=%s\n' "$stage_number" "$PWD/$stage_log"
+                printf 'stage.%02d.failure_log=%s\n' "$stage_number" "$PWD/$repetition_log"
+            } >>"$stage_meta"
             return "$status"
         fi
         rm -f "$repetition_log"
@@ -347,14 +381,27 @@ run_stage() {
     printf 'PASS  %s (%s/%s, %ss, peak RSS %s)\n' "$label" "$repetitions" \
         "$repetitions" "$total_duration" "$(format_bytes "$max_peak_rss")"
     printf 'PASS  %s (%s/%s, %ss, peak RSS %s)\n' "$label" "$repetitions" \
-        "$repetitions" "$total_duration" "$(format_bytes "$max_peak_rss")" >>"$RUN_SUMMARY"
-    printf 'stage.%02d.result=PASS\n' "$STAGE_NUMBER" >>"$RUN_METADATA"
-    printf 'stage.%02d.label=%s\n' "$STAGE_NUMBER" "$label" >>"$RUN_METADATA"
-    printf 'stage.%02d.completed_runs=%s\n' "$STAGE_NUMBER" "$repetitions" >>"$RUN_METADATA"
-    printf 'stage.%02d.requested_runs=%s\n' "$STAGE_NUMBER" "$repetitions" >>"$RUN_METADATA"
-    printf 'stage.%02d.duration_seconds=%s\n' "$STAGE_NUMBER" "$total_duration" >>"$RUN_METADATA"
-    printf 'stage.%02d.peak_rss_bytes=%s\n' "$STAGE_NUMBER" "$max_peak_rss" >>"$RUN_METADATA"
-    printf 'stage.%02d.log=%s\n' "$STAGE_NUMBER" "$PWD/$stage_log" >>"$RUN_METADATA"
+        "$repetitions" "$total_duration" "$(format_bytes "$max_peak_rss")" >>"$stage_summary"
+    {
+        printf 'stage.%02d.result=PASS\n' "$stage_number"
+        printf 'stage.%02d.label=%s\n' "$stage_number" "$label"
+        printf 'stage.%02d.completed_runs=%s\n' "$stage_number" "$repetitions"
+        printf 'stage.%02d.requested_runs=%s\n' "$stage_number" "$repetitions"
+        printf 'stage.%02d.duration_seconds=%s\n' "$stage_number" "$total_duration"
+        printf 'stage.%02d.peak_rss_bytes=%s\n' "$stage_number" "$max_peak_rss"
+        printf 'stage.%02d.log=%s\n' "$stage_number" "$PWD/$stage_log"
+    } >>"$stage_meta"
+}
+
+# Serial stage: takes the next number and publishes its records immediately, so
+# setup stages keep reporting in the order they run.
+run_stage() {
+    local status=0
+
+    STAGE_NUMBER=$((STAGE_NUMBER + 1))
+    run_stage_at "$STAGE_NUMBER" "$@" || status=$?
+    merge_stage_records "$STAGE_NUMBER"
+    return "$status"
 }
 
 rust_toolchain_channel() {
@@ -655,6 +702,56 @@ finish_success() {
         "$(format_bytes "$CLEANUP_RECLAIMED_BYTES")" "$PWD/$RUN_DIR"
 }
 
+# Clippy subsumes cargo check. Keep native validation serial to gate later
+# stages, then overlap independent checks with wasm without Cargo lock contention.
+run_check_stages() {
+    local repetitions="$1"
+    local wasm_pid tail_pid wasm_status=0 tail_status=0 status
+    local n_wasm n_loader n_docs n_contract
+
+    run_stage "cargo fmt --all --check" 1 cargo fmt --all --check
+    run_stage "cargo clippy --all-targets -- -D warnings" 1 \
+        cargo clippy --all-targets -- -D warnings
+    run_stage "cargo nextest run" "$repetitions" cargo nextest run
+
+    n_wasm=$((STAGE_NUMBER + 1))
+    n_loader=$((STAGE_NUMBER + 2))
+    n_docs=$((STAGE_NUMBER + 3))
+    n_contract=$((STAGE_NUMBER + 4))
+    STAGE_NUMBER="$n_contract"
+
+    configure_wasm_cargo_target
+
+    (
+        trap - EXIT INT TERM HUP
+        run_stage_at "$n_wasm" "wasm browser tests" "$repetitions" \
+            env CARGO_TARGET_DIR="$WASM_CARGO_TARGET_DIR" tools/run-wasm-tests.sh
+    ) &
+    wasm_pid=$!
+
+    (
+        trap - EXIT INT TERM HUP
+        run_stage_at "$n_loader" "web loader tests" "$repetitions" \
+            bash -c 'cd web/loader && exec node --test test/*.test.js' &&
+            run_stage_at "$n_docs" "customer documentation" 1 \
+                python3 docs/build.py --check &&
+            run_stage_at "$n_contract" "dev check contract tests" 1 \
+                python3 tools/test_dev_check.py
+    ) &
+    tail_pid=$!
+
+    wait "$wasm_pid" || wasm_status=$?
+    wait "$tail_pid" || tail_status=$?
+
+    merge_stage_records "$n_wasm" "$n_loader" "$n_docs" "$n_contract"
+
+    status="$wasm_status"
+    if ((status == 0)); then
+        status="$tail_status"
+    fi
+    return "$status"
+}
+
 check_usage() {
     cat <<'USAGE'
 Usage: ./dev.sh check [--explain-cache]
@@ -760,18 +857,7 @@ check() {
     printf 'CACHE %s %s\n' "$(printf '%s' "$cache_state" | tr '[:lower:]' '[:upper:]')" \
         "${key:-not-written}"
 
-    run_stage "cargo fmt --all --check" 1 cargo fmt --all --check
-    run_stage "cargo check --all-targets" 1 cargo check --all-targets
-    run_stage "cargo clippy --all-targets -- -D warnings" 1 \
-        cargo clippy --all-targets -- -D warnings
-    run_stage "cargo nextest run" "$repetitions" cargo nextest run
-    configure_wasm_cargo_target
-    run_stage "wasm browser tests" "$repetitions" \
-        env CARGO_TARGET_DIR="$WASM_CARGO_TARGET_DIR" tools/run-wasm-tests.sh
-    run_stage "web loader tests" "$repetitions" \
-        bash -c 'cd web/loader && exec node --test test/*.test.js'
-    run_stage "customer documentation" 1 python3 docs/build.py --check
-    run_stage "dev check contract tests" 1 python3 tools/test_dev_check.py
+    run_check_stages "$repetitions"
 
     refreshed_inputs="$(cache_inputs)"
     refreshed_key="$(cache_key_for_inputs "$refreshed_inputs")"

@@ -64,9 +64,15 @@ nextest, wasm, web, or filtered test commands directly.
 
 The wrapper owns caching, test execution and failure handling, current-stable
 toolchain setup, the release-safe environment, and token/time optimization. A
-cache miss runs each compile, lint, native, wasm, and web-loader stage once; a
+cache miss runs each lint, native, wasm, and web-loader stage once; a
 cache hit prints the prior successful stage summary and does no validation
-work. Successful stages print only START/PASS,
+work. There is no separate `cargo check` stage: `cargo clippy` runs the same
+rustc analysis under `-D warnings`, so checking first was a duplicate pass, not
+extra coverage. Format, lint, and native stages run in order, because they
+share Cargo's exclusive lock on `target/` and because a failed native run must
+block every stage behind it; the stages that need nothing from the wasm suite
+run alongside it once the native run has passed. Successful stages print only
+START/PASS,
 wall time, repetitions, and peak RSS. Complete stage output and metadata are
 retained in bounded `target/dev-check-logs/` runs; failures print the complete
 captured output for the failing run plus the complete stage-log path, without
