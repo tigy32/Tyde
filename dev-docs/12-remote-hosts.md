@@ -857,9 +857,12 @@ binary is not already installed on disk.
 
 ### 18.2 Auto-reconnect policy
 
-This document assumes connect/disconnect behavior and basic status reporting,
-but not a final reconnect strategy. We can add retry/backoff later without
-changing the host registry model.
+Desktop hosts retry failed initial connections and dropped connections
+indefinitely, waiting one second between attempts without backoff or jitter.
+Authentication failures also retry so a host can recover after credentials
+become available. An in-flight SSH attempt can take longer than one second.
+Explicit Disconnect or removing the host cancels retries. Startup connections
+run independently so an unavailable host cannot block other hosts.
 
 ### 18.3 Project grouping only, or sessions/agents too?
 

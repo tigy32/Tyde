@@ -7012,7 +7012,7 @@ fn apply_terminal_bootstrap(
 /// the wasm lifecycle tests, and `use super::*` in `mod wasm_tests` reaches
 /// this module, not its sibling test module.
 #[cfg(all(test, target_arch = "wasm32"))]
-mod restore_fixtures {
+pub(crate) mod restore_fixtures {
     use super::*;
     use protocol::{BackendKind, ProjectRootPath};
 

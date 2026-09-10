@@ -13191,6 +13191,181 @@ mod wasm_tests {
     }
 
     #[wasm_bindgen_test]
+    async fn host_retries_initial_and_dropped_connections_until_disconnected() {
+        js_sys::eval(r#"
+            window.__retry_events = {};
+            window.__retry_attempts = [];
+            window.__retry_available = false;
+            window.__retry_hello = null;
+            window.__TAURI__ = window.__TAURI__ || {};
+            window.__TAURI__.event = { listen: (name, callback) => {
+                window.__retry_events[name] = callback;
+                return Promise.resolve(() => delete window.__retry_events[name]);
+            }};
+            window.__TAURI__.core = { invoke: (cmd, args) => {
+                if (cmd === 'connect_host') {
+                    window.__retry_attempts.push(performance.now());
+                    if (!window.__retry_available) return Promise.reject('Permission denied (publickey)');
+                }
+                if (cmd === 'send_host_line') {
+                    const frame = JSON.parse(args.line);
+                    if (frame.kind === 'hello') window.__retry_hello = frame;
+                }
+                return Promise.resolve();
+            }};
+        "#).unwrap();
+        let state = AppState::new();
+        let mut host = settings_host("retry-host", "Work desktop");
+        host.transport = bridge::HostTransportConfig::SshStdio {
+            ssh_destination: "work".into(),
+            remote_command: Some("manual-bridge".into()),
+            lifecycle: bridge::RemoteHostLifecycleConfig::Manual,
+        };
+        state.configured_hosts.set(vec![host]);
+        state.connection_statuses.update(|statuses| {
+            statuses.insert(
+                "retry-host".into(),
+                crate::state::ConnectionStatus::Disconnected,
+            );
+        });
+        let listeners = crate::app::install_host_listeners(state.clone())
+            .await
+            .unwrap();
+        let container = make_container();
+        let handle = mount_to(container.clone(), move || {
+            provide_context(state.clone());
+            view! { <HostsTab /> }
+        });
+        next_tick().await;
+        find_button_by_text(&container, "Connect").unwrap().click();
+        next_tick().await;
+        next_tick().await;
+        assert!(
+            container.text_content().unwrap().contains("reconnecting"),
+            "an initial authentication failure must show automatic recovery"
+        );
+        assert!(
+            container
+                .text_content()
+                .unwrap()
+                .contains("Permission denied")
+        );
+        for _ in 0..3 {
+            let promise = js_sys::Promise::new(&mut |resolve, _| {
+                web_sys::window()
+                    .unwrap()
+                    .set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, 1100)
+                    .unwrap();
+            });
+            wasm_bindgen_futures::JsFuture::from(promise).await.unwrap();
+        }
+        let attempts: Vec<f64> = serde_json::from_str(
+            &js_sys::eval("JSON.stringify(window.__retry_attempts)")
+                .unwrap()
+                .as_string()
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            attempts.len() >= 4,
+            "authentication errors must keep retrying every second: {attempts:?}"
+        );
+        assert!(
+            attempts.windows(2).all(|pair| pair[1] - pair[0] >= 900.0),
+            "failed attempts must wait rather than spin: {attempts:?}"
+        );
+        js_sys::eval("window.__retry_available = true").unwrap();
+        let promise = js_sys::Promise::new(&mut |resolve, _| {
+            web_sys::window()
+                .unwrap()
+                .set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, 1100)
+                .unwrap();
+        });
+        wasm_bindgen_futures::JsFuture::from(promise).await.unwrap();
+        let hello: protocol::Envelope = serde_json::from_str(
+            &js_sys::eval("JSON.stringify(window.__retry_hello)")
+                .unwrap()
+                .as_string()
+                .unwrap(),
+        )
+        .unwrap();
+        let welcome = protocol::Envelope::from_payload(
+            hello.stream.clone(),
+            protocol::FrameKind::Welcome,
+            0,
+            &protocol::WelcomePayload {
+                protocol_version: protocol::PROTOCOL_VERSION,
+                tyde_version: protocol::TYDE_VERSION,
+                release_version: None,
+            },
+        )
+        .unwrap();
+        let line = serde_json::to_string(&welcome).unwrap();
+        js_sys::eval(&format!("window.__retry_events['tyde://host-line']({{payload: {{hostId: 'retry-host', line: {}}}}});", serde_json::to_string(&line).unwrap())).unwrap();
+        let bootstrap =
+            crate::dispatch::restore_fixtures::empty_host_bootstrap_envelope(&hello.stream.0, 1);
+        let line = serde_json::to_string(&bootstrap).unwrap();
+        js_sys::eval(&format!("window.__retry_events['tyde://host-line']({{payload: {{hostId: 'retry-host', line: {}}}}});", serde_json::to_string(&line).unwrap())).unwrap();
+        next_tick().await;
+        assert!(container.text_content().unwrap().contains("Connected"));
+        js_sys::eval(r#"
+            window.__retry_available = false;
+            window.__retry_attempts = [];
+            window.__retry_events['tyde://host-error']({payload: {hostId: 'retry-host', message: 'Permission denied'}});
+            window.__retry_events['tyde://host-disconnected']({payload: {hostId: 'retry-host'}});
+        "#).unwrap();
+        next_tick().await;
+        next_tick().await;
+        assert!(
+            container.text_content().unwrap().contains("reconnecting"),
+            "authentication failure after a successful connection must also recover"
+        );
+        for _ in 0..3 {
+            let promise = js_sys::Promise::new(&mut |resolve, _| {
+                web_sys::window()
+                    .unwrap()
+                    .set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, 1100)
+                    .unwrap();
+            });
+            wasm_bindgen_futures::JsFuture::from(promise).await.unwrap();
+        }
+        assert!(
+            js_sys::eval("window.__retry_attempts.length")
+                .unwrap()
+                .as_f64()
+                .unwrap()
+                >= 3.0
+        );
+        find_button_by_text(&container, "Disconnect")
+            .unwrap()
+            .click();
+        next_tick().await;
+        assert!(find_button_by_text(&container, "Connect").is_some());
+        let stopped = js_sys::eval("window.__retry_attempts.length")
+            .unwrap()
+            .as_f64();
+        let promise = js_sys::Promise::new(&mut |resolve, _| {
+            web_sys::window()
+                .unwrap()
+                .set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, 1100)
+                .unwrap();
+        });
+        wasm_bindgen_futures::JsFuture::from(promise).await.unwrap();
+        assert_eq!(
+            js_sys::eval("window.__retry_attempts.length")
+                .unwrap()
+                .as_f64(),
+            stopped,
+            "Disconnect must cancel the pending retry"
+        );
+        for listener in listeners {
+            listener.remove();
+        }
+        drop(handle);
+        container.remove();
+    }
+
+    #[wasm_bindgen_test]
     async fn disconnect_clears_host_ui_and_connect_starts_a_fresh_snapshot() {
         use crate::components::agent_monitor_view::AgentMonitorView;
         use crate::components::center_zone::CenterZone;

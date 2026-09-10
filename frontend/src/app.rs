@@ -1008,7 +1008,8 @@ async fn initialize_hosts(state: AppState, listener_token: u64) {
         .collect::<Vec<_>>();
 
     for host_id in auto_connect_hosts {
-        connect_one_host(state.clone(), host_id).await;
+        let state = state.clone();
+        spawn_local(async move { connect_one_host(state, host_id).await });
     }
 }
 
@@ -1122,8 +1123,12 @@ pub(crate) async fn install_host_listeners(
         bridge::listen_host_disconnected(move |event| {
             let state = disconnect_state.clone();
             let host_id = event.host_id;
-            if !state.configured_hosts.with_untracked(|hosts| hosts.iter().any(|host| host.id == host_id)) { return; }
-            if state.connection_statuses.with_untracked(|statuses| matches!(statuses.get(&host_id), Some(ConnectionStatus::Error(message)) if host_config::ssh_requires_attention(message))) { return; }
+            if !state
+                .configured_hosts
+                .with_untracked(|hosts| hosts.iter().any(|host| host.id == host_id))
+            {
+                return;
+            }
             if matches!(
                 state.connection_statuses.get_untracked().get(&host_id),
                 Some(ConnectionStatus::Disconnected)
@@ -1135,51 +1140,15 @@ pub(crate) async fn install_host_listeners(
                     host_id.clone(),
                     ConnectionStatus::Reconnecting {
                         attempt: 1,
-                        retry_in_seconds: 0,
+                        retry_in_seconds: 1,
                         message: "Refreshing connection…".into(),
                     },
                 );
             });
+            let epoch = state.cancel_host_connect(&host_id);
             spawn_local(async move {
-                let mut attempt = 0u32;
-                loop {
-                    attempt = attempt.saturating_add(1);
-                    if matches!(
-                        state.connection_statuses.get_untracked().get(&host_id),
-                        Some(ConnectionStatus::Disconnected | ConnectionStatus::Connected)
-                    ) {
-                        return;
-                    }
-                    connect_one_host(state.clone(), host_id.clone()).await;
-                    if !matches!(
-                        state.connection_statuses.get_untracked().get(&host_id),
-                        Some(ConnectionStatus::Error(_))
-                    ) {
-                        return;
-                    }
-                    if state.connection_statuses.with_untracked(|statuses| matches!(statuses.get(&host_id), Some(ConnectionStatus::Error(message)) if host_config::ssh_requires_attention(message))) { return; }
-                    let retry_epoch = state.host_connection_epochs.with_untracked(|epochs| epochs.get(&host_id).copied());
-                    let seconds = (1u32 << attempt.min(5)).min(30);
-                    state.connection_statuses.update(|statuses| {
-                        statuses.insert(
-                            host_id.clone(),
-                            ConnectionStatus::Reconnecting {
-                                attempt: attempt + 1,
-                                retry_in_seconds: seconds,
-                                message: "Disconnected — refreshing connection…".into(),
-                            },
-                        );
-                    });
-                    let promise = js_sys::Promise::new(&mut |resolve, _| {
-                        if let Some(window) = web_sys::window() {
-                            let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(
-                                &resolve,
-                                (seconds * 1000) as i32,
-                            );
-                        }
-                    });
-                    let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
-                    if state.host_connection_epochs.with_untracked(|epochs| epochs.get(&host_id).copied()) != retry_epoch { return; }
+                if wait_for_host_retry(&state, &host_id, epoch).await {
+                    connect_one_host(state, host_id).await;
                 }
             });
         })
@@ -1299,6 +1268,62 @@ pub(crate) async fn disconnect_one_host(state: AppState, host_id: String) -> Res
 
 pub async fn connect_one_host(state: AppState, host_id: String) {
     let epoch = state.cancel_host_connect(&host_id);
+    let mut attempt = 0u32;
+    loop {
+        attempt = attempt.saturating_add(1);
+        connect_host_attempt(state.clone(), host_id.clone(), epoch).await;
+        if state
+            .host_connection_epochs
+            .with_untracked(|epochs| epochs.get(&host_id).copied())
+            != Some(epoch)
+        {
+            return;
+        }
+        let Some(ConnectionStatus::Error(message)) = state
+            .connection_statuses
+            .with_untracked(|statuses| statuses.get(&host_id).cloned())
+        else {
+            return;
+        };
+        log::warn!(
+            "host.connect.retry host={host_id} attempt={attempt} delay_seconds=1 error={message}"
+        );
+        state.connection_statuses.update(|statuses| {
+            statuses.insert(
+                host_id.clone(),
+                ConnectionStatus::Reconnecting {
+                    attempt: attempt.saturating_add(1),
+                    retry_in_seconds: 1,
+                    message,
+                },
+            );
+        });
+        if !wait_for_host_retry(&state, &host_id, epoch).await {
+            return;
+        }
+    }
+}
+
+async fn wait_for_host_retry(state: &AppState, host_id: &str, epoch: u64) -> bool {
+    let promise = js_sys::Promise::new(&mut |resolve, _| {
+        if let Some(window) = web_sys::window() {
+            let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, 1000);
+        }
+    });
+    let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+    state
+        .host_connection_epochs
+        .with_untracked(|epochs| epochs.get(host_id).copied())
+        == Some(epoch)
+        && !state.connection_statuses.with_untracked(|statuses| {
+            matches!(
+                statuses.get(host_id),
+                Some(ConnectionStatus::Disconnected | ConnectionStatus::Connected)
+            )
+        })
+}
+
+async fn connect_host_attempt(state: AppState, host_id: String, epoch: u64) {
     let epoch_state = state.clone();
     let epoch_host = host_id.clone();
     let current = move || {
@@ -1313,7 +1338,14 @@ pub async fn connect_one_host(state: AppState, host_id: String) {
     let target_label = configured_host_label(&state, &host_id);
     log::info!("host.connect.start host={}", host_id);
     state.connection_statuses.update(|statuses| {
-        statuses.insert(host_id.clone(), ConnectionStatus::Connecting);
+        if let Some(ConnectionStatus::Reconnecting {
+            retry_in_seconds, ..
+        }) = statuses.get_mut(&host_id)
+        {
+            *retry_in_seconds = 0;
+        } else {
+            statuses.insert(host_id.clone(), ConnectionStatus::Connecting);
+        }
     });
 
     if is_managed_remote_host(&state, &host_id) {
@@ -1398,7 +1430,11 @@ pub async fn connect_one_host(state: AppState, host_id: String) {
         platform: "wasm".to_owned(),
     };
 
-    if let Err(error) = send_frame(&host_id, host_stream, FrameKind::Hello, &hello).await {
+    let sent = send_frame(&host_id, host_stream, FrameKind::Hello, &hello).await;
+    if !current() {
+        return;
+    }
+    if let Err(error) = sent {
         log::error!("failed to send hello to host {}: {}", host_id, error);
         state.connection_statuses.update(|statuses| {
             statuses.insert(

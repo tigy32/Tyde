@@ -821,28 +821,13 @@ async fn setup_recovery(
             let mut attempt: u32 = 0;
             loop {
                 attempt = attempt.saturating_add(1);
-                let delay = if attempt == 1 {
-                    0
-                } else {
-                    (1u32 << attempt.min(7).saturating_sub(2)).min(30)
-                };
-                for remaining in (0..=delay).rev() {
-                    context.status(false, attempt, remaining, reason.clone());
-                    if remaining > 0 {
-                        tokio::select! {
-                            _ = session.closed() => return,
-                            _ = context.retry.notified() => break,
-                            _ = tokio::time::sleep(Duration::from_secs(1)) => {},
-                        }
-                    }
+                context.status(false, attempt, 1, reason.clone());
+                tokio::select! {
+                    _ = session.closed() => return,
+                    _ = context.retry.notified() => {},
+                    _ = tokio::time::sleep(Duration::from_secs(1)) => {},
                 }
-                if delay > 0 {
-                    let jitter = u64::from(uuid::Uuid::new_v4().as_bytes()[0]);
-                    tokio::select! {
-                        _ = session.closed() => return,
-                        _ = tokio::time::sleep(Duration::from_millis(jitter)) => {},
-                    }
-                }
+                context.status(false, attempt, 0, reason.clone());
                 let next = tokio::select! {
                     _ = session.closed() => return,
                     result = setup_connection_transport(&context.host_id, context.app.clone(), context.transport.clone(), context.host.clone(), context.live.clone()) => result,
@@ -877,11 +862,6 @@ async fn setup_recovery(
                             reason.push_str(&format!("; {diagnostic}"));
                         }
                         tracing::warn!(host_id = %context.host_id, attempt, %reason, "SSH reconnect attempt failed");
-                        if host_config::ssh_requires_attention(&reason) {
-                            let _ = emit_error(&context.app, &context.host_id, reason);
-                            session.close();
-                            return;
-                        }
                         if expired {
                             context.status(
                                 false,
