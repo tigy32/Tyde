@@ -474,7 +474,7 @@ Stated plainly so none of it is mistaken for a gap to be quietly filled later.
 
 ## Opt-in usage limit management
 
-Host Settings → Supervisor → Usage limits connects account capacity to agent
+Host Settings → Usage management connects account capacity to agent
 scheduling. Usage management and automatic compaction both default off. The
 initial thresholds are 90% quota used and 60% context occupancy; each accepts
 1–100%. These settings are independent of the model-based supervisor.

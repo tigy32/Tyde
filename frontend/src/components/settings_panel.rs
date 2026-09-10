@@ -494,6 +494,7 @@ enum SettingsTab {
     Display,
     AiSummaries,
     Supervisor,
+    UsageManagement,
     Subagents,
     Backends,
     CustomAgents,
@@ -523,6 +524,7 @@ impl SettingsTab {
             Self::Display => "Code & Output Display",
             Self::AiSummaries => "AI Summaries",
             Self::Supervisor => "Supervisor",
+            Self::UsageManagement => "Usage management",
             Self::Subagents => "Subagents",
             Self::Backends => "Backends",
             Self::CustomAgents => "Custom Agents",
@@ -544,6 +546,7 @@ impl SettingsTab {
             Self::Hosts | Self::Appearance | Self::Display => SettingsScope::Device,
             Self::AiSummaries
             | Self::Supervisor
+            | Self::UsageManagement
             | Self::Subagents
             | Self::Backends
             | Self::CustomAgents
@@ -655,6 +658,16 @@ impl SettingsTab {
                 "AWS profile",
                 "AWS region",
                 "Bedrock",
+            ],
+            Self::UsageManagement => &[
+                "Usage management",
+                "Usage limits",
+                "Enable usage limit management",
+                "Pause at usage percentage",
+                "Compact before waiting for reset",
+                "Compact at context percentage",
+                "Quota",
+                "Automatic resume",
             ],
             Self::Supervisor => &[
                 "Supervisor",
@@ -768,12 +781,13 @@ impl SettingsTab {
     }
 }
 
-const ALL_TABS: [SettingsTab; 15] = [
+const ALL_TABS: [SettingsTab; 16] = [
     SettingsTab::Hosts,
     SettingsTab::Appearance,
     SettingsTab::Display,
     SettingsTab::AiSummaries,
     SettingsTab::Supervisor,
+    SettingsTab::UsageManagement,
     SettingsTab::Subagents,
     SettingsTab::Backends,
     SettingsTab::CustomAgents,
@@ -801,9 +815,10 @@ const DEVICE_GROUP_TABS: [SettingsTab; 3] = [
 /// does on its own (summaries, supervisor, subagents), what an agent is given
 /// (custom agents, steering, skills, MCP), what the host machine can do (code
 /// intelligence, voice), then reach and diagnostics (mobile, debug).
-const HOST_GROUP_TABS: [SettingsTab; 11] = [
+const HOST_GROUP_TABS: [SettingsTab; 12] = [
     SettingsTab::AiSummaries,
     SettingsTab::Supervisor,
+    SettingsTab::UsageManagement,
     SettingsTab::Subagents,
     SettingsTab::CustomAgents,
     SettingsTab::Steering,
@@ -1000,6 +1015,7 @@ pub fn SettingsPanel() -> impl IntoView {
                                     SettingsTab::Display => view! { <DisplayTab /> }.into_any(),
                                     SettingsTab::AiSummaries => view! { <AiSummariesTab /> }.into_any(),
                                     SettingsTab::Supervisor => view! { <SupervisorTab /> }.into_any(),
+                                    SettingsTab::UsageManagement => view! { <UsageManagementTab /> }.into_any(),
                                     SettingsTab::Subagents => view! { <SubagentsTab /> }.into_any(),
                                     SettingsTab::Backends => view! { <BackendsTab /> }.into_any(),
                                     SettingsTab::CustomAgents => view! { <CustomAgentsTab /> }.into_any(),
@@ -2361,7 +2377,6 @@ fn AiSummariesTab() -> impl IntoView {
 #[component]
 fn SupervisorTab() -> impl IntoView {
     let state = expect_context::<AppState>();
-    let usage_state = state.clone();
     let fields_state = state.clone();
 
     view! {
@@ -2374,7 +2389,15 @@ fn SupervisorTab() -> impl IntoView {
         <div class="settings-schema-fields">
             {move || host_schema_section(&fields_state, "supervisor")}
         </div>
-        <h2 class="settings-panel-title">"Usage limits"</h2>
+    }
+}
+
+#[component]
+fn UsageManagementTab() -> impl IntoView {
+    let usage_state = expect_context::<AppState>();
+
+    view! {
+        <h2 class="settings-panel-title">"Usage management"</h2>
         <div class="settings-schema-fields">
             {move || host_schema_section(&usage_state, "usage_limits")}
         </div>
@@ -11612,7 +11635,7 @@ mod wasm_tests {
             view! { <SettingsPanel /> }
         });
         next_tick().await;
-        click_tab(&container, "Supervisor");
+        click_tab(&container, "Usage management");
         next_tick().await;
         let enabled = toggle_for_label(&container, "Enable usage limit management");
         let compact = toggle_for_label(&container, "Compact before waiting for reset");
