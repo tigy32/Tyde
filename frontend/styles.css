@@ -7499,13 +7499,16 @@ math merror {
     display: flex;
     align-items: center;
     justify-content: center;
-    width: 22px;
+    gap: 4px;
+    padding: 0 5px;
     height: 22px;
     flex-shrink: 0;
     border: 0;
     border-radius: 4px;
     background: transparent;
-    color: var(--text-tertiary);
+    color: var(--text-secondary);
+    font-size: 0.769rem;
+    white-space: nowrap;
     cursor: pointer;
 }
 
