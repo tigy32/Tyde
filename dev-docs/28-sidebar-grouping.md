@@ -136,6 +136,16 @@ Keyboard fallback:
 - The UI uses `aria-grabbed`, `aria-dropeffect`, a live status region, and visible
   focus/drop outlines.
 
+Project and custom-group headings have a keyboard-accessible chevron disclosure
+and a count of agents matching the current filters. Collapsing removes the
+member rows while leaving the heading and group actions available, including
+group drop targets. Choices are saved in local browser storage by stable group
+or host/project identity, independent of the active project. They survive panel
+remounts, app reloads, filtering, and group renames. Switching to a view whose
+agents are all collapsed preserves that choice; visible headings let the user
+expand them explicitly. This is a device-local presentation preference, not a
+server-owned membership or filtering preference.
+
 Group headers support inline rename and delete. Delete ungroups members and does
 not close or kill agents. The sidebar does not use `window.confirm`,
 `window.alert`, or `window.prompt`.

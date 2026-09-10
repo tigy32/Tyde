@@ -884,10 +884,88 @@ fn render_ungroup_drop_target(
     }
 }
 
+const COLLAPSED_FOLDERS_STORAGE_KEY: &str = "tyde.agents.collapsed-folders.v1";
+
+fn load_collapsed_folders() -> HashSet<String> {
+    #[cfg(target_arch = "wasm32")]
+    if let Some(storage) =
+        web_sys::window().and_then(|window| window.local_storage().ok().flatten())
+        && let Ok(Some(encoded)) = storage.get_item(COLLAPSED_FOLDERS_STORAGE_KEY)
+        && let Ok(folders) = serde_json::from_str(&encoded)
+    {
+        return folders;
+    }
+    HashSet::new()
+}
+
+fn folder_toggle(
+    collapsed: RwSignal<HashSet<String>>,
+    key: String,
+    label: String,
+    count: usize,
+) -> impl IntoView {
+    let toggle_key = key.clone();
+    let expanded = Memo::new(move |_| !collapsed.with(|folders| folders.contains(&key)));
+    view! {
+        <button
+            type="button"
+            class="agent-folder-toggle"
+            aria-label=label.clone()
+            title=label.clone()
+            aria-expanded=move || expanded.get().to_string()
+            on:keydown=move |ev: web_sys::KeyboardEvent| ev.stop_propagation()
+            on:click=move |ev: web_sys::MouseEvent| {
+                ev.stop_propagation();
+                collapsed.update(|folders| {
+                    if !folders.remove(&toggle_key) {
+                        folders.insert(toggle_key.clone());
+                    }
+                });
+                if let Some(storage) = web_sys::window().and_then(|window| window.local_storage().ok().flatten()) {
+                    let encoded = collapsed.with_untracked(|folders| serde_json::to_string(folders).expect("folder keys serialize"));
+                    if let Err(error) = storage.set_item(COLLAPSED_FOLDERS_STORAGE_KEY, &encoded) {
+                        log::warn!("failed to persist collapsed agent folders: {error:?}");
+                    }
+                }
+            }
+        >
+            <svg class="agent-folder-chevron" class:expanded=move || expanded.get()
+                width="12" height="12" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                <path d="m6 3 5 5-5 5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" />
+            </svg>
+            <span class="agent-folder-label">{label.clone()}</span>
+            <span class="agent-folder-count" aria-hidden="true">{count}</span>
+        </button>
+    }
+}
+
+fn folder_members(
+    state: AppState,
+    groups: Vec<AgentTreeGroup>,
+    interactions: AgentsPanelInteractions,
+    collapsed: RwSignal<HashSet<String>>,
+    key: String,
+) -> impl IntoView {
+    let expanded = Memo::new(move |_| !collapsed.with(|folders| folders.contains(&key)));
+    move || {
+        if expanded.get() {
+            groups
+                .clone()
+                .into_iter()
+                .map(|group| render_agent_tree_group(state.clone(), group, interactions.clone()))
+                .collect_view()
+                .into_any()
+        } else {
+            ().into_any()
+        }
+    }
+}
+
 #[component]
 pub fn AgentsPanel() -> impl IntoView {
     let state = expect_context::<AppState>();
     let search = RwSignal::new(String::new());
+    let collapsed_folders = RwSignal::new(load_collapsed_folders());
     // Per-parent collapse state: parents whose children are hidden.
     let collapsed_parents: RwSignal<HashSet<AgentId>> = RwSignal::new(HashSet::new());
     // Editing state lives here so it survives agent list re-renders caused by
@@ -1085,6 +1163,8 @@ pub fn AgentsPanel() -> impl IntoView {
                                         {custom_groups.into_iter().map(|custom_group| {
                                             let group_id = custom_group.group.id.clone();
                                             let group_id_attr = group_id.0.clone();
+                                            let folder_key = format!("group:{}", group_id.0);
+                                            let member_count = custom_group.groups.iter().map(|group| 1 + group.children.len()).sum();
                                             let group_name = custom_group.group.name.clone();
                                             let section_group_id = group_id.clone();
                                             let header_group_id = group_id.clone();
@@ -1178,6 +1258,7 @@ pub fn AgentsPanel() -> impl IntoView {
                                             let edit_compare_name_base = group_name.clone();
                                             let header_class_group_id = header_group_id.clone();
                                             let header_focus_group_id = header_group_id.clone();
+                                            let members_key = folder_key.clone();
                                             view! {
                                                 <section
                                                     class=move || {
@@ -1266,7 +1347,7 @@ pub fn AgentsPanel() -> impl IntoView {
                                                                 }.into_any()
                                                             } else {
                                                                 view! {
-                                                                    <span class="agent-sidebar-custom-group-name">{group_name.clone()}</span>
+                                                                    {folder_toggle(collapsed_folders, folder_key.clone(), group_name.clone(), member_count)}
                                                                 }.into_any()
                                                             }
                                                         }}
@@ -1291,13 +1372,7 @@ pub fn AgentsPanel() -> impl IntoView {
                                                             </button>
                                                         </span>
                                                     </div>
-                                                    {custom_group.groups.into_iter().map(|group| {
-                                                        render_agent_tree_group(
-                                                            state.clone(),
-                                                            group,
-                                                            interactions.clone(),
-                                                        )
-                                                    }).collect_view()}
+                                                    {folder_members(state.clone(), custom_group.groups, interactions.clone(), collapsed_folders, members_key)}
                                                 </section>
                                             }
                                         }).collect_view()}
@@ -1345,16 +1420,14 @@ pub fn AgentsPanel() -> impl IntoView {
                                         <section class="agent-sidebar-host-section" data-host-id=host.key>
                                             <div class="agent-sidebar-host-header">{format!("Host: {}", host.label)}</div>
                                             {host.projects.into_iter().map(|project| {
+                                                let folder_key = format!("project:{}", project.key);
+                                                let member_count = project.groups.iter().map(|group| 1 + group.children.len()).sum();
                                                 view! {
                                                     <section class="agent-sidebar-project-section" data-project-key=project.key>
-                                                        <div class="agent-sidebar-project-header">{format!("Project: {}", project.label)}</div>
-                                                        {project.groups.into_iter().map(|group| {
-                                                            render_agent_tree_group(
-                                                                state.clone(),
-                                                                group,
-                                                                interactions.clone(),
-                                                            )
-                                                        }).collect_view()}
+                                                        <div class="agent-sidebar-project-header">
+                                                            {folder_toggle(collapsed_folders, folder_key.clone(), format!("Project: {}", project.label), member_count)}
+                                                        </div>
+                                                        {folder_members(state.clone(), project.groups, interactions.clone(), collapsed_folders, folder_key)}
                                                     </section>
                                                 }
                                             }).collect_view()}
@@ -3427,6 +3500,141 @@ mod wasm_tests {
                 && !default_text.contains("Beta Agent"),
             "grouped agents must not be duplicated in Host/Project; got {default_text:?}"
         );
+    }
+
+    #[wasm_bindgen_test]
+    async fn folder_collapse_survives_project_switch_rename_and_remount() {
+        let storage = web_sys::window().unwrap().local_storage().unwrap().unwrap();
+        storage
+            .remove_item("tyde.agents.collapsed-folders.v1")
+            .unwrap();
+        let container = make_container();
+        let state = make_app_state("local");
+        seed_sidebar_group_fixture(&state);
+        apply_group_snapshot(
+            &state,
+            assigned_group("collapse-review", "Review Group", &["beta-agent"]),
+        );
+        let handle = mount_panel(&container, state.clone());
+        for _ in 0..4 {
+            next_tick().await;
+        }
+
+        let toggle = |label: &str| -> HtmlElement {
+            container
+                .query_selector(&format!("button[aria-label='{label}'][aria-expanded]"))
+                .unwrap()
+                .expect("folder has an accessible disclosure button")
+                .dyn_into()
+                .unwrap()
+        };
+        assert!(
+            container
+                .text_content()
+                .unwrap()
+                .contains("Parent Alpha Agent")
+        );
+        assert!(container.text_content().unwrap().contains("Beta Agent"));
+        toggle("Project: Alpha Project").click();
+        toggle("Review Group").click();
+        for _ in 0..4 {
+            next_tick().await;
+        }
+        assert_eq!(
+            toggle("Project: Alpha Project")
+                .get_attribute("aria-expanded")
+                .as_deref(),
+            Some("false")
+        );
+        assert_eq!(
+            toggle("Review Group")
+                .get_attribute("aria-expanded")
+                .as_deref(),
+            Some("false")
+        );
+        let text = container.text_content().unwrap();
+        assert!(!text.contains("Parent Alpha Agent") && !text.contains("Child Alpha Agent"));
+        assert!(!text.contains("Beta Agent"));
+        assert!(
+            text.contains("Gamma Agent"),
+            "other folders remain expanded"
+        );
+
+        state.active_project.set(Some(ActiveProjectRef {
+            host_id: "local".to_owned(),
+            project_id: ProjectId("alpha".to_owned()),
+        }));
+        let mut preferences = state.agents_view_preferences.get_untracked();
+        preferences.sidebar.project_visibility = AgentsSidebarProjectVisibility::CurrentProjectOnly;
+        state.agents_view_preferences.set(preferences);
+        for _ in 0..4 {
+            next_tick().await;
+        }
+        assert_eq!(
+            toggle("Project: Alpha Project")
+                .get_attribute("aria-expanded")
+                .as_deref(),
+            Some("false")
+        );
+        assert!(
+            !container
+                .text_content()
+                .unwrap()
+                .contains("Parent Alpha Agent")
+        );
+        assert!(
+            toggle("Project: Alpha Project")
+                .get_bounding_client_rect()
+                .height()
+                > 0.0,
+            "a view containing only collapsed agents still exposes its heading"
+        );
+        state.active_project.set(None);
+        apply_group_snapshot(
+            &state,
+            assigned_group("collapse-review", "Renamed Review", &["beta-agent"]),
+        );
+        for _ in 0..4 {
+            next_tick().await;
+        }
+        assert_eq!(
+            toggle("Renamed Review")
+                .get_attribute("aria-expanded")
+                .as_deref(),
+            Some("false")
+        );
+        drop(handle);
+        let _handle = mount_panel(&container, state.clone());
+        for _ in 0..4 {
+            next_tick().await;
+        }
+        assert_eq!(
+            toggle("Project: Alpha Project")
+                .get_attribute("aria-expanded")
+                .as_deref(),
+            Some("false")
+        );
+        assert_eq!(
+            toggle("Renamed Review")
+                .get_attribute("aria-expanded")
+                .as_deref(),
+            Some("false")
+        );
+        assert!(!container.text_content().unwrap().contains("Beta Agent"));
+        toggle("Project: Alpha Project").click();
+        toggle("Renamed Review").click();
+        for _ in 0..4 {
+            next_tick().await;
+        }
+        let text = container.text_content().unwrap();
+        assert!(
+            text.contains("Parent Alpha Agent")
+                && text.contains("Child Alpha Agent")
+                && text.contains("Beta Agent")
+        );
+        storage
+            .remove_item("tyde.agents.collapsed-folders.v1")
+            .unwrap();
     }
 
     #[wasm_bindgen_test]

@@ -6467,6 +6467,56 @@ math merror {
     color: var(--text-secondary);
 }
 
+.agent-folder-toggle {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex: 1;
+    min-width: 0;
+    width: 100%;
+    min-height: 28px;
+    padding: 3px 4px;
+    border: 0;
+    border-radius: 5px;
+    background: transparent;
+    color: inherit;
+    font: inherit;
+    letter-spacing: inherit;
+    text-transform: inherit;
+    text-align: left;
+    cursor: pointer;
+}
+
+.agent-folder-toggle:hover {
+    background: var(--surface-1);
+    color: var(--text-primary);
+}
+
+.agent-folder-toggle:focus-visible {
+    outline: 2px solid var(--accent-primary);
+    outline-offset: 2px;
+}
+
+.agent-folder-chevron {
+    flex-shrink: 0;
+}
+
+.agent-folder-chevron.expanded {
+    transform: rotate(90deg);
+}
+
+.agent-folder-label {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.agent-folder-count {
+    margin-left: auto;
+    color: var(--text-tertiary);
+    font-variant-numeric: tabular-nums;
+}
+
 .agent-card-group {
     display: flex;
     flex-direction: column;
