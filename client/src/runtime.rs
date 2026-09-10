@@ -955,6 +955,9 @@ async fn handle_host_envelope(
             let _ = host_tx.send(HostEvent::AgentActivitySummary(payload)).await;
             true
         }
+        FrameKind::AgentBackgroundWorkNotify => envelope
+            .parse_payload::<protocol::AgentBackgroundWorkNotifyPayload>()
+            .is_ok(),
         FrameKind::AgentTurnStateNotify => {
             // Liveness for agents this client has not attached; the runtime
             // attaches every agent it is told about, so it has no use for it.

@@ -565,6 +565,12 @@ pub fn ChatView() -> impl IntoView {
                 .with(|m| m.get(&active.as_agent_ref()).copied().unwrap_or(false));
         if turn_active {
             parts.push("Responding".to_string());
+        } else if !agent_is_terminated_tracked(s_subtitle.agents, &active)
+            && s_subtitle
+                .agents_with_background_work
+                .with(|agents| agents.contains(&active.as_agent_ref()))
+        {
+            parts.push("⧗ Background work".to_string());
         }
         if parts.is_empty() {
             None
@@ -1789,6 +1795,28 @@ mod wasm_tests {
             .get_untracked()
             .expect("active agent")
             .as_agent_ref();
+        state.agents_with_background_work.update(|agents| {
+            agents.insert(agent_ref.clone());
+        });
+        settle_autoscroll().await;
+        let subtitle = container
+            .query_selector("[data-mobile-test='chat-subtitle']")
+            .unwrap()
+            .expect("chat subtitle");
+        assert!(
+            subtitle
+                .text_content()
+                .unwrap_or_default()
+                .contains("⧗ Background work"),
+            "an idle chat waiting on background tasks must show the hourglass"
+        );
+        assert!(
+            container
+                .query_selector("[data-mobile-test='chat-stop']")
+                .unwrap()
+                .is_none(),
+            "waiting for background work does not create an active turn to stop"
+        );
         state.agent_turn_active.update(|m| {
             m.insert(agent_ref.clone(), true);
         });
@@ -1823,6 +1851,10 @@ mod wasm_tests {
             .expect("subtitle")
             .text_content()
             .unwrap_or_default();
+        assert!(
+            !subtitle.contains("Background work"),
+            "a terminated agent cannot still claim background work"
+        );
         assert!(
             !subtitle.contains("Responding"),
             "a crashed agent must not be described as responding, got: {subtitle}"

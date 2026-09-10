@@ -632,6 +632,7 @@ pub(crate) fn classify(kind: FrameKind) -> OutputLane {
         FrameKind::ChatEvent
         | FrameKind::AgentActivitySummary
         | FrameKind::AgentActivityStats
+        | FrameKind::AgentBackgroundWorkNotify
         | FrameKind::AgentTurnStateNotify
         | FrameKind::TaskTokenUsage
         | FrameKind::QueuedMessages

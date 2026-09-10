@@ -1008,6 +1008,7 @@ pub struct AppState {
     pub goal_capabilities: RwSignal<HashMap<AgentRef, protocol::GoalCapabilities>>,
     pub agent_message_queue: RwSignal<HashMap<AgentRef, Vec<QueuedMessageEntry>>>,
     pub agent_turn_active: RwSignal<HashMap<AgentRef, bool>>,
+    pub agents_with_background_work: RwSignal<HashSet<AgentRef>>,
     /// The server's per-agent activity stats — the same `AgentActivityStats`
     /// frame desktop consumes, replayed on bootstrap and re-emitted on change.
     /// Mobile reads its current context occupancy.
@@ -1125,6 +1126,7 @@ impl AppState {
             goal_capabilities: RwSignal::new(HashMap::new()),
             agent_message_queue: RwSignal::new(HashMap::new()),
             agent_turn_active: RwSignal::new(HashMap::new()),
+            agents_with_background_work: RwSignal::new(HashSet::new()),
             agent_activity_stats: RwSignal::new(HashMap::new()),
             transient_events: RwSignal::new(HashMap::new()),
             agent_session_settings: RwSignal::new(HashMap::new()),
@@ -1841,6 +1843,9 @@ impl AppState {
         });
         self.agent_turn_active.update(|m| {
             m.retain(|k, _| k.local_host_id != *host);
+        });
+        self.agents_with_background_work.update(|agents| {
+            agents.retain(|agent| agent.local_host_id != *host);
         });
         self.agent_activity_stats.update(|m| {
             m.retain(|k, _| k.local_host_id != *host);

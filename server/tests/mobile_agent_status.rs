@@ -106,11 +106,16 @@ async fn lazy_client_learns_agent_liveness_from_the_host_stream() {
     busy_launch.wait_until_entered().await;
 
     let idle_follow_up = MockGateHandle::new();
+    let idle_second_follow_up = MockGateHandle::new();
     let idle = fixture
         .spawn_scripted(
             "idle",
             MockScript::one(MockTurn::text("done"))
-                .then(MockTurn::gated_text("working again", &idle_follow_up)),
+                .then(MockTurn::gated_text("working again", &idle_follow_up))
+                .then(MockTurn::gated_text(
+                    "working once more",
+                    &idle_second_follow_up,
+                )),
         )
         .await;
     settle_turn(&mut fixture, &idle).await;
@@ -306,6 +311,9 @@ async fn lazy_client_learns_agent_liveness_from_the_host_stream() {
         .send_message(&idle.stream, "once more".to_owned())
         .await
         .expect("send second follow-up to idle");
+    // With only two scripted turns this request emitted ScriptExhausted and
+    // closed the backend; observing its transient running flag was a race.
+    idle_second_follow_up.wait_until_entered().await;
     assert!(
         next_turn_state_on(
             &mut mobile,
@@ -315,5 +323,16 @@ async fn lazy_client_learns_agent_liveness_from_the_host_stream() {
         )
         .await,
         "unattached idle must still be announced running on the host stream"
+    );
+    idle_second_follow_up.release_one();
+    assert!(
+        !next_turn_state_on(
+            &mut mobile,
+            &idle.new_agent.agent_id,
+            &attached,
+            "idle second follow-up finished"
+        )
+        .await,
+        "unattached idle must return to idle after its second follow-up"
     );
 }

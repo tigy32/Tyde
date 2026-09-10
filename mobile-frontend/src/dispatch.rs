@@ -112,6 +112,7 @@ pub fn prime_host_for_tests(state: &AppState, host: &LocalHostId) {
         release_version: None,
     };
     let bootstrap = BootstrapHostPayload {
+        agents_with_background_work: Vec::new(),
         settings: BootstrapHostSettings {
             enabled_backends: Vec::new(),
             default_backend: None,
@@ -384,6 +385,30 @@ pub fn dispatch_envelope(state: &AppState, host: &LocalHostId, envelope: Envelop
         | FrameKind::VoiceOutput
         | FrameKind::VoiceStop
         | FrameKind::VoiceError => crate::voice::handle_control(state, host, &envelope),
+        FrameKind::AgentBackgroundWorkNotify => {
+            match envelope.parse_payload::<protocol::AgentBackgroundWorkNotifyPayload>() {
+                Ok(payload) => {
+                    let agent_ref = AgentRef {
+                        local_host_id: host.clone(),
+                        agent_id: payload.agent_id,
+                    };
+                    log::info!(
+                        "dispatch agent_background_work_notify host={} agent_id={} has_background_work={}",
+                        host,
+                        agent_ref.agent_id,
+                        payload.has_background_work
+                    );
+                    state.agents_with_background_work.update(|agents| {
+                        if payload.has_background_work {
+                            agents.insert(agent_ref);
+                        } else {
+                            agents.remove(&agent_ref);
+                        }
+                    });
+                }
+                Err(error) => log::error!("failed to parse AgentBackgroundWorkNotify: {error}"),
+            }
+        }
         FrameKind::AgentTurnStateNotify => {
             match envelope.parse_payload::<AgentTurnStateNotifyPayload>() {
                 Ok(payload) => {
@@ -1272,6 +1297,9 @@ fn drop_agent_state(state: &AppState, agent_ref: &AgentRef) {
         m.remove(agent_ref);
     });
     state.forget_session_history(agent_ref);
+    state.agents_with_background_work.update(|agents| {
+        agents.remove(agent_ref);
+    });
     state.streaming_text.update(|m| {
         m.remove(agent_ref);
     });
@@ -2758,6 +2786,18 @@ fn apply_host_bootstrap(
     for dropped in &dropped_refs {
         state.forget_session_history(dropped);
     }
+    state.agents_with_background_work.update(|agents| {
+        agents.retain(|agent| agent.local_host_id != *host);
+        agents.extend(
+            payload
+                .agents_with_background_work
+                .into_iter()
+                .map(|agent_id| AgentRef {
+                    local_host_id: host.clone(),
+                    agent_id,
+                }),
+        );
+    });
     let mut turn_states = Vec::with_capacity(payload.agents.len());
     state.agents.update(|agents| {
         agents.retain(|a| a.local_host_id != *host || snapshot_ids.contains(&a.agent_id));
@@ -3906,6 +3946,7 @@ mod wasm_tests {
             turn_active: true,
         };
         let bootstrap = settings_model::HostBootstrapPayload {
+            agents_with_background_work: Vec::new(),
             settings: settings_model::HostSettings {
                 enabled_backends: vec![protocol::BackendKind::Codex],
                 default_backend: Some(protocol::BackendKind::Codex),

@@ -124,6 +124,23 @@ impl MockTurn {
         Self::done(text_steps(text.into(), TextShape::default()))
     }
 
+    pub fn background_task_wait(tool_call_id: &str, drain: &MockGateHandle) -> Self {
+        let mut steps = vec![MockStep::emit(emit::typing(true))];
+        steps.extend(
+            emit::background_task_started_frames(tool_call_id, false)
+                .into_iter()
+                .map(MockStep::emit),
+        );
+        steps.push(MockStep::emit(emit::typing(false)));
+        steps.push(MockStep::Gate(drain.gate()));
+        steps.extend(
+            emit::background_task_finished_frames(tool_call_id)
+                .into_iter()
+                .map(MockStep::emit),
+        );
+        Self::done(steps)
+    }
+
     pub fn text_after_gate(text: impl Into<String>, gate: &MockGateHandle) -> Self {
         let mut steps = vec![MockStep::Gate(gate.gate())];
         steps.extend(text_steps(text.into(), TextShape::default()));

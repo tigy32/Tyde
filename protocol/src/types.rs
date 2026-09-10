@@ -13,7 +13,7 @@ use serde_json::Value;
 /// `protocol::TydeReleaseVersion`.
 pub use host_config::{LOCAL_HOST_ID, TydeReleaseVersion};
 
-pub const PROTOCOL_VERSION: u32 = 60;
+pub const PROTOCOL_VERSION: u32 = 61;
 pub const TYDE_VERSION: Version = Version {
     major: 0,
     minor: 8,
@@ -1174,6 +1174,7 @@ pub enum FrameKind {
     AgentActivitySummary,
     AgentActivityStats,
     AgentTurnStateNotify,
+    AgentBackgroundWorkNotify,
     TaskTokenUsage,
     AgentStart,
     AgentRenamed,
@@ -1368,6 +1369,7 @@ impl fmt::Display for FrameKind {
             Self::NewAgent => f.write_str("new_agent"),
             Self::AgentActivitySummary => f.write_str("agent_activity_summary"),
             Self::AgentActivityStats => f.write_str("agent_activity_stats"),
+            Self::AgentBackgroundWorkNotify => f.write_str("agent_background_work_notify"),
             Self::AgentTurnStateNotify => f.write_str("agent_turn_state_notify"),
             Self::TaskTokenUsage => f.write_str("task_token_usage"),
             Self::AgentStart => f.write_str("agent_start"),
@@ -1758,6 +1760,8 @@ pub struct WorkflowRefreshPayload {}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostBootstrapPayload<S = Value> {
+    #[serde(default)]
+    pub agents_with_background_work: Vec<AgentId>,
     pub settings: S,
     /// Content-derived tag of the client-visible (secret-redacted) settings
     /// document in `settings`. Same derivation as
@@ -4466,9 +4470,14 @@ pub struct AgentActivitySummaryPayload {
     pub state: AgentActivitySummaryState,
 }
 
-/// Host-stream liveness update for an agent whose instance stream the
-/// subscriber has not attached. Once the stream is attached, `AgentBootstrap`
-/// and the agent's own chat events are authoritative and this frame stops.
+/// Host-stream background work for both attached and unopened agents.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentBackgroundWorkNotifyPayload {
+    pub agent_id: AgentId,
+    pub has_background_work: bool,
+}
+
+/// Host-stream liveness for unopened agents; attached streams supply their own.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentTurnStateNotifyPayload {
     pub agent_id: AgentId,

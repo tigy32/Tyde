@@ -26,7 +26,7 @@ use protocol::{
     MobilePushReason, MobilePushSubscribePayload, MobilePushSubscription, PushAuthSecret,
     PushEndpointUrl, PushPublicKey, VapidPrivateKey, VapidPublicKey,
 };
-use server::backend::mock::{MockScript, MockTurn};
+use server::backend::mock::{MockGateHandle, MockScript, MockTurn};
 use server::store::mobile_pairings::{
     MOBILE_PAIRINGS_STORE_PATH_ENV, MobilePairingRecord, MobilePairings, MobilePairingsStore,
     key_fingerprint,
@@ -270,12 +270,65 @@ async fn idle_agent_delivers_an_encrypted_push_to_the_paired_device() {
     let mut mobile = connect_mobile(fixture.host_for_test()).await;
     register_subscription(&mut mobile, keys.subscription(endpoint)).await;
 
+    let drain = MockGateHandle::new();
     let agent = fixture
         .spawn_scripted(
             "push-idle",
-            MockScript::one(MockTurn::text("mock backend response to: push idle")),
+            MockScript::one(MockTurn::background_task_wait("push-background", &drain))
+                .then(MockTurn::text("mock backend response to: push idle")),
         )
         .await;
+
+    drain.wait_until_entered().await;
+    fixture::next_frame_matching_on(&mut mobile, "live background work", |env| {
+        env.kind == FrameKind::AgentBackgroundWorkNotify
+            && env
+                .parse_payload::<protocol::AgentBackgroundWorkNotifyPayload>()
+                .is_ok_and(|p| p.agent_id == agent.new_agent.agent_id && p.has_background_work)
+    })
+    .await;
+    let (mut reconnected, bootstrap) =
+        fixture::connect_mobile_client_with_bootstrap(fixture.host_for_test(), DEVICE_ID).await;
+    assert!(
+        bootstrap
+            .agents_with_background_work
+            .contains(&agent.new_agent.agent_id),
+        "a reconnect must retain background work for unopened agents"
+    );
+    let stream = &bootstrap
+        .agents
+        .iter()
+        .find(|entry| entry.agent_id == agent.new_agent.agent_id)
+        .expect("reconnected agent")
+        .instance_stream;
+    fixture::send_load_agent_on(&mut reconnected, stream).await;
+    fixture::next_frame_matching_on(&mut reconnected, "agent attached", |env| {
+        env.kind == FrameKind::AgentBootstrap
+    })
+    .await;
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(500), pushes.recv())
+            .await
+            .is_err(),
+        "an idle agent waiting for background work must not notify"
+    );
+    drain.release_one();
+    fixture::next_frame_matching_on(
+        &mut reconnected,
+        "attached background work drained",
+        |env| {
+            env.kind == FrameKind::AgentBackgroundWorkNotify
+                && env
+                    .parse_payload::<protocol::AgentBackgroundWorkNotifyPayload>()
+                    .is_ok_and(|p| p.agent_id == agent.new_agent.agent_id && !p.has_background_work)
+        },
+    )
+    .await;
+    fixture
+        .client
+        .send_message(&agent.stream, "collect the result".to_owned())
+        .await
+        .expect("send follow-up");
 
     let captured = tokio::time::timeout(PUSH_WAIT, pushes.recv())
         .await
@@ -509,7 +562,8 @@ async fn only_agents_the_user_started_notify() {
     let parent = fixture
         .spawn_scripted(
             "orchestrator",
-            MockScript::one(MockTurn::text("mock backend response to: orchestrate")),
+            MockScript::one(MockTurn::text("mock backend response to: orchestrate"))
+                .then(MockTurn::text("waiting for my child")),
         )
         .await;
     let parent_id = parent.new_agent.agent_id.clone();
@@ -522,14 +576,54 @@ async fn only_agents_the_user_started_notify() {
     assert_eq!(first.agent_name, "orchestrator");
 
     let caller = fixture.agent_control_caller(&parent_id).await;
+    let child_gate = MockGateHandle::new();
     let reservation = fixture
         .reserve_next_mock_launch(
             "orchestrated",
-            MockScript::one(MockTurn::text("mock backend response to: orchestrated")),
+            MockScript::one(MockTurn::gated_text(
+                "mock backend response to: orchestrated",
+                &child_gate,
+            )),
         )
         .await;
     mcp_spawn_agent(&caller, "orchestrated").await;
     drop(reservation);
+    child_gate.wait_until_entered().await;
+    fixture::next_frame_matching_on(&mut mobile, "parent waiting for child", |env| {
+        env.kind == FrameKind::AgentBackgroundWorkNotify
+            && env
+                .parse_payload::<protocol::AgentBackgroundWorkNotifyPayload>()
+                .is_ok_and(|p| p.agent_id == parent_id && p.has_background_work)
+    })
+    .await;
+    fixture
+        .client
+        .send_message(&parent.stream, "check child".to_owned())
+        .await
+        .expect("parent follow-up");
+    fixture.next_chat_event_matching(&parent, "parent follow-up response", |event| {
+        matches!(event, protocol::ChatEvent::MessageAdded(message) if message.content.contains("waiting for my child"))
+            || matches!(event, protocol::ChatEvent::StreamEnd(data) if data.message.content.contains("waiting for my child"))
+    }).await;
+    fixture
+        .next_chat_event_matching(&parent, "parent idle with child running", |event| {
+            matches!(event, protocol::ChatEvent::TypingStatusChanged(false))
+        })
+        .await;
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(500), pushes.recv())
+            .await
+            .is_err(),
+        "a parent waiting for its child must not notify"
+    );
+    child_gate.release_one();
+    fixture::next_frame_matching_on(&mut mobile, "parent child finished", |env| {
+        env.kind == FrameKind::AgentBackgroundWorkNotify
+            && env
+                .parse_payload::<protocol::AgentBackgroundWorkNotifyPayload>()
+                .is_ok_and(|p| p.agent_id == parent_id && !p.has_background_work)
+    })
+    .await;
 
     // Now a second spawn the user made themselves. Its notification is what
     // proves the delivery path was working the whole time.

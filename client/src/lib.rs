@@ -1469,6 +1469,10 @@ impl Connection {
                     let _: CommandErrorPayload =
                         envelope.parse_payload().map_err(FrameError::Json)?;
                 }
+                FrameKind::AgentBackgroundWorkNotify => {
+                    let _: protocol::AgentBackgroundWorkNotifyPayload =
+                        envelope.parse_payload().map_err(FrameError::Json)?;
+                }
                 FrameKind::AgentTurnStateNotify => {
                     let _: AgentTurnStateNotifyPayload =
                         envelope.parse_payload().map_err(FrameError::Json)?;

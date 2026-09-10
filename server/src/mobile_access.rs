@@ -2506,7 +2506,12 @@ impl MobileAccessActor {
                     Err(broadcast::error::RecvError::Closed) => return,
                 };
 
-                if transition.restored_without_live_turn {
+                let background_now = host.agent_has_background_work(&transition.agent_id).await;
+                tracing::debug!(agent_id = %transition.agent_id, background_at_transition = transition.has_background_work, background_now, "mobile push background work state");
+                if transition.restored_without_live_turn
+                    || transition.has_background_work
+                    || background_now
+                {
                     continue;
                 }
                 let goal_reason = if transition.goal_status_changed {

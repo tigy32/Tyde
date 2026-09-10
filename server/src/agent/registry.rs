@@ -51,6 +51,7 @@ pub(crate) struct AgentStatusTransition {
     pub to: AgentControlStatus,
     pub pending_user_response: Option<PendingUserResponseKind>,
     pub has_queued_messages: bool,
+    pub has_background_work: bool,
     pub restored_without_live_turn: bool,
 }
 
@@ -74,6 +75,7 @@ pub(crate) struct AgentStatus {
     /// `Idle` means "between turns", not "finished". Maintained wherever the
     /// queue snapshot is published.
     pub has_queued_messages: bool,
+    pub has_background_work: bool,
     /// When the current or most recent live turn started. The supervisor's
     /// stall clock starts here, so a turn whose backend never emits anything is
     /// still measured from the moment it began rather than from an older event.
@@ -140,19 +142,25 @@ impl AgentStatusHandle {
         let mut status = self.status.lock().await;
         let from = status.status();
         let was_active = status.is_active();
+        let had_background_work = status.has_background_work;
         let prior_goal_status = status.goal.as_ref().map(|goal| goal.status);
         update(&mut status);
         let to = status.status();
         let turn_active = status.is_active();
         let pending_user_response = status.pending_user_response;
         let has_queued_messages = status.has_queued_messages;
+        let has_background_work = status.has_background_work;
         let restored_without_live_turn = status.restored_without_live_turn;
         let goal = status.goal.clone();
         let goal_status_changed = prior_goal_status.is_some()
             && prior_goal_status != goal.as_ref().map(|goal| goal.status);
         drop(status);
 
-        if from != to || was_active != turn_active || goal_status_changed {
+        if from != to
+            || was_active != turn_active
+            || goal_status_changed
+            || had_background_work != has_background_work
+        {
             // A send fails only with no live receivers, which is the normal
             // state; a receiver that falls behind learns about it from its own
             // `Lagged` error rather than from here.
@@ -164,6 +172,7 @@ impl AgentStatusHandle {
                 goal_status_changed,
                 pending_user_response,
                 has_queued_messages,
+                has_background_work,
                 restored_without_live_turn,
             });
         }
@@ -451,6 +460,31 @@ impl AgentRegistry {
 
     pub fn agent_access_mode(&self, agent_id: &AgentId) -> Option<BackendAccessMode> {
         self.agents.get(agent_id).map(|entry| entry.access_mode)
+    }
+
+    pub fn parent_agent_id(&self, agent_id: &AgentId) -> Option<AgentId> {
+        self.agents.get(agent_id)?.parent_agent_id.clone()
+    }
+
+    pub async fn has_background_work(&self, agent_id: &AgentId) -> bool {
+        let Some(entry) = self.agents.get(agent_id) else {
+            return false;
+        };
+        let status = entry.status_handle.snapshot().await;
+        if status.terminated {
+            return false;
+        }
+        if status.has_background_work {
+            return true;
+        }
+        for child in self.agents.values() {
+            if child.parent_agent_id.as_ref() == Some(agent_id)
+                && child.status_handle.snapshot().await.is_active()
+            {
+                return true;
+            }
+        }
+        false
     }
 
     pub fn agent_ids(&self) -> Vec<AgentId> {

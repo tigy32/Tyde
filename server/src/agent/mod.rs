@@ -3290,6 +3290,23 @@ pub(crate) fn spawn_agent_actor(
                 );
                 last_supervisor_settings = supervisor_settings;
             }
+            let has_background_work =
+                replay_state
+                    .active_tool_progress
+                    .values()
+                    .any(|progress| match &progress.update {
+                        protocol::ToolProgressUpdate::Workflow(_)
+                        | protocol::ToolProgressUpdate::SubAgent(_) => true,
+                        protocol::ToolProgressUpdate::Other { .. } => {
+                            progress.execution_mode == ToolExecutionMode::Background
+                        }
+                        protocol::ToolProgressUpdate::AgentControl(_) => false,
+                    });
+            if status_handle.snapshot().await.has_background_work != has_background_work {
+                status_handle
+                    .update(|status| status.has_background_work = has_background_work)
+                    .await;
+            }
             let supervisor_status = status_handle.snapshot().await;
             supervisor_state.observe(
                 &supervisor_status,

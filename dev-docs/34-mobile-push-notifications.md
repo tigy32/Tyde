@@ -47,7 +47,7 @@ third party was put in the content path in the first place.
 
 ### 3. Suppression is state, not a timer
 
-Two rules decide whether an idle edge becomes a notification, and both read real
+Suppression rules decide whether an idle edge becomes a notification and read real
 state — there is no debounce window (see the "no timeouts over local state"
 rule):
 
@@ -57,7 +57,19 @@ rule):
   (`AgentStatus::has_queued_messages`). It resumes immediately, so `Idle` here
   means "between turns", not "finished".
 
-The second rule is why `has_queued_messages` was added to `AgentStatus`.
+- **The agent still has background work**: running background commands,
+  workflows, native sub-agents, or active direct children. The notifier checks
+  both the transition snapshot and current host state before delivering any
+  notification reason. A stale tracked task can therefore suppress a push even
+  if the model has stopped waiting for it; avoiding premature notifications is
+  intentional. Draining a task alone does not send a delayed notification.
+
+Mobile receives `agents_with_background_work` in `HostBootstrap` and subsequent
+`AgentBackgroundWorkNotify` frames for both unopened and attached agents. Idle
+agents with work remaining show a yellow hourglass and “Background work” in the
+agent list, and the same label in the chat header.
+
+The queued-message rule is why `has_queued_messages` was added to `AgentStatus`.
 `dispatch_queued_message` marks the turn active *after* the previous turn has
 already ended, so there is a genuine transient `Idle` between them. A debounce
 window would have papered over that; the flag describes it.

@@ -420,10 +420,16 @@ fn agent_row(
         .agent_turn_active
         .with(|m| m.get(&agent_ref).copied().unwrap_or(false));
 
+    let background_work = is_active
+        && state
+            .agents_with_background_work
+            .with(|agents| agents.contains(&agent_ref));
     let tone = if has_error {
         StatusTone::Error
     } else if turn_active {
         StatusTone::Active
+    } else if background_work {
+        StatusTone::Pending
     } else if is_active {
         StatusTone::Online
     } else {
@@ -433,6 +439,8 @@ fn agent_row(
         "Error"
     } else if turn_active {
         "Thinking"
+    } else if background_work {
+        "⧗ Background work"
     } else if is_active {
         "Idle"
     } else {
@@ -447,6 +455,8 @@ fn agent_row(
         PillTone::Error
     } else if turn_active {
         PillTone::Accent
+    } else if background_work {
+        PillTone::Warning
     } else if is_active {
         PillTone::Success
     } else {
@@ -457,6 +467,8 @@ fn agent_row(
         "agent-row-error"
     } else if turn_active {
         "agent-row-active"
+    } else if background_work {
+        "agent-row-background"
     } else if is_active {
         "agent-row-idle"
     } else {
@@ -819,6 +831,29 @@ mod wasm_tests {
                 .to_owned()
         };
         assert_eq!(status_text(), "Idle", "control: the agent begins idle");
+        let background_update = |has_background_work, seq| {
+            crate::dispatch::dispatch_envelope(
+                &state,
+                &host,
+                protocol::Envelope::from_payload(
+                    StreamPath("/host/mobile-background".to_owned()),
+                    protocol::FrameKind::AgentBackgroundWorkNotify,
+                    seq,
+                    &protocol::AgentBackgroundWorkNotifyPayload {
+                        agent_id: agent_ref.agent_id.clone(),
+                        has_background_work,
+                    },
+                )
+                .unwrap(),
+            );
+        };
+        background_update(true, 0);
+        next_tick().await;
+        assert_eq!(
+            status_text(),
+            "⧗ Background work",
+            "waiting agents show the hourglass and background work label"
+        );
 
         state.agent_turn_active.update(|turns| {
             turns.insert(agent_ref.clone(), true);
@@ -833,6 +868,13 @@ mod wasm_tests {
         state.agent_turn_active.update(|turns| {
             turns.remove(&agent_ref);
         });
+        next_tick().await;
+        assert_eq!(
+            status_text(),
+            "⧗ Background work",
+            "turn completion is not readiness while work remains"
+        );
+        background_update(false, 1);
         next_tick().await;
         assert_eq!(
             status_text(),

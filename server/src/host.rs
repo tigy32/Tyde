@@ -2580,6 +2580,12 @@ impl HostHandle {
         }
         let (usage_handles, closed_usage_snapshots, live_usage_agent_ids, usage_agent_sessions) =
             task_token_usage_sources_for_state(&state);
+        let mut agents_with_background_work = Vec::new();
+        for agent in &agents {
+            if state.registry.has_background_work(&agent.agent_id).await {
+                agents_with_background_work.push(agent.agent_id.clone());
+            }
+        }
         let settings_store_for_projection = Arc::clone(&state.settings_store);
         drop(state);
         let task_token_usages = task_token_usage_rollups_from_handles(
@@ -2595,6 +2601,7 @@ impl HostHandle {
             settings_wire_projection(&store, &settings)
         };
         let bootstrap = HostBootstrapPayload {
+            agents_with_background_work,
             settings,
             settings_etag,
             settings_schema: settings_model::host_settings_schema().clone(),
@@ -5057,6 +5064,9 @@ impl HostHandle {
             let mut state = self.state.lock().await;
             let activity_summary =
                 initial_agent_activity_summary_state(&mut state, &start.agent_id);
+            if let Some(parent) = &start.parent_agent_id {
+                fan_out_agent_background_work(&mut state, parent).await;
+            }
             let turn_active = agent_turn_active(&state, &start.agent_id).await;
             let host_streams = state
                 .host_streams
@@ -5486,6 +5496,9 @@ impl HostHandle {
             let mut state = self.state.lock().await;
             let activity_summary =
                 initial_agent_activity_summary_state(&mut state, &start.agent_id);
+            if let Some(parent) = &start.parent_agent_id {
+                fan_out_agent_background_work(&mut state, parent).await;
+            }
             let turn_active = agent_turn_active(&state, &start.agent_id).await;
             let host_streams = state
                 .host_streams
@@ -9198,7 +9211,11 @@ impl HostHandle {
         }
 
         for closed_agent_id in close_ids {
+            let parent = state.registry.parent_agent_id(&closed_agent_id);
             let removed = state.registry.remove_agent(&closed_agent_id);
+            if let Some(parent) = parent {
+                fan_out_agent_background_work(&mut state, &parent).await;
+            }
             state.agent_visibility.remove_agent(&closed_agent_id);
             state.spawn_publication_claims.remove(&closed_agent_id);
             if removed.is_none() {
@@ -9498,6 +9515,19 @@ impl HostHandle {
         };
         let turn_active = status.snapshot().await.is_active();
         fan_out_agent_turn_state(&mut state, agent_id, turn_active);
+        fan_out_agent_background_work(&mut state, agent_id).await;
+        if let Some(parent) = state.registry.parent_agent_id(agent_id) {
+            fan_out_agent_background_work(&mut state, &parent).await;
+        }
+    }
+
+    pub(crate) async fn agent_has_background_work(&self, agent_id: &AgentId) -> bool {
+        self.state
+            .lock()
+            .await
+            .registry
+            .has_background_work(agent_id)
+            .await
     }
 
     async fn fan_out_all_agent_turn_states(&self) {
@@ -9508,6 +9538,7 @@ impl HostHandle {
             };
             let turn_active = status.snapshot().await.is_active();
             fan_out_agent_turn_state(&mut state, &agent_id, turn_active);
+            fan_out_agent_background_work(&mut state, &agent_id).await;
         }
     }
 
@@ -10921,6 +10952,9 @@ impl HostHandle {
             let mut state = self.state.lock().await;
             let activity_summary =
                 initial_agent_activity_summary_state(&mut state, &start.agent_id);
+            if let Some(parent) = &start.parent_agent_id {
+                fan_out_agent_background_work(&mut state, parent).await;
+            }
             let turn_active = agent_turn_active(&state, &start.agent_id).await;
             state
                 .host_streams
@@ -15982,7 +16016,9 @@ fn emit_or_queue_host_frame(
     // would end on the older value.
     if matches!(
         kind,
-        FrameKind::SessionSummaryCountUpdated | FrameKind::AgentTurnStateNotify
+        FrameKind::SessionSummaryCountUpdated
+            | FrameKind::AgentTurnStateNotify
+            | FrameKind::AgentBackgroundWorkNotify
     ) && subscriber.new_agent_fanouts_in_flight > 0
     {
         subscriber.held_fanout_frames.push((kind, payload));
@@ -17533,6 +17569,35 @@ async fn agent_turn_active(state: &HostState, agent_id: &AgentId) -> bool {
         .agent_status_handle(agent_id)
         .unwrap_or_else(|| panic!("registry missing status for listed agent {}", agent_id));
     status.snapshot().await.is_active()
+}
+
+async fn fan_out_agent_background_work(state: &mut HostState, agent_id: &AgentId) {
+    let has_background_work = state.registry.has_background_work(agent_id).await;
+    let payload = serde_json::to_value(protocol::AgentBackgroundWorkNotifyPayload {
+        agent_id: agent_id.clone(),
+        has_background_work,
+    })
+    .expect("serialize agent background work");
+    let prefix = format!("/agent/{agent_id}/");
+    tracing::debug!(agent_id = %agent_id, has_background_work, "mobile background work status");
+    state.host_streams.retain(|_, subscriber| {
+        if subscriber.agent_replay != AgentReplayMode::Lazy {
+            return true;
+        }
+        if !subscriber
+            .known_agent_streams
+            .iter()
+            .any(|stream| stream.0.starts_with(&prefix))
+        {
+            return true;
+        }
+        emit_or_queue_host_frame(
+            subscriber,
+            FrameKind::AgentBackgroundWorkNotify,
+            payload.clone(),
+        )
+        .is_ok()
+    });
 }
 
 fn fan_out_agent_turn_state(state: &mut HostState, agent_id: &AgentId, turn_active: bool) {
