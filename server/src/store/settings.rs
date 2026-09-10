@@ -664,6 +664,7 @@ fn empty_settings() -> HostSettings {
         backend_tier_configs: std::collections::HashMap::new(),
         background_agent_features: Default::default(),
         supervisor: Default::default(),
+        usage_limits: Default::default(),
         code_intel: Default::default(),
         backend_config: std::collections::HashMap::new(),
         launch_profiles: BTreeMap::new(),
@@ -673,6 +674,11 @@ fn empty_settings() -> HostSettings {
 }
 
 fn validate_settings(settings: HostSettings) -> Result<HostSettings, String> {
+    if !(1..=100).contains(&settings.usage_limits.stop_used_percent)
+        || !(1..=100).contains(&settings.usage_limits.compact_context_percent)
+    {
+        return Err("usage limit percentages must be between 1 and 100".to_owned());
+    }
     let enabled_backends = normalize_backend_list(settings.enabled_backends);
     if settings
         .default_backend
@@ -817,6 +823,7 @@ fn validate_settings(settings: HostSettings) -> Result<HostSettings, String> {
         backend_tier_configs: settings.backend_tier_configs,
         background_agent_features: settings.background_agent_features,
         supervisor: settings.supervisor,
+        usage_limits: settings.usage_limits,
         code_intel,
         backend_config,
         launch_profiles,

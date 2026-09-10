@@ -97,6 +97,8 @@ pub struct HostSettings {
     #[serde(default)]
     pub supervisor: SupervisorSettings,
     #[serde(default)]
+    pub usage_limits: UsageLimitSettings,
+    #[serde(default)]
     pub code_intel: CodeIntelSettings,
     /// Per-backend deep configuration (e.g. Hermes default model/provider).
     /// Host-level and persistent, distinct from lightweight per-session
@@ -141,6 +143,7 @@ impl Default for HostSettings {
             backend_tier_configs: HashMap::new(),
             background_agent_features: default_background_agent_features(),
             supervisor: SupervisorSettings::default(),
+            usage_limits: UsageLimitSettings::default(),
             code_intel: CodeIntelSettings::default(),
             backend_config: HashMap::new(),
             launch_profiles: BTreeMap::new(),
@@ -311,6 +314,26 @@ pub struct BackgroundAgentFeaturesSettings {
     pub auto_generate_agent_names: bool,
     #[serde(default)]
     pub agent_activity_summaries: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(default)]
+pub struct UsageLimitSettings {
+    pub enabled: bool,
+    pub stop_used_percent: u8,
+    pub compact_enabled: bool,
+    pub compact_context_percent: u8,
+}
+
+impl Default for UsageLimitSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            stop_used_percent: 90,
+            compact_enabled: false,
+            compact_context_percent: 60,
+        }
+    }
 }
 
 /// Agent supervisor: when an agent goes idle, a hidden one-shot model call
@@ -513,6 +536,7 @@ fn decorate_host_settings_schema(schema: &mut Value) {
             {"id": "general", "title": "General", "order": 10},
             {"id": "subagents", "title": "Subagents", "order": 20},
             {"id": "supervisor", "title": "Supervisor", "order": 30},
+            {"id": "usage_limits", "title": "Usage limits", "order": 35},
             {"id": "voice", "title": "Voice", "order": 40},
             {"id": "mobile", "title": "Mobile", "order": 50}
         ]),
@@ -615,6 +639,50 @@ fn decorate_host_settings_schema(schema: &mut Value) {
             title,
             description,
         );
+    }
+    for (field, order, widget, title, description) in [
+        (
+            "enabled",
+            10,
+            "toggle",
+            "Enable usage limit management",
+            "Pause agents sharing a reported quota at the configured usage percentage and resume after a fresh report confirms capacity has reset. Off by default.",
+        ),
+        (
+            "stop_used_percent",
+            20,
+            "slider",
+            "Pause at usage percentage",
+            "Percentage of reported quota used before pausing. Leave headroom for in-flight work and compaction; provider reports can lag.",
+        ),
+        (
+            "compact_enabled",
+            30,
+            "toggle",
+            "Compact before waiting for reset",
+            "Automatically compact paused agents whose context exceeds the threshold. Compaction can consume quota. Off by default.",
+        ),
+        (
+            "compact_context_percent",
+            40,
+            "slider",
+            "Compact at context percentage",
+            "Compact when the reported context reaches this percentage of its context window.",
+        ),
+    ] {
+        annotate_property(
+            schema,
+            "UsageLimitSettings",
+            field,
+            "usage_limits",
+            order,
+            widget,
+        );
+        set_property_text(schema, "UsageLimitSettings", field, title, description);
+    }
+    for field in ["stop_used_percent", "compact_context_percent"] {
+        set_numeric_bounds(schema, "UsageLimitSettings", field, 1, 100);
+        set_numeric_step(schema, "UsageLimitSettings", field, 1);
     }
     for (field, order, widget) in [
         ("enabled", 10, "toggle"),

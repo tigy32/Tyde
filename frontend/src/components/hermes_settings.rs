@@ -3301,6 +3301,7 @@ mod wasm_tests {
                     backend_tier_configs: HashMap::new(),
                     background_agent_features: Default::default(),
                     supervisor: Default::default(),
+                    usage_limits: Default::default(),
                     code_intel: Default::default(),
                     backend_config: HashMap::new(),
                     launch_profiles: Default::default(),

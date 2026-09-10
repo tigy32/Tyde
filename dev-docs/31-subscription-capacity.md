@@ -470,3 +470,43 @@ Stated plainly so none of it is mistaken for a gap to be quietly filled later.
   historical consumption.**
 - **Automatic routing, fallback, model downgrade, or backend switching on
   capacity.** Not in this feature, at any layer, ever.
+
+
+## Opt-in usage limit management
+
+Host Settings → Supervisor → Usage limits connects account capacity to agent
+scheduling. Usage management and automatic compaction both default off. The
+initial thresholds are 90% quota used and 60% context occupancy; each accepts
+1–100%. These settings are independent of the model-based supervisor.
+
+While enabled, capacity polling refreshes approximately once a minute. A fresh
+reported bucket at or above the threshold pauses the host's agents on that
+backend, interrupts active turns, and holds queued messages. Buckets remain
+separate: percentages are never added or averaged. This is a conservative
+backend-wide gate, including model-specific buckets reported by that backend.
+Other backends continue normally. Reports can lag and already-running work or
+compaction can consume quota, so the threshold is not a hard spending cap.
+
+When enabled and context occupancy is known to exceed its threshold, automatic
+compaction uses the existing context-compaction coordinator after the turn and
+tools settle. It does not run a supervisor verdict. Failed compaction holds
+automatic continuation and shows an explanation. Disabling usage management
+releases held work. Unknown context occupancy does not trigger compaction.
+
+Resumption requires a fresh report below the threshold, after the held bucket's
+reset time, with a changed reset marker for every held bucket. Expired times,
+missing buckets, and unavailable readings alone never release work. Sources
+without percentages cannot trigger the policy; without a reported reset they
+cannot automatically release it. The server must remain running for the pause
+and continuation cycle; automatic continuation state is not restored after a
+server restart. Queued messages use the existing persisted queue.
+
+Desktop and mobile chat display the pause. “Cancel continuation” cancels the
+interrupted task's automatic follow-up; explicitly queued messages remain queued.
+Idle agents do not receive unsolicited continuation prompts.
+
+The server capacity tests exercise this policy through a running server and
+protocol clients. Disabling the pause admission branch makes both usage-flow
+regressions fail waiting for the missing pause, while the other native tests
+pass. Browser tests cover the opt-in controls and cancellation from an idle
+composer.

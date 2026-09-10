@@ -536,8 +536,10 @@ pub(crate) fn requested_context_compaction_route(
     if capability.coordinator != BackendCompactionCoordinator::ContextOperation {
         return Err("backend is still assigned to legacy compaction".to_owned());
     }
-    if trigger == CompactionTrigger::SupervisorRequested
-        && matches!(&capability.availability, Availability::AutomaticOnly { .. })
+    if matches!(
+        trigger,
+        CompactionTrigger::SupervisorRequested | CompactionTrigger::UsageLimitRequested
+    ) && matches!(&capability.availability, Availability::AutomaticOnly { .. })
     {
         return Err("supervisor fallback is disabled for an automatic-only backend".to_owned());
     }
@@ -574,6 +576,12 @@ fn enabled_supervisor_stall_timeout(
 struct ActivitySummarySettingsSignal {
     enabled: bool,
     epoch: u64,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct UsageLimitSignal {
+    pub settings: settings_model::UsageLimitSettings,
+    pub snapshots: Vec<BackendCapacitySnapshot>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -691,6 +699,7 @@ pub(crate) struct HostState {
     activity_summary_settings_tx: watch::Sender<ActivitySummarySettingsSignal>,
     supervisor_epoch: u64,
     supervisor_settings_tx: watch::Sender<SupervisorSettingsSignal>,
+    usage_limits_tx: watch::Sender<UsageLimitSignal>,
     pub sub_agent_spawn_tx: HostSubAgentSpawnTx,
     pub capacity_tx: HostCapacityTx,
     pub supervisor_compaction_tx: SupervisorCompactionTx,
@@ -5009,12 +5018,14 @@ impl HostHandle {
             #[cfg(feature = "test-support")]
             let request = consume_mock_launch_reservation(&state, request);
             let supervisor_settings_rx = state.supervisor_settings_tx.subscribe();
+            let usage_limits_rx = state.usage_limits_tx.subscribe();
             let supervisor_use_mock_backend = state.use_mock_backend;
             let supervisor_compaction_tx = state.supervisor_compaction_tx.clone();
             let spawned = state.registry.spawn(
                 request,
                 &agent_control_mcp,
                 crate::agent::AgentActorRuntimeResources {
+                    usage_limits_rx,
                     session_store: Arc::clone(&session_store),
                     supervisor_settings_rx,
                     use_mock_backend: supervisor_use_mock_backend,
@@ -5451,12 +5462,14 @@ impl HostHandle {
             #[cfg(feature = "test-support")]
             let request = consume_mock_launch_reservation(&state, request);
             let supervisor_settings_rx = state.supervisor_settings_tx.subscribe();
+            let usage_limits_rx = state.usage_limits_tx.subscribe();
             let supervisor_use_mock_backend = state.use_mock_backend;
             let supervisor_compaction_tx = state.supervisor_compaction_tx.clone();
             let spawned = state.registry.spawn(
                 request,
                 &agent_control_mcp,
                 crate::agent::AgentActorRuntimeResources {
+                    usage_limits_rx,
                     session_store,
                     supervisor_settings_rx,
                     use_mock_backend: supervisor_use_mock_backend,
@@ -9359,6 +9372,10 @@ impl HostHandle {
             .await
             .activity_summary_settings_tx
             .subscribe()
+    }
+
+    pub(crate) async fn usage_limits_receiver(&self) -> watch::Receiver<UsageLimitSignal> {
+        self.state.lock().await.usage_limits_tx.subscribe()
     }
 
     async fn supervisor_settings_receiver(&self) -> watch::Receiver<SupervisorSettingsSignal> {
@@ -13613,6 +13630,10 @@ fn spawn_host_inner(
             settings: host_settings.supervisor,
             epoch: 0,
         });
+    let (usage_limits_tx, _) = watch::channel(UsageLimitSignal {
+        settings: host_settings.usage_limits,
+        snapshots: Vec::new(),
+    });
     let mobile_pairings_store = MobilePairingsStore::load(paths.mobile_pairings)?;
     let custom_agent_store = CustomAgentStore::load(paths.custom_agent)?;
     let (role_preset_ids, personality_preset_ids) = team_preset_validation_refs();
@@ -13736,6 +13757,7 @@ fn spawn_host_inner(
             activity_summary_epoch: 0,
             supervisor_epoch: 0,
             supervisor_settings_tx,
+            usage_limits_tx,
             activity_summary_settings_tx,
             sub_agent_spawn_tx,
             capacity_tx: capacity_tx.clone(),
@@ -17509,6 +17531,9 @@ async fn apply_agent_activity_summary_setting(
 }
 
 fn apply_agent_supervisor_setting(state: &mut HostState, settings: &settings_model::HostSettings) {
+    state
+        .usage_limits_tx
+        .send_modify(|signal| signal.settings = settings.usage_limits);
     let current = *state.supervisor_settings_tx.borrow();
     if current.settings == settings.supervisor {
         return;
@@ -18058,6 +18083,9 @@ fn backend_capacity_snapshots(state: &HostState) -> Vec<BackendCapacitySnapshot>
 
 fn fan_out_backend_capacity(state: &mut HostState) {
     let snapshots = backend_capacity_snapshots(state);
+    state
+        .usage_limits_tx
+        .send_modify(|signal| signal.snapshots = snapshots.clone());
     let paths = state.host_streams.keys().cloned().collect::<Vec<_>>();
     let mut dead_paths = Vec::new();
     for path in paths {
@@ -18998,6 +19026,10 @@ impl HostHandle {
                     .expect("checked capacity snapshot must exist");
                 current.retrieved_at_ms = retrieved_at_ms;
                 current.freshness = snapshot.freshness;
+                let snapshots = backend_capacity_snapshots(&host_state);
+                host_state
+                    .usage_limits_tx
+                    .send_modify(|signal| signal.snapshots = snapshots);
                 if force_emit {
                     fan_out_backend_capacity(&mut host_state);
                 }

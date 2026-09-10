@@ -162,6 +162,7 @@ pub fn prime_host_for_tests(state: &AppState, host_id: &str) {
             backend_tier_configs: std::collections::HashMap::new(),
             background_agent_features: Default::default(),
             supervisor: Default::default(),
+            usage_limits: Default::default(),
             code_intel: Default::default(),
             backend_config: std::collections::HashMap::new(),
             launch_profiles: Default::default(),
@@ -4078,6 +4079,16 @@ fn apply_agent_activity_summary(
 
 fn apply_agent_activity_stats(state: &AppState, host_id: &str, payload: AgentActivityStatsPayload) {
     let agent_id = payload.agent_id;
+    if payload
+        .stats
+        .usage_limit_pause
+        .as_ref()
+        .is_some_and(|pause| !pause.resume_interrupted_turn)
+    {
+        state.interrupt_pending.update(|pending| {
+            pending.remove(&agent_id);
+        });
+    }
     log::debug!(
         "dispatch agent_activity_stats host={host_id} agent_id={agent_id} tool_calls={}",
         payload.stats.tool_calls
@@ -7031,6 +7042,7 @@ mod restore_fixtures {
                     backend_tier_configs: std::collections::HashMap::new(),
                     background_agent_features: Default::default(),
                     supervisor: Default::default(),
+                    usage_limits: Default::default(),
                     code_intel: Default::default(),
                     backend_config: std::collections::HashMap::new(),
                     launch_profiles: Default::default(),

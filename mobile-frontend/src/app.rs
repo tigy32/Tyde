@@ -1241,6 +1241,7 @@ mod wasm_tests {
             backend_tier_configs: Default::default(),
             background_agent_features: Default::default(),
             supervisor: Default::default(),
+            usage_limits: Default::default(),
             code_intel: Default::default(),
             backend_config: Default::default(),
             launch_profiles: Default::default(),

@@ -230,6 +230,33 @@ impl MockTurn {
         ))
     }
 
+    pub fn with_context_usage(mut self, input_tokens: u64, context_window: u64) -> Self {
+        let MockTurnBody::Steps(steps) = &mut self.body else {
+            panic!("context usage requires a scripted turn");
+        };
+        steps.insert(
+            steps.len().saturating_sub(1),
+            MockStep::emit(BackendEvent::ModelRequestTokenUsage(
+                protocol::ModelRequestTokenUsage {
+                    request_id: protocol::ModelRequestId {
+                        turn_id: protocol::ModelTurnId(Uuid::new_v4().to_string()),
+                        sequence: 1,
+                    },
+                    request: emit::mock_turn_token_usage(),
+                    turn: emit::mock_turn_token_usage(),
+                    cumulative: emit::mock_turn_token_usage(),
+                    model_context_window: Some(context_window),
+                    current_context_usage: Some(protocol::CurrentContextUsage::Known {
+                        input_tokens,
+                        context_window,
+                    }),
+                    estimated_context_breakdown: None,
+                },
+            )),
+        );
+        self
+    }
+
     pub fn text_with_mid_turn_error(
         text: impl Into<String>,
         diagnostic: impl Into<String>,

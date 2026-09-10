@@ -2361,6 +2361,7 @@ fn AiSummariesTab() -> impl IntoView {
 #[component]
 fn SupervisorTab() -> impl IntoView {
     let state = expect_context::<AppState>();
+    let usage_state = state.clone();
     let fields_state = state.clone();
 
     view! {
@@ -2372,6 +2373,10 @@ fn SupervisorTab() -> impl IntoView {
 
         <div class="settings-schema-fields">
             {move || host_schema_section(&fields_state, "supervisor")}
+        </div>
+        <h2 class="settings-panel-title">"Usage limits"</h2>
+        <div class="settings-schema-fields">
+            {move || host_schema_section(&usage_state, "usage_limits")}
         </div>
     }
 }
@@ -4083,6 +4088,18 @@ fn host_schema_field_disabled(pointer: &str, settings: &Value) -> bool {
         .and_then(Value::as_bool)
         .unwrap_or(false);
     match pointer {
+        "/usage_limits/enabled" => false,
+        pointer if pointer.starts_with("/usage_limits/") => {
+            !settings
+                .pointer("/usage_limits/enabled")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+                || (pointer == "/usage_limits/compact_context_percent"
+                    && !settings
+                        .pointer("/usage_limits/compact_enabled")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false))
+        }
         "/supervisor/enabled" => false,
         "/supervisor/stall_timeout_seconds" => {
             !supervisor_enabled
@@ -9222,6 +9239,7 @@ mod wasm_tests {
                     backend_tier_configs: std::collections::HashMap::new(),
                     background_agent_features: Default::default(),
                     supervisor: Default::default(),
+                    usage_limits: Default::default(),
                     code_intel: Default::default(),
                     backend_config: std::collections::HashMap::new(),
                     launch_profiles: Default::default(),
@@ -11010,7 +11028,8 @@ mod wasm_tests {
                         auto_generate_agent_names,
                         agent_activity_summaries,
                     },
-                    supervisor: settings_model::SupervisorSettings::default(),
+                    supervisor: Default::default(),
+                    usage_limits: Default::default(),
                     code_intel,
                     backend_config: std::collections::HashMap::new(),
                     launch_profiles: Default::default(),
@@ -11581,6 +11600,59 @@ mod wasm_tests {
         assert!(stall.checked());
     }
 
+    #[wasm_bindgen_test]
+    async fn usage_limit_controls_are_opt_in_and_reactive() {
+        let container = make_container();
+        let state = AppState::new();
+        install_general_host_settings(&state, true, false, None);
+        state.settings_open.set(true);
+        let mounted_state = state.clone();
+        let _handle = mount_to(container.clone(), move || {
+            provide_context(mounted_state);
+            view! { <SettingsPanel /> }
+        });
+        next_tick().await;
+        click_tab(&container, "Supervisor");
+        next_tick().await;
+        let enabled = toggle_for_label(&container, "Enable usage limit management");
+        let compact = toggle_for_label(&container, "Compact before waiting for reset");
+        let percent: web_sys::HtmlInputElement = container
+            .query_selector("input[aria-label='Pause at usage percentage']")
+            .unwrap()
+            .unwrap()
+            .dyn_into()
+            .unwrap();
+        let context: web_sys::HtmlInputElement = container
+            .query_selector("input[aria-label='Compact at context percentage']")
+            .unwrap()
+            .unwrap()
+            .dyn_into()
+            .unwrap();
+        assert!(!enabled.checked());
+        assert!(!enabled.disabled());
+        assert!(!compact.checked());
+        assert!(compact.disabled());
+        assert!(percent.disabled());
+        assert!(context.disabled());
+        assert_eq!(percent.value(), "90");
+        assert_eq!(context.value(), "60");
+        state.host_settings_by_host.update(|hosts| {
+            hosts.get_mut("host-general").unwrap().usage_limits.enabled = true;
+        });
+        next_tick().await;
+        assert!(!percent.disabled());
+        assert!(!compact.disabled());
+        assert!(context.disabled());
+        state.host_settings_by_host.update(|hosts| {
+            let settings = hosts.get_mut("host-general").unwrap();
+            settings.usage_limits.compact_enabled = true;
+            settings.usage_limits.compact_context_percent = 75;
+        });
+        next_tick().await;
+        assert!(!context.disabled());
+        assert_eq!(context.value(), "75");
+    }
+
     /// The Background agent features section must reflect the host's current
     /// `background_agent_features` values (checked/unchecked) and tell the
     /// user the summaries feature costs money.
@@ -11708,6 +11780,7 @@ mod wasm_tests {
             backend_tier_configs: std::collections::HashMap::new(),
             background_agent_features: Default::default(),
             supervisor: Default::default(),
+            usage_limits: Default::default(),
             code_intel: Default::default(),
             backend_config,
             launch_profiles: Default::default(),
@@ -13572,6 +13645,7 @@ mod wasm_tests {
                     backend_tier_configs: std::collections::HashMap::new(),
                     background_agent_features: Default::default(),
                     supervisor: Default::default(),
+                    usage_limits: Default::default(),
                     code_intel: Default::default(),
                     backend_config: std::collections::HashMap::new(),
                     launch_profiles: profiles

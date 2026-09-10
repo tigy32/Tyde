@@ -139,6 +139,7 @@ fn expected_empty_settings() -> HostSettings {
         backend_tier_configs: std::collections::HashMap::new(),
         background_agent_features: Default::default(),
         supervisor: Default::default(),
+        usage_limits: Default::default(),
         code_intel: Default::default(),
         backend_config: std::collections::HashMap::new(),
         launch_profiles: Default::default(),
@@ -389,6 +390,7 @@ fn persisted_backend_lists_are_canonicalized_but_not_defaulted() {
             backend_tier_configs: std::collections::HashMap::new(),
             background_agent_features: Default::default(),
             supervisor: Default::default(),
+            usage_limits: Default::default(),
             code_intel: Default::default(),
             backend_config: std::collections::HashMap::new(),
             launch_profiles: Default::default(),
@@ -409,7 +411,33 @@ async fn supervisor_settings_apply_and_validate_over_protocol() {
     assert_eq!(defaults.max_kicks_per_task, 3);
     assert_eq!(defaults.retry_attempts, 1);
 
+    assert!(!fixture.bootstrap.settings.usage_limits.enabled);
+    assert!(!fixture.bootstrap.settings.usage_limits.compact_enabled);
     let valid = [
+        (
+            "usage-enable",
+            "/usage_limits/enabled",
+            serde_json::json!(true),
+            serde_json::json!(false),
+        ),
+        (
+            "usage-compact",
+            "/usage_limits/compact_enabled",
+            serde_json::json!(true),
+            serde_json::json!(false),
+        ),
+        (
+            "usage-stop",
+            "/usage_limits/stop_used_percent",
+            serde_json::json!(85),
+            serde_json::json!(90),
+        ),
+        (
+            "usage-context",
+            "/usage_limits/compact_context_percent",
+            serde_json::json!(70),
+            serde_json::json!(60),
+        ),
         (
             "supervisor-enabled",
             "/supervisor/enabled",
@@ -491,6 +519,18 @@ async fn supervisor_settings_apply_and_validate_over_protocol() {
     }
 
     for (write_id, path, value, expected) in [
+        (
+            "usage-stop-zero",
+            "/usage_limits/stop_used_percent",
+            serde_json::json!(0),
+            serde_json::json!(85),
+        ),
+        (
+            "usage-context-over",
+            "/usage_limits/compact_context_percent",
+            serde_json::json!(101),
+            serde_json::json!(70),
+        ),
         (
             "supervisor-delay-zero",
             "/supervisor/auto_compact_inactivity_delay_seconds",

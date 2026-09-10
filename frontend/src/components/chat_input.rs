@@ -1380,6 +1380,19 @@ pub fn ChatInput(
             pending_team_member,
         )
     });
+    let usage_state = state.clone();
+    let usage_pause = Memo::new(move |_| {
+        agent_ref.get().and_then(|agent| {
+            usage_state.agent_activity_stats.with(|stats| {
+                stats
+                    .get(&agent)
+                    .and_then(|stats| stats.usage_limit_pause.clone())
+            })
+        })
+    });
+    let cancel_usage_state = state.clone();
+    let cancel_usage =
+        Callback::new(move |()| interrupt_target_turn(&cancel_usage_state, agent_ref));
     let notice_state = state.clone();
 
     view! {
@@ -1391,6 +1404,20 @@ pub fn ChatInput(
             on:dragleave=on_dragleave
             on:drop=on_drop
         >
+            <Show when=move || usage_pause.get().is_some() && !is_terminated.get()>
+                <div class="chat-backend-notice" role="status">
+                    <span>{move || if usage_pause.get().is_some_and(|pause| pause.compaction_failed) {
+                        "Usage pause: compaction failed. Disable usage management in Settings to release held work."
+                    } else {
+                        "Usage pause: queued work will resume after the quota resets."
+                    }}</span>
+                    <Show when=move || usage_pause.get().is_some_and(|pause| pause.resume_interrupted_turn)>
+                        <button type="button" class="chat-backend-notice-cta" on:click={move |_| cancel_usage.run(())}>
+                            "Cancel continuation"
+                        </button>
+                    </Show>
+                </div>
+            </Show>
             <Show when=move || { drag_depth.get() > 0 }>
                 <div
                     class="chat-input-drop-overlay"
@@ -2309,6 +2336,76 @@ mod wasm_tests {
             c.has_attribute("disabled"),
             "caret must be disabled with no menu items (no session)"
         );
+    }
+
+    #[wasm_bindgen_test]
+    async fn idle_usage_pause_exposes_cancellation() {
+        let state = AppState::new();
+        configure(&state, false, false, "");
+        let agent = ActiveAgentRef {
+            host_id: HOST.to_owned(),
+            agent_id: AgentId(AGENT.to_owned()),
+        };
+        state.agent_activity_stats.update(|stats| {
+            stats.insert(
+                agent.clone(),
+                protocol::AgentActivityStats {
+                    usage_limit_pause: Some(protocol::UsageLimitPauseState {
+                        resume_interrupted_turn: true,
+                        compaction_failed: false,
+                    }),
+                    ..Default::default()
+                },
+            );
+        });
+        let calls = stub_send_recording();
+        let mount_state = state.clone();
+        let container = make_container();
+        let _h = mount_to(container.clone(), move || {
+            provide_context(mount_state.clone());
+            view! { <ChatInput /> }
+        });
+        next_tick().await;
+        assert!(container.text_content().unwrap().contains("Usage pause:"));
+        assert!(
+            container
+                .text_content()
+                .unwrap()
+                .contains("Cancel continuation")
+        );
+        container
+            .query_selector(".chat-backend-notice-cta")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap()
+            .click();
+        next_tick().await;
+        next_tick().await;
+        assert_eq!(interrupt_frames(&calls), 1);
+        state.agent_activity_stats.update(|stats| {
+            stats
+                .get_mut(&agent)
+                .unwrap()
+                .usage_limit_pause
+                .as_mut()
+                .unwrap()
+                .resume_interrupted_turn = false;
+        });
+        next_tick().await;
+        assert!(
+            !container
+                .text_content()
+                .unwrap()
+                .contains("Cancel continuation")
+        );
+        assert!(container.text_content().unwrap().contains("Usage pause:"));
+        state.agent_activity_stats.update(|stats| {
+            stats.get_mut(&agent).unwrap().usage_limit_pause = None;
+        });
+        next_tick().await;
+        assert!(!container.text_content().unwrap().contains("Usage pause:"));
+        stub_send_host_line();
     }
 
     #[wasm_bindgen_test]

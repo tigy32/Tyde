@@ -104,9 +104,26 @@ pub(crate) async fn run_backend_poll_loop(host: WeakHostHandle, backend_kind: Ba
         } else {
             retry_delay(failures)
         };
+        let mut usage_limits = host.usage_limits_receiver().await;
+        let delay = if usage_limits.borrow().settings.enabled {
+            delay.min(Duration::from_secs(60))
+        } else {
+            delay
+        };
         // Dropped before sleeping, so an idle loop never holds the host alive.
         drop(host);
-        tokio::time::sleep(delay + jitter_for(backend_kind, delay)).await;
+        let sleep = tokio::time::sleep(delay + jitter_for(backend_kind, delay));
+        tokio::pin!(sleep);
+        let enabled = usage_limits.borrow().settings.enabled;
+        loop {
+            tokio::select! {
+                _ = &mut sleep => break,
+                result = usage_limits.changed() => {
+                    if result.is_err() { return; }
+                    if usage_limits.borrow().settings.enabled != enabled { break; }
+                }
+            }
+        }
         trigger = CapacityPollTrigger::Scheduled;
     }
 }

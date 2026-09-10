@@ -213,6 +213,7 @@ pub(crate) struct AgentActorRuntimeContext {
     pub(crate) review_registry: ReviewRegistryHandle,
     pub(crate) status_handle: registry::AgentStatusHandle,
     pub(crate) supervisor_settings_rx: watch::Receiver<crate::host::SupervisorSettingsSignal>,
+    pub(crate) usage_limits_rx: watch::Receiver<crate::host::UsageLimitSignal>,
     pub(crate) use_mock_backend: bool,
     pub(crate) supervisor_compaction_tx: crate::host::SupervisorCompactionTx,
     pub(crate) provider_version: Option<String>,
@@ -229,6 +230,7 @@ pub(crate) struct AgentActorRuntimeResources {
     /// The supervisor runs inside the actor, so it holds the settings watch for
     /// its whole life instead of being handed one per host command.
     pub(crate) supervisor_settings_rx: watch::Receiver<crate::host::SupervisorSettingsSignal>,
+    pub(crate) usage_limits_rx: watch::Receiver<crate::host::UsageLimitSignal>,
     pub(crate) use_mock_backend: bool,
     pub(crate) supervisor_compaction_tx: crate::host::SupervisorCompactionTx,
     pub(crate) provider_version: Option<String>,
@@ -249,6 +251,7 @@ impl AgentActorRuntimeResources {
             review_registry: self.review_registry,
             status_handle,
             supervisor_settings_rx: self.supervisor_settings_rx,
+            usage_limits_rx: self.usage_limits_rx,
             use_mock_backend: self.use_mock_backend,
             supervisor_compaction_tx: self.supervisor_compaction_tx,
             provider_version: self.provider_version,
@@ -493,11 +496,13 @@ fn context_compaction_fallback_allowed(
     trigger: CompactionTrigger,
     capability: &crate::backend::BackendCompactionCapability,
 ) -> bool {
-    trigger != CompactionTrigger::SupervisorRequested
-        || !matches!(
-            &capability.availability,
-            crate::backend::BackendCompactionAvailability::AutomaticOnly { .. }
-        )
+    !matches!(
+        trigger,
+        CompactionTrigger::SupervisorRequested | CompactionTrigger::UsageLimitRequested
+    ) || !matches!(
+        &capability.availability,
+        crate::backend::BackendCompactionAvailability::AutomaticOnly { .. }
+    )
 }
 
 fn mark_inline_context_fallback_preparing(
@@ -2535,6 +2540,7 @@ pub(crate) fn spawn_agent_actor(
         host_sub_agent_spawn_tx,
         capacity_tx,
         mut supervisor_settings_rx,
+        mut usage_limits_rx,
         use_mock_backend: supervisor_use_mock_backend,
         supervisor_compaction_tx,
         session_summary_count_tx,
@@ -3045,6 +3051,9 @@ pub(crate) fn spawn_agent_actor(
         let mut close_deadline: Option<tokio::time::Instant> = None;
         let mut active_compaction: Option<ActiveCompaction> = None;
         let mut context_compaction: Option<CompactionFlight> = None;
+        let mut usage_pause: Option<UsageLimitPause> = None;
+        let mut usage_tick = tokio::time::interval(Duration::from_secs(1));
+        usage_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         // Observations already accounted for by a requested operation's marker.
         // The flight alone cannot carry this: the terminal result takes it, and
         // the backend's observation of the same compaction arrives afterwards on
@@ -3229,6 +3238,19 @@ pub(crate) fn spawn_agent_actor(
                     .as_ref()
                     .is_some_and(|images| !images.is_empty())
         });
+        let initial_usage_hold = {
+            let signal = usage_limits_rx.borrow();
+            signal.settings.enabled
+                && usage_limit_report(&signal, backend_kind).is_some_and(|report| {
+                    report.buckets.iter().any(|bucket| {
+                        usage_limit_used(bucket)
+                            .is_some_and(|used| used >= signal.settings.stop_used_percent)
+                    })
+                })
+        };
+        if initial_usage_hold && let Some(input) = initial_follow_up.take() {
+            pending_inputs.push_back(AgentInput::SendMessage(input));
+        }
         if !resume_replay_gate_pending
             && let Some(input) = initial_follow_up.take()
             && !send_initial_follow_up_or_park(
@@ -3290,6 +3312,239 @@ pub(crate) fn spawn_agent_actor(
                 );
                 last_supervisor_settings = supervisor_settings;
             }
+            let usage_signal = usage_limits_rx.borrow().clone();
+            let usage_settings = usage_signal.settings;
+            let usage_report = usage_limit_report(&usage_signal, backend_kind);
+            let exceeded = usage_report
+                .map(|report| {
+                    report
+                        .buckets
+                        .iter()
+                        .filter(|bucket| {
+                            usage_limit_used(bucket)
+                                .is_some_and(|used| used >= usage_settings.stop_used_percent)
+                        })
+                        .cloned()
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            if usage_settings.enabled
+                && !exceeded.is_empty()
+                && usage_pause.is_none()
+                && matches!(lifecycle, ActorLifecycle::Running)
+            {
+                let resume_turn = in_turn && !resume_replay_gate_pending;
+                usage_pause = Some(UsageLimitPause {
+                    held_buckets: exceeded.clone(),
+                    resume_turn,
+                    ..UsageLimitPause::default()
+                });
+                tracing::info!(agent_id = %current_start.agent_id, threshold = usage_settings.stop_used_percent, "pausing agent for usage limit");
+                append_chat_event(&canonical_stream, &mut event_log, &mut subscribers,
+                    &mut replay_state, &usage_limit_notice(format!(
+                        "Usage limit pause: quota has reached {}%. Queued work is held until a fresh report confirms the quota reset. Cancel continuation in the composer to stop automatic continuation.", usage_settings.stop_used_percent))).await;
+                if resume_turn {
+                    backend.as_ref().expect("live backend").interrupt().await;
+                }
+            }
+            if let Some(pause) = usage_pause.as_mut() {
+                for bucket in &exceeded {
+                    if let Some(held) = pause
+                        .held_buckets
+                        .iter_mut()
+                        .find(|held| held.id == bucket.id)
+                    {
+                        *held = bucket.clone();
+                    } else {
+                        pause.held_buckets.push(bucket.clone());
+                    }
+                }
+                if let Some(reply) = pause.compaction_reply.as_mut() {
+                    match reply.try_recv() {
+                        Ok(Ok(operation)) => {
+                            pause.compaction_operation = Some(operation);
+                            pause.compaction_reply = None;
+                        }
+                        Ok(Err(error)) => {
+                            pause.compaction_failed = true;
+                            pause.compaction_reply = None;
+                            append_chat_event(&canonical_stream, &mut event_log, &mut subscribers,
+                                &mut replay_state, &usage_limit_notice(format!("Usage limit compaction could not start: {error}. Automatic continuation is held; disable usage management to release it."))).await;
+                        }
+                        Err(oneshot::error::TryRecvError::Closed) => {
+                            pause.compaction_reply = None;
+                            pause.compaction_failed = true;
+                        }
+                        Err(oneshot::error::TryRecvError::Empty) => {}
+                    }
+                }
+                if let Some(operation) = pause.compaction_operation.as_ref() {
+                    let terminal = event_log
+                        .iter()
+                        .rev()
+                        .filter(|env| env.kind == FrameKind::ContextCompactionNotify)
+                        .filter_map(|env| {
+                            env.parse_payload::<ContextCompactionNotifyPayload>().ok()
+                        })
+                        .find(|payload| &payload.operation_id == operation);
+                    if let Some(terminal) = terminal {
+                        match terminal.status {
+                            ContextCompactionStatus::Completed => pause.compaction_operation = None,
+                            ContextCompactionStatus::Failed { .. } => {
+                                pause.compaction_operation = None;
+                                pause.compaction_failed = true;
+                                append_chat_event(&canonical_stream, &mut event_log, &mut subscribers,
+                                    &mut replay_state, &usage_limit_notice("Usage limit compaction failed. Automatic continuation is held; disable usage management to release it.".to_owned())).await;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                let reset_confirmed = usage_report.is_some_and(|report| {
+                    pause.held_buckets.iter().all(|held| {
+                        let protocol::CapacityReset::At { at_ms } = held.reset else {
+                            return false;
+                        };
+                        now_ms() >= at_ms
+                            && report.buckets.iter().any(|current| {
+                                current.id == held.id
+                                    && usage_limit_used(current)
+                                        .is_some_and(|used| used < usage_settings.stop_used_percent)
+                                    && current.reset != held.reset
+                            })
+                    }) && report.buckets.iter().all(|bucket| {
+                        usage_limit_used(bucket)
+                            .is_none_or(|used| used < usage_settings.stop_used_percent)
+                    })
+                });
+                let compact_due = usage_settings.compact_enabled
+                    && activity_stats
+                        .stats
+                        .current_context_usage
+                        .as_ref()
+                        .and_then(protocol::CurrentContextUsage::known)
+                        .is_some_and(|(tokens, window)| {
+                            window > 0
+                                && tokens.saturating_mul(100)
+                                    >= window.saturating_mul(u64::from(
+                                        usage_settings.compact_context_percent,
+                                    ))
+                        });
+                if usage_settings.enabled
+                    && compact_due
+                    && !pause.compaction_attempted
+                    && !in_turn
+                    && !resume_replay_gate_pending
+                    && context_compaction.is_none()
+                    && active_compaction.is_none()
+                    && open_tool_call_ids.is_empty()
+                    && pending_tool_response_ids.is_empty()
+                {
+                    pause.compaction_attempted = true;
+                    let (reply, result) = oneshot::channel();
+                    pause.compaction_reply = Some(result);
+                    let _ = actor_tx.send(AgentCommand::RequestContextCompaction {
+                        trigger: CompactionTrigger::UsageLimitRequested,
+                        focus: Some("Preserve the unfinished task and next steps so work can continue after the usage quota resets.".to_owned()),
+                        barrier_timeout: Duration::from_secs(300),
+                        inactivity_gate: None,
+                        reply,
+                    });
+                } else if (!usage_settings.enabled
+                    || (reset_confirmed
+                        && (!compact_due || pause.compaction_attempted)
+                        && !pause.compaction_failed
+                        && pause.compaction_reply.is_none()
+                        && pause.compaction_operation.is_none()))
+                    && !in_turn
+                    && context_compaction.is_none()
+                    && active_compaction.is_none()
+                    && !resume_replay_gate_pending
+                {
+                    let resume_turn = pause.resume_turn;
+                    usage_pause = None;
+                    append_chat_event(
+                        &canonical_stream,
+                        &mut event_log,
+                        &mut subscribers,
+                        &mut replay_state,
+                        &usage_limit_notice(
+                            "Usage limit pause ended. Resuming held work.".to_owned(),
+                        ),
+                    )
+                    .await;
+                    if let Some(input) = initial_follow_up.take() {
+                        pending_inputs.push_front(AgentInput::SendMessage(input));
+                    }
+                    if !queue.is_empty() && pending_inputs.is_empty() {
+                        let dispatch = release_context_compaction_barrier(
+                            backend.as_ref().expect("live backend"),
+                            &mut queue,
+                            &mut in_turn,
+                            &mut idle_transition_armed,
+                            &canonical_stream,
+                            &mut event_log,
+                            &mut subscribers,
+                            &current_start.agent_id,
+                            &session_store,
+                            &status_handle,
+                            &review_registry,
+                            false,
+                        )
+                        .await;
+                        if dispatch == QueuedMessageDispatchOutcome::Closed {
+                            terminalize_closed_queue_dispatch(QueueDispatchTerminalContext {
+                                accepting_input: &accepting_input_task,
+                                status_handle: &status_handle,
+                                canonical_stream: &canonical_stream,
+                                event_log: &mut event_log,
+                                replay_state: &mut replay_state,
+                                subscribers: &mut subscribers,
+                                queue: &mut queue,
+                                session_store: &session_store,
+                                transcript_store: &transcript_store,
+                                context_compaction: &mut context_compaction,
+                                activity_stats: &mut activity_stats,
+                                current_session_id: current_session_id.as_ref(),
+                                pending_alias: &mut pending_alias,
+                                current_start: &mut current_start,
+                                start_tx: &start_tx,
+                                latest_output: &mut latest_output,
+                                pending_inputs: &mut pending_inputs,
+                                rx: &mut rx,
+                                open_tool_call_ids: &mut open_tool_call_ids,
+                                pending_tool_response_ids: &mut pending_tool_response_ids,
+                                active_agent_await_ids: &mut active_agent_await_ids,
+                            })
+                            .await;
+                            return;
+                        }
+                    } else if resume_turn && pending_inputs.is_empty() {
+                        pending_inputs.push_back(AgentInput::SendMessage(SendMessagePayload {
+                            message: "The usage pause has ended. Continue the interrupted task from where you stopped.".to_owned(),
+                            images: None, origin: Some(MessageOrigin::Supervisor), tool_response: None,
+                        }));
+                    }
+                }
+            }
+            let usage_paused = usage_pause.is_some();
+            let pause_snapshot = usage_pause
+                .as_ref()
+                .map(|pause| protocol::UsageLimitPauseState {
+                    resume_interrupted_turn: pause.resume_turn,
+                    compaction_failed: pause.compaction_failed,
+                });
+            if activity_stats.stats.usage_limit_pause != pause_snapshot {
+                activity_stats.stats.usage_limit_pause = pause_snapshot;
+                upsert_activity_stats_snapshot(
+                    &canonical_stream,
+                    &mut event_log,
+                    &mut subscribers,
+                    &current_start.agent_id,
+                    activity_stats.snapshot(),
+                )
+                .await;
+            }
             let has_background_work =
                 replay_state
                     .active_tool_progress
@@ -3316,7 +3571,7 @@ pub(crate) fn spawn_agent_actor(
                 !replay_state.active_background_progress.is_empty(),
                 Instant::now(),
             );
-            let supervisor_deadline = if supervisor_status.goal.is_some() {
+            let supervisor_deadline = if usage_paused || supervisor_status.goal.is_some() {
                 None
             } else {
                 supervisor_state
@@ -3329,7 +3584,8 @@ pub(crate) fn spawn_agent_actor(
             // silent immediately is measured from when it began rather than
             // from an older event. One interrupt per window: a backend that
             // swallows the first gets another a full window later, not a loop.
-            let stall_deadline = (supervisor_status.goal.is_none()
+            let stall_deadline = (!usage_paused
+                && supervisor_status.goal.is_none()
                 && supervisor_settings.settings.enabled
                 && supervisor_settings.settings.stall_timeout_enabled
                 && in_turn)
@@ -3485,6 +3741,8 @@ pub(crate) fn spawn_agent_actor(
                 // may arm supervision that was switched off entirely, so it has
                 // to wake the loop rather than wait for unrelated traffic.
                 Ok(()) = supervisor_settings_rx.changed() => {}
+                Ok(()) = usage_limits_rx.changed() => {}
+                _ = usage_tick.tick(), if usage_settings.enabled || usage_paused => {}
                 Some((launched_at, result)) = supervisor_verdict_rx.recv() => {
                     let now = Instant::now();
                     let launched_settings = supervisor_state.in_flight_verdict(launched_at);
@@ -4461,6 +4719,7 @@ pub(crate) fn spawn_agent_actor(
                     }
 
                     if real_idle_transition
+                        && !usage_paused
                         && matches!(lifecycle, ActorLifecycle::Running)
                         && !compaction_blocked
                         && !queue.is_empty()
@@ -4631,7 +4890,7 @@ pub(crate) fn spawn_agent_actor(
                 maybe_command = next_agent_command(
                     &mut pending_inputs,
                     &mut rx,
-                    !resume_replay_gate_pending,
+                    !resume_replay_gate_pending && !usage_paused,
                 ) => {
                     let Some(command) = maybe_command else {
                         break;
@@ -4858,6 +5117,7 @@ pub(crate) fn spawn_agent_actor(
                                     if initial_follow_up.is_none()
                                         && acknowledged_gated_deliveries == 0
                                         && !queue.is_empty()
+                                        && !usage_paused
                                         && !compaction_blocked
                                         && context_compaction.as_ref().is_none_or(|flight| {
                                             queue.front().is_some_and(|queued| {
@@ -4964,7 +5224,7 @@ pub(crate) fn spawn_agent_actor(
                                             return;
                                         }
                                     }
-                                    if let Some(input) = initial_follow_up.take()
+                                    if !usage_paused && let Some(input) = initial_follow_up.take()
                                         && !send_initial_follow_up_or_park(
                                             input,
                                             InitialFollowUpContext {
@@ -5146,6 +5406,11 @@ pub(crate) fn spawn_agent_actor(
                                 .await;
                                 continue;
                             }
+                            if usage_paused && matches!(&input, AgentInput::SendMessage(msg) if msg.tool_response.is_some()) {
+                                pending_inputs.push_back(input);
+                                if let Some(reply) = delivery_ack.take() { let _ = reply.send(Ok(())); }
+                                continue;
+                            }
                             match input {
                                 AgentInput::SendMessage(msg) => {
                                     let admitted_tool_response = msg.tool_response.clone();
@@ -5280,7 +5545,7 @@ pub(crate) fn spawn_agent_actor(
                                             })
                                             .await;
                                     }
-                                    if (in_turn || context_compaction.is_some())
+                                    if (usage_paused || in_turn || context_compaction.is_some())
                                         && !is_tool_response
                                     {
                                         let queued_message_id =
@@ -5697,6 +5962,7 @@ pub(crate) fn spawn_agent_actor(
                                     )
                                     .await;
 
+                                    if usage_paused { continue; }
                                     if in_turn {
                                         if !backend
                                             .as_ref()
@@ -5885,7 +6151,9 @@ pub(crate) fn spawn_agent_actor(
                                         protocol::GoalControl::Resume => caps.resume,
                                         protocol::GoalControl::Clear => caps.clear,
                                     });
-                                    let error = if !supported {
+                                    let error = if usage_paused && matches!(control, protocol::GoalControl::Set { .. } | protocol::GoalControl::Resume) {
+                                        Some("Usage limit pause blocks starting or resuming a native goal until the quota resets".to_owned())
+                                    } else if !supported {
                                         Some("This session does not support that native goal control".to_owned())
                                     } else {
                                         match backend.as_ref().expect("running actor has backend").send_with_outcome(AgentInput::GoalControl(control)).await {
@@ -6228,7 +6496,7 @@ pub(crate) fn spawn_agent_actor(
                                 )));
                                 continue;
                             }
-                            let queue_watermark = next_queue_sequence.saturating_sub(1);
+                            let queue_watermark = if usage_paused { 0 } else { next_queue_sequence.saturating_sub(1) };
                             context_compaction = Some(CompactionFlight {
                                 operation_id: operation_id.clone(),
                                 route,
@@ -6617,6 +6885,7 @@ pub(crate) fn spawn_agent_actor(
                                 &session_store,
                                 &status_handle,
                                 &review_registry,
+                                usage_paused,
                             )
                             .await;
                             if dispatch == QueuedMessageDispatchOutcome::Closed {
@@ -6810,6 +7079,7 @@ pub(crate) fn spawn_agent_actor(
                                     &session_store,
                                     &status_handle,
                                     &review_registry,
+                                    usage_paused,
                                 )
                                 .await;
                                 if dispatch == QueuedMessageDispatchOutcome::Closed {
@@ -7169,6 +7439,13 @@ pub(crate) fn spawn_agent_actor(
                             let _ = reply.send(outcome);
                         }
                         AgentCommand::Interrupt { reply } => {
+                            if let Some(pause) = usage_pause.as_mut() {
+                                pause.resume_turn = false;
+                                if !in_turn || context_compaction.is_some() || active_compaction.is_some() {
+                                    let _ = reply.send(InterruptOutcome::Interrupted);
+                                    continue;
+                                }
+                            }
                             tracing::debug!(
                                 agent_id = %current_start.agent_id,
                                 ?backend_kind,
@@ -8262,6 +8539,56 @@ fn stall_timeout_label(seconds: u32) -> String {
         return "1 second".to_owned();
     }
     format!("{seconds} seconds")
+}
+
+fn usage_limit_notice(content: String) -> ChatEvent {
+    ChatEvent::MessageAdded(ChatMessage {
+        message_id: None,
+        timestamp: now_ms(),
+        sender: MessageSender::System,
+        content,
+        reasoning: None,
+        tool_calls: Vec::new(),
+        model_info: None,
+        token_usage: None,
+        context_breakdown: None,
+        images: None,
+    })
+}
+
+fn usage_limit_report(
+    signal: &crate::host::UsageLimitSignal,
+    backend_kind: BackendKind,
+) -> Option<&protocol::CapacityReport> {
+    signal.snapshots.iter().find_map(|snapshot| {
+        if snapshot.backend_kind != backend_kind
+            || now_ms().saturating_sub(snapshot.retrieved_at_ms) > 120_000
+        {
+            return None;
+        }
+        match &snapshot.state {
+            protocol::BackendCapacityState::Known { report } => Some(report),
+            _ => None,
+        }
+    })
+}
+
+fn usage_limit_used(bucket: &protocol::CapacityBucket) -> Option<u8> {
+    match bucket.measure {
+        protocol::CapacityMeasure::UsedPercent { used_percent, .. }
+        | protocol::CapacityMeasure::CreditUsage { used_percent, .. } => Some(used_percent),
+        _ => None,
+    }
+}
+
+#[derive(Default)]
+struct UsageLimitPause {
+    held_buckets: Vec<protocol::CapacityBucket>,
+    resume_turn: bool,
+    compaction_attempted: bool,
+    compaction_reply: Option<oneshot::Receiver<Result<CompactionOperationId, String>>>,
+    compaction_operation: Option<CompactionOperationId>,
+    compaction_failed: bool,
 }
 
 fn supervisor_stall_interrupt_notice_event(stall_timeout_seconds: u32) -> ChatEvent {
@@ -11162,8 +11489,9 @@ async fn release_context_compaction_barrier(
     session_store: &Arc<Mutex<SessionStore>>,
     status_handle: &registry::AgentStatusHandle,
     review_registry: &ReviewRegistryHandle,
+    usage_paused: bool,
 ) -> QueuedMessageDispatchOutcome {
-    if *in_turn {
+    if *in_turn || usage_paused {
         return QueuedMessageDispatchOutcome::Empty;
     }
     dispatch_queued_message(QueuedMessageDispatchContext {

@@ -1418,6 +1418,8 @@ pub fn ChatInput() -> impl IntoView {
             });
         }
     };
+    let usage_interrupt = do_interrupt.clone();
+    let cancel_usage_continuation = Callback::new(move |()| usage_interrupt());
     let interrupt_for_menu = do_interrupt;
 
     // "Fork + send": fork the active agent's session and send the draft to the
@@ -1501,6 +1503,16 @@ pub fn ChatInput() -> impl IntoView {
     let can_btw =
         Memo::new(move |_| has_input.get() && active_agent_has_session_id_tracked(&btw_state));
     // Steer = thinking + draft text or photos.
+    let usage_state = state.clone();
+    let usage_pause = Memo::new(move |_| {
+        usage_state.active_agent.get().and_then(|active| {
+            usage_state.agent_activity_stats.with(|stats| {
+                stats
+                    .get(&active.as_agent_ref())
+                    .and_then(|stats| stats.usage_limit_pause.clone())
+            })
+        })
+    });
     let is_steer = Memo::new(move |_| is_running.get() && has_input.get());
     let menu_open = RwSignal::new(false);
     let on_split_keydown = move |ev: web_sys::KeyboardEvent| {
@@ -1753,6 +1765,20 @@ pub fn ChatInput() -> impl IntoView {
             >
                 {move || composer.announcement.get()}
             </div>
+            <Show when=move || usage_pause.get().is_some() && !is_terminated.get()>
+                <div class="chat-input-queued-title" role="status">
+                    <span>{move || if usage_pause.get().is_some_and(|pause| pause.compaction_failed) {
+                        "Usage pause: compaction failed. Disable usage management on the host to release held work."
+                    } else {
+                        "Usage pause: queued work will resume after the quota resets."
+                    }}</span>
+                    <Show when=move || usage_pause.get().is_some_and(|pause| pause.resume_interrupted_turn)>
+                        <button type="button" on:click={move |_| cancel_usage_continuation.run(())}>
+                            "Cancel continuation"
+                        </button>
+                    </Show>
+                </div>
+            </Show>
             <Show when=move || state.active_agent.get().is_none()>
                 <NewChatOptions />
             </Show>

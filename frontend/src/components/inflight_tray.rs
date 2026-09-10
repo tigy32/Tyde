@@ -3345,6 +3345,7 @@ mod wasm_tests {
         token_usage: protocol::TokenUsage,
     ) -> protocol::AgentActivityStats {
         protocol::AgentActivityStats {
+            usage_limit_pause: None,
             last_output_line: last_output_line.map(|s| s.to_owned()),
             tool_calls,
             token_usage,

@@ -3734,6 +3734,7 @@ pub enum CompactionTrigger {
     UserTyped,
     TeamRequested,
     SupervisorRequested,
+    UsageLimitRequested,
     BackendAutomatic,
     BackendObservedManual,
 }
@@ -4484,8 +4485,16 @@ pub struct AgentTurnStateNotifyPayload {
     pub turn_active: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsageLimitPauseState {
+    pub resume_interrupted_turn: bool,
+    pub compaction_failed: bool,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentActivityStats {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_limit_pause: Option<UsageLimitPauseState>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_output_line: Option<String>,
     #[serde(default)]
