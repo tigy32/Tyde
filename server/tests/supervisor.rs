@@ -889,14 +889,24 @@ async fn supervisor_and_auto_compact_gates_fail_independently() {
 
 #[tokio::test]
 async fn supervisor_auto_compaction_skips_context_below_threshold() {
-    let mut fixture = auto_compaction_fixture(300_000).await;
+    let mut fixture = auto_compaction_fixture(200_000).await;
 
-    spawn_supervised_agent(&mut fixture, "supervised-below-agent", true).await;
+    let agent = spawn_supervised_agent_with_turn(
+        &mut fixture,
+        "supervised-below-agent",
+        MOCK_SUPERVISOR_DONE,
+        |response| {
+            MockTurn::text_with_context_250k(response).with_context_usage(190_000, 1_000_000)
+        },
+    )
+    .await;
+    // The mock compacts in place, so NewAgent alone cannot detect a mistaken
+    // compaction when the old breakdown exceeds the current measurement.
     assert_no_envelope(
         &mut fixture.client,
         QUIET_WAIT,
         "auto-compaction below the configured context minimum",
-        |env| env.kind == FrameKind::NewAgent,
+        |env| is_compaction_lifecycle_on(env, &agent),
     )
     .await;
 }
@@ -919,11 +929,16 @@ async fn supervisor_auto_compaction_skips_context_equal_to_threshold() {
 async fn supervisor_auto_compaction_runs_above_threshold_once() {
     let mut fixture = auto_compaction_fixture(200_000).await;
 
-    let original = spawn_supervised_agent(&mut fixture, "supervised-done-agent", true).await;
+    let original = spawn_supervised_agent_with_turn(
+        &mut fixture,
+        "supervised-done-agent",
+        MOCK_SUPERVISOR_DONE,
+        |response| MockTurn::text(response).with_context_usage(242_953, 1_000_000),
+    )
+    .await;
 
-    // The failing run reached the eligible 250,000 > 200,000 threshold but
-    // timed out only on the stale replacement NewAgent. The mock advertises
-    // native JSON RPC, so the same-session typed terminal is completion.
+    // Claude reports occupancy separately from the optional message breakdown.
+    // The supervisor must still compact when that measurement exceeds the limit.
     wait_for_native_supervisor_compaction(
         &mut fixture.client,
         &original,

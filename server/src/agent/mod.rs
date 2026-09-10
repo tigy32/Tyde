@@ -3709,8 +3709,22 @@ pub(crate) fn spawn_agent_actor(
                             Some(session_id) => session_store.lock().await.get(session_id),
                             None => None,
                         };
+                        let current_context_input_tokens = match activity_stats
+                            .stats
+                            .current_context_usage
+                            .as_ref()
+                        {
+                            Some(usage) => usage.known().map(|(tokens, _)| tokens),
+                            None => context.current_context_input_tokens,
+                        };
+                        tracing::debug!(
+                            agent_id = %current_start.agent_id,
+                            ?current_context_input_tokens,
+                            minimum_tokens = supervisor_settings.settings.auto_compact_min_context_tokens,
+                            "evaluating supervisor auto-compaction context threshold"
+                        );
                         let over_threshold =
-                            context.current_context_input_tokens.is_some_and(|current| {
+                            current_context_input_tokens.is_some_and(|current| {
                                 current
                                     > supervisor_settings.settings.auto_compact_min_context_tokens
                             });
