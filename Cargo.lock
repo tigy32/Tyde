@@ -8932,6 +8932,7 @@ dependencies = [
 name = "tyde-process-env"
 version = "0.0.0"
 dependencies = [
+ "rustix",
  "tokio",
  "tracing",
 ]

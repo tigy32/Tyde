@@ -2,6 +2,8 @@ use std::collections::HashSet;
 use std::ffi::{OsStr, OsString};
 #[cfg(unix)]
 use std::io::Read;
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::process::{Command, Stdio};
@@ -9,7 +11,7 @@ use std::sync::OnceLock;
 #[cfg(unix)]
 use std::time::{Duration, Instant};
 
-static RESOLVED_CHILD_PROCESS_PATH: OnceLock<Option<OsString>> = OnceLock::new();
+static RESOLVED_CHILD_PROCESS_PATH: OnceLock<Result<OsString, String>> = OnceLock::new();
 #[cfg(unix)]
 const LOGIN_SHELL_TIMEOUT: Duration = Duration::from_secs(60);
 #[cfg(unix)]
@@ -22,26 +24,11 @@ pub fn init_process_env() -> Result<(), String> {
 }
 
 pub fn initialize_process_env() -> Result<&'static OsStr, String> {
-    if let Some(cached) = RESOLVED_CHILD_PROCESS_PATH.get() {
-        return match cached {
-            Some(path) => Ok(path.as_os_str()),
-            None => Err("login-shell PATH initialization previously failed".to_string()),
-        };
-    }
-
-    match compute_resolved_child_process_path() {
-        Ok(path) => {
-            let _ = RESOLVED_CHILD_PROCESS_PATH.set(Some(path));
-            Ok(RESOLVED_CHILD_PROCESS_PATH
-                .get()
-                .and_then(Option::as_deref)
-                .expect("initialized above"))
-        }
-        Err(err) => {
-            let _ = RESOLVED_CHILD_PROCESS_PATH.set(None);
-            Err(err)
-        }
-    }
+    RESOLVED_CHILD_PROCESS_PATH
+        .get_or_init(compute_resolved_child_process_path)
+        .as_ref()
+        .map(OsString::as_os_str)
+        .map_err(Clone::clone)
 }
 
 pub fn command(program: impl AsRef<OsStr>) -> Result<tokio::process::Command, String> {
@@ -126,14 +113,22 @@ fn extend_login_shell_path(segments: &mut Vec<PathBuf>) -> Result<(), String> {
         begin = PROBE_SENTINEL_BEGIN,
         end = PROBE_SENTINEL_END,
     );
-    let mut child = match Command::new(&shell)
+    let mut command = Command::new(&shell);
+    command
         .arg("-ilc")
         .arg(&script)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-    {
+        .stderr(Stdio::null());
+    // Interactive Bash can stop on SIGTTIN in a terminal's background group.
+    // SAFETY: the child hook only calls the async-signal-safe setsid syscall.
+    unsafe {
+        command.pre_exec(|| {
+            rustix::process::setsid()?;
+            Ok(())
+        });
+    }
+    let mut child = match command.spawn() {
         Ok(child) => child,
         Err(err) => {
             let message = format!("failed to query login-shell PATH via {shell}: {err}");
