@@ -42,7 +42,7 @@ use crate::store::session::{
     CommitCompactedBinding, CompactionOperationRecord, FinishCompactionOperation, SessionStore,
     StoredCompactionState,
 };
-use crate::store::transcript::TranscriptStore;
+use crate::store::transcript::{SessionJournal, TranscriptStore};
 use crate::stream::Stream;
 use crate::sub_agent::HostSubAgentSpawnTx;
 
@@ -551,6 +551,7 @@ struct PreparedContextFallback {
 
 #[derive(Default)]
 struct AgentReplayState {
+    journal: Option<Arc<SessionJournal>>,
     active_stream: Option<ReplayActiveStream>,
     typing: bool,
     operation_cancelled: bool,
@@ -3064,7 +3065,7 @@ pub(crate) fn spawn_agent_actor(
             VecDeque::new();
         let mut compaction_blocked = false;
         current_session_id = Some(actor_session_id.clone());
-        register_transcript_session(&canonical_stream, &actor_session_id, &transcript_store);
+        replay_state.journal = Some(transcript_store.open_session(&actor_session_id));
         current_start.session_id = Some(actor_session_id.clone());
         let _ = start_tx.send(current_start.clone());
         let mut resume_replay_gate_pending = false;
@@ -3933,7 +3934,10 @@ pub(crate) fn spawn_agent_actor(
                         }
                         if resume_replay_gate_pending {
                             event_log.retain(|event| event.kind != FrameKind::ChatEvent);
-                            replay_state = AgentReplayState::default();
+                            replay_state = AgentReplayState {
+                                journal: replay_state.journal.take(),
+                                ..Default::default()
+                            };
                             latest_output = AgentControlLatestOutput::default();
                             let payload = AgentErrorPayload {
                                 agent_id: current_start.agent_id.clone(),
@@ -4270,7 +4274,7 @@ pub(crate) fn spawn_agent_actor(
                             .await
                             {
                                 persist_compaction_marker(
-                                    &canonical_stream,
+                                    replay_state.journal.as_ref(),
                                     current_session_id
                                         .as_ref()
                                         .expect("live agent must have session_id"),
@@ -7861,10 +7865,12 @@ pub(crate) fn spawn_relay_agent_actor(
 
     tokio::spawn(async move {
         let canonical_stream = format!("/agent/{}", agent_id);
-        register_transcript_session(&canonical_stream, &session_id, &transcript_store);
         let mut event_log: Vec<Envelope> = Vec::new();
         let mut latest_output = AgentControlLatestOutput::default();
-        let mut replay_state = AgentReplayState::default();
+        let mut replay_state = AgentReplayState {
+            journal: Some(transcript_store.open_session(&session_id)),
+            ..Default::default()
+        };
         let mut subscribers: Vec<Stream> = Vec::new();
         let mut active_stream_text = String::new();
         let mut activity_stats = AgentActivityStatsTracker::for_backend(start.backend_kind);
@@ -9941,7 +9947,7 @@ async fn append_chat_event_with_transcript_metadata(
             event,
         );
         journal_new_replay_records(
-            canonical_stream,
+            replay_state.journal.as_ref(),
             std::slice::from_ref(&revision),
             0,
             HashMap::new(),
@@ -9951,7 +9957,7 @@ async fn append_chat_event_with_transcript_metadata(
         let provider_identities =
             transcript_provider_identities(event_log, replay_len_before, transcript_metadata);
         journal_new_replay_records(
-            canonical_stream,
+            replay_state.journal.as_ref(),
             event_log,
             replay_len_before,
             provider_identities,
@@ -9988,36 +9994,6 @@ fn transcript_provider_identities(
             }
         })
         .collect()
-}
-
-#[derive(Clone)]
-struct RegisteredTranscriptSession {
-    session_id: SessionId,
-    store: TranscriptStore,
-}
-
-type TranscriptSessionRegistry = std::sync::Mutex<HashMap<String, RegisteredTranscriptSession>>;
-
-fn transcript_session_registry() -> &'static TranscriptSessionRegistry {
-    static REGISTRY: std::sync::OnceLock<TranscriptSessionRegistry> = std::sync::OnceLock::new();
-    REGISTRY.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
-}
-
-fn register_transcript_session(
-    canonical_stream: &str,
-    session_id: &SessionId,
-    store: &TranscriptStore,
-) {
-    transcript_session_registry()
-        .lock()
-        .expect("transcript session registry poisoned")
-        .insert(
-            canonical_stream.to_owned(),
-            RegisteredTranscriptSession {
-                session_id: session_id.clone(),
-                store: store.clone(),
-            },
-        );
 }
 
 async fn seed_fork_transcript_history(
@@ -10062,9 +10038,10 @@ async fn seed_fork_transcript_history(
     }
     let store_for_write = store.clone();
     let fork_for_write = fork_session_id.clone();
+    let journal = store.open_session(fork_session_id);
     tokio::task::spawn_blocking(move || {
         for record in &fork_records {
-            store_for_write.append_import_if_missing(record)?;
+            journal.append_import_if_missing(record)?;
         }
         store_for_write.mark_authoritative(&fork_for_write)
     })
@@ -10133,24 +10110,15 @@ async fn load_authoritative_completed_tool_call_ids(
 }
 
 async fn journal_new_replay_records(
-    canonical_stream: &str,
+    journal: Option<&Arc<SessionJournal>>,
     event_log: &[Envelope],
     start: usize,
     provider_identities: HashMap<u64, crate::store::transcript::ProviderEventIdentity>,
 ) {
-    let Some(registered) = transcript_session_registry()
-        .lock()
-        .expect("transcript session registry poisoned")
-        .get(canonical_stream)
-        .cloned()
-    else {
+    let Some(journal) = journal.cloned() else {
         return;
     };
-    let session_id = registered.session_id;
-    let store = registered.store;
-    if !store.actor_io_enabled() {
-        return;
-    }
+    let session_id = journal.session_id().clone();
     let records = event_log[start..]
         .iter()
         .filter(|envelope| envelope.kind == FrameKind::ChatEvent)
@@ -10180,7 +10148,8 @@ async fn journal_new_replay_records(
     if records.is_empty() {
         return;
     }
-    let persistence = tokio::task::spawn_blocking(move || store.append_live_records(records)).await;
+    let persistence =
+        tokio::task::spawn_blocking(move || journal.append_live_records(records)).await;
     match persistence {
         Ok(Ok(())) => {}
         Ok(Err(error)) => {
@@ -11444,7 +11413,8 @@ async fn record_context_compaction_terminal(
     )
     .await
     {
-        persist_compaction_marker(canonical_stream, session_id, sequence, &marker).await;
+        persist_compaction_marker(replay_state.journal.as_ref(), session_id, sequence, &marker)
+            .await;
     }
     upsert_context_compaction_snapshot(
         canonical_stream,
@@ -12012,22 +11982,14 @@ async fn append_compaction_marker_once(
 }
 
 async fn persist_compaction_marker(
-    canonical_stream: &str,
+    journal: Option<&Arc<SessionJournal>>,
     session_id: &SessionId,
     sequence: u64,
     marker: &ContextCompactionTimelineEvent,
 ) {
-    let Some(store) = transcript_session_registry()
-        .lock()
-        .expect("transcript session registry poisoned")
-        .get(canonical_stream)
-        .map(|registered| registered.store.clone())
-    else {
+    let Some(journal) = journal.cloned() else {
         return;
     };
-    if !store.actor_io_enabled() {
-        return;
-    }
     let record = crate::store::transcript::TranscriptRecord {
         logical_session_id: session_id.clone(),
         sequence,
@@ -12049,7 +12011,7 @@ async fn persist_compaction_marker(
     let session_id = session_id.clone();
     let marker_id = marker.marker_id.0.clone();
     let persisted =
-        tokio::task::spawn_blocking(move || store.append_import_if_missing(&record).map(|_| ()))
+        tokio::task::spawn_blocking(move || journal.append_import_if_missing(&record).map(|_| ()))
             .await;
     match persisted {
         Ok(Ok(())) => {}

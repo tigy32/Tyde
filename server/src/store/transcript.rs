@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Instant, SystemTime};
 
 use protocol::{ChatEvent, SessionId};
@@ -39,10 +39,29 @@ pub(crate) struct TranscriptRecord {
 #[derive(Debug, Clone)]
 pub(crate) struct TranscriptStore {
     root: PathBuf,
-    indexes: Arc<Mutex<TranscriptIndexes>>,
+    sessions: Arc<Mutex<HashMap<SessionId, Weak<SessionJournal>>>>,
 }
 
-type TranscriptIndexes = HashMap<SessionId, Arc<Mutex<Option<TranscriptIndex>>>>;
+#[derive(Debug)]
+pub(crate) struct SessionJournal {
+    store: TranscriptStore,
+    session_id: SessionId,
+    index: Mutex<Option<TranscriptIndex>>,
+}
+
+impl Drop for SessionJournal {
+    fn drop(&mut self) {
+        // A replacement may have opened after this owner's strong count reached zero.
+
+        if let Ok(mut sessions) = self.store.sessions.lock()
+            && sessions
+                .get(&self.session_id)
+                .is_some_and(|entry| std::ptr::eq(entry.as_ptr(), self))
+        {
+            sessions.remove(&self.session_id);
+        }
+    }
+}
 
 #[derive(Debug, Default)]
 struct TranscriptIndex {
@@ -93,7 +112,7 @@ impl TranscriptStore {
     pub(crate) fn new(root: PathBuf) -> Self {
         Self {
             root,
-            indexes: Arc::new(Mutex::new(HashMap::new())),
+            sessions: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -147,92 +166,21 @@ impl TranscriptStore {
         JournalStamp::from_metadata(&metadata)
     }
 
-    pub(crate) fn append_import_if_missing(
-        &self,
-        record: &TranscriptRecord,
-    ) -> Result<bool, String> {
-        self.append_records(&record.logical_session_id, vec![record.clone()], false)
-            .map(|appended| appended != 0)
-    }
-
-    pub(crate) fn append_live_records(&self, records: Vec<TranscriptRecord>) -> Result<(), String> {
-        let Some(session_id) = records
-            .first()
-            .map(|record| record.logical_session_id.clone())
-        else {
-            return Ok(());
-        };
-        self.append_records(&session_id, records, true).map(|_| ())
-    }
-
-    fn append_records(
-        &self,
-        session_id: &SessionId,
-        records: Vec<TranscriptRecord>,
-        assign_sequence: bool,
-    ) -> Result<usize, String> {
-        let started = Instant::now();
-        let session_index = self
-            .indexes
+    pub(crate) fn open_session(&self, session_id: &SessionId) -> Arc<SessionJournal> {
+        let mut sessions = self
+            .sessions
             .lock()
-            .map_err(|error| format!("transcript index registry poisoned: {error}"))?
-            .entry(session_id.clone())
-            .or_default()
-            .clone();
-        // Clones share this per-session lock so sequence allocation, dedupe,
-        // durable append, and index publication are one ordered operation.
-        let mut cached = session_index
-            .lock()
-            .map_err(|error| format!("transcript index poisoned: {error}"))?;
-        let result = (|| {
-            let path = self.journal_path(session_id);
-            let stamp = match std::fs::metadata(&path) {
-                Ok(metadata) => Some(JournalStamp::from_metadata(&metadata)?),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-                Err(error) => return Err(format!("failed to inspect {}: {error}", path.display())),
-            };
-            if cached.as_ref().is_none_or(|index| index.stamp != stamp) {
-                let mut index = TranscriptIndex {
-                    stamp,
-                    ..Default::default()
-                };
-                let existing = self.load(session_id)?;
-                tracing::debug!(%session_id, records = existing.len(), "loading transcript append index");
-                for record in existing {
-                    index.include(&record);
-                }
-                *cached = Some(index);
-            }
-            let index = cached
-                .as_mut()
-                .ok_or("transcript index was not initialized")?;
-            let mut appended = 0;
-            for mut record in records {
-                if record.logical_session_id != *session_id {
-                    return Err("transcript append batch contains multiple sessions".to_owned());
-                }
-                if index.event_ids.contains(&record.event_id)
-                    || record
-                        .provider_identity
-                        .as_ref()
-                        .is_some_and(|identity| index.provider_identities.contains(identity))
-                {
-                    continue;
-                }
-                if assign_sequence {
-                    record.sequence = index.next_sequence;
-                }
-                index.stamp = Some(self.append(&record)?);
-                index.include(&record);
-                appended += 1;
-            }
-            Ok(appended)
-        })();
-        if result.is_err() {
-            *cached = None;
+            .expect("transcript session registry poisoned");
+        if let Some(session) = sessions.get(session_id).and_then(Weak::upgrade) {
+            return session;
         }
-        tracing::debug!(%session_id, elapsed_ms = started.elapsed().as_millis(), success = result.is_ok(), "completed transcript append batch");
-        result
+        let session = Arc::new(SessionJournal {
+            store: self.clone(),
+            session_id: session_id.clone(),
+            index: Mutex::new(None),
+        });
+        sessions.insert(session_id.clone(), Arc::downgrade(&session));
+        session
     }
 
     pub(crate) fn load(&self, session_id: &SessionId) -> Result<Vec<TranscriptRecord>, String> {
@@ -306,4 +254,84 @@ fn safe_id(id: &str) -> String {
             }
         })
         .collect()
+}
+
+impl SessionJournal {
+    pub(crate) fn session_id(&self) -> &SessionId {
+        &self.session_id
+    }
+
+    pub(crate) fn append_import_if_missing(
+        &self,
+        record: &TranscriptRecord,
+    ) -> Result<bool, String> {
+        self.append_records(vec![record.clone()], false)
+            .map(|appended| appended != 0)
+    }
+
+    pub(crate) fn append_live_records(&self, records: Vec<TranscriptRecord>) -> Result<(), String> {
+        self.append_records(records, true).map(|_| ())
+    }
+
+    fn append_records(
+        &self,
+        records: Vec<TranscriptRecord>,
+        assign_sequence: bool,
+    ) -> Result<usize, String> {
+        let started = Instant::now();
+        let session_id = &self.session_id;
+        let mut cached = self
+            .index
+            .lock()
+            .map_err(|error| format!("transcript index poisoned: {error}"))?;
+        let result = (|| {
+            let path = self.store.journal_path(session_id);
+            let stamp = match std::fs::metadata(&path) {
+                Ok(metadata) => Some(JournalStamp::from_metadata(&metadata)?),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => return Err(format!("failed to inspect {}: {error}", path.display())),
+            };
+            if cached.as_ref().is_none_or(|index| index.stamp != stamp) {
+                let mut index = TranscriptIndex {
+                    stamp,
+                    ..Default::default()
+                };
+                let existing = self.store.load(session_id)?;
+                tracing::debug!(%session_id, records = existing.len(), "loading transcript append index");
+                for record in existing {
+                    index.include(&record);
+                }
+                *cached = Some(index);
+            }
+            let index = cached
+                .as_mut()
+                .ok_or("transcript index was not initialized")?;
+            let mut appended = 0;
+            for mut record in records {
+                if record.logical_session_id != *session_id {
+                    return Err("transcript append batch contains multiple sessions".to_owned());
+                }
+                if index.event_ids.contains(&record.event_id)
+                    || record
+                        .provider_identity
+                        .as_ref()
+                        .is_some_and(|identity| index.provider_identities.contains(identity))
+                {
+                    continue;
+                }
+                if assign_sequence {
+                    record.sequence = index.next_sequence;
+                }
+                index.stamp = Some(self.store.append(&record)?);
+                index.include(&record);
+                appended += 1;
+            }
+            Ok(appended)
+        })();
+        if result.is_err() {
+            *cached = None;
+        }
+        tracing::debug!(%session_id, elapsed_ms = started.elapsed().as_millis(), success = result.is_ok(), "completed transcript append batch");
+        result
+    }
 }
