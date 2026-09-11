@@ -3877,11 +3877,44 @@ impl KiroInner {
         else {
             return;
         };
-        self.state
-            .lock()
-            .await
+        let mut state = self.state.lock().await;
+        state
             .opencode_request_usages
-            .push((usage, message_id));
+            .push((usage.clone(), message_id));
+        let mut turn = TokenUsage::default();
+        for (request, _) in &state.opencode_request_usages {
+            add_token_usage(&mut turn, request);
+        }
+        add_token_usage(&mut state.opencode_cumulative_usage, &usage);
+        let model = state.model.as_deref().unwrap_or("opencode");
+        let current_context_usage = opencode_context_usage(model, &usage)
+            .or_else(|| state.opencode_current_context_usage.clone());
+        let request_id = ModelRequestId {
+            turn_id: ModelTurnId(format!(
+                "{}:{}",
+                state.session_id, state.opencode_turn_sequence
+            )),
+            sequence: u32::try_from(state.opencode_request_usages.len()).unwrap_or(u32::MAX),
+        };
+        tracing::debug!(
+            model,
+            ?request_id,
+            request = ?usage,
+            ?current_context_usage,
+            "OpenCode request context usage diagnostic"
+        );
+        self.emitter
+            .model_request_token_usage(&ModelRequestTokenUsage {
+                request_id,
+                request: usage,
+                turn,
+                cumulative: state.opencode_cumulative_usage.clone(),
+                model_context_window: current_context_usage
+                    .as_ref()
+                    .and_then(|usage| usage.known().map(|(_, window)| window)),
+                current_context_usage,
+                estimated_context_breakdown: None,
+            });
     }
 
     async fn transition_opencode_provider_message(&self, provider_message_id: Option<String>) {
@@ -3931,56 +3964,17 @@ impl KiroInner {
     }
 
     async fn finalize_opencode_turn(&self) {
-        let (turn_id, requests, turn, cumulative, model, reported_context_usage) = {
+        let (requests, turn, cumulative, model) = {
             let mut state = self.state.lock().await;
             let requests = std::mem::take(&mut state.opencode_request_usages);
             let mut turn = TokenUsage::default();
             for (usage, _) in &requests {
                 add_token_usage(&mut turn, usage);
             }
-            let turn_id = ModelTurnId(format!(
-                "{}:{}",
-                state.session_id, state.opencode_turn_sequence
-            ));
-            add_token_usage(&mut state.opencode_cumulative_usage, &turn);
             let cumulative = state.opencode_cumulative_usage.clone();
             let model = state.model.clone().unwrap_or_else(|| "opencode".to_owned());
-            let current_context_usage = state.opencode_current_context_usage.clone();
-            (
-                turn_id,
-                requests,
-                turn,
-                cumulative,
-                model,
-                current_context_usage,
-            )
+            (requests, turn, cumulative, model)
         };
-
-        for (sequence, (request, _)) in requests.iter().enumerate() {
-            let current_context_usage =
-                opencode_context_usage(&model, request).or_else(|| reported_context_usage.clone());
-            tracing::debug!(
-                model,
-                ?request,
-                ?current_context_usage,
-                "OpenCode request context usage diagnostic"
-            );
-            self.emitter
-                .model_request_token_usage(&ModelRequestTokenUsage {
-                    request_id: ModelRequestId {
-                        turn_id: turn_id.clone(),
-                        sequence: u32::try_from(sequence + 1).unwrap_or(u32::MAX),
-                    },
-                    request: request.clone(),
-                    turn: turn.clone(),
-                    cumulative: cumulative.clone(),
-                    model_context_window: current_context_usage
-                        .as_ref()
-                        .and_then(|usage| usage.known().map(|(_, window)| window)),
-                    current_context_usage,
-                    estimated_context_breakdown: None,
-                });
-        }
 
         if let Some((request, Some(message_id))) = requests.last() {
             self.emitter

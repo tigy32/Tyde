@@ -96,3 +96,27 @@ locations, rejected inputs, and the return move. Antigravity additionally
 passed the two-root scenario. Kiro passed the single-root scenario again to
 cover the shared ACP transport changes. All seven now declare relocation
 capability; multiple-root capability belongs to Codex and Antigravity.
+
+## Live context usage during tool loops
+
+`real_usage_accounting` checks that context occupancy reaches the event stream
+between sequential file reads, through either request telemetry or message
+metadata. Counting distinct occupancy values only after the turn finishes does
+not establish that the live context bar can update.
+
+The OpenCode baseline on 2026-09-11 failed this assertion: the chain's four
+request observations all arrived at chat-event position 27, with none between
+tool requests at positions 7 and 13. OpenCode now publishes request usage and
+advances cumulative usage when each request is recorded. Turn completion
+updates the final message metadata without publishing or counting requests a
+second time. The request diagnostic includes its identity and occupancy.
+
+The fixed OpenCode run (`opencode/mimo-v2.5-free`) passed: context observations
+arrived at chat-event positions 10, 16, 22, and 29, interleaved with tool
+requests at positions 7, 13, and 19. The existing token-accounting assertions
+also passed.
+
+The extended scenario passed on Claude (Haiku), Codex (`gpt-5.6-luna`),
+Antigravity, Grok (`grok-4.6`), and Hermes (`openai/gpt-4.1-mini` through
+OpenRouter). Claude's first attempt failed at the opening handshake because
+its OAuth session had expired; the approved retry passed after reauthentication.

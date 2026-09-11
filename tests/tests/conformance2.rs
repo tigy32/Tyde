@@ -3438,6 +3438,43 @@ fn assert_context_usage_updates_within_turn(
         return;
     }
 
+    let tool_positions: Vec<_> = turn
+        .events()
+        .iter()
+        .enumerate()
+        .filter_map(|(position, event)| {
+            matches!(event, ChatEvent::ToolRequest(_)).then_some(position)
+        })
+        .collect();
+    assert!(
+        tool_positions.len() >= USAGE_CHAIN_FILES.len(),
+        "{}: the usage chain did not exercise sequential tool requests",
+        turn.label()
+    );
+    for pair in tool_positions.windows(2) {
+        let live_request_usage = turn
+            .context_usage_event_positions
+            .iter()
+            .any(|position| *position > pair[0] && *position <= pair[1]);
+        let live_message_usage = turn.events()[pair[0] + 1..=pair[1]]
+            .iter()
+            .filter_map(|event| match event {
+                ChatEvent::StreamEnd(end) => end.message.context_breakdown.as_ref(),
+                ChatEvent::MessageMetadataUpdated(update) => update.context_breakdown.as_ref(),
+                _ => None,
+            })
+            .any(|usage| usage.input_tokens > 0 && usage.context_window >= usage.input_tokens);
+        assert!(
+            live_request_usage || live_message_usage,
+            "{}: no live context occupancy arrived between tool requests at events {} and {}; \
+             context observations arrived at {:?}. End-of-turn usage cannot update a live bar.",
+            turn.label(),
+            pair[0],
+            pair[1],
+            turn.context_usage_event_positions
+        );
+    }
+
     let mut occupancies = BTreeSet::new();
     for observation in turn.model_requests() {
         if let Some(CurrentContextUsage::Known {

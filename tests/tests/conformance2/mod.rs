@@ -21,6 +21,7 @@ pub struct Turn {
     pub prompt: String,
     pub events: Vec<ChatEvent>,
     pub model_requests: Vec<ModelRequestTokenUsage>,
+    pub context_usage_event_positions: Vec<usize>,
 }
 
 impl Turn {
@@ -556,6 +557,7 @@ pub async fn collect_turn<B: Backend>(host: &mut Harness<B>, _agent: &Agent, pro
         prompt: prompt.to_owned(),
         events: Vec::new(),
         model_requests: Vec::new(),
+        context_usage_event_positions: Vec::new(),
     };
     let deadline = tokio::time::Instant::now() + Duration::from_secs(240);
     let stream = host
@@ -583,7 +585,17 @@ pub async fn collect_turn<B: Backend>(host: &mut Harness<B>, _agent: &Agent, pro
                     return turn;
                 }
             }
-            BackendEvent::ModelRequestTokenUsage(usage) => turn.model_requests.push(usage),
+            BackendEvent::ModelRequestTokenUsage(usage) => {
+                if usage
+                    .current_context_usage
+                    .as_ref()
+                    .and_then(|value| value.known())
+                    .is_some()
+                {
+                    turn.context_usage_event_positions.push(turn.events.len());
+                }
+                turn.model_requests.push(usage);
+            }
             BackendEvent::Compaction(_) => {}
         }
     }
@@ -778,6 +790,7 @@ impl<B: Backend> Harness<B> {
             prompt: prompt.to_owned(),
             events: Vec::new(),
             model_requests: Vec::new(),
+            context_usage_event_positions: Vec::new(),
         }
     }
 
@@ -2011,7 +2024,17 @@ pub async fn ask_through_final_response<B: Backend>(
                     };
                 }
             }
-            BackendEvent::ModelRequestTokenUsage(usage) => turn.model_requests.push(usage),
+            BackendEvent::ModelRequestTokenUsage(usage) => {
+                if usage
+                    .current_context_usage
+                    .as_ref()
+                    .and_then(|value| value.known())
+                    .is_some()
+                {
+                    turn.context_usage_event_positions.push(turn.events.len());
+                }
+                turn.model_requests.push(usage);
+            }
             BackendEvent::Compaction(_) => {}
         }
     }
