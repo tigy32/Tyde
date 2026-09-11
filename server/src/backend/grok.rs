@@ -25,6 +25,8 @@ pub(crate) fn capabilities() -> BackendCapabilities {
     [
         BackendCapability::ListSessions,
         BackendCapability::ResumeSession,
+        #[cfg(unix)]
+        BackendCapability::SetWorkspaceRoots,
         BackendCapability::ImageInput,
         BackendCapability::Interrupt,
         BackendCapability::SessionSettings,
@@ -52,6 +54,145 @@ pub(crate) fn capabilities() -> BackendCapabilities {
         BackendCapability::CompactionReported,
     ]
     .into()
+}
+
+fn link_workspace_session(
+    session_id: &str,
+    previous: &str,
+    destination: &str,
+) -> Result<std::path::PathBuf, String> {
+    uuid::Uuid::parse_str(session_id)
+        .map_err(|error| format!("Invalid Grok session identity: {error}"))?;
+    let sessions = crate::paths::home_dir()?.join(".grok").join("sessions");
+    let encode = |root: &str| -> String {
+        root.bytes()
+            .map(|byte| {
+                if byte.is_ascii_alphanumeric() || b"-_.~".contains(&byte) {
+                    char::from(byte).to_string()
+                } else {
+                    format!("%{byte:02X}")
+                }
+            })
+            .collect()
+    };
+    let source = sessions
+        .join(encode(previous))
+        .join(session_id)
+        .canonicalize()
+        .map_err(|error| format!("Cannot locate Grok conversation for relocation: {error}"))?;
+    if !source.join("summary.json").is_file() {
+        return Err("Grok conversation is missing its native summary".to_owned());
+    }
+    let alias = sessions.join(encode(destination)).join(session_id);
+    if let Ok(existing) = alias.canonicalize() {
+        return if existing == source {
+            Ok(source)
+        } else {
+            Err(
+                "Destination already contains a different Grok conversation with the same identity"
+                    .to_owned(),
+            )
+        };
+    }
+    std::fs::create_dir_all(alias.parent().ok_or("Invalid Grok session alias path")?)
+        .map_err(|error| format!("Cannot prepare Grok destination scope: {error}"))?;
+    // Keep one native transcript. Copying would let later resumes diverge.
+    #[cfg(unix)]
+    let linked = std::os::unix::fs::symlink(&source, &alias);
+    #[cfg(not(unix))]
+    let linked: std::io::Result<()> = Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "Grok workspace relocation requires directory symlink support",
+    ));
+    linked.map_err(|error| {
+        format!("Cannot alias Grok conversation into destination scope: {error}")
+    })?;
+    tracing::info!(%session_id, source = %source.display(), alias = %alias.display(), "Linked Grok conversation into destination workspace scope");
+    Ok(source)
+}
+
+pub(crate) async fn relocate_workspace_session(
+    session_id: &str,
+    previous: &str,
+    destination: &str,
+) -> Result<(), String> {
+    fn write_json(path: &std::path::Path, value: &serde_json::Value) -> Result<(), String> {
+        let mut temporary =
+            tempfile::NamedTempFile::new_in(path.parent().ok_or("Invalid native metadata path")?)
+                .map_err(|error| format!("Cannot prepare native metadata update: {error}"))?;
+        serde_json::to_writer(temporary.as_file_mut(), value)
+            .map_err(|error| format!("Cannot encode native metadata: {error}"))?;
+        temporary
+            .persist(path)
+            .map_err(|error| format!("Cannot replace native metadata: {error}"))?;
+        Ok(())
+    }
+    let source = link_workspace_session(session_id, previous, destination)?;
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(source.join("summary.json.lock"))
+        .map_err(|error| format!("Cannot open Grok summary lock: {error}"))?;
+    lock.try_lock()
+        .map_err(|error| format!("Grok conversation is still being written: {error}"))?;
+    let mut updates = Vec::new();
+    for (filename, field) in [
+        ("summary.json", "/info/cwd"),
+        ("prompt_context.json", "/working_directory"),
+    ] {
+        let path = source.join(filename);
+        let before: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(&path)
+                .map_err(|error| format!("Cannot read Grok {filename}: {error}"))?,
+        )
+        .map_err(|error| format!("Invalid Grok {filename}: {error}"))?;
+        if before.pointer(field).and_then(serde_json::Value::as_str) != Some(previous) {
+            return Err(format!(
+                "Grok {filename} has a different workspace; refusing stale relocation"
+            ));
+        }
+        let mut after = before.clone();
+        *after
+            .pointer_mut(field)
+            .ok_or("Missing Grok workspace field")? = serde_json::json!(destination);
+        if filename == "summary.json" {
+            for (key, argument) in [
+                ("git_root_dir", "--show-toplevel"),
+                ("head_commit", "HEAD"),
+                ("head_branch", "--abbrev-ref"),
+            ] {
+                let mut command = crate::process_env::command("git")?;
+                command
+                    .current_dir(destination)
+                    .args(["rev-parse", argument]);
+                if argument == "--abbrev-ref" {
+                    command.arg("HEAD");
+                }
+                let output = command
+                    .output()
+                    .await
+                    .map_err(|error| format!("Cannot inspect destination git metadata: {error}"))?;
+                after[key] = if output.status.success() {
+                    serde_json::json!(String::from_utf8_lossy(&output.stdout).trim())
+                } else {
+                    serde_json::Value::Null
+                };
+            }
+        }
+        updates.push((path, before, after));
+    }
+    for (index, (path, _, after)) in updates.iter().enumerate() {
+        if let Err(error) = write_json(path, after) {
+            for (path, before, _) in &updates[..index] {
+                write_json(path, before)?;
+            }
+            return Err(error);
+        }
+    }
+    tracing::info!(%session_id, %destination, "Relocated Grok native summary and prompt workspace without rewriting conversation history");
+    Ok(())
 }
 
 pub(crate) async fn list_sessions(
@@ -271,6 +412,10 @@ impl crate::backend::Backend for GrokBackend {
         payload: protocol::SetSessionSettingsPayload,
     ) -> Result<(), String> {
         self.0.update_session_settings(payload).await
+    }
+
+    async fn set_workspace_roots(&mut self, workspace_roots: Vec<String>) -> Result<(), String> {
+        self.0.set_workspace_roots(workspace_roots).await
     }
 
     async fn read_session_settings(&self) -> Result<protocol::SessionSettingsValues, String> {

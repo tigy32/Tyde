@@ -909,7 +909,7 @@ impl KiroInner {
             .try_lock_owned()
             .map_err(|_| "ACP session must be idle before changing workspace roots".to_owned())?;
         self.bridge.sync_inbound().await?;
-        let (session_id, startup_mcp_servers, settings) = {
+        let (session_id, previous_root, startup_mcp_servers, settings) = {
             let state = self.state.lock().await;
             if self.shutting_down.load(Ordering::Acquire)
                 || self.in_flight_prompts.load(Ordering::SeqCst) > 0
@@ -924,6 +924,7 @@ impl KiroInner {
             }
             (
                 state.session_id.clone(),
+                state.workspace_root.clone(),
                 state.startup_mcp_servers.clone(),
                 json!({"model": state.model, "mode": state.mode}),
             )
@@ -933,6 +934,59 @@ impl KiroInner {
             .store(true, Ordering::Release);
         let reload_guard = AcpWorkspaceReload(&self.workspace_reload_in_progress);
         tracing::info!(%session_id, %cwd, backend = ?self.adapter.backend_kind(), "Reloading ACP session in new workspace roots");
+        let kind = self.adapter.backend_kind();
+        if matches!(
+            kind,
+            protocol::BackendKind::Grok | protocol::BackendKind::Opencode
+        ) {
+            let mut spec = self.adapter.spawn_spec(
+                &super::adapter::AcpSessionRoots {
+                    session_cwd: cwd.clone(),
+                    scope_root: cwd.clone(),
+                },
+                None,
+            )?;
+            if kind == protocol::BackendKind::Grok {
+                let index = spec
+                    .local_args
+                    .iter()
+                    .position(|argument| argument == "stdio")
+                    .ok_or("Grok relocation requires its native agent stdio invocation")?;
+                spec.local_args.insert(index, "--no-leader".to_owned());
+            }
+            let program = spec.local_program.clone();
+            tracing::info!(%session_id, %cwd, ?kind, "Retiring native runtime before relocating persisted workspace metadata");
+            self.bridge
+                .restart_local(spec, async {
+                    match kind {
+                        protocol::BackendKind::Grok => {
+                            crate::backend::grok::relocate_workspace_session(
+                                &session_id,
+                                &previous_root,
+                                cwd,
+                            )
+                            .await
+                        }
+                        protocol::BackendKind::Opencode => {
+                            crate::backend::opencode::relocate_workspace_session(
+                                &program,
+                                &session_id,
+                                &previous_root,
+                                cwd,
+                            )
+                            .await
+                        }
+                        _ => unreachable!(),
+                    }
+                })
+                .await?;
+            let initialized = self
+                .bridge
+                .request("initialize", acp_initialize_params(self.adapter.as_ref()))
+                .await?;
+            let capabilities = parse_capabilities(&initialized);
+            authenticate_if_required(&self.bridge, &capabilities, self.adapter.as_ref()).await?;
+        }
         let response = self
             .bridge
             .request(

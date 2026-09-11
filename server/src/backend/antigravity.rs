@@ -84,8 +84,14 @@ const ANTIGRAVITY_BRIDGE_SERVER_NAME: &str = crate::mcp_bridge::MANAGED_SERVER_N
 
 static ANTIGRAVITY_MCP_CONFIG_MUTEX: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
+struct WorkspaceRootsRequest {
+    roots: Vec<String>,
+    reply: oneshot::Sender<Result<(), String>>,
+}
+
 #[derive(Clone)]
 pub struct AntigravityBackend {
+    workspace_tx: mpsc::UnboundedSender<WorkspaceRootsRequest>,
     settings_tx:
         mpsc::UnboundedSender<(SessionSettingsValues, oneshot::Sender<Result<(), String>>)>,
     input_tx: mpsc::UnboundedSender<AgentInput>,
@@ -115,6 +121,7 @@ struct AntigravityState {
 
 /// Everything a spawned `agy` process needs, kept so the supervisor can restart
 /// it after an interrupt without re-deriving any of it.
+#[derive(Clone)]
 struct AgyLaunch {
     primary_root: String,
     extra_roots: Vec<String>,
@@ -939,6 +946,7 @@ struct Supervisor {
     inner: Arc<AntigravityInner>,
     launch: AgyLaunch,
     brain_dir: PathBuf,
+    conversation_db: PathBuf,
     /// Deleted when the supervisor exits, taking this session's credentials
     /// with it.
     descriptor_dir: Option<tempfile::TempDir>,
@@ -970,6 +978,7 @@ impl Supervisor {
     async fn run(
         mut self,
         mut process: AgyProcess,
+        mut workspace_rx: mpsc::UnboundedReceiver<WorkspaceRootsRequest>,
         mut settings_rx: mpsc::UnboundedReceiver<(
             SessionSettingsValues,
             oneshot::Sender<Result<(), String>>,
@@ -1043,6 +1052,16 @@ impl Supervisor {
                     if let Err(error) = result {
                         emitter.backend_error(&format!("Antigravity native child relay failed: {error}"));
                     }
+                }
+
+                update = workspace_rx.recv() => {
+                    let Some(WorkspaceRootsRequest { roots, reply }) = update else { break };
+                    let result = if input_rx.is_empty() {
+                        self.set_workspace_roots(&mut process, roots).await
+                    } else {
+                        Err("Antigravity has queued input and cannot change workspace roots".to_owned())
+                    };
+                    let _ = reply.send(result);
                 }
 
                 update = settings_rx.recv() => {
@@ -1407,6 +1426,72 @@ impl Supervisor {
         });
     }
 
+    async fn set_workspace_roots(
+        &mut self,
+        process: &mut AgyProcess,
+        roots: Vec<String>,
+    ) -> Result<(), String> {
+        let state = self.inner.state.lock().await;
+        if state.closing
+            || state.turn_active
+            || self.mapper.is_some()
+            || !self.pending_questions.is_empty()
+            || !self.native_pending.is_empty()
+            || !self.native_children.is_empty()
+        {
+            return Err("Antigravity session must be idle with no running background work before changing workspace roots".to_owned());
+        }
+        drop(state);
+        let mut launch = self.launch.clone();
+        launch.primary_root = roots[0].clone();
+        launch.extra_roots = roots[1..].to_vec();
+        if let Some(projection) = self.skill_projection.as_ref() {
+            launch.extra_roots.push(
+                projection
+                    .path()
+                    .to_str()
+                    .ok_or("Antigravity skill projection path is not UTF-8")?
+                    .to_owned(),
+            );
+        }
+        tracing::info!(session_id = %self.session_id, ?roots, "Changing Antigravity workspace roots");
+        // The resumed native trajectory, not CLI --add-dir, owns tool workspaces.
+        process.terminate().await;
+        let replacement_roots = std::iter::once(launch.primary_root.clone())
+            .chain(launch.extra_roots.iter().cloned())
+            .collect::<Vec<_>>();
+        let metadata = relocate_antigravity_metadata(
+            &self.conversation_db,
+            &self.launch.primary_root,
+            &replacement_roots,
+        );
+        let result = match &metadata {
+            Ok(_) => {
+                AgyProcess::start(
+                    &launch,
+                    Some(&self.session_id),
+                    Arc::clone(&self.inner.emitter),
+                )
+                .await
+            }
+            Err(error) => Err(error.clone()),
+        };
+        match result {
+            Ok(replacement) => *process = replacement,
+            Err(error) => {
+                if let Ok((before, after)) = metadata {
+                    replace_antigravity_metadata(&self.conversation_db, &after, &before)?;
+                }
+                *process = AgyProcess::start(&self.launch, Some(&self.session_id), Arc::clone(&self.inner.emitter)).await
+                    .map_err(|recovery| format!("Workspace relocation failed: {error}; original runtime recovery failed: {recovery}"))?;
+                return Err(error);
+            }
+        }
+        self.launch = launch;
+        tracing::info!(session_id = %self.session_id, ?roots, "Antigravity resumed in the new workspace roots");
+        Ok(())
+    }
+
     /// A model change is a process restart: `--model` is a launch flag and
     /// `agy` takes no equivalent over stdin. The conversation survives it.
     async fn apply_settings(
@@ -1661,12 +1746,115 @@ fn antigravity_capacity_bucket(group: &str, bucket: &AgyUsageBucket) -> Capacity
 struct AntigravityTrajectoryMetadata {
     #[prost(message, repeated, tag = "1")]
     workspaces: Vec<AntigravityWorkspace>,
+    #[prost(string, repeated, tag = "7")]
+    workspace_uris: Vec<String>,
 }
 
 #[derive(Clone, PartialEq, prost::Message)]
 struct AntigravityWorkspace {
     #[prost(string, tag = "1")]
     uri: String,
+}
+
+fn replace_antigravity_metadata(
+    path: &Path,
+    expected: &[u8],
+    replacement: &[u8],
+) -> Result<(), String> {
+    let mut connection =
+        rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)
+            .map_err(|error| format!("Cannot open native conversation metadata: {error}"))?;
+    let transaction = connection
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|error| format!("Cannot lock native conversation metadata: {error}"))?;
+    let changed = transaction
+        .execute(
+            "UPDATE trajectory_metadata_blob SET data = ?1 WHERE id = 'main' AND data = ?2",
+            rusqlite::params![replacement, expected],
+        )
+        .map_err(|error| {
+            format!("Cannot update native conversation workspace metadata: {error}")
+        })?;
+    if changed != 1 {
+        return Err(
+            "Native conversation metadata changed concurrently; relocation cannot proceed"
+                .to_owned(),
+        );
+    }
+    transaction
+        .commit()
+        .map_err(|error| format!("Cannot commit native conversation workspace metadata: {error}"))
+}
+
+fn relocate_antigravity_metadata(
+    path: &Path,
+    previous_root: &str,
+    roots: &[String],
+) -> Result<(Vec<u8>, Vec<u8>), String> {
+    use prost::Message;
+    let connection =
+        rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(|error| format!("Cannot read native conversation metadata: {error}"))?;
+    let before: Vec<u8> = connection
+        .query_row(
+            "SELECT data FROM trajectory_metadata_blob WHERE id = 'main'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("Cannot read native workspace metadata: {error}"))?;
+    drop(connection);
+    let stored = AntigravityTrajectoryMetadata::decode(before.as_slice())
+        .map_err(|error| format!("Invalid native conversation workspace metadata: {error}"))?;
+    let previous_uri = url::Url::from_file_path(previous_root)
+        .map_err(|()| "Invalid previous workspace path".to_owned())?
+        .to_string();
+    let stored_primary = stored
+        .workspace_uris
+        .first()
+        .or_else(|| stored.workspaces.first().map(|workspace| &workspace.uri));
+    if stored_primary != Some(&previous_uri) {
+        return Err(
+            "Native conversation workspace differs from this runtime; refusing a stale relocation"
+                .to_owned(),
+        );
+    }
+    let uris = roots
+        .iter()
+        .map(|root| {
+            url::Url::from_file_path(root)
+                .map(|uri| uri.to_string())
+                .map_err(|()| format!("Cannot encode workspace URI: {root}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let metadata = AntigravityTrajectoryMetadata {
+        workspaces: uris
+            .iter()
+            .map(|uri| AntigravityWorkspace { uri: uri.clone() })
+            .collect(),
+        workspace_uris: uris,
+    };
+    let mut after = metadata.encode_to_vec();
+    let mut remaining = before.as_slice();
+    // Retain every unknown field byte-for-byte; decoding/re-encoding a partial
+    // schema would destroy provider-owned history and configuration metadata.
+    while !remaining.is_empty() {
+        let field = remaining;
+        let (tag, wire) = prost::encoding::decode_key(&mut remaining)
+            .map_err(|error| format!("Invalid native workspace metadata: {error}"))?;
+        prost::encoding::skip_field(
+            wire,
+            tag,
+            &mut remaining,
+            prost::encoding::DecodeContext::default(),
+        )
+        .map_err(|error| format!("Invalid native workspace metadata field: {error}"))?;
+        if tag != 1 && tag != 7 {
+            after.extend_from_slice(&field[..field.len() - remaining.len()]);
+        }
+    }
+    replace_antigravity_metadata(path, &before, &after)?;
+    tracing::info!(path = %path.display(), ?roots, "Updated native Antigravity trajectory workspace fields without changing history");
+    Ok((before, after))
 }
 
 fn antigravity_session_workspace_roots(path: &Path) -> Result<Vec<String>, String> {
@@ -2137,6 +2325,8 @@ impl Backend for AntigravityBackend {
         use tyde_agent_adapter::BackendCapability as Cap;
         [
             Cap::ResumeSession,
+            Cap::SetWorkspaceRoots,
+            Cap::SetMultipleWorkspaceRoots,
             Cap::Interrupt,
             Cap::SessionSettings,
             Cap::StartupMcpServers,
@@ -2266,6 +2456,18 @@ impl Backend for AntigravityBackend {
             .map_err(|_| "Antigravity settings update channel closed".to_owned())?
     }
 
+    async fn set_workspace_roots(&mut self, workspace_roots: Vec<String>) -> Result<(), String> {
+        let roots = super::validate_local_workspace_roots(workspace_roots)?;
+        let (reply, result) = oneshot::channel();
+        self.workspace_tx
+            .send(WorkspaceRootsRequest { roots, reply })
+            .map_err(|_| "Antigravity session has closed".to_owned())?;
+        result.await.map_err(|_| {
+            "Antigravity closed while changing workspace roots; provider outcome is unknown"
+                .to_owned()
+        })?
+    }
+
     async fn read_session_settings(&self) -> Result<SessionSettingsValues, String> {
         let state = self.inner.state.lock().await;
         crate::backend::session_settings_from_json(json!({"model": state.model}))
@@ -2309,6 +2511,7 @@ impl Backend for AntigravityBackend {
             state.closing = true;
             state.shutdown_complete.take()
         };
+        drop(self.workspace_tx);
         drop(self.settings_tx);
         drop(self.input_tx);
         drop(self.interrupt_tx);
@@ -2426,6 +2629,7 @@ impl AntigravityBackend {
             }
         });
 
+        let (workspace_tx, workspace_rx) = mpsc::unbounded_channel();
         let (settings_tx, settings_rx) = mpsc::unbounded_channel();
         let (input_tx, input_rx) = mpsc::unbounded_channel::<AgentInput>();
         let (interrupt_tx, interrupt_rx) = mpsc::unbounded_channel::<()>();
@@ -2436,6 +2640,7 @@ impl AntigravityBackend {
             inner: Arc::clone(&inner),
             launch,
             brain_dir: antigravity_brain_dir(conversations_dir),
+            conversation_db: antigravity_conversation_db_path(&session_id, conversations_dir),
             descriptor_dir: Some(descriptor_dir),
             skill_projection: skill_setup.projection,
             mapper: None,
@@ -2451,7 +2656,14 @@ impl AntigravityBackend {
         };
         tokio::spawn(async move {
             supervisor
-                .run(process, settings_rx, input_rx, interrupt_rx, initial_turn)
+                .run(
+                    process,
+                    workspace_rx,
+                    settings_rx,
+                    input_rx,
+                    interrupt_rx,
+                    initial_turn,
+                )
                 .await;
         });
 
@@ -2477,6 +2689,7 @@ impl AntigravityBackend {
 
         Ok((
             Self {
+                workspace_tx,
                 settings_tx,
                 input_tx,
                 interrupt_tx,

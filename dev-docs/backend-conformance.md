@@ -63,13 +63,15 @@ Real runs, including a baseline run without the fix, still require approval.
 Real runs on 2026-09-11 used the same filesystem and retained-history
 assertions for every eligible backend:
 
-| Scenario | Claude | Codex | Hermes | Kiro |
-| --- | --- | --- | --- | --- |
-| `real_workspace_relocation` | Pass | Pass | Pass | Pass |
-| `real_multiple_workspace_relocation` | — | Pass | — | — |
+| Scenario | Claude | Codex | Hermes | Kiro | Grok | OpenCode | Antigravity |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `real_workspace_relocation` | Pass | Pass | Pass | Pass | Pass | Pass | Pass |
+| `real_multiple_workspace_relocation` | — | Pass | — | — | — | — | Pass |
 
 Models were Claude Haiku, Codex `gpt-5.6-luna`, Hermes
-`openai/gpt-4.1-mini` through OpenRouter, and Kiro's `auto` selection.
+`openai/gpt-4.1-mini` through OpenRouter, Kiro's `auto` selection, Grok
+`grok-4.6`, OpenCode `opencode/mimo-v2.5-free`, and Antigravity
+`Gemini 3.7 Flash (Medium)`.
 Claude used isolated configuration trusting only disposable fixture roots.
 Hermes's default DeepSeek model repeatedly continued reasoning after correct
 file operations and timed out; the passing run used the existing
@@ -80,10 +82,17 @@ cwd/root overrides. The first Hermes run failed because its native session
 remained busy during cleanup after Tyde's idle event. These real failures
 establish red coverage for the corresponding fixes.
 
-Attempts on other providers exposed unsupported paths: Grok searched for
-its transcript under the destination's directory-scoped storage; OpenCode
-acknowledged ACP reload while native `pwd` remained in the original root;
-and Antigravity's restarted conversation used terminals with inconsistent
-cwd values, including the old root. Earlier Antigravity passes did not hold
-under subsequent runs. These providers do not declare relocation capability.
-Their exclusions are not passing coverage.
+The remaining providers first failed this same scenario: Grok could not find
+its directory-scoped transcript; aliasing it alone then left `pwd` in the
+original directory. OpenCode retained the original cwd after both ACP reload
+and process restart. Antigravity retained old workspace URIs in its native
+trajectory despite different launch roots; `--new-project` was ignored when
+resuming. These failures establish red coverage for the native metadata
+relocation paths documented in `06-projects.md`.
+
+After the fixes, Grok, OpenCode, and Antigravity passed the unchanged shared
+single-root scenario, including retained conversation context, exact file
+locations, rejected inputs, and the return move. Antigravity additionally
+passed the two-root scenario. Kiro passed the single-root scenario again to
+cover the shared ACP transport changes. All seven now declare relocation
+capability; multiple-root capability belongs to Codex and Antigravity.

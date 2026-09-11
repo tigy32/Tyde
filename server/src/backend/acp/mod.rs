@@ -23,7 +23,7 @@ use command_group::{AsyncCommandGroup, AsyncGroupChild};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::ChildStdin;
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::sync::{Mutex, RwLock, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::backend::{StartupMcpServer, StartupMcpTransport};
@@ -109,7 +109,7 @@ impl AcpSpawnSpec {
 }
 
 pub struct AcpBridge {
-    rpc: AcpRpc,
+    rpc: RwLock<AcpRpc>,
     inbound_tx: mpsc::UnboundedSender<AcpInbound>,
     terminals: Mutex<HashMap<String, Arc<Mutex<AcpTerminal>>>>,
     next_terminal_id: AtomicU64,
@@ -120,10 +120,10 @@ impl AcpBridge {
         spec: AcpSpawnSpec,
         ssh_host: Option<&str>,
     ) -> Result<(Self, mpsc::UnboundedReceiver<AcpInbound>), String> {
-        let (rpc, inbound_tx, inbound_rx) = AcpRpc::spawn(spec, ssh_host).await?;
+        let (rpc, inbound_tx, inbound_rx) = AcpRpc::spawn(spec, ssh_host, None).await?;
         Ok((
             Self {
-                rpc,
+                rpc: RwLock::new(rpc),
                 inbound_tx,
                 terminals: Mutex::new(HashMap::new()),
                 next_terminal_id: AtomicU64::new(1),
@@ -143,19 +143,19 @@ impl AcpBridge {
         method: &str,
         params: Value,
     ) -> Result<Value, AcpRequestError> {
-        self.rpc.request(method, params).await
+        self.rpc.read().await.request(method, params).await
     }
 
     pub async fn notify(&self, method: &str, params: Value) -> Result<(), String> {
-        self.rpc.notify(method, params).await
+        self.rpc.read().await.notify(method, params).await
     }
 
     pub async fn respond(&self, id: Value, result: Value) -> Result<(), String> {
-        self.rpc.respond(id, result).await
+        self.rpc.read().await.respond(id, result).await
     }
 
     pub async fn respond_error(&self, id: Value, code: i64, message: &str) -> Result<(), String> {
-        self.rpc.respond_error(id, code, message).await
+        self.rpc.read().await.respond_error(id, code, message).await
     }
 
     pub async fn sync_inbound(&self) -> Result<(), String> {
@@ -166,6 +166,25 @@ impl AcpBridge {
         ack_rx
             .await
             .map_err(|_| "ACP inbound barrier dropped".to_string())
+    }
+
+    pub(crate) async fn restart_local(
+        &self,
+        spec: AcpSpawnSpec,
+        prepare: impl std::future::Future<Output = Result<(), String>> + Send,
+    ) -> Result<(), String> {
+        let mut rpc = self.rpc.write().await;
+        if !rpc.pending.lock().await.is_empty() {
+            return Err("ACP process has outstanding requests and cannot restart".to_owned());
+        }
+        // An intentional retirement must not close the stable session event stream.
+        rpc.stdout_task.abort();
+        rpc.stderr_task.abort();
+        rpc.shutdown().await;
+        prepare.await?;
+        let (replacement, _, _) = AcpRpc::spawn(spec, None, Some(self.inbound_tx.clone())).await?;
+        *rpc = replacement;
+        Ok(())
     }
 
     pub async fn trace_terminal_state(&self, reason: &str) {
@@ -210,12 +229,16 @@ impl AcpBridge {
             Ok(Some(result)) => result,
             Ok(None) => return Ok(false),
             Err(err) => {
-                self.rpc.respond_error(id, -32_000, &err).await?;
+                self.rpc
+                    .read()
+                    .await
+                    .respond_error(id, -32_000, &err)
+                    .await?;
                 return Ok(true);
             }
         };
 
-        self.rpc.respond(id, result).await?;
+        self.rpc.read().await.respond(id, result).await?;
         Ok(true)
     }
 
@@ -229,7 +252,7 @@ impl AcpBridge {
         for terminal in terminals {
             let _ = terminate_terminal(terminal).await;
         }
-        self.rpc.shutdown().await;
+        self.rpc.read().await.shutdown().await;
     }
 
     async fn handle_builtin_request(
@@ -1152,6 +1175,7 @@ impl AcpRpc {
     async fn spawn(
         spec: AcpSpawnSpec,
         ssh_host: Option<&str>,
+        existing_inbound: Option<mpsc::UnboundedSender<AcpInbound>>,
     ) -> Result<
         (
             Self,
@@ -1210,6 +1234,7 @@ impl AcpRpc {
         let child_ref = Arc::new(Mutex::new(Some(child)));
         let pending: PendingRpcMap = Arc::new(Mutex::new(HashMap::new()));
         let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();
+        let inbound_tx = existing_inbound.unwrap_or(inbound_tx);
 
         let stdout_pending = Arc::clone(&pending);
         let stdout_inbound = inbound_tx.clone();

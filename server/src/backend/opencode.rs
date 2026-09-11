@@ -36,6 +36,7 @@ pub(crate) fn capabilities() -> BackendCapabilities {
     [
         BackendCapability::ListSessions,
         BackendCapability::ResumeSession,
+        BackendCapability::SetWorkspaceRoots,
         BackendCapability::ImageInput,
         BackendCapability::SessionSettings,
         BackendCapability::StartupMcpServers,
@@ -54,6 +55,78 @@ pub(crate) fn capabilities() -> BackendCapabilities {
         BackendCapability::GenericOtherTool,
     ]
     .into()
+}
+
+pub(crate) async fn relocate_workspace_session(
+    program: &str,
+    session_id: &str,
+    previous: &str,
+    destination: &str,
+) -> Result<(), String> {
+    async fn export(
+        program: &str,
+        session_id: &str,
+        cwd: &str,
+    ) -> Result<serde_json::Value, String> {
+        let output = crate::process_env::command(program)?
+            .current_dir(cwd)
+            .args(["export", session_id])
+            .output()
+            .await
+            .map_err(|error| format!("Cannot export OpenCode conversation: {error}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "OpenCode export failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+        serde_json::from_slice(&output.stdout)
+            .map_err(|error| format!("Invalid OpenCode conversation export: {error}"))
+    }
+    let before = export(program, session_id, previous).await?;
+    if before
+        .pointer("/info/id")
+        .and_then(serde_json::Value::as_str)
+        != Some(session_id)
+        || before
+            .pointer("/info/directory")
+            .and_then(serde_json::Value::as_str)
+            != Some(previous)
+    {
+        return Err("OpenCode conversation identity or directory changed concurrently".to_owned());
+    }
+    let mut file = tempfile::NamedTempFile::new()
+        .map_err(|error| format!("Cannot prepare private OpenCode export: {error}"))?;
+    serde_json::to_writer(file.as_file_mut(), &before)
+        .map_err(|error| format!("Cannot save private OpenCode export: {error}"))?;
+    let output = crate::process_env::command(program)?
+        .current_dir(destination)
+        .arg("import")
+        .arg(file.path())
+        .output()
+        .await
+        .map_err(|error| format!("Cannot import OpenCode conversation in destination: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "OpenCode relocation import failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    let after = export(program, session_id, destination).await?;
+    if after
+        .pointer("/info/id")
+        .and_then(serde_json::Value::as_str)
+        != Some(session_id)
+        || after
+            .pointer("/info/directory")
+            .and_then(serde_json::Value::as_str)
+            != Some(destination)
+        || after.get("messages") != before.get("messages")
+    {
+        return Err("OpenCode import did not preserve conversation identity/history and acknowledge the destination".to_owned());
+    }
+    tracing::info!(%session_id, %destination, "Native OpenCode import relocated session metadata and preserved every message");
+    Ok(())
 }
 
 pub(crate) async fn list_sessions(
@@ -289,6 +362,10 @@ impl crate::backend::Backend for OpencodeBackend {
         payload: protocol::SetSessionSettingsPayload,
     ) -> Result<(), String> {
         self.0.update_session_settings(payload).await
+    }
+
+    async fn set_workspace_roots(&mut self, workspace_roots: Vec<String>) -> Result<(), String> {
+        self.0.set_workspace_roots(workspace_roots).await
     }
 
     async fn read_session_settings(&self) -> Result<protocol::SessionSettingsValues, String> {
