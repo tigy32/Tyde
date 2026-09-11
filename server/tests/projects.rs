@@ -1137,6 +1137,76 @@ async fn create_project_pushes_file_list_and_git_status() {
     assert!(matches!(review_summaries[0].status, ReviewStatus::Draft));
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn slow_git_refresh_keeps_host_connections_responsive() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut fixture = Fixture::new_with_runtime_config(server::HostRuntimeConfig {
+        force_project_watch_limit: true,
+        ..Default::default()
+    })
+    .await;
+    let repo = init_git_repo("slow-git", &[("src/lib.rs", "pub fn a() {}\n")]);
+    let project = create_project(
+        &mut fixture.client,
+        "Slow Git",
+        vec![repo.path().to_string_lossy().into_owned()],
+    )
+    .await;
+    expect_project_bootstrap(&mut fixture.client, "slow git bootstrap").await;
+    expect_command_error(&mut fixture.client, "watch limit warning").await;
+
+    let hook = repo.path().join(".git/slow-fsmonitor");
+    fs::write(&hook, "#!/bin/sh\n: > .git/monitor-started\nwhile [ ! -f .git/monitor-release ]; do sleep 0.01; done\nprintf 'token\\000/\\000'\n").unwrap();
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+    git(
+        repo.path(),
+        &["config", "core.fsmonitor", hook.to_str().unwrap()],
+    );
+    write_file(&repo.path().join("src/lib.rs"), "pub fn changed() {}\n");
+
+    let root = repo.path().to_path_buf();
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    // The independent watchdog releases real Git even if it blocks the sole
+    // async worker, so the regression fails instead of hanging the suite.
+    let watchdog = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        while !root.join(".git/monitor-started").exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "Git never entered fsmonitor"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let _ = entered_tx.send(());
+        std::thread::sleep(Duration::from_secs(2));
+        fs::write(root.join(".git/monitor-release"), "").unwrap();
+    });
+    entered_rx.await.expect("fsmonitor started");
+    let (connection, bootstrap) = fixture.connect_with_bootstrap().await;
+    assert!(
+        bootstrap
+            .projects
+            .iter()
+            .any(|candidate| candidate.id == project.id)
+    );
+    assert!(
+        !repo.path().join(".git/monitor-release").exists(),
+        "host connection waited for the slow Git refresh to finish"
+    );
+    fs::write(repo.path().join(".git/monitor-release"), "").unwrap();
+    let status = expect_project_git_status_matching(
+        &mut fixture.client,
+        "status after slow Git",
+        |status| status.roots.iter().any(|root| !root.clean),
+    )
+    .await;
+    assert_eq!(status.roots[0].files[0].relative_path, "src/lib.rs");
+    drop(connection);
+    watchdog.join().unwrap();
+}
+
 #[tokio::test]
 async fn project_create_pushes_file_list_and_git_status_for_all_roots() {
     let mut fixture = Fixture::new().await;

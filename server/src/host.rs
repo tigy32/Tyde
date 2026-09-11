@@ -17345,15 +17345,26 @@ async fn subscribe_host_to_project(
         .with_path(project_stream_path(&project_id));
     let project_files = subscriber.project_files;
     let summaries = state.review_registry.summaries(project_id.clone()).await?;
-    let handle = ensure_project_actor(state, project_id).await?;
-    handle
-        .add_subscriber(
-            host_path.clone(),
-            project_output_stream,
-            summaries,
-            project_files,
-        )
-        .await
+    let handle = ensure_project_actor(state, project_id.clone()).await?;
+    let response = handle.begin_add_subscriber(
+        host_path.clone(),
+        project_output_stream,
+        summaries,
+        project_files,
+    )?;
+    let host_path = host_path.clone();
+    // Registration holds the host lock and precedes the connection writer.
+    // Waiting for a project refresh here also stalls unrelated host commands.
+    tokio::spawn(async move {
+        let result = response
+            .await
+            .unwrap_or_else(|_| Err("project stream subscription stopped".to_owned()));
+        if let Err(error) = result {
+            tracing::warn!(host_stream = %host_path, %project_id, %error,
+                "failed to attach host to project stream");
+        }
+    });
+    Ok(())
 }
 
 async fn emit_review_list_changed_for_project(

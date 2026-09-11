@@ -21,7 +21,7 @@ use protocol::{
     ProjectSearchFileResult, ProjectSearchMatch, ProjectSearchPayload, ReviewSummary, StreamPath,
 };
 use serde_json::Value;
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::sync::{Mutex, Semaphore, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, MissedTickBehavior, interval_at, sleep};
 
@@ -30,6 +30,8 @@ use crate::store::project::ProjectStore;
 use crate::stream::Stream;
 
 const PROJECT_REFRESH_DEBOUNCE: Duration = Duration::from_millis(250);
+const PROJECT_GIT_REFRESH_SPACING: Duration = Duration::from_secs(1);
+static PROJECT_BACKGROUND_READS: Semaphore = Semaphore::const_new(2);
 const GIT_STATUS_POLL_INTERVAL: Duration = Duration::from_secs(5);
 const RECENT_HISTORY_LIMIT: usize = 100;
 const BINARY_PREVIEW_LIMIT_BYTES: u64 = 8 * 1024 * 1024;
@@ -274,6 +276,18 @@ impl ProjectStreamHandle {
         review_summaries: Vec<ReviewSummary>,
         file_delivery: ProjectFileDelivery,
     ) -> Result<(), String> {
+        self.begin_add_subscriber(host_path, stream, review_summaries, file_delivery)?
+            .await
+            .map_err(|_| "project stream subscription stopped".to_owned())?
+    }
+
+    pub(crate) fn begin_add_subscriber(
+        &self,
+        host_path: StreamPath,
+        stream: Stream,
+        review_summaries: Vec<ReviewSummary>,
+        file_delivery: ProjectFileDelivery,
+    ) -> Result<oneshot::Receiver<Result<(), String>>, String> {
         let (reply, response) = oneshot::channel();
         self.tx
             .send(ProjectStreamCommand::AddSubscriber {
@@ -284,9 +298,7 @@ impl ProjectStreamHandle {
                 reply,
             })
             .map_err(|_| "project stream subscription stopped".to_owned())?;
-        response
-            .await
-            .map_err(|_| "project stream subscription stopped".to_owned())?
+        Ok(response)
     }
 
     pub(crate) async fn remove_subscriber(&self, host_path: StreamPath) {
@@ -419,7 +431,7 @@ pub(crate) async fn spawn_project_subscription(
     let project = load_subscription_project(&project_store, &project_id).await?;
     let (watch_tx, watch_rx) = mpsc::unbounded_channel();
     let watched_roots = project.root_paths();
-    let snapshot = initialize_snapshot(&project)?;
+    let snapshot = background_project_read(&project, "initialize", initialize_snapshot).await?;
     let (watcher_ready_tx, watcher_ready_rx) = mpsc::unbounded_channel();
     {
         let project = project.clone();
@@ -511,6 +523,31 @@ fn create_project_watcher(
     Ok(ProjectWatcher::new(watcher))
 }
 
+async fn background_project_read<T: Send + 'static>(
+    project: &Project,
+    operation: &'static str,
+    read: impl FnOnce(&Project) -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    let queued = std::time::Instant::now();
+    let permit = PROJECT_BACKGROUND_READS
+        .acquire()
+        .await
+        .map_err(|error| format!("project read queue closed: {error}"))?;
+    let project = project.clone();
+    tokio::task::spawn_blocking(move || {
+        let started = std::time::Instant::now();
+        let queue_ms = queued.elapsed().as_millis();
+        let result = read(&project);
+        drop(permit);
+        tracing::debug!(project_id = %project.id, operation, queue_ms,
+            elapsed_ms = started.elapsed().as_millis(), success = result.is_ok(),
+            "completed background project read");
+        result
+    })
+    .await
+    .map_err(|error| format!("project {operation} task failed: {error}"))?
+}
+
 fn initialize_snapshot(project: &Project) -> Result<ProjectSnapshotState, String> {
     let mut snapshot = ProjectSnapshotState {
         file_entries: scan_raw_entries(project)?,
@@ -558,6 +595,7 @@ async fn run_project_subscription(
     let mut watcher_initializing = watcher.is_none();
     let mut watcher_warning = None::<String>;
     let mut debounce_active = false;
+    let mut next_git_refresh = Instant::now();
     let mut debounce_sleep = Box::pin(sleep(Duration::from_secs(60 * 60 * 24 * 365)));
     let mut git_poll = interval_at(
         Instant::now() + GIT_STATUS_POLL_INTERVAL,
@@ -796,7 +834,7 @@ async fn run_project_subscription(
                             // Later activity must not postpone already queued changes.
                             if !debounce_active {
                                 debounce_active = true;
-                                debounce_sleep.as_mut().reset(Instant::now() + PROJECT_REFRESH_DEBOUNCE);
+                                debounce_sleep.as_mut().reset((Instant::now() + PROJECT_REFRESH_DEBOUNCE).max(next_git_refresh));
                             }
                         }
                     }
@@ -847,6 +885,8 @@ async fn run_project_subscription(
                     emit_fatal_project_stream_error(&mut subscribers, "project_watch", error).await;
                     return;
                 }
+                next_git_refresh = Instant::now() + PROJECT_GIT_REFRESH_SPACING;
+                git_poll.reset();
                 let changes = take_pending_file_version_changes(&mut pending_file_version_changes);
                 notify_file_version_listeners(&mut file_version_listeners, &changes);
                 // §M4: also tell the *frontend* which files advanced, so it can
@@ -876,7 +916,7 @@ async fn run_project_subscription(
                     }
                 }
             }
-            _ = git_poll.tick() => {
+            _ = git_poll.tick(), if !debounce_active => {
                 let result = if let Some(watcher) = watcher.as_mut() {
                     refresh_incremental(
                         &project_store,
@@ -906,6 +946,7 @@ async fn run_project_subscription(
                     emit_fatal_project_stream_error(&mut subscribers, "project_git_status", error).await;
                     return;
                 }
+                next_git_refresh = Instant::now() + PROJECT_GIT_REFRESH_SPACING;
             }
         }
     }
@@ -926,9 +967,10 @@ async fn refresh_full(
     let latest_project = load_subscription_project(project_store, project_id).await?;
     ensure_watched_roots(&latest_project, watcher, watched_roots, watch_tx)?;
 
-    let raw_entries = scan_raw_entries(&latest_project)?;
+    let raw_entries = background_project_read(&latest_project, "files", scan_raw_entries).await?;
     let file_list = full_file_list_from_raw(&latest_project, &raw_entries);
-    let git_status = build_git_status(&latest_project)?;
+    let git_status =
+        background_project_read(&latest_project, "git status", build_git_status).await?;
     let git_json = serialize_git_status(&git_status)?;
 
     *project = latest_project;
@@ -961,9 +1003,10 @@ async fn refresh_full_unwatched(
     review_registry: &ReviewRegistryHandle,
 ) -> Result<(), String> {
     let latest_project = load_subscription_project(project_store, project_id).await?;
-    let raw_entries = scan_raw_entries(&latest_project)?;
+    let raw_entries = background_project_read(&latest_project, "files", scan_raw_entries).await?;
     let file_list = full_file_list_from_raw(&latest_project, &raw_entries);
-    let git_status = build_git_status(&latest_project)?;
+    let git_status =
+        background_project_read(&latest_project, "git status", build_git_status).await?;
     let git_json = serialize_git_status(&git_status)?;
 
     *project = latest_project;
@@ -996,7 +1039,8 @@ async fn refresh_git_status_unwatched(
     review_registry: &ReviewRegistryHandle,
 ) -> Result<(), String> {
     let latest_project = load_subscription_project(project_store, project_id).await?;
-    let git_status = build_git_status(&latest_project)?;
+    let git_status =
+        background_project_read(&latest_project, "git status", build_git_status).await?;
     let git_json = serialize_git_status(&git_status)?;
     let git_changed = snapshot.git_status.as_ref() != Some(&git_json);
 
@@ -1046,7 +1090,7 @@ async fn refresh_incremental(
         sync_code_intel_overview_roots(&mut snapshot.code_intel_overview, project.root_paths());
 
     if files_changed {
-        let current_raw = scan_raw_entries(project)?;
+        let current_raw = background_project_read(project, "files", scan_raw_entries).await?;
         if snapshot.file_entries != current_raw {
             snapshot.file_entries = current_raw;
             let file_list = full_file_list_from_raw(project, &snapshot.file_entries);
@@ -1055,7 +1099,7 @@ async fn refresh_incremental(
     }
 
     if git_changed {
-        let git_status = build_git_status(project)?;
+        let git_status = background_project_read(project, "git status", build_git_status).await?;
         let git_json = serialize_git_status(&git_status)?;
         let status_changed = snapshot.git_status.as_ref() != Some(&git_json);
         tracing::debug!(
@@ -1718,7 +1762,11 @@ async fn refresh_remembered_diffs(
             path: key.path.clone(),
             context_mode,
         };
-        match read_diff(project, payload) {
+        match background_project_read(project, "git diff", move |project| {
+            read_diff(project, payload)
+        })
+        .await
+        {
             Ok(diff) => {
                 let _ = send_payload(stream, FrameKind::ProjectGitDiff, &diff).await;
             }
@@ -1910,7 +1958,10 @@ pub(crate) fn build_dir_listing(
 }
 
 pub(crate) fn build_git_status(project: &Project) -> Result<ProjectGitStatusPayload, String> {
-    build_git_status_with_runner(project, run_git_mode)
+    let started = std::time::Instant::now();
+    let result = build_git_status_with_runner(project, run_git_mode);
+    tracing::debug!(project_id = %project.id, elapsed_ms = started.elapsed().as_millis(), success = result.is_ok(), "completed project git status read");
+    result
 }
 
 pub(crate) fn is_not_git_repository_error(error: &str) -> bool {
