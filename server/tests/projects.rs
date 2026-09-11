@@ -1731,6 +1731,37 @@ async fn project_read_diff_returns_unstaged_diff() {
             .iter()
             .any(|line| line.text.contains("println!(\"hello\")"))
     );
+
+    let status_before = git_stdout(repo.path(), &["status", "--porcelain"]);
+    write_file(
+        &repo.path().join("src/main.rs"),
+        "fn main() {\n    println!(\"latest\");\n}\n",
+    );
+    assert_eq!(
+        git_stdout(repo.path(), &["status", "--porcelain"]),
+        status_before
+    );
+    let refreshed = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let diff =
+                expect_project_git_diff(&mut fixture.client, "live diff after second edit").await;
+            if diff
+                .files
+                .iter()
+                .flat_map(|file| &file.hunks)
+                .flat_map(|hunk| &hunk.lines)
+                .any(|line| {
+                    line.kind == ProjectGitDiffLineKind::Added && line.text.contains("latest")
+                })
+            {
+                return diff;
+            }
+        }
+    })
+    .await
+    .expect("live diff must refresh when an already-modified file changes again");
+    assert_eq!(refreshed.path.as_deref(), Some("src/main.rs"));
+    assert_eq!(refreshed.context_mode, DiffContextMode::Hunks);
 }
 
 #[tokio::test]
@@ -2564,34 +2595,104 @@ async fn project_list_dir_returns_deeper_entries() {
 }
 
 #[tokio::test]
-async fn live_watcher_sends_full_snapshot_after_deleted_files() {
+async fn live_watcher_refreshes_files_during_continuous_activity() {
     let mut fixture = Fixture::new().await;
     let repo = init_git_repo(
         "delete-poll",
         &[("keep.rs", "// keep\n"), ("remove_me.rs", "// remove\n")],
     );
 
-    let _project = create_project_with_real_roots(
+    let project = create_project_with_real_roots(
         &mut fixture.client,
         "Delete Poll",
         vec![repo.path().to_string_lossy().to_string()],
     )
     .await;
 
-    // Delete a file — the debounced watcher should send a fresh full snapshot without it.
-    fs::remove_file(repo.path().join("remove_me.rs")).expect("failed to delete remove_me.rs");
+    let changed_path = ProjectPath {
+        root: ProjectRootPath(project_root(&project, 0)),
+        relative_path: "keep.rs".to_owned(),
+    };
+    fixture
+        .client
+        .project_read_file(
+            &project.id,
+            ProjectReadFilePayload {
+                path: changed_path.clone(),
+            },
+        )
+        .await
+        .expect("read initial file");
+    let initial = expect_project_file_contents(&mut fixture.client, "initial contents").await;
 
-    let file_list = expect_project_file_list_matching(
-        &mut fixture.client,
-        "file list after deletion",
-        |file_list| {
-            file_list.roots[0]
-                .entries
-                .iter()
-                .all(|entry| entry.relative_path != "remove_me.rs")
-        },
-    )
-    .await;
+    fs::remove_file(repo.path().join("remove_me.rs")).expect("failed to delete remove_me.rs");
+    fs::write(repo.path().join("keep.rs"), "// updated\n").expect("update keep.rs");
+
+    // Builds and agents need not leave the entire project idle for a refresh.
+    let activity_path = repo.path().join("activity.log");
+    let activity = async {
+        let mut writes = 0;
+        loop {
+            fs::write(&activity_path, format!("activity {writes}\n")).expect("write activity");
+            fs::read(&activity_path).expect("read activity");
+            writes += 1;
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    };
+    let receive_updates = async {
+        let mut listing = None;
+        let mut version = None;
+        while listing.is_none() || version.is_none() {
+            let env = fixture
+                .client
+                .next_event()
+                .await
+                .expect("project event")
+                .expect("connection open");
+            match env.kind {
+                FrameKind::ProjectFileList => {
+                    let files: ProjectFileListPayload = env.parse_payload().expect("file list");
+                    if files.roots[0]
+                        .entries
+                        .iter()
+                        .all(|entry| entry.relative_path != "remove_me.rs")
+                    {
+                        listing = Some(files);
+                    }
+                }
+                FrameKind::ProjectEvent => {
+                    if let protocol::ProjectEventPayload::FilesChanged { files } =
+                        env.parse_payload().expect("file changes")
+                    {
+                        for change in files {
+                            if change.path == changed_path && change.version > initial.version {
+                                version = Some(change.version);
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        (
+            listing.expect("updated listing"),
+            version.expect("updated version"),
+        )
+    };
+    let (file_list, changed_version) = tokio::select! {
+        result = tokio::time::timeout(Duration::from_secs(3), receive_updates) => {
+            result.expect("file listing and contents invalidation must arrive while filesystem activity continues")
+        }
+        () = activity => unreachable!("activity continues until updates arrive"),
+    };
+    fixture
+        .client
+        .project_read_file(&project.id, ProjectReadFilePayload { path: changed_path })
+        .await
+        .expect("read changed file");
+    let updated = expect_project_file_contents(&mut fixture.client, "updated contents").await;
+    assert_eq!(updated.contents.as_deref(), Some("// updated\n"));
+    assert!(updated.version >= changed_version);
     let entries = &file_list.roots[0].entries;
 
     assert!(

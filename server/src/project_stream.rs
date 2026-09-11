@@ -786,8 +786,18 @@ async fn run_project_subscription(
                         let refresh = classify_watch_event(&event);
                         if !refresh.is_empty() || !pending_file_version_changes.is_empty() {
                             pending_update.merge(refresh);
-                            debounce_active = true;
-                            debounce_sleep.as_mut().reset(Instant::now() + PROJECT_REFRESH_DEBOUNCE);
+                            tracing::debug!(
+                                project_id = %project_id,
+                                event_kind = ?event.kind,
+                                pending_files = pending_file_version_changes.len(),
+                                debounce_active,
+                                "scheduling project filesystem refresh"
+                            );
+                            // Later activity must not postpone already queued changes.
+                            if !debounce_active {
+                                debounce_active = true;
+                                debounce_sleep.as_mut().reset(Instant::now() + PROJECT_REFRESH_DEBOUNCE);
+                            }
                         }
                     }
                     Err(error) if matches!(error.kind, notify::ErrorKind::MaxFilesWatch) => {
@@ -1047,10 +1057,21 @@ async fn refresh_incremental(
     if git_changed {
         let git_status = build_git_status(project)?;
         let git_json = serialize_git_status(&git_status)?;
-        if snapshot.git_status.as_ref() != Some(&git_json) {
+        let status_changed = snapshot.git_status.as_ref() != Some(&git_json);
+        tracing::debug!(
+            %project_id,
+            files_changed,
+            status_changed,
+            remembered_diffs = snapshot.diff_context_modes.len(),
+            "refreshing project git state"
+        );
+        if status_changed {
             snapshot.git_status = Some(git_json);
             fan_out_payload(subscribers, FrameKind::ProjectGitStatus, &git_status).await?;
             reset_reviews_for_clean_unstaged_roots(review_registry, project_id, &git_status).await;
+        }
+        // Further edits to a modified file leave its Git status unchanged.
+        if files_changed || status_changed {
             refresh_remembered_diffs(project, snapshot, subscribers).await;
         }
     }
