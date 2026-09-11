@@ -494,6 +494,8 @@ impl ClaudeSession {
         } else {
             (pick_workspace_root(workspace_roots)?, None)
         };
+        let configured_workspace_roots =
+            crate::backend::session_workspace_roots(workspace_roots, &workspace_root)?;
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let ClaudeSkillExposure {
             plugin: skill_plugin,
@@ -509,6 +511,7 @@ impl ClaudeSession {
             active_response: StdMutex::new(None),
             state: Mutex::new(ClaudeState {
                 workspace_root,
+                workspace_roots: configured_workspace_roots,
                 ssh_host: resolved_ssh_host,
                 session_id: None,
                 fork_from_session_id: mode.fork_from_session_id,
@@ -725,6 +728,7 @@ impl ClaudeEffort {
 
 struct ClaudeState {
     workspace_root: String,
+    workspace_roots: Option<Vec<String>>,
     ssh_host: Option<String>,
     session_id: Option<String>,
     fork_from_session_id: Option<String>,
@@ -787,6 +791,7 @@ impl Default for ClaudeState {
     fn default() -> Self {
         Self {
             workspace_root: String::new(),
+            workspace_roots: None,
             ssh_host: None,
             session_id: None,
             fork_from_session_id: None,
@@ -1658,6 +1663,7 @@ enum TurnStartError {
 
 struct ClaudeProcessSpawnConfig {
     workspace_root: String,
+    workspace_roots: Option<Vec<String>>,
     ssh_host: Option<String>,
     session_id: Option<String>,
     fork_from_session_id: Option<String>,
@@ -2724,7 +2730,9 @@ impl ClaudeInner {
             return Err(TurnStartError::Cancelled);
         }
 
-        let input_message = build_stream_json_user_message(prompt, images);
+        let prompt =
+            super::workspace_prompt(prompt, self.state.lock().await.workspace_roots.as_deref());
+        let input_message = build_stream_json_user_message(&prompt, images);
         let stdin = {
             let runtime = self.runtime.lock().await;
             runtime
@@ -3150,6 +3158,7 @@ impl ClaudeInner {
             );
             let config = ClaudeProcessSpawnConfig {
                 workspace_root: state.workspace_root.clone(),
+                workspace_roots: state.workspace_roots.clone(),
                 ssh_host: state.ssh_host.clone(),
                 session_id: if state.ephemeral {
                     None
@@ -5045,7 +5054,8 @@ impl ClaudeInner {
                 .get("images")
                 .cloned()
                 .and_then(|images| serde_json::from_value(images).ok());
-            self.emitter.user_message(content, images);
+            self.emitter
+                .user_message(super::workspace_prompt_user_text(content), images);
             return;
         }
 
@@ -5394,6 +5404,11 @@ fn build_claude_cli_args(config: &ClaudeProcessSpawnConfig) -> Vec<String> {
         effective_permission_mode.to_string(),
     ];
 
+    if let Some(roots) = &config.workspace_roots {
+        for root in &roots[1..] {
+            cli_args.extend(["--add-dir".to_owned(), root.clone()]);
+        }
+    }
     if config.ephemeral {
         cli_args.push("--no-session-persistence".to_string());
     }
@@ -14369,6 +14384,7 @@ impl Backend for ClaudeBackend {
         [
             tyde_agent_adapter::BackendCapability::ResumeSession,
             tyde_agent_adapter::BackendCapability::SetWorkspaceRoots,
+            tyde_agent_adapter::BackendCapability::SetMultipleWorkspaceRoots,
             tyde_agent_adapter::BackendCapability::ForkSession,
             tyde_agent_adapter::BackendCapability::ImageInput,
             tyde_agent_adapter::BackendCapability::Interrupt,
@@ -14823,11 +14839,6 @@ impl Backend for ClaudeBackend {
     }
 
     async fn set_workspace_roots(&mut self, workspace_roots: Vec<String>) -> Result<(), String> {
-        if workspace_roots.len() != 1 {
-            return Err(
-                "Claude workspace relocation requires exactly one workspace root".to_owned(),
-            );
-        }
         let roots = super::validate_local_workspace_roots(workspace_roots)?;
         let handle = self
             .command_handle
@@ -14906,8 +14917,22 @@ impl Backend for ClaudeBackend {
                 ));
             }
         }
-        tracing::info!(session_id = ?state.session_id, %cwd, "Claude confirmed workspace roots");
         drop(state);
+        let request_id = uuid::Uuid::new_v4().to_string();
+        inner
+            .send_control_request_value(
+                request_id.clone(),
+                json!({
+                    "type": "control_request", "request_id": request_id,
+                    "request": {"subtype": "apply_flag_settings", "settings": {
+                        "permissions": {"additionalDirectories": &roots[1..]}
+                    }}
+                }),
+                CLAUDE_CONTROL_RESPONSE_TIMEOUT,
+            )
+            .await?;
+        inner.state.lock().await.workspace_roots = Some(roots.clone());
+        tracing::info!(?session_id, ?roots, "Claude confirmed workspace roots");
         Ok(())
     }
 

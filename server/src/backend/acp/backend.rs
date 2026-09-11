@@ -468,6 +468,8 @@ impl KiroSession {
             ),
         )
         .await?;
+        let configured_workspace_roots =
+            crate::backend::session_workspace_roots(workspace_roots, &roots.scope_root)?;
 
         let mut spawn_spec = adapter.spawn_spec(&roots, mode.ssh_host.as_deref())?;
         if let Some(model) = mode
@@ -574,6 +576,7 @@ impl KiroSession {
             state: Mutex::new(KiroState {
                 session_id,
                 workspace_root: roots.scope_root,
+                workspace_roots: configured_workspace_roots,
                 admin_session: mode.admin_session,
                 steering_content: mode.steering_content.map(|s| s.to_string()),
                 startup_mcp_servers: mode.startup_mcp_servers.to_vec(),
@@ -651,6 +654,7 @@ impl KiroSession {
 struct KiroState {
     session_id: String,
     workspace_root: String,
+    workspace_roots: Option<Vec<String>>,
     admin_session: bool,
     steering_content: Option<String>,
     startup_mcp_servers: Vec<StartupMcpServer>,
@@ -901,9 +905,6 @@ impl KiroInner {
                     .to_owned(),
             );
         }
-        if workspace_roots.len() != 1 {
-            return Err("ACP workspace relocation requires exactly one workspace root".to_owned());
-        }
         let roots = crate::backend::validate_local_workspace_roots(workspace_roots)?;
         let prompt_guard = Arc::clone(&self.prompt_lock)
             .try_lock_owned()
@@ -1015,6 +1016,7 @@ impl KiroInner {
         {
             let mut state = self.state.lock().await;
             state.workspace_root = cwd.clone();
+            state.workspace_roots = Some(roots.clone());
             let models = extract_known_models(&response);
             if !models.is_empty() {
                 state.known_models = models;
@@ -1212,6 +1214,10 @@ impl KiroInner {
                     message.clone()
                 };
 
+                let effective_message = crate::backend::workspace_prompt(
+                    &effective_message,
+                    self.state.lock().await.workspace_roots.as_deref(),
+                );
                 let mut prompt_blocks = vec![json!({
                     "type": "text",
                     "text": effective_message,
@@ -2336,6 +2342,7 @@ impl KiroInner {
             KiroState {
                 session_id: session_id.0.clone(),
                 workspace_root: parent.workspace_root.clone(),
+                workspace_roots: parent.workspace_roots.clone(),
                 model: parent.model.clone(),
                 mode: parent.mode.clone(),
                 startup_mcp_servers: parent.startup_mcp_servers.clone(),
@@ -2674,7 +2681,8 @@ impl KiroInner {
         }
 
         self.flush_replay_assistant_message().await;
-        self.emitter.user_message(&text, None);
+        self.emitter
+            .user_message(crate::backend::workspace_prompt_user_text(&text), None);
         self.state
             .lock()
             .await
@@ -6373,6 +6381,7 @@ impl Backend for KiroBackend {
             tyde_agent_adapter::BackendCapability::ListSessions,
             tyde_agent_adapter::BackendCapability::ResumeSession,
             tyde_agent_adapter::BackendCapability::SetWorkspaceRoots,
+            tyde_agent_adapter::BackendCapability::SetMultipleWorkspaceRoots,
             tyde_agent_adapter::BackendCapability::ImageInput,
             tyde_agent_adapter::BackendCapability::SessionSettings,
             tyde_agent_adapter::BackendCapability::StartupMcpServers,

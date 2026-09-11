@@ -1801,6 +1801,11 @@ impl CodexSession {
         let mut skill_setup = skill_setup;
         skill_setup.diagnostics.splice(0..0, skill_notices);
 
+        let runtime_roots = codex_runtime_workspace_roots(workspace_roots, &cwd);
+        tracing::info!(
+            ?runtime_roots,
+            "Starting Codex with ordered workspace roots"
+        );
         let mut thread_start_params = json!({
             "cwd": cwd,
             "sandbox": codex_sandbox_mode(access_mode, execution_mode),
@@ -1809,6 +1814,9 @@ impl CodexSession {
             "experimentalRawEvents": CODEX_ENABLE_EXPERIMENTAL_RAW_EVENTS,
             "persistExtendedHistory": false
         });
+        if !runtime_roots.is_empty() {
+            thread_start_params["runtimeWorkspaceRoots"] = json!(runtime_roots);
+        }
         #[cfg(feature = "test-support")]
         if legacy_dynamic_await {
             thread_start_params["dynamicTools"] = json!([{
@@ -1857,7 +1865,7 @@ impl CodexSession {
             return Err("Codex thread/start response missing thread.id".to_owned());
         }
 
-        Self::from_thread_response(
+        let (session, events) = Self::from_thread_response(
             rpc,
             inbound_rx,
             CodexThreadResources {
@@ -1874,7 +1882,10 @@ impl CodexSession {
             "thread/start",
             subagent_emitter,
         )
-        .await
+        .await?;
+        session.inner.state.lock().await.workspace_roots_override =
+            (!runtime_roots.is_empty()).then_some(runtime_roots);
+        Ok((session, events))
     }
 
     pub async fn fork(

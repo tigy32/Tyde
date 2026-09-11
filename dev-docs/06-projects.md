@@ -241,24 +241,34 @@ remote roots; SSH sessions cannot be relocated through this operation.
 | Backend | Implementation | Root sets |
 | --- | --- | --- |
 | Codex | `thread/settings/update` acknowledges cwd; subsequent `turn/start` requests carry the replacement runtime roots | One or more |
-| Hermes | `session.cwd.set`; verifies returned directory | Exactly one |
-| Claude | Native `set_cwd` control request; verifies directory and transcript relocation | Exactly one |
-| Kiro | ACP `session/load` with the existing session ID and new directory; suppresses replayed history and restores model/mode | Exactly one |
-| OpenCode | Stop ACP, export/import the existing session in the destination using native CLI commands, verify identical messages, then reload | Exactly one |
-| Grok | Stop ACP, alias the single native transcript into the new directory scope, update saved cwd/context under the native summary lock, then reload a dedicated process | Exactly one, local Unix |
-| Antigravity | Stop the runtime, transact the native trajectory workspace metadata, then resume the same conversation | One or more |
+| Hermes | `session.cwd.set` for cwd; ordered roots supplied in provider prompt context | One or more |
+| Claude | Native `set_cwd` plus `apply_flag_settings` for additional directories; `--add-dir` on startup/resume | One or more |
+| Kiro | ACP `session/load` with the existing session ID and new directory; suppresses replayed history and restores model/mode | One or more |
+| OpenCode | Stop ACP, export/import the existing session in the destination using native CLI commands, verify identical messages, then reload | One or more |
+| Grok | Stop ACP, alias the single native transcript into the new directory scope, update saved cwd/context under the native summary lock, then reload a dedicated process | One or more, local Unix |
+| Antigravity | Keep a primary native project directory, supply all project roots in prompt context, and update native metadata before restart/resume | One or more |
 
-The supported paths passed real relocation conformance on 2026-09-11; see
-`backend-conformance.md` for models and limitations. ACP providers must
-advertise `session/load`. Claude requires a persistent session and a destination trusted by the native CLI;
+See `backend-conformance.md` for real-provider verification, models, and
+limitations. ACP providers must advertise `session/load`. Claude requires a
+persistent session and a destination trusted by the native CLI;
 its trust-required response is returned as an error without asserting user
 consent. Its native setter also refreshes destination project configuration
 and relocates the transcript. Hermes waits up to ten seconds for native
 post-turn cleanup when its cwd setter explicitly reports busy without mutation.
-Codex stages runtime roots
-in the live adapter after the native cwd acknowledgement; those roots are
+Codex supplies runtime roots on thread creation and stages them in the live
+adapter on startup, resume, and after native cwd acknowledgement; those roots are
 materialized on the next turn, including Tyde background wake turns. Callers
 must persist the requested roots for later process-level resume.
+
+Claude, Kiro, Grok, OpenCode, Hermes, and Antigravity retain
+all project roots and prepend the current ordered list to provider prompts.
+The first root remains the native cwd; additional roots use absolute paths
+with the existing tool permission policies. Each list replaces the previous
+one, including when extra roots are removed without changing the primary.
+The adapter restores the list from the caller's roots on startup/resume and
+removes this context prefix from replayed user messages. Claude additionally
+uses native additional-directory settings to grant directory access. Native
+permissions alone did not replace the old root list in resumed model context.
 
 Grok and OpenCode restore the directory saved with the native session, so a
 new process or ACP directory argument alone is insufficient. Grok's aliases
@@ -268,19 +278,24 @@ while the native process is stopped. OpenCode's native import updates the
 existing session's project and directory while retaining message identities;
 the adapter compares the complete exported messages before and after import.
 
-Antigravity restores workspace URIs from its SQLite trajectory metadata.
+Antigravity registers only the primary project directory with native terminals:
+empty-cwd calls otherwise choose different project roots between calls.
+Additional project directories remain available through absolute-path tools
+and the ordered prompt context. Native skill projections are retained.
+Antigravity restores native workspace URIs from its SQLite trajectory metadata.
 The adapter replaces only protobuf fields 1 and 7, preserving all other
 fields byte-for-byte, with a compare-and-swap transaction. It restores the
 previous metadata and runtime if reopening fails and the metadata has not
 changed concurrently. These storage migrations require ownership of the idle
 native conversation; another native client must not operate it concurrently.
-These migrations do not rewrite conversation or tool history. ACP process replacement
-retains Tyde's event stream and suppresses replay during the native reload.
+These migrations do not rewrite conversation or tool history. ACP process
+replacement retains Tyde's event stream and suppresses replay during the native reload.
 
 `real_workspace_relocation` exercises the same history-preserving move, real
 file reads/writes, invalid-request rejection, and return move on every backend
 declaring `SetWorkspaceRoots`. `real_multiple_workspace_relocation` repeats
-that flow with two destination roots for `SetMultipleWorkspaceRoots` backends.
+that flow with two destination roots for every relocating backend and checks
+that it declares `SetMultipleWorkspaceRoots`.
 The scenarios never give the model the destination paths or file contents.
 They require checking runtime cwd before writing; all filesystem assertions
 remain identical across providers. Claude can use a disposable config via

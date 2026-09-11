@@ -27,6 +27,8 @@ pub(crate) fn capabilities() -> BackendCapabilities {
         BackendCapability::ResumeSession,
         #[cfg(unix)]
         BackendCapability::SetWorkspaceRoots,
+        #[cfg(unix)]
+        BackendCapability::SetMultipleWorkspaceRoots,
         BackendCapability::ImageInput,
         BackendCapability::Interrupt,
         BackendCapability::SessionSettings,

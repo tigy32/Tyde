@@ -1561,6 +1561,49 @@ pub trait Backend: Send + Sync + 'static {
         Self: Sized;
 }
 
+pub(crate) fn session_workspace_roots(
+    roots: &[String],
+    cwd: &str,
+) -> Result<Option<Vec<String>>, String> {
+    if roots.is_empty() {
+        return Ok(None);
+    }
+    if roots.len() == 1 {
+        return Ok(Some(vec![cwd.to_owned()]));
+    }
+    if let Some((_, paths)) = crate::remote::parse_remote_workspace_roots(roots)? {
+        if paths.len() != roots.len() {
+            return Err("Workspace roots must all belong to the same host".to_owned());
+        }
+        return Ok(Some(paths));
+    }
+    validate_local_workspace_roots(roots.to_vec()).map(Some)
+}
+
+const WORKSPACE_CONTEXT_PREFIX: &str = "<tyde_workspace>\n";
+const WORKSPACE_CONTEXT_SUFFIX: &str = "\nThe JSON array above is the current ordered workspace root list. The first root is the default working directory; the other roots are additional project directories available to your tools by absolute path. This list replaces any workspace roots described in earlier turns. Follow applicable instructions in each directory when working there.\n</tyde_workspace>\n\n";
+
+pub(crate) fn workspace_prompt(message: &str, roots: Option<&[String]>) -> String {
+    let Some(roots) = roots else {
+        return message.to_owned();
+    };
+    let roots = serde_json::json!(roots);
+    format!("{WORKSPACE_CONTEXT_PREFIX}{roots}{WORKSPACE_CONTEXT_SUFFIX}{message}")
+}
+
+pub(crate) fn workspace_prompt_user_text(content: &str) -> &str {
+    let Some((roots, message)) = content
+        .strip_prefix(WORKSPACE_CONTEXT_PREFIX)
+        .and_then(|rest| rest.split_once(WORKSPACE_CONTEXT_SUFFIX))
+    else {
+        return content;
+    };
+    match serde_json::from_str::<Vec<String>>(roots) {
+        Ok(roots) if !roots.is_empty() => message,
+        _ => content,
+    }
+}
+
 pub(crate) fn validate_local_workspace_roots(
     workspace_roots: Vec<String>,
 ) -> Result<Vec<String>, String> {

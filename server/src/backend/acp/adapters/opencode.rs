@@ -52,33 +52,7 @@ impl OpenCodeAdapter {
         session_id: &str,
         workspace_root: &str,
     ) -> Result<Value, String> {
-        // OpenCode can exit before a piped stdout drains (the live session
-        // export stopped at 64 KiB). A file receives the complete JSON.
-        let capture = tempfile::NamedTempFile::new().map_err(|error| error.to_string())?;
-        let stdout = capture.reopen().map_err(|error| error.to_string())?;
-        let mut command = crate::process_env::command(self.command())?;
-        command
-            .args(["export", session_id])
-            .current_dir(workspace_root)
-            .stdout(stdout)
-            .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true);
-        let child = command
-            .spawn()
-            .map_err(|error| format!("Failed to execute OpenCode export: {error}"))?;
-        let output =
-            tokio::time::timeout(std::time::Duration::from_secs(5), child.wait_with_output())
-                .await
-                .map_err(|error| format!("OpenCode export timed out: {error}"))?
-                .map_err(|error| format!("Failed to execute OpenCode export: {error}"))?;
-        if !output.status.success() {
-            return Err(format!("OpenCode export failed: {}", output.status));
-        }
-        let bytes = tokio::fs::read(capture.path())
-            .await
-            .map_err(|error| format!("Failed to read OpenCode export: {error}"))?;
-        serde_json::from_slice(&bytes)
-            .map_err(|error| format!("Invalid OpenCode export JSON: {error}"))
+        crate::backend::opencode::export_session(self.command(), session_id, workspace_root).await
     }
 
     async fn child_transcript_events(

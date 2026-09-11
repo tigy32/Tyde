@@ -119,7 +119,9 @@ macro_rules! conformance2_scenario {
                 claude,
                 server::backend::claude::ClaudeBackend,
                 Profile::new(
-                    &["haiku", "claude-haiku-4-5-20251001"],
+                    // The OpenRouter gateway reports the same pinned Haiku 4.5
+                    // as anthropic/claude-haiku-4.5 in native model events.
+                    &["haiku", "claude-haiku-4-5-20251001", "anthropic/claude-haiku-4.5"],
                     &[("model", "haiku"), ("effort", "low")]
                 )
             );
@@ -4907,11 +4909,12 @@ async fn real_workspace_relocation<B: Backend>(host: &mut Harness<B>) {
 
 conformance2_scenario!(
     real_multiple_workspace_relocation,
-    [BackendCapability::SetMultipleWorkspaceRoots]
+    [BackendCapability::SetWorkspaceRoots]
 );
 
 async fn real_multiple_workspace_relocation<B: Backend>(host: &mut Harness<B>) {
     workspace_relocation_flow(host, 2).await;
+    assert!(host.declares(BackendCapability::SetMultipleWorkspaceRoots));
 }
 
 async fn workspace_relocation_flow<B: Backend>(host: &mut Harness<B>, root_count: usize) {
@@ -4935,19 +4938,63 @@ async fn workspace_relocation_flow<B: Backend>(host: &mut Harness<B>, root_count
     let initial = format!(
         "We are checking a workspace relocation feature. The synthetic test marker for this conversation is {memory}. Keep it in conversation context for the later file-writing step; do not write it to disk yet. Acknowledge this setup with TYDE_RELOCATION_READY and do not use tools."
     );
-    let agent = spawn_agent(host, &initial).await;
+    let initial_roots = std::iter::once(host.workspace().to_str().unwrap().to_owned())
+        .chain(roots.iter().skip(1).cloned())
+        .collect::<Vec<_>>();
+    let mut agent = spawn_agent_at_roots(host, initial_roots.clone(), &initial).await;
     let ready = collect_turn(host, &agent, &initial).await;
     assert_final_text_contains(&ready, "TYDE_RELOCATION_READY");
 
+    let startup = ask(host, &agent, "Write startup-roots.json in your default working directory containing a JSON array of every current configured workspace root in order. Use the configured roots, not a directory search. Also write startup-access.txt in every root containing exactly STARTUP_ACCESS_OK. Reply TYDE_ROOTS_READY.").await;
+    assert_final_text_contains(&startup, "TYDE_ROOTS_READY");
+    let startup_roots: Vec<String> = serde_json::from_str(
+        &std::fs::read_to_string(host.workspace().join("startup-roots.json"))
+            .expect("startup roots"),
+    )
+    .expect("startup roots JSON");
+    assert_eq!(
+        startup_roots, initial_roots,
+        "startup dropped workspace roots"
+    );
+    for root in &initial_roots {
+        assert_eq!(
+            std::fs::read_to_string(Path::new(root).join("startup-access.txt"))
+                .expect("startup write in every root")
+                .trim_end(),
+            "STARTUP_ACCESS_OK"
+        );
+    }
     set_workspace_roots(host, roots.clone())
         .await
         .expect("relocate live conversation");
-    let mut turns = vec![ready];
-    for output in ["relocation-result.txt", "relocation-after-rejection.txt"] {
+    let mut turns = vec![ready, startup];
+    for output in [
+        "relocation-result.txt",
+        "relocation-after-rejection.txt",
+        "relocation-after-resume.txt",
+        "relocation-primary-only.txt",
+    ] {
+        if output == "relocation-after-resume.txt" {
+            assert_clean_close(host, &agent).await;
+            agent = resume_agent_at_roots(host, roots.clone(), &agent.session_id).await;
+            assert!(agent.replayed_history.iter().any(|event| matches!(event,
+                ChatEvent::MessageAdded(message) if matches!(message.sender, protocol::MessageSender::User) && message.content == initial
+            )), "resume did not preserve the visible user message");
+        }
+        if output == "relocation-primary-only.txt" {
+            roots.truncate(1);
+            contents.truncate(1);
+            set_workspace_roots(host, roots.clone())
+                .await
+                .expect("remove extra roots without changing cwd");
+            assert_clean_close(host, &agent).await;
+            agent = resume_agent_at_roots(host, roots.clone(), &agent.session_id).await;
+        }
         if output == "relocation-after-rejection.txt" {
             for invalid in [
                 Vec::new(),
                 vec!["relative-directory".to_owned()],
+                vec![roots[0].clone(), "relative-directory".to_owned()],
                 vec![
                     destination
                         .path()
@@ -4973,8 +5020,15 @@ async fn workspace_relocation_flow<B: Backend>(host: &mut Harness<B>, root_count
             }
         }
         let prompt = format!(
-            "Your workspace has been changed through the runtime. There are exactly {root_count} configured workspace roots. Use only those roots, in order. Read relocation-source.txt in each one. Do not search /tmp or inspect other workspaces. Write {output} in your current default working directory, with the synthetic test marker from earlier as the first line and each file's contents on subsequent lines in root order. Before writing, verify the runtime default directory with pwd in a fresh terminal call without a cwd override. Write only there using a relative filename. Do not change directory or use a path remembered from earlier turns. Do not guess file contents. Reply with TYDE_RELOCATION_WRITTEN."
+            "Your workspace has been changed through the runtime. Discover the current configured workspace roots from your runtime context. Use only those roots, in order. Read relocation-source.txt in each one. Do not search /tmp or inspect other workspaces. Write {output} in your current default working directory, with the synthetic test marker from earlier as the first line and each file's contents on subsequent lines in root order. Before writing, verify the runtime default directory with pwd in a fresh terminal call without a cwd override. Write only there using a relative filename. Do not change directory or use a path remembered from earlier turns. Copy file contents byte-for-byte with a script instead of manually retyping them. Do not guess file contents. Also write {output}.roots.json in the default directory containing a JSON array of the current configured root paths in order, and write {output}.writable in EVERY root containing that root's relocation-source.txt contents. Reply with TYDE_RELOCATION_WRITTEN."
         );
+        let prompt = if host.backend() == BackendKind::Grok {
+            format!(
+                "{prompt} Separate the output lines with actual LF bytes (ASCII 10), not literal backslash-n text. In Python use bytes([10]) as the separator to avoid shell escaping mistakes."
+            )
+        } else {
+            prompt
+        };
         let turn = ask(host, &agent, &prompt).await;
         assert_final_text_contains(&turn, "TYDE_RELOCATION_WRITTEN");
         assert!(
@@ -4992,6 +5046,23 @@ async fn workspace_relocation_flow<B: Backend>(host: &mut Harness<B>, root_count
             expected,
             "workspace change lost conversation context or used the wrong roots"
         );
+        let reported_roots: Vec<String> = serde_json::from_str(
+            &std::fs::read_to_string(Path::new(&roots[0]).join(format!("{output}.roots.json")))
+                .expect("current root inventory"),
+        )
+        .expect("root inventory JSON");
+        assert_eq!(
+            reported_roots, roots,
+            "provider advertised a different root set"
+        );
+        for (root, content) in roots.iter().zip(&contents) {
+            assert_eq!(
+                std::fs::read_to_string(Path::new(root).join(format!("{output}.writable")))
+                    .expect("write access in every root")
+                    .trim_end(),
+                content
+            );
+        }
         assert!(
             !host.workspace().join(output).exists(),
             "agent still wrote into the original workspace"
@@ -5007,7 +5078,7 @@ async fn workspace_relocation_flow<B: Backend>(host: &mut Harness<B>, root_count
     set_workspace_roots(host, host.workspace_roots())
         .await
         .expect("return to original workspace");
-    let returned = ask(host, &agent, "The runtime workspace has changed again. First verify its default directory with pwd in a fresh terminal call without a cwd override. Then write the relative filename relocation-returned.txt only in that directory, containing only the synthetic test marker from earlier. Do not change directory, reuse a previously remembered path, or write a second copy elsewhere. Reply with TYDE_RELOCATION_RETURNED.").await;
+    let returned = ask(host, &agent, "The runtime workspace has changed again. First verify its default directory with pwd in a fresh terminal call without a cwd override. Then write the relative filename relocation-returned.txt only in that directory, containing only the synthetic test marker from earlier. Do not change directory, reuse a previously remembered path, or write a second copy elsewhere. Also write relocation-returned.roots.json in that directory containing a JSON array of all current configured workspace root paths in order. Reply with TYDE_RELOCATION_RETURNED.").await;
     assert_final_text_contains(&returned, "TYDE_RELOCATION_RETURNED");
     assert_eq!(
         std::fs::read_to_string(host.workspace().join("relocation-returned.txt"))
@@ -5020,6 +5091,16 @@ async fn workspace_relocation_flow<B: Backend>(host: &mut Harness<B>, root_count
             .join("relocation-returned.txt")
             .exists(),
         "second move retained the destination cwd"
+    );
+    let returned_roots: Vec<String> = serde_json::from_str(
+        &std::fs::read_to_string(host.workspace().join("relocation-returned.roots.json"))
+            .expect("returned root inventory"),
+    )
+    .expect("returned root JSON");
+    assert_eq!(
+        returned_roots,
+        host.workspace_roots(),
+        "removed roots remain advertised"
     );
     turns.push(returned);
     assert_universal_contract(&turns);

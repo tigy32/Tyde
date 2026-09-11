@@ -780,6 +780,7 @@ struct HermesSessionIds {
 }
 
 struct HermesSessionActor {
+    workspace_roots: Option<Vec<String>>,
     gateway: HermesGatewayHandle,
     live_session_id: String,
     mapper: HermesEventMapper,
@@ -1134,6 +1135,7 @@ impl Backend for HermesBackend {
             tyde_agent_adapter::BackendCapability::ListSessions,
             tyde_agent_adapter::BackendCapability::ResumeSession,
             tyde_agent_adapter::BackendCapability::SetWorkspaceRoots,
+            tyde_agent_adapter::BackendCapability::SetMultipleWorkspaceRoots,
             tyde_agent_adapter::BackendCapability::ImageInput,
             tyde_agent_adapter::BackendCapability::Interrupt,
             tyde_agent_adapter::BackendCapability::SessionSettings,
@@ -1177,6 +1179,10 @@ impl Backend for HermesBackend {
         config: BackendSpawnConfig,
         initial_input: protocol::SendMessagePayload,
     ) -> Result<(Self, EventStream), String> {
+        let configured_workspace_roots = crate::backend::session_workspace_roots(
+            &workspace_roots,
+            &session_cwd(&workspace_roots)?,
+        )?;
         reject_unverified_resume_capabilities(&config)?;
         let resolved_settings = resolve_session_settings(&config);
         let profile = resolve_session_profile(&resolved_settings)?;
@@ -1240,6 +1246,7 @@ impl Backend for HermesBackend {
         )));
         let active_compaction = Arc::new(std::sync::Mutex::new(None));
         let actor = HermesSessionActor {
+            workspace_roots: configured_workspace_roots,
             gateway: gateway.clone(),
             live_session_id: ids.live_session_id.clone(),
             mapper: HermesEventMapper::default(),
@@ -1275,6 +1282,10 @@ impl Backend for HermesBackend {
         config: BackendSpawnConfig,
         session_id: SessionId,
     ) -> Result<(Self, EventStream), String> {
+        let configured_workspace_roots = crate::backend::session_workspace_roots(
+            &workspace_roots,
+            &session_cwd(&workspace_roots)?,
+        )?;
         reject_unverified_resume_capabilities(&config)?;
         let resolved_settings = resolve_session_settings(&config);
         let profile = resolve_session_profile(&resolved_settings)?;
@@ -1364,6 +1375,7 @@ impl Backend for HermesBackend {
         )));
         let active_compaction = Arc::new(std::sync::Mutex::new(None));
         let actor = HermesSessionActor {
+            workspace_roots: configured_workspace_roots,
             gateway: gateway.clone(),
             live_session_id,
             mapper: HermesEventMapper {
@@ -1509,11 +1521,6 @@ impl Backend for HermesBackend {
             return Err(
                 "Hermes workspace relocation is currently supported only for local sessions"
                     .to_owned(),
-            );
-        }
-        if workspace_roots.len() != 1 {
-            return Err(
-                "Hermes workspace relocation requires exactly one workspace root".to_owned(),
             );
         }
         let roots = super::validate_local_workspace_roots(workspace_roots)?;
@@ -2365,7 +2372,8 @@ impl HermesSessionActor {
             );
             return Err("Hermes did not confirm the requested workspace roots; provider state must be reconciled before continuing".to_owned());
         }
-        tracing::info!(session_id = %self.live_session_id, %cwd, "Hermes confirmed workspace roots");
+        tracing::info!(session_id = %self.live_session_id, ?roots, "Hermes confirmed workspace roots");
+        self.workspace_roots = Some(roots);
         Ok(())
     }
 
@@ -2824,7 +2832,7 @@ impl HermesSessionActor {
                 "prompt.submit",
                 json!({
                     "session_id": self.live_session_id,
-                    "text": payload.message,
+                    "text": super::workspace_prompt(&payload.message, self.workspace_roots.as_deref()),
                 }),
             )
             .await
@@ -7370,6 +7378,11 @@ fn hermes_history_to_chat_events(value: &Value) -> Result<Vec<ChatEvent>, String
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string();
+        let text = if role == "user" {
+            super::workspace_prompt_user_text(&text).to_owned()
+        } else {
+            text
+        };
         let content_offset = u32::try_from(text.chars().count()).unwrap_or(u32::MAX);
         let mut tool_calls = hermes_history_tool_calls(message, content_offset)?;
         for tool_call in &mut tool_calls {

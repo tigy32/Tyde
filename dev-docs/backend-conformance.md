@@ -66,9 +66,9 @@ assertions for every eligible backend:
 | Scenario | Claude | Codex | Hermes | Kiro | Grok | OpenCode | Antigravity |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | `real_workspace_relocation` | Pass | Pass | Pass | Pass | Pass | Pass | Pass |
-| `real_multiple_workspace_relocation` | — | Pass | — | — | — | — | Pass |
+| `real_multiple_workspace_relocation` | Pass | Pass | Pass | Pass | Pass | Pass | Pass |
 
-Models were Claude Haiku, Codex `gpt-5.6-luna`, Hermes
+Models were Claude Haiku 4.5 through OpenRouter, Codex `gpt-5.6-luna`, Hermes
 `openai/gpt-4.1-mini` through OpenRouter, Kiro's `auto` selection, Grok
 `grok-4.6`, OpenCode `opencode/mimo-v2.5-free`, and Antigravity
 `Gemini 3.7 Flash (Medium)`.
@@ -94,8 +94,49 @@ After the fixes, Grok, OpenCode, and Antigravity passed the unchanged shared
 single-root scenario, including retained conversation context, exact file
 locations, rejected inputs, and the return move. Antigravity additionally
 passed the two-root scenario. Kiro passed the single-root scenario again to
-cover the shared ACP transport changes. All seven now declare relocation
-capability; multiple-root capability belongs to Codex and Antigravity.
+cover the shared ACP transport changes. That initial implementation declared
+relocation capability on all seven,
+with multiple-root capability on Codex and Antigravity.
+
+The expanded multi-root lifecycle now checks startup, reads and writes in
+all roots, exact root inventories, invalid additional roots, process resume
+with unchanged visible user messages, removing extra roots while retaining
+the primary cwd, and returning to the original workspace. It runs against
+every backend declaring workspace relocation. Expected root counts, root
+paths, and source-file contents are never supplied by the test's user prompts. Removing extra roots is followed by
+an immediate process resume before sending the next prompt, so old root
+context cannot survive unnoticed in conversation history.
+
+Baseline live runs rejected multiple roots on Hermes, Kiro, Grok, and
+OpenCode. The expanded startup check also found that Codex omitted runtime
+roots from thread creation, despite already supporting multi-root relocation.
+Claude's first baseline run was blocked by expired local OAuth credentials;
+a subsequent run through the documented OpenRouter gateway reproduced the
+one-root rejection with the real Claude CLI and Claude Haiku 4.5.
+
+The stronger lifecycle then exposed stale Claude root context after removing
+an extra directory and resuming, OpenCode exports truncated at exactly
+65,536 bytes when piped, and Antigravity empty-cwd terminals alternating
+between project roots. These are covered by the unchanged filesystem and
+root-inventory assertions. All seven passed both expanded scenarios after
+these fixes; Antigravity also passed `real_skills` to cover its retained native
+skill projection. Grok relocation remains local Unix only.
+
+Claude's gateway reports the same pinned Haiku 4.5 model as
+`anthropic/claude-haiku-4.5`; the test accepts that exact alias alongside the
+native CLI aliases. Grok's generated script repeatedly wrote literal
+backslash-n text, so its prompt explicitly requests LF bytes. The common
+filesystem assertions are unchanged. A Codex marker-copy failure and an
+OpenCode turn timeout passed on unchanged retries; these failures are not
+counted as successful runs.
+
+Final passing evidence is retained in `/tmp/tyde-all-roots-live-furaasrr`
+(Hermes and Kiro, both scenarios; Codex single-root),
+`/tmp/tyde-all-roots-live-kkcnycoy` (Codex multi-root, OpenCode single-root,
+Antigravity both scenarios and skills), `/tmp/tyde-all-roots-live-66po20s1`
+(OpenCode multi-root), and `/tmp/tyde-all-roots-live-6gkhyp5u` (Claude and
+Grok, both scenarios). These are targeted real-provider runs, not a run of
+the complete conformance suite.
 
 ## Live context usage during tool loops
 

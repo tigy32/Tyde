@@ -37,6 +37,7 @@ pub(crate) fn capabilities() -> BackendCapabilities {
         BackendCapability::ListSessions,
         BackendCapability::ResumeSession,
         BackendCapability::SetWorkspaceRoots,
+        BackendCapability::SetMultipleWorkspaceRoots,
         BackendCapability::ImageInput,
         BackendCapability::SessionSettings,
         BackendCapability::StartupMcpServers,
@@ -57,33 +58,46 @@ pub(crate) fn capabilities() -> BackendCapabilities {
     .into()
 }
 
+pub(crate) async fn export_session(
+    program: &str,
+    session_id: &str,
+    workspace_root: &str,
+) -> Result<serde_json::Value, String> {
+    // OpenCode can exit before a piped stdout drains (the live session
+    // export stopped at 64 KiB). A file receives the complete JSON.
+    let capture = tempfile::NamedTempFile::new().map_err(|error| error.to_string())?;
+    let stdout = capture.reopen().map_err(|error| error.to_string())?;
+    let mut command = crate::process_env::command(program)?;
+    command
+        .args(["export", session_id])
+        .current_dir(workspace_root)
+        .stdout(stdout)
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    let child = command
+        .spawn()
+        .map_err(|error| format!("Failed to execute OpenCode export: {error}"))?;
+    let output = tokio::time::timeout(std::time::Duration::from_secs(5), child.wait_with_output())
+        .await
+        .map_err(|error| format!("OpenCode export timed out: {error}"))?
+        .map_err(|error| format!("Failed to execute OpenCode export: {error}"))?;
+    if !output.status.success() {
+        return Err(format!("OpenCode export failed: {}", output.status));
+    }
+    let bytes = tokio::fs::read(capture.path())
+        .await
+        .map_err(|error| format!("Failed to read OpenCode export: {error}"))?;
+    tracing::info!(%session_id, bytes = bytes.len(), "Captured complete native OpenCode conversation export");
+    serde_json::from_slice(&bytes).map_err(|error| format!("Invalid OpenCode export JSON: {error}"))
+}
+
 pub(crate) async fn relocate_workspace_session(
     program: &str,
     session_id: &str,
     previous: &str,
     destination: &str,
 ) -> Result<(), String> {
-    async fn export(
-        program: &str,
-        session_id: &str,
-        cwd: &str,
-    ) -> Result<serde_json::Value, String> {
-        let output = crate::process_env::command(program)?
-            .current_dir(cwd)
-            .args(["export", session_id])
-            .output()
-            .await
-            .map_err(|error| format!("Cannot export OpenCode conversation: {error}"))?;
-        if !output.status.success() {
-            return Err(format!(
-                "OpenCode export failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            ));
-        }
-        serde_json::from_slice(&output.stdout)
-            .map_err(|error| format!("Invalid OpenCode conversation export: {error}"))
-    }
-    let before = export(program, session_id, previous).await?;
+    let before = export_session(program, session_id, previous).await?;
     if before
         .pointer("/info/id")
         .and_then(serde_json::Value::as_str)
@@ -112,7 +126,7 @@ pub(crate) async fn relocate_workspace_session(
             String::from_utf8_lossy(&output.stderr)
         ));
     }
-    let after = export(program, session_id, destination).await?;
+    let after = export_session(program, session_id, destination).await?;
     if after
         .pointer("/info/id")
         .and_then(serde_json::Value::as_str)

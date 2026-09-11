@@ -504,17 +504,21 @@ pub fn user_message(prompt: &str) -> SendMessagePayload {
 }
 
 pub async fn spawn_agent<B: Backend>(host: &mut Harness<B>, prompt: &str) -> Agent {
+    spawn_agent_at_roots(host, host.workspace_roots(), prompt).await
+}
+
+pub async fn spawn_agent_at_roots<B: Backend>(
+    host: &mut Harness<B>,
+    roots: Vec<String>,
+    prompt: &str,
+) -> Agent {
     assert!(
         host.backend.is_none(),
         "close the previous session before spawning"
     );
-    let (backend, events) = B::spawn(
-        host.workspace_roots(),
-        host.config.clone(),
-        user_message(prompt),
-    )
-    .await
-    .expect("spawn through Backend trait");
+    let (backend, events) = B::spawn(roots, host.config.clone(), user_message(prompt))
+        .await
+        .expect("spawn through Backend trait");
     let session_id = backend.session_id();
     host.last_session_id = Some(session_id.clone());
     host.backend = Some(backend);
@@ -1274,11 +1278,19 @@ pub async fn stored_session<B: Backend>(host: &mut Harness<B>) -> server::backen
 }
 
 pub async fn resume_agent<B: Backend>(host: &mut Harness<B>, id: &SessionId) -> Agent {
+    resume_agent_at_roots(host, host.workspace_roots(), id).await
+}
+
+pub async fn resume_agent_at_roots<B: Backend>(
+    host: &mut Harness<B>,
+    roots: Vec<String>,
+    id: &SessionId,
+) -> Agent {
     assert!(
         host.backend.is_none(),
         "close the previous session before resuming"
     );
-    let (backend, mut events) = B::resume(host.workspace_roots(), host.config.clone(), id.clone())
+    let (backend, mut events) = B::resume(roots, host.config.clone(), id.clone())
         .await
         .expect("resume through Backend trait");
     assert_eq!(

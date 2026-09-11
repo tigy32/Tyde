@@ -123,6 +123,7 @@ struct AntigravityState {
 /// it after an interrupt without re-deriving any of it.
 #[derive(Clone)]
 struct AgyLaunch {
+    workspace_roots: Vec<String>,
     primary_root: String,
     extra_roots: Vec<String>,
     access_mode: BackendAccessMode,
@@ -213,6 +214,12 @@ fn prepare_antigravity_skills(
 }
 
 impl AgyLaunch {
+    fn native_roots(&self) -> Vec<String> {
+        std::iter::once(self.primary_root.clone())
+            .chain(self.extra_roots.iter().cloned())
+            .collect()
+    }
+
     fn args(&self, conversation_id: Option<&str>) -> Vec<String> {
         let mut args = vec![
             "--print-timeout".to_string(),
@@ -1213,7 +1220,8 @@ impl Supervisor {
             self.inner.emitter.user_message(user_message, None);
         }
         self.inner.emitter.typing_status_changed(true);
-        if let Err(err) = process.send_turn(message).await {
+        let message = super::workspace_prompt(message, Some(&self.launch.workspace_roots));
+        if let Err(err) = process.send_turn(&message).await {
             self.inner.emitter.backend_error(&err);
             self.inner.emitter.typing_status_changed(false);
             self.inner.state.lock().await.turn_active = false;
@@ -1444,7 +1452,8 @@ impl Supervisor {
         drop(state);
         let mut launch = self.launch.clone();
         launch.primary_root = roots[0].clone();
-        launch.extra_roots = roots[1..].to_vec();
+        launch.workspace_roots = roots.clone();
+        launch.extra_roots.clear();
         if let Some(projection) = self.skill_projection.as_ref() {
             launch.extra_roots.push(
                 projection
@@ -1457,9 +1466,7 @@ impl Supervisor {
         tracing::info!(session_id = %self.session_id, ?roots, "Changing Antigravity workspace roots");
         // The resumed native trajectory, not CLI --add-dir, owns tool workspaces.
         process.terminate().await;
-        let replacement_roots = std::iter::once(launch.primary_root.clone())
-            .chain(launch.extra_roots.iter().cloned())
-            .collect::<Vec<_>>();
+        let replacement_roots = launch.native_roots();
         let metadata = relocate_antigravity_metadata(
             &self.conversation_db,
             &self.launch.primary_root,
@@ -2119,6 +2126,11 @@ fn antigravity_history(brain_dir: &Path, session_id: &str) -> Result<Vec<ChatEve
         } else {
             content
         };
+        let content = if kind == "USER_INPUT" {
+            super::workspace_prompt_user_text(content)
+        } else {
+            content
+        };
         let mut declarations = Vec::new();
         let mut requests = Vec::new();
         if let Some(calls) = row.get("tool_calls").and_then(Value::as_array) {
@@ -2558,7 +2570,12 @@ impl AntigravityBackend {
             install_antigravity_mcp_config(&config.startup_mcp_servers, descriptor_dir.path())
                 .await?;
 
-        let mut extra_roots = extra_roots;
+        // Multiple native project roots make empty-Cwd terminal calls choose
+        // different folders. Keep one project cwd; expose extra roots in context.
+        let workspace_roots = std::iter::once(primary_root.clone())
+            .chain(extra_roots)
+            .collect();
+        let mut extra_roots = Vec::new();
         if let Some(projection) = skill_setup.projection.as_ref() {
             let root = projection.path().to_str().ok_or_else(|| {
                 format!(
@@ -2569,6 +2586,7 @@ impl AntigravityBackend {
             extra_roots.push(root.to_string());
         }
         let launch = AgyLaunch {
+            workspace_roots,
             primary_root,
             extra_roots,
             access_mode: config.resolved_spawn_config.access_mode,
@@ -2590,6 +2608,24 @@ impl AntigravityBackend {
             None => Vec::new(),
         };
 
+        let resume_metadata = if let Some(id) = resume.as_ref() {
+            let path = antigravity_conversation_db_path(id, conversations_dir);
+            let stored = antigravity_session_workspace_roots(&path)?;
+            let native_roots = launch.native_roots();
+            if stored != native_roots {
+                let previous = stored
+                    .first()
+                    .ok_or("Antigravity conversation has no native workspace")?;
+                tracing::info!(session_id = %id.0, ?native_roots, "Restoring Antigravity primary workspace and skill roots before resume");
+                let (before, after) =
+                    relocate_antigravity_metadata(&path, previous, &native_roots)?;
+                Some((path, before, after))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         let process = match AgyProcess::start(
             &launch,
             resume.as_ref().map(|id| id.0.as_str()),
@@ -2598,7 +2634,12 @@ impl AntigravityBackend {
         .await
         {
             Ok(process) => process,
-            Err(err) => return Err(err),
+            Err(err) => {
+                if let Some((path, before, after)) = resume_metadata {
+                    replace_antigravity_metadata(&path, &after, &before)?;
+                }
+                return Err(err);
+            }
         };
 
         let session_id = SessionId(process.conversation_id.clone());
