@@ -216,7 +216,11 @@ use crate::workflows::registry::{
 use crate::workflows::store::WorkflowRunStore;
 use crate::workflows::watch::{WorkflowCatalogSignal, WorkflowWatcherHandle};
 
+type ProjectSubscriptionReady =
+    futures_util::future::Shared<futures_util::future::BoxFuture<'static, Result<(), String>>>;
+
 struct HostSubscriber {
+    project_readiness: HashMap<ProjectId, ProjectSubscriptionReady>,
     stream: Stream,
     voice_desktop: Option<bool>,
     project_files: ProjectFileDelivery,
@@ -2271,6 +2275,7 @@ impl HostHandle {
         let previous = state.host_streams.insert(
             host_path.clone(),
             HostSubscriber {
+                project_readiness: HashMap::new(),
                 stream: host_stream,
                 voice_desktop,
                 project_files,
@@ -11253,42 +11258,60 @@ impl HostHandle {
             .remove(&(connection_host_stream.clone(), browse_stream_path.clone()));
     }
 
-    async fn ensure_host_project_subscription(
+    pub(crate) async fn ensure_host_project_subscription(
         &self,
         connection_host_stream: &StreamPath,
         project_output_stream: &Stream,
         project_id: ProjectId,
         operation: &'static str,
     ) -> AppResult<ProjectStreamHandle> {
-        let mut state = self.state.lock().await;
-        // Read the delivery policy off the registered host stream rather than
-        // assuming one: guessing `Full` would ship file listings to a client
-        // that opted out, and guessing `Off` would blank the desktop browser.
-        let project_files = state
-            .host_streams
-            .get(connection_host_stream)
-            .map(|subscriber| subscriber.project_files)
-            .ok_or_else(|| {
-                project_command_error(
-                    operation,
-                    format!("host stream {connection_host_stream} is not registered"),
-                )
-            })?;
-        let summaries = state
-            .review_registry
-            .summaries(project_id.clone())
-            .await
-            .map_err(|error| project_command_error(operation, error))?;
-        let handle = ensure_project_actor(&mut state, project_id)
-            .await
-            .map_err(|error| project_command_error(operation, error))?;
-        handle
-            .add_subscriber(
-                connection_host_stream.clone(),
-                project_output_stream.clone(),
-                summaries,
-                project_files,
-            )
+        let (handle, readiness) = {
+            let mut state = self.state.lock().await;
+            let project_files = state
+                .host_streams
+                .get(connection_host_stream)
+                .map(|subscriber| subscriber.project_files)
+                .ok_or_else(|| {
+                    project_command_error(
+                        operation,
+                        format!("host stream {connection_host_stream} is not registered"),
+                    )
+                })?;
+            let handle = ensure_project_actor(&mut state, project_id.clone())
+                .await
+                .map_err(|error| project_command_error(operation, error))?;
+            let readiness = match state
+                .host_streams
+                .get(connection_host_stream)
+                .and_then(|subscriber| subscriber.project_readiness.get(&project_id))
+                .cloned()
+            {
+                Some(readiness) => readiness,
+                None => {
+                    let summaries = state
+                        .review_registry
+                        .summaries(project_id.clone())
+                        .await
+                        .map_err(|error| project_command_error(operation, error))?;
+                    let response = handle
+                        .begin_add_subscriber(
+                            connection_host_stream.clone(),
+                            project_output_stream.clone(),
+                            summaries,
+                            project_files,
+                        )
+                        .map_err(|error| project_command_error(operation, error))?;
+                    track_project_subscription(
+                        &mut state,
+                        connection_host_stream,
+                        project_id,
+                        response,
+                    )
+                }
+            };
+            (handle, readiness)
+        };
+        readiness
             .await
             .map_err(|error| project_command_error(operation, error))?;
         Ok(handle)
@@ -11991,29 +12014,14 @@ impl HostHandle {
             output_stream = %project_output_stream.path(),
             "received review_create"
         );
-        let (project_store, review_registry, project_stream) = {
+        let (project_store, review_registry) = {
             let state = self.state.lock().await;
             (
                 Arc::clone(&state.project_store),
                 state.review_registry.clone(),
-                state
-                    .project_streams
-                    .get(&project_id)
-                    .map(|subscription| subscription.handle.clone()),
             )
         };
-
         let project = load_project(&project_store, &project_id, OPERATION).await?;
-        // Review replies use a separate stream; they must not overtake the
-        // initial project snapshot when connection subscription is deferred.
-        if let Some(project_stream) = project_stream {
-            project_stream
-                .await_subscriber(connection_host_stream.clone())
-                .await
-                .map_err(|error| {
-                    AppError::internal_message(OPERATION, error.clone(), anyhow!(error))
-                })?;
-        }
         let normalized_selection = review_create_selection(&project, &payload.selection)
             .map_err(|error| AppError::invalid(OPERATION, error))?;
         let selection_root = match &normalized_selection {
@@ -17000,6 +17008,9 @@ async fn fan_out_project_notify(state: &mut HostState, payload: ProjectNotifyPay
         let Some(subscriber) = state.host_streams.get_mut(&path) else {
             continue;
         };
+        if let ProjectNotifyPayload::Delete { project } = &payload {
+            subscriber.project_readiness.remove(&project.id);
+        }
         if emit_project_notify_for_subscriber(&payload, subscriber)
             .await
             .is_err()
@@ -17326,6 +17337,9 @@ async fn ensure_project_actor(
         return Ok(subscription.handle.clone());
     }
 
+    for subscriber in state.host_streams.values_mut() {
+        subscriber.project_readiness.remove(&project_id);
+    }
     if let Some(mut router) = state.code_intel_routers.remove(&project_id) {
         router.shutdown_all();
     }
@@ -17366,19 +17380,44 @@ async fn subscribe_host_to_project(
         summaries,
         project_files,
     )?;
-    let host_path = host_path.clone();
-    // Registration holds the host lock and precedes the connection writer.
-    // Waiting for a project refresh here also stalls unrelated host commands.
-    tokio::spawn(async move {
-        let result = response
+    // The observer polls a stored clone; registration must not await it.
+    drop(track_project_subscription(
+        state, host_path, project_id, response,
+    ));
+    Ok(())
+}
+
+fn track_project_subscription(
+    state: &mut HostState,
+    host_path: &StreamPath,
+    project_id: ProjectId,
+    response: tokio::sync::oneshot::Receiver<Result<(), String>>,
+) -> ProjectSubscriptionReady {
+    let readiness = async move {
+        response
             .await
-            .unwrap_or_else(|_| Err("project stream subscription stopped".to_owned()));
+            .unwrap_or_else(|_| Err("project stream subscription stopped".to_owned()))
+    }
+    .boxed()
+    .shared();
+    state
+        .host_streams
+        .get_mut(host_path)
+        .expect("subscriber checked above")
+        .project_readiness
+        .insert(project_id.clone(), readiness.clone());
+    let host_path = host_path.clone();
+    let pending = readiness.clone();
+    tokio::spawn(async move {
+        let result = pending.await;
+        tracing::debug!(host_stream = %host_path, %project_id, ready = result.is_ok(),
+            "project bootstrap subscription settled");
         if let Err(error) = result {
             tracing::warn!(host_stream = %host_path, %project_id, %error,
                 "failed to attach host to project stream");
         }
     });
-    Ok(())
+    readiness
 }
 
 async fn emit_review_list_changed_for_project(

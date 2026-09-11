@@ -1157,8 +1157,20 @@ async fn slow_git_refresh_keeps_host_connections_responsive() {
     expect_project_bootstrap(&mut fixture.client, "slow git bootstrap").await;
     expect_command_error(&mut fixture.client, "watch limit warning").await;
 
+    let agent = fixture
+        .spawn_scripted(
+            "pending-project-interrupt",
+            server::backend::mock::MockScript::one(server::backend::mock::MockTurn::held_text(
+                "waiting for interrupt",
+            )),
+        )
+        .await;
+    fixture.next_chat_event_matching(&agent, "held response", |event| {
+        matches!(event, protocol::ChatEvent::StreamDelta(delta) if delta.text.contains("waiting for interrupt"))
+    }).await;
+
     let hook = repo.path().join(".git/slow-fsmonitor");
-    fs::write(&hook, "#!/bin/sh\n: > .git/monitor-started\nwhile [ ! -f .git/monitor-release ]; do sleep 0.01; done\nprintf 'token\\000/\\000'\n").unwrap();
+    fs::write(&hook, "#!/bin/sh\n: > .git/monitor-started\nwhile [ -d .git ] && [ ! -f .git/monitor-release ]; do sleep 0.01; done\nprintf 'token\\000/\\000'\n").unwrap();
     fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
     git(
         repo.path(),
@@ -1181,10 +1193,23 @@ async fn slow_git_refresh_keeps_host_connections_responsive() {
         }
         let _ = entered_tx.send(());
         std::thread::sleep(Duration::from_secs(2));
-        fs::write(root.join(".git/monitor-release"), "").unwrap();
+        if let Err(error) = fs::write(root.join(".git/monitor-release"), "") {
+            assert_eq!(
+                error.kind(),
+                std::io::ErrorKind::NotFound,
+                "release Git watchdog: {error}"
+            );
+        }
     });
     entered_rx.await.expect("fsmonitor started");
-    let (connection, bootstrap) = fixture.connect_with_bootstrap().await;
+    let (mut connection, bootstrap) = fixture.connect_with_bootstrap().await;
+    let late_agent_stream = bootstrap
+        .agents
+        .iter()
+        .find(|candidate| candidate.agent_id == agent.new_agent.agent_id)
+        .expect("late connection knows the running agent")
+        .instance_stream
+        .clone();
     assert!(
         bootstrap
             .projects
@@ -1195,13 +1220,63 @@ async fn slow_git_refresh_keeps_host_connections_responsive() {
         !repo.path().join(".git/monitor-release").exists(),
         "host connection waited for the slow Git refresh to finish"
     );
+    connection
+        .review_create(
+            &project.id,
+            protocol::ReviewCreatePayload {
+                request_id: None,
+                selection: protocol::ReviewDiffSelection::Workspace {
+                    scope: ProjectDiffScope::Unstaged,
+                },
+            },
+        )
+        .await
+        .unwrap();
+    connection.interrupt(&late_agent_stream).await.unwrap();
+    fixture
+        .next_chat_event_matching(&agent, "interrupt behind pending review", |event| {
+            matches!(event, protocol::ChatEvent::TypingStatusChanged(false))
+        })
+        .await;
+    assert!(
+        !repo.path().join(".git/monitor-release").exists(),
+        "interrupt waited behind a project subscription"
+    );
     fs::write(repo.path().join(".git/monitor-release"), "").unwrap();
-    let status = expect_project_git_status_matching(
-        &mut fixture.client,
-        "status after slow Git",
-        |status| status.roots.iter().any(|root| !root.clean),
+    next_frame_matching_on(
+        &mut connection,
+        "bootstrap before review response",
+        |event| {
+            assert_ne!(
+                event.kind,
+                FrameKind::ReviewBootstrap,
+                "review response overtook project bootstrap"
+            );
+            event.kind == FrameKind::ProjectBootstrap
+        },
     )
     .await;
+    next_frame_matching_on(
+        &mut connection,
+        "review response after bootstrap",
+        |event| event.kind == FrameKind::ReviewBootstrap,
+    )
+    .await;
+
+    // The added agent also emits ContextCompactionCapability after interruption;
+    // select the project's status without treating agent lifecycle frames as Git output.
+    let status = next_frame_matching_on(&mut fixture.client, "status after slow Git", |event| {
+        event.kind == FrameKind::ProjectGitStatus
+            && event.stream == StreamPath(format!("/project/{}", project.id))
+            && event
+                .parse_payload::<ProjectGitStatusPayload>()
+                .unwrap()
+                .roots
+                .iter()
+                .any(|root| !root.clean)
+    })
+    .await;
+    let status: ProjectGitStatusPayload = status.parse_payload().unwrap();
     assert_eq!(status.roots[0].files[0].relative_path, "src/lib.rs");
     drop(connection);
     watchdog.join().unwrap();

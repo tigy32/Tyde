@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -646,9 +647,16 @@ async fn app_loop(resources: AppLoopResources) -> Result<(), FrameError> {
             }
         }
     });
+    let mut project_queues = HashMap::<protocol::StreamPath, mpsc::Sender<Envelope>>::new();
+    let mut project_tasks = tokio::task::JoinSet::<()>::new();
     let mut voice_ingress = VoiceIngressState::default();
     loop {
         tokio::select! {
+            result = project_tasks.join_next(), if !project_tasks.is_empty() => {
+                if let Some(Err(error)) = result {
+                    return Err(FrameError::Protocol(format!("project request task failed: {error}")));
+                }
+            }
             _ = cancel.cancelled() => return Ok(()),
             _ = tokio::time::sleep(MOBILE_CLIENT_LIVENESS_TIMEOUT),
                 if has_peer_liveness_deadline(&origin) =>
@@ -749,6 +757,25 @@ async fn app_loop(resources: AppLoopResources) -> Result<(), FrameError> {
                     continue;
                 }
 
+                if envelope.stream.0.starts_with("/project/") {
+                    let queue = project_queues.entry(envelope.stream.clone()).or_insert_with(|| {
+                        let (tx, rx) = mpsc::channel::<Envelope>(32);
+                        let host = host.clone();
+                        let host_stream = host_stream.clone();
+                        let output = host_output_stream.clone();
+                        let origin = origin.clone();
+                        let cancel = cancel.clone();
+                        project_tasks.spawn(route_project_requests(host, host_stream, output, origin, cancel, rx));
+                        tx
+                    });
+                    if queue.try_send(envelope).is_err() {
+                        let error = AppError::invalid("project_request", "project request queue is full or closed");
+                        emit_command_error(&host_output_stream, request_stream, request_kind, request_id, &error);
+                    }
+                    first_request.notify_one();
+                    continue;
+                }
+
                 let route_result =
                     route_client_envelope(
                         &host,
@@ -772,6 +799,34 @@ async fn app_loop(resources: AppLoopResources) -> Result<(), FrameError> {
                     }
                 }
                 first_request.notify_one();
+            }
+        }
+    }
+}
+
+async fn route_project_requests(
+    host: HostHandle,
+    host_stream: protocol::StreamPath,
+    output: Stream,
+    origin: ConnectionOrigin,
+    cancel: CancellationToken,
+    mut requests: mpsc::Receiver<Envelope>,
+) {
+    while let Some(envelope) = requests.recv().await {
+        let request_stream = envelope.stream.clone();
+        let request_kind = envelope.kind;
+        let request_id = envelope
+            .payload
+            .get("request_id")
+            .and_then(serde_json::Value::as_str)
+            .map(ToOwned::to_owned);
+        if let Err(error) =
+            route_client_envelope(&host, &host_stream, &output, &origin, envelope).await
+        {
+            emit_command_error(&output, request_stream, request_kind, request_id, &error);
+            if error.fatal {
+                cancel.cancel();
+                return;
             }
         }
     }

@@ -800,6 +800,13 @@ pub(crate) async fn route_client_envelope(
         let stream_path = envelope.stream.clone();
         let project_id = parse_project_id(&stream_path)?;
         let project_output_stream = host_output_stream.with_path(stream_path.clone());
+        host.ensure_host_project_subscription(
+            connection_host_stream,
+            &project_output_stream,
+            project_id.clone(),
+            "project_subscription",
+        )
+        .await?;
 
         match envelope.kind {
             FrameKind::ProjectAccessed => {
