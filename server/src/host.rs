@@ -11991,15 +11991,29 @@ impl HostHandle {
             output_stream = %project_output_stream.path(),
             "received review_create"
         );
-        let (project_store, review_registry) = {
+        let (project_store, review_registry, project_stream) = {
             let state = self.state.lock().await;
             (
                 Arc::clone(&state.project_store),
                 state.review_registry.clone(),
+                state
+                    .project_streams
+                    .get(&project_id)
+                    .map(|subscription| subscription.handle.clone()),
             )
         };
 
         let project = load_project(&project_store, &project_id, OPERATION).await?;
+        // Review replies use a separate stream; they must not overtake the
+        // initial project snapshot when connection subscription is deferred.
+        if let Some(project_stream) = project_stream {
+            project_stream
+                .await_subscriber(connection_host_stream.clone())
+                .await
+                .map_err(|error| {
+                    AppError::internal_message(OPERATION, error.clone(), anyhow!(error))
+                })?;
+        }
         let normalized_selection = review_create_selection(&project, &payload.selection)
             .map_err(|error| AppError::invalid(OPERATION, error))?;
         let selection_root = match &normalized_selection {

@@ -192,6 +192,10 @@ enum ProjectStreamCommand {
         file_delivery: ProjectFileDelivery,
         reply: oneshot::Sender<Result<(), String>>,
     },
+    AwaitSubscriber {
+        host_path: StreamPath,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
     RemoveSubscriber {
         host_path: StreamPath,
     },
@@ -299,6 +303,16 @@ impl ProjectStreamHandle {
             })
             .map_err(|_| "project stream subscription stopped".to_owned())?;
         Ok(response)
+    }
+
+    pub(crate) async fn await_subscriber(&self, host_path: StreamPath) -> Result<(), String> {
+        let (reply, response) = oneshot::channel();
+        self.tx
+            .send(ProjectStreamCommand::AwaitSubscriber { host_path, reply })
+            .map_err(|_| "project stream subscription stopped".to_owned())?;
+        response
+            .await
+            .map_err(|_| "project stream subscription stopped".to_owned())?
     }
 
     pub(crate) async fn remove_subscriber(&self, host_path: StreamPath) {
@@ -635,6 +649,17 @@ async fn run_project_subscription(
                                 false,
                             ).await;
                         }
+                        let _ = reply.send(result);
+                    }
+                    ProjectStreamCommand::AwaitSubscriber { host_path, reply } => {
+                        let ready = subscribers.contains_key(&host_path);
+                        tracing::debug!(%project_id, host_stream = %host_path, ready,
+                            "checking project bootstrap delivery before dependent request");
+                        let result = if ready {
+                            Ok(())
+                        } else {
+                            Err("host is not subscribed to the project stream".to_owned())
+                        };
                         let _ = reply.send(result);
                     }
                     ProjectStreamCommand::RemoveSubscriber { host_path } => {
