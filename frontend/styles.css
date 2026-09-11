@@ -9737,7 +9737,7 @@ math merror {
 }
 
 .settings-backend-row > .settings-toggle {
-    margin-left: var(--space-2);
+    margin-left: auto;
 }
 
 /* Fixed columns for the two chips: without them every row starts its
@@ -11020,8 +11020,8 @@ math merror {
     background: var(--surface-3);
 }
 
-/* The description is the only elastic member of the row, so it is what gives
-   way first: it truncates rather than wrapping the row onto a second line. */
+/* Descriptions and versions yield space to keep the enable toggle inside
+   the card, including when the probe reports a full command path. */
 .settings-backend-desc {
     flex: 1;
     min-width: 0;
@@ -11034,7 +11034,12 @@ math merror {
 }
 
 .settings-backend-version {
-    flex-shrink: 0;
+    flex: 0 1 auto;
+    min-width: 0;
+    max-width: 45%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
     font-family: var(--font-mono);
     font-size: 0.846rem;
     color: var(--text-tertiary);

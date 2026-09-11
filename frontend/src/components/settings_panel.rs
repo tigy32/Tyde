@@ -6690,6 +6690,7 @@ fn BackendCard(kind: BackendKind) -> impl IntoView {
     let setup_info_for_status = setup_info.clone();
     let setup_info_for_label = setup_info.clone();
     let setup_info_for_version = setup_info.clone();
+    let setup_info_for_version_title = setup_info.clone();
     let setup_info_for_details = setup_info.clone();
     let setup_info_for_notes = setup_info.clone();
 
@@ -6728,8 +6729,11 @@ fn BackendCard(kind: BackendKind) -> impl IntoView {
                 <span class=move || backend_setup_status_class(setup_info_for_status().as_ref())>
                     {move || backend_setup_status_label(setup_info_for_label().as_ref())}
                 </span>
-                <span class="settings-backend-desc">{description}</span>
-                <span class="settings-backend-version">
+                <span class="settings-backend-desc" title=description>{description}</span>
+                <span
+                    class="settings-backend-version"
+                    title=move || setup_info_for_version_title().and_then(|info| info.installed_version)
+                >
                     {move || setup_info_for_version().and_then(|info| info.installed_version)}
                 </span>
                 {move || match setup_info_for_details() {
@@ -13018,6 +13022,105 @@ mod wasm_tests {
             Some("openrouter"),
             "the edit must carry the typed value: {setting:?}"
         );
+    }
+
+    #[wasm_bindgen_test]
+    async fn backend_cards_contain_long_versions_and_align_toggles() {
+        let document = web_sys::window().unwrap().document().unwrap();
+        let style = document.create_element("style").unwrap();
+        style.set_text_content(Some(include_str!("../../styles.css")));
+        document.head().unwrap().append_child(&style).unwrap();
+        let container = make_container();
+        let versions = [
+            (BackendKind::Codex, "codex-cli 0.153.4"),
+            (
+                BackendKind::Hermes,
+                "/Users/mike/.hermes/tyde-hermes-python -m tui_gateway.entry",
+            ),
+            (BackendKind::Grok, "grok 1.0.25 (f7e67d6988e2) [stable]"),
+        ];
+        let handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            install_backend_config_host(
+                &state,
+                BackendConfigValues::default(),
+                vec![BackendKind::Codex],
+            );
+            state.backend_setup_by_host.update(|hosts| {
+                hosts.insert(
+                    "host-cfg".to_owned(),
+                    versions
+                        .iter()
+                        .map(|(kind, version)| {
+                            let mut info = backend_setup_info(*kind, BackendSetupStatus::Installed);
+                            info.installed_version = Some((*version).to_owned());
+                            info
+                        })
+                        .collect(),
+                );
+            });
+            provide_context(state);
+            view! {
+                <div class="settings-backend-list">
+                    {versions.into_iter().map(|(kind, _)| view! { <BackendCard kind /> }).collect::<Vec<_>>()}
+                </div>
+            }
+        });
+        for width in [404, 640] {
+            container
+                .style()
+                .set_property("width", &format!("{width}px"))
+                .unwrap();
+            next_tick().await;
+            let cards = container
+                .query_selector_all(".settings-backend-card")
+                .unwrap();
+            let mut toggle_right: Option<f64> = None;
+            for i in 0..cards.length() {
+                let card: HtmlElement = cards.item(i).unwrap().dyn_into().unwrap();
+                let row: HtmlElement = card
+                    .query_selector(".settings-backend-row")
+                    .unwrap()
+                    .unwrap()
+                    .dyn_into()
+                    .unwrap();
+                let toggle = card
+                    .query_selector(".settings-toggle")
+                    .unwrap()
+                    .unwrap()
+                    .get_bounding_client_rect();
+                let bounds = card.get_bounding_client_rect();
+                log::info!(
+                    "backend layout width={width} row={i}: card_right={} toggle_right={} scroll={} client={}",
+                    bounds.right(),
+                    toggle.right(),
+                    row.scroll_width(),
+                    row.client_width()
+                );
+                assert!(
+                    toggle.width() >= 30.0,
+                    "toggle must retain its usable width"
+                );
+                assert!(
+                    toggle.right() <= bounds.right(),
+                    "toggle must stay inside its card"
+                );
+                assert!(
+                    row.scroll_width() <= row.client_width(),
+                    "backend details must not overflow the row"
+                );
+                if let Some(right) = toggle_right {
+                    assert!(
+                        (toggle.right() - right).abs() < 1.0,
+                        "toggles must align across backends"
+                    );
+                }
+                toggle_right = Some(toggle.right());
+            }
+        }
+        drop(handle);
+        container.remove();
+        style.remove();
     }
 
     /// A backend whose CLI is found but unusable is reported `Unavailable`
