@@ -10180,23 +10180,7 @@ async fn journal_new_replay_records(
     if records.is_empty() {
         return;
     }
-    let persistence_session_id = session_id.clone();
-    let persistence = tokio::task::spawn_blocking(move || {
-        let mut next_sequence = store
-            .load(&persistence_session_id)?
-            .into_iter()
-            .map(|record| record.sequence)
-            .max()
-            .map_or(0, |sequence| sequence.saturating_add(1));
-        for mut record in records {
-            record.sequence = next_sequence;
-            if store.append_import_if_missing(&record)? {
-                next_sequence = next_sequence.saturating_add(1);
-            }
-        }
-        Ok::<(), String>(())
-    })
-    .await;
+    let persistence = tokio::task::spawn_blocking(move || store.append_live_records(records)).await;
     match persistence {
         Ok(Ok(())) => {}
         Ok(Err(error)) => {

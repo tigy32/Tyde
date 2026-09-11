@@ -6294,6 +6294,109 @@ async fn cancelling_parent_terminally_closes_live_native_child_and_replays_idle(
     );
 }
 
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn live_send_and_interrupt_do_not_reread_the_transcript() {
+    use rustix::fs::inotify;
+    use std::mem::MaybeUninit;
+
+    let mut fixture = Fixture::new().await;
+    let agent = fixture
+        .spawn_scripted(
+            "journal-responsiveness",
+            MockScript::one(MockTurn::text("previous response ".repeat(65_536)))
+                .then(MockTurn::held_text("working after large transcript")),
+        )
+        .await;
+    fixture
+        .finish_turn(&agent)
+        .await
+        .assert_stream_end_contains("previous response");
+    let journal = std::fs::read_dir(fixture.store_dir().join("transcripts"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "jsonl")
+        })
+        .expect("persisted transcript");
+    assert!(std::fs::metadata(&journal).unwrap().len() > 1_000_000);
+    let watch =
+        inotify::init(inotify::CreateFlags::NONBLOCK | inotify::CreateFlags::CLOEXEC).unwrap();
+    inotify::add_watch(
+        &watch,
+        &journal,
+        inotify::WatchFlags::ACCESS | inotify::WatchFlags::MODIFY,
+    )
+    .unwrap();
+
+    fixture
+        .client
+        .send_message(&agent.stream, "Continue working".to_owned())
+        .await
+        .unwrap();
+    fixture.next_chat_event_matching(&agent, "held response started", |event| {
+        matches!(event, ChatEvent::StreamDelta(delta) if delta.text.contains("working after large transcript"))
+    }).await;
+    fixture.client.interrupt(&agent.stream).await.unwrap();
+    fixture
+        .next_chat_event_matching(
+            &agent,
+            "interrupt reaches backend and becomes idle",
+            |event| matches!(event, ChatEvent::TypingStatusChanged(false)),
+        )
+        .await;
+
+    // Observe real file reads, rather than a machine-dependent latency limit:
+    // rereading old payloads before every append is the source of the stall.
+    let mut buffer = [MaybeUninit::uninit(); 1024];
+    let mut reader = inotify::Reader::new(watch, &mut buffer);
+    let mut writes = 0;
+    loop {
+        match reader.next() {
+            Ok(event) => {
+                assert!(
+                    !event.events().contains(inotify::ReadFlags::ACCESS),
+                    "live event handling reread the existing transcript before processing the interrupt"
+                );
+                if event.events().contains(inotify::ReadFlags::MODIFY) {
+                    writes += 1;
+                }
+            }
+            Err(rustix::io::Errno::AGAIN) => break,
+            Err(error) => panic!("read transcript filesystem events: {error}"),
+        }
+    }
+    assert!(
+        writes > 0,
+        "the send/interrupt flow must still be persisted"
+    );
+    let records = std::fs::read_to_string(&journal)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert!(
+        records
+            .windows(2)
+            .all(|pair| pair[0]["sequence"].as_u64().unwrap()
+                < pair[1]["sequence"].as_u64().unwrap())
+    );
+    let ids = records
+        .iter()
+        .map(|record| record["event_id"].as_str().unwrap())
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(ids.len(), records.len());
+    // held_text emits this assistant StreamEnd and no MessageAdded for the
+    // request text. Persist the reply the client saw during the new turn.
+    assert!(records.iter().any(|record| {
+        matches!(
+            serde_json::from_value::<ChatEvent>(record["event"].clone()).unwrap(),
+            ChatEvent::StreamEnd(end) if end.message.content == "working after large transcript"
+        )
+    }));
+}
+
 #[tokio::test]
 async fn interrupting_parent_keeps_agent_control_children_running() {
     let mut fixture = Fixture::new().await;
