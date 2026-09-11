@@ -741,92 +741,108 @@ async fn workbench_create_rolls_back_previously_created_roots_on_late_git_failur
 
 #[tokio::test]
 async fn workbench_remove_succeeds_when_worktree_dir_was_deleted_out_of_band() {
-    let mut fixture = Fixture::new().await;
-    let repo = init_git_repo("missing-worktree");
-    let parent = create_project(&mut fixture.client, vec![repo.path()]).await;
-    let workbench = create_workbench(&mut fixture.client, &parent, "missing-worktree").await;
-    let worktree_root = PathBuf::from(project_roots(&workbench)[0].clone());
-    fs::remove_dir_all(&worktree_root).expect("remove worktree dir out of band");
+    for residual_directory in [false, true] {
+        let mut fixture = Fixture::new().await;
+        let repo = init_git_repo("missing-worktree");
+        let parent = create_project(&mut fixture.client, vec![repo.path()]).await;
+        let workbench = create_workbench(&mut fixture.client, &parent, "missing-worktree").await;
+        let worktree_root = PathBuf::from(project_roots(&workbench)[0].clone());
+        fs::remove_dir_all(&worktree_root).expect("remove worktree dir out of band");
 
-    // A worktree dir deleted out of band (manual `rm -rf`, or a half-failed
-    // earlier removal) must not brick the record: removal succeeds, prunes
-    // git's worktree bookkeeping, and deletes the store record.
-    fixture
-        .client
-        .workbench_remove(WorkbenchRemovePayload {
-            id: workbench.id.clone(),
-            force: false,
-        })
-        .await
-        .expect("workbench_remove write failed");
-    let expected_stream = protocol::StreamPath(format!("/project/{}", workbench.id));
-    let deleted_root = worktree_root.to_string_lossy();
-    let mut tolerated_watcher_error = false;
-    // The watcher can report the removed root before the host-stream delete.
-    // Accept only that source-confirmed project-stream failure and still
-    // require the matching delete notification.
-    loop {
-        let env = expect_next_event(&mut fixture.client, "missing worktree remove").await;
-        match env.kind {
-            FrameKind::ProjectNotify => {
-                let notify: ProjectNotifyPayload = env
-                    .parse_payload()
-                    .expect("parse ProjectNotifyPayload for missing worktree remove");
-                match notify {
-                    ProjectNotifyPayload::Delete { project } if project.id == workbench.id => break,
-                    other => panic!(
-                        "expected matching workbench delete: context=missing worktree remove, stream={}, kind={:?}, payload={other:?}",
-                        env.stream, env.kind
-                    ),
+        if residual_directory {
+            fs::create_dir(&worktree_root).expect("recreate residual directory");
+            fs::write(worktree_root.join("keep.txt"), "unsaved work").expect("write residual file");
+        }
+
+        // A worktree dir deleted out of band (manual `rm -rf`, or a half-failed
+        // earlier removal) must not brick the record: removal succeeds, prunes
+        // git's worktree bookkeeping, and deletes the store record.
+        fixture
+            .client
+            .workbench_remove(WorkbenchRemovePayload {
+                id: workbench.id.clone(),
+                force: false,
+            })
+            .await
+            .expect("workbench_remove write failed");
+        let expected_stream = protocol::StreamPath(format!("/project/{}", workbench.id));
+        let deleted_root = worktree_root.to_string_lossy();
+        let mut tolerated_watcher_error = false;
+        // The watcher can report the removed root before the host-stream delete.
+        // Accept only that source-confirmed project-stream failure and still
+        // require the matching delete notification.
+        loop {
+            let env = expect_next_event(&mut fixture.client, "missing worktree remove").await;
+            match env.kind {
+                FrameKind::ProjectNotify => {
+                    let notify: ProjectNotifyPayload = env
+                        .parse_payload()
+                        .expect("parse ProjectNotifyPayload for missing worktree remove");
+                    match notify {
+                        ProjectNotifyPayload::Delete { project } if project.id == workbench.id => {
+                            break;
+                        }
+                        other => panic!(
+                            "expected matching workbench delete: context=missing worktree remove, stream={}, kind={:?}, payload={other:?}",
+                            env.stream, env.kind
+                        ),
+                    }
                 }
+                FrameKind::CommandError => {
+                    let error: CommandErrorPayload = env
+                        .parse_payload()
+                        .expect("parse CommandErrorPayload for missing worktree remove");
+                    assert!(
+                        !tolerated_watcher_error,
+                        "received duplicate watcher error: context=missing worktree remove, envelope_stream={}, stream={}, request_kind={:?}, operation={}, code={:?}, message={:?}, fatal={}",
+                        env.stream,
+                        error.stream,
+                        error.request_kind,
+                        error.operation,
+                        error.code,
+                        error.message,
+                        error.fatal
+                    );
+                    assert_eq!(env.stream, expected_stream, "unexpected envelope stream");
+                    assert_eq!(error.stream, expected_stream, "unexpected payload stream");
+                    assert_eq!(error.request_kind, FrameKind::ProjectFileList);
+                    assert_eq!(error.operation, "project_watch");
+                    assert_eq!(error.code, CommandErrorCode::Internal);
+                    assert!(error.fatal, "watcher error must be fatal");
+                    assert!(
+                        error.message.contains(deleted_root.as_ref()),
+                        "watcher error must name the exact deleted worktree path: path={deleted_root:?}, message={:?}",
+                        error.message
+                    );
+                    tolerated_watcher_error = true;
+                }
+                kind => panic!(
+                    "expected workbench delete: context=missing worktree remove, stream={}, kind={kind:?}",
+                    env.stream
+                ),
             }
-            FrameKind::CommandError => {
-                let error: CommandErrorPayload = env
-                    .parse_payload()
-                    .expect("parse CommandErrorPayload for missing worktree remove");
-                assert!(
-                    !tolerated_watcher_error,
-                    "received duplicate watcher error: context=missing worktree remove, envelope_stream={}, stream={}, request_kind={:?}, operation={}, code={:?}, message={:?}, fatal={}",
-                    env.stream,
-                    error.stream,
-                    error.request_kind,
-                    error.operation,
-                    error.code,
-                    error.message,
-                    error.fatal
-                );
-                assert_eq!(env.stream, expected_stream, "unexpected envelope stream");
-                assert_eq!(error.stream, expected_stream, "unexpected payload stream");
-                assert_eq!(error.request_kind, FrameKind::ProjectFileList);
-                assert_eq!(error.operation, "project_watch");
-                assert_eq!(error.code, CommandErrorCode::Internal);
-                assert!(error.fatal, "watcher error must be fatal");
-                assert!(
-                    error.message.contains(deleted_root.as_ref()),
-                    "watcher error must name the exact deleted worktree path: path={deleted_root:?}, message={:?}",
-                    error.message
-                );
-                tolerated_watcher_error = true;
-            }
-            kind => panic!(
-                "expected workbench delete: context=missing worktree remove, stream={}, kind={kind:?}",
-                env.stream
-            ),
+        }
+
+        let worktrees = Command::new("git")
+            .arg("-C")
+            .arg(repo.path())
+            .args(["worktree", "list", "--porcelain"])
+            .output()
+            .expect("run git worktree list");
+        assert!(worktrees.status.success());
+        assert!(
+            !String::from_utf8_lossy(&worktrees.stdout)
+                .contains(worktree_root.to_string_lossy().as_ref()),
+            "git worktree bookkeeping should be pruned for the missing worktree"
+        );
+        if residual_directory {
+            assert_eq!(
+                fs::read_to_string(worktree_root.join("keep.txt"))
+                    .expect("preserved residual file"),
+                "unsaved work"
+            );
         }
     }
-
-    let worktrees = Command::new("git")
-        .arg("-C")
-        .arg(repo.path())
-        .args(["worktree", "list", "--porcelain"])
-        .output()
-        .expect("run git worktree list");
-    assert!(worktrees.status.success());
-    assert!(
-        !String::from_utf8_lossy(&worktrees.stdout)
-            .contains(worktree_root.to_string_lossy().as_ref()),
-        "git worktree bookkeeping should be pruned for the missing worktree"
-    );
 }
 
 #[tokio::test]

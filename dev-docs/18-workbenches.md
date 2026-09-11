@@ -502,8 +502,8 @@ changes only `Project.name`. The git branch and on-disk path do not change.
 ### 6.7 Workbench delete (`WorkbenchRemove`)
 
 `ProjectDelete` on a `ProjectSource::GitWorkbench` record is rejected with
-`InvalidInput`. The user must use `WorkbenchRemove`. This ensures the
-on-disk worktree is always cleaned up alongside the record.
+`InvalidInput`. The user must use `WorkbenchRemove`. This ensures valid
+on-disk worktrees are cleaned up alongside the record.
 
 `WorkbenchRemove { force: false }` rejects when any worktree root is dirty
 (`git status --porcelain=v1 --untracked-files=all` produces output). The error
@@ -531,8 +531,10 @@ Additional structural blockers:
 
 - The parent project record is missing — surfaces as `Internal` (this means
   the store is corrupt; see §8).
-- An absent worktree path is pruned from git bookkeeping and does not block
-  deletion of the authoritative record.
+- An absent worktree path or missing `.git` entry does not block deletion of
+  the authoritative record. Git bookkeeping is pruned and any residual folder
+  and files are preserved, including on a forced retry. Other Git errors still
+  block removal.
 
 Dirty roots require either explicit user cleanup or an explicit forced retry. A
 missing parent requires repairing the corrupt project store.

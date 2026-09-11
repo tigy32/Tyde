@@ -6142,32 +6142,30 @@ impl HostHandle {
         }
 
         for root in roots {
-            let exists = tokio::fs::try_exists(&root.worktree_root.0)
-                .await
-                .map_err(|error| AppError::internal(OPERATION, anyhow!(error)))?;
-            if exists {
+            let has_git_metadata =
+                tokio::fs::try_exists(Path::new(&root.worktree_root.0).join(".git"))
+                    .await
+                    .map_err(|error| AppError::internal(OPERATION, anyhow!(error)))?;
+            if has_git_metadata {
                 git_worktree_remove(&root.parent_root, &root.worktree_root, payload.force)
                     .await
                     .map_err(|error| {
                         AppError::internal_message(OPERATION, error.clone(), anyhow!(error))
                     })?;
             } else {
-                // The worktree dir was deleted out of band (or by an
-                // earlier half-failed removal); prune git's worktree
-                // bookkeeping in the parent repo and keep going so the
-                // record can still be removed. A retry after a partial
-                // failure lands here and succeeds.
+                // A leftover directory without .git may contain recovered work.
+                // Preserve it while removing the stale workbench registration.
                 tracing::warn!(
                     project_id = %project.id,
                     worktree_root = %root.worktree_root,
-                    "worktree root missing during workbench removal; pruning git worktree bookkeeping"
+                    "worktree Git metadata missing during workbench removal; preserving residual files and pruning git worktree bookkeeping"
                 );
                 if let Err(error) = git_worktree_prune(&root.parent_root).await {
                     tracing::warn!(
                         project_id = %project.id,
                         parent_root = %root.parent_root,
                         error = %error,
-                        "failed to prune git worktrees for missing worktree root"
+                        "failed to prune git worktrees for root with missing Git metadata"
                     );
                 }
             }
@@ -6322,14 +6320,16 @@ impl HostHandle {
 
         let mut dirty_roots = Vec::new();
         for root in roots {
-            let exists = tokio::fs::try_exists(&root.worktree_root.0)
-                .await
-                .map_err(|error| AppError::internal(OPERATION, anyhow!(error)))?;
-            if !exists {
-                // The worktree dir was deleted out of band (or by an
-                // earlier half-failed removal). Treat it as removable
-                // rather than blocking: removal prunes git bookkeeping
-                // and deletes the record, so retries are the recourse.
+            let has_git_metadata =
+                tokio::fs::try_exists(Path::new(&root.worktree_root.0).join(".git"))
+                    .await
+                    .map_err(|error| AppError::internal(OPERATION, anyhow!(error)))?;
+            if !has_git_metadata {
+                tracing::warn!(
+                    project_id = %project.id,
+                    worktree_root = %root.worktree_root,
+                    "worktree Git metadata missing; allowing stale workbench cleanup without git status"
+                );
                 continue;
             }
             let status = git_status_porcelain(&root.worktree_root)
