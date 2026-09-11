@@ -675,21 +675,6 @@ fn notify_composer_draft_limit(notified: RwSignal<bool>) {
 }
 
 #[cfg(target_arch = "wasm32")]
-fn notify_composer_draft_eviction(notified: RwSignal<bool>, evicted: usize) {
-    if evicted == 0 || notified.get_untracked() {
-        return;
-    }
-    notified.set(true);
-    wasm_bindgen_futures::spawn_local(async {
-        crate::bridge::message_dialog(
-            "Draft recovery limit reached",
-            "Tyde reached its bounded crash-recovery storage limit. Older drafts were removed from recovery storage.",
-        )
-        .await;
-    });
-}
-
-#[cfg(target_arch = "wasm32")]
 fn notify_composer_draft_persistence_failure(
     notified: RwSignal<bool>,
     failure: DraftPersistenceFailure,
@@ -710,18 +695,15 @@ fn notify_composer_draft_persistence_failure(
 
 #[cfg(target_arch = "wasm32")]
 fn surface_composer_draft_persistence_outcome(
-    pending_evictions: RwSignal<usize>,
-    eviction_notified: RwSignal<bool>,
     limit_notified: RwSignal<bool>,
     failure_notified: RwSignal<bool>,
     outcome: DraftPersistenceOutcome,
 ) {
-    let pending = pending_evictions
-        .try_update(std::mem::take)
-        .unwrap_or_default();
-    let evicted = pending.saturating_add(outcome.bounds.evicted);
-    if evicted > 0 {
-        log::warn!("composer draft bounds evicted {evicted} entries");
+    if outcome.bounds.evicted > 0 {
+        log::warn!(
+            "composer draft bounds evicted {} entries",
+            outcome.bounds.evicted
+        );
     }
     if let Some(failure) = outcome.failure {
         notify_composer_draft_persistence_failure(failure_notified, failure);
@@ -732,7 +714,6 @@ fn surface_composer_draft_persistence_outcome(
             limit_notified.set(false);
         }
         failure_notified.set(false);
-        notify_composer_draft_eviction(eviction_notified, evicted);
     }
 }
 
@@ -873,7 +854,8 @@ mod composer_draft_tests {
     }
 
     #[wasm_bindgen_test]
-    fn typing_path_queues_eviction_notice_until_persistence() {
+    fn exceeding_the_draft_count_silently_drops_the_oldest_draft() {
+        clear_storage();
         let state = AppState::new();
         let composer = state.composer_untracked();
         for index in 0..=MAX_PERSISTED_COMPOSER_DRAFT_ENTRIES {
@@ -883,11 +865,37 @@ mod composer_draft_tests {
             composer.text.set(format!("draft-{index}"));
             assert!(state.checkpoint_composer_draft(&composer));
         }
-        assert_eq!(state.composer_draft_pending_evictions.get_untracked(), 1);
-        assert!(
-            !state.composer_draft_eviction_notified.get_untracked(),
-            "typing may queue an eviction notice but must not open its modal"
+        state.flush_composer_drafts();
+
+        let encoded = web_sys::window()
+            .unwrap()
+            .local_storage()
+            .unwrap()
+            .unwrap()
+            .get_item(COMPOSER_DRAFT_STORAGE_KEY)
+            .unwrap()
+            .expect("the newest drafts are persisted");
+        let persisted = serde_json::from_str::<PersistedComposerDraftStore>(&encoded).unwrap();
+        assert_eq!(
+            persisted.entries.len(),
+            MAX_PERSISTED_COMPOSER_DRAFT_ENTRIES
         );
+        assert!(persisted.find_index(&owner("typing-0")).is_none());
+        assert!(
+            persisted
+                .find_index(&owner(&format!(
+                    "typing-{MAX_PERSISTED_COMPOSER_DRAFT_ENTRIES}"
+                )))
+                .is_some()
+        );
+        assert!(
+            !state.composer_draft_limit_notified.get_untracked()
+                && !state
+                    .composer_draft_persistence_failure_notified
+                    .get_untracked(),
+            "dropping the oldest draft is routine and must not raise a notice"
+        );
+        clear_storage();
     }
 
     #[wasm_bindgen_test]
@@ -3594,10 +3602,6 @@ pub struct AppState {
     #[cfg(target_arch = "wasm32")]
     composer_draft_limit_notified: RwSignal<bool>,
     #[cfg(target_arch = "wasm32")]
-    composer_draft_pending_evictions: RwSignal<usize>,
-    #[cfg(target_arch = "wasm32")]
-    composer_draft_eviction_notified: RwSignal<bool>,
-    #[cfg(target_arch = "wasm32")]
     composer_draft_persistence_failure_notified: RwSignal<bool>,
     pub task_lists: RwSignal<HashMap<AgentId, TaskList>>,
     pub native_goals: RwSignal<HashMap<AgentId, protocol::NativeGoal>>,
@@ -4146,10 +4150,6 @@ impl AppState {
             composer_draft_persistence: register_composer_draft_scheduler(),
             #[cfg(target_arch = "wasm32")]
             composer_draft_limit_notified: RwSignal::new(false),
-            #[cfg(target_arch = "wasm32")]
-            composer_draft_pending_evictions: RwSignal::new(0),
-            #[cfg(target_arch = "wasm32")]
-            composer_draft_eviction_notified: RwSignal::new(false),
             #[cfg(target_arch = "wasm32")]
             composer_draft_persistence_failure_notified: RwSignal::new(false),
             task_lists: RwSignal::new(HashMap::new()),
@@ -5946,9 +5946,7 @@ impl AppState {
         match update {
             DraftStoreUpdate::Stored { evicted } => {
                 if evicted > 0 {
-                    log::warn!("composer draft bounds queued {evicted} evictions");
-                    self.composer_draft_pending_evictions
-                        .update(|pending| *pending = pending.saturating_add(evicted));
+                    log::warn!("composer draft bounds evicted {evicted} entries");
                 }
                 true
             }
@@ -5983,8 +5981,6 @@ impl AppState {
         // Resolved when the debounce fires, not now: the protected-from-
         // eviction entry is whichever chat the user is in at write time.
         let owner_state = self.clone();
-        let pending_evictions = self.composer_draft_pending_evictions;
-        let eviction_notified = self.composer_draft_eviction_notified;
         let limit_notified = self.composer_draft_limit_notified;
         let failure_notified = self.composer_draft_persistence_failure_notified;
         let scheduler_id = self.composer_draft_persistence.id;
@@ -5993,13 +5989,7 @@ impl AppState {
             let outcome = drafts
                 .try_update(|drafts| persist_composer_drafts(drafts, active_owner.as_ref()))
                 .unwrap_or_default();
-            surface_composer_draft_persistence_outcome(
-                pending_evictions,
-                eviction_notified,
-                limit_notified,
-                failure_notified,
-                outcome,
-            );
+            surface_composer_draft_persistence_outcome(limit_notified, failure_notified, outcome);
             COMPOSER_DRAFT_TIMEOUTS.with(|timeouts| {
                 timeouts.borrow_mut().remove(&scheduler_id);
             });
@@ -6047,8 +6037,6 @@ impl AppState {
             .try_update(|drafts| persist_composer_drafts(drafts, active_owner.as_ref()))
             .unwrap_or_default();
         surface_composer_draft_persistence_outcome(
-            self.composer_draft_pending_evictions,
-            self.composer_draft_eviction_notified,
             self.composer_draft_limit_notified,
             self.composer_draft_persistence_failure_notified,
             outcome,
