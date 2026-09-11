@@ -4595,17 +4595,18 @@ impl HostHandle {
                         (effective, None)
                     }
                 };
-                let (sanitized_settings, settings_failure) = sanitize_stored_session_settings(
-                    record.backend_kind,
-                    session_settings_schema.as_ref(),
-                    record.session_settings.clone(),
-                );
-                let combined_startup_warning = match (startup_warning, missing_project_warning) {
-                    (Some(a), Some(b)) => Some(format!("{a}; {b}")),
-                    (Some(a), None) => Some(a),
-                    (None, Some(b)) => Some(b),
-                    (None, None) => None,
-                };
+                let (sanitized_settings, settings_failure, settings_warning) =
+                    sanitize_stored_session_settings(
+                        record.backend_kind,
+                        session_settings_schema.as_ref(),
+                        record.session_settings.clone(),
+                    );
+                let warnings = [startup_warning, missing_project_warning, settings_warning]
+                    .into_iter()
+                    .flatten()
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                let combined_startup_warning = (!warnings.is_empty()).then_some(warnings);
                 ResolvedSpawnRequest {
                     name: resolved_name,
                     origin,
@@ -4895,22 +4896,23 @@ impl HostHandle {
                         Err(failure) => (None, Some(failure)),
                     }
                 };
-                let (sanitized_settings, settings_failure) = sanitize_stored_session_settings(
-                    backend_kind,
-                    session_settings_schema.as_ref(),
-                    record.session_settings.clone(),
-                );
+                let (sanitized_settings, settings_failure, settings_warning) =
+                    sanitize_stored_session_settings(
+                        backend_kind,
+                        session_settings_schema.as_ref(),
+                        record.session_settings.clone(),
+                    );
                 let startup_failure = startup_failure
                     .or(non_resumable_failure)
                     .or(backend_support_failure)
                     .or(schema_failure)
                     .or(settings_failure);
-                let combined_startup_warning = match (startup_warning, missing_project_warning) {
-                    (Some(a), Some(b)) => Some(format!("{a}; {b}")),
-                    (Some(a), None) => Some(a),
-                    (None, Some(b)) => Some(b),
-                    (None, None) => None,
-                };
+                let warnings = [startup_warning, missing_project_warning, settings_warning]
+                    .into_iter()
+                    .flatten()
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                let combined_startup_warning = (!warnings.is_empty()).then_some(warnings);
                 let (resolved_name, initial_alias) = match payload.name.clone() {
                     Some(name) => (
                         name.clone(),
@@ -18598,12 +18600,13 @@ fn sanitize_stored_session_settings(
 ) -> (
     Option<protocol::SessionSettingsValues>,
     Option<AgentStartupFailure>,
+    Option<String>,
 ) {
     let Some(stored_settings) = stored_settings else {
-        return (None, None);
+        return (None, None, None);
     };
     if stored_settings.0.is_empty() {
-        return (Some(stored_settings), None);
+        return (Some(stored_settings), None, None);
     }
     let Some(schema) = schema else {
         return (
@@ -18611,20 +18614,64 @@ fn sanitize_stored_session_settings(
             Some(AgentStartupFailure::backend_failed(format!(
                 "{backend_kind:?} session settings schema unavailable; cannot apply stored session settings"
             ))),
+            None,
         );
     };
-    if let Err(err) = validate_session_settings_values(schema, &stored_settings) {
-        return (
-            None,
-            Some(AgentStartupFailure::internal(format!(
-                "invalid stored session settings for backend {backend_kind:?}: {err}"
-            ))),
-        );
+    let mut resolved = stored_settings.clone();
+    loop {
+        let sanitized = sanitize_session_settings_values(schema, &resolved);
+        if sanitized == resolved {
+            break;
+        }
+        let invalid = resolved
+            .0
+            .keys()
+            .filter(|key| !sanitized.0.contains_key(*key))
+            .cloned()
+            .collect::<HashSet<_>>();
+        // Resolve invalid dependencies first: removing an obsolete model may
+        // make the saved effort valid under the default model's options.
+        let removable = invalid
+            .iter()
+            .filter(|key| {
+                !schema
+                    .fields
+                    .iter()
+                    .find(|field| field.key.as_str() == key.as_str())
+                    .and_then(|field| field.select_options_by_setting.as_ref())
+                    .is_some_and(|options| invalid.contains(&options.setting_key))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if removable.is_empty() {
+            resolved = sanitized;
+        } else {
+            for key in removable {
+                resolved.0.remove(&key);
+            }
+        }
     }
-    (
-        Some(sanitize_session_settings_values(schema, &stored_settings)),
-        None,
-    )
+    let mut discarded = stored_settings
+        .0
+        .keys()
+        .filter(|key| !resolved.0.contains_key(*key))
+        .cloned()
+        .collect::<Vec<_>>();
+    discarded.sort();
+    let warning = if discarded.is_empty() {
+        None
+    } else {
+        tracing::warn!(
+            ?backend_kind,
+            ?discarded,
+            "discarding unavailable stored session overrides"
+        );
+        Some(format!(
+            "{backend_kind:?} saved session settings are no longer available and were not reapplied: {}. Review session settings before sending another message.",
+            discarded.join(", ")
+        ))
+    };
+    (Some(resolved), None, warning)
 }
 
 fn backend_has_dynamic_session_schema(backend_kind: protocol::BackendKind) -> bool {

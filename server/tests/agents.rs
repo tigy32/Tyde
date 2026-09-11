@@ -1847,7 +1847,9 @@ async fn spawn_user_child(
     assert_eq!(child_start.origin, AgentOrigin::User);
     assert_eq!(child_start.parent_agent_id.as_ref(), Some(parent_agent_id));
 
-    expect_turn_on_stream(
+    // A completed initial turn replays StreamStart without historical typing
+    // markers. Use the bootstrap-aware oracle already used for MCP children.
+    expect_agent_control_child_initial_turn_on_stream(
         client,
         &child_new.instance_stream,
         &format!("mock backend response to: {prompt}"),

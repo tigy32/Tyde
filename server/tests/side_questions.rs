@@ -609,3 +609,308 @@ async fn removed_backend_fork_fails_without_touching_source_session() {
     assert_eq!(after[0].updated_at_ms, before[0].updated_at_ms);
     assert_eq!(after[0].parent_id, before[0].parent_id);
 }
+
+fn mock_model_discovery(model: &str, efforts: &[&str]) -> server::backend::BackendDiscovery {
+    let field = |key: &str, values: &[&str]| protocol::SessionSettingField {
+        key: key.to_owned(),
+        label: key.to_owned(),
+        description: None,
+        use_slider: false,
+        select_options_by_setting: None,
+        field_type: protocol::SessionSettingFieldType::Select {
+            options: values
+                .iter()
+                .map(|value| protocol::SelectOption {
+                    value: (*value).to_owned(),
+                    label: (*value).to_owned(),
+                })
+                .collect(),
+            default: None,
+            nullable: true,
+        },
+    };
+    let mut reasoning = field("reasoning_effort", efforts);
+    reasoning.select_options_by_setting = Some(protocol::SelectOptionsBySetting {
+        setting_key: "model".to_owned(),
+        values: vec![protocol::SelectOptionsForValue {
+            setting_value: model.to_owned(),
+            options: efforts
+                .iter()
+                .map(|effort| protocol::SelectOption {
+                    value: (*effort).to_owned(),
+                    label: (*effort).to_owned(),
+                })
+                .collect(),
+        }],
+    });
+    server::backend::BackendDiscovery {
+        schema: protocol::SessionSettingsSchema {
+            backend_kind: BackendKind::Codex,
+            fields: vec![field("model", &[model]), reasoning],
+        },
+        launch_profiles: Vec::new(),
+    }
+}
+
+#[tokio::test]
+async fn btw_sessions_recover_after_model_catalog_changes() {
+    let runtime = |model: &str, effort: &str| server::HostRuntimeConfig {
+        mock_backend_discovery: [(
+            BackendKind::Codex,
+            server::backend::mock::MockDiscovery::new(vec![Ok(mock_model_discovery(
+                model,
+                &[effort],
+            ))]),
+        )]
+        .into_iter()
+        .collect(),
+        skip_real_backend_probe: true,
+        ..Default::default()
+    };
+    let mut fixture = Fixture::new_with_runtime_config(runtime("saved-model", "high")).await;
+    let write_id = fixture
+        .client
+        .replace_setting(
+            "/enabled_backends",
+            vec![BackendKind::Codex],
+            fixture.bootstrap.settings.enabled_backends.clone(),
+        )
+        .await
+        .expect("enable Codex");
+    fixture::expect_settings_write_applied(&mut fixture.client, &write_id, "enable Codex").await;
+    let saved_settings = protocol::SessionSettingsValues(
+        [
+            (
+                "model".to_owned(),
+                protocol::SessionSettingValue::String("saved-model".to_owned()),
+            ),
+            (
+                "reasoning_effort".to_owned(),
+                protocol::SessionSettingValue::String("high".to_owned()),
+            ),
+        ]
+        .into_iter()
+        .collect(),
+    );
+    let (source, start) = fixture
+        .spawn_with(SpawnAgentPayload {
+            name: Some("Source".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::New {
+                workspace_roots: vec!["/tmp".to_owned()],
+                prompt: "source prompt".to_owned(),
+                images: None,
+                backend_kind: BackendKind::Codex,
+                launch_profile_id: None,
+                cost_hint: None,
+                access_mode: BackendAccessMode::Unrestricted,
+                session_settings: Some(saved_settings.clone()),
+            },
+        })
+        .await;
+    collect_turn_delta_text(&mut fixture.client, &source.stream, "source turn").await;
+    let source_session = start.session_id.expect("source session");
+    let (btw, start) = fixture
+        .spawn_with(SpawnAgentPayload {
+            name: Some("BTW: Restart reproduction".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::Fork {
+                from_session_id: source_session.clone(),
+                prompt: "side question".to_owned(),
+                images: None,
+                access_mode: None,
+            },
+        })
+        .await;
+    collect_turn_delta_text(&mut fixture.client, &btw.stream, "BTW turn").await;
+    let btw_session = start.session_id.expect("BTW session");
+    let records = load_sessions(fixture.store_dir());
+    for id in [&source_session, &btw_session] {
+        let record = records
+            .iter()
+            .find(|record| &record.id == id)
+            .expect("saved session");
+        eprintln!(
+            "BTW RESTART saved id={} settings={:?}",
+            id, record.session_settings
+        );
+        assert_eq!(record.session_settings.as_ref(), Some(&saved_settings));
+    }
+    fixture
+        .client
+        .close_agent(&source.stream)
+        .await
+        .expect("close source");
+    fixture
+        .client
+        .close_agent(&btw.stream)
+        .await
+        .expect("close BTW");
+    for (stage, (model, effort)) in [
+        ("saved-model", "high"),
+        ("replacement-model", "high"),
+        ("replacement-model", "medium"),
+        ("replacement-model", "medium"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let host = server::spawn_host_with_mock_backend_and_runtime_config(
+            fixture.store_dir().join("sessions.json"),
+            fixture.store_dir().join("projects.json"),
+            fixture.store_dir().join("settings.json"),
+            runtime(model, effort),
+        )
+        .expect("restart host");
+        let (mut client, _) = fixture::connect_host(host.clone()).await;
+        let mut operations = vec![
+            SpawnAgentParams::Resume {
+                session_id: source_session.clone(),
+                prompt: None,
+            },
+            SpawnAgentParams::Resume {
+                session_id: btw_session.clone(),
+                prompt: None,
+            },
+        ];
+        if stage == 1 {
+            operations.insert(
+                0,
+                SpawnAgentParams::Fork {
+                    from_session_id: btw_session.clone(),
+                    prompt: "fork after catalog change".to_owned(),
+                    images: None,
+                    access_mode: None,
+                },
+            );
+        }
+        for params in operations {
+            client
+                .spawn_agent(SpawnAgentPayload {
+                    name: None,
+                    custom_agent_id: None,
+                    parent_agent_id: None,
+                    project_id: None,
+                    params,
+                })
+                .await
+                .expect("resume session after restart");
+            let agent =
+                expect_new_agent_with_diagnostics(&mut client, &host, "resumed agent").await;
+            let start =
+                expect_agent_start(&mut client, &agent.instance_stream, "restored start").await;
+            let session_id = start.session_id.expect("restored session id");
+            if stage == 1 || stage == 2 {
+                let warning = expect_agent_error(
+                    &mut client,
+                    &agent.instance_stream,
+                    "obsolete settings warning",
+                )
+                .await;
+                eprintln!("BTW RESTART recovery warning: {warning:?}");
+                assert!(
+                    !warning.fatal,
+                    "obsolete settings must not block reopening: {warning:?}"
+                );
+                let discarded = if stage == 1 {
+                    "model"
+                } else {
+                    "reasoning_effort"
+                };
+                assert!(warning.message.contains(discarded), "{warning:?}");
+                assert!(warning.message.contains("not reapplied"), "{warning:?}");
+            }
+            let env =
+                fixture::next_logical_frame_matching_on(&mut client, "restored settings", |env| {
+                    if env.stream == agent.instance_stream {
+                        assert_ne!(
+                            env.kind,
+                            FrameKind::AgentError,
+                            "unexpected startup error: {env:?}"
+                        );
+                    }
+                    env.stream == agent.instance_stream && env.kind == FrameKind::SessionSettings
+                })
+                .await;
+            let settings: protocol::SessionSettingsPayload = env.parse_payload().expect("settings");
+            let mut expected = saved_settings.clone();
+            if stage > 0 {
+                expected.0.remove("model");
+            }
+            if stage > 1 {
+                expected.0.remove("reasoning_effort");
+            }
+            assert_eq!(settings.values, expected);
+            client
+                .send_message(&agent.instance_stream, "after restart".to_owned())
+                .await
+                .expect("send after restart");
+            // Resume replays history before returning the new reply.
+            loop {
+                let text =
+                    collect_turn_delta_text(&mut client, &agent.instance_stream, "resumed reply")
+                        .await;
+                if text.contains("mock backend response to: after restart") {
+                    break;
+                }
+                eprintln!("BTW RESTART replay before new reply: {text}");
+            }
+            let records = load_sessions(fixture.store_dir());
+            let record = records
+                .iter()
+                .find(|record| record.id == session_id)
+                .expect("resumed record");
+            assert_eq!(record.session_settings.as_ref(), Some(&expected));
+            eprintln!("BTW RESTART resumed id={session_id} catalog={model}");
+            client
+                .close_agent(&agent.instance_stream)
+                .await
+                .expect("close resumed agent");
+        }
+        if stage == 1 {
+            client
+                .spawn_agent(SpawnAgentPayload {
+                    name: Some("Invalid fresh settings".to_owned()),
+                    custom_agent_id: None,
+                    parent_agent_id: None,
+                    project_id: None,
+                    params: SpawnAgentParams::New {
+                        workspace_roots: vec!["/tmp".to_owned()],
+                        prompt: "must not start".to_owned(),
+                        images: None,
+                        backend_kind: BackendKind::Codex,
+                        launch_profile_id: None,
+                        cost_hint: None,
+                        access_mode: BackendAccessMode::Unrestricted,
+                        session_settings: Some(saved_settings.clone()),
+                    },
+                })
+                .await
+                .expect("submit invalid fresh settings");
+            let agent =
+                expect_new_agent_with_diagnostics(&mut client, &host, "invalid fresh agent").await;
+            let error = expect_agent_error(
+                &mut client,
+                &agent.instance_stream,
+                "invalid fresh settings",
+            )
+            .await;
+            assert!(
+                error.fatal,
+                "new settings must remain strictly validated: {error:?}"
+            );
+            assert!(
+                error.message.contains("invalid supplied session settings"),
+                "{error:?}"
+            );
+            client
+                .close_agent(&agent.instance_stream)
+                .await
+                .expect("close failed fresh agent");
+        }
+    }
+}
