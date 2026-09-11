@@ -14368,6 +14368,7 @@ impl Backend for ClaudeBackend {
     fn capabilities() -> tyde_agent_adapter::BackendCapabilities {
         [
             tyde_agent_adapter::BackendCapability::ResumeSession,
+            tyde_agent_adapter::BackendCapability::SetWorkspaceRoots,
             tyde_agent_adapter::BackendCapability::ForkSession,
             tyde_agent_adapter::BackendCapability::ImageInput,
             tyde_agent_adapter::BackendCapability::Interrupt,
@@ -14819,6 +14820,95 @@ impl Backend for ClaudeBackend {
                 SendOutcome::Closed
             }
         }
+    }
+
+    async fn set_workspace_roots(&mut self, workspace_roots: Vec<String>) -> Result<(), String> {
+        if workspace_roots.len() != 1 {
+            return Err(
+                "Claude workspace relocation requires exactly one workspace root".to_owned(),
+            );
+        }
+        let roots = super::validate_local_workspace_roots(workspace_roots)?;
+        let handle = self
+            .command_handle
+            .lock()
+            .expect("Claude command handle slot poisoned")
+            .clone()
+            .ok_or_else(|| "Claude session is not ready".to_owned())?;
+        let inner = &handle.inner;
+        let event_gate = inner.turn_event_gate.lock().await;
+        let state = inner.state.lock().await;
+        if state.ssh_host.is_some() || state.ephemeral {
+            return Err(
+                "Claude workspace relocation requires a persistent local session".to_owned(),
+            );
+        }
+        if state.closing
+            || state.active_turn.is_some()
+            || state.pending_compaction.is_some()
+            || inner
+                .typing_active
+                .load(std::sync::atomic::Ordering::Acquire)
+            || inner
+                .background_work_active
+                .load(std::sync::atomic::Ordering::Acquire)
+            || inner
+                .pending_cli_wake
+                .load(std::sync::atomic::Ordering::Acquire)
+            || !inner
+                .native_subagent_tasks
+                .lock()
+                .expect("Claude native task mutex poisoned")
+                .is_empty()
+        {
+            return Err("Claude session must be idle with no running background work before changing workspace roots".to_owned());
+        }
+        let cwd = &roots[0];
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let session_id = state.session_id.clone();
+        drop(state);
+        drop(event_gate);
+        tracing::info!(?session_id, %cwd, "Changing Claude workspace roots");
+        let response = inner
+            .send_control_request_value(
+                request_id.clone(),
+                json!({
+                    "type": "control_request", "request_id": request_id,
+                    "request": {"subtype": "set_cwd", "path": cwd},
+                }),
+                CLAUDE_CONTROL_RESPONSE_TIMEOUT,
+            )
+            .await?;
+        let mut state = inner.state.lock().await;
+        match response.get("status").and_then(Value::as_str) {
+            Some("ok") if response.get("cwd").and_then(Value::as_str) == Some(cwd.as_str()) => {
+                state.workspace_root = cwd.clone();
+                if response
+                    .get("transcript_relocated")
+                    .and_then(Value::as_bool)
+                    != Some(true)
+                {
+                    return Err("Claude changed directory but could not relocate its transcript; resume storage must be reconciled before continuing".to_owned());
+                }
+            }
+            Some("needs_trust") => {
+                return Err(format!(
+                    "Claude requires the user to trust destination {} before changing workspace roots",
+                    response.get("directory").unwrap_or(&Value::Null)
+                ));
+            }
+            Some("rejected") => {
+                return Err(format!("Claude rejected workspace relocation: {response}"));
+            }
+            _ => {
+                return Err(format!(
+                    "Claude did not confirm workspace relocation; provider state must be reconciled: {response}"
+                ));
+            }
+        }
+        tracing::info!(session_id = ?state.session_id, %cwd, "Claude confirmed workspace roots");
+        drop(state);
+        Ok(())
     }
 
     async fn read_session_settings(&self) -> Result<protocol::SessionSettingsValues, String> {

@@ -561,6 +561,7 @@ impl KiroSession {
             bridge: Arc::new(bridge),
             emitter: Arc::new(TurnEmitter::new_for_agent(event_tx, AgentName(&agent_name))),
             shutting_down: AtomicBool::new(false),
+            workspace_reload_in_progress: AtomicBool::new(false),
             ssh_host: mode.ssh_host,
             capacity_probe,
             capacity_state: Mutex::new(KiroCapacityState::default()),
@@ -862,6 +863,7 @@ struct KiroInner {
     emitter: Arc<TurnEmitter>,
     state: Mutex<KiroState>,
     shutting_down: AtomicBool,
+    workspace_reload_in_progress: AtomicBool,
     ssh_host: Option<String>,
     capacity_probe: Option<AcpSpawnSpec>,
     capacity_state: Mutex<KiroCapacityState>,
@@ -880,7 +882,106 @@ struct KiroCapacityState {
     in_flight: bool,
 }
 
+struct AcpWorkspaceReload<'a>(&'a AtomicBool);
+
+impl Drop for AcpWorkspaceReload<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
 impl KiroInner {
+    async fn set_workspace_roots(
+        self: &Arc<Self>,
+        workspace_roots: Vec<String>,
+    ) -> Result<(), String> {
+        if self.ssh_host.is_some() || !self.capabilities.load_session {
+            return Err(
+                "ACP workspace relocation requires a local provider with session/load support"
+                    .to_owned(),
+            );
+        }
+        if workspace_roots.len() != 1 {
+            return Err("ACP workspace relocation requires exactly one workspace root".to_owned());
+        }
+        let roots = crate::backend::validate_local_workspace_roots(workspace_roots)?;
+        let prompt_guard = Arc::clone(&self.prompt_lock)
+            .try_lock_owned()
+            .map_err(|_| "ACP session must be idle before changing workspace roots".to_owned())?;
+        self.bridge.sync_inbound().await?;
+        let (session_id, startup_mcp_servers, settings) = {
+            let state = self.state.lock().await;
+            if self.shutting_down.load(Ordering::Acquire)
+                || self.in_flight_prompts.load(Ordering::SeqCst) > 0
+                || state.active_response.is_some()
+                || !state.active_tool_contexts.is_empty()
+                || state.pending_compaction.is_some()
+                || state.replaying_history
+                || !self.native_child_sessions.lock().await.is_empty()
+                || !self.native_owned_children.lock().await.is_empty()
+            {
+                return Err("ACP session must be idle with no running background work before changing workspace roots".to_owned());
+            }
+            (
+                state.session_id.clone(),
+                state.startup_mcp_servers.clone(),
+                json!({"model": state.model, "mode": state.mode}),
+            )
+        };
+        let cwd = &roots[0];
+        self.workspace_reload_in_progress
+            .store(true, Ordering::Release);
+        let reload_guard = AcpWorkspaceReload(&self.workspace_reload_in_progress);
+        tracing::info!(%session_id, %cwd, backend = ?self.adapter.backend_kind(), "Reloading ACP session in new workspace roots");
+        let response = self
+            .bridge
+            .request(
+                "session/load",
+                json!({
+                    "sessionId": session_id,
+                    "cwd": cwd,
+                    "mcpServers": acp_mcp_servers_json(&startup_mcp_servers),
+                }),
+            )
+            .await;
+        let drained = self.bridge.sync_inbound().await;
+        let response = response?;
+        drained?;
+        if let Some(reported) = response
+            .get("cwd")
+            .or_else(|| response.get("currentWorkingDirectory"))
+            .or_else(|| response.pointer("/_meta/currentWorkingDirectory"))
+            .and_then(Value::as_str)
+            && reported != cwd
+        {
+            return Err(format!(
+                "ACP provider reported workspace {reported} instead of {cwd}; provider state must be reconciled"
+            ));
+        }
+        {
+            let mut state = self.state.lock().await;
+            state.workspace_root = cwd.clone();
+            let models = extract_known_models(&response);
+            if !models.is_empty() {
+                state.known_models = models;
+            }
+            let modes = extract_known_modes(&response);
+            if !modes.is_empty() {
+                state.known_modes = modes;
+            }
+        }
+        self.execute(SessionCommand::UpdateSettings {
+            settings,
+            persist: false,
+        })
+        .await?;
+        self.bridge.sync_inbound().await?;
+        drop(reload_guard);
+        drop(prompt_guard);
+        tracing::info!(%session_id, %cwd, backend = ?self.adapter.backend_kind(), "ACP session reloaded in new workspace roots");
+        Ok(())
+    }
+
     async fn set_capacity_emitter(self: &Arc<Self>, emitter: Arc<dyn SubAgentEmitter>) {
         self.capacity_state.lock().await.emitter = Some(emitter.clone());
         if self.capacity_probe.is_none()
@@ -2086,6 +2187,11 @@ impl KiroInner {
                 }
                 return;
             }
+            // session/load replays the existing transcript. Relocation must not
+            // duplicate those messages and historical tool executions.
+            if self.workspace_reload_in_progress.load(Ordering::Acquire) {
+                return;
+            }
             self.handle_local_notification(method, params).await;
         })
     }
@@ -2195,6 +2301,7 @@ impl KiroInner {
             )),
             state: Mutex::new(state),
             shutting_down: AtomicBool::new(false),
+            workspace_reload_in_progress: AtomicBool::new(false),
             ssh_host: self.ssh_host.clone(),
             capacity_probe: None,
             capacity_state: Mutex::new(KiroCapacityState {
@@ -6217,6 +6324,7 @@ impl Backend for KiroBackend {
         [
             tyde_agent_adapter::BackendCapability::ListSessions,
             tyde_agent_adapter::BackendCapability::ResumeSession,
+            tyde_agent_adapter::BackendCapability::SetWorkspaceRoots,
             tyde_agent_adapter::BackendCapability::ImageInput,
             tyde_agent_adapter::BackendCapability::SessionSettings,
             tyde_agent_adapter::BackendCapability::StartupMcpServers,
@@ -6672,6 +6780,13 @@ impl Backend for KiroBackend {
                 settings: session_settings_to_json(&payload.values),
                 persist: false,
             })
+            .await
+    }
+
+    async fn set_workspace_roots(&mut self, workspace_roots: Vec<String>) -> Result<(), String> {
+        self.command_handle
+            .inner
+            .set_workspace_roots(workspace_roots)
             .await
     }
 

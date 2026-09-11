@@ -223,3 +223,59 @@ This matches the existing session store pattern.
 - No special local-vs-remote project behavior in the client.
 - No automatic workspace-root derivation from project roots.
 - No silent delete of dangling session references.
+
+## 9. Backend workspace relocation
+
+`Backend::set_workspace_roots(&mut self, Vec<String>)` changes the execution
+workspace of an idle conversation without sending a prompt or replacing its
+session identity. It is a backend primitive, not a project-move protocol event:
+the server and frontend do not yet expose it as a move action.
+
+The first root is the default working directory. Unsupported root sets are
+rejected rather than truncated. Callers must serialize relocation with other
+input, settings, and compaction. The implementations reject ongoing turns,
+tracked background work, and compaction. Initial support requires existing,
+absolute local directories and rejects empty, duplicate, missing, file, and
+remote roots; SSH sessions cannot be relocated through this operation.
+
+| Backend | Implementation | Root sets |
+| --- | --- | --- |
+| Codex | `thread/settings/update` acknowledges cwd; subsequent `turn/start` requests carry the replacement runtime roots | One or more |
+| Hermes | `session.cwd.set`; verifies returned directory | Exactly one |
+| Claude | Native `set_cwd` control request; verifies directory and transcript relocation | Exactly one |
+| Kiro | ACP `session/load` with the existing session ID and new directory; suppresses replayed history and restores model/mode | Exactly one |
+| OpenCode | Explicit unsupported result; ACP reload acknowledges the new directory but native tools retain the original cwd | None |
+| Grok | Explicit unsupported result; live `session/load` looks for its transcript under the destination directory scope | None |
+| Antigravity | Explicit unsupported result; restarted conversations retain terminals with old or inconsistent default directories | None |
+
+The supported paths passed real relocation conformance on 2026-09-11; see
+`backend-conformance.md` for models and limitations. ACP providers must
+advertise `session/load` and honor its directory argument for an existing
+session. Claude
+requires a persistent session and a destination trusted by the native CLI;
+its trust-required response is returned as an error without asserting user
+consent. Its native setter also refreshes destination project configuration
+and relocates the transcript. Hermes waits up to ten seconds for native
+post-turn cleanup when its cwd setter explicitly reports busy without mutation. Codex stages runtime roots
+in the live adapter after the native cwd acknowledgement; those roots are
+materialized on the next turn, including Tyde background wake turns. Callers
+must persist the requested roots for later process-level resume.
+
+`real_workspace_relocation` exercises the same history-preserving move, real
+file reads/writes, invalid-request rejection, and return move on every backend
+declaring `SetWorkspaceRoots`. `real_multiple_workspace_relocation` repeats
+that flow with two destination roots for `SetMultipleWorkspaceRoots` backends.
+The scenarios never give the model the destination paths or file contents.
+They require checking runtime cwd before writing; all filesystem assertions
+remain identical across providers. Claude can use a disposable config via
+`TYDE_CONFORMANCE_CLAUDE_FIXTURE_CONFIG` and matching `CLAUDE_CONFIG_DIR`.
+That directory must contain `.claude.json` and a `tyde-conformance-fixture`
+marker. The shared setup trusts only its newly created fixture roots in that
+isolated config; it never changes the user's normal project trust settings.
+
+A later server operation must coordinate project assignment, persistent roots,
+project-scoped steering, skills, MCP configuration, and client notifications.
+This primitive leaves Tyde's project configuration unchanged. Persist roots
+only after provider acknowledgement. A transport failure or mismatched reply
+can leave the provider state uncertain; it is not proof of rollback, and must
+be reconciled before continuing the conversation.

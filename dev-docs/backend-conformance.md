@@ -57,3 +57,33 @@ requires a capacity rejection and idle state for each, and checks that the
 backend event stream remains open after each rejection. The scenario is
 registered for every supported backend with identical setup and assertions.
 Real runs, including a baseline run without the fix, still require approval.
+
+## Workspace relocation
+
+Real runs on 2026-09-11 used the same filesystem and retained-history
+assertions for every eligible backend:
+
+| Scenario | Claude | Codex | Hermes | Kiro |
+| --- | --- | --- | --- | --- |
+| `real_workspace_relocation` | Pass | Pass | Pass | Pass |
+| `real_multiple_workspace_relocation` | — | Pass | — | — |
+
+Models were Claude Haiku, Codex `gpt-5.6-luna`, Hermes
+`openai/gpt-4.1-mini` through OpenRouter, and Kiro's `auto` selection.
+Claude used isolated configuration trusting only disposable fixture roots.
+Hermes's default DeepSeek model repeatedly continued reasoning after correct
+file operations and timed out; the passing run used the existing
+`TYDE_HERMES_TEST_MODEL` override without changing assertions.
+
+The first Codex runs failed because loaded-thread `thread/resume` ignored
+cwd/root overrides. The first Hermes run failed because its native session
+remained busy during cleanup after Tyde's idle event. These real failures
+establish red coverage for the corresponding fixes.
+
+Attempts on other providers exposed unsupported paths: Grok searched for
+its transcript under the destination's directory-scoped storage; OpenCode
+acknowledged ACP reload while native `pwd` remained in the original root;
+and Antigravity's restarted conversation used terminals with inconsistent
+cwd values, including the old root. Earlier Antigravity passes did not hold
+under subsequent runs. These providers do not declare relocation capability.
+Their exclusions are not passing coverage.

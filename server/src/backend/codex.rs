@@ -4284,6 +4284,7 @@ enum CodexNotificationOwner {
 
 struct CodexState {
     thread_id: String,
+    workspace_roots_override: Option<Vec<String>>,
     response_splitters: HashMap<String, CodexResponseSplitter>,
     pending_resume_thread_id: Option<String>,
     effective_model: Option<String>,
@@ -4383,6 +4384,7 @@ fn initial_codex_state(
         .is_some_and(|splitter| splitter.enabled);
     CodexState {
         thread_id,
+        workspace_roots_override: None,
         response_splitters,
         pending_resume_thread_id: None,
         effective_model: model,
@@ -6207,6 +6209,10 @@ impl CodexInner {
                 params["effort"] = Value::String(effort);
             }
 
+            if let Some(roots) = &inner.state.lock().await.workspace_roots_override {
+                params["cwd"] = json!(roots[0]);
+                params["runtimeWorkspaceRoots"] = json!(roots);
+            }
             if let Err(error) = inner.rpc.request("turn/start", params).await {
                 let mut state = inner.state.lock().await;
                 state.background_wake_request_in_flight = false;
@@ -7828,6 +7834,10 @@ impl CodexInner {
                 params["sandboxPolicy"] =
                     codex_sandbox_policy(access_mode, turn_network_access, execution_mode);
 
+                if let Some(roots) = &self.state.lock().await.workspace_roots_override {
+                    params["cwd"] = json!(roots[0]);
+                    params["runtimeWorkspaceRoots"] = json!(roots);
+                }
                 let turn_start = self.rpc.request("turn/start", params).await;
                 eprintln!("TYDE CODEX TURN START RESPONSE result={turn_start:?}");
                 if let Err(err) = turn_start {
@@ -19090,6 +19100,7 @@ use super::{
 };
 
 pub struct CodexBackend {
+    workspace_is_local: bool,
     input_tx: mpsc::UnboundedSender<AgentInput>,
     settings_tx: mpsc::UnboundedSender<CodexSettingsUpdate>,
     interrupt_tx: mpsc::UnboundedSender<CodexInterrupt>,
@@ -19126,6 +19137,9 @@ impl CodexBackend {
             .then(|| config.subagent_emitter.clone())
             .flatten();
         let (input_tx, mut input_rx) = mpsc::unbounded_channel::<AgentInput>();
+        let workspace_is_local = !workspace_roots
+            .iter()
+            .any(|root| root.starts_with("ssh://"));
         let (settings_tx, mut settings_rx) = mpsc::unbounded_channel::<CodexSettingsUpdate>();
         let (cancel_task_tx, mut cancel_task_rx) =
             mpsc::unbounded_channel::<CodexCancelBackgroundTask>();
@@ -19455,6 +19469,7 @@ impl CodexBackend {
 
         Ok((
             Self {
+                workspace_is_local,
                 input_tx,
                 settings_tx,
                 interrupt_tx,
@@ -20474,6 +20489,8 @@ impl Backend for CodexBackend {
     fn capabilities() -> tyde_agent_adapter::BackendCapabilities {
         [
             tyde_agent_adapter::BackendCapability::ResumeSession,
+            tyde_agent_adapter::BackendCapability::SetWorkspaceRoots,
+            tyde_agent_adapter::BackendCapability::SetMultipleWorkspaceRoots,
             tyde_agent_adapter::BackendCapability::ForkSession,
             tyde_agent_adapter::BackendCapability::ImageInput,
             tyde_agent_adapter::BackendCapability::Interrupt,
@@ -20530,6 +20547,9 @@ impl Backend for CodexBackend {
         session_id: protocol::SessionId,
     ) -> Result<(Self, EventStream), String> {
         let (input_tx, mut input_rx) = mpsc::unbounded_channel::<AgentInput>();
+        let workspace_is_local = !workspace_roots
+            .iter()
+            .any(|root| root.starts_with("ssh://"));
         let (settings_tx, mut settings_rx) = mpsc::unbounded_channel::<CodexSettingsUpdate>();
         let (cancel_task_tx, mut cancel_task_rx) =
             mpsc::unbounded_channel::<CodexCancelBackgroundTask>();
@@ -20749,6 +20769,7 @@ impl Backend for CodexBackend {
 
         Ok((
             Self {
+                workspace_is_local,
                 input_tx,
                 settings_tx,
                 interrupt_tx,
@@ -20775,6 +20796,9 @@ impl Backend for CodexBackend {
         }
 
         let (input_tx, mut input_rx) = mpsc::unbounded_channel::<AgentInput>();
+        let workspace_is_local = !workspace_roots
+            .iter()
+            .any(|root| root.starts_with("ssh://"));
         let (settings_tx, mut settings_rx) = mpsc::unbounded_channel::<CodexSettingsUpdate>();
         let (cancel_task_tx, mut cancel_task_rx) =
             mpsc::unbounded_channel::<CodexCancelBackgroundTask>();
@@ -21023,6 +21047,7 @@ impl Backend for CodexBackend {
 
         Ok((
             Self {
+                workspace_is_local,
                 input_tx,
                 settings_tx,
                 interrupt_tx,
@@ -21149,6 +21174,53 @@ impl Backend for CodexBackend {
                 SendOutcome::Closed
             }
         }
+    }
+
+    async fn set_workspace_roots(&mut self, workspace_roots: Vec<String>) -> Result<(), String> {
+        if !self.workspace_is_local {
+            return Err(
+                "Codex workspace relocation is currently supported only for local sessions"
+                    .to_owned(),
+            );
+        }
+        let roots = super::validate_local_workspace_roots(workspace_roots)?;
+        let handle = self
+            .compaction_handle
+            .lock()
+            .expect("Codex command handle mutex poisoned")
+            .clone()
+            .ok_or_else(|| "Codex session is not ready".to_owned())?;
+        let state = handle.inner.state.lock().await;
+        if state.active_turn_id.is_some()
+            || state.awaiting_root_turn_start
+            || state.pending_compaction.is_some()
+            || state.pending_request.is_some()
+            || !state.pending_tool_call_ids.is_empty()
+            || !state.background_commands.is_empty()
+            || !state.outstanding_command_executions.is_empty()
+            || !state.pending_background_wakes.is_empty()
+            || state.background_wake_request_in_flight
+            || !state.subagent_streams.is_empty()
+            || !state.pending_subagent_spawns.is_empty()
+        {
+            return Err("Codex session must be idle with no running background work before changing workspace roots".to_owned());
+        }
+        let thread_id = state.thread_id.clone();
+        drop(state);
+        tracing::info!(%thread_id, ?roots, "Changing Codex workspace roots");
+        handle
+            .inner
+            .rpc
+            .request(
+                "thread/settings/update",
+                json!({"threadId": thread_id, "cwd": roots[0]}),
+            )
+            .await?;
+        // Loaded thread/resume ignores root overrides. The native settings
+        // setter accepts cwd; runtime roots are applied on each next turn.
+        handle.inner.state.lock().await.workspace_roots_override = Some(roots.clone());
+        tracing::info!(%thread_id, ?roots, "Codex accepted cwd and staged runtime roots for subsequent turns");
+        Ok(())
     }
 
     async fn read_session_settings(&self) -> Result<protocol::SessionSettingsValues, String> {

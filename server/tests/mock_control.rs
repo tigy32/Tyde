@@ -2,9 +2,9 @@ mod fixture;
 
 use fixture::{Fixture, next_logical_frame_matching_on};
 use protocol::{
-    AgentErrorPayload, BackendKind, ChatEvent, ExitPlanModeDecision, FrameKind,
-    ListSessionsPayload, MessageSender, SendMessageToolResponse, SessionListPayload,
-    SpawnAgentParams, SpawnAgentPayload,
+    AgentBootstrapEvent, AgentBootstrapPayload, AgentErrorPayload, BackendKind, ChatEvent,
+    ExitPlanModeDecision, FrameKind, ListSessionsPayload, MessageSender, SendMessageToolResponse,
+    SessionListPayload, SpawnAgentParams, SpawnAgentPayload,
 };
 use server::backend::mock::{MockGateHandle, MockRequest, MockScript, MockTurn, MockViolation};
 
@@ -579,55 +579,97 @@ async fn reserved_script_governs_resumed_session() {
 
 #[tokio::test]
 async fn reserved_script_governs_forked_session() {
-    let mut fixture = Fixture::new().await;
-    let (seed, seed_start) = fixture
-        .spawn_with(SpawnAgentPayload {
-            name: Some("fork-seed".to_owned()),
-            custom_agent_id: None,
-            parent_agent_id: None,
-            project_id: None,
-            params: SpawnAgentParams::New {
-                workspace_roots: vec!["/tmp/test".to_owned()],
-                prompt: "hello".to_owned(),
-                images: None,
-                backend_kind: BackendKind::Claude,
-                launch_profile_id: None,
-                cost_hint: None,
-                access_mode: Default::default(),
-                session_settings: None,
-            },
-        })
-        .await;
-    fixture.finish_turn(&seed).await;
-    let session_id = seed_start
-        .session_id
-        .expect("seed AgentStart carries the session id");
+    for _ in 0..16 {
+        let mut fixture = Fixture::new().await;
+        let (seed, seed_start) = fixture
+            .spawn_with(SpawnAgentPayload {
+                name: Some("fork-seed".to_owned()),
+                custom_agent_id: None,
+                parent_agent_id: None,
+                project_id: None,
+                params: SpawnAgentParams::New {
+                    workspace_roots: vec!["/tmp/test".to_owned()],
+                    prompt: "hello".to_owned(),
+                    images: None,
+                    backend_kind: BackendKind::Claude,
+                    launch_profile_id: None,
+                    cost_hint: None,
+                    access_mode: Default::default(),
+                    session_settings: None,
+                },
+            })
+            .await;
+        fixture.finish_turn(&seed).await;
+        let session_id = seed_start
+            .session_id
+            .expect("seed AgentStart carries the session id");
 
-    let reservation = fixture
-        .reserve_next_mock_launch(
-            "fork-scripted",
-            MockScript::one(MockTurn::text("scripted fork response")),
-        )
-        .await;
-    let (forked, _start) = fixture
-        .spawn_with(SpawnAgentPayload {
-            name: Some("fork-scripted".to_owned()),
-            custom_agent_id: None,
-            parent_agent_id: None,
-            project_id: None,
-            params: SpawnAgentParams::Fork {
-                from_session_id: session_id,
-                prompt: "fork prompt".to_owned(),
-                images: None,
-                access_mode: None,
-            },
-        })
-        .await;
-    drop(reservation);
+        // A completed bootstrap retains StreamEnd but strips historical typing
+        // edges. Gate the reserved response until attachment so finish_turn
+        // observes the live busy-to-idle transition it is designed to collect.
+        let gate = MockGateHandle::new();
+        let reservation = fixture
+            .reserve_next_mock_launch(
+                "fork-scripted",
+                MockScript::one(MockTurn::text_after_gate("scripted fork response", &gate)),
+            )
+            .await;
+        let (forked, _start) = fixture
+            .spawn_with(SpawnAgentPayload {
+                name: Some("fork-scripted".to_owned()),
+                custom_agent_id: None,
+                parent_agent_id: None,
+                project_id: None,
+                params: SpawnAgentParams::Fork {
+                    from_session_id: session_id,
+                    prompt: "fork prompt".to_owned(),
+                    images: None,
+                    access_mode: None,
+                },
+            })
+            .await;
+        gate.wait_until_entered().await;
+        gate.release_one();
+        drop(reservation);
 
-    let turn = fixture.finish_turn(&forked).await;
-    turn.assert_stream_end_contains("scripted fork response");
-    fixture.mock(&forked).await.assert_clean().await;
+        let turn = fixture.finish_turn(&forked).await;
+        turn.assert_stream_end_contains("scripted fork response");
+        fixture.mock(&forked).await.assert_clean().await;
+
+        let (mut late_client, host_bootstrap) = fixture.connect_with_bootstrap().await;
+        let descriptor = host_bootstrap
+            .agents
+            .iter()
+            .find(|agent| agent.agent_id == forked.new_agent.agent_id)
+            .expect("completed fork remains visible to a later client");
+        assert!(!descriptor.turn_active);
+        let envelope =
+            fixture::next_frame_matching_on(&mut late_client, "completed fork bootstrap", |env| {
+                env.kind == FrameKind::AgentBootstrap && env.stream == descriptor.instance_stream
+            })
+            .await;
+        let bootstrap: AgentBootstrapPayload = envelope.parse_payload().expect("fork bootstrap");
+        assert!(!bootstrap.turn_active);
+        assert!(
+            bootstrap.events.iter().all(|event| !matches!(
+                event,
+                AgentBootstrapEvent::ChatEvent(ChatEvent::TypingStatusChanged(true))
+            )),
+            "completed history must not replay a live busy edge"
+        );
+        assert_eq!(
+            bootstrap
+                .events
+                .iter()
+                .filter(|event| matches!(
+                    event, AgentBootstrapEvent::ChatEvent(ChatEvent::StreamEnd(end))
+                        if end.message.content == "scripted fork response"
+                ))
+                .count(),
+            1,
+            "the reserved fork response must survive late attachment exactly once"
+        );
+    }
 }
 
 #[tokio::test]

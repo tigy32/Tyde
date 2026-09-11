@@ -4859,6 +4859,136 @@ async fn codex_global_settings<B: Backend>(host: &mut Harness<B>) {
     std::fs::write(&config_path, restore).expect("restore native config");
 }
 
+conformance2_scenario!(
+    real_workspace_relocation,
+    [BackendCapability::SetWorkspaceRoots]
+);
+
+async fn real_workspace_relocation<B: Backend>(host: &mut Harness<B>) {
+    workspace_relocation_flow(host, 1).await;
+}
+
+conformance2_scenario!(
+    real_multiple_workspace_relocation,
+    [BackendCapability::SetMultipleWorkspaceRoots]
+);
+
+async fn real_multiple_workspace_relocation<B: Backend>(host: &mut Harness<B>) {
+    workspace_relocation_flow(host, 2).await;
+}
+
+async fn workspace_relocation_flow<B: Backend>(host: &mut Harness<B>, root_count: usize) {
+    trust_fixture_workspace(host.workspace());
+    let destination = tempfile::Builder::new()
+        .prefix("tyde-relocation-")
+        .tempdir_in("/tmp")
+        .expect("destination workspace");
+    let mut roots = Vec::new();
+    let mut contents = Vec::new();
+    for index in 0..root_count {
+        let root = destination.path().join(format!("root-{index}"));
+        std::fs::create_dir(&root).expect("create destination root");
+        trust_fixture_workspace(&root);
+        let content = unique_payload();
+        std::fs::write(root.join("relocation-source.txt"), &content).expect("seed destination");
+        roots.push(root.to_str().expect("UTF-8 root").to_owned());
+        contents.push(content);
+    }
+    let memory = unique_payload();
+    let initial = format!(
+        "We are checking a workspace relocation feature. The synthetic test marker for this conversation is {memory}. Keep it in conversation context for the later file-writing step; do not write it to disk yet. Acknowledge this setup with TYDE_RELOCATION_READY and do not use tools."
+    );
+    let agent = spawn_agent(host, &initial).await;
+    let ready = collect_turn(host, &agent, &initial).await;
+    assert_final_text_contains(&ready, "TYDE_RELOCATION_READY");
+
+    set_workspace_roots(host, roots.clone())
+        .await
+        .expect("relocate live conversation");
+    let mut turns = vec![ready];
+    for output in ["relocation-result.txt", "relocation-after-rejection.txt"] {
+        if output == "relocation-after-rejection.txt" {
+            for invalid in [
+                Vec::new(),
+                vec!["relative-directory".to_owned()],
+                vec![
+                    destination
+                        .path()
+                        .join("missing")
+                        .to_str()
+                        .unwrap()
+                        .to_owned(),
+                ],
+                vec![roots[0].clone(), roots[0].clone()],
+                vec![
+                    destination
+                        .path()
+                        .join("root-0/relocation-source.txt")
+                        .to_str()
+                        .unwrap()
+                        .to_owned(),
+                ],
+            ] {
+                assert!(
+                    set_workspace_roots(host, invalid).await.is_err(),
+                    "accepted invalid workspace roots"
+                );
+            }
+        }
+        let prompt = format!(
+            "Your workspace has been changed through the runtime. There are exactly {root_count} configured workspace roots. Use only those roots, in order. Read relocation-source.txt in each one. Do not search /tmp or inspect other workspaces. Write {output} in your current default working directory, with the synthetic test marker from earlier as the first line and each file's contents on subsequent lines in root order. Before writing, verify the runtime default directory with pwd in a fresh terminal call without a cwd override. Write only there using a relative filename. Do not change directory or use a path remembered from earlier turns. Do not guess file contents. Reply with TYDE_RELOCATION_WRITTEN."
+        );
+        let turn = ask(host, &agent, &prompt).await;
+        assert_final_text_contains(&turn, "TYDE_RELOCATION_WRITTEN");
+        assert!(
+            !turn.tool_requests().collect::<Vec<_>>().is_empty(),
+            "relocation did not exercise real file tools"
+        );
+        let expected = std::iter::once(memory.as_str())
+            .chain(contents.iter().map(String::as_str))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let actual = std::fs::read_to_string(Path::new(&roots[0]).join(output))
+            .expect("output in destination workspace");
+        assert_eq!(
+            actual.trim_end(),
+            expected,
+            "workspace change lost conversation context or used the wrong roots"
+        );
+        assert!(
+            !host.workspace().join(output).exists(),
+            "agent still wrote into the original workspace"
+        );
+        for extra in &roots[1..] {
+            assert!(
+                !Path::new(extra).join(output).exists(),
+                "extra root became the default cwd"
+            );
+        }
+        turns.push(turn);
+    }
+    set_workspace_roots(host, host.workspace_roots())
+        .await
+        .expect("return to original workspace");
+    let returned = ask(host, &agent, "The runtime workspace has changed again. First verify its default directory with pwd in a fresh terminal call without a cwd override. Then write the relative filename relocation-returned.txt only in that directory, containing only the synthetic test marker from earlier. Do not change directory, reuse a previously remembered path, or write a second copy elsewhere. Reply with TYDE_RELOCATION_RETURNED.").await;
+    assert_final_text_contains(&returned, "TYDE_RELOCATION_RETURNED");
+    assert_eq!(
+        std::fs::read_to_string(host.workspace().join("relocation-returned.txt"))
+            .expect("output in original workspace")
+            .trim_end(),
+        memory
+    );
+    assert!(
+        !Path::new(&roots[0])
+            .join("relocation-returned.txt")
+            .exists(),
+        "second move retained the destination cwd"
+    );
+    turns.push(returned);
+    assert_universal_contract(&turns);
+    assert_clean_close(host, &agent).await;
+}
+
 conformance2_scenario!(real_session_settings, [BackendCapability::SessionSettings]);
 
 async fn real_session_settings<B: Backend>(host: &mut Harness<B>) {

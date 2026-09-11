@@ -1401,6 +1401,26 @@ pub trait Backend: Send + Sync + 'static {
     /// Return the backend-native session ID for this live handle.
     fn session_id(&self) -> SessionId;
 
+    /// Replace an idle session's workspace without starting a turn or losing
+    /// its conversation. The first root is the default working directory.
+    /// Callers must serialize this with input, settings, and compaction, and
+    /// persist the new roots only after success. This does not reassign a Tyde
+    /// project or replace its steering, skills, or MCP configuration.
+    ///
+    /// Unsupported root sets must be rejected, never truncated. A transport
+    /// failure can leave the provider's outcome unknown; callers must not
+    /// assume that every error means the provider rolled back the operation.
+    fn set_workspace_roots(
+        &mut self,
+        workspace_roots: Vec<String>,
+    ) -> impl std::future::Future<Output = Result<(), String>> + Send {
+        async move {
+            Err(format!(
+                "This backend does not support changing workspace roots to {workspace_roots:?}"
+            ))
+        }
+    }
+
     /// Send an input event to the backend.
     /// Returns false if the backend has terminated and can't accept input.
     fn send(&self, input: AgentInput) -> impl std::future::Future<Output = bool> + Send;
@@ -1539,6 +1559,33 @@ pub trait Backend: Send + Sync + 'static {
     fn shutdown(self) -> impl std::future::Future<Output = ()> + Send
     where
         Self: Sized;
+}
+
+pub(crate) fn validate_local_workspace_roots(
+    workspace_roots: Vec<String>,
+) -> Result<Vec<String>, String> {
+    if workspace_roots.is_empty() {
+        return Err("Changing workspace roots requires at least one directory".to_owned());
+    }
+    let mut roots = Vec::with_capacity(workspace_roots.len());
+    for root in workspace_roots {
+        let path = std::path::Path::new(&root);
+        if !path.is_absolute() || !path.is_dir() {
+            return Err(format!(
+                "Workspace root must be an existing absolute local directory: {root}"
+            ));
+        }
+        let canonical = std::fs::canonicalize(path)
+            .map_err(|error| format!("Cannot resolve workspace root {root}: {error}"))?
+            .into_os_string()
+            .into_string()
+            .map_err(|_| format!("Workspace root is not UTF-8: {root}"))?;
+        if roots.contains(&canonical) {
+            return Err(format!("Duplicate workspace root: {root}"));
+        }
+        roots.push(canonical);
+    }
+    Ok(roots)
 }
 
 /// Resolve a `BackendKind` to its concrete [`Backend`] type.

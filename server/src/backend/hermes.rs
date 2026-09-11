@@ -439,6 +439,7 @@ print(json.dumps(skills.get("external_dirs", [])))
 
 #[derive(Clone)]
 pub struct HermesBackend {
+    workspace_is_local: bool,
     session_settings: SessionSettingsValues,
     command_tx: mpsc::UnboundedSender<HermesBackendCommand>,
     session_id: Arc<std::sync::Mutex<SessionId>>,
@@ -448,6 +449,7 @@ pub struct HermesBackend {
 }
 
 enum HermesBackendCommand {
+    SetWorkspaceRoots(Vec<String>, oneshot::Sender<Result<(), String>>),
     ReadSessionSettings(oneshot::Sender<Result<SessionSettingsValues, String>>),
     Input(AgentInput),
     UpdateSessionSettings(
@@ -1131,6 +1133,7 @@ impl Backend for HermesBackend {
         [
             tyde_agent_adapter::BackendCapability::ListSessions,
             tyde_agent_adapter::BackendCapability::ResumeSession,
+            tyde_agent_adapter::BackendCapability::SetWorkspaceRoots,
             tyde_agent_adapter::BackendCapability::ImageInput,
             tyde_agent_adapter::BackendCapability::Interrupt,
             tyde_agent_adapter::BackendCapability::SessionSettings,
@@ -1256,6 +1259,7 @@ impl Backend for HermesBackend {
 
         Ok((
             Self {
+                workspace_is_local: remote_host.is_none(),
                 command_tx,
                 session_settings: resolved_settings,
                 session_id: stored_session_id,
@@ -1386,6 +1390,7 @@ impl Backend for HermesBackend {
 
         Ok((
             Self {
+                workspace_is_local: remote_host.is_none(),
                 command_tx,
                 session_settings: resolved_settings,
                 session_id: stored_session_id,
@@ -1497,6 +1502,28 @@ impl Backend for HermesBackend {
                 false
             }
         }
+    }
+
+    async fn set_workspace_roots(&mut self, workspace_roots: Vec<String>) -> Result<(), String> {
+        if !self.workspace_is_local {
+            return Err(
+                "Hermes workspace relocation is currently supported only for local sessions"
+                    .to_owned(),
+            );
+        }
+        if workspace_roots.len() != 1 {
+            return Err(
+                "Hermes workspace relocation requires exactly one workspace root".to_owned(),
+            );
+        }
+        let roots = super::validate_local_workspace_roots(workspace_roots)?;
+        let (reply, result) = oneshot::channel();
+        self.command_tx
+            .send(HermesBackendCommand::SetWorkspaceRoots(roots, reply))
+            .map_err(|_| "Hermes session has closed".to_owned())?;
+        result.await.map_err(|_| {
+            "Hermes closed while changing workspace roots; provider outcome is unknown".to_owned()
+        })?
     }
 
     async fn read_session_settings(&self) -> Result<SessionSettingsValues, String> {
@@ -2292,6 +2319,56 @@ fn model_summary_from_payload(value: &Value) -> Option<String> {
 }
 
 impl HermesSessionActor {
+    async fn set_workspace_roots(&mut self, roots: Vec<String>) -> Result<(), String> {
+        if self.mapper.current_message_id.is_some()
+            || self.mapper.current_reasoning_seen
+            || !self.mapper.pending_tools.is_empty()
+            || self.mapper.pending_approval_tool_id.is_some()
+            || !self.mapper.background_tasks.is_empty()
+            || !self.native_subagents.is_empty()
+            || self
+                .active_compaction
+                .lock()
+                .expect("Hermes active compaction mutex poisoned")
+                .is_some()
+        {
+            return Err("Hermes session must be idle with no running background work before changing workspace roots".to_owned());
+        }
+        let cwd = &roots[0];
+        tracing::info!(session_id = %self.live_session_id, %cwd, "Changing Hermes workspace roots");
+        // message.complete precedes native post-turn cleanup and running=false.
+        // A busy reply guarantees the setter did not mutate the workspace.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let response = loop {
+            match self
+                .gateway
+                .request_typed(
+                    "session.cwd.set",
+                    json!({"session_id": self.live_session_id, "cwd": cwd}),
+                )
+                .await
+            {
+                Ok(response) => break response,
+                Err(error)
+                    if error.code == Some(4009) && tokio::time::Instant::now() < deadline =>
+                {
+                    tracing::debug!(session_id = %self.live_session_id, "Waiting for Hermes native post-turn cleanup before relocation");
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+                Err(error) => return Err(error.to_string()),
+            }
+        };
+        if response.get("cwd").and_then(Value::as_str) != Some(cwd.as_str()) {
+            tracing::error!(
+                ?response,
+                "Hermes did not confirm the requested workspace roots"
+            );
+            return Err("Hermes did not confirm the requested workspace roots; provider state must be reconciled before continuing".to_owned());
+        }
+        tracing::info!(session_id = %self.live_session_id, %cwd, "Hermes confirmed workspace roots");
+        Ok(())
+    }
+
     async fn handle_compaction(
         &mut self,
         request: BackendCompactionRequest,
@@ -2497,6 +2574,10 @@ impl HermesSessionActor {
                     let Some(command) = maybe_command else { break; };
                     match command {
                         HermesBackendCommand::Input(input) => self.handle_input(input).await,
+                        HermesBackendCommand::SetWorkspaceRoots(roots, reply) => {
+                            let result = self.set_workspace_roots(roots).await;
+                            let _ = reply.send(result);
+                        }
                         HermesBackendCommand::ReadSessionSettings(reply) => {
                             let _ = reply.send(self.read_session_settings().await);
                         }

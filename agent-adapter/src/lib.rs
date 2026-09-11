@@ -85,6 +85,8 @@ macro_rules! exhaustive_capabilities {
 exhaustive_capabilities! {
     ListSessions,
     ResumeSession,
+    SetWorkspaceRoots,
+    SetMultipleWorkspaceRoots,
     ForkSession,
     ImageInput,
     Interrupt,
