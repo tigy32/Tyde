@@ -938,6 +938,8 @@ pub fn App() -> impl IntoView {
     view! {
         <div class="app-shell" node_ref=app_shell_ref>
             <Header />
+            <crate::components::app_updates::AppUpdateRuntime />
+            <crate::components::app_updates::UpdatePrompt />
             <div class="app-body">
                 <ProjectRail />
                 <Workbench />
@@ -1210,6 +1212,13 @@ pub(crate) async fn install_host_listeners(
         bridge::listen_host_lifecycle(move |event| {
             if host_is_manually_disconnected(&lifecycle_state, &event.host_id) {
                 return;
+            }
+            if let host_config::RemoteHostLifecycleStatus::Snapshot { snapshot } = &event.status {
+                let version = match &snapshot.running {
+                    host_config::RemoteTydeRunningState::Managed { version } => Some(version),
+                    _ => snapshot.current_link_version.as_ref(),
+                };
+                crate::components::app_updates::observe_server_version(&lifecycle_state, version);
             }
             lifecycle_state.host_lifecycle_statuses.update(|statuses| {
                 statuses.insert(event.host_id, event.status);

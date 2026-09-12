@@ -15212,3 +15212,27 @@ pre.tool-error-pre {
         animation: none;
     }
 }
+
+.app-update-prompt {
+    position: fixed;
+    right: 20px;
+    bottom: 72px;
+    z-index: 1100;
+    width: min(420px, calc(100vw - 40px));
+    max-height: calc(100vh - 120px);
+    overflow: auto;
+    padding: 20px;
+    border: 1px solid var(--border-secondary);
+    border-radius: 12px;
+    background: var(--surface-2);
+    color: var(--text-primary);
+    box-shadow: 0 8px 32px #0006;
+}
+
+.app-update-prompt h2 { margin: 0 0 12px; font-size: 16px; }
+.app-update-prompt p { margin: 12px 0; line-height: 1.5; }
+.app-update-prompt pre { white-space: pre-wrap; overflow-wrap: anywhere; }
+.app-update-prompt [role="alert"] { color: var(--error); }
+.app-update-actions { display: flex; gap: 8px; justify-content: flex-end; }
+.app-update-actions button { padding: 6px 14px; }
+.app-update-actions button:last-child { background: var(--accent-primary); color: var(--text-on-accent); }

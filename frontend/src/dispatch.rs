@@ -325,6 +325,12 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
 
     match envelope.kind {
         FrameKind::Welcome => {
+            if let Ok(payload) = envelope.parse_payload::<WelcomePayload>() {
+                crate::components::app_updates::observe_server_version(
+                    state,
+                    payload.release_version.as_ref(),
+                );
+            }
             state.command_errors_by_host.update(|errors| {
                 errors.remove(host_id);
             });
@@ -432,6 +438,10 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
         }
         FrameKind::Reject => match envelope.parse_payload::<RejectPayload>() {
             Ok(payload) => {
+                crate::components::app_updates::observe_server_version(
+                    state,
+                    payload.release_version.as_ref(),
+                );
                 log::error!(
                     "connection rejected on host {}: {}",
                     host_id,

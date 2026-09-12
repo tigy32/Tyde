@@ -894,7 +894,18 @@ async fn agents_view_preferences_agent_tags_manual_lifecycle_persists_and_delete
         },
     )
     .await;
-    let notify = expect_preferences_notify(&mut fixture.client, "assign manual tag").await;
+    // The failing run read manual_assignments=[] from a pending system-tag
+    // notification emitted during AgentStart, before AssignTag was applied.
+    // Match the assignment transition, then retain the exact target/tag oracle.
+    let notify =
+        expect_preferences_notify_where(&mut fixture.client, "assign manual tag", |notify| {
+            eprintln!(
+                "assign manual tag: observed tags={:?}",
+                notify.snapshot.tags
+            );
+            !notify.snapshot.tags.manual_assignments.is_empty()
+        })
+        .await;
     assert_eq!(
         notify.snapshot.tags.manual_assignments,
         vec![protocol::AgentManualTagAssignment {

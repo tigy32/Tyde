@@ -489,6 +489,7 @@ pub fn restore_appearance(state: &AppState) {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SettingsTab {
+    Updates,
     Hosts,
     Appearance,
     Display,
@@ -519,6 +520,7 @@ enum SettingsScope {
 impl SettingsTab {
     fn label(self) -> &'static str {
         match self {
+            Self::Updates => "Updates",
             Self::Hosts => "Hosts",
             Self::Appearance => "Appearance",
             Self::Display => "Code & Output Display",
@@ -543,7 +545,7 @@ impl SettingsTab {
     /// to say so.
     fn scope(self) -> SettingsScope {
         match self {
-            Self::Hosts | Self::Appearance | Self::Display => SettingsScope::Device,
+            Self::Updates | Self::Hosts | Self::Appearance | Self::Display => SettingsScope::Device,
             Self::AiSummaries
             | Self::Supervisor
             | Self::UsageManagement
@@ -563,6 +565,14 @@ impl SettingsTab {
     /// All searchable text for this tab: labels, descriptions, option names.
     fn search_text(self) -> &'static [&'static str] {
         match self {
+            Self::Updates => &[
+                "Updates",
+                "Release",
+                "Preview",
+                "Update channel",
+                "Check for updates",
+                "Automatic updates",
+            ],
             Self::Hosts => &[
                 "Hosts",
                 "Configured Hosts",
@@ -781,7 +791,8 @@ impl SettingsTab {
     }
 }
 
-const ALL_TABS: [SettingsTab; 16] = [
+const ALL_TABS: [SettingsTab; 17] = [
+    SettingsTab::Updates,
     SettingsTab::Hosts,
     SettingsTab::Appearance,
     SettingsTab::Display,
@@ -801,7 +812,8 @@ const ALL_TABS: [SettingsTab; 16] = [
 ];
 
 /// Device-local tabs, listed under the "This Device" sidebar group.
-const DEVICE_GROUP_TABS: [SettingsTab; 3] = [
+const DEVICE_GROUP_TABS: [SettingsTab; 4] = [
+    SettingsTab::Updates,
     SettingsTab::Hosts,
     SettingsTab::Appearance,
     SettingsTab::Display,
@@ -1011,6 +1023,7 @@ pub fn SettingsPanel() -> impl IntoView {
                             {move || match active_page.get() {
                                 SettingsPage::Tab(tab) => match tab {
                                     SettingsTab::Hosts => view! { <HostsTab /> }.into_any(),
+                                    SettingsTab::Updates => view! { <crate::components::app_updates::UpdatesSettings /> }.into_any(),
                                     SettingsTab::Appearance => view! { <AppearanceTab /> }.into_any(),
                                     SettingsTab::Display => view! { <DisplayTab /> }.into_any(),
                                     SettingsTab::AiSummaries => view! { <AiSummariesTab /> }.into_any(),

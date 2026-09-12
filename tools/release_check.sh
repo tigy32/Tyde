@@ -86,6 +86,7 @@ python3 -B - \
     tools/check_transport_protocol_version.py \
     tools/set_release_version.py \
     tools/release_tool.py \
+    tools/update_manifest.py \
     tools/pretag_release_build.py \
     tools/smoke_headless_release.py <<'PY'
 import pathlib

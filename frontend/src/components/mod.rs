@@ -41,3 +41,5 @@ pub mod tool_card;
 pub mod workbench;
 pub mod workflow_view;
 pub mod workflows_panel;
+
+pub mod app_updates;

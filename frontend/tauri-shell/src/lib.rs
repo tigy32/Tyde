@@ -8,6 +8,8 @@ mod host_uds;
 mod logging;
 mod remote_bootstrap;
 mod router;
+#[cfg(desktop)]
+mod updates;
 #[cfg(not(target_os = "windows"))]
 mod voice_media;
 
@@ -1385,6 +1387,8 @@ pub fn run() {
                 #[cfg(not(target_os = "windows"))]
                 voice_media,
             });
+            #[cfg(desktop)]
+            updates::init(app.handle())?;
             Ok(())
         })
         .invoke_handler(production_invoke_handler::<tauri::Wry, _>(

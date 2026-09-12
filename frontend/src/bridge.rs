@@ -724,3 +724,30 @@ mod wasm_tests {
         );
     }
 }
+
+pub async fn app_update_command(
+    command: &'static str,
+    args: serde_json::Value,
+) -> Result<host_config::updates::AppUpdateStatus, String> {
+    let args = serde_wasm_bindgen::to_value(&args).map_err(|error| error.to_string())?;
+    let value = tauri_invoke(command, args)
+        .await
+        .map_err(|error| tauri_error_message(command, error))?;
+    serde_wasm_bindgen::from_value(value).map_err(|error| error.to_string())
+}
+
+pub async fn listen_app_update(
+    callback: impl Fn(host_config::updates::AppUpdateStatus) + 'static,
+) -> Result<UnlistenHandle, String> {
+    listen_event(
+        "tyde://app-update",
+        move |value| match serde_wasm_bindgen::from_value::<
+            TauriEvent<host_config::updates::AppUpdateStatus>,
+        >(value)
+        {
+            Ok(event) => callback(event.payload),
+            Err(error) => log::error!("failed to parse app-update event: {error}"),
+        },
+    )
+    .await
+}

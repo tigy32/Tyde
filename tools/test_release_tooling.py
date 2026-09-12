@@ -31,7 +31,7 @@ SHA = "a" * 40
 
 def release_assets(tag: str) -> list[dict[str, str]]:
     version = tag[1:]
-    names = sorted(release_tool.HEADLESS_ASSETS)
+    names = sorted(release_tool.HEADLESS_ASSETS | release_tool.update_manifest.expected_assets(tag))
     names.extend(
         [
             f"Tyde_{version}_aarch64-apple-darwin.dmg",

@@ -3504,6 +3504,9 @@ impl ComposerHandle {
 
 #[derive(Clone)]
 pub struct AppState {
+    pub app_update_status: RwSignal<Option<host_config::updates::AppUpdateStatus>>,
+    pub app_update_error: RwSignal<Option<String>>,
+    pub app_update_request: RwSignal<bool>,
     pub configured_hosts: RwSignal<Vec<ConfiguredHost>>,
     pub host_connection_epochs: RwSignal<HashMap<String, u64>>,
     pub host_refresh_pending: RwSignal<HashSet<String>>,
@@ -4107,6 +4110,9 @@ impl AppState {
         });
 
         Self {
+            app_update_status: RwSignal::new(None),
+            app_update_error: RwSignal::new(None),
+            app_update_request: RwSignal::new(false),
             configured_hosts: RwSignal::new(Vec::new()),
             host_connection_epochs: RwSignal::new(HashMap::new()),
             host_refresh_pending: RwSignal::new(HashSet::new()),

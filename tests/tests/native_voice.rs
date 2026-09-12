@@ -1187,6 +1187,17 @@ fn mqtt_config(
 
 #[tokio::test]
 async fn production_writer_interleaves_four_megabyte_bulk() {
+    let diagnostic_path =
+        std::env::temp_dir().join(format!("tyde-voice-writer-{}.log", std::process::id()));
+    tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_env_filter("server::connection=info,mqtt_transport=debug,rumqttc=debug")
+        .with_writer(std::sync::Mutex::new(
+            std::fs::File::create(&diagnostic_path).expect("writer latency diagnostics"),
+        ))
+        .try_init()
+        .expect("writer latency tracing");
+    eprintln!("writer latency diagnostics: {}", diagnostic_path.display());
     let broker = support::start_plain_mqtt_broker().expect("start real rumqttd broker");
     let room = RoomId::random();
     let psk = PreSharedKey::random();
@@ -1310,6 +1321,10 @@ async fn production_writer_interleaves_four_megabyte_bulk() {
     .await
     .expect("bulk, voice, and control all traverse real MQTT");
     let latency = control_latency.unwrap();
+    eprintln!(
+        "writer delivery: control={control_latency:?}, audio={audio_latency:?}, records={}",
+        probe.records_written()
+    );
     assert!(
         latency <= Duration::from_millis(100),
         "control latency {latency:?} exceeded the defensible local-production bound"

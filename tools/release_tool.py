@@ -15,6 +15,7 @@ import sys
 from typing import Any
 
 import check_mobile_web_manifest as mobile_manifest
+import update_manifest
 from set_release_version import normalize_tag
 
 
@@ -255,6 +256,15 @@ def _require_arch_pair(names: list[str], label: str) -> None:
 def validate_assets(release: Any, tag: str) -> list[str]:
     version = normalize_tag(tag)
     names = _asset_names(release)
+    updater_assets = {name for name in names if name.startswith("tyde-update")}
+    expected_updates = update_manifest.expected_assets(tag)
+    if updater_assets != expected_updates:
+        raise ReleaseToolError(
+            f"signed updater asset set mismatch; missing={sorted(expected_updates - updater_assets)} "
+            f"extra={sorted(updater_assets - expected_updates)}"
+        )
+    all_names = names
+    names = [name for name in names if name not in updater_assets]
     actual_headless = {name for name in names if name.startswith("tyde-server-")}
     if actual_headless != HEADLESS_ASSETS:
         missing = sorted(HEADLESS_ASSETS - actual_headless)
@@ -293,13 +303,16 @@ def validate_assets(release: Any, tag: str) -> list[str]:
     elif len(msi) != 1 or version not in msi[0]:
         raise ReleaseToolError("stable release assets must contain one versioned MSI")
 
+    package_signatures = {
+        f"{name}.sig" for name in appimages + debs + rpms + installers + msi
+    }
     recognized = set(HEADLESS_ASSETS) | set(
         dmg + appimages + debs + rpms + checksums + installers + msi
-    )
+    ) | package_signatures
     unexpected = sorted(set(names) - recognized)
     if unexpected:
         raise ReleaseToolError(f"unexpected release assets: {', '.join(unexpected)}")
-    return names
+    return all_names
 
 
 def _release_value(release: dict[str, Any], camel: str, snake: str) -> Any:

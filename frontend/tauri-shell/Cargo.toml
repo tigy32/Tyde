@@ -40,6 +40,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid.workspace = true
 server = { path = "../../server" }
 
+[target.'cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))'.dependencies]
+tauri-plugin-updater = "2.11.0"
+semver = "1"
+
 [target.'cfg(not(target_os = "windows"))'.dependencies]
 cpal = "0.15.3"
 opus = "0.3.1"
