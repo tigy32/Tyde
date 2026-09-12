@@ -325,7 +325,10 @@ class ReleaseValidationTests(unittest.TestCase):
         stable_assets = [
             asset
             for asset in release_assets("v1.2.3")
-            if not asset["name"].endswith(".msi")
+            if not (
+                asset["name"].startswith("Tyde_")
+                and asset["name"].endswith(".msi")
+            )
         ]
         with self.assertRaisesRegex(release_tool.ReleaseToolError, "must contain"):
             release_tool.validate_assets({"assets": stable_assets}, "v1.2.3")
@@ -453,7 +456,7 @@ class ReleaseShellTests(unittest.TestCase):
     def _write_fake_commands(self) -> None:
         self._write(
             "python3",
-            """#!/usr/bin/env bash
+            r"""#!/usr/bin/env bash
 echo "python3 $*" >> "$FAKE_LOG"
 if [[ "$*" == *"release_tool.py run-command"* ]]; then
   while [[ "$1" != "run-command" ]]; do shift; done
