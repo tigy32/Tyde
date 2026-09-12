@@ -9146,13 +9146,20 @@ math merror {
 }
 
 .settings-scope-select {
-    padding: var(--space-1) var(--space-2);
+    appearance: none;
+    -webkit-appearance: none;
+    padding: var(--space-1) 28px var(--space-1) var(--space-2);
     font-family: var(--font-sans);
     font-size: 1rem;
     color: var(--text-primary);
-    background: var(--surface-1);
+    background-color: var(--surface-1);
+    background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12'><path d='M2 4l4 4 4-4' stroke='%23a0a0a0' stroke-width='1.5' fill='none' stroke-linecap='round' stroke-linejoin='round'/></svg>");
+    background-repeat: no-repeat;
+    background-position: right 8px center;
+    background-size: 12px 12px;
     border: 1px solid var(--border-primary);
     border-radius: 6px;
+    cursor: pointer;
 }
 
 .settings-scope-notice {
@@ -9345,14 +9352,21 @@ math merror {
 }
 
 .settings-select {
-    padding: var(--space-2) var(--space-3);
+    appearance: none;
+    -webkit-appearance: none;
+    padding: var(--space-2) 28px var(--space-2) var(--space-3);
     font-family: var(--font-sans);
     font-size: 1rem;
     color: var(--text-primary);
-    background: var(--surface-2);
+    background-color: var(--surface-2);
+    background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12'><path d='M2 4l4 4 4-4' stroke='%23a0a0a0' stroke-width='1.5' fill='none' stroke-linecap='round' stroke-linejoin='round'/></svg>");
+    background-repeat: no-repeat;
+    background-position: right 8px center;
+    background-size: 12px 12px;
     border: 1px solid var(--border-primary);
     border-radius: 6px;
     outline: none;
+    cursor: pointer;
     transition: border-color 0.15s;
 }
 
