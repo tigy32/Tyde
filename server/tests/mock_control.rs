@@ -36,10 +36,13 @@ async fn reserved_script_governs_launch_turn() {
 #[tokio::test]
 async fn reservation_name_mismatch_fails_spawn_visibly() {
     let mut fixture = Fixture::new().await;
+    // Completed bootstrap history deliberately omits typing edges. Keep the
+    // reserved turn live until attachment so finish_turn can observe both.
+    let gate = MockGateHandle::new();
     let reservation = fixture
         .reserve_next_mock_launch(
             "the-reserved-name",
-            MockScript::one(MockTurn::text("reserved response")),
+            MockScript::one(MockTurn::text_after_gate("reserved response", &gate)),
         )
         .await;
 
@@ -80,6 +83,12 @@ async fn reservation_name_mismatch_fails_spawn_visibly() {
     // The mismatching spawn did not consume the reservation: the spawn it was
     // reserved for still gets the script.
     let reserved = fixture.spawn("the-reserved-name", "any prompt").await;
+    gate.wait_until_entered().await;
+    eprintln!(
+        "Reserved recovery launch attached before response: {:?}",
+        reserved.new_agent.agent_id
+    );
+    gate.release_one();
     let turn = fixture.finish_turn(&reserved).await;
     turn.assert_stream_end_contains("reserved response");
     drop(reservation);
