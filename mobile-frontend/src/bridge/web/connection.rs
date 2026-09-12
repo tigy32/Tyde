@@ -33,10 +33,7 @@ use host_config::{HostDisconnectedEvent, HostErrorEvent, HostLineEvent};
 use mobile_shell_types::{
     LocalHostId, PairedHostConnectionStatus, PairedHostConnectionStatusEvent,
 };
-use mqtt_transport::{
-    ManagedMqttConnectConfig, MqttReconnectBackoff, MqttTransportError, ParticipantRole,
-    PreSharedKey,
-};
+use mqtt_transport::{MqttReconnectBackoff, MqttTransportError, PreSharedKey};
 use protocol::MobileAccessErrorCode;
 use tokio::io::{AsyncRead, AsyncWrite, BufReader};
 use tokio::sync::{mpsc, watch};
@@ -58,7 +55,7 @@ use tokio::time::{sleep, timeout};
 use wasmtimer::tokio::{sleep, timeout};
 
 const CONNECTION_CHANNEL_CAPACITY: usize = 256;
-const CONNECT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(20);
+const CONNECT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(60);
 const WRITER_LIVENESS_DEADLINE: Duration = Duration::from_secs(45);
 /// After this many consecutive retryable failures with the same typed error
 /// code the actor keeps retrying with backoff but pins a persistent `Failed`
@@ -851,7 +848,7 @@ impl ConnectionManager {
 // ── Connection actor ──────────────────────────────────────────────────────
 
 enum ConnectErr {
-    Transport(MqttTransportError),
+    Rtc(rtc_transport::Error),
     Io(std::io::Error),
     Timeout,
     WriterDeadline {
@@ -867,11 +864,11 @@ enum ConnectErr {
 impl std::fmt::Display for ConnectErr {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Transport(error) => write!(f, "{error}"),
-            Self::Io(error) => write!(f, "I/O error on MQTT Tyde byte stream: {error}"),
+            Self::Rtc(error) => write!(f, "{error}"),
+            Self::Io(error) => write!(f, "I/O error on Tyde byte stream: {error}"),
             Self::Timeout => write!(
                 f,
-                "MQTT connection attempt timed out after {CONNECT_ATTEMPT_TIMEOUT:?}: no broker \
+                "WebRTC connection attempt timed out after {CONNECT_ATTEMPT_TIMEOUT:?}: no transport \
                  failure was reported, but the host never completed the rendezvous — it may be \
                  offline, asleep, or not running Tyde"
             ),
@@ -879,7 +876,7 @@ impl std::fmt::Display for ConnectErr {
                 local_submission_id,
             } => write!(
                 f,
-                "MQTT writer work for local submission {} exceeded the session liveness deadline \
+                "Transport writer work for local submission {} exceeded the session liveness deadline \
                  of {WRITER_LIVENESS_DEADLINE:?}",
                 local_submission_id.0
             ),
@@ -893,7 +890,7 @@ impl std::fmt::Display for ConnectErr {
 impl ConnectErr {
     fn is_retryable(&self) -> bool {
         match self {
-            Self::Transport(error) => error.is_retryable(),
+            Self::Rtc(error) => matches!(error, rtc_transport::Error::Connection { .. }),
             Self::Io(error) => io_error_is_retryable(error),
             Self::Timeout | Self::WriterDeadline { .. } | Self::Invalidated(_) => true,
             Self::NeedsRepair(_) => false,
@@ -903,7 +900,7 @@ impl ConnectErr {
 
     fn error_code(&self) -> MobileAccessErrorCode {
         match self {
-            Self::Transport(error) => transport_error_code(error),
+            Self::Rtc(_) => MobileAccessErrorCode::TransportFailed,
             Self::Io(error) => transport_error_from_io(error)
                 .map(transport_error_code)
                 .unwrap_or(MobileAccessErrorCode::TransportFailed),
@@ -1104,13 +1101,6 @@ fn handle_retryable_connect_failure(
     failures: &mut RepeatedFailures,
     error: &ConnectErr,
 ) -> bool {
-    if connect_error_invalidates_credentials(error) {
-        log::warn!(
-            "MQTT connection to {local_host_id} lost broker authorization ({error}); discarding \
-             cached credentials so the retry mints a fresh grant"
-        );
-        super::service::clear_cached_credentials(local_host_id);
-    }
     if !error.is_retryable() {
         manager.emit_final_failure(local_host_id, actor_instance_id, error);
         return false;
@@ -1119,7 +1109,7 @@ fn handle_retryable_connect_failure(
     if failures.is_persistent() {
         manager.emit_persistent_failure(local_host_id, actor_instance_id, error, attempts);
     } else {
-        log::warn!("MQTT connection to {local_host_id} failed; retrying: {error}");
+        log::warn!("Mobile connection to {local_host_id} failed; retrying: {error}");
         manager.emit_connecting(local_host_id, actor_instance_id);
     }
     true
@@ -1178,29 +1168,16 @@ async fn connect_direct_once(
 async fn connect_managed_once(
     record: &WebPairedHostRecord,
     psk: &PreSharedKey,
-) -> Result<mqtt_transport::EnvelopeStream, ConnectErr> {
-    let (broker, credentials) =
-        super::service::obtain_managed_credentials(record, now_ms()).await?;
-    let config = ManagedMqttConnectConfig {
-        broker,
-        credentials,
-        room: record.room.ok_or_else(|| {
-            ConnectErr::NeedsRepair(format!(
-                "\"{}\" has no rendezvous room; re-pair from the host's QR code.",
-                record.host_label
-            ))
-        })?,
-        psk: psk.clone(),
-        role: ParticipantRole::Client,
-    };
+) -> Result<rtc_transport::RtcStream, ConnectErr> {
+    let credentials = super::service::obtain_rtc_credentials(record).await?;
     match timeout(
         CONNECT_ATTEMPT_TIMEOUT,
-        mqtt_transport::connect_managed_ephemeral(config),
+        rtc_transport::connect(credentials, psk.as_bytes()),
     )
     .await
     {
         Ok(Ok(stream)) => Ok(stream),
-        Ok(Err(error)) => Err(ConnectErr::Transport(error)),
+        Ok(Err(error)) => Err(ConnectErr::Rtc(error)),
         Err(_) => Err(ConnectErr::Timeout),
     }
 }
@@ -1328,7 +1305,7 @@ where
                             local_host_id: local_host_id.clone(),
                             connection_instance_id: submission_connection_id,
                             local_submission_id,
-                            outcome: SubmissionTransportOutcome::BrokerAcknowledged,
+                            outcome: SubmissionTransportOutcome::TransportAcknowledged,
                         });
                     }
                     Err(WriteAttemptFailure::Io(error)) => {
@@ -1374,7 +1351,7 @@ where
                         settle_connected_teardown(local_host_id, in_flight.take(), rx);
                         return ConnectedOutcome::Disconnected(ConnectErr::Io(std::io::Error::new(
                             std::io::ErrorKind::UnexpectedEof,
-                            "MQTT Tyde byte stream closed",
+                            "Tyde byte stream closed",
                         )));
                     }
                     Ok(Some(frame)) => {
@@ -1441,7 +1418,7 @@ where
                 };
                 in_flight = Some((submission_connection_id, local_submission_id));
                 // Do not batch mobile writes. One logical line per write+flush is
-                // what makes BrokerAcknowledged attributable to this submission.
+                // what makes TransportAcknowledged attributable to this submission.
                 write_future = Some(Box::pin(async move {
                     let write = async { match command { ConnectionCommand::SendLine{line,..}=>write_host_line(&mut writer,&line).await, ConnectionCommand::SendFrame{frame,permit,..}=>{let result=protocol::write_frame(&mut writer,&frame).await.map_err(|error|std::io::Error::new(std::io::ErrorKind::InvalidData,error));drop(permit);result} } };
                     let result = match timeout(writer_deadline, write).await {
@@ -1589,25 +1566,6 @@ fn transport_error_from_io(error: &std::io::Error) -> Option<&MqttTransportError
 /// carriers preserve retryability and credential classification.
 fn write_ack_error_from_io(error: &std::io::Error) -> Option<&mqtt_transport::WriteAckError> {
     error_source_from_io::<mqtt_transport::WriteAckError>(error)
-}
-
-/// True when the failure means the broker rejected this connection's grant
-/// (AWS IoT re-validates the CONNECT token via its custom authorizer roughly
-/// every 5 minutes) or the client's own renewal deadline passed. Reconnecting
-/// with the cached grant would just fail again, so the cache must be dropped
-/// before the retry mints credentials.
-fn connect_error_invalidates_credentials(error: &ConnectErr) -> bool {
-    match error {
-        ConnectErr::Transport(transport) => transport.invalidates_managed_credentials(),
-        ConnectErr::Io(io_error) => transport_error_from_io(io_error)
-            .map(MqttTransportError::invalidates_managed_credentials)
-            .or_else(|| {
-                write_ack_error_from_io(io_error)
-                    .map(mqtt_transport::WriteAckError::invalidates_managed_credentials)
-            })
-            .unwrap_or(false),
-        _ => false,
-    }
 }
 
 fn transport_error_code(error: &MqttTransportError) -> MobileAccessErrorCode {

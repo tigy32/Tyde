@@ -238,7 +238,7 @@ pub enum SubmissionTarget {
 
 /// Resting state of a recovery record.
 ///
-/// `BrokerAcknowledged` is deliberately not representable here: it *retires*
+/// `TransportAcknowledged` is deliberately not representable here: it *retires*
 /// the record. A record can therefore never rest in a state that claims
 /// delivery.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -414,7 +414,7 @@ pub fn wire_images(images: &[protocol::ImageData]) -> Option<Vec<protocol::Image
 /// submission is *unresolved*, not safe — it can still come back `NotSent` or
 /// `DeliveryUnknown`, and its record is the only holder of the text the user would
 /// then need back. A record leaves the store by exactly three routes:
-/// `BrokerAcknowledged` retires it, the user withdraws it, or the host is
+/// `TransportAcknowledged` retires it, the user withdraws it, or the host is
 /// forgotten. Going transiently one over the cap (a resend holds its replacement
 /// before retiring the attempt it supersedes) is strictly better than losing a
 /// message, so [`AppState::hold_submission`] inserts unconditionally.
@@ -971,7 +971,7 @@ pub struct AppState {
     /// the connection layer's [`LocalSubmissionId`] — one entry per *transport
     /// attempt*. Bounded, in-memory, and non-persistent. Records are held silently
     /// while `QueuedLocally` and are surfaced only on a transport failure;
-    /// `BrokerAcknowledged` removes them.
+    /// `TransportAcknowledged` removes them.
     pub pending_submissions: RwSignal<HashMap<LocalSubmissionId, PendingSubmission>>,
     /// Logical submissions the user took back, so the UI that created one can
     /// still say what became of it after its record is gone.
@@ -1398,7 +1398,7 @@ impl AppState {
     /// *before* admission; by the time we are here the frame is already gone and
     /// refusing to hold its text would simply lose it.
     ///
-    /// A record leaves this store by exactly three routes: `BrokerAcknowledged`
+    /// A record leaves this store by exactly three routes: `TransportAcknowledged`
     /// retires it, the user discards it, or the host is forgotten.
     pub fn hold_submission(&self, submission: PendingSubmission) {
         self.pending_submissions.update(|records| {
@@ -1409,7 +1409,7 @@ impl AppState {
     /// Apply a transport fact reported by the connection layer for one
     /// submission.
     ///
-    /// `BrokerAcknowledged` **retires the record silently** — no dismissal, no
+    /// `TransportAcknowledged` **retires the record silently** — no dismissal, no
     /// accumulation, no announcement. It is a transport fact only: it does not
     /// claim the host received or applied the frame, and the record is not kept
     /// around pretending otherwise.
@@ -1454,7 +1454,7 @@ impl AppState {
                 SubmissionTransportOutcome::DeliveryUnknown => {
                     record.state = PendingSubmissionState::DeliveryUnknown;
                 }
-                SubmissionTransportOutcome::BrokerAcknowledged => {
+                SubmissionTransportOutcome::TransportAcknowledged => {
                     records.remove(&local_submission_id);
                 }
             }

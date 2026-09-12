@@ -191,3 +191,5 @@ pub use types::{
     LOCAL_HOST_ID, TydeReleaseVersion,
 };
 pub use validator::{ObservedFrame, ProtocolValidator, ProtocolViolation};
+
+pub use types::mobile_rtc::*;

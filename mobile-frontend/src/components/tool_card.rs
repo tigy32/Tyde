@@ -2392,7 +2392,7 @@ mod wasm_tests {
         state.apply_submission_outcome(
             record.local_submission_id,
             record.connection_instance_id,
-            crate::bridge::SubmissionTransportOutcome::BrokerAcknowledged,
+            crate::bridge::SubmissionTransportOutcome::TransportAcknowledged,
         );
         next_tick().await;
 

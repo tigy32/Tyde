@@ -256,7 +256,6 @@ pub async fn forget_paired_host(local_host_id: &LocalHostId) -> Result<(), Strin
     // Best-effort disconnect (ignore "no active connection").
     let _ = connection::manager().disconnect(local_host_id.clone());
     // Drop the in-memory managed broker grant so a forgotten host can't reuse it.
-    service::clear_cached_credentials(local_host_id);
 
     // Attempt every deletion so a single failure can't strand the rest, and
     // report all failures explicitly rather than silently ignoring them

@@ -1,5 +1,6 @@
 [workspace]
 resolver = "2"
+exclude = ["vendor/webrtc"]
 members = [
     "protocol",
     "settings-model",
@@ -15,6 +16,7 @@ members = [
     "process-env",
     "tyde-server",
     "mqtt-transport",
+    "rtc-transport",
     "mobile-shell-types",
     "mobile-frontend",
 ]
@@ -32,6 +34,7 @@ tracing = "0.1"
 uuid = { version = "1", features = ["v4"] }
 
 [patch.crates-io]
+webrtc = { path = "vendor/webrtc" }
 webrtc-audio-processing-sys = { path = "vendor/webrtc-audio-processing-sys" }
 
 [profile.dev]

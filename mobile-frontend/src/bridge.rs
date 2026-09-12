@@ -46,7 +46,7 @@ impl std::error::Error for SendRejected {}
 pub enum SubmissionTransportOutcome {
     QueuedLocally,
     NotSent,
-    BrokerAcknowledged,
+    TransportAcknowledged,
     DeliveryUnknown,
 }
 

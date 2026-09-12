@@ -15,6 +15,7 @@ mobile-shell-types = { path = "../mobile-shell-types" }
 # target also compiles this (rumqttc backend) so the runtime-detect shell
 # builds without any cfg split; only the wasm bundle actually runs the web path.
 mqtt-transport = { path = "../mqtt-transport" }
+rtc-transport = { path = "../rtc-transport" }
 leptos = { version = "0.8.17", features = ["csr"] }
 serde = { workspace = true }
 serde_json = { workspace = true }

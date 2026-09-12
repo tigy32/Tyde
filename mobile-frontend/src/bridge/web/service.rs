@@ -19,20 +19,10 @@
 //!    `GET /auth/session` (no handoff code) re-probes an already-established
 //!    session on later loads (`authenticated` / `pass_required` /
 //!    `mobile_session_required`).
-//! 3. `POST /pairings/redeem` (cookie) consumes the scanned offer and returns the
-//!    durable `device_pairing_secret` plus mobile-scoped AWS IoT broker
-//!    credentials.
-//! 4. `POST /pairings/{id}/broker-credentials` (cookie + HMAC over
-//!    `device_pairing_secret`) mints fresh short-lived broker credentials on each
-//!    (re)connect.
-//!
-//! Every request uses `credentials: "include"` so the session cookie rides along;
-//! **no** auth secret is ever read from a JS global or held in JS memory (the
-//! `handoffCode` is a one-time redirect marker, not a stored token — it is
-//! consumed and dropped from the URL on first read). The connection manager only
-//! ever receives service-issued [`mqtt_transport::ManagedMqttConnectConfig`]
-//! material, and ephemeral broker grants are cached only in memory — never
-//! written to IndexedDB.
+//! 3. `POST /pairings/redeem` (cookie) stores the durable device pairing identity.
+//! 4. `POST /pairings/{id}/webrtc` (cookie + pairing HMAC) issues fresh TURN and
+//!    signaling credentials for every connection attempt. Grants are never cached
+//!    or persisted. The canonical WebRTC contract comes from `protocol`.
 //!
 //! ## Configuration
 //!
@@ -56,12 +46,11 @@
 //! `service_unavailable`, not a spinner or a silent legacy connect.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use mobile_shell_types::LocalHostId;
-use mqtt_transport::{MQTT_TRANSPORT_PROTOCOL_VERSION, ManagedMobilePairingQrPayload};
+use mqtt_transport::ManagedMobilePairingQrPayload;
 use protocol::{
     ManagedBrokerAuthorizerName, ManagedBrokerClientId, ManagedBrokerConnectAuth,
     ManagedBrokerCredentialScope, ManagedBrokerCredentials, ManagedBrokerEndpoint,
@@ -131,14 +120,6 @@ enum AuthCallbackExchangeAction {
     Ready(Option<MobileServiceAuthState>),
 }
 
-/// Client clock-skew plus mint/connect latency margin applied against the
-/// service-owned `connect_valid_until_ms` boundary, so a grant that looks
-/// connectable on the phone's clock is still inside the boundary when the
-/// CONNECT reaches AWS. The authorizer's own minimum-lifetime policy lives in
-/// tycode-mobile-service and arrives already folded into
-/// `connect_valid_until_ms` — it is deliberately not mirrored here.
-const CREDENTIAL_CLOCK_SKEW_ALLOWANCE_MS: u64 = 60_000;
-
 /// Terminal or re-renderable outcome of a redeem attempt. `Auth` re-drives the
 /// [`MobileServiceAuthState`] card (e.g. the session lapsed into `pass_required`
 /// mid-flow); `Repair` and `Terminal` are dead ends the pairing flow renders as
@@ -150,7 +131,7 @@ pub enum RedeemOutcome {
     Terminal { message: String },
 }
 
-/// Failure obtaining managed broker credentials for a (re)connect. Surfaced by
+/// Failure obtaining managed TURN credentials for a (re)connect. Surfaced by
 /// the connection manager as a typed, terminal-or-retryable connect error.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ManagedCredentialError {
@@ -159,7 +140,7 @@ pub struct ManagedCredentialError {
     pub retryable: bool,
 }
 
-// ── In-memory session marker + ephemeral credential cache ───────────────────
+// ── In-memory authentication callback state ───────────────────
 
 thread_local! {
     /// Local echo of the `tycode.dev` session state so a stubbed redeem knows it
@@ -170,25 +151,6 @@ thread_local! {
     static AUTH_CALLBACK_EXCHANGE: RefCell<AuthCallbackExchange> =
         const { RefCell::new(AuthCallbackExchange::Unchecked) };
 
-    /// Fresh mobile broker grants, held **only in memory** (never persisted —
-    /// finding #5 / dev-docs/30). Populated by redeem and mint; reused for a
-    /// reconnect that happens while still connectable; dropped on forget or
-    /// reload.
-    static CREDENTIAL_CACHE: RefCell<HashMap<LocalHostId, CachedBrokerGrant>> =
-        RefCell::new(HashMap::new());
-}
-
-/// A cached broker grant paired with the service-owned connect-validity
-/// boundary from the mint/redeem contract. The boundary is not part of the
-/// protocol [`ManagedBrokerCredentials`], so it rides alongside them in this
-/// in-memory cache only. No `Debug`: the credentials carry secrets.
-#[derive(Clone)]
-struct CachedBrokerGrant {
-    credentials: ManagedBrokerCredentials,
-    /// Absolute epoch-ms deadline after which the AWS authorizer will refuse a
-    /// CONNECT with this grant, computed service-side (token expiry minus the
-    /// authorizer's minimum-lifetime policy).
-    connect_valid_until_ms: u64,
 }
 
 fn mark_authenticated(value: bool) {
@@ -197,32 +159,6 @@ fn mark_authenticated(value: bool) {
 
 fn is_authenticated() -> bool {
     AUTHENTICATED.with(Cell::get)
-}
-
-fn cache_credentials(local_host_id: &LocalHostId, grant: CachedBrokerGrant) {
-    CREDENTIAL_CACHE.with(|cache| {
-        cache.borrow_mut().insert(local_host_id.clone(), grant);
-    });
-}
-
-fn cached_connectable_credentials(
-    local_host_id: &LocalHostId,
-    now_ms: u64,
-) -> Option<ManagedBrokerCredentials> {
-    CREDENTIAL_CACHE.with(|cache| {
-        cache
-            .borrow()
-            .get(local_host_id)
-            .filter(|grant| cached_grant_is_connectable(grant, now_ms))
-            .map(|grant| grant.credentials.clone())
-    })
-}
-
-/// Drops the in-memory broker grant for a forgotten host so it can't be reused.
-pub fn clear_cached_credentials(local_host_id: &LocalHostId) {
-    CREDENTIAL_CACHE.with(|cache| {
-        cache.borrow_mut().remove(local_host_id);
-    });
 }
 
 // ── Config ──────────────────────────────────────────────────────────────────
@@ -567,7 +503,7 @@ fn strip_fragment_params(url: &web_sys::Url, keys: &[&str]) {
 
 /// Redeems the scanned offer against `tycode.dev` (`POST /pairings/redeem`,
 /// cookie-authenticated), persists the durable managed pairing, and connects to
-/// the managed broker. Returns a [`RedeemOutcome`] on failure — never a fallback
+/// the managed relay. Returns a [`RedeemOutcome`] on failure — never a fallback
 /// to a legacy/public broker.
 pub async fn redeem_and_connect(qr_uri: &str) -> Result<(), RedeemOutcome> {
     let offer =
@@ -598,29 +534,6 @@ pub async fn redeem_and_connect(qr_uri: &str) -> Result<(), RedeemOutcome> {
         )),
         _ => Err(RedeemOutcome::Auth(not_configured())),
     }
-}
-
-/// Obtains managed broker credentials for a (re)connect: reuses the in-memory
-/// cached grant while its service-owned `connect_valid_until_ms` boundary
-/// (minus a clock-skew allowance) has not passed, otherwise mints new ones via
-/// `POST /pairings/{id}/broker-credentials` (cookie + HMAC). Used by the
-/// connection manager to build the `ManagedMqttConnectConfig`.
-pub async fn obtain_managed_credentials(
-    record: &WebPairedHostRecord,
-    now_ms: u64,
-) -> Result<(ManagedBrokerEndpoint, ManagedBrokerCredentials), ManagedCredentialError> {
-    let managed = record
-        .managed
-        .as_ref()
-        .ok_or_else(|| ManagedCredentialError {
-            code: MobileAccessErrorCode::RepairRequired,
-            message: "paired host has no managed tycode.dev identity".to_owned(),
-            retryable: false,
-        })?;
-    if let Some(credentials) = cached_connectable_credentials(&record.local_host_id, now_ms) {
-        return Ok((managed.broker.clone(), credentials));
-    }
-    mint_managed_credentials(record, managed).await
 }
 
 // ── Live HTTP: auth ──────────────────────────────────────────────────────────
@@ -855,7 +768,7 @@ async fn redeem_live(
         device_nonce: nonce(),
         release_version: TYDE_VERSION.to_string(),
         protocol_version: PROTOCOL_VERSION,
-        transport_protocol_version: MQTT_TRANSPORT_PROTOCOL_VERSION,
+        transport_protocol_version: protocol::MOBILE_RTC_PROTOCOL_VERSION,
     };
     let bytes = match serde_json::to_vec(&body) {
         Ok(bytes) => bytes,
@@ -894,8 +807,8 @@ async fn redeem_live(
 }
 
 /// Persists the durable managed pairing (host record + PSK + device secret),
-/// caches the initial broker grant **in memory only**, and starts the managed
-/// connection. Shared by the live and stubbed redeem paths.
+/// then starts the managed connection with fresh TURN credentials.
+/// Shared by the live and stubbed redeem paths.
 async fn finish_redeem(
     offer: &ManagedMobilePairingQrPayload,
     result: RedeemResult,
@@ -946,11 +859,6 @@ async fn finish_redeem(
         return Err(RedeemOutcome::Terminal { message });
     }
 
-    // Reuse the redeem-issued grant for the first connect (in memory only).
-    if let Some(grant) = result.mobile_broker_credentials {
-        cache_credentials(&local_host_id, grant);
-    }
-
     if let Err(message) = super::connection::manager()
         .connect(local_host_id.clone())
         .await
@@ -963,101 +871,105 @@ async fn finish_redeem(
     Ok(())
 }
 
-// ── Live HTTP: mint broker credentials (reconnect) ────────────────────────────
+// ── Live HTTP: mint TURN credentials (reconnect) ────────────────────────────
 
-async fn mint_managed_credentials(
+pub(super) async fn obtain_rtc_credentials(
     record: &WebPairedHostRecord,
-    managed: &ManagedPairingRecord,
-) -> Result<(ManagedBrokerEndpoint, ManagedBrokerCredentials), ManagedCredentialError> {
-    let config = load_config();
-    let Some(base_url) = config.base_url.clone() else {
-        return Err(ManagedCredentialError {
-            code: MobileAccessErrorCode::ServiceUnavailable,
-            message: "no tycode.dev endpoint is configured to refresh broker credentials"
-                .to_owned(),
-            retryable: false,
-        });
+) -> Result<protocol::types::MobileRtcCredentials, ManagedCredentialError> {
+    use protocol::types::{
+        MOBILE_RTC_PROTOCOL_VERSION, MobilePeerRole, MobileRtcCredentials,
+        MobileRtcCredentialsRequest,
     };
-    // Join any boot callback exchange before minting. Terminal auth/pass states
-    // stop reconnect, while a retryable service failure falls through so this
-    // real mint request can recover after a transient outage without a reload.
+    let error = |code, message: String, retryable| ManagedCredentialError {
+        code,
+        message,
+        retryable,
+    };
+    let managed = record.managed.as_ref().ok_or_else(|| {
+        error(
+            MobileAccessErrorCode::RepairRequired,
+            "paired host has no managed identity".to_owned(),
+            false,
+        )
+    })?;
+    let base_url = load_config().base_url.ok_or_else(|| {
+        error(
+            MobileAccessErrorCode::ServiceUnavailable,
+            "no mobile service endpoint is configured".to_owned(),
+            false,
+        )
+    })?;
     if let Some(state) = resolve_auth_callback().await {
         handoff_auth_state_to_credential_result(state)?;
     }
     let device_secret = super::store::load_device_secret(&managed.device_secret_key_id)
         .await
-        .map_err(|message| ManagedCredentialError {
-            code: MobileAccessErrorCode::RepairRequired,
-            message,
-            retryable: false,
-        })?;
-
-    let request = MintRequest {
-        role: "mobile",
-        client_instance_id: nonce(),
-        protocol_version: PROTOCOL_VERSION,
-        transport_protocol_version: MQTT_TRANSPORT_PROTOCOL_VERSION,
-        requested_rooms: vec![RequestedRoom {
-            room_id: record
-                .room
-                .ok_or_else(|| ManagedCredentialError {
-                    code: MobileAccessErrorCode::RepairRequired,
-                    message: "paired host has no rendezvous room".to_owned(),
-                    retryable: false,
-                })?
-                .to_string(),
-            purpose: "rendezvous",
-        }],
+        .map_err(|message| error(MobileAccessErrorCode::RepairRequired, message, false))?;
+    let request = MobileRtcCredentialsRequest {
+        role: MobilePeerRole::Mobile,
+        protocol_version: MOBILE_RTC_PROTOCOL_VERSION,
     };
-    let body = serde_json::to_vec(&request).map_err(|err| ManagedCredentialError {
-        code: MobileAccessErrorCode::Internal,
-        message: format!("failed to serialize broker credential request: {err}"),
-        retryable: false,
+    let body = serde_json::to_vec(&request).map_err(|cause| {
+        error(
+            MobileAccessErrorCode::Internal,
+            format!("cannot encode WebRTC credential request: {cause}"),
+            false,
+        )
     })?;
-    let endpoint_path = format!("/pairings/{}/broker-credentials", managed.pairing_id);
-    let path = format!("{}{endpoint_path}", url_path_prefix(&base_url));
-    let auth_header =
-        pairing_auth_header(&device_secret, "POST", &path, &body).map_err(|message| {
-            ManagedCredentialError {
-                code: MobileAccessErrorCode::Internal,
-                message,
-                retryable: false,
-            }
-        })?;
-    let url = format!("{base_url}{endpoint_path}");
-    let headers = [(PAIRING_AUTH_HEADER, auth_header.as_str())];
-
-    match send(HttpMethod::Post, &url, Some(&body), &headers).await {
+    let endpoint = format!("/pairings/{}/webrtc", managed.pairing_id);
+    let path = format!("{}{endpoint}", url_path_prefix(&base_url));
+    let authorization = pairing_auth_header(&device_secret, "POST", &path, &body)
+        .map_err(|message| error(MobileAccessErrorCode::Internal, message, false))?;
+    match send(
+        HttpMethod::Post,
+        &format!("{base_url}{endpoint}"),
+        Some(&body),
+        &[(PAIRING_AUTH_HEADER, authorization.as_str())],
+    )
+    .await
+    {
         Ok(HttpJson { status, body }) if status < 300 => {
-            let response: MintResponse =
-                serde_json::from_str(&body).map_err(|err| ManagedCredentialError {
-                    code: MobileAccessErrorCode::ServiceUnavailable,
-                    message: format!("unreadable broker credential response: {err}"),
-                    retryable: true,
+            let credentials: MobileRtcCredentials =
+                serde_json::from_str(&body).map_err(|cause| {
+                    error(
+                        MobileAccessErrorCode::InvalidConfig,
+                        format!("cannot decode WebRTC credentials: {cause}"),
+                        false,
+                    )
                 })?;
-            let broker = response.broker.into_protocol().map_err(mint_conv_err)?;
-            let connect_valid_until_ms = response.broker_credentials.connect_valid_until_ms;
-            let credentials = response
-                .broker_credentials
-                .into_protocol(&broker)
-                .map_err(mint_conv_err)?;
-            // Cache in memory for the next reconnect within its service-owned
-            // connect boundary; never persisted (finding #5).
-            cache_credentials(
-                &record.local_host_id,
-                CachedBrokerGrant {
-                    credentials: credentials.clone(),
-                    connect_valid_until_ms,
-                },
-            );
-            Ok((broker, credentials))
+            if credentials.pairing_id.as_str() != managed.pairing_id
+                || credentials.role != MobilePeerRole::Mobile
+            {
+                return Err(error(
+                    MobileAccessErrorCode::InvalidConfig,
+                    "WebRTC credentials belong to a different peer".to_owned(),
+                    false,
+                ));
+            }
+            if credentials.protocol_version != MOBILE_RTC_PROTOCOL_VERSION
+                || credentials.expires_at_ms <= now_ms().saturating_add(60_000)
+                || credentials.ice_servers.is_empty()
+                || credentials.signaling_token.is_empty()
+                || credentials.ice_servers.iter().any(|server| {
+                    server.urls.is_empty()
+                        || server.username.is_empty()
+                        || server.credential.is_empty()
+                })
+            {
+                return Err(error(
+                    MobileAccessErrorCode::InvalidConfig,
+                    "WebRTC credentials are incomplete, expired, or incompatible".to_owned(),
+                    false,
+                ));
+            }
+            Ok(credentials)
         }
         Ok(HttpJson { body, .. }) => Err(mint_error_from_body(&body)),
-        Err(message) => Err(ManagedCredentialError {
-            code: MobileAccessErrorCode::ServiceUnavailable,
+        Err(message) => Err(error(
+            MobileAccessErrorCode::ServiceUnavailable,
             message,
-            retryable: true,
-        }),
+            true,
+        )),
     }
 }
 
@@ -1098,7 +1010,7 @@ fn pairing_auth_header(
     ))
 }
 
-/// Extracts the `{pairing_id}` segment from a `.../pairings/{id}/broker-credentials`
+/// Extracts the `{pairing_id}` segment from a `.../pairings/{id}/webrtc`
 /// path so the HMAC canonical string binds the pairing exactly as the server does.
 fn pairing_id_from_path(path: &str) -> &str {
     path.rsplit_once("/pairings/")
@@ -1222,10 +1134,6 @@ fn url_path_prefix(base_url: &str) -> String {
         Ok(url) => url.pathname().trim_end_matches('/').to_owned(),
         Err(_) => String::new(),
     }
-}
-
-fn cached_grant_is_connectable(grant: &CachedBrokerGrant, now_ms: u64) -> bool {
-    grant.connect_valid_until_ms > now_ms.saturating_add(CREDENTIAL_CLOCK_SKEW_ALLOWANCE_MS)
 }
 
 // ── Error mapping ─────────────────────────────────────────────────────────────
@@ -1427,14 +1335,6 @@ fn mint_error_from_body(body: &str) -> ManagedCredentialError {
     }
 }
 
-fn mint_conv_err(message: String) -> ManagedCredentialError {
-    ManagedCredentialError {
-        code: MobileAccessErrorCode::InvalidConfig,
-        message,
-        retryable: false,
-    }
-}
-
 // ── Contract types (mobile client's view of the tycode.dev JSON) ──────────────
 //
 // Structs that carry any secret (device pairing secret, offer secret, broker
@@ -1475,21 +1375,6 @@ struct RedeemRequest {
     transport_protocol_version: u32,
 }
 
-#[derive(Debug, Serialize)]
-struct MintRequest {
-    role: &'static str,
-    client_instance_id: String,
-    protocol_version: u32,
-    transport_protocol_version: u32,
-    requested_rooms: Vec<RequestedRoom>,
-}
-
-#[derive(Debug, Serialize)]
-struct RequestedRoom {
-    room_id: String,
-    purpose: &'static str,
-}
-
 /// Parsed redeem result in mobile-side types. Built from the live JSON response
 /// or the dev stub; consumed by [`finish_redeem`]. No `Debug` — holds the device
 /// pairing secret.
@@ -1498,7 +1383,6 @@ struct RedeemResult {
     device_id: String,
     device_pairing_secret: String,
     broker: ManagedBrokerEndpoint,
-    mobile_broker_credentials: Option<CachedBrokerGrant>,
 }
 
 #[derive(Deserialize)]
@@ -1513,25 +1397,14 @@ struct RedeemResponse {
 impl RedeemResponse {
     fn into_result(self) -> Result<RedeemResult, String> {
         let broker = self.broker.into_protocol()?;
-        let connect_valid_until_ms = self.mobile_broker_credentials.connect_valid_until_ms;
-        let credentials = self.mobile_broker_credentials.into_protocol(&broker)?;
+        self.mobile_broker_credentials.into_protocol(&broker)?;
         Ok(RedeemResult {
             pairing_id: self.pairing_id,
             device_id: self.device_id,
             device_pairing_secret: self.device_pairing_secret,
             broker,
-            mobile_broker_credentials: Some(CachedBrokerGrant {
-                credentials,
-                connect_valid_until_ms,
-            }),
         })
     }
-}
-
-#[derive(Deserialize)]
-struct MintResponse {
-    broker: ContractBroker,
-    broker_credentials: ContractCredentials,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1579,6 +1452,9 @@ impl ContractCredentials {
         self,
         broker: &ManagedBrokerEndpoint,
     ) -> Result<ManagedBrokerCredentials, String> {
+        if self.connect_valid_until_ms > self.expires_at_ms {
+            return Err("broker connect deadline exceeds credential expiration".to_owned());
+        }
         Ok(ManagedBrokerCredentials {
             grant_id: ManagedBrokerGrantId::new(self.grant_id)
                 .map_err(|err| format!("invalid managed grant id: {err}"))?,
@@ -1851,7 +1727,6 @@ fn stub_redeem_result(offer: &ManagedMobilePairingQrPayload) -> RedeemResult {
         device_id: "dev_stub".to_owned(),
         device_pairing_secret: "device_pairing_secret_stub".to_owned(),
         broker: offer.broker.clone(),
-        mobile_broker_credentials: None,
     }
 }
 
@@ -1925,13 +1800,18 @@ mod wasm_tests {
         }
     }
 
-    fn install_fetch_mock(responses: Vec<(u16, &'static str)>) -> FetchMock {
+    fn install_fetch_mock(responses: Vec<(u16, &str)>) -> FetchMock {
         let window = web_sys::window().expect("window");
         let original_fetch = js_sys::Reflect::get(&window, &JsValue::from_str("fetch"))
             .expect("read original fetch");
         let calls = Rc::new(RefCell::new(Vec::new()));
         let calls_for_fetch = calls.clone();
-        let response_queue = Rc::new(RefCell::new(VecDeque::from(responses)));
+        let response_queue = Rc::new(RefCell::new(
+            responses
+                .into_iter()
+                .map(|(status, body)| (status, body.to_owned()))
+                .collect::<VecDeque<_>>(),
+        ));
         let responses_for_fetch = response_queue.clone();
         let closure = Closure::<dyn FnMut(JsValue) -> js_sys::Promise>::new(
             move |request_value: JsValue| {
@@ -1945,8 +1825,8 @@ mod wasm_tests {
                 let (status, body) = responses_for_fetch
                     .borrow_mut()
                     .pop_front()
-                    .unwrap_or((500, r#"{"error":{"code":"internal","message":"unexpected extra request","retryable":true}}"#));
-                response_promise(status, body)
+                    .unwrap_or_else(|| (500, r#"{"error":{"code":"internal","message":"unexpected extra request","retryable":true}}"#.to_owned()));
+                response_promise(status, &body)
             },
         );
         js_sys::Reflect::set(&window, &JsValue::from_str("fetch"), closure.as_ref())
@@ -2060,33 +1940,11 @@ mod wasm_tests {
     }
 
     const VALID_MINT_RESPONSE: &str = r#"{
-        "pairing_id":"pair_01J",
-        "status":"active",
-        "broker":{
-            "endpoint":"wss://a1234567890-ats.iot.us-west-2.amazonaws.com/mqtt",
-            "provider":"aws_iot_core",
-            "region":"us-west-2",
-            "authorizer_name":"tycode-mobile-v1"
-        },
-        "broker_credentials":{
-            "grant_id":"grant_01J",
-            "client_id":"tyde/prod/pair_01J/mobile/dev_01J/grant_01J",
-            "connect":{
-                "username":"tyde?x-amz-customauthorizer-name=tycode-mobile-v1",
-                "password":"signed-grant",
-                "websocket_url":"wss://a1234567890-ats.iot.us-west-2.amazonaws.com/mqtt?x-amz-customauthorizer-name=tycode-mobile-v1&tycode-grant=signed-grant",
-                "headers":{"x-amz-customauthorizer-name":"tycode-mobile-v1","tycode-grant":"signed-grant"}
-            },
-            "scope":{
-                "namespace":"tyde/prod/pair_01J",
-                "role":"mobile",
-                "publish":["tyde/prod/pair_01J/rooms/+/client-to-host"],
-                "subscribe":["tyde/prod/pair_01J/rooms/+/host-to-client"]
-            },
-            "issued_at_ms":1,
-            "connect_valid_until_ms":4102444500000,
-            "expires_at_ms":4102444800000
-        }
+        "protocol_version":1,"pairing_id":"pair_01J","role":"mobile",
+        "signaling_url":"https://tycode.dev/api/tyde/mobile/v1/webrtc/signal",
+        "signaling_token":"signed-grant", "expires_at_ms":4102444800000,
+        "ice_servers":[{"urls":["turn:turn.cloudflare.com:3478?transport=udp"],
+          "username":"turn-user","credential":"turn-password"}]
     }"#;
 
     #[wasm_bindgen_test]
@@ -2980,7 +2838,7 @@ mod wasm_tests {
             mobile_shell_types::KeychainSecretId("missing-device-secret".to_owned()),
         );
 
-        let error = obtain_managed_credentials(&record, 0)
+        let error = obtain_rtc_credentials(&record)
             .await
             .expect_err("handoff failure must abort reconnect credentials");
 
@@ -2996,7 +2854,7 @@ mod wasm_tests {
                 method: "POST".to_owned(),
                 url: "https://tycode.dev/api/tyde/mobile/v1/auth/session".to_owned(),
             }],
-            "failed handoff must not continue to /broker-credentials"
+            "failed handoff must not continue to /webrtc"
         );
 
         drop(fetch);
@@ -3030,7 +2888,7 @@ mod wasm_tests {
                 .expect("store device secret");
         let record = reconnect_record("reconnect-handoff-ok", device_secret_key_id.clone());
 
-        let error = obtain_managed_credentials(&record, 0)
+        let error = obtain_rtc_credentials(&record)
             .await
             .expect_err("second mocked service response fails the mint");
 
@@ -3044,9 +2902,7 @@ mod wasm_tests {
         );
         assert_eq!(calls[1].method, "POST");
         assert!(
-            calls[1]
-                .url
-                .ends_with("/pairings/pair_01J/broker-credentials"),
+            calls[1].url.ends_with("/pairings/pair_01J/webrtc"),
             "second call must be broker credential mint: {:?}",
             calls
         );
@@ -3104,7 +2960,7 @@ mod wasm_tests {
         let record_for_task = record.clone();
         wasm_bindgen_futures::spawn_local(async move {
             *credential_result_for_task.borrow_mut() =
-                Some(obtain_managed_credentials(&record_for_task, 0).await);
+                Some(obtain_rtc_credentials(&record_for_task).await);
         });
         next_tick().await;
         assert_eq!(
@@ -3153,9 +3009,8 @@ mod wasm_tests {
                 },
                 FetchCall {
                     method: "POST".to_owned(),
-                    url:
-                        "https://tycode.dev/api/tyde/mobile/v1/pairings/pair_01J/broker-credentials"
-                            .to_owned(),
+                    url: "https://tycode.dev/api/tyde/mobile/v1/pairings/pair_01J/webrtc"
+                        .to_owned(),
                 },
             ],
             "one auth exchange must finish before the single credential mint"
@@ -3193,7 +3048,7 @@ mod wasm_tests {
                 .await
                 .expect("store device secret");
         let record = reconnect_record("reconnect-after-auth-outage", device_secret_key_id.clone());
-        obtain_managed_credentials(&record, 0)
+        obtain_rtc_credentials(&record)
             .await
             .expect("recovered service must receive a real credential mint");
 
@@ -3206,266 +3061,90 @@ mod wasm_tests {
                 },
                 FetchCall {
                     method: "POST".to_owned(),
-                    url:
-                        "https://tycode.dev/api/tyde/mobile/v1/pairings/pair_01J/broker-credentials"
-                            .to_owned(),
+                    url: "https://tycode.dev/api/tyde/mobile/v1/pairings/pair_01J/webrtc"
+                        .to_owned(),
                 },
             ],
             "a cached transient probe failure must not suppress the recovered mint"
         );
 
-        clear_cached_credentials(&record.local_host_id);
         let _ = super::super::store::delete_device_secret(&device_secret_key_id).await;
         drop(fetch);
         set_config("");
     }
 
-    /// A successful reconnect mint must preserve the browser-safe AWS IoT
-    /// custom-authorizer WebSocket URL in typed credentials. The MQTT layer then
-    /// uses this URL instead of falling back to the broker endpoint.
+    // These flows replace the MQTT URL/cache tests: every WebRTC reconnect must
+    // obtain fresh, peer-scoped relay credentials, including before expiry.
     #[wasm_bindgen_test]
-    async fn reconnect_mint_parses_managed_websocket_url() {
-        set_config(r#"{"baseUrl":"https://tycode.dev/api/tyde/mobile/v1","provider":"google"}"#);
-        let device_secret_key_id =
-            super::super::store::store_device_secret("device_pairing_secret_test")
-                .await
-                .expect("store device secret");
-        let fetch = install_fetch_mock(vec![(
-            200,
-            r#"{
-                "pairing_id":"pair_01J",
-                "status":"active",
-                "broker":{
-                    "endpoint":"wss://a1234567890-ats.iot.us-west-2.amazonaws.com/mqtt",
-                    "provider":"aws_iot_core",
-                    "region":"us-west-2",
-                    "authorizer_name":"tycode-mobile-v1"
-                },
-                "broker_credentials":{
-                    "grant_id":"grant_01J",
-                    "client_id":"tyde/prod/pair_01J/mobile/dev_01J/grant_01J",
-                    "connect":{
-                        "username":"tyde?x-amz-customauthorizer-name=tycode-mobile-v1",
-                        "password":"signed-grant",
-                        "websocket_url":"wss://a1234567890-ats.iot.us-west-2.amazonaws.com/mqtt?x-amz-customauthorizer-name=tycode-mobile-v1&tycode-grant=signed-grant",
-                        "headers":{"x-amz-customauthorizer-name":"tycode-mobile-v1","tycode-grant":"signed-grant"}
-                    },
-                    "scope":{
-                        "namespace":"tyde/prod/pair_01J",
-                        "role":"mobile",
-                        "publish":["tyde/prod/pair_01J/rooms/+/client-to-host"],
-                        "subscribe":["tyde/prod/pair_01J/rooms/+/host-to-client"]
-                    },
-                    "issued_at_ms":1,
-                    "connect_valid_until_ms":4102444500000,
-                    "expires_at_ms":4102444800000
-                }
-            }"#,
-        )]);
-        let record = reconnect_record("reconnect-websocket-url", device_secret_key_id.clone());
-
-        let (_broker, credentials) = obtain_managed_credentials(&record, 0)
+    async fn reconnect_mints_fresh_relay_credentials_each_time() {
+        set_config(r#"{"baseUrl":"https://tycode.dev/api/tyde/mobile/v1"}"#);
+        let fetch =
+            install_fetch_mock(vec![(200, VALID_MINT_RESPONSE), (200, VALID_MINT_RESPONSE)]);
+        let secret = super::super::store::store_device_secret("device_pairing_secret_test")
             .await
-            .expect("mint credentials");
-
-        assert_eq!(
-            credentials
-                .connect
-                .websocket_url
-                .as_ref()
-                .map(|url| url.as_str()),
-            Some(
-                "wss://a1234567890-ats.iot.us-west-2.amazonaws.com/mqtt?x-amz-customauthorizer-name=tycode-mobile-v1&tycode-grant=signed-grant"
-            )
-        );
-        assert_eq!(fetch.calls().len(), 1);
-
-        clear_cached_credentials(&record.local_host_id);
-        let _ = super::super::store::delete_device_secret(&device_secret_key_id).await;
-        drop(fetch);
-        set_config("");
-    }
-
-    fn cached_test_grant(
-        grant_id: &str,
-        connect_valid_until_ms: u64,
-        expires_at_ms: u64,
-    ) -> CachedBrokerGrant {
-        CachedBrokerGrant {
-            credentials: cached_test_credentials(grant_id, expires_at_ms),
-            connect_valid_until_ms,
+            .expect("store secret");
+        let record = reconnect_record("reconnect-turn", secret.clone());
+        for expected_calls in 1..=2 {
+            let credentials = obtain_rtc_credentials(&record).await.expect("TURN grant");
+            assert_eq!(
+                credentials.signaling_url.as_str(),
+                "https://tycode.dev/api/tyde/mobile/v1/webrtc/signal"
+            );
+            assert_eq!(
+                credentials.ice_servers[0].urls[0].as_str(),
+                "turn:turn.cloudflare.com:3478?transport=udp"
+            );
+            assert_eq!(credentials.ice_servers[0].username, "turn-user");
+            assert_eq!(credentials.ice_servers[0].credential, "turn-password");
+            assert_eq!(
+                fetch.calls().len(),
+                expected_calls,
+                "a reconnect must reach the service even before expiration"
+            );
+            assert!(
+                fetch
+                    .calls()
+                    .iter()
+                    .all(|call| call.url.ends_with("/pairings/pair_01J/webrtc"))
+            );
         }
+        super::super::store::delete_device_secret(&secret)
+            .await
+            .expect("delete secret");
+        drop(fetch);
+        set_config("");
     }
 
-    fn cached_test_credentials(grant_id: &str, expires_at_ms: u64) -> ManagedBrokerCredentials {
-        ManagedBrokerCredentials {
-            grant_id: ManagedBrokerGrantId::new(grant_id).expect("grant id"),
-            client_id: ManagedBrokerClientId::new("tyde/prod/pair_01J/mobile/dev_01J/grant_cached")
-                .expect("client id"),
-            connect: ManagedBrokerConnectAuth {
-                username: Some(
-                    "tyde?x-amz-customauthorizer-name=tycode-mobile-v1".to_owned(),
-                ),
-                password: Some("cached-grant".to_owned()),
-                websocket_url: Some(
-                    protocol::BrokerUrl::new(
-                        "wss://a1234567890-ats.iot.us-west-2.amazonaws.com/mqtt?x-amz-customauthorizer-name=tycode-mobile-v1&tycode-grant=cached-grant",
-                    )
-                    .expect("websocket url"),
-                ),
-                headers: Default::default(),
-            },
-            scope: ManagedBrokerCredentialScope {
-                namespace: ManagedBrokerTopicNamespace::new("tyde/prod/pair_01J")
-                    .expect("namespace"),
-                role: ManagedBrokerRole::Mobile,
-                publish: vec!["tyde/prod/pair_01J/rooms/+/client-to-host".to_owned()],
-                subscribe: vec!["tyde/prod/pair_01J/rooms/+/host-to-client".to_owned()],
-            },
-            issued_at_ms: 0,
-            expires_at_ms,
+    #[wasm_bindgen_test]
+    async fn reconnect_rejects_expired_or_incomplete_or_wrong_peer_grants() {
+        set_config(r#"{"baseUrl":"https://tycode.dev/api/tyde/mobile/v1"}"#);
+        let secret = super::super::store::store_device_secret("device_pairing_secret_test_invalid")
+            .await
+            .expect("store secret");
+        let record = reconnect_record("reconnect-invalid-turn", secret.clone());
+        for (field, value) in [
+            ("pairing_id", serde_json::json!("another-pair")),
+            ("role", serde_json::json!("host")),
+            ("expires_at_ms", serde_json::json!(1)),
+            ("ice_servers", serde_json::json!([])),
+            ("signaling_url", serde_json::Value::Null),
+        ] {
+            let mut body: serde_json::Value =
+                serde_json::from_str(VALID_MINT_RESPONSE).expect("fixture");
+            body[field] = value;
+            let body = body.to_string();
+            let fetch = install_fetch_mock(vec![(200, &body)]);
+            let error = obtain_rtc_credentials(&record)
+                .await
+                .expect_err("invalid grant must fail closed");
+            assert_eq!(error.code, MobileAccessErrorCode::InvalidConfig);
+            assert!(!error.retryable);
+            assert_eq!(fetch.calls().len(), 1);
+            drop(fetch);
         }
-    }
-
-    /// The latent credential bug: a cached grant whose token has not expired
-    /// but whose service-owned connect boundary has passed must be re-minted,
-    /// never reused — the authorizer would refuse the connect.
-    #[wasm_bindgen_test]
-    async fn cached_grant_past_service_connect_boundary_is_reminted_not_reused() {
-        set_config(r#"{"baseUrl":"https://tycode.dev/api/tyde/mobile/v1","provider":"google"}"#);
-        let fetch = install_fetch_mock(vec![(200, VALID_MINT_RESPONSE)]);
-        let device_secret_key_id =
-            super::super::store::store_device_secret("device_pairing_secret_stale_grant")
-                .await
-                .expect("store device secret");
-        let record = reconnect_record("reconnect-stale-grant", device_secret_key_id.clone());
-        let now = 1_000_000_000_u64;
-        // Token still valid for 299s, but the service says CONNECT stopped
-        // being acceptable 1s ago — connectability must follow the boundary,
-        // not the token expiry.
-        cache_credentials(
-            &record.local_host_id,
-            cached_test_grant("grant_stale", now - 1_000, now + 299_000),
-        );
-
-        let (_broker, credentials) = obtain_managed_credentials(&record, now)
+        super::super::store::delete_device_secret(&secret)
             .await
-            .expect("a sub-minimum cached grant must trigger a fresh mint");
-
-        assert_eq!(
-            credentials.grant_id.as_str(),
-            "grant_01J",
-            "the freshly minted grant must be returned, not the dead cached one"
-        );
-        let calls = fetch.calls();
-        assert_eq!(calls.len(), 1, "exactly one mint request must be issued");
-        assert!(
-            calls[0]
-                .url
-                .ends_with("/pairings/pair_01J/broker-credentials"),
-            "the call must be a broker credential mint: {calls:?}"
-        );
-
-        clear_cached_credentials(&record.local_host_id);
-        let _ = super::super::store::delete_device_secret(&device_secret_key_id).await;
-        drop(fetch);
-        set_config("");
-    }
-
-    /// The in-memory grant cache still works: a cached grant whose service
-    /// connect boundary is safely beyond the clock-skew allowance is reused
-    /// without any service call.
-    #[wasm_bindgen_test]
-    async fn cached_grant_within_service_connect_boundary_is_reused() {
-        set_config(r#"{"baseUrl":"https://tycode.dev/api/tyde/mobile/v1","provider":"google"}"#);
-        let fetch = install_fetch_mock(Vec::new());
-        // The device secret is intentionally absent: a cache hit must never
-        // touch the keystore or the service.
-        let record = reconnect_record(
-            "reconnect-fresh-grant",
-            mobile_shell_types::KeychainSecretId("unused-device-secret".to_owned()),
-        );
-        let now = 1_000_000_000_u64;
-        cache_credentials(
-            &record.local_host_id,
-            cached_test_grant(
-                "grant_cached_fresh",
-                now + CREDENTIAL_CLOCK_SKEW_ALLOWANCE_MS + 60_000,
-                now + 900_000,
-            ),
-        );
-
-        let (_broker, credentials) = obtain_managed_credentials(&record, now)
-            .await
-            .expect("a still-valid cached grant must be reused");
-
-        assert_eq!(credentials.grant_id.as_str(), "grant_cached_fresh");
-        assert!(
-            fetch.calls().is_empty(),
-            "no service request may be issued for a still-valid cached grant"
-        );
-
-        clear_cached_credentials(&record.local_host_id);
-        drop(fetch);
-        set_config("");
-    }
-
-    #[wasm_bindgen_test]
-    async fn reconnect_mint_rejects_missing_managed_websocket_url() {
-        set_config(r#"{"baseUrl":"https://tycode.dev/api/tyde/mobile/v1","provider":"google"}"#);
-        let device_secret_key_id =
-            super::super::store::store_device_secret("device_pairing_secret_test_missing_url")
-                .await
-                .expect("store device secret");
-        let fetch = install_fetch_mock(vec![(
-            200,
-            r#"{
-                "pairing_id":"pair_01J",
-                "status":"active",
-                "broker":{
-                    "endpoint":"wss://a1234567890-ats.iot.us-west-2.amazonaws.com/mqtt",
-                    "provider":"aws_iot_core",
-                    "region":"us-west-2",
-                    "authorizer_name":"tycode-mobile-v1"
-                },
-                "broker_credentials":{
-                    "grant_id":"grant_01J",
-                    "client_id":"tyde/prod/pair_01J/mobile/dev_01J/grant_01J",
-                    "connect":{
-                        "headers":{"x-amz-customauthorizer-name":"tycode-mobile-v1","tycode-grant":"signed-grant"}
-                    },
-                    "scope":{
-                        "namespace":"tyde/prod/pair_01J",
-                        "role":"mobile",
-                        "publish":["tyde/prod/pair_01J/rooms/+/client-to-host"],
-                        "subscribe":["tyde/prod/pair_01J/rooms/+/host-to-client"]
-                    },
-                    "issued_at_ms":1,
-                    "connect_valid_until_ms":4102444500000,
-                    "expires_at_ms":4102444800000
-                }
-            }"#,
-        )]);
-        let record = reconnect_record(
-            "reconnect-missing-websocket-url",
-            device_secret_key_id.clone(),
-        );
-
-        let error = obtain_managed_credentials(&record, 0)
-            .await
-            .expect_err("missing websocket_url must fail closed");
-
-        assert_eq!(error.code, MobileAccessErrorCode::InvalidConfig);
-        assert!(!error.retryable);
-        assert!(
-            error.message.contains("connect.websocket_url"),
-            "missing field must be explicit: {}",
-            error.message
-        );
-        assert_eq!(fetch.calls().len(), 1);
-
-        let _ = super::super::store::delete_device_secret(&device_secret_key_id).await;
-        drop(fetch);
+            .expect("delete secret");
         set_config("");
     }
 }

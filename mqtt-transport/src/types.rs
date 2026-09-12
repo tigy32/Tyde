@@ -334,7 +334,7 @@ impl ManagedMobilePairingQrPayload {
         Self {
             v: MOBILE_MANAGED_QR_VERSION,
             protocol_version: params.protocol_version,
-            transport_protocol_version: MQTT_TRANSPORT_PROTOCOL_VERSION,
+            transport_protocol_version: protocol::MOBILE_RTC_PROTOCOL_VERSION,
             tyde_version: TYDE_VERSION,
             release_version: params.release_version,
             offer_id: params.offer_id,
@@ -364,10 +364,10 @@ impl ManagedMobilePairingQrPayload {
                 expected: MOBILE_MANAGED_QR_VERSION,
             });
         }
-        if self.transport_protocol_version != MQTT_TRANSPORT_PROTOCOL_VERSION {
+        if self.transport_protocol_version != protocol::MOBILE_RTC_PROTOCOL_VERSION {
             return Err(TransportTypeError::TransportProtocolVersionMismatch {
                 actual: self.transport_protocol_version,
-                expected: MQTT_TRANSPORT_PROTOCOL_VERSION,
+                expected: protocol::MOBILE_RTC_PROTOCOL_VERSION,
             });
         }
         if self.offer_secret.trim().is_empty() {

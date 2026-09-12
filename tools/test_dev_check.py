@@ -123,6 +123,8 @@ def native_voice_authorization_is_validated(source: str) -> bool:
 
 
 NATIVE_VOICE_AEC_VENDOR = "vendor/webrtc-audio-processing-sys"
+MOBILE_RTC_VENDOR = "vendor/webrtc"
+MOBILE_RTC_PATCH = 'webrtc = { path = "vendor/webrtc" }'
 NATIVE_VOICE_AEC_PATCH = (
     'webrtc-audio-processing-sys = { path = '
     '"vendor/webrtc-audio-processing-sys" }'
@@ -483,13 +485,12 @@ def expected_native_voice_patch_surface(root_manifest: str) -> bool:
         value = parse_toml_patch_value(pieces[1])
         if value is None or not insert_toml_value(patch, patch_path, value):
             return False
-    return saw_patch and patch == {
-        "crates-io": {
-            "webrtc-audio-processing-sys": {
-                "path": "vendor/webrtc-audio-processing-sys"
-            }
-        }
-    }
+    aec = {"webrtc-audio-processing-sys": {"path": NATIVE_VOICE_AEC_VENDOR}}
+    return saw_patch and patch in (
+        {"crates-io": aec},
+        {"crates-io": {**aec, "webrtc": {"path": MOBILE_RTC_VENDOR}}},
+    )
+
 
 
 def native_voice_vendor_surface_violations(
@@ -498,15 +499,21 @@ def native_voice_vendor_surface_violations(
 ) -> list[str]:
     violations = []
     if not expected_native_voice_patch_surface(root_manifest):
-        violations.append("root [patch.crates-io] must contain only the pinned AEC DSP")
+        violations.append("root [patch.crates-io] must contain only the pinned AEC DSP and mobile transport")
 
     vendor_roots = {
         "/".join(pathlib.PurePosixPath(path).parts[:2])
         for path in vendor_files
         if pathlib.PurePosixPath(path).parts[:1] == ("vendor",)
     }
-    if vendor_roots != {NATIVE_VOICE_AEC_VENDOR}:
-        violations.append("vendor surface contains a dependency other than the pinned AEC DSP")
+    # Mobile now has an explicit WebRTC byte transport. The old global ban
+    # rejected that requested dependency; keep the voice DSP itself network-free.
+    if vendor_roots not in ({NATIVE_VOICE_AEC_VENDOR}, {NATIVE_VOICE_AEC_VENDOR, MOBILE_RTC_VENDOR}):
+        violations.append("vendor surface contains an unapproved dependency")
+    if MOBILE_RTC_VENDOR in vendor_roots:
+        rtc_manifest = vendor_files.get(f"{MOBILE_RTC_VENDOR}/Cargo.toml", "")
+        if not re.search(r'(?m)^name = "webrtc"$', rtc_manifest) or not re.search(r'(?m)^version = "0.20.5"$', rtc_manifest):
+            violations.append("mobile WebRTC vendor provenance is missing")
 
     manifest_path = f"{NATIVE_VOICE_AEC_VENDOR}/Cargo.toml"
     manifest = vendor_files.get(manifest_path)
@@ -591,6 +598,8 @@ def native_voice_vendor_surface_violations(
         re.IGNORECASE,
     )
     for path, source in vendor_files.items():
+        if path.startswith(f"{MOBILE_RTC_VENDOR}/"):
+            continue
         if pathlib.PurePosixPath(path).name == "Cargo.toml":
             section = ""
             for line in source.splitlines():
@@ -2117,6 +2126,9 @@ exec "$DEV_CHECK_REAL_PYTHON" "$@"
                 "mobile-frontend/Cargo.toml",
             )
         )
+        # The one audited transport patch is permitted; voice/application crates
+        # must still use the byte adapter and may not grow their own RTC stack.
+        manifests = manifests.replace(MOBILE_RTC_PATCH, "")
         for forbidden in ("str0m", "mdns-sd", "webrtc =", "webrtc-ice",
                           "webrtc-dtls", "webrtc-sctp"):
             self.assertNotIn(forbidden, manifests)
@@ -2126,7 +2138,7 @@ exec "$DEV_CHECK_REAL_PYTHON" "$@"
                 native_voice_vendor_surfaces(REPO_ROOT),
             ),
             [],
-            "only the pinned local AEC DSP may occupy vendored build surfaces",
+            "only the pinned AEC DSP and mobile transport may occupy vendored build surfaces",
         )
 
         shell_sources = [
@@ -3247,6 +3259,14 @@ class WasmToolScriptTests(unittest.TestCase):
         binaries.mkdir()
         (root / "frontend").mkdir()
         (root / "mobile-frontend").mkdir()
+        (root / "rtc-transport").mkdir()
+        fixture = root / "target" / "debug" / "tyde-rtc-fixture"
+        fixture.parent.mkdir(parents=True)
+        fixture.write_text(
+            '#!/usr/bin/env bash\nprintf "http://127.0.0.1:1" >"$1"\nexec sleep 30\n',
+            encoding="utf-8",
+        )
+        fixture.chmod(0o755)
         script = tools / "run-wasm-tests.sh"
         shutil.copy2(REPO_ROOT / "tools" / "run-wasm-tests.sh", script)
         (root / "Cargo.lock").write_text(
@@ -3336,7 +3356,7 @@ class WasmToolScriptTests(unittest.TestCase):
 
             self.assertEqual(run.returncode, 0, run.stderr)
             invocations = self._cargo_invocations(record)
-            self.assertEqual(len(invocations), 2)
+            self.assertEqual(len(invocations), 3)
             for invocation in invocations:
                 # 120s, not the 20s the runner defaults to when nothing sets it.
                 self.assertEqual(invocation["WASM_BINDGEN_TEST_TIMEOUT"], "120")
@@ -3358,7 +3378,7 @@ class WasmToolScriptTests(unittest.TestCase):
             )
             self.assertEqual(accepted.returncode, 0, accepted.stderr)
             invocations = self._cargo_invocations(record)
-            self.assertEqual(len(invocations), 2)
+            self.assertEqual(len(invocations), 3)
             for invocation in invocations:
                 self.assertEqual(invocation["WASM_BINDGEN_TEST_TIMEOUT"], "45")
 
@@ -3441,13 +3461,13 @@ class WasmToolScriptTests(unittest.TestCase):
                     )
                     self.assertEqual(run.returncode, 0, run.stderr)
                     invocations = self._cargo_invocations(record)
-                    self.assertEqual(len(invocations), 2)
+                    self.assertEqual(len(invocations), 3)
                     for invocation in invocations:
                         self.assertEqual(
                             invocation["WASM_BINDGEN_TEST_TIMEOUT"], accepted
                         )
 
-    def test_browser_suite_timeout_propagates_to_both_wasm_invocations(
+    def test_browser_suite_timeout_propagates_to_all_wasm_invocations(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as temp_name:
@@ -3462,7 +3482,7 @@ class WasmToolScriptTests(unittest.TestCase):
             invocations = self._cargo_invocations(record)
             self.assertEqual(
                 [invocation["cwd"] for invocation in invocations],
-                ["frontend", "mobile-frontend"],
+                ["frontend", "rtc-transport", "mobile-frontend"],
             )
             for invocation in invocations:
                 self.assertEqual(invocation["WASM_BINDGEN_TEST_TIMEOUT"], "120")
@@ -3514,10 +3534,10 @@ class WasmToolScriptTests(unittest.TestCase):
             self.assertEqual(run.returncode, 0, run.stderr)
 
             invocations = self._cargo_invocations(record)
-            # Exactly two invocations, neither carrying a filter, a --skip, or
+            # All three suites, none carrying a filter, a --skip, or
             # any other test-selection argument. Sharding the suite to fit a
             # timeout would silently drop whatever falls outside the partition.
-            self.assertEqual(len(invocations), 2)
+            self.assertEqual(len(invocations), 3)
             for invocation in invocations:
                 self.assertEqual(
                     invocation["argv"], "test --target wasm32-unknown-unknown"

@@ -753,7 +753,7 @@ run_check_stages() {
     run_stage "cargo fmt --all --check" 1 cargo fmt --all --check
     run_stage "cargo clippy --all-targets -- -D warnings" 1 \
         cargo clippy --all-targets -- -D warnings
-    run_stage "build conformance MCP bridge" 1 cargo build -p tyde-server --bin tyde-server
+    run_stage "build conformance MCP bridge" 1 cargo build -p tyde-server --bin tyde-server -p tyde-dev-driver --bin tyde-dev-driver
     run_stage "cargo nextest run" "$repetitions" cargo nextest run
 
     n_wasm=$((STAGE_NUMBER + 1))

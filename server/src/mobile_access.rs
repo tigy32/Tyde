@@ -612,6 +612,60 @@ struct ManagedServiceBaseUrl {
 }
 
 impl ManagedMobileServiceClient {
+    async fn mint_host_rtc_credentials(
+        &self,
+        record: &MobilePairingRecord,
+    ) -> Result<protocol::types::MobileRtcCredentials, ManagedServiceError> {
+        use protocol::types::{
+            MOBILE_RTC_PROTOCOL_VERSION, MobilePeerRole, MobileRtcCredentials,
+            MobileRtcCredentialsRequest,
+        };
+        let managed = record.managed.as_ref().ok_or_else(|| {
+            ManagedServiceError::new(
+                MobileAccessErrorCode::RepairRequired,
+                "mobile pairing has no managed identity",
+            )
+        })?;
+        let request = MobileRtcCredentialsRequest {
+            role: MobilePeerRole::Host,
+            protocol_version: MOBILE_RTC_PROTOCOL_VERSION,
+        };
+        let body = serde_json::to_vec(&request).map_err(|error| {
+            ManagedServiceError::new(
+                MobileAccessErrorCode::Internal,
+                format!("cannot encode WebRTC credential request: {error}"),
+            )
+        })?;
+        let endpoint = format!("/pairings/{}/webrtc", managed.pairing_id);
+        let auth = pairing_auth_header(
+            &managed.host_pairing_secret,
+            "POST",
+            &self.base.path_for(&endpoint),
+            &body,
+            BrokerRole::Host,
+            &managed.pairing_id,
+        )?;
+        let response = self
+            .http
+            .post(self.base.url_for(&endpoint))
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .header("x-tycode-pairing-auth", auth)
+            .body(body)
+            .send()
+            .await
+            .map_err(ManagedServiceError::transport)?;
+        let credentials: MobileRtcCredentials = parse_managed_response(response).await?;
+        if credentials.pairing_id.as_str() != managed.pairing_id
+            || credentials.role != MobilePeerRole::Host
+        {
+            return Err(ManagedServiceError::new(
+                MobileAccessErrorCode::ServiceUnavailable,
+                "WebRTC credentials belong to a different peer",
+            ));
+        }
+        Ok(credentials)
+    }
+
     fn new(configured_base_url: Option<String>) -> Result<Self, String> {
         // `reqwest` uses no-provider rustls; ensure a default crypto provider is
         // installed before building the client or `Client::new` panics with
@@ -706,59 +760,6 @@ impl ManagedMobileServiceClient {
             ));
         }
         Ok(())
-    }
-
-    async fn mint_host_broker_credentials(
-        &self,
-        record: &MobilePairingRecord,
-    ) -> Result<MintBrokerCredentialsResponse, ManagedServiceError> {
-        let managed = record.managed.as_ref().ok_or_else(|| {
-            ManagedServiceError::new(
-                MobileAccessErrorCode::RepairRequired,
-                "mobile pairing has no managed tycode.dev identity",
-            )
-        })?;
-        let request = MintBrokerCredentialsRequest {
-            role: BrokerRole::Host,
-            client_instance_id: Uuid::new_v4().to_string(),
-            protocol_version: PROTOCOL_VERSION,
-            transport_protocol_version: mqtt_transport::MQTT_TRANSPORT_PROTOCOL_VERSION,
-            requested_rooms: vec![RequestedRoom {
-                room_id: record.room.to_string(),
-                purpose: RequestedRoomPurpose::Rendezvous,
-            }],
-        };
-        let body = serde_json::to_vec(&request).map_err(|err| {
-            ManagedServiceError::new(
-                MobileAccessErrorCode::Internal,
-                format!("failed to serialize broker credential request: {err}"),
-            )
-        })?;
-        let path = self.base.path_for(&format!(
-            "/pairings/{}/broker-credentials",
-            managed.pairing_id
-        ));
-        let auth = pairing_auth_header(
-            &managed.host_pairing_secret,
-            "POST",
-            &path,
-            &body,
-            BrokerRole::Host,
-            &managed.pairing_id,
-        )?;
-        let response = self
-            .http
-            .post(self.base.url_for(&format!(
-                "/pairings/{}/broker-credentials",
-                managed.pairing_id
-            )))
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .header("x-tycode-pairing-auth", auth)
-            .body(body)
-            .send()
-            .await
-            .map_err(ManagedServiceError::transport)?;
-        parse_managed_response(response).await
     }
 }
 
@@ -940,47 +941,6 @@ enum HostOfferStatus {
     Failed,
 }
 
-#[derive(Debug, Serialize)]
-struct MintBrokerCredentialsRequest {
-    role: BrokerRole,
-    client_instance_id: String,
-    protocol_version: u32,
-    transport_protocol_version: u32,
-    requested_rooms: Vec<RequestedRoom>,
-}
-
-#[derive(Debug, Serialize)]
-struct RequestedRoom {
-    room_id: String,
-    purpose: RequestedRoomPurpose,
-}
-
-#[derive(Debug, Clone, Copy, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum RequestedRoomPurpose {
-    Rendezvous,
-}
-
-#[derive(Deserialize)]
-struct MintBrokerCredentialsResponse {
-    pairing_id: String,
-    status: PairingStatus,
-    broker: ContractBrokerEndpoint,
-    broker_credentials: ContractBrokerCredentials,
-}
-
-impl std::fmt::Debug for MintBrokerCredentialsResponse {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("MintBrokerCredentialsResponse")
-            .field("pairing_id", &self.pairing_id)
-            .field("status", &self.status)
-            .field("broker", &self.broker)
-            .field("broker_credentials", &"<redacted>")
-            .finish()
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum BrokerRole {
@@ -995,15 +955,6 @@ impl std::fmt::Display for BrokerRole {
             Self::Mobile => formatter.write_str("mobile"),
         }
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum PairingStatus {
-    Active,
-    Revoked,
-    RepairRequired,
-    Suspended,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -2242,7 +2193,7 @@ impl MobileAccessActor {
             host_label: host_label.clone(),
             host_release_version: host_release_version.to_string(),
             protocol_version: PROTOCOL_VERSION,
-            transport_protocol_version: mqtt_transport::MQTT_TRANSPORT_PROTOCOL_VERSION,
+            transport_protocol_version: protocol::MOBILE_RTC_PROTOCOL_VERSION,
             host_nonce: Uuid::new_v4().to_string(),
         };
         let response = match self.managed_service.create_host_offer(request).await {
@@ -3618,18 +3569,19 @@ fn spawn_pairing_accept_task(
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let offer_id = credential.offer_id.clone();
-        let result = connect_mobile_record_stream(
-            credential.broker.clone(),
-            credential.managed.as_ref().map(|managed| {
-                (
-                    managed.broker.clone(),
-                    managed.host_broker_credentials.clone(),
+        let result = match &credential.managed {
+            Some(_) => Err(MobileTaskError::transport(
+                "Managed pairing must complete the service handoff before connecting".to_owned(),
+            )),
+            None => {
+                connect_mobile_record_stream(
+                    credential.broker.clone(),
+                    credential.room,
+                    credential.psk.clone(),
                 )
-            }),
-            credential.room,
-            credential.psk.clone(),
-        )
-        .await;
+                .await
+            }
+        };
         match result {
             Ok(stream) => {
                 let _ =
@@ -3658,7 +3610,7 @@ fn spawn_device_accept_task(
                 Ok(stream) => {
                     let _ = tx.send(MobileAccessCommand::DeviceTransportConnected {
                         device_id: record.device_id.clone(),
-                        stream: Box::new(stream),
+                        stream,
                     });
                     return;
                 }
@@ -3895,79 +3847,44 @@ fn managed_handoff_from_poll_response(
 async fn connect_mobile_device_stream(
     managed_service: &ManagedMobileServiceClient,
     record: &MobilePairingRecord,
-) -> Result<EnvelopeStream, MobileTaskError> {
-    let managed = match &record.managed {
-        Some(managed) => {
-            let response = managed_service
-                .mint_host_broker_credentials(record)
+) -> Result<BoxedMobileTransport, MobileTaskError> {
+    match &record.managed {
+        Some(_) => {
+            let credentials = managed_service
+                .mint_host_rtc_credentials(record)
                 .await
                 .map_err(MobileTaskError::managed_service)?;
-            if response.pairing_id != managed.pairing_id || response.status != PairingStatus::Active
-            {
-                return Err(MobileTaskError {
-                    code: MobileAccessErrorCode::RepairRequired,
-                    message: "managed mobile service returned credentials for the wrong pairing"
-                        .to_owned(),
-                });
-            }
-            let broker = response
-                .broker
-                .into_protocol()
-                .map_err(MobileTaskError::managed_service)?;
-            let credentials = response
-                .broker_credentials
-                .into_protocol()
-                .map_err(MobileTaskError::managed_service)?;
-            Some((broker, credentials))
+            rtc_transport::connect(credentials, record.psk.as_bytes())
+                .await
+                .map(|stream| Box::new(stream) as BoxedMobileTransport)
+                .map_err(|error| {
+                    MobileTaskError::transport(format!("managed WebRTC transport failed: {error}"))
+                })
         }
-        None => None,
-    };
-    connect_mobile_record_stream(
-        record.broker.clone(),
-        managed,
-        record.room,
-        record.psk.clone(),
-    )
-    .await
+        None => {
+            connect_mobile_record_stream(record.broker.clone(), record.room, record.psk.clone())
+                .await
+                .map(|stream| Box::new(stream) as BoxedMobileTransport)
+        }
+    }
 }
 
 async fn connect_mobile_record_stream(
     broker: BrokerEndpoint,
-    managed: Option<(ManagedBrokerEndpoint, ManagedBrokerCredentials)>,
     room: RoomId,
     psk: PreSharedKey,
 ) -> Result<EnvelopeStream, MobileTaskError> {
-    match managed {
-        Some((broker, credentials)) => {
-            let config = mqtt_transport::ManagedMqttConnectConfig {
-                broker,
-                credentials,
-                room,
-                psk,
-                role: ParticipantRole::Host,
-            };
-            mqtt_transport::connect_managed_ephemeral(config)
-                .await
-                .map_err(|err| {
-                    MobileTaskError::transport(format!(
-                        "managed MQTT mobile transport failed: {err}"
-                    ))
-                })
-        }
-        None => {
-            let config = MqttConnectConfig {
-                endpoint: broker,
-                room,
-                psk,
-                role: ParticipantRole::Host,
-            };
-            mqtt_transport::connect_ephemeral(config)
-                .await
-                .map_err(|err| {
-                    MobileTaskError::transport(format!("MQTT mobile transport failed: {err}"))
-                })
-        }
-    }
+    let config = MqttConnectConfig {
+        endpoint: broker,
+        room,
+        psk,
+        role: ParticipantRole::Host,
+    };
+    mqtt_transport::connect_ephemeral(config)
+        .await
+        .map_err(|error| {
+            MobileTaskError::transport(format!("development MQTT transport failed: {error}"))
+        })
 }
 
 async fn bridge_authenticated_mobile(

@@ -14,6 +14,152 @@ use serde_json::Value;
 pub use host_config::{LOCAL_HOST_ID, TydeReleaseVersion};
 
 pub const PROTOCOL_VERSION: u32 = 61;
+
+// Exported verbatim to TydeMobileService by tools/export-mobile-rtc.py.
+pub mod mobile_rtc {
+    use schemars::JsonSchema;
+    use serde::{Deserialize, Serialize};
+    use std::fmt;
+
+    macro_rules! rtc_identifier {
+        ($name:ident) => {
+            #[derive(
+                Debug,
+                Clone,
+                PartialEq,
+                Eq,
+                PartialOrd,
+                Ord,
+                Hash,
+                Serialize,
+                Deserialize,
+                JsonSchema,
+            )]
+            #[serde(transparent)]
+            pub struct $name(pub String);
+            impl $name {
+                pub fn as_str(&self) -> &str {
+                    &self.0
+                }
+            }
+            impl fmt::Display for $name {
+                fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                    f.write_str(&self.0)
+                }
+            }
+        };
+    }
+
+    rtc_identifier!(MobilePairingId);
+    rtc_identifier!(MobileRtcSessionId);
+    rtc_identifier!(MobileSignalingUrl);
+    rtc_identifier!(MobileTurnUrl);
+
+    pub const MOBILE_RTC_PROTOCOL_VERSION: u32 = 1;
+    pub const MOBILE_RTC_CHANNEL_LABEL: &str = "tyde.v1";
+    pub const MOBILE_RTC_CHANNEL_ID: u16 = 0;
+
+    #[derive(
+        Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
+    )]
+    #[serde(rename_all = "snake_case")]
+    pub enum MobilePeerRole {
+        Host,
+        Mobile,
+    }
+
+    #[derive(Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+    pub struct MobileIceServer {
+        pub urls: Vec<MobileTurnUrl>,
+        pub username: String,
+        pub credential: String,
+    }
+
+    impl fmt::Debug for MobileIceServer {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("MobileIceServer")
+                .field("urls", &self.urls)
+                .field("username", &"<redacted>")
+                .field("credential", &"<redacted>")
+                .finish()
+        }
+    }
+
+    #[derive(Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+    pub struct MobileRtcCredentials {
+        pub protocol_version: u32,
+        pub pairing_id: MobilePairingId,
+        pub role: MobilePeerRole,
+        pub signaling_url: MobileSignalingUrl,
+        pub signaling_token: String,
+        pub ice_servers: Vec<MobileIceServer>,
+        pub expires_at_ms: u64,
+    }
+
+    impl fmt::Debug for MobileRtcCredentials {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("MobileRtcCredentials")
+                .field("protocol_version", &self.protocol_version)
+                .field("pairing_id", &self.pairing_id)
+                .field("role", &self.role)
+                .field("signaling_url", &self.signaling_url)
+                .field("signaling_token", &"<redacted>")
+                .field("ice_servers", &self.ice_servers)
+                .field("expires_at_ms", &self.expires_at_ms)
+                .finish()
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+    #[serde(rename_all = "snake_case")]
+    pub enum MobileSdpKind {
+        Offer,
+        Answer,
+    }
+
+    #[derive(Clone, Serialize, Deserialize, JsonSchema)]
+    pub struct MobileRtcDescription {
+        pub session_id: MobileRtcSessionId,
+        pub kind: MobileSdpKind,
+        pub sdp: String,
+        pub authentication: String,
+    }
+
+    #[derive(Clone, Serialize, Deserialize, JsonSchema)]
+    #[serde(tag = "kind", rename_all = "snake_case")]
+    pub enum MobileSignalEvent {
+        Waiting,
+        Description { description: MobileRtcDescription },
+        Failed { message: String },
+    }
+
+    #[derive(Clone, Serialize, Deserialize, JsonSchema)]
+    #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+    pub enum MobileSignalCommand {
+        Poll {
+            session_id: Option<MobileRtcSessionId>,
+        },
+        Publish {
+            description: MobileRtcDescription,
+        },
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+    pub struct MobileSignalClaims {
+        pub protocol_version: u32,
+        pub pairing_id: MobilePairingId,
+        pub role: MobilePeerRole,
+        pub expires_at_ms: u64,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+    pub struct MobileRtcCredentialsRequest {
+        pub role: MobilePeerRole,
+        pub protocol_version: u32,
+    }
+}
+pub use mobile_rtc::*;
+
 pub const TYDE_VERSION: Version = Version {
     major: 0,
     minor: 8,

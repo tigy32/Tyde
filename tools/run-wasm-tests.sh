@@ -641,6 +641,7 @@ fi
 # ── Run the tests ─────────────────────────────────────────────────────────
 export CHROMEDRIVER="$driver_bin"
 export PATH="$(dirname "$runner_bin"):$PATH"
+export CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER="$runner_bin"
 
 # Build the wasm test modules without DWARF.
 #
@@ -695,6 +696,30 @@ cd "$repo_root/frontend"
 log "running: cargo test --target wasm32-unknown-unknown $* (frontend)"
 cargo test --target wasm32-unknown-unknown "$@"
 
+fixture_ready="$(mktemp "$cache_dir/rtc-ready.XXXXXX")"
+fixture_log="$cache_dir/rtc-fixture.log"
+"$repo_root/target/debug/tyde-rtc-fixture" "$fixture_ready" >"$fixture_log" 2>&1 &
+fixture_pid=$!
+cleanup_rtc_fixture() {
+    if kill -0 "$fixture_pid" 2>/dev/null; then kill "$fixture_pid"; fi
+    wait "$fixture_pid" 2>/dev/null || true
+    rm -f "$fixture_ready"
+}
+trap cleanup_rtc_fixture EXIT
+for ((attempt=0; attempt<100; attempt++)); do
+    [[ ! -s "$fixture_ready" ]] || break
+    kill -0 "$fixture_pid" 2>/dev/null || { cat "$fixture_log" >&2; die "TURN fixture exited before readiness"; }
+    sleep 0.1
+done
+[[ -s "$fixture_ready" ]] || die "TURN fixture did not become ready"
+export TYDE_RTC_TEST_URL="$(cat "$fixture_ready")"
+cd "$repo_root/rtc-transport"
+log "running: cargo test --target wasm32-unknown-unknown $* (rtc-transport)"
+if ! cargo test --target wasm32-unknown-unknown "$@"; then
+    cat "$fixture_log" >&2
+    die "browser/native TURN tests failed"
+fi
+
 cd "$repo_root/mobile-frontend"
 log "running: cargo test --target wasm32-unknown-unknown $* (mobile-frontend)"
-exec cargo test --target wasm32-unknown-unknown "$@"
+cargo test --target wasm32-unknown-unknown "$@"

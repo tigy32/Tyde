@@ -1,0 +1,252 @@
+[package]
+name = "webrtc"
+version = "0.20.5"
+authors = ["Rain Liu <yliu@webrtc.rs>"]
+edition = "2024"
+license = "MIT/Apache-2.0"
+homepage = "https://webrtc.rs"
+documentation = "https://docs.rs/webrtc"
+repository = "https://github.com/webrtc-rs/webrtc"
+keywords = ["sansio", "networking", "protocols"]
+categories = ["network-programming"]
+description = "Async-friendly WebRTC implementation in Rust"
+
+[features]
+default = ["runtime-tokio"]
+# Runtime features are purely additive: each one only makes a built-in `Runtime`
+# implementation available. They never select which primitives the library uses,
+# so enabling both is safe and a process may drive connections on either.
+runtime-tokio = ["dep:tokio"]
+runtime-smol = ["dep:smol"]
+# Deterministic virtual-clock runtime (`MockRuntime`). Test-only: it implements the same
+# `Runtime` trait as the two above, but drives timers from a manually advanced clock and
+# does not perform I/O.
+runtime-mock = []
+
+[dependencies]
+rtc = { version = "0.20.5", path = "rtc" }
+
+bytes = "1.12.0"
+async-trait = "0.1.89"
+log = "0.4.33"
+futures = "0.3.32"
+
+# Executor-agnostic primitives. These are plain data structures driven by wakers,
+# so they work on any runtime and are NOT feature-gated — only reactor-bound
+# operations (timers, I/O, spawning) go through the `Runtime` trait.
+async-channel = "2.5.0"
+async-broadcast = "0.7.2"
+event-listener = "5.4.1"
+quinn-udp = { version = "0.6.1", default-features = false, features = ["log"] }
+
+# Async runtimes (all optional)
+tokio = { version = "1.52.3", features = ["net", "time", "sync", "rt", "rt-multi-thread"], optional = true }
+smol = { version = "2.0.2", optional = true }
+
+[dev-dependencies]
+signal = { version = "0.20.5", path = "rtc/examples/signal", package = "rtc-signal" }
+
+env_logger = "0.11.11"
+chrono = "0.4.45"
+clap = { version = "4.6.1", features = ["derive"] }
+anyhow = "1.0.103"
+ctrlc = "3.5.2"
+serde_json = "1.0.150"
+hyper = { version = "0.14.32", features = ["full"] }
+rand = "0.10.1"
+base64 = "0.22.1"
+
+# For `examples/custom-runtime`: a third-party runtime built on neither tokio nor smol,
+# proving the `Runtime` trait is pluggable.
+async-executor = "1.14.0"
+async-io = "2.6.0"
+futures-lite = "2.6.1"
+
+[[example]]
+name = "custom-runtime"
+path = "examples/custom-runtime/custom-runtime.rs"
+bench = false
+
+[[example]]
+name = "broadcast"
+path = "examples/broadcast/broadcast.rs"
+bench = false
+
+[[example]]
+name = "data-channels"
+path = "examples/data-channels/data-channels.rs"
+bench = false
+
+[[example]]
+name = "data-channels-close"
+path = "examples/data-channels-close/data-channels-close.rs"
+bench = false
+
+[[example]]
+name = "data-channels-create"
+path = "examples/data-channels-create/data-channels-create.rs"
+bench = false
+
+[[example]]
+name = "data-channels-flow-control"
+path = "examples/data-channels-flow-control/data-channels-flow-control.rs"
+bench = false
+
+[[example]]
+name = "data-channels-flow-control-multi"
+path = "examples/data-channels-flow-control-multi/data-channels-flow-control-multi.rs"
+bench = false
+
+[[example]]
+name = "data-channels-stress-bench"
+path = "examples/data-channels-stress-bench/data-channels-stress-bench.rs"
+bench = false
+
+[[example]]
+name = "data-channels-offer"
+path = "examples/data-channels-offer-answer/data-channels-offer.rs"
+bench = false
+required-features = ["runtime-tokio"]
+
+[[example]]
+name = "data-channels-answer"
+path = "examples/data-channels-offer-answer/data-channels-answer.rs"
+bench = false
+required-features = ["runtime-tokio"]
+
+[[example]]
+name = "data-channels-simple"
+path = "examples/data-channels-simple/data-channels-simple.rs"
+bench = false
+required-features = ["runtime-tokio"]
+
+[[example]]
+name = "ice-restart"
+path = "examples/ice-restart/ice-restart.rs"
+bench = false
+required-features = ["runtime-tokio"]
+
+[[example]]
+name = "insertable-streams"
+path = "examples/insertable-streams/insertable-streams.rs"
+bench = false
+
+[[example]]
+name = "mdns-query-and-gather"
+path = "examples/mdns-query-and-gather/mdns-query-and-gather.rs"
+bench = false
+
+[[example]]
+name = "play-from-disk-vpx"
+path = "examples/play-from-disk-vpx/play-from-disk-vpx.rs"
+bench = false
+
+[[example]]
+name = "play-from-disk-h26x"
+path = "examples/play-from-disk-h26x/play-from-disk-h26x.rs"
+bench = false
+
+[[example]]
+name = "play-from-disk-renegotiation"
+path = "examples/play-from-disk-renegotiation/play-from-disk-renegotiation.rs"
+bench = false
+required-features = ["runtime-tokio"]
+
+[[example]]
+name = "play-from-disk-playlist-control"
+path = "examples/play-from-disk-playlist-control/play-from-disk-playlist-control.rs"
+bench = false
+required-features = ["runtime-tokio"]
+
+[[example]]
+name = "reflect"
+path = "examples/reflect/reflect.rs"
+bench = false
+
+[[example]]
+name = "rtcp-processing"
+path = "examples/rtcp-processing/rtcp-processing.rs"
+bench = false
+
+[[example]]
+name = "rtp-forwarder"
+path = "examples/rtp-forwarder/rtp-forwarder.rs"
+bench = false
+
+[[example]]
+name = "rtp-to-webrtc"
+path = "examples/rtp-to-webrtc/rtp-to-webrtc.rs"
+bench = false
+
+[[example]]
+name = "save-to-disk-vpx"
+path = "examples/save-to-disk-vpx/save-to-disk-vpx.rs"
+bench = false
+
+[[example]]
+name = "save-to-disk-h26x"
+path = "examples/save-to-disk-h26x/save-to-disk-h26x.rs"
+bench = false
+
+[[example]]
+name = "save-to-disk-av1"
+path = "examples/save-to-disk-av1/save-to-disk-av1.rs"
+bench = false
+
+[[example]]
+name = "simulcast"
+path = "examples/simulcast/simulcast.rs"
+bench = false
+
+[[example]]
+name = "simulcast_add_transceiver_from_kind"
+path = "examples/simulcast_add_transceiver_from_kind/simulcast_add_transceiver_from_kind.rs"
+bench = false
+
+[[example]]
+name = "swap-tracks"
+path = "examples/swap-tracks/swap-tracks.rs"
+bench = false
+
+[[example]]
+name = "trickle-ice"
+path = "examples/trickle-ice/trickle-ice.rs"
+bench = false
+
+[[example]]
+name = "trickle-ice-host"
+path = "examples/trickle-ice-host/trickle-ice-host.rs"
+bench = false
+
+[[example]]
+name = "trickle-ice-srflx"
+path = "examples/trickle-ice-srflx/trickle-ice-srflx.rs"
+bench = false
+
+[[example]]
+name = "trickle-ice-relay"
+path = "examples/trickle-ice-relay/trickle-ice-relay.rs"
+bench = false
+
+[[example]]
+name = "ice-tcp"
+path = "examples/ice-tcp/ice-tcp.rs"
+bench = false
+required-features = ["runtime-tokio"]
+
+[[example]]
+name = "ice-tcp-active-offer"
+path = "examples/ice-tcp-active-passive/ice-tcp-active-offer.rs"
+bench = false
+required-features = ["runtime-tokio"]
+
+[[example]]
+name = "ice-tcp-passive-answer"
+path = "examples/ice-tcp-active-passive/ice-tcp-passive-answer.rs"
+bench = false
+required-features = ["runtime-tokio"]
+
+[[example]]
+name = "stats"
+path = "examples/stats/stats.rs"
+bench = false

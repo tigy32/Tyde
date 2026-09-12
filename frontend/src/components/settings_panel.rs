@@ -53,7 +53,7 @@ const RESERVED_MCP_NAMES: &[&str] = &["tyde-debug", "tyde-agent-control", "tyde-
 /// - the URL must point at a **loopback** host (`localhost`, an IPv4 loopback
 ///   like `127.0.0.1`, or the `[::1]` IPv6 loopback). Custom broker URLs are
 ///   dev/test-only; the public default and any other host are rejected because
-///   production mobile access uses tycode.dev-managed AWS IoT.
+///   production mobile access uses tycode.dev-managed WebRTC.
 fn validate_broker_url_input(raw: &str) -> Result<(), &'static str> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -193,9 +193,9 @@ fn expires_in_seconds(expires_at_ms: u64) -> Option<u64> {
 fn broker_status_line(status: &MobileBrokerStatus) -> String {
     match status {
         MobileBrokerStatus::Disabled => "Mobile connections disabled".to_owned(),
-        MobileBrokerStatus::Connecting { .. } => "Connecting to broker…".to_owned(),
-        MobileBrokerStatus::Online { .. } => "Broker online".to_owned(),
-        MobileBrokerStatus::Error { message, .. } => format!("Broker error: {message}"),
+        MobileBrokerStatus::Connecting { .. } => "Connecting mobile access…".to_owned(),
+        MobileBrokerStatus::Online { .. } => "Mobile access ready".to_owned(),
+        MobileBrokerStatus::Error { message, .. } => format!("Mobile connection error: {message}"),
         MobileBrokerStatus::RepairRequired { message, .. } => {
             format!("Repair required: {message}")
         }
@@ -759,7 +759,8 @@ impl SettingsTab {
                 "Enable mobile connections",
                 "Managed access",
                 "tycode.dev",
-                "AWS IoT",
+                "WebRTC",
+                "Cloudflare TURN",
                 "Broker URL",
                 "Tyggs Pass",
                 "Repair",
@@ -5838,12 +5839,12 @@ fn NativeVoiceSettings(state: AppState) -> impl IntoView {
     }
 }
 
-/// Mobile pairing settings for `tycode.dev`-managed AWS IoT access.
+/// Mobile pairing settings for `tycode.dev`-managed WebRTC access.
 /// Two host-scoped settings live here:
 ///   * `enable_mobile_connections` — master kill switch.
 ///   * `mobile_broker_url` — **dev/test-only** broker override. Production
 ///     mobile access is provisioned through `tycode.dev` managed pairing
-///     onto AWS IoT Core; the server only honours this override for a
+///     through Cloudflare TURN; the server only honours this override for a
 ///     loopback broker in local development and fails closed for public /
 ///     free / custom production brokers. Empty input (the default) means
 ///     "use managed access" (None on the wire).
@@ -6084,7 +6085,7 @@ fn MobileTab() -> impl IntoView {
         <h2 class="settings-panel-title">"Mobile"</h2>
 
         <p class="settings-description settings-panel-intro">
-            "Reach this host from the Tyde mobile app, so you can read what your agents are doing and reply to them away from your desk. Pairing provisions a scoped, tycode.dev-signed AWS IoT broker connection for the two devices — there is no public or free MQTT broker involved, and traffic is not relayed through a shared server. Your phone signs in with a Tyggs Pass to complete pairing; this host is never asked for your Tyggs credentials. This host can also serve the mobile app itself, over an address on your own network with no managed service in the path — see \"Host the mobile app from this machine\" below."
+            "Reach this host from the Tyde mobile app to follow your agents and reply away from your desk. Managed access connects your paired devices through an encrypted WebRTC connection using Cloudflare TURN. Sign in with your Tyggs Pass on your phone to pair. You can also host the mobile app on your own network using the settings below."
         </p>
 
         <div class="settings-field">
@@ -6110,7 +6111,7 @@ fn MobileTab() -> impl IntoView {
         <div class="settings-field settings-mobile-pairing">
             <label class="settings-label">"Pair a mobile device"</label>
             <p class="settings-description">
-                "Start a pairing session, then scan the QR code with the Tyde mobile app. The QR carries a one-time managed pairing offer, the managed broker endpoint, and a one-shot pre-shared key; the mobile app redeems the offer with tycode.dev to obtain scoped AWS IoT credentials. The pairing session expires after a couple of minutes."
+                "Start a pairing session, then scan the QR code with the Tyde mobile app. The QR shares a one-time offer and a pairing key. Keep it private and scan it before the session expires."
             </p>
             // Broker status pill — surfaces broker_status from the
             // MobileAccessState snapshot. Keeps the user informed when
@@ -6308,7 +6309,7 @@ fn MobileTab() -> impl IntoView {
         <div class="settings-field">
             <label class="settings-label">"Broker URL (dev override)"</label>
             <p class="settings-description">
-                "Advanced, local-development only. Production mobile access uses tycode.dev-managed AWS IoT, and the server fails closed for public, free, or custom production brokers. This override is honoured only for a loopback broker (localhost / 127.0.0.1) during local development. Leave blank for managed access."
+                "Advanced, local-development only. Leave blank for managed WebRTC access. The development broker override accepts only a loopback address on this machine (localhost / 127.0.0.1)."
             </p>
             <div class="settings-mobile-broker-row">
                 <input
@@ -6361,7 +6362,7 @@ fn MobileTab() -> impl IntoView {
                 "Managed access — encrypted contents, visible metadata"
             </p>
             <p class="settings-description">
-                "Tyde end-to-end encrypts every message between this host and your paired mobile devices, so neither tycode.dev nor AWS IoT can read your chats, files, or commands. AWS IoT still sees connection metadata — client id, topic names, connection timing, and message sizes. tycode.dev mints short-lived, scoped broker credentials and never receives your Tyggs tokens or Tyde message contents."
+                "Tyde end-to-end encrypts messages between this host and your paired devices. Cloudflare relays encrypted traffic and can see connection metadata such as IP addresses, timing, and traffic volume. tycode.dev authorizes pairing and supplies temporary relay credentials; it cannot read your chats, files, or commands."
             </p>
         </div>
     }
@@ -9458,8 +9459,10 @@ mod wasm_tests {
 
         let text = container.text_content().unwrap_or_default().to_lowercase();
         assert!(
-            text.contains("tycode.dev") || text.contains("aws iot") || text.contains("managed"),
-            "mobile copy must describe managed tycode.dev / AWS IoT access; got: {text:?}"
+            text.contains("tycode.dev")
+                && text.contains("webrtc")
+                && text.contains("cloudflare turn"),
+            "mobile copy must describe managed tycode.dev / WebRTC access; got: {text:?}"
         );
         assert!(
             text.contains("encrypt"),

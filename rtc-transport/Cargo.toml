@@ -1,0 +1,41 @@
+[package]
+name = "rtc-transport"
+edition.workspace = true
+
+[dependencies]
+base64.workspace = true
+futures-channel = "0.3"
+futures-util = { version = "0.3", features = ["sink"] }
+hmac = "0.12"
+protocol = { path = "../protocol", default-features = false }
+serde_json.workspace = true
+sha2 = "0.10"
+thiserror.workspace = true
+tracing.workspace = true
+url = "2"
+uuid = { version = "1", features = ["v4", "js"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+async-trait = "0.1"
+bytes = "1"
+tokio.workspace = true
+webrtc = "=0.20.5"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+tokio = { version = "1", default-features = false, features = ["sync", "macros", "io-util"] }
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+wasmtimer = "0.4"
+web-sys = { version = "0.3", features = [
+    "BinaryType", "Event", "MessageEvent", "WebSocket",
+    "RtcConfiguration", "RtcPeerConnection", "RtcIceTransportPolicy",
+    "RtcIceServer", "RtcIceGatheringState", "RtcPeerConnectionState",
+    "RtcDataChannel", "RtcDataChannelInit", "RtcDataChannelState",
+    "RtcDataChannelType", "RtcSessionDescription", "RtcSessionDescriptionInit",
+    "RtcSdpType",
+] }
+
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+wasm-bindgen-test = "0.3"
