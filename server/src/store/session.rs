@@ -1061,6 +1061,12 @@ impl SessionStore {
             self.refresh_if_stale()?;
             let seq = peek_write_seq(&self.path)?;
             if seq != self.write_seq.get() {
+                tracing::warn!(
+                    path = %self.path.display(),
+                    disk_seq = seq,
+                    loaded_seq = self.write_seq.get(),
+                    "Session store sequence peek disagrees with loaded JSON"
+                );
                 continue;
             }
 

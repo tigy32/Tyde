@@ -543,8 +543,8 @@ fn rewrite_sessions_json_with_foreign_record(path: &Path, foreign_id: &str) {
     );
     #[derive(serde::Serialize)]
     struct SessionsFile<'a> {
-        write_seq: u64,
         records: &'a serde_json::Map<String, serde_json::Value>,
+        write_seq: u64,
     }
     let body = serde_json::to_string(&SessionsFile {
         write_seq: write_seq + 1,
@@ -556,7 +556,11 @@ fn rewrite_sessions_json_with_foreign_record(path: &Path, foreign_id: &str) {
 
 #[tokio::test]
 async fn session_store_keeps_foreign_records_across_turn() {
-    let mut fixture = Fixture::new().await;
+    let mut fixture = Fixture::new_with_store_files(
+        r#"{"records": {}, "write_seq": 41}"#,
+        r#"{"version": 2, "records": {}, "write_seq": 17}"#,
+    )
+    .await;
 
     fixture
         .client

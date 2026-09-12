@@ -555,9 +555,9 @@ fn rewrite_projects_json_with_foreign_record(path: &Path, foreign_id: &str) {
     );
     #[derive(serde::Serialize)]
     struct ProjectsFile<'a> {
-        write_seq: u64,
         version: u64,
         records: &'a serde_json::Map<String, serde_json::Value>,
+        write_seq: u64,
     }
     let body = serde_json::to_string_pretty(&ProjectsFile {
         write_seq: write_seq + 1,
