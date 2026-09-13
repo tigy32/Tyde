@@ -41,11 +41,18 @@ key must be backed up and stored as the GitHub Actions secret
 Never commit a private key or silently rotate the public key: existing clients
 must continue to trust future updates.
 
-The release workflow creates updater artifacts, then `tools/update_manifest.py
-package` signs uniquely named packages for each target. Its `assemble` command
-requires every platform fragment before uploading `tyde-update.json`. Normal
-publication depends on that job. The manual release guard also requires the
-complete manifest/package/signature asset set. Draft releases cannot be offered
+Tauri signs the installers during the build. `tools/update_manifest.py package`
+stages the existing Windows and Linux installers for a single upload, preserving
+their names and bytes. macOS additionally needs an app archive for each
+architecture, with distinct filenames. Signatures are embedded in
+`tyde-update.json`; standalone `.sig` files are not uploaded. This produces 21
+assets for preview releases, or 22 for stable releases including MSI, excluding
+GitHub's automatic source archives.
+
+The `assemble` command requires every platform fragment before uploading the
+manifest. Normal publication depends on that job. The manual release guard also
+requires the complete installer/manifest asset set and rejects duplicate updater
+copies or loose signatures. Draft releases cannot be offered
 by the public updater. An installed app selects the highest eligible published
 version that carries this manifest, independently of GitHub's latest-release
 pointer. Metadata and downloads use HTTPS and package signatures are mandatory.
@@ -57,7 +64,9 @@ those remote actions follow the repository's explicit-approval rules.
 
 ## Coverage
 
-The native HTTP flow exercises release channel selection, semantic ordering,
+The native HTTP flow exercises packaging and manifest assembly for stable and
+preview releases, rejection of duplicate assets and missing or mismatched
+signatures, release channel selection, semantic ordering,
 draft/unsigned-release exclusion, downgrade prevention, valid signed downloads,
 tampering, and failed requests. Its signing fixtures contain only a public key,
 signature, and inert package bytes; their private key is not retained in Git.

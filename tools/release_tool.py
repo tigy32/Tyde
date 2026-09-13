@@ -303,12 +303,9 @@ def validate_assets(release: Any, tag: str) -> list[str]:
     elif len(msi) != 1 or version not in msi[0]:
         raise ReleaseToolError("stable release assets must contain one versioned MSI")
 
-    package_signatures = {
-        f"{name}.sig" for name in appimages + debs + rpms + installers + msi
-    }
     recognized = set(HEADLESS_ASSETS) | set(
         dmg + appimages + debs + rpms + checksums + installers + msi
-    ) | package_signatures
+    )
     unexpected = sorted(set(names) - recognized)
     if unexpected:
         raise ReleaseToolError(f"unexpected release assets: {', '.join(unexpected)}")

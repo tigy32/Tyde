@@ -490,7 +490,30 @@ mod integration_tests {
 
     impl Feed {
         async fn start() -> Self {
-            let (directory, manifest) = assembled_manifest();
+            let directory =
+                std::env::temp_dir().join(format!("tyde-update-feed-{}", uuid::Uuid::new_v4()));
+            let mut manifests = std::collections::BTreeMap::new();
+            let mut artifacts = std::collections::BTreeMap::new();
+            for version in ["1.10.0", "2.0.0-beta.10"] {
+                let release_directory = directory.join(version);
+                let manifest = assembled_manifest(&release_directory, version);
+                for target in std::fs::read_dir(release_directory.join("staged")).unwrap() {
+                    for entry in
+                        std::fs::read_dir(target.unwrap().path().join("artifacts")).unwrap()
+                    {
+                        let entry = entry.unwrap();
+                        assert!(
+                            artifacts
+                                .insert(
+                                    entry.file_name().into_string().unwrap(),
+                                    std::fs::read(entry.path()).unwrap()
+                                )
+                                .is_none()
+                        );
+                    }
+                }
+                manifests.insert(version.to_owned(), manifest);
+            }
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let root = format!("http://{}", listener.local_addr().unwrap());
             let tampered = Arc::new(AtomicBool::new(false));
@@ -505,7 +528,7 @@ mod integration_tests {
                     let length = stream.read(&mut request).await.unwrap();
                     let request = String::from_utf8_lossy(&request[..length]);
                     let path = request.split_whitespace().nth(1).unwrap();
-                    let code = if failed_response.load(Ordering::Relaxed) {
+                    let mut code = if failed_response.load(Ordering::Relaxed) {
                         "503 Service Unavailable"
                     } else {
                         "200 OK"
@@ -532,17 +555,27 @@ mod integration_tests {
                         .unwrap()
                     } else if path.ends_with("tyde-update.json") {
                         let version = path.split('/').nth(2).unwrap().trim_start_matches('v');
-                        let mut response = manifest.clone();
-                        response["version"] = json!(version);
+                        let mut response = manifests.get(version).unwrap().clone();
                         for platform in response["platforms"].as_object_mut().unwrap().values_mut()
                         {
-                            platform["url"] = json!(format!("{server_root}/package"));
+                            let name = platform["url"]
+                                .as_str()
+                                .unwrap()
+                                .rsplit('/')
+                                .next()
+                                .unwrap();
+                            platform["url"] = json!(format!("{server_root}/{name}"));
                         }
                         serde_json::to_vec(&response).unwrap()
-                    } else if tampered_response.load(Ordering::Relaxed) {
-                        b"tampered package".to_vec()
+                    } else if let Some(bytes) = artifacts.get(path.trim_start_matches('/')) {
+                        if tampered_response.load(Ordering::Relaxed) {
+                            b"tampered package".to_vec()
+                        } else {
+                            bytes.clone()
+                        }
                     } else {
-                        include_bytes!("../test-fixtures/updater/package").to_vec()
+                        code = "404 Not Found";
+                        b"No published installer at this path".to_vec()
                     };
                     let header = format!(
                         "HTTP/1.1 {code}\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n",
@@ -562,65 +595,142 @@ mod integration_tests {
         }
     }
 
-    fn assembled_manifest() -> (PathBuf, serde_json::Value) {
-        let directory =
-            std::env::temp_dir().join(format!("tyde-update-feed-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir(&directory).unwrap();
-        let targets = [
-            ("aarch64-apple-darwin", "darwin-aarch64", vec!["app"]),
-            ("x86_64-apple-darwin", "darwin-x86_64", vec!["app"]),
-            (
-                "aarch64-unknown-linux-gnu",
-                "linux-aarch64",
-                vec!["appimage", "deb", "rpm"],
-            ),
-            (
-                "x86_64-unknown-linux-gnu",
-                "linux-x86_64",
-                vec!["appimage", "deb", "rpm"],
-            ),
-            (
-                "x86_64-pc-windows-msvc",
-                "windows-x86_64",
-                vec!["nsis", "msi"],
-            ),
-        ];
-        for (target, base, installers) in targets {
-            let mut platforms = serde_json::Map::new();
-            for installer in installers {
-                let extension = match installer {
-                    "app" => "app.tar.gz",
-                    "appimage" => "AppImage",
-                    "nsis" => "exe",
-                    other => other,
-                };
-                let entry = json!({
-                    "url": format!("https://github.com/tigy32/Tyde/releases/download/v1.10.0/tyde-update-1.10.0-{target}.{extension}"),
-                    "signature": include_str!("../test-fixtures/updater/package.sig").trim(),
-                });
-                if matches!(installer, "app" | "appimage" | "nsis") {
-                    platforms.insert(base.to_owned(), entry.clone());
-                }
-                platforms.insert(format!("{base}-{installer}"), entry);
-            }
-            let fragment = json!({"version": "1.10.0", "platforms": platforms});
-            std::fs::write(
-                directory.join(format!("update-{target}.json")),
-                serde_json::to_vec(&fragment).unwrap(),
-            )
-            .unwrap();
-        }
+    fn assembled_manifest(directory: &std::path::Path, version: &str) -> serde_json::Value {
+        std::fs::create_dir_all(directory).unwrap();
+        let tag = format!("v{version}");
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .unwrap()
             .parent()
             .unwrap();
+        let config = directory.join("tauri.conf.json");
+        std::fs::write(
+            &config,
+            serde_json::to_vec(&json!({"plugins": {"updater": {
+                "pubkey": include_str!("../test-fixtures/updater/public.key").trim(),
+            }}}))
+            .unwrap(),
+        )
+        .unwrap();
+        let targets = [
+            ("aarch64-apple-darwin", vec!["app"]),
+            ("x86_64-apple-darwin", vec!["app"]),
+            ("aarch64-unknown-linux-gnu", vec!["appimage", "deb", "rpm"]),
+            ("x86_64-unknown-linux-gnu", vec!["appimage", "deb", "rpm"]),
+            (
+                "x86_64-pc-windows-msvc",
+                if version.contains('-') {
+                    vec!["nsis"]
+                } else {
+                    vec!["nsis", "msi"]
+                },
+            ),
+        ];
+        for (target, installers) in targets {
+            let bundle = directory.join("bundles").join(target);
+            let staged = directory.join("staged").join(target);
+            let package = |config: &std::path::Path| {
+                std::process::Command::new(if cfg!(windows) { "python" } else { "python3" })
+                    .arg(root.join("tools/update_manifest.py"))
+                    .args(["package", "--tag", &tag, "--target", target, "--bundle"])
+                    .arg(&bundle)
+                    .arg("--output")
+                    .arg(&staged)
+                    .arg("--config")
+                    .arg(config)
+                    .env("PYTHONDONTWRITEBYTECODE", "1")
+                    .env_remove("TAURI_SIGNING_PRIVATE_KEY")
+                    .env_remove("TAURI_SIGNING_PRIVATE_KEY_PASSWORD")
+                    .output()
+                    .unwrap()
+            };
+            let mut expected = std::collections::BTreeSet::new();
+            for installer in installers {
+                let arm = target.starts_with("aarch64");
+                let name = match installer {
+                    "app" => "Tyde.app.tar.gz".to_owned(),
+                    "appimage" => format!(
+                        "Tyde_{version}_{}.AppImage",
+                        if arm { "aarch64" } else { "amd64" }
+                    ),
+                    "deb" => format!("Tyde_{version}_{}.deb", if arm { "arm64" } else { "amd64" }),
+                    "rpm" => format!(
+                        "Tyde-{version}-1.{}.rpm",
+                        if arm { "aarch64" } else { "x86_64" }
+                    ),
+                    "nsis" => format!("Tyde_{version}_x64-setup.exe"),
+                    "msi" => format!("Tyde_{version}_x64_en-US.msi"),
+                    other => panic!("Unexpected installer {other}"),
+                };
+                let subdir = if installer == "app" {
+                    "macos"
+                } else {
+                    installer
+                };
+                std::fs::create_dir_all(bundle.join(subdir)).unwrap();
+                let source = bundle.join(subdir).join(&name);
+                std::fs::write(&source, include_bytes!("../test-fixtures/updater/package"))
+                    .unwrap();
+                if target == "aarch64-apple-darwin" {
+                    let missing = package(&config);
+                    assert!(!missing.status.success());
+                    assert!(
+                        String::from_utf8_lossy(&missing.stderr)
+                            .contains("Missing updater signature")
+                    );
+                }
+                std::fs::write(
+                    source.with_file_name(format!("{name}.sig")),
+                    include_str!("../test-fixtures/updater/package.sig"),
+                )
+                .unwrap();
+                if target == "aarch64-apple-darwin" {
+                    let mismatched = package(&root.join("frontend/tauri-shell/tauri.conf.json"));
+                    assert!(
+                        !mismatched.status.success(),
+                        "Fixture signatures must not be trusted by the production app"
+                    );
+                    assert!(
+                        String::from_utf8_lossy(&mismatched.stderr)
+                            .contains("does not match the application's pinned public key")
+                    );
+                }
+                expected.insert(if installer == "app" {
+                    format!("tyde-update-{version}-{target}.app.tar.gz")
+                } else {
+                    name
+                });
+            }
+            let result = package(&config);
+            assert!(
+                result.status.success(),
+                "Packaging {target} failed: {}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            eprintln!("{}", String::from_utf8_lossy(&result.stdout));
+            let mut actual = std::collections::BTreeSet::new();
+            for entry in std::fs::read_dir(staged.join("artifacts")).unwrap() {
+                let entry = entry.unwrap();
+                assert_eq!(
+                    std::fs::read(entry.path()).unwrap(),
+                    include_bytes!("../test-fixtures/updater/package"),
+                    "Staging must preserve the original signed installer bytes"
+                );
+                actual.insert(entry.file_name().into_string().unwrap());
+            }
+            assert_eq!(
+                actual, expected,
+                "Upload only one installer per format, without loose signatures"
+            );
+            let fragment = format!("update-{target}.json");
+            std::fs::copy(staged.join(&fragment), directory.join(fragment)).unwrap();
+        }
         let output = directory.join("tyde-update.json");
         let assemble = || {
             std::process::Command::new(if cfg!(windows) { "python" } else { "python3" })
                 .arg(root.join("tools/update_manifest.py"))
-                .args(["assemble", "--tag", "v1.10.0", "--fragments"])
-                .arg(&directory)
+                .args(["assemble", "--tag", &tag, "--fragments"])
+                .arg(directory)
                 .arg("--output")
                 .arg(&output)
                 .env("PYTHONDONTWRITEBYTECODE", "1")
@@ -635,13 +745,13 @@ mod integration_tests {
         );
         let manifest: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&output).unwrap()).unwrap();
-        validate_published_assets(root, &directory, &manifest);
+        validate_published_assets(root, directory, &manifest);
         std::fs::remove_file(directory.join("update-aarch64-apple-darwin.json")).unwrap();
         assert!(
             !assemble().status.success(),
             "An incomplete platform set must block release publication"
         );
-        (directory, manifest)
+        manifest
     }
 
     fn validate_published_assets(
@@ -649,6 +759,9 @@ mod integration_tests {
         directory: &std::path::Path,
         manifest: &serde_json::Value,
     ) {
+        let version = manifest["version"].as_str().unwrap();
+        let tag = format!("v{version}");
+        let preview = version.contains('-');
         let mut names: std::collections::BTreeSet<String> = [
             "tyde-update.json",
             "tyde-server-aarch64-apple-darwin.zip",
@@ -668,17 +781,12 @@ mod integration_tests {
             "Tyde_1.10.0_x64_en-US.msi",
         ]
         .into_iter()
-        .map(str::to_owned)
+        .filter(|name| !preview || !name.ends_with(".msi"))
+        .map(|name| name.replace("1.10.0", version))
         .collect();
         for name in names.clone() {
             if name.ends_with(".AppImage") || name.ends_with(".deb") {
                 names.insert(format!("{name}.sha256"));
-            }
-            if [".AppImage", ".deb", ".rpm", ".exe", ".msi"]
-                .iter()
-                .any(|suffix| name.ends_with(suffix))
-            {
-                names.insert(format!("{name}.sig"));
             }
         }
         for platform in manifest["platforms"].as_object().unwrap().values() {
@@ -689,21 +797,20 @@ mod integration_tests {
                 .next()
                 .unwrap();
             names.insert(name.to_owned());
-            names.insert(format!("{name}.sig"));
         }
+        assert_eq!(
+            names.len(),
+            if preview { 21 } else { 22 },
+            "Releases reuse every Windows/Linux installer and embed signatures in the manifest"
+        );
         let input = directory.join("release.json");
         let validate = |names: &std::collections::BTreeSet<String>| {
-            let release = json!({"tagName": "v1.10.0", "isDraft": false, "isPrerelease": false,
+            let release = json!({"tagName": tag, "isDraft": false, "isPrerelease": preview,
                 "assets": names.iter().map(|name| json!({"name": name})).collect::<Vec<_>>()});
             std::fs::write(&input, serde_json::to_vec(&release).unwrap()).unwrap();
             std::process::Command::new(if cfg!(windows) { "python" } else { "python3" })
                 .arg(root.join("tools/release_tool.py"))
-                .args([
-                    "validate-release",
-                    "v1.10.0",
-                    "--require-published",
-                    "--input",
-                ])
+                .args(["validate-release", &tag, "--require-published", "--input"])
                 .arg(&input)
                 .env("PYTHONDONTWRITEBYTECODE", "1")
                 .output()
@@ -724,7 +831,21 @@ mod integration_tests {
         names.insert("unrecognized.sig".into());
         assert!(
             !validate(&names).status.success(),
-            "Only signatures of recognized packages may be added by Tauri Action"
+            "Standalone signature assets must not be published"
+        );
+        names.remove("unrecognized.sig");
+        names.insert(format!("Tyde_{version}_amd64.AppImage.sig"));
+        assert!(
+            !validate(&names).status.success(),
+            "Even recognized installer signatures belong inside the manifest"
+        );
+        names.remove(&format!("Tyde_{version}_amd64.AppImage.sig"));
+        names.insert(format!(
+            "tyde-update-{version}-x86_64-unknown-linux-gnu.AppImage"
+        ));
+        assert!(
+            !validate(&names).status.success(),
+            "A second copy of an installer must block publication"
         );
     }
 
@@ -740,7 +861,7 @@ mod integration_tests {
                 .unwrap()
                 .unwrap();
         assert_eq!(stable.to_string(), "1.10.0");
-        let (preview, _) =
+        let (preview, preview_endpoint) =
             release_endpoint(UpdateChannel::Preview, &current, &releases, &downloads)
                 .await
                 .unwrap()
@@ -777,6 +898,22 @@ mod integration_tests {
         assert_eq!(update.version, "1.10.0");
         let bytes = update.download(|_, _| {}, || {}).await.unwrap();
         assert_eq!(bytes, include_bytes!("../test-fixtures/updater/package"));
+        let preview_update = app
+            .updater_builder()
+            .target("windows-x86_64")
+            .endpoints(vec![preview_endpoint])
+            .unwrap()
+            .build()
+            .unwrap()
+            .check()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(preview_update.version, "2.0.0-beta.10");
+        assert_eq!(
+            preview_update.download(|_, _| {}, || {}).await.unwrap(),
+            include_bytes!("../test-fixtures/updater/package")
+        );
         feed.tampered.store(true, Ordering::Relaxed);
         assert!(
             update.download(|_, _| {}, || {}).await.is_err(),

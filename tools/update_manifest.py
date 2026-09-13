@@ -4,10 +4,8 @@ from __future__ import annotations
 import argparse
 import base64
 import json
-import os
 from pathlib import Path
 import shutil
-import subprocess
 from urllib.parse import quote
 
 from set_release_version import normalize_tag
@@ -19,20 +17,14 @@ TARGETS = {
     "aarch64-unknown-linux-gnu": ("linux-aarch64", {"appimage": "appimage/*.AppImage", "deb": "deb/*.deb", "rpm": "rpm/*.rpm"}),
     "x86_64-pc-windows-msvc": ("windows-x86_64", {"nsis": "nsis/*-setup.exe"}),
 }
-EXTENSIONS = {"app": "app.tar.gz", "appimage": "AppImage", "deb": "deb", "rpm": "rpm", "nsis": "exe", "msi": "msi"}
 
 
 def expected_assets(tag: str) -> set[str]:
     version = normalize_tag(tag)
-    names = {"tyde-update.json"}
-    for target, (base, patterns) in TARGETS.items():
-        installers = set(patterns)
-        if base.startswith("windows") and "-" not in version:
-            installers.add("msi")
-        for installer in installers:
-            name = f"tyde-update-{version}-{target}.{EXTENSIONS[installer]}"
-            names.update((name, name + ".sig"))
-    return names
+    return {"tyde-update.json"} | {
+        f"tyde-update-{version}-{target}.app.tar.gz"
+        for target, (base, _) in TARGETS.items() if base.startswith("darwin")
+    }
 
 
 def package(args: argparse.Namespace) -> None:
@@ -41,29 +33,36 @@ def package(args: argparse.Namespace) -> None:
     patterns = dict(patterns)
     if base.startswith("windows") and "-" not in version:
         patterns["msi"] = "msi/*.msi"
-    args.output.mkdir(parents=True, exist_ok=True)
-    platforms = {}
-    npx = shutil.which("npx")
-    if not npx:
-        raise RuntimeError("npx is required to sign update artifacts")
-    if not os.environ.get("TAURI_SIGNING_PRIVATE_KEY"):
-        raise RuntimeError("TAURI_SIGNING_PRIVATE_KEY is required to sign update artifacts")
+    public_key = json.loads(args.config.read_text())["plugins"]["updater"]["pubkey"]
+    key_bytes = base64.b64decode(base64.b64decode(public_key).splitlines()[1], validate=True)
+    packages = []
     for installer, pattern in patterns.items():
         matches = list(args.bundle.glob(pattern))
         if len(matches) != 1:
             raise RuntimeError(f"Expected one {installer} artifact for {args.target}, found {matches}")
-        artifact = args.output / f"tyde-update-{version}-{args.target}.{EXTENSIONS[installer]}"
-        shutil.copyfile(matches[0], artifact)
-        subprocess.run([npx, "--no-install", "tauri", "signer", "sign", str(artifact)], check=True)
-        signature = artifact.with_name(artifact.name + ".sig").read_text().strip()
-        config_path = Path(__file__).resolve().parents[1] / "frontend/tauri-shell/tauri.conf.json"
-        public_key = json.loads(config_path.read_text())["plugins"]["updater"]["pubkey"]
-        key_bytes = base64.b64decode(base64.b64decode(public_key).splitlines()[1], validate=True)
+        source = matches[0]
+        signature_path = source.with_name(source.name + ".sig")
+        if not signature_path.is_file():
+            raise RuntimeError(f"Missing updater signature: {signature_path}")
+        signature = signature_path.read_text().strip()
         signature_bytes = base64.b64decode(base64.b64decode(signature).splitlines()[1], validate=True)
         # Catch an incorrectly configured CI key before publishing unusable updates.
         # The installed application independently verifies the full signature.
         if len(key_bytes) != 42 or len(signature_bytes) != 74 or key_bytes[2:10] != signature_bytes[2:10]:
             raise RuntimeError("Updater signing key does not match the application's pinned public key")
+        # Both macOS architectures otherwise produce the same Tyde.app.tar.gz name.
+        name = f"tyde-update-{version}-{args.target}.app.tar.gz" if installer == "app" else source.name
+        packages.append((installer, source, name, signature))
+    artifacts = args.output / "artifacts"
+    artifacts.mkdir(parents=True, exist_ok=True)
+    unexpected = {path.name for path in artifacts.iterdir()} - {name for _, _, name, _ in packages}
+    if unexpected:
+        raise RuntimeError(f"Unexpected staged release artifacts: {sorted(unexpected)}")
+    platforms = {}
+    for installer, source, name, signature in packages:
+        artifact = artifacts / name
+        shutil.copyfile(source, artifact)
+        print(f"Staged {args.target} {installer}: {name}")
         entry = {"url": f"https://github.com/{args.repository}/releases/download/{args.tag}/{quote(artifact.name)}", "signature": signature}
         platforms[f"{base}-{installer}"] = entry
         if installer in {"app", "appimage", "nsis"}:
@@ -107,6 +106,7 @@ def main() -> None:
         if name == "package":
             command.add_argument("--target", choices=TARGETS, required=True)
             command.add_argument("--bundle", type=Path, required=True)
+            command.add_argument("--config", type=Path, default=Path(__file__).resolve().parents[1] / "frontend/tauri-shell/tauri.conf.json")
         else:
             command.add_argument("--fragments", type=Path, required=True)
     args = parser.parse_args()

@@ -320,21 +320,14 @@ jobs:
           tauriScript: npx --prefix ../.. tauri
           args: ${{ matrix.tauri-args }}
 
-      - name: Build with Tauri and upload release bundles
+      - name: Build Windows and Linux installers with Tauri
         if: "!startsWith(matrix.platform, 'macos')"
         uses: tauri-apps/tauri-action@v0
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           projectPath: frontend/tauri-shell
-          tagName: ${{ env.RELEASE_TAG }}
-          releaseName: Tyde ${{ env.RELEASE_TAG }}
-          releaseBody: ''
-          releaseDraft: true
-          includeUpdaterJson: false
-          prerelease: ${{ contains(env.RELEASE_TAG, '-') }}
           tauriScript: npx --prefix ../.. tauri
           # MSI rejects semver prerelease labels; stable Windows builds still use all bundles.
           args: ${{ matrix.tauri-args }}${{ matrix.platform == 'windows-latest' && contains(env.RELEASE_TAG, '-') && ' --bundles nsis' || '' }}
@@ -481,9 +474,6 @@ jobs:
           gh release upload "$RELEASE_TAG" "$MACOS_DMG" --clobber
 
       - name: Package signed desktop updates
-        env:
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         shell: bash
         run: |
           python tools/update_manifest.py package --tag "$RELEASE_TAG" \
@@ -491,11 +481,11 @@ jobs:
             --bundle "target/${{ matrix.rust-target }}/release/bundle" \
             --output "$RUNNER_TEMP/tyde-updates"
 
-      - name: Upload signed desktop updates
+      - name: Upload signed desktop installers
         shell: bash
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release upload "$RELEASE_TAG" "$RUNNER_TEMP"/tyde-updates/tyde-update-* --clobber
+        run: gh release upload "$RELEASE_TAG" "$RUNNER_TEMP"/tyde-updates/artifacts/* --clobber
 
       - uses: actions/upload-artifact@v4
         with:
