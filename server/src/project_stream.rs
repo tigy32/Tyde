@@ -21,9 +21,9 @@ use protocol::{
     ProjectSearchFileResult, ProjectSearchMatch, ProjectSearchPayload, ReviewSummary, StreamPath,
 };
 use serde_json::Value;
-use tokio::sync::{Mutex, Semaphore, mpsc, oneshot};
-use tokio::task::JoinHandle;
-use tokio::time::{Instant, MissedTickBehavior, interval_at, sleep};
+use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::task::{JoinHandle, JoinSet};
+use tokio::time::{Instant, MissedTickBehavior, interval_at, sleep, sleep_until};
 
 use crate::review::ReviewRegistryHandle;
 use crate::store::project::ProjectStore;
@@ -31,7 +31,6 @@ use crate::stream::Stream;
 
 const PROJECT_REFRESH_DEBOUNCE: Duration = Duration::from_millis(250);
 const PROJECT_GIT_REFRESH_SPACING: Duration = Duration::from_secs(1);
-static PROJECT_BACKGROUND_READS: Semaphore = Semaphore::const_new(2);
 const GIT_STATUS_POLL_INTERVAL: Duration = Duration::from_secs(5);
 const RECENT_HISTORY_LIMIT: usize = 100;
 const BINARY_PREVIEW_LIMIT_BYTES: u64 = 8 * 1024 * 1024;
@@ -116,7 +115,7 @@ pub(crate) struct ProjectSnapshotState {
     /// Previous file entries per root, used to decide whether a new full snapshot is needed.
     pub file_entries: BTreeMap<ProjectRootPath, BTreeSet<RawFileEntry>>,
     pub git_status: Option<Value>,
-    pub diff_context_modes: HashMap<(StreamPath, ProjectDiffRequestKey), DiffContextMode>,
+    diff_context_modes: HashMap<(StreamPath, ProjectDiffRequestKey), RememberedDiffContext>,
     pub code_intel_overview: CodeIntelOverviewPayload,
 }
 
@@ -517,16 +516,11 @@ async fn background_project_read<T: Send + 'static>(
     read: impl FnOnce(&Project) -> Result<T, String> + Send + 'static,
 ) -> Result<T, String> {
     let queued = std::time::Instant::now();
-    let permit = PROJECT_BACKGROUND_READS
-        .acquire()
-        .await
-        .map_err(|error| format!("project read queue closed: {error}"))?;
     let project = project.clone();
     tokio::task::spawn_blocking(move || {
         let started = std::time::Instant::now();
         let queue_ms = queued.elapsed().as_millis();
         let result = read(&project);
-        drop(permit);
         tracing::debug!(project_id = %project.id, operation, queue_ms,
             elapsed_ms = started.elapsed().as_millis(), success = result.is_ok(),
             "completed background project read");
@@ -584,6 +578,9 @@ async fn run_project_subscription(
     let mut watcher_warning = None::<String>;
     let mut debounce_active = false;
     let mut next_git_refresh = Instant::now();
+    let mut pending_git = PendingGitRefresh::default();
+    let mut diff_request_generation = 0_u64;
+    let mut git_tasks = JoinSet::new();
     let mut debounce_sleep = Box::pin(sleep(Duration::from_secs(60 * 60 * 24 * 365)));
     let mut git_poll = interval_at(
         Instant::now() + GIT_STATUS_POLL_INTERVAL,
@@ -630,32 +627,28 @@ async fn run_project_subscription(
                         snapshot.diff_context_modes.retain(|(subscriber, _), _| subscriber != &host_path);
                     }
                     ProjectStreamCommand::Refresh { reply } => {
-                        let result = if let Some(watcher) = watcher.as_mut() {
-                            refresh_full(
-                                &project_store,
-                                &project_id,
-                                &mut project,
-                                &mut snapshot,
-                                watcher,
-                                &mut watched_roots,
-                                watch_tx.clone(),
-                                &mut subscribers,
-                                &review_registry,
-                            ).await
-                        } else {
-                            refresh_full_unwatched(
-                                &project_store,
-                                &project_id,
-                                &mut project,
-                                &mut snapshot,
-                                &mut subscribers,
-                                &review_registry,
-                            ).await
-                        };
-                        let _ = reply.send(result);
+                        let result = refresh_project_files(
+                            &project_store,
+                            &project_id,
+                            &mut project,
+                            &mut snapshot,
+                            watcher.as_mut(),
+                            &mut watched_roots,
+                            watch_tx.clone(),
+                            &mut subscribers,
+                            true,
+                        ).await;
+                        match result {
+                            Ok(()) => {
+                                pending_git.request(true, true);
+                                pending_git.replies.push(reply);
+                            }
+                            Err(error) => { let _ = reply.send(Err(error)); }
+                        }
                     }
                     ProjectStreamCommand::RememberDiffContext { host_path, key, context_mode, reply } => {
-                        snapshot.diff_context_modes.insert((host_path, key), context_mode);
+                        diff_request_generation += 1;
+                        snapshot.diff_context_modes.insert((host_path, key), RememberedDiffContext { context_mode, generation: diff_request_generation });
                         let _ = reply.send(Ok(()));
                     }
                     ProjectStreamCommand::EmitProjectEvent { payload, reply } => {
@@ -740,23 +733,22 @@ async fn run_project_subscription(
                 match maybe_watcher {
                     Some(Ok(ready_watcher)) => {
                         watcher = Some(ready_watcher);
-                        if let Some(watcher) = watcher.as_mut()
-                            && let Err(error) = refresh_full(
-                                &project_store,
-                                &project_id,
-                                &mut project,
-                                &mut snapshot,
-                                watcher,
-                                &mut watched_roots,
-                                watch_tx.clone(),
-                                &mut subscribers,
-                                &review_registry,
-                            ).await
-                        {
+                        if let Err(error) = refresh_project_files(
+                            &project_store,
+                            &project_id,
+                            &mut project,
+                            &mut snapshot,
+                            watcher.as_mut(),
+                            &mut watched_roots,
+                            watch_tx.clone(),
+                            &mut subscribers,
+                            true,
+                        ).await {
                             tracing::warn!(project_id = %project_id, error = %error, "stopping project subscription after watcher initialization refresh failure");
                             emit_fatal_project_stream_error(&mut subscribers, "project_watch", error).await;
                             return;
                         }
+                        pending_git.request(true, true);
                     }
                     Some(Err(error)) if error.limit_reached => {
                         let message = project_watch_limit_guidance(&error.message);
@@ -822,7 +814,7 @@ async fn run_project_subscription(
                             // Later activity must not postpone already queued changes.
                             if !debounce_active {
                                 debounce_active = true;
-                                debounce_sleep.as_mut().reset((Instant::now() + PROJECT_REFRESH_DEBOUNCE).max(next_git_refresh));
+                                debounce_sleep.as_mut().reset(Instant::now() + PROJECT_REFRESH_DEBOUNCE);
                             }
                         }
                     }
@@ -844,37 +836,26 @@ async fn run_project_subscription(
             _ = &mut debounce_sleep, if debounce_active => {
                 debounce_active = false;
                 let refresh = pending_update.take();
-                let result = if let Some(watcher) = watcher.as_mut() {
-                    refresh_incremental(
+                let full = watcher.is_none();
+                if (refresh.files || full)
+                    && let Err(error) = refresh_project_files(
                         &project_store,
                         &project_id,
                         &mut project,
                         &mut snapshot,
-                        watcher,
+                        watcher.as_mut(),
                         &mut watched_roots,
                         watch_tx.clone(),
                         &mut subscribers,
-                        &review_registry,
-                        refresh.files,
-                        refresh.git,
-                    ).await
-                } else {
-                    refresh_full_unwatched(
-                        &project_store,
-                        &project_id,
-                        &mut project,
-                        &mut snapshot,
-                        &mut subscribers,
-                        &review_registry,
-                    ).await
-                };
-                if let Err(error) = result {
-                    tracing::warn!(project_id = %project_id, error = %error, "stopping project subscription after debounced refresh failure");
-                    emit_fatal_project_stream_error(&mut subscribers, "project_watch", error).await;
-                    return;
+                        full,
+                    ).await {
+                        tracing::warn!(project_id = %project_id, error = %error, "stopping project subscription after debounced refresh failure");
+                        emit_fatal_project_stream_error(&mut subscribers, "project_watch", error).await;
+                        return;
                 }
-                next_git_refresh = Instant::now() + PROJECT_GIT_REFRESH_SPACING;
-                git_poll.reset();
+                if refresh.git || full {
+                    pending_git.request(full, refresh.files || full);
+                }
                 let changes = take_pending_file_version_changes(&mut pending_file_version_changes);
                 notify_file_version_listeners(&mut file_version_listeners, &changes);
                 // §M4: also tell the *frontend* which files advanced, so it can
@@ -904,145 +885,115 @@ async fn run_project_subscription(
                     }
                 }
             }
-            _ = git_poll.tick(), if !debounce_active => {
-                let result = if let Some(watcher) = watcher.as_mut() {
-                    refresh_incremental(
-                        &project_store,
-                        &project_id,
-                        &mut project,
-                        &mut snapshot,
-                        watcher,
-                        &mut watched_roots,
-                        watch_tx.clone(),
-                        &mut subscribers,
-                        &review_registry,
-                        false,
-                        true,
-                    ).await
-                } else {
-                    refresh_git_status_unwatched(
-                        &project_store,
-                        &project_id,
-                        &mut project,
-                        &mut snapshot,
-                        &mut subscribers,
-                        &review_registry,
-                    ).await
-                };
-                if let Err(error) = result {
-                    tracing::warn!(project_id = %project_id, error = %error, "stopping project subscription after git status refresh failure");
+            _ = git_poll.tick(), if !debounce_active && git_tasks.is_empty() && !pending_git.requested => {
+                pending_git.request(false, false);
+            }
+            _ = sleep_until(if pending_git.full {
+                Instant::now()
+            } else {
+                next_git_refresh
+            }), if pending_git.requested && git_tasks.is_empty() => {
+                let metadata_result = async {
+                    let latest_project = load_subscription_project(&project_store, &project_id).await?;
+                    if let Some(watcher) = watcher.as_mut() {
+                        ensure_watched_roots(&latest_project, watcher, &mut watched_roots, watch_tx.clone())?;
+                    }
+                    project = latest_project;
+                    if sync_code_intel_overview_roots(&mut snapshot.code_intel_overview, project.root_paths()) {
+                        fan_out_payload(&mut subscribers, FrameKind::CodeIntelOverview, &snapshot.code_intel_overview).await?;
+                    }
+                    Ok::<(), String>(())
+                }.await;
+                if let Err(error) = metadata_result {
+                    for reply in std::mem::take(&mut pending_git.replies) {
+                        let _ = reply.send(Err(error.clone()));
+                    }
                     emit_fatal_project_stream_error(&mut subscribers, "project_git_status", error).await;
                     return;
                 }
+                let request = std::mem::take(&mut pending_git);
+                tracing::debug!(%project_id, full = request.full, refresh_diffs = request.refresh_diffs,
+                    waiting_replies = request.replies.len(), "starting background project Git refresh");
+                let project = project.clone();
+                let previous_status = snapshot.git_status.clone();
+                let remembered = snapshot.diff_context_modes.clone();
+                git_tasks.spawn(async move {
+                    let refresh_diffs = request.refresh_diffs;
+                    let result = background_project_read(&project, "git refresh", move |project| {
+                        read_git_refresh(project, previous_status, remembered, refresh_diffs)
+                    }).await;
+                    CompletedGitRefresh { project, request, result }
+                });
+            }
+            completed = git_tasks.join_next(), if !git_tasks.is_empty() => {
                 next_git_refresh = Instant::now() + PROJECT_GIT_REFRESH_SPACING;
+                git_poll.reset();
+                let mut completed = match completed.expect("active Git refresh") {
+                    Ok(completed) => completed,
+                    Err(error) => {
+                        let message = format!("project Git refresh task failed: {error}");
+                        tracing::warn!(%project_id, %message, "stopping project subscription");
+                        emit_fatal_project_stream_error(&mut subscribers, "project_git_status", message).await;
+                        return;
+                    }
+                };
+                if completed.project.root_paths() != project.root_paths() {
+                    tracing::debug!(%project_id, "discarding Git refresh for obsolete project roots");
+                    pending_git.request(true, true);
+                    pending_git.replies.append(&mut completed.request.replies);
+                    continue;
+                }
+                let result = match completed.result {
+                    Ok(refresh) => apply_git_refresh(
+                        &project_id,
+                        &mut snapshot,
+                        &mut subscribers,
+                        &review_registry,
+                        refresh,
+                        completed.request.full,
+                    ).await,
+                    Err(error) => Err(error),
+                };
+                let explicit_refresh = !completed.request.replies.is_empty();
+                for reply in completed.request.replies {
+                    let _ = reply.send(result.clone());
+                }
+                if let Err(error) = result {
+                    tracing::warn!(%project_id, %error, "project Git refresh failed");
+                    if !explicit_refresh {
+                        emit_fatal_project_stream_error(&mut subscribers, "project_git_status", error).await;
+                        return;
+                    }
+                }
             }
         }
     }
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn refresh_full(
+async fn refresh_project_files(
     project_store: &Arc<Mutex<ProjectStore>>,
     project_id: &ProjectId,
     project: &mut Project,
     snapshot: &mut ProjectSnapshotState,
-    watcher: &mut ProjectWatcher,
+    watcher: Option<&mut ProjectWatcher>,
     watched_roots: &mut Vec<ProjectRootPath>,
     watch_tx: mpsc::UnboundedSender<notify::Result<Event>>,
     subscribers: &mut HashMap<StreamPath, ProjectSubscriber>,
-    review_registry: &ReviewRegistryHandle,
+    full: bool,
 ) -> Result<(), String> {
     let latest_project = load_subscription_project(project_store, project_id).await?;
-    ensure_watched_roots(&latest_project, watcher, watched_roots, watch_tx)?;
-
-    let raw_entries = background_project_read(&latest_project, "files", scan_raw_entries).await?;
-    let file_list = full_file_list_from_raw(&latest_project, &raw_entries);
-    let git_status =
-        background_project_read(&latest_project, "git status", build_git_status).await?;
-    let git_json = serialize_git_status(&git_status)?;
-
-    *project = latest_project;
-    snapshot.file_entries = raw_entries;
-    snapshot.git_status = Some(git_json);
-    let code_intel_roots_changed =
-        sync_code_intel_overview_roots(&mut snapshot.code_intel_overview, project.root_paths());
-
-    fan_out_payload(subscribers, FrameKind::ProjectFileList, &file_list).await?;
-    fan_out_payload(subscribers, FrameKind::ProjectGitStatus, &git_status).await?;
-    if code_intel_roots_changed {
-        fan_out_payload(
-            subscribers,
-            FrameKind::CodeIntelOverview,
-            &snapshot.code_intel_overview,
-        )
-        .await?;
+    if let Some(watcher) = watcher {
+        ensure_watched_roots(&latest_project, watcher, watched_roots, watch_tx)?;
     }
-    reset_reviews_for_clean_unstaged_roots(review_registry, project_id, &git_status).await;
-    refresh_remembered_diffs(project, snapshot, subscribers).await;
-    Ok(())
-}
-
-async fn refresh_full_unwatched(
-    project_store: &Arc<Mutex<ProjectStore>>,
-    project_id: &ProjectId,
-    project: &mut Project,
-    snapshot: &mut ProjectSnapshotState,
-    subscribers: &mut HashMap<StreamPath, ProjectSubscriber>,
-    review_registry: &ReviewRegistryHandle,
-) -> Result<(), String> {
-    let latest_project = load_subscription_project(project_store, project_id).await?;
-    let raw_entries = background_project_read(&latest_project, "files", scan_raw_entries).await?;
-    let file_list = full_file_list_from_raw(&latest_project, &raw_entries);
-    let git_status =
-        background_project_read(&latest_project, "git status", build_git_status).await?;
-    let git_json = serialize_git_status(&git_status)?;
-
     *project = latest_project;
-    snapshot.file_entries = raw_entries;
-    snapshot.git_status = Some(git_json);
-    let code_intel_roots_changed =
-        sync_code_intel_overview_roots(&mut snapshot.code_intel_overview, project.root_paths());
-
-    fan_out_payload(subscribers, FrameKind::ProjectFileList, &file_list).await?;
-    fan_out_payload(subscribers, FrameKind::ProjectGitStatus, &git_status).await?;
-    if code_intel_roots_changed {
-        fan_out_payload(
-            subscribers,
-            FrameKind::CodeIntelOverview,
-            &snapshot.code_intel_overview,
-        )
-        .await?;
+    let current_raw = background_project_read(project, "files", scan_raw_entries).await?;
+    if full || snapshot.file_entries != current_raw {
+        snapshot.file_entries = current_raw;
+        let file_list = full_file_list_from_raw(project, &snapshot.file_entries);
+        fan_out_payload(subscribers, FrameKind::ProjectFileList, &file_list).await?;
     }
-    reset_reviews_for_clean_unstaged_roots(review_registry, project_id, &git_status).await;
-    refresh_remembered_diffs(project, snapshot, subscribers).await;
-    Ok(())
-}
-
-async fn refresh_git_status_unwatched(
-    project_store: &Arc<Mutex<ProjectStore>>,
-    project_id: &ProjectId,
-    project: &mut Project,
-    snapshot: &mut ProjectSnapshotState,
-    subscribers: &mut HashMap<StreamPath, ProjectSubscriber>,
-    review_registry: &ReviewRegistryHandle,
-) -> Result<(), String> {
-    let latest_project = load_subscription_project(project_store, project_id).await?;
-    let git_status =
-        background_project_read(&latest_project, "git status", build_git_status).await?;
-    let git_json = serialize_git_status(&git_status)?;
-    let git_changed = snapshot.git_status.as_ref() != Some(&git_json);
-
-    *project = latest_project;
-    let code_intel_roots_changed =
-        sync_code_intel_overview_roots(&mut snapshot.code_intel_overview, project.root_paths());
-
-    if git_changed {
-        snapshot.git_status = Some(git_json);
-        fan_out_payload(subscribers, FrameKind::ProjectGitStatus, &git_status).await?;
-        reset_reviews_for_clean_unstaged_roots(review_registry, project_id, &git_status).await;
-        refresh_remembered_diffs(project, snapshot, subscribers).await;
-    }
-    if code_intel_roots_changed {
+    if sync_code_intel_overview_roots(&mut snapshot.code_intel_overview, project.root_paths()) {
         fan_out_payload(
             subscribers,
             FrameKind::CodeIntelOverview,
@@ -1053,70 +1004,110 @@ async fn refresh_git_status_unwatched(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn refresh_incremental(
-    project_store: &Arc<Mutex<ProjectStore>>,
+#[derive(Default)]
+struct PendingGitRefresh {
+    requested: bool,
+    full: bool,
+    refresh_diffs: bool,
+    replies: Vec<oneshot::Sender<Result<(), String>>>,
+}
+
+impl PendingGitRefresh {
+    fn request(&mut self, full: bool, refresh_diffs: bool) {
+        self.requested = true;
+        self.full |= full;
+        self.refresh_diffs |= refresh_diffs;
+    }
+}
+
+struct CompletedGitRefresh {
+    project: Project,
+    request: PendingGitRefresh,
+    result: Result<GitRefresh, String>,
+}
+
+struct GitRefresh {
+    status: ProjectGitStatusPayload,
+    serialized_status: Value,
+    diffs: Vec<RefreshedProjectDiff>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RememberedDiffContext {
+    context_mode: DiffContextMode,
+    generation: u64,
+}
+
+struct RefreshedProjectDiff {
+    host_path: StreamPath,
+    key: ProjectDiffRequestKey,
+    context: RememberedDiffContext,
+    result: Result<ProjectGitDiffPayload, String>,
+}
+
+fn read_git_refresh(
+    project: &Project,
+    previous_status: Option<Value>,
+    remembered: HashMap<(StreamPath, ProjectDiffRequestKey), RememberedDiffContext>,
+    refresh_diffs: bool,
+) -> Result<GitRefresh, String> {
+    let status = build_git_status(project)?;
+    let serialized_status = serialize_git_status(&status)?;
+    let status_changed = previous_status.as_ref() != Some(&serialized_status);
+    tracing::debug!(project_id = %project.id, status_changed,
+        remembered_diffs = remembered.len(), "refreshing project git state");
+    let diffs = if refresh_diffs || status_changed {
+        read_remembered_diffs(project, remembered)
+    } else {
+        Vec::new()
+    };
+    Ok(GitRefresh {
+        status,
+        serialized_status,
+        diffs,
+    })
+}
+
+async fn apply_git_refresh(
     project_id: &ProjectId,
-    project: &mut Project,
     snapshot: &mut ProjectSnapshotState,
-    watcher: &mut ProjectWatcher,
-    watched_roots: &mut Vec<ProjectRootPath>,
-    watch_tx: mpsc::UnboundedSender<notify::Result<Event>>,
     subscribers: &mut HashMap<StreamPath, ProjectSubscriber>,
     review_registry: &ReviewRegistryHandle,
-    files_changed: bool,
-    git_changed: bool,
+    refresh: GitRefresh,
+    full: bool,
 ) -> Result<(), String> {
-    if !files_changed && !git_changed {
-        return Ok(());
+    if full || snapshot.git_status.as_ref() != Some(&refresh.serialized_status) {
+        snapshot.git_status = Some(refresh.serialized_status);
+        fan_out_payload(subscribers, FrameKind::ProjectGitStatus, &refresh.status).await?;
+        reset_reviews_for_clean_unstaged_roots(review_registry, project_id, &refresh.status).await;
     }
-
-    let latest_project = load_subscription_project(project_store, project_id).await?;
-    ensure_watched_roots(&latest_project, watcher, watched_roots, watch_tx)?;
-    *project = latest_project;
-    let code_intel_roots_changed =
-        sync_code_intel_overview_roots(&mut snapshot.code_intel_overview, project.root_paths());
-
-    if files_changed {
-        let current_raw = background_project_read(project, "files", scan_raw_entries).await?;
-        if snapshot.file_entries != current_raw {
-            snapshot.file_entries = current_raw;
-            let file_list = full_file_list_from_raw(project, &snapshot.file_entries);
-            fan_out_payload(subscribers, FrameKind::ProjectFileList, &file_list).await?;
+    for diff in refresh.diffs {
+        if snapshot
+            .diff_context_modes
+            .get(&(diff.host_path.clone(), diff.key))
+            != Some(&diff.context)
+        {
+            continue;
+        }
+        let Some(subscriber) = subscribers.get(&diff.host_path) else {
+            continue;
+        };
+        match diff.result {
+            Ok(payload) => {
+                let _ = send_payload(&subscriber.stream, FrameKind::ProjectGitDiff, &payload).await;
+            }
+            Err(error) => {
+                emit_project_command_error(
+                    &subscriber.stream,
+                    FrameKind::ProjectReadDiff,
+                    "project_read_diff",
+                    error,
+                    false,
+                )
+                .await
+            }
         }
     }
-
-    if git_changed {
-        let git_status = background_project_read(project, "git status", build_git_status).await?;
-        let git_json = serialize_git_status(&git_status)?;
-        let status_changed = snapshot.git_status.as_ref() != Some(&git_json);
-        tracing::debug!(
-            %project_id,
-            files_changed,
-            status_changed,
-            remembered_diffs = snapshot.diff_context_modes.len(),
-            "refreshing project git state"
-        );
-        if status_changed {
-            snapshot.git_status = Some(git_json);
-            fan_out_payload(subscribers, FrameKind::ProjectGitStatus, &git_status).await?;
-            reset_reviews_for_clean_unstaged_roots(review_registry, project_id, &git_status).await;
-        }
-        // Further edits to a modified file leave its Git status unchanged.
-        if files_changed || status_changed {
-            refresh_remembered_diffs(project, snapshot, subscribers).await;
-        }
-    }
-
-    if code_intel_roots_changed {
-        fan_out_payload(
-            subscribers,
-            FrameKind::CodeIntelOverview,
-            &snapshot.code_intel_overview,
-        )
-        .await?;
-    }
-
     Ok(())
 }
 
@@ -1719,17 +1710,12 @@ async fn broadcast_project_event(
     Ok(())
 }
 
-async fn refresh_remembered_diffs(
+fn read_remembered_diffs(
     project: &Project,
-    snapshot: &ProjectSnapshotState,
-    subscribers: &HashMap<StreamPath, ProjectSubscriber>,
-) {
-    let mut remembered = snapshot
-        .diff_context_modes
-        .iter()
-        .map(|((host_path, key), context_mode)| (host_path.clone(), key.clone(), *context_mode))
-        .collect::<Vec<_>>();
-    remembered.sort_by(|(host_a, key_a, _), (host_b, key_b, _)| {
+    remembered: HashMap<(StreamPath, ProjectDiffRequestKey), RememberedDiffContext>,
+) -> Vec<RefreshedProjectDiff> {
+    let mut remembered = remembered.into_iter().collect::<Vec<_>>();
+    remembered.sort_by(|((host_a, key_a), _), ((host_b, key_b), _)| {
         host_a
             .0
             .cmp(&host_b.0)
@@ -1737,39 +1723,25 @@ async fn refresh_remembered_diffs(
             .then_with(|| diff_scope_sort_key(key_a.scope).cmp(&diff_scope_sort_key(key_b.scope)))
             .then_with(|| key_a.path.cmp(&key_b.path))
     });
-
-    for (host_path, key, context_mode) in remembered {
-        let Some(stream) = subscribers.get(&host_path).map(|s| &s.stream) else {
-            continue;
-        };
-        let payload = ProjectReadDiffPayload {
-            request_id: None,
-            root: key.root.clone(),
-            scope: key.scope,
-            revision: key.revision.clone(),
-            path: key.path.clone(),
-            context_mode,
-        };
-        match background_project_read(project, "git diff", move |project| {
-            read_diff(project, payload)
+    remembered
+        .into_iter()
+        .map(|((host_path, key), context)| {
+            let payload = ProjectReadDiffPayload {
+                request_id: None,
+                root: key.root.clone(),
+                scope: key.scope,
+                revision: key.revision.clone(),
+                path: key.path.clone(),
+                context_mode: context.context_mode,
+            };
+            RefreshedProjectDiff {
+                host_path,
+                key,
+                context,
+                result: read_diff(project, payload),
+            }
         })
-        .await
-        {
-            Ok(diff) => {
-                let _ = send_payload(stream, FrameKind::ProjectGitDiff, &diff).await;
-            }
-            Err(error) => {
-                emit_project_command_error(
-                    stream,
-                    FrameKind::ProjectReadDiff,
-                    "project_read_diff",
-                    error,
-                    false,
-                )
-                .await;
-            }
-        }
-    }
+        .collect()
 }
 
 fn diff_scope_sort_key(scope: ProjectDiffScope) -> u8 {

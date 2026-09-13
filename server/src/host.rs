@@ -12037,7 +12037,14 @@ impl HostHandle {
             root = selection_root.map(|root| root.0.as_str()).unwrap_or("<workspace>"),
             "reading initial review diffs"
         );
-        let diffs = match read_review_diffs(&project, &normalized_selection) {
+        let diff_selection = normalized_selection.clone();
+        let diff_result =
+            tokio::task::spawn_blocking(move || read_review_diffs(&project, &diff_selection))
+                .await
+                .map_err(|error| {
+                    AppError::internal_message(OPERATION, "review diff task failed", error)
+                })?;
+        let diffs = match diff_result {
             Ok(diffs) => {
                 let stats = host_diff_stats(&diffs);
                 tracing::info!(

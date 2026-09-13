@@ -75,8 +75,9 @@ async fn expect_project_file_list(
     client: &mut client::Connection,
     context: &str,
 ) -> ProjectFileListPayload {
-    let env = expect_next_event(client, context).await;
-    assert_eq!(env.kind, FrameKind::ProjectFileList);
+    // An independent Git refresh emitted ProjectGitStatus before a staging
+    // listing. Project streams allow these unsolicited state pushes (§4).
+    let env = expect_project_response(client, FrameKind::ProjectFileList, context).await;
     env.parse_payload()
         .expect("failed to parse ProjectFileListPayload")
 }
@@ -1157,6 +1158,16 @@ async fn slow_git_refresh_keeps_host_connections_responsive() {
     expect_project_bootstrap(&mut fixture.client, "slow git bootstrap").await;
     expect_command_error(&mut fixture.client, "watch limit warning").await;
 
+    let peer_repo = init_git_repo("slow-peer", &[("peer.rs", "// peer\n")]);
+    create_project(
+        &mut fixture.client,
+        "Slow Peer",
+        vec![peer_repo.path().to_string_lossy().into_owned()],
+    )
+    .await;
+    expect_project_bootstrap(&mut fixture.client, "peer bootstrap").await;
+    expect_command_error(&mut fixture.client, "peer watch limit warning").await;
+
     let agent = fixture
         .spawn_scripted(
             "pending-project-interrupt",
@@ -1169,22 +1180,27 @@ async fn slow_git_refresh_keeps_host_connections_responsive() {
         matches!(event, protocol::ChatEvent::StreamDelta(delta) if delta.text.contains("waiting for interrupt"))
     }).await;
 
-    let hook = repo.path().join(".git/slow-fsmonitor");
-    fs::write(&hook, "#!/bin/sh\n: > .git/monitor-started\nwhile [ -d .git ] && [ ! -f .git/monitor-release ]; do sleep 0.01; done\nprintf 'token\\000/\\000'\n").unwrap();
-    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
-    git(
-        repo.path(),
-        &["config", "core.fsmonitor", hook.to_str().unwrap()],
-    );
+    for repository in [&repo, &peer_repo] {
+        let hook = repository.path().join(".git/slow-fsmonitor");
+        fs::write(&hook, "#!/bin/sh\n: > .git/monitor-started\nwhile [ -d .git ] && [ ! -f .git/monitor-release ]; do sleep 0.01; done\nprintf 'token\\000/\\000'\n").unwrap();
+        fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+        git(
+            repository.path(),
+            &["config", "core.fsmonitor", hook.to_str().unwrap()],
+        );
+    }
     write_file(&repo.path().join("src/lib.rs"), "pub fn changed() {}\n");
 
-    let root = repo.path().to_path_buf();
+    let roots = [repo.path().to_path_buf(), peer_repo.path().to_path_buf()];
     let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
     // The independent watchdog releases real Git even if it blocks the sole
     // async worker, so the regression fails instead of hanging the suite.
     let watchdog = std::thread::spawn(move || {
         let deadline = std::time::Instant::now() + Duration::from_secs(15);
-        while !root.join(".git/monitor-started").exists() {
+        while roots
+            .iter()
+            .any(|root| !root.join(".git/monitor-started").exists())
+        {
             assert!(
                 std::time::Instant::now() < deadline,
                 "Git never entered fsmonitor"
@@ -1193,12 +1209,14 @@ async fn slow_git_refresh_keeps_host_connections_responsive() {
         }
         let _ = entered_tx.send(());
         std::thread::sleep(Duration::from_secs(2));
-        if let Err(error) = fs::write(root.join(".git/monitor-release"), "") {
-            assert_eq!(
-                error.kind(),
-                std::io::ErrorKind::NotFound,
-                "release Git watchdog: {error}"
-            );
+        for root in roots {
+            if let Err(error) = fs::write(root.join(".git/monitor-release"), "") {
+                assert_eq!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound,
+                    "release Git watchdog: {error}"
+                );
+            }
         }
     });
     entered_rx.await.expect("fsmonitor started");
@@ -1220,6 +1238,71 @@ async fn slow_git_refresh_keeps_host_connections_responsive() {
         !repo.path().join(".git/monitor-release").exists(),
         "host connection waited for the slow Git refresh to finish"
     );
+    let path = ProjectPath {
+        root: ProjectRootPath(project_root(&project, 0)),
+        relative_path: "src/lib.rs".to_owned(),
+    };
+    fixture
+        .client
+        .project_read_file(&project.id, ProjectReadFilePayload { path })
+        .await
+        .unwrap();
+    let contents = next_frame_matching_on(&mut fixture.client, "file during slow Git", |event| {
+        event.kind == FrameKind::ProjectFileContents
+    })
+    .await;
+    let contents: ProjectFileContentsPayload = contents.parse_payload().unwrap();
+    assert_eq!(contents.contents.as_deref(), Some("pub fn changed() {}\n"));
+    assert!(
+        !repo.path().join(".git/monitor-release").exists(),
+        "file read waited for the slow Git refresh to finish"
+    );
+    let independent_repo = init_git_repo("independent", &[("ready.rs", "// ready\n")]);
+    create_project(
+        &mut fixture.client,
+        "Independent",
+        vec![independent_repo.path().to_string_lossy().into_owned()],
+    )
+    .await;
+    expect_project_bootstrap(
+        &mut fixture.client,
+        "independent project during stalled Git",
+    )
+    .await;
+    expect_command_error(&mut fixture.client, "independent watch limit warning").await;
+    assert!(
+        !repo.path().join(".git/monitor-release").exists(),
+        "independent project waited behind other projects' Git work"
+    );
+    fixture
+        .client
+        .project_list_dir(
+            &project.id,
+            ProjectListDirPayload {
+                root: ProjectRootPath(project_root(&project, 0)),
+                path: "src".to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+    let listing = next_frame_matching_on(&mut fixture.client, "folder during slow Git", |event| {
+        event.kind == FrameKind::ProjectFileList
+            && event.stream == StreamPath(format!("/project/{}", project.id))
+            && event
+                .parse_payload::<ProjectFileListPayload>()
+                .unwrap()
+                .roots[0]
+                .entries
+                .iter()
+                .any(|entry| entry.relative_path == "src/lib.rs")
+    })
+    .await;
+    let listing: ProjectFileListPayload = listing.parse_payload().unwrap();
+    assert_eq!(listing.roots[0].root.0, project_root(&project, 0));
+    assert!(
+        !repo.path().join(".git/monitor-release").exists(),
+        "folder expansion waited for the slow Git refresh to finish"
+    );
     connection
         .review_create(
             &project.id,
@@ -1232,6 +1315,24 @@ async fn slow_git_refresh_keeps_host_connections_responsive() {
         )
         .await
         .unwrap();
+    next_frame_matching_on(
+        &mut connection,
+        "bootstrap before review response",
+        |event| {
+            assert_ne!(
+                event.kind,
+                FrameKind::ReviewBootstrap,
+                "review response overtook project bootstrap"
+            );
+            event.kind == FrameKind::ProjectBootstrap
+                && event.stream == StreamPath(format!("/project/{}", project.id))
+        },
+    )
+    .await;
+    assert!(
+        !repo.path().join(".git/monitor-release").exists(),
+        "project bootstrap waited for the slow Git refresh to finish"
+    );
     connection.interrupt(&late_agent_stream).await.unwrap();
     fixture
         .next_chat_event_matching(&agent, "interrupt behind pending review", |event| {
@@ -1243,19 +1344,7 @@ async fn slow_git_refresh_keeps_host_connections_responsive() {
         "interrupt waited behind a project subscription"
     );
     fs::write(repo.path().join(".git/monitor-release"), "").unwrap();
-    next_frame_matching_on(
-        &mut connection,
-        "bootstrap before review response",
-        |event| {
-            assert_ne!(
-                event.kind,
-                FrameKind::ReviewBootstrap,
-                "review response overtook project bootstrap"
-            );
-            event.kind == FrameKind::ProjectBootstrap
-        },
-    )
-    .await;
+    fs::write(peer_repo.path().join(".git/monitor-release"), "").unwrap();
     next_frame_matching_on(
         &mut connection,
         "review response after bootstrap",
@@ -2446,7 +2535,16 @@ async fn project_stage_file_updates_git_status_and_diffs() {
         .await
         .expect("project_stage_file failed");
 
-    let _ = expect_project_file_list(&mut fixture.client, "file list after stage file").await;
+    let file_list =
+        expect_project_file_list(&mut fixture.client, "file list after stage file").await;
+    assert_eq!(file_list.roots.len(), 1);
+    assert_eq!(file_list.roots[0].root.0, project_root(&project, 0));
+    let entry = file_list.roots[0]
+        .entries
+        .iter()
+        .find(|entry| entry.relative_path == "src/main.rs")
+        .expect("staged file remains listed");
+    assert_eq!(entry.op, FileEntryOp::Add);
     let git_status = expect_project_git_status_matching(
         &mut fixture.client,
         "git status after stage file",
@@ -2569,7 +2667,16 @@ async fn project_stage_hunk_stages_only_one_hunk() {
         .await
         .expect("project_stage_hunk failed");
 
-    let _ = expect_project_file_list(&mut fixture.client, "file list after stage hunk").await;
+    let file_list =
+        expect_project_file_list(&mut fixture.client, "file list after stage hunk").await;
+    assert_eq!(file_list.roots.len(), 1);
+    assert_eq!(file_list.roots[0].root.0, project_root(&project, 0));
+    let entry = file_list.roots[0]
+        .entries
+        .iter()
+        .find(|entry| entry.relative_path == "src/main.rs")
+        .expect("staged file remains listed");
+    assert_eq!(entry.op, FileEntryOp::Add);
     let git_status = expect_project_git_status_matching(
         &mut fixture.client,
         "git status after stage hunk",
