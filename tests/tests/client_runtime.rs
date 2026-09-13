@@ -721,6 +721,7 @@ async fn split_endpoints_allow_event_loops_and_commands_to_run_independently() {
                 | HostEvent::BackendConfigSchemas(_)
                 | HostEvent::BackendConfigSnapshots(_)
                 | HostEvent::BackendCapacity(_)
+                | HostEvent::AgentMoveResult(_)
                 | HostEvent::AgentClosed(_)
                 | HostEvent::ProjectNotify(_)
                 | HostEvent::NewTerminal(_)

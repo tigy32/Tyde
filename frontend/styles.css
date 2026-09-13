@@ -15281,3 +15281,14 @@ pre.tool-error-pre {
 .app-update-actions { display: flex; gap: 8px; justify-content: flex-end; }
 .app-update-actions button { padding: 6px 14px; }
 .app-update-actions button:last-child { background: var(--accent-primary); color: var(--text-on-accent); }
+
+.agent-move-modal { min-width: 0; box-sizing: border-box; }
+.agent-move-modal .modal-title { white-space: normal; }
+.agent-move-modal .agent-move-choice[aria-pressed="true"] {
+    border-color: var(--accent-primary);
+    box-shadow: inset 3px 0 var(--accent-primary);
+}
+.agent-move-modal .agent-move-choice:focus-visible {
+    outline: 2px solid var(--accent-primary);
+    outline-offset: 2px;
+}

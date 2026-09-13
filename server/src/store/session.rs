@@ -426,6 +426,19 @@ impl SessionStore {
         })
     }
 
+    pub fn move_to_project(
+        &self,
+        session_id: &SessionId,
+        project_id: Option<ProjectId>,
+        roots: Vec<String>,
+    ) -> Result<(), String> {
+        self.update(session_id, |record| {
+            record.project_id = project_id;
+            record.workspace_roots = roots;
+            record.updated_at_ms = now_ms();
+        })
+    }
+
     pub fn detach_project(&self, project_id: &ProjectId) -> Result<Vec<SessionId>, String> {
         self.cas(|records| {
             let mut detached = Vec::new();

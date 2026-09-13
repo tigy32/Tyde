@@ -1253,6 +1253,52 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                 format!("failed to parse agent_start payload: {error}"),
             ),
         },
+        FrameKind::AgentMoveResult => {
+            match envelope.parse_payload::<protocol::types::AgentMoveResultPayload>() {
+                Ok(payload) => {
+                    if let Ok(start) = &payload.result {
+                        let is_active = state.active_agent.get_untracked().is_some_and(|agent| {
+                            agent.host_id == host_id && agent.agent_id == start.agent_id
+                        });
+                        if is_active {
+                            state.follow_moved_agent_project(start.project_id.clone().map(
+                                |project_id| crate::state::ActiveProjectRef {
+                                    host_id: host_id.to_owned(),
+                                    project_id,
+                                },
+                            ));
+                        }
+                        state.sessions.update(|sessions| {
+                            for session in sessions.iter_mut().filter(|session| {
+                                session.host_id == host_id
+                                    && Some(&session.summary.id) == start.session_id.as_ref()
+                            }) {
+                                session.summary.project_id = start.project_id.clone();
+                                session.summary.workspace_roots = start.workspace_roots.clone();
+                            }
+                        });
+                        state.agents.update(|agents| {
+                            if let Some(agent) = agents.iter_mut().find(|agent| {
+                                agent.host_id == host_id && agent.agent_id == start.agent_id
+                            }) {
+                                agent.project_id = start.project_id.clone();
+                                agent.workspace_roots = start.workspace_roots.clone();
+                            }
+                        });
+                    }
+                    state
+                        .agent_move_result
+                        .set(Some((host_id.to_owned(), payload)));
+                }
+                Err(error) => report_dispatch_error(
+                    state,
+                    host_id,
+                    &envelope.stream,
+                    envelope.kind,
+                    format!("failed to parse agent move result: {error}"),
+                ),
+            }
+        }
         FrameKind::AgentRenamed => match envelope.parse_payload::<AgentRenamedPayload>() {
             Ok(payload) => apply_agent_rename(state, host_id, payload),
             Err(error) => report_dispatch_error(

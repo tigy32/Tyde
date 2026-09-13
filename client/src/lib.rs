@@ -636,6 +636,13 @@ impl Connection {
             .await
     }
 
+    pub async fn move_agent(
+        &mut self,
+        payload: protocol::types::AgentMovePayload,
+    ) -> Result<(), FrameError> {
+        self.send_host_payload(FrameKind::AgentMove, &payload).await
+    }
+
     pub async fn project_rename(
         &mut self,
         payload: ProjectRenamePayload,
@@ -1471,6 +1478,10 @@ impl Connection {
                 }
                 FrameKind::AgentBackgroundWorkNotify => {
                     let _: protocol::AgentBackgroundWorkNotifyPayload =
+                        envelope.parse_payload().map_err(FrameError::Json)?;
+                }
+                FrameKind::AgentMoveResult => {
+                    let _: protocol::types::AgentMoveResultPayload =
                         envelope.parse_payload().map_err(FrameError::Json)?;
                 }
                 FrameKind::AgentTurnStateNotify => {

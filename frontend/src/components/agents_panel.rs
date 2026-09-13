@@ -1564,6 +1564,9 @@ fn agent_card(
     child_count: usize,
     interactions: AgentsPanelInteractions,
 ) -> impl IntoView {
+    let moving_project = RwSignal::new(false);
+    let move_project_agent = agent.clone();
+    let move_project_state = state.clone();
     let editing_agent = interactions.editing_agent;
     let edit_value = interactions.edit_value;
     let collapsed_parents = interactions.collapsed_parents;
@@ -2124,6 +2127,10 @@ fn agent_card(
                     >
                         "\u{2630}"
                     </button>
+                    <button type="button" class="filter-toggle agent-card-action" title="Move to project…" aria-label="Move to project…"
+                        on:click=move |ev: web_sys::MouseEvent| { ev.stop_propagation(); moving_project.set(true); }>
+                        "Move to project…"
+                    </button>
                     <button
                         type="button"
                         class="filter-toggle agent-card-action"
@@ -2178,6 +2185,9 @@ fn agent_card(
                     </button>
                 </div>
             </div>
+            <Show when=move || moving_project.get()>
+                <MoveAgentProjectDialog state=move_project_state.clone() agent=move_project_agent.clone() open=moving_project />
+            </Show>
             <CardContextMenu menu=card_menu label="Agent actions" anchor=card_anchor>
                 <button
                     type="button"
@@ -2206,6 +2216,10 @@ fn agent_card(
                     }
                 >
                     "Move to group"
+                </button>
+                <button type="button" class="context-menu-item" role="menuitem"
+                    on:click=move |ev: web_sys::MouseEvent| { ev.stop_propagation(); card_menu.set(None); moving_project.set(true); }>
+                    "Move to project…"
                 </button>
                 {
                     let control = menu_compaction_control.clone();
@@ -2254,6 +2268,192 @@ fn agent_card(
                     "Close agent"
                 </button>
             </CardContextMenu>
+        </div>
+    }
+}
+
+#[component]
+fn MoveAgentProjectDialog(
+    state: AppState,
+    agent: AgentInfo,
+    open: RwSignal<bool>,
+) -> impl IntoView {
+    let search = RwSignal::new(String::new());
+    let selected = RwSignal::new(None::<ProjectId>);
+    let pending = RwSignal::new(None::<String>);
+    let error = RwSignal::new(None::<String>);
+    let input = NodeRef::<leptos::html::Input>::new();
+    let previous_focus = web_sys::window()
+        .and_then(|window| window.document())
+        .and_then(|document| document.active_element());
+    on_cleanup(move || {
+        use wasm_bindgen::JsCast;
+        if let Some(element) =
+            previous_focus.and_then(|element| element.dyn_into::<web_sys::HtmlElement>().ok())
+            && element.is_connected()
+        {
+            let _ = element.focus();
+        }
+    });
+    Effect::new(move |_| {
+        if let Some(input) = input.get() {
+            let _ = input.focus();
+        }
+    });
+    let host = agent.host_id.clone();
+    let current = agent.project_id.clone();
+    let projects = state.projects;
+    let destinations = Memo::new(move |_| {
+        let query = search.get().to_lowercase();
+        let mut choices = projects
+            .get()
+            .into_iter()
+            .filter(|item| {
+                item.host_id == host
+                    && Some(&item.project.id) != current.as_ref()
+                    && (item.project.name.to_lowercase().contains(&query)
+                        || item
+                            .project
+                            .root_paths()
+                            .iter()
+                            .any(|root| root.0.to_lowercase().contains(&query)))
+            })
+            .collect::<Vec<_>>();
+        choices.sort_by_key(|item| item.project.name.to_lowercase());
+        choices
+    });
+    let busy_agent = agent.agent_id.clone();
+    let active_turns = state.agent_turn_active;
+    let unavailable = Memo::new(move |_| {
+        if agent.parent_agent_id.is_some()
+            || agent.team_member_id.is_some()
+            || agent.workflow.is_some()
+        {
+            Some("Team, workflow, and child agents belong to their existing project.")
+        } else if !agent.started
+            || active_turns
+                .get()
+                .get(&busy_agent)
+                .copied()
+                .unwrap_or(false)
+        {
+            Some("Wait until the agent finishes its turn before moving it.")
+        } else {
+            None
+        }
+    });
+    let connections = state.connection_statuses;
+    let connection_host = agent.host_id.clone();
+    Effect::new(move |_| {
+        if pending.get().is_some()
+            && !matches!(
+                connections.get().get(&connection_host),
+                Some(crate::state::ConnectionStatus::Connected)
+            )
+        {
+            pending.set(None);
+            error.set(Some("Connection lost while moving. Reconnect to check the agent's project before trying again.".to_owned()));
+        }
+    });
+    let result = state.agent_move_result;
+    let result_host = agent.host_id.clone();
+    Effect::new(move |_| {
+        let Some(request) = pending.get() else { return };
+        if let Some((host, response)) = result.get()
+            && host == result_host
+            && response.request_id == request
+        {
+            pending.set(None);
+            match response.result {
+                Ok(_) => open.set(false),
+                Err(message) => error.set(Some(message)),
+            }
+        }
+    });
+    let send_host = agent.host_id.clone();
+    let send_agent = agent.agent_id.clone();
+    let streams = state.host_streams;
+    let send = move |_| {
+        if pending.get_untracked().is_some() || unavailable.get_untracked().is_some() {
+            return;
+        }
+        let Some(project_id) = selected.get_untracked() else {
+            return;
+        };
+        let Some(stream) = streams.get_untracked().get(&send_host).cloned() else {
+            error.set(Some(
+                "The host is disconnected. Reconnect and try again.".to_owned(),
+            ));
+            return;
+        };
+        let request_id = crate::state::new_history_request_id();
+        pending.set(Some(request_id.clone()));
+        error.set(None);
+        let host = send_host.clone();
+        let payload = protocol::types::AgentMovePayload {
+            request_id,
+            agent_id: send_agent.clone(),
+            project_id,
+        };
+        leptos::task::spawn_local(async move {
+            if let Err(message) =
+                crate::send::send_frame(&host, stream, FrameKind::AgentMove, &payload).await
+            {
+                pending.set(None);
+                error.set(Some(message));
+            }
+        });
+    };
+    view! {
+        <div class="modal-backdrop" style="position:fixed;inset:0;z-index:1100;background:rgba(0,0,0,.4)"
+            on:click=move |ev: web_sys::MouseEvent| { ev.stop_propagation(); if pending.get_untracked().is_none() { open.set(false); } } />
+        <div class="modal workbench-create-modal agent-move-modal" role="dialog" aria-modal="true" aria-label="Move agent to project"
+            style="position:fixed;left:50%;top:15%;transform:translateX(-50%);z-index:1101;width:min(480px,calc(100vw - 32px));max-height:75vh;overflow:auto"
+            on:click=|ev: web_sys::MouseEvent| ev.stop_propagation()
+            on:keydown=move |ev: web_sys::KeyboardEvent| {
+                use wasm_bindgen::JsCast;
+                ev.stop_propagation();
+                if ev.key() == "Escape" && pending.get_untracked().is_none() { open.set(false); }
+                if ev.key() == "Tab" && let Some(dialog) = ev.current_target().and_then(|target| target.dyn_into::<web_sys::Element>().ok()) && let Ok(elements) = dialog.query_selector_all("button:not(:disabled), input:not(:disabled)") {
+                    if elements.length() == 0 { ev.prevent_default(); return; }
+                    let first = elements.item(0).unwrap().dyn_into::<web_sys::HtmlElement>().unwrap();
+                    let last = elements.item(elements.length() - 1).unwrap().dyn_into::<web_sys::HtmlElement>().unwrap();
+                    let active = web_sys::window().and_then(|window| window.document()).and_then(|document| document.active_element());
+                    if ev.shift_key() && active.as_ref() == Some(first.as_ref()) { ev.prevent_default(); let _ = last.focus(); }
+                    else if !ev.shift_key() && active.as_ref() == Some(last.as_ref()) { ev.prevent_default(); let _ = first.focus(); }
+                }
+            }>
+            <div class="modal-title">"Move "{agent.name}" to project"</div>
+            <div class="modal-body">
+                <p>"Continue this conversation in all folders of the selected project. The agent keeps its current instructions and tool settings."</p>
+                <input class="modal-input" type="search" aria-label="Search projects" placeholder="Search projects or folders…" node_ref=input
+                    disabled=move || pending.get().is_some() prop:value=move || search.get() on:input=move |ev| search.set(event_target_value(&ev)) />
+                <div role="group" aria-label="Destination project" style="display:flex;flex-direction:column;gap:8px;margin:12px 0">
+                    {move || destinations.get().into_iter().map(|item| {
+                        let project = item.project;
+                        let id = project.id.clone();
+                        let selected_id = id.clone();
+                        let roots = project.root_paths();
+                        let detail = match project.source { protocol::ProjectSource::GitWorkbench { branch, .. } => format!("Workbench · {}", branch.0), _ => "Project".to_owned() };
+                        view! {
+                            <button type="button" class="modal-input agent-move-choice" style="text-align:left;white-space:normal" aria-pressed=move || (selected.get().as_ref() == Some(&selected_id)).to_string()
+                                disabled=move || pending.get().is_some() on:click=move |_| { selected.set(Some(id.clone())); error.set(None); }>
+                                <strong>{project.name}</strong>" · "{detail}
+                                {roots.into_iter().enumerate().map(|(index, root)| view! { <div style="font-size:12px;overflow-wrap:anywhere">{root.0}{if index == 0 { " (default directory)" } else { "" }}</div> }).collect_view()}
+                            </button>
+                        }
+                    }).collect_view()}
+                    <Show when=move || destinations.get().is_empty()><p>"No other matching projects on this host."</p></Show>
+                </div>
+                {move || unavailable.get().map(|message| view! { <p role="status">{message}</p> })}
+                {move || error.get().map(|message| view! { <p class="modal-error" role="alert">{message}</p> })}
+                <div class="modal-actions">
+                    <button type="button" class="modal-button" disabled=move || pending.get().is_some() on:click=move |_| open.set(false)>"Cancel"</button>
+                    <button type="button" class="modal-button primary" disabled=move || pending.get().is_some() || unavailable.get().is_some() || selected.get().is_none() on:click=send>
+                        {move || if pending.get().is_some() { "Moving…" } else { "Move agent" }}
+                    </button>
+                </div>
+            </div>
         </div>
     }
 }
@@ -2934,6 +3134,7 @@ mod wasm_tests {
         for item in [
             "Rename agent",
             "Move to group",
+            "Move to project…",
             "Compact context",
             "Close agent",
         ] {
@@ -4443,6 +4644,189 @@ mod wasm_tests {
         assert!(
             enabled,
             "compact should be offered again after a non-fatal failure: {label}"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    async fn move_project_picker_sends_destination_and_shows_server_errors() {
+        let calls = install_send_stub_with_dialog_ok();
+        let container = make_container();
+        let state = make_app_state("h");
+        crate::dispatch::prime_host_for_tests(&state, "h");
+        push_agent_with_scope(
+            &state,
+            "h",
+            "move-me",
+            "Moving agent",
+            true,
+            Some("source"),
+            None,
+        );
+        state.projects.set(vec![
+            project_info("h", "source", "Source", 0),
+            project_info("h", "destination", "Destination", 0),
+            project_info("other", "foreign", "Other host project", 0),
+        ]);
+        let agent = state.agents.get_untracked()[0].clone();
+        open_agent_chat(&state, &agent);
+        state.open_tab(TabContent::AgentMonitor, "Source overview".to_owned(), true);
+        state.switch_active_project(Some(crate::state::ActiveProjectRef {
+            host_id: "h".to_owned(),
+            project_id: ProjectId("destination".to_owned()),
+        }));
+        state.open_tab(
+            TabContent::AgentMonitor,
+            "Destination overview".to_owned(),
+            true,
+        );
+        open_agent_chat(&state, &agent);
+        state
+            .composer_untracked()
+            .text
+            .set("Keep this draft".to_owned());
+        let open = RwSignal::new(true);
+        let mounted_state = state.clone();
+        let _handle = mount_to(
+            container.clone(),
+            move || view! { <MoveAgentProjectDialog state=mounted_state.clone() agent=agent.clone() open=open /> },
+        );
+        for _ in 0..4 {
+            next_tick().await;
+        }
+        let text = container.text_content().unwrap();
+        assert!(text.contains("Destination") && text.contains("/tmp/destination"));
+        assert!(!text.contains("Other host project"));
+        let buttons = container.query_selector_all("button").unwrap();
+        let find = |label: &str| -> HtmlElement {
+            (0..buttons.length())
+                .map(|i| buttons.item(i).unwrap().dyn_into::<HtmlElement>().unwrap())
+                .find(|button| button.text_content().unwrap_or_default().contains(label))
+                .unwrap()
+        };
+        let submit = find("Move agent");
+        assert!(submit.has_attribute("disabled"));
+        find("Destination").click();
+        next_tick().await;
+        assert!(!submit.has_attribute("disabled"));
+        submit.click();
+        for _ in 0..6 {
+            next_tick().await;
+        }
+        let frames = recorded_frames(&calls);
+        let (_, payload, stream) = frames
+            .iter()
+            .find(|(kind, _, _)| kind == "agent_move")
+            .expect("move command");
+        assert_eq!(payload["agent_id"], "move-me");
+        assert_eq!(payload["project_id"], "destination");
+        assert!(stream.starts_with("/host/"));
+        assert!(container.text_content().unwrap().contains("Moving…"));
+        dispatch_frame(
+            &state,
+            "h",
+            StreamPath(stream.clone()),
+            FrameKind::AgentMoveResult,
+            0,
+            &protocol::types::AgentMoveResultPayload {
+                request_id: payload["request_id"].as_str().unwrap().to_owned(),
+                agent_id: AgentId("move-me".to_owned()),
+                result: Err("Wait for background work to finish".to_owned()),
+            },
+        );
+        for _ in 0..4 {
+            next_tick().await;
+        }
+        assert!(
+            container
+                .text_content()
+                .unwrap()
+                .contains("Wait for background work to finish")
+        );
+        assert!(!submit.has_attribute("disabled"));
+        assert!(open.get_untracked());
+        submit.click();
+        for _ in 0..6 {
+            next_tick().await;
+        }
+        let frames = recorded_frames(&calls);
+        let (_, retry, _) = frames
+            .iter()
+            .rev()
+            .find(|(kind, _, _)| kind == "agent_move")
+            .unwrap();
+        let start = protocol::AgentStartPayload {
+            agent_id: AgentId("move-me".to_owned()),
+            name: "Moving agent".to_owned(),
+            origin: AgentOrigin::User,
+            backend_kind: BackendKind::Claude,
+            launch_profile_id: None,
+            workspace_roots: vec!["/tmp/destination".to_owned()],
+            project_id: Some(ProjectId("destination".to_owned())),
+            custom_agent_id: None,
+            team_id: None,
+            team_member_id: None,
+            parent_agent_id: None,
+            session_id: None,
+            workflow: None,
+            created_at_ms: 0,
+        };
+        dispatch_frame(
+            &state,
+            "h",
+            StreamPath(stream.clone()),
+            FrameKind::AgentMoveResult,
+            1,
+            &protocol::types::AgentMoveResultPayload {
+                request_id: retry["request_id"].as_str().unwrap().to_owned(),
+                agent_id: start.agent_id.clone(),
+                result: Ok(start),
+            },
+        );
+        for _ in 0..4 {
+            next_tick().await;
+        }
+        assert!(!open.get_untracked());
+        assert_eq!(
+            state.active_agent.get_untracked().unwrap().agent_id.0,
+            "move-me"
+        );
+        assert_eq!(
+            state.active_project.get_untracked().unwrap().project_id.0,
+            "destination"
+        );
+        assert_eq!(
+            state.composer_untracked().text.get_untracked(),
+            "Keep this draft"
+        );
+        assert_eq!(
+            state.agents.get_untracked()[0].workspace_roots,
+            vec!["/tmp/destination"]
+        );
+        let labels = || {
+            state.center_zone.with_untracked(|zone| {
+                zone.all_tabs()
+                    .map(|(_, tab)| tab.label.clone())
+                    .collect::<Vec<_>>()
+            })
+        };
+        assert!(
+            labels().contains(&"Destination overview".to_owned()),
+            "destination view was not restored"
+        );
+        assert!(!labels().contains(&"Source overview".to_owned()));
+        state.switch_active_project(Some(crate::state::ActiveProjectRef {
+            host_id: "h".to_owned(),
+            project_id: ProjectId("source".to_owned()),
+        }));
+        assert!(labels().contains(&"Source overview".to_owned()));
+        assert!(!state.center_zone.with_untracked(|zone| zone.all_tabs().any(|(_, tab)| matches!(&tab.content, TabContent::Chat { agent_ref: Some(agent), .. } if agent.agent_id.0 == "move-me"))));
+        state.switch_active_project(Some(crate::state::ActiveProjectRef {
+            host_id: "h".to_owned(),
+            project_id: ProjectId("destination".to_owned()),
+        }));
+        assert_eq!(
+            state.composer_untracked().text.get_untracked(),
+            "Keep this draft"
         );
     }
 

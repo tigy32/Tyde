@@ -162,6 +162,7 @@ pub enum HostEvent {
     TeamContextCompactionNotify(TeamContextCompactionNotifyPayload),
     WorkflowNotify(WorkflowNotifyPayload),
     WorkflowRunNotify(WorkflowRunNotifyPayload),
+    AgentMoveResult(protocol::types::AgentMoveResultPayload),
     AgentClosed(AgentClosedPayload),
     NewAgent(AgentEndpoint),
     NewTerminal(TerminalEndpoint),
@@ -278,6 +279,13 @@ impl HostCommands {
 
     pub async fn project_create(&self, payload: ProjectCreatePayload) -> Result<(), ClientError> {
         self.send(FrameKind::ProjectCreate, &payload).await
+    }
+
+    pub async fn move_agent(
+        &self,
+        payload: protocol::types::AgentMovePayload,
+    ) -> Result<(), ClientError> {
+        self.send(FrameKind::AgentMove, &payload).await
     }
 
     pub async fn project_rename(&self, payload: ProjectRenamePayload) -> Result<(), ClientError> {
@@ -1209,6 +1217,14 @@ async fn handle_host_envelope(
                 Err(_) => return false,
             };
             let _ = host_tx.send(HostEvent::CommandError(payload)).await;
+            true
+        }
+        FrameKind::AgentMoveResult => {
+            let payload = match envelope.parse_payload() {
+                Ok(payload) => payload,
+                Err(_) => return false,
+            };
+            let _ = host_tx.send(HostEvent::AgentMoveResult(payload)).await;
             true
         }
         FrameKind::AgentClosed => {

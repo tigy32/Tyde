@@ -3237,3 +3237,150 @@ async fn sha256_root_history_uses_repository_empty_tree() {
     assert_eq!(diff.files.len(), 1);
     assert_eq!(diff.files[0].relative_path, "root.txt");
 }
+
+#[tokio::test]
+async fn move_agent_preserves_conversation_and_persists_all_project_roots() {
+    let mut fixture = Fixture::new().await;
+    let origin = tempfile::tempdir().unwrap();
+    let target = tempfile::tempdir().unwrap();
+    let extra = tempfile::tempdir().unwrap();
+    let source = create_project_with_real_roots(
+        &mut fixture.client,
+        "Source",
+        vec![origin.path().to_str().unwrap().to_owned()],
+    )
+    .await;
+    let destination = create_project_with_real_roots(
+        &mut fixture.client,
+        "Destination",
+        vec![
+            target.path().to_str().unwrap().to_owned(),
+            extra.path().to_str().unwrap().to_owned(),
+        ],
+    )
+    .await;
+    let gate = server::backend::mock::MockGateHandle::new();
+    let reservation = fixture
+        .reserve_next_mock_launch(
+            "Moving agent",
+            server::backend::mock::MockScript::one(server::backend::mock::MockTurn::gated_text(
+                "Before moving",
+                &gate,
+            ))
+            .then(server::backend::mock::MockTurn::text(
+                "Continued after moving",
+            ))
+            .then(server::backend::mock::MockTurn::text(
+                "Continued after returning",
+            )),
+        )
+        .await;
+    let (agent, start) = fixture
+        .spawn_with(protocol::SpawnAgentPayload {
+            name: Some("Moving agent".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: Some(source.id.clone()),
+            params: protocol::SpawnAgentParams::New {
+                workspace_roots: project_roots(&source),
+                prompt: "Hello before moving".to_owned(),
+                images: None,
+                backend_kind: protocol::BackendKind::Claude,
+                launch_profile_id: None,
+                cost_hint: None,
+                access_mode: Default::default(),
+                session_settings: None,
+            },
+        })
+        .await;
+    drop(reservation);
+    gate.wait_until_entered().await;
+    fixture
+        .client
+        .move_agent(protocol::types::AgentMovePayload {
+            request_id: "busy".to_owned(),
+            agent_id: start.agent_id.clone(),
+            project_id: destination.id.clone(),
+        })
+        .await
+        .unwrap();
+    let busy = next_frame_matching_on(&mut fixture.client, "busy move rejection", |env| {
+        env.kind == FrameKind::AgentMoveResult
+    })
+    .await
+    .parse_payload::<protocol::types::AgentMoveResultPayload>()
+    .unwrap();
+    assert!(busy.result.unwrap_err().contains("finished"));
+    gate.release_one();
+    fixture
+        .next_chat_event_matching(&agent, "initial turn idle", |event| {
+            matches!(event, protocol::ChatEvent::TypingStatusChanged(false))
+        })
+        .await;
+    let mut observer = fixture.connect().await;
+    for (request_id, project_id, expected) in [
+        ("missing", ProjectId("missing-project".to_owned()), None),
+        (
+            "move",
+            destination.id.clone(),
+            Some(project_roots(&destination)),
+        ),
+        ("return", source.id.clone(), Some(project_roots(&source))),
+    ] {
+        fixture
+            .client
+            .move_agent(protocol::types::AgentMovePayload {
+                request_id: request_id.to_owned(),
+                agent_id: start.agent_id.clone(),
+                project_id: project_id.clone(),
+            })
+            .await
+            .unwrap();
+        let result = next_frame_matching_on(&mut fixture.client, "move result", |env| {
+            env.kind == FrameKind::AgentMoveResult
+        })
+        .await
+        .parse_payload::<protocol::types::AgentMoveResultPayload>()
+        .unwrap();
+        assert_eq!(result.request_id, request_id);
+        match expected {
+            None => assert!(result.result.is_err()),
+            Some(roots) => {
+                let moved = result.result.unwrap();
+                assert_eq!(moved.agent_id, start.agent_id);
+                assert_eq!(moved.session_id, start.session_id);
+                assert_eq!(moved.project_id, Some(project_id.clone()));
+                assert_eq!(moved.workspace_roots, roots);
+                let broadcast = next_frame_matching_on(&mut observer, "observer move", |env| {
+                    env.kind == FrameKind::AgentMoveResult
+                })
+                .await
+                .parse_payload::<protocol::types::AgentMoveResultPayload>()
+                .unwrap();
+                assert_eq!(broadcast.result.unwrap().project_id, Some(project_id));
+                let (_, persisted) = fixture.connect_fresh_host_with_bootstrap().await;
+                let saved = persisted
+                    .sessions
+                    .iter()
+                    .find(|session| Some(&session.id) == start.session_id.as_ref())
+                    .expect("moved session persisted");
+                assert_eq!(saved.workspace_roots, roots);
+                assert_eq!(saved.project_id, moved.project_id);
+                fixture
+                    .client
+                    .send_message(&agent.stream, "Continue the same chat".to_owned())
+                    .await
+                    .unwrap();
+                fixture.finish_turn(&agent).await;
+            }
+        }
+    }
+    let (_, bootstrap) = fixture.connect_fresh_host_with_bootstrap().await;
+    let session = bootstrap
+        .sessions
+        .iter()
+        .find(|session| Some(&session.id) == start.session_id.as_ref())
+        .expect("saved session after host restart");
+    assert_eq!(session.project_id, Some(source.id.clone()));
+    assert_eq!(session.workspace_roots, project_roots(&source));
+}

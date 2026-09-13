@@ -606,6 +606,20 @@ pub fn dispatch_envelope(state: &AppState, host: &LocalHostId, envelope: Envelop
                 error
             ),
         },
+        FrameKind::AgentMoveResult => {
+            if let Ok(payload) = envelope.parse_payload::<protocol::types::AgentMoveResultPayload>()
+                && let Ok(start) = payload.result
+            {
+                state.agents.update(|agents| {
+                    if let Some(agent) = agents.iter_mut().find(|agent| {
+                        agent.local_host_id == *host && agent.agent_id == start.agent_id
+                    }) {
+                        agent.project_id = start.project_id;
+                        agent.workspace_roots = start.workspace_roots;
+                    }
+                });
+            }
+        }
         FrameKind::AgentRenamed => {
             if let Ok(payload) = envelope.parse_payload::<AgentRenamedPayload>() {
                 let agent_ref = AgentRef {

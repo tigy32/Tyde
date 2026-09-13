@@ -6376,16 +6376,16 @@ fn MobileTab() -> impl IntoView {
 /// to it overflowed the wasm stack while constructing the page.
 #[component]
 fn MobileDirectSection() -> AnyView {
-    let state = expect_context::<AppState>();
+    let state = std::sync::Arc::new(expect_context::<AppState>());
     let state_for_direct_status = state.clone();
     let pairing_error: RwSignal<Option<String>> = RwSignal::new(None);
 
-    let direct_state_for_host = move || -> Option<MobileAccessStatePayload> {
+    let direct_state_for_host = Memo::new(move |_| -> Option<MobileAccessStatePayload> {
         let host_id = state_for_direct_status.selected_host_id.get()?;
         state_for_direct_status
             .mobile_access_state
             .with(|m| m.get(&host_id).cloned())
-    };
+    });
     let state_for_can_start = state.clone();
     let can_start_pairing = move || can_start_mobile_pairing(&state_for_can_start);
 
@@ -6401,7 +6401,9 @@ fn MobileDirectSection() -> AnyView {
     let state_for_direct_start = state.clone();
 
     let direct_status = move || -> Option<MobileDirectHostingStatus> {
-        direct_state_for_host().map(|state| state.direct_hosting)
+        direct_state_for_host
+            .get()
+            .map(|state| state.direct_hosting)
     };
     let direct_enabled_checked = move || {
         state_for_direct_checked
@@ -6616,7 +6618,13 @@ fn MobileDirectField(
     slug: &'static str,
     read: fn(&settings_model::HostSettings) -> Option<String>,
 ) -> AnyView {
-    let state = expect_context::<AppState>();
+    // Each input closure used to embed AppState, multiplying debug Wasm stack
+    // frames during into_owned until rendering trapped out of bounds.
+    let state = std::sync::Arc::new(expect_context::<AppState>());
+    log::debug!(
+        "Mobile direct field captures shared state; AppState bytes={}",
+        std::mem::size_of::<AppState>()
+    );
     let state_for_value = state.clone();
     let state_for_disabled = state.clone();
     let state_for_change = state.clone();

@@ -1277,6 +1277,7 @@ async fn agents_view_preferences_agent_groups_lifecycle_single_membership_and_pe
     )
     .await;
     let notify = expect_preferences_notify(&mut fixture.client, "move to second group").await;
+    eprintln!("Group move notification: {notify:?}");
     let second_group_id = notify
         .snapshot
         .groups

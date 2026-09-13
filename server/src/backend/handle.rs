@@ -8,6 +8,10 @@ pub(crate) type BackendHandle = Box<dyn BackendSender>;
 
 /// Type-erased backend handle for agent input and acknowledged settings edits.
 pub(crate) trait BackendSender: Send + Sync + 'static {
+    fn set_workspace_roots(
+        &mut self,
+        roots: Vec<String>,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + '_>>;
     fn compaction_capability(&self) -> crate::backend::BackendCompactionCapability;
     fn begin_compaction<'a>(
         &'a self,
@@ -40,6 +44,13 @@ pub(crate) trait BackendSender: Send + Sync + 'static {
 }
 
 impl<B: Backend> BackendSender for B {
+    fn set_workspace_roots(
+        &mut self,
+        roots: Vec<String>,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + '_>> {
+        Box::pin(Backend::set_workspace_roots(self, roots))
+    }
+
     fn compaction_capability(&self) -> crate::backend::BackendCompactionCapability {
         Backend::compaction_capability(self)
     }

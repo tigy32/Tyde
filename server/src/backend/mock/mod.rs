@@ -549,6 +549,18 @@ impl Backend for MockBackend {
         Ok(sessions)
     }
 
+    async fn set_workspace_roots(&mut self, roots: Vec<String>) -> Result<(), String> {
+        let roots = crate::backend::validate_local_workspace_roots(roots)?;
+        let mut store = session_store()
+            .lock()
+            .expect("mock backend session store mutex poisoned");
+        let record = store
+            .get_mut(&self.session_id.0)
+            .ok_or("mock session is missing")?;
+        record.workspace_roots = roots;
+        Ok(())
+    }
+
     fn session_id(&self) -> SessionId {
         self.session_id.clone()
     }

@@ -715,6 +715,7 @@ pub(crate) fn classify(kind: FrameKind) -> OutputLane {
         | FrameKind::BackendSetupRefresh
         | FrameKind::RunBackendSetup
         | FrameKind::ProjectCreate
+        | FrameKind::AgentMove
         | FrameKind::ProjectRename
         | FrameKind::ProjectReorder
         | FrameKind::ProjectAddRoot
@@ -794,6 +795,7 @@ pub(crate) fn classify(kind: FrameKind) -> OutputLane {
         | FrameKind::BackendSetup
         | FrameKind::NewAgent
         | FrameKind::AgentStart
+        | FrameKind::AgentMoveResult
         | FrameKind::AgentRenamed
         | FrameKind::AgentCompactNotify
         | FrameKind::ContextCompactionNotify

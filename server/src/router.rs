@@ -240,6 +240,11 @@ pub(crate) async fn route_client_envelope(
                 validate_project_roots(&payload.roots)?;
                 host.create_project(payload).await?;
             }
+            FrameKind::AgentMove => {
+                let payload: protocol::types::AgentMovePayload =
+                    parse_payload(&envelope, "agent_move")?;
+                host.move_agent(payload, host_output_stream).await?;
+            }
             FrameKind::ProjectRename => {
                 let payload: ProjectRenamePayload = parse_payload(&envelope, "project_rename")?;
                 ensure_non_empty("project_rename", "id", payload.id.0.as_str())?;

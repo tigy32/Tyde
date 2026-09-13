@@ -2162,10 +2162,17 @@ pub(crate) struct HostSubAgentEmitter {
     spawn_tx: HostSubAgentSpawnTx,
     capacity_tx: HostCapacityTx,
     parent_agent_id: AgentId,
-    workspace_roots: Vec<String>,
+    workspace_roots: std::sync::RwLock<Vec<String>>,
 }
 
 impl HostSubAgentEmitter {
+    pub(crate) fn set_workspace_roots(&self, roots: Vec<String>) {
+        *self
+            .workspace_roots
+            .write()
+            .expect("subagent workspace lock") = roots;
+    }
+
     pub(crate) fn new(
         spawn_tx: HostSubAgentSpawnTx,
         capacity_tx: HostCapacityTx,
@@ -2176,7 +2183,7 @@ impl HostSubAgentEmitter {
             spawn_tx,
             capacity_tx,
             parent_agent_id,
-            workspace_roots,
+            workspace_roots: std::sync::RwLock::new(workspace_roots),
         }
     }
 }
@@ -2217,7 +2224,11 @@ impl SubAgentEmitter for HostSubAgentEmitter {
             self.spawn_tx
                 .send(HostSubAgentSpawnRequest {
                     parent_agent_id: self.parent_agent_id.clone(),
-                    workspace_roots: self.workspace_roots.clone(),
+                    workspace_roots: self
+                        .workspace_roots
+                        .read()
+                        .expect("subagent workspace lock")
+                        .clone(),
                     tool_use_id,
                     name,
                     description,
@@ -4994,6 +5005,14 @@ impl HostHandle {
             if let Some(parent_agent_id) = request.parent_agent_id.as_ref() {
                 let parent = state.registry.agent_handle(parent_agent_id);
                 match parent {
+                    Some(handle) if handle.is_moving_project() => {
+                        return Err(AppError::conflict(
+                            "spawn_agent",
+                            format!(
+                                "cannot spawn a child of agent {parent_agent_id}: the agent is moving projects"
+                            ),
+                        ));
+                    }
                     Some(handle) if handle.is_closing() => {
                         return Err(AppError::conflict(
                             "spawn_agent",
@@ -5685,6 +5704,86 @@ impl HostHandle {
         self.update_workflow_watcher_targets_and_reload("project_create")
             .await?;
         Ok(())
+    }
+
+    pub(crate) async fn move_agent(
+        &self,
+        payload: protocol::types::AgentMovePayload,
+        output: &Stream,
+    ) -> AppResult<()> {
+        let result = self
+            .move_agent_to_project(&payload.agent_id, &payload.project_id)
+            .await;
+        let success = result.is_ok();
+        let response = protocol::types::AgentMoveResultPayload {
+            request_id: payload.request_id,
+            agent_id: payload.agent_id,
+            result,
+        };
+        let value = serde_json::to_value(response).map_err(|error| {
+            AppError::internal_message("agent_move", "serialize move result", error)
+        })?;
+        if success {
+            let mut state = self.state.lock().await;
+            for subscriber in state.host_streams.values_mut() {
+                let _ =
+                    emit_or_queue_host_frame(subscriber, FrameKind::AgentMoveResult, value.clone());
+            }
+        } else {
+            let _ = output.send_value(FrameKind::AgentMoveResult, value);
+        }
+        Ok(())
+    }
+
+    async fn move_agent_to_project(
+        &self,
+        agent_id: &AgentId,
+        project_id: &ProjectId,
+    ) -> Result<AgentStartPayload, String> {
+        let (handle, project) = {
+            let state = self.state.lock().await;
+            let handle = state
+                .registry
+                .agent_handle(agent_id)
+                .ok_or("This agent is no longer running")?;
+            let project = state
+                .project_store
+                .lock()
+                .await
+                .get(project_id)
+                .ok_or("Destination project no longer exists")?;
+            (handle, project)
+        };
+        let lock_id = match &project.source {
+            ProjectSource::GitWorkbench {
+                parent_project_id, ..
+            } => parent_project_id,
+            _ => project_id,
+        };
+        let lock = self.workbench_parent_lock(lock_id).await;
+        let _guard = lock.lock().await;
+        let roots = self
+            .resolve_spawn_workspace_roots(Some(project_id), &[])
+            .await?;
+        let roots = crate::backend::validate_local_workspace_roots(roots)?;
+        let start = handle.snapshot();
+        if !crate::backend::capabilities_for_backend_kind(start.backend_kind)
+            .contains(tyde_agent_adapter::BackendCapability::SetWorkspaceRoots)
+        {
+            return Err("This backend cannot move a running conversation".to_owned());
+        }
+        if start.team_id.is_some() || start.workflow.is_some() || start.parent_agent_id.is_some() {
+            return Err("Move a standalone agent; team, workflow, and child agents belong to their existing project".to_owned());
+        }
+        let _move_guard = {
+            let state = self.state.lock().await;
+            let guard = handle.reserve_project_move()?;
+            if state.registry.agent_subtree_post_order(agent_id).len() > 1 {
+                return Err("Close this agent's child agents before moving it".to_owned());
+            }
+            guard
+        };
+        handle.move_to_project(project_id.clone(), roots).await
     }
 
     pub(crate) async fn rename_project(&self, payload: ProjectRenamePayload) -> AppResult<()> {

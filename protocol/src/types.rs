@@ -1228,6 +1228,8 @@ pub enum FrameKind {
     BackendSetupRefresh,
     RunBackendSetup,
     ProjectCreate,
+    AgentMove,
+    AgentMoveResult,
     ProjectRename,
     ProjectReorder,
     ProjectAddRoot,
@@ -1429,6 +1431,8 @@ impl fmt::Display for FrameKind {
             Self::BackendSetupRefresh => f.write_str("backend_setup_refresh"),
             Self::RunBackendSetup => f.write_str("run_backend_setup"),
             Self::ProjectCreate => f.write_str("project_create"),
+            Self::AgentMove => f.write_str("agent_move"),
+            Self::AgentMoveResult => f.write_str("agent_move_result"),
             Self::ProjectRename => f.write_str("project_rename"),
             Self::ProjectReorder => f.write_str("project_reorder"),
             Self::ProjectAddRoot => f.write_str("project_add_root"),
@@ -4559,6 +4563,20 @@ pub struct AgentStartPayload {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workflow: Option<AgentWorkflowMetadata>,
     pub created_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentMovePayload {
+    pub request_id: String,
+    pub agent_id: AgentId,
+    pub project_id: ProjectId,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentMoveResultPayload {
+    pub request_id: String,
+    pub agent_id: AgentId,
+    pub result: Result<AgentStartPayload, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -229,7 +229,8 @@ This matches the existing session store pattern.
 `Backend::set_workspace_roots(&mut self, Vec<String>)` changes the execution
 workspace of an idle conversation without sending a prompt or replacing its
 session identity. It is a backend primitive, not a project-move protocol event:
-the server and frontend do not yet expose it as a move action.
+the desktop frontend exposes it through **Move to project…** in an agent's
+actions menu and expanded card.
 
 The first root is the default working directory. Unsupported root sets are
 rejected rather than truncated. Callers must serialize relocation with other
@@ -304,9 +305,17 @@ That directory must contain `.claude.json` and a `tyde-conformance-fixture`
 marker. The shared setup trusts only its newly created fixture roots in that
 isolated config; it never changes the user's normal project trust settings.
 
-A later server operation must coordinate project assignment, persistent roots,
-project-scoped steering, skills, MCP configuration, and client notifications.
-This primitive leaves Tyde's project configuration unchanged. Persist roots
-only after provider acknowledgement. A transport failure or mismatched reply
+The host `AgentMove` operation resolves every destination project root and
+serializes relocation through the agent actor. It rejects active turns,
+queued work, compaction, background work, and team/workflow/child ownership.
+It persists roots and project assignment after provider acknowledgement and
+broadcasts `AgentMoveResult` to connected host clients. Existing chat tabs,
+messages, and drafts retain their identity. The live agent keeps its current
+instructions, skills, MCP tools, and settings; moving is not a customization
+reload. Opening a saved conversation follows normal project configuration
+resolution. Native directory-specific instructions follow backend behavior.
+If relocation or persistence fails, the actor attempts to restore its prior
+roots. An unreconciled provider is closed before accepting further input.
+Persist roots only after provider acknowledgement. A transport failure or mismatched reply
 can leave the provider state uncertain; it is not proof of rollback, and must
 be reconciled before continuing the conversation.

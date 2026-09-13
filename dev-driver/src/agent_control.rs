@@ -1132,6 +1132,16 @@ fn apply_envelope(snapshot: &mut SnapshotState, envelope: &protocol::Envelope) {
                 );
             }
         }
+        FrameKind::AgentMoveResult => {
+            let payload: protocol::types::AgentMoveResultPayload =
+                envelope.parse_payload().expect("validated move result");
+            if let Ok(start) = payload.result
+                && let Some(agent) = snapshot.agents.get_mut(&start.agent_id)
+            {
+                agent.project_id = start.project_id;
+                agent.workspace_roots = start.workspace_roots;
+            }
+        }
         FrameKind::AgentRenamed => {
             let payload: AgentRenamedPayload = envelope
                 .parse_payload()

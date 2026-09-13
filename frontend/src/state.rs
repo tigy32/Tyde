@@ -3515,6 +3515,7 @@ pub struct AppState {
     pub connection_statuses: RwSignal<HashMap<String, ConnectionStatus>>,
     pub host_lifecycle_statuses: RwSignal<HashMap<String, RemoteHostLifecycleStatus>>,
     pub command_errors_by_host: RwSignal<HashMap<String, String>>,
+    pub agent_move_result: RwSignal<Option<(String, protocol::types::AgentMoveResultPayload)>>,
     pub command_errors_by_request: RwSignal<HashMap<String, String>>,
     pub native_voice_supported: RwSignal<bool>,
     pub voice_capabilities_by_host: RwSignal<HashMap<String, protocol::VoiceCapabilitiesPayload>>,
@@ -4121,6 +4122,7 @@ impl AppState {
             connection_statuses: RwSignal::new(HashMap::new()),
             host_lifecycle_statuses: RwSignal::new(HashMap::new()),
             command_errors_by_host: RwSignal::new(HashMap::new()),
+            agent_move_result: RwSignal::new(None),
             command_errors_by_request: RwSignal::new(HashMap::new()),
             native_voice_supported: RwSignal::new(true),
             voice_capabilities_by_host: RwSignal::new(HashMap::new()),
@@ -6207,6 +6209,41 @@ impl AppState {
         // show, so it outranks any restore still in flight.
         self.retire_pending_restores();
         self.apply_active_project(next);
+    }
+
+    pub(crate) fn follow_moved_agent_project(&self, next: Option<ActiveProjectRef>) {
+        if self.active_project.get_untracked() == next {
+            return;
+        }
+        let chat = self.center_zone.with_untracked(|zone| {
+            let (_, tab_id) = zone.composer_owner()?;
+            zone.tab(tab_id).cloned()
+        });
+        self.switch_active_project(next);
+        let Some(chat) = chat else { return };
+        let remove_chat = |zone: &mut CenterZoneState| {
+            let doomed = zone
+                .all_tabs()
+                .filter(|(_, tab)| tab.content == chat.content)
+                .map(|(_, tab)| tab.id)
+                .collect();
+            zone.remove_tabs(&doomed);
+        };
+        self.project_view_memory.update(|memories| {
+            for memory in memories.values_mut() {
+                if let Some(zone) = &mut memory.center_zone {
+                    remove_chat(zone);
+                }
+            }
+        });
+        self.center_zone.update(|zone| {
+            remove_chat(zone);
+            if let Some(pane) = zone.pane_mut(zone.focused_id()) {
+                pane.tabs.push(chat.clone());
+                pane.active_tab_id = Some(chat.id);
+            }
+        });
+        self.bump_tab_lru(chat.id);
     }
 
     /// Activate a project as part of restoring a reload, **without** retiring

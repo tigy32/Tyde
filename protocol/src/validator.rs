@@ -824,6 +824,16 @@ impl ProtocolValidator {
             FrameKind::ProjectCreate => {
                 parse_host_payload::<ProjectCreatePayload>(self, envelope, "ProjectCreate")
             }
+            FrameKind::AgentMove => {
+                parse_host_payload::<crate::types::AgentMovePayload>(self, envelope, "AgentMove")
+            }
+            FrameKind::AgentMoveResult => {
+                parse_host_payload::<crate::types::AgentMoveResultPayload>(
+                    self,
+                    envelope,
+                    "AgentMoveResult",
+                )
+            }
             FrameKind::ProjectRename => {
                 parse_host_payload::<ProjectRenamePayload>(self, envelope, "ProjectRename")
             }
