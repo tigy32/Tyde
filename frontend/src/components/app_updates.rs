@@ -108,12 +108,20 @@ fn busy(state: &AppState) -> bool {
             .with(|value| value.as_ref().is_some_and(|status| status.phase.busy()))
 }
 
+fn channel_label(channel: UpdateChannel) -> &'static str {
+    match channel {
+        UpdateChannel::Release => "Release",
+        UpdateChannel::Preview => "Preview",
+    }
+}
+
 fn status_text(status: &AppUpdateStatus) -> String {
     match status.phase {
-        UpdatePhase::Idle if status.last_checked.is_some() => {
-            "You’re up to date on this channel.".into()
-        }
-        UpdatePhase::Idle => "Ready to check for updates.".into(),
+        UpdatePhase::Idle if status.last_checked.is_some() => format!(
+            "Up to date on the {} channel.",
+            channel_label(status.preferences.channel)
+        ),
+        UpdatePhase::Idle => "Not checked for updates yet.".into(),
         UpdatePhase::Checking => "Checking for updates…".into(),
         UpdatePhase::Available => format!(
             "Tyde {} is available.",
@@ -131,8 +139,8 @@ fn status_text(status: &AppUpdateStatus) -> String {
             ),
             None => format!("Downloading update… {} MB", status.downloaded / 1_000_000),
         },
-        UpdatePhase::Installing => "Installing update and restarting Tyde…".into(),
-        UpdatePhase::Error => "The update could not be completed. You can try again.".into(),
+        UpdatePhase::Installing => "Installing the update and restarting Tyde…".into(),
+        UpdatePhase::Error => "The update did not finish. You can try again.".into(),
     }
 }
 
@@ -147,13 +155,49 @@ pub fn UpdatesSettings() -> impl IntoView {
     let automatic_state = state.clone();
     let check_state = state.clone();
     let install_state = state.clone();
+    let alert = Signal::derive(move || {
+        error
+            .get()
+            .or_else(|| status.with(|value| value.as_ref().and_then(|value| value.error.clone())))
+    });
     view! {
         <h2 class="settings-panel-title">"Updates"</h2>
-        {move || status.get().map(|status| format!("Installed version: {}", status.current_version))}
-        <p>"Release includes stable versions. Preview also includes beta and other preview versions. Switching channels never installs an older version."</p>
+
+        <p class="settings-description settings-panel-intro">
+            "Tyde updates itself in place from its signed release repository. It only tells you when a newer version exists — nothing downloads or installs until you approve it."
+        </p>
+
         <div class="settings-field">
-            <label for="app-update-channel">"Update channel"</label>
-            <select id="app-update-channel" disabled=move || disabled.get() || status.get().is_none()
+            <div class="app-update-card">
+                <div class="app-update-card-info">
+                    <span class="settings-label">"Installed version"</span>
+                    <span class="app-update-version">
+                        {move || status.get().map(|status| status.current_version).unwrap_or_else(|| "Unknown".into())}
+                    </span>
+                    <p class="settings-description app-update-state" role="status">
+                        {move || status.with(|value| value.as_ref().map(status_text).unwrap_or_else(|| "In-place updates are available in the desktop app.".into()))}
+                    </p>
+                </div>
+                <div class="app-update-card-actions">
+                    <button class="settings-btn" disabled=move || disabled.get() || status.get().is_none()
+                        on:click=move |_| command(check_state.clone(), "plugin:app-updates|check_now", serde_json::json!({}))>"Check for updates"</button>
+                    <Show when=move || status.with(|value| value.as_ref().is_some_and(|value| value.version.is_some()))>
+                        <button class="settings-btn settings-btn-primary" disabled=move || disabled.get()
+                            on:click={let install_state = install_state.clone(); move |_| {
+                                install_state.app_update_status.update(|value| { if let Some(value) = value { value.prompt = true; } });
+                            }}>"Review update"</button>
+                    </Show>
+                </div>
+            </div>
+            <Show when=move || alert.get().is_some()>
+                <p class="app-update-error" role="alert">{move || alert.get()}</p>
+            </Show>
+        </div>
+
+        <div class="settings-field">
+            <label class="settings-label" for="app-update-channel">"Update channel"</label>
+            <p class="settings-description">"Release offers stable versions only. Preview also offers betas and other prereleases — newer, but less tested. Switching channels never installs a version older than the one you have."</p>
+            <select id="app-update-channel" class="settings-select" disabled=move || disabled.get() || status.get().is_none()
                 prop:value=move || status.with(|value| match value.as_ref().map(|value| value.preferences.channel) {
                     Some(UpdateChannel::Preview) => "preview", _ => "release",
                 })
@@ -166,29 +210,25 @@ pub fn UpdatesSettings() -> impl IntoView {
                 <option value="preview">"Preview"</option>
             </select>
         </div>
+
         <div class="settings-field">
-            <label>
-                <input type="checkbox" disabled=move || disabled.get() || status.get().is_none()
-                    prop:checked=move || status.with(|value| value.as_ref().is_some_and(|value| value.preferences.automatic))
-                    on:change=move |event| {
-                        let automatic = event_target_checked(&event);
-                        let channel = status.with_untracked(|value| value.as_ref().map(|value| value.preferences.channel).unwrap_or(UpdateChannel::Release));
-                        command(automatic_state.clone(), "plugin:app-updates|configure", serde_json::json!({"channel": channel, "automatic": automatic}));
-                    }/>
-                " Automatically check for updates"
-            </label>
-            <p>"Checks at startup, every six hours, and when a server reports a newer version. Downloads only start after you choose Yes."</p>
+            <div class="settings-toggle-row">
+                <div>
+                    <label class="settings-label" for="app-update-automatic">"Check for updates automatically"</label>
+                    <p class="settings-description">"Looks for a newer version at startup, every six hours, and whenever a connected server reports one. You are only notified; the download still waits for your approval."</p>
+                </div>
+                <label class="settings-toggle">
+                    <input id="app-update-automatic" type="checkbox" disabled=move || disabled.get() || status.get().is_none()
+                        prop:checked=move || status.with(|value| value.as_ref().is_some_and(|value| value.preferences.automatic))
+                        on:change=move |event| {
+                            let automatic = event_target_checked(&event);
+                            let channel = status.with_untracked(|value| value.as_ref().map(|value| value.preferences.channel).unwrap_or(UpdateChannel::Release));
+                            command(automatic_state.clone(), "plugin:app-updates|configure", serde_json::json!({"channel": channel, "automatic": automatic}));
+                        }/>
+                    <span class="settings-toggle-slider"></span>
+                </label>
+            </div>
         </div>
-        <p role="status">{move || status.with(|value| value.as_ref().map(status_text).unwrap_or_else(|| "In-place updates are available in the desktop app.".into()))}</p>
-        <p role="alert">{move || error.get().or_else(|| status.with(|value| value.as_ref().and_then(|value| value.error.clone())))}</p>
-        <button class="settings-btn" disabled=move || disabled.get() || status.get().is_none()
-            on:click=move |_| command(check_state.clone(), "plugin:app-updates|check_now", serde_json::json!({}))>"Check for updates"</button>
-        <Show when=move || status.with(|value| value.as_ref().is_some_and(|value| value.version.is_some()))>
-            <button class="settings-btn" disabled=move || disabled.get()
-                on:click={let install_state = install_state.clone(); move |_| {
-                    install_state.app_update_status.update(|value| { if let Some(value) = value { value.prompt = true; } });
-                }}>"Review update"</button>
-        </Show>
     }
 }
 
@@ -358,7 +398,17 @@ mod wasm_tests {
             container
                 .text_content()
                 .unwrap()
-                .contains("Installed version: 1.0.0")
+                .contains("Installed version")
+        );
+        assert_eq!(
+            container
+                .query_selector(".app-update-version")
+                .unwrap()
+                .unwrap()
+                .text_content()
+                .unwrap()
+                .trim(),
+            "1.0.0"
         );
         assert!(container.query_selector("aside").unwrap().is_none());
 

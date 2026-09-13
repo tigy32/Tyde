@@ -15213,6 +15213,51 @@ pre.tool-error-pre {
     }
 }
 
+.app-update-card {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: var(--space-4);
+    padding: var(--space-4);
+    background: var(--surface-2);
+    border: 1px solid var(--border-primary);
+    border-radius: 8px;
+}
+
+.app-update-card-info {
+    min-width: 0;
+}
+
+.app-update-card-info .settings-label {
+    margin-bottom: 0;
+}
+
+.app-update-version {
+    display: block;
+    font-family: var(--font-mono);
+    font-size: 1.077rem;
+    color: var(--text-bright);
+    overflow-wrap: anywhere;
+}
+
+.app-update-card-info .app-update-state {
+    margin: var(--space-2) 0 0;
+}
+
+.app-update-card-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-2);
+}
+
+.app-update-error {
+    margin-top: var(--space-2);
+    font-size: 0.923rem;
+    line-height: 1.4;
+    color: var(--error);
+}
+
 .app-update-prompt {
     position: fixed;
     right: 20px;
