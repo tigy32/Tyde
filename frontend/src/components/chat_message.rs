@@ -1,7 +1,10 @@
+use std::sync::Arc;
+
 use leptos::prelude::*;
 use protocol::MessageSender;
 use wasm_bindgen::JsCast;
 
+use crate::components::image_lightbox::ImageLightbox;
 use crate::components::tool_card::ToolCardListView;
 use crate::markdown::render_markdown;
 use crate::state::{ActiveAgentRef, ChatMessageEntry, ToolRequestEntry};
@@ -163,27 +166,30 @@ pub(crate) fn interleave_message(
 
 /// Attached images, rendered in the slot [`interleave_message`] chose for them.
 fn render_message_images(images: Vec<protocol::ImageData>) -> impl IntoView {
+    let sources: Arc<[String]> = images
+        .iter()
+        .map(|img| format!("data:{};base64,{}", img.media_type, img.data))
+        .collect();
+    let current = RwSignal::new(None::<usize>);
+    let is_open = Memo::new(move |_| current.get().is_some());
+    let lightbox_sources = sources.clone();
     view! {
         <div class="chat-card-images">
-            {images.into_iter().map(|img| {
-                let src = format!("data:{};base64,{}", img.media_type, img.data);
-                let href = matches!(
-                    img.media_type.as_str(),
-                    "image/png" | "image/jpeg" | "image/jpg" | "image/gif" | "image/webp"
-                )
-                .then(|| src.clone());
+            {sources.iter().cloned().enumerate().map(|(index, src)| {
                 view! {
-                    <a
-                        class="chat-card-image-link"
-                        href=href
-                        target="_blank"
-                        rel="noopener"
+                    <button
+                        type="button"
+                        class="chat-card-image-button"
                         aria-label="Open image full size"
+                        on:click=move |_| current.set(Some(index))
                     >
                         <img class="chat-card-image" src=src alt="Chat image" loading="lazy" />
-                    </a>
+                    </button>
                 }
             }).collect::<Vec<_>>()}
+            <Show when=move || is_open.get()>
+                <ImageLightbox sources=lightbox_sources.clone() current=current />
+            </Show>
         </div>
     }
 }
@@ -1114,19 +1120,27 @@ mod wasm_tests {
     }
 
     fn mount_message(entry: ChatMessageEntry) -> HtmlElement {
+        mount_message_with_state(entry).0
+    }
+
+    fn mount_message_with_state(entry: ChatMessageEntry) -> (HtmlElement, AppState) {
         let container = make_container();
+        let mounted_state = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let slot = mounted_state.clone();
         // Leak the mount handle so the component stays mounted after this
         // helper returns; dropping it would unmount and clear the container.
         mount_to(container.clone(), move || {
             let state = AppState::new();
-            provide_context(state);
+            provide_context(state.clone());
+            slot.borrow_mut().replace(state);
             let agent_ref: Signal<Option<crate::state::ActiveAgentRef>> =
                 RwSignal::new(None).into();
             let entry = ArcRwSignal::new(entry.clone());
             view! { <ChatMessageView agent_ref=agent_ref entry=entry /> }
         })
         .forget();
-        container
+        let state = mounted_state.borrow_mut().take().expect("mount ran");
+        (container, state)
     }
 
     #[wasm_bindgen_test]
@@ -1301,7 +1315,7 @@ mod wasm_tests {
         );
         assert_eq!(
             container
-                .query_selector(".chat-card-image-link")
+                .query_selector(".chat-card-images button")
                 .unwrap()
                 .and_then(|el| el.get_attribute("aria-label"))
                 .as_deref(),
@@ -1434,31 +1448,207 @@ mod wasm_tests {
             .collect()
     }
 
+    fn svg_image(width: u32, height: u32, fill: &str) -> protocol::ImageData {
+        let svg = format!(
+            "<svg xmlns='http://www.w3.org/2000/svg' width='{width}' height='{height}'>\
+             <rect width='100%' height='100%' fill='{fill}'/></svg>"
+        );
+        protocol::ImageData {
+            media_type: "image/svg+xml".to_owned(),
+            data: web_sys::window().unwrap().btoa(&svg).unwrap(),
+        }
+    }
+
+    async fn decoded(image: &web_sys::Element) -> web_sys::DomRect {
+        let image: web_sys::HtmlImageElement = image.clone().dyn_into().unwrap();
+        wasm_bindgen_futures::JsFuture::from(image.decode())
+            .await
+            .expect("image decodes");
+        image.get_bounding_client_rect()
+    }
+
+    fn image_viewer() -> Option<web_sys::Element> {
+        web_sys::window()
+            .unwrap()
+            .document()
+            .unwrap()
+            .query_selector("[role='dialog'][aria-label='Image viewer']")
+            .unwrap()
+    }
+
+    fn active_element() -> Option<web_sys::Element> {
+        web_sys::window()
+            .unwrap()
+            .document()
+            .unwrap()
+            .active_element()
+    }
+
+    fn press(target: &web_sys::Element, key: &str) {
+        let init = web_sys::KeyboardEventInit::new();
+        init.set_key(key);
+        init.set_bubbles(true);
+        init.set_cancelable(true);
+        let event =
+            web_sys::KeyboardEvent::new_with_keyboard_event_init_dict("keydown", &init).unwrap();
+        target.dispatch_event(&event).unwrap();
+    }
+
+    /// Clearing the app's global listeners on drop keeps a failed assertion
+    /// from leaking a keydown handler into every later test in the binary.
+    struct GlobalListeners;
+
+    impl GlobalListeners {
+        fn install(state: &AppState) -> Self {
+            crate::app::clear_app_listeners();
+            crate::app::install_keydown_listener(
+                state.clone(),
+                crate::components::center_zone::workspace_width(),
+            );
+            Self
+        }
+    }
+
+    impl Drop for GlobalListeners {
+        fn drop(&mut self) {
+            crate::app::clear_app_listeners();
+        }
+    }
+
+    /// Generated images stay small in the transcript; activating one blows it
+    /// up over the whole window, the arrow keys step through the message's
+    /// other images, and Escape dismisses only the viewer — not Settings or
+    /// anything else the app's global Escape would close — returning focus to
+    /// the thumbnail.
     #[wasm_bindgen_test]
-    async fn assistant_generated_image_renders_as_full_size_link() {
+    async fn generated_images_open_in_a_full_window_viewer() {
+        ensure_styles_loaded();
         let mut entry = assistant_msg(None);
         entry.message.content.clear();
-        entry.message.images = Some(vec![protocol::ImageData {
-            media_type: "image/png".to_owned(),
-            data: "iVBORw0KGgo=".to_owned(),
-        }]);
-        let container = mount_message(entry);
+        entry.message.images = Some(vec![
+            svg_image(1600, 1000, "#c33"),
+            svg_image(1000, 1000, "#3c3"),
+        ]);
+        let (container, state) = mount_message_with_state(entry);
+        state.settings_open.set(true);
+        let _listeners = GlobalListeners::install(&state);
         next_tick().await;
 
-        let link = container
-            .query_selector(".chat-card-image-link")
+        let thumbnails = container
+            .query_selector_all("button[aria-label='Open image full size']")
+            .unwrap();
+        assert_eq!(thumbnails.length(), 2, "each image is its own control");
+        let first: HtmlElement = thumbnails.item(0).unwrap().dyn_into().unwrap();
+        let first_image = first.query_selector("img").unwrap().unwrap();
+        let second_image = thumbnails
+            .item(1)
             .unwrap()
-            .expect("generated image has a full-size link");
-        assert_eq!(link.get_attribute("target").as_deref(), Some("_blank"));
-        let image = container
-            .query_selector(".chat-card-image")
+            .dyn_into::<web_sys::Element>()
             .unwrap()
-            .expect("generated image renders inline");
+            .query_selector("img")
+            .unwrap()
+            .unwrap();
+        let thumbnail_rect = decoded(&first_image).await;
         assert!(
-            image
-                .get_attribute("src")
-                .is_some_and(|src| src.starts_with("data:image/png;base64,"))
+            thumbnail_rect.width() <= 200.0 && thumbnail_rect.height() <= 200.0,
+            "the transcript keeps a small preview, got {}x{}",
+            thumbnail_rect.width(),
+            thumbnail_rect.height()
         );
+        assert!(image_viewer().is_none(), "nothing is blown up until asked");
+
+        first.focus().unwrap();
+        first.click();
+        next_tick().await;
+
+        let viewer = image_viewer().expect("activating the thumbnail opens the viewer");
+        assert!(
+            active_element().is_some_and(|el| el.is_same_node(Some(&viewer))),
+            "focus moves into the viewer so its keys work without another click"
+        );
+        let root = web_sys::window()
+            .unwrap()
+            .document()
+            .unwrap()
+            .document_element()
+            .unwrap();
+        let viewport_width = f64::from(root.client_width());
+        let viewport_height = f64::from(root.client_height());
+        let viewer_rect = viewer.get_bounding_client_rect();
+        assert_eq!(
+            (viewer_rect.width(), viewer_rect.height()),
+            (viewport_width, viewport_height),
+            "the viewer covers the whole window, not the transcript column"
+        );
+        let large_image = viewer.query_selector("img").unwrap().unwrap();
+        assert_eq!(
+            large_image.get_attribute("src"),
+            first_image.get_attribute("src"),
+            "the viewer shows the image that was activated"
+        );
+        let large_rect = decoded(&large_image).await;
+        assert!(
+            large_rect.width() > thumbnail_rect.width() * 2.0,
+            "the image is blown up well past its preview: {} vs {}",
+            large_rect.width(),
+            thumbnail_rect.width()
+        );
+        assert!(
+            large_rect.left() >= 0.0
+                && large_rect.top() >= 0.0
+                && large_rect.right() <= viewport_width
+                && large_rect.bottom() <= viewport_height,
+            "the whole image fits on screen, got {:?}",
+            (
+                large_rect.left(),
+                large_rect.top(),
+                large_rect.right(),
+                large_rect.bottom()
+            )
+        );
+        assert!(
+            viewer.text_content().unwrap_or_default().contains("1 / 2"),
+            "a multi-image message says where in the set the viewer is"
+        );
+
+        press(&viewer, "ArrowRight");
+        next_tick().await;
+        assert_eq!(
+            large_image.get_attribute("src"),
+            second_image.get_attribute("src"),
+            "ArrowRight steps to the next image in the message"
+        );
+        assert!(viewer.text_content().unwrap_or_default().contains("2 / 2"));
+        press(&viewer, "ArrowRight");
+        next_tick().await;
+        assert_eq!(
+            large_image.get_attribute("src"),
+            second_image.get_attribute("src"),
+            "stepping stops at the last image"
+        );
+
+        let focused = active_element().expect("focus stays inside the viewer");
+        press(&focused, "Escape");
+        next_tick().await;
+        assert!(image_viewer().is_none(), "Escape closes the viewer");
+        assert!(
+            state.settings_open.get_untracked(),
+            "the same Escape must not also dismiss the layer underneath"
+        );
+        assert!(
+            active_element().is_some_and(|el| el.is_same_node(Some(&first))),
+            "focus returns to the thumbnail that opened the viewer"
+        );
+
+        first.click();
+        next_tick().await;
+        image_viewer()
+            .expect("the viewer reopens")
+            .dyn_into::<HtmlElement>()
+            .unwrap()
+            .click();
+        next_tick().await;
+        assert!(image_viewer().is_none(), "clicking the backdrop closes it");
     }
 
     fn badge_title(container: &HtmlElement) -> Option<String> {

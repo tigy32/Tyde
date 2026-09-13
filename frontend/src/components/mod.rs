@@ -22,6 +22,7 @@ pub mod hermes_settings;
 pub mod home_view;
 pub mod host_browser;
 pub mod hover_popover;
+pub mod image_lightbox;
 pub mod inflight_tray;
 pub mod inline_review;
 pub mod launch_menu;
