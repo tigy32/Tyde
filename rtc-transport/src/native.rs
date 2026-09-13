@@ -1,18 +1,19 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::tls_runtime::TlsRuntime;
 use bytes::BytesMut;
 use futures_util::StreamExt;
 use futures_util::future::Abortable;
 use protocol::types::{MOBILE_RTC_CHANNEL_ID, MOBILE_RTC_CHANNEL_LABEL, MobileIceServer};
 use tokio::sync::watch;
+use tokio_rustls::rustls::RootCertStore;
 use webrtc::data_channel::{DataChannel, DataChannelEvent, RTCDataChannelInit};
 use webrtc::peer_connection::{
     PeerConnection, PeerConnectionBuilder, PeerConnectionEventHandler, RTCConfigurationBuilder,
     RTCIceGatheringState, RTCIceServer, RTCIceTransportPolicy, RTCPeerConnectionState,
     RTCSessionDescription,
 };
-use webrtc::runtime::TokioRuntime;
 
 use crate::{
     BUFFER_BYTES, CHUNK_BYTES, Error, RtcStream, StreamEndpoint, WINDOW_CHUNKS, failure,
@@ -41,8 +42,13 @@ impl PeerConnectionEventHandler for Handler {
                 | RTCPeerConnectionState::Closed
                 | RTCPeerConnectionState::Disconnected
         ) {
-            self.failure
-                .send_replace(Some(format!("WebRTC connection entered {state}")));
+            self.failure.send_if_modified(|reason| {
+                if reason.is_some() {
+                    return false;
+                }
+                *reason = Some(format!("WebRTC connection entered {state}"));
+                true
+            });
         }
     }
 }
@@ -56,18 +62,29 @@ pub struct Peer {
 
 impl Peer {
     pub async fn new(servers: &[MobileIceServer]) -> Result<Self, Error> {
+        Self::with_tls_roots(
+            servers,
+            RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned()),
+        )
+        .await
+    }
+
+    pub async fn with_tls_roots(
+        servers: &[MobileIceServer],
+        roots: RootCertStore,
+    ) -> Result<Self, Error> {
         if servers.is_empty() {
             return Err(failure("configuration", "TURN credentials are required"));
         }
         if servers.iter().any(|server| {
             server.urls.is_empty()
                 || server.urls.iter().any(|url| {
-                    !url.as_str().starts_with("turn:") || !url.as_str().ends_with("?transport=udp")
+                    !url.as_str().starts_with("turns:") || !url.as_str().ends_with("?transport=tcp")
                 })
         }) {
             return Err(failure(
                 "configuration",
-                "native TURN requires explicitly configured UDP relay URLs",
+                "native TURN requires explicitly configured TLS relay URLs",
             ));
         }
         let ice_servers = servers
@@ -80,6 +97,7 @@ impl Peer {
             .collect();
         let (gathered_tx, gathered) = watch::channel(false);
         let (failure_tx, failure_rx) = watch::channel(None);
+        let runtime = Arc::new(TlsRuntime::new(roots, failure_tx.clone())?);
         let connection = PeerConnectionBuilder::new()
             .with_configuration(
                 RTCConfigurationBuilder::new()
@@ -91,8 +109,8 @@ impl Peer {
                 gathered: gathered_tx,
                 failure: failure_tx,
             }))
-            .with_runtime(Arc::new(TokioRuntime))
-            .with_udp_addrs(vec!["0.0.0.0:0"])
+            .with_runtime(runtime)
+            .with_udp_addrs(Vec::<std::net::SocketAddr>::new())
             .with_data_channel_send_buffer_limit(BUFFER_BYTES)
             .build()
             .await
@@ -161,13 +179,21 @@ impl Peer {
             .set_local_description(description)
             .await
             .map_err(|error| failure("apply local description", error))?;
-        tokio::time::timeout(
-            Duration::from_secs(20),
-            self.gathered.wait_for(|complete| *complete),
-        )
-        .await
-        .map_err(|error| failure("gather TURN candidates", error))?
-        .map_err(|error| failure("gather TURN candidates", error))?;
+        let gather = async {
+            tokio::select! {
+                result = self.gathered.wait_for(|complete| *complete) => {
+                    result.map_err(|error| failure("gather TURN candidates", error))?;
+                    Ok(())
+                }
+                result = self.failure.wait_for(|reason| reason.is_some()) => {
+                    let reason = result.map_err(|error| failure("gather TURN candidates", error))?;
+                    Err(failure("gather TURN candidates", reason.as_deref().ok_or_else(|| failure("gather TURN candidates", "failure reason missing"))?))
+                }
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(20), gather)
+            .await
+            .map_err(|error| failure("gather TURN candidates", error))??;
         let description = self
             .connection
             .local_description()

@@ -5,15 +5,17 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use protocol::{MobileIceServer, MobileRtcDescription, MobileSdpKind};
+use protocol::{MobileRtcDescription, MobileSdpKind};
 use rtc_transport::{Peer, authenticate_description, verify_description};
+use std::sync::Arc;
+use tests::rtc::RelayFixture;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 async fn offer(
-    State(ice): State<MobileIceServer>,
+    State(relay): State<Arc<RelayFixture>>,
     Json(description): Json<MobileRtcDescription>,
 ) -> Response {
-    match answer(ice, description).await {
+    match answer(relay, description).await {
         Ok(answer) => Json(answer).into_response(),
         Err(error) => {
             eprintln!("browser TURN fixture failed: {error}");
@@ -23,12 +25,13 @@ async fn offer(
 }
 
 async fn answer(
-    ice: MobileIceServer,
+    relay: Arc<RelayFixture>,
     description: MobileRtcDescription,
 ) -> Result<MobileRtcDescription, rtc_transport::Error> {
     let session = description.session_id.clone();
     verify_description(&description, &session, MobileSdpKind::Offer, &[53; 32])?;
-    let mut peer = Peer::new(&[ice]).await?;
+    let mut peer =
+        Peer::with_tls_roots(std::slice::from_ref(&relay.tls_ice), relay.roots.clone()).await?;
     let answer = peer.answer(description.sdp).await?;
     let signed = authenticate_description(session, MobileSdpKind::Answer, answer, &[53; 32])?;
     tokio::spawn(async move {
@@ -64,13 +67,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ready_path = std::env::args()
         .nth(1)
         .ok_or("expected readiness file argument")?;
-    let (relay, ice) = tests::rtc::relay().await;
+    let relay = Arc::new(tests::rtc::relay().await);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
     let app = Router::new()
         .route(
             "/ice",
-            get(|State(ice): State<MobileIceServer>| async { Json(vec![ice]) }),
+            get(|State(relay): State<Arc<RelayFixture>>| async move {
+                Json(vec![relay.browser_ice.clone()])
+            }),
         )
         .route(
             "/offer",
@@ -93,9 +98,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 response
             },
         ))
-        .with_state(ice);
+        .with_state(relay.clone());
     std::fs::write(ready_path, format!("http://{address}"))?;
     axum::serve(listener, app).await?;
-    relay.close().await?;
+    relay.close().await;
     Ok(())
 }

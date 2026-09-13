@@ -11,7 +11,7 @@ use rtc::peer_connection::transport::{
     CandidateConfig, CandidateHostConfig, RTCIceCandidate, RTCIceCandidateInit,
 };
 use rtc::shared::FourTuple;
-use rtc::shared::error::Result;
+use rtc::shared::error::{Error, Result};
 use rtc::shared::tcp_framing::{TcpFrameDecoder, frame_packet};
 use rtc::shared::{TaggedBytesMut, TransportContext, TransportProtocol};
 use std::collections::HashMap;
@@ -29,10 +29,45 @@ pub(crate) type TcpAcceptResult = (
     io::Result<(Arc<dyn AsyncTcpStream>, SocketAddr)>,
 );
 
+enum FrameDecoder {
+    Ice(TcpFrameDecoder),
+    Turn(BytesMut),
+}
+
+impl FrameDecoder {
+    fn extend_from_slice(&mut self, bytes: &[u8]) {
+        match self {
+            Self::Ice(decoder) => decoder.extend_from_slice(bytes),
+            Self::Turn(buffer) => buffer.extend_from_slice(bytes),
+        }
+    }
+
+    fn next_packet(&mut self) -> Result<Option<BytesMut>> {
+        let buffer = match self {
+            Self::Ice(decoder) => return Ok(decoder.next_packet().map(|packet| BytesMut::from(&packet[..]))),
+            Self::Turn(buffer) => buffer,
+        };
+        if buffer.len() < 4 { return Ok(None); }
+        let payload = u16::from_be_bytes([buffer[2], buffer[3]]) as usize;
+        let (length, padded) = match buffer[0] >> 6 {
+            0 if payload.is_multiple_of(4) => (20 + payload, 20 + payload),
+            1 => (4 + payload, 4 + payload.div_ceil(4) * 4),
+            _ => return Err(Error::Other("invalid TURN stream record header".to_owned())),
+        };
+        if buffer.len() < padded { return Ok(None); }
+        if buffer[0] >> 6 == 0 && buffer[4..8] != [0x21, 0x12, 0xa4, 0x42] {
+            return Err(Error::Other("invalid TURN STUN magic cookie".to_owned()));
+        }
+        let mut packet = buffer.split_to(padded);
+        packet.truncate(length);
+        Ok(Some(packet))
+    }
+}
+
 pub(crate) struct RTCTcpTransport {
     listeners: HashMap<SocketAddr, Arc<dyn AsyncTcpListener>>,
     streams: HashMap<FourTuple, Arc<dyn AsyncTcpStream>>,
-    decoders: HashMap<FourTuple, TcpFrameDecoder>,
+    decoders: HashMap<FourTuple, FrameDecoder>,
     pub(crate) accept_futures: FuturesUnordered<BoxFuture<'static, TcpAcceptResult>>,
     pub(crate) read_futures: FuturesUnordered<BoxFuture<'static, TcpReadResult>>,
 }
@@ -103,7 +138,17 @@ impl RTCTcpTransport {
             return Box::pin(async { Ok(0) });
         };
 
-        let framed = frame_packet(&msg.message);
+        let framed = if matches!(self.decoders.get(&four_tuple), Some(FrameDecoder::Turn(_))) {
+            // RFC 8656: TURN has its own headers, and ChannelData is padded
+            // to four bytes on a stream. It does not use ICE-TCP's prefix.
+            let mut bytes = msg.message.to_vec();
+            if bytes.first().is_some_and(|byte| byte >> 6 == 1) {
+                bytes.resize(bytes.len().div_ceil(4) * 4, 0);
+            }
+            bytes
+        } else {
+            frame_packet(&msg.message)
+        };
         let len = msg.message.len();
         Box::pin(async move {
             stream.write_all(&framed).await?;
@@ -148,7 +193,13 @@ impl RTCTcpTransport {
         stream: Arc<dyn AsyncTcpStream>,
     ) {
         self.streams.insert(four_tuple, stream.clone());
-        self.decoders.insert(four_tuple, TcpFrameDecoder::new());
+        self.decoders.insert(four_tuple, FrameDecoder::Ice(TcpFrameDecoder::new()));
+        self.arm_read(four_tuple, stream);
+    }
+
+    pub(crate) fn register_turn_stream(&mut self, four_tuple: FourTuple, stream: Arc<dyn AsyncTcpStream>) {
+        self.streams.insert(four_tuple, stream.clone());
+        self.decoders.insert(four_tuple, FrameDecoder::Turn(BytesMut::new()));
         self.arm_read(four_tuple, stream);
     }
 
@@ -182,17 +233,21 @@ impl RTCTcpTransport {
         Some(four_tuple)
     }
 
-    pub(crate) fn on_read(&mut self, res: TcpReadResult) -> Vec<TaggedBytesMut> {
+    pub(crate) fn on_read(&mut self, res: TcpReadResult) -> Result<Vec<TaggedBytesMut>> {
         let mut out = Vec::new();
         match res {
             TcpReadResult::Packet { four_tuple, n, buf } => {
                 if n == 0 {
+                    if matches!(self.decoders.get(&four_tuple), Some(FrameDecoder::Turn(_))) {
+                        self.remove_stream(&four_tuple);
+                        return Err(Error::Other("TURN TLS connection closed".to_owned()));
+                    }
                     trace!("TCP connection EOF for {:?}", four_tuple);
                     self.remove_stream(&four_tuple);
                 } else {
                     if let Some(decoder) = self.decoders.get_mut(&four_tuple) {
                         decoder.extend_from_slice(&buf[..n]);
-                        while let Some(packet) = decoder.next_packet() {
+                        while let Some(packet) = decoder.next_packet()? {
                             out.push(TaggedBytesMut {
                                 now: Instant::now(),
                                 transport: TransportContext {
@@ -215,6 +270,10 @@ impl RTCTcpTransport {
                 err,
                 buf: _,
             } => {
+                if matches!(self.decoders.get(&four_tuple), Some(FrameDecoder::Turn(_))) {
+                    self.remove_stream(&four_tuple);
+                    return Err(Error::Other(format!("TURN TLS read failed: {err}")));
+                }
                 if is_retryable_socket_recv_error(&err) {
                     trace!("Transient TCP read error on {:?}: {}", four_tuple, err);
                     if let Some(stream) = self.streams.get(&four_tuple).cloned() {
@@ -226,7 +285,7 @@ impl RTCTcpTransport {
                 }
             }
         }
-        out
+        Ok(out)
     }
 
     pub(crate) fn gather_candidates(&self) -> Vec<RTCIceCandidateInit> {

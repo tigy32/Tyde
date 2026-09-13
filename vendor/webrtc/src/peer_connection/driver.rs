@@ -35,7 +35,7 @@ use rtc::media_stream::MediaStreamTrack;
 use rtc::peer_connection::configuration::{RTCIceServer, RTCIceTransportPolicy};
 use rtc::peer_connection::event::{RTCDataChannelEvent, RTCPeerConnectionEvent, RTCTrackEvent};
 use rtc::peer_connection::message::RTCMessage;
-use rtc::peer_connection::state::RTCIceGatheringState;
+use rtc::peer_connection::state::{RTCIceGatheringState, RTCPeerConnectionState};
 use rtc::peer_connection::transport::RTCIceCandidateInit;
 use rtc::rtp_transceiver::{RTCRtpReceiverId, RTCRtpSenderId};
 use rtc::sansio::Protocol;
@@ -374,7 +374,9 @@ where
             let local_addr = listener.local_addr()?;
             tcp_listeners.insert(local_addr, runtime.wrap_tcp_listener(listener)?);
         }
-        if self.udp_sockets.is_empty() && tcp_listeners.is_empty() {
+        let outgoing_turn_tls = self.ice_gather_policy == RTCIceTransportPolicy::Relay
+            && self.ice_servers.iter().any(|server| server.urls.iter().any(|url| url.starts_with("turns:")));
+        if self.udp_sockets.is_empty() && tcp_listeners.is_empty() && !outgoing_turn_tls {
             return Err(Error::Other(
                 "no udp_sockets or tcp_listeners available".to_owned(),
             ));
@@ -838,7 +840,13 @@ where
                 // Incoming TCP frame data from any tcp stream
                 tcp_read_result = tcp_read_future => {
                     if let Some(Some(res) ) = tcp_read_result {
-                        let packets = self.tcp_transport.on_read(res);
+                        let packets = match self.tcp_transport.on_read(res) {
+                            Ok(packets) => packets,
+                            Err(error) => {
+                                self.inner.handler.on_connection_state_change(RTCPeerConnectionState::Failed).await;
+                                return Err(error);
+                            }
+                        };
                         for packet in packets {
                             if let Err(err) = self.handle_read(packet).await {
                                 error!("handle_read error on TCP: {}", err);
@@ -961,6 +969,9 @@ where
                 if let Err(err) = core.add_local_candidate(candidate) {
                     error!("Failed to add relay local candidate: {}", err);
                 }
+            }
+            RTCTurnRelayEventOut::TlsStream(four_tuple, stream) => {
+                self.tcp_transport.register_turn_stream(four_tuple, stream);
             }
             RTCTurnRelayEventOut::TurnGatheringComplete => {
                 self.turn_gathering_complete = true;
@@ -1382,6 +1393,7 @@ where
                     && let Err(err) = self.turn_relayer.gather().await
                 {
                     error!("Failed to gather relay candidates: {}", err);
+                    self.inner.handler.on_connection_state_change(RTCPeerConnectionState::Failed).await;
                 }
             }
             PeerConnectionDriverEvent::RemoteIceTcpPassiveCandidate(candidate) => {
@@ -1679,6 +1691,12 @@ where
             for message in turn_messages {
                 core.handle_read(message)?;
             }
+        }
+
+        // Relay input can produce OnOpen and the first message together.
+        // Deliver that event before exposing its message to the application.
+        for event in Self::drain_core_events(self.inner.clone()).await {
+            self.handle_rtc_event(event).await;
         }
 
         // 3.b peer_connection poll_read() - Process incoming messages

@@ -29,6 +29,8 @@ opus = "0.3.1"
 rtc-transport = { path = "../rtc-transport" }
 turn = "0.17.2"
 webrtc-util = { version = "0.17.1", features = ["vnet"] }
+tokio-rustls = "0.26"
+rcgen = "0.14"
 
 [dev-dependencies]
 proc-macro2 = "1"

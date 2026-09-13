@@ -1,6 +1,6 @@
 //! TURN relayer for async peer connections.
 
-use crate::runtime::Runtime;
+use crate::runtime::{AsyncTcpStream, Runtime};
 use log::{debug, error, trace, warn};
 use rtc::ice::url::SchemeType;
 use rtc::peer_connection::configuration::{RTCIceServer, RTCIceTransportPolicy};
@@ -35,6 +35,7 @@ pub(crate) enum RTCTurnRelayEventIn {
 pub(crate) enum RTCTurnRelayEventOut {
     LocalIceCandidate(RTCIceCandidateInit),
     TurnGatheringComplete,
+    TlsStream(FourTuple, Arc<dyn AsyncTcpStream>),
 }
 
 #[derive(Debug)]
@@ -50,6 +51,7 @@ struct ManagedTurnClient {
     local_addr: SocketAddr,
     relay_addr: Option<SocketAddr>,
     gather_finished: bool,
+    connection_transport: TransportProtocol,
 }
 
 pub(crate) struct RTCTurnRelayer {
@@ -255,12 +257,8 @@ impl RTCTurnRelayer {
                     continue;
                 }
 
-                if url.is_secure() {
-                    warn!("Skipping unsupported secure TURN url {}", url);
-                    continue;
-                }
-
-                if url.proto.to_string() != "udp" {
+                let tls = url.is_secure() && url.proto.to_string() == "tcp";
+                if !tls && (url.is_secure() || url.proto.to_string() != "udp") {
                     warn!("Skipping unsupported non-UDP TURN url {}", url);
                     continue;
                 }
@@ -277,7 +275,20 @@ impl RTCTurnRelayer {
                     }
                 };
 
-                for local_addr in &self.local_addrs {
+                let connection_addrs = if tls {
+                    let peer_addr = resolved_addrs.first().copied().ok_or_else(|| {
+                        Error::Other(format!("TURN hostname {turn_server_addr} resolved to no addresses"))
+                    })?;
+                    let stream = runtime.connect_tls(peer_addr, &url.host).await?;
+                    let local_addr = stream.local_addr()?;
+                    self.events.push_back(RTCTurnRelayEventOut::TlsStream(
+                        FourTuple { local_addr, peer_addr }, stream,
+                    ));
+                    vec![local_addr]
+                } else {
+                    self.local_addrs.clone()
+                };
+                for local_addr in &connection_addrs {
                     let Some(peer_addr) = resolved_addrs
                         .iter()
                         .copied()
@@ -298,6 +309,8 @@ impl RTCTurnRelayer {
                         stun_serv_addr: peer_addr.to_string(),
                         turn_serv_addr: peer_addr.to_string(),
                         local_addr: *local_addr,
+                        // TURN's allocation remains UDP between relays even when
+                        // the client-to-relay connection uses TLS over TCP.
                         transport_protocol: TransportProtocol::UDP,
                         username: url.username.clone(),
                         password: url.password.clone(),
@@ -321,6 +334,7 @@ impl RTCTurnRelayer {
                             local_addr: *local_addr,
                             relay_addr: None,
                             gather_finished: false,
+                            connection_transport: if tls { TransportProtocol::TCP } else { TransportProtocol::UDP },
                         },
                     );
                 }
@@ -633,7 +647,8 @@ impl Protocol<TaggedBytesMut, TaggedBytesMut, RTCTurnRelayEventIn> for RTCTurnRe
 
     fn poll_write(&mut self) -> Option<Self::Wout> {
         for managed_client in self.clients.values_mut() {
-            while let Some(msg) = managed_client.client.poll_write() {
+            while let Some(mut msg) = managed_client.client.poll_write() {
+                msg.transport.transport_protocol = managed_client.connection_transport;
                 self.wouts.push_back(msg);
             }
         }

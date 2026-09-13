@@ -41,13 +41,17 @@ see `vendor/webrtc/TYDE-PATCH.md` for its source and regression evidence.
 
 ## Network requirement
 
-The pinned native `webrtc` 0.20.5 TURN implementation supports UDP relay
-allocation. The service therefore issues UDP URLs explicitly to hosts; it does
-not send unsupported TCP/TLS URLs and rely on the library silently skipping them.
-Hosts need outbound UDP to Cloudflare TURN (normally port 3478). Browser/mobile
-peers receive Cloudflare's UDP, TCP and TLS relay URLs, including TLS on 443.
-A host with UDP blocked fails visibly. Supporting native TURN over TCP/TLS needs
-an implementation with that capability; this migration does not claim it.
+Native hosts connect to `turns:turn.cloudflare.com:443?transport=tcp` using
+certificate-verified TLS over an outgoing TCP connection. Their WebRTC runtime
+creates no UDP sockets or inbound TCP listeners, and rejects plain TCP and UDP
+relay URLs. No router port forwarding is required. The service must return the
+TLS endpoint explicitly; absence is an error rather than a transport fallback.
+
+WebRTC's DTLS encryption still protects the application data end to end. TLS
+additionally authenticates the Cloudflare relay and encrypts the host-to-relay
+connection, including TURN control messages. TCP alone does not add encryption.
+Browser/mobile peers retain the browser's UDP/TCP/TLS TURN connectivity. Relays
+may exchange UDP internally; that does not require UDP access on the host.
 
 The loopback MQTT override remains an explicit development/test facility. The
 managed production connection path never invokes it. The old broker metadata in
@@ -90,8 +94,13 @@ must reject it. No production resource changes are part of local validation.
 across reconnections, and a browser/native TURN test using the production byte
 adapters. The browser fixture is bound to loopback and exists only for the suite.
 Both flows transfer four MiB with a delayed reader and assert complete ordered
-bytes. The native flow also rejects a different pairing key and a substituted
-DTLS fingerprint. Mobile DOM/service flows exercise fresh credential minting,
+bytes. Native peers connect through a real TLS endpoint to the real TURN server;
+the same flow rejects an untrusted certificate and a trusted certificate for the
+wrong hostname before exercising successful transfer and reconnection. The
+browser also sends immediately from its channel-open callback, checking native
+startup event ordering before the bulk transfer. The native flow rejects a
+different pairing key and a substituted DTLS fingerprint. Mobile DOM/service
+flows exercise fresh credential minting,
 authentication failures and invalid/expired grants.
 
 The service suite exercises real HTTP boundaries for signaling isolation,

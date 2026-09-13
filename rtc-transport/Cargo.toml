@@ -21,6 +21,8 @@ async-trait = "0.1"
 bytes = "1"
 tokio.workspace = true
 webrtc = "=0.20.5"
+tokio-rustls = "0.26"
+webpki-roots = "1"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 tokio = { version = "1", default-features = false, features = ["sync", "macros", "io-util"] }

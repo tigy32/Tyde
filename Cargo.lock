@@ -7366,6 +7366,7 @@ dependencies = [
  "sha2 0.10.9",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-rustls 0.26.4",
  "tracing",
  "url",
  "uuid",
@@ -7374,6 +7375,7 @@ dependencies = [
  "wasm-bindgen-test",
  "wasmtimer",
  "web-sys",
+ "webpki-roots",
  "webrtc",
 ]
 
@@ -9239,6 +9241,7 @@ dependencies = [
  "paste",
  "proc-macro2",
  "protocol",
+ "rcgen",
  "reqwest 0.12.28",
  "rmcp",
  "rtc-transport",
@@ -9251,6 +9254,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-rustls 0.26.4",
  "tokio-tungstenite",
  "tracing-subscriber",
  "turn",

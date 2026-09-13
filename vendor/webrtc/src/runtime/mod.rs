@@ -152,6 +152,20 @@ pub trait Runtime: Send + Sync + Debug + 'static {
         remote_addr: SocketAddr,
     ) -> Pin<Box<dyn Future<Output = io::Result<Arc<dyn AsyncTcpStream>>> + Send + 'a>>;
 
+    /// Connect to TURN over TLS, verifying the certificate against `server_name`.
+    fn connect_tls<'a>(
+        &'a self,
+        remote_addr: SocketAddr,
+        server_name: &'a str,
+    ) -> Pin<Box<dyn Future<Output = io::Result<Arc<dyn AsyncTcpStream>>> + Send + 'a>> {
+        Box::pin(async move {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!("{} cannot connect TLS to {server_name} at {remote_addr}", self.name()),
+            ))
+        })
+    }
+
     /// Resolve a host string (`"host:port"`) to socket addresses.
     fn resolve_host<'a>(
         &'a self,

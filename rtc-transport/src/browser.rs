@@ -354,6 +354,18 @@ mod wasm_tests {
             .expect("TURN configuration");
         for _ in 0..2 {
             let mut peer = Peer::new(&ice).await.expect("browser peer");
+            let channel = peer.channel.clone();
+            let notify_open = channel.onopen().expect("connection open handler");
+            let send_on_open = Closure::<dyn FnMut(Event)>::new(move |event: Event| {
+                channel
+                    .send_with_u8_array(b"\x00ready")
+                    .expect("send first bytes immediately when the channel opens");
+                notify_open
+                    .call1(&JsValue::UNDEFINED, &event)
+                    .expect("notify the browser connection");
+            });
+            peer.channel
+                .set_onopen(Some(send_on_open.as_ref().unchecked_ref()));
             let offer = peer.offer().await.expect("browser TURN offer");
             let session = MobileRtcSessionId(uuid::Uuid::new_v4().to_string());
             let signed = crate::authenticate_description(
@@ -377,6 +389,20 @@ mod wasm_tests {
             peer.set_answer(answer.sdp)
                 .await
                 .expect("apply native answer");
+            wasmtimer::tokio::timeout(Duration::from_secs(5), async {
+                for expected in [b"\x01".as_slice(), b"\x00ready".as_slice()] {
+                    let record = peer.messages.recv().await.expect("native startup response");
+                    assert_eq!(
+                        record, expected,
+                        "native peer must acknowledge and echo bytes sent from onopen"
+                    );
+                }
+                peer.channel
+                    .send_with_u8_array(&[1])
+                    .expect("acknowledge the startup echo");
+            })
+            .await
+            .expect("native peer must accept immediate data without a startup delay");
             let stream = peer
                 .into_stream()
                 .await

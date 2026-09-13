@@ -16,6 +16,8 @@ use tokio::sync::{mpsc, oneshot};
 #[cfg(not(target_arch = "wasm32"))]
 mod native;
 #[cfg(not(target_arch = "wasm32"))]
+mod tls_runtime;
+#[cfg(not(target_arch = "wasm32"))]
 pub use native::Peer;
 #[cfg(target_arch = "wasm32")]
 mod browser;

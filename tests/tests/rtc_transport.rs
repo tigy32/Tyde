@@ -5,11 +5,14 @@ use tests::rtc::relay;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::{sleep, timeout};
 
-async fn connect(ice: &MobileIceServer) -> (RtcStream, RtcStream) {
-    let mut mobile = Peer::new(std::slice::from_ref(ice))
+async fn connect(
+    ice: &MobileIceServer,
+    roots: &tokio_rustls::rustls::RootCertStore,
+) -> (RtcStream, RtcStream) {
+    let mut mobile = Peer::with_tls_roots(std::slice::from_ref(ice), roots.clone())
         .await
         .expect("mobile peer");
-    let mut host = Peer::new(std::slice::from_ref(ice))
+    let mut host = Peer::with_tls_roots(std::slice::from_ref(ice), roots.clone())
         .await
         .expect("host peer");
     let session = MobileRtcSessionId(uuid::Uuid::new_v4().to_string());
@@ -67,8 +70,36 @@ async fn real_turn_preserves_bulk_backpressure_and_server_protocol_on_reconnect(
             .try_init()
             .expect("transport diagnostics");
         eprintln!("TURN flow: start relay");
-        let (relay, ice) = relay().await;
-        let (mut mobile, mut host) = connect(&ice).await;
+        let relay = relay().await;
+        let ice = &relay.tls_ice;
+        let roots = &relay.roots;
+        let mut untrusted = Peer::new(std::slice::from_ref(ice))
+            .await
+            .expect("untrusted TLS peer setup");
+        let error = timeout(Duration::from_secs(5), untrusted.offer())
+            .await
+            .expect("certificate rejection must be prompt")
+            .expect_err("an untrusted TURN certificate must fail");
+        assert!(
+            error.to_string().contains("certificate"),
+            "TLS failure must report certificate verification: {error}"
+        );
+        drop(untrusted);
+        let mut wrong_name = ice.clone();
+        wrong_name.urls[0].0 = format!("turns:{}?transport=tcp", relay.tls_address);
+        let mut mismatched = Peer::with_tls_roots(&[wrong_name], roots.clone())
+            .await
+            .expect("hostname mismatch setup");
+        let error = timeout(Duration::from_secs(5), mismatched.offer())
+            .await
+            .expect("hostname rejection must be prompt")
+            .expect_err("a trusted certificate for the wrong hostname must fail");
+        assert!(
+            error.to_string().contains("certificate"),
+            "hostname failure must report certificate verification: {error}"
+        );
+        drop(mismatched);
+        let (mut mobile, mut host) = connect(ice, roots).await;
         let bulk: Vec<u8> = (0..4 * 1024 * 1024)
             .map(|index| (index % 251) as u8)
             .collect();
@@ -115,7 +146,7 @@ async fn real_turn_preserves_bulk_backpressure_and_server_protocol_on_reconnect(
         .expect("real Tyde server");
         for iteration in 0..2 {
             eprintln!("TURN flow: server reconnect {iteration}");
-            let (mobile, host) = connect(&ice).await;
+            let (mobile, host) = connect(ice, roots).await;
             let server_host = host_handle.clone();
             let server_task = tokio::spawn(async move {
                 let accepted = server::accept(&server::ServerConfig::current(), host)
@@ -138,7 +169,7 @@ async fn real_turn_preserves_bulk_backpressure_and_server_protocol_on_reconnect(
             drop(client);
             server_task.abort();
         }
-        relay.close().await.expect("close relay");
+        relay.close().await;
     })
     .await
     .expect("real TURN flow must complete promptly");
