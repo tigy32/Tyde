@@ -580,6 +580,12 @@ pub async fn next_frame_matching_on(
         if env.kind == FrameKind::CustomAgentNotify {
             let _ = is_builtin_team_custom_agent_notify(&env);
         }
+        if matches!(context, "NewAgent" | "AgentStart") && env.kind == FrameKind::ChatEvent {
+            eprintln!(
+                "SPAWN WAIT DISCARDED context={context} stream={} payload={}",
+                env.stream, env.payload
+            );
+        }
         if env.kind == FrameKind::AgentStart {
             eprintln!("TYDE FIXTURE SKIPPED AGENT START context={context} envelope={env:?}");
         }
@@ -774,6 +780,9 @@ pub fn pop_pending_frame_matching_on(
 pub fn agent_bootstrap_frames(env: &Envelope) -> VecDeque<Envelope> {
     assert_eq!(env.kind, FrameKind::AgentBootstrap);
     let payload: AgentBootstrapPayload = env.parse_payload().expect("parse AgentBootstrapPayload");
+    if payload.events.iter().any(|event| matches!(event, AgentBootstrapEvent::AgentStart(start) if start.name.starts_with("BTW:"))) {
+        eprintln!("SIDE QUESTION BOOTSTRAP turn_active={} events={:?}", payload.turn_active, payload.events);
+    }
     if payload.events.iter().any(|event| matches!(event, AgentBootstrapEvent::AgentStart(start) if start.name == "fork-scripted")) {
         eprintln!("TYDE FORK FIXTURE BOOTSTRAP turn_active={} events={:?}", payload.turn_active, payload.events);
     }

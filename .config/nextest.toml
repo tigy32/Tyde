@@ -28,6 +28,11 @@ threads-required = "num-test-threads"
 filter = 'binary_id(server::settings) & test(backend_setup_payload_reports_found_unusable_hermes_cli)'
 threads-required = "num-test-threads"
 
+# Keep startup ordering evidence even when the intermittent side-question race passes.
+[[profile.default.overrides]]
+filter = 'binary_id(server::side_questions) & test(btw_sessions_recover_after_model_catalog_changes)'
+success-output = "final"
+
 [profile.default]
 # The native suite is a fast local gate, not a background job. Crossing five
 # minutes is a test failure that must be fixed rather than normalized.

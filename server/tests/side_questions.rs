@@ -163,6 +163,10 @@ async fn collect_turn_delta_text(
     let mut saw_turn = false;
     loop {
         let env = expect_event(client, context).await;
+        eprintln!(
+            "SIDE QUESTION TURN context={context} kind={:?} stream={} payload={}",
+            env.kind, env.stream, env.payload
+        );
         if env.stream != *stream || env.kind != FrameKind::ChatEvent {
             continue;
         }
@@ -652,6 +656,34 @@ fn mock_model_discovery(model: &str, efforts: &[&str]) -> server::backend::Backe
     }
 }
 
+async fn expect_completed_reply(
+    client: &mut client::Connection,
+    stream: &StreamPath,
+    expected: &str,
+    context: &str,
+) -> String {
+    loop {
+        let env = expect_event(client, context).await;
+        if env.stream != *stream || env.kind != FrameKind::ChatEvent {
+            continue;
+        }
+        eprintln!(
+            "SIDE QUESTION REPLY context={context} payload={}",
+            env.payload
+        );
+        // Completed bootstrap replay has StreamEnd but no live idle event.
+        // Match the requested reply so parent history cannot satisfy this wait.
+        let message = match env.parse_payload::<ChatEvent>().expect("parse reply") {
+            ChatEvent::MessageAdded(message) => message,
+            ChatEvent::StreamEnd(end) => end.message,
+            _ => continue,
+        };
+        if message.content.contains(expected) {
+            return message.content;
+        }
+    }
+}
+
 #[tokio::test]
 async fn btw_sessions_recover_after_model_catalog_changes() {
     let runtime = |model: &str, effort: &str| server::HostRuntimeConfig {
@@ -710,7 +742,13 @@ async fn btw_sessions_recover_after_model_catalog_changes() {
             },
         })
         .await;
-    collect_turn_delta_text(&mut fixture.client, &source.stream, "source turn").await;
+    expect_completed_reply(
+        &mut fixture.client,
+        &source.stream,
+        "mock backend response to: source prompt",
+        "source turn",
+    )
+    .await;
     let source_session = start.session_id.expect("source session");
     let (btw, start) = fixture
         .spawn_with(SpawnAgentPayload {
@@ -726,7 +764,34 @@ async fn btw_sessions_recover_after_model_catalog_changes() {
             },
         })
         .await;
-    collect_turn_delta_text(&mut fixture.client, &btw.stream, "BTW turn").await;
+    let reply = expect_completed_reply(
+        &mut fixture.client,
+        &btw.stream,
+        "mock backend response to: side question",
+        "BTW turn",
+    )
+    .await;
+    assert!(reply.contains("mock backend response to: side question"));
+    let (mut observer, observer_bootstrap) = fixture.connect_with_bootstrap().await;
+    let observed_btw = observer_bootstrap
+        .agents
+        .iter()
+        .find(|agent| agent.agent_id == btw.new_agent.agent_id)
+        .expect("finished BTW in observer bootstrap");
+    expect_agent_start(
+        &mut observer,
+        &observed_btw.instance_stream,
+        "finished BTW start",
+    )
+    .await;
+    let replay = expect_completed_reply(
+        &mut observer,
+        &observed_btw.instance_stream,
+        "mock backend response to: side question",
+        "finished BTW replay",
+    )
+    .await;
+    assert!(replay.contains("mock backend response to: side question"));
     let btw_session = start.session_id.expect("BTW session");
     let records = load_sessions(fixture.store_dir());
     for id in [&source_session, &btw_session] {
