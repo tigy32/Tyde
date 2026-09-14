@@ -72,6 +72,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let address = listener.local_addr()?;
     let app = Router::new()
         .route(
+            "/interrupt-traffic",
+            post(|State(relay): State<Arc<RelayFixture>>| async move {
+                Json(
+                    relay
+                        .interrupt_traffic(std::time::Duration::from_secs(8))
+                        .await,
+                )
+            })
+            .options(|| async { StatusCode::NO_CONTENT }),
+        )
+        .route(
             "/ice",
             get(|State(relay): State<Arc<RelayFixture>>| async move {
                 Json(vec![relay.browser_ice.clone()])

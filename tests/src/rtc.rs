@@ -1,6 +1,7 @@
 use protocol::{MobileIceServer, MobileTurnUrl};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 use turn::auth::{AuthHandler, generate_auth_key};
 use turn::relay::relay_static::RelayAddressGeneratorStatic;
@@ -83,6 +84,8 @@ pub async fn relay() -> RelayFixture {
         ..browser_ice.clone()
     };
     let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+    let outage = Arc::new(RelayOutage::default());
+    let connection_outage = outage.clone();
     let task = tokio::spawn(async move {
         let mut connections = tokio::task::JoinSet::new();
         loop {
@@ -91,8 +94,9 @@ pub async fn relay() -> RelayFixture {
                     let (socket, _) = accepted.expect("accept TLS TURN connection");
                     socket.set_nodelay(true).expect("TLS TURN nodelay");
                     let acceptor = acceptor.clone();
+                    let outage = connection_outage.clone();
                     connections.spawn(async move {
-                        if let Err(error) = tls_frontend(acceptor, socket, address).await {
+                        if let Err(error) = tls_frontend(acceptor, socket, address, outage).await {
                             eprintln!("TLS TURN fixture connection ended: {error}");
                         }
                     });
@@ -110,6 +114,7 @@ pub async fn relay() -> RelayFixture {
         tls_address,
         roots,
         task,
+        outage,
     }
 }
 
@@ -120,12 +125,38 @@ pub struct RelayFixture {
     pub tls_address: SocketAddr,
     pub roots: tokio_rustls::rustls::RootCertStore,
     task: tokio::task::JoinHandle<()>,
+    outage: Arc<RelayOutage>,
 }
 
 impl RelayFixture {
+    pub async fn interrupt_traffic(&self, duration: Duration) -> usize {
+        self.outage.dropped.store(0, Ordering::SeqCst);
+        self.outage.active.store(true, Ordering::SeqCst);
+        tokio::time::sleep(duration).await;
+        self.outage.active.store(false, Ordering::SeqCst);
+        self.outage.dropped.load(Ordering::SeqCst)
+    }
+
     pub async fn close(&self) {
         self.task.abort();
         self.server.close().await.expect("close TURN server");
+    }
+}
+
+#[derive(Default)]
+struct RelayOutage {
+    active: AtomicBool,
+    dropped: AtomicUsize,
+}
+
+impl RelayOutage {
+    fn drop_packet(&self) -> bool {
+        if self.active.load(Ordering::SeqCst) {
+            self.dropped.fetch_add(1, Ordering::SeqCst);
+            true
+        } else {
+            false
+        }
     }
 }
 
@@ -141,6 +172,7 @@ async fn tls_frontend(
     acceptor: tokio_rustls::TlsAcceptor,
     socket: tokio::net::TcpStream,
     turn: SocketAddr,
+    outage: Arc<RelayOutage>,
 ) -> std::io::Result<()> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let tls = acceptor.accept(socket).await?;
@@ -162,13 +194,18 @@ async fn tls_frontend(
             let mut packet = vec![0; length + padding];
             packet[..4].copy_from_slice(&header);
             reader.read_exact(&mut packet[4..]).await?;
-            udp.send(&packet[..length]).await?;
+            if !outage.drop_packet() {
+                udp.send(&packet[..length]).await?;
+            }
         }
     };
     let mut send_tls = async || -> std::io::Result<()> {
         let mut packet = vec![0; 65536];
         loop {
             let count = udp.recv(&mut packet).await?;
+            if outage.drop_packet() {
+                continue;
+            }
             writer.write_all(&packet[..count]).await?;
             if packet[0] & 0xc0 == 0x40 {
                 let padding = (4 - count % 4) % 4;

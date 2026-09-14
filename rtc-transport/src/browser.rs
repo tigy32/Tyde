@@ -128,9 +128,7 @@ impl Peer {
         let state = self.connection.connection_state();
         if matches!(
             state,
-            RtcPeerConnectionState::Failed
-                | RtcPeerConnectionState::Closed
-                | RtcPeerConnectionState::Disconnected
+            RtcPeerConnectionState::Failed | RtcPeerConnectionState::Closed
         ) {
             return Err(failure(
                 "connection state",
@@ -403,6 +401,7 @@ mod wasm_tests {
             })
             .await
             .expect("native peer must accept immediate data without a startup delay");
+            let connection = peer.connection.clone();
             let stream = peer
                 .into_stream()
                 .await
@@ -435,6 +434,34 @@ mod wasm_tests {
                 received, bytes,
                 "browser/native TURN must preserve every byte"
             );
+            let dropped: usize = client
+                .post(format!("{endpoint}/interrupt-traffic"))
+                .send()
+                .await
+                .expect("interrupt the real relay")
+                .json()
+                .await
+                .expect("dropped relay packet count");
+            assert!(dropped > 0, "the real relay must interrupt connectivity");
+            tyde_time::timeout(Duration::from_secs(10), async {
+                writer
+                    .write_all(b"recovered")
+                    .await
+                    .expect("write after outage");
+                writer.flush().await.expect("acknowledge after outage");
+                let mut echo = [0; 9];
+                reader
+                    .read_exact(&mut echo)
+                    .await
+                    .expect("echo after outage");
+                assert_eq!(&echo, b"recovered");
+                assert_eq!(
+                    connection.connection_state(),
+                    RtcPeerConnectionState::Connected
+                );
+            })
+            .await
+            .expect("the existing browser connection must recover without reconnecting");
         }
     }
 }

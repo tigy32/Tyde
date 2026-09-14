@@ -38,9 +38,7 @@ impl PeerConnectionEventHandler for Handler {
         tracing::info!(?state, "mobile WebRTC connection state changed");
         if matches!(
             state,
-            RTCPeerConnectionState::Failed
-                | RTCPeerConnectionState::Closed
-                | RTCPeerConnectionState::Disconnected
+            RTCPeerConnectionState::Failed | RTCPeerConnectionState::Closed
         ) {
             self.failure.send_if_modified(|reason| {
                 if reason.is_some() {

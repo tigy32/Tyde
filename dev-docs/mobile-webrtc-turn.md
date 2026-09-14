@@ -41,6 +41,16 @@ see `vendor/webrtc/TYDE-PATCH.md` for its source and regression evidence.
 
 ## Reconnect recovery
 
+The transport keeps a stream alive through the temporary ICE `Disconnected`
+state, as defined by [WebRTC](https://www.w3.org/TR/webrtc/#dom-rtcicetransportstate).
+Previously the native ICE agent detected five seconds of missing traffic and
+the adapter immediately destroyed the connection. The real relay regression
+drops traffic for eight seconds, restores it, and requires the same stream to
+preserve bulk bytes and bidirectional acknowledgements. Browser/native coverage
+also resumes its existing stream after the outage. `Failed`, `Closed`, channel
+errors, and the existing application liveness deadlines still end the stream.
+Host close diagnostics identify which connection task ended and its elapsed time.
+
 The shared browser timer layer owns and cancels individual `setTimeout` calls.
 The former timer driver accumulated callbacks for cancelled long deadlines and
 stopped scheduling the next event when its reference count exceeded 20. In the

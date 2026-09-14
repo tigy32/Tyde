@@ -175,6 +175,8 @@ async fn run_connection_with_origin(
     origin: ConnectionOrigin,
     voice_providers: crate::voice::VoiceProviders,
 ) -> Result<(), FrameError> {
+    let mobile_connection = origin.is_mobile();
+    let started = std::time::Instant::now();
     let host_stream = connection
         .outgoing_seq
         .keys()
@@ -278,6 +280,7 @@ async fn run_connection_with_origin(
     // Wait for the first task to finish, then tear the scope down.
     // Drain only the two losers — re-polling a JoinHandle that tokio::select!
     // already resolved panics with "JoinHandle polled after completion".
+    #[derive(Debug)]
     enum SelectWinner {
         Reader,
         Writer,
@@ -306,6 +309,16 @@ async fn run_connection_with_origin(
             (res.unwrap_or(Ok(())), SelectWinner::App)
         }
     };
+
+    if mobile_connection {
+        tracing::info!(
+            stream = %host_stream,
+            closed_by = ?winner,
+            elapsed_ms = started.elapsed().as_millis(),
+            failed = result.is_err(),
+            "mobile connection task ended",
+        );
+    }
 
     // Drain the two aborted tasks so their Drop runs (socket halves close, fd released).
     match winner {

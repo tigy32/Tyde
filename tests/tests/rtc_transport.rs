@@ -100,6 +100,11 @@ async fn real_turn_preserves_bulk_backpressure_and_server_protocol_on_reconnect(
         );
         drop(mismatched);
         let (mut mobile, mut host) = connect(ice, roots).await;
+        assert!(
+            relay.interrupt_traffic(Duration::from_secs(8)).await > 0,
+            "the real relay must drop traffic beyond ICE's five-second disconnect threshold"
+        );
+        eprintln!("TURN flow: relay restored after temporary packet loss");
         let bulk: Vec<u8> = (0..4 * 1024 * 1024)
             .map(|index| (index % 251) as u8)
             .collect();
