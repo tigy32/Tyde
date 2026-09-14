@@ -3252,10 +3252,8 @@ pub struct TeamMemberShuffleSuggestionEntry {
     pub serial: u64,
 }
 
-/// Per-project filter state for the Agents panel. Stored per active project
-/// (keyed by `Option<ActiveProjectRef>`, where `None` represents the Home
-/// project) so user toggles persist across project switches for the life of
-/// the app.
+/// Agents panel filter predicate input, derived from the server-owned sidebar
+/// preferences. The same values apply in every project.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct AgentsPanelFilters {
     pub hide_sub_agents: bool,
@@ -3313,21 +3311,20 @@ impl AgentsViewOverlay {
     }
 }
 
-/// Per-project filter state for the Sessions/History panel. Stored per
-/// active project (keyed by `Option<ActiveProjectRef>`, where `None`
-/// represents the Home project) so user toggles persist across project
-/// switches for the life of the app.
-#[derive(Clone, Debug, Default, PartialEq)]
+/// Filter state for the Sessions/History panel, shared by every project for
+/// the life of the app. Resuming a session switches to its project, so
+/// per-project values reset the toggles as soon as the panel was used.
+#[derive(Clone, Debug, PartialEq)]
 pub struct SessionsPanelFilters {
     pub show_child_sessions: bool,
     pub show_other_projects: bool,
 }
 
-impl SessionsPanelFilters {
-    pub fn defaults_for(project: Option<&ActiveProjectRef>) -> Self {
+impl Default for SessionsPanelFilters {
+    fn default() -> Self {
         Self {
             show_child_sessions: false,
-            show_other_projects: project.is_none(),
+            show_other_projects: true,
         }
     }
 }
@@ -3888,7 +3885,7 @@ pub struct AppState {
     /// timeout captures the generation it armed for and only drops the overlay
     /// if no newer mutation has since superseded it.
     pub agents_view_overlay_generation: RwSignal<u64>,
-    pub sessions_panel_filters: RwSignal<HashMap<Option<ActiveProjectRef>, SessionsPanelFilters>>,
+    pub sessions_panel_filters: RwSignal<SessionsPanelFilters>,
     /// Per-review full state. Server is the source of truth: a `ReviewView`
     /// subscribes to `/review/<id>` and dispatch applies `ReviewEvent`
     /// deltas to the entry. The first event on subscribe is always
@@ -4263,7 +4260,7 @@ impl AppState {
             agents_view_preferences_host: RwSignal::new(None),
             pending_agents_view_overlay: RwSignal::new(AgentsViewOverlay::default()),
             agents_view_overlay_generation: RwSignal::new(0),
-            sessions_panel_filters: RwSignal::new(HashMap::new()),
+            sessions_panel_filters: RwSignal::new(SessionsPanelFilters::default()),
             reviews: RwSignal::new(HashMap::new()),
             review_summaries: RwSignal::new(HashMap::new()),
             review_create_pending: RwSignal::new(HashMap::new()),
@@ -6769,13 +6766,6 @@ impl AppState {
         // non-persisted optimistic overlay is likewise left untouched — it is
         // reconciled by the next server notify/bootstrap, never by host
         // teardown. See `dev-docs/26-agent-organization.md` §5.5.
-        self.sessions_panel_filters.update(|map| {
-            map.retain(|active, _| {
-                active
-                    .as_ref()
-                    .is_none_or(|active| active.host_id != host_id)
-            });
-        });
 
         self.host_streams.update(|streams| {
             streams.remove(host_id);

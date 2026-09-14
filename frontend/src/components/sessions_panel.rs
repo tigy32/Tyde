@@ -114,28 +114,15 @@ pub fn SessionsPanel() -> impl IntoView {
     let state = expect_context::<AppState>();
     let search = RwSignal::new(String::new());
 
-    // Per-project filter values. Falls back to context-aware defaults when
-    // the user hasn't toggled anything yet for this project.
     let filters_state = state.clone();
-    let current_filters = Memo::new(move |_| {
-        let active = filters_state.active_project.get();
-        let overrides = filters_state.sessions_panel_filters.get();
-        overrides
-            .get(&active)
-            .cloned()
-            .unwrap_or_else(|| SessionsPanelFilters::defaults_for(active.as_ref()))
-    });
+    let current_filters = Memo::new(move |_| filters_state.sessions_panel_filters.get());
 
     let update_filters = {
         let state = state.clone();
         move |mutate: Box<dyn FnOnce(&mut SessionsPanelFilters)>| {
-            let active = state.active_project.get_untracked();
-            state.sessions_panel_filters.update(|map| {
-                let entry = map
-                    .entry(active.clone())
-                    .or_insert_with(|| SessionsPanelFilters::defaults_for(active.as_ref()));
-                mutate(entry);
-            });
+            state
+                .sessions_panel_filters
+                .update(|filters| mutate(filters));
         }
     };
 
@@ -1439,5 +1426,96 @@ mod wasm_tests {
             vec![Some(20)],
             "a bounded view re-asks for its own bound"
         );
+    }
+
+    /// "Show all projects" is sticky across projects. Resuming a session
+    /// switches to its project; the toggle used to be stored per project, so
+    /// it reset as soon as the user picked a session from another project.
+    #[wasm_bindgen_test]
+    async fn show_all_projects_is_sticky_across_project_switches() {
+        install_send_stub();
+        let state = AppState::new();
+        state.active_project.set(None);
+        connect(&state, "host-a", "/host-1");
+        state.connection_statuses.update(|statuses| {
+            statuses.insert("host-a".to_owned(), ConnectionStatus::Connected);
+        });
+        let project_session = |id: &str, project: &str, updated: u64| {
+            let mut session = listed_session("host-a", id, 1, updated);
+            session.summary.alias = Some(format!("Session {id}"));
+            session.summary.project_id = Some(protocol::ProjectId(project.to_owned()));
+            session
+        };
+        state.sessions.set(vec![
+            project_session("abc-1", "abc", 200),
+            project_session("xyz-1", "xyz", 100),
+        ]);
+
+        let (container, _handle) = mount_panel(state.clone());
+        settle().await;
+        let toggle = || -> HtmlElement {
+            let buttons = container
+                .query_selector_all(".panel-filters button")
+                .unwrap();
+            (0..buttons.length())
+                .filter_map(|i| buttons.item(i))
+                .filter_map(|node| node.dyn_into::<HtmlElement>().ok())
+                .find(|el| {
+                    el.text_content()
+                        .unwrap_or_default()
+                        .contains("Show all projects")
+                })
+                .expect("History renders a Show all projects toggle")
+        };
+        let toggle_on = || toggle().class_name().contains("active");
+        let card = |id: &str| -> Option<HtmlElement> {
+            let cards = container.query_selector_all(".session-card").unwrap();
+            (0..cards.length())
+                .filter_map(|i| cards.item(i))
+                .filter_map(|node| node.dyn_into::<HtmlElement>().ok())
+                .find(|el| {
+                    el.text_content()
+                        .unwrap_or_default()
+                        .contains(&format!("Session {id}"))
+                })
+        };
+
+        assert!(toggle_on());
+        assert!(card("abc-1").is_some() && card("xyz-1").is_some());
+
+        card("abc-1").expect("abc session is listed").click();
+        settle().await;
+        assert_eq!(
+            state
+                .active_project
+                .get_untracked()
+                .map(|project| project.project_id),
+            Some(protocol::ProjectId("abc".to_owned())),
+            "precondition: resuming the session switched to its project"
+        );
+        assert!(
+            toggle_on(),
+            "resuming a session from another project must not turn the toggle off"
+        );
+        assert!(
+            card("xyz-1").is_some(),
+            "sessions from other projects stay listed after the project switch"
+        );
+
+        toggle().click();
+        settle().await;
+        assert!(!toggle_on());
+        assert!(card("abc-1").is_some() && card("xyz-1").is_none());
+
+        state.switch_active_project(Some(ActiveProjectRef {
+            host_id: "host-a".to_owned(),
+            project_id: protocol::ProjectId("xyz".to_owned()),
+        }));
+        settle().await;
+        assert!(
+            !toggle_on(),
+            "a toggle turned off in one project stays off in the next"
+        );
+        assert!(card("abc-1").is_none() && card("xyz-1").is_some());
     }
 }

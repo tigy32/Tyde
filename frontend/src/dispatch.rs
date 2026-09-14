@@ -7832,6 +7832,11 @@ mod wasm_tests {
             host_id: "host-a".to_owned(),
             project_id: ProjectId("project-a".to_owned()),
         }));
+        // History shows all projects until the user scopes it; this case is
+        // about the scoped view.
+        state
+            .sessions_panel_filters
+            .update(|filters| filters.show_other_projects = false);
 
         // Host A holds only a row from *another* project, so nothing matches
         // the project-scoped filter. Host B holds a row and has more pages.

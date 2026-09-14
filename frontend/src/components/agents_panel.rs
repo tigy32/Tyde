@@ -56,33 +56,25 @@ pub fn agent_passes_filters(
 }
 
 /// Resolve the effective "show other projects" value from the server-owned
-/// project-visibility preference and the active project. `ContextualDefault`
-/// keeps today's behavior (Home shows all, in-project shows current only); the
-/// two pinned modes are absolute everywhere.
-fn effective_show_other_projects(
-    visibility: AgentsSidebarProjectVisibility,
-    active_project: Option<&ActiveProjectRef>,
-) -> bool {
+/// project-visibility preference. It never depends on the active project:
+/// opening an agent switches to that agent's project, so a project-dependent
+/// default turned the selector off as soon as it was used. The unpinned
+/// `ContextualDefault` therefore shows all projects everywhere.
+fn effective_show_other_projects(visibility: AgentsSidebarProjectVisibility) -> bool {
     match visibility {
-        AgentsSidebarProjectVisibility::ContextualDefault => active_project.is_none(),
-        AgentsSidebarProjectVisibility::AllProjects => true,
+        AgentsSidebarProjectVisibility::ContextualDefault
+        | AgentsSidebarProjectVisibility::AllProjects => true,
         AgentsSidebarProjectVisibility::CurrentProjectOnly => false,
     }
 }
 
 /// Project the server-owned sidebar preferences into the predicate input the
 /// filter memo consumes. This is a pure derivation, not stored state.
-fn sidebar_to_panel_filters(
-    sidebar: &AgentsSidebarPreferences,
-    active_project: Option<&ActiveProjectRef>,
-) -> AgentsPanelFilters {
+fn sidebar_to_panel_filters(sidebar: &AgentsSidebarPreferences) -> AgentsPanelFilters {
     AgentsPanelFilters {
         hide_sub_agents: sidebar.hide_sub_agents,
         hide_inactive: sidebar.hide_inactive,
-        show_other_projects: effective_show_other_projects(
-            sidebar.project_visibility,
-            active_project,
-        ),
+        show_other_projects: effective_show_other_projects(sidebar.project_visibility),
     }
 }
 
@@ -1011,14 +1003,13 @@ pub fn AgentsPanel() -> impl IntoView {
     // Sidebar selectors (hide inactive / hide sub-agents / project visibility)
     // are server-owned preferences (dev-docs/26 §12.1). The effective predicate
     // input is derived per render from the durable snapshot plus the optimistic
-    // overlay (`effective_agents_sidebar_preferences`) and the active project —
-    // no component-local persistence, so it can never become a second source of
-    // truth or a flicker source.
+    // overlay (`effective_agents_sidebar_preferences`) — no component-local
+    // persistence, so it can never become a second source of truth or a
+    // flicker source.
     let filters_state = state.clone();
     let current_filters = Memo::new(move |_| {
         let sidebar = filters_state.effective_agents_sidebar_preferences();
-        let active = filters_state.active_project.get();
-        sidebar_to_panel_filters(&sidebar, active.as_ref())
+        sidebar_to_panel_filters(&sidebar)
     });
 
     let filter_state = state.clone();
@@ -1094,10 +1085,9 @@ pub fn AgentsPanel() -> impl IntoView {
     let toggle_other_projects = {
         let state = state.clone();
         move |_| {
-            let active = state.active_project.get_untracked();
             let mut sidebar = state.effective_agents_sidebar_preferences();
             sidebar.project_visibility =
-                if effective_show_other_projects(sidebar.project_visibility, active.as_ref()) {
+                if effective_show_other_projects(sidebar.project_visibility) {
                     AgentsSidebarProjectVisibility::CurrentProjectOnly
                 } else {
                     AgentsSidebarProjectVisibility::AllProjects
@@ -5885,29 +5875,92 @@ mod wasm_tests {
             .expect("expected a set_agents_view_preferences frame")
     }
 
-    /// ContextualDefault: at Home the "Show other projects" selector reads as
-    /// effective-on; inside a project it reads as effective-off — all derived
-    /// from the server snapshot, with no component-local persistence.
+    /// "Show other projects" is sticky across projects. Opening an agent from
+    /// another project switches to that project; the unpinned selector used to
+    /// read as off inside a project, so the list collapsed as soon as the user
+    /// picked something from it. It must stay on, and a pinned "off" must
+    /// likewise survive the trip back Home.
     #[wasm_bindgen_test]
-    async fn sidebar_contextual_default_reflects_active_project() {
+    async fn show_other_projects_is_sticky_across_project_switches() {
+        let _calls = install_send_stub_with_dialog_ok();
         let container = make_container();
         let state = primed_sidebar_state(AgentsSidebarPreferences::default());
+        state
+            .configured_hosts
+            .set(vec![configured_host("local", "Local Host")]);
+        state.projects.set(vec![
+            project_info("local", "abc", "ABC Project", 0),
+            project_info("local", "xyz", "XYZ Project", 1),
+        ]);
+        push_agent_with_scope(
+            &state,
+            "local",
+            "agent-abc",
+            "ABC Agent",
+            true,
+            Some("abc"),
+            None,
+        );
+        push_agent_with_scope(
+            &state,
+            "local",
+            "agent-xyz",
+            "XYZ Agent",
+            true,
+            Some("xyz"),
+            None,
+        );
         let _handle = mount_panel(&container, state.clone());
-        next_tick().await;
+        for _ in 0..4 {
+            next_tick().await;
+        }
+        let card_rendered = |agent_id: &str| {
+            container
+                .query_selector(&format!("[data-agent-id='{agent_id}'] .agent-card"))
+                .unwrap()
+                .is_some()
+        };
 
+        assert!(button_active(&container, "Show other projects"));
+        assert!(card_rendered("agent-abc") && card_rendered("agent-xyz"));
+
+        agent_card_el(&container, "agent-abc").click();
+        for _ in 0..8 {
+            next_tick().await;
+        }
+        assert_eq!(
+            state
+                .active_project
+                .get_untracked()
+                .map(|project| project.project_id),
+            Some(ProjectId("abc".to_owned())),
+            "precondition: opening the agent switched to its project"
+        );
         assert!(
             button_active(&container, "Show other projects"),
-            "ContextualDefault at Home shows all projects (effective-on)"
+            "opening an agent in another project must not turn the selector off"
+        );
+        assert!(
+            card_rendered("agent-xyz"),
+            "agents from other projects stay listed after the project switch"
         );
 
-        state.active_project.set(Some(ActiveProjectRef {
-            host_id: "local".to_owned(),
-            project_id: ProjectId("p1".to_owned()),
-        }));
+        filter_button(&container, "Show other projects").click();
         next_tick().await;
+        assert!(!button_active(&container, "Show other projects"));
+        assert!(card_rendered("agent-abc") && !card_rendered("agent-xyz"));
+
+        state.switch_active_project(None);
+        for _ in 0..4 {
+            next_tick().await;
+        }
         assert!(
             !button_active(&container, "Show other projects"),
-            "ContextualDefault inside a project shows current only (effective-off)"
+            "a pinned off selector stays off when returning Home"
+        );
+        assert!(
+            !card_rendered("agent-abc") && !card_rendered("agent-xyz"),
+            "Home with other projects hidden lists no project agents"
         );
     }
 
@@ -5917,7 +5970,7 @@ mod wasm_tests {
     async fn sidebar_toggle_emits_typed_set_sidebar_preferences() {
         let calls = install_send_stub_with_dialog_ok();
         let container = make_container();
-        // At Home, ContextualDefault is effective-on, so a click pins the
+        // The unpinned ContextualDefault is effective-on, so a click pins the
         // opposite explicit value: current_project_only.
         let state = primed_sidebar_state(AgentsSidebarPreferences::default());
         let _handle = mount_panel(&container, state.clone());
