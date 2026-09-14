@@ -16,7 +16,7 @@ members = [
     "host-config",
     "process-env",
     "tyde-server",
-    "mqtt-transport",
+    "mobile-pairing",
     "rtc-transport",
     "mobile-shell-types",
     "mobile-frontend",

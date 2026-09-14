@@ -1,19 +1,15 @@
 use std::fmt;
 use std::io::Cursor;
-#[cfg(feature = "test-support")]
-use std::net::IpAddr;
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-pub use protocol::DEFAULT_MOBILE_MQTT_BROKER_URL;
-use protocol::{BrokerUrl, ManagedBrokerEndpoint, MobilePairingOfferId, TYDE_VERSION};
+use protocol::{MobilePairingOfferId, TYDE_VERSION};
 use rand::RngCore;
 use rand::rngs::OsRng;
 use serde::de::{Error as DeError, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
 
-pub const ROOM_ID_LEN: usize = 16;
 pub const PRE_SHARED_KEY_LEN: usize = 32;
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -40,11 +36,8 @@ pub enum TransportTypeError {
     #[error("unsupported mobile pairing QR version {actual}; expected {expected}")]
     PairingQrVersionMismatch { actual: u32, expected: u32 },
 
-    #[error("unsupported MQTT transport protocol version {actual}; expected {expected}")]
+    #[error("unsupported mobile transport protocol version {actual}; expected {expected}")]
     TransportProtocolVersionMismatch { actual: u32, expected: u32 },
-
-    #[error("invalid MQTT broker URL: {message}")]
-    InvalidBrokerUrl { message: String },
 
     #[error("failed to encode {type_name} as CBOR: {message}")]
     CborEncode {
@@ -59,186 +52,16 @@ pub enum TransportTypeError {
     },
 }
 
-pub const MQTT_TRANSPORT_PROTOCOL_VERSION: u32 = 6;
-pub const LEGACY_MOBILE_QR_VERSION: u32 = 2;
-pub const MOBILE_QR_VERSION: u32 = LEGACY_MOBILE_QR_VERSION;
 pub const MOBILE_MANAGED_QR_VERSION: u32 = 3;
-/// Pairing with a host that serves the mobile web app itself. Lives beside the
-/// MQTT payloads because the QR dispatcher has to decide between all three from
-/// one string; it carries no MQTT coordinates of its own.
 pub const MOBILE_DIRECT_QR_VERSION: u32 = 4;
-pub const MQTT_VERSION: u8 = 5;
-pub const MQTT_QOS_AT_LEAST_ONCE: u8 = 1;
-pub const MQTT_RETAIN: bool = false;
-pub const MQTT_CLEAN_START: bool = true;
 const LEGACY_PAIRING_URI_PREFIX: &str = "tyde-pair://v1?";
-const MANAGED_PAIRING_URI_PREFIX: &str = "tyde-pair://v2?";
 const DIRECT_PAIRING_URI_PREFIX: &str = "tyde-pair://v3?";
-const PAIRING_URI_PREFIX: &str = LEGACY_PAIRING_URI_PREFIX;
+const MANAGED_PAIRING_URI_PREFIX: &str = "tyde-pair://v2?";
 /// Origin-root web loader that turns the host's pairing QR into a generic
 /// HTTPS link the native iOS/Android Camera can open. The PSK-bearing
 /// `tyde-pair://…` URI rides in the URL FRAGMENT (after `#`) so it is never
 /// sent to the S3/CloudFront origin; the loader clears the fragment on read.
 pub const MOBILE_PAIRING_WEB_BASE_URL: &str = "https://tycode.dev/tyde/";
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct BrokerEndpoint {
-    pub url: BrokerUrl,
-    pub auth: BrokerAuth,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum BrokerAuth {
-    Anonymous,
-    UsernamePassword { username: String, password: String },
-}
-
-pub fn default_mobile_broker_endpoint() -> BrokerEndpoint {
-    BrokerEndpoint {
-        url: BrokerUrl::new(DEFAULT_MOBILE_MQTT_BROKER_URL)
-            .expect("default mobile MQTT broker URL is valid"),
-        auth: BrokerAuth::Anonymous,
-    }
-}
-
-pub fn is_legacy_public_broker_endpoint(endpoint: &BrokerEndpoint) -> bool {
-    endpoint.url.as_str() == DEFAULT_MOBILE_MQTT_BROKER_URL
-        && matches!(endpoint.auth, BrokerAuth::Anonymous)
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct MqttTransportPolicy {
-    pub mqtt_version: u8,
-    pub qos: u8,
-    pub retain: bool,
-    pub clean_start: bool,
-}
-
-impl Default for MqttTransportPolicy {
-    fn default() -> Self {
-        Self {
-            mqtt_version: MQTT_VERSION,
-            qos: MQTT_QOS_AT_LEAST_ONCE,
-            retain: MQTT_RETAIN,
-            clean_start: MQTT_CLEAN_START,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MobilePairingQrPayload {
-    pub v: u32,
-    pub protocol_version: u32,
-    pub tyde_version: protocol::Version,
-    pub broker: BrokerEndpoint,
-    pub policy: MqttTransportPolicy,
-    pub room: RoomId,
-    pub psk: PreSharedKey,
-    pub host_label: String,
-    /// Exact, prerelease-capable host build version used by the web/PWA loader
-    /// to select the matching versioned bundle. `Option` for backward
-    /// compatibility with QR codes from older hosts.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub release_version: Option<protocol::TydeReleaseVersion>,
-}
-
-impl MobilePairingQrPayload {
-    pub fn new(
-        protocol_version: u32,
-        broker: BrokerEndpoint,
-        room: RoomId,
-        psk: PreSharedKey,
-        host_label: String,
-    ) -> Self {
-        Self {
-            v: MOBILE_QR_VERSION,
-            protocol_version,
-            tyde_version: TYDE_VERSION,
-            broker,
-            policy: MqttTransportPolicy::default(),
-            room,
-            psk,
-            host_label,
-            // Populated by the host from its real build version (see
-            // `server::host_release_version`); `new` leaves it unset.
-            release_version: None,
-        }
-    }
-
-    pub fn encode_cbor(&self) -> Result<Vec<u8>, TransportTypeError> {
-        encode_cbor("MobilePairingQrPayload", self)
-    }
-
-    pub fn decode_cbor(bytes: &[u8]) -> Result<Self, TransportTypeError> {
-        let payload: Self = decode_cbor("MobilePairingQrPayload", bytes)?;
-        if payload.v != MOBILE_QR_VERSION {
-            return Err(TransportTypeError::PairingQrVersionMismatch {
-                actual: payload.v,
-                expected: MOBILE_QR_VERSION,
-            });
-        }
-        if payload.policy != MqttTransportPolicy::default() {
-            return Err(TransportTypeError::InvalidPairingUri {
-                message: "unsupported MQTT transport policy in pairing QR".to_owned(),
-            });
-        }
-        validate_broker_url(&payload.broker.url)?;
-        Ok(payload)
-    }
-
-    pub fn to_uri(&self) -> Result<String, TransportTypeError> {
-        let cbor = self.encode_cbor()?;
-        let encoded = URL_SAFE_NO_PAD.encode(cbor);
-        Ok(format!("{PAIRING_URI_PREFIX}{encoded}"))
-    }
-
-    pub fn from_uri(uri: &str) -> Result<Self, TransportTypeError> {
-        let encoded = uri.strip_prefix(PAIRING_URI_PREFIX).ok_or_else(|| {
-            TransportTypeError::InvalidPairingUri {
-                message: format!("URI must start with {PAIRING_URI_PREFIX}"),
-            }
-        })?;
-        if encoded.is_empty() {
-            return Err(TransportTypeError::InvalidPairingUri {
-                message: "URI payload must not be empty".to_owned(),
-            });
-        }
-        let cbor =
-            URL_SAFE_NO_PAD
-                .decode(encoded)
-                .map_err(|err| TransportTypeError::InvalidBase64 {
-                    type_name: "MobilePairingQrPayload URI payload",
-                    message: err.to_string(),
-                })?;
-        Self::decode_cbor(&cbor)
-    }
-
-    /// Builds the generic HTTPS pairing link encoded into the host's QR. The
-    /// PSK-bearing `tyde-pair://…` URI is placed in the URL FRAGMENT so the
-    /// native Camera opens the web loader at the origin without ever sending
-    /// the secret to the S3/CloudFront origin (fragments are not transmitted in
-    /// the HTTP request). The loader reads and clears the fragment on load.
-    pub fn to_pairing_url(&self) -> Result<String, TransportTypeError> {
-        Ok(format!("{MOBILE_PAIRING_WEB_BASE_URL}#{}", self.to_uri()?))
-    }
-
-    /// Legacy direct decoder retained for old local/dev pairings. New QR scan
-    /// flows should call [`MobilePairingQrOffer::from_any`] so legacy public
-    /// broker payloads are classified as repair-required instead of connected.
-    pub fn from_any(input: &str) -> Result<Self, TransportTypeError> {
-        let trimmed = input.trim();
-        if trimmed.starts_with(PAIRING_URI_PREFIX) {
-            return Self::from_uri(trimmed);
-        }
-        if let Some((_, fragment)) = trimmed.split_once('#')
-            && fragment.starts_with(PAIRING_URI_PREFIX)
-        {
-            return Self::from_uri(fragment);
-        }
-        Self::from_uri(trimmed)
-    }
-}
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ManagedMobilePairingQrPayload {
@@ -249,8 +72,6 @@ pub struct ManagedMobilePairingQrPayload {
     pub release_version: protocol::TydeReleaseVersion,
     pub offer_id: MobilePairingOfferId,
     pub offer_secret: String,
-    pub broker: ManagedBrokerEndpoint,
-    pub room: RoomId,
     pub psk: PreSharedKey,
     pub host_label: String,
     pub expires_at_ms: u64,
@@ -262,8 +83,6 @@ pub struct ManagedMobilePairingQrPayloadParams {
     pub release_version: protocol::TydeReleaseVersion,
     pub offer_id: MobilePairingOfferId,
     pub offer_secret: String,
-    pub broker: ManagedBrokerEndpoint,
-    pub room: RoomId,
     pub psk: PreSharedKey,
     pub host_label: String,
     pub expires_at_ms: u64,
@@ -276,8 +95,6 @@ impl fmt::Debug for ManagedMobilePairingQrPayloadParams {
             .field("release_version", &self.release_version)
             .field("offer_id", &self.offer_id)
             .field("offer_secret", &"<redacted>")
-            .field("broker", &self.broker)
-            .field("room", &self.room)
             .field("psk", &"<redacted>")
             .field("host_label", &self.host_label)
             .field("expires_at_ms", &self.expires_at_ms)
@@ -298,8 +115,6 @@ impl fmt::Debug for ManagedMobilePairingQrPayload {
             .field("release_version", &self.release_version)
             .field("offer_id", &self.offer_id)
             .field("offer_secret", &"<redacted>")
-            .field("broker", &self.broker)
-            .field("room", &self.room)
             .field("psk", &"<redacted>")
             .field("host_label", &self.host_label)
             .field("expires_at_ms", &self.expires_at_ms)
@@ -313,24 +128,21 @@ impl ManagedMobilePairingQrPayload {
         release_version: protocol::TydeReleaseVersion,
         offer_id: MobilePairingOfferId,
         offer_secret: String,
-        broker: ManagedBrokerEndpoint,
         host_label: String,
         expires_at_ms: u64,
     ) -> Self {
-        Self::new_with_rendezvous(ManagedMobilePairingQrPayloadParams {
+        Self::new_with_key(ManagedMobilePairingQrPayloadParams {
             protocol_version,
             release_version,
             offer_id,
             offer_secret,
-            broker,
-            room: RoomId::random(),
             psk: PreSharedKey::random(),
             host_label,
             expires_at_ms,
         })
     }
 
-    pub fn new_with_rendezvous(params: ManagedMobilePairingQrPayloadParams) -> Self {
+    pub fn new_with_key(params: ManagedMobilePairingQrPayloadParams) -> Self {
         Self {
             v: MOBILE_MANAGED_QR_VERSION,
             protocol_version: params.protocol_version,
@@ -339,8 +151,6 @@ impl ManagedMobilePairingQrPayload {
             release_version: params.release_version,
             offer_id: params.offer_id,
             offer_secret: params.offer_secret,
-            broker: params.broker,
-            room: params.room,
             psk: params.psk,
             host_label: params.host_label,
             expires_at_ms: params.expires_at_ms,
@@ -383,23 +193,6 @@ impl ManagedMobilePairingQrPayload {
         if self.expires_at_ms == 0 {
             return Err(TransportTypeError::InvalidPairingUri {
                 message: "managed pairing expiry must not be zero".to_owned(),
-            });
-        }
-        validate_broker_url(&self.broker.endpoint)?;
-        let parsed = url::Url::parse(self.broker.endpoint.as_str()).map_err(|err| {
-            TransportTypeError::InvalidBrokerUrl {
-                message: format!(
-                    "managed broker URL {:?} is invalid: {err}",
-                    self.broker.endpoint.as_str()
-                ),
-            }
-        })?;
-        if parsed.scheme() != "wss" {
-            return Err(TransportTypeError::InvalidBrokerUrl {
-                message: format!(
-                    "managed pairing broker URL scheme {:?} is unsupported; expected wss://",
-                    parsed.scheme()
-                ),
             });
         }
         Ok(())
@@ -635,12 +428,12 @@ pub fn validate_direct_origin(origin: &str) -> Result<String, TransportTypeError
 pub enum MobilePairingQrOffer {
     ManagedService(ManagedMobilePairingQrPayload),
     Direct(DirectMobilePairingQrPayload),
-    LegacyPublicBrokerRepairRequired(MobilePairingQrPayload),
+    LegacyRepairRequired,
 }
 
 impl MobilePairingQrOffer {
     /// Supported QR scan entry point. Managed service offers are returned as
-    /// connectable. Legacy v1 public-broker payloads remain parseable only so
+    /// connectable. Legacy v1 payloads are recognized only so
     /// callers can surface an explicit repair/re-pair flow.
     pub fn from_uri(uri: &str) -> Result<Self, TransportTypeError> {
         if uri.starts_with(MANAGED_PAIRING_URI_PREFIX) {
@@ -650,8 +443,7 @@ impl MobilePairingQrOffer {
             return DirectMobilePairingQrPayload::from_uri(uri).map(Self::Direct);
         }
         if uri.starts_with(LEGACY_PAIRING_URI_PREFIX) {
-            return MobilePairingQrPayload::from_uri(uri)
-                .map(Self::LegacyPublicBrokerRepairRequired);
+            return Ok(Self::LegacyRepairRequired);
         }
         Err(TransportTypeError::InvalidPairingUri {
             message: format!(
@@ -684,186 +476,6 @@ pub fn parse_mobile_pairing_qr_offer(
     input: &str,
 ) -> Result<MobilePairingQrOffer, TransportTypeError> {
     MobilePairingQrOffer::from_any(input)
-}
-
-pub fn validate_broker_url(broker_url: &BrokerUrl) -> Result<(), TransportTypeError> {
-    let parsed = url::Url::parse(broker_url.as_str()).map_err(|err| {
-        TransportTypeError::InvalidBrokerUrl {
-            message: format!("broker URL {:?} is invalid: {err}", broker_url.as_str()),
-        }
-    })?;
-    if parsed.host_str().is_none() {
-        return Err(TransportTypeError::InvalidBrokerUrl {
-            message: "broker URL is missing a host".to_owned(),
-        });
-    }
-    if !parsed.username().is_empty() || parsed.password().is_some() {
-        return Err(TransportTypeError::InvalidBrokerUrl {
-            message: "broker credentials must be supplied out-of-band, not embedded in the URL"
-                .to_owned(),
-        });
-    }
-    if parsed.fragment().is_some() {
-        return Err(TransportTypeError::InvalidBrokerUrl {
-            message: "broker URL fragments are not valid MQTT transport configuration".to_owned(),
-        });
-    }
-    match parsed.scheme() {
-        "mqtts" if parsed.path() == "/" || parsed.path().is_empty() => Ok(()),
-        "mqtts" => Err(TransportTypeError::InvalidBrokerUrl {
-            message: "mqtts:// broker URLs must not include a path".to_owned(),
-        }),
-        "wss" => Ok(()),
-        "mqtt" | "tcp" if loopback_plaintext_allowed(&parsed) => Ok(()),
-        "mqtt" | "tcp" | "ws" => Err(TransportTypeError::InvalidBrokerUrl {
-            message: format!(
-                "broker URL scheme {:?} is insecure; only mqtts:// and wss:// are allowed",
-                parsed.scheme()
-            ),
-        }),
-        scheme => Err(TransportTypeError::InvalidBrokerUrl {
-            message: format!(
-                "broker URL scheme {scheme:?} is unsupported; expected mqtts:// or wss://"
-            ),
-        }),
-    }
-}
-
-fn loopback_plaintext_allowed(parsed: &url::Url) -> bool {
-    #[cfg(feature = "test-support")]
-    {
-        parsed.host_str().is_some_and(|host| {
-            host.eq_ignore_ascii_case("localhost") || {
-                host.parse::<IpAddr>()
-                    .map(|addr| addr.is_loopback())
-                    .unwrap_or(false)
-            }
-        })
-    }
-    #[cfg(not(feature = "test-support"))]
-    {
-        let _ = parsed;
-        false
-    }
-}
-
-fn encode_cbor<T: Serialize>(
-    type_name: &'static str,
-    value: &T,
-) -> Result<Vec<u8>, TransportTypeError> {
-    let mut encoded = Vec::new();
-    ciborium::into_writer(value, &mut encoded).map_err(|err| TransportTypeError::CborEncode {
-        type_name,
-        message: err.to_string(),
-    })?;
-    Ok(encoded)
-}
-
-fn decode_cbor<T: for<'de> Deserialize<'de>>(
-    type_name: &'static str,
-    bytes: &[u8],
-) -> Result<T, TransportTypeError> {
-    let mut cursor = Cursor::new(bytes);
-    let value =
-        ciborium::from_reader(&mut cursor).map_err(|err| TransportTypeError::CborDecode {
-            type_name,
-            message: err.to_string(),
-        })?;
-    if cursor.position() != bytes.len() as u64 {
-        return Err(TransportTypeError::CborDecode {
-            type_name,
-            message: "trailing bytes after CBOR payload".to_owned(),
-        });
-    }
-    Ok(value)
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-pub struct RoomId(pub [u8; ROOM_ID_LEN]);
-
-impl RoomId {
-    pub fn random() -> Self {
-        let mut bytes = [0_u8; ROOM_ID_LEN];
-        OsRng.fill_bytes(&mut bytes);
-        Self(bytes)
-    }
-
-    pub fn from_base64url_no_pad(value: &str) -> Result<Self, TransportTypeError> {
-        let bytes =
-            URL_SAFE_NO_PAD
-                .decode(value)
-                .map_err(|err| TransportTypeError::InvalidBase64 {
-                    type_name: "RoomId",
-                    message: err.to_string(),
-                })?;
-        let actual = bytes.len();
-        let bytes: [u8; ROOM_ID_LEN] =
-            bytes
-                .try_into()
-                .map_err(|_| TransportTypeError::InvalidLength {
-                    type_name: "RoomId",
-                    expected: ROOM_ID_LEN,
-                    actual,
-                })?;
-        Ok(Self(bytes))
-    }
-
-    pub fn as_base64url_no_pad(&self) -> String {
-        URL_SAFE_NO_PAD.encode(self.0)
-    }
-
-    pub fn as_bytes(&self) -> &[u8; ROOM_ID_LEN] {
-        &self.0
-    }
-}
-
-impl fmt::Debug for RoomId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_tuple("RoomId")
-            .field(&self.as_base64url_no_pad())
-            .finish()
-    }
-}
-
-impl fmt::Display for RoomId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.as_base64url_no_pad())
-    }
-}
-
-impl Serialize for RoomId {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_str(&self.as_base64url_no_pad())
-    }
-}
-
-impl<'de> Deserialize<'de> for RoomId {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        struct RoomIdVisitor;
-
-        impl Visitor<'_> for RoomIdVisitor {
-            type Value = RoomId;
-
-            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                f.write_str("a 16-byte RoomId encoded as base64url without padding")
-            }
-
-            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
-            where
-                E: DeError,
-            {
-                RoomId::from_base64url_no_pad(value).map_err(E::custom)
-            }
-        }
-
-        deserializer.deserialize_str(RoomIdVisitor)
-    }
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -991,4 +603,35 @@ impl<'de> Visitor<'de> for PreSharedKeyBytesVisitor {
         }
         PreSharedKey::from_slice(&bytes).map_err(A::Error::custom)
     }
+}
+
+fn encode_cbor<T: Serialize>(
+    type_name: &'static str,
+    value: &T,
+) -> Result<Vec<u8>, TransportTypeError> {
+    let mut encoded = Vec::new();
+    ciborium::into_writer(value, &mut encoded).map_err(|err| TransportTypeError::CborEncode {
+        type_name,
+        message: err.to_string(),
+    })?;
+    Ok(encoded)
+}
+
+fn decode_cbor<T: for<'de> Deserialize<'de>>(
+    type_name: &'static str,
+    bytes: &[u8],
+) -> Result<T, TransportTypeError> {
+    let mut cursor = Cursor::new(bytes);
+    let value =
+        ciborium::from_reader(&mut cursor).map_err(|err| TransportTypeError::CborDecode {
+            type_name,
+            message: err.to_string(),
+        })?;
+    if cursor.position() != bytes.len() as u64 {
+        return Err(TransportTypeError::CborDecode {
+            type_name,
+            message: "trailing bytes after CBOR payload".to_owned(),
+        });
+    }
+    Ok(value)
 }

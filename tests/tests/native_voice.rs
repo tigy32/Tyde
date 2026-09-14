@@ -1,11 +1,6 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-mod support;
-
-use mqtt_transport::{
-    BrokerAuth, BrokerEndpoint, MqttConnectConfig, ParticipantRole, PreSharedKey, RoomId,
-};
 use protocol::{
     Envelope, FrameKind, FrameReader, StreamPath, VoiceAudioPayload, VoiceDirection, VoiceSessionId,
 };
@@ -1168,50 +1163,21 @@ async fn real_amazon_transcribe_streams_prerecorded_dictation() {
         .expect("server task");
 }
 
-fn mqtt_config(
-    broker: &support::LocalMqttBroker,
-    room: RoomId,
-    psk: PreSharedKey,
-    role: ParticipantRole,
-) -> MqttConnectConfig {
-    MqttConnectConfig {
-        endpoint: BrokerEndpoint {
-            url: broker.broker_url.clone(),
-            auth: BrokerAuth::Anonymous,
-        },
-        room,
-        psk,
-        role,
-    }
-}
-
 #[tokio::test]
 async fn production_writer_interleaves_four_megabyte_bulk() {
     let diagnostic_path =
         std::env::temp_dir().join(format!("tyde-voice-writer-{}.log", std::process::id()));
     tracing_subscriber::fmt()
         .with_ansi(false)
-        .with_env_filter("server::connection=info,mqtt_transport=debug,rumqttc=debug")
+        .with_env_filter("server::connection=info,rtc_transport=debug")
         .with_writer(std::sync::Mutex::new(
             std::fs::File::create(&diagnostic_path).expect("writer latency diagnostics"),
         ))
         .try_init()
         .expect("writer latency tracing");
     eprintln!("writer latency diagnostics: {}", diagnostic_path.display());
-    let broker = support::start_plain_mqtt_broker().expect("start real rumqttd broker");
-    let room = RoomId::random();
-    let psk = PreSharedKey::random();
-    let (host, client) = tokio::join!(
-        mqtt_transport::connect_ephemeral(mqtt_config(
-            &broker,
-            room,
-            psk.clone(),
-            ParticipantRole::Host
-        )),
-        mqtt_transport::connect_ephemeral(mqtt_config(&broker, room, psk, ParticipantRole::Client)),
-    );
-    let host = host.expect("host production MQTT byte transport");
-    let client = client.expect("client production MQTT byte transport");
+    let relay = tests::rtc::relay().await;
+    let (client, host) = tests::rtc::connect(&relay.tls_ice, &relay.roots).await;
     let (_, host_writer) = tokio::io::split(host);
     let (client_reader, _) = tokio::io::split(client);
     let bulk_stream = StreamPath("/project/bulk".into());
@@ -1286,7 +1252,7 @@ async fn production_writer_interleaves_four_megabyte_bulk() {
             let frame = reader
                 .read_frame()
                 .await
-                .expect("production framed MQTT read")
+                .expect("production framed TURN read")
                 .expect("frame");
             match frame.envelope.kind {
                 FrameKind::VoiceStop => {
@@ -1319,7 +1285,7 @@ async fn production_writer_interleaves_four_megabyte_bulk() {
         }
     })
     .await
-    .expect("bulk, voice, and control all traverse real MQTT");
+    .expect("bulk, voice, and control all traverse real TURN");
     let latency = control_latency.unwrap();
     eprintln!(
         "writer delivery: control={control_latency:?}, audio={audio_latency:?}, records={}",

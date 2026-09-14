@@ -8009,18 +8009,7 @@ impl HostHandle {
                 "supervisor max kicks per task must be at least 1; disable the supervisor instead of setting it to 0".to_owned(),
             );
         }
-        if candidate.mobile_broker_url != current.mobile_broker_url
-            && let Err(message) = crate::store::settings::validate_mobile_broker_url_for_write(
-                candidate.mobile_broker_url.as_ref(),
-            )
-        {
-            push_error(
-                &mut field_errors,
-                "/mobile_broker_url",
-                SettingsErrorCode::Invalid,
-                message,
-            );
-        }
+
         let backend_tiers_touched = parsed_ops.iter().any(|(tokens, _, _)| {
             tokens
                 .first()

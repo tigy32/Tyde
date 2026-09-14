@@ -97,9 +97,9 @@ pub fn prime_host_for_tests(state: &AppState, host: &LocalHostId) {
     use protocol::{
         BackendSetupPayload as BootstrapBackendSetup, HostBootstrapPayload as BootstrapHostPayload,
         MobileAccessStatePayload as BootstrapMobileAccess,
-        MobileBrokerStatus as BootstrapBrokerStatus, MobilePairingState as BootstrapPairingState,
-        PROTOCOL_VERSION, TYDE_VERSION, TeamPresetCatalog as BootstrapTeamPresetCatalog,
-        WelcomePayload as BootstrapWelcome,
+        MobileConnectionStatus as BootstrapConnectionStatus,
+        MobilePairingState as BootstrapPairingState, PROTOCOL_VERSION, TYDE_VERSION,
+        TeamPresetCatalog as BootstrapTeamPresetCatalog, WelcomePayload as BootstrapWelcome,
     };
     use settings_model::HostSettings as BootstrapHostSettings;
 
@@ -117,8 +117,7 @@ pub fn prime_host_for_tests(state: &AppState, host: &LocalHostId) {
             enabled_backends: Vec::new(),
             default_backend: None,
             enable_mobile_connections: false,
-            mobile_broker_url: None,
-            mobile_broker_auth: Default::default(),
+
             mobile_direct_hosting_enabled: false,
             mobile_direct_bind_addr: None,
             mobile_direct_public_origin: None,
@@ -143,7 +142,7 @@ pub fn prime_host_for_tests(state: &AppState, host: &LocalHostId) {
         settings_schema: serde_json::Value::Null,
         configured_secrets: Vec::new(),
         mobile_access: BootstrapMobileAccess {
-            broker_status: BootstrapBrokerStatus::Disabled,
+            connection_status: BootstrapConnectionStatus::Disabled,
             pairing: BootstrapPairingState::Idle,
             paired_devices: Vec::new(),
             direct_hosting: protocol::MobileDirectHostingStatus::Disabled,
@@ -1157,7 +1156,7 @@ fn report_protocol_error(
         log::warn!("connection already unavailable while invalidating host={host}: {error}");
     }
     state.mobile_shell_error.set(Some(MobileShellError {
-        code: MobileAccessErrorCode::BrokerProtocol,
+        code: MobileAccessErrorCode::TransportFailed,
         message,
     }));
 }
@@ -3351,7 +3350,7 @@ mod wasm_tests {
             .mobile_shell_error
             .get_untracked()
             .expect("shell error");
-        assert_eq!(error.code, MobileAccessErrorCode::BrokerProtocol);
+        assert_eq!(error.code, MobileAccessErrorCode::TransportFailed);
         assert!(error.message.contains("closing dispatch"));
     }
 
@@ -3966,8 +3965,7 @@ mod wasm_tests {
                 enabled_backends: vec![protocol::BackendKind::Codex],
                 default_backend: Some(protocol::BackendKind::Codex),
                 enable_mobile_connections: false,
-                mobile_broker_url: None,
-                mobile_broker_auth: Default::default(),
+
                 mobile_direct_hosting_enabled: false,
                 mobile_direct_bind_addr: None,
                 mobile_direct_public_origin: None,
@@ -3992,7 +3990,7 @@ mod wasm_tests {
             settings_schema: serde_json::Value::Null,
             configured_secrets: Vec::new(),
             mobile_access: protocol::MobileAccessStatePayload {
-                broker_status: protocol::MobileBrokerStatus::Disabled,
+                connection_status: protocol::MobileConnectionStatus::Disabled,
                 pairing: protocol::MobilePairingState::Idle,
                 paired_devices: Vec::new(),
                 direct_hosting: protocol::MobileDirectHostingStatus::Disabled,

@@ -397,11 +397,6 @@ mod wasm_tests {
     use super::*;
     use crate::state::PairedHostSummary;
     use leptos::mount::mount_to;
-    use mobile_shell_types::{
-        BrokerAuthSummary as BrokerAuth, BrokerEndpointSummary as BrokerEndpoint,
-        RoomIdSummary as RoomId,
-    };
-    use protocol::BrokerUrl;
     use wasm_bindgen::JsCast;
     use wasm_bindgen_test::*;
     use web_sys::HtmlElement;
@@ -440,11 +435,7 @@ mod wasm_tests {
         PairedHostSummary {
             local_host_id: LocalHostId(id.to_owned()),
             host_label: label.to_owned(),
-            broker: Some(BrokerEndpoint {
-                url: BrokerUrl::new("wss://broker.example.test/mqtt").unwrap(),
-                auth: BrokerAuth::Anonymous,
-            }),
-            room: Some(RoomId("AQEBAQEBAQEBAQEBAQEBAQ".to_owned())),
+
             credential_fingerprint: "fp".to_owned(),
             auto_connect: false,
             last_connected_at_ms: None,

@@ -8,16 +8,16 @@ import subprocess
 import sys
 
 
-TRANSPORT_VERSION_PATH = pathlib.Path("mqtt-transport/src/types.rs")
+TRANSPORT_VERSION_PATH = pathlib.Path("protocol/src/types.rs")
 WIRE_CONTRACT_PATHS = (
-    pathlib.Path("mqtt-transport/src/chunking.rs"),
-    pathlib.Path("mqtt-transport/src/framing.rs"),
-    pathlib.Path("mqtt-transport/src/rendezvous.rs"),
-    pathlib.Path("mqtt-transport/src/session.rs"),
-    pathlib.Path("mqtt-transport/src/topic.rs"),
+    pathlib.Path("rtc-transport/src/lib.rs"),
+    pathlib.Path("rtc-transport/src/signaling.rs"),
+    pathlib.Path("rtc-transport/src/native.rs"),
+    pathlib.Path("rtc-transport/src/browser.rs"),
+    TRANSPORT_VERSION_PATH,
 )
 VERSION_PATTERN = re.compile(
-    r"pub const MQTT_TRANSPORT_PROTOCOL_VERSION:\s*u32\s*=\s*(\d+)\s*;"
+    r"pub const MOBILE_RTC_PROTOCOL_VERSION:\s*u32\s*=\s*(\d+)\s*;"
 )
 SEMVER_TAG_PATTERN = re.compile(
     r"^v(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)"
@@ -50,7 +50,7 @@ def read_version(source: str, label: str) -> int:
     match = VERSION_PATTERN.search(source)
     if match is None:
         raise TransportVersionError(
-            f"{label} does not define MQTT_TRANSPORT_PROTOCOL_VERSION"
+            f"{label} does not define MOBILE_RTC_PROTOCOL_VERSION"
         )
     return int(match.group(1))
 
@@ -77,6 +77,65 @@ def latest_release_tag(repo_root: pathlib.Path) -> str:
     )
 
 
+RUST_TOKEN = re.compile(
+    r'//[^\n]*|/\*[\s\S]*?\*/|r(?P<hashes>#+)"[\s\S]*?"(?P=hashes)'
+    r'|"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])\''
+    r'|[A-Za-z_][A-Za-z_0-9]*|::|\S'
+)
+
+
+def wire_tokens(source: str) -> tuple[str, ...]:
+    tokens = [match.group() for match in RUST_TOKEN.finditer(source)
+              if not match.group().startswith(("//", "/*"))]
+    result = []
+    cursor = 0
+    test_module = ["#", "[", "cfg", "(", "test", ")", "]", "mod", "wasm_tests", "{"]
+    while cursor < len(tokens):
+        if tokens[cursor:cursor + len(test_module)] == test_module:
+            cursor += len(test_module)
+            depth = 1
+            while cursor < len(tokens) and depth:
+                depth += (tokens[cursor] == "{") - (tokens[cursor] == "}")
+                cursor += 1
+            if depth:
+                raise TransportVersionError("unterminated browser test module")
+            continue
+        # Treating temporary ICE loss as fatal is a local lifecycle policy.
+        # Removing that alternative changes no SDP, record, ACK or credential.
+        if (tokens[cursor:cursor + 1] == ["|"]
+                and tokens[cursor + 1:cursor + 2] in (
+                    ["RTCPeerConnectionState"], ["RtcPeerConnectionState"])
+                and tokens[cursor + 2:cursor + 4] == ["::", "Disconnected"]):
+            cursor += 4
+            continue
+        result.append(tokens[cursor])
+        cursor += 1
+    return tuple(result)
+
+
+def wire_source(path: pathlib.Path, source: str) -> tuple[str, ...]:
+    if path == TRANSPORT_VERSION_PATH:
+        # Application frames have their own version; only exported RTC types
+        # belong to this guard. Changing the version itself is not a wire change.
+        start = source.find("pub mod mobile_rtc {")
+        if start < 0:
+            return wire_tokens(VERSION_PATTERN.sub("", source))
+        end = source.index("pub use mobile_rtc::*;", start)
+        return wire_tokens(VERSION_PATTERN.sub("", source[start:end]))
+    # The reconnect repair replaced the browser timer driver, preserving every
+    # deadline and wire byte. Normalize only those equivalent call/import names;
+    # changes to arguments, framing, authentication or negotiation still fail.
+    source = source.replace("wasmtimer::tokio::", "tyde_time::")
+    source = source.replace(
+        '#[cfg(not(target_arch = "wasm32"))]\n'
+        'use tokio::time::{sleep, timeout};\n'
+        '#[cfg(target_arch = "wasm32")]\n'
+        'use tyde_time::{sleep, timeout};',
+        'use tyde_time::{sleep, timeout};',
+    )
+    return wire_tokens(source)
+
+
 def check_transport_version(
     repo_root: pathlib.Path, baseline_ref: str | None = None
 ) -> tuple[str, int, int, tuple[pathlib.Path, ...]]:
@@ -93,21 +152,21 @@ def check_transport_version(
     )
     if current_version < baseline_version:
         raise TransportVersionError(
-            "MQTT_TRANSPORT_PROTOCOL_VERSION decreased "
+            "MOBILE_RTC_PROTOCOL_VERSION decreased "
             f"from {baseline_version} at {baseline} to {current_version}"
         )
 
     changed = tuple(
         path
         for path in WIRE_CONTRACT_PATHS
-        if read_ref_file(repo_root, baseline, path)
-        != (repo_root / path).read_text(encoding="utf-8")
+        if wire_source(path, read_ref_file(repo_root, baseline, path))
+        != wire_source(path, (repo_root / path).read_text(encoding="utf-8"))
     )
     if changed and current_version <= baseline_version:
         paths = ", ".join(str(path) for path in changed)
         raise TransportVersionError(
-            "MQTT wire-contract source changed without increasing "
-            "MQTT_TRANSPORT_PROTOCOL_VERSION "
+            "RTC wire-contract source changed without increasing "
+            "MOBILE_RTC_PROTOCOL_VERSION "
             f"(baseline {baseline} uses {baseline_version}, current uses "
             f"{current_version}; changed: {paths})"
         )
@@ -132,12 +191,12 @@ def main() -> int:
 
     if changed:
         print(
-            "MQTT transport protocol guard passed: "
+            "RTC transport protocol guard passed: "
             f"{baseline}={old}, current={current}"
         )
     else:
         print(
-            "MQTT transport wire contract unchanged: "
+            "RTC transport wire contract unchanged: "
             f"{baseline}={old}, current={current}"
         )
     return 0

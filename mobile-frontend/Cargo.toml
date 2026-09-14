@@ -12,10 +12,10 @@ protocol = { path = "../protocol" }
 settings-model = { path = "../settings-model" }
 host-config = { path = "../host-config" }
 mobile-shell-types = { path = "../mobile-shell-types" }
-# Direct-to-wasm MQTT transport for the browser (PWA) backend. The native
-# target also compiles this (rumqttc backend) so the runtime-detect shell
+# Pairing identities and keys shared by the browser and native builds.
+# The native target also compiles this so the runtime-detect shell
 # builds without any cfg split; only the wasm bundle actually runs the web path.
-mqtt-transport = { path = "../mqtt-transport" }
+mobile-pairing = { path = "../mobile-pairing" }
 rtc-transport = { path = "../rtc-transport" }
 leptos = { version = "0.8.17", features = ["csr"] }
 serde = { workspace = true }

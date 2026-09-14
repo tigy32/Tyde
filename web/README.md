@@ -101,7 +101,7 @@ loader into running attacker code or a known-bad client. Defenses, in order:
    `WebAssembly.instantiate` is allowed (we do NOT grant general
    `'unsafe-eval'`). Plus `object-src 'none'`, `base-uri 'none'`,
    `default-src 'self'` and a narrow `connect-src 'self' wss:` (the app reaches
-   the broker over wss and fetches same-origin; `https:` is intentionally
+   self-hosted endpoints over wss and fetches same-origin; `https:` is intentionally
    omitted). Set via `<meta>` for local use; **Phase 6 must also send it (and
    `frame-ancestors 'none'`, which `<meta>` ignores) as an HTTP response
    header.** The production response policy also sends

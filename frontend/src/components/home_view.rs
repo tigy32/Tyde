@@ -345,8 +345,7 @@ mod wasm_tests {
                     enabled_backends: vec![BackendKind::Claude],
                     default_backend: Some(BackendKind::Claude),
                     enable_mobile_connections: false,
-                    mobile_broker_url: None,
-                    mobile_broker_auth: Default::default(),
+
                     mobile_direct_hosting_enabled: false,
                     mobile_direct_bind_addr: None,
                     mobile_direct_public_origin: None,

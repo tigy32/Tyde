@@ -5,7 +5,7 @@ release must not publish without a matching `/tyde/v<release>/` mobile web
 bundle built from the same source protocol.
 
 Managed Tyggs Pass + AWS MQTT access is specified in
-`30-mobile-managed-broker.md`. Release automation still owns bundle/protocol
+`30-mobile-managed-access.md`. Release automation still owns bundle/protocol
 coherence; the managed broker plan adds the requirement that a production
 mobile bundle authenticate with Tyggs through `tycode.dev` before redeeming a
 pairing offer.

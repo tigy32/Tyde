@@ -3,10 +3,10 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 use blake2::{Blake2s256, Digest};
-use mqtt_transport::{BrokerEndpoint, PreSharedKey, RoomId, validate_broker_url};
+use mobile_pairing::PreSharedKey;
 use protocol::{
-    ManagedBrokerCredentials, ManagedBrokerEndpoint, MobileDeviceId, MobileDeviceState,
-    MobileDeviceSummary, MobilePairingOfferId, MobilePushState, MobilePushSubscription,
+    MobileDeviceId, MobileDeviceState, MobileDeviceSummary, MobilePairingOfferId, MobilePushState,
+    MobilePushSubscription,
 };
 use serde::{Deserialize, Serialize};
 
@@ -25,8 +25,8 @@ pub struct MobilePairings {
     #[serde(default)]
     pub devices: Vec<MobilePairingRecord>,
     /// Devices paired against the host's own HTTP origin. Kept in their own
-    /// list because they share none of an MQTT pairing's coordinates — no
-    /// broker, no room, no pre-shared key — and because everything the two
+    /// list because they use bearer tokens instead of shared keys, and because
+    /// everything the two
     /// kinds do share is reachable through [`MobilePairings::device_mut`].
     #[serde(default)]
     pub direct_devices: Vec<DirectMobilePairingRecord>,
@@ -90,8 +90,6 @@ pub struct DeviceMut<'a> {
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ActiveMobilePairingCredential {
     pub offer_id: MobilePairingOfferId,
-    pub broker: BrokerEndpoint,
-    pub room: RoomId,
     pub psk: PreSharedKey,
     pub created_at_ms: u64,
     pub key_fingerprint: String,
@@ -104,8 +102,6 @@ impl fmt::Debug for ActiveMobilePairingCredential {
         formatter
             .debug_struct("ActiveMobilePairingCredential")
             .field("offer_id", &self.offer_id)
-            .field("broker", &self.broker)
-            .field("room", &self.room)
             .field("psk", &"<redacted>")
             .field("created_at_ms", &self.created_at_ms)
             .field("key_fingerprint", &self.key_fingerprint)
@@ -117,8 +113,6 @@ impl fmt::Debug for ActiveMobilePairingCredential {
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MobilePairingRecord {
     pub device_id: MobileDeviceId,
-    pub broker: BrokerEndpoint,
-    pub room: RoomId,
     pub psk: PreSharedKey,
     pub label: String,
     pub created_at_ms: u64,
@@ -157,8 +151,6 @@ impl fmt::Debug for MobilePairingRecord {
         formatter
             .debug_struct("MobilePairingRecord")
             .field("device_id", &self.device_id)
-            .field("broker", &self.broker)
-            .field("room", &self.room)
             .field("psk", &"<redacted>")
             .field("label", &self.label)
             .field("created_at_ms", &self.created_at_ms)
@@ -175,8 +167,6 @@ impl fmt::Debug for MobilePairingRecord {
 pub struct ActiveManagedMobilePairingCredential {
     pub host_offer_token: String,
     pub pairing_url: String,
-    pub broker: ManagedBrokerEndpoint,
-    pub host_broker_credentials: ManagedBrokerCredentials,
     pub expires_at_ms: u64,
     #[serde(default, skip_serializing)]
     pub handoff: Option<ManagedMobilePairingHandoff>,
@@ -188,8 +178,6 @@ impl fmt::Debug for ActiveManagedMobilePairingCredential {
             .debug_struct("ActiveManagedMobilePairingCredential")
             .field("host_offer_token", &"<redacted>")
             .field("pairing_url", &"<redacted>")
-            .field("broker", &self.broker)
-            .field("host_broker_credentials", &"<redacted>")
             .field("expires_at_ms", &self.expires_at_ms)
             .field("handoff", &self.handoff)
             .finish()
@@ -205,8 +193,6 @@ pub struct ManagedMobilePairingHandoff {
     pub device_label: String,
     pub device_created_at_ms: u64,
     pub device_last_seen_at_ms: Option<u64>,
-    pub broker: ManagedBrokerEndpoint,
-    pub host_broker_credentials: ManagedBrokerCredentials,
 }
 
 impl fmt::Debug for ManagedMobilePairingHandoff {
@@ -220,8 +206,6 @@ impl fmt::Debug for ManagedMobilePairingHandoff {
             .field("device_label", &self.device_label)
             .field("device_created_at_ms", &self.device_created_at_ms)
             .field("device_last_seen_at_ms", &self.device_last_seen_at_ms)
-            .field("broker", &self.broker)
-            .field("host_broker_credentials", &"<redacted>")
             .finish()
     }
 }
@@ -230,7 +214,6 @@ impl fmt::Debug for ManagedMobilePairingHandoff {
 pub struct ManagedMobilePairingCredential {
     pub pairing_id: String,
     pub host_pairing_secret: String,
-    pub broker: ManagedBrokerEndpoint,
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -267,7 +250,6 @@ impl fmt::Debug for ManagedMobilePairingCredential {
             .debug_struct("ManagedMobilePairingCredential")
             .field("pairing_id", &self.pairing_id)
             .field("host_pairing_secret", &"<redacted>")
-            .field("broker", &self.broker)
             .finish()
     }
 }
@@ -466,8 +448,6 @@ impl MobilePairings {
 
 fn same_managed_pairing_record(left: &MobilePairingRecord, right: &MobilePairingRecord) -> bool {
     left.device_id == right.device_id
-        && left.broker == right.broker
-        && left.room == right.room
         && left.psk == right.psk
         && left.label == right.label
         && left.created_at_ms == right.created_at_ms
@@ -602,7 +582,7 @@ pub fn token_hash(secret: &str) -> String {
 }
 
 /// Short, stable identifier shown next to a direct device in the UI, playing
-/// the same role the PSK fingerprint plays for an MQTT pairing.
+/// the same role the PSK fingerprint plays for an managed pairing.
 pub fn direct_key_fingerprint(token: &str) -> String {
     token_hash(token).chars().take(16).collect()
 }
@@ -709,7 +689,6 @@ fn validate_active(active: &ActiveMobilePairingCredential) -> Result<(), String>
     if active.offer_id.0.is_empty() {
         return Err("active mobile pairing offer_id must not be empty".to_owned());
     }
-    validate_broker_url(&active.broker.url).map_err(|err| err.to_string())?;
     let expected = key_fingerprint(&active.psk);
     if active.key_fingerprint != expected {
         return Err(format!(
@@ -733,7 +712,6 @@ fn validate_device(record: &MobilePairingRecord) -> Result<(), String> {
             record.device_id
         ));
     }
-    validate_broker_url(&record.broker.url).map_err(|err| err.to_string())?;
     let expected = key_fingerprint(&record.psk);
     if record.key_fingerprint != expected {
         return Err(format!(
@@ -750,7 +728,6 @@ fn validate_device(record: &MobilePairingRecord) -> Result<(), String> {
 fn validate_active_managed(managed: &ActiveManagedMobilePairingCredential) -> Result<(), String> {
     validate_non_empty("active mobile host_offer_token", &managed.host_offer_token)?;
     validate_non_empty("active mobile pairing_url", &managed.pairing_url)?;
-    validate_managed_broker(&managed.broker)?;
     if managed.expires_at_ms == 0 {
         return Err("active managed mobile pairing expires_at_ms must not be zero".to_owned());
     }
@@ -776,7 +753,7 @@ fn validate_managed_handoff(handoff: &ManagedMobilePairingHandoff) -> Result<(),
     if handoff.device_created_at_ms == 0 {
         return Err("managed mobile handoff device_created_at_ms must not be zero".to_owned());
     }
-    validate_managed_broker(&handoff.broker)
+    Ok(())
 }
 
 fn validate_managed_pairing(managed: &ManagedMobilePairingCredential) -> Result<(), String> {
@@ -785,11 +762,7 @@ fn validate_managed_pairing(managed: &ManagedMobilePairingCredential) -> Result<
         "managed mobile host_pairing_secret",
         &managed.host_pairing_secret,
     )?;
-    validate_managed_broker(&managed.broker)
-}
-
-fn validate_managed_broker(broker: &ManagedBrokerEndpoint) -> Result<(), String> {
-    validate_broker_url(&broker.endpoint).map_err(|err| err.to_string())
+    Ok(())
 }
 
 fn validate_non_empty(field: &'static str, value: &str) -> Result<(), String> {

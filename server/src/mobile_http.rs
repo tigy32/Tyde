@@ -1,7 +1,7 @@
 //! Direct HTTP hosting of the mobile web app.
 //!
 //! The managed path serves the loader shell and the immutable app bundles from
-//! `tycode.dev` and tunnels the client's protocol connection over MQTT. This
+//! `tycode.dev` and tunnels the client's protocol connection over WebRTC. This
 //! module serves the same URL space from the host itself, for networks that
 //! would rather reach an internal site than have a client tunnel out to a
 //! broker.
@@ -381,7 +381,7 @@ fn serve_inner(assets: &MobileWebAssets, method: &Method, path: &str) -> Respons
 }
 
 /// A byte stream over a WebSocket, so `accept` can run the ordinary Tyde
-/// handshake on it exactly as it does over a Unix socket or an MQTT session.
+/// handshake on it exactly as it does over a Unix socket or an WebRTC session.
 ///
 /// The socket itself stays on the HTTP server's runtime and talks to this
 /// through channels. That is not indirection for its own sake: the mobile

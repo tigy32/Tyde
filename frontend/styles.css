@@ -9568,18 +9568,6 @@ math merror {
     width: 6rem;
 }
 
-.settings-mobile-broker-row {
-    display: flex;
-    align-items: center;
-    gap: var(--space-2);
-    flex-wrap: wrap;
-}
-
-.settings-mobile-broker-input {
-    flex: 1 1 320px;
-    min-width: 0;
-}
-
 .settings-mobile-warning {
     margin-top: var(--space-3);
     padding: var(--space-3);
@@ -9593,17 +9581,6 @@ math merror {
     font-weight: 600;
     color: var(--text-primary);
     margin: 0 0 var(--space-2) 0;
-}
-
-.settings-mobile-broker-error {
-    margin-top: var(--space-2);
-    font-size: 0.923rem;
-    color: var(--error, var(--accent-primary));
-    line-height: 1.4;
-}
-
-.settings-mobile-broker-input[aria-invalid="true"] {
-    border-color: var(--error, var(--accent-primary));
 }
 
 /* --- Direct hosting section --- */
@@ -9657,7 +9634,7 @@ math merror {
     background: var(--surface-2);
 }
 
-.settings-mobile-pairing-broker {
+.settings-mobile-pairing-connection {
     display: inline-block;
     margin: var(--space-2) 0;
     padding: 2px 8px;
@@ -9667,21 +9644,21 @@ math merror {
     border: 1px solid var(--border-primary);
 }
 
-.settings-mobile-pairing-broker-online {
+.settings-mobile-pairing-connection-online {
     color: var(--success, var(--accent-primary));
     border-color: var(--success, var(--accent-primary));
 }
 
-.settings-mobile-pairing-broker-connecting {
+.settings-mobile-pairing-connection-connecting {
     color: var(--text-secondary);
 }
 
-.settings-mobile-pairing-broker-disabled {
+.settings-mobile-pairing-connection-disabled {
     color: var(--text-tertiary);
     font-style: italic;
 }
 
-.settings-mobile-pairing-broker-error {
+.settings-mobile-pairing-connection-error {
     color: var(--error, var(--accent-primary));
     border-color: var(--error, var(--accent-primary));
 }

@@ -88,10 +88,9 @@ connection, including TURN control messages. TCP alone does not add encryption.
 Browser/mobile peers retain the browser's UDP/TCP/TLS TURN connectivity. Relays
 may exchange UDP internally; that does not require UDP access on the host.
 
-The loopback MQTT override remains an explicit development/test facility. The
-managed production connection path never invokes it. The old broker metadata in
-persisted pairing records and the service's legacy pairing response remains for
-stored-identity/schema compatibility; it is not a connection fallback.
+The MQTT crate, loopback override, broker settings and credential APIs have been
+removed. Existing managed pairing records keep their identities and keys while
+ignoring obsolete transport fields. Old public-broker pairings require re-pairing.
 
 ## Canonical contract
 
@@ -104,24 +103,17 @@ python3 tools/export-mobile-rtc.py /path/to/TydeMobileService
 ```
 
 The generated service module must be committed with the corresponding API change.
-The existing Tyde application protocol version is unchanged; its payloads and
-framing have not changed.
+The application protocol version increases for the removal of broker fields and
+settings. The WebRTC transport version and byte framing remain unchanged.
 
 ## Deployment
 
-The companion `TydeMobileService` migration must precede the application rollout:
-
-- Apply `003_mobile_rtc_signaling.sql` and grant the runtime role access to
-  `mobile_rtc_signals` through the migration tool.
-- Add `TYCODE_RTC_SIGNING_KEY` (at least 32 random bytes) and
-  `TYCODE_TURN_API_TOKEN` to the existing Secrets Manager runtime JSON.
-- Set the CloudFormation `CloudflareTurnKeyId` parameter and deploy the updated
-  service configuration. `TYCODE_SIGNALING_URL` points to the HTTPS signal route.
-- Deploy matching host and mobile builds; old managed QR codes are versioned and
-  should be rescanned from the updated host.
-
-This requires a configuration/database deployment; the code-only deployment guard
-must reject it. No production resource changes are part of local validation.
+TURN is already deployed. Removing its predecessor requires a separate approved
+service/schema rollout after clients use TURN. The companion service documents
+migration `004_retire_mobile_broker.sql`, removal of IoT resources, and cleanup
+of the obsolete signing key from the existing SSM SecureString. Pairing records
+and encryption keys remain intact. The code-only deploy guard rejects these
+infrastructure/schema changes. Local validation performs no production changes.
 
 ## Validation
 

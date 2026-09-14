@@ -2105,7 +2105,7 @@ exec "$DEV_CHECK_REAL_PYTHON" "$@"
                 "frontend/src",
                 "frontend/tauri-shell/src",
                 "mobile-frontend/src",
-                "mqtt-transport/src",
+                "mobile-pairing/src",
                 "protocol/src",
                 "server/src",
             )
@@ -2171,7 +2171,7 @@ exec "$DEV_CHECK_REAL_PYTHON" "$@"
             self.assertIn(required, scheduler)
         voice_tests = (REPO_ROOT / "tests/tests/native_voice.rs").read_text()
         for required in ("run_connection_with_synthetic_voice", "start_production_writer_probe",
-                         "start_plain_mqtt_broker", "FrameKind::VoiceInterrupt",
+                         "tests::rtc::connect", "FrameKind::VoiceInterrupt",
                          "FrameKind::ProjectFileContents", "4 * 1024 * 1024",
                          "voice_settings_refresh_capabilities_for_every_live_connection"):
             self.assertIn(required, voice_tests)
@@ -3612,6 +3612,13 @@ profile = "minimal"
         self.assertNotIn('if [[ "${DEV_CHECK_CONTRACT_CHILD', source)
         self.assertIn('"dev check contract tests" 1 \\\n', source)
         self.assertIn("python3 tools/test_dev_check.py", source)
+
+
+def load_tests(loader, suite, pattern):
+    from test_release_tooling import TransportProtocolVersionTests
+
+    suite.addTests(loader.loadTestsFromTestCase(TransportProtocolVersionTests))
+    return suite
 
 
 if __name__ == "__main__":

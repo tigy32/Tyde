@@ -82,7 +82,7 @@ non-retryable failures.
 
 Production managed-broker ownership, Tyggs Pass gating, `tycode.dev` pairing
 APIs, and AWS IoT authorization are specified in
-`30-mobile-managed-broker.md`. This protocol document remains about the Tyde
+`30-mobile-managed-access.md`. This protocol document remains about the Tyde
 wire stream: any Tyde-visible mobile state still has to be modeled in Rust in
 `protocol/src/types.rs` and emitted by the server for the UI to render.
 

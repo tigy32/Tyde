@@ -41,7 +41,7 @@ The CSP mirrors the loader's `index.html` `<meta>` CSP **plus** `frame-ancestors
 'none'` (which `<meta>` cannot express). Load-bearing directives:
 `script-src 'self' 'wasm-unsafe-eval'` (same-origin JS + WASM compile, **no**
 general `unsafe-eval`),
-`connect-src 'self' wss:` (broker over wss,
+`connect-src 'self' wss:` (self-hosted WebSockets,
 same-origin manifest/bundle fetches, and the same-origin
 `/api/tyde/mobile/v1` managed-service API), `object-src 'none'`, `base-uri
 'none'`, `frame-ancestors 'none'`. HSTS is added here too (it cannot be set via

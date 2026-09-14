@@ -18,7 +18,7 @@
       No third-party JS is ever allowed.
 
       `connect-src 'self' wss:` is intentionally narrow: the WASM app reaches
-      the broker over `wss://` and fetches the manifest/bundle plus the
+      self-hosted endpoints over `wss://` and fetches the manifest/bundle plus the
       `tycode.dev` managed-service API from same-origin (`'self'`). `https:` is
       deliberately omitted — add it back only if a future feature needs
       cross-origin HTTPS.
@@ -161,7 +161,7 @@
          fails closed instead of falling back to a public broker. -->
     <script
       src="./mobile-service-config.js"
-      integrity="sha384-jF6cgAc2qWz8oyNWwzSClvbz2B8A4Nji6QMLWD94suaAfY2jbhzLXzIavKGl35OB"
+      integrity="sha384-W/bYW0t+yBfiITvvdxcdI1TYUdeAoPpq2CtO61eZJgSUaAr4oKjg9sp7OyFOwt2d"
     ></script>
 
     <!-- Bundled pure-JS QR decoder (jsQR, Apache-2.0). Loaded as a same-origin

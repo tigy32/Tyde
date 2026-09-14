@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::future::Future;
 use std::io::Write;
@@ -13,21 +13,16 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use fs2::FileExt;
 use hmac::{Hmac, Mac};
-use mqtt_transport::{
-    BrokerAuth, BrokerEndpoint, DirectMobilePairingQrPayload, EnvelopeStream,
-    ManagedMobilePairingQrPayload, ManagedMobilePairingQrPayloadParams, MobilePairingQrPayload,
-    MqttConnectConfig, ParticipantRole, PreSharedKey, RoomId, validate_broker_url,
+use mobile_pairing::{
+    DirectMobilePairingQrPayload, ManagedMobilePairingQrPayload,
+    ManagedMobilePairingQrPayloadParams, PreSharedKey,
 };
 use protocol::{
-    AgentControlStatus, AgentOrigin, BrokerUrl, FrameKind, ManagedBrokerAuthorizerName,
-    ManagedBrokerClientId, ManagedBrokerConnectAuth, ManagedBrokerCredentialScope,
-    ManagedBrokerCredentials, ManagedBrokerEndpoint, ManagedBrokerGrantId, ManagedBrokerProvider,
-    ManagedBrokerRegion, ManagedBrokerRole, ManagedBrokerTopicNamespace, MobileAccessErrorCode,
-    MobileAccessStatePayload, MobileBrokerStatus, MobileDeviceId, MobileDeviceRenamePayload,
-    MobileDeviceRevokePayload, MobileDeviceState, MobileDirectHostingStatus,
-    MobilePairingCancelPayload, MobilePairingOfferId, MobilePairingOfferPayload,
-    MobilePairingQrUri, MobilePairingState, MobilePushNotification, MobilePushReason,
-    MobilePushSubscription, MobileWebBundleSource, PROTOCOL_VERSION, StreamPath,
+    AgentControlStatus, AgentOrigin, FrameKind, MobileAccessErrorCode, MobileAccessStatePayload,
+    MobileConnectionStatus, MobileDeviceId, MobileDeviceRenamePayload, MobileDeviceRevokePayload,
+    MobileDeviceState, MobileDirectHostingStatus, MobilePairingCancelPayload, MobilePairingOfferId,
+    MobilePairingOfferPayload, MobilePairingQrUri, MobilePairingState, MobilePushNotification,
+    MobilePushReason, MobilePushSubscription, MobileWebBundleSource, PROTOCOL_VERSION, StreamPath,
 };
 use serde::{Deserialize, Serialize};
 use settings_model::HostSettings;
@@ -291,7 +286,7 @@ pub(crate) enum MobileAccessCommand {
     },
     StartPairing {
         requester: StreamPath,
-        /// Pair against the host's own HTTP origin rather than the broker.
+        /// Pair against the host's own HTTP origin rather than the managed relay.
         direct: bool,
     },
     /// A phone is redeeming a direct-hosting pairing offer over HTTP.
@@ -334,10 +329,6 @@ pub(crate) enum MobileAccessCommand {
     /// device list can say so rather than silently delivering nothing.
     PushSubscriptionGone {
         device_id: MobileDeviceId,
-    },
-    PairingTransportConnected {
-        offer_id: MobilePairingOfferId,
-        stream: EnvelopeStream,
     },
     DeviceTransportConnected {
         device_id: MobileDeviceId,
@@ -418,10 +409,6 @@ impl MobileAccessCommandFailure {
             MobileAccessErrorCode::ServiceAuthRequired => "service_auth_required",
             MobileAccessErrorCode::ServiceAuthFailed => "service_auth_failed",
             MobileAccessErrorCode::ServiceUnavailable => "service_unavailable",
-            MobileAccessErrorCode::BrokerUnavailable => "broker_unavailable",
-            MobileAccessErrorCode::BrokerConnectionFailed => "broker_connection_failed",
-            MobileAccessErrorCode::BrokerProtocol => "broker_protocol",
-            MobileAccessErrorCode::BrokerRejected => "broker_rejected",
             MobileAccessErrorCode::PairingExpired => "pairing_expired",
             MobileAccessErrorCode::PairingRejected => "pairing_rejected",
             MobileAccessErrorCode::CryptoFailed => "crypto_failed",
@@ -440,7 +427,6 @@ impl MobileAccessCommandFailure {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum AcceptTaskKey {
-    Pairing(MobilePairingOfferId),
     Device(MobileDeviceId),
 }
 
@@ -453,7 +439,7 @@ pub(crate) struct MobileAccessActor {
     settings: HostSettings,
     pairing_ttl: Duration,
     pairings: MobilePairings,
-    broker_status: MobileBrokerStatus,
+    connection_status: MobileConnectionStatus,
     pairing: MobilePairingState,
     subscribers: HashMap<StreamPath, Stream>,
     bootstrap_subscribers: HashMap<StreamPath, PendingBootstrapSubscriber>,
@@ -472,9 +458,9 @@ pub(crate) struct MobileAccessActor {
 }
 
 /// The direct mobile web server is deliberately independent of
-/// `enable_mobile_connections`: that switch governs the managed broker path,
+/// `enable_mobile_connections`: that switch governs the managed relay path,
 /// and a network locked down enough to want direct hosting is exactly the one
-/// that does not want an outbound broker connection alongside it.
+/// that does not want an outbound relay connection alongside it.
 enum DirectHostingState {
     Disabled,
     Running(RunningDirectHost),
@@ -642,7 +628,7 @@ impl ManagedMobileServiceClient {
             "POST",
             &self.base.path_for(&endpoint),
             &body,
-            BrokerRole::Host,
+            PairingRole::Host,
             &managed.pairing_id,
         )?;
         let response = self
@@ -843,8 +829,6 @@ struct CreateHostOfferResponse {
     offer_secret: String,
     host_offer_token: String,
     expires_at_ms: u64,
-    broker: ContractBrokerEndpoint,
-    host_broker_credentials: ContractBrokerCredentials,
     status: HostOfferStatus,
 }
 
@@ -856,8 +840,6 @@ impl std::fmt::Debug for CreateHostOfferResponse {
             .field("offer_secret", &"<redacted>")
             .field("host_offer_token", &"<redacted>")
             .field("expires_at_ms", &self.expires_at_ms)
-            .field("broker", &self.broker)
-            .field("host_broker_credentials", &"<redacted>")
             .field("status", &self.status)
             .finish()
     }
@@ -871,8 +853,6 @@ struct PollHostOfferResponse {
     pairing_id: Option<String>,
     host_pairing_secret: Option<String>,
     device: Option<ContractDeviceSummary>,
-    broker: Option<ContractBrokerEndpoint>,
-    host_broker_credentials: Option<ContractBrokerCredentials>,
     host_handoff: Option<ContractHostHandoffState>,
 }
 
@@ -889,11 +869,6 @@ impl std::fmt::Debug for PollHostOfferResponse {
                 &self.host_pairing_secret.as_ref().map(|_| "<redacted>"),
             )
             .field("device", &self.device)
-            .field("broker", &self.broker)
-            .field(
-                "host_broker_credentials",
-                &self.host_broker_credentials.as_ref().map(|_| "<redacted>"),
-            )
             .field("host_handoff", &self.host_handoff)
             .finish()
     }
@@ -943,12 +918,12 @@ enum HostOfferStatus {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-enum BrokerRole {
+enum PairingRole {
     Host,
     Mobile,
 }
 
-impl std::fmt::Display for BrokerRole {
+impl std::fmt::Display for PairingRole {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Host => formatter.write_str("host"),
@@ -963,79 +938,6 @@ struct ContractDeviceSummary {
     label: String,
     created_at_ms: u64,
     last_seen_at_ms: Option<u64>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct ContractBrokerEndpoint {
-    endpoint: String,
-    provider: ContractBrokerProvider,
-    region: String,
-    authorizer_name: String,
-}
-
-#[derive(Debug, Clone, Copy, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum ContractBrokerProvider {
-    AwsIotCore,
-}
-
-#[derive(Clone, Deserialize)]
-struct ContractBrokerCredentials {
-    grant_id: String,
-    client_id: String,
-    connect: ContractBrokerConnect,
-    scope: ContractBrokerCredentialScope,
-    issued_at_ms: u64,
-    connect_valid_until_ms: u64,
-    expires_at_ms: u64,
-}
-
-impl std::fmt::Debug for ContractBrokerCredentials {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("ContractBrokerCredentials")
-            .field("grant_id", &self.grant_id)
-            .field("client_id", &self.client_id)
-            .field("connect", &"<redacted>")
-            .field("scope", &self.scope)
-            .field("issued_at_ms", &self.issued_at_ms)
-            .field("connect_valid_until_ms", &self.connect_valid_until_ms)
-            .field("expires_at_ms", &self.expires_at_ms)
-            .finish()
-    }
-}
-
-#[derive(Clone, Deserialize)]
-struct ContractBrokerConnect {
-    username: Option<String>,
-    password: Option<String>,
-    #[serde(default)]
-    websocket_url: Option<protocol::BrokerUrl>,
-    #[serde(default)]
-    headers: BTreeMap<String, String>,
-}
-
-impl std::fmt::Debug for ContractBrokerConnect {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("ContractBrokerConnect")
-            .field("username", &self.username.as_ref().map(|_| "<redacted>"))
-            .field("password", &self.password.as_ref().map(|_| "<redacted>"))
-            .field(
-                "websocket_url",
-                &self.websocket_url.as_ref().map(|_| "<redacted>"),
-            )
-            .field("headers", &"<redacted>")
-            .finish()
-    }
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct ContractBrokerCredentialScope {
-    namespace: String,
-    role: BrokerRole,
-    publish: Vec<String>,
-    subscribe: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1068,7 +970,6 @@ enum ManagedErrorCode {
     RepairRequired,
     PairingRevoked,
     VersionMismatch,
-    BrokerUnavailable,
     ServiceUnavailable,
     RateLimited,
     Internal,
@@ -1109,7 +1010,7 @@ impl ManagedErrorBody {
             ManagedErrorCode::MobileSessionRequired => MobileAccessErrorCode::ServiceAuthRequired,
             ManagedErrorCode::PassRequired => MobileAccessErrorCode::PassRequired,
             ManagedErrorCode::Forbidden | ManagedErrorCode::NotFound => {
-                MobileAccessErrorCode::BrokerRejected
+                MobileAccessErrorCode::PairingRejected
             }
             ManagedErrorCode::OfferAlreadyRedeemed => MobileAccessErrorCode::PairingRejected,
             ManagedErrorCode::DuplicateDevice => MobileAccessErrorCode::DuplicateDevice,
@@ -1118,7 +1019,6 @@ impl ManagedErrorBody {
             ManagedErrorCode::RepairRequired => MobileAccessErrorCode::RepairRequired,
             ManagedErrorCode::PairingRevoked => MobileAccessErrorCode::RevokedDevice,
             ManagedErrorCode::VersionMismatch => MobileAccessErrorCode::VersionMismatch,
-            ManagedErrorCode::BrokerUnavailable => MobileAccessErrorCode::BrokerUnavailable,
             ManagedErrorCode::ServiceUnavailable
             | ManagedErrorCode::RateLimited
             | ManagedErrorCode::Internal => MobileAccessErrorCode::ServiceUnavailable,
@@ -1139,88 +1039,12 @@ impl ManagedErrorBody {
     }
 }
 
-impl ContractBrokerEndpoint {
-    fn into_protocol(self) -> Result<ManagedBrokerEndpoint, ManagedServiceError> {
-        let provider = match self.provider {
-            ContractBrokerProvider::AwsIotCore => ManagedBrokerProvider::AwsIotCore,
-        };
-        Ok(ManagedBrokerEndpoint {
-            endpoint: BrokerUrl::new(self.endpoint).map_err(|err| {
-                ManagedServiceError::new(
-                    MobileAccessErrorCode::ServiceUnavailable,
-                    format!("managed service returned invalid broker endpoint: {err}"),
-                )
-            })?,
-            provider,
-            region: ManagedBrokerRegion::new(self.region).map_err(|err| {
-                ManagedServiceError::new(
-                    MobileAccessErrorCode::ServiceUnavailable,
-                    format!("managed service returned invalid broker region: {err}"),
-                )
-            })?,
-            authorizer_name: ManagedBrokerAuthorizerName::new(self.authorizer_name).map_err(
-                |err| {
-                    ManagedServiceError::new(
-                        MobileAccessErrorCode::ServiceUnavailable,
-                        format!("managed service returned invalid broker authorizer: {err}"),
-                    )
-                },
-            )?,
-        })
-    }
-}
-
-impl ContractBrokerCredentials {
-    fn into_protocol(self) -> Result<ManagedBrokerCredentials, ManagedServiceError> {
-        Ok(ManagedBrokerCredentials {
-            grant_id: ManagedBrokerGrantId::new(self.grant_id).map_err(|err| {
-                ManagedServiceError::new(
-                    MobileAccessErrorCode::ServiceUnavailable,
-                    format!("managed service returned invalid broker grant id: {err}"),
-                )
-            })?,
-            client_id: ManagedBrokerClientId::new(self.client_id).map_err(|err| {
-                ManagedServiceError::new(
-                    MobileAccessErrorCode::ServiceUnavailable,
-                    format!("managed service returned invalid broker client id: {err}"),
-                )
-            })?,
-            connect: ManagedBrokerConnectAuth {
-                username: self.connect.username,
-                password: self.connect.password,
-                websocket_url: self.connect.websocket_url,
-                headers: self.connect.headers,
-            },
-            scope: ManagedBrokerCredentialScope {
-                namespace: ManagedBrokerTopicNamespace::new(self.scope.namespace).map_err(
-                    |err| {
-                        ManagedServiceError::new(
-                            MobileAccessErrorCode::ServiceUnavailable,
-                            format!(
-                                "managed service returned invalid broker topic namespace: {err}"
-                            ),
-                        )
-                    },
-                )?,
-                role: match self.scope.role {
-                    BrokerRole::Host => ManagedBrokerRole::Host,
-                    BrokerRole::Mobile => ManagedBrokerRole::Mobile,
-                },
-                publish: self.scope.publish,
-                subscribe: self.scope.subscribe,
-            },
-            issued_at_ms: self.issued_at_ms,
-            expires_at_ms: self.expires_at_ms,
-        })
-    }
-}
-
 fn pairing_auth_header(
     secret: &str,
     method: &str,
     path: &str,
     body: &[u8],
-    role: BrokerRole,
+    role: PairingRole,
     pairing_id: &str,
 ) -> Result<String, ManagedServiceError> {
     let nonce = Uuid::new_v4().to_string();
@@ -1254,7 +1078,7 @@ struct PairingSignatureInput<'a> {
     nonce: &'a str,
     timestamp_ms: u64,
     pairing_id: &'a str,
-    role: BrokerRole,
+    role: PairingRole,
 }
 
 fn sign_pairing_request(input: PairingSignatureInput<'_>) -> Result<String, ManagedServiceError> {
@@ -1306,15 +1130,14 @@ impl MobileAccessActor {
             init.pairings_store.save(&pairings)?;
         }
         let managed_service = ManagedMobileServiceClient::new(init.managed_service_base_url)?;
-        let legacy_repair_changed =
-            mark_legacy_pairings_repair_required(&mut pairings, &init.initial_settings);
+        let legacy_repair_changed = mark_legacy_pairings_repair_required(&mut pairings);
         if legacy_repair_changed {
             init.pairings_store.save(&pairings)?;
         }
-        let broker_status = if init.initial_settings.enable_mobile_connections {
-            initial_enabled_broker_status(&pairings, &init.initial_settings)
+        let connection_status = if init.initial_settings.enable_mobile_connections {
+            managed_connection_status_for_pairings(&pairings)
         } else {
-            MobileBrokerStatus::Disabled
+            MobileConnectionStatus::Disabled
         };
         let pairing = match (&pairings.pending_handoff_ack, &pairings.active_pairing) {
             (Some(pending), None) => MobilePairingState::Active {
@@ -1350,7 +1173,7 @@ impl MobileAccessActor {
             settings: init.initial_settings,
             pairing_ttl: init.pairing_ttl,
             pairings,
-            broker_status,
+            connection_status,
             pairing,
             subscribers: HashMap::new(),
             bootstrap_subscribers: HashMap::new(),
@@ -1437,9 +1260,6 @@ impl MobileAccessActor {
                 } => {
                     let result = self.rename_device(&device_id, label).await;
                     let _ = reply.send(result);
-                }
-                MobileAccessCommand::PairingTransportConnected { offer_id, stream } => {
-                    self.pairing_transport_connected(&offer_id, stream).await;
                 }
                 MobileAccessCommand::DeviceTransportConnected { device_id, stream } => {
                     self.device_transport_connected(&device_id, stream).await;
@@ -1548,17 +1368,14 @@ impl MobileAccessActor {
 
     async fn apply_settings(&mut self, settings: HostSettings) {
         let was_enabled = self.settings.enable_mobile_connections;
-        let old_url = self.settings.mobile_broker_url.clone();
         self.settings = settings;
-        let url_changed = old_url != self.settings.mobile_broker_url;
         let direct_hosting_before = self.direct_hosting_status();
         self.apply_direct_hosting();
         let direct_hosting_changed = self.direct_hosting_status() != direct_hosting_before;
-        if mark_legacy_pairings_repair_required(&mut self.pairings, &self.settings)
+        if mark_legacy_pairings_repair_required(&mut self.pairings)
             && let Err(message) = self.pairings_store.save(&self.pairings)
         {
-            self.broker_status = MobileBrokerStatus::Error {
-                broker_url: self.settings.mobile_broker_url.clone(),
+            self.connection_status = MobileConnectionStatus::Error {
                 code: MobileAccessErrorCode::StoreLoadFailed,
                 message,
             };
@@ -1567,7 +1384,7 @@ impl MobileAccessActor {
         }
 
         if !self.settings.enable_mobile_connections {
-            if !was_enabled && !url_changed {
+            if !was_enabled {
                 if direct_hosting_changed {
                     self.fan_out_state().await;
                 }
@@ -1578,7 +1395,7 @@ impl MobileAccessActor {
             return;
         }
 
-        if !was_enabled || url_changed {
+        if !was_enabled {
             self.enable_mobile_access().await;
             self.fan_out_state().await;
         } else if direct_hosting_changed {
@@ -1599,7 +1416,7 @@ impl MobileAccessActor {
             return;
         }
         // `enable_mobile_connections` is the master switch for every mobile
-        // transport, not just the broker: turning it off has to stop the direct
+        // transport, including self-hosting: turning it off has to stop the direct
         // origin too, or a paired phone would keep connecting over HTTP after
         // the user believes they cut mobile access off. Report it rather than
         // going quiet, or turning direct hosting on with the master switch off
@@ -1686,29 +1503,7 @@ impl MobileAccessActor {
     }
 
     async fn enable_mobile_access(&mut self) {
-        let endpoint = match dev_broker_endpoint(&self.settings) {
-            Ok(Some(endpoint)) => {
-                self.broker_status = MobileBrokerStatus::Online {
-                    broker_url: endpoint.url.clone(),
-                };
-                Some(endpoint)
-            }
-            Ok(None) => {
-                self.broker_status = managed_broker_status_for_pairings(&self.pairings);
-                None
-            }
-            Err(message) => {
-                self.abort_all_tasks();
-                self.mobile_pairings_lease = None;
-                self.broker_status = MobileBrokerStatus::Error {
-                    broker_url: self.settings.mobile_broker_url.clone(),
-                    code: MobileAccessErrorCode::InvalidConfig,
-                    message,
-                };
-                return;
-            }
-        };
-
+        self.connection_status = managed_connection_status_for_pairings(&self.pairings);
         if self.mobile_pairings_lease.is_none() {
             match MobilePairingsLease::try_acquire(self.pairings_store.path()) {
                 Ok(lease) => {
@@ -1716,12 +1511,8 @@ impl MobileAccessActor {
                 }
                 Err(message) => {
                     self.abort_all_tasks();
-                    self.broker_status = MobileBrokerStatus::Error {
-                        broker_url: endpoint
-                            .as_ref()
-                            .map(|endpoint| endpoint.url.clone())
-                            .or_else(|| first_managed_broker_url(&self.pairings)),
-                        code: MobileAccessErrorCode::BrokerUnavailable,
+                    self.connection_status = MobileConnectionStatus::Error {
+                        code: MobileAccessErrorCode::ServiceUnavailable,
                         message,
                     };
                     return;
@@ -1729,19 +1520,14 @@ impl MobileAccessActor {
             }
         }
 
-        if endpoint.is_some() {
-            self.spawn_active_pairing_accept_if_needed();
-            self.spawn_device_accepts_if_needed();
-        } else {
-            self.spawn_managed_device_accepts_if_needed();
-            self.resume_managed_pairing_handoff_if_needed();
-        }
+        self.spawn_managed_device_accepts_if_needed();
+        self.resume_managed_pairing_handoff_if_needed();
     }
 
     async fn disable_mobile_access(&mut self) {
         self.abort_all_tasks();
         self.mobile_pairings_lease = None;
-        self.broker_status = MobileBrokerStatus::Disabled;
+        self.connection_status = MobileConnectionStatus::Disabled;
         self.pairing = MobilePairingState::Idle;
         self.active_requester = None;
         if self.pairings.active_pairing.take().is_some() {
@@ -1764,9 +1550,7 @@ impl MobileAccessActor {
             }
         };
 
-        // Direct pairing does not touch the broker, so it deliberately skips
-        // every managed precondition below — including the mobile-connections
-        // switch, which governs the broker path only.
+        // Self-hosted pairing validates its own prerequisites.
         if direct {
             self.start_direct_pairing(requester, offer_id).await;
             return;
@@ -1783,17 +1567,10 @@ impl MobileAccessActor {
         }
         if let Some(pending) = self.pairings.pending_handoff_ack.clone()
             && now_ms().is_ok_and(|now| now >= pending.expires_at_ms)
-            && let Some(broker_url) = self
-                .pairings
-                .devices
-                .iter()
-                .find(|record| record.device_id == pending.device_id)
-                .map(|record| record.broker.url.clone())
         {
             self.expire_pending_handoff(
                 &pending.offer_id,
                 &pending.pairing_id,
-                broker_url,
                 "Managed mobile handoff acknowledgement expired".to_owned(),
                 0,
             )
@@ -1812,109 +1589,7 @@ impl MobileAccessActor {
             return;
         }
 
-        match dev_broker_endpoint(&self.settings) {
-            Ok(Some(broker)) => {
-                self.start_dev_pairing(requester, offer_id, broker).await;
-            }
-            Ok(None) => {
-                self.start_managed_pairing(requester).await;
-            }
-            Err(message) => {
-                self.pairing = MobilePairingState::Failed {
-                    offer_id,
-                    code: MobileAccessErrorCode::InvalidConfig,
-                    message,
-                };
-                self.fan_out_state().await;
-            }
-        }
-    }
-
-    async fn start_dev_pairing(
-        &mut self,
-        requester: StreamPath,
-        offer_id: MobilePairingOfferId,
-        broker: BrokerEndpoint,
-    ) {
-        let created_at_ms = match now_ms() {
-            Ok(now) => now,
-            Err(message) => {
-                self.pairing = MobilePairingState::Failed {
-                    offer_id,
-                    code: MobileAccessErrorCode::Internal,
-                    message,
-                };
-                self.fan_out_state().await;
-                return;
-            }
-        };
-        let expires_at_ms = created_at_ms.saturating_add(self.pairing_ttl.as_millis() as u64);
-        let room = RoomId::random();
-        let psk = PreSharedKey::random();
-        let key_fingerprint = key_fingerprint(&psk);
-        let credential = ActiveMobilePairingCredential {
-            offer_id: offer_id.clone(),
-            broker: broker.clone(),
-            room,
-            psk,
-            created_at_ms,
-            key_fingerprint,
-            managed: None,
-        };
-        let mut qr_payload = MobilePairingQrPayload::new(
-            PROTOCOL_VERSION,
-            broker,
-            credential.room,
-            credential.psk.clone(),
-            "Tyde Host".to_owned(),
-        );
-        // Advertise the host's real build version so the web/PWA loader can pick
-        // the matching versioned bundle.
-        qr_payload.release_version = crate::host_release_version();
-        let qr_uri = match qr_payload.to_pairing_url() {
-            Ok(uri) => MobilePairingQrUri(uri),
-            Err(err) => {
-                self.pairing = MobilePairingState::Failed {
-                    offer_id,
-                    code: MobileAccessErrorCode::Internal,
-                    message: format!("failed to encode pairing QR payload: {err}"),
-                };
-                self.fan_out_state().await;
-                return;
-            }
-        };
-
-        self.cancel_active_pairing_without_state();
-        self.pairings.active_pairing = Some(credential.clone());
-        if let Err(message) = self.pairings_store.save(&self.pairings) {
-            self.pairing = MobilePairingState::Failed {
-                offer_id,
-                code: MobileAccessErrorCode::StoreLoadFailed,
-                message,
-            };
-            self.fan_out_state().await;
-            return;
-        }
-        self.active_requester = Some(requester.clone());
-        self.pairing = MobilePairingState::Active {
-            offer_id: offer_id.clone(),
-            expires_at_ms,
-        };
-        self.spawn_pairing_accept(credential);
-        self.schedule_pairing_ttl(offer_id.clone(), expires_at_ms);
-        self.fan_out_state().await;
-
-        let Some(stream) = self.subscribers.get(&requester).cloned() else {
-            return;
-        };
-        let offer = MobilePairingOfferPayload {
-            offer_id,
-            qr_uri,
-            expires_at_ms,
-        };
-        if send_mobile_pairing_offer(&stream, &offer).await.is_err() {
-            self.subscribers.remove(&requester);
-        }
+        self.start_managed_pairing(requester).await;
     }
 
     /// Publishes a single-use, short-lived offer for a phone that will reach
@@ -2206,8 +1881,7 @@ impl MobileAccessActor {
                     code: error.code,
                     message: error.message,
                 };
-                self.broker_status = MobileBrokerStatus::Error {
-                    broker_url: None,
+                self.connection_status = MobileConnectionStatus::Error {
                     code: error.code,
                     message: "managed mobile service could not create a pairing offer".to_owned(),
                 };
@@ -2241,46 +1915,19 @@ impl MobileAccessActor {
                 return;
             }
         };
-        let broker = match response.broker.into_protocol() {
-            Ok(broker) => broker,
-            Err(error) => {
-                self.pairing = MobilePairingState::Failed {
-                    offer_id,
-                    code: error.code,
-                    message: error.message,
-                };
-                self.fan_out_state().await;
-                return;
-            }
-        };
-        let host_broker_credentials = match response.host_broker_credentials.into_protocol() {
-            Ok(credentials) => credentials,
-            Err(error) => {
-                self.pairing = MobilePairingState::Failed {
-                    offer_id,
-                    code: error.code,
-                    message: error.message,
-                };
-                self.fan_out_state().await;
-                return;
-            }
-        };
-        let room = RoomId::random();
         let psk = PreSharedKey::random();
         let key_fingerprint = key_fingerprint(&psk);
-        let qr_payload = ManagedMobilePairingQrPayload::new_with_rendezvous(
-            ManagedMobilePairingQrPayloadParams {
+        let qr_payload =
+            ManagedMobilePairingQrPayload::new_with_key(ManagedMobilePairingQrPayloadParams {
                 protocol_version: PROTOCOL_VERSION,
                 release_version: host_release_version,
                 offer_id: offer_id.clone(),
                 offer_secret: response.offer_secret,
-                broker: broker.clone(),
-                room,
+
                 psk: psk.clone(),
                 host_label,
                 expires_at_ms: response.expires_at_ms,
-            },
-        );
+            });
         let pairing_url = match qr_payload.to_pairing_url() {
             Ok(url) => url,
             Err(err) => {
@@ -2293,22 +1940,16 @@ impl MobileAccessActor {
                 return;
             }
         };
-        let broker_endpoint = BrokerEndpoint {
-            url: broker.endpoint.clone(),
-            auth: BrokerAuth::Anonymous,
-        };
         let credential = ActiveMobilePairingCredential {
             offer_id: offer_id.clone(),
-            broker: broker_endpoint,
-            room,
+
             psk,
             created_at_ms,
             key_fingerprint,
             managed: Some(ActiveManagedMobilePairingCredential {
                 host_offer_token: response.host_offer_token,
                 pairing_url: pairing_url.clone(),
-                broker: broker.clone(),
-                host_broker_credentials,
+
                 expires_at_ms: response.expires_at_ms,
                 handoff: None,
             }),
@@ -2329,9 +1970,7 @@ impl MobileAccessActor {
             offer_id: offer_id.clone(),
             expires_at_ms: response.expires_at_ms,
         };
-        self.broker_status = MobileBrokerStatus::Connecting {
-            broker_url: broker.endpoint.clone(),
-        };
+        self.connection_status = MobileConnectionStatus::Connecting;
         self.schedule_pairing_ttl(offer_id.clone(), response.expires_at_ms);
         self.spawn_offer_poll(credential);
         self.fan_out_state().await;
@@ -2667,112 +2306,6 @@ impl MobileAccessActor {
         }
     }
 
-    async fn pairing_transport_connected(
-        &mut self,
-        offer_id: &MobilePairingOfferId,
-        stream: EnvelopeStream,
-    ) {
-        let Some(active) = self.pairings.active_pairing.take() else {
-            return;
-        };
-        if &active.offer_id != offer_id {
-            self.pairings.active_pairing = Some(active);
-            return;
-        }
-        self.accept_tasks
-            .remove(&AcceptTaskKey::Pairing(offer_id.clone()));
-        if let Some(task) = self.pairing_ttl_task.take() {
-            task.abort();
-        }
-        let device_id = match new_device_id() {
-            Ok(device_id) => device_id,
-            Err(message) => {
-                self.pairing = MobilePairingState::Failed {
-                    offer_id: offer_id.clone(),
-                    code: MobileAccessErrorCode::Internal,
-                    message,
-                };
-                self.pairings.active_pairing = Some(active);
-                self.fan_out_state().await;
-                return;
-            }
-        };
-        let now = now_ms().unwrap_or(active.created_at_ms);
-        let managed_record = match active
-            .managed
-            .as_ref()
-            .and_then(|managed| managed.handoff.as_ref())
-        {
-            Some(handoff) => {
-                let device_id = handoff.device_id.clone();
-                let record = MobilePairingRecord {
-                    device_id,
-                    broker: BrokerEndpoint {
-                        url: handoff.broker.endpoint.clone(),
-                        auth: BrokerAuth::Anonymous,
-                    },
-                    room: active.room,
-                    psk: active.psk.clone(),
-                    label: handoff.device_label.clone(),
-                    created_at_ms: handoff.device_created_at_ms,
-                    last_seen_at_ms: handoff.device_last_seen_at_ms.or(Some(now)),
-                    state: MobileDeviceState::Connected,
-                    key_fingerprint: active.key_fingerprint.clone(),
-                    push: None,
-                    managed: Some(ManagedMobilePairingCredential {
-                        pairing_id: handoff.pairing_id.clone(),
-                        host_pairing_secret: handoff.host_pairing_secret.clone(),
-                        broker: handoff.broker.clone(),
-                    }),
-                };
-                Some((record.device_id.clone(), record))
-            }
-            None if active.managed.is_some() => {
-                self.pairing = MobilePairingState::Failed {
-                    offer_id: offer_id.clone(),
-                    code: MobileAccessErrorCode::RepairRequired,
-                    message: "managed pairing completed without tycode.dev handoff".to_owned(),
-                };
-                self.pairings.active_pairing = Some(active);
-                self.fan_out_state().await;
-                return;
-            }
-            None => None,
-        };
-        let record = MobilePairingRecord {
-            device_id: device_id.clone(),
-            broker: active.broker,
-            room: active.room,
-            psk: active.psk,
-            label: "Mobile device".to_owned(),
-            created_at_ms: active.created_at_ms,
-            last_seen_at_ms: Some(now),
-            state: MobileDeviceState::Connected,
-            key_fingerprint: active.key_fingerprint,
-            push: None,
-            managed: None,
-        };
-        let (device_id, record) = managed_record.unwrap_or((device_id, record));
-        self.pairings.devices.push(record);
-        if let Err(message) = self.pairings_store.save(&self.pairings) {
-            self.pairing = MobilePairingState::Failed {
-                offer_id: offer_id.clone(),
-                code: MobileAccessErrorCode::StoreLoadFailed,
-                message,
-            };
-            self.fan_out_state().await;
-            return;
-        }
-        self.active_requester = None;
-        self.pairing = MobilePairingState::Consumed {
-            offer_id: offer_id.clone(),
-        };
-        self.spawn_connected_bridge(device_id.clone(), Box::new(stream));
-        self.spawn_device_accept(device_id);
-        self.fan_out_state().await;
-        self.schedule_pairing_grace(offer_id.clone());
-    }
-
     async fn device_transport_connected(
         &mut self,
         device_id: &MobileDeviceId,
@@ -2803,25 +2336,7 @@ impl MobileAccessActor {
         let Some(managed) = active.managed.as_ref() else {
             return;
         };
-        if handoff.host_broker_credentials.scope.role != ManagedBrokerRole::Host
-            || handoff.host_broker_credentials.issued_at_ms
-                >= handoff.host_broker_credentials.expires_at_ms
-        {
-            let message =
-                "managed mobile handoff contained invalid host broker credentials".to_owned();
-            self.pairing = MobilePairingState::Failed {
-                offer_id: offer_id.clone(),
-                code: MobileAccessErrorCode::ServiceUnavailable,
-                message: message.clone(),
-            };
-            self.broker_status = MobileBrokerStatus::Error {
-                broker_url: Some(handoff.broker.endpoint),
-                code: MobileAccessErrorCode::ServiceUnavailable,
-                message,
-            };
-            self.fan_out_state().await;
-            return;
-        }
+
         if let Some(task) = self.pairing_ttl_task.take() {
             task.abort();
         }
@@ -2829,14 +2344,9 @@ impl MobileAccessActor {
         let pairing_id = handoff.pairing_id.clone();
         let handoff_expires_at_ms = handoff.handoff_expires_at_ms;
         let device_id = handoff.device_id.clone();
-        let broker_url = handoff.broker.endpoint.clone();
         let record = MobilePairingRecord {
             device_id: device_id.clone(),
-            broker: BrokerEndpoint {
-                url: broker_url.clone(),
-                auth: BrokerAuth::Anonymous,
-            },
-            room: active.room,
+
             psk: active.psk.clone(),
             label: handoff.device_label,
             created_at_ms: handoff.device_created_at_ms,
@@ -2847,7 +2357,6 @@ impl MobileAccessActor {
             managed: Some(ManagedMobilePairingCredential {
                 pairing_id: pairing_id.clone(),
                 host_pairing_secret: handoff.host_pairing_secret,
-                broker: handoff.broker,
             }),
         };
         let pending_ack = PendingManagedMobileHandoffAck {
@@ -2866,8 +2375,7 @@ impl MobileAccessActor {
                     code: MobileAccessErrorCode::DuplicateDevice,
                     message: message.clone(),
                 };
-                self.broker_status = MobileBrokerStatus::Error {
-                    broker_url: Some(broker_url),
+                self.connection_status = MobileConnectionStatus::Error {
                     code: MobileAccessErrorCode::DuplicateDevice,
                     message,
                 };
@@ -2883,8 +2391,7 @@ impl MobileAccessActor {
                 code: MobileAccessErrorCode::StoreLoadFailed,
                 message: message.clone(),
             };
-            self.broker_status = MobileBrokerStatus::Error {
-                broker_url: Some(broker_url),
+            self.connection_status = MobileConnectionStatus::Error {
                 code: MobileAccessErrorCode::StoreLoadFailed,
                 message,
             };
@@ -2901,9 +2408,7 @@ impl MobileAccessActor {
             offer_id: offer_id.clone(),
             expires_at_ms: handoff_expires_at_ms,
         };
-        self.broker_status = MobileBrokerStatus::Connecting {
-            broker_url: broker_url.clone(),
-        };
+        self.connection_status = MobileConnectionStatus::Connecting;
         self.spawn_device_accept(device_id);
         if insert == ManagedMobilePairingRecordInsert::Inserted {
             self.fan_out_state().await;
@@ -2940,8 +2445,7 @@ impl MobileAccessActor {
                 code: MobileAccessErrorCode::RepairRequired,
                 message: message.clone(),
             };
-            self.broker_status = MobileBrokerStatus::Error {
-                broker_url: None,
+            self.connection_status = MobileConnectionStatus::Error {
                 code: MobileAccessErrorCode::RepairRequired,
                 message,
             };
@@ -2949,12 +2453,11 @@ impl MobileAccessActor {
             return;
         };
         let device_id = record.device_id;
-        let broker_url = record.broker.url;
+
         if now_ms().is_ok_and(|now| now >= pending.expires_at_ms) {
             self.expire_pending_handoff(
                 offer_id,
                 pairing_id,
-                broker_url,
                 "Managed mobile handoff acknowledgement expired".to_owned(),
                 attempt,
             )
@@ -2967,14 +2470,8 @@ impl MobileAccessActor {
             .await
         {
             if error.code == MobileAccessErrorCode::PairingExpired {
-                self.expire_pending_handoff(
-                    offer_id,
-                    pairing_id,
-                    broker_url,
-                    error.message,
-                    attempt,
-                )
-                .await;
+                self.expire_pending_handoff(offer_id, pairing_id, error.message, attempt)
+                    .await;
                 return;
             }
             let pairing = MobilePairingState::Failed {
@@ -2982,14 +2479,13 @@ impl MobileAccessActor {
                 code: error.code,
                 message: error.message.clone(),
             };
-            let broker_status = MobileBrokerStatus::Error {
-                broker_url: Some(broker_url),
+            let connection_status = MobileConnectionStatus::Error {
                 code: error.code,
                 message: error.message,
             };
-            let changed = self.pairing != pairing || self.broker_status != broker_status;
+            let changed = self.pairing != pairing || self.connection_status != connection_status;
             self.pairing = pairing;
-            self.broker_status = broker_status;
+            self.connection_status = connection_status;
             if error.code == MobileAccessErrorCode::ServiceUnavailable {
                 self.schedule_handoff_ack_retry(
                     offer_id.clone(),
@@ -3012,14 +2508,13 @@ impl MobileAccessActor {
                 code: MobileAccessErrorCode::StoreLoadFailed,
                 message: message.clone(),
             };
-            let broker_status = MobileBrokerStatus::Error {
-                broker_url: Some(broker_url),
+            let connection_status = MobileConnectionStatus::Error {
                 code: MobileAccessErrorCode::StoreLoadFailed,
                 message,
             };
-            let changed = self.pairing != pairing || self.broker_status != broker_status;
+            let changed = self.pairing != pairing || self.connection_status != connection_status;
             self.pairing = pairing;
-            self.broker_status = broker_status;
+            self.connection_status = connection_status;
             self.schedule_handoff_ack_retry(
                 offer_id.clone(),
                 pairing_id.to_owned(),
@@ -3036,7 +2531,7 @@ impl MobileAccessActor {
             offer_id: offer_id.clone(),
         };
         if !self.connected_tasks.contains_key(&device_id) {
-            self.broker_status = MobileBrokerStatus::Connecting { broker_url };
+            self.connection_status = MobileConnectionStatus::Connecting;
         }
         self.fan_out_state().await;
         self.schedule_pairing_grace(offer_id.clone());
@@ -3046,7 +2541,6 @@ impl MobileAccessActor {
         &mut self,
         offer_id: &MobilePairingOfferId,
         pairing_id: &str,
-        broker_url: BrokerUrl,
         expiry_message: String,
         attempt: u32,
     ) {
@@ -3058,14 +2552,13 @@ impl MobileAccessActor {
                 code: MobileAccessErrorCode::StoreLoadFailed,
                 message: message.clone(),
             };
-            let broker_status = MobileBrokerStatus::Error {
-                broker_url: Some(broker_url),
+            let connection_status = MobileConnectionStatus::Error {
                 code: MobileAccessErrorCode::StoreLoadFailed,
                 message,
             };
-            let changed = self.pairing != pairing || self.broker_status != broker_status;
+            let changed = self.pairing != pairing || self.connection_status != connection_status;
             self.pairing = pairing;
-            self.broker_status = broker_status;
+            self.connection_status = connection_status;
             self.schedule_handoff_ack_retry(
                 offer_id.clone(),
                 pairing_id.to_owned(),
@@ -3121,12 +2614,11 @@ impl MobileAccessActor {
     }
 
     fn mark_device_connected(&mut self, device_id: &MobileDeviceId, now: Option<u64>) -> bool {
-        let broker_url = self
+        let is_managed = self
             .pairings
             .devices
             .iter()
-            .find(|record| &record.device_id == device_id)
-            .map(|record| record.broker.url.clone());
+            .any(|record| &record.device_id == device_id && record.managed.is_some());
         let Some(device) = self.pairings.device_mut(device_id) else {
             return false;
         };
@@ -3137,10 +2629,9 @@ impl MobileAccessActor {
         if let Err(message) = self.pairings_store.save(&self.pairings) {
             tracing::warn!(error = %message, "failed to persist mobile device connection state");
         }
-        // Only an MQTT pairing has a broker whose health this reports; a direct
-        // device reached the host without one.
-        if let Some(broker_url) = broker_url {
-            self.broker_status = MobileBrokerStatus::Online { broker_url };
+        // Self-hosted device connections do not change managed relay status.
+        if is_managed {
+            self.connection_status = MobileConnectionStatus::Online;
         }
         true
     }
@@ -3216,16 +2707,7 @@ impl MobileAccessActor {
                     tracing::warn!(error = %message, "failed to persist mobile device repair state");
                 }
             }
-            self.broker_status = MobileBrokerStatus::Error {
-                broker_url: self
-                    .pairings
-                    .devices
-                    .iter()
-                    .find(|record| &record.device_id == device_id)
-                    .map(|record| record.broker.url.clone()),
-                code,
-                message,
-            };
+            self.connection_status = MobileConnectionStatus::Error { code, message };
             self.fan_out_state().await;
         }
     }
@@ -3274,7 +2756,7 @@ impl MobileAccessActor {
             return;
         }
         self.connected_tasks.remove(device_id);
-        let is_mqtt_device = self
+        let is_managed_device = self
             .pairings
             .devices
             .iter()
@@ -3287,34 +2769,12 @@ impl MobileAccessActor {
                 tracing::warn!(error = %message, "failed to persist mobile device disconnect state");
             }
         }
-        // The host re-arms an MQTT accept itself. A direct device owns its own
+        // The host re-arms an WebRTC accept itself. A direct device owns its own
         // reconnect, so waiting on one here would never resolve.
-        if is_mqtt_device && self.settings.enable_mobile_connections {
+        if is_managed_device && self.settings.enable_mobile_connections {
             self.spawn_device_accept(device_id.clone());
         }
         self.fan_out_state().await;
-    }
-
-    fn spawn_active_pairing_accept_if_needed(&mut self) {
-        let Some(active) = self.pairings.active_pairing.clone() else {
-            return;
-        };
-        self.spawn_pairing_accept(active);
-    }
-
-    fn spawn_device_accepts_if_needed(&mut self) {
-        let device_ids: Vec<MobileDeviceId> = self
-            .pairings
-            .devices
-            .iter()
-            .filter(|record| record.state != MobileDeviceState::RepairRequired)
-            .filter(|record| record.state != MobileDeviceState::Revoked)
-            .filter(|record| record.managed.is_none())
-            .map(|record| record.device_id.clone())
-            .collect();
-        for device_id in device_ids {
-            self.spawn_device_accept(device_id);
-        }
     }
 
     fn spawn_managed_device_accepts_if_needed(&mut self) {
@@ -3347,22 +2807,6 @@ impl MobileAccessActor {
         {
             self.spawn_offer_poll(active);
         }
-    }
-
-    fn spawn_pairing_accept(&mut self, credential: ActiveMobilePairingCredential) {
-        let key = AcceptTaskKey::Pairing(credential.offer_id.clone());
-        if self.accept_tasks.contains_key(&key) {
-            return;
-        }
-        if credential
-            .managed
-            .as_ref()
-            .is_some_and(|managed| managed.handoff.is_none())
-        {
-            return;
-        }
-        let task = spawn_pairing_accept_task(self.tx.clone(), credential);
-        self.accept_tasks.insert(key, task);
     }
 
     fn spawn_device_accept(&mut self, device_id: MobileDeviceId) {
@@ -3485,13 +2929,7 @@ impl MobileAccessActor {
     }
 
     fn cancel_active_pairing_without_state(&mut self) {
-        if let Some(active) = self.pairings.active_pairing.take()
-            && let Some(task) = self
-                .accept_tasks
-                .remove(&AcceptTaskKey::Pairing(active.offer_id.clone()))
-        {
-            task.abort();
-        }
+        self.pairings.active_pairing = None;
         if let Some(task) = self.pairing_ttl_task.take() {
             task.abort();
         }
@@ -3538,7 +2976,7 @@ impl MobileAccessActor {
             }
         }
         MobileAccessStatePayload {
-            broker_status: self.broker_status.clone(),
+            connection_status: self.connection_status.clone(),
             pairing: self.pairing.clone(),
             paired_devices,
             direct_hosting: self.direct_hosting_status(),
@@ -3561,41 +2999,6 @@ impl MobileAccessActor {
             self.subscribers.remove(&path);
         }
     }
-}
-
-fn spawn_pairing_accept_task(
-    tx: mpsc::UnboundedSender<MobileAccessCommand>,
-    credential: ActiveMobilePairingCredential,
-) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        let offer_id = credential.offer_id.clone();
-        let result = match &credential.managed {
-            Some(_) => Err(MobileTaskError::transport(
-                "Managed pairing must complete the service handoff before connecting".to_owned(),
-            )),
-            None => {
-                connect_mobile_record_stream(
-                    credential.broker.clone(),
-                    credential.room,
-                    credential.psk.clone(),
-                )
-                .await
-            }
-        };
-        match result {
-            Ok(stream) => {
-                let _ =
-                    tx.send(MobileAccessCommand::PairingTransportConnected { offer_id, stream });
-            }
-            Err(error) => {
-                let _ = tx.send(MobileAccessCommand::PairingFailed {
-                    offer_id,
-                    code: error.code,
-                    message: error.message,
-                });
-            }
-        }
-    })
 }
 
 fn spawn_device_accept_task(
@@ -3788,36 +3191,6 @@ fn managed_handoff_from_poll_response(
                     format!("managed mobile offer {offer_id} returned an invalid device summary"),
                 ));
             }
-            let broker = response
-                .broker
-                .ok_or_else(|| {
-                    ManagedServiceError::new(
-                        MobileAccessErrorCode::RepairRequired,
-                        format!("managed mobile offer {offer_id} was redeemed without broker"),
-                    )
-                })?
-                .into_protocol()?;
-            let host_broker_credentials = response
-                .host_broker_credentials
-                .ok_or_else(|| {
-                    ManagedServiceError::new(
-                        MobileAccessErrorCode::RepairRequired,
-                        format!(
-                            "managed mobile offer {offer_id} was redeemed without host broker credentials"
-                        ),
-                    )
-                })?
-                .into_protocol()?;
-            if host_broker_credentials.scope.role != ManagedBrokerRole::Host
-                || host_broker_credentials.issued_at_ms >= host_broker_credentials.expires_at_ms
-            {
-                return Err(ManagedServiceError::new(
-                    MobileAccessErrorCode::ServiceUnavailable,
-                    format!(
-                        "managed mobile offer {offer_id} returned invalid host broker credentials"
-                    ),
-                ));
-            }
             Ok(ManagedPollOutcome::Redeemed(Box::new(
                 ManagedMobilePairingHandoff {
                     pairing_id,
@@ -3827,8 +3200,6 @@ fn managed_handoff_from_poll_response(
                     device_label: device.label,
                     device_created_at_ms: device.created_at_ms,
                     device_last_seen_at_ms: device.last_seen_at_ms,
-                    broker,
-                    host_broker_credentials,
                 },
             )))
         }
@@ -3848,42 +3219,15 @@ async fn connect_mobile_device_stream(
     managed_service: &ManagedMobileServiceClient,
     record: &MobilePairingRecord,
 ) -> Result<BoxedMobileTransport, MobileTaskError> {
-    match &record.managed {
-        Some(_) => {
-            let credentials = managed_service
-                .mint_host_rtc_credentials(record)
-                .await
-                .map_err(MobileTaskError::managed_service)?;
-            rtc_transport::connect(credentials, record.psk.as_bytes())
-                .await
-                .map(|stream| Box::new(stream) as BoxedMobileTransport)
-                .map_err(|error| {
-                    MobileTaskError::transport(format!("managed WebRTC transport failed: {error}"))
-                })
-        }
-        None => {
-            connect_mobile_record_stream(record.broker.clone(), record.room, record.psk.clone())
-                .await
-                .map(|stream| Box::new(stream) as BoxedMobileTransport)
-        }
-    }
-}
-
-async fn connect_mobile_record_stream(
-    broker: BrokerEndpoint,
-    room: RoomId,
-    psk: PreSharedKey,
-) -> Result<EnvelopeStream, MobileTaskError> {
-    let config = MqttConnectConfig {
-        endpoint: broker,
-        room,
-        psk,
-        role: ParticipantRole::Host,
-    };
-    mqtt_transport::connect_ephemeral(config)
+    let credentials = managed_service
+        .mint_host_rtc_credentials(record)
         .await
+        .map_err(MobileTaskError::managed_service)?;
+    rtc_transport::connect(credentials, record.psk.as_bytes())
+        .await
+        .map(|stream| Box::new(stream) as BoxedMobileTransport)
         .map_err(|error| {
-            MobileTaskError::transport(format!("development MQTT transport failed: {error}"))
+            MobileTaskError::transport(format!("managed WebRTC transport failed: {error}"))
         })
 }
 
@@ -3910,95 +3254,24 @@ async fn bridge_authenticated_mobile(
     });
 }
 
-fn dev_broker_endpoint(settings: &HostSettings) -> Result<Option<BrokerEndpoint>, String> {
-    let Some(url) = settings.mobile_broker_url.as_ref() else {
-        return Ok(None);
-    };
-    validate_broker_url(url).map_err(|err| err.to_string())?;
-    if url.as_str() == protocol::DEFAULT_MOBILE_MQTT_BROKER_URL {
-        return Err(
-            "the public default mobile broker is no longer supported; pair through tycode.dev"
-                .to_owned(),
-        );
-    }
-    if !is_loopback_broker_url(url) {
-        return Err(
-            "custom mobile broker URLs are dev/test-only; production mobile access uses tycode.dev"
-                .to_owned(),
-        );
-    }
-    let auth = match settings.mobile_broker_auth.password.as_ref() {
-        Some(password) => BrokerAuth::UsernamePassword {
-            username: settings.mobile_broker_auth.username.clone(),
-            password: password.expose().to_owned(),
-        },
-        None => BrokerAuth::Anonymous,
-    };
-    Ok(Some(BrokerEndpoint {
-        url: url.clone(),
-        auth,
-    }))
-}
-
-fn initial_enabled_broker_status(
-    pairings: &MobilePairings,
-    settings: &HostSettings,
-) -> MobileBrokerStatus {
-    match dev_broker_endpoint(settings) {
-        Ok(Some(endpoint)) => MobileBrokerStatus::Online {
-            broker_url: endpoint.url,
-        },
-        Ok(None) => managed_broker_status_for_pairings(pairings),
-        Err(message) => MobileBrokerStatus::Error {
-            broker_url: settings.mobile_broker_url.clone(),
-            code: MobileAccessErrorCode::InvalidConfig,
-            message,
-        },
-    }
-}
-
-fn managed_broker_status_for_pairings(pairings: &MobilePairings) -> MobileBrokerStatus {
-    if let Some(broker_url) = first_managed_broker_url(pairings) {
-        return MobileBrokerStatus::Connecting { broker_url };
-    }
-    if let Some(broker_url) = pairings
+fn managed_connection_status_for_pairings(pairings: &MobilePairings) -> MobileConnectionStatus {
+    if pairings.devices.iter().any(|record| {
+        record.managed.is_some()
+            && !matches!(
+                record.state,
+                MobileDeviceState::RepairRequired | MobileDeviceState::Revoked
+            )
+    }) || pairings
         .active_pairing
         .as_ref()
-        .and_then(|active| active.managed.as_ref())
-        .map(|managed| managed.broker.endpoint.clone())
+        .is_some_and(|active| active.managed.is_some())
     {
-        return MobileBrokerStatus::Connecting { broker_url };
+        return MobileConnectionStatus::Connecting;
     }
-    if pairings
-        .devices
-        .iter()
-        .any(|record| record.state == MobileDeviceState::RepairRequired)
-    {
-        return MobileBrokerStatus::RepairRequired {
-            code: MobileAccessErrorCode::RepairRequired,
-            message: "Stored mobile pairings must be repaired by pairing again through tycode.dev"
-                .to_owned(),
-        };
-    }
-    MobileBrokerStatus::RepairRequired {
+    MobileConnectionStatus::RepairRequired {
         code: MobileAccessErrorCode::RepairRequired,
-        message: "Mobile access requires a tycode.dev managed pairing before connecting".to_owned(),
+        message: "Pair a mobile device through tycode.dev to connect".to_owned(),
     }
-}
-
-fn first_managed_broker_url(pairings: &MobilePairings) -> Option<BrokerUrl> {
-    pairings.devices.iter().find_map(|record| {
-        if matches!(
-            record.state,
-            MobileDeviceState::RepairRequired | MobileDeviceState::Revoked
-        ) {
-            return None;
-        }
-        record
-            .managed
-            .as_ref()
-            .map(|managed| managed.broker.endpoint.clone())
-    })
 }
 
 fn terminal_device_accept_error(code: MobileAccessErrorCode) -> bool {
@@ -4008,34 +3281,15 @@ fn terminal_device_accept_error(code: MobileAccessErrorCode) -> bool {
     )
 }
 
-fn mark_legacy_pairings_repair_required(
-    pairings: &mut MobilePairings,
-    settings: &HostSettings,
-) -> bool {
+fn mark_legacy_pairings_repair_required(pairings: &mut MobilePairings) -> bool {
     let mut changed = false;
     for record in &mut pairings.devices {
-        if record.managed.is_none()
-            && !legacy_dev_pairing_allowed(record, settings)
-            && record.state != MobileDeviceState::RepairRequired
-        {
+        if record.managed.is_none() && record.state != MobileDeviceState::RepairRequired {
             record.state = MobileDeviceState::RepairRequired;
             changed = true;
         }
     }
     changed
-}
-
-fn legacy_dev_pairing_allowed(record: &MobilePairingRecord, settings: &HostSettings) -> bool {
-    let Some(configured) = settings.mobile_broker_url.as_ref() else {
-        return false;
-    };
-    configured == &record.broker.url && is_loopback_broker_url(configured)
-}
-
-fn is_loopback_broker_url(url: &BrokerUrl) -> bool {
-    url::Url::parse(url.as_str())
-        .ok()
-        .is_some_and(|parsed| is_loopback_url(&parsed))
 }
 
 fn is_loopback_url(parsed: &url::Url) -> bool {

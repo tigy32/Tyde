@@ -74,7 +74,7 @@ fi
 VERSION="${VERSION#v}"
 log "Release version: $VERSION"
 
-log "Checking MQTT transport protocol version"
+log "Checking RTC transport protocol version"
 python3 tools/check_transport_protocol_version.py
 
 log "Checking release tooling shell syntax"

@@ -495,16 +495,6 @@ fn PairedHostCard(host: PairedHostSummary) -> impl IntoView {
     let host_label = host.host_label.clone();
     // A host paired over its own origin has no broker or room to show; say so
     // rather than rendering an empty field that reads like missing data.
-    let broker_url = host
-        .broker
-        .as_ref()
-        .map(|broker| broker.url.to_string())
-        .unwrap_or_else(|| "Hosted by this Tyde".to_owned());
-    let room_id = host
-        .room
-        .as_ref()
-        .map(|room| room.to_string())
-        .unwrap_or_else(|| "—".to_owned());
     let credential_fingerprint = host.credential_fingerprint.clone();
     let last_connected = host
         .last_connected_at_ms
@@ -566,14 +556,6 @@ fn PairedHostCard(host: PairedHostSummary) -> impl IntoView {
         <div class="settings-group">
             <SettingsRow label="Label">
                 <span class="settings-value">{host_label}</span>
-            </SettingsRow>
-            <SettingsRow label="Broker">
-                <span class="settings-value settings-value-mono" data-mobile-test="settings-broker-url">
-                    {broker_url}
-                </span>
-            </SettingsRow>
-            <SettingsRow label="Room">
-                <span class="settings-value settings-value-mono">{room_id}</span>
             </SettingsRow>
             <SettingsRow label="Credential">
                 <span class="settings-value settings-value-mono">{credential_fingerprint}</span>
@@ -1146,16 +1128,6 @@ mod wasm_tests {
         PairedHostSummary {
             local_host_id: LocalHostId(id.to_owned()),
             host_label: "Studio Mac".to_owned(),
-            broker: Some(mobile_shell_types::BrokerEndpointSummary {
-                url: protocol::BrokerUrl::new(
-                    "wss://a1b2c3d4e5f6g7h8i9j0-ats.iot.us-west-2.amazonaws.com:443/mqtt/tyde-mobile-broker",
-                )
-                .unwrap(),
-                auth: mobile_shell_types::BrokerAuthSummary::Anonymous,
-            }),
-            room: Some(mobile_shell_types::RoomIdSummary(
-                "AQEBAQEBAQEBAQEBAQEBAQ".to_owned(),
-            )),
             credential_fingerprint: "SHA256:8f3c1d9e7b2a4c6e0f1a2b3c4d5e6f70".to_owned(),
             auto_connect: true,
             last_connected_at_ms: Some(0),
@@ -1372,17 +1344,14 @@ mod wasm_tests {
             "the forget hint must sit below the button, not beside it"
         );
 
-        // The long broker URL is shown in full, wrapped.
-        let broker = container
-            .query_selector("[data-mobile-test='settings-broker-url']")
-            .unwrap()
-            .expect("broker url");
+        let text = container.text_content().unwrap_or_default();
         assert!(
-            broker
-                .text_content()
-                .unwrap_or_default()
-                .contains("tyde-mobile-broker"),
-            "the broker URL is shown to the end"
+            text.contains("SHA256:8f3c1d9e7b2a4c6e0f1a2b3c4d5e6f70"),
+            "the full credential fingerprint remains visible"
+        );
+        assert!(
+            !text.contains("Broker") && !text.contains("Room"),
+            "retired transport settings are absent"
         );
         let status_text = container.text_content().unwrap_or_default();
         assert!(

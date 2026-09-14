@@ -1,61 +1,8 @@
-use protocol::{MobileIceServer, MobileRtcSessionId, MobileSdpKind};
-use rtc_transport::{Peer, RtcStream, authenticate_description, verify_description};
+use rtc_transport::Peer;
 use std::time::Duration;
-use tests::rtc::relay;
+use tests::rtc::{connect, relay};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::{sleep, timeout};
-
-async fn connect(
-    ice: &MobileIceServer,
-    roots: &tokio_rustls::rustls::RootCertStore,
-) -> (RtcStream, RtcStream) {
-    let mut mobile = Peer::with_tls_roots(std::slice::from_ref(ice), roots.clone())
-        .await
-        .expect("mobile peer");
-    let mut host = Peer::with_tls_roots(std::slice::from_ref(ice), roots.clone())
-        .await
-        .expect("host peer");
-    let session = MobileRtcSessionId(uuid::Uuid::new_v4().to_string());
-    let key = [53; 32];
-    eprintln!("TURN flow: gathering mobile offer");
-    let offer = mobile.offer().await.expect("gather mobile TURN candidates");
-    eprintln!("TURN flow: mobile offer gathered");
-    assert!(offer.lines().any(|line| line.contains(" typ relay")));
-    assert!(
-        !offer.lines().any(|line| line.contains(" typ host")),
-        "test must require the relay"
-    );
-    let mut signed = authenticate_description(session.clone(), MobileSdpKind::Offer, offer, &key)
-        .expect("sign offer");
-    assert!(
-        verify_description(&signed, &session, MobileSdpKind::Offer, &[54; 32]).is_err(),
-        "another pairing cannot authenticate this real peer"
-    );
-    let original = signed.sdp.clone();
-    signed.sdp = signed
-        .sdp
-        .replace("a=fingerprint:", "a=fingerprint:tampered");
-    assert!(
-        verify_description(&signed, &session, MobileSdpKind::Offer, &key).is_err(),
-        "signaling cannot substitute a DTLS fingerprint"
-    );
-    signed.sdp = original;
-    verify_description(&signed, &session, MobileSdpKind::Offer, &key)
-        .expect("authenticate host offer");
-    let answer = host
-        .answer(signed.sdp)
-        .await
-        .expect("gather host TURN candidates");
-    let signed = authenticate_description(session.clone(), MobileSdpKind::Answer, answer, &key)
-        .expect("sign answer");
-    verify_description(&signed, &session, MobileSdpKind::Answer, &key)
-        .expect("authenticate mobile answer");
-    mobile.set_answer(signed.sdp).await.expect("apply answer");
-    let (mobile, host) =
-        tokio::try_join!(mobile.into_stream(), host.into_stream()).expect("open relayed channels");
-    eprintln!("TURN flow: channels open");
-    (mobile, host)
-}
 
 #[tokio::test]
 async fn real_turn_preserves_bulk_backpressure_and_server_protocol_on_reconnect() {

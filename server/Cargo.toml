@@ -21,7 +21,7 @@ client = { path = "../client" }
 devtools-protocol = { path = "../devtools-protocol" }
 protocol = { path = "../protocol" }
 settings-model = { path = "../settings-model" }
-mqtt-transport = { path = "../mqtt-transport" }
+mobile-pairing = { path = "../mobile-pairing" }
 rtc-transport = { path = "../rtc-transport" }
 axum = { version = "0.8", features = ["ws"] }
 base64 = "0.22"
@@ -72,7 +72,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 sha2 = "0.10"
 client = { path = "../client" }
 tyde-dev-driver = { path = "../dev-driver" }
-mqtt-transport = { path = "../mqtt-transport", features = ["test-support"] }
+mobile-pairing = { path = "../mobile-pairing" }
 tokio = { workspace = true, features = ["test-util"] }
 rmcp = { version = "0.15.0", default-features = false, features = ["client", "server", "transport-streamable-http-client-reqwest", "transport-streamable-http-server"] }
 serde.workspace = true

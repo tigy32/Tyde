@@ -14,10 +14,10 @@ use protocol::{
     BackendConfigPersistenceMode, BackendConfigSnapshotStatus, BackendConfigValues, BackendKind,
     BackendNativeSettingsAdvisory, BackendNativeSettingsGroup, BackendNativeSettingsGroupKind,
     BackendNativeSettingsSnapshot, BackendNativeSettingsWritePayload, BackendSetupAction,
-    BackendSetupInfo, BackendSetupStatus, BrokerUrl, CodeIntelProviderId, CustomAgent,
-    CustomAgentId, DiffContextMode, FrameKind, InvokeSettingsActionPayload, LaunchProfileEntry,
-    LaunchProfileId, McpServerConfig, McpServerId, McpTransportConfig, MobileAccessStatePayload,
-    MobileBrokerStatus, MobileDeviceState, MobileDirectHostingStatus, MobilePairingOfferId,
+    BackendSetupInfo, BackendSetupStatus, CodeIntelProviderId, CustomAgent, CustomAgentId,
+    DiffContextMode, FrameKind, InvokeSettingsActionPayload, LaunchProfileEntry, LaunchProfileId,
+    McpServerConfig, McpServerId, McpTransportConfig, MobileAccessStatePayload,
+    MobileConnectionStatus, MobileDeviceState, MobileDirectHostingStatus, MobilePairingOfferId,
     MobilePairingOfferPayload, MobilePairingState, MobilePushState, MobileWebBundleSource,
     ProjectId, RunBackendSetupPayload, SessionSchemaEntry, SessionSettingField,
     SessionSettingFieldType, SessionSettingValue, SessionSettingsSchema, SessionSettingsValues,
@@ -40,99 +40,9 @@ use protocol::clear_invalid_dependent_select_values;
 
 const RESERVED_MCP_NAMES: &[&str] = &["tyde-debug", "tyde-agent-control", "tyde-review-feedback"];
 
-/// Frontend-side mirror of the server's broker-URL acceptance rules for the
-/// `mobile_broker_url` **dev override**. The server
-/// (`server::mobile_access::dev_broker_endpoint`, over
-/// `mqtt-transport::validate_broker_url`) is the authoritative validator; this
-/// mirror gives the user immediate inline feedback instead of a value that is
-/// accepted here but rejected on write.
-///
-/// Rules mirrored:
-/// - scheme must be `mqtts://` or `wss://` (no insecure/unknown schemes);
-/// - no embedded credentials (`@`) or fragments (`#`);
-/// - the URL must point at a **loopback** host (`localhost`, an IPv4 loopback
-///   like `127.0.0.1`, or the `[::1]` IPv6 loopback). Custom broker URLs are
-///   dev/test-only; the public default and any other host are rejected because
-///   production mobile access uses tycode.dev-managed WebRTC.
-fn validate_broker_url_input(raw: &str) -> Result<(), &'static str> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return Ok(());
-    }
-    let lower = trimmed.to_ascii_lowercase();
-    if lower.starts_with("mqtts://") || lower.starts_with("wss://") {
-        let after_scheme = trimmed
-            .split_once("://")
-            .map(|(_, rest)| rest)
-            .unwrap_or("");
-        if after_scheme.is_empty() {
-            return Err("Broker URL is missing a host after the scheme.");
-        }
-        if after_scheme.contains('@') {
-            return Err(
-                "Broker credentials must be supplied out-of-band, not embedded in the URL.",
-            );
-        }
-        if after_scheme.contains('#') {
-            return Err("Broker URL fragments (#…) are not supported.");
-        }
-        // Dev-override loopback rule — matches the server, which fails closed
-        // for public/free/custom production brokers.
-        if !broker_url_host(after_scheme)
-            .as_deref()
-            .is_some_and(is_loopback_host)
-        {
-            return Err(
-                "Custom broker URLs are dev/test-only and must be a loopback host (localhost / 127.0.0.1). Leave blank for tycode.dev-managed access.",
-            );
-        }
-        Ok(())
-    } else if lower.starts_with("mqtt://")
-        || lower.starts_with("ws://")
-        || lower.starts_with("tcp://")
-    {
-        Err("Insecure scheme — use mqtts:// or wss:// instead.")
-    } else if lower.contains("://") {
-        Err("Unsupported scheme — only mqtts:// and wss:// are accepted.")
-    } else {
-        Err("Broker URL must start with mqtts:// or wss://.")
-    }
-}
-
-/// Extracts the host from the part of a broker URL after `://`. The server
-/// parses the URL with the `url` crate and applies the same loopback check to
-/// `url::Url::host()`; this string extraction yields the same host for the
-/// broker URLs the field accepts. Callers have already rejected embedded
-/// credentials (`@`) and fragments (`#`). Returns `None` when no host is present.
-fn broker_url_host(after_scheme: &str) -> Option<String> {
-    // Authority is everything before the first path/query separator.
-    let authority = after_scheme.split(['/', '?']).next().unwrap_or("");
-    if authority.is_empty() {
-        return None;
-    }
-    // IPv6 literal: "[::1]:8883" -> host "::1".
-    if let Some(rest) = authority.strip_prefix('[') {
-        return rest
-            .split_once(']')
-            .map(|(host, _)| host.to_owned())
-            .filter(|host| !host.is_empty());
-    }
-    // "host" or "host:port" -> host up to the first ':'.
-    let host = authority.split(':').next().unwrap_or("");
-    (!host.is_empty()).then(|| host.to_owned())
-}
-
 /// Mirror of the server's `is_loopback_url` host check: `localhost` (case
 /// insensitive) or any IP literal whose address is a loopback address (covers
 /// `127.0.0.0/8` and `::1`).
-fn is_loopback_host(host: &str) -> bool {
-    host.eq_ignore_ascii_case("localhost")
-        || host
-            .parse::<std::net::IpAddr>()
-            .map(|addr| addr.is_loopback())
-            .unwrap_or(false)
-}
-
 /// Render the pairing `qr_uri` as an inline SVG QR code. Returns an
 /// SVG string that callers splat into the DOM via `inner_html`.
 /// Uses `qrcodegen` (pure Rust, no transitive deps) with Medium ECC —
@@ -186,30 +96,31 @@ fn expires_in_seconds(expires_at_ms: u64) -> Option<u64> {
     Some(remaining_ms / 1000)
 }
 
-/// Short, user-facing label for the broker connection state.
-/// Doesn't include the broker URL itself — that's already visible
-/// below in the Broker URL field. Errors include the server message
+/// Short, user-facing label for the relay connection state.
+/// Errors include the server message
 /// verbatim because it's the most actionable info we have.
-fn broker_status_line(status: &MobileBrokerStatus) -> String {
+fn connection_status_line(status: &MobileConnectionStatus) -> String {
     match status {
-        MobileBrokerStatus::Disabled => "Mobile connections disabled".to_owned(),
-        MobileBrokerStatus::Connecting { .. } => "Connecting mobile access…".to_owned(),
-        MobileBrokerStatus::Online { .. } => "Mobile access ready".to_owned(),
-        MobileBrokerStatus::Error { message, .. } => format!("Mobile connection error: {message}"),
-        MobileBrokerStatus::RepairRequired { message, .. } => {
+        MobileConnectionStatus::Disabled => "Mobile connections disabled".to_owned(),
+        MobileConnectionStatus::Connecting => "Connecting mobile access…".to_owned(),
+        MobileConnectionStatus::Online => "Mobile access ready".to_owned(),
+        MobileConnectionStatus::Error { message, .. } => {
+            format!("Mobile connection error: {message}")
+        }
+        MobileConnectionStatus::RepairRequired { message, .. } => {
             format!("Repair required: {message}")
         }
     }
 }
 
 /// Slug used by CSS to pick a per-state color for the broker pill.
-fn broker_status_slug(status: &MobileBrokerStatus) -> &'static str {
+fn connection_status_slug(status: &MobileConnectionStatus) -> &'static str {
     match status {
-        MobileBrokerStatus::Disabled => "disabled",
-        MobileBrokerStatus::Connecting { .. } => "connecting",
-        MobileBrokerStatus::Online { .. } => "online",
-        MobileBrokerStatus::Error { .. } => "error",
-        MobileBrokerStatus::RepairRequired { .. } => "error",
+        MobileConnectionStatus::Disabled => "disabled",
+        MobileConnectionStatus::Connecting => "connecting",
+        MobileConnectionStatus::Online => "online",
+        MobileConnectionStatus::Error { .. } => "error",
+        MobileConnectionStatus::RepairRequired { .. } => "error",
     }
 }
 
@@ -761,7 +672,6 @@ impl SettingsTab {
                 "tycode.dev",
                 "WebRTC",
                 "Cloudflare TURN",
-                "Broker URL",
                 "Tyggs Pass",
                 "Repair",
                 "Encryption",
@@ -2243,7 +2153,7 @@ fn CodeIntelSettingsSection() -> impl IntoView {
             <p class="settings-description">
                 "Where to find rust-analyzer, the language server that provides Rust navigation and diagnostics. Leave this empty and Tyde uses the rustup proxy in ~/.cargo/bin, which is correct for almost every setup. Set an absolute path when you are on a custom toolchain that rustup cannot install rust-analyzer for, or when you need a specific build. The path is checked on the host, not on this device, so it must be valid there."
             </p>
-            <div class="settings-mobile-broker-row">
+            <div class="settings-mobile-connection-row">
                 <input
                     class="settings-input settings-code-intel-path-input"
                     type="text"
@@ -4216,10 +4126,6 @@ fn host_schema_section(state: &AppState, section: &str) -> AnyView {
     host_schema_fields(state, section, None)
 }
 
-fn host_schema_section_prefix(state: &AppState, section: &str, pointer_prefix: &str) -> AnyView {
-    host_schema_fields(state, section, Some(pointer_prefix))
-}
-
 fn pretty_json(value: &Value) -> String {
     serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
 }
@@ -5842,40 +5748,19 @@ fn NativeVoiceSettings(state: AppState) -> impl IntoView {
 /// Mobile pairing settings for `tycode.dev`-managed WebRTC access.
 /// Two host-scoped settings live here:
 ///   * `enable_mobile_connections` — master kill switch.
-///   * `mobile_broker_url` — **dev/test-only** broker override. Production
-///     mobile access is provisioned through `tycode.dev` managed pairing
-///     through Cloudflare TURN; the server only honours this override for a
-///     loopback broker in local development and fails closed for public /
-///     free / custom production brokers. Empty input (the default) means
-///     "use managed access" (None on the wire).
-///
-/// All mobile-access behaviour is server-owned: the frontend renders the
-/// typed `MobileAccessStatePayload` (`broker_status` / `pairing`) and never
-/// infers broker semantics or chooses a broker itself. Starting a pairing
-/// initiates a server-owned managed pairing; the server decides managed vs.
-/// the explicit loopback dev override, so the UI can never trigger an
-/// unmanaged/public-broker fallback.
+/// Managed access and self-hosted access are explicit pairing modes. The server
+/// owns connection state, pairing authorization and recovery.
 #[component]
 fn MobileTab() -> impl IntoView {
     let state = expect_context::<AppState>();
     let state_for_enabled_checked = state.clone();
     let state_for_enabled_disabled = state.clone();
-    let state_for_broker_value = state.clone();
-    let state_for_broker_disabled = state.clone();
-    let state_for_broker_commit = state.clone();
-    let state_for_broker_keydown = state.clone();
-    let state_for_broker_reset = state.clone();
-    let state_for_broker_credentials = state.clone();
     let state_for_pairing_lookup = state.clone();
     let state_for_offer_lookup = state.clone();
     let state_for_start_pending = state.clone();
     let state_for_start_click = state.clone();
     let state_for_cancel_click = state.clone();
 
-    // Inline error surfaced when the user types something the server
-    // would reject. Cleared when the user types again, when the field
-    // is reset via "Use default", or when a valid URL commits.
-    let broker_error: RwSignal<Option<String>> = RwSignal::new(None);
     // Inline error surfaced when MobilePairingStart fails locally
     // (e.g. no host stream). Server-side failures land via
     // `MobileAccessState::Failed` instead and render via
@@ -5899,85 +5784,6 @@ fn MobileTab() -> impl IntoView {
             let input: web_sys::HtmlInputElement = target.unchecked_into();
             send_host_replace(&state, "/enable_mobile_connections", input.checked());
         }
-    };
-
-    // The text field always reflects the current override. Empty
-    // input commits `None`, which the server resolves to its built-in
-    // default.
-    let broker_value = move || {
-        state_for_broker_value
-            .selected_host_settings()
-            .and_then(|settings| settings.mobile_broker_url)
-            .map(|url| url.as_str().to_owned())
-            .unwrap_or_default()
-    };
-    let broker_disabled = {
-        let state = state_for_broker_disabled.clone();
-        move || state.selected_host_settings().is_none()
-    };
-    let broker_disabled_for_input = broker_disabled.clone();
-    let broker_disabled_for_button = broker_disabled.clone();
-
-    // Validate + send. Used by both `change` (blur) and Enter so the
-    // two code paths can't drift. Returns the input element so the
-    // caller can still touch the DOM if needed (none currently do).
-    let commit_broker = move |state: &AppState, raw: &str| {
-        let trimmed = raw.trim();
-        if trimmed.is_empty() {
-            broker_error.set(None);
-            send_host_replace(state, "/mobile_broker_url", Option::<BrokerUrl>::None);
-            return;
-        }
-        if let Err(message) = validate_broker_url_input(trimmed) {
-            broker_error.set(Some(message.to_owned()));
-            return;
-        }
-        match BrokerUrl::new(trimmed.to_owned()) {
-            Ok(url) => {
-                broker_error.set(None);
-                send_host_replace(state, "/mobile_broker_url", Some(url));
-            }
-            Err(error) => {
-                log::error!("invalid broker URL {trimmed:?}: {error}");
-                broker_error.set(Some(error.to_string()));
-            }
-        }
-    };
-
-    // `commit_broker` only captures `Copy` handles (RwSignal), so we
-    // can hand it to both event closures by value without an Rc.
-    let on_broker_commit = move |ev: web_sys::Event| {
-        let target = ev.target().unwrap();
-        let input: web_sys::HtmlInputElement = target.unchecked_into();
-        let raw = input.value();
-        commit_broker(&state_for_broker_commit, &raw);
-    };
-    let on_broker_keydown = move |ev: web_sys::KeyboardEvent| {
-        if ev.key() != "Enter" {
-            return;
-        }
-        ev.prevent_default();
-        let Some(target) = ev.target() else {
-            return;
-        };
-        let Ok(input) = target.dyn_into::<web_sys::HtmlInputElement>() else {
-            return;
-        };
-        let raw = input.value();
-        commit_broker(&state_for_broker_keydown, &raw);
-    };
-    // Typing clears any prior error so the user isn't yelled at while
-    // they're still editing.
-    let on_broker_input = move |_: web_sys::Event| {
-        broker_error.set(None);
-    };
-    let on_broker_reset = move |_: web_sys::MouseEvent| {
-        broker_error.set(None);
-        send_host_replace(
-            &state_for_broker_reset,
-            "/mobile_broker_url",
-            Option::<BrokerUrl>::None,
-        );
     };
 
     // ---- Pairing section reactive lookups ----
@@ -6068,15 +5874,15 @@ fn MobileTab() -> impl IntoView {
     // flight. It does NOT require the broker to be `Online` — in the managed
     // flow the broker only reaches `Online` *after* a pairing exists, so a
     // `Connecting` / `RepairRequired` (no pairing yet, or a stored pairing that
-    // needs re-pairing) / `Error` broker status is exactly when the user needs
+    // needs re-pairing) / `Error` connection status is exactly when the user needs
     // to start a fresh managed pairing. Starting is server-owned and cannot pick
-    // an unmanaged/public broker, so gating it on broker status would only block
+    // an unmanaged/public broker, so gating it on connection status would only block
     // the (re-)pairing that resolves those states.
     let pairing_phase = move || -> Option<MobilePairingState> {
         mobile_state_for_host().map(|state| state.pairing)
     };
-    let broker_phase = move || -> Option<MobileBrokerStatus> {
-        mobile_state_for_host().map(|state| state.broker_status)
+    let connection_phase = move || -> Option<MobileConnectionStatus> {
+        mobile_state_for_host().map(|state| state.connection_status)
     };
     let state_for_can_start_settings = state.clone();
     let can_start_pairing = move || can_start_mobile_pairing(&state_for_can_start_settings);
@@ -6113,13 +5919,13 @@ fn MobileTab() -> impl IntoView {
             <p class="settings-description">
                 "Start a pairing session, then scan the QR code with the Tyde mobile app. The QR shares a one-time offer and a pairing key. Keep it private and scan it before the session expires."
             </p>
-            // Broker status pill — surfaces broker_status from the
+            // Connection status pill — surfaces connection_status from the
             // MobileAccessState snapshot. Keeps the user informed when
             // the broker is offline / errored so a missing Start button
             // is self-explanatory.
-            {move || broker_phase().map(|status| view! {
-                <p class=format!("settings-mobile-pairing-broker settings-mobile-pairing-broker-{}", broker_status_slug(&status))>
-                    {broker_status_line(&status)}
+            {move || connection_phase().map(|status| view! {
+                <p class=format!("settings-mobile-pairing-connection settings-mobile-pairing-connection-{}", connection_status_slug(&status))>
+                    {connection_status_line(&status)}
                 </p>
             })}
             {move || pairing_phase().and_then(|phase| pairing_status_line(&phase)).map(|line| view! {
@@ -6225,7 +6031,7 @@ fn MobileTab() -> impl IntoView {
                 }
             }}
             {move || pairing_error.get().map(|message| view! {
-                <p class="settings-mobile-broker-error" role="alert">{message}</p>
+                <p class="settings-mobile-connection-error" role="alert">{message}</p>
             })}
             {move || {
                 let devices = paired_devices();
@@ -6305,57 +6111,6 @@ fn MobileTab() -> impl IntoView {
         </div>
 
         <MobileDirectSection />
-
-        <div class="settings-field">
-            <label class="settings-label">"Broker URL (dev override)"</label>
-            <p class="settings-description">
-                "Advanced, local-development only. Leave blank for managed WebRTC access. The development broker override accepts only a loopback address on this machine (localhost / 127.0.0.1)."
-            </p>
-            <div class="settings-mobile-broker-row">
-                <input
-                    type="text"
-                    class="settings-input settings-mobile-broker-input"
-                    prop:value=broker_value
-                    placeholder="wss://127.0.0.1:8083/mqtt"
-                    disabled=broker_disabled_for_input
-                    autocapitalize="none"
-                    autocomplete="off"
-                    spellcheck="false"
-                    aria-label="Broker URL (dev override)"
-                    aria-invalid=move || if broker_error.get().is_some() { "true" } else { "false" }
-                    on:input=on_broker_input
-                    on:change=on_broker_commit
-                    on:keydown=on_broker_keydown
-                />
-                <button
-                    type="button"
-                    class="filter-toggle settings-mobile-broker-reset"
-                    disabled=broker_disabled_for_button
-                    title="Clear the dev override and use managed access"
-                    on:click=on_broker_reset
-                >
-                    "Use managed"
-                </button>
-            </div>
-            {move || broker_error.get().map(|message| view! {
-                <p class="settings-mobile-broker-error" role="alert">{message}</p>
-            })}
-        </div>
-
-        {move || {
-            state_for_broker_credentials
-                .selected_host_settings()
-                .is_some_and(|settings| settings.mobile_broker_url.is_some())
-                .then(|| view! {
-                    <div class="settings-mobile-broker-credentials">
-                        {host_schema_section_prefix(
-                            &state_for_broker_credentials,
-                            "mobile",
-                            "/mobile_broker_auth/",
-                        )}
-                    </div>
-                })
-        }}
 
         <div class="settings-mobile-warning" role="note">
             <p class="settings-mobile-warning-heading">
@@ -6569,7 +6324,7 @@ fn MobileDirectSection() -> AnyView {
         }}
     </div>
         {move || pairing_error.get().map(|message| view! {
-            <p class="settings-mobile-broker-error" role="alert">{message}</p>
+            <p class="settings-mobile-connection-error" role="alert">{message}</p>
         })}
     }
     .into_any()
@@ -6579,7 +6334,7 @@ fn MobileDirectSection() -> AnyView {
 /// and no offer is already in flight. Both the managed and the direct pairing
 /// buttons gate on this, so they cannot drift into offering two at once.
 ///
-/// It deliberately does not consider broker status. In the managed flow the
+/// It deliberately does not consider connection status. In the managed flow the
 /// broker only reaches `Online` *after* a pairing exists, so a `Connecting` /
 /// `RepairRequired` / `Error` broker is exactly when a fresh pairing is needed.
 fn can_start_mobile_pairing(state: &AppState) -> bool {
@@ -9244,7 +8999,7 @@ mod wasm_tests {
     /// taking ownership of the provided `AppState`. Mirrors the data
     /// path the dispatcher uses when it receives a real
     /// `HostSettingsPayload` from the server.
-    fn install_mobile_host_settings(state: &AppState, broker_url: Option<&str>, enabled: bool) {
+    fn install_mobile_host_settings(state: &AppState, enabled: bool) {
         let host_id = "host-mobile".to_owned();
         state.selected_host_id.set(Some(host_id.clone()));
         state.host_streams.update(|m| {
@@ -9272,9 +9027,7 @@ mod wasm_tests {
                     enabled_backends: vec![protocol::BackendKind::Claude],
                     default_backend: Some(protocol::BackendKind::Claude),
                     enable_mobile_connections: enabled,
-                    mobile_broker_url: broker_url
-                        .map(|s| protocol::BrokerUrl::new(s.to_owned()).expect("broker url")),
-                    mobile_broker_auth: Default::default(),
+
                     mobile_direct_hosting_enabled: false,
                     mobile_direct_bind_addr: None,
                     mobile_direct_public_origin: None,
@@ -9324,129 +9077,8 @@ mod wasm_tests {
         panic!("settings tab labelled {label:?} not found among {observed:?}");
     }
 
-    fn broker_input(container: &HtmlElement) -> web_sys::HtmlInputElement {
-        container
-            .query_selector(".settings-mobile-broker-input")
-            .unwrap()
-            .expect("broker URL input must render on the Mobile tab")
-            .dyn_into()
-            .unwrap()
-    }
-
-    /// With no `mobile_broker_url` override the input renders empty. Its
-    /// placeholder must advertise the dev-only loopback override — never a
-    /// public / free broker (managed access is the production path).
-    #[wasm_bindgen_test]
-    async fn mobile_tab_broker_override_placeholder_is_loopback_not_public() {
-        let container = make_container();
-        let _handle = mount_to(container.clone(), move || {
-            let state = AppState::new();
-            install_mobile_host_settings(&state, None, false);
-            state.settings_open.set(true);
-            provide_context(state);
-            view! { <SettingsPanel /> }
-        });
-        next_tick().await;
-        click_tab(&container, "Mobile");
-        next_tick().await;
-
-        let input = broker_input(&container);
-        assert_eq!(
-            input.value(),
-            "",
-            "broker URL input must be empty when no host override exists"
-        );
-        let placeholder = input.get_attribute("placeholder").unwrap_or_default();
-        assert!(
-            placeholder.contains("127.0.0.1") || placeholder.contains("localhost"),
-            "broker override placeholder must be a loopback dev example; got {placeholder:?}"
-        );
-        assert!(
-            !placeholder.contains("emqx") && !placeholder.to_lowercase().contains("public"),
-            "broker override placeholder must not advertise a public/free broker; got {placeholder:?}"
-        );
-    }
-
-    /// When the host has an explicit override, the broker URL input
-    /// must display it (not the placeholder).
-    #[wasm_bindgen_test]
-    async fn mobile_tab_broker_input_reflects_host_override() {
-        let container = make_container();
-        let _handle = mount_to(container.clone(), move || {
-            let state = AppState::new();
-            install_mobile_host_settings(&state, Some("mqtts://mybroker.example/relay"), true);
-            state.settings_open.set(true);
-            provide_context(state);
-            view! { <SettingsPanel /> }
-        });
-        next_tick().await;
-        click_tab(&container, "Mobile");
-        next_tick().await;
-
-        let input = broker_input(&container);
-        assert_eq!(
-            input.value(),
-            "mqtts://mybroker.example/relay",
-            "broker URL input must reflect the host override exactly"
-        );
-    }
-
-    #[wasm_bindgen_test]
-    async fn mobile_broker_secret_uses_published_revision_tokens() {
-        let calls = install_settings_send_stub();
-        let container = make_container();
-        let state = AppState::new();
-        install_mobile_host_settings(&state, Some("wss://127.0.0.1:8083/mqtt"), true);
-        state.settings_open.set(true);
-        let state_for_mount = state.clone();
-        let _handle = mount_to(container.clone(), move || {
-            provide_context(state_for_mount.clone());
-            view! { <SettingsPanel /> }
-        });
-        next_tick().await;
-        click_tab(&container, "Mobile");
-        next_tick().await;
-
-        let password: web_sys::HtmlInputElement = container
-            .query_selector(".settings-mobile-broker-credentials input[type='password']")
-            .unwrap()
-            .expect("write-only broker password field")
-            .dyn_into()
-            .unwrap();
-        set_and_change(&password, "first-secret");
-        for _ in 0..3 {
-            next_tick().await;
-        }
-        let first = recorded_settings_write_ops(&calls)
-            .into_iter()
-            .find(|op| op["path"] == "/mobile_broker_auth/password")
-            .expect("first secret write");
-        assert_eq!(first["expected"]["kind"], "absent");
-
-        state.configured_secrets_by_host.update(|secrets| {
-            secrets.insert(
-                "host-mobile".to_owned(),
-                vec![protocol::ConfiguredSecret {
-                    pointer: "/mobile_broker_auth/password".to_owned(),
-                    token: "server-secret-revision".to_owned(),
-                }],
-            );
-        });
-        set_and_change(&password, "replacement-secret");
-        for _ in 0..3 {
-            next_tick().await;
-        }
-        let replacement = recorded_settings_write_ops(&calls)
-            .into_iter()
-            .rev()
-            .find(|op| op["path"] == "/mobile_broker_auth/password")
-            .expect("replacement secret write");
-        assert_eq!(replacement["expected"]["kind"], "version");
-        assert_eq!(replacement["expected"]["token"], "server-secret-revision");
-    }
-
-    /// The Mobile tab copy must reflect **managed** tycode.dev / AWS IoT
-    /// access: (1) it names managed access (tycode.dev / AWS IoT), (2) it
+    /// The Mobile tab copy must reflect **managed** tycode.dev / Cloudflare TURN
+    /// access: (1) it names managed access (tycode.dev / Cloudflare TURN), (2) it
     /// mentions Tyde end-to-end encryption, (3) it calls out visible metadata,
     /// and (4) it must NOT frame the broker as a public / free / custom MQTT
     /// broker (that model no longer exists — the server fails closed for it).
@@ -9456,7 +9088,7 @@ mod wasm_tests {
         let container = make_container();
         let _handle = mount_to(container.clone(), move || {
             let state = AppState::new();
-            install_mobile_host_settings(&state, None, false);
+            install_mobile_host_settings(&state, false);
             state.settings_open.set(true);
             provide_context(state);
             view! { <SettingsPanel /> }
@@ -9492,43 +9124,6 @@ mod wasm_tests {
         assert!(
             !text.contains("tyde broker"),
             "mobile copy must not say 'Tyde broker' (Tyde is the client); got: {text:?}"
-        );
-    }
-
-    /// The "Use managed" button must always be present alongside the broker
-    /// URL override input so the user can clear a dev override and return to
-    /// tycode.dev-managed access without manually clearing the field.
-    #[wasm_bindgen_test]
-    async fn mobile_tab_has_use_managed_button() {
-        let container = make_container();
-        let _handle = mount_to(container.clone(), move || {
-            let state = AppState::new();
-            install_mobile_host_settings(&state, Some("mqtts://override/relay"), true);
-            state.settings_open.set(true);
-            provide_context(state);
-            view! { <SettingsPanel /> }
-        });
-        next_tick().await;
-        click_tab(&container, "Mobile");
-        next_tick().await;
-
-        let buttons = container.query_selector_all("button").unwrap();
-        let mut found = false;
-        for i in 0..buttons.length() {
-            let Some(node) = buttons.item(i) else {
-                continue;
-            };
-            let Ok(el) = node.dyn_into::<HtmlElement>() else {
-                continue;
-            };
-            if el.text_content().as_deref().map(str::trim) == Some("Use managed") {
-                found = true;
-                break;
-            }
-        }
-        assert!(
-            found,
-            "Mobile tab must surface a 'Use managed' button to clear the dev broker override"
         );
     }
 
@@ -9690,91 +9285,6 @@ mod wasm_tests {
         dispatch_event_from_js(input, "keydown", Some("Enter"));
     }
 
-    /// Pressing Enter on a valid **loopback** override commits a `SettingsWrite`
-    /// frame whose payload is `MobileBrokerUrl { broker_url: Some(...) }`.
-    /// Load-bearing assertion that the typed-URL commit path actually reaches
-    /// the wire for the only broker kind the server accepts.
-    #[wasm_bindgen_test]
-    async fn mobile_tab_enter_commits_valid_loopback_broker_url() {
-        let calls = install_settings_send_stub();
-        let container = make_container();
-        let _handle = mount_to(container.clone(), move || {
-            let state = AppState::new();
-            install_mobile_host_settings(&state, None, true);
-            state.settings_open.set(true);
-            provide_context(state);
-            view! { <SettingsPanel /> }
-        });
-        next_tick().await;
-        click_tab(&container, "Mobile");
-        next_tick().await;
-
-        let input = broker_input(&container);
-        input.set_value("mqtts://127.0.0.1:8883");
-        dispatch_enter(&input);
-        for _ in 0..4 {
-            next_tick().await;
-        }
-
-        let settings = recorded_settings_write_ops(&calls);
-        let mobile = settings
-            .iter()
-            .find(|op| op.get("path").and_then(Value::as_str) == Some("/mobile_broker_url"))
-            .expect("Enter on a valid loopback broker URL must emit a settings write");
-        let broker_url = mobile
-            .get("value")
-            .and_then(Value::as_str)
-            .expect("the replacement must carry the URL");
-        assert_eq!(broker_url, "mqtts://127.0.0.1:8883");
-    }
-
-    /// Clicking "Use managed" commits `MobileBrokerUrl { broker_url: None }`.
-    /// The server resolves None to tycode.dev-managed access, so this is how
-    /// the user clears a dev override without manually clearing the field.
-    #[wasm_bindgen_test]
-    async fn mobile_tab_use_managed_button_commits_none() {
-        let calls = install_settings_send_stub();
-        let container = make_container();
-        let _handle = mount_to(container.clone(), move || {
-            let state = AppState::new();
-            install_mobile_host_settings(&state, Some("mqtts://override.example"), true);
-            state.settings_open.set(true);
-            provide_context(state);
-            view! { <SettingsPanel /> }
-        });
-        next_tick().await;
-        click_tab(&container, "Mobile");
-        next_tick().await;
-
-        // Find the Use default button by text and click it.
-        let buttons = container.query_selector_all("button").unwrap();
-        let mut clicked = false;
-        for i in 0..buttons.length() {
-            let Some(node) = buttons.item(i) else {
-                continue;
-            };
-            let Ok(el) = node.dyn_into::<HtmlElement>() else {
-                continue;
-            };
-            if el.text_content().as_deref().map(str::trim) == Some("Use managed") {
-                el.click();
-                clicked = true;
-                break;
-            }
-        }
-        assert!(clicked, "Use managed button must be present and clickable");
-        for _ in 0..4 {
-            next_tick().await;
-        }
-
-        let settings = recorded_settings_write_ops(&calls);
-        let mobile = settings
-            .iter()
-            .find(|op| op.get("path").and_then(Value::as_str) == Some("/mobile_broker_url"))
-            .expect("Use managed must emit a settings write");
-        assert!(mobile.get("value").is_some_and(Value::is_null));
-    }
-
     /// Toggling the "Enable mobile connections" checkbox commits a
     /// `SettingsWrite` frame whose payload is
     /// `EnableMobileConnections { enabled }`. Without this assertion
@@ -9786,7 +9296,7 @@ mod wasm_tests {
         let container = make_container();
         let _handle = mount_to(container.clone(), move || {
             let state = AppState::new();
-            install_mobile_host_settings(&state, None, false);
+            install_mobile_host_settings(&state, false);
             state.settings_open.set(true);
             provide_context(state);
             view! { <SettingsPanel /> }
@@ -9843,7 +9353,7 @@ mod wasm_tests {
         state.mobile_access_state.update(|m| {
             let entry = m.entry("host-mobile".to_owned()).or_insert_with(|| {
                 protocol::MobileAccessStatePayload {
-                    broker_status: MobileBrokerStatus::Disabled,
+                    connection_status: MobileConnectionStatus::Disabled,
                     pairing: MobilePairingState::Idle,
                     paired_devices: Vec::new(),
                     direct_hosting: protocol::MobileDirectHostingStatus::Disabled,
@@ -9871,7 +9381,7 @@ mod wasm_tests {
         let container = make_container();
         let _handle = mount_to(container.clone(), move || {
             let state = AppState::new();
-            install_mobile_host_settings(&state, None, true);
+            install_mobile_host_settings(&state, true);
             state.settings_open.set(true);
             provide_context(state);
             view! { <SettingsPanel /> }
@@ -9920,7 +9430,7 @@ mod wasm_tests {
         let calls = install_settings_send_stub();
         let container = make_container();
         let state = AppState::new();
-        install_mobile_host_settings(&state, None, true);
+        install_mobile_host_settings(&state, true);
         install_direct_hosting(
             &state,
             protocol::MobileDirectHostingStatus::Disabled,
@@ -9986,7 +9496,7 @@ mod wasm_tests {
     async fn mobile_tab_direct_pairing_waits_for_a_live_origin() {
         let container = make_container();
         let state = AppState::new();
-        install_mobile_host_settings(&state, None, true);
+        install_mobile_host_settings(&state, true);
         install_direct_hosting(&state, protocol::MobileDirectHostingStatus::Disabled, None);
         state.settings_open.set(true);
         let state_for_mount = state.clone();
@@ -10083,7 +9593,7 @@ mod wasm_tests {
         let container = make_container();
         let _handle = mount_to(container.clone(), move || {
             let state = AppState::new();
-            install_mobile_host_settings(&state, None, true);
+            install_mobile_host_settings(&state, true);
             install_active_offer(&state, "offer-direct", LINK, 9_999_999_999_999);
             state.settings_open.set(true);
             provide_context(state);
@@ -10128,7 +9638,7 @@ mod wasm_tests {
     async fn mobile_tab_direct_hosting_error_is_announced() {
         let container = make_container();
         let state = AppState::new();
-        install_mobile_host_settings(&state, None, true);
+        install_mobile_host_settings(&state, true);
         install_direct_hosting(
             &state,
             protocol::MobileDirectHostingStatus::Error {
@@ -10170,7 +9680,7 @@ mod wasm_tests {
         let container = make_container();
         let _handle = mount_to(container.clone(), move || {
             let state = AppState::new();
-            install_mobile_host_settings(&state, None, false);
+            install_mobile_host_settings(&state, false);
             state.settings_open.set(true);
             provide_context(state);
             view! { <SettingsPanel /> }
@@ -10213,7 +9723,7 @@ mod wasm_tests {
         let container = make_container();
         let _handle = mount_to(container.clone(), move || {
             let state = AppState::new();
-            install_mobile_host_settings(&state, None, false);
+            install_mobile_host_settings(&state, false);
             state.settings_open.set(true);
             provide_context(state);
             view! { <SettingsPanel /> }
@@ -10255,7 +9765,7 @@ mod wasm_tests {
         let container = make_container();
         let _handle = mount_to(container.clone(), move || {
             let state = AppState::new();
-            install_mobile_host_settings(&state, None, false);
+            install_mobile_host_settings(&state, false);
             state.native_voice_supported.set(false);
             state.settings_open.set(true);
             provide_context(state);
@@ -10274,133 +9784,13 @@ mod wasm_tests {
         );
     }
 
-    /// Pressing Enter on an insecure-scheme URL must (a) NOT emit any
-    /// SettingsWrite frame for the broker URL and (b) render an inline
-    /// error message that mentions the scheme problem. This is the
-    /// silent-failure regression guard the prior review called out.
-    #[wasm_bindgen_test]
-    async fn mobile_tab_invalid_url_shows_inline_error_and_suppresses_send() {
-        let calls = install_settings_send_stub();
-        let container = make_container();
-        let _handle = mount_to(container.clone(), move || {
-            let state = AppState::new();
-            install_mobile_host_settings(&state, None, true);
-            state.settings_open.set(true);
-            provide_context(state);
-            view! { <SettingsPanel /> }
-        });
-        next_tick().await;
-        click_tab(&container, "Mobile");
-        next_tick().await;
-
-        let input = broker_input(&container);
-        input.set_value("mqtt://broker.example:1883");
-        dispatch_enter(&input);
-        for _ in 0..4 {
-            next_tick().await;
-        }
-
-        // No MobileBrokerUrl SettingsWrite frame should have been sent.
-        let settings = recorded_settings_write_ops(&calls);
-        assert!(
-            settings
-                .iter()
-                .all(|s| s.get("kind").and_then(|k| k.as_str()) != Some("mobile_broker_url")),
-            "Invalid broker URL must not be committed; recorded settings: {settings:?}"
-        );
-
-        // The inline error must be visible AND mention scheme/insecure
-        // so the user can correct it without guessing.
-        let error_el = container
-            .query_selector(".settings-mobile-broker-error")
-            .unwrap()
-            .expect("Invalid broker URL must surface an inline error message");
-        let error_text = error_el.text_content().unwrap_or_default().to_lowercase();
-        assert!(
-            error_text.contains("insecure")
-                || error_text.contains("mqtts")
-                || error_text.contains("scheme"),
-            "Inline error must explain the scheme problem; got: {error_text:?}"
-        );
-
-        // aria-invalid must flip so screen readers announce the error.
-        let aria_invalid = input.get_attribute("aria-invalid");
-        assert_eq!(
-            aria_invalid.as_deref(),
-            Some("true"),
-            "Broker URL input must set aria-invalid=true while showing the error"
-        );
-    }
-
-    /// QA finding: a valid-scheme, valid-shape but **non-loopback** broker URL
-    /// (which the server now rejects at write time) must fail closed inline —
-    /// (a) no `MobileBrokerUrl` frame is sent, (b) the `settings-mobile-broker-error`
-    /// message renders and names the loopback rule, and (c) the field flips
-    /// `aria-invalid`. Previously this URL was sent and the rejection only
-    /// appeared in the global header.
-    #[wasm_bindgen_test]
-    async fn mobile_tab_non_loopback_broker_shows_inline_error_and_suppresses_send() {
-        let calls = install_settings_send_stub();
-        let container = make_container();
-        let _handle = mount_to(container.clone(), move || {
-            let state = AppState::new();
-            install_mobile_host_settings(&state, None, true);
-            state.settings_open.set(true);
-            provide_context(state);
-            view! { <SettingsPanel /> }
-        });
-        next_tick().await;
-        click_tab(&container, "Mobile");
-        next_tick().await;
-
-        let input = broker_input(&container);
-        input.set_value("mqtts://broker.example.test:8883");
-        dispatch_enter(&input);
-        for _ in 0..4 {
-            next_tick().await;
-        }
-
-        // (a) Nothing is committed to the wire.
-        let settings = recorded_settings_write_ops(&calls);
-        assert!(
-            settings
-                .iter()
-                .all(|s| s.get("kind").and_then(|k| k.as_str()) != Some("mobile_broker_url")),
-            "Non-loopback broker URL must not be committed; recorded settings: {settings:?}"
-        );
-
-        // (b) Inline error renders in the field's own error element and the copy
-        // explains the loopback/managed rule so the user isn't left guessing.
-        let error_el = container
-            .query_selector(".settings-mobile-broker-error")
-            .unwrap()
-            .expect("Non-loopback broker URL must surface an inline error message");
-        let error_text = error_el.text_content().unwrap_or_default().to_lowercase();
-        assert!(
-            error_text.contains("loopback"),
-            "Inline error must explain the loopback rule; got: {error_text:?}"
-        );
-        assert!(
-            error_text.contains("managed") || error_text.contains("localhost"),
-            "Inline error should point the user at managed access / loopback; got: {error_text:?}"
-        );
-
-        // (c) aria-invalid announces the problem to assistive tech.
-        assert_eq!(
-            input.get_attribute("aria-invalid").as_deref(),
-            Some("true"),
-            "Broker URL input must set aria-invalid=true while showing the error"
-        );
-    }
-
     // ---- Mobile pairing section ----
 
     /// Seed an Online broker `MobileAccessState` snapshot under the
     /// installed host so the Start-pairing button can render enabled.
-    fn install_online_broker_state(state: &AppState) {
-        let url = BrokerUrl::new("mqtts://broker.test:8883").expect("broker url");
+    fn install_online_connection_state(state: &AppState) {
         let payload = protocol::MobileAccessStatePayload {
-            broker_status: MobileBrokerStatus::Online { broker_url: url },
+            connection_status: MobileConnectionStatus::Online,
             pairing: MobilePairingState::Idle,
             paired_devices: Vec::new(),
             direct_hosting: protocol::MobileDirectHostingStatus::Disabled,
@@ -10422,9 +9812,9 @@ mod wasm_tests {
         state.mobile_pairing_offer.update(|m| {
             m.insert("host-mobile".to_owned(), offer);
         });
-        let url = BrokerUrl::new("mqtts://broker.test:8883").expect("broker url");
+
         let payload = protocol::MobileAccessStatePayload {
-            broker_status: MobileBrokerStatus::Online { broker_url: url },
+            connection_status: MobileConnectionStatus::Online,
             pairing: MobilePairingState::Active {
                 offer_id: protocol::MobilePairingOfferId(offer_id.to_owned()),
                 expires_at_ms,
@@ -10497,8 +9887,8 @@ mod wasm_tests {
         let container = make_container();
         let _handle = mount_to(container.clone(), move || {
             let state = AppState::new();
-            install_mobile_host_settings(&state, None, true);
-            install_online_broker_state(&state);
+            install_mobile_host_settings(&state, true);
+            install_online_connection_state(&state);
             state.settings_open.set(true);
             provide_context(state);
             view! { <SettingsPanel /> }
@@ -10541,8 +9931,8 @@ mod wasm_tests {
         let container = make_container();
         let _handle = mount_to(container.clone(), move || {
             let state = AppState::new();
-            install_mobile_host_settings(&state, None, false);
-            install_online_broker_state(&state);
+            install_mobile_host_settings(&state, false);
+            install_online_connection_state(&state);
             state.settings_open.set(true);
             provide_context(state);
             view! { <SettingsPanel /> }
@@ -10568,13 +9958,13 @@ mod wasm_tests {
         let container = make_container();
         let _handle = mount_to(container.clone(), move || {
             let state = AppState::new();
-            install_mobile_host_settings(&state, None, true);
-            let url = BrokerUrl::new("mqtts://broker.test:8883").expect("broker url");
+            install_mobile_host_settings(&state, true);
+
             state.mobile_access_state.update(|m| {
                 m.insert(
                     "host-mobile".to_owned(),
                     protocol::MobileAccessStatePayload {
-                        broker_status: MobileBrokerStatus::Online { broker_url: url },
+                        connection_status: MobileConnectionStatus::Online,
                         pairing: MobilePairingState::Idle,
                         direct_hosting: protocol::MobileDirectHostingStatus::Disabled,
                         paired_devices: vec![protocol::MobileDeviceSummary {
@@ -10635,7 +10025,7 @@ mod wasm_tests {
         let container = make_container();
         let _handle = mount_to(container.clone(), move || {
             let state = AppState::new();
-            install_mobile_host_settings(&state, None, true);
+            install_mobile_host_settings(&state, true);
             install_active_offer(
                 &state,
                 "offer-abc",
@@ -10720,8 +10110,8 @@ mod wasm_tests {
         );
     }
 
-    /// When the managed broker is in Error state, the pairing card surfaces the
-    /// server error message via the broker status pill AND keeps Pair via cloud
+    /// When the managed relay is in Error state, the pairing card surfaces the
+    /// server error message via the connection status pill AND keeps Pair via cloud
     /// enabled: in the managed flow, (re-)pairing is exactly how the user
     /// recovers from a broker error, so gating Start on broker health would only
     /// block the fix. (Starting is server-owned, so it can't pick an
@@ -10732,11 +10122,10 @@ mod wasm_tests {
         let container = make_container();
         let _handle = mount_to(container.clone(), move || {
             let state = AppState::new();
-            install_mobile_host_settings(&state, None, true);
+            install_mobile_host_settings(&state, true);
             let payload = protocol::MobileAccessStatePayload {
-                broker_status: MobileBrokerStatus::Error {
-                    broker_url: None,
-                    code: protocol::MobileAccessErrorCode::BrokerConnectionFailed,
+                connection_status: MobileConnectionStatus::Error {
+                    code: protocol::MobileAccessErrorCode::TransportFailed,
                     message: "broker unreachable".to_owned(),
                 },
                 pairing: MobilePairingState::Idle,
@@ -10768,7 +10157,7 @@ mod wasm_tests {
     }
 
     /// First managed pairing: before any pairing exists the server reports
-    /// `MobileBrokerStatus::RepairRequired` (there is no `Online` broker yet).
+    /// `MobileConnectionStatus::RepairRequired` (there is no `Online` broker yet).
     /// Pair via cloud MUST be enabled in this state — otherwise the user can
     /// never start their first managed pairing — and the repair message must
     /// surface so the state is self-explanatory.
@@ -10778,9 +10167,9 @@ mod wasm_tests {
         let container = make_container();
         let _handle = mount_to(container.clone(), move || {
             let state = AppState::new();
-            install_mobile_host_settings(&state, None, true);
+            install_mobile_host_settings(&state, true);
             let payload = protocol::MobileAccessStatePayload {
-                broker_status: MobileBrokerStatus::RepairRequired {
+                connection_status: MobileConnectionStatus::RepairRequired {
                     code: protocol::MobileAccessErrorCode::RepairRequired,
                     message:
                         "Mobile access requires a tycode.dev managed pairing before connecting"
@@ -10863,9 +10252,7 @@ mod wasm_tests {
         // offer id. The new offer payload itself is only delivered to
         // the requester (not this bystander).
         let new_state = protocol::MobileAccessStatePayload {
-            broker_status: MobileBrokerStatus::Online {
-                broker_url: BrokerUrl::new("mqtts://broker.test:8883").expect("broker url"),
-            },
+            connection_status: MobileConnectionStatus::Online {},
             pairing: MobilePairingState::Active {
                 offer_id: MobilePairingOfferId("offer-B".to_owned()),
                 expires_at_ms: u64::MAX,
@@ -10932,9 +10319,7 @@ mod wasm_tests {
         });
 
         let access_state = protocol::MobileAccessStatePayload {
-            broker_status: MobileBrokerStatus::Online {
-                broker_url: BrokerUrl::new("mqtts://broker.test:8883").expect("broker url"),
-            },
+            connection_status: MobileConnectionStatus::Online {},
             pairing: MobilePairingState::Active {
                 offer_id: MobilePairingOfferId(offer_id_str.to_owned()),
                 expires_at_ms: u64::MAX,
@@ -10989,9 +10374,7 @@ mod wasm_tests {
         });
 
         let access_state = protocol::MobileAccessStatePayload {
-            broker_status: MobileBrokerStatus::Online {
-                broker_url: BrokerUrl::new("mqtts://broker.test:8883").expect("broker url"),
-            },
+            connection_status: MobileConnectionStatus::Online {},
             // Cancelled: offer_id is still in the state but the
             // pairing lifecycle is no longer Active — UI should
             // stop rendering the QR.
@@ -11062,8 +10445,7 @@ mod wasm_tests {
                     enabled_backends: vec![protocol::BackendKind::Claude],
                     default_backend: Some(protocol::BackendKind::Claude),
                     enable_mobile_connections: false,
-                    mobile_broker_url: None,
-                    mobile_broker_auth: Default::default(),
+
                     mobile_direct_hosting_enabled: false,
                     mobile_direct_bind_addr: None,
                     mobile_direct_public_origin: None,
@@ -11816,8 +11198,7 @@ mod wasm_tests {
             enabled_backends,
             default_backend: Some(BackendKind::Hermes),
             enable_mobile_connections: false,
-            mobile_broker_url: None,
-            mobile_broker_auth: Default::default(),
+
             mobile_direct_hosting_enabled: false,
             mobile_direct_bind_addr: None,
             mobile_direct_public_origin: None,
@@ -13955,8 +13336,7 @@ mod wasm_tests {
                     enabled_backends: vec![BackendKind::Hermes],
                     default_backend: Some(BackendKind::Hermes),
                     enable_mobile_connections: false,
-                    mobile_broker_url: None,
-                    mobile_broker_auth: Default::default(),
+
                     mobile_direct_hosting_enabled: false,
                     mobile_direct_bind_addr: None,
                     mobile_direct_public_origin: None,

@@ -125,9 +125,9 @@ pub fn prime_host_for_tests(state: &AppState, host_id: &str) {
     use protocol::{
         BackendSetupPayload as BootstrapBackendSetup, HostBootstrapPayload as BootstrapHostPayload,
         MobileAccessStatePayload as BootstrapMobileAccess,
-        MobileBrokerStatus as BootstrapBrokerStatus, MobilePairingState as BootstrapPairingState,
-        PROTOCOL_VERSION, TYDE_VERSION, TeamPresetCatalog as BootstrapTeamPresetCatalog,
-        WelcomePayload as BootstrapWelcome,
+        MobileConnectionStatus as BootstrapConnectionStatus,
+        MobilePairingState as BootstrapPairingState, PROTOCOL_VERSION, TYDE_VERSION,
+        TeamPresetCatalog as BootstrapTeamPresetCatalog, WelcomePayload as BootstrapWelcome,
     };
     use settings_model::HostSettings as BootstrapHostSettings;
 
@@ -147,8 +147,7 @@ pub fn prime_host_for_tests(state: &AppState, host_id: &str) {
             enabled_backends: Vec::new(),
             default_backend: None,
             enable_mobile_connections: false,
-            mobile_broker_url: None,
-            mobile_broker_auth: Default::default(),
+
             mobile_direct_hosting_enabled: false,
             mobile_direct_bind_addr: None,
             mobile_direct_public_origin: None,
@@ -173,7 +172,7 @@ pub fn prime_host_for_tests(state: &AppState, host_id: &str) {
         settings_schema: serde_json::Value::Null,
         configured_secrets: Vec::new(),
         mobile_access: BootstrapMobileAccess {
-            broker_status: BootstrapBrokerStatus::Disabled,
+            connection_status: BootstrapConnectionStatus::Disabled,
             pairing: BootstrapPairingState::Idle,
             paired_devices: Vec::new(),
             direct_hosting: protocol::MobileDirectHostingStatus::Disabled,
@@ -7083,8 +7082,7 @@ pub(crate) mod restore_fixtures {
                     enabled_backends: Vec::new(),
                     default_backend: None,
                     enable_mobile_connections: false,
-                    mobile_broker_url: None,
-                    mobile_broker_auth: Default::default(),
+
                     mobile_direct_hosting_enabled: false,
                     mobile_direct_bind_addr: None,
                     mobile_direct_public_origin: None,
@@ -7109,7 +7107,7 @@ pub(crate) mod restore_fixtures {
                 settings_schema: serde_json::Value::Null,
                 configured_secrets: Vec::new(),
                 mobile_access: MobileAccessStatePayload {
-                    broker_status: protocol::MobileBrokerStatus::Disabled,
+                    connection_status: protocol::MobileConnectionStatus::Disabled,
                     pairing: MobilePairingState::Idle,
                     paired_devices: Vec::new(),
                     direct_hosting: protocol::MobileDirectHostingStatus::Disabled,

@@ -1,6 +1,5 @@
 use std::fmt;
 
-use protocol::BrokerUrl;
 pub use protocol::MobileAccessErrorCode;
 use serde::{Deserialize, Serialize};
 
@@ -30,50 +29,11 @@ impl fmt::Display for KeychainSecretId {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct BrokerEndpointSummary {
-    pub url: BrokerUrl,
-    pub auth: BrokerAuthSummary,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum BrokerAuthSummary {
-    Anonymous,
-    UsernamePassword {
-        username: String,
-        has_password: bool,
-    },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct RoomIdSummary(pub String);
-
-impl fmt::Display for RoomIdSummary {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct MobilePairingPreview {
-    pub host_label: String,
-    pub broker_url: BrokerUrl,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PairedHostSummary {
     pub local_host_id: LocalHostId,
     pub host_label: String,
-    /// MQTT rendezvous. Absent for a host paired over its own HTTP origin,
-    /// which has no broker and no room to report.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub broker: Option<BrokerEndpointSummary>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub room: Option<RoomIdSummary>,
     pub credential_fingerprint: String,
     pub auto_connect: bool,
     pub last_connected_at_ms: Option<u64>,

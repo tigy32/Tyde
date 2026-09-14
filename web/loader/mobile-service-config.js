@@ -2,7 +2,7 @@
 //
 // This file is intentionally an external same-origin script so the loader's CSP
 // does not need inline JavaScript. It contains only public endpoint metadata;
-// session cookies, pairing secrets, broker grants, and Tyggs tokens must never
+// session cookies, pairing secrets, relay grants, and Tyggs tokens must never
 // be written here.
 (() => {
   "use strict";

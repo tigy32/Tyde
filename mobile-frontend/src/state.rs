@@ -4,8 +4,7 @@ use leptos::prelude::*;
 
 use crate::bridge::{LocalSubmissionId, SubmissionTransportOutcome};
 pub use mobile_shell_types::{
-    LocalHostId, MobilePairingPreview, MobileShellError, PairedHostConnectionStatus,
-    PairedHostSummary,
+    LocalHostId, MobileShellError, PairedHostConnectionStatus, PairedHostSummary,
 };
 pub use protocol::MobileServiceAuthState;
 use protocol::types::AgentCompactNotifyPayload;
@@ -191,7 +190,7 @@ pub enum SubmissionWithdrawal {
 /// host received or applied anything.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SubmissionLifecycle {
-    /// Admitted and still on its way out (or already retired by a broker ack —
+    /// Admitted and still on its way out (or already retired by a transport ack —
     /// which is a transport fact only, and leaves "queued locally" as the last
     /// true thing that can be said).
     QueuedLocally,
@@ -429,21 +428,9 @@ pub const MAX_PENDING_SUBMISSIONS_PER_HOST: usize = 64;
 pub enum PairingScreen {
     Scanner,
     ManualPaste,
-    /// Direct-pairing confirmation (legacy v1 native-shell path). The QR already
-    /// carries the room + PSK, so tapping Pair stores the credential and starts
-    /// the encrypted MQTT connection immediately (no `tycode.dev` round-trip).
-    Confirm {
-        qr_uri: String,
-        preview: MobilePairingPreview,
-    },
-    /// Runs the direct-pairing MQTT connect for [`PairingScreen::Confirm`].
-    InProgress {
-        qr_uri: String,
-        preview: MobilePairingPreview,
-    },
     /// A managed (`tyde-pair://v2`) offer: authenticate with `tycode.dev`
     /// (Tyggs OAuth → pass proof → mobile session) and, once authenticated,
-    /// redeem the offer and connect to the managed broker. `auth` is the typed
+    /// redeem the offer and connect to the managed relay. `auth` is the typed
     /// server-owned auth state driving which card renders (spinner / paywall /
     /// retry / redeeming).
     ServiceAuth {
@@ -481,7 +468,7 @@ pub enum PairingScreen {
 
 /// Classification of a scanned/pasted pairing URI, produced by
 /// [`crate::bridge::classify_pairing_offer`] via
-/// `mqtt_transport::parse_mobile_pairing_qr_offer`. The pairing flow renders a
+/// `mobile_pairing::parse_mobile_pairing_qr_offer`. The pairing flow renders a
 /// different screen per variant, so the UI branches on typed offer data rather
 /// than on which bridge backend is active.
 #[derive(Clone, Debug, PartialEq)]
@@ -495,7 +482,6 @@ pub enum PairingOffer {
     /// Native-shell direct pairing: the existing preview → confirm →
     /// `start_pairing` path. The native shell owns its own managed handshake, so
     /// the web bundle never produces this variant.
-    DirectPairing { preview: MobilePairingPreview },
     /// A host serving this bundle itself (`tyde-pair://v3`). Confirming
     /// redeems the offer against the origin the page came from; there is no
     /// broker and no `tycode.dev` step.
@@ -1532,7 +1518,7 @@ impl AppState {
     /// Reads the live attempt first, then the terminal record of a withdrawal.
     /// **An absent record is not a delivery claim**: it falls back to
     /// `QueuedLocally`, which is the last thing the client actually knew — a
-    /// broker ack retires a record and proves nothing about the host.
+    /// transport ack retires a record and proves nothing about the host.
     ///
     /// This is a lookup by client-local identity. It never correlates a server
     /// event with a submission.

@@ -235,7 +235,7 @@ check_release_version() {
 
 check_transport_protocol_version() {
     python3 "$TRANSPORT_VERSION_CHECKER" >/dev/null || die \
-        "MQTT transport protocol version guard failed"
+        "RTC transport protocol version guard failed"
 }
 
 remote_tag_lines() {

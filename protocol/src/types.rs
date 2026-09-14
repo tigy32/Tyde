@@ -13,7 +13,7 @@ use serde_json::Value;
 /// `protocol::TydeReleaseVersion`.
 pub use host_config::{LOCAL_HOST_ID, TydeReleaseVersion};
 
-pub const PROTOCOL_VERSION: u32 = 61;
+pub const PROTOCOL_VERSION: u32 = 62;
 
 // Exported verbatim to TydeMobileService by tools/export-mobile-rtc.py.
 pub mod mobile_rtc {
@@ -165,9 +165,6 @@ pub const TYDE_VERSION: Version = Version {
     minor: 8,
     patch: 14,
 };
-/// Shared MQTT-over-WebSocket-Secure endpoint reachable from both the native
-/// host and the browser/PWA client (no mixed content; broker terminates TLS).
-pub const DEFAULT_MOBILE_MQTT_BROKER_URL: &str = "wss://broker.emqx.io:8084/mqtt";
 pub const DEFAULT_SESSION_LIST_PAGE_LIMIT: u32 = 64;
 pub const DEFAULT_MOBILE_SESSION_LIST_PAGE_LIMIT: u32 = 20;
 pub const MAX_SESSION_LIST_PAGE_LIMIT: u32 = 128;
@@ -241,247 +238,6 @@ impl fmt::Display for ProtocolTypeError {
 }
 
 impl std::error::Error for ProtocolTypeError {}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
-#[serde(transparent)]
-pub struct BrokerUrl(String);
-
-impl BrokerUrl {
-    pub fn new(value: impl Into<String>) -> Result<Self, ProtocolTypeError> {
-        let value = value.into();
-        if value.is_empty() {
-            return Err(ProtocolTypeError::EmptyIdentifier {
-                type_name: "BrokerUrl",
-            });
-        }
-        Ok(Self(value))
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Display for BrokerUrl {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct ManagedBrokerRegion(String);
-
-impl ManagedBrokerRegion {
-    pub fn new(value: impl Into<String>) -> Result<Self, ProtocolTypeError> {
-        let value = value.into();
-        if value.is_empty() {
-            return Err(ProtocolTypeError::EmptyIdentifier {
-                type_name: "ManagedBrokerRegion",
-            });
-        }
-        Ok(Self(value))
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Display for ManagedBrokerRegion {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl Serialize for ManagedBrokerRegion {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_str(self.as_str())
-    }
-}
-
-impl<'de> Deserialize<'de> for ManagedBrokerRegion {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        Self::new(String::deserialize(deserializer)?).map_err(D::Error::custom)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct ManagedBrokerAuthorizerName(String);
-
-impl ManagedBrokerAuthorizerName {
-    pub fn new(value: impl Into<String>) -> Result<Self, ProtocolTypeError> {
-        let value = value.into();
-        if value.is_empty() {
-            return Err(ProtocolTypeError::EmptyIdentifier {
-                type_name: "ManagedBrokerAuthorizerName",
-            });
-        }
-        Ok(Self(value))
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Display for ManagedBrokerAuthorizerName {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl Serialize for ManagedBrokerAuthorizerName {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_str(self.as_str())
-    }
-}
-
-impl<'de> Deserialize<'de> for ManagedBrokerAuthorizerName {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        Self::new(String::deserialize(deserializer)?).map_err(D::Error::custom)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct ManagedBrokerGrantId(String);
-
-impl ManagedBrokerGrantId {
-    pub fn new(value: impl Into<String>) -> Result<Self, ProtocolTypeError> {
-        let value = value.into();
-        if value.is_empty() {
-            return Err(ProtocolTypeError::EmptyIdentifier {
-                type_name: "ManagedBrokerGrantId",
-            });
-        }
-        Ok(Self(value))
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Display for ManagedBrokerGrantId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl Serialize for ManagedBrokerGrantId {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_str(self.as_str())
-    }
-}
-
-impl<'de> Deserialize<'de> for ManagedBrokerGrantId {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        Self::new(String::deserialize(deserializer)?).map_err(D::Error::custom)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct ManagedBrokerClientId(String);
-
-impl ManagedBrokerClientId {
-    pub fn new(value: impl Into<String>) -> Result<Self, ProtocolTypeError> {
-        let value = value.into();
-        if value.is_empty() {
-            return Err(ProtocolTypeError::EmptyIdentifier {
-                type_name: "ManagedBrokerClientId",
-            });
-        }
-        Ok(Self(value))
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Display for ManagedBrokerClientId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl Serialize for ManagedBrokerClientId {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_str(self.as_str())
-    }
-}
-
-impl<'de> Deserialize<'de> for ManagedBrokerClientId {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        Self::new(String::deserialize(deserializer)?).map_err(D::Error::custom)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct ManagedBrokerTopicNamespace(String);
-
-impl ManagedBrokerTopicNamespace {
-    pub fn new(value: impl Into<String>) -> Result<Self, ProtocolTypeError> {
-        let value = value.into();
-        if value.is_empty() {
-            return Err(ProtocolTypeError::EmptyIdentifier {
-                type_name: "ManagedBrokerTopicNamespace",
-            });
-        }
-        Ok(Self(value))
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Display for ManagedBrokerTopicNamespace {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl Serialize for ManagedBrokerTopicNamespace {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_str(self.as_str())
-    }
-}
-
-impl<'de> Deserialize<'de> for ManagedBrokerTopicNamespace {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        Self::new(String::deserialize(deserializer)?).map_err(D::Error::custom)
-    }
-}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct MobilePairingOfferId(pub String);
@@ -3202,7 +2958,7 @@ pub struct HeartbeatPayload {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MobilePairingStartPayload {
-    /// Pair against the host's own HTTP origin instead of the managed broker.
+    /// Pair against the host's own HTTP origin instead of the managed relay.
     /// Defaulted so a client built before direct hosting still asks for the
     /// managed flow it knows.
     #[serde(default)]
@@ -3342,7 +3098,7 @@ pub enum MobilePushReason {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MobileAccessStatePayload {
-    pub broker_status: MobileBrokerStatus,
+    pub connection_status: MobileConnectionStatus,
     pub pairing: MobilePairingState,
     pub paired_devices: Vec<MobileDeviceSummary>,
     #[serde(default)]
@@ -3425,83 +3181,13 @@ pub struct MobilePairingOfferPayload {
     pub expires_at_ms: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ManagedBrokerProvider {
-    AwsIotCore,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ManagedBrokerRole {
-    Host,
-    Mobile,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ManagedBrokerEndpoint {
-    pub endpoint: BrokerUrl,
-    pub provider: ManagedBrokerProvider,
-    pub region: ManagedBrokerRegion,
-    pub authorizer_name: ManagedBrokerAuthorizerName,
-}
-
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ManagedBrokerConnectAuth {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub username: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub password: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub websocket_url: Option<BrokerUrl>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub headers: BTreeMap<String, String>,
-}
-
-impl fmt::Debug for ManagedBrokerConnectAuth {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ManagedBrokerConnectAuth")
-            .field("username", &self.username.as_ref().map(|_| "<redacted>"))
-            .field("password", &self.password.as_ref().map(|_| "<redacted>"))
-            .field(
-                "websocket_url",
-                &self.websocket_url.as_ref().map(|_| "<redacted>"),
-            )
-            .field("header_count", &self.headers.len())
-            .finish()
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ManagedBrokerCredentialScope {
-    pub namespace: ManagedBrokerTopicNamespace,
-    pub role: ManagedBrokerRole,
-    pub publish: Vec<String>,
-    pub subscribe: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ManagedBrokerCredentials {
-    pub grant_id: ManagedBrokerGrantId,
-    pub client_id: ManagedBrokerClientId,
-    pub connect: ManagedBrokerConnectAuth,
-    pub scope: ManagedBrokerCredentialScope,
-    pub issued_at_ms: u64,
-    pub expires_at_ms: u64,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-pub enum MobileBrokerStatus {
+pub enum MobileConnectionStatus {
     Disabled,
-    Connecting {
-        broker_url: BrokerUrl,
-    },
-    Online {
-        broker_url: BrokerUrl,
-    },
+    Connecting,
+    Online,
     Error {
-        broker_url: Option<BrokerUrl>,
         code: MobileAccessErrorCode,
         message: String,
     },
@@ -3583,10 +3269,6 @@ pub enum MobileAccessErrorCode {
     ServiceAuthRequired,
     ServiceAuthFailed,
     ServiceUnavailable,
-    BrokerUnavailable,
-    BrokerConnectionFailed,
-    BrokerProtocol,
-    BrokerRejected,
     PairingExpired,
     PairingRejected,
     CryptoFailed,

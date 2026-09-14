@@ -1,20 +1,13 @@
 use settings_model::HostBootstrapPayload;
 use std::time::Duration;
 
-mod support;
-
-use mqtt_transport::{
-    MobilePairingQrPayload, MqttConnectConfig, MqttTransportPolicy, ParticipantRole,
-    host_to_client_topic,
-};
 use protocol::{
-    AgentBootstrapEvent, AgentBootstrapPayload, BackendKind, BrokerUrl, ChatEvent,
-    CommandErrorCode, CommandErrorPayload, Envelope, FrameKind, ListSessionsPayload,
-    LoadAgentPayload, MobileAccessErrorCode, MobileAccessStatePayload, MobileBrokerStatus,
-    MobileDeviceState, MobilePairingOfferPayload, MobilePairingStartPayload, MobilePairingState,
+    AgentBootstrapEvent, AgentBootstrapPayload, BackendKind, ChatEvent, CommandErrorCode,
+    CommandErrorPayload, Envelope, FrameKind, ListSessionsPayload, LoadAgentPayload,
+    MobileAccessErrorCode, MobileAccessStatePayload, MobileConnectionStatus, MobilePairingState,
     NewAgentPayload, ProjectCreatePayload, ProjectRootPath, SendMessagePayload, SessionId,
-    SessionListPageStatus, SettingsWriteId, SettingsWriteResultPayload, SpawnAgentParams,
-    SpawnAgentPayload, StreamPath, TerminalCreatePayload, TerminalLaunchTarget, write_envelope,
+    SessionListPageStatus, SpawnAgentParams, SpawnAgentPayload, StreamPath, TerminalCreatePayload,
+    TerminalLaunchTarget, write_envelope,
 };
 use server::backend::BackendSession;
 use server::store::session::SessionStore;
@@ -25,6 +18,7 @@ const EVENT_TIMEOUT: Duration = Duration::from_secs(5);
 struct Harness {
     host: server::HostHandle,
     _store_dir: tempfile::TempDir,
+    relay: tests::rtc::RelayFixture,
 }
 
 impl Harness {
@@ -45,6 +39,7 @@ impl Harness {
         Self {
             host,
             _store_dir: store_dir,
+            relay: tests::rtc::relay().await,
         }
     }
 
@@ -146,23 +141,6 @@ async fn wait_for_command_error(
     }
 }
 
-async fn wait_for_settings_write_result(
-    client: &mut client::Connection,
-    write_id: &SettingsWriteId,
-    context: &str,
-) -> SettingsWriteResultPayload {
-    loop {
-        let env = next_event(client, context).await;
-        if env.kind == FrameKind::SettingsWriteResult {
-            let result: SettingsWriteResultPayload =
-                env.parse_payload().expect("parse SettingsWriteResult");
-            if result.write_id == *write_id {
-                return result;
-            }
-        }
-    }
-}
-
 async fn wait_for_chat_stream_end(client: &mut client::Connection, context: &str) -> ChatEvent {
     loop {
         let env = next_event(client, context).await;
@@ -184,16 +162,9 @@ async fn expect_initial_replay(client: &mut client::Connection) -> MobileAccessS
     let env = expect_next_kind(client, FrameKind::HostBootstrap, "initial HostBootstrap").await;
     let bootstrap: HostBootstrapPayload = env.parse_payload().expect("parse HostBootstrap");
     let state = bootstrap.mobile_access;
-    assert_eq!(state.broker_status, MobileBrokerStatus::Disabled);
+    assert_eq!(state.connection_status, MobileConnectionStatus::Disabled);
     assert_eq!(state.pairing, MobilePairingState::Idle);
     state
-}
-
-async fn set_mobile_broker_url(client: &mut client::Connection, broker_url: Option<BrokerUrl>) {
-    client
-        .replace_setting("/mobile_broker_url", broker_url, Option::<BrokerUrl>::None)
-        .await
-        .expect("set mobile broker URL");
 }
 
 async fn set_mobile_enabled(client: &mut client::Connection, enabled: bool) {
@@ -222,15 +193,6 @@ async fn wait_for_mobile_state(
             return state;
         }
     }
-}
-
-async fn send_mobile_pairing_start(client: &mut client::Connection) {
-    send_host_payload(
-        client,
-        FrameKind::MobilePairingStart,
-        &MobilePairingStartPayload { direct: false },
-    )
-    .await;
 }
 
 async fn send_host_payload<T: serde::Serialize>(
@@ -332,31 +294,12 @@ fn assert_initial_mock_response(bootstrap: &AgentBootstrapPayload, prompt: &str,
 }
 
 #[tokio::test]
-async fn mqtt_mobile_new_chat_spawns_and_loads_agent() {
-    let broker = support::start_plain_mqtt_broker().expect("start local MQTT broker");
+async fn turn_mobile_new_chat_spawns_and_loads_agent() {
     let harness = Harness::new().await;
     let mut desktop = harness.connect_desktop().await;
     expect_initial_replay(&mut desktop).await;
 
-    set_mobile_broker_url(&mut desktop, Some(broker.broker_url.clone())).await;
-    set_mobile_enabled(&mut desktop, true).await;
-    let _ = wait_for_mobile_state(
-        &mut desktop,
-        |state| matches!(state.broker_status, MobileBrokerStatus::Online { .. }),
-        "MobileBrokerStatus::Online",
-    )
-    .await;
-    send_mobile_pairing_start(&mut desktop).await;
-
-    let offer_env = wait_for_kind(
-        &mut desktop,
-        FrameKind::MobilePairingOffer,
-        "MobilePairingOffer",
-    )
-    .await;
-    let offer: MobilePairingOfferPayload = offer_env.parse_payload().expect("parse offer");
-    let qr = MobilePairingQrPayload::from_any(&offer.qr_uri.0).expect("parse QR");
-    let mut mobile = connect_mobile_client(&qr).await;
+    let mut mobile = connect_mobile_client(&harness).await;
     let bootstrap_env = expect_next_kind(
         &mut mobile,
         FrameKind::HostBootstrap,
@@ -431,7 +374,7 @@ async fn mqtt_mobile_new_chat_spawns_and_loads_agent() {
     .await;
     assert_initial_mock_response(&first_bootstrap, prompt, "first mobile load");
 
-    let mut reconnected = connect_mobile_client(&qr).await;
+    let mut reconnected = connect_mobile_client(&harness).await;
     let reconnected_agent =
         expect_mobile_replay(&mut reconnected, 0, "reconnected mobile replay").await;
     assert_eq!(reconnected_agent.agent_id, mobile_agent.agent_id);
@@ -456,8 +399,7 @@ async fn mqtt_mobile_new_chat_spawns_and_loads_agent() {
 }
 
 #[tokio::test]
-async fn mqtt_mobile_duplicate_load_agent_reports_command_error() {
-    let broker = support::start_plain_mqtt_broker().expect("start local MQTT broker");
+async fn turn_mobile_duplicate_load_agent_reports_command_error() {
     let harness = Harness::new().await;
     let mut desktop = harness.connect_desktop().await;
     expect_initial_replay(&mut desktop).await;
@@ -484,25 +426,7 @@ async fn mqtt_mobile_duplicate_load_agent_reports_command_error() {
     let _ = wait_for_kind(&mut desktop, FrameKind::NewAgent, "desktop NewAgent").await;
     let _ = wait_for_chat_stream_end(&mut desktop, "desktop initial StreamEnd").await;
 
-    set_mobile_broker_url(&mut desktop, Some(broker.broker_url.clone())).await;
-    set_mobile_enabled(&mut desktop, true).await;
-    let _ = wait_for_mobile_state(
-        &mut desktop,
-        |state| matches!(state.broker_status, MobileBrokerStatus::Online { .. }),
-        "MobileBrokerStatus::Online",
-    )
-    .await;
-    send_mobile_pairing_start(&mut desktop).await;
-
-    let offer_env = wait_for_kind(
-        &mut desktop,
-        FrameKind::MobilePairingOffer,
-        "MobilePairingOffer",
-    )
-    .await;
-    let offer: MobilePairingOfferPayload = offer_env.parse_payload().expect("parse offer");
-    let qr = MobilePairingQrPayload::from_any(&offer.qr_uri.0).expect("parse QR");
-    let mut mobile = connect_mobile_client(&qr).await;
+    let mut mobile = connect_mobile_client(&harness).await;
     let replayed_agent = expect_mobile_replay(&mut mobile, 0, "mobile duplicate load replay").await;
 
     load_mobile_agent(&mut mobile, &replayed_agent).await;
@@ -571,18 +495,18 @@ async fn enabling_mobile_without_pairing_fails_closed() {
         &mut desktop,
         |state| {
             matches!(
-                state.broker_status,
-                MobileBrokerStatus::RepairRequired {
+                state.connection_status,
+                MobileConnectionStatus::RepairRequired {
                     code: MobileAccessErrorCode::RepairRequired,
                     ..
                 }
             )
         },
-        "MobileBrokerStatus::RepairRequired",
+        "MobileConnectionStatus::RepairRequired",
     )
     .await;
-    match repair.broker_status {
-        MobileBrokerStatus::RepairRequired { message, .. } => {
+    match repair.connection_status {
+        MobileConnectionStatus::RepairRequired { message, .. } => {
             assert!(message.contains("tycode.dev"));
         }
         other => panic!("expected RepairRequired broker status, got {other:?}"),
@@ -590,68 +514,7 @@ async fn enabling_mobile_without_pairing_fails_closed() {
 }
 
 #[tokio::test]
-async fn plaintext_public_mqtt_url_is_rejected_at_settings_write() {
-    let harness = Harness::new().await;
-    let mut desktop = harness.connect_desktop().await;
-    expect_initial_replay(&mut desktop).await;
-
-    let write_id = desktop
-        .replace_setting(
-            "/mobile_broker_url",
-            Some(BrokerUrl::new("mqtt://broker.example.test:1883").expect("broker URL")),
-            Option::<BrokerUrl>::None,
-        )
-        .await
-        .expect("send invalid broker setting");
-    let error =
-        wait_for_settings_write_result(&mut desktop, &write_id, "invalid mobile broker setting")
-            .await;
-    assert!(!error.applied);
-    assert!(error.field_errors[0].message.contains("insecure"));
-}
-
-#[tokio::test]
-async fn pairing_qr_embeds_configured_mqtt_endpoint_and_secret_room() {
-    let harness = Harness::new().await;
-    let mut desktop = harness.connect_desktop().await;
-    expect_initial_replay(&mut desktop).await;
-    let broker_url = BrokerUrl::new("mqtts://127.0.0.1:8883").expect("broker URL");
-
-    set_mobile_broker_url(&mut desktop, Some(broker_url.clone())).await;
-    set_mobile_enabled(&mut desktop, true).await;
-    let _ = wait_for_mobile_state(
-        &mut desktop,
-        |state| matches!(state.broker_status, MobileBrokerStatus::Online { .. }),
-        "MobileBrokerStatus::Online",
-    )
-    .await;
-    send_mobile_pairing_start(&mut desktop).await;
-
-    let offer_env = wait_for_kind(
-        &mut desktop,
-        FrameKind::MobilePairingOffer,
-        "MobilePairingOffer",
-    )
-    .await;
-    let offer: MobilePairingOfferPayload = offer_env.parse_payload().expect("parse offer");
-    let qr = MobilePairingQrPayload::from_any(&offer.qr_uri.0).expect("parse QR");
-
-    assert_eq!(qr.broker.url, broker_url);
-    assert_eq!(qr.policy, MqttTransportPolicy::default());
-    assert_eq!(
-        host_to_client_topic(&qr.room),
-        format!("tyde/v1/{}/host-to-client", qr.room)
-    );
-    assert_eq!(
-        mqtt_transport::client_to_host_topic(&qr.room),
-        format!("tyde/v1/{}/client-to-host", qr.room)
-    );
-    assert_eq!(qr.psk.as_bytes().len(), 32);
-}
-
-#[tokio::test]
-async fn mqtt_pairing_accepts_mobile_tyde_hello_over_encrypted_stream() {
-    let broker = support::start_plain_mqtt_broker().expect("start local MQTT broker");
+async fn turn_accepts_mobile_tyde_hello_over_encrypted_stream() {
     let harness = Harness::new().await;
     let mut desktop = harness.connect_desktop().await;
     expect_initial_replay(&mut desktop).await;
@@ -673,56 +536,7 @@ async fn mqtt_pairing_accepts_mobile_tyde_hello_over_encrypted_stream() {
     )
     .await;
 
-    set_mobile_broker_url(&mut desktop, Some(broker.broker_url.clone())).await;
-    set_mobile_enabled(&mut desktop, true).await;
-    let _ = wait_for_mobile_state(
-        &mut desktop,
-        |state| matches!(state.broker_status, MobileBrokerStatus::Online { .. }),
-        "MobileBrokerStatus::Online",
-    )
-    .await;
-    send_mobile_pairing_start(&mut desktop).await;
-
-    let offer_env = wait_for_kind(
-        &mut desktop,
-        FrameKind::MobilePairingOffer,
-        "MobilePairingOffer",
-    )
-    .await;
-    let offer: MobilePairingOfferPayload = offer_env.parse_payload().expect("parse offer");
-    let qr = MobilePairingQrPayload::from_any(&offer.qr_uri.0).expect("parse QR");
-    assert_eq!(qr.broker.url, broker.broker_url);
-
-    let mobile_stream = timeout(
-        EVENT_TIMEOUT,
-        mqtt_transport::connect_ephemeral(MqttConnectConfig {
-            endpoint: qr.broker.clone(),
-            room: qr.room,
-            psk: qr.psk.clone(),
-            role: ParticipantRole::Client,
-        }),
-    )
-    .await
-    .expect("timed out connecting mobile MQTT transport")
-    .expect("mobile MQTT transport");
-    let mut mobile = timeout(
-        EVENT_TIMEOUT,
-        client::connect(&client::ClientConfig::current(), mobile_stream),
-    )
-    .await
-    .expect("timed out waiting for mobile Tyde Hello")
-    .expect("mobile Tyde Hello");
-
-    let state = wait_for_mobile_state(
-        &mut desktop,
-        |state| matches!(state.pairing, MobilePairingState::Consumed { .. }),
-        "consumed mobile pairing",
-    )
-    .await;
-    assert!(matches!(
-        state.paired_devices.first().map(|device| &device.state),
-        Some(MobileDeviceState::Connected)
-    ));
+    let mut mobile = connect_mobile_client(&harness).await;
 
     let env = expect_next_kind(
         &mut mobile,
@@ -766,31 +580,12 @@ async fn mqtt_pairing_accepts_mobile_tyde_hello_over_encrypted_stream() {
 }
 
 #[tokio::test]
-async fn mqtt_mobile_bootstrap_pages_large_session_store() {
-    let broker = support::start_plain_mqtt_broker().expect("start local MQTT broker");
+async fn turn_mobile_bootstrap_pages_large_session_store() {
     let harness = Harness::with_seeded_sessions(300).await;
     let mut desktop = harness.connect_desktop().await;
     expect_initial_replay(&mut desktop).await;
 
-    set_mobile_broker_url(&mut desktop, Some(broker.broker_url.clone())).await;
-    set_mobile_enabled(&mut desktop, true).await;
-    let _ = wait_for_mobile_state(
-        &mut desktop,
-        |state| matches!(state.broker_status, MobileBrokerStatus::Online { .. }),
-        "MobileBrokerStatus::Online",
-    )
-    .await;
-    send_mobile_pairing_start(&mut desktop).await;
-
-    let offer_env = wait_for_kind(
-        &mut desktop,
-        FrameKind::MobilePairingOffer,
-        "MobilePairingOffer",
-    )
-    .await;
-    let offer: MobilePairingOfferPayload = offer_env.parse_payload().expect("parse offer");
-    let qr = MobilePairingQrPayload::from_any(&offer.qr_uri.0).expect("parse QR");
-    let mut mobile = connect_mobile_client(&qr).await;
+    let mut mobile = connect_mobile_client(&harness).await;
 
     let env = expect_next_kind(
         &mut mobile,
@@ -813,7 +608,7 @@ async fn mqtt_mobile_bootstrap_pages_large_session_store() {
     );
     assert!(
         serialized_len < 128 * 1024,
-        "mobile HostBootstrap over MQTT should stay bounded, got {serialized_len} bytes"
+        "mobile HostBootstrap over TURN should stay bounded, got {serialized_len} bytes"
     );
 
     let mut loaded = bootstrap.sessions.len();
@@ -852,8 +647,7 @@ async fn mqtt_mobile_bootstrap_pages_large_session_store() {
 }
 
 #[tokio::test]
-async fn mqtt_mobile_receives_agent_replay_sessions_and_chat_events() {
-    let broker = support::start_plain_mqtt_broker().expect("start local MQTT broker");
+async fn turn_mobile_receives_agent_replay_sessions_and_chat_events() {
     let harness = Harness::new().await;
     let mut desktop = harness.connect_desktop().await;
     expect_initial_replay(&mut desktop).await;
@@ -906,44 +700,7 @@ async fn mqtt_mobile_receives_agent_replay_sessions_and_chat_events() {
     let _ = wait_for_kind(&mut desktop, FrameKind::NewAgent, "desktop NewAgent").await;
     let _ = wait_for_chat_stream_end(&mut desktop, "desktop initial StreamEnd").await;
 
-    set_mobile_broker_url(&mut desktop, Some(broker.broker_url.clone())).await;
-    set_mobile_enabled(&mut desktop, true).await;
-    let _ = wait_for_mobile_state(
-        &mut desktop,
-        |state| matches!(state.broker_status, MobileBrokerStatus::Online { .. }),
-        "MobileBrokerStatus::Online",
-    )
-    .await;
-    send_mobile_pairing_start(&mut desktop).await;
-
-    let offer_env = wait_for_kind(
-        &mut desktop,
-        FrameKind::MobilePairingOffer,
-        "MobilePairingOffer",
-    )
-    .await;
-    let offer: MobilePairingOfferPayload = offer_env.parse_payload().expect("parse offer");
-    let qr = MobilePairingQrPayload::from_any(&offer.qr_uri.0).expect("parse QR");
-
-    let mobile_stream = timeout(
-        EVENT_TIMEOUT,
-        mqtt_transport::connect_ephemeral(MqttConnectConfig {
-            endpoint: qr.broker.clone(),
-            room: qr.room,
-            psk: qr.psk.clone(),
-            role: ParticipantRole::Client,
-        }),
-    )
-    .await
-    .expect("timed out connecting mobile MQTT transport")
-    .expect("mobile MQTT transport");
-    let mut mobile = timeout(
-        EVENT_TIMEOUT,
-        client::connect(&client::ClientConfig::current(), mobile_stream),
-    )
-    .await
-    .expect("timed out waiting for mobile Tyde Hello")
-    .expect("mobile Tyde Hello");
+    let mut mobile = connect_mobile_client(&harness).await;
 
     let mut project_count = 0;
     let mut replayed_agent = None;
@@ -985,7 +742,7 @@ async fn mqtt_mobile_receives_agent_replay_sessions_and_chat_events() {
         .send_message_payload(
             &replayed_agent.instance_stream,
             SendMessagePayload {
-                message: "hello from mobile mqtt test".to_owned(),
+                message: "hello from mobile TURN test".to_owned(),
                 images: None,
                 origin: None,
                 tool_response: None,
@@ -1000,15 +757,14 @@ async fn mqtt_mobile_receives_agent_replay_sessions_and_chat_events() {
     assert!(
         end.message
             .content
-            .contains("mock backend response to: hello from mobile mqtt test"),
+            .contains("mock backend response to: hello from mobile TURN test"),
         "unexpected final message: {}",
         end.message.content
     );
 }
 
 #[tokio::test]
-async fn mqtt_mobile_reconnect_replays_bootstrap_state_again() {
-    let broker = support::start_plain_mqtt_broker().expect("start local MQTT broker");
+async fn turn_mobile_reconnect_replays_bootstrap_state_again() {
     let harness = Harness::new().await;
     let mut desktop = harness.connect_desktop().await;
     expect_initial_replay(&mut desktop).await;
@@ -1054,29 +810,10 @@ async fn mqtt_mobile_reconnect_replays_bootstrap_state_again() {
     let _ = wait_for_kind(&mut desktop, FrameKind::NewAgent, "desktop NewAgent").await;
     let _ = wait_for_chat_stream_end(&mut desktop, "desktop initial StreamEnd").await;
 
-    set_mobile_broker_url(&mut desktop, Some(broker.broker_url.clone())).await;
-    set_mobile_enabled(&mut desktop, true).await;
-    let _ = wait_for_mobile_state(
-        &mut desktop,
-        |state| matches!(state.broker_status, MobileBrokerStatus::Online { .. }),
-        "MobileBrokerStatus::Online",
-    )
-    .await;
-    send_mobile_pairing_start(&mut desktop).await;
-
-    let offer_env = wait_for_kind(
-        &mut desktop,
-        FrameKind::MobilePairingOffer,
-        "MobilePairingOffer",
-    )
-    .await;
-    let offer: MobilePairingOfferPayload = offer_env.parse_payload().expect("parse offer");
-    let qr = MobilePairingQrPayload::from_any(&offer.qr_uri.0).expect("parse QR");
-
-    let mut first = connect_mobile_client(&qr).await;
+    let mut first = connect_mobile_client(&harness).await;
     expect_mobile_replay(&mut first, 1, "first mobile replay").await;
 
-    let mut second = connect_mobile_client(&qr).await;
+    let mut second = connect_mobile_client(&harness).await;
     let replayed_agent = expect_mobile_replay(&mut second, 1, "second mobile replay").await;
 
     send_host_payload(
@@ -1122,26 +859,28 @@ async fn mqtt_mobile_reconnect_replays_bootstrap_state_again() {
     );
 }
 
-async fn connect_mobile_client(qr: &MobilePairingQrPayload) -> client::Connection {
-    let mobile_stream = timeout(
-        EVENT_TIMEOUT,
-        mqtt_transport::connect_ephemeral(MqttConnectConfig {
-            endpoint: qr.broker.clone(),
-            room: qr.room,
-            psk: qr.psk.clone(),
-            role: ParticipantRole::Client,
-        }),
-    )
-    .await
-    .expect("timed out connecting mobile MQTT transport")
-    .expect("mobile MQTT transport");
+async fn connect_mobile_client(harness: &Harness) -> client::Connection {
+    let (mobile, host) = tests::rtc::connect(&harness.relay.tls_ice, &harness.relay.roots).await;
+    let handle = harness.host.clone();
+    tokio::spawn(async move {
+        let accepted = server::accept(&server::ServerConfig::current(), host)
+            .await
+            .expect("mobile handshake");
+        server::run_mobile_connection(
+            accepted,
+            handle,
+            protocol::MobileDeviceId("relay-test".to_owned()),
+        )
+        .await
+        .expect("mobile connection");
+    });
     timeout(
         EVENT_TIMEOUT,
-        client::connect(&client::ClientConfig::current(), mobile_stream),
+        client::connect(&client::ClientConfig::current(), mobile),
     )
     .await
-    .expect("timed out waiting for mobile Tyde Hello")
-    .expect("mobile Tyde Hello")
+    .expect("mobile handshake deadline")
+    .expect("mobile connection")
 }
 
 async fn expect_mobile_replay(

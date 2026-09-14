@@ -3,10 +3,10 @@
 Server-owned host settings delivered over the `/host/*` stream. Builds on
 `01-philosophy.md`, `02-protocol.md`, and `04-host-registry.md`.
 
-Managed mobile broker access has an additional product/service boundary:
-`30-mobile-managed-broker.md` owns the Tyggs Pass, `tycode.dev`, and AWS IoT
+Managed mobile access has an additional product/service boundary:
+`30-mobile-managed-access.md` owns the Tyggs Pass, `tycode.dev`, and Cloudflare TURN
 contract. Host settings may expose server-owned mobile controls, but they must
-not store Tyggs account data, pass proofs, billing state, or production broker
+not store Tyggs account data, pass proofs, billing state, or relay
 fallbacks that bypass `tycode.dev`.
 
 ---

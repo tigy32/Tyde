@@ -224,8 +224,7 @@ fn write_host_settings_with_launch_profiles(
         enabled_backends: backends.to_vec(),
         default_backend,
         enable_mobile_connections: false,
-        mobile_broker_url: None,
-        mobile_broker_auth: Default::default(),
+
         mobile_direct_hosting_enabled: false,
         mobile_direct_bind_addr: None,
         mobile_direct_public_origin: None,
@@ -339,8 +338,8 @@ async fn connection_emits_one_host_bootstrap_without_old_initial_spam() {
     assert!(bootstrap.sessions.is_empty());
     assert!(bootstrap.projects.is_empty());
     assert!(matches!(
-        bootstrap.mobile_access.broker_status,
-        protocol::MobileBrokerStatus::Disabled
+        bootstrap.mobile_access.connection_status,
+        protocol::MobileConnectionStatus::Disabled
     ));
 
     expect_no_event(

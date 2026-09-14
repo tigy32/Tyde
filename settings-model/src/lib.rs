@@ -3,7 +3,7 @@
 //! This crate is the home of the typed host-settings family (`HostSettings`
 //! and its sub-structs), separate from the wire protocol. It depends on
 //! `protocol` for shared domain IDs and newtypes (`BackendKind`,
-//! `SessionSettingsValues`, `BrokerUrl`, `CodeIntelProviderId`,
+//! `SessionSettingsValues`, ``, `CodeIntelProviderId`,
 //! `AcpAgentSpec`, ...); `protocol` never depends on this crate.
 //!
 //! This crate is wasm-clean: no tokio or native-only dependencies, and it
@@ -14,10 +14,10 @@ use std::fmt;
 use std::sync::OnceLock;
 
 use protocol::{
-    AcpAgentSpec, BackendConfigValues, BackendKind, BrokerUrl, CodeIntelProviderId,
-    LaunchProfileId, SessionSettingsValues, SpawnCostHint, VoiceAvailability,
+    AcpAgentSpec, BackendConfigValues, BackendKind, CodeIntelProviderId, LaunchProfileId,
+    SessionSettingsValues, SpawnCostHint, VoiceAvailability,
 };
-use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -45,10 +45,6 @@ pub struct HostSettings {
     pub default_backend: Option<BackendKind>,
     #[serde(default)]
     pub enable_mobile_connections: bool,
-    #[serde(default)]
-    pub mobile_broker_url: Option<BrokerUrl>,
-    #[serde(default)]
-    pub mobile_broker_auth: MobileBrokerAuthSettings,
     /// Serve the mobile web app straight from this host over HTTP instead of
     /// tunnelling it through the managed service. Tyde speaks plain HTTP; the
     /// deployment is expected to terminate TLS in front of it, because
@@ -129,8 +125,6 @@ impl Default for HostSettings {
             enabled_backends: Vec::new(),
             default_backend: None,
             enable_mobile_connections: false,
-            mobile_broker_url: None,
-            mobile_broker_auth: MobileBrokerAuthSettings::default(),
             mobile_direct_hosting_enabled: false,
             mobile_direct_bind_addr: None,
             mobile_direct_public_origin: None,
@@ -163,65 +157,6 @@ pub fn default_delegation_launch_profile_order() -> Vec<LaunchProfileId> {
     .into_iter()
     .map(|id| LaunchProfileId(id.to_owned()))
     .collect()
-}
-
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct SecretString(String);
-
-impl SecretString {
-    pub fn new(value: impl Into<String>) -> Self {
-        Self(value.into())
-    }
-
-    pub fn expose(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Debug for SecretString {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("SecretString(<redacted>)")
-    }
-}
-
-impl JsonSchema for SecretString {
-    fn inline_schema() -> bool {
-        true
-    }
-
-    fn schema_name() -> std::borrow::Cow<'static, str> {
-        "SecretString".into()
-    }
-
-    fn json_schema(_: &mut SchemaGenerator) -> Schema {
-        json_schema!({
-            "type": "string",
-            "format": "password",
-            "writeOnly": true
-        })
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-pub struct MobileBrokerAuthSettings {
-    #[serde(default = "default_mobile_broker_username")]
-    pub username: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub password: Option<SecretString>,
-}
-
-impl Default for MobileBrokerAuthSettings {
-    fn default() -> Self {
-        Self {
-            username: default_mobile_broker_username(),
-            password: None,
-        }
-    }
-}
-
-fn default_mobile_broker_username() -> String {
-    "tyde".to_owned()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -548,7 +483,6 @@ fn decorate_host_settings_schema(schema: &mut Value) {
         ("tyde_agent_control_max_depth", "subagents", 20, "slider"),
         ("complexity_tiers_enabled", "subagents", 30, "toggle"),
         ("enable_mobile_connections", "mobile", 10, "toggle"),
-        ("mobile_broker_url", "mobile", 20, "text"),
         ("mobile_direct_hosting_enabled", "mobile", 50, "toggle"),
         ("mobile_direct_bind_addr", "mobile", 60, "text"),
         ("mobile_direct_public_origin", "mobile", 65, "text"),
@@ -556,16 +490,7 @@ fn decorate_host_settings_schema(schema: &mut Value) {
     ] {
         annotate_property(schema, "HostSettings", field, section, order, widget);
     }
-    for (field, order, widget) in [("username", 30, "text"), ("password", 40, "password")] {
-        annotate_property(
-            schema,
-            "MobileBrokerAuthSettings",
-            field,
-            "mobile",
-            order,
-            widget,
-        );
-    }
+
     for (field, title, description) in [
         (
             "tyde_debug_mcp_enabled",
@@ -593,11 +518,6 @@ fn decorate_host_settings_schema(schema: &mut Value) {
             "Allow paired mobile devices to connect to this host.",
         ),
         (
-            "mobile_broker_url",
-            "Development broker URL",
-            "Optional loopback MQTT broker override used for local development.",
-        ),
-        (
             "mobile_direct_hosting_enabled",
             "Host the mobile app directly",
             "Serve the mobile web app from this host over HTTP instead of tunnelling it through the managed service. Needs Mobile connections on as well. Put a TLS-terminating reverse proxy in front of it: over plain HTTP browsers disable service workers, WebCrypto, the camera and push notifications.",
@@ -620,26 +540,7 @@ fn decorate_host_settings_schema(schema: &mut Value) {
     ] {
         set_property_text(schema, "HostSettings", field, title, description);
     }
-    for (field, title, description) in [
-        (
-            "username",
-            "Development broker username",
-            "Username for the loopback development broker override.",
-        ),
-        (
-            "password",
-            "Development broker password",
-            "Password for the loopback development broker. Stored write-only; the current value is never sent back to clients.",
-        ),
-    ] {
-        set_property_text(
-            schema,
-            "MobileBrokerAuthSettings",
-            field,
-            title,
-            description,
-        );
-    }
+
     for (field, order, widget, title, description) in [
         (
             "enabled",

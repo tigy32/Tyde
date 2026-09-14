@@ -21,12 +21,8 @@ use std::rc::Rc;
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use mobile_shell_types::{
-    BrokerAuthSummary, BrokerEndpointSummary, KeychainSecretId, LocalHostId, PairedHostSummary,
-    RoomIdSummary,
-};
-use mqtt_transport::{BrokerAuth, BrokerEndpoint, PreSharedKey, RoomId};
-use protocol::ManagedBrokerEndpoint;
+use mobile_pairing::PreSharedKey;
+use mobile_shell_types::{KeychainSecretId, LocalHostId, PairedHostSummary};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -34,27 +30,12 @@ use super::idb;
 
 const HOSTS_KEY: &str = "all";
 
-/// tycode.dev managed pairing identity attached to a [`WebPairedHostRecord`].
-///
-/// Present only for managed (`tyde-pair://v2`) pairings; legacy records leave it
-/// `None`. The transport rendezvous params (broker URL, `room`, PSK) still live
-/// on the parent record's `broker`/`room`/`psk_keychain_key_id` fields so the
-/// paired-host summary and legacy code paths are unchanged — this only carries
-/// the extra managed-service identity needed to mint fresh broker credentials.
-///
-/// Only durable material lives here: the pairing/device ids, the managed broker
-/// endpoint, and a key-id reference to the durable `device_pairing_secret`. No
-/// Tyggs OAuth token or pass proof (locked decision #6), and — critically — no
-/// short-lived broker grant: ephemeral `ManagedBrokerCredentials` are minted
-/// fresh from `tycode.dev` on each connect and held only in memory, never
-/// persisted (dev-docs/30 "Subsequent reconnects": "Each side requests fresh
-/// short-lived broker credentials").
+/// Durable managed pairing identity. Relay grants are never persisted.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ManagedPairingRecord {
     pub pairing_id: String,
     pub device_id: String,
-    pub broker: ManagedBrokerEndpoint,
     pub device_secret_key_id: KeychainSecretId,
 }
 
@@ -66,14 +47,6 @@ pub struct ManagedPairingRecord {
 pub struct WebPairedHostRecord {
     pub local_host_id: LocalHostId,
     pub host_label: String,
-    /// MQTT rendezvous. Absent for direct-hosting pairings, which reach the
-    /// host over its own origin and have no broker, room, or pre-shared key.
-    /// Present-or-absent rather than defaulted: a synthetic broker would make
-    /// a direct record look connectable over a transport it cannot use.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub broker: Option<BrokerEndpoint>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub room: Option<RoomId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub psk_keychain_key_id: Option<KeychainSecretId>,
     pub credential_fingerprint: String,
@@ -91,7 +64,7 @@ pub struct WebPairedHostRecord {
 /// Identity of a device paired against a host that serves the app itself.
 ///
 /// The durable bearer token lives in IndexedDB behind a key id, exactly as the
-/// PSK does for an MQTT pairing, rather than inline in this record.
+/// PSK does for an managed pairing, rather than inline in this record.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DirectPairingRecord {
@@ -104,19 +77,6 @@ impl WebPairedHostRecord {
         PairedHostSummary {
             local_host_id: self.local_host_id.clone(),
             host_label: self.host_label.clone(),
-            broker: self.broker.as_ref().map(|broker| BrokerEndpointSummary {
-                url: broker.url.clone(),
-                auth: match &broker.auth {
-                    BrokerAuth::Anonymous => BrokerAuthSummary::Anonymous,
-                    BrokerAuth::UsernamePassword { username, password } => {
-                        BrokerAuthSummary::UsernamePassword {
-                            username: username.clone(),
-                            has_password: !password.is_empty(),
-                        }
-                    }
-                },
-            }),
-            room: self.room.map(|room| RoomIdSummary(room.to_string())),
             credential_fingerprint: self.credential_fingerprint.clone(),
             auto_connect: self.auto_connect,
             last_connected_at_ms: self.last_connected_at_ms,
@@ -139,20 +99,13 @@ pub fn direct_credential_fingerprint(origin: &str, device_id: &protocol::MobileD
         .collect()
 }
 
-/// Stable, traversal-safe 16-char credential fingerprint. Byte-for-byte port of
-/// `paired_hosts::credential_fingerprint` (SHA-256 over broker URL + room +
-/// PSK), computed at pairing time while the raw PSK bytes are still in hand.
-pub fn credential_fingerprint(
-    broker: &BrokerEndpoint,
-    room: &RoomId,
-    psk: &PreSharedKey,
-) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(broker.url.as_str().as_bytes());
-    hasher.update(room.as_base64url_no_pad().as_bytes());
-    hasher.update(psk.as_bytes());
-    let encoded = URL_SAFE_NO_PAD.encode(hasher.finalize());
-    encoded.chars().take(16).collect()
+/// Computed for new pairings; existing stored fingerprints remain unchanged.
+pub fn credential_fingerprint(psk: &PreSharedKey) -> String {
+    URL_SAFE_NO_PAD
+        .encode(Sha256::digest(psk.as_bytes()))
+        .chars()
+        .take(16)
+        .collect()
 }
 
 // ── Host record store ────────────────────────────────────────────────────
@@ -361,7 +314,7 @@ impl PskStore for IndexedDbPskStore {
 
 #[cfg(all(test, target_arch = "wasm32"))]
 mod wasm_tests {
-    use mqtt_transport::{BrokerAuth, BrokerEndpoint, PreSharedKey, RoomId};
+    use mobile_pairing::PreSharedKey;
     use wasm_bindgen_test::*;
 
     use super::*;
@@ -369,19 +322,12 @@ mod wasm_tests {
     wasm_bindgen_test_configure!(run_in_browser);
 
     fn unique_record(tag: &str) -> WebPairedHostRecord {
-        let broker = BrokerEndpoint {
-            url: protocol::BrokerUrl::new("wss://broker.emqx.io:8084/mqtt").expect("broker url"),
-            auth: BrokerAuth::Anonymous,
-        };
-        let room = RoomId([5_u8; 16]);
         let psk = PreSharedKey::from_slice(&[6_u8; 32]).expect("psk");
         WebPairedHostRecord {
             local_host_id: LocalHostId(format!("host-{tag}-{}", uuid::Uuid::new_v4())),
             host_label: "Round Trip".to_owned(),
-            broker: Some(broker.clone()),
-            room: Some(room),
             psk_keychain_key_id: Some(KeychainSecretId(format!("psk-{tag}"))),
-            credential_fingerprint: credential_fingerprint(&broker, &room, &psk),
+            credential_fingerprint: credential_fingerprint(&psk),
             auto_connect: true,
             last_connected_at_ms: None,
             managed: None,

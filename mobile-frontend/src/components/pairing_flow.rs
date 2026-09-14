@@ -14,14 +14,6 @@ pub fn PairingFlow(screen: PairingScreen) -> impl IntoView {
     match screen {
         PairingScreen::Scanner => view! { <ScannerScreen /> }.into_any(),
         PairingScreen::ManualPaste => view! { <ManualPasteScreen /> }.into_any(),
-        PairingScreen::Confirm { qr_uri, preview } => view! {
-            <ConfirmScreen qr_uri=qr_uri preview=preview />
-        }
-        .into_any(),
-        PairingScreen::InProgress { qr_uri, preview } => view! {
-            <InProgressScreen qr_uri=qr_uri preview=preview />
-        }
-        .into_any(),
         PairingScreen::ServiceAuth {
             qr_uri,
             host_label,
@@ -63,7 +55,6 @@ fn route_offer(state: &AppState, qr_uri: String, offer: PairingOffer) {
             auth: MobileServiceAuthState::Idle,
         },
         PairingOffer::RepairRequired { message } => PairingScreen::RepairRequired { message },
-        PairingOffer::DirectPairing { preview } => PairingScreen::Confirm { qr_uri, preview },
         PairingOffer::SelfHosted { host_label } => {
             PairingScreen::SelfHostedConfirm { qr_uri, host_label }
         }
@@ -246,104 +237,6 @@ fn ManualPasteScreen() -> impl IntoView {
                         {move || if pending.get() { "Checking…" } else { "Continue" }}
                     </span>
                 </button>
-            </div>
-        </div>
-    }
-}
-
-/// "Pair with: <host_label>?" confirmation. The QR already contains the MQTT
-/// room and PSK credential; tapping Pair stores the PSK in Keychain and starts
-/// the encrypted MQTT connection.
-#[component]
-fn ConfirmScreen(qr_uri: String, preview: crate::state::MobilePairingPreview) -> impl IntoView {
-    let state = use_context::<AppState>().expect("AppState context");
-    let host_label = preview.host_label.clone();
-
-    let state_for_cancel = state.clone();
-    let state_for_pair = state.clone();
-    let qr_uri_for_pair = qr_uri.clone();
-    let preview_for_pair = preview.clone();
-
-    let on_pair = Callback::new(move |_: ()| {
-        state_for_pair
-            .app_mode
-            .set(AppMode::Pairing(PairingScreen::InProgress {
-                qr_uri: qr_uri_for_pair.clone(),
-                preview: preview_for_pair.clone(),
-            }));
-    });
-
-    view! {
-        <div class="view pairing-view">
-            <div class="view-header">
-                <h1 class="view-title">{format!("Pair with {host_label}?")}</h1>
-                <button
-                    class="header-action"
-                    on:click=move |_| state_for_cancel.app_mode.set(AppMode::Pairing(PairingScreen::Scanner))
-                >"Back"</button>
-            </div>
-            <div class="view-body">
-                <p class="pairing-instruction">
-                    {format!("Pairing stores an encrypted MQTT credential for \"{host_label}\" in this device's Keychain.")}
-                </p>
-                <Button
-                    label="Pair"
-                    variant=ButtonVariant::Primary
-                    full_width=true
-                    on_click=on_pair
-                />
-            </div>
-        </div>
-    }
-}
-
-#[component]
-fn InProgressScreen(qr_uri: String, preview: crate::state::MobilePairingPreview) -> impl IntoView {
-    let state = use_context::<AppState>().expect("AppState context");
-    let started = RwSignal::new(false);
-    let host_label = preview.host_label.clone();
-
-    // Kick off the actual pairing on first render.
-    {
-        let state = state.clone();
-        let qr_uri = qr_uri.clone();
-        Effect::new(move |_| {
-            if started.get_untracked() {
-                return;
-            }
-            started.set(true);
-            let state = state.clone();
-            let qr_uri = qr_uri.clone();
-            spawn_local(async move {
-                match bridge::start_pairing(&qr_uri).await {
-                    Ok(()) => {
-                        // The `tyde://paired-hosts-changed` event is the
-                        // source of truth for the paired list. Returning to the
-                        // workspace lets the picker render that event.
-                        state.app_mode.set(AppMode::Workspace);
-                    }
-                    Err(error) => {
-                        state
-                            .app_mode
-                            .set(AppMode::Pairing(PairingScreen::Failed { message: error }));
-                    }
-                }
-            });
-        });
-    }
-
-    view! {
-        <div class="view pairing-view">
-            <div class="view-header">
-                <h1 class="view-title">"Pairing…"</h1>
-            </div>
-            <div class="view-body">
-                <div class="pairing-progress">
-                    <span class="pairing-spinner">"…"</span>
-                    <p class="pairing-instruction">
-                        {format!("Connecting to {host_label} over encrypted MQTT.")}
-                    </p>
-                </div>
             </div>
         </div>
     }
@@ -856,8 +749,6 @@ fn FailedScreen(message: String) -> impl IntoView {
 mod wasm_tests {
     use super::*;
     use leptos::mount::mount_to;
-    use mobile_shell_types::MobilePairingPreview;
-    use protocol::BrokerUrl;
     use wasm_bindgen::JsCast;
     use wasm_bindgen_test::*;
     use web_sys::HtmlElement;
@@ -879,13 +770,6 @@ mod wasm_tests {
                 .unwrap();
         });
         let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
-    }
-
-    fn fixture_preview(host_label: &str) -> MobilePairingPreview {
-        MobilePairingPreview {
-            host_label: host_label.to_owned(),
-            broker_url: BrokerUrl::new("mqtts://broker.emqx.io:8883").unwrap(),
-        }
     }
 
     fn set_service_config(json: &str) {
@@ -1137,30 +1021,6 @@ mod wasm_tests {
                 .is_some(),
             "the paywall must still offer the way forward"
         );
-    }
-
-    #[wasm_bindgen_test]
-    async fn confirm_screen_shows_host_label() {
-        let preview = fixture_preview("Living Room");
-        let container = make_container();
-        let _handle = mount_to(container.clone(), move || {
-            let state = AppState::new();
-            provide_context(state);
-            view! {
-                <PairingFlow screen=PairingScreen::Confirm {
-                    qr_uri: "tyde-pair://v1?test".to_owned(),
-                    preview: preview.clone(),
-                } />
-            }
-        });
-        next_tick().await;
-
-        let text = container.text_content().unwrap_or_default();
-        assert!(
-            text.contains("Pair with Living Room"),
-            "expected confirmation prompt: {text}"
-        );
-        assert!(text.contains("Pair"), "expected Pair button: {text}");
     }
 
     /// A `pass_required` auth state renders the paywall card with a working

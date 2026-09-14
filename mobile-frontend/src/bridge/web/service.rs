@@ -1,8 +1,8 @@
 //! Browser (PWA) `tycode.dev` managed mobile-access client.
 //!
 //! The managed pairing flow (`tyde-pair://v2`) runs a **pre-transport** sequence
-//! against `tycode.dev` before any MQTT credential exists (see
-//! `dev-docs/30-mobile-managed-broker.md`):
+//! against `tycode.dev` before any relay credential exists (see
+//! `dev-docs/30-mobile-managed-access.md`):
 //!
 //! 1. The user signs in with Tyggs **through `tycode.dev`** via a full-page
 //!    redirect to `GET /auth/start?provider=<provider>&return_to=<app-url>`. The
@@ -49,15 +49,9 @@ use std::cell::{Cell, RefCell};
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use mobile_pairing::ManagedMobilePairingQrPayload;
 use mobile_shell_types::LocalHostId;
-use mqtt_transport::ManagedMobilePairingQrPayload;
-use protocol::{
-    ManagedBrokerAuthorizerName, ManagedBrokerClientId, ManagedBrokerConnectAuth,
-    ManagedBrokerCredentialScope, ManagedBrokerCredentials, ManagedBrokerEndpoint,
-    ManagedBrokerGrantId, ManagedBrokerProvider, ManagedBrokerRegion, ManagedBrokerRole,
-    ManagedBrokerTopicNamespace, MobileAccessErrorCode, MobileServiceAuthState, PROTOCOL_VERSION,
-    TYDE_VERSION,
-};
+use protocol::{MobileAccessErrorCode, MobileServiceAuthState, PROTOCOL_VERSION, TYDE_VERSION};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::oneshot;
@@ -827,17 +821,11 @@ async fn finish_redeem(
             }
         };
 
-    let broker_endpoint = mqtt_transport::BrokerEndpoint {
-        url: result.broker.endpoint.clone(),
-        auth: mqtt_transport::BrokerAuth::Anonymous,
-    };
-    let fingerprint =
-        super::store::credential_fingerprint(&broker_endpoint, &offer.room, &offer.psk);
+    let fingerprint = super::store::credential_fingerprint(&offer.psk);
     let record = WebPairedHostRecord {
         local_host_id: LocalHostId(uuid::Uuid::new_v4().to_string()),
         host_label: offer.host_label.trim().to_owned(),
-        broker: Some(broker_endpoint),
-        room: Some(offer.room),
+
         psk_keychain_key_id: Some(psk_key_id.clone()),
         credential_fingerprint: fingerprint,
         auto_connect: true,
@@ -845,7 +833,7 @@ async fn finish_redeem(
         managed: Some(ManagedPairingRecord {
             pairing_id: result.pairing_id,
             device_id: result.device_id,
-            broker: result.broker,
+
             device_secret_key_id: device_secret_key_id.clone(),
         }),
         direct: None,
@@ -1281,7 +1269,7 @@ fn auth_state_from_error_body(error: ErrorBody, config: &ServiceConfig) -> Mobil
             message: error.message,
         },
         // 503/429/500 families are transient — offer a retry.
-        "service_unavailable" | "broker_unavailable" | "rate_limited" | "internal" => {
+        "service_unavailable" | "rate_limited" | "internal" => {
             MobileServiceAuthState::ServiceUnavailable {
                 message: error.message,
                 retryable: true,
@@ -1328,7 +1316,7 @@ fn redeem_outcome_from_error(body: &str, config: &ServiceConfig) -> RedeemOutcom
         "invalid_request" => RedeemOutcome::Terminal {
             message: error.message,
         },
-        "service_unavailable" | "broker_unavailable" | "rate_limited" | "internal" => {
+        "service_unavailable" | "rate_limited" | "internal" => {
             RedeemOutcome::Auth(MobileServiceAuthState::ServiceUnavailable {
                 message: error.message,
                 retryable: true,
@@ -1349,7 +1337,7 @@ fn mint_error_from_body(body: &str) -> ManagedCredentialError {
             retryable: true,
         };
     };
-    // Documented broker-credential failure states (dev-docs/30 §broker-credentials
+    // Documented relay-credential failure states (dev-docs/30 §relay-credentials
     // + Common error codes). No undocumented codes.
     let (code, retryable) = match error.code.as_str() {
         "pass_required" => (MobileAccessErrorCode::PassRequired, false),
@@ -1360,7 +1348,6 @@ fn mint_error_from_body(body: &str) -> ManagedCredentialError {
         "repair_required" | "pairing_revoked" | "version_mismatch" | "not_found" | "forbidden" => {
             (MobileAccessErrorCode::RepairRequired, false)
         }
-        "broker_unavailable" => (MobileAccessErrorCode::BrokerUnavailable, true),
         "service_unavailable" | "rate_limited" | "internal" => {
             (MobileAccessErrorCode::ServiceUnavailable, true)
         }
@@ -1425,7 +1412,6 @@ struct RedeemResult {
     pairing_id: String,
     device_id: String,
     device_pairing_secret: String,
-    broker: ManagedBrokerEndpoint,
 }
 
 #[derive(Deserialize)]
@@ -1433,284 +1419,14 @@ struct RedeemResponse {
     pairing_id: String,
     device_id: String,
     device_pairing_secret: String,
-    broker: ContractBroker,
-    mobile_broker_credentials: ContractCredentials,
 }
 
 impl RedeemResponse {
     fn into_result(self) -> Result<RedeemResult, String> {
-        let broker = self.broker.into_protocol()?;
-        self.mobile_broker_credentials.into_protocol(&broker)?;
         Ok(RedeemResult {
             pairing_id: self.pairing_id,
             device_id: self.device_id,
             device_pairing_secret: self.device_pairing_secret,
-            broker,
-        })
-    }
-}
-
-#[derive(Debug, Deserialize)]
-struct ContractBroker {
-    endpoint: String,
-    provider: String,
-    region: String,
-    authorizer_name: String,
-}
-
-impl ContractBroker {
-    fn into_protocol(self) -> Result<ManagedBrokerEndpoint, String> {
-        let provider = match self.provider.as_str() {
-            "aws_iot_core" => ManagedBrokerProvider::AwsIotCore,
-            other => return Err(format!("unsupported managed broker provider {other:?}")),
-        };
-        Ok(ManagedBrokerEndpoint {
-            endpoint: protocol::BrokerUrl::new(&self.endpoint)
-                .map_err(|err| format!("invalid managed broker endpoint: {err}"))?,
-            provider,
-            region: ManagedBrokerRegion::new(self.region)
-                .map_err(|err| format!("invalid managed broker region: {err}"))?,
-            authorizer_name: ManagedBrokerAuthorizerName::new(self.authorizer_name)
-                .map_err(|err| format!("invalid managed broker authorizer: {err}"))?,
-        })
-    }
-}
-
-#[derive(Deserialize)]
-struct ContractCredentials {
-    grant_id: String,
-    client_id: String,
-    connect: ContractConnect,
-    scope: ContractScope,
-    issued_at_ms: u64,
-    /// Service-owned absolute connect-validity boundary: token expiry minus
-    /// the authorizer's minimum-lifetime policy, computed by
-    /// tycode-mobile-service. Required — a response without it is unreadable.
-    connect_valid_until_ms: u64,
-    expires_at_ms: u64,
-}
-
-impl ContractCredentials {
-    fn into_protocol(
-        self,
-        broker: &ManagedBrokerEndpoint,
-    ) -> Result<ManagedBrokerCredentials, String> {
-        if self.connect_valid_until_ms > self.expires_at_ms {
-            return Err("broker connect deadline exceeds credential expiration".to_owned());
-        }
-        Ok(ManagedBrokerCredentials {
-            grant_id: ManagedBrokerGrantId::new(self.grant_id)
-                .map_err(|err| format!("invalid managed grant id: {err}"))?,
-            client_id: ManagedBrokerClientId::new(self.client_id)
-                .map_err(|err| format!("invalid managed client id: {err}"))?,
-            connect: self.connect.into_protocol(broker)?,
-            scope: self.scope.into_protocol()?,
-            issued_at_ms: self.issued_at_ms,
-            expires_at_ms: self.expires_at_ms,
-        })
-    }
-}
-
-#[derive(Deserialize)]
-struct ContractConnect {
-    #[serde(default)]
-    username: Option<String>,
-    #[serde(default)]
-    password: Option<String>,
-    #[serde(default)]
-    websocket_url: Option<String>,
-    #[serde(default)]
-    headers: std::collections::BTreeMap<String, String>,
-}
-
-impl ContractConnect {
-    fn into_protocol(
-        self,
-        broker: &ManagedBrokerEndpoint,
-    ) -> Result<ManagedBrokerConnectAuth, String> {
-        let websocket_url = validate_managed_websocket_url(self.websocket_url, broker)?;
-        Ok(ManagedBrokerConnectAuth {
-            username: self.username,
-            password: self.password,
-            websocket_url: Some(websocket_url),
-            headers: self.headers,
-        })
-    }
-}
-
-fn validate_managed_websocket_url(
-    websocket_url: Option<String>,
-    broker: &ManagedBrokerEndpoint,
-) -> Result<protocol::BrokerUrl, String> {
-    let websocket_url = websocket_url.ok_or_else(|| {
-        "managed AWS IoT browser credentials require connect.websocket_url".to_owned()
-    })?;
-    if websocket_url.trim() != websocket_url || websocket_url.is_empty() {
-        return Err("managed broker connect.websocket_url must not be empty or padded".to_owned());
-    }
-    if websocket_url
-        .bytes()
-        .any(|byte| byte <= 0x20 || byte == 0x7f)
-    {
-        return Err(
-            "managed broker connect.websocket_url must not contain control or whitespace characters"
-                .to_owned(),
-        );
-    }
-    if websocket_url.contains('#') {
-        return Err("managed broker connect.websocket_url must not contain a fragment".to_owned());
-    }
-
-    let base_endpoint = broker.endpoint.as_str();
-    validate_managed_broker_endpoint_base(base_endpoint)?;
-    let (url_base, query) = websocket_url.split_once('?').ok_or_else(|| {
-        "managed broker connect.websocket_url must include AWS IoT custom-authorizer query parameters"
-            .to_owned()
-    })?;
-    if url_base != base_endpoint {
-        return Err(
-            "managed broker connect.websocket_url base must match broker endpoint".to_owned(),
-        );
-    }
-    if query.is_empty() {
-        return Err(
-            "managed broker connect.websocket_url custom-authorizer query must not be empty"
-                .to_owned(),
-        );
-    }
-
-    let authorizer = query_value(query, "x-amz-customauthorizer-name").ok_or_else(|| {
-        "managed broker connect.websocket_url is missing x-amz-customauthorizer-name".to_owned()
-    })?;
-    if authorizer != broker.authorizer_name.as_str() {
-        return Err(format!(
-            "managed broker connect.websocket_url authorizer {authorizer:?} does not match broker authorizer {:?}",
-            broker.authorizer_name.as_str()
-        ));
-    }
-    if let Some(token_key) = query_value(query, "token-key-name")
-        && token_key != "tycode-grant"
-    {
-        return Err(format!(
-            "managed broker connect.websocket_url token-key-name {token_key:?} is unsupported; expected \"tycode-grant\""
-        ));
-    }
-    let token = query_value(query, "tycode-grant").ok_or_else(|| {
-        "managed broker connect.websocket_url is missing custom-authorizer token parameter \"tycode-grant\""
-            .to_owned()
-    })?;
-    if token.trim().is_empty() {
-        return Err(
-            "managed broker connect.websocket_url custom-authorizer token must not be empty"
-                .to_owned(),
-        );
-    }
-
-    protocol::BrokerUrl::new(websocket_url)
-        .map_err(|err| format!("invalid managed broker connect.websocket_url: {err}"))
-}
-
-fn validate_managed_broker_endpoint_base(base_endpoint: &str) -> Result<(), String> {
-    if !base_endpoint.starts_with("wss://") {
-        return Err(
-            "managed AWS IoT browser credentials require a wss:// broker endpoint".to_owned(),
-        );
-    }
-    if base_endpoint.contains('?') {
-        return Err(
-            "managed broker endpoint must not include query parameters when validating connect.websocket_url"
-                .to_owned(),
-        );
-    }
-    if base_endpoint.contains('#') {
-        return Err(
-            "managed broker endpoint must not include fragments when validating connect.websocket_url"
-                .to_owned(),
-        );
-    }
-    let without_scheme = base_endpoint.trim_start_matches("wss://");
-    let (host, path) = without_scheme.split_once('/').ok_or_else(|| {
-        "managed AWS IoT browser credentials require a /mqtt broker endpoint path".to_owned()
-    })?;
-    if host.is_empty() {
-        return Err("managed broker endpoint is missing a host".to_owned());
-    }
-    if host.contains('@') {
-        return Err(
-            "managed broker endpoint must not embed URL username/password credentials".to_owned(),
-        );
-    }
-    if path != "mqtt" {
-        return Err(format!(
-            "managed AWS IoT browser credentials require broker endpoint path /mqtt; got /{path}"
-        ));
-    }
-    Ok(())
-}
-
-fn query_value(query: &str, wanted: &str) -> Option<String> {
-    query.split('&').find_map(|pair| {
-        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
-        let key = percent_decode_query_component(key)?;
-        if key == wanted {
-            Some(percent_decode_query_component(value)?)
-        } else {
-            None
-        }
-    })
-}
-
-fn percent_decode_query_component(value: &str) -> Option<String> {
-    let bytes = value.as_bytes();
-    let mut output = Vec::with_capacity(bytes.len());
-    let mut index = 0;
-    while index < bytes.len() {
-        match bytes[index] {
-            b'%' => {
-                let high = *bytes.get(index + 1)?;
-                let low = *bytes.get(index + 2)?;
-                output.push((hex_value(high)? << 4) | hex_value(low)?);
-                index += 3;
-            }
-            byte => {
-                output.push(byte);
-                index += 1;
-            }
-        }
-    }
-    String::from_utf8(output).ok()
-}
-
-fn hex_value(byte: u8) -> Option<u8> {
-    match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
-        b'A'..=b'F' => Some(byte - b'A' + 10),
-        _ => None,
-    }
-}
-
-#[derive(Debug, Deserialize)]
-struct ContractScope {
-    namespace: String,
-    role: String,
-    publish: Vec<String>,
-    subscribe: Vec<String>,
-}
-
-impl ContractScope {
-    fn into_protocol(self) -> Result<ManagedBrokerCredentialScope, String> {
-        let role = match self.role.as_str() {
-            "host" => ManagedBrokerRole::Host,
-            "mobile" => ManagedBrokerRole::Mobile,
-            other => return Err(format!("unsupported managed broker role {other:?}")),
-        };
-        Ok(ManagedBrokerCredentialScope {
-            namespace: ManagedBrokerTopicNamespace::new(self.namespace)
-                .map_err(|err| format!("invalid managed topic namespace: {err}"))?,
-            role,
-            publish: self.publish,
-            subscribe: self.subscribe,
         })
     }
 }
@@ -1719,9 +1435,9 @@ impl ContractScope {
 
 /// Parses `qr_uri` as a managed (`tyde-pair://v2`) offer, accepting both the raw
 /// URI and the `https://tycode.dev/tyde/#…` fragment-wrapped loader form. The
-/// extended v2 payload carries `offer_id`, `offer_secret`, `broker`, `room`, and
+/// extended v2 payload carries `offer_id`, `offer_secret`, release/protocol versions, and
 /// `psk` — everything the redeem + connect needs.
-fn parse_managed_offer(qr_uri: &str) -> Result<ManagedMobilePairingQrPayload, String> {
+pub(super) fn parse_managed_offer(qr_uri: &str) -> Result<ManagedMobilePairingQrPayload, String> {
     ManagedMobilePairingQrPayload::from_any(qr_uri)
         .map_err(|error| format!("not a managed Tyde pairing offer: {error}"))
 }
@@ -1762,14 +1478,13 @@ fn stub_auth_state(kind: &str, config: &ServiceConfig) -> MobileServiceAuthState
 
 /// Synthesizes a redeem result for the `stubRedeem: "ok"` dev/test path so the
 /// persistence + connect wiring is exercisable without a live service. No broker
-/// credentials are minted here (the fake broker can't be reached); the stored
+/// credentials are minted here; the stored
 /// record is what the tests assert.
 fn stub_redeem_result(offer: &ManagedMobilePairingQrPayload) -> RedeemResult {
     RedeemResult {
         pairing_id: format!("pair_stub_{}", offer.offer_id.as_str()),
         device_id: "dev_stub".to_owned(),
         device_pairing_secret: "device_pairing_secret_stub".to_owned(),
-        broker: offer.broker.clone(),
     }
 }
 
@@ -1959,15 +1674,10 @@ mod wasm_tests {
         local_host_id: &str,
         device_secret_key_id: mobile_shell_types::KeychainSecretId,
     ) -> WebPairedHostRecord {
-        let managed_broker = super::super::tests_support::sample_managed_broker();
         WebPairedHostRecord {
             local_host_id: LocalHostId(local_host_id.to_owned()),
             host_label: "Living Room".to_owned(),
-            broker: Some(mqtt_transport::BrokerEndpoint {
-                url: managed_broker.endpoint.clone(),
-                auth: mqtt_transport::BrokerAuth::Anonymous,
-            }),
-            room: Some(mqtt_transport::RoomId([7_u8; 16])),
+
             psk_keychain_key_id: Some(mobile_shell_types::KeychainSecretId("psk-test".to_owned())),
             credential_fingerprint: "fingerprint".to_owned(),
             auto_connect: true,
@@ -1975,7 +1685,7 @@ mod wasm_tests {
             managed: Some(ManagedPairingRecord {
                 pairing_id: "pair_01J".to_owned(),
                 device_id: "dev_01J".to_owned(),
-                broker: managed_broker,
+
                 device_secret_key_id,
             }),
             direct: None,
@@ -2111,12 +1821,6 @@ mod wasm_tests {
                     .is_some_and(|managed| managed.device_id == "dev_stub")
             })
             .expect("a managed record must be stored");
-        // The scanned room + PSK are preserved for the rendezvous.
-        assert_eq!(
-            record.room,
-            Some(payload.room),
-            "stored room must match the QR"
-        );
         let psk = IndexedDbPskStore
             .load(
                 record
@@ -2126,8 +1830,18 @@ mod wasm_tests {
             )
             .await
             .expect("psk stored");
+        // The scanned PSK is preserved for authenticated signaling.
+        let psk = IndexedDbPskStore
+            .load(
+                record
+                    .psk_keychain_key_id
+                    .as_ref()
+                    .expect("a managed pairing stores a PSK"),
+            )
+            .await
+            .expect("PSK stored");
         assert_eq!(psk, payload.psk, "stored PSK must match the QR");
-        // Persisted record must NOT contain any broker credentials (finding #5):
+        // Persisted record must NOT contain any relay credentials (finding #5):
         // the serialized JSON carries only durable identifiers.
         let json = serde_json::to_string(record).expect("serialize record");
         assert!(
@@ -2861,7 +2575,7 @@ mod wasm_tests {
             .expect("restore url");
     }
 
-    /// Reconnect handoff failure must stop before broker-credential minting and
+    /// Reconnect handoff failure must stop before relay-credential minting and
     /// surface the auth-required state as a typed credential error.
     #[wasm_bindgen_test]
     async fn reconnect_handoff_failure_stops_before_mint() {
@@ -2908,7 +2622,7 @@ mod wasm_tests {
     }
 
     /// A successful reconnect handoff preserves the intended path: it exchanges
-    /// the handoff first, then proceeds to the broker-credentials request.
+    /// the handoff first, then proceeds to the relay-credentials request.
     #[wasm_bindgen_test]
     async fn reconnect_handoff_success_continues_to_mint() {
         let window = web_sys::window().expect("window");

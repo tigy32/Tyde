@@ -13,11 +13,9 @@ mod service;
 mod store;
 
 use host_config::HostLineEvent;
+use mobile_pairing::{MobilePairingQrOffer, parse_mobile_pairing_qr_offer};
 use mobile_shell_types::{
     KnownConnectionInstance, LocalHostId, PairedHostConnectionStatusEvent, PairedHostSummary,
-};
-use mqtt_transport::{
-    MOBILE_QR_VERSION, MobilePairingQrOffer, MobilePairingQrPayload, parse_mobile_pairing_qr_offer,
 };
 use protocol::PROTOCOL_VERSION;
 
@@ -119,11 +117,9 @@ pub async fn classify_pairing_offer(qr_uri: &str) -> Result<PairingOffer, String
             let host_label = normalize_host_label(payload.host_label.clone())?;
             Ok(PairingOffer::SelfHosted { host_label })
         }
-        MobilePairingQrOffer::LegacyPublicBrokerRepairRequired(_) => {
-            Ok(PairingOffer::RepairRequired {
-                message: LEGACY_QR_REPAIR_MESSAGE.to_owned(),
-            })
-        }
+        MobilePairingQrOffer::LegacyRepairRequired => Ok(PairingOffer::RepairRequired {
+            message: LEGACY_QR_REPAIR_MESSAGE.to_owned(),
+        }),
     }
 }
 
@@ -157,8 +153,7 @@ pub async fn redeem_self_hosted_and_connect(qr_uri: &str) -> Result<(), String> 
     let record = WebPairedHostRecord {
         local_host_id: LocalHostId(uuid::Uuid::new_v4().to_string()),
         host_label,
-        broker: None,
-        room: None,
+
         psk_keychain_key_id: None,
         credential_fingerprint: store::direct_credential_fingerprint(&origin, &grant.device_id),
         auto_connect: true,
@@ -190,7 +185,7 @@ fn default_device_label() -> String {
         .unwrap_or_else(|| "Phone".to_owned())
 }
 
-/// Redeems a managed offer with `tycode.dev` and connects to the managed broker.
+/// Redeems a managed offer with `tycode.dev` and connects to the managed relay.
 /// Thin re-export of the [`service`] seam so the pairing flow calls it through
 /// the `bridge` façade like every other host action.
 pub async fn redeem_managed_and_connect(qr_uri: &str) -> Result<(), RedeemOutcome> {
@@ -200,42 +195,6 @@ pub async fn redeem_managed_and_connect(qr_uri: &str) -> Result<(), RedeemOutcom
 /// User-facing copy for a legacy public-broker QR that fails closed. Kept in one
 /// place so the scan-time and stored-record repair surfaces stay consistent.
 const LEGACY_QR_REPAIR_MESSAGE: &str = "This is an older Tyde pairing code that used the shared public broker, which is no longer supported. Open Tyde on your computer, open the Mobile tab in Settings (Settings → Mobile), turn on mobile access again, and scan the new QR code to re-pair.";
-
-pub async fn start_pairing(qr_uri: &str) -> Result<(), String> {
-    let payload = parse_and_validate(qr_uri)?;
-
-    let psk_store = IndexedDbPskStore;
-    let key_id = psk_store.store(&payload.psk).await?;
-    let fingerprint = store::credential_fingerprint(&payload.broker, &payload.room, &payload.psk);
-    let record = WebPairedHostRecord {
-        local_host_id: LocalHostId(uuid::Uuid::new_v4().to_string()),
-        host_label: normalize_host_label(payload.host_label.clone())?,
-        broker: Some(payload.broker.clone()),
-        room: Some(payload.room),
-        psk_keychain_key_id: Some(key_id.clone()),
-        credential_fingerprint: fingerprint,
-        auto_connect: true,
-        last_connected_at_ms: None,
-        managed: None,
-        direct: None,
-    };
-    let local_host_id = record.local_host_id.clone();
-
-    let host_store = IndexedDbHostStore;
-    if let Err(store_error) = host_store.insert(record).await {
-        let _ = psk_store.delete(&key_id).await;
-        return Err(store_error);
-    }
-
-    if let Err(connect_error) = connection::manager().connect(local_host_id.clone()).await {
-        let _ = host_store.remove(&local_host_id).await;
-        let _ = psk_store.delete(&key_id).await;
-        return Err(connect_error);
-    }
-
-    emit_paired_hosts_changed().await;
-    Ok(())
-}
 
 // ── Connection control ────────────────────────────────────────────────────
 
@@ -259,7 +218,7 @@ pub async fn forget_paired_host(local_host_id: &LocalHostId) -> Result<(), Strin
         .ok_or_else(|| format!("paired host {local_host_id} was not found"))?;
     // Best-effort disconnect (ignore "no active connection").
     let _ = connection::manager().disconnect(local_host_id.clone());
-    // Drop the in-memory managed broker grant so a forgotten host can't reuse it.
+    // Drop the in-memory managed relay grant so a forgotten host can't reuse it.
 
     // Attempt every deletion so a single failure can't strand the rest, and
     // report all failures explicitly rather than silently ignoring them
@@ -484,38 +443,6 @@ async fn emit_paired_hosts_changed() {
     }
 }
 
-fn parse_and_validate(qr_uri: &str) -> Result<MobilePairingQrPayload, String> {
-    let payload = MobilePairingQrPayload::from_any(qr_uri)
-        .map_err(|error| format!("invalid mobile pairing URI: {error}"))?;
-    if payload.v != MOBILE_QR_VERSION {
-        return Err(format!(
-            "unsupported mobile pairing QR version {}, expected {}",
-            payload.v, MOBILE_QR_VERSION
-        ));
-    }
-    if payload.protocol_version != PROTOCOL_VERSION {
-        // Web self-heal: this PWA bundle's compiled protocol no longer matches
-        // the host. Ask the loader to forget the stale bundle and reboot into the
-        // version-matched one, carrying the raw pairing URI so it can re-pair
-        // without a second scan. The strict check is preserved — we STILL return
-        // Err so this bundle never proceeds; the matching bundle the loader boots
-        // re-runs this exact validation authoritatively.
-        //
-        // This self-heal exists only because THIS bundle ships the dispatch
-        // below. A bundle built before this change (e.g. an already-running older
-        // beta) has no such code, so it cannot retroactively self-heal — it just
-        // surfaces the returned error. The loader bounds repeated reboots so a
-        // misconfigured release can't spin forever.
-        request_loader_repair(qr_uri);
-        return Err(format!(
-            "unsupported Tyde protocol version {}, expected {}",
-            payload.protocol_version, PROTOCOL_VERSION
-        ));
-    }
-    let _ = normalize_host_label(payload.host_label.clone())?;
-    Ok(payload)
-}
-
 /// Dispatch the PWA loader's `tyde:repair-needed` event with the raw pairing URI
 /// so the loader forgets the stale bundle and reboots into the version-matched
 /// one (see `web/loader/loader.js` `onRepairNeeded`). Best-effort: any failure
@@ -579,14 +506,10 @@ fn normalize_host_label(host_label: String) -> Result<String, String> {
 /// [`service`]). Kept here so both test suites build identical managed URIs.
 #[cfg(all(test, target_arch = "wasm32"))]
 pub(crate) mod tests_support {
-    use mqtt_transport::{
-        ManagedMobilePairingQrPayload, ManagedMobilePairingQrPayloadParams, MobilePairingQrPayload,
-        PreSharedKey, RoomId, default_mobile_broker_endpoint,
+    use mobile_pairing::{
+        ManagedMobilePairingQrPayload, ManagedMobilePairingQrPayloadParams, PreSharedKey,
     };
-    use protocol::{
-        BrokerUrl, ManagedBrokerAuthorizerName, ManagedBrokerEndpoint, ManagedBrokerProvider,
-        ManagedBrokerRegion, MobilePairingOfferId, PROTOCOL_VERSION, TydeReleaseVersion,
-    };
+    use protocol::{MobilePairingOfferId, PROTOCOL_VERSION, TydeReleaseVersion};
 
     pub async fn store_reconnect_host() -> mobile_shell_types::LocalHostId {
         use super::store::{
@@ -605,8 +528,6 @@ pub(crate) mod tests_support {
             .insert(WebPairedHostRecord {
                 local_host_id: local_host_id.clone(),
                 host_label: "Reconnect host".to_owned(),
-                broker: None,
-                room: None,
                 psk_keychain_key_id: Some(key),
                 credential_fingerprint: "reconnect-fixture".to_owned(),
                 auto_connect: false,
@@ -615,36 +536,46 @@ pub(crate) mod tests_support {
                 managed: Some(ManagedPairingRecord {
                     pairing_id: "pair_reconnect".to_owned(),
                     device_id: "dev_reconnect".to_owned(),
-                    broker: sample_managed_broker(),
                     device_secret_key_id: secret,
                 }),
             })
             .await
             .unwrap();
+        // Exercise the real IndexedDB upgrade path with an older saved record.
+        // The existing reconnect flow must keep its identity and PSK usable.
+        let raw = super::idb::get(super::idb::STORE_HOSTS, "all")
+            .await
+            .unwrap()
+            .unwrap();
+        let mut records: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let record = records
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|record| record["localHostId"] == local_host_id.0)
+            .unwrap();
+        record["broker"] =
+            serde_json::json!({"url":"wss://retired.invalid/mqtt","auth":{"kind":"anonymous"}});
+        record["room"] = serde_json::json!("AAAAAAAAAAAAAAAAAAAAAA");
+        record["managed"]["broker"] = serde_json::json!({
+            "endpoint":"wss://retired.invalid/mqtt", "provider":"aws_iot_core",
+            "region":"us-west-2", "authorizer_name":"retired"
+        });
+        super::idb::put(super::idb::STORE_HOSTS, "all", &records.to_string())
+            .await
+            .unwrap();
         local_host_id
-    }
-
-    pub fn sample_managed_broker() -> ManagedBrokerEndpoint {
-        ManagedBrokerEndpoint {
-            endpoint: BrokerUrl::new("wss://a1234567890-ats.iot.us-west-2.amazonaws.com/mqtt")
-                .expect("managed broker url"),
-            provider: ManagedBrokerProvider::AwsIotCore,
-            region: ManagedBrokerRegion::new("us-west-2").expect("region"),
-            authorizer_name: ManagedBrokerAuthorizerName::new("tycode-mobile-v1")
-                .expect("authorizer"),
-        }
     }
 
     /// A managed v2 offer with deterministic room + PSK, so tests can assert the
     /// scanned rendezvous material is preserved through redeem/persistence.
     pub fn sample_managed_payload() -> ManagedMobilePairingQrPayload {
-        ManagedMobilePairingQrPayload::new_with_rendezvous(ManagedMobilePairingQrPayloadParams {
+        ManagedMobilePairingQrPayload::new_with_key(ManagedMobilePairingQrPayloadParams {
             protocol_version: PROTOCOL_VERSION,
             release_version: TydeReleaseVersion::parse("0.8.19").expect("release version"),
             offer_id: MobilePairingOfferId::new("offer_01J").expect("offer id"),
             offer_secret: "offer_secret_from_qr".to_owned(),
-            broker: sample_managed_broker(),
-            room: RoomId([5_u8; 16]),
+
             psk: PreSharedKey::from_slice(&[6_u8; 32]).expect("psk"),
             host_label: "Living Room".to_owned(),
             expires_at_ms: 4_102_444_800_000,
@@ -665,7 +596,6 @@ pub(crate) mod tests_support {
             TydeReleaseVersion::parse("0.8.19").expect("release version"),
             MobilePairingOfferId::new("offer_01J").expect("offer id"),
             "offer_secret_from_qr".to_owned(),
-            sample_managed_broker(),
             "Living Room".to_owned(),
             4_102_444_800_000,
         );
@@ -674,21 +604,12 @@ pub(crate) mod tests_support {
     }
 
     pub fn legacy_public_broker_uri() -> String {
-        MobilePairingQrPayload::new(
-            PROTOCOL_VERSION,
-            default_mobile_broker_endpoint(),
-            RoomId([3_u8; 16]),
-            PreSharedKey::from_slice(&[4_u8; 32]).expect("psk"),
-            "Living Room".to_owned(),
-        )
-        .to_uri()
-        .expect("encode legacy pairing uri")
+        "tyde-pair://v1?legacy-retired".to_owned()
     }
 }
 
 #[cfg(all(test, target_arch = "wasm32"))]
 mod wasm_tests {
-    use mqtt_transport::{PreSharedKey, RoomId, default_mobile_broker_endpoint};
     use wasm_bindgen_test::*;
 
     use super::*;
@@ -696,44 +617,28 @@ mod wasm_tests {
     wasm_bindgen_test_configure!(run_in_browser);
 
     fn valid_uri() -> String {
-        MobilePairingQrPayload::new(
-            PROTOCOL_VERSION,
-            default_mobile_broker_endpoint(),
-            RoomId([3_u8; 16]),
-            PreSharedKey::from_slice(&[4_u8; 32]).expect("psk"),
-            "Living Room".to_owned(),
-        )
-        .to_uri()
-        .expect("encode pairing uri")
+        tests_support::sample_managed_uri()
     }
 
     #[wasm_bindgen_test]
     fn parse_and_validate_accepts_https_fragment_qr_value() {
         let uri = valid_uri();
         let wrapped = format!("https://tycode.dev/tyde/#{uri}");
-        assert!(MobilePairingQrPayload::from_uri(&wrapped).is_err());
-        let payload = parse_and_validate(&wrapped).expect("https fragment pairing uri");
+        assert!(mobile_pairing::ManagedMobilePairingQrPayload::from_uri(&wrapped).is_err());
+        let payload = service::parse_managed_offer(&wrapped).expect("https fragment pairing uri");
         assert_eq!(payload.host_label, "Living Room");
         assert_eq!(payload.protocol_version, PROTOCOL_VERSION);
     }
 
     fn mismatched_protocol_uri() -> String {
-        MobilePairingQrPayload::new(
-            PROTOCOL_VERSION + 1,
-            default_mobile_broker_endpoint(),
-            RoomId([3_u8; 16]),
-            PreSharedKey::from_slice(&[4_u8; 32]).expect("psk"),
-            "Living Room".to_owned(),
-        )
-        .to_uri()
-        .expect("encode pairing uri")
+        tests_support::mismatched_protocol_managed_uri()
     }
 
     /// On a protocol mismatch the web bridge still rejects (strict check), AND it
     /// dispatches the loader's `tyde:repair-needed` event carrying the raw URI so
     /// the PWA loader can reboot into the version-matched bundle.
     #[wasm_bindgen_test]
-    fn protocol_mismatch_rejects_and_dispatches_repair_needed() {
+    async fn protocol_mismatch_rejects_and_dispatches_repair_needed() {
         use std::cell::RefCell;
         use std::rc::Rc;
         use wasm_bindgen::JsCast;
@@ -753,7 +658,7 @@ mod wasm_tests {
             .add_event_listener_with_callback("tyde:repair-needed", cb.as_ref().unchecked_ref())
             .expect("add listener");
 
-        let result = parse_and_validate(&uri);
+        let result = classify_pairing_offer(&uri).await;
         assert!(result.is_err(), "strict protocol check still rejects");
 
         window
@@ -769,7 +674,7 @@ mod wasm_tests {
 
     /// A protocol-matching URI must NOT dispatch repair-needed.
     #[wasm_bindgen_test]
-    fn matching_protocol_does_not_dispatch_repair_needed() {
+    async fn matching_protocol_does_not_dispatch_repair_needed() {
         use std::cell::RefCell;
         use std::rc::Rc;
         use wasm_bindgen::JsCast;
@@ -785,7 +690,9 @@ mod wasm_tests {
             .add_event_listener_with_callback("tyde:repair-needed", cb.as_ref().unchecked_ref())
             .expect("add listener");
 
-        let _ = parse_and_validate(&valid_uri()).expect("valid uri parses");
+        let _ = classify_pairing_offer(&valid_uri())
+            .await
+            .expect("valid uri parses");
 
         window
             .remove_event_listener_with_callback("tyde:repair-needed", cb.as_ref().unchecked_ref())

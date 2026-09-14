@@ -1,5 +1,5 @@
 //! Web/PWA bridge for the mobile client's host I/O, storage, QR scanning, and
-//! dialogs. The browser talks directly to hosts over MQTT-over-WebSocket,
+//! dialogs. The browser talks directly to hosts over WebRTC-over-WebSocket,
 //! persists pairing data in IndexedDB, and delivers events in process.
 
 pub(crate) mod web;
@@ -160,7 +160,6 @@ dispatch!(list_paired_hosts() -> Result<Vec<PairedHostSummary>, String>);
 dispatch!(list_paired_host_connection_statuses() -> Result<Vec<PairedHostConnectionStatusEvent>, String>);
 dispatch!(list_pending_host_lines() -> Result<Vec<HostLineEvent>, String>);
 dispatch!(classify_pairing_offer(qr_uri: &str) -> Result<PairingOffer, String>);
-dispatch!(start_pairing(qr_uri: &str) -> Result<(), String>);
 dispatch!(redeem_self_hosted_and_connect(qr_uri: &str) -> Result<(), String>);
 dispatch!(connect_paired_host(local_host_id: &LocalHostId) -> Result<(), String>);
 dispatch!(reconnect_paired_host(local_host_id: &LocalHostId) -> Result<(), String>);
@@ -222,7 +221,7 @@ pub async fn probe_managed_auth() -> MobileServiceAuthState {
 }
 
 /// Redeems a managed offer (`POST /pairings/redeem`) and connects to the
-/// managed broker.
+/// managed relay.
 pub async fn redeem_managed_and_connect(qr_uri: &str) -> Result<(), RedeemOutcome> {
     web::redeem_managed_and_connect(qr_uri).await
 }

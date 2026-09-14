@@ -2,7 +2,7 @@
 //!
 //! This is the surviving wasm single-context implementation of the mobile
 //! connection contract. Behaviour preserved: connect → run the framed host-record
-//! loop → reconnect with [`MqttReconnectBackoff`] on retryable drops, surfacing
+//! loop → reconnect with [`ReconnectBackoff`] on retryable drops, surfacing
 //! the same `host-line` / `host-disconnected` / `host-error` /
 //! connection-status events consumed by the mobile frontend.
 //!
@@ -30,10 +30,10 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use host_config::{HostDisconnectedEvent, HostErrorEvent, HostLineEvent};
+use mobile_pairing::{PreSharedKey, ReconnectBackoff};
 use mobile_shell_types::{
     LocalHostId, PairedHostConnectionStatus, PairedHostConnectionStatusEvent,
 };
-use mqtt_transport::{MqttReconnectBackoff, MqttTransportError, PreSharedKey};
 use protocol::MobileAccessErrorCode;
 use tokio::io::{AsyncRead, AsyncWrite, BufReader};
 use tokio::sync::{mpsc, watch};
@@ -869,7 +869,7 @@ enum ConnectErr {
     },
     Invalidated(ConnectionInvalidation),
     NeedsRepair(String),
-    /// The managed pairing could not obtain broker credentials from `tycode.dev`
+    /// The managed pairing could not obtain relay credentials from `tycode.dev`
     /// (session expired, service unavailable, pairing revoked, …).
     ManagedCredentials(ManagedCredentialError),
 }
@@ -913,11 +913,9 @@ impl ConnectErr {
     fn error_code(&self) -> MobileAccessErrorCode {
         match self {
             Self::Rtc(_) => MobileAccessErrorCode::TransportFailed,
-            Self::Io(error) => transport_error_from_io(error)
-                .map(transport_error_code)
-                .unwrap_or(MobileAccessErrorCode::TransportFailed),
+            Self::Io(_) => MobileAccessErrorCode::TransportFailed,
             Self::Timeout => MobileAccessErrorCode::TransportFailed,
-            Self::WriterDeadline { .. } => MobileAccessErrorCode::BrokerProtocol,
+            Self::WriterDeadline { .. } => MobileAccessErrorCode::TransportFailed,
             Self::Invalidated(ConnectionInvalidation::HeartbeatTimeout { .. }) => {
                 MobileAccessErrorCode::TransportFailed
             }
@@ -925,7 +923,7 @@ impl ConnectErr {
             Self::Invalidated(ConnectionInvalidation::ForegroundResume { .. }) => {
                 MobileAccessErrorCode::TransportFailed
             }
-            Self::Invalidated(_) => MobileAccessErrorCode::BrokerProtocol,
+            Self::Invalidated(_) => MobileAccessErrorCode::TransportFailed,
             Self::NeedsRepair(_) => MobileAccessErrorCode::RepairRequired,
             Self::ManagedCredentials(error) => error.code,
         }
@@ -952,7 +950,7 @@ async fn run_connection_actor(
     mut control_rx: watch::Receiver<ConnectionControl>,
 ) {
     let local_host_id = record.local_host_id.clone();
-    let mut backoff = MqttReconnectBackoff::default();
+    let mut backoff = ReconnectBackoff::default();
     let mut failures = RepeatedFailures::default();
     loop {
         if !failures.is_persistent() {
@@ -1348,7 +1346,7 @@ where
                         log::error!(
                             "mobile_writer_deadline host={local_host_id} local_submission_id={} code={:?} session_cancelled=true",
                             local_submission_id.0,
-                            MobileAccessErrorCode::BrokerProtocol,
+                            MobileAccessErrorCode::TransportFailed,
                         );
                         return ConnectedOutcome::Disconnected(ConnectErr::WriterDeadline {
                             local_submission_id,
@@ -1520,7 +1518,7 @@ async fn next_control(control_rx: &mut watch::Receiver<ConnectionControl>) -> Co
 
 async fn wait_backoff_or_control(
     control_rx: &mut watch::Receiver<ConnectionControl>,
-    backoff: &mut MqttReconnectBackoff,
+    backoff: &mut ReconnectBackoff,
 ) -> ConnectionControl {
     let delay = match backoff.next_delay() {
         Ok(delay) => delay,
@@ -1534,12 +1532,6 @@ async fn wait_backoff_or_control(
 }
 
 fn io_error_is_retryable(error: &std::io::Error) -> bool {
-    if let Some(transport) = transport_error_from_io(error) {
-        return transport.is_retryable();
-    }
-    if let Some(write_ack) = write_ack_error_from_io(error) {
-        return write_ack.is_retryable();
-    }
     matches!(
         error.kind(),
         std::io::ErrorKind::UnexpectedEof
@@ -1548,69 +1540,6 @@ fn io_error_is_retryable(error: &std::io::Error) -> bool {
             | std::io::ErrorKind::ConnectionAborted
             | std::io::ErrorKind::TimedOut
     )
-}
-
-/// Typed transport errors can sit several layers deep: the byte stream fails
-/// with `io::Error(MqttTransportError)`, the frame reader wraps that in
-/// `FrameError::Io`, and callers may wrap once more. A single-level
-/// `get_ref()` downcast misses those, which misclassified the planned
-/// renewal-deadline teardown as fatal — so walk the whole source chain.
-fn error_source_from_io<T: std::error::Error + 'static>(error: &std::io::Error) -> Option<&T> {
-    let mut source: Option<&(dyn std::error::Error + 'static)> = error
-        .get_ref()
-        .map(|inner| inner as &(dyn std::error::Error + 'static));
-    while let Some(current) = source {
-        if let Some(typed) = current.downcast_ref::<T>() {
-            return Some(typed);
-        }
-        // `io::Error::source()` skips the payload it carries (it returns the
-        // payload's own source), so descend through nested io errors via
-        // `get_ref` to keep each payload visible to the downcast above.
-        source = match current.downcast_ref::<std::io::Error>() {
-            Some(nested_io) => nested_io
-                .get_ref()
-                .map(|inner| inner as &(dyn std::error::Error + 'static)),
-            None => current.source(),
-        };
-    }
-    None
-}
-
-fn transport_error_from_io(error: &std::io::Error) -> Option<&MqttTransportError> {
-    error_source_from_io::<MqttTransportError>(error)
-}
-
-/// Outbound write failures cross the io boundary as [`mqtt_transport::WriteAckError`]
-/// (the typed transport error itself is not cloneable across every ack); both
-/// carriers preserve retryability and credential classification.
-fn write_ack_error_from_io(error: &std::io::Error) -> Option<&mqtt_transport::WriteAckError> {
-    error_source_from_io::<mqtt_transport::WriteAckError>(error)
-}
-
-fn transport_error_code(error: &MqttTransportError) -> MobileAccessErrorCode {
-    match error {
-        MqttTransportError::Configuration { .. } => MobileAccessErrorCode::InvalidConfig,
-        MqttTransportError::BrokerConnect { .. }
-        | MqttTransportError::Subscribe { .. }
-        | MqttTransportError::SubscribeRejected { .. }
-        | MqttTransportError::BrokerDisconnected { .. }
-        | MqttTransportError::PeerSilenceTimeout { .. }
-        | MqttTransportError::ManagedSessionExpired => {
-            MobileAccessErrorCode::BrokerConnectionFailed
-        }
-        MqttTransportError::Publish { .. } | MqttTransportError::PublishRejected { .. } => {
-            MobileAccessErrorCode::BrokerProtocol
-        }
-        MqttTransportError::Framing(_)
-        | MqttTransportError::RetainedMessage { .. }
-        | MqttTransportError::PublishAckMismatch { .. }
-        | MqttTransportError::PublishAckTimeout { .. }
-        | MqttTransportError::ReceiverCreditTimeout { .. } => {
-            MobileAccessErrorCode::TransportFailed
-        }
-        MqttTransportError::Crypto(_) => MobileAccessErrorCode::CryptoFailed,
-        MqttTransportError::ActorClosed => MobileAccessErrorCode::TransportFailed,
-    }
 }
 
 async fn emit_paired_hosts_changed() {

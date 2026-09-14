@@ -1363,7 +1363,7 @@ fn reply_note(lifecycle: SubmissionLifecycle) -> (&'static str, &'static str) {
             "alert",
             "Moved back to the message box — this reply was not sent.",
         ),
-        // Queued, or retired by a broker ack. Both leave "queued locally" as the
+        // Queued, or retired by a transport ack. Both leave "queued locally" as the
         // last true statement the client can make.
         SubmissionLifecycle::QueuedLocally => ("status", "Queued locally."),
     }
@@ -2367,7 +2367,7 @@ mod wasm_tests {
         );
     }
 
-    /// A broker ack retires the record. That is a transport fact and nothing more,
+    /// A transport ack retires the record. That is a transport fact and nothing more,
     /// so the card must not upgrade it into "the agent has your answer".
     #[wasm_bindgen_test]
     async fn a_broker_ack_retires_the_record_without_claiming_delivery() {

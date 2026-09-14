@@ -10,24 +10,24 @@ const JITTER_DENOMINATOR: u64 = 4;
 
 #[derive(Debug, Error)]
 pub enum ReconnectBackoffError {
-    #[error("MQTT reconnect backoff initial delay must be greater than zero")]
+    #[error("mobile reconnect backoff initial delay must be greater than zero")]
     InitialDelayZero,
 
-    #[error("MQTT reconnect backoff max delay {max:?} is smaller than initial delay {initial:?}")]
+    #[error("mobile reconnect backoff max delay {max:?} is smaller than initial delay {initial:?}")]
     MaxBeforeInitial { initial: Duration, max: Duration },
 
-    #[error("failed to read random bytes for MQTT reconnect jitter: {0}")]
+    #[error("failed to read random bytes for mobile reconnect jitter: {0}")]
     Random(#[from] getrandom::Error),
 }
 
 #[derive(Debug, Clone)]
-pub struct MqttReconnectBackoff {
+pub struct ReconnectBackoff {
     initial: Duration,
     max: Duration,
     current: Duration,
 }
 
-impl MqttReconnectBackoff {
+impl ReconnectBackoff {
     pub fn new(initial: Duration, max: Duration) -> Result<Self, ReconnectBackoffError> {
         if initial.is_zero() {
             return Err(ReconnectBackoffError::InitialDelayZero);
@@ -57,7 +57,7 @@ impl MqttReconnectBackoff {
     }
 }
 
-impl Default for MqttReconnectBackoff {
+impl Default for ReconnectBackoff {
     fn default() -> Self {
         Self {
             initial: RECONNECT_INITIAL,

@@ -429,7 +429,6 @@ fn boot_pairing_screen(
             auth: callback_auth.unwrap_or(MobileServiceAuthState::Idle),
         },
         PairingOffer::RepairRequired { message } => PairingScreen::RepairRequired { message },
-        PairingOffer::DirectPairing { preview } => PairingScreen::Confirm { qr_uri, preview },
         PairingOffer::SelfHosted { host_label } => {
             PairingScreen::SelfHostedConfirm { qr_uri, host_label }
         }
@@ -683,7 +682,7 @@ fn handle_host_line_event(state: &AppState, event: bridge::HostLineEvent) {
             // the same per-stream seq counter as Hello/SendMessage, so it
             // cannot itself be re-parsed inbound and trigger another report.
             emit_client_parse_error(state, &host, message.clone(), event.line.clone());
-            report_shell_error(state, MobileAccessErrorCode::BrokerProtocol, message);
+            report_shell_error(state, MobileAccessErrorCode::TransportFailed, message);
         }
     }
 
@@ -1193,11 +1192,6 @@ mod wasm_tests {
     use super::*;
     use crate::state::PairedHostSummary;
     use leptos::mount::mount_to;
-    use mobile_shell_types::{
-        BrokerAuthSummary as BrokerAuth, BrokerEndpointSummary as BrokerEndpoint,
-        RoomIdSummary as RoomId,
-    };
-    use protocol::BrokerUrl;
     use wasm_bindgen::JsCast;
     use wasm_bindgen_test::*;
     use web_sys::HtmlElement;
@@ -1435,8 +1429,7 @@ mod wasm_tests {
             enabled_backends: Vec::new(),
             default_backend: None,
             enable_mobile_connections: false,
-            mobile_broker_url: None,
-            mobile_broker_auth: Default::default(),
+
             mobile_direct_hosting_enabled: false,
             mobile_direct_bind_addr: None,
             mobile_direct_public_origin: None,
@@ -1463,11 +1456,7 @@ mod wasm_tests {
         PairedHostSummary {
             local_host_id: LocalHostId(id.to_owned()),
             host_label: label.to_owned(),
-            broker: Some(BrokerEndpoint {
-                url: BrokerUrl::new("wss://broker.example.test/mqtt").unwrap(),
-                auth: BrokerAuth::Anonymous,
-            }),
-            room: Some(RoomId("AQEBAQEBAQEBAQEBAQEBAQ".to_owned())),
+
             credential_fingerprint: "fp".to_owned(),
             auto_connect: false,
             last_connected_at_ms: None,
@@ -1884,7 +1873,7 @@ mod wasm_tests {
             .mobile_shell_error
             .get_untracked()
             .expect("shell error");
-        assert_eq!(error.code, MobileAccessErrorCode::BrokerProtocol);
+        assert_eq!(error.code, MobileAccessErrorCode::TransportFailed);
         assert!(error.message.contains("unknown_frame"));
     }
 

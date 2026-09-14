@@ -6,7 +6,7 @@ edition.workspace = true
 client = { path = "../client" }
 protocol = { path = "../protocol" }
 settings-model = { path = "../settings-model" }
-mqtt-transport = { path = "../mqtt-transport", features = ["test-support"] }
+mobile-pairing = { path = "../mobile-pairing" }
 server = { path = "../server", features = ["test-support"] }
 tyde-dev-driver = { path = "../dev-driver" }
 tyde-agent-adapter = { path = "../agent-adapter" }
@@ -23,7 +23,6 @@ thiserror.workspace = true
 tokio.workspace = true
 tokio-tungstenite = "0.29"
 uuid.workspace = true
-rumqttd = "0.20.0"
 opus = "0.3.1"
 
 rtc-transport = { path = "../rtc-transport" }

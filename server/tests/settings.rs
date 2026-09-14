@@ -125,8 +125,7 @@ fn expected_empty_settings() -> HostSettings {
         enabled_backends: Vec::new(),
         default_backend: None,
         enable_mobile_connections: false,
-        mobile_broker_url: None,
-        mobile_broker_auth: Default::default(),
+
         mobile_direct_hosting_enabled: false,
         mobile_direct_bind_addr: None,
         mobile_direct_public_origin: None,
@@ -375,8 +374,7 @@ fn persisted_backend_lists_are_canonicalized_but_not_defaulted() {
             ],
             default_backend: Some(BackendKind::Claude),
             enable_mobile_connections: false,
-            mobile_broker_url: None,
-            mobile_broker_auth: Default::default(),
+
             mobile_direct_hosting_enabled: false,
             mobile_direct_bind_addr: None,
             mobile_direct_public_origin: None,
@@ -1000,115 +998,30 @@ async fn settings_write_scalar_applies_advances_etag_and_fans_out() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn secret_settings_publish_tokens_and_reject_stale_replacement() {
+async fn retired_transport_secrets_cannot_be_written() {
     let mut fixture = Fixture::new().await;
-    let mut second = fixture.connect().await;
-    let path = "/mobile_broker_auth/password";
-
     fixture
         .client
         .settings_write(SettingsWritePayload {
-            write_id: SettingsWriteId("secret-a".to_owned()),
+            write_id: SettingsWriteId("retired-secret".to_owned()),
             ops: vec![SettingOp::Replace {
-                path: path.to_owned(),
-                value: serde_json::json!("first-secret"),
+                path: "/mobile_broker_auth/password".to_owned(),
+                value: serde_json::json!("must-not-be-stored"),
                 expected: SettingExpectation::Absent,
             }],
         })
         .await
-        .expect("configure secret from absent");
-    let first = expect_host_settings_frame(&mut fixture.client, "secret A fanout").await;
-    assert!(
-        serde_json::to_value(&first.settings)
-            .expect("serialize redacted host settings")
-            .pointer(path)
-            .is_none(),
-        "secret values must be absent from HostSettings"
-    );
-    let first_secret = first
-        .configured_secrets
-        .iter()
-        .find(|secret| secret.pointer == path)
-        .expect("configured secret token after absent-to-A")
-        .clone();
-    assert!(
-        expect_settings_write_result(&mut fixture.client, "secret-a", "secret A result")
-            .await
-            .applied
-    );
-    let second_first: HostSettingsPayload =
-        next_frame_matching_on(&mut second, "second client secret A fanout", |env| {
-            env.kind == FrameKind::HostSettings
-        })
-        .await
-        .parse_payload()
-        .expect("parse second client HostSettings");
-    assert_eq!(second_first.configured_secrets, first.configured_secrets);
-
-    fixture
-        .client
-        .settings_write(SettingsWritePayload {
-            write_id: SettingsWriteId("secret-b".to_owned()),
-            ops: vec![SettingOp::Replace {
-                path: path.to_owned(),
-                value: serde_json::json!("second-secret"),
-                expected: SettingExpectation::Version {
-                    token: first_secret.token.clone(),
-                },
-            }],
-        })
-        .await
-        .expect("replace secret A with B");
-    let second_value = expect_host_settings_frame(&mut fixture.client, "secret B fanout").await;
-    let second_secret = second_value
-        .configured_secrets
-        .iter()
-        .find(|secret| secret.pointer == path)
-        .expect("configured secret token after A-to-B");
-    assert_ne!(second_secret.token, first_secret.token);
-    assert_ne!(second_value.etag, first.etag);
-    assert!(
-        expect_settings_write_result(&mut fixture.client, "secret-b", "secret B result")
-            .await
-            .applied
-    );
-
-    second
-        .settings_write(SettingsWritePayload {
-            write_id: SettingsWriteId("secret-stale".to_owned()),
-            ops: vec![SettingOp::Replace {
-                path: path.to_owned(),
-                value: serde_json::json!("stale-secret"),
-                expected: SettingExpectation::Version {
-                    token: first_secret.token,
-                },
-            }],
-        })
-        .await
-        .expect("submit stale secret replacement");
-    let stale = expect_settings_write_result(
-        &mut second,
-        "secret-stale",
-        "stale secret replacement result",
+        .expect("attempt retired setting write");
+    let result = expect_settings_write_result(
+        &mut fixture.client,
+        "retired-secret",
+        "retired secret rejection",
     )
     .await;
-    assert!(!stale.applied);
-    assert_eq!(stale.field_errors[0].pointer, path);
-    assert_eq!(stale.field_errors[0].code, SettingsErrorCode::Conflict);
-    assert_eq!(stale.current_etag, second_value.etag);
-
-    let (_client, bootstrap) = fixture.connect_with_bootstrap().await;
-    assert_eq!(bootstrap.settings_etag, second_value.etag);
-    assert_eq!(
-        bootstrap.configured_secrets,
-        second_value.configured_secrets
-    );
-    assert!(
-        serde_json::to_value(&bootstrap.settings)
-            .expect("serialize redacted bootstrap settings")
-            .pointer(path)
-            .is_none()
-    );
+    assert!(!result.applied);
+    assert!(!result.field_errors.is_empty());
+    let observer = fixture.connect().await;
+    drop(observer);
 }
 
 #[tokio::test(start_paused = true)]

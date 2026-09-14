@@ -11,7 +11,7 @@
 
 use std::time::Duration;
 
-use mqtt_transport::DirectMobilePairingQrPayload;
+use mobile_pairing::DirectMobilePairingQrPayload;
 use protocol::{
     CommandErrorPayload, Envelope, FrameKind, MobileAccessStatePayload, MobileDirectHostingStatus,
     MobilePairingOfferPayload, MobilePairingStartPayload,

@@ -1,9 +1,8 @@
 use std::io::Write;
-use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::{collections::BTreeMap, mem};
 
-use protocol::{BackendKind, BrokerUrl, KIRO_BACKEND, LEGACY_ACP_BACKEND, LaunchProfileId};
+use protocol::{BackendKind, KIRO_BACKEND, LEGACY_ACP_BACKEND, LaunchProfileId};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use settings_model::{
@@ -650,8 +649,7 @@ fn empty_settings() -> HostSettings {
         enabled_backends: Vec::new(),
         default_backend: None,
         enable_mobile_connections: false,
-        mobile_broker_url: None,
-        mobile_broker_auth: Default::default(),
+
         mobile_direct_hosting_enabled: false,
         mobile_direct_bind_addr: None,
         mobile_direct_public_origin: None,
@@ -688,14 +686,6 @@ fn validate_settings(settings: HostSettings) -> Result<HostSettings, String> {
             "default_backend {:?} must be present in enabled_backends",
             settings.default_backend
         ));
-    }
-
-    if settings
-        .mobile_broker_url
-        .as_ref()
-        .is_some_and(|url| url.as_str().trim().is_empty())
-    {
-        return Err("mobile_broker_url must not be empty".to_owned());
     }
 
     if !(TYDE_AGENT_CONTROL_MAX_DEPTH_MIN..=TYDE_AGENT_CONTROL_MAX_DEPTH_MAX)
@@ -809,8 +799,7 @@ fn validate_settings(settings: HostSettings) -> Result<HostSettings, String> {
         enabled_backends,
         default_backend: settings.default_backend,
         enable_mobile_connections: settings.enable_mobile_connections,
-        mobile_broker_url: settings.mobile_broker_url,
-        mobile_broker_auth: settings.mobile_broker_auth,
+
         mobile_direct_hosting_enabled: settings.mobile_direct_hosting_enabled,
         mobile_direct_bind_addr: settings.mobile_direct_bind_addr,
         mobile_direct_public_origin: settings.mobile_direct_public_origin,
@@ -955,52 +944,6 @@ fn parse_secret_token_key(encoded: &str) -> Option<[u8; 32]> {
         key[index] = u8::from_str_radix(std::str::from_utf8(chunk).ok()?, 16).ok()?;
     }
     Some(key)
-}
-
-pub(crate) fn validate_mobile_broker_url_for_write(
-    broker_url: Option<&BrokerUrl>,
-) -> Result<(), String> {
-    let Some(url) = broker_url else {
-        return Ok(());
-    };
-    if url.as_str().trim().is_empty() {
-        return Err("mobile_broker_url must not be empty".to_owned());
-    }
-    mqtt_transport::validate_broker_url(url).map_err(|err| err.to_string())?;
-    if url.as_str() == protocol::DEFAULT_MOBILE_MQTT_BROKER_URL {
-        return Err(
-            "the public default mobile broker is no longer supported; pair through tycode.dev"
-                .to_owned(),
-        );
-    }
-    if !is_loopback_broker_url(url) {
-        return Err(
-            "custom mobile broker URLs are dev/test-only; production mobile access uses tycode.dev"
-                .to_owned(),
-        );
-    }
-    Ok(())
-}
-
-fn is_loopback_broker_url(url: &BrokerUrl) -> bool {
-    url::Url::parse(url.as_str())
-        .ok()
-        .is_some_and(|parsed| is_loopback_url(&parsed))
-}
-
-fn is_loopback_url(parsed: &url::Url) -> bool {
-    match parsed.host() {
-        Some(url::Host::Domain(host)) => {
-            host.eq_ignore_ascii_case("localhost")
-                || host
-                    .parse::<IpAddr>()
-                    .map(|addr| addr.is_loopback())
-                    .unwrap_or(false)
-        }
-        Some(url::Host::Ipv4(addr)) => addr.is_loopback(),
-        Some(url::Host::Ipv6(addr)) => addr.is_loopback(),
-        None => false,
-    }
 }
 
 pub(crate) fn normalize_backend_list(backends: Vec<BackendKind>) -> Vec<BackendKind> {

@@ -3994,7 +3994,7 @@ pub struct AppState {
     /// control.
     pub compaction_capability: RwSignal<HashMap<AgentId, CompactionCapabilitySnapshot>>,
     /// Latest server-pushed `MobileAccessState` snapshot per host. The
-    /// payload carries broker status, the pairing-lifecycle phase
+    /// payload carries connection status, the pairing-lifecycle phase
     /// (`Idle | Active | Consumed | Expired | Cancelled | Failed`), and
     /// the paired-device list. The Mobile settings tab reads from this
     /// to render pairing status / device list. Server is the source of

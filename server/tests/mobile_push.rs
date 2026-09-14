@@ -17,14 +17,14 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use fixture::Fixture;
 use hkdf::Hkdf;
-use mqtt_transport::{BrokerAuth, BrokerEndpoint, PreSharedKey, RoomId};
+use mobile_pairing::PreSharedKey;
 use p256::elliptic_curve::rand_core::{OsRng, RngCore};
 use p256::elliptic_curve::sec1::ToEncodedPoint;
 use p256::{PublicKey, SecretKey};
 use protocol::{
-    BrokerUrl, FrameKind, MobileDeviceId, MobileDeviceState, MobilePushNotification,
-    MobilePushReason, MobilePushSubscribePayload, MobilePushSubscription, PushAuthSecret,
-    PushEndpointUrl, PushPublicKey, VapidPrivateKey, VapidPublicKey,
+    FrameKind, MobileDeviceId, MobileDeviceState, MobilePushNotification, MobilePushReason,
+    MobilePushSubscribePayload, MobilePushSubscription, PushAuthSecret, PushEndpointUrl,
+    PushPublicKey, VapidPrivateKey, VapidPublicKey,
 };
 use server::backend::mock::{MockGateHandle, MockScript, MockTurn};
 use server::store::mobile_pairings::{
@@ -220,16 +220,11 @@ fn seed_paired_device() -> tempfile::TempDir {
         std::env::set_var(MOBILE_PAIRINGS_STORE_PATH_ENV, &path);
     }
 
-    let store = MobilePairingsStore::load(path).expect("load pairings store");
+    let store = MobilePairingsStore::load(path.clone()).expect("load pairings store");
     let psk = PreSharedKey::random();
     let mut pairings = MobilePairings::empty();
     pairings.devices.push(MobilePairingRecord {
         device_id: MobileDeviceId(DEVICE_ID.to_owned()),
-        broker: BrokerEndpoint {
-            url: BrokerUrl::new("wss://broker.invalid:8084/mqtt").expect("broker url"),
-            auth: BrokerAuth::Anonymous,
-        },
-        room: RoomId::random(),
         key_fingerprint: key_fingerprint(&psk),
         psk,
         label: "Test phone".to_owned(),
@@ -240,6 +235,19 @@ fn seed_paired_device() -> tempfile::TempDir {
         managed: None,
     });
     store.save(&pairings).expect("seed pairings store");
+    // Existing installations still have these retired fields. The real host
+    // must load the device and deliver its encrypted push after this upgrade.
+    let mut stored: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).expect("read old pairing"))
+            .expect("pairing JSON");
+    stored["devices"][0]["broker"] =
+        serde_json::json!({"url":"wss://retired.invalid/mqtt","auth":{"kind":"anonymous"}});
+    stored["devices"][0]["room"] = serde_json::json!("AAAAAAAAAAAAAAAAAAAAAA");
+    std::fs::write(
+        &path,
+        serde_json::to_vec(&stored).expect("old pairing encoding"),
+    )
+    .expect("write old pairing");
     dir
 }
 

@@ -126,7 +126,7 @@ class TransportProtocolVersionTests(unittest.TestCase):
             target.parent.mkdir(parents=True, exist_ok=True)
             if path == transport_version_check.TRANSPORT_VERSION_PATH:
                 target.write_text(
-                    "pub const MQTT_TRANSPORT_PROTOCOL_VERSION: u32 = 3;\n",
+                    "pub const MOBILE_RTC_PROTOCOL_VERSION: u32 = 3;\n",
                     encoding="utf-8",
                 )
             else:
@@ -144,7 +144,7 @@ class TransportProtocolVersionTests(unittest.TestCase):
 
         with self.assertRaisesRegex(
             transport_version_check.TransportVersionError,
-            "without increasing MQTT_TRANSPORT_PROTOCOL_VERSION",
+            "without increasing MOBILE_RTC_PROTOCOL_VERSION",
         ):
             transport_version_check.check_transport_version(self.root)
 
@@ -152,7 +152,7 @@ class TransportProtocolVersionTests(unittest.TestCase):
         path = self.root / transport_version_check.WIRE_CONTRACT_PATHS[1]
         path.write_text("changed wire contract\n", encoding="utf-8")
         (self.root / transport_version_check.TRANSPORT_VERSION_PATH).write_text(
-            "pub const MQTT_TRANSPORT_PROTOCOL_VERSION: u32 = 4;\n",
+            "pub const MOBILE_RTC_PROTOCOL_VERSION: u32 = 4;\n",
             encoding="utf-8",
         )
 
@@ -173,9 +173,52 @@ class TransportProtocolVersionTests(unittest.TestCase):
 
         self.assertEqual((old, current, changed), (3, 3, ()))
 
+    def test_timer_driver_repair_preserves_wire_guard(self) -> None:
+        path = self.root / transport_version_check.WIRE_CONTRACT_PATHS[3]
+        path.write_text("wasmtimer::tokio::timeout(Duration::from_secs(20), gather)\n")
+        subprocess.run(["git", "add", "."], cwd=self.root, check=True)
+        subprocess.run(["git", "commit", "-qm", "timer baseline"], cwd=self.root, check=True)
+        path.write_text("tyde_time::timeout(Duration::from_secs(20), gather)\n")
+        self.assertEqual(transport_version_check.check_transport_version(self.root, "HEAD")[3], ())
+        path.write_text("tyde_time::timeout(Duration::from_secs(25), gather)\n")
+        with self.assertRaises(transport_version_check.TransportVersionError):
+            transport_version_check.check_transport_version(self.root, "HEAD")
+
+    def test_exported_rtc_type_change_requires_version(self) -> None:
+        path = self.root / transport_version_check.TRANSPORT_VERSION_PATH
+        path.write_text("pub mod mobile_rtc {\n"
+                        "pub const MOBILE_RTC_PROTOCOL_VERSION: u32 = 3;\n"
+                        "pub struct Grant { pub token: String }\n}\npub use mobile_rtc::*;\n")
+        subprocess.run(["git", "add", "."], cwd=self.root, check=True)
+        subprocess.run(["git", "commit", "-qm", "RTC schema baseline"], cwd=self.root, check=True)
+        path.write_text(path.read_text().replace("token: String", "token: Vec<u8>"))
+        with self.assertRaises(transport_version_check.TransportVersionError):
+            transport_version_check.check_transport_version(self.root, "HEAD")
+
+    def test_local_ice_recovery_and_tests_preserve_wire_guard(self) -> None:
+        paths = [self.root / path for path in transport_version_check.WIRE_CONTRACT_PATHS[2:4]]
+        for path, state in zip(paths, ("RTCPeerConnectionState", "RtcPeerConnectionState")):
+            path.write_text(
+                f'fn terminal() {{ matches!(state, {state}::Failed | {state}::Closed | {state}::Disconnected) }}\n'
+                '#[cfg(test)]\nmod wasm_tests { fn outage() { assert_eq!("}", "}"); } }\n'
+                'fn send_ack() { send(&[1]); }\n'
+            )
+        subprocess.run(["git", "add", "."], cwd=self.root, check=True)
+        subprocess.run(["git", "commit", "-qm", "ICE policy baseline"], cwd=self.root, check=True)
+        for path, state in zip(paths, ("RTCPeerConnectionState", "RtcPeerConnectionState")):
+            path.write_text(path.read_text().replace(f" | {state}::Disconnected", "")
+                            .replace('assert_eq!("}", "}");', 'assert!(recovered());'))
+        self.assertEqual(transport_version_check.check_transport_version(self.root, "HEAD")[3], ())
+        for path in paths:
+            unchanged = path.read_text()
+            path.write_text(unchanged.replace("send(&[1])", "send(&[2])"))
+            with self.assertRaises(transport_version_check.TransportVersionError):
+                transport_version_check.check_transport_version(self.root, "HEAD")
+            path.write_text(unchanged)
+
     def test_rejects_transport_version_decrease(self) -> None:
         (self.root / transport_version_check.TRANSPORT_VERSION_PATH).write_text(
-            "pub const MQTT_TRANSPORT_PROTOCOL_VERSION: u32 = 2;\n",
+            "pub const MOBILE_RTC_PROTOCOL_VERSION: u32 = 2;\n",
             encoding="utf-8",
         )
 
