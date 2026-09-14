@@ -9492,6 +9492,14 @@ math merror {
     gap: var(--space-4);
 }
 
+.settings-toggle-row > .settings-segmented-control {
+    flex-shrink: 0;
+}
+
+.settings-toggle-row > .settings-segmented-control .segment {
+    white-space: nowrap;
+}
+
 .settings-toggle {
     position: relative;
     display: inline-flex;
@@ -10304,19 +10312,6 @@ math merror {
     margin: 0;
     font-size: 0.8rem;
     color: var(--text-tertiary);
-}
-
-/* Explicit unset markers so a blank control is never read as a real value. */
-.settings-native-unset {
-    align-self: flex-start;
-    font-size: 0.68rem;
-    text-transform: uppercase;
-    letter-spacing: 0.04em;
-    color: var(--text-tertiary);
-    background: var(--surface-2);
-    border: 1px solid var(--border-primary);
-    border-radius: 4px;
-    padding: 0 var(--space-2);
 }
 
 .settings-native-unset-note {

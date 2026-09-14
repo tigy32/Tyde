@@ -5197,6 +5197,10 @@ fn schema_settings_field(
         .unwrap_or_default();
 
     let present = current.is_some_and(|value| !value.is_null());
+    let nullable = prop_schema
+        .get("type")
+        .and_then(Value::as_array)
+        .is_some_and(|types| types.iter().any(|kind| kind.as_str() == Some("null")));
 
     // The value the backend applies while this field is unset, when the backend
     // could actually read it. Shown as a hint only: it is never committed, so
@@ -5204,17 +5208,27 @@ fn schema_settings_field(
     let default_hint = prop_schema
         .get("x-tyde-default")
         .filter(|value| !value.is_null() && !present);
-    let default_hint_label = prop_schema
+    let default_label = prop_schema
         .get("x-tyde-default-label")
-        .and_then(Value::as_str)
-        .unwrap_or("Default");
-    let default_display = default_hint.map(|value| {
-        let text = match value.as_str() {
-            Some(text) => text.to_owned(),
-            None => value.to_string(),
-        };
-        format!("{default_hint_label} · {text}")
-    });
+        .and_then(Value::as_str);
+    let default_display = match (default_label, default_hint) {
+        (label, Some(value)) => {
+            let text = match value {
+                Value::Bool(true) => "On".to_owned(),
+                Value::Bool(false) => "Off".to_owned(),
+                Value::String(text) => prop_schema
+                    .get("x-tyde-enum-labels")
+                    .and_then(|labels| labels.get(text))
+                    .and_then(Value::as_str)
+                    .unwrap_or(text)
+                    .to_owned(),
+                other => other.to_string(),
+            };
+            Some(format!("{} ({text})", label.unwrap_or("Default")))
+        }
+        (Some(label), None) => Some(label.to_owned()),
+        (None, None) => None,
+    };
 
     let control = if secret {
         let has_value = current
@@ -5270,7 +5284,12 @@ fn schema_settings_field(
                 return;
             }
             let el: web_sys::HtmlSelectElement = ev.target().unwrap().unchecked_into();
-            target.commit(Value::String(el.value()));
+            let value = el.value();
+            target.commit(if nullable && value.is_empty() {
+                Value::Null
+            } else {
+                Value::String(value)
+            });
         };
         view! {
             <select
@@ -5280,10 +5299,12 @@ fn schema_settings_field(
                 aria-label=aria_label
                 on:change=on_change
             >
-                {(!present)
+                {(nullable || !present)
                     .then(|| {
                         // Selected while unset, so the backend's default is
-                        // visible without the field claiming to be set.
+                        // visible without the field claiming to be set. A
+                        // nullable field keeps it offered after a value is
+                        // chosen, so returning to the default is one pick.
                         let label = default_display
                             .clone()
                             .unwrap_or_else(|| "Not set".to_owned());
@@ -5295,10 +5316,58 @@ fn schema_settings_field(
         .into_any()
     } else {
         match schema_type {
+            Some("boolean") if nullable => {
+                // Unset, on, and off are three different saved states, so a
+                // two-state switch cannot show them: unset would have to
+                // borrow the look of on or off. Each gets its own segment, and
+                // choosing the default segment clears the override.
+                let current = current.and_then(Value::as_bool);
+                let default_text = default_display
+                    .clone()
+                    .unwrap_or_else(|| "Default".to_owned());
+                let segments = [
+                    (default_text, None),
+                    ("On".to_owned(), Some(true)),
+                    ("Off".to_owned(), Some(false)),
+                ]
+                .into_iter()
+                .map(|(text, choice)| {
+                    let target = target.clone();
+                    let selected = current == choice;
+                    let on_click = move |_| {
+                        if disabled && !target.is_host() {
+                            return;
+                        }
+                        target.commit(choice.map_or(Value::Null, Value::Bool));
+                    };
+                    view! {
+                        <button
+                            type="button"
+                            class=if selected { "segment active" } else { "segment" }
+                            aria-pressed=if selected { "true" } else { "false" }
+                            disabled=disabled
+                            on:click=on_click
+                        >
+                            {text}
+                        </button>
+                    }
+                })
+                .collect::<Vec<_>>();
+                view! {
+                    <div
+                        class="settings-segmented-control"
+                        role="group"
+                        aria-label=schema_field_aria_label(&target, &label)
+                    >
+                        {segments}
+                    </div>
+                }
+                .into_any()
+            }
             Some("boolean") => {
                 // An unset toggle shows the default in force rather than a bare
                 // off state, which would misreport any setting the backend
-                // defaults on. The caption says it is not a user setting.
+                // defaults on.
                 let current = current
                     .and_then(Value::as_bool)
                     .or_else(|| default_hint.and_then(Value::as_bool))
@@ -5340,7 +5409,9 @@ fn schema_settings_field(
                         return;
                     }
                     let el: web_sys::HtmlInputElement = ev.target().unwrap().unchecked_into();
-                    if let Ok(parsed) = el.value().parse::<i64>()
+                    if nullable && el.value().trim().is_empty() {
+                        target.commit(Value::Null);
+                    } else if let Ok(parsed) = el.value().parse::<i64>()
                         && minimum.is_none_or(|min| parsed as f64 >= min)
                         && maximum.is_none_or(|max| parsed as f64 <= max)
                     {
@@ -5356,7 +5427,7 @@ fn schema_settings_field(
                             step=step
                             class="settings-input settings-native-input settings-supervisor-number-input"
                             prop:value=move || current.map(|n| n.to_string()).unwrap_or_default()
-                            placeholder=(!present)
+                            placeholder=(nullable || !present)
                             .then(|| default_display.clone().unwrap_or_else(|| "Not set".to_owned()))
                             autocomplete="off"
                             disabled=disabled
@@ -5385,7 +5456,9 @@ fn schema_settings_field(
                         return;
                     }
                     let el: web_sys::HtmlInputElement = ev.target().unwrap().unchecked_into();
-                    if let Ok(parsed) = el.value().parse::<f64>()
+                    if nullable && el.value().trim().is_empty() {
+                        target.commit(Value::Null);
+                    } else if let Ok(parsed) = el.value().parse::<f64>()
                         && minimum.is_none_or(|min| parsed >= min)
                         && maximum.is_none_or(|max| parsed <= max)
                         && let Some(number) = serde_json::Number::from_f64(parsed)
@@ -5401,7 +5474,7 @@ fn schema_settings_field(
                         step=step
                         class="settings-input settings-native-input"
                         prop:value=move || current.map(|n| n.to_string()).unwrap_or_default()
-                        placeholder=(!present)
+                        placeholder=(nullable || !present)
                             .then(|| default_display.clone().unwrap_or_else(|| "Not set".to_owned()))
                         autocomplete="off"
                         disabled=disabled
@@ -5422,14 +5495,19 @@ fn schema_settings_field(
                         return;
                     }
                     let el: web_sys::HtmlInputElement = ev.target().unwrap().unchecked_into();
-                    target.commit(Value::String(el.value()));
+                    let value = el.value();
+                    target.commit(if nullable && value.is_empty() {
+                        Value::Null
+                    } else {
+                        Value::String(value)
+                    });
                 };
                 view! {
                     <input
                         type="text"
                         class="settings-input settings-native-input"
                         prop:value=current
-                        placeholder=(!present)
+                        placeholder=(nullable || !present)
                             .then(|| default_display.clone().unwrap_or_else(|| "Not set".to_owned()))
                         autocomplete="off"
                         spellcheck="false"
@@ -5451,17 +5529,12 @@ fn schema_settings_field(
         }
     };
 
-    // Explicit unset marker so neither a blank control nor a rendered default
-    // is ever read as a value this field is actually set to.
-    let unset_caption = (!present).then(|| {
-        let caption = match &default_display {
-            Some(_) => format!("Unset · {default_hint_label}"),
-            None => "Unset".to_owned(),
-        };
-        view! { <span class="settings-native-unset">{caption}</span> }
-    });
-
+    // A nullable toggle or choice list already offers the default as one of
+    // its own choices, so a separate reset button would repeat it.
+    let default_in_control =
+        nullable && !secret && (schema_type == Some("boolean") || !enum_values.is_empty());
     let reset = (present
+        && !default_in_control
         && prop_schema
             .get("x-tyde-reset-label")
             .and_then(Value::as_str)
@@ -5491,7 +5564,6 @@ fn schema_settings_field(
                     </div>
                     {control}
                 </div>
-                {unset_caption}
                 {reset}
             </div>
         }
@@ -5502,7 +5574,6 @@ fn schema_settings_field(
                 <label class="settings-label">{label}</label>
                 {description.map(|text| view! { <p class="settings-description">{text}</p> })}
                 {control}
-                {unset_caption}
                 {reset}
             </div>
         }
@@ -14161,7 +14232,8 @@ mod wasm_tests {
             ("memory", "Memory", "features.memories", serde_json::json!({"title":"Enable Codex memory","type":["boolean","null"]})),
             ("advanced", "Advanced", "allow_login_shell", serde_json::json!({"title":"Allow login shells","type":["boolean","null"],"x-tyde-default":true,"x-tyde-default-label":"Codex default"})),
         ].into_iter().map(|(id,title,key,mut property)| {
-            property["x-tyde-reset-label"] = serde_json::json!("Use CLI default");
+            property["x-tyde-reset-label"] = serde_json::json!("Use Codex default");
+            property["x-tyde-default-label"] = serde_json::json!("Codex default");
             BackendNativeSettingsGroup { id:id.to_owned(),title:title.to_owned(),kind:BackendNativeSettingsGroupKind::Core,
                 settings_path:vec!["values".to_owned()],description:None,
                 schema:serde_json::json!({"properties":{key:property}}) }
@@ -14186,27 +14258,48 @@ mod wasm_tests {
             vec!["Defaults", "Subagents", "Responses", "Memory", "Advanced"]
         );
 
-        // An unset boolean shows the default in force, not a bare off state
-        // that would misreport a setting the backend defaults on.
+        // An unset boolean selects the default, naming the value in force,
+        // and neither explicit choice: it must not read as a set on or off.
         native_tab_by_label(&container, "Advanced").click();
         next_tick().await;
         let advanced = &native_panels(&container)[4];
-        let login_shell: HtmlInputElement = advanced
-            .query_selector("input[type=checkbox]")
-            .unwrap()
-            .expect("the login-shell toggle must render")
-            .dyn_into()
-            .unwrap();
-        assert!(
-            login_shell.checked(),
-            "an unset toggle must show the reported default, not off"
+        assert_eq!(
+            choice_segments(advanced),
+            vec![
+                ("Codex default (On)".to_owned(), true),
+                ("On".to_owned(), false),
+                ("Off".to_owned(), false),
+            ],
+            "an unset boolean must select the named default, not on or off"
         );
         assert!(
-            advanced
+            !advanced
                 .text_content()
                 .unwrap_or_default()
-                .contains("Unset · Codex default"),
-            "the rendered default must be captioned as unset, not as a set value"
+                .contains("Unset"),
+            "the selected default says the field is unset; a caption repeats it"
+        );
+
+        // A set boolean selects its explicit value, and the default stays one
+        // pick away inside the control rather than behind a separate button.
+        native_tab_by_label(&container, "Memory").click();
+        next_tick().await;
+        let memory = &native_panels(&container)[3];
+        assert_eq!(
+            choice_segments(memory),
+            vec![
+                ("Codex default".to_owned(), false),
+                ("On".to_owned(), true),
+                ("Off".to_owned(), false),
+            ],
+            "a set boolean must select its value, distinct from the default"
+        );
+        assert!(
+            !memory
+                .text_content()
+                .unwrap_or_default()
+                .contains("Use Codex default"),
+            "a boolean offering its default must not repeat it as a reset button"
         );
 
         // An unset enum keeps its empty selection while naming the default.
@@ -14228,7 +14321,7 @@ mod wasm_tests {
             responses
                 .text_content()
                 .unwrap_or_default()
-                .contains("Codex default · pragmatic"),
+                .contains("Codex default (pragmatic)"),
             "the unset option must name the default in force"
         );
 
@@ -14273,6 +14366,7 @@ mod wasm_tests {
             rendered_limit.disabled(),
             "editing must lock the rendered field until the server responds"
         );
+        let refreshed_after_limit = snapshot.clone();
         let mut refreshed = snapshot;
         refreshed.settings = Some(sent["settings"].clone());
         state.native_settings_save_state.set(Default::default());
@@ -14293,7 +14387,7 @@ mod wasm_tests {
         let buttons = panel.query_selector_all("button").unwrap();
         let reset = (0..buttons.length())
             .filter_map(|i| buttons.item(i))
-            .find(|button| button.text_content().as_deref() == Some("Use CLI default"))
+            .find(|button| button.text_content().as_deref() == Some("Use Codex default"))
             .expect("reset control");
         reset.dyn_into::<HtmlElement>().unwrap().click();
         for _ in 0..3 {
@@ -14302,6 +14396,34 @@ mod wasm_tests {
         let sent = last_native_settings(&calls).expect("Codex reset");
         assert!(sent["settings"]["values"]["agents.max_concurrent_threads_per_session"].is_null());
         assert_eq!(sent["settings"]["values"]["features.memories"], true);
+
+        let mut refreshed = refreshed_after_limit;
+        refreshed.settings = Some(sent["settings"].clone());
+        state.native_settings_save_state.set(Default::default());
+        state.backend_native_settings.update(|hosts| {
+            hosts
+                .get_mut(TYCODE_HOST)
+                .unwrap()
+                .insert(BackendKind::Codex, refreshed);
+        });
+        for _ in 0..3 {
+            next_tick().await;
+        }
+        native_tab_by_label(&container, "Memory").click();
+        next_tick().await;
+        choice_segment(&native_panels(&container)[3], "Codex default").click();
+        for _ in 0..3 {
+            next_tick().await;
+        }
+        let sent = last_native_settings(&calls).expect("Codex boolean reset");
+        assert!(
+            sent["settings"]["values"]["features.memories"].is_null(),
+            "choosing the default must clear the override, not save on or off"
+        );
+        assert!(
+            sent["settings"]["values"]["agents.max_concurrent_threads_per_session"].is_null(),
+            "clearing one override must keep the earlier reset"
+        );
     }
 
     /// A Ready snapshot renders each server-provided group with its current
@@ -15477,7 +15599,7 @@ mod wasm_tests {
         );
     }
 
-    /// Absent properties render an explicit unset state (marker + "Not set"
+    /// Absent properties render an explicit unset state (a "Not set"
     /// placeholder), never a blank/default control that reads as a real value.
     #[wasm_bindgen_test]
     async fn tycode_native_settings_missing_values_show_unset() {
@@ -15514,11 +15636,6 @@ mod wasm_tests {
         });
         next_tick().await;
 
-        let text = container.text_content().unwrap_or_default();
-        assert!(
-            text.contains("Unset"),
-            "an absent property must be marked unset: {text:?}"
-        );
         // The present `model` seeds a real value; the absent `region` is unset.
         let inputs = container
             .query_selector_all("input[type=\"text\"].settings-native-input")
@@ -15639,15 +15756,14 @@ mod wasm_tests {
             .dyn_into()
             .unwrap();
         assert_eq!(endpoint.value(), "https://api.example");
-        let checkbox: HtmlInputElement = container
-            .query_selector("input[type=\"checkbox\"]")
-            .unwrap()
-            .expect("a nullable boolean renders a checkbox")
-            .dyn_into()
-            .unwrap();
-        assert!(
-            checkbox.checked(),
-            "the nullable boolean seeds from its current value"
+        assert_eq!(
+            choice_segments(&container),
+            vec![
+                ("Default".to_owned(), false),
+                ("On".to_owned(), true),
+                ("Off".to_owned(), false),
+            ],
+            "the nullable boolean seeds its explicit value, distinct from the default"
         );
     }
 
@@ -15749,7 +15865,7 @@ mod wasm_tests {
     }
 
     /// An explicit JSON `null` from the server is unset, not a concrete value:
-    /// a nullable boolean shows unchecked-and-marked-unset (not a real `false`),
+    /// a nullable boolean selects its default choice (not a real `false`),
     /// an enum shows "Not set" (not a real option), and a string shows empty with
     /// a "Not set" hint. Non-null siblings still render their real value.
     #[wasm_bindgen_test]
@@ -15795,16 +15911,6 @@ mod wasm_tests {
         });
         next_tick().await;
 
-        // Three null fields are marked unset; the non-null `model` is not.
-        assert_eq!(
-            container
-                .query_selector_all(".settings-native-unset")
-                .unwrap()
-                .length(),
-            3,
-            "each explicit-null field is marked unset; the non-null one is not"
-        );
-
         // Enum null → "Not set" (empty), not a real option.
         let select: HtmlSelectElement = container
             .query_selector(".settings-native-group select")
@@ -15818,16 +15924,15 @@ mod wasm_tests {
             "an explicit-null enum shows Not set, not a concrete option"
         );
 
-        // Boolean null → unchecked AND marked unset, never a concrete false.
-        let checkbox: HtmlInputElement = container
-            .query_selector("input[type=\"checkbox\"]")
-            .unwrap()
-            .expect("a nullable boolean renders a checkbox")
-            .dyn_into()
-            .unwrap();
-        assert!(
-            !checkbox.checked(),
-            "an explicit-null boolean must not render as a concrete checked value"
+        // Boolean null → the default choice, never a concrete on or off.
+        assert_eq!(
+            choice_segments(&container),
+            vec![
+                ("Default".to_owned(), true),
+                ("On".to_owned(), false),
+                ("Off".to_owned(), false),
+            ],
+            "an explicit-null boolean must select the default, not on or off"
         );
 
         // Field order is alphabetical: endpoint (0), model (1).
@@ -16003,6 +16108,33 @@ mod wasm_tests {
         (0..panels.length())
             .map(|i| panels.item(i).unwrap().dyn_into().unwrap())
             .collect()
+    }
+
+    /// Each choice button under `root` as the user reads it: its label and
+    /// whether it is the pressed choice.
+    fn choice_segments(root: &HtmlElement) -> Vec<(String, bool)> {
+        let buttons = root
+            .query_selector_all("[role=\"group\"] button[aria-pressed]")
+            .unwrap();
+        (0..buttons.length())
+            .map(|i| {
+                let button = buttons.item(i).unwrap().dyn_into::<HtmlElement>().unwrap();
+                (
+                    button.text_content().unwrap_or_default(),
+                    button.get_attribute("aria-pressed").as_deref() == Some("true"),
+                )
+            })
+            .collect()
+    }
+
+    fn choice_segment(root: &HtmlElement, label: &str) -> HtmlElement {
+        let buttons = root
+            .query_selector_all("[role=\"group\"] button[aria-pressed]")
+            .unwrap();
+        (0..buttons.length())
+            .filter_map(|i| buttons.item(i)?.dyn_into::<HtmlElement>().ok())
+            .find(|button| button.text_content().as_deref() == Some(label))
+            .unwrap_or_else(|| panic!("no choice labelled {label:?}"))
     }
 
     /// A backend whose native settings span several groups renders them as a tab

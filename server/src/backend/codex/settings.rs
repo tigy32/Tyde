@@ -95,7 +95,7 @@ fn fields(models: &[Value], config: &Value) -> Vec<Field> {
             key: "service_tier",
             title: "Default speed",
             group: "defaults",
-            description: "Service tier for new chats. Default means standard speed; accelerated tiers can cost more and require account access.",
+            description: "Service tier for new chats. Faster tiers can cost more and require account access.",
             schema: choices(speed),
         },
         Field {
@@ -186,7 +186,7 @@ fn fields(models: &[Value], config: &Value) -> Vec<Field> {
             key: "model_auto_compact_token_limit",
             title: "Automatic compaction threshold",
             group: "advanced",
-            description: "Context tokens that trigger automatic compaction. Unset uses the model default.",
+            description: "Context tokens that trigger automatic compaction. Codex's default depends on the model.",
             schema: integer(),
         },
         Field {
@@ -419,29 +419,34 @@ fn snapshot(
                 }
                 schema["x-tyde-enum-labels"] = json!(labels);
             }
-            schema["x-tyde-reset-label"] = json!("Use CLI default");
+            schema["x-tyde-reset-label"] = json!("Use Codex default");
             if let Some(options) = schema.get_mut("enum").and_then(Value::as_array_mut)
                 && let Some(value) = values.get(field.key)
                 && !options.contains(value)
             {
                 options.push(value.clone());
             }
+            schema["x-tyde-default-label"] = json!("Codex default");
             let default = field_default(field.key, config, raw, models, selected, catalog);
             if let Some(default) = &default {
                 schema["x-tyde-default"] = default.clone();
-                schema["x-tyde-default-label"] = json!("Codex default");
             }
-            let inherited = config_value(config, field.key).filter(|value| !value.is_null());
-            schema["description"] = json!(match (&default, inherited) {
-                // The control renders the default itself, so the description
-                // only has to say what leaving the field unset means.
-                (Some(_), _) => format!("{} Unset uses Codex's default.", field.description),
-                (None, Some(value)) => format!(
-                    "{} Current effective CLI value: {value}. Unset removes your user override.",
+            // Every control already offers "Codex default", so the description
+            // only adds what the control cannot show: a value another Codex
+            // configuration layer resolves in place of the one shown.
+            let shown = values.get(field.key).or(default.as_ref());
+            let resolved = config_value(config, field.key)
+                .filter(|value| !value.is_null() && Some(*value) != shown)
+                .map(|value| match value {
+                    Value::String(text) => text.clone(),
+                    other => other.to_string(),
+                });
+            schema["description"] = json!(match resolved {
+                Some(value) => format!(
+                    "{} Codex currently resolves this to {value}.",
                     field.description
                 ),
-                (None, None) =>
-                    format!("{} Unset lets Codex choose its default.", field.description),
+                None => field.description.to_owned(),
             });
             properties.insert(field.key.to_owned(), schema);
         }
