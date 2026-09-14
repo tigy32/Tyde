@@ -131,5 +131,6 @@ tokio = { workspace = true }
 tokio = { version = "1", default-features = false, features = ["sync", "macros", "io-util"] }
 
 [dev-dependencies]
-web-sys = { version = "0.3", features = ["HtmlIFrameElement"] }
+ciborium = "0.2"
+web-sys = { version = "0.3", features = ["HtmlIFrameElement", "EventInit"] }
 wasm-bindgen-test = "0.3"

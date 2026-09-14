@@ -91,9 +91,7 @@ fn ScannerScreen() -> impl IntoView {
                         match bridge::classify_pairing_offer(&trimmed).await {
                             Ok(offer) => route_offer(&state, trimmed, offer),
                             Err(e) => {
-                                error.set(Some(format!(
-                                    "Scanned code isn't a Tyde pairing QR: {e}"
-                                )));
+                                error.set(Some(e));
                             }
                         }
                     }
@@ -193,7 +191,7 @@ fn ManualPasteScreen() -> impl IntoView {
         spawn_local(async move {
             match bridge::classify_pairing_offer(&trimmed).await {
                 Ok(offer) => route_offer(&state, trimmed, offer),
-                Err(e) => error.set(Some(format!("Invalid pairing URI: {e}"))),
+                Err(e) => error.set(Some(e)),
             }
             pending.set(false);
         });
@@ -901,38 +899,158 @@ mod wasm_tests {
         );
     }
 
-    /// The paste validation error appears *because the user just tapped Continue*.
-    /// Unannounced, a screen-reader user simply taps it again.
     #[wasm_bindgen_test]
     async fn paste_validation_error_announces_itself() {
+        use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+        use std::{cell::RefCell, rc::Rc};
+        use wasm_bindgen::closure::Closure;
+
+        let window = web_sys::window().unwrap();
+        let repairs = Rc::new(RefCell::new(Vec::new()));
+        let captured = repairs.clone();
+        let listener =
+            Closure::<dyn FnMut(web_sys::CustomEvent)>::new(move |event: web_sys::CustomEvent| {
+                captured
+                    .borrow_mut()
+                    .push(event.detail().as_string().unwrap());
+            });
+        window
+            .add_event_listener_with_callback(
+                "tyde:repair-needed",
+                listener.as_ref().unchecked_ref(),
+            )
+            .unwrap();
+        let state = AppState::new();
+        state
+            .app_mode
+            .set(AppMode::Pairing(PairingScreen::ManualPaste));
+        let mounted = state.clone();
         let container = make_container();
-        let _handle = mount_to(container.clone(), move || {
-            let state = AppState::new();
-            provide_context(state);
-            view! { <PairingFlow screen=PairingScreen::ManualPaste /> }
+        let handle = mount_to(container.clone(), move || {
+            provide_context(mounted.clone());
+            move || match mounted.app_mode.get() {
+                AppMode::Pairing(screen) => view! { <PairingFlow screen=screen /> }.into_any(),
+                _ => ().into_any(),
+            }
         });
         next_tick().await;
-
-        assert!(
-            role_of(&container, "pairing-paste-error").is_none(),
-            "nothing has failed yet — an alert here would be inventing one"
-        );
-
-        // Tap Continue with an empty box: the product itself calls this an error.
+        assert!(role_of(&container, "pairing-paste-error").is_none());
         let continue_button: HtmlElement = container
             .query_selector("button.ui-button-primary")
             .unwrap()
-            .expect("Continue must render")
+            .unwrap()
             .dyn_into()
             .unwrap();
         continue_button.click();
         next_tick().await;
-
         assert_eq!(
             role_of(&container, "pairing-paste-error").as_deref(),
-            Some("alert"),
-            "the validation failure must be announced when it appears"
+            Some("alert")
         );
+
+        let input: web_sys::HtmlTextAreaElement = container
+            .query_selector("textarea")
+            .unwrap()
+            .unwrap()
+            .dyn_into()
+            .unwrap();
+        let submit = |uri: &str| {
+            input.set_value(uri);
+            let init = web_sys::EventInit::new();
+            init.set_bubbles(true);
+            input
+                .dispatch_event(&web_sys::Event::new_with_event_init_dict("input", &init).unwrap())
+                .unwrap();
+            continue_button.click();
+        };
+
+        let mut payload = bridge::web::tests_support::sample_managed_payload();
+        payload.protocol_version = protocol::PROTOCOL_VERSION + 1;
+        let mut fields: ciborium::Value =
+            ciborium::from_reader(payload.encode_cbor().unwrap().as_slice()).unwrap();
+        // beta 11 rejected beta 12's removed `broker` before it read the
+        // protocol. Model the next schema removing a currently required field.
+        fields
+            .as_map_mut()
+            .unwrap()
+            .retain(|(key, _)| key.as_text() != Some("host_label"));
+        let encode = |fields: &ciborium::Value| {
+            let mut bytes = Vec::new();
+            ciborium::into_writer(fields, &mut bytes).unwrap();
+            format!(
+                "https://tycode.dev/tyde/#tyde-pair://v2?{}",
+                URL_SAFE_NO_PAD.encode(bytes)
+            )
+        };
+        let future_uri = encode(&fields);
+        submit(&future_uri);
+        next_tick().await;
+        let observed = repairs.borrow().clone();
+        let message = container.text_content().unwrap();
+        // Clear the capture even on the red run: later UI flows must be isolated.
+        window
+            .remove_event_listener_with_callback(
+                "tyde:repair-needed",
+                listener.as_ref().unchecked_ref(),
+            )
+            .unwrap();
+        assert_eq!(
+            observed,
+            vec![future_uri.clone()],
+            "a different schema must reach the loader before full decoding: {message}"
+        );
+        assert!(
+            message.contains("Switching"),
+            "explain the client switch: {message}"
+        );
+        assert!(
+            !message.contains("missing field"),
+            "the old schema must not decode the new payload"
+        );
+        window
+            .add_event_listener_with_callback(
+                "tyde:repair-needed",
+                listener.as_ref().unchecked_ref(),
+            )
+            .unwrap();
+        repairs.borrow_mut().clear();
+
+        for (key, value) in fields.as_map_mut().unwrap() {
+            if key.as_text() == Some("protocol_version") {
+                *value = ciborium::Value::Integer(protocol::PROTOCOL_VERSION.into());
+            }
+        }
+        submit(&encode(&fields));
+        next_tick().await;
+        let observed = repairs.borrow().clone();
+        window
+            .remove_event_listener_with_callback(
+                "tyde:repair-needed",
+                listener.as_ref().unchecked_ref(),
+            )
+            .unwrap();
+        let message = container.text_content().unwrap();
+        assert!(
+            observed.is_empty(),
+            "malformed current-version codes must not cause repair loops"
+        );
+        assert!(
+            message.contains("missing field `host_label`"),
+            "current-version payloads remain fully validated: {message}"
+        );
+        assert_eq!(
+            role_of(&container, "pairing-paste-error").as_deref(),
+            Some("alert")
+        );
+
+        submit(&bridge::web::tests_support::sample_managed_uri());
+        next_tick().await;
+        assert!(
+            container.text_content().unwrap().contains("Living Room"),
+            "a valid current-version code proceeds to the host pairing screen"
+        );
+        drop(handle);
+        container.remove();
     }
 
     /// `AuthFailed` and `ServiceUnavailable` both name a failure in the product state.

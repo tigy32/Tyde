@@ -4420,6 +4420,7 @@ name = "mobile-frontend"
 version = "0.0.0"
 dependencies = [
  "base64 0.22.1",
+ "ciborium",
  "console_error_panic_hook",
  "console_log",
  "futures-channel",

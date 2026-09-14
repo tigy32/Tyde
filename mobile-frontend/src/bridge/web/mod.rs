@@ -13,7 +13,9 @@ mod service;
 mod store;
 
 use host_config::HostLineEvent;
-use mobile_pairing::{MobilePairingQrOffer, parse_mobile_pairing_qr_offer};
+use mobile_pairing::{
+    MobilePairingQrOffer, mobile_pairing_qr_protocol_version, parse_mobile_pairing_qr_offer,
+};
 use mobile_shell_types::{
     KnownConnectionInstance, LocalHostId, PairedHostConnectionStatusEvent, PairedHostSummary,
 };
@@ -92,28 +94,28 @@ pub fn take_pending_pairing_uri() -> Option<String> {
 /// loader self-heal reboot the legacy path uses, then returns an error so this
 /// bundle never proceeds.
 pub async fn classify_pairing_offer(qr_uri: &str) -> Result<PairingOffer, String> {
+    if let Some(version) = mobile_pairing_qr_protocol_version(qr_uri)
+        .map_err(|error| format!("invalid mobile pairing URI: {error}"))?
+        && version != PROTOCOL_VERSION
+    {
+        log::info!(
+            "mobile_pairing_schema_handoff host_protocol={version} client_protocol={PROTOCOL_VERSION}"
+        );
+        request_loader_repair(qr_uri);
+        return Err(
+            "Switching to the client for this host. If this page does not reload, open the \
+             pairing QR with your phone's Camera app."
+                .to_owned(),
+        );
+    }
     let offer = parse_mobile_pairing_qr_offer(qr_uri)
         .map_err(|error| format!("invalid mobile pairing URI: {error}"))?;
     match offer {
         MobilePairingQrOffer::ManagedService(payload) => {
-            if payload.protocol_version != PROTOCOL_VERSION {
-                request_loader_repair(qr_uri);
-                return Err(format!(
-                    "unsupported Tyde protocol version {}, expected {}",
-                    payload.protocol_version, PROTOCOL_VERSION
-                ));
-            }
             let host_label = normalize_host_label(payload.host_label.clone())?;
             Ok(PairingOffer::ManagedService { host_label })
         }
         MobilePairingQrOffer::Direct(payload) => {
-            if payload.protocol_version != PROTOCOL_VERSION {
-                request_loader_repair(qr_uri);
-                return Err(format!(
-                    "unsupported Tyde protocol version {}, expected {}",
-                    payload.protocol_version, PROTOCOL_VERSION
-                ));
-            }
             let host_label = normalize_host_label(payload.host_label.clone())?;
             Ok(PairingOffer::SelfHosted { host_label })
         }

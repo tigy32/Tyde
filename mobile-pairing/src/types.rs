@@ -472,6 +472,38 @@ fn is_pairing_uri(value: &str) -> bool {
         || value.starts_with(LEGACY_PAIRING_URI_PREFIX)
 }
 
+/// Reads the stable version header before version-specific offer fields.
+/// This does not validate an offer or authorize redemption.
+pub fn mobile_pairing_qr_protocol_version(input: &str) -> Result<Option<u32>, TransportTypeError> {
+    let trimmed = input.trim();
+    let uri = if is_pairing_uri(trimmed) {
+        trimmed
+    } else {
+        trimmed
+            .split_once('#')
+            .map_or(trimmed, |(_, fragment)| fragment)
+    };
+    let Some(encoded) = uri
+        .strip_prefix(MANAGED_PAIRING_URI_PREFIX)
+        .or_else(|| uri.strip_prefix(DIRECT_PAIRING_URI_PREFIX))
+    else {
+        return Ok(None);
+    };
+    let bytes =
+        URL_SAFE_NO_PAD
+            .decode(encoded)
+            .map_err(|error| TransportTypeError::InvalidBase64 {
+                type_name: "mobile pairing QR header",
+                message: error.to_string(),
+            })?;
+    #[derive(Deserialize)]
+    struct Header {
+        protocol_version: u32,
+    }
+    let header: Header = decode_cbor("mobile pairing QR header", &bytes)?;
+    Ok(Some(header.protocol_version))
+}
+
 pub fn parse_mobile_pairing_qr_offer(
     input: &str,
 ) -> Result<MobilePairingQrOffer, TransportTypeError> {

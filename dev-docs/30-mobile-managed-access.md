@@ -50,3 +50,16 @@ so host and mobile must run matching release bundles. This does not change the
 WebRTC transport version. The service's broker-free schema and infrastructure
 must be deployed through the separately reviewed retirement rollout documented
 in `TydeMobileService`; local code changes do not remove deployed resources.
+
+In-app classification reads the stable `protocol_version` header before
+version-specific offer fields. A different protocol requests the loader
+handoff, which resolves the QR's release against the manifest and validates
+its published protocol before booting it. Matching protocols still require the
+full payload to validate. Only protocol numbers are logged, never the QR.
+
+Beta 11 requires the removed `broker` field before noticing beta 12's protocol,
+so its scanner reports a CBOR missing-field error. Opening a fresh host QR
+through the phone's Camera app reaches the stable HTTPS loader, which loads the
+matching client before full decoding. Reloading a remembered beta 11 client
+alone may keep selecting beta 11. This ordering fix applies to newly shipped
+clients; it cannot change code inside an already published older bundle.
