@@ -3615,7 +3615,10 @@ profile = "minimal"
 
 
 def load_tests(loader, suite, pattern):
-    from test_release_tooling import TransportProtocolVersionTests
+    if __package__:
+        from .test_release_tooling import TransportProtocolVersionTests
+    else:
+        from test_release_tooling import TransportProtocolVersionTests
 
     suite.addTests(loader.loadTestsFromTestCase(TransportProtocolVersionTests))
     return suite
