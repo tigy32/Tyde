@@ -49,10 +49,7 @@ use crate::bridge::{
     SubmissionTransportOutcome, SubmissionTransportOutcomeEvent,
 };
 
-#[cfg(not(target_arch = "wasm32"))]
-use tokio::time::{sleep, timeout};
-#[cfg(target_arch = "wasm32")]
-use wasmtimer::tokio::{sleep, timeout};
+use tyde_time::{sleep, timeout};
 
 const CONNECTION_CHANNEL_CAPACITY: usize = 256;
 const CONNECT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(60);
@@ -387,6 +384,14 @@ impl ConnectionManager {
         self.spawn_connection(local_host_id).await
     }
 
+    pub async fn reconnect(&self, local_host_id: LocalHostId) -> Result<(), String> {
+        if self.inner.borrow().active.contains_key(&local_host_id) {
+            self.disconnect(local_host_id.clone())?;
+        }
+        log::info!("mobile_connection_control host={local_host_id} control=Reconnect");
+        self.connect(local_host_id).await
+    }
+
     pub fn disconnect(&self, local_host_id: LocalHostId) -> Result<(), String> {
         let active = self
             .inner
@@ -411,16 +416,17 @@ impl ConnectionManager {
         local_host_id: &LocalHostId,
         reason: ConnectionInvalidation,
     ) -> Result<(), InvalidationRejected> {
+        #[cfg(target_arch = "wasm32")]
+        let interrupt_connect = matches!(&reason, ConnectionInvalidation::ForegroundResume { .. });
+        #[cfg(not(target_arch = "wasm32"))]
+        let interrupt_connect = false;
         let control = self
             .inner
             .borrow()
             .active
             .get(local_host_id)
-            .and_then(|active| {
-                active
-                    .connection_instance_id
-                    .map(|_| active.control.clone())
-            })
+            .filter(|active| active.connection_instance_id.is_some() || interrupt_connect)
+            .map(|active| active.control.clone())
             .ok_or(InvalidationRejected::NotConnected)?;
         if control.is_closed() {
             return Err(InvalidationRejected::ConnectionClosed);
@@ -841,7 +847,14 @@ impl ConnectionManager {
             "mobile host {local_host_id} has failed {attempts} consecutive reconnect attempts; \
              still retrying: {error}"
         );
-        self.emit_connecting(local_host_id, actor_instance_id);
+        self.set_status_and_emit(
+            local_host_id.clone(),
+            PairedHostConnectionStatus::Failed {
+                code: error.error_code(),
+                message: format!("{error}. Retrying automatically."),
+            },
+            None,
+        );
     }
 }
 
@@ -868,9 +881,8 @@ impl std::fmt::Display for ConnectErr {
             Self::Io(error) => write!(f, "I/O error on Tyde byte stream: {error}"),
             Self::Timeout => write!(
                 f,
-                "WebRTC connection attempt timed out after {CONNECT_ATTEMPT_TIMEOUT:?}: no transport \
-                 failure was reported, but the host never completed the rendezvous — it may be \
-                 offline, asleep, or not running Tyde"
+                "Connection attempt timed out after {CONNECT_ATTEMPT_TIMEOUT:?}. \
+                 Check your network and that the host is running Tyde"
             ),
             Self::WriterDeadline {
                 local_submission_id,
@@ -1169,15 +1181,22 @@ async fn connect_managed_once(
     record: &WebPairedHostRecord,
     psk: &PreSharedKey,
 ) -> Result<rtc_transport::RtcStream, ConnectErr> {
-    let credentials = super::service::obtain_rtc_credentials(record).await?;
-    match timeout(
-        CONNECT_ATTEMPT_TIMEOUT,
-        rtc_transport::connect(credentials, psk.as_bytes()),
-    )
-    .await
-    {
-        Ok(Ok(stream)) => Ok(stream),
-        Ok(Err(error)) => Err(ConnectErr::Rtc(error)),
+    let attempt = async {
+        log::info!(
+            "mobile_connect_attempt host={} stage=credentials",
+            record.local_host_id
+        );
+        let credentials = super::service::obtain_rtc_credentials(record).await?;
+        log::info!(
+            "mobile_connect_attempt host={} stage=signaling",
+            record.local_host_id
+        );
+        rtc_transport::connect(credentials, psk.as_bytes())
+            .await
+            .map_err(ConnectErr::Rtc)
+    };
+    match timeout(CONNECT_ATTEMPT_TIMEOUT, attempt).await {
+        Ok(result) => result,
         Err(_) => Err(ConnectErr::Timeout),
     }
 }

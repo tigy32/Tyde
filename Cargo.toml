@@ -3,6 +3,7 @@ resolver = "2"
 exclude = ["vendor/webrtc"]
 members = [
     "protocol",
+    "time",
     "settings-model",
     "agent-adapter",
     "server",

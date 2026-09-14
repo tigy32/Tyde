@@ -202,7 +202,7 @@ impl Peer {
             }
             Ok(sdp)
         };
-        wasmtimer::tokio::timeout(Duration::from_secs(20), gather)
+        tyde_time::timeout(Duration::from_secs(20), gather)
             .await
             .map_err(|error| failure("gather TURN candidates", error))?
     }
@@ -224,7 +224,7 @@ impl Peer {
                     .map_err(|error| failure("open data channel", error))?;
             }
         };
-        wasmtimer::tokio::timeout(Duration::from_secs(25), open)
+        tyde_time::timeout(Duration::from_secs(25), open)
             .await
             .map_err(|error| failure("open data channel", error))??;
         tracing::info!("mobile WebRTC data channel opened through TURN");
@@ -234,7 +234,7 @@ impl Peer {
             let run = async {
                 tokio::select! {
                     result = self.run(worker) => result,
-                    _ = wasmtimer::tokio::sleep(lifetime) => Err(failure("credentials", "TURN credential renewal is required")),
+                    _ = tyde_time::sleep(lifetime) => Err(failure("credentials", "TURN credential renewal is required")),
                 }
             };
             if let Ok(Err(error)) = Abortable::new(run, registration).await {
@@ -319,10 +319,10 @@ impl Drop for Peer {
         wasm_bindgen_futures::spawn_local(async move {
             let drain = async {
                 while channel.ready_state() != RtcDataChannelState::Closed {
-                    wasmtimer::tokio::sleep(Duration::from_millis(10)).await;
+                    tyde_time::sleep(Duration::from_millis(10)).await;
                 }
             };
-            if let Err(error) = wasmtimer::tokio::timeout(Duration::from_secs(5), drain).await {
+            if let Err(error) = tyde_time::timeout(Duration::from_secs(5), drain).await {
                 tracing::warn!(%error, "WebRTC acknowledgement drain timed out before close");
             }
             connection.close();
@@ -389,7 +389,7 @@ mod wasm_tests {
             peer.set_answer(answer.sdp)
                 .await
                 .expect("apply native answer");
-            wasmtimer::tokio::timeout(Duration::from_secs(5), async {
+            tyde_time::timeout(Duration::from_secs(5), async {
                 for expected in [b"\x01".as_slice(), b"\x00ready".as_slice()] {
                     let record = peer.messages.recv().await.expect("native startup response");
                     assert_eq!(
@@ -420,13 +420,13 @@ mod wasm_tests {
                 writer.flush().await.expect("peer acknowledged bulk");
             };
             let receive = async {
-                wasmtimer::tokio::sleep(Duration::from_millis(200)).await;
+                tyde_time::sleep(Duration::from_millis(200)).await;
                 for (index, chunk) in received.chunks_mut(256 * 1024).enumerate() {
                     reader.read_exact(chunk).await.expect("read native echo");
                     console_log!("browser TURN received {} bytes", (index + 1) * 256 * 1024);
                 }
             };
-            wasmtimer::tokio::timeout(Duration::from_secs(30), async {
+            tyde_time::timeout(Duration::from_secs(30), async {
                 futures_util::join!(send, receive);
             })
             .await

@@ -3,8 +3,9 @@ name = "rtc-transport"
 edition.workspace = true
 
 [dependencies]
+tyde-time = { path = "../time" }
 base64.workspace = true
-futures-channel = "0.3"
+futures-channel = { version = "0.3", features = ["sink"] }
 futures-util = { version = "0.3", features = ["sink"] }
 hmac = "0.12"
 protocol = { path = "../protocol", default-features = false }
@@ -29,7 +30,6 @@ tokio = { version = "1", default-features = false, features = ["sync", "macros",
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 js-sys = "0.3"
-wasmtimer = "0.4"
 web-sys = { version = "0.3", features = [
     "BinaryType", "Event", "MessageEvent", "WebSocket",
     "RtcConfiguration", "RtcPeerConnection", "RtcIceTransportPolicy",

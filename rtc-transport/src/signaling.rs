@@ -6,10 +6,7 @@ use std::time::Duration;
 
 use crate::{Error, Peer, RtcStream, authenticate_description, failure, verify_description};
 
-#[cfg(not(target_arch = "wasm32"))]
-use tokio::time::{sleep, timeout};
-#[cfg(target_arch = "wasm32")]
-use wasmtimer::tokio::{sleep, timeout};
+use tyde_time::{sleep, timeout};
 
 pub async fn connect(
     credentials: MobileRtcCredentials,

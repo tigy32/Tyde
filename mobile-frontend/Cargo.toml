@@ -7,6 +7,7 @@ default = []
 ui-fixtures = []
 
 [dependencies]
+tyde-time = { path = "../time" }
 protocol = { path = "../protocol" }
 settings-model = { path = "../settings-model" }
 host-config = { path = "../host-config" }
@@ -28,6 +29,8 @@ sha2 = "0.11.0"
 p256 = "0.13"
 base64 = { workspace = true }
 web-sys = { version = "0.3", features = [
+    "AbortController",
+    "AbortSignal",
     "Clipboard",
     "CanvasRenderingContext2d",
     "CustomEvent",
@@ -121,14 +124,11 @@ pulldown-cmark = { version = "0.12", default-features = false, features = ["html
 send_wrapper = "0.6"
 futures-channel = "0.3"
 
-# Native (compile-gate only) timers come from tokio::time; the wasm bundle uses
-# wasmtimer because tokio's `time` driver does not run on wasm32.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tokio = { workspace = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 tokio = { version = "1", default-features = false, features = ["sync", "macros", "io-util"] }
-wasmtimer = "0.4"
 
 [dev-dependencies]
 web-sys = { version = "0.3", features = ["HtmlIFrameElement"] }

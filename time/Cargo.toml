@@ -1,0 +1,12 @@
+[package]
+name = "tyde-time"
+edition.workspace = true
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { version = "1", default-features = false, features = ["time"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+futures-channel = "0.3"
+futures-util = "0.3"
+js-sys = "0.3"
+wasm-bindgen = "0.2"

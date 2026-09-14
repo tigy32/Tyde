@@ -4878,11 +4878,11 @@ dependencies = [
  "settings-model",
  "sha2 0.11.0",
  "tokio",
+ "tyde-time",
  "uuid",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "wasm-bindgen-test",
- "wasmtimer",
  "web-sys",
 ]
 
@@ -6326,7 +6326,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
- "wasmtimer",
+ "tyde-time",
 ]
 
 [[package]]
@@ -7368,12 +7368,12 @@ dependencies = [
  "tokio",
  "tokio-rustls 0.26.4",
  "tracing",
+ "tyde-time",
  "url",
  "uuid",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "wasm-bindgen-test",
- "wasmtimer",
  "web-sys",
  "webpki-roots",
  "webrtc",
@@ -9892,6 +9892,17 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "tyde-time"
+version = "0.0.0"
+dependencies = [
+ "futures-channel",
+ "futures-util",
+ "js-sys",
+ "tokio",
+ "wasm-bindgen",
 ]
 
 [[package]]

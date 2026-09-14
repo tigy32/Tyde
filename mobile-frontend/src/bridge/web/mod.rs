@@ -243,6 +243,10 @@ pub async fn connect_paired_host(local_host_id: &LocalHostId) -> Result<(), Stri
     connection::manager().connect(local_host_id.clone()).await
 }
 
+pub async fn reconnect_paired_host(local_host_id: &LocalHostId) -> Result<(), String> {
+    connection::manager().reconnect(local_host_id.clone()).await
+}
+
 pub async fn disconnect_paired_host(local_host_id: &LocalHostId) -> Result<(), String> {
     connection::manager().disconnect(local_host_id.clone())
 }
@@ -583,6 +587,42 @@ pub(crate) mod tests_support {
         BrokerUrl, ManagedBrokerAuthorizerName, ManagedBrokerEndpoint, ManagedBrokerProvider,
         ManagedBrokerRegion, MobilePairingOfferId, PROTOCOL_VERSION, TydeReleaseVersion,
     };
+
+    pub async fn store_reconnect_host() -> mobile_shell_types::LocalHostId {
+        use super::store::{
+            IndexedDbHostStore, IndexedDbPskStore, ManagedPairingRecord, PskStore,
+            WebPairedHostRecord, store_device_secret,
+        };
+        let local_host_id = mobile_shell_types::LocalHostId(uuid::Uuid::new_v4().to_string());
+        let key = IndexedDbPskStore
+            .store(&PreSharedKey::from_slice(&[53; 32]).unwrap())
+            .await
+            .unwrap();
+        let secret = store_device_secret("reconnect-fixture-device-secret")
+            .await
+            .unwrap();
+        IndexedDbHostStore
+            .insert(WebPairedHostRecord {
+                local_host_id: local_host_id.clone(),
+                host_label: "Reconnect host".to_owned(),
+                broker: None,
+                room: None,
+                psk_keychain_key_id: Some(key),
+                credential_fingerprint: "reconnect-fixture".to_owned(),
+                auto_connect: false,
+                last_connected_at_ms: None,
+                direct: None,
+                managed: Some(ManagedPairingRecord {
+                    pairing_id: "pair_reconnect".to_owned(),
+                    device_id: "dev_reconnect".to_owned(),
+                    broker: sample_managed_broker(),
+                    device_secret_key_id: secret,
+                }),
+            })
+            .await
+            .unwrap();
+        local_host_id
+    }
 
     pub fn sample_managed_broker() -> ManagedBrokerEndpoint {
         ManagedBrokerEndpoint {

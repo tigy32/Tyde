@@ -36,6 +36,31 @@ fn jserr(value: JsValue) -> String {
         .unwrap_or_else(|| format!("{value:?}"))
 }
 
+// Reconnect cancellation can drop these futures before the browser fires its
+// callback. Detach handlers before dropping their Rust closures, and close any
+// open database even when an operation is interrupted.
+struct RequestListeners(IdbRequest);
+impl Drop for RequestListeners {
+    fn drop(&mut self) {
+        self.0.set_onsuccess(None);
+        self.0.set_onerror(None);
+    }
+}
+
+struct UpgradeListener(IdbOpenDbRequest);
+impl Drop for UpgradeListener {
+    fn drop(&mut self) {
+        self.0.set_onupgradeneeded(None);
+    }
+}
+
+struct DatabaseConnection(IdbDatabase);
+impl Drop for DatabaseConnection {
+    fn drop(&mut self) {
+        self.0.close();
+    }
+}
+
 async fn await_request<R: AsRef<IdbRequest>>(req: R) -> Result<JsValue, String> {
     let req: &IdbRequest = req.as_ref();
     let (tx, rx) = tokio::sync::oneshot::channel::<Result<JsValue, String>>();
@@ -62,13 +87,14 @@ async fn await_request<R: AsRef<IdbRequest>>(req: R) -> Result<JsValue, String> 
         }
     });
 
+    let listeners = RequestListeners(req.clone());
     req.set_onsuccess(Some(onsuccess.as_ref().unchecked_ref()));
     req.set_onerror(Some(onerror.as_ref().unchecked_ref()));
 
     let outcome = rx
         .await
         .map_err(|_| "indexeddb request was dropped before completing".to_owned())?;
-    // Keep the closures alive until the request settled.
+    drop(listeners);
     drop(onsuccess);
     drop(onerror);
     outcome
@@ -105,9 +131,11 @@ async fn open_db() -> Result<IdbDatabase, String> {
             }
         },
     );
+    let upgrade_listener = UpgradeListener(open_req.clone());
     open_req.set_onupgradeneeded(Some(onupgrade.as_ref().unchecked_ref()));
 
     let result = await_request(open_req).await?;
+    drop(upgrade_listener);
     drop(onupgrade);
     result
         .dyn_into::<IdbDatabase>()
@@ -116,13 +144,14 @@ async fn open_db() -> Result<IdbDatabase, String> {
 
 pub async fn get(store: &str, key: &str) -> Result<Option<String>, String> {
     let db = open_db().await?;
+    let connection = DatabaseConnection(db.clone());
     let tx = db
         .transaction_with_str_and_mode(store, IdbTransactionMode::Readonly)
         .map_err(jserr)?;
     let object_store = tx.object_store(store).map_err(jserr)?;
     let request = object_store.get(&JsValue::from_str(key)).map_err(jserr)?;
     let value = await_request(request).await?;
-    db.close();
+    drop(connection);
     if value.is_undefined() || value.is_null() {
         Ok(None)
     } else {
@@ -135,6 +164,7 @@ pub async fn get(store: &str, key: &str) -> Result<Option<String>, String> {
 
 pub async fn put(store: &str, key: &str, value: &str) -> Result<(), String> {
     let db = open_db().await?;
+    let connection = DatabaseConnection(db.clone());
     let tx = db
         .transaction_with_str_and_mode(store, IdbTransactionMode::Readwrite)
         .map_err(jserr)?;
@@ -143,12 +173,13 @@ pub async fn put(store: &str, key: &str, value: &str) -> Result<(), String> {
         .put_with_key(&JsValue::from_str(value), &JsValue::from_str(key))
         .map_err(jserr)?;
     await_request(request).await?;
-    db.close();
+    drop(connection);
     Ok(())
 }
 
 pub async fn delete(store: &str, key: &str) -> Result<(), String> {
     let db = open_db().await?;
+    let connection = DatabaseConnection(db.clone());
     let tx = db
         .transaction_with_str_and_mode(store, IdbTransactionMode::Readwrite)
         .map_err(jserr)?;
@@ -157,6 +188,6 @@ pub async fn delete(store: &str, key: &str) -> Result<(), String> {
         .delete(&JsValue::from_str(key))
         .map_err(jserr)?;
     await_request(request).await?;
-    db.close();
+    drop(connection);
     Ok(())
 }

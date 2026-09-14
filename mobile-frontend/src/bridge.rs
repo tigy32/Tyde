@@ -163,6 +163,7 @@ dispatch!(classify_pairing_offer(qr_uri: &str) -> Result<PairingOffer, String>);
 dispatch!(start_pairing(qr_uri: &str) -> Result<(), String>);
 dispatch!(redeem_self_hosted_and_connect(qr_uri: &str) -> Result<(), String>);
 dispatch!(connect_paired_host(local_host_id: &LocalHostId) -> Result<(), String>);
+dispatch!(reconnect_paired_host(local_host_id: &LocalHostId) -> Result<(), String>);
 dispatch!(disconnect_paired_host(local_host_id: &LocalHostId) -> Result<(), String>);
 dispatch!(forget_paired_host(local_host_id: &LocalHostId) -> Result<(), String>);
 dispatch!(send_host_line(local_host_id: &LocalHostId, line: &str) -> Result<Accepted, SendRejected>);

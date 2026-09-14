@@ -1066,6 +1066,23 @@ pub(super) struct HttpJson {
     pub body: String,
 }
 
+struct PendingServiceRequest {
+    controller: web_sys::AbortController,
+    stage: Cell<&'static str>,
+}
+
+impl Drop for PendingServiceRequest {
+    fn drop(&mut self) {
+        if self.stage.get() != "complete" {
+            log::warn!(
+                "mobile_service_request cancelled stage={}",
+                self.stage.get()
+            );
+        }
+        self.controller.abort();
+    }
+}
+
 /// Issues a `tycode.dev` request with the session cookie attached
 /// (`credentials: "include"`). No auth secret is ever taken from a JS global or
 /// added as a bearer header — the cookie is the sole session credential.
@@ -1076,7 +1093,12 @@ pub(super) async fn send(
     headers: &[(&str, &str)],
 ) -> Result<HttpJson, String> {
     let window = web_sys::window().ok_or("no window for fetch")?;
+    let pending = PendingServiceRequest {
+        controller: web_sys::AbortController::new().map_err(js_err)?,
+        stage: Cell::new("response headers"),
+    };
     let init = web_sys::RequestInit::new();
+    init.set_signal(Some(&pending.controller.signal()));
     init.set_method(method.as_str());
     init.set_mode(web_sys::RequestMode::Cors);
     init.set_credentials(web_sys::RequestCredentials::Include);
@@ -1096,18 +1118,39 @@ pub(super) async fn send(
     init.set_headers(&header_map);
 
     let request = web_sys::Request::new_with_str_and_init(url, &init).map_err(js_err)?;
-    let response_value = JsFuture::from(window.fetch_with_request(&request))
+    let started_at_ms = now_ms();
+    log::info!("mobile_service_request started method={}", method.as_str());
+    let receive = async {
+        let response_value = JsFuture::from(window.fetch_with_request(&request))
+            .await
+            .map_err(|err| format!("tycode.dev request failed: {}", js_err(err)))?;
+        let response: web_sys::Response = response_value
+            .dyn_into()
+            .map_err(|_| "fetch did not return a Response".to_owned())?;
+        let status = response.status();
+        pending.stage.set("response body");
+        let text_value = JsFuture::from(response.text().map_err(js_err)?)
+            .await
+            .map_err(js_err)?;
+        let body = text_value
+            .as_string()
+            .ok_or("service response body was not text")?;
+        pending.stage.set("complete");
+        log::info!(
+            "mobile_service_request completed status={status} elapsed_ms={}",
+            now_ms().saturating_sub(started_at_ms)
+        );
+        Ok(HttpJson { status, body })
+    };
+    use tyde_time::timeout;
+    timeout(std::time::Duration::from_secs(15), receive)
         .await
-        .map_err(|err| format!("tycode.dev request failed: {}", js_err(err)))?;
-    let response: web_sys::Response = response_value
-        .dyn_into()
-        .map_err(|_| "fetch did not return a Response".to_owned())?;
-    let status = response.status();
-    let text_value = JsFuture::from(response.text().map_err(js_err)?)
-        .await
-        .map_err(js_err)?;
-    let body = text_value.as_string().unwrap_or_default();
-    Ok(HttpJson { status, body })
+        .map_err(|_| {
+            format!(
+                "tycode.dev request timed out waiting for {}",
+                pending.stage.get()
+            )
+        })?
 }
 
 fn js_err(value: JsValue) -> String {

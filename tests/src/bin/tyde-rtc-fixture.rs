@@ -1,7 +1,7 @@
 use axum::{
     Json, Router,
     extract::State,
-    http::{HeaderValue, StatusCode, header},
+    http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
@@ -81,26 +81,53 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "/offer",
             post(offer).options(|| async { StatusCode::NO_CONTENT }),
         )
+        .with_state(relay.clone())
+        .merge(tests::rtc_reconnect::router(
+            relay.clone(),
+            format!("http://{address}"),
+        ))
         .layer(axum::middleware::map_response(
-            |mut response: Response| async {
+            |headers: HeaderMap, mut response: Response| async move {
                 response.headers_mut().insert(
                     header::ACCESS_CONTROL_ALLOW_ORIGIN,
-                    HeaderValue::from_static("*"),
+                    headers
+                        .get(header::ORIGIN)
+                        .cloned()
+                        .unwrap_or(HeaderValue::from_static("*")),
                 );
                 response.headers_mut().insert(
                     header::ACCESS_CONTROL_ALLOW_HEADERS,
-                    HeaderValue::from_static("content-type"),
+                    HeaderValue::from_static("content-type, x-tycode-pairing-auth, authorization"),
                 );
                 response.headers_mut().insert(
                     header::ACCESS_CONTROL_ALLOW_METHODS,
                     HeaderValue::from_static("GET, POST, OPTIONS"),
                 );
+                response.headers_mut().insert(
+                    header::ACCESS_CONTROL_ALLOW_CREDENTIALS,
+                    HeaderValue::from_static("true"),
+                );
                 response
             },
-        ))
-        .with_state(relay.clone());
+        ));
     std::fs::write(ready_path, format!("http://{address}"))?;
-    axum::serve(listener, app).await?;
+    tokio::select! {
+        result = async { axum::serve(listener, app).await } => result?,
+        () = shutdown() => {}
+    }
     relay.close().await;
     Ok(())
+}
+
+async fn shutdown() {
+    #[cfg(unix)]
+    {
+        let mut signal = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("fixture termination signal");
+        signal.recv().await;
+    }
+    #[cfg(not(unix))]
+    tokio::signal::ctrl_c()
+        .await
+        .expect("fixture shutdown signal");
 }

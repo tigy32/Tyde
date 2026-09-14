@@ -25,12 +25,13 @@ fn HostReconnectButton() -> impl IntoView {
         let Some(host) = state.active_local_host_id.get_untracked() else {
             return;
         };
+        log::info!("mobile_connection_control host={host} control=Reconnect button=clicked");
         reconnecting.set(true);
         spawn_local(async move {
-            if let Err(error) = bridge::connect_paired_host(&host).await {
-                log::error!("reconnect: connect_paired_host({host}) failed: {error}");
+            if let Err(error) = bridge::reconnect_paired_host(&host).await {
+                log::error!("reconnect: reconnect_paired_host({host}) failed: {error}");
             }
-            reconnecting.set(false);
+            let _ = reconnecting.try_set(false);
         });
     };
 
@@ -106,6 +107,7 @@ pub fn ConnectionBanner() -> impl IntoView {
                                     aria_label="Connecting to host".to_string()
                                 />
                                 <span class="status-text">"Connecting…"</span>
+                                <HostReconnectButton />
                             </div>
                         }.into_any()
                     }
@@ -148,6 +150,7 @@ pub fn ConnectionBanner() -> impl IntoView {
                                     data_mobile_test="connection-banner-dot-error"
                                 />
                                 <span class="status-text">{msg}</span>
+                                <HostReconnectButton />
                                 <button
                                     type="button"
                                     class="connection-banner-dismiss error-banner-dismiss"

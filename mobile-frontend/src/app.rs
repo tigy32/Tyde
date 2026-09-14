@@ -268,7 +268,7 @@ async fn sleep(duration: Duration) {
 
 #[cfg(target_arch = "wasm32")]
 async fn sleep(duration: Duration) {
-    wasmtimer::tokio::sleep(duration).await;
+    tyde_time::sleep(duration).await;
 }
 
 #[component]
@@ -1219,6 +1219,215 @@ mod wasm_tests {
                 .unwrap();
         });
         let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+    }
+
+    async fn reconnect_fixture_http(base: &str, path: &str, mode: Option<&str>) -> String {
+        use wasm_bindgen_futures::JsFuture;
+        let init = web_sys::RequestInit::new();
+        init.set_method(if mode.is_some() { "POST" } else { "GET" });
+        if let Some(mode) = mode {
+            init.set_body(&wasm_bindgen::JsValue::from_str(mode));
+        }
+        let request =
+            web_sys::Request::new_with_str_and_init(&format!("{base}/{path}"), &init).unwrap();
+        let response: web_sys::Response =
+            JsFuture::from(web_sys::window().unwrap().fetch_with_request(&request))
+                .await
+                .unwrap()
+                .dyn_into()
+                .unwrap();
+        assert!(response.ok(), "reconnect fixture request failed");
+        JsFuture::from(response.text().unwrap())
+            .await
+            .unwrap()
+            .as_string()
+            .unwrap()
+    }
+
+    async fn wait_reconnect_requests(base: &str, count: usize) {
+        loop {
+            let requests: usize = reconnect_fixture_http(base, "requests", None)
+                .await
+                .parse()
+                .unwrap();
+            log::info!(
+                "reconnect observation: requests={requests} expected={count} time={}",
+                js_sys::Date::now()
+            );
+            if requests >= count {
+                return;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    #[wasm_bindgen_test]
+    async fn stalled_reconnect_recovers_through_visible_controls_and_foreground_resume() {
+        use crate::components::ConnectionBanner;
+        use wasm_bindgen::JsValue;
+        let _ = console_log::init_with_level(log::Level::Info);
+        let _sends = bridge::test_clean_sends();
+        let fixture =
+            option_env!("TYDE_RTC_TEST_URL").expect("dev.sh starts the real TURN fixture");
+        let base = format!("{fixture}/reconnect/{}", uuid::Uuid::new_v4());
+        let window = web_sys::window().unwrap();
+        let config_key = JsValue::from_str("__TYDE_MOBILE_SERVICE__");
+        let previous_config = js_sys::Reflect::get(&window, &config_key).unwrap();
+        let config = js_sys::JSON::parse(
+            &serde_json::json!({"baseUrl":base,"provider":"google"}).to_string(),
+        )
+        .unwrap();
+        js_sys::Reflect::set(&window, &config_key, &config).unwrap();
+        let host = bridge::web::tests_support::store_reconnect_host().await;
+        let state = AppState::new();
+        state.active_local_host_id.set(Some(host.clone()));
+        let status_state = state.clone();
+        let status_host = host.clone();
+        let status_listener = bridge::listen_paired_host_connection_status(move |event| {
+            if event.local_host_id == status_host {
+                apply_connection_status(
+                    &status_state,
+                    event.local_host_id,
+                    event.status,
+                    event.connection_instance_id,
+                );
+            }
+        })
+        .await
+        .unwrap();
+        let line_state = state.clone();
+        let line_host = host.clone();
+        let line_listener = bridge::listen_host_line(move |event| {
+            if event.host_id == line_host.0 {
+                handle_host_line_event(&line_state, event);
+            }
+        })
+        .await
+        .unwrap();
+        let container = make_container();
+        let mounted_state = state.clone();
+        let mount = mount_to(container.clone(), move || {
+            provide_context(mounted_state.clone());
+            view! { <ConnectionBanner /> }
+        });
+        let flow = async {
+            reconnect_fixture_http(&base, "control", Some("stall")).await;
+            bridge::connect_paired_host(&host).await.unwrap();
+            wait_reconnect_requests(&base, 1).await;
+            next_tick().await;
+            assert!(container.text_content().unwrap().contains("Connecting"));
+            // The first response remains stalled; later attempts get a real 503.
+            reconnect_fixture_http(&base, "control", Some("unavailable")).await;
+            tyde_time::timeout(Duration::from_secs(18), wait_reconnect_requests(&base, 2))
+                .await
+                .map_err(|_| "a stalled credential request must time out and retry")?;
+            loop {
+                if container
+                    .text_content()
+                    .unwrap_or_default()
+                    .contains("Retrying automatically")
+                {
+                    break;
+                }
+                sleep(Duration::from_millis(50)).await;
+            }
+            let text = container.text_content().unwrap();
+            assert!(
+                text.contains("Relay service temporarily unavailable"),
+                "show the actual failure: {text}"
+            );
+            assert!(
+                text.contains("Reconnect"),
+                "persistent failures offer recovery: {text}"
+            );
+            reconnect_fixture_http(&base, "control", Some("stall-body")).await;
+            let before: usize = reconnect_fixture_http(&base, "requests", None)
+                .await
+                .parse()
+                .unwrap();
+            log::info!("reconnect regression: click with {before} credential requests");
+            container
+                .query_selector("[aria-label='Reconnect to this host']")
+                .unwrap()
+                .unwrap()
+                .dyn_into::<HtmlElement>()
+                .unwrap()
+                .click();
+            tyde_time::timeout(
+                Duration::from_secs(2),
+                wait_reconnect_requests(&base, before + 1),
+            )
+            .await
+            .map_err(|_| "Reconnect interrupts the existing retry actor")?;
+            next_tick().await;
+            assert!(
+                container.text_content().unwrap().contains("Reconnect"),
+                "connecting remains actionable"
+            );
+            // A response whose headers arrived can still stall while reading its body.
+            tyde_time::timeout(
+                Duration::from_secs(18),
+                wait_reconnect_requests(&base, before + 2),
+            )
+            .await
+            .map_err(|_| "a stalled credential body must time out and retry")?;
+            reconnect_fixture_http(&base, "control", Some("ready")).await;
+            recover_after_foreground(&state, 60_000).await;
+            loop {
+                if state.connection_statuses.with_untracked(|statuses| {
+                    matches!(statuses.get(&host), Some(ConnectionStatus::Connected))
+                }) {
+                    // Bootstrap clears the initial probe. Drive the app's real
+                    // heartbeat tick once the fresh host state has arrived.
+                    heartbeat_tick(&state).await;
+                    if state
+                        .heartbeat_round_trip_ms_by_host
+                        .with_untracked(|round_trips| round_trips.contains_key(&host))
+                    {
+                        break;
+                    }
+                }
+                sleep(Duration::from_millis(50)).await;
+            }
+            // Successful traffic repeatedly cancels long stream deadlines.
+            // The next heartbeat must still run promptly after that churn.
+            for _ in 0..32 {
+                state.heartbeat_round_trip_ms_by_host.update(|round_trips| {
+                    round_trips.remove(&host);
+                });
+                heartbeat_tick(&state).await;
+                tyde_time::timeout(Duration::from_secs(2), async {
+                    while !state
+                        .heartbeat_round_trip_ms_by_host
+                        .with_untracked(|round_trips| round_trips.contains_key(&host))
+                    {
+                        sleep(Duration::from_millis(50)).await;
+                    }
+                })
+                .await
+                .map_err(|_| "completed traffic must not delay the next heartbeat")?;
+            }
+            assert!(
+                state.host_bootstrap_applied_for_current_stream_untracked(&host),
+                "the fresh TURN connection bootstraps the real host"
+            );
+            next_tick().await;
+            assert!(
+                container.text_content().unwrap().contains("ms"),
+                "the real host answered the heartbeat"
+            );
+            Ok::<(), &str>(())
+        };
+        let result = tyde_time::timeout(Duration::from_secs(60), flow).await;
+        bridge::forget_paired_host(&host).await.unwrap();
+        status_listener.remove();
+        line_listener.remove();
+        js_sys::Reflect::set(&window, &config_key, &previous_config).unwrap();
+        drop(mount);
+        container.remove();
+        result
+            .expect("stalled reconnect recovery completes promptly")
+            .expect("stalled reconnect recovery");
     }
 
     fn empty_host_settings() -> settings_model::HostSettings {

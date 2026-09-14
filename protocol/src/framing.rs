@@ -3,10 +3,7 @@ use std::io;
 
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-#[cfg(not(target_arch = "wasm32"))]
-use tokio::time::timeout as reassembly_timeout;
-#[cfg(target_arch = "wasm32")]
-use wasmtimer::tokio::timeout as reassembly_timeout;
+use tyde_time::timeout as reassembly_timeout;
 
 use crate::Envelope;
 use crate::types::SeqMismatch;

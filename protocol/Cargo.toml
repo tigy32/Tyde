@@ -4,9 +4,10 @@ edition.workspace = true
 
 [features]
 default = ["framing"]
-framing = ["dep:tokio", "dep:wasmtimer"]
+framing = ["dep:tokio", "dep:tyde-time"]
 
 [dependencies]
+tyde-time = { path = "../time", optional = true }
 host-config = { path = "../host-config" }
 schemars = "1.2.1"
 serde.workspace = true
@@ -18,4 +19,3 @@ tokio = { version = "1", optional = true, default-features = false, features = [
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 tokio = { version = "1", optional = true, default-features = false, features = ["io-util"] }
-wasmtimer = { version = "0.4", optional = true }

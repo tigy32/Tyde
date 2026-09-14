@@ -39,6 +39,31 @@ or forge peer authentication without the pairing key.
 The pinned WebRTC dependency includes a small TURN driver queue-ordering fix;
 see `vendor/webrtc/TYDE-PATCH.md` for its source and regression evidence.
 
+## Reconnect recovery
+
+The shared browser timer layer owns and cancels individual `setTimeout` calls.
+The former timer driver accumulated callbacks for cancelled long deadlines and
+stopped scheduling the next event when its reference count exceeded 20. In the
+real browser recovery flow, a 50 ms wait then slept until an unrelated 2-second
+or 15-second deadline fired. Heartbeat, retry, signaling and frame-reassembly
+timers all use the replacement; native timing remains on Tokio.
+
+Mobile service requests have a 15-second deadline covering both response headers
+and the complete response body. Cancelling or timing out a request aborts its
+browser fetch. The complete managed credential-and-negotiation attempt is bounded
+by the existing 60-second connection deadline. Returning after a background pause
+can interrupt an attempt that is still obtaining credentials or negotiating.
+
+After three consecutive failures of the same kind, the banner shows the error
+and explains that retries continue automatically. Reconnect remains available
+while connecting and after an error; it cancels the old attempt and starts fresh.
+Request-stage and elapsed-time diagnostics contain no cookies or relay secrets.
+
+The browser regression stalls real HTTP headers and bodies, restores the service,
+and drives the recovery controls through a real TURN connection to a host. It
+requires a fresh bootstrap and heartbeat reply. Before the fix, the initial
+stalled response prevented even a second credential request.
+
 ## Network requirement
 
 Native hosts connect to `turns:turn.cloudflare.com:443?transport=tcp` using
