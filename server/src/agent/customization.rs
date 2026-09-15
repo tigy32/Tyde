@@ -16,6 +16,7 @@ pub use crate::backend::customization::{ResolvedSkill, ResolvedSpawnConfig, Skil
 pub(crate) struct ResolveSpawnConfigRequest<'a> {
     pub backend_kind: BackendKind,
     pub project_id: Option<&'a ProjectId>,
+    pub workspace_roots: &'a [String],
     pub custom_agent_id: Option<&'a CustomAgentId>,
     pub built_in_mcp_servers: &'a [StartupMcpServer],
     pub custom_agent_store: &'a CustomAgentStore,
@@ -43,6 +44,12 @@ pub(crate) fn resolve_spawn_config(
     let skill_delivery = crate::backend::skill_delivery(request.backend_kind);
     let mut tool_policy = ToolPolicy::Unrestricted;
 
+    let project_skills = crate::store::skills::scan_workspace_skills(request.workspace_roots)?;
+    let mut project_skill_names = std::collections::HashSet::new();
+    for skill in &project_skills {
+        project_skill_names.insert(skill.name.clone());
+    }
+
     // A spawn with no explicit custom agent uses the editable "Default"
     // builtin, so users can customize every plain chat from Settings →
     // Custom Agents. An explicit selection must exist; the implicit default
@@ -67,9 +74,14 @@ pub(crate) fn resolve_spawn_config(
 
         if is_default_custom_agent(&custom_agent) {
             skill_selection = SkillSelection::AllInstalled;
+            skills.extend(project_skills);
             for skill in request.skill_store.list()? {
-                skills.push(resolve_skill(request.skill_store, &skill.id)?);
+                if !project_skill_names.contains(&skill.name) {
+                    skills.push(resolve_skill(request.skill_store, &skill.id)?);
+                }
             }
+            skills
+                .sort_by(|left, right| left.name.cmp(&right.name).then(left.id.0.cmp(&right.id.0)));
             for mcp_server in request.mcp_server_store.list()? {
                 push_mcp_server(
                     &custom_agent.id,
@@ -79,9 +91,15 @@ pub(crate) fn resolve_spawn_config(
                 )?;
             }
         } else {
+            skills.extend(project_skills);
             for skill_id in &custom_agent.skill_ids {
-                skills.push(resolve_skill(request.skill_store, skill_id)?);
+                let resolved = resolve_skill(request.skill_store, skill_id)?;
+                if !project_skill_names.contains(&resolved.name) {
+                    skills.push(resolved);
+                }
             }
+            skills
+                .sort_by(|left, right| left.name.cmp(&right.name).then(left.id.0.cmp(&right.id.0)));
 
             for mcp_server_id in &custom_agent.mcp_server_ids {
                 let mcp_server = request.mcp_server_store.get(mcp_server_id).ok_or_else(|| {
@@ -98,6 +116,9 @@ pub(crate) fn resolve_spawn_config(
                 )?;
             }
         }
+    } else if !project_skills.is_empty() {
+        skills.extend(project_skills);
+        skills.sort_by(|left, right| left.name.cmp(&right.name).then(left.id.0.cmp(&right.id.0)));
     }
 
     crate::backend::validate_tool_policy(request.backend_kind, &tool_policy)?;

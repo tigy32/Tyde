@@ -4233,6 +4233,7 @@ impl HostHandle {
                     match resolve_spawn_config(ResolveSpawnConfigRequest {
                         backend_kind,
                         project_id: project_id.as_ref(),
+                        workspace_roots: &workspace_roots,
                         custom_agent_id: requested_custom_agent_id.as_ref(),
                         built_in_mcp_servers: &startup_mcp_servers,
                         custom_agent_store: &custom_agents,
@@ -4511,6 +4512,7 @@ impl HostHandle {
                             resolve_spawn_config(ResolveSpawnConfigRequest {
                                 backend_kind: record.backend_kind,
                                 project_id: project_id.as_ref(),
+                                workspace_roots: &record.workspace_roots,
                                 custom_agent_id: None,
                                 built_in_mcp_servers: &startup_mcp_servers,
                                 custom_agent_store: &custom_agents,
@@ -4538,6 +4540,7 @@ impl HostHandle {
                         match resolve_spawn_config(ResolveSpawnConfigRequest {
                             backend_kind: record.backend_kind,
                             project_id: project_id.as_ref(),
+                            workspace_roots: &record.workspace_roots,
                             custom_agent_id: Some(stored_custom_agent_id),
                             built_in_mcp_servers: &startup_mcp_servers,
                             custom_agent_store: &custom_agents,
@@ -4564,6 +4567,7 @@ impl HostHandle {
                     match resolve_spawn_config(ResolveSpawnConfigRequest {
                         backend_kind: record.backend_kind,
                         project_id: project_id.as_ref(),
+                        workspace_roots: &record.workspace_roots,
                         custom_agent_id: None,
                         built_in_mcp_servers: &startup_mcp_servers,
                         custom_agent_store: &custom_agents,
@@ -4794,6 +4798,7 @@ impl HostHandle {
                             resolve_spawn_config(ResolveSpawnConfigRequest {
                                 backend_kind,
                                 project_id: project_id.as_ref(),
+                                workspace_roots: &workspace_roots,
                                 custom_agent_id: None,
                                 built_in_mcp_servers: &startup_mcp_servers,
                                 custom_agent_store: &custom_agents,
@@ -4821,6 +4826,7 @@ impl HostHandle {
                         match resolve_spawn_config(ResolveSpawnConfigRequest {
                             backend_kind,
                             project_id: project_id.as_ref(),
+                            workspace_roots: &workspace_roots,
                             custom_agent_id: Some(stored_custom_agent_id),
                             built_in_mcp_servers: &startup_mcp_servers,
                             custom_agent_store: &custom_agents,
@@ -4849,6 +4855,7 @@ impl HostHandle {
                     match resolve_spawn_config(ResolveSpawnConfigRequest {
                         backend_kind,
                         project_id: project_id.as_ref(),
+                        workspace_roots: &workspace_roots,
                         custom_agent_id: None,
                         built_in_mcp_servers: &startup_mcp_servers,
                         custom_agent_store: &custom_agents,
@@ -12474,6 +12481,7 @@ impl HostHandle {
             resolve_spawn_config(ResolveSpawnConfigRequest {
                 backend_kind,
                 project_id: Some(&project_id),
+                workspace_roots: &project_roots,
                 custom_agent_id: custom_agent_id.as_ref(),
                 built_in_mcp_servers: &startup_mcp_servers,
                 custom_agent_store: &custom_agents,

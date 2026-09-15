@@ -1489,3 +1489,178 @@ async fn steering_ordering_combines_host_and_project_by_title() {
     let text = expect_turn_text(&mut fixture.client, "steering turn").await;
     assert!(text.contains("[steering: project alpha\\n\\nhost zulu]"));
 }
+
+fn write_project_skill(workspace_dir: &Path, rel_dir: &str, skill_name: &str, body: &str) {
+    let skill_dir = workspace_dir.join(rel_dir).join(skill_name);
+    fs::create_dir_all(&skill_dir).unwrap_or_else(|err| {
+        panic!(
+            "create project skill dir {} failed: {err}",
+            skill_dir.display()
+        )
+    });
+    fs::write(skill_dir.join("SKILL.md"), body)
+        .unwrap_or_else(|err| panic!("write project skill body failed: {err}"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn spawn_resolves_project_skills_from_workspace_root() {
+    let mut fixture = Fixture::new().await;
+    let workspace = tempfile::tempdir().expect("tempdir");
+    let workspace_path = workspace.path();
+
+    write_project_skill(
+        workspace_path,
+        ".agents/skills",
+        "agent-tool",
+        "Agent tool instructions",
+    );
+    write_project_skill(
+        workspace_path,
+        ".skills",
+        "shared-helper",
+        "Shared helper instructions",
+    );
+
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            name: Some("project-skills-agent".to_string()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::New {
+                workspace_roots: vec![workspace_path.to_string_lossy().to_string()],
+                prompt: "run".to_string(),
+                images: None,
+                backend_kind: BackendKind::Claude,
+                launch_profile_id: None,
+                cost_hint: None,
+                access_mode: Default::default(),
+                session_settings: None,
+            },
+        })
+        .await
+        .expect("spawn_agent failed");
+
+    let _ = expect_next_event(&mut fixture.client, "NewAgent").await;
+    let _ = expect_next_event(&mut fixture.client, "AgentStart").await;
+    let text = expect_turn_text(&mut fixture.client, "turn text").await;
+    assert!(text.contains("[skills: agent-tool, shared-helper]"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn project_skills_override_host_skills_on_name_collision() {
+    let mut fixture = Fixture::new().await;
+    let workspace = tempfile::tempdir().expect("tempdir");
+    let workspace_path = workspace.path();
+
+    let host_override = sample_skill("tool", "tool");
+    let host_unique = sample_skill("host-only", "host-only");
+    write_skill(fixture.store_dir(), &host_override, "Host tool body");
+    write_skill(fixture.store_dir(), &host_unique, "Host unique body");
+
+    fixture
+        .client
+        .skill_refresh(SkillRefreshPayload::default())
+        .await
+        .expect("skill_refresh failed");
+    let _ = expect_next_event(&mut fixture.client, "SkillNotify 1").await;
+    let _ = expect_next_event(&mut fixture.client, "SkillNotify 2").await;
+
+    write_project_skill(
+        workspace_path,
+        ".agents/skills",
+        "tool",
+        "Project tool body override",
+    );
+
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            name: Some("override-agent".to_string()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::New {
+                workspace_roots: vec![workspace_path.to_string_lossy().to_string()],
+                prompt: "run".to_string(),
+                images: None,
+                backend_kind: BackendKind::Claude,
+                launch_profile_id: None,
+                cost_hint: None,
+                access_mode: Default::default(),
+                session_settings: None,
+            },
+        })
+        .await
+        .expect("spawn_agent failed");
+
+    let _ = expect_next_event(&mut fixture.client, "NewAgent").await;
+    let _ = expect_next_event(&mut fixture.client, "AgentStart").await;
+    let text = expect_turn_text(&mut fixture.client, "turn text").await;
+    assert!(text.contains("[skills: host-only, tool]"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn explicit_custom_agent_resolves_project_skills_alongside_selection() {
+    let mut fixture = Fixture::new().await;
+    let workspace = tempfile::tempdir().expect("tempdir");
+    let workspace_path = workspace.path();
+
+    let host_skill = sample_skill("host-skill", "host-skill");
+    write_skill(fixture.store_dir(), &host_skill, "Host skill body");
+    fixture
+        .client
+        .skill_refresh(SkillRefreshPayload::default())
+        .await
+        .expect("skill_refresh failed");
+    let _ = expect_next_event(&mut fixture.client, "SkillNotify").await;
+
+    let custom_agent = sample_custom_agent(
+        "specialist",
+        vec![host_skill.id.clone()],
+        vec![],
+        ToolPolicy::Unrestricted,
+    );
+    fixture
+        .client
+        .custom_agent_upsert(CustomAgentUpsertPayload {
+            custom_agent: custom_agent.clone(),
+        })
+        .await
+        .expect("custom_agent_upsert failed");
+    let _ = expect_next_event(&mut fixture.client, "CustomAgentNotify").await;
+
+    write_project_skill(
+        workspace_path,
+        ".agents/skills",
+        "project-skill",
+        "Project skill body",
+    );
+
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            name: Some("specialist-agent".to_string()),
+            custom_agent_id: Some(custom_agent.id.clone()),
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::New {
+                workspace_roots: vec![workspace_path.to_string_lossy().to_string()],
+                prompt: "run".to_string(),
+                images: None,
+                backend_kind: BackendKind::Claude,
+                launch_profile_id: None,
+                cost_hint: None,
+                access_mode: Default::default(),
+                session_settings: None,
+            },
+        })
+        .await
+        .expect("spawn_agent failed");
+
+    let _ = expect_next_event(&mut fixture.client, "NewAgent").await;
+    let _ = expect_next_event(&mut fixture.client, "AgentStart").await;
+    let text = expect_turn_text(&mut fixture.client, "turn text").await;
+    assert!(text.contains("[skills: host-skill, project-skill]"));
+}

@@ -5,8 +5,11 @@ use std::path::PathBuf;
 use protocol::{Skill, SkillId};
 use serde::{Deserialize, Serialize};
 
+use crate::backend::customization::ResolvedSkill;
+
 const SKILL_METADATA_FILENAME: &str = "metadata.json";
 const SKILL_BODY_FILENAME: &str = "SKILL.md";
+const WORKSPACE_SKILL_REL_DIRS: &[&str] = &[".agents/skills", ".skills"];
 
 #[derive(Debug, Serialize, Deserialize)]
 struct StoreFile {
@@ -541,4 +544,144 @@ fn validate_skill(skill: &Skill) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// Scan workspace roots for project-level skills.
+///
+/// For each root directory in `workspace_roots`, this checks for skills located
+/// in `.agents/skills/<skill_name>/SKILL.md` or `.skills/<skill_name>/SKILL.md`.
+/// All paths are canonicalized and proven to stay within the workspace root.
+pub fn scan_workspace_skills(workspace_roots: &[String]) -> Result<Vec<ResolvedSkill>, String> {
+    let mut resolved_skills = Vec::new();
+    let mut seen_names = std::collections::HashSet::new();
+
+    for root_str in workspace_roots {
+        let root_path = PathBuf::from(root_str);
+        if !root_path.exists() {
+            continue;
+        }
+        let canonical_root = match std::fs::canonicalize(&root_path) {
+            Ok(path) => path,
+            Err(err) => {
+                tracing::warn!(
+                    root = %root_path.display(),
+                    error = %err,
+                    "failed to canonicalize workspace root; skipping project skills scan"
+                );
+                continue;
+            }
+        };
+
+        for rel_dir in WORKSPACE_SKILL_REL_DIRS {
+            let skills_dir = canonical_root.join(rel_dir);
+            if !skills_dir.is_dir() {
+                continue;
+            }
+
+            let mut dir_names = Vec::new();
+            match std::fs::read_dir(&skills_dir) {
+                Ok(entries) => {
+                    for entry in entries {
+                        let entry = match entry {
+                            Ok(entry) => entry,
+                            Err(err) => {
+                                tracing::warn!(
+                                    skills_dir = %skills_dir.display(),
+                                    error = %err,
+                                    "failed to read project skill directory entry; skipping"
+                                );
+                                continue;
+                            }
+                        };
+                        let file_type = match entry.file_type() {
+                            Ok(file_type) => file_type,
+                            Err(err) => {
+                                tracing::warn!(
+                                    path = %entry.path().display(),
+                                    error = %err,
+                                    "failed to stat project skill entry; skipping"
+                                );
+                                continue;
+                            }
+                        };
+                        if !file_type.is_dir() {
+                            continue;
+                        }
+                        dir_names.push(entry.file_name().to_string_lossy().to_string());
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        skills_dir = %skills_dir.display(),
+                        error = %err,
+                        "failed to read project skills directory; skipping"
+                    );
+                    continue;
+                }
+            }
+
+            dir_names.sort();
+
+            for dir_name in dir_names {
+                if seen_names.contains(&dir_name) {
+                    continue;
+                }
+
+                let skill_dir = skills_dir.join(&dir_name);
+                let source_dir = match canonical_within(&canonical_root, &skill_dir) {
+                    Ok(path) => path,
+                    Err(err) => {
+                        tracing::warn!(
+                            skill = %dir_name,
+                            error = %err,
+                            "project skill directory escapes workspace root; skipping"
+                        );
+                        continue;
+                    }
+                };
+
+                let skill_md =
+                    match canonical_within(&source_dir, &source_dir.join(SKILL_BODY_FILENAME)) {
+                        Ok(path) => path,
+                        Err(err) => {
+                            tracing::warn!(
+                                skill = %dir_name,
+                                error = %err,
+                                "project skill SKILL.md escapes skill directory; skipping"
+                            );
+                            continue;
+                        }
+                    };
+
+                let metadata = match std::fs::metadata(&skill_md) {
+                    Ok(meta) => meta,
+                    Err(err) => {
+                        tracing::warn!(
+                            path = %skill_md.display(),
+                            error = %err,
+                            "failed to stat project skill SKILL.md; skipping"
+                        );
+                        continue;
+                    }
+                };
+                if !metadata.file_type().is_file() {
+                    tracing::warn!(
+                        path = %skill_md.display(),
+                        "project skill SKILL.md is not a regular file; skipping"
+                    );
+                    continue;
+                }
+
+                let Some(skill) = load_skill_from_dir(&source_dir, &dir_name) else {
+                    continue;
+                };
+
+                seen_names.insert(dir_name);
+                resolved_skills.push(ResolvedSkill::path_only(skill, source_dir, skill_md));
+            }
+        }
+    }
+
+    resolved_skills.sort_by(|left, right| left.name.cmp(&right.name));
+    Ok(resolved_skills)
 }
