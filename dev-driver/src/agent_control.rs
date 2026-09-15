@@ -1071,6 +1071,7 @@ fn apply_envelope(snapshot: &mut SnapshotState, envelope: &protocol::Envelope) {
                 | ChatEvent::GoalCapabilities(_)
                 | ChatEvent::GoalChanged(_)
                 | ChatEvent::GoalCompleted(_)
+                | ChatEvent::SlashCommandsChanged(_)
                 | ChatEvent::TaskUpdate(_)
                 | ChatEvent::RetryAttempt(_)
                 | ChatEvent::Orchestration(_)

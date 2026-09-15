@@ -1514,6 +1514,29 @@ pub fn ChatInput() -> impl IntoView {
         })
     });
     let is_steer = Memo::new(move |_| is_running.get() && has_input.get());
+    // Slash-command completion: offered only while the draft is a bare
+    // `/prefix`, from the set the active agent's backend last advertised.
+    let slash_state = state.clone();
+    let slash_matches = Memo::new(move |_| -> Vec<protocol::SlashCommand> {
+        let Some(active) = slash_state.active_agent.get() else {
+            return Vec::new();
+        };
+        slash_state.chat_input.with(|draft| {
+            slash_state.slash_commands.with(|map| {
+                map.get(&active.as_agent_ref())
+                    .map(|catalog| catalog.completions(draft).into_iter().cloned().collect())
+                    .unwrap_or_default()
+            })
+        })
+    });
+    let slash_open = Memo::new(move |_| !slash_matches.get().is_empty());
+    let slash_accept_state = state.clone();
+    let accept_slash_command = Callback::new(move |name: String| {
+        slash_accept_state.chat_input.set(format!("/{name} "));
+        if let Some(textarea) = textarea_ref.get_untracked() {
+            let _ = textarea.focus();
+        }
+    });
     let menu_open = RwSignal::new(false);
     let on_split_keydown = move |ev: web_sys::KeyboardEvent| {
         if ev.key() == "Escape" && menu_open.get() {
@@ -1866,6 +1889,38 @@ pub fn ChatInput() -> impl IntoView {
                 </div>
             </Show>
             <crate::voice::MobileVoiceComposerBar />
+            <Show when=move || slash_open.get()>
+                <div
+                    class="chat-slash-menu"
+                    role="listbox"
+                    aria-label="Slash commands"
+                    data-mobile-test="chat-slash-menu"
+                >
+                    {move || {
+                        slash_matches
+                            .get()
+                            .into_iter()
+                            .map(|command| {
+                                let protocol::SlashCommand { name, description, input_hint } = command;
+                                let label = format!("/{name}");
+                                view! {
+                                    <button
+                                        type="button"
+                                        class="chat-slash-option"
+                                        role="option"
+                                        data-mobile-test="chat-slash-option"
+                                        on:click=move |_| accept_slash_command.run(name.clone())
+                                    >
+                                        <span class="chat-slash-name">{label}</span>
+                                        {input_hint.map(|hint| view! { <span class="chat-slash-hint">{hint}</span> })}
+                                        {description.map(|text| view! { <span class="chat-slash-desc">{text}</span> })}
+                                    </button>
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                    }}
+                </div>
+            </Show>
             <div class="chat-input-row" data-mobile-test="chat-input-capsule">
                 <Show when=move || is_running.get()>
                     <svg
@@ -2499,6 +2554,127 @@ mod wasm_tests {
         let event = js_sys::Reflect::construct(&ctor, &args).unwrap();
         let event: web_sys::Event = event.unchecked_into();
         target.dispatch_event(&event).unwrap()
+    }
+
+    #[wasm_bindgen_test]
+    async fn slash_menu_completes_a_typed_command_prefix() {
+        let container = make_container();
+        let host = LocalHostId("host-1".to_owned());
+        let agent_id = AgentId("agent-1".to_owned());
+        let state = AppState::new();
+        state.active_local_host_id.set(Some(host.clone()));
+        state.agents.set(vec![AgentInfo {
+            local_host_id: host.clone(),
+            agent_id: agent_id.clone(),
+            name: "Agent".to_owned(),
+            origin: AgentOrigin::User,
+            backend_kind: BackendKind::Claude,
+            workspace_roots: Vec::new(),
+            project_id: None,
+            parent_agent_id: None,
+            session_id: Some(SessionId("sess-1".to_owned())),
+            custom_agent_id: None,
+            created_at_ms: 0,
+            instance_stream: StreamPath("/agent/agent-1/inst".to_owned()),
+            started: true,
+            fatal_error: None,
+        }]);
+        state.active_agent.set(Some(crate::state::ActiveAgentRef {
+            local_host_id: host.clone(),
+            agent_id: agent_id.clone(),
+        }));
+        let command =
+            |name: &str, description: Option<&str>, hint: Option<&str>| protocol::SlashCommand {
+                name: name.to_owned(),
+                description: description.map(str::to_owned),
+                input_hint: hint.map(str::to_owned),
+            };
+        state.slash_commands.update(|map| {
+            map.insert(
+                AgentRef {
+                    local_host_id: host.clone(),
+                    agent_id: agent_id.clone(),
+                },
+                protocol::SlashCommandCatalog {
+                    commands: vec![
+                        command("compact", Some("Summarize the conversation"), Some("focus")),
+                        command("context", None, None),
+                        command("review", None, None),
+                    ],
+                },
+            );
+        });
+        let state_for_mount = state.clone();
+        let _h = mount_to(container.clone(), move || {
+            provide_context(state_for_mount);
+            view! { <ChatInput /> }
+        });
+        next_tick().await;
+
+        let menu = |container: &HtmlElement| {
+            container
+                .query_selector("[data-mobile-test='chat-slash-menu']")
+                .unwrap()
+        };
+        let option_names = |container: &HtmlElement| -> Vec<String> {
+            let nodes = container
+                .query_selector_all("[data-mobile-test='chat-slash-option'] .chat-slash-name")
+                .unwrap();
+            (0..nodes.length())
+                .filter_map(|i| nodes.item(i))
+                .map(|node| node.text_content().unwrap_or_default().trim().to_owned())
+                .collect()
+        };
+        assert!(menu(&container).is_none(), "an empty draft offers nothing");
+
+        type_text(&container, "/co");
+        next_tick().await;
+        assert_eq!(option_names(&container), ["/compact", "/context"]);
+        let first = container
+            .query_selector("[data-mobile-test='chat-slash-option']")
+            .unwrap()
+            .expect("first completion");
+        let first_text = first.text_content().unwrap_or_default();
+        assert!(
+            first_text.contains("focus") && first_text.contains("Summarize the conversation"),
+            "hint and description must be visible, got {first_text:?}"
+        );
+
+        let second: HtmlElement = container
+            .query_selector_all("[data-mobile-test='chat-slash-option']")
+            .unwrap()
+            .item(1)
+            .expect("second completion")
+            .dyn_into()
+            .unwrap();
+        second.click();
+        next_tick().await;
+        assert_eq!(state.chat_input.get_untracked(), "/context ");
+        let field: web_sys::HtmlTextAreaElement = container
+            .query_selector("[data-mobile-test='chat-input']")
+            .unwrap()
+            .unwrap()
+            .dyn_into()
+            .unwrap();
+        assert_eq!(
+            field.value(),
+            "/context ",
+            "the completed draft reaches the field"
+        );
+        assert!(
+            menu(&container).is_none(),
+            "the completed draft has a trailing space, so nothing is offered"
+        );
+
+        type_text(&container, "/compact focus");
+        next_tick().await;
+        assert!(menu(&container).is_none(), "arguments close the menu");
+        type_text(&container, "see /compact");
+        next_tick().await;
+        assert!(
+            menu(&container).is_none(),
+            "a slash inside prose is not a command"
+        );
     }
 
     fn type_text(container: &HtmlElement, text: &str) {

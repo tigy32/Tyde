@@ -2108,6 +2108,11 @@ pub fn apply_chat_event(state: &AppState, agent_ref: &AgentRef, event: ChatEvent
                 goals.insert(agent_ref, capabilities);
             });
         }
+        ChatEvent::SlashCommandsChanged(catalog) => {
+            state.slash_commands.update(|catalogs| {
+                catalogs.insert(agent_ref, catalog);
+            });
+        }
         ChatEvent::GoalChanged(goal) => {
             state.native_goals.update(|goals| {
                 if let Some(goal) = goal {
@@ -2400,6 +2405,7 @@ impl MobileHistoryReplay {
             | ChatEvent::GoalCapabilities(_)
             | ChatEvent::GoalChanged(_)
             | ChatEvent::GoalCompleted(_)
+            | ChatEvent::SlashCommandsChanged(_)
             | ChatEvent::TaskUpdate(_)
             | ChatEvent::OperationCancelled(_)
             | ChatEvent::RetryAttempt(_)
@@ -3221,6 +3227,7 @@ fn chat_event_label(event: &ChatEvent) -> &'static str {
         ChatEvent::GoalCapabilities(_) => "GoalCapabilities",
         ChatEvent::GoalChanged(_) => "GoalChanged",
         ChatEvent::GoalCompleted(_) => "GoalCompleted",
+        ChatEvent::SlashCommandsChanged(_) => "SlashCommandsChanged",
         ChatEvent::TaskUpdate(_) => "TaskUpdate",
         ChatEvent::OperationCancelled(_) => "OperationCancelled",
         ChatEvent::RetryAttempt(_) => "RetryAttempt",

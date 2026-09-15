@@ -13,7 +13,7 @@ use crate::state::{ActiveAgentRef, AppState, ComposerHandle, ConnectionStatus, P
 
 use protocol::{
     AgentOrigin, BackendKind, BackendSetupStatus, FrameKind, ImageData, InterruptPayload,
-    SendMessagePayload, StreamPath,
+    SendMessagePayload, SlashCommand, StreamPath,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1050,10 +1050,97 @@ pub fn ChatInput(
                 || submit_on_enter_images.with(|images| !images.is_empty()))
     };
 
+    let textarea_ref = NodeRef::<leptos::html::Textarea>::new();
+
+    // ── Slash-command completion ─────────────────────────────────────────
+    // Offered only while the draft is a bare `/prefix`, from the set the
+    // target agent's backend last advertised. Arguments or prose after the
+    // token close the menu: the draft is then what the user meant.
+    let slash_state = state.clone();
+    let slash_text = composer.text.clone();
+    let slash_matches = Memo::new(move |_| -> Vec<SlashCommand> {
+        let Some(agent) = agent_ref.get() else {
+            return Vec::new();
+        };
+        slash_text.with(|draft| {
+            slash_state.slash_commands.with(|map| {
+                map.get(&agent.agent_id)
+                    .map(|catalog| catalog.completions(draft).into_iter().cloned().collect())
+                    .unwrap_or_default()
+            })
+        })
+    });
+    let slash_dismissed = RwSignal::new(false);
+    let slash_selected = RwSignal::new(0usize);
+    // Typing reopens a dismissed menu and restarts the selection at the top.
+    let slash_query = composer.text.clone();
+    Effect::new(move |_| {
+        slash_query.track();
+        slash_dismissed.set(false);
+        slash_selected.set(0);
+    });
+    let slash_open = Memo::new(move |_| !slash_dismissed.get() && !slash_matches.get().is_empty());
+    let slash_accept_composer = composer.clone();
+    let accept_slash_command = Callback::new(move |index: usize| {
+        let Some(command) = slash_matches.get_untracked().get(index).cloned() else {
+            return;
+        };
+        slash_accept_composer
+            .text
+            .set(format!("/{} ", command.name));
+        if let Some(textarea) = textarea_ref.get_untracked() {
+            let _ = textarea.focus();
+        }
+    });
+    let slash_exact_text = composer.text.clone();
+    // A draft that already spells a listed command in full is sent by Enter,
+    // not completed again; Tab always completes.
+    let slash_draft_is_exact = move || {
+        let matches = slash_matches.get_untracked();
+        let Some(command) = matches.get(slash_selected.get_untracked()) else {
+            return false;
+        };
+        slash_exact_text.with_untracked(|draft| {
+            protocol::slash_command_name(draft) == Some(command.name.as_str())
+        })
+    };
+
     let on_keydown_state = state.clone();
     let on_keydown_composer = composer.clone();
     let on_keydown_images = pending_images;
     let on_keydown = move |ev: leptos::ev::KeyboardEvent| {
+        if slash_open.get_untracked() {
+            let count = slash_matches.get_untracked().len().max(1);
+            let plain = !ev.shift_key() && !ev.meta_key() && !ev.ctrl_key() && !ev.alt_key();
+            match ev.key().as_str() {
+                "ArrowDown" => {
+                    ev.prevent_default();
+                    slash_selected.update(|index| *index = (*index + 1) % count);
+                    return;
+                }
+                "ArrowUp" => {
+                    ev.prevent_default();
+                    slash_selected.update(|index| *index = (*index + count - 1) % count);
+                    return;
+                }
+                "Tab" if plain => {
+                    ev.prevent_default();
+                    accept_slash_command.run(slash_selected.get_untracked());
+                    return;
+                }
+                "Enter" if plain && !slash_draft_is_exact() => {
+                    ev.prevent_default();
+                    accept_slash_command.run(slash_selected.get_untracked());
+                    return;
+                }
+                "Escape" => {
+                    ev.prevent_default();
+                    slash_dismissed.set(true);
+                    return;
+                }
+                _ => {}
+            }
+        }
         if ev.key() != "Enter" {
             return;
         }
@@ -1197,7 +1284,6 @@ pub fn ChatInput(
         }
     };
 
-    let textarea_ref = NodeRef::<leptos::html::Textarea>::new();
     let textarea_measure_ref = NodeRef::<leptos::html::Div>::new();
     let on_input_composer = composer.clone();
     // Throttle textarea autosize to one update per animation frame.
@@ -1508,6 +1594,48 @@ pub fn ChatInput(
             <crate::voice::VoiceComposerBar agent_ref=agent_ref composer=composer.clone() />
 
             <div class="chat-input-row">
+                <Show when=move || slash_open.get()>
+                    <div
+                        class="chat-slash-menu"
+                        role="listbox"
+                        aria-label="Slash commands"
+                        data-test="chat-slash-menu"
+                    >
+                        {move || {
+                            let selected = slash_selected.get();
+                            slash_matches
+                                .get()
+                                .into_iter()
+                                .enumerate()
+                                .map(|(index, command)| {
+                                    let is_selected = index == selected;
+                                    let SlashCommand { name, description, input_hint } = command;
+                                    view! {
+                                        <button
+                                            type="button"
+                                            class=if is_selected { "chat-slash-option selected" } else { "chat-slash-option" }
+                                            role="option"
+                                            aria-selected=is_selected.to_string()
+                                            data-test="chat-slash-option"
+                                            tabindex="-1"
+                                            on:mousedown=move |ev: web_sys::MouseEvent| {
+                                                // Keep the textarea focused so the
+                                                // completed draft stays editable.
+                                                ev.prevent_default();
+                                                accept_slash_command.run(index);
+                                            }
+                                            on:mouseenter=move |_| slash_selected.set(index)
+                                        >
+                                            <span class="chat-slash-name">{format!("/{name}")}</span>
+                                            {input_hint.map(|hint| view! { <span class="chat-slash-hint">{hint}</span> })}
+                                            {description.map(|text| view! { <span class="chat-slash-desc">{text}</span> })}
+                                        </button>
+                                    }
+                                })
+                                .collect::<Vec<_>>()
+                        }}
+                    </div>
+                </Show>
                 <textarea
                     class="chat-textarea"
                     placeholder=move || {
@@ -3042,6 +3170,177 @@ mod wasm_tests {
 
     fn textarea(container: &HtmlElement) -> web_sys::Element {
         query(container, "textarea").expect("textarea must be present")
+    }
+
+    fn seed_slash_commands(state: &AppState) {
+        let command = |name: &str, description: Option<&str>, hint: Option<&str>| SlashCommand {
+            name: name.to_owned(),
+            description: description.map(str::to_owned),
+            input_hint: hint.map(str::to_owned),
+        };
+        state.slash_commands.update(|map| {
+            map.insert(
+                AgentId(AGENT.to_owned()),
+                protocol::SlashCommandCatalog {
+                    commands: vec![
+                        command("compact", Some("Summarize the conversation"), Some("focus")),
+                        command("context", None, None),
+                        command("review", Some("Review the branch"), None),
+                    ],
+                },
+            );
+        });
+    }
+
+    /// The `/name` labels of the offered completions, in menu order.
+    fn slash_option_names(container: &HtmlElement) -> Vec<String> {
+        let nodes = container
+            .query_selector_all("[data-test='chat-slash-option'] .chat-slash-name")
+            .unwrap();
+        (0..nodes.length())
+            .filter_map(|i| nodes.item(i))
+            .map(|node| node.text_content().unwrap_or_default().trim().to_owned())
+            .collect()
+    }
+
+    fn slash_menu_open(container: &HtmlElement) -> bool {
+        query(container, "[data-test='chat-slash-menu']").is_some()
+    }
+
+    #[wasm_bindgen_test]
+    async fn slash_menu_offers_only_commands_matching_a_bare_prefix() {
+        let container = make_container();
+        let state = AppState::new();
+        configure(&state, true, false, "");
+        seed_slash_commands(&state);
+        let state_for_mount = state.clone();
+        let _h = mount_to(container.clone(), move || {
+            provide_context(state_for_mount.clone());
+            view! { <ChatInput /> }
+        });
+        next_tick().await;
+        assert!(
+            !slash_menu_open(&container),
+            "an empty draft offers nothing"
+        );
+
+        state.composer_untracked().text.set("/co".to_owned());
+        next_tick().await;
+        assert_eq!(slash_option_names(&container), ["/compact", "/context"]);
+        let first = query(&container, "[data-test='chat-slash-option']").unwrap();
+        let first_text = first.text_content().unwrap_or_default();
+        assert!(
+            first_text.contains("focus") && first_text.contains("Summarize the conversation"),
+            "the hint and description must be visible on the offered command, got {first_text:?}"
+        );
+
+        state.composer_untracked().text.set("/x".to_owned());
+        next_tick().await;
+        assert!(!slash_menu_open(&container), "no command starts with x");
+
+        state
+            .composer_untracked()
+            .text
+            .set("/compact focus".to_owned());
+        next_tick().await;
+        assert!(
+            !slash_menu_open(&container),
+            "arguments after the command close the menu"
+        );
+
+        state
+            .composer_untracked()
+            .text
+            .set("see /compact".to_owned());
+        next_tick().await;
+        assert!(
+            !slash_menu_open(&container),
+            "a slash inside prose is not a command"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    async fn slash_menu_keyboard_completes_the_draft_without_sending() {
+        let container = make_container();
+        let state = AppState::new();
+        configure(&state, true, false, "");
+        seed_slash_commands(&state);
+        let calls = stub_send_recording();
+        let state_for_mount = state.clone();
+        let _h = mount_to(container.clone(), move || {
+            provide_context(state_for_mount.clone());
+            view! { <ChatInput /> }
+        });
+        next_tick().await;
+
+        state.composer_untracked().text.set("/c".to_owned());
+        next_tick().await;
+        assert_eq!(slash_option_names(&container), ["/compact", "/context"]);
+        dispatch_keydown(&textarea(&container), "ArrowDown", false, false);
+        next_tick().await;
+        dispatch_keydown(&textarea(&container), "Enter", false, false);
+        next_tick().await;
+        next_tick().await;
+        assert_eq!(
+            state.composer_untracked().text.get_untracked(),
+            "/context ",
+            "Enter on a partial draft completes the selected command"
+        );
+        let field: web_sys::HtmlTextAreaElement = textarea(&container).dyn_into().unwrap();
+        assert_eq!(field.value(), "/context ");
+        assert!(
+            !slash_menu_open(&container),
+            "the completed draft has a trailing space, so nothing is offered"
+        );
+        assert!(
+            send_message_payloads(&calls).is_empty(),
+            "completing a command must not send a message"
+        );
+
+        state.composer_untracked().text.set("/r".to_owned());
+        next_tick().await;
+        assert!(slash_menu_open(&container));
+        dispatch_keydown(&textarea(&container), "Escape", false, false);
+        next_tick().await;
+        assert!(!slash_menu_open(&container), "Escape dismisses the menu");
+        state.composer_untracked().text.set("/re".to_owned());
+        next_tick().await;
+        assert!(slash_menu_open(&container), "typing again reopens it");
+        dispatch_keydown(&textarea(&container), "Tab", false, false);
+        next_tick().await;
+        assert_eq!(state.composer_untracked().text.get_untracked(), "/review ");
+        stub_send_host_line();
+    }
+
+    #[wasm_bindgen_test]
+    async fn enter_sends_a_fully_typed_slash_command() {
+        let container = make_container();
+        let state = AppState::new();
+        configure(&state, true, false, "");
+        seed_slash_commands(&state);
+        let calls = stub_send_recording();
+        let state_for_mount = state.clone();
+        let _h = mount_to(container.clone(), move || {
+            provide_context(state_for_mount.clone());
+            view! { <ChatInput /> }
+        });
+        next_tick().await;
+
+        state.composer_untracked().text.set("/compact".to_owned());
+        next_tick().await;
+        assert_eq!(
+            slash_option_names(&container),
+            ["/compact"],
+            "the menu still shows the command the draft spells"
+        );
+        dispatch_keydown(&textarea(&container), "Enter", false, false);
+        next_tick().await;
+        next_tick().await;
+        let payloads = send_message_payloads(&calls);
+        assert_eq!(payloads.len(), 1, "a fully typed command is sent by Enter");
+        assert_eq!(payloads[0]["message"], "/compact");
+        assert_eq!(state.composer_untracked().text.get_untracked(), "");
+        stub_send_host_line();
     }
 
     /// Cmd+Enter while idle with a draft submits the message: the observable

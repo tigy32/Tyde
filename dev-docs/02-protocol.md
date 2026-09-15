@@ -485,3 +485,85 @@ Pause and clear change the native goal; the existing Cancel action remains the
 control for interrupting an in-flight turn. Native completion, blocked, and
 limit transitions use the existing mobile push delivery path. Intermediate
 idle turns with a goal do not produce ordinary completion pushes.
+
+## Slash commands on agent streams
+
+Every backend advertises the slash commands its session accepts and runs one
+when a user message starts with its `/name`. Adapters declare
+`BackendCapability::SlashCommands` and publish the current set as
+`ChatEvent::SlashCommandsChanged(SlashCommandCatalog)`. Each publication
+replaces the previous set; entries carry the name without its slash, an
+optional description, and an optional input hint. Where the set comes from,
+and how an invoking message runs, is the adapter's business:
+
+- **Claude Code** lists commands in its `initialize` response (with
+  descriptions and argument hints) and `init` frame; the frame's
+  `terminal_slash_commands` (`exit`, `statusline`, …) are removed because a
+  headless session cannot honor them. An invoking message is written to the
+  process verbatim.
+- **ACP agents** send `available_commands_update`, handled ahead of turn
+  quarantine because it is session state. The generic backend sends an
+  invoking message as the prompt text verbatim; an `AcpAgentAdapter` can
+  reshape the advertised set (`normalize_slash_commands`) and choose another
+  route for a command (`plan_slash_command`): an RPC whose rendered result is
+  the reply, or a reply Tyde composes from session state. Measured behavior:
+  - *Kiro* never sends the standard update. It advertises on
+    `_kiro.dev/commands/available` and runs commands through
+    `_kiro.dev/commands/execute`, which takes `{command, args}` rather than the
+    typed line (`session/prompt` hands a `/command` to the model as prose).
+    The adapter translates the advertisement, remembers each command's
+    subcommands so `/context add x` becomes `{subcommand, value}`, and shows
+    the `message` of the execute result. Commands only its terminal UI can
+    carry out (`chat`, `quit`, `paste`, `reply`, `voice`, `rewind`) are not
+    offered.
+  - *Grok* sends the standard update. Its host-answered commands (`feedback`)
+    reply through `agent_message_chunk`, but `context` and `session-info` are
+    rendered by its terminal UI from `_x.ai/session/info`; the agent accepts
+    them on `session/prompt` and ends the turn silently. The adapter answers
+    both from that RPC. `always-approve` is a terminal-UI permission toggle
+    and is not offered.
+  - *OpenCode* advertises only its prompt-expanding commands (`init`,
+    `review`, `customize-opencode`); its terminal UI's informational commands
+    never reach the agent over ACP. The adapter adds `status` and `models`,
+    answered from the session's recorded model, mode, model list, and usage.
+- **Antigravity** answers `/help` with a machine-readable `command_result`
+  listing its CLI commands; the adapter reads it once per session start. The
+  stream-json process refuses CLI-answered commands, so an invoking message
+  runs as its own `--print` invocation and the CLI's reply is shown as the
+  response. Commands that change CLI-wide configuration Tyde owns per session
+  (`model`, `effort`, `permissions`, `hooks`, `config`) are not offered.
+- **Hermes** exposes the TUI's command registry through the gateway's
+  `commands.catalog` — built-ins, quick commands, plugin commands, and skills,
+  each with the registry's usage hint. (`complete.slash` is a ranked,
+  capped completion popup that drops most of the registry on a bare `/`.)
+  Entries tagged for a surface Tyde lacks (`terminal`, `messaging`,
+  `composer-voice`) are not offered. An invoking message runs through
+  `slash.exec` (or `command.dispatch` for skills and prompt-building
+  built-ins, whose returned message then runs as an ordinary turn).
+- **Codex** app-server advertises no command list, so the adapter offers the
+  TUI commands it can honor through RPCs — `compact` (`thread/compact/start`),
+  `review` (`review/start`), and `status` (`thread/read` +
+  `account/rateLimits/read`) — with the TUI's own descriptions. The rest of the
+  TUI's commands are interface chrome Tyde already provides.
+
+The set is session state, not transcript. The agent actor keeps the latest
+publication out of the replay log, so history pages never carry a stale set,
+and appends it to every bootstrap so a subscriber that attaches later starts
+from the same set a live subscriber has.
+
+There is no separate input kind. A `SendMessage` whose leading token is
+`/name` for an advertised command is delivered to the provider verbatim, with
+no workspace or steering wrapper, because providers recognize a command only at
+the very start of the text. Any other message keeps the ordinary wrapping, so
+prose that happens to start with a slash, or an unknown `/name`, still reaches
+the model as text. The one gap is the first message of a brand-new agent: the
+set is not known until the session starts, so that message always travels as
+text.
+
+Clients complete a bare `/prefix` draft from the set (`SlashCommandCatalog::completions`)
+and never offer completions once arguments or prose follow the token.
+
+The conformance scenario `real_slash_commands` runs against every backend: the
+advertised set must be well-formed, a read-only command from it must run to a
+visible reply without any model request, and a slash-prefixed non-command must
+still reach the model as text.

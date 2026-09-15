@@ -456,6 +456,11 @@ impl TurnEmitter {
             .send_chat(ChatEvent::GoalCapabilities(capabilities));
     }
 
+    pub fn slash_commands(&self, catalog: protocol::SlashCommandCatalog) {
+        self.lock()
+            .send_chat(ChatEvent::SlashCommandsChanged(catalog));
+    }
+
     pub fn task_update(&self, tasks: &TaskList) {
         self.lock().send_chat(ChatEvent::TaskUpdate(tasks.clone()));
     }

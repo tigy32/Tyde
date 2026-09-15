@@ -488,6 +488,7 @@ impl Backend for MockBackend {
             tyde_agent_adapter::BackendCapability::CompactionReported,
             tyde_agent_adapter::BackendCapability::AgentInitiatedTurns,
             tyde_agent_adapter::BackendCapability::GenericOtherTool,
+            tyde_agent_adapter::BackendCapability::SlashCommands,
         ]
         .into()
     }

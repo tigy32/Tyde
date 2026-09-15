@@ -14,8 +14,9 @@ use protocol::{
     AgentControlProgressKind, AgentControlProgressStatus, AgentId, AgentOrigin,
     BackendCapacityState, BackendKind, CapacityMeasure, CapacitySource, ChatEvent,
     CurrentContextUsage, ImageData, MessageSender, MessageTokenUsage, SessionId,
-    SessionSettingFieldType, SessionSettingsValues, TaskStatus, TokenUsage, ToolExecutionMode,
-    ToolExecutionOutcome, ToolExecutionResult, ToolProgressUpdate, ToolRequestType,
+    SessionSettingFieldType, SessionSettingsValues, SlashCommandCatalog, TaskStatus, TokenUsage,
+    ToolExecutionMode, ToolExecutionOutcome, ToolExecutionResult, ToolProgressUpdate,
+    ToolRequestType,
 };
 use serde_json::Value;
 use server::backend::Backend;
@@ -2863,6 +2864,7 @@ fn describe_event(event: &ChatEvent) -> String {
         ChatEvent::GoalCapabilities(_) => "GoalCapabilities".to_owned(),
         ChatEvent::GoalChanged(_) => "GoalChanged".to_owned(),
         ChatEvent::GoalCompleted(_) => "GoalCompleted".to_owned(),
+        ChatEvent::SlashCommandsChanged(_) => "SlashCommandsChanged".to_owned(),
         ChatEvent::TaskUpdate(_) => "TaskUpdate".to_owned(),
         ChatEvent::OperationCancelled(_) => "OperationCancelled".to_owned(),
         ChatEvent::RetryAttempt(_) => "RetryAttempt".to_owned(),
@@ -4747,6 +4749,138 @@ fn assert_reasoning_reaches_the_client(turns: &[Turn]) {
     );
 }
 conformance2_scenario!(real_conversation, []);
+conformance2_scenario!(real_slash_commands, [BackendCapability::SlashCommands]);
+
+/// A command that answers without changing the session, chosen from the
+/// advertised set by preference: a runtime is free to list `reset`, `exit`, or
+/// anything else destructive, and the scenario must never run one of those.
+const READ_ONLY_SLASH_COMMANDS: [&str; 7] = [
+    "context", "help", "cost", "status", "version", "tools", "usage",
+];
+
+/// Slash commands are session state the backend discovers and honors: it
+/// advertises the set the session accepts, a message invoking one of them runs
+/// the command instead of being read as prose, and a message that merely
+/// starts with a slash still reaches the model as text.
+async fn real_slash_commands<B: Backend>(host: &mut Harness<B>) {
+    let agent = spawn_agent(host, &launch_prompt()).await;
+    let launched = collect_turn(host, &agent, &launch_prompt()).await;
+    assert_ready_handshake(&launched);
+
+    let catalog = advertised_slash_commands(&launched);
+    assert_slash_command_set_is_well_formed(&launched, &catalog);
+    let command = read_only_slash_command(&launched, &catalog);
+
+    let invocation = format!("/{command}");
+    let invoked = ask(host, &agent, &invocation).await;
+    assert_no_error_message(&invoked.label(), invoked.events());
+    assert_reached_idle(&invoked);
+    assert_eq!(
+        invoked
+            .user_messages()
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>(),
+        vec![invocation.as_str()],
+        "{}: the command must be shown exactly as typed",
+        invoked.label()
+    );
+    assert!(
+        !invoked.final_text().trim().is_empty(),
+        "{}: running {invocation} produced no visible response",
+        invoked.label()
+    );
+    // A command is answered by the runtime, not the model. A model request
+    // here means the text was read as prose — the exact failure this scenario
+    // exists to catch — so it is asserted wherever the backend can report it.
+    if invoked.declares(BackendCapability::ModelRequestUsageReported) {
+        assert!(
+            invoked.model_requests().is_empty(),
+            "{}: {invocation} reached the model as prose ({} model request(s)) instead of \
+             running as a command",
+            invoked.label(),
+            invoked.model_requests().len()
+        );
+    }
+
+    let marker = unique_payload();
+    let prose = ask(
+        host,
+        &agent,
+        format!(
+            "/not-a-command-{} Reply with exactly {marker} and nothing else. Do not use any tools.",
+            marker.to_ascii_lowercase()
+        ),
+    )
+    .await;
+    assert_final_text_contains(&prose, &marker);
+    assert_universal_contract(&[launched, prose]);
+}
+
+fn advertised_slash_commands(turn: &Turn) -> SlashCommandCatalog {
+    turn.events()
+        .iter()
+        .filter_map(|event| match event {
+            ChatEvent::SlashCommandsChanged(catalog) => Some(catalog.clone()),
+            _ => None,
+        })
+        .next_back()
+        .unwrap_or_else(|| {
+            panic!(
+                "{}: the backend declares SlashCommands but advertised no command set during \
+                 the opening turn",
+                turn.label()
+            )
+        })
+}
+
+fn assert_slash_command_set_is_well_formed(turn: &Turn, catalog: &SlashCommandCatalog) {
+    assert!(
+        !catalog.commands.is_empty(),
+        "{}: advertised an empty command set",
+        turn.label()
+    );
+    let mut seen = BTreeSet::new();
+    for command in &catalog.commands {
+        assert!(
+            !command.name.is_empty()
+                && !command.name.starts_with('/')
+                && !command.name.contains(char::is_whitespace),
+            "{}: malformed command name {:?}",
+            turn.label(),
+            command.name
+        );
+        assert!(
+            seen.insert(command.name.as_str()),
+            "{}: command {:?} advertised twice",
+            turn.label(),
+            command.name
+        );
+    }
+}
+
+fn read_only_slash_command(turn: &Turn, catalog: &SlashCommandCatalog) -> String {
+    READ_ONLY_SLASH_COMMANDS
+        .iter()
+        .find(|name| {
+            catalog
+                .commands
+                .iter()
+                .any(|command| command.name == **name)
+        })
+        .map(|name| (*name).to_owned())
+        .unwrap_or_else(|| {
+            panic!(
+                "{}: none of the read-only commands {READ_ONLY_SLASH_COMMANDS:?} is advertised; \
+                 the set was {:?}",
+                turn.label(),
+                catalog
+                    .commands
+                    .iter()
+                    .map(|command| command.name.as_str())
+                    .collect::<Vec<_>>()
+            )
+        })
+}
 
 #[test]
 #[ignore = "real Codex native settings conformance; requires TYDE_RUN_REAL_AI_TESTS=1"]

@@ -52,6 +52,14 @@ const ANTIGRAVITY_STARTUP_TIMEOUT: Duration = Duration::from_secs(120);
 /// `/usage` answers locally in well under a second; this only bounds a probe
 /// that has stopped answering.
 const ANTIGRAVITY_CAPACITY_TIMEOUT: Duration = Duration::from_secs(30);
+/// Bound on a CLI-answered command (`/help`, `/usage`, …) run as its own
+/// `--print` invocation. These make no model request.
+const ANTIGRAVITY_COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
+/// CLI commands that change configuration `agy` shares across every process —
+/// model, effort, permissions, hooks, settings. Tyde owns those per session,
+/// so they are not offered; the remaining CLI-answered commands are read-only.
+const ANTIGRAVITY_CONFIGURATION_COMMANDS: [&str; 5] =
+    ["config", "effort", "hooks", "model", "permissions"];
 /// How often the account's quota is re-read. Refreshing on every turn would
 /// spawn a process per turn to watch a number that moves in hours.
 const ANTIGRAVITY_CAPACITY_REFRESH_INTERVAL: Duration = Duration::from_secs(120);
@@ -974,6 +982,9 @@ struct Supervisor {
     native_sessions: BTreeSet<String>,
     native_children: tokio::task::JoinSet<()>,
     session_id: String,
+    /// The CLI-answered commands advertised for this session. An invoking
+    /// message runs as its own `--print` invocation, never as a turn.
+    slash_commands: Option<protocol::SlashCommandCatalog>,
 }
 
 struct InitialTurn {
@@ -1127,6 +1138,36 @@ impl Supervisor {
         }
     }
 
+    /// Answers an advertised CLI command as its own `--print` run and shows
+    /// the CLI's reply as the response. The persistent process is not
+    /// involved: no turn starts there and no model request is made.
+    async fn run_cli_command(&mut self, message: &str) -> bool {
+        let emitter = Arc::clone(&self.inner.emitter);
+        emitter.user_message(message, None);
+        emitter.typing_status_changed(true);
+        let model = self.launch.model.clone();
+        let cwd = PathBuf::from(&self.launch.primary_root);
+        match run_antigravity_cli_command(&model, Some(&cwd), message.trim()).await {
+            Ok(output) if output.error.is_none() => {
+                let text = output.response.trim_end().to_owned();
+                let response = emitter.stream_start(Some(&model));
+                emitter.stream_delta(&response, &text);
+                emitter.stream_end(
+                    response,
+                    StreamEndPayload {
+                        content: text,
+                        model_info: Some(ModelInfo { model }),
+                        ..Default::default()
+                    },
+                );
+            }
+            Ok(output) => emitter.error_message(&output.error.unwrap_or_default()),
+            Err(error) => emitter.error_message(&error),
+        }
+        emitter.typing_status_changed(false);
+        true
+    }
+
     async fn handle_input(&mut self, process: &mut AgyProcess, input: AgentInput) -> bool {
         match input {
             AgentInput::SendMessage(payload) => {
@@ -1134,6 +1175,12 @@ impl Supervisor {
                     && !self.answer_question(response).await
                 {
                     return true;
+                }
+                if payload.tool_response.is_none()
+                    && let Some(catalog) = self.slash_commands.as_ref()
+                    && catalog.invoked_by(&payload.message).is_some()
+                {
+                    return self.run_cli_command(&payload.message).await;
                 }
                 // A tool response is not a chat message, so it produces no user
                 // bubble — the card the user acted on is the record of it.
@@ -1611,6 +1658,122 @@ fn tool_execution_result(
             result: json!({ "output": output }),
         },
     }
+}
+
+/// What a CLI-answered command printed: the structured `command_result`
+/// payload when the command has one, the `result` frame's response text, and
+/// the error the CLI reported, if any.
+#[derive(Default)]
+struct AgyCommandOutput {
+    command: Option<Value>,
+    response: String,
+    error: Option<String>,
+}
+
+/// Runs a CLI-answered command (`/help`, `/usage`, …) as its own `--print`
+/// invocation. `agy` answers these itself, without a model request, and only
+/// in print mode: the stream-json process refuses them with "run it as its own
+/// --print /help invocation".
+async fn run_antigravity_cli_command(
+    model: &str,
+    cwd: Option<&Path>,
+    command: &str,
+) -> Result<AgyCommandOutput, String> {
+    let mut process = crate::process_env::command("agy")
+        .map_err(|err| format!("Antigravity CLI is unavailable: {err:?}"))?;
+    process.args([
+        "--output-format",
+        "stream-json",
+        "--model",
+        model,
+        "-p",
+        command,
+    ]);
+    if let Some(path) = process_env::resolved_child_process_path() {
+        process.env("PATH", path);
+    }
+    if let Some(cwd) = cwd {
+        process.current_dir(cwd);
+    }
+    process
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    let output = tokio::time::timeout(ANTIGRAVITY_COMMAND_TIMEOUT, process.output())
+        .await
+        .map_err(|_| {
+            format!(
+                "Antigravity did not answer {command} within {}s",
+                ANTIGRAVITY_COMMAND_TIMEOUT.as_secs()
+            )
+        })?
+        .map_err(|err| format!("Antigravity could not run {command}: {err}"))?;
+    let mut answer = AgyCommandOutput::default();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let Ok(frame) = parse_frame(line.trim()) else {
+            continue;
+        };
+        match frame {
+            AgyFrame::CommandResult(payload) => answer.command = Some(payload),
+            AgyFrame::Result(result) => {
+                answer.error = result.status.eq_ignore_ascii_case("ERROR").then(|| {
+                    result
+                        .error
+                        .clone()
+                        .filter(|error| !error.trim().is_empty())
+                        .unwrap_or_else(|| format!("Antigravity reported {command} failed"))
+                });
+                answer.response = result.response;
+            }
+            _ => {}
+        }
+    }
+    Ok(answer)
+}
+
+/// The commands the CLI itself answers, read from its own `/help`, minus the
+/// configuration commands Tyde owns per session.
+async fn read_antigravity_slash_commands(model: String) -> Option<protocol::SlashCommandCatalog> {
+    let output = match run_antigravity_cli_command(&model, None, "/help").await {
+        Ok(output) => output,
+        Err(error) => {
+            tracing::warn!(%error, "Antigravity /help failed; slash commands unavailable");
+            return None;
+        }
+    };
+    if let Some(error) = output.error {
+        tracing::warn!(
+            error,
+            "Antigravity /help reported an error; slash commands unavailable"
+        );
+        return None;
+    }
+    let commands = output
+        .command
+        .as_ref()?
+        .get("data")?
+        .get("commands")?
+        .as_array()?
+        .iter()
+        .filter_map(|command| {
+            let name = command.get("name")?.as_str()?.trim();
+            if name.is_empty() || ANTIGRAVITY_CONFIGURATION_COMMANDS.contains(&name) {
+                return None;
+            }
+            Some(protocol::SlashCommand {
+                name: name.to_owned(),
+                description: command
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|description| !description.is_empty())
+                    .map(str::to_owned),
+                input_hint: None,
+            })
+        })
+        .collect::<Vec<_>>();
+    (!commands.is_empty()).then_some(protocol::SlashCommandCatalog { commands })
 }
 
 /// Reads the account's remaining quota with no conversation and no live agent.
@@ -2359,6 +2522,7 @@ impl Backend for AntigravityBackend {
             Cap::GenericGenerateImage,
             Cap::GenericSleep,
             Cap::GenericOtherTool,
+            Cap::SlashCommands,
         ]
         .into()
     }
@@ -2626,6 +2790,9 @@ impl AntigravityBackend {
         } else {
             None
         };
+        // Overlaps with the process start, which itself blocks on `init`.
+        let slash_commands_probe =
+            tokio::spawn(read_antigravity_slash_commands(launch.model.clone()));
         let process = match AgyProcess::start(
             &launch,
             resume.as_ref().map(|id| id.0.as_str()),
@@ -2641,6 +2808,10 @@ impl AntigravityBackend {
                 return Err(err);
             }
         };
+        let slash_commands = slash_commands_probe.await.ok().flatten();
+        if let Some(catalog) = slash_commands.clone() {
+            emitter.slash_commands(catalog);
+        }
 
         let session_id = SessionId(process.conversation_id.clone());
         let inner = Arc::new(AntigravityInner {
@@ -2694,6 +2865,7 @@ impl AntigravityBackend {
             native_sessions: BTreeSet::new(),
             native_children: tokio::task::JoinSet::new(),
             session_id: session_id.0.clone(),
+            slash_commands,
         };
         tokio::spawn(async move {
             supervisor

@@ -126,6 +126,11 @@ exhaustive_capabilities! {
     // them, so "continuing a command is a second action" asserts nothing there.
     YieldsRunningCommands,
     NativeGoals,
+    // The runtime advertises the slash commands its session accepts and runs
+    // one when a user message starts with its `/name`. Measured: Claude lists
+    // them in its `initialize` response and `init` frame; ACP agents send
+    // `available_commands_update`. Codex app-server exposes no command list.
+    SlashCommands,
     AgentInitiatedTurns,
     MidTurnSteering,
     ReasoningDeltas,

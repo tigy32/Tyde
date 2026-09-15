@@ -2,16 +2,25 @@ use std::borrow::Cow;
 
 use futures_util::future::BoxFuture;
 use protocol::{
-    AcpAdapterId, AcpAgentSpec, BackendKind, MessageTokenUsage, TokenUsage, TokenUsageScope,
-    TokenUsageUnavailableReason,
+    AcpAdapterId, AcpAgentSpec, BackendKind, MessageTokenUsage, SlashCommand, TokenUsage,
+    TokenUsageScope, TokenUsageUnavailableReason,
 };
 use serde_json::{Value, json};
 
 use crate::backend::acp::AcpSpawnSpec;
 use crate::backend::acp::adapter::{
-    AcpAgentAdapter, AcpCapabilities, AcpSessionKind, AcpSessionRoots, NormalizedUpdate,
+    AcpAgentAdapter, AcpCapabilities, AcpSessionKind, AcpSessionRoots, AcpSlashCommandCtx,
+    AcpSlashCommandPlan, NormalizedUpdate,
 };
 use crate::backend::acp::adapters::stock::pick_local_workspace_root;
+
+/// Grok's terminal UI answers these from `_x.ai/session/info` itself; the
+/// agent accepts them on `session/prompt` and completes the turn without
+/// saying anything.
+const GROK_SESSION_INFO_COMMANDS: &[&str] = &["context", "session-info"];
+
+/// A permission-mode toggle of Grok's own terminal UI; Tyde owns approvals.
+const GROK_TERMINAL_ONLY_COMMANDS: &[&str] = &["always-approve"];
 
 pub struct GrokAdapter {
     spec: AcpAgentSpec,
@@ -100,6 +109,30 @@ impl AcpAgentAdapter for GrokAdapter {
             .find_map(|line| line.strip_prefix("description:").map(str::trim))
             .unwrap_or("Grok subagent");
         Some((protocol::SessionId(session), name.to_owned()))
+    }
+
+    fn normalize_slash_commands(&self, commands: Vec<SlashCommand>) -> Vec<SlashCommand> {
+        commands
+            .into_iter()
+            .filter(|command| !GROK_TERMINAL_ONLY_COMMANDS.contains(&command.name.as_str()))
+            .collect()
+    }
+
+    fn plan_slash_command(
+        &self,
+        command: &SlashCommand,
+        _message: &str,
+        ctx: &AcpSlashCommandCtx<'_>,
+    ) -> AcpSlashCommandPlan {
+        if GROK_SESSION_INFO_COMMANDS.contains(&command.name.as_str()) {
+            AcpSlashCommandPlan::Request {
+                method: "_x.ai/session/info",
+                params: json!({ "sessionId": ctx.session_id }),
+                render: render_grok_session_info,
+            }
+        } else {
+            AcpSlashCommandPlan::Prompt
+        }
     }
 
     fn normalize_notification(&self, method: &str, params: &Value) -> Option<NormalizedUpdate> {
@@ -539,4 +572,71 @@ fn find_i64(value: &Value, keys: &[&str]) -> Option<i64> {
     value
         .as_array()
         .and_then(|values| values.iter().find_map(|value| find_i64(value, keys)))
+}
+
+/// The view Grok's own UI gives of `_x.ai/session/info`: model, turn count,
+/// and the context window broken down by what fills it.
+fn render_grok_session_info(response: &Value) -> String {
+    let info = response.get("result").unwrap_or(response);
+    let text = |key: &str| {
+        info.get(key)
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+    };
+    let count = |value: Option<&Value>| value.and_then(Value::as_u64).unwrap_or(0);
+    let mut lines = vec!["**Session**".to_owned()];
+    if let Some(model) = text("modelDisplayName").or_else(|| text("model")) {
+        lines.push(format!("- Model: {model}"));
+    }
+    if let Some(agent) = text("agentName") {
+        lines.push(format!("- Agent: {agent}"));
+    }
+    if let Some(cwd) = text("cwd") {
+        lines.push(format!("- Working directory: {cwd}"));
+    }
+    lines.push(format!("- Turns: {}", count(info.get("turns"))));
+    let Some(context) = info.get("context").filter(|context| context.is_object()) else {
+        return lines.join("\n");
+    };
+    let used = count(context.get("used"));
+    let total = count(context.get("total"));
+    lines.push(String::new());
+    lines.push("**Context window**".to_owned());
+    match used.saturating_mul(100).checked_div(total) {
+        Some(percent) => lines.push(format!("- Used: {used} / {total} tokens ({percent}%)")),
+        None => lines.push(format!("- Used: {used} tokens")),
+    }
+    for (label, key) in [
+        ("System prompt", "systemPromptTokens"),
+        ("Tool definitions", "toolDefinitionsTokens"),
+        ("Messages", "messageTokens"),
+        ("Free", "freeTokens"),
+    ] {
+        if let Some(tokens) = context.get(key).and_then(Value::as_u64) {
+            lines.push(format!("- {label}: {tokens} tokens"));
+        }
+    }
+    for category in context
+        .get("usageCategories")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let Some(label) = category.get("label").and_then(Value::as_str) else {
+            continue;
+        };
+        let detail = category
+            .get("detail")
+            .and_then(Value::as_str)
+            .map(|detail| format!(" ({detail})"))
+            .unwrap_or_default();
+        lines.push(format!(
+            "- {label}: {} tokens{detail}",
+            count(category.get("tokens"))
+        ));
+    }
+    if let Some(compactions) = context.get("compactionCount").and_then(Value::as_u64) {
+        lines.push(format!("- Compactions: {compactions}"));
+    }
+    lines.join("\n")
 }

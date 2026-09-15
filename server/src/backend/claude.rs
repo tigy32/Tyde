@@ -21,10 +21,11 @@ use protocol::{
     CapacityMeasure, CapacityReport, CapacityReset, CapacityScope, CapacitySource,
     CapacityUnavailableReason, CapacityWindow, ClaudeLimitType, ContextBreakdown,
     CurrentContextUsage, ExitPlanModeDecision, ImageData, MessageTokenUsage, ModelInfo,
-    ReasoningData, SendMessageToolResponse, SessionId, TokenUsage, TokenUsageScope,
-    TokenUsageUnavailableReason, ToolExecutionMode, ToolExecutionOutcome, ToolExecutionResult,
-    ToolPolicy, ToolProgressData, ToolProgressUpdate, ToolRequestType, ToolUseData,
-    ValueProvenance, WorkflowAgentState, WorkflowAgentStatus, WorkflowRunState, WorkflowRunStatus,
+    ReasoningData, SendMessageToolResponse, SessionId, SlashCommand, SlashCommandCatalog,
+    TokenUsage, TokenUsageScope, TokenUsageUnavailableReason, ToolExecutionMode,
+    ToolExecutionOutcome, ToolExecutionResult, ToolPolicy, ToolProgressData, ToolProgressUpdate,
+    ToolRequestType, ToolUseData, ValueProvenance, WorkflowAgentState, WorkflowAgentStatus,
+    WorkflowRunState, WorkflowRunStatus,
 };
 
 use crate::backend::claude_skills::{
@@ -541,6 +542,9 @@ impl ClaudeSession {
                     BackendCompactionCapabilityEvidence::None,
                 ),
                 compact_command_advertised: None,
+                initialize_slash_commands: None,
+                init_slash_commands: None,
+                slash_commands: None,
                 installed_provider_version: None,
                 provider_version: None,
                 process_generation: 0,
@@ -761,6 +765,13 @@ struct ClaudeState {
     active_turn: Option<ActiveTurn>,
     compaction_capability: BackendCompactionCapability,
     compact_command_advertised: Option<bool>,
+    /// Every command the `initialize` response described, with descriptions
+    /// and argument hints. The `init` frame later says which are terminal-bound.
+    initialize_slash_commands: Option<Vec<SlashCommand>>,
+    init_slash_commands: Option<ClaudeInitSlashCommands>,
+    /// The set last advertised on the stream. Consulted to deliver an invoking
+    /// message verbatim, and so only a real change is published again.
+    slash_commands: Option<SlashCommandCatalog>,
     installed_provider_version: Option<String>,
     provider_version: Option<String>,
     process_generation: u64,
@@ -818,6 +829,9 @@ impl Default for ClaudeState {
                 BackendCompactionCapabilityEvidence::None,
             ),
             compact_command_advertised: None,
+            initialize_slash_commands: None,
+            init_slash_commands: None,
+            slash_commands: None,
             installed_provider_version: None,
             provider_version: None,
             process_generation: 0,
@@ -1321,6 +1335,64 @@ fn claude_init_frame_skills(value: &Value) -> Option<Result<Option<Vec<String>>,
         names.push(name.to_string());
     }
     Some(Ok(Some(names)))
+}
+
+/// The slash commands a `system`/`init` frame reports: every user-invocable
+/// name, and the subset the CLI marks terminal-bound (`exit`, `statusline`, …)
+/// that a headless session cannot honor and remote UIs are told to hide.
+struct ClaudeInitSlashCommands {
+    names: Option<Vec<String>>,
+    terminal: Vec<String>,
+}
+
+fn claude_init_frame_slash_commands(value: &Value) -> Option<ClaudeInitSlashCommands> {
+    if value.get("type").and_then(Value::as_str) != Some("system")
+        || value.get("subtype").and_then(Value::as_str) != Some("init")
+    {
+        return None;
+    }
+    let names = |key: &str| {
+        value.get(key).and_then(Value::as_array).map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(|name| name.trim_start_matches('/').to_owned())
+                .filter(|name| !name.is_empty())
+                .collect::<Vec<_>>()
+        })
+    };
+    Some(ClaudeInitSlashCommands {
+        names: names("slash_commands"),
+        terminal: names("terminal_slash_commands").unwrap_or_default(),
+    })
+}
+
+/// The commands an `initialize` control response describes. Unlike the `init`
+/// frame's bare name list, these carry descriptions and argument hints.
+fn claude_initialize_slash_commands(response: &Value) -> Option<Vec<SlashCommand>> {
+    let commands = response.get("commands")?.as_array()?;
+    Some(
+        commands
+            .iter()
+            .filter_map(|command| {
+                let name = command
+                    .as_str()
+                    .or_else(|| command.get("name").and_then(Value::as_str))?
+                    .trim_start_matches('/');
+                (!name.is_empty()).then(|| SlashCommand {
+                    name: name.to_owned(),
+                    description: command
+                        .get("description")
+                        .and_then(Value::as_str)
+                        .and_then(normalize_nonempty),
+                    input_hint: command
+                        .get("argumentHint")
+                        .and_then(Value::as_str)
+                        .and_then(normalize_nonempty),
+                })
+            })
+            .collect(),
+    )
 }
 
 fn parse_claude_system_frame(value: &Value) -> Result<ClaudeSystemFrame, String> {
@@ -2730,8 +2802,14 @@ impl ClaudeInner {
             return Err(TurnStartError::Cancelled);
         }
 
-        let prompt =
-            super::workspace_prompt(prompt, self.state.lock().await.workspace_roots.as_deref());
+        let prompt = {
+            let state = self.state.lock().await;
+            if super::invokes_slash_command(state.slash_commands.as_ref(), prompt) {
+                prompt.to_owned()
+            } else {
+                super::workspace_prompt(prompt, state.workspace_roots.as_deref())
+            }
+        };
         let input_message = build_stream_json_user_message(&prompt, images);
         let stdin = {
             let runtime = self.runtime.lock().await;
@@ -3545,7 +3623,52 @@ impl ClaudeInner {
         }
     }
 
+    async fn record_initialize_slash_commands(&self, response: &Value) {
+        let Some(commands) = claude_initialize_slash_commands(response) else {
+            return;
+        };
+        let mut state = self.state.lock().await;
+        state.initialize_slash_commands = Some(commands);
+        self.publish_slash_commands(&mut state);
+    }
+
+    async fn record_init_slash_commands(&self, update: ClaudeInitSlashCommands) {
+        let mut state = self.state.lock().await;
+        state.init_slash_commands = Some(update);
+        self.publish_slash_commands(&mut state);
+    }
+
+    /// Advertise the effective set once the `init` frame has arrived: it is
+    /// the only source that says which commands are terminal-bound, and
+    /// publishing before it would briefly offer commands the session cannot
+    /// run. Descriptions come from the `initialize` response when it had any.
+    fn publish_slash_commands(&self, state: &mut ClaudeState) {
+        let Some(init) = state.init_slash_commands.as_ref() else {
+            return;
+        };
+        let mut commands = match (&state.initialize_slash_commands, &init.names) {
+            (Some(described), _) => described.clone(),
+            (None, Some(names)) => names
+                .iter()
+                .map(|name| SlashCommand {
+                    name: name.clone(),
+                    description: None,
+                    input_hint: None,
+                })
+                .collect(),
+            (None, None) => return,
+        };
+        commands.retain(|command| !init.terminal.contains(&command.name));
+        let catalog = SlashCommandCatalog { commands };
+        if state.slash_commands.as_ref() == Some(&catalog) {
+            return;
+        }
+        state.slash_commands = Some(catalog.clone());
+        self.emitter.slash_commands(catalog);
+    }
+
     async fn configure_capacity_from_initialize(&self, response: &Value) {
+        self.record_initialize_slash_commands(response).await;
         let access = claude_capacity_access_from_initialize(response);
         let emitter = {
             let mut state = self.state.lock().await;
@@ -5993,6 +6116,9 @@ async fn read_claude_stdout_persistent(
                 .unwrap_or(""),
             "received Claude CLI frame"
         );
+        if let Some(update) = claude_init_frame_slash_commands(&value) {
+            inner.record_init_slash_commands(update).await;
+        }
         if let Some(reported) = claude_init_frame_skills(&value) {
             inner.record_skill_init_frame(reported).await;
         }
@@ -6077,6 +6203,9 @@ async fn read_claude_stdout_persistent(
 
         // The `init` frame lists the skills the CLI actually loaded. It is not
         // `continue`d: the frame still flows to the per-turn reducer.
+        if let Some(update) = claude_init_frame_slash_commands(&value) {
+            inner.record_init_slash_commands(update).await;
+        }
         if let Some(reported) = claude_init_frame_skills(&value) {
             inner.record_skill_init_frame(reported).await;
             // Settled — whether every skill arrived or some did not. Everything
@@ -14420,6 +14549,7 @@ impl Backend for ClaudeBackend {
             // `result.modelUsage[model].contextWindow`, and never reports what
             // fills it -- so deliberately no `ContextBreakdownReported`.
             tyde_agent_adapter::BackendCapability::ContextUsageReported,
+            tyde_agent_adapter::BackendCapability::SlashCommands,
         ]
         .into()
     }

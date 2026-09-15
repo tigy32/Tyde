@@ -783,6 +783,9 @@ struct HermesSessionActor {
     workspace_roots: Option<Vec<String>>,
     gateway: HermesGatewayHandle,
     live_session_id: String,
+    /// The command set advertised for this session; an invoking message runs
+    /// through the gateway instead of `prompt.submit`.
+    slash_commands: Option<protocol::SlashCommandCatalog>,
     mapper: HermesEventMapper,
     events_tx: mpsc::UnboundedSender<BackendEvent>,
     stored_session_id: Arc<std::sync::Mutex<SessionId>>,
@@ -1163,6 +1166,7 @@ impl Backend for HermesBackend {
             tyde_agent_adapter::BackendCapability::OpaqueToolProgress,
             tyde_agent_adapter::BackendCapability::RetryTelemetry,
             tyde_agent_adapter::BackendCapability::UserQuestionRequests,
+            tyde_agent_adapter::BackendCapability::SlashCommands,
         ]
         .into()
     }
@@ -1245,10 +1249,15 @@ impl Backend for HermesBackend {
             gateway.provider_version.as_deref(),
         )));
         let active_compaction = Arc::new(std::sync::Mutex::new(None));
+        let slash_commands = discover_hermes_slash_commands(&gateway).await;
+        if let Some(catalog) = slash_commands.clone() {
+            let _ = events_tx.send(BackendEvent::Chat(ChatEvent::SlashCommandsChanged(catalog)));
+        }
         let actor = HermesSessionActor {
             workspace_roots: configured_workspace_roots,
             gateway: gateway.clone(),
             live_session_id: ids.live_session_id.clone(),
+            slash_commands,
             mapper: HermesEventMapper::default(),
             events_tx,
             stored_session_id: Arc::clone(&stored_session_id),
@@ -1374,10 +1383,15 @@ impl Backend for HermesBackend {
             gateway.provider_version.as_deref(),
         )));
         let active_compaction = Arc::new(std::sync::Mutex::new(None));
+        let slash_commands = discover_hermes_slash_commands(&gateway).await;
+        if let Some(catalog) = slash_commands.clone() {
+            let _ = events_tx.send(BackendEvent::Chat(ChatEvent::SlashCommandsChanged(catalog)));
+        }
         let actor = HermesSessionActor {
             workspace_roots: configured_workspace_roots,
             gateway: gateway.clone(),
             live_session_id,
+            slash_commands,
             mapper: HermesEventMapper {
                 cumulative_usage_incomplete: true,
                 ..HermesEventMapper::default()
@@ -2808,6 +2822,15 @@ impl HermesSessionActor {
             self.emit_error("Hermes prompt.submit requires a non-empty message");
             return;
         }
+        if let Some(command) = self
+            .slash_commands
+            .as_ref()
+            .and_then(|catalog| catalog.invoked_by(&payload.message))
+            .cloned()
+        {
+            self.run_slash_command(&payload.message, &command).await;
+            return;
+        }
 
         let attached_paths = match self.attach_images(&images).await {
             Ok(paths) => paths,
@@ -2826,13 +2849,17 @@ impl HermesSessionActor {
         )));
         self.mapper.typing_active = true;
         self.emit(ChatEvent::TypingStatusChanged(true));
+        self.submit_prompt(&payload.message, &attached_paths).await;
+    }
+
+    async fn submit_prompt(&mut self, message: &str, attached_paths: &[String]) {
         match self
             .gateway
             .request(
                 "prompt.submit",
                 json!({
                     "session_id": self.live_session_id,
-                    "text": super::workspace_prompt(&payload.message, self.workspace_roots.as_deref()),
+                    "text": super::workspace_prompt(message, self.workspace_roots.as_deref()),
                 }),
             )
             .await
@@ -2845,10 +2872,112 @@ impl HermesSessionActor {
                 Err(err) => self.emit_turn_failure(err),
             },
             Err(err) => {
-                self.detach_images(&attached_paths).await;
+                self.detach_images(attached_paths).await;
                 self.emit_turn_failure(format!("Hermes prompt.submit failed: {err}"));
             }
         }
+    }
+
+    /// Runs an advertised command through the gateway rather than the model.
+    /// `slash.exec` answers most commands directly; skills and prompt-building
+    /// built-ins come back as a message to submit, which then runs as an
+    /// ordinary turn under the command the user typed.
+    async fn run_slash_command(&mut self, message: &str, command: &protocol::SlashCommand) {
+        self.recent_stderr.clear();
+        self.emit(ChatEvent::MessageAdded(user_message(message, None)));
+        self.mapper.typing_active = true;
+        self.emit(ChatEvent::TypingStatusChanged(true));
+        let args = message.trim_start()[1 + command.name.len()..]
+            .trim()
+            .to_owned();
+        let exec = self
+            .gateway
+            .request_typed(
+                "slash.exec",
+                json!({ "session_id": self.live_session_id, "command": message.trim() }),
+            )
+            .await;
+        let dispatched = match exec {
+            Ok(response) => response,
+            // 4018: not a slash-worker command — skills, bundles, and the
+            // prompt-building built-ins are served by command.dispatch.
+            Err(error) if error.code == Some(4018) => {
+                match self
+                    .gateway
+                    .request_typed(
+                        "command.dispatch",
+                        json!({
+                            "session_id": self.live_session_id,
+                            "name": command.name,
+                            "arg": args,
+                        }),
+                    )
+                    .await
+                {
+                    Ok(response) => response,
+                    Err(error) => {
+                        self.emit_turn_failure(format!(
+                            "Hermes /{} failed: {}",
+                            command.name, error.message
+                        ));
+                        return;
+                    }
+                }
+            }
+            Err(error) => {
+                self.emit_turn_failure(format!(
+                    "Hermes /{} failed: {}",
+                    command.name, error.message
+                ));
+                return;
+            }
+        };
+        let submits_prompt = matches!(
+            dispatched.get("type").and_then(Value::as_str),
+            Some("send" | "skill")
+        );
+        if submits_prompt && let Some(prompt) = dispatched.get("message").and_then(Value::as_str) {
+            let prompt = prompt.to_owned();
+            self.submit_prompt(&prompt, &[]).await;
+            return;
+        }
+        let output = dispatched
+            .get("output")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .unwrap_or_else(|| dispatched.to_string());
+        self.emit_command_reply(output);
+    }
+
+    /// Shows a gateway-answered command's output as the response to the turn
+    /// the command opened, then ends that turn.
+    fn emit_command_reply(&mut self, text: String) {
+        let model = self.mapper.model.clone();
+        self.emit(ChatEvent::StreamStart(StreamStartData {
+            agent: HERMES_AGENT_NAME.to_owned(),
+            model: model.clone(),
+        }));
+        self.emit(ChatEvent::StreamDelta(protocol::StreamTextDeltaData {
+            text: text.clone(),
+        }));
+        self.emit(ChatEvent::StreamEnd(StreamEndData {
+            message: ChatMessage {
+                message_id: None,
+                timestamp: unix_now_ms(),
+                sender: MessageSender::Assistant {
+                    agent: HERMES_AGENT_NAME.to_owned(),
+                },
+                content: text,
+                reasoning: None,
+                tool_calls: Vec::new(),
+                model_info: model.map(|model| protocol::ModelInfo { model }),
+                token_usage: None,
+                context_breakdown: None,
+                images: None,
+            },
+        }));
+        self.mapper.typing_active = false;
+        self.emit(ChatEvent::TypingStatusChanged(false));
     }
 
     async fn attach_images(&self, images: &[ImageData]) -> Result<Vec<String>, String> {
@@ -7205,6 +7334,83 @@ fn model_select_options_from_payload(
     }
 
     Ok((model_options, model_default))
+}
+
+/// The command set the Hermes TUI offers, read from the gateway's completion
+/// registry: every built-in, plugin, and skill command with its description.
+/// Hermes has no advertise-on-connect message, so the list is read once the
+/// session exists and read again on resume.
+/// Desktop-availability tags on `commands.catalog` entries that name a
+/// surface Tyde does not have: the command needs Hermes' own terminal, a
+/// messaging platform, or a voice composer.
+const HERMES_UNAVAILABLE_DESKTOP_TAGS: &[&str] = &["terminal", "messaging", "composer-voice"];
+
+/// The gateway's registry-backed catalog: built-ins, quick commands, plugin
+/// commands, and skills. `complete.slash` is the wrong source — it is ranked
+/// and capped for a completion popup, so it drops most of the registry when
+/// browsing a bare `/`.
+async fn discover_hermes_slash_commands(
+    gateway: &HermesGatewayHandle,
+) -> Option<protocol::SlashCommandCatalog> {
+    let response = match gateway.request("commands.catalog", json!({})).await {
+        Ok(response) => response,
+        Err(error) => {
+            tracing::warn!(%error, "Hermes commands.catalog failed; slash commands unavailable");
+            return None;
+        }
+    };
+    let pairs = response.get("pairs")?.as_array()?;
+    let meta = response.get("commands").and_then(Value::as_object);
+    let mut seen = std::collections::HashSet::new();
+    let commands = pairs
+        .iter()
+        .filter_map(|pair| {
+            let key = pair.get(0)?.as_str()?.trim();
+            let name = key.trim_start_matches('/');
+            if name.is_empty()
+                || name.contains(char::is_whitespace)
+                || !seen.insert(name.to_owned())
+            {
+                return None;
+            }
+            let desktop = meta
+                .and_then(|meta| meta.get(key))
+                .and_then(|entry| entry.get("desktop"))
+                .and_then(Value::as_str);
+            if desktop.is_some_and(|tag| HERMES_UNAVAILABLE_DESKTOP_TAGS.contains(&tag)) {
+                return None;
+            }
+            let (description, input_hint) = split_hermes_usage(
+                name,
+                pair.get(1).and_then(Value::as_str).unwrap_or_default(),
+            );
+            Some(protocol::SlashCommand {
+                name: name.to_owned(),
+                description,
+                input_hint,
+            })
+        })
+        .collect::<Vec<_>>();
+    (!commands.is_empty()).then_some(protocol::SlashCommandCatalog { commands })
+}
+
+/// Hermes appends `(usage: /name <args>)` to a description; the args are the
+/// input hint and the rest is the description.
+fn split_hermes_usage(name: &str, description: &str) -> (Option<String>, Option<String>) {
+    let marker = format!(" (usage: /{name}");
+    let (description, hint) = match description.rsplit_once(&marker) {
+        Some((description, usage)) => (
+            description,
+            Some(usage.trim().trim_end_matches(')').trim().to_owned())
+                .filter(|hint| !hint.is_empty()),
+        ),
+        None => (description, None),
+    };
+    let description = description.trim();
+    (
+        (!description.is_empty()).then(|| description.to_owned()),
+        hint,
+    )
 }
 
 fn parse_session_create_ids(value: &Value) -> Result<HermesSessionIds, String> {

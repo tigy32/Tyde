@@ -54,6 +54,7 @@ pub(crate) fn capabilities() -> BackendCapabilities {
         BackendCapability::GenericReadFiles,
         BackendCapability::GenericWebSearch,
         BackendCapability::GenericOtherTool,
+        BackendCapability::SlashCommands,
     ]
     .into()
 }

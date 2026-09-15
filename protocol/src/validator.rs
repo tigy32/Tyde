@@ -2114,6 +2114,12 @@ fn summarize_chat_event(event: &ChatEvent) -> String {
         }
         ChatEvent::GoalChanged(goal) => format!("event=goal_changed {goal:?}"),
         ChatEvent::GoalCompleted(goal) => format!("event=goal_completed {goal:?}"),
+        ChatEvent::SlashCommandsChanged(catalog) => {
+            format!(
+                "event=slash_commands_changed commands={}",
+                catalog.commands.len()
+            )
+        }
         ChatEvent::TaskUpdate(tasks) => {
             format!(
                 "event=task_update title={:?} tasks={}",

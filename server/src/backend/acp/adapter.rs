@@ -19,7 +19,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use futures_util::future::BoxFuture;
-use protocol::{AcpAdapterId, AcpAgentSpec, BackendKind};
+use protocol::{AcpAdapterId, AcpAgentSpec, BackendKind, SlashCommand};
 use serde_json::Value;
 
 use super::AcpSpawnSpec;
@@ -100,6 +100,35 @@ pub struct AcpRequestCtx<'a> {
     /// session has any.
     pub system_prompt: Option<&'a str>,
     pub capabilities: &'a AcpCapabilities,
+}
+
+/// Session facts an adapter may fold into a slash command it answers itself.
+pub struct AcpSlashCommandCtx<'a> {
+    pub session_id: &'a str,
+    pub workspace_root: &'a str,
+    pub model: Option<&'a str>,
+    pub mode: Option<&'a str>,
+    /// The agent's model list as the generic backend last recorded it.
+    pub known_models: &'a [Value],
+    /// Tokens the session has consumed so far, as the agent reported them.
+    pub usage: &'a protocol::TokenUsage,
+    pub context_usage: Option<&'a protocol::CurrentContextUsage>,
+}
+
+/// How a message that invokes an advertised slash command reaches the agent.
+pub enum AcpSlashCommandPlan {
+    /// Send the message verbatim as the prompt; the agent runs the command.
+    Prompt,
+    /// Call a JSON-RPC method and show `render`'s view of its result as the
+    /// turn's response. For agents whose terminal UI answers the command
+    /// client-side from an RPC the ACP session also exposes.
+    Request {
+        method: &'static str,
+        params: Value,
+        render: fn(&Value) -> String,
+    },
+    /// Show text composed from session state without contacting the agent.
+    Reply(String),
 }
 
 /// A notification an adapter recognized and translated into standard terms.
@@ -194,6 +223,25 @@ pub trait AcpAgentAdapter: Send + Sync + 'static {
     /// nothing, because a conforming agent only emits `session/update`.
     fn normalize_notification(&self, _method: &str, _params: &Value) -> Option<NormalizedUpdate> {
         None
+    }
+
+    /// Adjust the advertised command set before Tyde publishes it: drop
+    /// commands only the agent's own terminal UI can carry out, add ones Tyde
+    /// answers on the agent's behalf. Default: publish the set as advertised.
+    fn normalize_slash_commands(&self, commands: Vec<SlashCommand>) -> Vec<SlashCommand> {
+        commands
+    }
+
+    /// Decide how an advertised command the user invoked is carried out.
+    /// Default: the prompt goes to the agent verbatim, which is what a
+    /// conforming agent expects for the commands it advertised.
+    fn plan_slash_command(
+        &self,
+        _command: &SlashCommand,
+        _message: &str,
+        _ctx: &AcpSlashCommandCtx<'_>,
+    ) -> AcpSlashCommandPlan {
+        AcpSlashCommandPlan::Prompt
     }
 
     /// Clean agent text before it reaches a chat stream. Default: pass through

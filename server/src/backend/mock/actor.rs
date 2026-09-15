@@ -42,6 +42,7 @@ pub(super) fn start_mock_command_loop(
     let script = VecDeque::from(launch_script.turns);
     let unbounded_echo = launch_script.unbounded_echo;
     let user_bubbles = launch_script.user_bubbles || user_bubbles_from_history;
+    let slash_commands = launch_script.slash_commands;
     let actor = MockActor {
         session_id,
         command_rx,
@@ -53,6 +54,7 @@ pub(super) fn start_mock_command_loop(
         script,
         unbounded_echo,
         user_bubbles,
+        slash_commands,
         phase: TurnPhase::Idle,
         goal_status: None,
         violations: Vec::new(),
@@ -109,6 +111,7 @@ struct MockActor {
     script: VecDeque<MockTurn>,
     unbounded_echo: bool,
     user_bubbles: bool,
+    slash_commands: Option<Vec<protocol::SlashCommand>>,
     phase: TurnPhase,
     goal_status: Option<protocol::GoalStatus>,
     violations: Vec<MockViolation>,
@@ -148,6 +151,17 @@ impl MockActor {
     }
 
     async fn run_loop(&mut self, control: &mut ControlPlane) {
+        if let Some(commands) = self.slash_commands.take()
+            && !self
+                .events_tx
+                .send_event(crate::backend::BackendEvent::Chat(
+                    protocol::ChatEvent::SlashCommandsChanged(protocol::SlashCommandCatalog {
+                        commands,
+                    }),
+                ))
+        {
+            return;
+        }
         if let Some(initial_message) = self.initial_message.take() {
             self.requests.push(MockRequest::Launch {
                 message: initial_message.clone(),

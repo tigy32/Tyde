@@ -2131,6 +2131,7 @@ impl CodexSession {
             skill_projection: std::sync::Mutex::new(skill_projection),
         });
 
+        inner.emitter.slash_commands(codex_slash_commands());
         if config.execution_mode == BackendExecutionMode::Agent {
             match inner
                 .rpc
@@ -4378,6 +4379,54 @@ struct CodexState {
     descendant_owner_threads: HashMap<String, String>,
     subagent_streams: HashMap<String, CodexSubAgentStream>,
     completed_subagent_streams: HashMap<String, CompletedCodexSubAgentStream>,
+}
+
+/// The Codex TUI commands Tyde honors through app-server RPCs, with the TUI's
+/// own descriptions. App-server advertises no command list, and the rest of
+/// the TUI's commands (`/model`, `/approvals`, `/new`, `/diff`, `/mention`,
+/// `/mcp`, …) are interface chrome Tyde already provides on its own.
+fn codex_slash_commands() -> protocol::SlashCommandCatalog {
+    let command = |name: &str, description: &str, hint: Option<&str>| protocol::SlashCommand {
+        name: name.to_owned(),
+        description: Some(description.to_owned()),
+        input_hint: hint.map(str::to_owned),
+    };
+    protocol::SlashCommandCatalog {
+        commands: vec![
+            command(
+                "compact",
+                "summarize conversation to prevent hitting the context limit",
+                None,
+            ),
+            command(
+                "review",
+                "review my current changes and find issues",
+                Some("[branch <name> | commit <sha> | <instructions>]"),
+            ),
+            command(
+                "status",
+                "show current session configuration and token usage",
+                None,
+            ),
+        ],
+    }
+}
+
+/// The `review/start` target a `/review` argument string names. No argument
+/// reviews the working tree, as the TUI's default does.
+fn codex_review_target(args: &str) -> Value {
+    let args = args.trim();
+    let mut words = args.splitn(2, char::is_whitespace);
+    let head = words.next().map(str::to_ascii_lowercase);
+    let rest = words.next().map(str::trim).filter(|rest| !rest.is_empty());
+    match (head.as_deref(), rest) {
+        (None | Some(""), _) => json!({ "type": "uncommittedChanges" }),
+        (Some("branch" | "base"), Some(branch)) => {
+            json!({ "type": "baseBranch", "branch": branch })
+        }
+        (Some("commit"), Some(sha)) => json!({ "type": "commit", "sha": sha }),
+        _ => json!({ "type": "custom", "instructions": args }),
+    }
 }
 
 fn initial_codex_state(
@@ -7777,6 +7826,9 @@ impl CodexInner {
 
                 if self.respond_pending_request(&message).await? {
                     return Ok(());
+                }
+                if let Some(command) = codex_slash_commands().invoked_by(&message) {
+                    return self.run_slash_command(&command.name, &message).await;
                 }
 
                 let (
@@ -15847,6 +15899,156 @@ impl CodexInner {
         .await;
     }
 
+    /// Runs one of [`codex_slash_commands`] for a message that invokes it. The
+    /// user bubble and typing state are already published by the caller.
+    /// `compact` and `review` open a provider turn through their RPCs and end
+    /// like any other turn; `status` is answered here without one.
+    async fn run_slash_command(&self, name: &str, message: &str) -> Result<(), String> {
+        let args = message.trim_start()[1 + name.len()..].trim();
+        let thread_id = self.state.lock().await.thread_id.clone();
+        match name {
+            "status" => {
+                let reply = self.render_status_command(&thread_id).await;
+                let model = self.state.lock().await.effective_model.clone();
+                let response = self.emitter.stream_start(model.as_deref());
+                self.emitter.stream_delta(&response, &reply);
+                self.emitter.stream_end(
+                    response,
+                    super::turn_emitter::StreamEndPayload {
+                        content: reply,
+                        model_info: model.map(|model| protocol::ModelInfo { model }),
+                        ..Default::default()
+                    },
+                );
+                // The send reserved a root turn; nothing will start one.
+                self.state.lock().await.awaiting_root_turn_start = false;
+                self.emitter.typing_status_changed(false);
+                Ok(())
+            }
+            "compact" | "review" => {
+                {
+                    let mut state = self.state.lock().await;
+                    state.interrupt_next_root_turn = false;
+                    state.awaiting_root_turn_start = true;
+                }
+                let (method, params) = if name == "compact" {
+                    ("thread/compact/start", json!({ "threadId": thread_id }))
+                } else {
+                    (
+                        "review/start",
+                        json!({ "threadId": thread_id, "target": codex_review_target(args) }),
+                    )
+                };
+                if let Err(err) = self.rpc.request(method, params).await {
+                    self.state.lock().await.awaiting_root_turn_start = false;
+                    self.emitter.typing_status_changed(false);
+                    return Err(err);
+                }
+                Ok(())
+            }
+            other => Err(format!(
+                "Codex slash command /{other} is advertised but not implemented"
+            )),
+        }
+    }
+
+    /// What the TUI's `/status` shows: the session's configuration, the token
+    /// usage the runtime last reported, and the account's rate limits.
+    async fn render_status_command(&self, thread_id: &str) -> String {
+        let thread = self
+            .rpc
+            .request(
+                "thread/read",
+                json!({ "threadId": thread_id, "includeTurns": false }),
+            )
+            .await
+            .ok();
+        let thread = thread.as_ref().and_then(|value| value.get("thread"));
+        let field = |key: &str| {
+            thread
+                .and_then(|thread| thread.get(key))
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+        };
+        let (approval_policy, access_mode, usage) = {
+            let state = self.state.lock().await;
+            (
+                state.approval_policy.clone(),
+                state.access_mode,
+                state
+                    .response_splitters
+                    .get(thread_id)
+                    .and_then(|splitter| splitter.last_token_usage.clone()),
+            )
+        };
+        let mut lines = vec!["**Session**".to_owned(), format!("- Thread: `{thread_id}`")];
+        if let Some(model) = field("model") {
+            let effort = field("reasoningEffort")
+                .map(|effort| format!(" (reasoning effort: {effort})"))
+                .unwrap_or_default();
+            lines.push(format!("- Model: {model}{effort}"));
+        }
+        if let Some(cwd) = field("cwd") {
+            lines.push(format!("- Working directory: {cwd}"));
+        }
+        lines.push(format!(
+            "- Approval policy: {}; access: {access_mode:?}",
+            approval_policy.unwrap_or_else(|| "default".to_owned())
+        ));
+        lines.push(String::new());
+        lines.push("**Token usage**".to_owned());
+        match usage.as_ref().and_then(|usage| usage.get("total")) {
+            Some(total) => {
+                let count = |key: &str| total.get(key).and_then(Value::as_u64).unwrap_or(0);
+                lines.push(format!(
+                    "- Total: {} tokens ({} input, {} output)",
+                    count("totalTokens"),
+                    count("inputTokens"),
+                    count("outputTokens")
+                ));
+                if let Some(window) = usage
+                    .as_ref()
+                    .and_then(|usage| usage.get("modelContextWindow"))
+                    .and_then(Value::as_u64)
+                {
+                    lines.push(format!("- Context window: {window} tokens"));
+                }
+            }
+            None => lines.push("- No turns completed yet".to_owned()),
+        }
+        lines.push(String::new());
+        lines.push("**Rate limits**".to_owned());
+        match self.rpc.request("account/rateLimits/read", json!({})).await {
+            Ok(snapshot) => {
+                let limits = snapshot.get("rateLimits").unwrap_or(&snapshot);
+                let mut reported = false;
+                for (label, key) in [("Primary", "primary"), ("Secondary", "secondary")] {
+                    let Some(window) = limits.get(key).filter(|window| window.is_object()) else {
+                        continue;
+                    };
+                    reported = true;
+                    let used = window
+                        .get("usedPercent")
+                        .and_then(Value::as_f64)
+                        .map(|percent| format!("{percent:.0}% used"))
+                        .unwrap_or_else(|| "usage not reported".to_owned());
+                    let reset = window
+                        .get("resetsAt")
+                        .and_then(Value::as_i64)
+                        .map(|at| format!(", resets at unix {at}"))
+                        .unwrap_or_default();
+                    lines.push(format!("- {label}: {used}{reset}"));
+                }
+                if !reported {
+                    lines.push("- Not reported".to_owned());
+                }
+            }
+            Err(_) => lines.push("- Unavailable".to_owned()),
+        }
+        lines.join("\n")
+    }
+
     fn emit_user_message_added(&self, content: &str, images: Option<&[ImageAttachment]>) {
         let image_payload = images.map(|images| {
             images
@@ -20260,6 +20462,7 @@ fn codex_transcript_provider_event_id(event: &ChatEvent) -> Option<String> {
         | ChatEvent::GoalCapabilities(_)
         | ChatEvent::GoalChanged(_)
         | ChatEvent::GoalCompleted(_)
+        | ChatEvent::SlashCommandsChanged(_)
         | ChatEvent::TaskUpdate(_)
         | ChatEvent::OperationCancelled(_)
         | ChatEvent::RetryAttempt(_)
@@ -20536,6 +20739,7 @@ impl Backend for CodexBackend {
             tyde_agent_adapter::BackendCapability::CapacityTelemetry,
             tyde_agent_adapter::BackendCapability::OutOfBandCapacity,
             tyde_agent_adapter::BackendCapability::RetryTelemetry,
+            tyde_agent_adapter::BackendCapability::SlashCommands,
         ]
         .into()
     }

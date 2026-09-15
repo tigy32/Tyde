@@ -1,6 +1,6 @@
 use protocol::{
     AgentId, ChatMessageId, ContextBreakdown, MessageMetadataUpdateData, MessageTokenUsage,
-    SessionId,
+    SessionId, SlashCommand,
 };
 use uuid::Uuid;
 
@@ -27,6 +27,8 @@ pub struct MockScript {
     pub(super) busy_self_turn_once: bool,
     pub(super) shutdown_gate: Option<MockGate>,
     pub(super) compaction_observation_gates: Option<(MockGate, MockGate)>,
+    /// Advertised as the session's slash-command set before the launch turn.
+    pub(super) slash_commands: Option<Vec<SlashCommand>>,
 }
 
 impl MockScript {
@@ -71,6 +73,11 @@ impl MockScript {
 
     pub fn with_busy_self_turn_once(mut self) -> Self {
         self.busy_self_turn_once = true;
+        self
+    }
+
+    pub fn with_slash_commands(mut self, commands: Vec<SlashCommand>) -> Self {
+        self.slash_commands = Some(commands);
         self
     }
 

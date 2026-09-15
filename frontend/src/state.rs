@@ -3607,6 +3607,9 @@ pub struct AppState {
     pub task_lists: RwSignal<HashMap<AgentId, TaskList>>,
     pub native_goals: RwSignal<HashMap<AgentId, protocol::NativeGoal>>,
     pub goal_capabilities: RwSignal<HashMap<AgentId, protocol::GoalCapabilities>>,
+    /// The slash commands each live agent's backend currently accepts, as last
+    /// published on its stream. The composer completes `/` drafts from this.
+    pub slash_commands: RwSignal<HashMap<AgentId, protocol::SlashCommandCatalog>>,
     /// Per-agent Tycode orchestration event log (sub-agent/workflow progress),
     /// chronological. Appended to as `ChatEvent::Orchestration` events arrive
     /// and as history replays; the orchestration panel folds it into a compact
@@ -4160,6 +4163,7 @@ impl AppState {
             task_lists: RwSignal::new(HashMap::new()),
             native_goals: RwSignal::new(HashMap::new()),
             goal_capabilities: RwSignal::new(HashMap::new()),
+            slash_commands: RwSignal::new(HashMap::new()),
             orchestration: RwSignal::new(HashMap::new()),
             center_zone,
             center_split_ratio: RwSignal::new(SplitRatio::default()),
@@ -4777,6 +4781,9 @@ impl AppState {
             map.remove(agent_id);
         });
         self.goal_capabilities.update(|map| {
+            map.remove(agent_id);
+        });
+        self.slash_commands.update(|map| {
             map.remove(agent_id);
         });
         self.task_lists.update(|map| {
@@ -6638,6 +6645,9 @@ impl AppState {
                 map.retain(|id, _| !drop_set.contains(id));
             });
             self.goal_capabilities.update(|map| {
+                map.retain(|id, _| !drop_set.contains(id));
+            });
+            self.slash_commands.update(|map| {
                 map.retain(|id, _| !drop_set.contains(id));
             });
             self.orchestration.update(|map| {

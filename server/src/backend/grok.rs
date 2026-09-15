@@ -54,6 +54,7 @@ pub(crate) fn capabilities() -> BackendCapabilities {
         BackendCapability::CapacityTelemetry,
         BackendCapability::OutOfBandCapacity,
         BackendCapability::CompactionReported,
+        BackendCapability::SlashCommands,
     ]
     .into()
 }

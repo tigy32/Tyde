@@ -5513,6 +5513,7 @@ impl HistoryReplay {
             }
             ChatEvent::GoalChanged(_)
             | ChatEvent::GoalCapabilities(_)
+            | ChatEvent::SlashCommandsChanged(_)
             | ChatEvent::TypingStatusChanged(_)
             | ChatEvent::StreamStart(_)
             | ChatEvent::StreamDelta(_)
@@ -5622,6 +5623,11 @@ pub fn apply_chat_event_from(
         ChatEvent::GoalCapabilities(capabilities) => {
             state.goal_capabilities.update(|map| {
                 map.insert(agent_id.clone(), capabilities);
+            });
+        }
+        ChatEvent::SlashCommandsChanged(catalog) => {
+            state.slash_commands.update(|map| {
+                map.insert(agent_id.clone(), catalog);
             });
         }
         ChatEvent::GoalChanged(goal) => {

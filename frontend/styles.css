@@ -4695,6 +4695,66 @@ kbd {
     letter-spacing: 0.04em;
 }
 
+/* Slash-command completion above the composer. Opens only while the draft is
+   a bare `/prefix`, so it never covers the textarea while prose is typed. */
+.chat-slash-menu {
+    position: absolute;
+    bottom: calc(100% + 6px);
+    left: 0;
+    z-index: 41;
+    min-width: 240px;
+    max-width: min(560px, 100%);
+    max-height: 240px;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    padding: 3px;
+    background: var(--surface-2);
+    border: 1px solid var(--border-primary);
+    border-radius: 6px;
+    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.3);
+    animation: menu-in 0.1s ease-out;
+}
+
+.chat-slash-option {
+    width: 100%;
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    text-align: left;
+    padding: 6px 10px;
+    border-radius: 4px;
+    background: transparent;
+    color: var(--text-primary);
+    font-size: 0.8rem;
+    line-height: 1.25;
+    cursor: pointer;
+    min-width: 0;
+}
+
+.chat-slash-option.selected {
+    background: var(--surface-hover);
+    color: var(--text-bright);
+}
+
+.chat-slash-name {
+    font-family: var(--font-mono);
+    flex-shrink: 0;
+}
+
+.chat-slash-hint {
+    color: var(--text-tertiary);
+    font-style: italic;
+    flex-shrink: 0;
+}
+
+.chat-slash-desc {
+    color: var(--text-secondary);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
 /* ===== Markdown Rendering =====
    Scoped to both the chat card body and `.tool-md`, the container that tool
    cards render agent-authored Markdown into (e.g. the message a

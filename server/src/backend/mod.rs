@@ -1591,6 +1591,17 @@ pub(crate) fn workspace_prompt(message: &str, roots: Option<&[String]>) -> Strin
     format!("{WORKSPACE_CONTEXT_PREFIX}{roots}{WORKSPACE_CONTEXT_SUFFIX}{message}")
 }
 
+/// Whether `message` must reach the provider verbatim because it invokes one
+/// of the slash commands the session advertised. Providers recognize a command
+/// only at the very start of the text, so wrapping it in workspace or steering
+/// context would turn the command back into prose.
+pub(crate) fn invokes_slash_command(
+    catalog: Option<&protocol::SlashCommandCatalog>,
+    message: &str,
+) -> bool {
+    catalog.is_some_and(|catalog| catalog.invoked_by(message).is_some())
+}
+
 pub(crate) fn workspace_prompt_user_text(content: &str) -> &str {
     let Some((roots, message)) = content
         .strip_prefix(WORKSPACE_CONTEXT_PREFIX)

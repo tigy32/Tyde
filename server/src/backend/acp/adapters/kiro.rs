@@ -15,21 +15,26 @@
 //!   before it reaches a chat stream.
 //! * `session/new` and `session/prompt` accept non-standard `systemPrompt`,
 //!   `modelId`, and `modeId` fields.
+//! * Slash commands are advertised on `_kiro.dev/commands/available` and run
+//!   through `_kiro.dev/commands/execute`, which takes a structured command
+//!   rather than the typed line; `session/prompt` hands a `/command` to the
+//!   model as prose.
 //!
 //! Everything else — the session lifecycle itself — is the generic backend's.
 
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::sync::Mutex;
 
 use futures_util::future::BoxFuture;
-use protocol::{AcpAdapterId, AcpAgentSpec, BackendKind, SessionId};
+use protocol::{AcpAdapterId, AcpAgentSpec, BackendKind, SessionId, SlashCommand};
 use serde_json::{Value, json};
 
 use crate::backend::BackendSession;
 use crate::backend::acp::AcpSpawnSpec;
 use crate::backend::acp::adapter::{
     AcpAgentAdapter, AcpAuthMethod, AcpAuthMethodHandling, AcpRequestCtx, AcpSessionKind,
-    AcpSessionRoots, NormalizedUpdate,
+    AcpSessionRoots, AcpSlashCommandCtx, AcpSlashCommandPlan, NormalizedUpdate,
 };
 use crate::backend::acp::backend as kiro_impl;
 
@@ -38,13 +43,113 @@ const KIRO_LOGIN_FALLBACK_INSTRUCTION: &str =
     "Run 'kiro-cli login' in a terminal, then retry Kiro in Tyde.";
 const KIRO_AUTH_INSTRUCTION_MAX_CHARS: usize = 512;
 
+/// Commands that only Kiro's own terminal UI can carry out: they read its
+/// clipboard, open `$EDITOR`, drive the microphone, or fork the session out
+/// from under Tyde.
+const KIRO_TERMINAL_ONLY_COMMANDS: &[&str] = &["paste", "reply", "voice", "rewind"];
+
 pub struct KiroAdapter {
     spec: AcpAgentSpec,
+    /// Subcommands per advertised command, so a typed `/context add x` becomes
+    /// the structured `{subcommand: "add", value: "x"}` the execute RPC takes.
+    subcommands: Mutex<HashMap<String, Vec<String>>>,
 }
 
 impl KiroAdapter {
     pub fn new(spec: AcpAgentSpec) -> Self {
-        Self { spec }
+        Self {
+            spec,
+            subcommands: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Translate Kiro's command advertisement into the standard update shape,
+    /// remembering each command's subcommands for later invocations.
+    fn normalize_commands_available(&self, params: &Value) -> Option<NormalizedUpdate> {
+        let commands = params.get("commands")?.as_array()?;
+        let mut subcommands = HashMap::new();
+        let available = commands
+            .iter()
+            .filter_map(|command| {
+                let name = command.get("name")?.as_str()?.trim_start_matches('/');
+                let meta = command.get("meta");
+                let local = meta
+                    .and_then(|meta| meta.get("local"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                if name.is_empty() || local {
+                    return None;
+                }
+                let subs = meta
+                    .and_then(|meta| meta.get("subcommands"))
+                    .and_then(Value::as_array)
+                    .map(|subs| {
+                        subs.iter()
+                            .filter_map(Value::as_str)
+                            .map(str::to_owned)
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                let hint = meta
+                    .and_then(|meta| meta.get("hint"))
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|hint| !hint.is_empty())
+                    .map(str::to_owned)
+                    .or_else(|| (!subs.is_empty()).then(|| format!("[{}]", subs.join("|"))));
+                subcommands.insert(name.to_owned(), subs);
+                Some(json!({
+                    "name": name,
+                    "description": command.get("description").cloned().unwrap_or(Value::Null),
+                    "input": hint.map(|hint| json!({ "hint": hint })).unwrap_or(Value::Null),
+                }))
+            })
+            .collect::<Vec<_>>();
+        *self
+            .subcommands
+            .lock()
+            .expect("kiro subcommand table poisoned") = subcommands;
+        Some(NormalizedUpdate {
+            session_update: "available_commands_update",
+            params: json!({ "availableCommands": available }),
+        })
+    }
+
+    /// The structured `args` of `_kiro.dev/commands/execute` for a typed line.
+    /// Every command's args struct accepts `subcommand` and `value`; a few
+    /// name their free text differently.
+    fn execute_args(&self, name: &str, rest: &str) -> Value {
+        let mut args = serde_json::Map::new();
+        let subs = self
+            .subcommands
+            .lock()
+            .expect("kiro subcommand table poisoned")
+            .get(name)
+            .cloned()
+            .unwrap_or_default();
+        let (first, remainder) = rest
+            .split_once(char::is_whitespace)
+            .map(|(first, remainder)| (first, remainder.trim()))
+            .unwrap_or((rest, ""));
+        let value = if !first.is_empty() && subs.iter().any(|sub| sub == first) {
+            args.insert("subcommand".to_owned(), Value::String(first.to_owned()));
+            remainder
+        } else {
+            rest
+        };
+        if !value.is_empty() {
+            args.insert("value".to_owned(), Value::String(value.to_owned()));
+            let free_text_field = match name {
+                "plan" => Some("prompt"),
+                "guide" => Some("question"),
+                "effort" => Some("level"),
+                _ => None,
+            };
+            if let Some(field) = free_text_field {
+                args.insert(field.to_owned(), Value::String(value.to_owned()));
+            }
+        }
+        Value::Object(args)
     }
 
     /// Kiro's own working directories, which reserve scratch subdirectories
@@ -184,7 +289,37 @@ impl AcpAgentAdapter for KiroAdapter {
         }
     }
 
+    fn normalize_slash_commands(&self, commands: Vec<SlashCommand>) -> Vec<SlashCommand> {
+        commands
+            .into_iter()
+            .filter(|command| !KIRO_TERMINAL_ONLY_COMMANDS.contains(&command.name.as_str()))
+            .collect()
+    }
+
+    fn plan_slash_command(
+        &self,
+        command: &SlashCommand,
+        message: &str,
+        ctx: &AcpSlashCommandCtx<'_>,
+    ) -> AcpSlashCommandPlan {
+        let rest = message.trim_start()[1 + command.name.len()..].trim();
+        AcpSlashCommandPlan::Request {
+            method: "_kiro.dev/commands/execute",
+            params: json!({
+                "sessionId": ctx.session_id,
+                "command": {
+                    "command": command.name,
+                    "args": self.execute_args(&command.name, rest),
+                },
+            }),
+            render: render_kiro_command_result,
+        }
+    }
+
     fn normalize_notification(&self, method: &str, params: &Value) -> Option<NormalizedUpdate> {
+        if method == "_kiro.dev/commands/available" {
+            return self.normalize_commands_available(params);
+        }
         // Kiro's proprietary family carries the discriminant in `type` rather
         // than `sessionUpdate`, and omits the `update` envelope.
         if method != "session/notification" {
@@ -341,6 +476,40 @@ impl AcpAgentAdapter for KiroAdapter {
             .iter()
             .map(|(name, value)| (name.clone(), value.clone()))
             .collect()
+    }
+}
+
+/// `_kiro.dev/commands/execute` answers `{success, message, data}`; the
+/// message is what Kiro's own UI prints, and `data` is the structured form.
+fn render_kiro_command_result(result: &Value) -> String {
+    let message = result
+        .get("message")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|message| !message.is_empty())
+        .or_else(|| {
+            result
+                .get("data")
+                .and_then(|data| data.get("message"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|message| !message.is_empty())
+        });
+    let succeeded = result
+        .get("success")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    match (succeeded, message) {
+        (true, Some(message)) => message.to_owned(),
+        (false, Some(message)) => format!("Kiro could not run the command: {message}"),
+        (false, None) => "Kiro could not run the command.".to_owned(),
+        (true, None) => match result.get("data").filter(|data| !data.is_null()) {
+            Some(data) => format!(
+                "```json\n{}\n```",
+                serde_json::to_string_pretty(data).unwrap_or_else(|_| data.to_string())
+            ),
+            None => "Done.".to_owned(),
+        },
     }
 }
 

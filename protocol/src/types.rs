@@ -3958,6 +3958,65 @@ pub struct GoalCapabilities {
     pub clear: bool,
 }
 
+// ── Slash commands ─────────────────────────────────────────────────────
+
+/// One provider-native slash command the live backend session accepts as the
+/// leading token of a user message.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SlashCommand {
+    /// The name without its leading slash. A message invokes the command by
+    /// starting with `/name`, followed by whitespace or the end of the text.
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// The provider's hint for what may follow the name, when it takes input.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_hint: Option<String>,
+}
+
+/// The complete set of slash commands a backend session currently accepts.
+/// Each publication replaces the previous set; an empty set means the
+/// session accepts none.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SlashCommandCatalog {
+    pub commands: Vec<SlashCommand>,
+}
+
+impl SlashCommandCatalog {
+    /// The advertised command `message` invokes, if any. Only the leading
+    /// token counts: `/compact focus` invokes `compact`; `see /tmp` and an
+    /// unknown `/name` invoke nothing and travel as ordinary text.
+    pub fn invoked_by(&self, message: &str) -> Option<&SlashCommand> {
+        let name = slash_command_name(message)?;
+        self.commands.iter().find(|command| command.name == name)
+    }
+
+    /// The commands a composer draft could still become, for completion. Only
+    /// a bare `/prefix` completes: once arguments or prose follow the token
+    /// the draft is what the user meant, and nothing is offered.
+    pub fn completions(&self, draft: &str) -> Vec<&SlashCommand> {
+        let Some(prefix) = draft.trim_start().strip_prefix('/') else {
+            return Vec::new();
+        };
+        if prefix.contains(char::is_whitespace) {
+            return Vec::new();
+        }
+        let prefix = prefix.to_lowercase();
+        self.commands
+            .iter()
+            .filter(|command| command.name.to_lowercase().starts_with(&prefix))
+            .collect()
+    }
+}
+
+/// The command token of a message shaped like `/name ...`, without the slash.
+pub fn slash_command_name(message: &str) -> Option<&str> {
+    let rest = message.trim_start().strip_prefix('/')?;
+    let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+    let name = &rest[..end];
+    (!name.is_empty()).then_some(name)
+}
+
 // ── Session settings ───────────────────────────────────────────────────
 
 /// Schema describing one backend's configurable session settings.
@@ -7650,6 +7709,11 @@ pub enum ChatEvent {
     GoalCapabilities(GoalCapabilities),
     GoalChanged(Option<NativeGoal>),
     GoalCompleted(NativeGoal),
+    /// The backend session's current slash-command set (see
+    /// [`SlashCommandCatalog`]). Session state rather than transcript: it is
+    /// never part of history pages, and a subscriber that attaches later
+    /// receives the latest set in its bootstrap.
+    SlashCommandsChanged(SlashCommandCatalog),
     MessageAdded(ChatMessage),
     MessageMetadataUpdated(MessageMetadataUpdateData),
     TypingStatusChanged(bool),

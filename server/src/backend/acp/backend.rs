@@ -14,14 +14,14 @@ use protocol::{
     CapacityUnavailableReason, CapacityWindow, ChatMessageId, ContextBreakdown,
     CurrentContextUsage, ExitPlanModeDecision, ImageData, MessageMetadataUpdateData,
     MessageTokenUsage, ModelInfo, ModelRequestId, ModelRequestTokenUsage, ModelTurnId,
-    ReasoningData, SendMessagePayload, SendMessageToolResponse, TokenUsage, TokenUsageScope,
-    TokenUsageUnavailableReason, ToolExecutionOutcome, ToolExecutionResult, ToolRequestType,
-    ToolUseData, ValueProvenance,
+    ReasoningData, SendMessagePayload, SendMessageToolResponse, SlashCommand, SlashCommandCatalog,
+    TokenUsage, TokenUsageScope, TokenUsageUnavailableReason, ToolExecutionOutcome,
+    ToolExecutionResult, ToolRequestType, ToolUseData, ValueProvenance,
 };
 
 use crate::acp::adapter::{
     AcpAgentAdapter, AcpAuthMethod, AcpAuthMethodHandling, AcpCapabilities, AcpRequestCtx,
-    AcpSessionKind, adapter_for_spec,
+    AcpSessionKind, AcpSlashCommandCtx, AcpSlashCommandPlan, adapter_for_spec,
 };
 use crate::acp::{
     AcpBridge, AcpInbound, AcpRequestError, AcpSpawnSpec, acp_mcp_servers_json, extract_message_id,
@@ -584,6 +584,7 @@ impl KiroSession {
                 mode: initial_mode,
                 known_models: extract_known_models(&session_started),
                 known_modes: extract_known_modes(&session_started),
+                slash_commands: None,
                 active_response: None,
                 active_stream_text: String::new(),
                 active_stream_tool_calls: Vec::new(),
@@ -662,6 +663,9 @@ struct KiroState {
     mode: Option<String>,
     known_models: Vec<Value>,
     known_modes: Vec<Value>,
+    /// The set last advertised on the stream. Consulted to deliver an invoking
+    /// message verbatim, and so only a real change is published again.
+    slash_commands: Option<SlashCommandCatalog>,
     active_response: Option<ResponseHandle>,
     active_stream_text: String,
     active_stream_tool_calls: Vec<ToolUseData>,
@@ -1198,26 +1202,80 @@ impl KiroInner {
                 self.emit_user_message_added(&message, images.as_deref());
                 self.emitter.typing_status_changed(true);
 
-                let (session_id, model, mode, steering) = {
+                let (session_id, model, mode, steering, command_plan) = {
                     let state = self.state.lock().await;
+                    let plan = state
+                        .slash_commands
+                        .as_ref()
+                        .and_then(|catalog| catalog.invoked_by(&message))
+                        .map(|command| {
+                            self.adapter.plan_slash_command(
+                                command,
+                                &message,
+                                &AcpSlashCommandCtx {
+                                    session_id: &state.session_id,
+                                    workspace_root: &state.workspace_root,
+                                    model: state.model.as_deref(),
+                                    mode: state.mode.as_deref(),
+                                    known_models: &state.known_models,
+                                    usage: &state.opencode_cumulative_usage,
+                                    context_usage: state.opencode_current_context_usage.as_ref(),
+                                },
+                            )
+                        });
                     (
                         state.session_id.clone(),
                         state.model.clone(),
                         state.mode.clone(),
                         state.steering_content.clone(),
+                        plan,
                     )
                 };
 
-                let effective_message = if let Some(ref s) = steering {
-                    format!("{}\n\n{}", s, message)
-                } else {
-                    message.clone()
+                let invokes_command = match command_plan {
+                    None => false,
+                    Some(AcpSlashCommandPlan::Prompt) => true,
+                    Some(AcpSlashCommandPlan::Request {
+                        method,
+                        params,
+                        render,
+                    }) => {
+                        let reply = match self.bridge.request(method, params).await {
+                            Ok(result) => render(&result),
+                            Err(err) => {
+                                self.abort_active_turn(&format!(
+                                    "{} request failed: {err}",
+                                    self.adapter.display_name()
+                                ))
+                                .await;
+                                drop(prompt_guard);
+                                return Ok(());
+                            }
+                        };
+                        self.reply_to_slash_command(reply, model.as_deref());
+                        drop(prompt_guard);
+                        return Ok(());
+                    }
+                    Some(AcpSlashCommandPlan::Reply(reply)) => {
+                        self.reply_to_slash_command(reply, model.as_deref());
+                        drop(prompt_guard);
+                        return Ok(());
+                    }
                 };
 
-                let effective_message = crate::backend::workspace_prompt(
-                    &effective_message,
-                    self.state.lock().await.workspace_roots.as_deref(),
-                );
+                let effective_message = if invokes_command {
+                    message.clone()
+                } else {
+                    let steered = if let Some(ref s) = steering {
+                        format!("{}\n\n{}", s, message)
+                    } else {
+                        message.clone()
+                    };
+                    crate::backend::workspace_prompt(
+                        &steered,
+                        self.state.lock().await.workspace_roots.as_deref(),
+                    )
+                };
                 let mut prompt_blocks = vec![json!({
                     "type": "text",
                     "text": effective_message,
@@ -2558,6 +2616,10 @@ impl KiroInner {
     /// The payload is already flat (no `update` envelope), so it goes straight
     /// to the shared dispatch.
     async fn handle_normalized_update(&self, update_type: &str, params: &Value) {
+        if update_type == "available_commands_update" {
+            self.handle_available_commands_update(params).await;
+            return;
+        }
         if self.should_drop_quarantined_update(update_type).await {
             return;
         }
@@ -2663,10 +2725,56 @@ impl KiroInner {
             .or_else(|| update.get("session_update"))
             .and_then(Value::as_str)
             .unwrap_or_default();
+        // The command set is session state rather than turn output: agents
+        // send it with session setup and after a cancel, so it must not be
+        // dropped with a quarantined or cancelled turn's updates.
+        if update_type == "available_commands_update" {
+            self.handle_available_commands_update(update).await;
+            return;
+        }
         if self.should_drop_quarantined_update(update_type).await {
             return;
         }
         self.dispatch_session_update(update_type, update).await;
+    }
+
+    async fn handle_available_commands_update(&self, update: &Value) {
+        let Some(commands) = acp_available_commands(update) else {
+            tracing::warn!(
+                update = %update,
+                "ACP available_commands_update carried no readable command list"
+            );
+            return;
+        };
+        let catalog = SlashCommandCatalog {
+            commands: self.adapter.normalize_slash_commands(commands),
+        };
+        {
+            let mut state = self.state.lock().await;
+            if state.slash_commands.as_ref() == Some(&catalog) {
+                return;
+            }
+            state.slash_commands = Some(catalog.clone());
+        }
+        self.emitter.slash_commands(catalog);
+    }
+
+    /// Shows a command answer Tyde obtained outside `session/prompt` as the
+    /// response to the turn the command opened, then ends that turn.
+    fn reply_to_slash_command(&self, reply: String, model: Option<&str>) {
+        let response = self.emitter.stream_start(model);
+        self.emitter.stream_delta(&response, &reply);
+        self.emitter.stream_end(
+            response,
+            StreamEndPayload {
+                content: reply,
+                model_info: model.map(|model| ModelInfo {
+                    model: model.to_owned(),
+                }),
+                ..Default::default()
+            },
+        );
+        self.emitter.typing_status_changed(false);
     }
 
     async fn handle_user_message_chunk(&self, params: &Value) {
@@ -5278,6 +5386,36 @@ fn extract_current_model(value: &Value) -> Option<String> {
         .filter(|raw| !raw.is_empty())
 }
 
+/// The command list of an `available_commands_update`, in the agent's order.
+/// Names are stored without a leading slash; a hint describes the input the
+/// command takes, when the agent says it takes any.
+fn acp_available_commands(update: &Value) -> Option<Vec<SlashCommand>> {
+    let commands = update
+        .get("availableCommands")
+        .or_else(|| update.get("available_commands"))?
+        .as_array()?;
+    let nonempty = |value: Option<&Value>| {
+        value
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(str::to_owned)
+    };
+    Some(
+        commands
+            .iter()
+            .filter_map(|command| {
+                let name = command.get("name")?.as_str()?.trim_start_matches('/');
+                (!name.is_empty()).then(|| SlashCommand {
+                    name: name.to_owned(),
+                    description: nonempty(command.get("description")),
+                    input_hint: nonempty(command.get("input").and_then(|input| input.get("hint"))),
+                })
+            })
+            .collect(),
+    )
+}
+
 fn extract_current_mode(value: &Value) -> Option<String> {
     value
         .get("mode")
@@ -6399,6 +6537,7 @@ impl Backend for KiroBackend {
             tyde_agent_adapter::BackendCapability::GenericViewImage,
             tyde_agent_adapter::BackendCapability::CapacityTelemetry,
             tyde_agent_adapter::BackendCapability::OutOfBandCapacity,
+            tyde_agent_adapter::BackendCapability::SlashCommands,
         ]
         .into()
     }

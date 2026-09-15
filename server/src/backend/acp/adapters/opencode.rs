@@ -1,12 +1,22 @@
 use std::borrow::Cow;
 
 use futures_util::future::BoxFuture;
-use protocol::{AcpAdapterId, AcpAgentSpec, BackendKind, MessageTokenUsage, TokenUsage};
+use protocol::{
+    AcpAdapterId, AcpAgentSpec, BackendKind, MessageTokenUsage, SlashCommand, TokenUsage,
+};
 use serde_json::{Value, json};
 
 use crate::backend::acp::AcpSpawnSpec;
-use crate::backend::acp::adapter::{AcpAgentAdapter, AcpSessionKind, AcpSessionRoots};
+use crate::backend::acp::adapter::{
+    AcpAgentAdapter, AcpSessionKind, AcpSessionRoots, AcpSlashCommandCtx, AcpSlashCommandPlan,
+};
 use crate::backend::acp::adapters::stock::pick_local_workspace_root;
+
+/// Commands Tyde answers for OpenCode, with the descriptions its own UI uses.
+const OPENCODE_TYDE_COMMANDS: &[(&str, &str)] = &[
+    ("status", "show session info, model, mode, and token usage"),
+    ("models", "list available models"),
+];
 
 pub struct OpenCodeAdapter {
     spec: AcpAgentSpec,
@@ -365,6 +375,36 @@ impl AcpAgentAdapter for OpenCodeAdapter {
         })
     }
 
+    fn normalize_slash_commands(&self, mut commands: Vec<SlashCommand>) -> Vec<SlashCommand> {
+        // OpenCode advertises only its prompt-expanding commands over ACP; the
+        // informational ones its terminal UI has (`/status`, `/models`) never
+        // reach the agent, so Tyde answers them from the session it holds.
+        for (name, description) in OPENCODE_TYDE_COMMANDS {
+            if commands.iter().any(|command| command.name == *name) {
+                continue;
+            }
+            commands.push(SlashCommand {
+                name: (*name).to_owned(),
+                description: Some((*description).to_owned()),
+                input_hint: None,
+            });
+        }
+        commands
+    }
+
+    fn plan_slash_command(
+        &self,
+        command: &SlashCommand,
+        _message: &str,
+        ctx: &AcpSlashCommandCtx<'_>,
+    ) -> AcpSlashCommandPlan {
+        match command.name.as_str() {
+            "status" => AcpSlashCommandPlan::Reply(render_opencode_status(ctx)),
+            "models" => AcpSlashCommandPlan::Reply(render_opencode_models(ctx)),
+            _ => AcpSlashCommandPlan::Prompt,
+        }
+    }
+
     fn normalize_tool_name<'a>(
         &self,
         tool_name: &'a str,
@@ -680,4 +720,69 @@ fn opencode_token_usage(raw: &Value) -> Option<TokenUsage> {
         cache_creation_input_tokens,
         reasoning_tokens,
     })
+}
+
+fn render_opencode_status(ctx: &AcpSlashCommandCtx<'_>) -> String {
+    let mut lines = vec![
+        "**Session**".to_owned(),
+        format!("- Session: `{}`", ctx.session_id),
+        format!("- Working directory: {}", ctx.workspace_root),
+    ];
+    if let Some(model) = ctx.model {
+        lines.push(format!("- Model: {model}"));
+    }
+    if let Some(mode) = ctx.mode {
+        lines.push(format!("- Mode: {mode}"));
+    }
+    lines.push(String::new());
+    lines.push("**Token usage**".to_owned());
+    if ctx.usage.total_tokens == 0 {
+        lines.push("- No turns completed yet".to_owned());
+    } else {
+        lines.push(format!(
+            "- Total: {} tokens ({} input, {} output)",
+            ctx.usage.total_tokens, ctx.usage.input_tokens, ctx.usage.output_tokens
+        ));
+    }
+    if let Some((input_tokens, context_window)) = ctx.context_usage.and_then(|usage| usage.known())
+    {
+        let percent = input_tokens
+            .saturating_mul(100)
+            .checked_div(context_window)
+            .unwrap_or(0);
+        lines.push(format!(
+            "- Context: {input_tokens} / {context_window} tokens ({percent}%)"
+        ));
+    }
+    lines.join("\n")
+}
+
+fn render_opencode_models(ctx: &AcpSlashCommandCtx<'_>) -> String {
+    if ctx.known_models.is_empty() {
+        return "OpenCode has not reported a model list for this session.".to_owned();
+    }
+    let mut lines = vec!["**Available models**".to_owned()];
+    for model in ctx.known_models {
+        let Some(id) = model
+            .get("id")
+            .or_else(|| model.get("modelId"))
+            .and_then(Value::as_str)
+        else {
+            continue;
+        };
+        let name = model
+            .get("name")
+            .or_else(|| model.get("displayName"))
+            .and_then(Value::as_str)
+            .filter(|name| *name != id)
+            .map(|name| format!(" — {name}"))
+            .unwrap_or_default();
+        let current = if ctx.model == Some(id) {
+            " (current)"
+        } else {
+            ""
+        };
+        lines.push(format!("- `{id}`{name}{current}"));
+    }
+    lines.join("\n")
 }

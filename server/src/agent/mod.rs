@@ -820,6 +820,7 @@ impl AgentActivityStatsTracker {
             | ChatEvent::GoalCapabilities(_)
             | ChatEvent::GoalChanged(_)
             | ChatEvent::GoalCompleted(_)
+            | ChatEvent::SlashCommandsChanged(_)
             | ChatEvent::TaskUpdate(_)
             | ChatEvent::OperationCancelled(_)
             | ChatEvent::RetryAttempt(_)
@@ -2663,6 +2664,7 @@ pub(crate) fn spawn_agent_actor(
         let mut event_log: Vec<Envelope> = Vec::new();
         let mut latest_output = AgentControlLatestOutput::default();
         let mut replay_state = AgentReplayState::default();
+        let mut latest_slash_commands: Option<protocol::SlashCommandCatalog> = None;
         let mut last_backend_event_at: Option<Instant> = None;
         let mut last_stall_interrupt_at: Option<Instant> = None;
         let mut subscribers: Vec<Stream> = Vec::new();
@@ -3050,6 +3052,7 @@ pub(crate) fn spawn_agent_actor(
                     &event_log,
                     Some(&replay_state),
                     &mut latest_output,
+                    latest_slash_commands.as_ref(),
                     &mut subscribers,
                     &mut pending_startup_attaches,
                     &status_handle,
@@ -3278,6 +3281,7 @@ pub(crate) fn spawn_agent_actor(
                 &event_log,
                 Some(&replay_state),
                 &mut latest_output,
+                latest_slash_commands.as_ref(),
                 &mut subscribers,
                 &mut pending_startup_attaches,
                 &status_handle,
@@ -4035,6 +4039,7 @@ pub(crate) fn spawn_agent_actor(
                                 &event_log,
                                 None,
                                 &mut latest_output,
+                                latest_slash_commands.as_ref(),
                                 &mut subscribers,
                                 &mut pending_resume_attaches,
                                 &status_handle,
@@ -4149,6 +4154,7 @@ pub(crate) fn spawn_agent_actor(
                         && restore_native_goal_snapshot(&event, &status_handle).await
                     {
                         if let BackendEvent::Chat(event) = event {
+                            remember_slash_commands(&mut latest_slash_commands, &event);
                             append_chat_event(&canonical_stream, &mut event_log, &mut subscribers, &mut replay_state, &event).await;
                         }
                         continue;
@@ -4599,6 +4605,9 @@ pub(crate) fn spawn_agent_actor(
                                 s.activity_counter = s.activity_counter.saturating_add(1);
                             }).await;
                         }
+                        ChatEvent::SlashCommandsChanged(catalog) => {
+                            latest_slash_commands = Some(catalog.clone());
+                        }
                         _ => {
                             status_handle.update(|s| {
                                 s.activity_counter = s.activity_counter.saturating_add(1);
@@ -4996,6 +5005,7 @@ pub(crate) fn spawn_agent_actor(
                             while let Ok(event) = events.try_recv_backend() {
                                 if restore_native_goal_snapshot(&event, &status_handle).await {
                                     if let BackendEvent::Chat(event) = event {
+                                        remember_slash_commands(&mut latest_slash_commands, &event);
                                         append_chat_event(&canonical_stream, &mut event_log, &mut subscribers, &mut replay_state, &event).await;
                                     }
                                     continue;
@@ -5175,6 +5185,7 @@ pub(crate) fn spawn_agent_actor(
                                         &event_log,
                                         Some(&replay_state),
                                         &mut latest_output,
+                                        latest_slash_commands.as_ref(),
                                         &mut subscribers,
                                         &mut pending_resume_attaches,
                                         &status_handle,
@@ -5376,6 +5387,7 @@ pub(crate) fn spawn_agent_actor(
                                         &event_log,
                                         None,
                                         &mut latest_output,
+                                        latest_slash_commands.as_ref(),
                                         &mut subscribers,
                                         &mut pending_resume_attaches,
                                         &status_handle,
@@ -7831,6 +7843,7 @@ pub(crate) fn spawn_agent_actor(
                                 Some(&replay_state),
                                 latest_output.output(),
                                 status_handle.snapshot().await.is_active(),
+                                latest_slash_commands.as_ref(),
                                 &mut subscribers,
                                 stream,
                             );
@@ -7958,6 +7971,7 @@ pub(crate) fn spawn_relay_agent_actor(
             journal: Some(transcript_store.open_session(&session_id)),
             ..Default::default()
         };
+        let mut latest_slash_commands: Option<protocol::SlashCommandCatalog> = None;
         let mut subscribers: Vec<Stream> = Vec::new();
         let mut active_stream_text = String::new();
         let mut activity_stats = AgentActivityStatsTracker::for_backend(start.backend_kind);
@@ -8258,6 +8272,7 @@ pub(crate) fn spawn_relay_agent_actor(
                         )
                         .await;
                     }
+                    remember_slash_commands(&mut latest_slash_commands, &event);
                     append_chat_event(
                         &canonical_stream,
                         &mut event_log,
@@ -8551,6 +8566,7 @@ pub(crate) fn spawn_relay_agent_actor(
                                 Some(&replay_state),
                                 latest_output.output(),
                                 status_handle.snapshot().await.is_active(),
+                                latest_slash_commands.as_ref(),
                                 &mut subscribers,
                                 stream,
                             );
@@ -9246,6 +9262,7 @@ async fn park_terminal_agent(
                     None,
                     latest_output.output(),
                     false,
+                    None,
                     subscribers,
                     stream,
                 );
@@ -9436,6 +9453,7 @@ async fn park_relay_terminal_agent(
                     None,
                     latest_output.output(),
                     status_handle.snapshot().await.is_active(),
+                    None,
                     subscribers,
                     stream,
                 );
@@ -10362,6 +10380,7 @@ async fn flush_pending_agent_attaches(
     event_log: &[Envelope],
     replay_state: Option<&AgentReplayState>,
     latest_output: &mut AgentControlLatestOutput,
+    slash_commands: Option<&protocol::SlashCommandCatalog>,
     subscribers: &mut Vec<Stream>,
     pending_attaches: &mut Vec<(Stream, oneshot::Sender<bool>)>,
     status_handle: &registry::AgentStatusHandle,
@@ -10375,6 +10394,7 @@ async fn flush_pending_agent_attaches(
             replay_state,
             &output,
             turn_active,
+            slash_commands,
             subscribers,
             stream,
         );
@@ -10537,8 +10557,9 @@ async fn terminalize_closed_queue_dispatch(context: QueueDispatchTerminalContext
     .await;
 }
 
-// Goal reads describe current provider state, even while transcript replay is gated.
-// Discarding them with historical chat leaves resumed controls unsupported.
+// Goal reads and the slash-command set describe current provider state, even
+// while transcript replay is gated. Discarding them with historical chat leaves
+// resumed controls unsupported.
 async fn restore_native_goal_snapshot(
     event: &BackendEvent,
     status_handle: &registry::AgentStatusHandle,
@@ -10559,9 +10580,19 @@ async fn restore_native_goal_snapshot(
                 .update(|status| status.goal = goal.clone())
                 .await;
         }
+        BackendEvent::Chat(ChatEvent::SlashCommandsChanged(_)) => {}
         _ => return false,
     }
     true
+}
+
+/// The actor's copy of the backend's current slash-command set, handed to
+/// every subscriber that attaches later. Kept outside the replay log so history
+/// pages never carry a stale set that could overwrite the live one.
+fn remember_slash_commands(latest: &mut Option<protocol::SlashCommandCatalog>, event: &ChatEvent) {
+    if let ChatEvent::SlashCommandsChanged(catalog) = event {
+        *latest = Some(catalog.clone());
+    }
 }
 
 async fn mark_agent_turn_active(status_handle: &registry::AgentStatusHandle) {
@@ -10855,6 +10886,9 @@ fn record_chat_event_for_replay(
             }
             push_chat_event_to_replay_log(canonical_stream, event_log, event);
         }
+        // Session state, not transcript: the actor holds the latest set for
+        // bootstrap, and a logged copy would resurface in history pages.
+        ChatEvent::SlashCommandsChanged(_) => {}
         ChatEvent::MessageAdded(_)
         | ChatEvent::GoalCapabilities(_)
         | ChatEvent::GoalChanged(_)
@@ -11260,7 +11294,8 @@ fn render_activity_chat_event(event: &ChatEvent) -> Option<String> {
         )),
         ChatEvent::GoalCapabilities(_)
         | ChatEvent::GoalChanged(_)
-        | ChatEvent::GoalCompleted(_) => None,
+        | ChatEvent::GoalCompleted(_)
+        | ChatEvent::SlashCommandsChanged(_) => None,
         ChatEvent::TaskUpdate(tasks) => {
             let title = tasks.title.trim();
             if title.is_empty() {
@@ -12170,11 +12205,17 @@ fn attach_subscriber_with_latest_output(
     replay_state: Option<&AgentReplayState>,
     latest_output: &AgentControlOutput,
     turn_active: bool,
+    slash_commands: Option<&protocol::SlashCommandCatalog>,
     subscribers: &mut Vec<Stream>,
     stream: Stream,
 ) -> bool {
     let stream_path = stream.path().clone();
     let mut events = agent_bootstrap_events_from_log(event_log);
+    if let Some(catalog) = slash_commands {
+        events.push(AgentBootstrapEvent::ChatEvent(
+            ChatEvent::SlashCommandsChanged(catalog.clone()),
+        ));
+    }
     let history_entries = filtered_session_history_entries_from_log(event_log, replay_state);
     let history_tail = initial_history_tail_entries(&history_entries);
     if let Some((oldest_tail_seq, _)) = history_tail.first() {

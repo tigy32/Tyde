@@ -2,11 +2,11 @@
 
 The backend conformance suite is `tests/tests/conformance2.rs`. Its harness calls the production `Backend` trait directly. It runs real installed providers and checks normalized events, native history, settings, and filesystem results. Server protocol behavior belongs in the mock-server simulations.
 
-The 29 scenarios below retain the original scenario names. Native-provider configuration and filesystem regressions also retain their original provider-specific oracles. Capability exclusions come from backend declarations; they are not passing backend runs.
+The 30 scenarios below retain the original scenario names. Native-provider configuration and filesystem regressions also retain their original provider-specific oracles. Capability exclusions come from backend declarations; they are not passing backend runs.
 
 ## Migration coverage
 
-Passing real runs recorded on 2026-09-09. A dash means the backend does not declare the case’s required capabilities or native skill delivery. The existing Codex configuration case applies only to Codex.
+Passing real runs recorded on 2026-09-09; `real_slash_commands` was recorded on 2026-09-14 (Claude, Codex, Antigravity) and 2026-09-15 (Kiro, Grok, OpenCode, Hermes). A dash means the backend does not declare the case’s required capabilities or native skill delivery. The existing Codex configuration case applies only to Codex.
 
 | Scenario | Claude | Codex | Kiro | Antigravity | Grok | OpenCode | Hermes |
 |---|---|---|---|---|---|---|---|
@@ -39,6 +39,7 @@ Passing real runs recorded on 2026-09-09. A dash means the backend does not decl
 | `real_tyde_agent_spawn` | Pass | Pass | Pass | Pass | Pass | Pass | Pass |
 | `real_agent_await_survives_a_resumed_session` | Pass | Pass | Pass | Pass | Pass | Pass | Pass |
 | `real_native_goal_lifecycle` | — | Pass | — | — | — | — | — |
+| `real_slash_commands` | Pass | Pass | Pass | Pass | Pass | Pass | Pass |
 
 Additional real regressions cover Claude’s native session location, Codex’s abandoned and legacy dynamic await tools, Claude plan approval, and Codex discovery lifecycle. The lifecycle test starts the real CLI and uses a transparent proxy to delay or disconnect transport; it supplies no provider responses.
 

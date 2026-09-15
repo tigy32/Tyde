@@ -992,6 +992,9 @@ pub struct AppState {
     pub task_lists: RwSignal<HashMap<AgentRef, TaskList>>,
     pub native_goals: RwSignal<HashMap<AgentRef, protocol::NativeGoal>>,
     pub goal_capabilities: RwSignal<HashMap<AgentRef, protocol::GoalCapabilities>>,
+    /// The slash commands each live agent's backend currently accepts, as last
+    /// published on its stream. The composer completes `/` drafts from this.
+    pub slash_commands: RwSignal<HashMap<AgentRef, protocol::SlashCommandCatalog>>,
     pub agent_message_queue: RwSignal<HashMap<AgentRef, Vec<QueuedMessageEntry>>>,
     pub agent_turn_active: RwSignal<HashMap<AgentRef, bool>>,
     pub agents_with_background_work: RwSignal<HashSet<AgentRef>>,
@@ -1110,6 +1113,7 @@ impl AppState {
             task_lists: RwSignal::new(HashMap::new()),
             native_goals: RwSignal::new(HashMap::new()),
             goal_capabilities: RwSignal::new(HashMap::new()),
+            slash_commands: RwSignal::new(HashMap::new()),
             agent_message_queue: RwSignal::new(HashMap::new()),
             agent_turn_active: RwSignal::new(HashMap::new()),
             agents_with_background_work: RwSignal::new(HashSet::new()),
