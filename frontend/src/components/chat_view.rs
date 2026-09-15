@@ -953,7 +953,6 @@ pub fn ChatView(
                         <ToolOutputModeToggle />
                     </Show>
                     <ReviewChangesButton agent_ref=agent_ref />
-                    <CompactContextButton agent_ref=agent_ref />
                 </div>
                 <TaskListView
                     agent_id=Signal::derive(move || {
@@ -1266,69 +1265,6 @@ fn MeasuredRow(
 }
 
 // ── Context compaction ──────────────────────────────────────────────────
-
-/// The chat header's compaction control. Discoverability: the agent-card
-/// action is hover-revealed in a side panel, which is not where a user
-/// working in a long conversation is looking when they need it.
-///
-/// Visible-but-disabled with a reason, never hidden — and enabled during a
-/// turn, because the server defers rather than refuses.
-#[component]
-fn CompactContextButton(agent_ref: Signal<Option<ActiveAgentRef>>) -> impl IntoView {
-    let state = expect_context::<AppState>();
-
-    let control = Signal::derive(move || {
-        let agent = agent_ref.get()?;
-        Some(crate::actions::compaction_control_state(&state, &agent))
-    });
-
-    let on_click = move |_: web_sys::MouseEvent| {
-        let Some(agent) = agent_ref.get_untracked() else {
-            return;
-        };
-        let state: AppState = expect_context::<AppState>();
-        let name = state.agents.with_untracked(|agents| {
-            agents
-                .iter()
-                .find(|candidate| {
-                    candidate.host_id == agent.host_id && candidate.agent_id == agent.agent_id
-                })
-                .map(|candidate| candidate.name.clone())
-                .unwrap_or_else(|| "this agent".to_owned())
-        });
-        wasm_bindgen_futures::spawn_local(async move {
-            crate::actions::request_context_compaction(state, agent, name).await;
-        });
-    };
-
-    view! {
-        {move || {
-            let control = control.get()?;
-            let enabled = control.is_enabled();
-            let label = match control.reason() {
-                None => "Compact context".to_owned(),
-                Some(reason) => format!("Compact context — unavailable: {reason}"),
-            };
-            Some(view! {
-                <button
-                    type="button"
-                    class="chat-header-compact"
-                    title=label.clone()
-                    aria-label=label
-                    // `aria-disabled`, not the native attribute: a natively
-                    // disabled button leaves the tab order and its reason
-                    // becomes hover-only. `request_context_compaction`
-                    // re-checks the gate, so the click is inert regardless.
-                    aria-disabled=move || if enabled { "false" } else { "true" }
-                    data-test="chat-header-compact"
-                    on:click=on_click
-                >
-                    "\u{27F2}"
-                </button>
-            })
-        }}
-    }
-}
 
 /// `384168` → `"384.2K"`. Visible text only; the accessible sentence spells
 /// the number out (see `dispatch::compaction_marker_announcement`).
@@ -4207,11 +4143,12 @@ mod wasm_tests {
         );
     }
 
-    /// The header control stays visible and explains itself when it cannot be
-    /// used. Hiding it — the previous behaviour — teaches the user it does not
-    /// exist, and the most common blocker is transient.
+    /// Compaction is not a chat-header action. The circular-arrow control
+    /// sat next to the tool-output verbosity toggle and was read as the
+    /// same control. Compact stays on the agent card, the command palette,
+    /// and the team controls.
     #[wasm_bindgen_test]
-    async fn header_compact_control_is_visible_and_explains_why_it_is_disabled() {
+    async fn chat_header_does_not_show_a_compact_control() {
         ensure_styles_loaded();
         let agent_id = AgentId("agent-header".to_owned());
         let host_id = "host-header".to_owned();
@@ -4224,7 +4161,6 @@ mod wasm_tests {
                 host_id: host_id_mount.clone(),
                 agent_id: agent_id_mount.clone(),
             };
-            // Disconnected host: a real, explainable blocker.
             provide_context(state);
             let agent_ref = Signal::derive(move || Some(bound.clone()));
             let is_active: Signal<bool> = Signal::derive(|| true);
@@ -4233,25 +4169,18 @@ mod wasm_tests {
         .forget();
         next_tick().await;
 
-        let button = query(&container, "[data-test='chat-header-compact']")
-            .expect("the control stays in the header even when unavailable");
-        assert_eq!(
-            button.get_attribute("aria-disabled").as_deref(),
-            Some("true"),
-            "and is disabled rather than hidden"
-        );
-        let label = button.get_attribute("aria-label").unwrap_or_default();
+        let header =
+            query(&container, ".chat-agent-header").expect("the chat header still renders");
         assert!(
-            label.contains("unavailable:"),
-            "the accessible name carries the reason: {label}"
+            header
+                .query_selector("[data-test='chat-header-compact']")
+                .unwrap()
+                .is_none(),
+            "compact is not a header action"
         );
-
-        // A natively-disabled button leaves the tab order, which makes the
-        // reason hover-only. `aria-disabled` keeps it focusable so a keyboard
-        // or screen-reader user can reach the explanation.
         assert!(
-            !button.has_attribute("disabled"),
-            "the reason must be reachable without a pointer"
+            query(&container, "[data-test='chat-header-compact']").is_none(),
+            "no leftover compact control is mounted outside the header either"
         );
     }
 }

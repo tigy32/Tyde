@@ -366,8 +366,8 @@ pub fn command_availability(
         | CommandId::GoToChat
         | CommandId::ToggleSettings
         | CommandId::SendFeedback => CommandAvailability::Enabled,
-        // Shares the one capability + gate selector with the chat header, the
-        // agent card, and the team controls, so the palette can never offer a
+        // Shares the one capability + gate selector with the agent card
+        // and the team controls, so the palette can never offer a
         // compaction the other surfaces refuse (or vice versa).
         CommandId::CompactContext => match state.active_agent.get() {
             None => CommandAvailability::Disabled("No active chat."),

@@ -2133,9 +2133,9 @@ fn availability_reason_text(reason: CompactionAvailabilityReason) -> &'static st
 }
 
 /// The single capability + gate selector every compaction control uses:
-/// the chat header button, the agent card action, the command palette entry,
-/// and the team control. One selector means one set of rules and one place a
-/// rule can be wrong.
+/// the agent card action, the command palette entry, and the team
+/// control. One selector means one set of rules and one place a rule
+/// can be wrong.
 pub fn compaction_control_state(
     state: &AppState,
     agent: &ActiveAgentRef,

@@ -2941,29 +2941,10 @@ kbd {
     to { transform: rotate(360deg); }
 }
 
-/* Header trigger, matching the neighbouring header controls. */
-.chat-header-compact {
-    background: transparent;
-    border: 1px solid var(--border);
-    border-radius: 4px;
-    color: var(--text-secondary);
-    cursor: pointer;
-    padding: 2px 6px;
-}
-
-/* The control uses `aria-disabled`, not the native attribute, so `:not(:disabled)`
-   matches an unavailable button and would brighten it on hover. Key the hover
-   affordance off the same predicate the dimmed state uses. */
-.chat-header-compact:hover:not([aria-disabled="true"]) {
-    color: var(--text-primary);
-    border-color: var(--text-secondary);
-}
-
 /* Unavailable controls use `aria-disabled`, not the native `disabled`
    attribute, so they stay in the tab order and their reason is reachable by
    keyboard and screen reader instead of hover-only. They still have to *look*
    unavailable. */
-.chat-header-compact[aria-disabled="true"],
 .agent-card-compact[aria-disabled="true"],
 .team-member-icon-btn-compact[aria-disabled="true"],
 .team-card-compact[aria-disabled="true"] {

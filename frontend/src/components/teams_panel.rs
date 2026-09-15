@@ -798,8 +798,8 @@ fn MemberRow(
         };
         let host_id = host_for_compact_click.clone();
         let state = state_for_compact_click.clone();
-        // Routed through the same helper as the chat header, the agent card,
-        // and the command palette, so all four share one capability rule and
+        // Routed through the same helper as the agent card and the
+        // command palette, so all three share one capability rule and
         // one duplicate-submit gate.
         spawn_local(async move {
             crate::actions::request_context_compaction(
