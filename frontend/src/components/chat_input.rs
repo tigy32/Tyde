@@ -1409,7 +1409,7 @@ pub fn ChatInput(
                     <span>{move || if usage_pause.get().is_some_and(|pause| pause.compaction_failed) {
                         "Usage pause: compaction failed. Disable usage management in Settings to release held work."
                     } else {
-                        "Usage pause: queued work will resume after the quota resets."
+                        "Usage pause: queued work will resume when fresh usage is below the pause threshold."
                     }}</span>
                     <Show when=move || usage_pause.get().is_some_and(|pause| pause.resume_interrupted_turn)>
                         <button type="button" class="chat-backend-notice-cta" on:click={move |_| cancel_usage.run(())}>
@@ -2367,6 +2367,12 @@ mod wasm_tests {
         });
         next_tick().await;
         assert!(container.text_content().unwrap().contains("Usage pause:"));
+        assert!(
+            container
+                .text_content()
+                .unwrap()
+                .contains("below the pause threshold")
+        );
         assert!(
             container
                 .text_content()

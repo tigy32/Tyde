@@ -119,7 +119,7 @@ async fn record(fixture: &Fixture, report: CapacityReport) {
 /// only the currently-binding bucket. Both used to replace the complete report,
 /// so the settings usage view flipped between three bars and one every time an
 /// agent refreshed.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn narrower_capacity_report_updates_bars_instead_of_replacing_them() {
     let mut fixture = Fixture::new().await;
 
@@ -291,6 +291,50 @@ async fn narrower_capacity_report_updates_bars_instead_of_replacing_them() {
         CapacitySource::ClaudeControlUsage,
         "the merged report must stay attributed to the source that produced its bucket set"
     );
+
+    for used in 1..=8 {
+        let updates = vec![
+            claude_bucket(ClaudeLimitType::FiveHour, "session limit", used),
+            claude_bucket(ClaudeLimitType::SevenDay, "weekly limit", used + 10),
+            model_bucket("Fable", used + 20),
+        ];
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(updates.len()));
+        let mut tasks = Vec::new();
+        for bucket in updates.clone() {
+            let host = fixture.host_for_test();
+            let barrier = barrier.clone();
+            tasks.push(tokio::spawn(async move {
+                barrier.wait().await;
+                host.record_backend_capacity_for_test(
+                    BackendKind::Claude,
+                    BackendCapacityState::Known {
+                        report: CapacityReport {
+                            source: CapacitySource::ClaudeControlUsage,
+                            observed_at_ms: None,
+                            plan: None,
+                            buckets: vec![bucket],
+                            coverage: CapacityCoverage::AllVendorBuckets,
+                        },
+                    },
+                )
+                .await;
+            }));
+        }
+        for task in tasks {
+            task.await.unwrap();
+        }
+        let mut client = fixture.connect().await;
+        let env = next_frame_matching_on(&mut client, "concurrent capacity replay", |env| {
+            claude_snapshot(env).is_some()
+        })
+        .await;
+        let snapshot = claude_snapshot(&env).unwrap();
+        assert_eq!(
+            held_report(&snapshot.state).unwrap().buckets,
+            updates,
+            "simultaneous partial readings must preserve every updated bar"
+        );
+    }
 }
 
 async fn set_usage_setting(fixture: &mut Fixture, path: &str, value: bool) {
@@ -538,5 +582,176 @@ async fn usage_limits_resume_only_the_interrupted_work() {
             .count(),
         2
     );
+    control.assert_clean().await;
+}
+
+#[tokio::test]
+async fn usage_limits_recover_from_corrections_without_reset_markers() {
+    use server::backend::mock::{MockRequest, MockScript, MockTurn};
+    let mut fixture = Fixture::new().await;
+    let agent = fixture
+        .spawn_scripted(
+            "quota corrections",
+            MockScript::one(MockTurn::text("ready")).with_unbounded_echo(),
+        )
+        .await;
+    fixture.finish_turn(&agent).await;
+    set_usage_setting(&mut fixture, "/usage_limits/enabled", true).await;
+    let control = fixture.mock(&agent).await;
+    for (cycle, reset) in [
+        CapacityReset::At {
+            at_ms: wall_ms() + 18_000_000,
+        },
+        CapacityReset::NotReported,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut bucket = claude_bucket(ClaudeLimitType::FiveHour, "session limit", 98);
+        bucket.reset = reset;
+        let mut report = CapacityReport {
+            source: CapacitySource::ClaudeControlUsage,
+            observed_at_ms: None,
+            plan: None,
+            buckets: vec![bucket, model_bucket("Fable", 88)],
+            coverage: CapacityCoverage::AllVendorBuckets,
+        };
+        record(&fixture, report.clone()).await;
+        usage_notice(&mut fixture, &agent, "Usage limit pause:").await;
+        fixture
+            .client
+            .send_message(&agent.stream, "held for corrected reading".to_owned())
+            .await
+            .unwrap();
+        fixture.expect_queued_messages(&agent, 1).await;
+        // A missing magnitude is not evidence that the triggering quota recovered.
+        report.buckets[0].measure = CapacityMeasure::ReportedWithoutMagnitude;
+        record(&fixture, report.clone()).await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(
+            control
+                .requests()
+                .await
+                .iter()
+                .filter(|request| matches!(request,
+            MockRequest::Input(message) if message.message == "held for corrected reading"))
+                .count(),
+            cycle
+        );
+        report.buckets[0].measure = used_percent(3);
+        record(&fixture, report).await;
+        usage_notice(&mut fixture, &agent, "Usage limit pause ended").await;
+        fixture.finish_turn(&agent).await;
+        assert_eq!(
+            control
+                .requests()
+                .await
+                .iter()
+                .filter(|request| matches!(request,
+            MockRequest::Input(message) if message.message == "held for corrected reading"))
+                .count(),
+            cycle + 1
+        );
+    }
+    quota(&fixture, 95, wall_ms() + 18_000_000).await;
+    usage_notice(&mut fixture, &agent, "Usage limit pause:").await;
+    fixture
+        .client
+        .send_message(&agent.stream, "held until threshold raised".to_owned())
+        .await
+        .unwrap();
+    fixture.expect_queued_messages(&agent, 1).await;
+    fixture
+        .client
+        .replace_setting("/usage_limits/stop_used_percent", 100u8, 90u8)
+        .await
+        .unwrap();
+    usage_notice(&mut fixture, &agent, "Usage limit pause ended").await;
+    fixture.finish_turn(&agent).await;
+    assert_eq!(
+        control
+            .requests()
+            .await
+            .iter()
+            .filter(|request| matches!(request,
+        MockRequest::Input(message) if message.message == "held until threshold raised"))
+            .count(),
+        1
+    );
+    control.assert_clean().await;
+}
+
+#[tokio::test]
+async fn usage_limits_do_not_treat_cached_observations_as_fresh() {
+    use server::backend::mock::{MockRequest, MockScript, MockTurn};
+    let mut fixture = Fixture::new().await;
+    let agent = fixture
+        .spawn_scripted(
+            "cached quota",
+            MockScript::one(MockTurn::text("ready")).with_unbounded_echo(),
+        )
+        .await;
+    fixture.finish_turn(&agent).await;
+    set_usage_setting(&mut fixture, "/usage_limits/enabled", true).await;
+    let mut report = CapacityReport {
+        source: CapacitySource::ClaudeControlUsage,
+        observed_at_ms: Some(wall_ms().saturating_sub(180_000)),
+        plan: None,
+        buckets: vec![claude_bucket(
+            ClaudeLimitType::FiveHour,
+            "session limit",
+            98,
+        )],
+        coverage: CapacityCoverage::AllVendorBuckets,
+    };
+    record(&fixture, report.clone()).await;
+    fixture
+        .client
+        .send_message(&agent.stream, "not blocked by old quota".to_owned())
+        .await
+        .unwrap();
+    fixture.finish_turn(&agent).await;
+    report.observed_at_ms = Some(wall_ms());
+    record(&fixture, report.clone()).await;
+    usage_notice(&mut fixture, &agent, "Usage limit pause:").await;
+    fixture
+        .client
+        .send_message(&agent.stream, "await fresh correction".to_owned())
+        .await
+        .unwrap();
+    fixture.expect_queued_messages(&agent, 1).await;
+    let triggering_observation = report.observed_at_ms.unwrap();
+    report.buckets[0].measure = used_percent(1);
+    report.observed_at_ms = Some(triggering_observation.saturating_sub(1));
+    record(&fixture, report.clone()).await;
+    let mut replay_client = fixture.connect().await;
+    let env = next_frame_matching_on(
+        &mut replay_client,
+        "latest quota observation replay",
+        |env| claude_snapshot(env).is_some(),
+    )
+    .await;
+    let snapshot = claude_snapshot(&env).unwrap();
+    assert_eq!(
+        bucket_percent(held_report(&snapshot.state).unwrap(), &report.buckets[0].id),
+        Some(98),
+        "a delayed older reading must not overwrite newer quota data or release held work"
+    );
+    report.observed_at_ms = Some(wall_ms().saturating_sub(180_000));
+    record(&fixture, report.clone()).await;
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let control = fixture.mock(&agent).await;
+    assert!(
+        !control
+            .requests()
+            .await
+            .iter()
+            .any(|request| matches!(request,
+        MockRequest::Input(message) if message.message == "await fresh correction"))
+    );
+    report.observed_at_ms = Some(wall_ms());
+    record(&fixture, report).await;
+    usage_notice(&mut fixture, &agent, "Usage limit pause ended").await;
+    fixture.finish_turn(&agent).await;
     control.assert_clean().await;
 }

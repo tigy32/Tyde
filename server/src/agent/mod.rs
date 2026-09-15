@@ -3393,10 +3393,12 @@ pub(crate) fn spawn_agent_actor(
                     resume_turn,
                     ..UsageLimitPause::default()
                 });
-                tracing::info!(agent_id = %current_start.agent_id, threshold = usage_settings.stop_used_percent, "pausing agent for usage limit");
+                tracing::info!(agent_id = %current_start.agent_id, ?backend_kind, threshold = usage_settings.stop_used_percent, report = ?usage_report, exceeded = ?exceeded, resume_turn, "pausing agent for usage limit");
                 append_chat_event(&canonical_stream, &mut event_log, &mut subscribers,
                     &mut replay_state, &usage_limit_notice(format!(
-                        "Usage limit pause: quota has reached {}%. Queued work is held until a fresh report confirms the quota reset. Cancel continuation in the composer to stop automatic continuation.", usage_settings.stop_used_percent))).await;
+                        "Usage limit pause: {} (pause threshold {}%). Queued work is held until a fresh report confirms usage is below the threshold. Cancel continuation in the composer to stop automatic continuation.",
+                        exceeded.iter().filter_map(|bucket| usage_limit_used(bucket).map(|used| format!("{} at {used}%", bucket.label))).collect::<Vec<_>>().join(", "),
+                        usage_settings.stop_used_percent))).await;
                 if resume_turn {
                     backend.as_ref().expect("live backend").interrupt().await;
                 }
@@ -3454,22 +3456,14 @@ pub(crate) fn spawn_agent_actor(
                         }
                     }
                 }
-                let reset_confirmed = usage_report.is_some_and(|report| {
+                let capacity_available = usage_report.is_some_and(|report| {
                     pause.held_buckets.iter().all(|held| {
-                        let protocol::CapacityReset::At { at_ms } = held.reset else {
-                            return false;
-                        };
-                        now_ms() >= at_ms
-                            && report.buckets.iter().any(|current| {
-                                current.id == held.id
-                                    && usage_limit_used(current)
-                                        .is_some_and(|used| used < usage_settings.stop_used_percent)
-                                    && current.reset != held.reset
-                            })
-                    }) && report.buckets.iter().all(|bucket| {
-                        usage_limit_used(bucket)
-                            .is_none_or(|used| used < usage_settings.stop_used_percent)
-                    })
+                        report.buckets.iter().any(|current| {
+                            current.id == held.id
+                                && usage_limit_used(current)
+                                    .is_some_and(|used| used < usage_settings.stop_used_percent)
+                        })
+                    }) && exceeded.is_empty()
                 });
                 let compact_due = usage_settings.compact_enabled
                     && activity_stats
@@ -3505,7 +3499,7 @@ pub(crate) fn spawn_agent_actor(
                         reply,
                     });
                 } else if (!usage_settings.enabled
-                    || (reset_confirmed
+                    || (capacity_available
                         && (!compact_due || pause.compaction_attempted)
                         && !pause.compaction_failed
                         && pause.compaction_reply.is_none()
@@ -3516,6 +3510,7 @@ pub(crate) fn spawn_agent_actor(
                     && !resume_replay_gate_pending
                 {
                     let resume_turn = pause.resume_turn;
+                    tracing::info!(agent_id = %current_start.agent_id, ?backend_kind, enabled = usage_settings.enabled, threshold = usage_settings.stop_used_percent, report = ?usage_report, held_buckets = ?pause.held_buckets, resume_turn, "releasing usage limit pause");
                     usage_pause = None;
                     append_chat_event(
                         &canonical_stream,
@@ -6223,7 +6218,7 @@ pub(crate) fn spawn_agent_actor(
                                         protocol::GoalControl::Clear => caps.clear,
                                     });
                                     let error = if usage_paused && matches!(control, protocol::GoalControl::Set { .. } | protocol::GoalControl::Resume) {
-                                        Some("Usage limit pause blocks starting or resuming a native goal until the quota resets".to_owned())
+                                        Some("Usage limit pause blocks starting or resuming a native goal until fresh usage is below the pause threshold".to_owned())
                                     } else if !supported {
                                         Some("This session does not support that native goal control".to_owned())
                                     } else {
@@ -8681,7 +8676,13 @@ fn usage_limit_report(
             return None;
         }
         match &snapshot.state {
-            protocol::BackendCapacityState::Known { report } => Some(report),
+            protocol::BackendCapacityState::Known { report }
+                if report.observed_at_ms.is_none_or(|observed_at_ms| {
+                    now_ms().saturating_sub(observed_at_ms) <= 120_000
+                }) =>
+            {
+                Some(report)
+            }
             _ => None,
         }
     })

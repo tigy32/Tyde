@@ -493,20 +493,35 @@ tools settle. It does not run a supervisor verdict. Failed compaction holds
 automatic continuation and shows an explanation. Disabling usage management
 releases held work. Unknown context occupancy does not trigger compaction.
 
-Resumption requires a fresh report below the threshold, after the held bucket's
-reset time, with a changed reset marker for every held bucket. Expired times,
-missing buckets, and unavailable readings alone never release work. Sources
-without percentages cannot trigger the policy; without a reported reset they
-cannot automatically release it. The server must remain running for the pause
-and continuation cycle; automatic continuation state is not restored after a
-server restart. Queued messages use the existing persisted queue.
+Resumption requires a fresh, below-threshold percentage for every held bucket,
+with no other bucket at or above the current threshold. Reset timestamps are
+informational: corrected readings, replenished credits and threshold changes
+can restore capacity without a new reset marker. Missing buckets, unknown
+magnitudes, expired timestamps and unavailable readings alone never release
+work. Both collection age and any supplied observation age must be at most two
+minutes. A provider that silently returns cached data without observation
+metadata cannot have its true observation age established by Tyde.
+
+Capacity merges and publication are atomic so simultaneous partial readings
+cannot overwrite one another's updates. Older observations from the same source
+cannot replace a newer held observation or refresh its collection age. Pause and
+release logs include the backend, threshold, report, triggering buckets and
+continuation decision; raw incoming reports are retained at debug level. Pause notices identify the actual
+triggering buckets and percentages rather than only repeating the threshold.
+
+The server must remain running for the pause and continuation cycle; automatic
+continuation state is not restored after a server restart. Queued messages use
+the existing persisted queue.
 
 Desktop and mobile chat display the pause. “Cancel continuation” cancels the
 interrupted task's automatic follow-up; explicitly queued messages remain queued.
 Idle agents do not receive unsolicited continuation prompts.
 
 The server capacity tests exercise this policy through a running server and
-protocol clients. Disabling the pause admission branch makes both usage-flow
-regressions fail waiting for the missing pause, while the other native tests
-pass. Browser tests cover the opt-in controls and cancellation from an idle
-composer.
+protocol clients, including compaction, queue release and cancellation. Recovery
+regressions failed before the fix waiting for a corrected 3% report to release
+work and trying to send work against an old 98% observation. The concurrent
+partial-report regression replayed an obsolete Fable value of 42% instead of the
+new 21%. The delayed-observation regression showed an older 1% reading replacing
+a newer 98% reading and dispatching held work. Browser tests cover the opt-in
+controls, recovery explanation and cancellation from an idle composer.

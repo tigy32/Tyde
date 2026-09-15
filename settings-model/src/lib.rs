@@ -547,7 +547,7 @@ fn decorate_host_settings_schema(schema: &mut Value) {
             10,
             "toggle",
             "Enable usage limit management",
-            "Pause agents sharing a reported quota at the configured usage percentage and resume after a fresh report confirms capacity has reset. Off by default.",
+            "Pause agents sharing a reported quota at the configured usage percentage and resume when a fresh report confirms usage is below that percentage. Off by default.",
         ),
         (
             "stop_used_percent",

@@ -18030,6 +18030,23 @@ fn resolve_recorded_capacity(
         let Some(held) = held_capacity_report(&current.state) else {
             return fresh;
         };
+        if report.source == held.source
+            && let (Some(incoming_at_ms), Some(held_at_ms)) =
+                (report.observed_at_ms, held.observed_at_ms)
+            && incoming_at_ms < held_at_ms
+        {
+            tracing::debug!(
+                source = ?report.source,
+                incoming_at_ms,
+                held_at_ms,
+                "ignoring delayed older capacity observation"
+            );
+            return (
+                current.state.clone(),
+                current.retrieved_at_ms,
+                current.freshness.clone(),
+            );
+        }
         if report.buckets.len() >= held.buckets.len() {
             return fresh;
         }
@@ -19211,25 +19228,29 @@ impl HostHandle {
         state: BackendCapacityState,
         force_emit: bool,
     ) {
-        let now_ms = capacity_now_ms();
-        let (state, retrieved_at_ms, freshness) = {
-            let host_state = self.state.lock().await;
-            resolve_recorded_capacity(
+        let (repeated, retrieved_at_ms) = {
+            let mut host_state = self.state.lock().await;
+            let now_ms = capacity_now_ms();
+            tracing::debug!(
+                ?backend_kind,
+                ?state,
+                force_emit,
+                received_at_ms = now_ms,
+                "received backend capacity reading"
+            );
+            let (state, retrieved_at_ms, freshness) = resolve_recorded_capacity(
                 host_state.backend_capacity.get(&backend_kind),
                 state,
                 now_ms,
-            )
-        };
-        let snapshot = BackendCapacitySnapshot {
-            backend_kind,
-            state,
-            retrieved_at_ms,
-            freshness,
-            refreshable: crate::backend::supports_out_of_band_capacity(backend_kind),
-        };
-        let repeated = {
-            let mut host_state = self.state.lock().await;
-            if host_state
+            );
+            let snapshot = BackendCapacitySnapshot {
+                backend_kind,
+                state,
+                retrieved_at_ms,
+                freshness,
+                refreshable: crate::backend::supports_out_of_band_capacity(backend_kind),
+            };
+            let repeated = if host_state
                 .backend_capacity
                 .get(&backend_kind)
                 .is_some_and(|current| current.state == snapshot.state)
@@ -19252,7 +19273,8 @@ impl HostHandle {
                 host_state.backend_capacity.insert(backend_kind, snapshot);
                 fan_out_backend_capacity(&mut host_state);
                 false
-            }
+            };
+            (repeated, retrieved_at_ms)
         };
         let host = self.clone();
         tokio::spawn(async move {
