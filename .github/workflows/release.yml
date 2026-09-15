@@ -473,6 +473,44 @@ jobs:
         run: |
           gh release upload "$RELEASE_TAG" "$MACOS_DMG" --clobber
 
+      # dpkg reads "0.9.3-beta.5" as upstream 0.9.3 with Debian revision
+      # beta.5, which sorts above 0.9.3 and makes the release look like a
+      # downgrade. Debian spells prereleases with "~", which sorts first.
+      # Tauri has no deb version override, so repack and re-sign the updater
+      # artifact. The asset filename keeps the semver tag.
+      - name: Use Debian prerelease version in deb
+        if: startsWith(matrix.platform, 'ubuntu') && contains(env.RELEASE_TAG, '-')
+        shell: bash
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          debs=(target/${{ matrix.rust-target }}/release/bundle/deb/*.deb)
+          if [[ ${#debs[@]} -ne 1 ]]; then
+            echo "Expected one deb, found: ${debs[*]}"
+            exit 1
+          fi
+          deb="${debs[0]}"
+          semver="${RELEASE_TAG#v}"
+          debian_version="${semver/-/\~}"
+          current="$(dpkg-deb --field "$deb" Version)"
+          if [[ "$current" != "$semver" ]]; then
+            echo "Expected deb Version $semver, found $current"
+            exit 1
+          fi
+          root="$RUNNER_TEMP/deb-root"
+          rm -rf "$root"
+          dpkg-deb --raw-extract "$deb" "$root"
+          sed -i "s/^Version: .*/Version: $debian_version/" "$root/DEBIAN/control"
+          dpkg-deb --root-owner-group --build "$root" "$deb"
+          rm -rf "$root"
+          test "$(dpkg-deb --field "$deb" Version)" = "$debian_version"
+          rm -f "$deb.sig"
+          npx tauri signer sign "$deb"
+          test -s "$deb.sig"
+
       - name: Package signed desktop updates
         shell: bash
         run: |
