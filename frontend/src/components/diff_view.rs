@@ -2395,7 +2395,7 @@ fn render_unified_item(
                                 cb(pdown_root_new.clone(), pdown_path_new.clone(), ReviewDiffSide::New, n);
                             }
                         ></span>
-                        <span class="diff-prefix">{prefix}</span>
+                        <span class="diff-prefix" data-prefix=prefix></span>
                         {move || {
                             // Reactive read so the row re-renders as
                             // chunked syntax tokens land via the lazy
@@ -3398,7 +3398,7 @@ fn UnifiedHunk(
                                 cb(pdown_root_new.clone(), pdown_path_new.clone(), ReviewDiffSide::New, n);
                             }
                         ></span>
-                        <span class="diff-prefix">{prefix}</span>
+                        <span class="diff-prefix" data-prefix=prefix></span>
                         {move || {
                             let result: AnyView = render_diff_text(&text, tokens.as_ref(), search_idx, &find_for_text);
                             result
@@ -4035,7 +4035,7 @@ fn render_sbs_paired_row(
                     title=if pointer_active { "Click or drag to comment" } else { "" }
                     on:pointerdown=on_pointer_down
                 ></span>
-                <span class="diff-prefix">{prefix}</span>
+                <span class="diff-prefix" data-prefix=prefix></span>
                 {move || {
                     // Reactive read: if the cell carries a token signal
                     // (live SBS path), pull the current value each render
@@ -4329,6 +4329,120 @@ mod wasm_tests {
         // original line — rendering must not corrupt or duplicate source.
         let rendered_text = container.text_content().unwrap_or_default();
         assert_eq!(rendered_text, "fn main() {}");
+    }
+
+    /// Copying diff rows must yield only source code. WKWebView copies the
+    /// text content of `user-select: none` spans inside a selection, so the
+    /// +/- marker has to be visible without being document text — in both
+    /// the unified and side-by-side layouts.
+    #[wasm_bindgen_test]
+    async fn diff_rows_show_markers_without_copying_them() {
+        ensure_styles_loaded();
+        let root = ProjectRootPath("test-root".to_owned());
+        let scope = ProjectDiffScope::Unstaged;
+        let path = "copy.rs".to_owned();
+        let removed = "    let old = 1;";
+        let added = "    let new = 2;";
+        let file = ProjectGitDiffFile {
+            relative_path: path.clone(),
+            change_kind: None,
+            is_binary: false,
+            unmerged: false,
+            hunks: vec![ProjectGitDiffHunk {
+                old_start: 1,
+                old_count: 1,
+                new_start: 1,
+                new_count: 1,
+                hunk_id: "h1".to_owned(),
+                lines: vec![
+                    ProjectGitDiffLine {
+                        kind: ProjectGitDiffLineKind::Removed,
+                        text: removed.to_owned(),
+                        old_line_number: Some(1),
+                        new_line_number: None,
+                    },
+                    ProjectGitDiffLine {
+                        kind: ProjectGitDiffLineKind::Added,
+                        text: added.to_owned(),
+                        old_line_number: None,
+                        new_line_number: Some(1),
+                    },
+                ],
+            }],
+        };
+        let diff = DiffViewState {
+            root: root.clone(),
+            scope,
+            path: Some(path.clone()),
+            context_mode: DiffContextMode::Hunks,
+            pending: false,
+            files: vec![file],
+        };
+
+        for mode in [DiffViewMode::Unified, DiffViewMode::SideBySide] {
+            let container = make_container();
+            let mount_root = root.clone();
+            let mount_path = path.clone();
+            let mount_diff = diff.clone();
+            let handle = mount_to(container.clone(), move || {
+                let state = AppState::new();
+                state.diff_view_mode.set(mode);
+                state.diff_contents.update(|d| {
+                    d.insert(
+                        crate::state::DiffKey::new(
+                            "h",
+                            protocol::ProjectId("p".to_owned()),
+                            mount_root.clone(),
+                            scope,
+                            mount_path.clone(),
+                        ),
+                        mount_diff.clone(),
+                    );
+                });
+                provide_context(state);
+                view! {
+                    <DiffView
+                        host_id="h".to_owned()
+                        project_id=protocol::ProjectId("p".to_owned())
+                        root=mount_root.clone()
+                        scope=scope
+                        path=mount_path.clone()
+                    />
+                }
+            });
+            next_tick().await;
+            next_tick().await;
+
+            for (selector, source, marker) in [
+                (".diff-line-removed", removed, "\"-\""),
+                (".diff-line-added", added, "\"+\""),
+            ] {
+                let row = container
+                    .query_selector(selector)
+                    .unwrap()
+                    .unwrap_or_else(|| panic!("{mode:?}: {selector} row rendered"));
+                assert_eq!(
+                    row.text_content().unwrap_or_default(),
+                    source,
+                    "{mode:?}: copied row text must be exactly the source line",
+                );
+                let prefix = row
+                    .query_selector(".diff-prefix")
+                    .unwrap()
+                    .unwrap_or_else(|| panic!("{mode:?}: {selector} marker rendered"));
+                let content = web_sys::window()
+                    .unwrap()
+                    .get_computed_style_with_pseudo_elt(&prefix, "::before")
+                    .unwrap()
+                    .unwrap()
+                    .get_property_value("content")
+                    .unwrap();
+                assert_eq!(content, marker, "{mode:?}: {selector} marker is visible");
+            }
+
+            drop(handle);
+            container.remove();
+        }
     }
 
     // ── Code intelligence over the diff ────────────────────────────────────

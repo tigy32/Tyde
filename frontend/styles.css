@@ -8634,6 +8634,12 @@ math merror {
     color: inherit;
 }
 
+/* Same WebKit copy leak as .diff-gutter::before: keep the +/- marker out of
+ * the document text so copied diff lines contain only source code. */
+.diff-prefix::before {
+    content: attr(data-prefix);
+}
+
 .diff-text {
     flex: 1;
     min-width: auto;

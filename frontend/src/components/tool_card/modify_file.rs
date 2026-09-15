@@ -137,14 +137,14 @@ fn build_diff_html(
                 DiffLineKind::Removed => ("inline-diff-removed", "-"),
             };
             html.push_str(&format!(
-                "<div class=\"inline-diff-line {cls}\"><span class=\"diff-prefix\">{}</span><span class=\"diff-text\">{}</span></div>",
+                "<div class=\"inline-diff-line {cls}\"><span class=\"diff-prefix\" data-prefix=\"{}\"></span><span class=\"diff-text\">{}</span></div>",
                 prefix,
                 escape_html(&line.text),
             ));
         }
         if cap < lines.len() {
             html.push_str(
-                "<div class=\"inline-diff-line inline-diff-context\"><span class=\"diff-prefix\"> </span><span class=\"diff-text\">\u{2026}</span></div>",
+                "<div class=\"inline-diff-line inline-diff-context\"><span class=\"diff-prefix\" data-prefix=\" \"></span><span class=\"diff-text\">\u{2026}</span></div>",
             );
         }
         html
@@ -205,6 +205,29 @@ mod wasm_tests {
         assert!(added >= 1);
         assert!(removed >= 1);
         assert!(!has_show_more(&container), "small diff has no toggle");
+
+        // Copying a row must yield only source code, while the +/- marker
+        // stays visible (WKWebView copies `user-select: none` text).
+        let document = web_sys::window().unwrap().document().unwrap();
+        let style = document.create_element("style").unwrap();
+        style.set_text_content(Some(include_str!("../../../styles.css")));
+        container.append_child(&style).unwrap();
+        for (selector, source, marker) in [
+            (".inline-diff-removed", "    println!(\"old\");", "\"-\""),
+            (".inline-diff-added", "    println!(\"new\");", "\"+\""),
+        ] {
+            let row = container.query_selector(selector).unwrap().unwrap();
+            assert_eq!(row.text_content().unwrap_or_default(), source);
+            let prefix = row.first_element_child().unwrap();
+            let content = web_sys::window()
+                .unwrap()
+                .get_computed_style_with_pseudo_elt(&prefix, "::before")
+                .unwrap()
+                .unwrap()
+                .get_property_value("content")
+                .unwrap();
+            assert_eq!(content, marker, "{selector} marker is visible");
+        }
     }
 
     #[wasm_bindgen_test]
