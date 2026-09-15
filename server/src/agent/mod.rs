@@ -12351,11 +12351,7 @@ fn session_history_window(
     let start = history_start_for_message_limit(&entries, eligible_end, limit);
     let selected = &entries[start..eligible_end];
     SessionHistoryWindow {
-        events: selected
-            .iter()
-            .rev()
-            .map(|(_, event)| event.clone())
-            .collect(),
+        events: selected.iter().map(|(_, event)| event.clone()).collect(),
         has_more_before: start > 0,
         oldest_seq: selected.first().map(|(seq, _)| *seq),
     }
@@ -12397,11 +12393,7 @@ async fn authoritative_session_history_window(
         let selected = &entries[start..end];
         let oldest_seq = selected.first().map(|(sequence, _)| *sequence);
         Some(SessionHistoryWindow {
-            events: selected
-                .iter()
-                .rev()
-                .map(|(_, event)| event.clone())
-                .collect(),
+            events: selected.iter().map(|(_, event)| event.clone()).collect(),
             has_more_before: start > 0,
             oldest_seq,
         })

@@ -258,14 +258,18 @@ async fn fetch_history_page(
         .expect("failed to parse SessionHistoryPayload")
 }
 
+// Pages carry events in the order they happened, exactly like the live
+// stream: both clients replay a page front to back before prepending it, so a
+// reversed page renders each loaded window upside down and attaches tool
+// cards to the wrong turns.
 fn assert_history_page(
     page: &SessionHistoryPayload,
-    expected_newest_first: &[&str],
+    expected_oldest_first: &[&str],
     expected_has_more_before: bool,
 ) {
     assert_eq!(
         page.events.len(),
-        expected_newest_first.len() * 3,
+        expected_oldest_first.len() * 3,
         "unexpected SessionHistory event count: {:?}",
         page.events
     );
@@ -274,15 +278,15 @@ fn assert_history_page(
         .as_chunks::<3>()
         .0
         .iter()
-        .zip(expected_newest_first)
+        .zip(expected_oldest_first)
     {
         let [
-            ChatEvent::StreamEnd(end),
-            ChatEvent::StreamDelta(delta),
             ChatEvent::StreamStart(_),
+            ChatEvent::StreamDelta(delta),
+            ChatEvent::StreamEnd(end),
         ] = response
         else {
-            panic!("expected newest-first response boundary, got {response:?}");
+            panic!("expected chronological response boundary, got {response:?}");
         };
         assert!(
             end.message.content.contains(expected),
@@ -707,7 +711,7 @@ async fn opening_agent_bootstrap_loads_tail_and_gates_older_history() {
         2,
     )
     .await;
-    assert_history_page(&first_page, &["history 39", "history 38"], true);
+    assert_history_page(&first_page, &["history 38", "history 39"], true);
     let first_cursor = first_page
         .oldest_seq
         .expect("first history page should include an oldest_seq cursor");
@@ -720,7 +724,7 @@ async fn opening_agent_bootstrap_loads_tail_and_gates_older_history() {
         2,
     )
     .await;
-    assert_history_page(&second_page, &["history 37", "history 36"], true);
+    assert_history_page(&second_page, &["history 36", "history 37"], true);
     let second_cursor = second_page
         .oldest_seq
         .expect("second history page should include an oldest_seq cursor");
@@ -734,7 +738,6 @@ async fn opening_agent_bootstrap_loads_tail_and_gates_older_history() {
     )
     .await;
     let expected_final_strings = (0..=35)
-        .rev()
         .map(|index| format!("history {index}"))
         .collect::<Vec<_>>();
     let expected_final = expected_final_strings
@@ -835,8 +838,8 @@ async fn first_history_fetch_uses_bootstrap_gate_cursor_without_live_dupes() {
     assert_history_page(
         &first_page,
         &[
-            "prior 35", "prior 34", "prior 33", "prior 32", "prior 31", "prior 30", "prior 29",
-            "prior 28", "prior 27", "prior 26",
+            "prior 26", "prior 27", "prior 28", "prior 29", "prior 30", "prior 31", "prior 32",
+            "prior 33", "prior 34", "prior 35",
         ],
         true,
     );
