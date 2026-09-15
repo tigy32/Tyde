@@ -4,9 +4,10 @@ Tyde shows the quota each backend reports for the account it is signed in to, so
 a human or an orchestrator can avoid starting work on a near-exhausted
 subscription.
 
-**This feature is advisory. Full stop.** It never selects, reroutes, switches,
-downgrades, or falls back between backends, accounts, or models. It never makes
-a paid model call. It never guesses a number.
+**Capacity collection is read-only.** It never reroutes ordinary agent work or
+falls back between backends, accounts, or models. It never makes a paid model
+call or guesses a number. The separate opt-in usage-window wake-up feature
+below can make one bounded maintenance call after a reset.
 
 Collection is bounded and backend-native, and it does not require a
 conversation. Every backend with a capacity source has an **out-of-band** one: a
@@ -15,6 +16,80 @@ and exits. The host polls those on its own schedule, so a backend nobody has
 talked to still shows a real figure. No probe starts a model turn or spends
 model tokens, every probe has a hard timeout, and a poll never overlaps another
 for the same backend.
+
+### Auto-start usage windows
+
+Usage management has two independent, default-off settings:
+`auto_start_short_windows` and `auto_start_weekly_windows`. Neither requires
+enabling quota-based agent pausing.
+
+The capacity poller owns an hourly wake-up pass. It waits a full hour on startup,
+refreshes the enabled, installed supported backends, and selects at most one
+eligible quota group. Weekly windows take priority; other groups wait for later
+hours. Normal 45-minute polling, minute-level pause/resume polling, passive
+updates, startup probes, manual refreshes, and post-attempt refreshes never
+send maintenance messages.
+
+A fresh zero-usage reading must have an expired provider reset timestamp, or
+follow a previously observed deadline that has elapsed. Zero alone, a missing
+magnitude, stale readings, and a future deadline are not evidence to spend
+quota. A future deadline may reflect normal activity whose usage rounds to
+zero. A rejected or near-limit reported window blocks the backend; active or
+queued ordinary work takes priority. Missed wake-ups are preferable to guesses.
+
+The selected backend receives exactly `hi` in an isolated inference-only
+conversation, using the same spawn machinery as naming and summaries. It gets
+no project history, MCP servers, or allowed tools, and is never registered as a
+visible agent or saved Tyde session. It has a 60-second startup/turn deadline,
+bounded output, and bounded shutdown, with no follow-ups or fallback. Provider
+native history retention remains provider-owned, just as it is for naming.
+
+`usage_wakeups.json`, beside the host settings store, is the spending guard.
+The host-wide hourly claim and attempt are persisted before sending, under a
+cross-process file lock. A failed, timed-out, or interrupted attempt remains
+consumed. The ledger retains each bucket's attempted reset and a window-length
+cooldown, so unchanged 0% reports, repeated ticks, clock rollback, toggle
+changes, and restarts cannot keep sending `hi`. Malformed/unwritable state
+fails closed. There are no automatic retries. One message can consume the
+attempts for several overlapping windows, including a disabled short window
+incidentally started by an enabled weekly window.
+
+The limit is one attempt per rolling hour across the entire host, not one per
+backend. Separate data directories/machines do not coordinate: enable this on
+only one host per provider account. The ledger keys providers and vendor bucket
+IDs rather than guessing account identity; changing login cannot bypass the
+host-wide spending guard. Logs distinguish reservation, completion, and failure;
+a completed response is not a claim that the timer start was confirmed. A
+read-only refresh updates the normal Usage display afterward.
+
+Supported targets:
+
+- Claude: five-hour and weekly account windows, plus model windows recognized
+  by the backend's model catalog (including Sonnet, Opus, and Fable).
+  Account-wide wake-ups use Haiku; model windows use that model. Unknown model
+  buckets and overage buckets are not guessed.
+- Codex: primary/secondary windows classified by reported duration; credits are
+  excluded. The backend's normal model is retained.
+- Antigravity: Gemini and third-party quota groups are separate. Gemini uses
+  its existing low-cost Gemini model; third-party uses the known Sonnet model.
+  Only recognized `gemini-` and `3p-` bucket IDs are eligible.
+- Grok: reported weekly billing windows, retaining the backend's normal model.
+  Monthly/unknown periods and unreported short windows are not eligible.
+- Kiro, Hermes, and OpenCode: no automatic wake-ups without suitable reported
+  short/weekly quota windows.
+
+Server protocol simulations cover actual hidden mock launches, exact `hi`
+input, isolation, hourly limits across providers, persistent deduplication,
+failures, concurrent ticks, and provider/group selection. The opt-in real
+`real_inference_only_usage_wakeup` case exercises the inference-only message,
+tool-free response, clean shutdown, and real capacity reads on every backend
+with out-of-band capacity. It does not manufacture a reset or spend down an
+account to force one, and must be separately approved before running.
+
+The hourly-limit regression was demonstrated with the production ledger's
+interval temporarily reduced to one minute: the real server launched two
+hidden mock conversations within an hour, and the unchanged launch-count
+assertion failed (2 versus 1). The production interval is one hour.
 
 ---
 

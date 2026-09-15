@@ -6,7 +6,8 @@
 //! connection answering a read-only status call — so the host collects on its
 //! own schedule instead of waiting for an agent to exist.
 //!
-//! Nothing here sends a prompt, starts a turn, or spends model tokens. See
+//! Ordinary polls never spend tokens. The separately gated hourly wake-up
+//! pass may send one hidden `hi` when explicitly enabled in settings. See
 //! `dev-docs/31-subscription-capacity.md`.
 
 use std::time::Duration;
@@ -33,6 +34,7 @@ pub(crate) enum CapacityPollTrigger {
     Startup,
     Scheduled,
     Manual,
+    UsageWakeup,
 }
 
 impl CapacityPollTrigger {
@@ -41,6 +43,7 @@ impl CapacityPollTrigger {
             Self::Startup => "startup",
             Self::Scheduled => "scheduled",
             Self::Manual => "manual",
+            Self::UsageWakeup => "usage_wakeup",
         }
     }
 }
@@ -149,13 +152,21 @@ pub(crate) async fn poll_once(
     backend_kind: BackendKind,
     trigger: CapacityPollTrigger,
 ) -> PollOutcome {
+    poll_with_report(host, backend_kind, trigger).await.0
+}
+
+async fn poll_with_report(
+    host: &HostHandle,
+    backend_kind: BackendKind,
+    trigger: CapacityPollTrigger,
+) -> (PollOutcome, Option<protocol::CapacityReport>) {
     if !host.begin_capacity_poll(backend_kind).await {
         tracing::debug!(
             ?backend_kind,
             trigger = trigger.label(),
             "capacity poll skipped; one is already in flight"
         );
-        return PollOutcome::Coalesced;
+        return (PollOutcome::Coalesced, None);
     }
     let context = host.capacity_probe_context(backend_kind).await;
     let state = match context {
@@ -172,6 +183,10 @@ pub(crate) async fn poll_once(
         }
         _ => PollOutcome::Failed,
     };
+    let report = match &state {
+        BackendCapacityState::Known { report } => Some(report.clone()),
+        _ => None,
+    };
     tracing::debug!(
         ?backend_kind,
         trigger = trigger.label(),
@@ -187,7 +202,43 @@ pub(crate) async fn poll_once(
     )
     .await;
     host.end_capacity_poll(backend_kind).await;
-    outcome
+    (outcome, report)
+}
+
+pub(crate) async fn run_usage_wakeup_poll_loop(host: WeakHostHandle) {
+    loop {
+        // No immediate startup send, catch-up burst, or refresh-button trigger.
+        tokio::time::sleep(crate::usage_wakeup::HOURLY_INTERVAL).await;
+        let Some(host) = host.upgrade() else {
+            return;
+        };
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let Some(backends) = host.begin_usage_wakeup_tick(now_ms).await else {
+            continue;
+        };
+        let mut reports = Vec::new();
+        for backend in backends {
+            let (_, report) =
+                poll_with_report(&host, backend, CapacityPollTrigger::UsageWakeup).await;
+            if let Some(report) = report {
+                reports.push((backend, report));
+            }
+        }
+        let finished_polling_at_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        if let Some(backend) = host
+            .finish_usage_wakeup_tick(finished_polling_at_ms, reports)
+            .await
+        {
+            // Read-only confirmation never invokes the wake-up scheduler.
+            poll_once(&host, backend, CapacityPollTrigger::UsageWakeup).await;
+        }
+    }
 }
 
 /// Every installed backend that can be polled without a conversation.

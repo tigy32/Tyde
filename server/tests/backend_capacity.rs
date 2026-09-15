@@ -9,6 +9,7 @@ use protocol::{
 };
 
 const AGED_BY_MS: u64 = 30 * 60 * 1000;
+const HOUR_MS: u64 = 60 * 60 * 1000;
 
 fn used_percent(used: u8) -> CapacityMeasure {
     CapacityMeasure::UsedPercent {
@@ -754,4 +755,576 @@ async fn usage_limits_do_not_treat_cached_observations_as_fresh() {
     usage_notice(&mut fixture, &agent, "Usage limit pause ended").await;
     fixture.finish_turn(&agent).await;
     control.assert_clean().await;
+}
+
+fn wakeup_report(
+    backend: BackendKind,
+    bucket: CapacityBucketId,
+    now: u64,
+    reset: u64,
+) -> (BackendKind, CapacityReport) {
+    let source = match backend {
+        BackendKind::Claude => CapacitySource::ClaudeControlUsage,
+        BackendKind::Codex => CapacitySource::CodexAccountRateLimitsUpdated,
+        BackendKind::Antigravity => CapacitySource::AntigravityUsageCommand,
+        BackendKind::Grok => CapacitySource::GrokBilling,
+        _ => panic!("unsupported wake-up fixture backend"),
+    };
+    (
+        backend,
+        CapacityReport {
+            source,
+            observed_at_ms: Some(now),
+            plan: None,
+            buckets: vec![CapacityBucket {
+                id: bucket,
+                label: "usage window".to_owned(),
+                measure: used_percent(0),
+                scope: CapacityScope::Account,
+                window: CapacityWindow::Rolling {
+                    duration_minutes: 5 * 60,
+                },
+                reset: CapacityReset::At { at_ms: reset },
+                status: None,
+            }],
+            coverage: CapacityCoverage::AllVendorBuckets,
+        },
+    )
+}
+
+async fn enable_wakeup_backends(fixture: &mut Fixture) {
+    fixture
+        .client
+        .replace_setting(
+            "/enabled_backends",
+            vec![
+                BackendKind::Claude,
+                BackendKind::Codex,
+                BackendKind::Antigravity,
+                BackendKind::Grok,
+            ],
+            fixture.bootstrap.settings.enabled_backends.clone(),
+        )
+        .await
+        .unwrap();
+    fixture
+        .next_frame_matching("wake-up backends enabled", |env| {
+            env.kind == FrameKind::HostSettings
+        })
+        .await;
+}
+
+async fn assert_hidden_hi(launch: &server::UsageWakeupLaunchForTest) {
+    use server::backend::mock::MockRequest;
+    let requests = launch.control.requests().await;
+    assert_eq!(
+        requests.len(),
+        1,
+        "maintenance must never send a follow-up: {requests:?}"
+    );
+    assert!(
+        matches!(&requests[0], MockRequest::Launch { message } if message == "hi"),
+        "maintenance prompt must be exactly hi: {requests:?}"
+    );
+    assert_eq!(
+        launch.config.execution_mode,
+        server::backend::BackendExecutionMode::InferenceOnly
+    );
+    assert_eq!(
+        launch.config.resolved_spawn_config.tool_policy,
+        protocol::ToolPolicy::AllowList { tools: vec![] }
+    );
+    assert!(launch.config.startup_mcp_servers.is_empty());
+    assert!(launch.config.cost_hint.is_none());
+    launch.control.assert_clean().await;
+}
+
+#[tokio::test]
+async fn usage_wakeups_are_hourly_hidden_and_durable_even_after_failure() {
+    use server::backend::mock::{MockScript, MockTurn};
+    let mut fixture = Fixture::new().await;
+    enable_wakeup_backends(&mut fixture).await;
+    let now = wall_ms();
+    let claude = CapacityBucketId::Claude {
+        limit: ClaudeLimitType::FiveHour,
+    };
+    let codex = CapacityBucketId::Codex {
+        slot: protocol::CodexLimitSlot::Primary,
+    };
+    let reset = now - HOUR_MS;
+    let host = fixture.host_for_test();
+    host.run_usage_wakeup_tick_for_test(
+        now,
+        vec![wakeup_report(
+            BackendKind::Claude,
+            claude.clone(),
+            now,
+            reset,
+        )],
+    )
+    .await;
+    assert!(
+        host.usage_wakeup_launches_for_test().await.is_empty(),
+        "default settings must spend nothing"
+    );
+    set_usage_setting(&mut fixture, "/usage_limits/auto_start_short_windows", true).await;
+    record(
+        &fixture,
+        wakeup_report(BackendKind::Claude, claude.clone(), now, reset).1,
+    )
+    .await;
+    fixture
+        .client
+        .backend_capacity_refresh(protocol::BackendCapacityRefreshPayload {
+            backend: BackendKind::Claude,
+        })
+        .await
+        .unwrap();
+    fixture
+        .next_frame_matching("manual refresh answered without wake-up", |env| {
+            claude_snapshot(env).is_some_and(|snapshot| {
+                matches!(snapshot.state, BackendCapacityState::Unsupported { .. })
+            })
+        })
+        .await;
+    assert!(
+        host.usage_wakeup_launches_for_test().await.is_empty(),
+        "manual/passive refresh must never spend quota"
+    );
+    host.run_usage_wakeup_tick_for_test(
+        now,
+        vec![wakeup_report(
+            BackendKind::Claude,
+            claude.clone(),
+            now,
+            reset,
+        )],
+    )
+    .await;
+    let launches = host.usage_wakeup_launches_for_test().await;
+    assert_eq!(launches.len(), 1);
+    assert_hidden_hi(&launches[0]).await;
+    let (_, bootstrap) = fixture.connect_with_bootstrap().await;
+    assert!(
+        bootstrap.agents.is_empty(),
+        "maintenance must not appear as an agent"
+    );
+    assert!(
+        bootstrap.sessions.is_empty(),
+        "maintenance must not appear as a saved chat"
+    );
+
+    let too_soon = now + HOUR_MS - 1;
+    host.run_usage_wakeup_tick_for_test(
+        too_soon,
+        vec![wakeup_report(
+            BackendKind::Codex,
+            codex.clone(),
+            too_soon,
+            reset,
+        )],
+    )
+    .await;
+    assert_eq!(
+        host.usage_wakeup_launches_for_test().await.len(),
+        1,
+        "hourly cap is host-wide, not per provider"
+    );
+    for hour in [1, 2, 10] {
+        let tick = now + hour * HOUR_MS;
+        host.run_usage_wakeup_tick_for_test(
+            tick,
+            vec![wakeup_report(
+                BackendKind::Claude,
+                claude.clone(),
+                tick,
+                reset,
+            )],
+        )
+        .await;
+    }
+    assert_eq!(
+        host.usage_wakeup_launches_for_test().await.len(),
+        1,
+        "unchanged zero usage must not cause endless hourly hi messages"
+    );
+
+    fixture.restart_host().await;
+    assert!(
+        fixture
+            .bootstrap
+            .settings
+            .usage_limits
+            .auto_start_short_windows
+    );
+    assert!(
+        !fixture
+            .bootstrap
+            .settings
+            .usage_limits
+            .auto_start_weekly_windows
+    );
+    let restarted = fixture.host_for_test();
+    let tick = now + 11 * HOUR_MS;
+    restarted
+        .run_usage_wakeup_tick_for_test(
+            tick,
+            vec![wakeup_report(
+                BackendKind::Claude,
+                claude.clone(),
+                tick,
+                reset,
+            )],
+        )
+        .await;
+    assert!(
+        restarted.usage_wakeup_launches_for_test().await.is_empty(),
+        "restart must retain reset deduplication"
+    );
+
+    restarted
+        .set_usage_wakeup_script_for_test(MockScript::one(MockTurn::error_card(
+            "provider unavailable",
+        )))
+        .await;
+    let tick = now + 12 * HOUR_MS;
+    let new_reset = tick - 1;
+    restarted
+        .run_usage_wakeup_tick_for_test(
+            tick,
+            vec![wakeup_report(
+                BackendKind::Claude,
+                claude.clone(),
+                tick,
+                new_reset,
+            )],
+        )
+        .await;
+    let launches = restarted.usage_wakeup_launches_for_test().await;
+    assert_eq!(launches.len(), 1);
+    assert_hidden_hi(&launches[0]).await;
+    let next_tick = tick + HOUR_MS - 1;
+    // A second host holding the same store must read the persisted guard, not
+    // its own obsolete in-memory last-attempt time.
+    host.run_usage_wakeup_tick_for_test(
+        next_tick,
+        vec![wakeup_report(BackendKind::Codex, codex, next_tick, reset)],
+    )
+    .await;
+    assert_eq!(host.usage_wakeup_launches_for_test().await.len(), 1);
+    let tick = now + 20 * HOUR_MS;
+    restarted
+        .run_usage_wakeup_tick_for_test(
+            tick,
+            vec![wakeup_report(BackendKind::Claude, claude, tick, new_reset)],
+        )
+        .await;
+    assert_eq!(
+        restarted.usage_wakeup_launches_for_test().await.len(),
+        1,
+        "a failed attempt must never be retried for that reset"
+    );
+
+    std::fs::write(fixture.store_dir().join("usage_wakeups.json"), "corrupt").unwrap();
+    let tick = now + 21 * HOUR_MS;
+    restarted
+        .run_usage_wakeup_tick_for_test(
+            tick,
+            vec![wakeup_report(
+                BackendKind::Claude,
+                CapacityBucketId::Claude {
+                    limit: ClaudeLimitType::FiveHour,
+                },
+                tick,
+                tick - 1,
+            )],
+        )
+        .await;
+    assert_eq!(
+        restarted.usage_wakeup_launches_for_test().await.len(),
+        1,
+        "unreadable spending guard must fail closed"
+    );
+}
+
+#[tokio::test]
+async fn usage_wakeups_prioritize_weekly_and_target_each_provider_quota() {
+    let mut fixture = Fixture::new().await;
+    enable_wakeup_backends(&mut fixture).await;
+    set_usage_setting(&mut fixture, "/usage_limits/auto_start_short_windows", true).await;
+    set_usage_setting(
+        &mut fixture,
+        "/usage_limits/auto_start_weekly_windows",
+        true,
+    )
+    .await;
+    let host = fixture.host_for_test();
+    let now = wall_ms();
+    let reset = now - HOUR_MS;
+    let claude = CapacityBucketId::Claude {
+        limit: ClaudeLimitType::FiveHour,
+    };
+    let codex = CapacityBucketId::Codex {
+        slot: protocol::CodexLimitSlot::Secondary,
+    };
+    let grok = CapacityBucketId::Grok {
+        bucket: "weekly".to_owned(),
+    };
+    let agy_gemini = CapacityBucketId::Antigravity {
+        bucket: "gemini-weekly".to_owned(),
+    };
+    let agy_third_party = CapacityBucketId::Antigravity {
+        bucket: "3p-5h".to_owned(),
+    };
+    let reports = |tick| {
+        let mut gemini = wakeup_report(BackendKind::Antigravity, agy_gemini.clone(), tick, reset);
+        gemini.1.buckets[0].window = CapacityWindow::Rolling {
+            duration_minutes: 7 * 24 * 60,
+        };
+        gemini.1.buckets.push(
+            wakeup_report(
+                BackendKind::Antigravity,
+                agy_third_party.clone(),
+                tick,
+                reset,
+            )
+            .1
+            .buckets
+            .remove(0),
+        );
+        vec![
+            wakeup_report(BackendKind::Claude, claude.clone(), tick, reset),
+            wakeup_report(BackendKind::Grok, grok.clone(), tick, reset),
+            gemini,
+            wakeup_report(BackendKind::Codex, codex.clone(), tick, reset),
+        ]
+    };
+    let mut concurrent = Vec::new();
+    for _ in 0..8 {
+        let host = host.clone();
+        let reports = reports(now);
+        concurrent.push(tokio::spawn(async move {
+            host.run_usage_wakeup_tick_for_test(now, reports).await;
+        }));
+    }
+    for task in concurrent {
+        task.await.unwrap();
+    }
+    let launches = host.usage_wakeup_launches_for_test().await;
+    assert_eq!(
+        launches.len(),
+        1,
+        "concurrent ticks must claim only one launch"
+    );
+    assert_eq!(
+        launches[0].backend_kind,
+        BackendKind::Grok,
+        "weekly must precede short even when short appears first"
+    );
+    for hour in 1..5 {
+        let tick = now + hour * HOUR_MS;
+        host.run_usage_wakeup_tick_for_test(tick, reports(tick))
+            .await;
+    }
+    let launches = host.usage_wakeup_launches_for_test().await;
+    assert_eq!(
+        launches.len(),
+        5,
+        "each independent quota group gets one turn, across five separate hours"
+    );
+    assert_eq!(launches[1].backend_kind, BackendKind::Antigravity);
+    assert!(
+        matches!(launches[1].config.session_settings.as_ref().unwrap().0.get("model"), Some(protocol::SessionSettingValue::String(model)) if model.starts_with("Gemini "))
+    );
+    assert_eq!(launches[2].backend_kind, BackendKind::Claude);
+    assert_eq!(launches[3].backend_kind, BackendKind::Antigravity);
+    assert!(
+        matches!(launches[3].config.session_settings.as_ref().unwrap().0.get("model"), Some(protocol::SessionSettingValue::String(model)) if model.starts_with("Claude Sonnet "))
+    );
+    assert_eq!(
+        launches[4].backend_kind,
+        BackendKind::Codex,
+        "Codex secondary with five-hour duration belongs to short windows"
+    );
+    for launch in &launches {
+        assert_hidden_hi(launch).await;
+    }
+    set_usage_setting(
+        &mut fixture,
+        "/usage_limits/auto_start_short_windows",
+        false,
+    )
+    .await;
+    set_usage_setting(
+        &mut fixture,
+        "/usage_limits/auto_start_weekly_windows",
+        false,
+    )
+    .await;
+    let tick = now + 8 * 24 * HOUR_MS;
+    host.run_usage_wakeup_tick_for_test(
+        tick,
+        vec![wakeup_report(BackendKind::Grok, grok, tick, tick - 1)],
+    )
+    .await;
+    assert_eq!(
+        host.usage_wakeup_launches_for_test().await.len(),
+        5,
+        "disabling both toggles stops maintenance"
+    );
+}
+
+#[tokio::test]
+async fn usage_wakeups_require_reset_evidence_and_coalesce_overlapping_windows() {
+    let mut fixture = Fixture::new().await;
+    // A fresh host bootstraps with no enabled providers. Enabling maintenance
+    // must not implicitly enable them; the scenario needs an explicit opt-in.
+    assert!(fixture.bootstrap.settings.enabled_backends.is_empty());
+    enable_wakeup_backends(&mut fixture).await;
+    set_usage_setting(
+        &mut fixture,
+        "/usage_limits/auto_start_weekly_windows",
+        true,
+    )
+    .await;
+    let host = fixture.host_for_test();
+    let now = wall_ms();
+    let sonnet = CapacityBucketId::Claude {
+        limit: ClaudeLimitType::SevenDaySonnet,
+    };
+    let short = CapacityBucketId::Claude {
+        limit: ClaudeLimitType::FiveHour,
+    };
+    for hour in 0..5 {
+        let tick = now + hour * HOUR_MS;
+        let mut report = wakeup_report(BackendKind::Claude, sonnet.clone(), tick, tick - 1);
+        match hour {
+            0 => report.1.buckets[0].reset = CapacityReset::NotReported,
+            1 => report.1.observed_at_ms = Some(tick - 180_000),
+            2 => report.1.buckets[0].measure = CapacityMeasure::ReportedWithoutMagnitude,
+            3 => report.1.buckets[0].measure = used_percent(1),
+            4 => {
+                let mut exhausted =
+                    wakeup_report(BackendKind::Claude, short.clone(), tick, tick - 1)
+                        .1
+                        .buckets
+                        .remove(0);
+                exhausted.measure = used_percent(100);
+                report.1.buckets.push(exhausted);
+            }
+            _ => unreachable!(),
+        }
+        host.run_usage_wakeup_tick_for_test(tick, vec![report])
+            .await;
+        assert!(
+            host.usage_wakeup_launches_for_test().await.is_empty(),
+            "unsafe observation at hour {hour} must not spend quota"
+        );
+    }
+    let tick = now + 5 * HOUR_MS;
+    let reset = tick + HOUR_MS;
+    host.run_usage_wakeup_tick_for_test(
+        tick,
+        vec![wakeup_report(
+            BackendKind::Claude,
+            sonnet.clone(),
+            tick,
+            reset,
+        )],
+    )
+    .await;
+    assert!(
+        host.usage_wakeup_launches_for_test().await.is_empty(),
+        "future timer with rounded zero is already running"
+    );
+    let tick = reset;
+    let mut report = wakeup_report(BackendKind::Claude, sonnet.clone(), tick, reset);
+    report.1.buckets[0].reset = CapacityReset::NotReported;
+    report.1.buckets.push(
+        wakeup_report(BackendKind::Claude, short.clone(), tick, reset)
+            .1
+            .buckets
+            .remove(0),
+    );
+    host.run_usage_wakeup_tick_for_test(tick, vec![report.clone()])
+        .await;
+    let launches = host.usage_wakeup_launches_for_test().await;
+    assert_eq!(
+        launches.len(),
+        1,
+        "previously observed deadline establishes the reset even when it disappears"
+    );
+    assert_eq!(
+        launches[0]
+            .config
+            .session_settings
+            .as_ref()
+            .unwrap()
+            .0
+            .get("model"),
+        Some(&protocol::SessionSettingValue::String("sonnet".to_owned()))
+    );
+    assert_hidden_hi(&launches[0]).await;
+    set_usage_setting(
+        &mut fixture,
+        "/usage_limits/auto_start_weekly_windows",
+        false,
+    )
+    .await;
+    set_usage_setting(&mut fixture, "/usage_limits/auto_start_short_windows", true).await;
+    for hour in [7, 14] {
+        let tick = now + hour * HOUR_MS;
+        report.1.observed_at_ms = Some(tick);
+        host.run_usage_wakeup_tick_for_test(tick, vec![report.clone()])
+            .await;
+        assert_eq!(
+            host.usage_wakeup_launches_for_test().await.len(),
+            1,
+            "weekly hi also consumes the overlapping short reset even if short was disabled"
+        );
+    }
+    set_usage_setting(
+        &mut fixture,
+        "/usage_limits/auto_start_weekly_windows",
+        true,
+    )
+    .await;
+    let tick = now + 15 * HOUR_MS;
+    host.run_usage_wakeup_tick_for_test(
+        tick,
+        vec![wakeup_report(BackendKind::Claude, sonnet, tick, tick - 1)],
+    )
+    .await;
+    assert_eq!(
+        host.usage_wakeup_launches_for_test().await.len(),
+        1,
+        "timestamp drift cannot bypass the independent weekly cooldown"
+    );
+    let tick = now + 8 * 24 * HOUR_MS;
+    host.run_usage_wakeup_tick_for_test(
+        tick,
+        vec![wakeup_report(
+            BackendKind::Claude,
+            CapacityBucketId::ClaudeModel {
+                name: "Fable".to_owned(),
+            },
+            tick,
+            tick - 1,
+        )],
+    )
+    .await;
+    let launches = host.usage_wakeup_launches_for_test().await;
+    assert_eq!(launches.len(), 2);
+    assert_eq!(
+        launches[1]
+            .config
+            .session_settings
+            .as_ref()
+            .unwrap()
+            .0
+            .get("model"),
+        Some(&protocol::SessionSettingValue::String("fable".to_owned())),
+        "model-scoped quotas must use the alias advertised in the backend catalog"
+    );
+    assert_hidden_hi(&launches[1]).await;
 }

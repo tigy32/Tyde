@@ -587,6 +587,9 @@ impl SettingsTab {
                 "Pause at usage percentage",
                 "Compact before waiting for reset",
                 "Compact at context percentage",
+                "Auto-start short usage windows",
+                "Auto-start weekly usage windows",
+                "Hourly wake-up",
                 "Quota",
                 "Automatic resume",
             ],
@@ -4035,7 +4038,9 @@ fn host_schema_field_disabled(pointer: &str, settings: &Value) -> bool {
         .and_then(Value::as_bool)
         .unwrap_or(false);
     match pointer {
-        "/usage_limits/enabled" => false,
+        "/usage_limits/enabled"
+        | "/usage_limits/auto_start_short_windows"
+        | "/usage_limits/auto_start_weekly_windows" => false,
         pointer if pointer.starts_with("/usage_limits/") => {
             !settings
                 .pointer("/usage_limits/enabled")
@@ -11120,6 +11125,29 @@ mod wasm_tests {
         next_tick().await;
         let enabled = toggle_for_label(&container, "Enable usage limit management");
         let compact = toggle_for_label(&container, "Compact before waiting for reset");
+        let short = toggle_for_label(&container, "Auto-start short usage windows");
+        let weekly = toggle_for_label(&container, "Auto-start weekly usage windows");
+        assert!(!short.checked());
+        assert!(!weekly.checked());
+        assert!(!short.disabled());
+        assert!(!weekly.disabled());
+        state.host_settings_by_host.update(|hosts| {
+            let settings = &mut hosts.get_mut("host-general").unwrap().usage_limits;
+            settings.auto_start_short_windows = true;
+        });
+        next_tick().await;
+        assert!(short.checked());
+        assert!(!weekly.checked());
+        assert!(!enabled.checked());
+        state.host_settings_by_host.update(|hosts| {
+            let settings = &mut hosts.get_mut("host-general").unwrap().usage_limits;
+            settings.auto_start_short_windows = false;
+            settings.auto_start_weekly_windows = true;
+        });
+        next_tick().await;
+        assert!(!short.checked());
+        assert!(weekly.checked());
+        assert!(!enabled.checked());
         let percent: web_sys::HtmlInputElement = container
             .query_selector("input[aria-label='Pause at usage percentage']")
             .unwrap()

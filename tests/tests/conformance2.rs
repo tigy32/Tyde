@@ -3907,6 +3907,41 @@ async fn real_capacity_without_a_conversation<B: Backend>(host: &mut Harness<B>)
     );
 }
 
+async fn real_inference_only_usage_wakeup<B: Backend>(host: &mut Harness<B>) {
+    host.refresh_capacity_and_await_report().await;
+    host.config = server::usage_wakeup_spawn_config(
+        host.config.session_settings.clone().unwrap_or_default(),
+        host.config.backend_storage.clone(),
+    );
+    let agent = spawn_agent(host, "hi").await;
+    let turn = tokio::time::timeout(Duration::from_secs(60), collect_turn(host, &agent, "hi"))
+        .await
+        .expect("the hidden hi must complete within the maintenance deadline");
+    assert_no_error_message("inference-only usage wake-up", turn.events());
+    assert!(
+        !turn.final_text().trim().is_empty(),
+        "hi must produce a response"
+    );
+    assert_eq!(
+        turn.tool_requests().count(),
+        0,
+        "maintenance must not request tools"
+    );
+    assert_eq!(
+        turn.tool_declarations().count(),
+        0,
+        "maintenance must not invoke native tools"
+    );
+    assert_universal_contract(&[turn]);
+    assert_clean_close(host, &agent).await;
+    host.refresh_capacity_and_await_report().await;
+}
+
+conformance2_scenario!(
+    real_inference_only_usage_wakeup,
+    [BackendCapability::OutOfBandCapacity]
+);
+
 async fn real_conversation_in_native_subagent<B: Backend>(host: &mut Harness<B>) {
     let workspace = host.workspace().to_path_buf();
     let first = unique_payload();

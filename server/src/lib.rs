@@ -15,6 +15,7 @@ pub(crate) mod mobile_access;
 pub(crate) mod mobile_http;
 pub(crate) mod mobile_push;
 pub mod paths;
+pub(crate) mod usage_wakeup;
 pub use tyde_process_env as process_env;
 pub(crate) mod project_stream;
 mod project_watch;
@@ -40,6 +41,8 @@ pub use acceptor::{BoundUdsListener, bind_uds, serve_uds};
 pub use acceptor::{HandshakeError, accept, listen_uds};
 #[cfg(feature = "test-support")]
 pub use agent::take_duplicate_tool_completion_count;
+#[cfg(feature = "test-support")]
+pub use agent::usage_wakeup_spawn_config;
 pub use agent_control_mcp::AgentControlMcpCaller;
 #[cfg(feature = "test-support")]
 pub use connection::run_connection_with_synthetic_voice;
@@ -54,7 +57,7 @@ pub use host::{
 #[cfg(feature = "test-support")]
 pub use host::{
     InstalledAgentNameGate, InstalledSpawnOperationTestGate, InstalledWorkbenchRemoveHook,
-    MockLaunchReservation,
+    MockLaunchReservation, UsageWakeupLaunchForTest,
 };
 pub use process_env::init_process_env;
 

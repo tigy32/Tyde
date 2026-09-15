@@ -588,6 +588,14 @@ pub(crate) struct UsageLimitSignal {
     pub snapshots: Vec<BackendCapacitySnapshot>,
 }
 
+#[cfg(feature = "test-support")]
+#[derive(Clone)]
+pub struct UsageWakeupLaunchForTest {
+    pub backend_kind: BackendKind,
+    pub config: crate::backend::BackendSpawnConfig,
+    pub control: crate::backend::mock::MockControl,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct SupervisorSettingsSignal {
     pub(crate) settings: settings_model::SupervisorSettings,
@@ -704,6 +712,12 @@ pub(crate) struct HostState {
     supervisor_epoch: u64,
     supervisor_settings_tx: watch::Sender<SupervisorSettingsSignal>,
     usage_limits_tx: watch::Sender<UsageLimitSignal>,
+    usage_wakeup_store: crate::usage_wakeup::WakeupStore,
+    usage_wakeup_in_flight: bool,
+    #[cfg(feature = "test-support")]
+    usage_wakeup_mock_script: Option<crate::backend::mock::MockScript>,
+    #[cfg(feature = "test-support")]
+    usage_wakeup_mock_launches: Vec<UsageWakeupLaunchForTest>,
     pub sub_agent_spawn_tx: HostSubAgentSpawnTx,
     pub capacity_tx: HostCapacityTx,
     pub supervisor_compaction_tx: SupervisorCompactionTx,
@@ -1641,8 +1655,216 @@ impl Drop for InstalledWorkbenchRemoveHook {
     }
 }
 
+impl HostHandle {
+    pub(crate) async fn begin_usage_wakeup_tick(&self, now_ms: u64) -> Option<Vec<BackendKind>> {
+        let mut state = self.state.lock().await;
+        let usage = state.usage_limits_tx.borrow().settings;
+        if state.usage_wakeup_in_flight
+            || (!usage.auto_start_short_windows && !usage.auto_start_weekly_windows)
+            || (state.skip_real_backend_probe && !state.use_mock_backend)
+        {
+            return None;
+        }
+        let settings = match state.settings_store.lock().await.get() {
+            Ok(settings) => settings,
+            Err(error) => {
+                tracing::error!(%error, "usage wake-up cannot read settings; not sending");
+                return None;
+            }
+        };
+        let backends: Vec<_> = settings
+            .enabled_backends
+            .into_iter()
+            .filter(|backend| crate::usage_wakeup::supports_wakeup(*backend))
+            .filter(|backend| {
+                state.use_mock_backend
+                    || state.backend_setup.backends.iter().any(|info| {
+                        info.backend_kind == *backend
+                            && info.status == protocol::BackendSetupStatus::Installed
+                    })
+            })
+            .collect();
+        if backends.is_empty() {
+            tracing::debug!("hourly usage wake-up has no enabled, installed supported backends");
+            return None;
+        }
+        match state.usage_wakeup_store.claim_hour(now_ms) {
+            Ok(true) => {
+                state.usage_wakeup_in_flight = true;
+                tracing::debug!(?backends, now_ms, "claimed hourly usage wake-up poll");
+                Some(backends)
+            }
+            Ok(false) => None,
+            Err(error) => {
+                tracing::error!(%error, "usage wake-up spending guard unavailable; not sending");
+                None
+            }
+        }
+    }
+
+    pub(crate) async fn finish_usage_wakeup_tick(
+        &self,
+        now_ms: u64,
+        mut reports: Vec<(BackendKind, protocol::CapacityReport)>,
+    ) -> Option<BackendKind> {
+        let prepared = {
+            let mut state = self.state.lock().await;
+            if !state.usage_wakeup_in_flight {
+                return None;
+            }
+            let usage = state.usage_limits_tx.borrow().settings;
+            let settings = state.settings_store.lock().await.get();
+            let enabled = match settings {
+                Ok(settings) => settings.enabled_backends,
+                Err(error) => {
+                    state.usage_wakeup_in_flight = false;
+                    tracing::error!(%error, "usage wake-up cannot recheck settings; not sending");
+                    return None;
+                }
+            };
+            reports.retain(|(backend, _)| enabled.contains(backend));
+            let mut blocked_backends = Vec::new();
+            for (backend, snapshot) in &state.backend_capacity {
+                if let BackendCapacityState::Known { report }
+                | BackendCapacityState::Stale { report, .. } = &snapshot.state
+                    && crate::usage_wakeup::has_blocking_limit(
+                        *backend,
+                        report,
+                        usage.stop_used_percent,
+                    )
+                {
+                    // A narrow fresh read must not hide another known binding
+                    // limit. Cached data can veto spending, never authorize it.
+                    blocked_backends.push(*backend);
+                }
+            }
+            for agent_id in state.registry.agent_ids() {
+                let Some(handle) = state.registry.agent_handle(&agent_id) else {
+                    continue;
+                };
+                let Some(status) = state.registry.agent_status_handle(&agent_id) else {
+                    continue;
+                };
+                let status = status.snapshot().await;
+                if status.is_active() || status.has_queued_messages || status.has_background_work {
+                    let backend = handle.snapshot().backend_kind;
+                    blocked_backends.push(backend);
+                }
+            }
+            let target = match state.usage_wakeup_store.reserve_attempt(
+                now_ms,
+                usage,
+                &reports,
+                &blocked_backends,
+            ) {
+                Ok(Some(target)) => target,
+                Ok(None) => {
+                    state.usage_wakeup_in_flight = false;
+                    return None;
+                }
+                Err(error) => {
+                    state.usage_wakeup_in_flight = false;
+                    tracing::error!(%error, "usage wake-up reservation failed; not sending");
+                    return None;
+                }
+            };
+            let config = crate::agent::usage_wakeup_spawn_config(
+                target.session_settings(),
+                state.backend_storage.clone(),
+            );
+            #[cfg(feature = "test-support")]
+            let config = {
+                let mut config = config;
+                if state.use_mock_backend {
+                    config.mock_launch = state
+                        .usage_wakeup_mock_script
+                        .take()
+                        .map(crate::backend::mock::MockLaunch::Script);
+                }
+                config
+            };
+            (target, config, state.use_mock_backend)
+        };
+        let (target, config, use_mock_backend) = prepared;
+        tracing::info!(backend = ?target.backend_kind, model = ?target.model, bucket = ?target.bucket,
+            reset_at_ms = target.reset_at_ms, "sending reserved hidden usage wake-up: hi");
+        let result = crate::agent::send_usage_wakeup(
+            #[cfg(feature = "test-support")]
+            self,
+            &target,
+            config,
+            use_mock_backend,
+        )
+        .await;
+        match result {
+            Ok(()) => tracing::info!(backend = ?target.backend_kind,
+                "usage wake-up completed; timer start is not yet confirmed"),
+            Err(error) => tracing::warn!(backend = ?target.backend_kind, %error,
+                "usage wake-up failed; attempt remains consumed and will not be retried"),
+        }
+        self.state.lock().await.usage_wakeup_in_flight = false;
+        Some(target.backend_kind)
+    }
+}
+
 #[cfg(feature = "test-support")]
 impl HostHandle {
+    pub async fn run_usage_wakeup_tick_for_test(
+        &self,
+        now_ms: u64,
+        reports: Vec<(BackendKind, protocol::CapacityReport)>,
+    ) {
+        assert!(
+            self.state.lock().await.use_mock_backend,
+            "sim tick requires the mock backend"
+        );
+        let Some(backends) = self.begin_usage_wakeup_tick(now_ms).await else {
+            return;
+        };
+        let reports: Vec<_> = reports
+            .into_iter()
+            .filter(|(backend, _)| backends.contains(backend))
+            .collect();
+        for (backend, report) in &reports {
+            self.record_backend_capacity_with_emit(
+                *backend,
+                BackendCapacityState::Known {
+                    report: report.clone(),
+                },
+                true,
+            )
+            .await;
+        }
+        self.finish_usage_wakeup_tick(now_ms, reports).await;
+    }
+
+    #[cfg(feature = "test-support")]
+    pub async fn set_usage_wakeup_script_for_test(&self, script: crate::backend::mock::MockScript) {
+        let mut state = self.state.lock().await;
+        assert!(
+            state.use_mock_backend,
+            "sim script requires the mock backend"
+        );
+        state.usage_wakeup_mock_script = Some(script);
+    }
+
+    #[cfg(feature = "test-support")]
+    pub(crate) async fn record_usage_wakeup_launch_for_test(
+        &self,
+        launch: UsageWakeupLaunchForTest,
+    ) {
+        self.state
+            .lock()
+            .await
+            .usage_wakeup_mock_launches
+            .push(launch);
+    }
+
+    #[cfg(feature = "test-support")]
+    pub async fn usage_wakeup_launches_for_test(&self) -> Vec<UsageWakeupLaunchForTest> {
+        self.state.lock().await.usage_wakeup_mock_launches.clone()
+    }
+
     pub async fn ingest_backend_capacity_for_test(
         &self,
         backend_kind: BackendKind,
@@ -13720,6 +13942,8 @@ fn spawn_host_inner(
     runtime_config: HostRuntimeConfig,
 ) -> Result<HostHandle, String> {
     crate::process_env::initialize_process_env()?;
+    let usage_wakeup_store =
+        crate::usage_wakeup::WakeupStore::new(paths.settings.with_file_name("usage_wakeups.json"));
     let transcript_root =
         if std::env::var("TYDE_TRANSCRIPT_STORE_DIR").is_ok_and(|path| !path.trim().is_empty()) {
             TranscriptStore::default_root()?
@@ -13885,6 +14109,12 @@ fn spawn_host_inner(
             supervisor_epoch: 0,
             supervisor_settings_tx,
             usage_limits_tx,
+            usage_wakeup_store,
+            usage_wakeup_in_flight: false,
+            #[cfg(feature = "test-support")]
+            usage_wakeup_mock_script: None,
+            #[cfg(feature = "test-support")]
+            usage_wakeup_mock_launches: Vec::new(),
             activity_summary_settings_tx,
             sub_agent_spawn_tx,
             capacity_tx: capacity_tx.clone(),
@@ -14815,6 +15045,9 @@ fn spawn_capacity_poll_loops(host: HostHandle) {
             return;
         }
         tracing::info!(?pollable, "starting subscription capacity polling");
+        tokio::spawn(crate::capacity_poll::run_usage_wakeup_poll_loop(
+            WeakHostHandle::downgrade(&host),
+        ));
         for backend_kind in pollable {
             // Weak on purpose. A poll loop runs for the life of the host, so a
             // strong handle would keep every host it ever started alive — and

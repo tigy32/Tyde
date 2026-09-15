@@ -411,7 +411,33 @@ async fn supervisor_settings_apply_and_validate_over_protocol() {
 
     assert!(!fixture.bootstrap.settings.usage_limits.enabled);
     assert!(!fixture.bootstrap.settings.usage_limits.compact_enabled);
+    assert!(
+        !fixture
+            .bootstrap
+            .settings
+            .usage_limits
+            .auto_start_short_windows
+    );
+    assert!(
+        !fixture
+            .bootstrap
+            .settings
+            .usage_limits
+            .auto_start_weekly_windows
+    );
     let valid = [
+        (
+            "usage-wake-short",
+            "/usage_limits/auto_start_short_windows",
+            serde_json::json!(true),
+            serde_json::json!(false),
+        ),
+        (
+            "usage-wake-weekly",
+            "/usage_limits/auto_start_weekly_windows",
+            serde_json::json!(true),
+            serde_json::json!(false),
+        ),
         (
             "usage-enable",
             "/usage_limits/enabled",

@@ -2015,6 +2015,102 @@ pub(crate) fn agent_name_generation_spawn_config(
     }
 }
 
+pub(crate) async fn send_usage_wakeup(
+    #[cfg(feature = "test-support")] host: &crate::host::HostHandle,
+    target: &crate::usage_wakeup::WakeupTarget,
+    config: BackendSpawnConfig,
+    use_mock_backend: bool,
+) -> Result<(), String> {
+    let workspace = tempfile::tempdir()
+        .map_err(|error| format!("Cannot create isolated usage wake-up workspace: {error}"))?;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let (backend, mut events, _) = tokio::time::timeout_at(
+        deadline,
+        spawn_backend(
+            use_mock_backend,
+            target.backend_kind,
+            vec![workspace.path().to_string_lossy().into_owned()],
+            config.clone(),
+            SendMessagePayload {
+                message: "hi".to_owned(),
+                images: None,
+                origin: None,
+                tool_response: None,
+            },
+        ),
+    )
+    .await
+    .map_err(|_| "Usage wake-up startup timed out".to_owned())??;
+    #[cfg(feature = "test-support")]
+    if let Some(control) = backend.mock_control() {
+        host.record_usage_wakeup_launch_for_test(crate::host::UsageWakeupLaunchForTest {
+            backend_kind: target.backend_kind,
+            config,
+            control,
+        })
+        .await;
+    }
+    let result = tokio::time::timeout_at(deadline, async {
+        let mut answered = false;
+        let mut output_bytes = 0;
+        for _ in 0..512 {
+            let Some(event) = events.recv().await else {
+                return Err("Usage wake-up ended without completing its turn".to_owned());
+            };
+            match event {
+                ChatEvent::MessageAdded(message)
+                    if matches!(message.sender, MessageSender::Error) =>
+                {
+                    return Err(message.content);
+                }
+                ChatEvent::ToolRequest(_) => {
+                    return Err("Usage wake-up requested a tool".to_owned());
+                }
+                ChatEvent::StreamDelta(delta) | ChatEvent::StreamReasoningDelta(delta) => {
+                    output_bytes += delta.text.len();
+                    if output_bytes > 4096 {
+                        return Err("Usage wake-up exceeded its response budget".to_owned());
+                    }
+                }
+                ChatEvent::RetryAttempt(_) | ChatEvent::OperationCancelled(_) => {
+                    return Err("Usage wake-up was cancelled or attempted a retry".to_owned());
+                }
+                ChatEvent::StreamEnd(end)
+                    if matches!(end.message.sender, MessageSender::Assistant { .. }) =>
+                {
+                    if !end.message.tool_calls.is_empty() {
+                        return Err("Usage wake-up attempted a tool call".to_owned());
+                    }
+                    if end.message.content.len() > 4096 {
+                        return Err("Usage wake-up exceeded its response budget".to_owned());
+                    }
+                    answered |= !end.message.content.trim().is_empty();
+                }
+                ChatEvent::TypingStatusChanged(false) if answered => return Ok(()),
+                _ => {}
+            }
+        }
+        Err("Usage wake-up exceeded its event budget".to_owned())
+    })
+    .await
+    .unwrap_or_else(|_| Err("Usage wake-up timed out".to_owned()));
+    tokio::time::timeout(Duration::from_secs(10), backend.shutdown())
+        .await
+        .map_err(|_| "Usage wake-up cleanup timed out".to_owned())?;
+    result
+}
+
+pub fn usage_wakeup_spawn_config(
+    settings: SessionSettingsValues,
+    storage: crate::backend::BackendStorage,
+) -> BackendSpawnConfig {
+    let mut config = agent_name_generation_spawn_config(Some(settings));
+    // Naming may choose a cheaper model; waking must spend the selected quota.
+    config.cost_hint = None;
+    config.backend_storage = storage;
+    config
+}
+
 async fn collect_agent_name_events(events: &mut EventStream) -> Result<String, String> {
     let mut streamed_text = String::new();
     // Some backends run session-setup commands before the naming turn, and

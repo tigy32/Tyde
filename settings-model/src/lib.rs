@@ -258,6 +258,8 @@ pub struct UsageLimitSettings {
     pub stop_used_percent: u8,
     pub compact_enabled: bool,
     pub compact_context_percent: u8,
+    pub auto_start_short_windows: bool,
+    pub auto_start_weekly_windows: bool,
 }
 
 impl Default for UsageLimitSettings {
@@ -267,6 +269,8 @@ impl Default for UsageLimitSettings {
             stop_used_percent: 90,
             compact_enabled: false,
             compact_context_percent: 60,
+            auto_start_short_windows: false,
+            auto_start_weekly_windows: false,
         }
     }
 }
@@ -569,6 +573,20 @@ fn decorate_host_settings_schema(schema: &mut Value) {
             "slider",
             "Compact at context percentage",
             "Compact when the reported context reaches this percentage of its context window.",
+        ),
+        (
+            "auto_start_short_windows",
+            50,
+            "toggle",
+            "Auto-start short usage windows",
+            "On the hourly usage refresh, send a hidden hi after a supported short usage window resets (including five-hour limits). Consumes quota. At most one wake-up attempt per hour across this host, with no retries for the same reset, even after restarting. Independent of pausing agents. Enable on only one host per account.",
+        ),
+        (
+            "auto_start_weekly_windows",
+            60,
+            "toggle",
+            "Auto-start weekly usage windows",
+            "On the hourly usage refresh, send a hidden hi after a supported weekly usage window resets. Weekly windows take priority; other targets wait for later hours. Shares the host-wide one-attempt-per-hour limit. May also start a short window. Consumes quota; off by default.",
         ),
     ] {
         annotate_property(
