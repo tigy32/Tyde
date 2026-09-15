@@ -78,21 +78,57 @@ fn install_app_height_probe() {
     let Some(window) = web_sys::window() else {
         return;
     };
-    apply_app_height(&window);
-
-    let resize_target = window.clone();
-    let on_resize = wasm_bindgen::closure::Closure::<dyn FnMut()>::new(move || {
-        apply_app_height(&resize_target);
-    });
-    if let Some(viewport) = window.visual_viewport() {
-        let _ =
-            viewport.add_event_listener_with_callback("resize", on_resize.as_ref().unchecked_ref());
-    }
-    let _ = window
-        .add_event_listener_with_callback("orientationchange", on_resize.as_ref().unchecked_ref());
-    on_resize.forget();
-
+    std::mem::forget(listen_for_app_height(&window));
     install_document_scroll_guard(&window);
+}
+
+fn listen_for_app_height(window: &web_sys::Window) -> impl FnOnce() {
+    apply_app_height(window);
+    let pending_frame = std::rc::Rc::new(std::cell::Cell::new(None));
+    let frame_pending = pending_frame.clone();
+    let frame_target = window.clone();
+    let on_frame = wasm_bindgen::closure::Closure::<dyn FnMut()>::new(move || {
+        frame_pending.set(None);
+        apply_app_height(&frame_target);
+        log::debug!("Mobile viewport animation frame; {}", viewport_metrics());
+    });
+    let resize_target = window.clone();
+    let resize_pending = pending_frame.clone();
+    let on_resize = wasm_bindgen::closure::Closure::<dyn FnMut(web_sys::Event)>::new(
+        move |event: web_sys::Event| {
+            apply_app_height(&resize_target);
+            log::debug!("Mobile viewport {}; {}", event.type_(), viewport_metrics());
+            // WebKit can fire resize before updating its height (bug 254861).
+            // Keep the immediate keyboard response, then read the settled frame.
+            if resize_pending.get().is_none() {
+                resize_pending.set(
+                    resize_target
+                        .request_animation_frame(on_frame.as_ref().unchecked_ref())
+                        .ok(),
+                );
+            }
+        },
+    );
+    let mut targets: Vec<(web_sys::EventTarget, &str)> = vec![
+        (window.clone().into(), "orientationchange"),
+        (window.clone().into(), "resize"),
+    ];
+    if let Some(viewport) = window.visual_viewport() {
+        targets.push((viewport.into(), "resize"));
+    }
+    for (target, event) in &targets {
+        let _ = target.add_event_listener_with_callback(event, on_resize.as_ref().unchecked_ref());
+    }
+    let cleanup_window = window.clone();
+    move || {
+        if let Some(frame) = pending_frame.take() {
+            let _ = cleanup_window.cancel_animation_frame(frame);
+        }
+        for (target, event) in targets {
+            let _ = target
+                .remove_event_listener_with_callback(event, on_resize.as_ref().unchecked_ref());
+        }
+    }
 }
 
 /// A visual-viewport drop smaller than this is browser chrome — the iOS URL bar
@@ -314,8 +350,7 @@ fn install_document_scroll_guard(window: &web_sys::Window) {
     on_scroll.forget();
 }
 
-/// One-shot launch diagnostics so a phone with a mis-sized viewport reports
-/// the actual numbers through the host log.
+/// Viewport and chrome geometry for the browser console, without chat content.
 fn viewport_metrics() -> String {
     let Some(window) = web_sys::window() else {
         return "viewport: no window".to_owned();
@@ -353,9 +388,38 @@ fn viewport_metrics() -> String {
         .and_then(|element| element.dyn_into::<web_sys::HtmlElement>().ok())
         .and_then(|root| root.style().get_property_value("--app-height").ok())
         .unwrap_or_default();
+    let baseline_height = VIEWPORT_BASELINE.with(|cell| cell.get().1);
+    let document = window.document();
+    let root = document
+        .as_ref()
+        .and_then(|document| document.document_element());
+    let keyboard = root
+        .as_ref()
+        .is_some_and(|root| root.has_attribute("data-keyboard-open"));
+    let visual_top = window
+        .visual_viewport()
+        .map(|viewport| viewport.offset_top())
+        .unwrap_or(-1.0);
+    let bottom = |selector| {
+        document
+            .as_ref()
+            .and_then(|document| document.query_selector(selector).ok().flatten())
+            .map(|element| element.get_bounding_client_rect().bottom())
+            .unwrap_or(-1.0)
+    };
+    let shell_bottom = bottom(".mobile-app");
+    let dock_bottom = bottom(".bottom-nav");
+    let dock_inset = document
+        .as_ref()
+        .and_then(|document| document.query_selector(".bottom-nav").ok().flatten())
+        .and_then(|dock| window.get_computed_style(&dock).ok().flatten())
+        .and_then(|style| style.get_property_value("margin-bottom").ok())
+        .unwrap_or_default();
     format!(
         "viewport: inner_h={inner_height} visual_h={visual_height} screen_h={screen_height} \
-         client_h={client_height} standalone={standalone} app_height={app_height}"
+         client_h={client_height} standalone={standalone} app_height={app_height} \
+         keyboard={keyboard} baseline_h={baseline_height} visual_top={visual_top} shell_bottom={shell_bottom} \
+         dock_bottom={dock_bottom} dock_inset={dock_inset}"
     )
 }
 
@@ -410,6 +474,176 @@ mod wasm_tests {
                 .unwrap();
         });
         let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+    }
+
+    async fn next_frame() {
+        let promise = js_sys::Promise::new(&mut |resolve, _reject| {
+            web_sys::window()
+                .unwrap()
+                .request_animation_frame(&resolve)
+                .unwrap();
+        });
+        let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+    }
+
+    #[wasm_bindgen_test]
+    async fn keyboard_dismissal_restores_reachable_bottom_tabs_after_late_measurement() {
+        use leptos::prelude::*;
+        use std::{cell::Cell, rc::Rc};
+
+        let window = web_sys::window().unwrap();
+        let document = window.document().unwrap();
+        let root: web_sys::HtmlElement = document.document_element().unwrap().dyn_into().unwrap();
+        let attributes: Vec<_> = ["style", "data-theme", "data-keyboard-open"]
+            .into_iter()
+            .map(|name| (name, root.get_attribute(name)))
+            .collect();
+        let baseline = VIEWPORT_BASELINE.with(|cell| cell.replace((0.0, 0.0)));
+        root.remove_attribute("data-keyboard-open").unwrap();
+        root.set_attribute("data-theme", "dark").unwrap();
+        root.style()
+            .set_property("--safe-area-bottom", "34px")
+            .unwrap();
+        let style = document.create_element("style").unwrap();
+        style.set_text_content(Some(include_str!("../styles.css")));
+        document.head().unwrap().append_child(&style).unwrap();
+        let container: web_sys::HtmlElement =
+            document.create_element("div").unwrap().dyn_into().unwrap();
+        // Other wasm fixtures remain in the document (the first run placed
+        // this shell at y=17438). Isolate its viewport, not its layout rules.
+        container
+            .set_attribute("style", "position:fixed;inset:0;z-index:2147483647")
+            .unwrap();
+        document.body().unwrap().append_child(&container).unwrap();
+        let mount = leptos::mount::mount_to(container.clone(), || {
+            provide_context(crate::state::AppState::new());
+            view! {
+                <div class="mobile-app">
+                    <div class="mobile-content"><textarea aria-label="Message" /></div>
+                    <crate::components::BottomNav />
+                </div>
+            }
+        });
+        next_tick().await;
+
+        let viewport = window.visual_viewport().unwrap();
+        let original =
+            js_sys::Object::get_own_property_descriptor(viewport.as_ref(), &"height".into());
+        let full_height = viewport.height();
+        let visible_height = Rc::new(Cell::new(full_height));
+        let height_for_getter = visible_height.clone();
+        let getter = wasm_bindgen::closure::Closure::<dyn FnMut() -> f64>::new(move || {
+            height_for_getter.get()
+        });
+        let descriptor = js_sys::Object::new();
+        js_sys::Reflect::set(&descriptor, &"configurable".into(), &true.into()).unwrap();
+        js_sys::Reflect::set(&descriptor, &"get".into(), getter.as_ref()).unwrap();
+        js_sys::Object::define_property(viewport.as_ref(), &"height".into(), &descriptor);
+        let cleanup = listen_for_app_height(&window);
+        let dock = container
+            .query_selector("[data-mobile-test='bottom-nav']")
+            .unwrap()
+            .unwrap();
+        let initial_bottom = dock.get_bounding_client_rect().bottom();
+        let input: web_sys::HtmlElement = container
+            .query_selector("textarea")
+            .unwrap()
+            .unwrap()
+            .dyn_into()
+            .unwrap();
+        input.focus().unwrap();
+        let keyboard_height = full_height / 2.0;
+        visible_height.set(keyboard_height);
+        viewport
+            .dispatch_event(&web_sys::Event::new("resize").unwrap())
+            .unwrap();
+        next_frame().await;
+        let open_bottom = dock.get_bounding_client_rect().bottom();
+
+        // WebKit can notify before its height getter changes (bug 254861).
+        // No second resize arrives to clear the keyboard-sized shell.
+        input.blur().unwrap();
+        viewport
+            .dispatch_event(&web_sys::Event::new("resize").unwrap())
+            .unwrap();
+        visible_height.set(full_height);
+        next_frame().await;
+        next_frame().await;
+        let restored_bottom = dock.get_bounding_client_rect().bottom();
+        wasm_bindgen_test::console_log!(
+            "Late keyboard dismissal: initial={initial_bottom} open={open_bottom} restored={restored_bottom}; {}",
+            viewport_metrics()
+        );
+        let rect = dock.get_bounding_client_rect();
+        let reachable = document
+            .element_from_point(
+                (rect.x() + rect.width() / 2.0) as f32,
+                (rect.bottom() - 6.0) as f32,
+            )
+            .is_some_and(|hit| dock.contains(Some(&hit)));
+
+        // A layout-viewport resize must also refresh the keyboard state,
+        // even when visualViewport sends no matching event.
+        visible_height.set(keyboard_height);
+        viewport
+            .dispatch_event(&web_sys::Event::new("resize").unwrap())
+            .unwrap();
+        next_frame().await;
+        visible_height.set(full_height);
+        window
+            .dispatch_event(&web_sys::Event::new("resize").unwrap())
+            .unwrap();
+        next_frame().await;
+        next_frame().await;
+        let window_restored_bottom = dock.get_bounding_client_rect().bottom();
+        wasm_bindgen_test::console_log!(
+            "Window resize dismissal: restored={window_restored_bottom}; {}",
+            viewport_metrics()
+        );
+
+        cleanup();
+        if original.is_undefined() {
+            js_sys::Reflect::delete_property(viewport.as_ref(), &"height".into()).unwrap();
+        } else {
+            js_sys::Object::define_property(
+                viewport.as_ref(),
+                &"height".into(),
+                original.unchecked_ref(),
+            );
+        }
+        drop(getter);
+        drop(mount);
+        container.remove();
+        style.remove();
+        for (name, value) in attributes {
+            if let Some(value) = value {
+                root.set_attribute(name, &value).unwrap();
+            } else {
+                root.remove_attribute(name).unwrap();
+            }
+        }
+        VIEWPORT_BASELINE.with(|cell| cell.set(baseline));
+
+        assert!(
+            (initial_bottom - (full_height - 26.0)).abs() <= 1.0,
+            "the tabs must start at the safe-area inset: {initial_bottom}"
+        );
+        assert!(
+            open_bottom <= keyboard_height && open_bottom > 52.0,
+            "the entire tab bar must stay above the open keyboard: {open_bottom}"
+        );
+        assert!(
+            (initial_bottom - restored_bottom).abs() <= 1.0,
+            "dismissal must restore the tabs to their original bottom edge: before={initial_bottom} after={restored_bottom}"
+        );
+        assert!(
+            reachable,
+            "restoring height must not clip the bottom of the tabs"
+        );
+        assert!(
+            (initial_bottom - window_restored_bottom).abs() <= 1.0,
+            "a window resize must restore the tabs without a visual resize: before={initial_bottom} after={window_restored_bottom}"
+        );
     }
 
     /// iPhone-ish numbers: a 393x852 portrait viewport and a ~336px keyboard.
