@@ -925,6 +925,7 @@ fn GitRootSection(
     let root_label = root_display_name(&root.root);
     let root_title = root.root.0.clone();
     let branch_label = root.branch.unwrap_or_else(|| "--".to_owned());
+    let branch_title = branch_label.clone();
 
     let ahead_behind = if root.ahead > 0 || root.behind > 0 {
         let mut parts = Vec::new();
@@ -1074,8 +1075,8 @@ fn GitRootSection(
                     <span class="fe-chevron">
                         {move || if expanded.get() { "\u{25be}" } else { "\u{25b8}" }}
                     </span>
-                    <span class="gp-root-name">{root_label}</span>
-                    <span class="gp-root-branch">{branch_label}</span>
+                    <span class="gp-root-name" title=root_title.clone()>{root_label}</span>
+                    <span class="gp-root-branch" title=branch_title>{branch_label}</span>
                     {ahead_behind.map(|ab| view! {
                         <span class="gp-root-ahead-behind">{ab}</span>
                     })}
@@ -3012,6 +3013,112 @@ mod wasm_tests {
                 .unwrap_or_default()
                 .contains("Working tree clean")
         );
+    }
+
+    /// The root name is the entry's identity, so a branch long enough to
+    /// fill the header must not squeeze it to a couple of characters: down to
+    /// the dock's default width the name stays whole and the branch is what
+    /// truncates, and at the dock's 220px minimum the name still keeps the
+    /// bulk of its text. Both full values stay reachable as hover titles, the
+    /// status chip and history control keep their place, and nothing spills
+    /// out of the header.
+    #[wasm_bindgen_test]
+    async fn long_branch_yields_header_width_to_the_root_name() {
+        ensure_styles_loaded();
+        stub_recording_bridge();
+        let container = make_container();
+        let mut root = root_with_unstaged("/Users/mike/src/AXD-Automation");
+        let branch = "hersheys/qp-scan-isolated-05-slot-fanout-rollup";
+        root.branch = Some(branch.to_owned());
+        let _mounted = mount_git_panel_with_root(container.clone(), false, root);
+        next_tick().await;
+
+        let header = query(&container, ".gp-root-header").expect("root header");
+        let name = query(&container, ".gp-root-name").expect("root name");
+        let branch_el = query(&container, ".gp-root-branch").expect("branch label");
+        let state = query(&container, "[data-test=gp-root-state]").expect("state chip");
+        let history = history_toggle(&container, 0);
+
+        assert_eq!(name.text_content().as_deref(), Some("AXD-Automation"));
+        assert_eq!(branch_el.text_content().as_deref(), Some(branch));
+        assert_eq!(
+            name.get_attribute("title").as_deref(),
+            Some("/Users/mike/src/AXD-Automation"),
+            "the full root stays reachable once the label truncates"
+        );
+        assert_eq!(
+            branch_el.get_attribute("title").as_deref(),
+            Some(branch),
+            "the full branch stays reachable once the label truncates"
+        );
+
+        // 220px is `--dock-min-width`, 320px `--dock-default-width`.
+        for width in [440, 320, 220] {
+            container
+                .style()
+                .set_property("width", &format!("{width}px"))
+                .unwrap();
+            next_tick().await;
+
+            let name_box = name.get_bounding_client_rect();
+            let branch_box = branch_el.get_bounding_client_rect();
+            let state_box = state.get_bounding_client_rect();
+            let history_box = history.get_bounding_client_rect();
+            let header_box = header.get_bounding_client_rect();
+            log::info!(
+                "root header width={width}: name={} of {} branch={} state={} history={}",
+                name_box.width(),
+                name.scroll_width(),
+                branch_box.width(),
+                state_box.width(),
+                history_box.width()
+            );
+
+            assert!(
+                branch_el.scroll_width() > branch_el.client_width(),
+                "the long branch is what gives way at {width}px"
+            );
+            assert!(
+                branch_box.width() >= 8.0,
+                "a sliver of branch must stay hoverable at {width}px; got {}px",
+                branch_box.width()
+            );
+            assert!(
+                name_box.right() <= branch_box.left() + 1.0,
+                "the root name still reads before the branch at {width}px"
+            );
+            assert!(
+                branch_box.right() <= state_box.left() + 1.0
+                    && state_box.right() <= history_box.left() + 1.0,
+                "status and history controls keep their place at {width}px"
+            );
+            assert!(
+                state_box.width() > 0.0 && history_box.width() >= 40.0,
+                "status and history controls stay visible at {width}px"
+            );
+            assert!(
+                history_box.right() <= header_box.right() + 0.5
+                    && header.scroll_width() <= header.client_width(),
+                "the header must not overflow at {width}px"
+            );
+
+            if width > 220 {
+                assert!(
+                    name.scroll_width() <= name.client_width() + 1,
+                    "the root name must stay whole at {width}px; it renders {}px \
+                     of {}px of text",
+                    name.client_width(),
+                    name.scroll_width()
+                );
+            } else {
+                let shown = f64::from(name.client_width()) / f64::from(name.scroll_width());
+                assert!(
+                    shown >= 0.6,
+                    "at the dock minimum the root name keeps the bulk of its \
+                     text; only {shown:.2} of it renders"
+                );
+            }
+        }
     }
 
     /// The commit message box is behind the Staged section's "Commit…"

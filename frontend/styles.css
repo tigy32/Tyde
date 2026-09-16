@@ -7585,6 +7585,11 @@ math merror {
     color: var(--text-primary);
 }
 
+/* The root name is how the user tells entries apart, so it outranks the
+   branch in the layout: both can shrink, but the branch's far larger shrink
+   factor means it gives way first and truncates while the name keeps its
+   full text. The branch keeps a sliver so its hover title stays reachable,
+   and only once it is down to that does the name itself start to truncate. */
 .gp-root-name {
     flex: 0 1 auto;
     min-width: 0;
@@ -7595,8 +7600,8 @@ math merror {
 }
 
 .gp-root-branch {
-    flex: 0 1 auto;
-    min-width: 0;
+    flex: 0 1000 auto;
+    min-width: 3ch;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
