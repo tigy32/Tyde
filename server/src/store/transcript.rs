@@ -428,8 +428,11 @@ impl SessionJournal {
             .map(|outcome| outcome.appended != 0)
     }
 
-    pub(crate) fn append_live_records(&self, records: Vec<TranscriptRecord>) -> Result<(), String> {
-        self.append_records(records, true).map(|_| ())
+    pub(crate) fn append_live_records(
+        &self,
+        records: Vec<TranscriptRecord>,
+    ) -> Result<TranscriptAppend, String> {
+        self.append_records(records, true)
     }
 
     fn append_records(

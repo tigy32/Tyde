@@ -2,11 +2,11 @@ mod fixture;
 
 use fixture::Fixture;
 use protocol::{
-    AgentBootstrapEvent, AgentBootstrapPayload, AgentStartPayload, BackendKind, ChatEvent,
-    DeleteSessionPayload, Envelope, FetchSessionHistoryPayload, FrameKind, ListSessionsPayload,
-    NewAgentPayload, Project, ProjectCreatePayload, ProjectNotifyPayload, ProjectRootPath,
-    SessionHistoryPayload, SessionId, SessionListPayload, SpawnAgentParams, SpawnAgentPayload,
-    StreamPath,
+    AgentBootstrapEvent, AgentBootstrapPayload, AgentErrorPayload, AgentStartPayload, BackendKind,
+    ChatEvent, DeleteSessionPayload, Envelope, FetchSessionHistoryPayload, FrameKind,
+    ListSessionsPayload, NewAgentPayload, Project, ProjectCreatePayload, ProjectNotifyPayload,
+    ProjectRootPath, SessionHistoryPayload, SessionId, SessionListPayload, SpawnAgentParams,
+    SpawnAgentPayload, StreamPath,
 };
 use server::backend::mock::{MockScript, MockTurn};
 use server::store::session::SessionStore;
@@ -2018,6 +2018,43 @@ async fn wait_for_session_id(fixture: &mut Fixture, context: &str) -> SessionId 
     list.sessions[0].id.clone()
 }
 
+/// Drive a turn to its end and count the agent errors seen along the way.
+///
+/// A latch that re-arms itself looks exactly like a working one until you count
+/// the reports across a whole turn.
+async fn expect_turn_counting_agent_errors(
+    client: &mut client::Connection,
+    expected_text: &str,
+) -> usize {
+    let mut errors = 0;
+    loop {
+        let env = fixture::next_frame_matching_on(client, expected_text, |env| {
+            matches!(env.kind, FrameKind::AgentError | FrameKind::ChatEvent)
+        })
+        .await;
+        if env.kind == FrameKind::AgentError {
+            errors += 1;
+            continue;
+        }
+        let event: ChatEvent = env.parse_payload().expect("parse ChatEvent");
+        if let ChatEvent::StreamEnd(end) = event {
+            assert!(
+                end.message.content.contains(expected_text),
+                "unexpected turn ended: {:?}",
+                end.message.content
+            );
+            return errors;
+        }
+    }
+}
+
+async fn next_agent_error(client: &mut client::Connection, context: &str) -> AgentErrorPayload {
+    fixture::next_frame_matching_on(client, context, |env| env.kind == FrameKind::AgentError)
+        .await
+        .parse_payload()
+        .expect("parse AgentError")
+}
+
 /// A record torn by a full disk costs its own tail and nothing more.
 ///
 /// `write_all` reports `ENOSPC` after committing part of a record, so the
@@ -2204,6 +2241,112 @@ async fn resume_serves_history_written_before_a_torn_transcript_record() {
         contents.len(),
         2,
         "the repaired journal must replay both turns and nothing besides: {contents:?}"
+    );
+}
+
+/// A transcript that stops being written says so.
+///
+/// The agent keeps running and the stream keeps updating when journaling
+/// breaks, so the loss is invisible until a resume comes back short of the work
+/// that was actually done. It has to reach the client while the turn is still
+/// live, and it has to be non-fatal — the agent is fine, only its history is
+/// not.
+#[tokio::test]
+async fn a_transcript_that_cannot_be_written_reports_a_non_fatal_error() {
+    let mut fixture = Fixture::new().await;
+
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            name: Some("unwritable".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::New {
+                workspace_roots: vec!["/tmp/test".to_owned()],
+                prompt: "hello".to_owned(),
+                images: None,
+                backend_kind: BackendKind::Claude,
+                launch_profile_id: None,
+                cost_hint: None,
+                access_mode: Default::default(),
+                session_settings: None,
+            },
+        })
+        .await
+        .expect("spawn agent failed");
+
+    let env = expect_next_event(&mut fixture.client, "NewAgent").await;
+    let agent: NewAgentPayload = env.parse_payload().expect("parse NewAgent");
+    let _ = expect_next_event(&mut fixture.client, "AgentStart").await;
+    expect_turn(&mut fixture.client, "mock backend response to: hello").await;
+
+    let session_id = wait_for_session_id(&mut fixture, "SessionList").await;
+    let journal = transcript_journal_path(&fixture, &session_id);
+
+    // A directory where the journal belongs fails every read and every write of
+    // it, for any user, which is the durable stand-in for a disk that has
+    // stopped accepting appends.
+    // The actor may still be flushing the turn it just finished, so claim the
+    // path until it stays claimed rather than racing it exactly once.
+    let mut blocked = false;
+    for _ in 0..100 {
+        let _ = std::fs::remove_file(&journal);
+        if std::fs::create_dir(&journal).is_ok() {
+            blocked = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(blocked, "could not block {}", journal.display());
+
+    fixture
+        .client
+        .send_message(
+            &agent.instance_stream,
+            "work that will not be saved".to_owned(),
+        )
+        .await
+        .expect("send message failed");
+
+    let error = next_agent_error(&mut fixture.client, "transcript persistence AgentError").await;
+    assert_eq!(error.agent_id, agent.agent_id);
+    assert!(
+        !error.fatal,
+        "a broken transcript must not be reported as a fatal agent error"
+    );
+    assert!(
+        error.message.contains("transcript"),
+        "the error should name what broke, got {:?}",
+        error.message
+    );
+
+    // The agent itself is unaffected, which is precisely why the failure needs
+    // announcing rather than inferring from the stream.
+    let extra = expect_turn_counting_agent_errors(
+        &mut fixture.client,
+        "mock backend response to: work that will not be saved",
+    )
+    .await;
+    assert_eq!(
+        extra, 0,
+        "one outage must report once, not once per event in the turn"
+    );
+
+    // A second turn in the same outage is still the same outage.
+    fixture
+        .client
+        .send_message(&agent.instance_stream, "still not saved".to_owned())
+        .await
+        .expect("send second message failed");
+    let extra = expect_turn_counting_agent_errors(
+        &mut fixture.client,
+        "mock backend response to: still not saved",
+    )
+    .await;
+    assert_eq!(
+        extra, 0,
+        "a continuing outage must not re-report itself every turn"
     );
 }
 

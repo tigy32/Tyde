@@ -557,6 +557,17 @@ struct PreparedContextFallback {
 #[derive(Default)]
 struct AgentReplayState {
     journal: Option<Arc<SessionJournal>>,
+    /// The agent the journal belongs to, so a write failure can name it in the
+    /// error that reaches the client.
+    journal_agent_id: Option<AgentId>,
+    /// A journal write failure already reported. Latched so a broken
+    /// transcript reports once per outage rather than once per event, and
+    /// cleared only by a write that actually lands.
+    journal_failed: bool,
+    /// History already reported as incomplete. Latched separately from
+    /// `journal_failed`: losing history that was written is a different fact
+    /// from failing to write more of it.
+    journal_history_loss_reported: bool,
     active_stream: Option<ReplayActiveStream>,
     typing: bool,
     operation_cancelled: bool,
@@ -3122,6 +3133,7 @@ pub(crate) fn spawn_agent_actor(
         let mut compaction_blocked = false;
         current_session_id = Some(actor_session_id.clone());
         replay_state.journal = Some(transcript_store.open_session(&actor_session_id));
+        replay_state.journal_agent_id = Some(current_start.agent_id.clone());
         current_start.session_id = Some(actor_session_id.clone());
         let _ = start_tx.send(current_start.clone());
         let mut resume_replay_gate_pending = false;
@@ -7969,6 +7981,7 @@ pub(crate) fn spawn_relay_agent_actor(
         let mut latest_output = AgentControlLatestOutput::default();
         let mut replay_state = AgentReplayState {
             journal: Some(transcript_store.open_session(&session_id)),
+            journal_agent_id: Some(agent_id.clone()),
             ..Default::default()
         };
         let mut latest_slash_commands: Option<protocol::SlashCommandCatalog> = None;
@@ -10049,7 +10062,7 @@ async fn append_chat_event_with_transcript_metadata(
 ) {
     let replay_len_before = event_log.len();
     record_chat_event_for_replay(canonical_stream, event_log, replay_state, event);
-    if event_log.len() == replay_len_before
+    let persistence = if event_log.len() == replay_len_before
         && replay_state.active_stream.is_none()
         && matches!(event, ChatEvent::ToolProgress(_))
     {
@@ -10071,7 +10084,7 @@ async fn append_chat_event_with_transcript_metadata(
             0,
             HashMap::new(),
         )
-        .await;
+        .await
     } else {
         let provider_identities =
             transcript_provider_identities(event_log, replay_len_before, transcript_metadata);
@@ -10081,9 +10094,17 @@ async fn append_chat_event_with_transcript_metadata(
             replay_len_before,
             provider_identities,
         )
-        .await;
-    }
+        .await
+    };
     broadcast_live_event(subscribers, FrameKind::ChatEvent, event).await;
+    report_transcript_persistence(
+        canonical_stream,
+        event_log,
+        subscribers,
+        replay_state,
+        persistence,
+    )
+    .await;
 }
 
 fn transcript_provider_identities(
@@ -10233,9 +10254,9 @@ async fn journal_new_replay_records(
     event_log: &[Envelope],
     start: usize,
     provider_identities: HashMap<u64, crate::store::transcript::ProviderEventIdentity>,
-) {
+) -> Result<Option<crate::store::transcript::TranscriptAppend>, String> {
     let Some(journal) = journal.cloned() else {
-        return;
+        return Ok(None);
     };
     let session_id = journal.session_id().clone();
     let records = event_log[start..]
@@ -10265,18 +10286,19 @@ async fn journal_new_replay_records(
         })
         .collect::<Vec<_>>();
     if records.is_empty() {
-        return;
+        return Ok(None);
     }
     let persistence =
         tokio::task::spawn_blocking(move || journal.append_live_records(records)).await;
     match persistence {
-        Ok(Ok(())) => {}
+        Ok(Ok(outcome)) => Ok(Some(outcome)),
         Ok(Err(error)) => {
             tracing::warn!(
                 session_id = %session_id,
                 %error,
                 "failed to append materialized transcript record"
             );
+            Err(error)
         }
         Err(error) => {
             tracing::warn!(
@@ -10284,8 +10306,115 @@ async fn journal_new_replay_records(
                 %error,
                 "transcript persistence task failed"
             );
+            Err(error.to_string())
         }
     }
+}
+
+/// Tell the client when this agent's transcript stops being written.
+///
+/// A journal that cannot be appended to is invisible from the stream: the
+/// agent keeps working and the UI keeps updating, and the loss only shows up
+/// later as history that resumes short of where the work actually got to.
+/// Reporting it as a non-fatal agent error puts it in front of someone while
+/// the turn is still running. The latch means one report per outage, not one
+/// per event.
+async fn report_transcript_persistence(
+    canonical_stream: &str,
+    event_log: &mut Vec<Envelope>,
+    subscribers: &mut Vec<Stream>,
+    replay_state: &mut AgentReplayState,
+    persistence: Result<Option<crate::store::transcript::TranscriptAppend>, String>,
+) {
+    let Some(agent_id) = replay_state.journal_agent_id.clone() else {
+        return;
+    };
+    let outcome = match persistence {
+        Err(error) => {
+            if replay_state.journal_failed {
+                return;
+            }
+            replay_state.journal_failed = true;
+            report_agent_problem(
+                canonical_stream,
+                event_log,
+                subscribers,
+                &agent_id,
+                format!(
+                    "This agent's transcript is no longer being saved, so its history will be \
+                     incomplete if the session is resumed. The agent itself is unaffected and is \
+                     still running. Cause: {error}"
+                ),
+            )
+            .await;
+            return;
+        }
+        Ok(outcome) => outcome,
+    };
+    // A batch with nothing to write proves nothing about the journal, so it
+    // must not read as recovery: a stream of deltas between two failed writes
+    // would otherwise re-arm the latch and report the same outage again.
+    let Some(outcome) = outcome.filter(|outcome| outcome.appended > 0) else {
+        return;
+    };
+    if replay_state.journal_failed {
+        replay_state.journal_failed = false;
+        tracing::info!(
+            stream = canonical_stream,
+            "transcript persistence recovered"
+        );
+    }
+    if replay_state.journal_history_loss_reported {
+        return;
+    }
+    let lost = if outcome.unreadable_record {
+        Some(
+            "Part of this agent's saved history was written by a different build of Tyde and \
+             cannot be read here, so its transcript ends earlier than the work does. Nothing has \
+             been deleted, and a build that understands those records can still read them."
+                .to_owned(),
+        )
+    } else if outcome.discarded_bytes > 0 {
+        Some(format!(
+            "The end of this agent's saved history was never finished being written — a full \
+             disk or a crash mid-write — so {} unusable bytes were discarded to keep the rest \
+             readable. History before that point is intact; anything after it was already lost.",
+            outcome.discarded_bytes
+        ))
+    } else {
+        None
+    };
+    if let Some(lost) = lost {
+        replay_state.journal_history_loss_reported = true;
+        report_agent_problem(canonical_stream, event_log, subscribers, &agent_id, lost).await;
+    }
+}
+
+/// Put a non-fatal problem in front of whoever is watching this agent.
+///
+/// It goes into the replay log as well as the live broadcast, so a client that
+/// attaches after the fact still sees it.
+async fn report_agent_problem(
+    canonical_stream: &str,
+    event_log: &mut Vec<Envelope>,
+    subscribers: &mut Vec<Stream>,
+    agent_id: &AgentId,
+    message: String,
+) {
+    let payload = AgentErrorPayload {
+        agent_id: agent_id.clone(),
+        code: AgentErrorCode::Internal,
+        message,
+        fatal: false,
+    };
+    append_event(
+        canonical_stream,
+        event_log,
+        subscribers,
+        FrameKind::AgentError,
+        &payload,
+    )
+    .await;
 }
 
 async fn mark_transcript_authoritative(store: &TranscriptStore, session_id: &SessionId) {
