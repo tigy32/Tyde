@@ -415,6 +415,22 @@ pub fn DiffView(
         });
     });
 
+    // Expansion is addressed with the tab's own identity — including for a
+    // committed range, where code intel is withheld but a full-context read of
+    // the same revisions is still exactly right.
+    let expand_context = match (diff_key.clone(), host_id.clone(), project_id.clone()) {
+        (Some(key), Some(host_id), Some(project_id)) if !review_mode => Some(DiffExpandContext {
+            host_id,
+            project_id,
+            key,
+            root: root.clone(),
+            scope,
+            revision: revision.clone(),
+            path: (!path.is_empty()).then(|| path.clone()),
+        }),
+        _ => None,
+    };
+
     let historical = !matches!(revision, ProjectDiffRevision::WorkingTree);
     let content_host_id = (!historical).then(|| host_id.clone()).flatten();
     let content_project_id = (!historical).then(|| project_id.clone()).flatten();
@@ -454,6 +470,7 @@ pub fn DiffView(
                             project_id=content_project_id.clone()
                             revision=content_revision.clone()
                             review_mode=review_mode
+                            expand=expand_context.clone()
                         />
                     }.into_any(),
                     None => view! {
@@ -1271,6 +1288,11 @@ fn DiffContent(
     #[prop(optional_no_strip)] project_id: Option<ProjectId>,
     #[prop(optional)] revision: ProjectDiffRevision,
     #[prop(optional)] review_mode: bool,
+    /// Identity used to fetch the full-context read that backs "expand
+    /// context". `None` for a frozen review snapshot, which has no project to
+    /// refetch from and therefore offers no expansion.
+    #[prop(optional_no_strip)]
+    expand: Option<DiffExpandContext>,
 ) -> impl IntoView {
     let state = expect_context::<AppState>();
     let initial_scroll_state = tab_id.and_then(|id| state.tab_scroll_state_untracked(id));
@@ -1286,6 +1308,9 @@ fn DiffContent(
             ProjectDiffScope::Uncommitted => "uncommitted".to_owned(),
         },
     };
+    let diff_root = diff.root.clone();
+    let diff_scope = diff.scope;
+    let context_mode = diff.context_mode;
     let perf_key = format!(
         "diff:{}:{}",
         diff.root.0,
@@ -1294,41 +1319,146 @@ fn DiffContent(
     crate::perf::log_phase("diff_open", "content_mount", &perf_key, "");
     let mount_t0 = crate::perf::now_ms();
 
-    // Flatten all diff lines into a searchable list and compute per-hunk
-    // starting offsets so each rendered line knows its flat search index.
-    let mut searchable_lines: Vec<String> = Vec::new();
-    let mut file_hunk_offsets: Vec<Vec<usize>> = Vec::new();
-    for file in &diff.files {
-        let mut hunk_offsets = Vec::new();
-        for hunk in &file.hunks {
-            hunk_offsets.push(searchable_lines.len());
-            for line in &hunk.lines {
-                searchable_lines.push(line.text.clone());
+    // ── Revealing the context git omitted ──────────────────────────────
+    // `expansions` holds, per file, the half-open slices of that file's
+    // full-context line list that are currently rendered. Absent means "just
+    // the hunks git gave us". Everything downstream — search indices, the
+    // virtual-scroll row model, syntax highlighting — is derived from the
+    // expanded files, so revealing context stays consistent across all of it
+    // instead of only changing what is painted.
+    let scroll_ref: NodeRef<leptos::html::Div> = NodeRef::new();
+    let base_files = Arc::new(diff.files.clone());
+    let expansions: RwSignal<std::collections::HashMap<String, ExpandRegions>> =
+        RwSignal::new(std::collections::HashMap::new());
+    let queued_expand: RwSignal<Option<ExpandAction>> = RwSignal::new(None);
+    let expand_key = expand.as_ref().map(|expand| expand.key.clone());
+    let expand_source: Memo<Option<crate::state::DiffExpandSource>> = {
+        let state = state.clone();
+        let key = expand_key.clone();
+        Memo::new(move |_| {
+            let key = key.as_ref()?;
+            state
+                .diff_expand_sources
+                .with(|sources| sources.get(key).cloned())
+        })
+    };
+    let expand_status: Memo<DiffExpandStatus> = Memo::new(move |_| match expand_source.get() {
+        None => DiffExpandStatus::Idle,
+        Some(source) if source.pending => DiffExpandStatus::Pending,
+        Some(source) => match source.error {
+            Some(message) => DiffExpandStatus::Failed(message),
+            None => DiffExpandStatus::Ready,
+        },
+    });
+
+    let files_for_memo = base_files.clone();
+    let expanded_files: Memo<Arc<Vec<ExpandedDiffFile>>> = Memo::new(move |_| {
+        let source = expand_source.get();
+        let regions_by_path = expansions.get();
+        Arc::new(
+            files_for_memo
+                .iter()
+                .map(|base| expand_one_file(base, source.as_ref(), &regions_by_path))
+                .collect(),
+        )
+    });
+    let per_file_expand: Memo<Arc<std::collections::HashMap<String, FileExpandUi>>> =
+        Memo::new(move |_| {
+            Arc::new(
+                expanded_files
+                    .get()
+                    .iter()
+                    .map(|entry| (entry.file.relative_path.clone(), entry.ui.clone()))
+                    .collect(),
+            )
+        });
+
+    if let Some(expand_ctx) = expand.clone() {
+        let act_state = state.clone();
+        let act_base = base_files.clone();
+        let act: Arc<dyn Fn(ExpandAction) + Send + Sync> = Arc::new(move |action: ExpandAction| {
+            // Revealed lines land *above* the control that asked for them, so
+            // without this the rows the user was reading slide down the
+            // screen. Pin the first row in the viewport instead.
+            let anchor = scroll_ref
+                .get_untracked()
+                .map(|element| (*element).clone().unchecked_into::<web_sys::Element>())
+                .and_then(|element| capture_diff_scroll_anchor(&element));
+            if let Some(anchor) = anchor {
+                request_animation_frame(move || {
+                    let Some(element) = scroll_ref.get_untracked() else {
+                        return;
+                    };
+                    let element: web_sys::Element = (*element).clone().unchecked_into();
+                    restore_diff_scroll_anchor(&element, &anchor);
+                });
+            }
+            if let ExpandAction::Collapse { path } = &action {
+                expansions.update(|regions| {
+                    regions.remove(path);
+                });
+                return;
+            }
+            let source = act_state
+                .diff_expand_sources
+                .with_untracked(|sources| sources.get(&expand_ctx.key).cloned());
+            match source {
+                Some(source) if !source.pending && source.error.is_none() => {
+                    apply_expand_action(&act_base, &source, expansions, &action);
+                }
+                // Nothing to reveal from yet: remember what the user asked for
+                // and replay it the moment the full-context read lands, so the
+                // first click does what it says instead of only fetching.
+                _ => {
+                    queued_expand.set(Some(action));
+                    request_expand_source(&act_state, &expand_ctx);
+                }
+            }
+        });
+        provide_context(DiffExpandUi {
+            status: expand_status,
+            per_file: per_file_expand,
+            act,
+        });
+
+        let replay_base = base_files.clone();
+        Effect::new(move |_| {
+            let Some(action) = queued_expand.get() else {
+                return;
+            };
+            let Some(source) = expand_source.get() else {
+                return;
+            };
+            if source.pending {
+                return;
+            }
+            queued_expand.set(None);
+            if source.error.is_none() {
+                apply_expand_action(&replay_base, &source, expansions, &action);
+            }
+        });
+    }
+
+    // Flatten all diff lines into a searchable list so each rendered line
+    // knows its flat search index. Deriving it from `expanded_files` is what
+    // keeps Find pointing at the right lines after context is revealed — the
+    // list it searches grows with the rows on screen. Kept in its own memo so
+    // typing in the find bar re-searches without rebuilding the list.
+    let search_lines: Memo<Arc<Vec<String>>> = Memo::new(move |_| {
+        let files = expanded_files.get();
+        let mut lines: Vec<String> = Vec::new();
+        for entry in files.iter() {
+            for hunk in &entry.file.hunks {
+                lines.extend(hunk.lines.iter().map(|line| line.text.clone()));
             }
         }
-        file_hunk_offsets.push(hunk_offsets);
-    }
-
-    let find_state = FindState::from_owned(searchable_lines);
+        Arc::new(lines)
+    });
+    let find_state = FindState::from_source_fn(move || {
+        crate::line_source::LineSource::Owned(search_lines.get())
+    });
     provide_context(find_state);
 
-    // Compute each file's rendered-row offset (its row index in the global
-    // virtual scrolling space). A "rendered row" is anything taking up a
-    // line of vertical real estate: file header, hunk header (only in
-    // Hunks mode), or one diff line. SBS pair rows count as one rendered
-    // row even though they show two cells.
-    //
-    // KNOWN LIMITATION (from codex review): the row-height model treats
-    // file/hunk headers as if they have the same height as a diff line.
-    // They don't, so spacer math accumulates a small drift across many
-    // files. Overscan hides most of it; a future fix is to count distinct
-    // height classes or pin all rows to a uniform line-height.
-    let mut file_rendered_offsets: Vec<usize> = Vec::with_capacity(diff.files.len());
-    let mut acc: usize = 0;
-    for file in &diff.files {
-        file_rendered_offsets.push(acc);
-        acc += rendered_rows_for_file(file, diff.context_mode);
-    }
     let prep_dt = crate::perf::now_ms() - mount_t0;
     let total_lines: usize = diff
         .files
@@ -1356,8 +1486,6 @@ fn DiffContent(
         line_height,
     };
     provide_context(scroll_ctx);
-
-    let scroll_ref: NodeRef<leptos::html::Div> = NodeRef::new();
 
     let restored_initial_scroll = std::rc::Rc::new(std::cell::Cell::new(false));
     let restored_initial_scroll_for_effect = restored_initial_scroll.clone();
@@ -1723,13 +1851,49 @@ fn DiffContent(
                         )
                     ></div>
                 })}
-                {diff.files.into_iter().enumerate().map(|(fi, file)| {
-                    let hunk_offsets = file_hunk_offsets[fi].clone();
-                    let root = diff.root.clone();
-                    let rendered_offset = file_rendered_offsets[fi];
-                    let decorations = decorations.clone();
-                    view! { <DiffFileView file=file scope_label=scope_label.clone() scope=diff.scope root=root context_mode=diff.context_mode hunk_offsets=hunk_offsets rendered_offset=rendered_offset decorations=decorations review_mode=review_mode /> }
-                }).collect::<Vec<_>>()}
+                {move || {
+                    // Search indices and virtual-scroll row offsets are
+                    // recomputed from the *expanded* files, so revealing
+                    // context can neither shift Find's highlights onto the
+                    // wrong rows nor desynchronize a later file's spacers.
+                    let files = expanded_files.get();
+                    let mut search_offset = 0usize;
+                    let mut rendered_offset = 0usize;
+                    let mut layout: Vec<(Vec<usize>, usize)> = Vec::with_capacity(files.len());
+                    for entry in files.iter() {
+                        let mut offsets = Vec::with_capacity(entry.file.hunks.len());
+                        for hunk in &entry.file.hunks {
+                            offsets.push(search_offset);
+                            search_offset += hunk.lines.len();
+                        }
+                        layout.push((offsets, rendered_offset));
+                        rendered_offset += rendered_rows_for_file(
+                            &entry.file,
+                            context_mode,
+                            entry.ui.shows_trailing_boundary(context_mode),
+                        );
+                    }
+                    files
+                        .iter()
+                        .enumerate()
+                        .map(|(fi, entry)| {
+                            let (hunk_offsets, rendered_offset) = layout[fi].clone();
+                            view! {
+                                <DiffFileView
+                                    file=entry.file.clone()
+                                    scope_label=scope_label.clone()
+                                    scope=diff_scope
+                                    root=diff_root.clone()
+                                    context_mode=context_mode
+                                    hunk_offsets=hunk_offsets
+                                    rendered_offset=rendered_offset
+                                    decorations=decorations.clone()
+                                    review_mode=review_mode
+                                />
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                }}
             </div>
             {move || {
                 // A miss still opens the menu — disabled, carrying its reason —
@@ -1763,7 +1927,11 @@ fn DiffContent(
 /// fall on the wrong file boundary until scrolling stabilizes. Acceptable
 /// for now; fix is to make this mode-aware (run `pair_lines_side_by_side`
 /// per hunk to count) and recompute when view_mode toggles.
-fn rendered_rows_for_file(file: &ProjectGitDiffFile, context_mode: DiffContextMode) -> usize {
+fn rendered_rows_for_file(
+    file: &ProjectGitDiffFile,
+    context_mode: DiffContextMode,
+    has_footer: bool,
+) -> usize {
     // Unmerged, binary, and no-hunk files render the file header plus a
     // single placeholder row instead of hunks. Counting it keeps the per-file
     // virtual-scroll offsets aligned in multi-file diffs.
@@ -1776,6 +1944,9 @@ fn rendered_rows_for_file(file: &ProjectGitDiffFile, context_mode: DiffContextMo
             total += 1;
         }
         total += hunk.lines.len();
+    }
+    if has_footer {
+        total += 1;
     }
     total
 }
@@ -1852,6 +2023,9 @@ fn DiffFileView(
             <div class="diff-file-header">
                 <span class="diff-file-path">{file.relative_path}</span>
                 {(!review_mode).then(|| view! { <span class="diff-scope-badge">{scope_label}</span> })}
+                {(!show_placeholder && context_mode == DiffContextMode::Hunks)
+                    .then(|| file_expand_actions_view(&relative_path))
+                    .flatten()}
                 {header_action_cb.as_ref().map(|cb| {
                     cb(header_action_root.clone(), header_action_path.clone())
                 })}
@@ -1917,15 +2091,22 @@ fn render_unified_hunks(
     relative_path: String,
     decorations: DiffDecorations,
 ) -> AnyView {
+    let hunk_count = file.hunks.len();
+    let footer = (context_mode == DiffContextMode::Hunks)
+        .then(|| gap_footer_view(&relative_path, hunk_count))
+        .flatten();
+    let previous_hunks = file.hunks.clone();
     view! {
         <div class="diff-hunks">
             {file.hunks.into_iter().enumerate().map(|(hi, hunk)| {
                 let offset = hunk_offsets[hi];
                 let decorations = decorations.clone();
+                let previous_hunk = hi.checked_sub(1).and_then(|prev| previous_hunks.get(prev).cloned());
                 view! {
-                    <UnifiedHunk hunk=hunk context_mode=context_mode line_offset=offset scope=scope root=root.clone() relative_path=relative_path.clone() decorations=decorations />
+                    <UnifiedHunk hunk=hunk previous_hunk=previous_hunk hi=hi context_mode=context_mode line_offset=offset scope=scope root=root.clone() relative_path=relative_path.clone() decorations=decorations />
                 }
             }).collect::<Vec<_>>()}
+            {footer}
         </div>
     }
     .into_any()
@@ -1940,6 +2121,8 @@ fn render_unified_hunks(
 enum UnifiedFileItem {
     HunkHeader { hi: usize },
     Line { hi: usize, li: usize },
+    // The omitted-context boundary between the last hunk and end of file.
+    GapFooter,
 }
 
 /// Build the per-file `Vec<UnifiedFileItem>` once. Item index i corresponds
@@ -1948,6 +2131,7 @@ enum UnifiedFileItem {
 fn build_unified_file_items(
     file: &ProjectGitDiffFile,
     context_mode: DiffContextMode,
+    has_footer: bool,
 ) -> Vec<UnifiedFileItem> {
     let mut items = Vec::new();
     for (hi, hunk) in file.hunks.iter().enumerate() {
@@ -1957,6 +2141,9 @@ fn build_unified_file_items(
         for li in 0..hunk.lines.len() {
             items.push(UnifiedFileItem::Line { hi, li });
         }
+    }
+    if has_footer {
+        items.push(UnifiedFileItem::GapFooter);
     }
     items
 }
@@ -1990,7 +2177,11 @@ fn render_unified_virtualized(args: UnifiedVirtualizedArgs) -> AnyView {
     } = args;
     let _ruv_t0 = crate::perf::now_ms();
     let _ruv_key = format!("diff:{}:{relative_path}", root.0);
-    let items = Arc::new(build_unified_file_items(&file, context_mode));
+    let items = Arc::new(build_unified_file_items(
+        &file,
+        context_mode,
+        context_mode == DiffContextMode::Hunks && has_trailing_gap(&relative_path),
+    ));
     let total_items = items.len();
     crate::perf::log_phase(
         "diff_open",
@@ -2247,34 +2438,16 @@ fn render_unified_item(
     decorations: &DiffDecorations,
 ) -> AnyView {
     match *item {
-        UnifiedFileItem::HunkHeader { hi } => {
-            let hunk = &file.hunks[hi];
-            let header = hunk_header_label(hunk);
-            let show_stage =
-                scope == ProjectDiffScope::Unstaged && context_mode == DiffContextMode::Hunks;
-            let stage_btn = if show_stage {
-                let r = root.clone();
-                let p = relative_path.to_owned();
-                let h = hunk.hunk_id.clone();
-                Some(view! {
-                    <button
-                        class="diff-hunk-stage-btn"
-                        title="Stage hunk"
-                        on:click=move |_| stage_hunk(r.clone(), p.clone(), h.clone())
-                    >
-                        "+"
-                    </button>
-                })
-            } else {
-                None
-            };
-            view! {
-                <div class="diff-hunk-header">
-                    {header}
-                    {stage_btn}
-                </div>
-            }
-            .into_any()
+        UnifiedFileItem::HunkHeader { hi } => hunk_header_view(
+            hi.checked_sub(1).and_then(|prev| file.hunks.get(prev)),
+            &file.hunks[hi],
+            hi,
+            root,
+            relative_path,
+            scope == ProjectDiffScope::Unstaged && context_mode == DiffContextMode::Hunks,
+        ),
+        UnifiedFileItem::GapFooter => {
+            gap_footer_view(relative_path, file.hunks.len()).unwrap_or_else(|| ().into_any())
         }
         UnifiedFileItem::Line { hi, li } => {
             let hunk = &file.hunks[hi];
@@ -2631,11 +2804,11 @@ fn render_sbs_pane_content(
     let show_stage_btn = scope == ProjectDiffScope::Unstaged && side == SbsSide::Right;
     let show_header = context_mode == DiffContextMode::Hunks;
 
-    let mut hunk_views: Vec<AnyView> = Vec::with_capacity(file.hunks.len());
-    for (hi, hunk) in file.hunks.into_iter().enumerate() {
+    let hunk_count = file.hunks.len();
+    let mut hunk_views: Vec<AnyView> = Vec::with_capacity(hunk_count);
+    for hi in 0..hunk_count {
+        let hunk = &file.hunks[hi];
         let line_offset = hunk_offsets[hi];
-        let header = hunk_header_label(&hunk);
-        let hunk_id = hunk.hunk_id.clone();
         let lines = hunk.lines.clone();
         let indices = sbs_search_indices(&lines, line_offset);
         let (old_sigs, new_sigs) = hunk_tokens[hi].clone();
@@ -2658,32 +2831,16 @@ fn render_sbs_pane_content(
             })
             .collect();
 
-        let header_view = if show_header {
-            let stage_btn = if show_stage_btn {
-                let r = root.clone();
-                let p = relative_path.clone();
-                let h = hunk_id.clone();
-                Some(view! {
-                    <button
-                        class="diff-hunk-stage-btn"
-                        title="Stage hunk"
-                        on:click=move |_| stage_hunk(r.clone(), p.clone(), h.clone())
-                    >
-                        "+"
-                    </button>
-                })
-            } else {
-                None
-            };
-            Some(view! {
-                <div class="diff-hunk-header">
-                    {header}
-                    {stage_btn}
-                </div>
-            })
-        } else {
-            None
-        };
+        let header_view = show_header.then(|| {
+            hunk_header_view(
+                hi.checked_sub(1).and_then(|prev| file.hunks.get(prev)),
+                &file.hunks[hi],
+                hi,
+                &root,
+                &relative_path,
+                show_stage_btn,
+            )
+        });
 
         hunk_views.push(
             view! {
@@ -2694,6 +2851,10 @@ fn render_sbs_pane_content(
             }
             .into_any(),
         );
+    }
+
+    if show_header && let Some(footer) = gap_footer_view(&relative_path, hunk_count) {
+        hunk_views.push(footer);
     }
 
     hunk_views.into_any()
@@ -2711,12 +2872,15 @@ type HunkPairs = (Vec<SideBySideRow>, Vec<(Option<usize>, Option<usize>)>);
 enum SbsItem {
     HunkHeader { hi: usize },
     PairedRow { hi: usize, ri: usize },
+    // The omitted-context boundary between the last hunk and end of file.
+    GapFooter,
 }
 
 fn build_sbs_file_items(
     _file: &ProjectGitDiffFile,
     hunk_pairs: &[HunkPairs],
     context_mode: DiffContextMode,
+    has_footer: bool,
 ) -> Vec<SbsItem> {
     let mut items = Vec::new();
     for (hi, (rows, _)) in hunk_pairs.iter().enumerate() {
@@ -2726,6 +2890,9 @@ fn build_sbs_file_items(
         for ri in 0..rows.len() {
             items.push(SbsItem::PairedRow { hi, ri });
         }
+    }
+    if has_footer {
+        items.push(SbsItem::GapFooter);
     }
     items
 }
@@ -2838,7 +3005,12 @@ fn render_sbs_virtualized(
         );
     }
 
-    let items = Arc::new(build_sbs_file_items(&file, &hunk_pairs, context_mode));
+    let items = Arc::new(build_sbs_file_items(
+        &file,
+        &hunk_pairs,
+        context_mode,
+        context_mode == DiffContextMode::Hunks && has_trailing_gap(&relative_path),
+    ));
     let total_items = items.len();
 
     if total_items < VIRTUALIZE_THRESHOLD {
@@ -3064,37 +3236,21 @@ fn render_sbs_item(
     decorations: &DiffDecorations,
 ) -> AnyView {
     match *item {
-        SbsItem::HunkHeader { hi } => {
-            // Header is identical-ish on both sides; show the stage
-            // button only on the right pane (matching the eager path).
-            let hunk = &file.hunks[hi];
-            let header = hunk_header_label(hunk);
-            let show_stage_btn = scope == ProjectDiffScope::Unstaged
+        // Header is identical-ish on both sides; show the stage button only
+        // on the right pane (matching the eager path). The expand controls
+        // render in both panes so the two stay row-aligned.
+        SbsItem::HunkHeader { hi } => hunk_header_view(
+            hi.checked_sub(1).and_then(|prev| file.hunks.get(prev)),
+            &file.hunks[hi],
+            hi,
+            root,
+            relative_path,
+            scope == ProjectDiffScope::Unstaged
                 && side == SbsSide::Right
-                && context_mode == DiffContextMode::Hunks;
-            let stage_btn = if show_stage_btn {
-                let r = root.clone();
-                let p = relative_path.to_owned();
-                let h = hunk.hunk_id.clone();
-                Some(view! {
-                    <button
-                        class="diff-hunk-stage-btn"
-                        title="Stage hunk"
-                        on:click=move |_| stage_hunk(r.clone(), p.clone(), h.clone())
-                    >
-                        "+"
-                    </button>
-                })
-            } else {
-                None
-            };
-            view! {
-                <div class="diff-hunk-header">
-                    {header}
-                    {stage_btn}
-                </div>
-            }
-            .into_any()
+                && context_mode == DiffContextMode::Hunks,
+        ),
+        SbsItem::GapFooter => {
+            gap_footer_view(relative_path, file.hunks.len()).unwrap_or_else(|| ().into_any())
         }
         SbsItem::PairedRow { hi, ri } => {
             let (rows, indices) = &hunk_pairs[hi];
@@ -3194,6 +3350,537 @@ fn start_divider_drag(pair_ref: NodeRef<leptos::html::Div>, split: RwSignal<f64>
     });
 }
 
+// ── Revealing the context git omitted around a hunk ──────────────────────
+//
+// Hunk mode asks git for `-U3`, so everything outside three lines of a change
+// is simply absent from the payload — there is nothing client-side to reveal.
+// The omitted lines are sourced by a second, full-context read of the *same*
+// diff (`-U9999999`): same git invocation, same revisions, same edit script,
+// only more surrounding context. That makes revealed lines exact rather than
+// reconstructed, and carries deletions, renames, and
+// "\ No newline at end of file" markers through unchanged.
+//
+// Every rendered hunk is a half-open `[start, end)` slice of that full-context
+// line list. Revealing grows a slice; two slices that grow into each other are
+// unioned by `normalize_expand_regions`, which is what makes the obsolete
+// separator disappear and guarantees no line is ever rendered twice.
+
+/// Lines revealed by one click on a directional expander. Big enough to be
+/// worth a click, small enough not to bury the change that is being read.
+const EXPAND_STEP_LINES: usize = 20;
+
+/// Half-open slices of a file's full-context line list, sorted and disjoint.
+type ExpandRegions = Vec<(usize, usize)>;
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ExpandDir {
+    /// Reveal lines directly above the hunk below the gap.
+    Up,
+    /// Reveal lines directly below the hunk above the gap.
+    Down,
+    /// Reveal the whole gap, up to the neighbouring hunk or file boundary.
+    All,
+}
+
+#[derive(Clone, PartialEq, Eq, Debug)]
+enum ExpandAction {
+    /// `gap` is the index of the rendered hunk *below* the boundary, so the
+    /// gap after the last hunk is `hunks.len()`.
+    Gap {
+        path: String,
+        gap: usize,
+        dir: ExpandDir,
+    },
+    All {
+        path: String,
+    },
+    Collapse {
+        path: String,
+    },
+}
+
+impl ExpandAction {
+    fn path(&self) -> &str {
+        match self {
+            Self::Gap { path, .. } | Self::All { path } | Self::Collapse { path } => path,
+        }
+    }
+}
+
+/// Whether the full-context read that backs expansion is available.
+#[derive(Clone, PartialEq, Eq, Debug)]
+enum DiffExpandStatus {
+    /// Not requested yet — the first expander click fetches it.
+    Idle,
+    Pending,
+    Ready,
+    Failed(String),
+}
+
+/// What the renderers need to know about one file's expansion state.
+#[derive(Clone, PartialEq, Eq, Debug)]
+struct FileExpandUi {
+    /// False when omitted context cannot be sourced for this file — it is
+    /// binary, it has no textual hunks, or the full-context read disagrees
+    /// with the hunks on screen. No expander is offered in that case rather
+    /// than one that would do nothing.
+    expandable: bool,
+    /// Whether this file currently shows more than the hunks git gave it.
+    expanded: bool,
+    /// Lines omitted after the last rendered hunk, or `None` while the
+    /// full-context read has not landed and the file's length is unknown.
+    trailing_gap: Option<usize>,
+}
+
+/// Expansion controls and state, published to the whole diff subtree by
+/// `DiffContent`. Absent from context entirely when this diff cannot expand
+/// (a frozen review snapshot, which has no project identity to refetch with).
+#[derive(Clone)]
+struct DiffExpandUi {
+    status: Memo<DiffExpandStatus>,
+    per_file: Memo<Arc<std::collections::HashMap<String, FileExpandUi>>>,
+    act: Arc<dyn Fn(ExpandAction) + Send + Sync>,
+}
+
+/// A full-context file's lines, in order. `-U9999999` yields one hunk per
+/// file, but concatenating is correct for any hunk count.
+fn full_context_lines(file: &ProjectGitDiffFile) -> Vec<ProjectGitDiffLine> {
+    file.hunks
+        .iter()
+        .flat_map(|hunk| hunk.lines.iter().cloned())
+        .collect()
+}
+
+/// Locate each of `base`'s hunks inside the full-context line list, returning
+/// one half-open range per hunk.
+///
+/// Returns `None` when the two reads disagree — the file changed between them,
+/// or git produced something we cannot line up. Declining is the only honest
+/// answer: revealing lines from a different version of the file would put text
+/// on screen that was never at those line numbers.
+fn locate_base_regions(
+    base: &ProjectGitDiffFile,
+    full: &[ProjectGitDiffLine],
+) -> Option<ExpandRegions> {
+    let mut by_new: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
+    let mut by_old: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
+    for (index, line) in full.iter().enumerate() {
+        if let Some(number) = line.new_line_number {
+            by_new.entry(number).or_insert(index);
+        }
+        if let Some(number) = line.old_line_number {
+            by_old.entry(number).or_insert(index);
+        }
+    }
+
+    let mut regions: ExpandRegions = Vec::with_capacity(base.hunks.len());
+    let mut previous_end = 0usize;
+    for hunk in &base.hunks {
+        let first = hunk.lines.first()?;
+        let start = match (first.new_line_number, first.old_line_number) {
+            (Some(number), _) => *by_new.get(&number)?,
+            (None, Some(number)) => *by_old.get(&number)?,
+            (None, None) => return None,
+        };
+        let end = start.checked_add(hunk.lines.len())?;
+        if end > full.len() || start < previous_end || full[start..end] != hunk.lines[..] {
+            return None;
+        }
+        regions.push((start, end));
+        previous_end = end;
+    }
+    Some(regions)
+}
+
+/// Sort, union, and merge touching regions. Regions that merely touch are
+/// merged too: nothing is omitted between them, so rendering a separator
+/// there would claim context is hidden when none is.
+fn normalize_expand_regions(mut regions: ExpandRegions) -> ExpandRegions {
+    regions.retain(|(start, end)| start < end);
+    regions.sort_unstable();
+    let mut merged: ExpandRegions = Vec::with_capacity(regions.len());
+    for (start, end) in regions {
+        match merged.last_mut() {
+            Some(last) if start <= last.1 => last.1 = last.1.max(end),
+            _ => merged.push((start, end)),
+        }
+    }
+    merged
+}
+
+/// Grow the region(s) touching the boundary above rendered hunk `gap`.
+fn apply_expand(regions: &mut ExpandRegions, gap: usize, dir: ExpandDir, total: usize) {
+    match dir {
+        ExpandDir::Up => {
+            if let Some(region) = regions.get_mut(gap) {
+                region.0 = region.0.saturating_sub(EXPAND_STEP_LINES);
+            }
+        }
+        ExpandDir::Down => {
+            if let Some(index) = gap.checked_sub(1)
+                && let Some(region) = regions.get_mut(index)
+            {
+                region.1 = region.1.saturating_add(EXPAND_STEP_LINES).min(total);
+            }
+        }
+        ExpandDir::All => {
+            let below_start = regions.get(gap).map(|region| region.0);
+            match (gap.checked_sub(1), below_start) {
+                // Between two hunks, or after the last one: grow the hunk
+                // above until it meets its neighbour / the end of the file.
+                (Some(index), below) => {
+                    if let Some(region) = regions.get_mut(index) {
+                        region.1 = below.unwrap_or(total);
+                    }
+                }
+                // Above the first hunk: grow it up to the start of the file.
+                (None, Some(_)) => {
+                    if let Some(region) = regions.get_mut(0) {
+                        region.0 = 0;
+                    }
+                }
+                (None, None) => {}
+            }
+        }
+    }
+    *regions = normalize_expand_regions(std::mem::take(regions));
+}
+
+/// Build the hunks to render for `regions`, plus the number of lines still
+/// omitted after the last one.
+///
+/// A region that still covers exactly one original hunk keeps that hunk's
+/// `hunk_id`, so "stage hunk" keeps addressing the same server-side hunk. A
+/// region that has merged several of them gets an empty id and no stage
+/// button: it is no longer a hunk git would stage.
+fn build_expanded_hunks(
+    base: &ProjectGitDiffFile,
+    full: &[ProjectGitDiffLine],
+    base_regions: &ExpandRegions,
+    regions: &ExpandRegions,
+) -> (Vec<ProjectGitDiffHunk>, usize) {
+    let mut hunks = Vec::with_capacity(regions.len());
+    let mut previous_end = 0usize;
+    for &(start, end) in regions {
+        let covered: Vec<usize> = base_regions
+            .iter()
+            .enumerate()
+            .filter(|&(_, &(base_start, base_end))| base_start >= start && base_end <= end)
+            .map(|(index, _)| index)
+            .collect();
+        // Untouched region: reuse the payload's own hunk verbatim so an
+        // un-expanded file renders exactly what it renders today.
+        if let [index] = covered[..]
+            && base_regions[index] == (start, end)
+        {
+            hunks.push(base.hunks[index].clone());
+            previous_end = end;
+            continue;
+        }
+        let lines = full[start..end].to_vec();
+        let old_numbers: Vec<u32> = lines
+            .iter()
+            .filter_map(|line| line.old_line_number)
+            .collect();
+        let new_numbers: Vec<u32> = lines
+            .iter()
+            .filter_map(|line| line.new_line_number)
+            .collect();
+        hunks.push(ProjectGitDiffHunk {
+            hunk_id: match covered[..] {
+                [index] => base.hunks[index].hunk_id.clone(),
+                _ => String::new(),
+            },
+            old_start: old_numbers.first().copied().unwrap_or(0),
+            old_count: old_numbers.len() as u32,
+            new_start: new_numbers.first().copied().unwrap_or(0),
+            new_count: new_numbers.len() as u32,
+            lines,
+        });
+        previous_end = end;
+    }
+    (hunks, full.len().saturating_sub(previous_end))
+}
+
+/// A rendered row used to hold the viewport still while rows are inserted
+/// around it: enough to find the same row again after the re-render, plus
+/// where it sat relative to the top of the scrollport.
+struct DiffScrollAnchor {
+    selector: String,
+    offset: f64,
+}
+
+fn escape_css_string(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+/// The first row at or below the top of the scrollport, if any. Revealing
+/// context inserts rows above it, which is exactly the case where holding the
+/// viewport still matters — the user asked to see more of the same code, not
+/// to be moved somewhere else in the file.
+fn capture_diff_scroll_anchor(scrollport: &web_sys::Element) -> Option<DiffScrollAnchor> {
+    let viewport_top = scrollport.get_bounding_client_rect().top();
+    let rows = scrollport.query_selector_all(".diff-line").ok()?;
+    for index in 0..rows.length() {
+        let row: web_sys::Element = rows.item(index)?.dyn_into().ok()?;
+        let rect = row.get_bounding_client_rect();
+        if rect.bottom() <= viewport_top {
+            continue;
+        }
+        let path = row
+            .closest(".diff-file")
+            .ok()
+            .flatten()
+            .and_then(|file| file.get_attribute("data-diff-path"))?;
+        let side = row.get_attribute("data-anchor-side")?;
+        let line = row
+            .get_attribute("data-anchor-line")
+            .filter(|line| !line.is_empty())?;
+        return Some(DiffScrollAnchor {
+            selector: format!(
+                ".diff-file[data-diff-path=\"{}\"] \
+                 .diff-line[data-anchor-side=\"{}\"][data-anchor-line=\"{}\"]",
+                escape_css_string(&path),
+                escape_css_string(&side),
+                escape_css_string(&line),
+            ),
+            offset: rect.top() - viewport_top,
+        });
+    }
+    None
+}
+
+fn restore_diff_scroll_anchor(scrollport: &web_sys::Element, anchor: &DiffScrollAnchor) {
+    let Ok(Some(row)) = scrollport.query_selector(&anchor.selector) else {
+        return;
+    };
+    let viewport_top = scrollport.get_bounding_client_rect().top();
+    let drift = (row.get_bounding_client_rect().top() - viewport_top) - anchor.offset;
+    if drift.abs() < 0.5 {
+        return;
+    }
+    scrollport.set_scroll_top(scrollport.scroll_top() + drift.round() as i32);
+}
+
+/// Identity needed to issue the full-context read that backs expansion for one
+/// diff. Absent for a frozen review snapshot: it carries no project to refetch
+/// from, so those diffs offer no expansion rather than a control that cannot
+/// work.
+#[derive(Clone)]
+struct DiffExpandContext {
+    host_id: String,
+    project_id: ProjectId,
+    key: crate::state::DiffKey,
+    root: ProjectRootPath,
+    scope: ProjectDiffScope,
+    revision: ProjectDiffRevision,
+    path: Option<String>,
+}
+
+/// One file as it is currently rendered, plus what its expand controls need.
+#[derive(Clone, PartialEq)]
+struct ExpandedDiffFile {
+    file: ProjectGitDiffFile,
+    ui: FileExpandUi,
+}
+
+impl FileExpandUi {
+    /// Whether a boundary row belongs below this file's last hunk.
+    fn shows_trailing_boundary(&self, context_mode: DiffContextMode) -> bool {
+        context_mode == DiffContextMode::Hunks
+            && self.expandable
+            && self.trailing_gap.is_some_and(|gap| gap > 0)
+    }
+}
+
+/// Derive the hunks to render for one file from its hunk-mode payload, the
+/// full-context read (when it has landed), and the regions the user revealed.
+fn expand_one_file(
+    base: &ProjectGitDiffFile,
+    source: Option<&crate::state::DiffExpandSource>,
+    regions_by_path: &std::collections::HashMap<String, ExpandRegions>,
+) -> ExpandedDiffFile {
+    // Binary blobs, unmerged files, and files with no textual hunks have no
+    // omitted context to reveal, and nothing to anchor a region to.
+    let renderable = !base.is_binary && !base.unmerged && !base.hunks.is_empty();
+    let located = source
+        .filter(|source| !source.pending && source.error.is_none())
+        .and_then(|source| {
+            let full = source
+                .files
+                .iter()
+                .find(|file| file.relative_path == base.relative_path)
+                .map(full_context_lines)?;
+            let base_regions = locate_base_regions(base, &full)?;
+            Some((full, base_regions))
+        });
+
+    let Some((full, base_regions)) = located else {
+        // A read that landed but does not line up with the hunks on screen
+        // means the file changed underneath the diff. Withdraw the controls
+        // rather than reveal lines from a different version of the file.
+        let source_settled = source.is_some_and(|source| !source.pending && source.error.is_none());
+        return ExpandedDiffFile {
+            file: base.clone(),
+            ui: FileExpandUi {
+                expandable: renderable && !source_settled,
+                expanded: false,
+                trailing_gap: None,
+            },
+        };
+    };
+
+    let regions = regions_by_path
+        .get(&base.relative_path)
+        .cloned()
+        .unwrap_or_else(|| base_regions.clone());
+    let (hunks, trailing_gap) = build_expanded_hunks(base, &full, &base_regions, &regions);
+    ExpandedDiffFile {
+        file: ProjectGitDiffFile {
+            hunks,
+            ..base.clone()
+        },
+        ui: FileExpandUi {
+            expandable: renderable,
+            expanded: regions != base_regions,
+            trailing_gap: Some(trailing_gap),
+        },
+    }
+}
+
+/// Fold one user action into `expansions`. Returns false when the
+/// full-context read cannot back it, in which case nothing is changed.
+fn apply_expand_action(
+    base_files: &[ProjectGitDiffFile],
+    source: &crate::state::DiffExpandSource,
+    expansions: RwSignal<std::collections::HashMap<String, ExpandRegions>>,
+    action: &ExpandAction,
+) -> bool {
+    let path = action.path();
+    let Some(base) = base_files
+        .iter()
+        .find(|file| file.relative_path == path)
+        .filter(|file| !file.hunks.is_empty())
+    else {
+        return false;
+    };
+    let Some(full) = source
+        .files
+        .iter()
+        .find(|file| file.relative_path == path)
+        .map(full_context_lines)
+    else {
+        return false;
+    };
+    let Some(base_regions) = locate_base_regions(base, &full) else {
+        return false;
+    };
+    let total = full.len();
+    match action {
+        ExpandAction::Collapse { .. } => expansions.update(|regions| {
+            regions.remove(path);
+        }),
+        ExpandAction::All { .. } => expansions.update(|regions| {
+            regions.insert(path.to_owned(), normalize_expand_regions(vec![(0, total)]));
+        }),
+        ExpandAction::Gap { gap, dir, .. } => expansions.update(|regions| {
+            let file_regions = regions
+                .entry(path.to_owned())
+                .or_insert_with(|| base_regions.clone());
+            apply_expand(file_regions, *gap, *dir, total);
+        }),
+    }
+    true
+}
+
+/// Dispatch the full-context read for a diff, unless one is already in flight
+/// or has already landed. Addressed to the diff's *own* project stream, with
+/// the same root/scope/revision/path as the hunks on screen — that identity is
+/// what makes the revealed lines the right ones.
+fn request_expand_source(state: &AppState, expand: &DiffExpandContext) {
+    let settled = state.diff_expand_sources.with_untracked(|sources| {
+        sources
+            .get(&expand.key)
+            .is_some_and(|source| source.pending || source.error.is_none())
+    });
+    if settled {
+        return;
+    }
+    let request_id = crate::state::next_client_request_id("project-diff-expand");
+    state.diff_expand_request_ids.update(|requests| {
+        requests.insert(expand.key.clone(), request_id.clone());
+    });
+    state.diff_expand_sources.update(|sources| {
+        sources.insert(
+            expand.key.clone(),
+            crate::state::DiffExpandSource {
+                pending: true,
+                error: None,
+                files: Vec::new(),
+            },
+        );
+    });
+
+    let payload = ProjectReadDiffPayload {
+        request_id: Some(request_id.clone()),
+        root: expand.root.clone(),
+        scope: expand.scope,
+        revision: expand.revision.clone(),
+        path: expand.path.clone(),
+        context_mode: DiffContextMode::FullFile,
+    };
+    let stream = StreamPath(format!("/project/{}", expand.project_id.0));
+    let host_id = expand.host_id.clone();
+    let key = expand.key.clone();
+    let state = state.clone();
+    spawn_local(async move {
+        let Err(error) = send_frame(&host_id, stream, FrameKind::ProjectReadDiff, &payload).await
+        else {
+            return;
+        };
+        log::error!("failed to send full-context ProjectReadDiff: {error}");
+        let is_current = state
+            .diff_expand_request_ids
+            .with_untracked(|requests| requests.get(&key) == Some(&request_id));
+        if !is_current {
+            return;
+        }
+        state.diff_expand_request_ids.update(|requests| {
+            requests.remove(&key);
+        });
+        state.diff_expand_sources.update(|sources| {
+            sources.insert(
+                key.clone(),
+                crate::state::DiffExpandSource {
+                    pending: false,
+                    error: Some(error.clone()),
+                    files: Vec::new(),
+                },
+            );
+        });
+    });
+}
+
+/// Lines omitted immediately above `hunk`. Context is identical on both sides
+/// of a diff, so the two sides always agree; taking the larger keeps the
+/// answer right for a pure add or delete, where one side has no line numbers
+/// at all.
+fn gap_above_hunk(previous: Option<&ProjectGitDiffHunk>, hunk: &ProjectGitDiffHunk) -> usize {
+    let side_gap = |start: u32, previous_end: Option<u32>| match previous_end {
+        Some(end) => (start as usize).saturating_sub(end as usize),
+        None => (start as usize).saturating_sub(1),
+    };
+    let old_gap = side_gap(
+        hunk.old_start,
+        previous.map(|hunk| hunk.old_start + hunk.old_count),
+    );
+    let new_gap = side_gap(
+        hunk.new_start,
+        previous.map(|hunk| hunk.new_start + hunk.new_count),
+    );
+    old_gap.max(new_gap)
+}
+
 fn fmt_line_range(start: u32, count: u32) -> String {
     if count == 0 {
         "—".to_string()
@@ -3208,6 +3895,247 @@ fn hunk_header_label(hunk: &ProjectGitDiffHunk) -> String {
     let old = fmt_line_range(hunk.old_start, hunk.old_count);
     let new = fmt_line_range(hunk.new_start, hunk.new_count);
     format!("Lines {old} → {new}")
+}
+
+/// One file's expansion state, or `None` when this diff cannot reveal omitted
+/// context at all.
+fn file_expand_ui(ui: &DiffExpandUi, relative_path: &str) -> Option<FileExpandUi> {
+    ui.per_file.with(|files| files.get(relative_path).cloned())
+}
+
+/// The controls rendered at one omitted-context boundary. `gap` is the index
+/// of the rendered hunk *below* the boundary, so the boundary after the last
+/// hunk is `hunks.len()` and `has_hunk_below` is false there.
+///
+/// Both directional controls fill the same gap — "up" reveals the lines just
+/// above the hunk below the boundary, "down" the lines just below the hunk
+/// above it — so a boundary between two hunks offers both, while the file's
+/// first and last boundaries offer only the direction that exists.
+fn gap_expander_view(
+    relative_path: &str,
+    gap: usize,
+    omitted: usize,
+    has_hunk_below: bool,
+) -> Option<AnyView> {
+    let ui = use_context::<DiffExpandUi>()?;
+    if omitted == 0 {
+        return None;
+    }
+    let path = relative_path.to_owned();
+    let has_hunk_above = gap > 0;
+    Some(
+        view! {
+            <span class="diff-expand-controls">
+                {move || {
+                    if !file_expand_ui(&ui, &path).is_some_and(|file| file.expandable) {
+                        return None;
+                    }
+                    let step = EXPAND_STEP_LINES.min(omitted);
+                    let act_up = ui.act.clone();
+                    let act_down = ui.act.clone();
+                    let act_all = ui.act.clone();
+                    let path_up = path.clone();
+                    let path_down = path.clone();
+                    let path_all = path.clone();
+                    let status = ui.status.get();
+                    Some(view! {
+                        <>
+                            {has_hunk_below.then(|| view! {
+                                <button
+                                    class="diff-expand-btn"
+                                    title=format!("Reveal {step} more lines above this hunk")
+                                    data-test="diff-expand-up"
+                                    on:click=move |ev: web_sys::MouseEvent| {
+                                        ev.stop_propagation();
+                                        act_up(ExpandAction::Gap {
+                                            path: path_up.clone(),
+                                            gap,
+                                            dir: ExpandDir::Up,
+                                        });
+                                    }
+                                >
+                                    "\u{2191}"
+                                </button>
+                            })}
+                            {has_hunk_above.then(|| view! {
+                                <button
+                                    class="diff-expand-btn"
+                                    title=format!("Reveal {step} more lines below the previous hunk")
+                                    data-test="diff-expand-down"
+                                    on:click=move |ev: web_sys::MouseEvent| {
+                                        ev.stop_propagation();
+                                        act_down(ExpandAction::Gap {
+                                            path: path_down.clone(),
+                                            gap,
+                                            dir: ExpandDir::Down,
+                                        });
+                                    }
+                                >
+                                    "\u{2193}"
+                                </button>
+                            })}
+                            <button
+                                class="diff-expand-btn diff-expand-btn-all"
+                                title="Reveal every line hidden at this boundary"
+                                data-test="diff-expand-gap-all"
+                                on:click=move |ev: web_sys::MouseEvent| {
+                                    ev.stop_propagation();
+                                    act_all(ExpandAction::Gap {
+                                        path: path_all.clone(),
+                                        gap,
+                                        dir: ExpandDir::All,
+                                    });
+                                }
+                            >
+                                {format!("Expand {omitted} lines")}
+                            </button>
+                            {match status {
+                                DiffExpandStatus::Pending => Some(view! {
+                                    <span class="diff-expand-note">"Loading context…"</span>
+                                }.into_any()),
+                                DiffExpandStatus::Failed(message) => Some(view! {
+                                    <span
+                                        class="diff-expand-note diff-expand-error"
+                                        data-test="diff-expand-error"
+                                    >
+                                        {format!("Context unavailable: {message}")}
+                                    </span>
+                                }.into_any()),
+                                _ => None,
+                            }}
+                        </>
+                    })
+                }}
+            </span>
+        }
+        .into_any(),
+    )
+}
+
+/// One `.diff-hunk-header` row: the line-range label, the expand controls for
+/// the boundary above this hunk, and the stage button.
+fn hunk_header_view(
+    previous: Option<&ProjectGitDiffHunk>,
+    hunk: &ProjectGitDiffHunk,
+    hi: usize,
+    root: &ProjectRootPath,
+    relative_path: &str,
+    show_stage: bool,
+) -> AnyView {
+    let header = hunk_header_label(hunk);
+    let omitted = gap_above_hunk(previous, hunk);
+    let expander = gap_expander_view(relative_path, hi, omitted, true);
+    // A region that merged several hunks is no longer a hunk the server can
+    // stage on its own, so it carries no hunk id and offers no stage button.
+    let stage_btn = (show_stage && !hunk.hunk_id.is_empty()).then(|| {
+        let root = root.clone();
+        let path = relative_path.to_owned();
+        let hunk_id = hunk.hunk_id.clone();
+        view! {
+            <button
+                class="diff-hunk-stage-btn"
+                title="Stage hunk"
+                on:click=move |_| stage_hunk(root.clone(), path.clone(), hunk_id.clone())
+            >
+                "+"
+            </button>
+        }
+    });
+    view! {
+        <div class="diff-hunk-header" data-test="diff-hunk-header">
+            <span class="diff-hunk-range">{header}</span>
+            {expander}
+            {stage_btn}
+        </div>
+    }
+    .into_any()
+}
+
+/// Whether a trailing boundary row belongs below this file's last hunk.
+fn has_trailing_gap(relative_path: &str) -> bool {
+    use_context::<DiffExpandUi>()
+        .and_then(|ui| {
+            ui.per_file
+                .with_untracked(|files| files.get(relative_path).cloned())
+        })
+        .is_some_and(|file| file.expandable && file.trailing_gap.is_some_and(|gap| gap > 0))
+}
+
+/// The boundary row below the last hunk, offering the context between it and
+/// the end of the file. Only rendered once the full-context read has landed —
+/// until then the file's length is unknown, and an expander that might reveal
+/// nothing is worse than none. The file-level "Expand all context" action
+/// reaches that region in the meantime.
+fn gap_footer_view(relative_path: &str, hunk_count: usize) -> Option<AnyView> {
+    let ui = use_context::<DiffExpandUi>()?;
+    let file = file_expand_ui(&ui, relative_path)?;
+    if !file.expandable {
+        return None;
+    }
+    let omitted = file.trailing_gap.filter(|gap| *gap > 0)?;
+    let expander = gap_expander_view(relative_path, hunk_count, omitted, false)?;
+    Some(
+        view! {
+            <div class="diff-hunk-header diff-hunk-footer" data-test="diff-expand-footer">
+                {expander}
+            </div>
+        }
+        .into_any(),
+    )
+}
+
+/// The file-level "Expand all context" / "Collapse context" pair rendered in
+/// the file header.
+fn file_expand_actions_view(relative_path: &str) -> Option<AnyView> {
+    let ui = use_context::<DiffExpandUi>()?;
+    let path = relative_path.to_owned();
+    Some(
+        view! {
+            <span class="diff-file-expand-actions">
+                {move || {
+                    let file = file_expand_ui(&ui, &path)?;
+                    if !file.expandable {
+                        return None;
+                    }
+                    let act_all = ui.act.clone();
+                    let act_collapse = ui.act.clone();
+                    let path_all = path.clone();
+                    let path_collapse = path.clone();
+                    Some(view! {
+                        <>
+                            <button
+                                class="diff-expand-btn"
+                                title="Reveal the whole file as context around these changes"
+                                data-test="diff-expand-all"
+                                on:click=move |ev: web_sys::MouseEvent| {
+                                    ev.stop_propagation();
+                                    act_all(ExpandAction::All { path: path_all.clone() });
+                                }
+                            >
+                                "Expand all context"
+                            </button>
+                            {file.expanded.then(|| view! {
+                                <button
+                                    class="diff-expand-btn"
+                                    title="Return to the hunks git produced"
+                                    data-test="diff-collapse-context"
+                                    on:click=move |ev: web_sys::MouseEvent| {
+                                        ev.stop_propagation();
+                                        act_collapse(ExpandAction::Collapse {
+                                            path: path_collapse.clone(),
+                                        });
+                                    }
+                                >
+                                    "Collapse context"
+                                </button>
+                            })}
+                        </>
+                    })
+                }}
+            </span>
+        }
+        .into_any(),
+    )
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3255,6 +4183,11 @@ fn line_prefix(kind: ProjectGitDiffLineKind) -> &'static str {
 #[component]
 fn UnifiedHunk(
     hunk: ProjectGitDiffHunk,
+    /// The hunk rendered directly above this one, so the header knows how
+    /// much context is omitted between them.
+    #[prop(optional_no_strip)]
+    previous_hunk: Option<ProjectGitDiffHunk>,
+    hi: usize,
     context_mode: DiffContextMode,
     line_offset: usize,
     scope: ProjectDiffScope,
@@ -3263,10 +4196,18 @@ fn UnifiedHunk(
     #[prop(optional)] decorations: DiffDecorations,
 ) -> impl IntoView {
     let find = use_context::<FindState>();
-    let header = hunk_header_label(&hunk);
     let show_header = context_mode == DiffContextMode::Hunks;
     let show_stage = scope == ProjectDiffScope::Unstaged;
-    let hunk_id = hunk.hunk_id.clone();
+    let header_view = show_header.then(|| {
+        hunk_header_view(
+            previous_hunk.as_ref(),
+            &hunk,
+            hi,
+            &root,
+            &relative_path,
+            show_stage,
+        )
+    });
     let token_lines: Vec<Option<LineTokens>> = match syntax_for_path(&relative_path) {
         Some(syn) => compute_hunk_tokens(&hunk, syn),
         None => vec![None; hunk.lines.len()],
@@ -3274,32 +4215,7 @@ fn UnifiedHunk(
 
     view! {
         <div class="diff-hunk">
-            {show_header.then(|| {
-                let stage_root = root.clone();
-                let stage_path = relative_path.clone();
-                let stage_hunk_id = hunk_id.clone();
-                view! {
-                    <div class="diff-hunk-header">
-                        {header}
-                        {show_stage.then(move || {
-                            let r = stage_root.clone();
-                            let p = stage_path.clone();
-                            let h = stage_hunk_id.clone();
-                            view! {
-                                <button
-                                    class="diff-hunk-stage-btn"
-                                    title="Stage hunk"
-                                    on:click=move |_| {
-                                        stage_hunk(r.clone(), p.clone(), h.clone());
-                                    }
-                                >
-                                    "+"
-                                </button>
-                            }
-                        })}
-                    </div>
-                }
-            })}
+            {header_view}
             {hunk.lines.into_iter().zip(token_lines).enumerate().map(|(i, (line, tokens))| {
                 let search_idx = line_offset + i;
                 let base_class = line_class(line.kind);
@@ -4443,6 +5359,511 @@ mod wasm_tests {
             drop(handle);
             container.remove();
         }
+    }
+
+    // ── Revealing the context git omitted around a hunk ─────────────────────
+
+    /// The file behind the expansion fixture: 60 lines, with line 10 and line
+    /// 40 rewritten. Hunk mode (`-U3`) shows two small islands; everything
+    /// else is context git never sent.
+    const EXPAND_FILE_LINES: u32 = 60;
+    const EXPAND_CHANGED_LINES: [u32; 2] = [10, 40];
+    const EXPAND_PATH: &str = "src/lib.rs";
+
+    fn expand_context_line(number: u32) -> ProjectGitDiffLine {
+        ProjectGitDiffLine {
+            kind: ProjectGitDiffLineKind::Context,
+            text: format!("line {number}"),
+            old_line_number: Some(number),
+            new_line_number: Some(number),
+        }
+    }
+
+    /// Every line of the diff at full context, exactly as `-U9999999` would
+    /// report it: one Removed/Added pair per changed line, context everywhere
+    /// else, line numbers aligned because each change is a 1:1 rewrite.
+    fn expand_full_lines() -> Vec<ProjectGitDiffLine> {
+        let mut lines = Vec::new();
+        for number in 1..=EXPAND_FILE_LINES {
+            if EXPAND_CHANGED_LINES.contains(&number) {
+                lines.push(ProjectGitDiffLine {
+                    kind: ProjectGitDiffLineKind::Removed,
+                    text: format!("line {number}"),
+                    old_line_number: Some(number),
+                    new_line_number: None,
+                });
+                lines.push(ProjectGitDiffLine {
+                    kind: ProjectGitDiffLineKind::Added,
+                    text: format!("line {number} changed"),
+                    old_line_number: None,
+                    new_line_number: Some(number),
+                });
+            } else {
+                lines.push(expand_context_line(number));
+            }
+        }
+        lines
+    }
+
+    /// The `-U3` view of the same change: two hunks with three lines of
+    /// context each, separated by 23 omitted lines.
+    fn expand_base_file() -> ProjectGitDiffFile {
+        let full = expand_full_lines();
+        let hunks = EXPAND_CHANGED_LINES
+            .iter()
+            .enumerate()
+            .map(|(index, &changed)| {
+                let lines: Vec<ProjectGitDiffLine> = full
+                    .iter()
+                    .filter(|line| {
+                        let number = line.new_line_number.or(line.old_line_number).unwrap_or(0);
+                        number + 3 >= changed && number <= changed + 3
+                    })
+                    .cloned()
+                    .collect();
+                ProjectGitDiffHunk {
+                    hunk_id: format!("{EXPAND_PATH}::{index}"),
+                    old_start: changed - 3,
+                    old_count: 7,
+                    new_start: changed - 3,
+                    new_count: 7,
+                    lines,
+                }
+            })
+            .collect();
+        ProjectGitDiffFile {
+            relative_path: EXPAND_PATH.to_owned(),
+            change_kind: None,
+            is_binary: false,
+            unmerged: false,
+            hunks,
+        }
+    }
+
+    fn expand_full_file() -> ProjectGitDiffFile {
+        ProjectGitDiffFile {
+            relative_path: EXPAND_PATH.to_owned(),
+            change_kind: None,
+            is_binary: false,
+            unmerged: false,
+            hunks: vec![ProjectGitDiffHunk {
+                hunk_id: format!("{EXPAND_PATH}::0"),
+                old_start: 1,
+                old_count: EXPAND_FILE_LINES,
+                new_start: 1,
+                new_count: EXPAND_FILE_LINES,
+                lines: expand_full_lines(),
+            }],
+        }
+    }
+
+    fn expand_root() -> ProjectRootPath {
+        ProjectRootPath("expand-root".to_owned())
+    }
+
+    fn expand_diff_key() -> crate::state::DiffKey {
+        crate::state::DiffKey::new(
+            "h",
+            ProjectId("p".to_owned()),
+            expand_root(),
+            ProjectDiffScope::Unstaged,
+            EXPAND_PATH,
+        )
+    }
+
+    /// Mount the hunk-mode diff with the full-context read already cached, so
+    /// the test drives the expansion controls rather than the network.
+    fn mount_expandable_diff(container: HtmlElement, mode: DiffViewMode) -> impl Sized {
+        let base = DiffViewState {
+            root: expand_root(),
+            scope: ProjectDiffScope::Unstaged,
+            path: Some(EXPAND_PATH.to_owned()),
+            context_mode: DiffContextMode::Hunks,
+            pending: false,
+            files: vec![expand_base_file()],
+        };
+        mount_to(container, move || {
+            let state = AppState::new();
+            state.diff_view_mode.set(mode);
+            state.diff_context_mode.set(DiffContextMode::Hunks);
+            state.diff_contents.update(|diffs| {
+                diffs.insert(expand_diff_key(), base.clone());
+            });
+            state.diff_expand_sources.update(|sources| {
+                sources.insert(
+                    expand_diff_key(),
+                    crate::state::DiffExpandSource {
+                        pending: false,
+                        error: None,
+                        files: vec![expand_full_file()],
+                    },
+                );
+            });
+            provide_context(state);
+            view! {
+                <DiffView
+                    host_id="h".to_owned()
+                    project_id=ProjectId("p".to_owned())
+                    root=expand_root()
+                    scope=ProjectDiffScope::Unstaged
+                    path=EXPAND_PATH.to_owned()
+                />
+            }
+        })
+    }
+
+    async fn next_frame() {
+        let promise = js_sys::Promise::new(&mut |resolve, _reject| {
+            web_sys::window()
+                .unwrap()
+                .request_animation_frame(&resolve)
+                .unwrap();
+        });
+        let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+    }
+
+    fn query_all(container: &HtmlElement, selector: &str) -> Vec<web_sys::Element> {
+        let nodes = container.query_selector_all(selector).unwrap();
+        (0..nodes.length())
+            .filter_map(|index| nodes.item(index))
+            .filter_map(|node| node.dyn_into::<web_sys::Element>().ok())
+            .collect()
+    }
+
+    /// Every line of source text the diff is currently showing, in order.
+    fn visible_diff_lines(container: &HtmlElement) -> Vec<String> {
+        query_all(container, ".diff-text")
+            .into_iter()
+            .map(|el| el.text_content().unwrap_or_default())
+            .collect()
+    }
+
+    /// The row rendering new-side line `number`, in the first pane that has
+    /// one. Side-by-side renders the same row in both panes.
+    fn new_side_row(container: &HtmlElement, number: u32) -> Option<web_sys::Element> {
+        query_all(
+            container,
+            &format!("[data-anchor-side=\"new\"][data-anchor-new-line=\"{number}\"]"),
+        )
+        .into_iter()
+        .next()
+    }
+
+    fn click_in(parent: &web_sys::Element, selector: &str) {
+        parent
+            .query_selector(selector)
+            .unwrap()
+            .unwrap_or_else(|| panic!("expected control {selector}"))
+            .dyn_into::<HtmlElement>()
+            .unwrap()
+            .click();
+    }
+
+    /// Full expansion flow over a diff with two separated hunks: reveal a
+    /// fixed step downward, close the remaining gap so the two hunks merge
+    /// into one, reach the start of the file, expand the whole file, and
+    /// collapse back to the hunks git produced.
+    #[wasm_bindgen_test]
+    async fn expanding_context_reveals_lines_and_merges_hunks() {
+        ensure_styles_loaded();
+        let container = make_container();
+        let handle = mount_expandable_diff(container.clone(), DiffViewMode::Unified);
+        next_tick().await;
+        next_tick().await;
+
+        // Hunk mode shows only the two islands git sent.
+        let lines = visible_diff_lines(&container);
+        assert_eq!(
+            lines.len(),
+            16,
+            "two -U3 hunks render eight rows each: {lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|line| line == "line 20"),
+            "omitted context must not be rendered before it is revealed: {lines:?}",
+        );
+
+        let headers = query_all(&container, "[data-test=\"diff-hunk-header\"]");
+        assert_eq!(headers.len(), 2, "one separator above each hunk");
+        assert_eq!(
+            headers[1]
+                .query_selector("[data-test=\"diff-expand-gap-all\"]")
+                .unwrap()
+                .unwrap()
+                .text_content()
+                .unwrap_or_default(),
+            "Expand 23 lines",
+            "the boundary states exactly how much is hidden there",
+        );
+        assert_eq!(
+            query_all(&container, "[data-test=\"diff-expand-footer\"]").len(),
+            1,
+            "the region between the last hunk and end of file is reachable too",
+        );
+
+        // Reveal one step downward from the hunk above the boundary.
+        click_in(&headers[1], "[data-test=\"diff-expand-down\"]");
+        next_tick().await;
+        let lines = visible_diff_lines(&container);
+        assert_eq!(lines.len(), 36, "one step reveals 20 lines: {lines:?}");
+        assert!(
+            lines.iter().any(|line| line == "line 14")
+                && lines.iter().any(|line| line == "line 33"),
+            "the step reveals the lines directly below the previous hunk: {lines:?}",
+        );
+        assert!(
+            !lines.iter().any(|line| line == "line 34"),
+            "and stops there: {lines:?}",
+        );
+
+        // Revealed lines read as ordinary unchanged context, not as a change.
+        let window = web_sys::window().unwrap();
+        let background = |element: &web_sys::Element| {
+            window
+                .get_computed_style(element)
+                .unwrap()
+                .unwrap()
+                .get_property_value("background-color")
+                .unwrap()
+        };
+        let revealed = new_side_row(&container, 20).expect("revealed row");
+        let untouched_context = new_side_row(&container, 9).expect("original context row");
+        let changed = new_side_row(&container, 10).expect("added row");
+        assert_eq!(
+            background(&revealed),
+            background(&untouched_context),
+            "a revealed line is drawn exactly like the context around the hunk",
+        );
+        assert_ne!(
+            background(&revealed),
+            background(&changed),
+            "and is still distinguishable from a changed line",
+        );
+
+        // Close the remaining gap: the two hunks become one and the separator
+        // between them goes away.
+        let headers = query_all(&container, "[data-test=\"diff-hunk-header\"]");
+        assert_eq!(headers.len(), 2, "still two hunks before the merge");
+        assert_eq!(
+            headers[1]
+                .query_selector("[data-test=\"diff-expand-gap-all\"]")
+                .unwrap()
+                .unwrap()
+                .text_content()
+                .unwrap_or_default(),
+            "Expand 3 lines",
+            "the boundary now reports only what is left",
+        );
+        click_in(&headers[1], "[data-test=\"diff-expand-gap-all\"]");
+        next_tick().await;
+
+        let lines = visible_diff_lines(&container);
+        assert_eq!(
+            query_all(&container, "[data-test=\"diff-hunk-header\"]").len(),
+            1,
+            "merged hunks leave a single boundary, above the first line shown",
+        );
+        for number in [33_u32, 37] {
+            assert_eq!(
+                lines
+                    .iter()
+                    .filter(|line| *line == &format!("line {number}"))
+                    .count(),
+                1,
+                "merging must not duplicate a line: {lines:?}",
+            );
+        }
+        // Line numbering runs unbroken through the seam, and no separator is
+        // left taking up vertical space inside the merged hunk.
+        let rows = query_all(&container, "[data-anchor-side]");
+        assert_eq!(
+            rows.len(),
+            39,
+            "the merged hunk spans lines 7-43 plus both rewritten lines' old rows",
+        );
+        let new_side_numbers: Vec<String> = rows
+            .iter()
+            .filter(|row| row.get_attribute("data-anchor-side").as_deref() == Some("new"))
+            .filter_map(|row| row.get_attribute("data-anchor-new-line"))
+            .collect();
+        assert_eq!(
+            new_side_numbers,
+            (7..=43_u32).map(|n| n.to_string()).collect::<Vec<_>>(),
+            "new-side numbering must run unbroken through the seam",
+        );
+        let mut previous = rows[0].get_bounding_client_rect();
+        assert!(
+            previous.height() > 0.0,
+            "the first merged row must be visible"
+        );
+        for row in rows.iter().skip(1) {
+            let rect = row.get_bounding_client_rect();
+            assert!(
+                (rect.top() - previous.bottom()).abs() < 1.0,
+                "rows must sit directly on top of each other with no separator \
+                 between them (top {}, previous bottom {})",
+                rect.top(),
+                previous.bottom(),
+            );
+            assert!(rect.height() > 0.0, "every merged row must be visible");
+            previous = rect;
+        }
+
+        // Reach the start of the file from the remaining boundary.
+        let headers = query_all(&container, "[data-test=\"diff-hunk-header\"]");
+        click_in(&headers[0], "[data-test=\"diff-expand-up\"]");
+        next_tick().await;
+        let lines = visible_diff_lines(&container);
+        assert!(
+            lines.first().is_some_and(|line| line == "line 1"),
+            "expanding up past the sixth line reaches the start of the file: {lines:?}",
+        );
+        assert!(
+            query_all(&container, "[data-test=\"diff-hunk-header\"]")[0]
+                .query_selector("[data-test=\"diff-expand-up\"]")
+                .unwrap()
+                .is_none(),
+            "no control is offered at a boundary with nothing left behind it",
+        );
+
+        // File-level expand, then collapse back to the original hunks.
+        click_in(&container, "[data-test=\"diff-expand-all\"]");
+        next_tick().await;
+        let lines = visible_diff_lines(&container);
+        assert_eq!(
+            lines.len(),
+            EXPAND_FILE_LINES as usize + EXPAND_CHANGED_LINES.len(),
+            "expand all renders every line of the file once: {lines:?}",
+        );
+        assert!(lines.iter().any(|line| line == "line 60"));
+        assert_eq!(
+            query_all(&container, "[data-test=\"diff-expand-footer\"]").len(),
+            0,
+            "nothing is omitted after the last hunk any more",
+        );
+
+        click_in(&container, "[data-test=\"diff-collapse-context\"]");
+        next_tick().await;
+        let lines = visible_diff_lines(&container);
+        assert_eq!(lines.len(), 16, "collapse restores the hunks: {lines:?}");
+        assert!(!lines.iter().any(|line| line == "line 20"));
+        assert_eq!(
+            query_all(&container, "[data-test=\"diff-hunk-header\"]").len(),
+            2,
+            "and brings the separator between them back",
+        );
+
+        drop(handle);
+        container.remove();
+    }
+
+    /// Lines revealed above the viewport must not slide the code the user is
+    /// reading down the screen.
+    #[wasm_bindgen_test]
+    async fn expanding_context_above_the_viewport_holds_scroll_position() {
+        ensure_styles_loaded();
+        // A short viewport so the boundary being expanded is scrolled off the
+        // top — the only case where holding the scroll position is visible.
+        let container = make_container();
+        container
+            .set_attribute(
+                "style",
+                "position: absolute; top: 0; left: 0; width: 800px; height: 200px; \
+                 display: flex; flex-direction: column;",
+            )
+            .unwrap();
+        let handle = mount_expandable_diff(container.clone(), DiffViewMode::Unified);
+        next_tick().await;
+        next_tick().await;
+
+        let scrollport = container
+            .query_selector(".diff-content")
+            .unwrap()
+            .expect("diff scrollport")
+            .dyn_into::<HtmlElement>()
+            .unwrap();
+        scrollport.set_scroll_top(scrollport.scroll_height());
+        next_tick().await;
+        assert!(
+            scrollport.scroll_top() > 0,
+            "the fixture must actually scroll for this test to mean anything",
+        );
+
+        let viewport_top = || scrollport.get_bounding_client_rect().top();
+        let offset_of = |number: u32| {
+            new_side_row(&container, number)
+                .unwrap_or_else(|| panic!("line {number} is rendered"))
+                .get_bounding_client_rect()
+                .top()
+                - viewport_top()
+        };
+        let before = offset_of(41);
+        assert!(
+            (0.0..200.0).contains(&before),
+            "the anchor row must start inside the viewport (offset {before})",
+        );
+
+        // Reveal the whole 23-line gap, which sits above the viewport.
+        let headers = query_all(&container, "[data-test=\"diff-hunk-header\"]");
+        click_in(&headers[1], "[data-test=\"diff-expand-gap-all\"]");
+        next_tick().await;
+        next_frame().await;
+        next_frame().await;
+
+        assert!(
+            new_side_row(&container, 25).is_some(),
+            "the gap really was filled in above the viewport",
+        );
+        let after = offset_of(41);
+        assert!(
+            (after - before).abs() < 2.0,
+            "the rows on screen must stay put (was {before}, now {after})",
+        );
+
+        drop(handle);
+        container.remove();
+    }
+
+    /// Side-by-side has the same boundaries, and both panes must keep
+    /// rendering the same rows at the same heights through an expansion.
+    #[wasm_bindgen_test]
+    async fn expanding_context_side_by_side_keeps_panes_aligned() {
+        ensure_styles_loaded();
+        let container = make_container();
+        let handle = mount_expandable_diff(container.clone(), DiffViewMode::SideBySide);
+        next_tick().await;
+        next_tick().await;
+
+        let headers = query_all(&container, "[data-test=\"diff-hunk-header\"]");
+        assert_eq!(
+            headers.len(),
+            4,
+            "both panes render both boundaries so their rows stay aligned",
+        );
+        click_in(&headers[1], "[data-test=\"diff-expand-gap-all\"]");
+        next_tick().await;
+
+        assert_eq!(
+            query_all(&container, "[data-test=\"diff-hunk-header\"]").len(),
+            2,
+            "the merged hunks leave one boundary per pane",
+        );
+        let rows = query_all(&container, "[data-anchor-new-line=\"25\"]");
+        assert_eq!(rows.len(), 2, "a revealed line renders in both panes");
+        assert_eq!(
+            rows[0].text_content().unwrap_or_default().trim(),
+            "line 25",
+            "and shows the same source text",
+        );
+        let left = rows[0].get_bounding_client_rect();
+        let right = rows[1].get_bounding_client_rect();
+        assert!(
+            (left.top() - right.top()).abs() < 1.0 && (left.height() - right.height()).abs() < 1.0,
+            "panes must stay row-aligned after expansion ({left:?} vs {right:?})",
+        );
+
+        drop(handle);
+        container.remove();
     }
 
     // ── Code intelligence over the diff ────────────────────────────────────

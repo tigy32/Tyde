@@ -567,6 +567,29 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                             .map(|(key, _)| key.clone())
                             .collect::<Vec<_>>()
                     });
+                    let failed_expand_keys =
+                        state.diff_expand_request_ids.with_untracked(|requests| {
+                            requests
+                                .iter()
+                                .filter(|(_, pending_id)| *pending_id == &request_id)
+                                .map(|(key, _)| key.clone())
+                                .collect::<Vec<_>>()
+                        });
+                    for key in failed_expand_keys {
+                        state.diff_expand_request_ids.update(|requests| {
+                            requests.remove(&key);
+                        });
+                        state.diff_expand_sources.update(|sources| {
+                            sources.insert(
+                                key.clone(),
+                                crate::state::DiffExpandSource {
+                                    pending: false,
+                                    error: Some(payload.message.clone()),
+                                    files: Vec::new(),
+                                },
+                            );
+                        });
+                    }
                     for key in failed_keys {
                         state.diff_request_ids.update(|requests| {
                             requests.remove(&key);
@@ -1843,6 +1866,31 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                     payload_path.clone(),
                 );
                 let perf_key = format!("diff:{}:{payload_path}", payload.root.0);
+
+                // A full-context read issued by "expand context" carries its
+                // own request id and never touches `diff_contents`: the diff on
+                // screen stays in hunk mode, and this payload only supplies the
+                // lines it omits.
+                let expand_request_id = state
+                    .diff_expand_request_ids
+                    .with_untracked(|requests| requests.get(&key).cloned());
+                if payload.request_id.is_some() && payload.request_id == expand_request_id {
+                    state.diff_expand_request_ids.update(|requests| {
+                        requests.remove(&key);
+                    });
+                    state.diff_expand_sources.update(|sources| {
+                        sources.insert(
+                            key,
+                            crate::state::DiffExpandSource {
+                                pending: false,
+                                error: None,
+                                files: payload.files,
+                            },
+                        );
+                    });
+                    return;
+                }
+
                 let pending_request_id = state
                     .diff_request_ids
                     .with_untracked(|requests| requests.get(&key).cloned());
@@ -1880,6 +1928,15 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                     .with_untracked(|diffs| diffs.get(&key).cloned());
                 match reduce_diff_response(current.as_ref(), payload) {
                     Some(next) => {
+                        // The hunks just changed, so any cached full-context
+                        // read is a read of a file that no longer matches them.
+                        // Drop it rather than reveal context from it.
+                        state.diff_expand_sources.update(|sources| {
+                            sources.remove(&key);
+                        });
+                        state.diff_expand_request_ids.update(|requests| {
+                            requests.remove(&key);
+                        });
                         state.diff_request_ids.update(|requests| {
                             requests.remove(&key);
                         });

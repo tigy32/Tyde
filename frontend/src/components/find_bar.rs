@@ -41,6 +41,15 @@ impl FindState {
     /// an `Arc<str>` of the whole file), or `LineSource::Owned` for the
     /// diff viewer (which builds its searchable line list eagerly).
     pub fn new(lines: LineSource) -> Self {
+        Self::from_source_fn(move || lines.clone())
+    }
+
+    /// Build a `FindState` over a line source that can change while the view
+    /// stays mounted — the diff viewer's, which grows when the user reveals
+    /// context around a hunk. `source` is called inside the results memo, so
+    /// any signal it reads re-runs the search and keeps every row's flat
+    /// search index pointing at the line it actually renders.
+    pub fn from_source_fn(source: impl Fn() -> LineSource + Send + Sync + 'static) -> Self {
         let query = RwSignal::new(String::new());
         let case_sensitive = RwSignal::new(false);
         let whole_word = RwSignal::new(false);
@@ -54,7 +63,7 @@ impl FindState {
             let cs = case_sensitive.get();
             let ww = whole_word.get();
             let rx = use_regex.get();
-            compute_matches(&lines, &q, cs, ww, rx, error_w)
+            compute_matches(&source(), &q, cs, ww, rx, error_w)
         });
 
         Self {
@@ -72,12 +81,6 @@ impl FindState {
     pub fn from_file(content: &str) -> (Self, FileLines) {
         let f = FileLines::new(content);
         (Self::new(LineSource::File(f.clone())), f)
-    }
-
-    /// Convenience for callers that already have a `Vec<String>` (e.g.
-    /// the diff viewer's flattened search index).
-    pub fn from_owned(lines: Vec<String>) -> Self {
-        Self::new(LineSource::Owned(std::sync::Arc::new(lines)))
     }
 }
 

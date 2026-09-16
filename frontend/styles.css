@@ -8576,12 +8576,68 @@ math merror {
 }
 
 .diff-hunk-header {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
     font-family: var(--font-mono);
     font-size: 0.846rem;
     color: var(--text-tertiary);
     background: color-mix(in srgb, var(--accent-primary) 6%, transparent);
     padding: 2px var(--space-4);
     border-bottom: 1px solid var(--border-primary);
+}
+
+/* Boundary row rendered below a file's last hunk. Same box as a hunk
+ * header so the virtual-scroll row model (which assumes one row height)
+ * and the two side-by-side panes stay aligned. */
+.diff-hunk-footer {
+    border-top: 1px solid var(--border-primary);
+}
+
+.diff-hunk-range {
+    flex-shrink: 0;
+}
+
+/* Controls at an omitted-context boundary. Kept to the height of the
+ * header line: a taller control would desynchronize the side-by-side
+ * panes, which lay their rows out independently. */
+.diff-expand-controls,
+.diff-file-expand-actions {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-1, 2px);
+    min-width: 0;
+}
+
+.diff-expand-btn {
+    flex-shrink: 0;
+    background: var(--surface-2, rgba(255, 255, 255, 0.05));
+    border: 1px solid var(--border-primary);
+    color: var(--text-tertiary);
+    font-family: inherit;
+    font-size: 0.769rem;
+    line-height: 14px;
+    min-width: 18px;
+    padding: 0 4px;
+    border-radius: 3px;
+    cursor: pointer;
+}
+
+.diff-expand-btn:hover {
+    background: var(--surface-3, rgba(255, 255, 255, 0.12));
+    color: var(--text-primary);
+}
+
+.diff-expand-note {
+    font-size: 0.769rem;
+    color: var(--text-tertiary);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.diff-expand-error {
+    color: var(--error);
 }
 
 .diff-line {

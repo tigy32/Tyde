@@ -2987,6 +2987,18 @@ impl DiffViewState {
     }
 }
 
+/// A full-context (`-U9999999`) read of a diff, used as the source of the
+/// lines hunk mode omits. Holding the whole diff rather than raw file text is
+/// what makes revealed context exact: it is the same git invocation that
+/// produced the hunks, so old/new line numbers, renames, and deletions all
+/// line up by construction instead of being reconstructed client-side.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct DiffExpandSource {
+    pub pending: bool,
+    pub error: Option<String>,
+    pub files: Vec<ProjectGitDiffFile>,
+}
+
 /// Pure reducer for `ProjectGitDiff` responses. Returns `Some(new_state)` if
 /// the payload should replace the stored entry, or `None` if it should be
 /// ignored as stale.
@@ -3680,6 +3692,13 @@ pub struct AppState {
     pub diff_contents: RwSignal<HashMap<DiffKey, DiffViewState>>,
     pub diff_request_ids: RwSignal<HashMap<DiffKey, String>>,
     pub diff_request_errors: RwSignal<HashMap<DiffKey, String>>,
+    /// Full-context reads that back "expand context" in hunk mode, keyed by
+    /// the same `DiffKey` as the hunk-mode diff they belong to. Fetched only
+    /// when the user first asks to reveal omitted lines, and dropped whenever
+    /// a fresh hunk-mode response lands for the key so revealed context can
+    /// never come from a stale read of the file.
+    pub diff_expand_sources: RwSignal<HashMap<DiffKey, DiffExpandSource>>,
+    pub diff_expand_request_ids: RwSignal<HashMap<DiffKey, String>>,
     pub terminals: RwSignal<Vec<TerminalInfo>>,
     pub active_terminal: RwSignal<Option<ActiveTerminalRef>>,
     /// Agents whose interrupt has been sent but not yet acknowledged by a
@@ -4186,6 +4205,8 @@ impl AppState {
             diff_contents: RwSignal::new(HashMap::new()),
             diff_request_ids: RwSignal::new(HashMap::new()),
             diff_request_errors: RwSignal::new(HashMap::new()),
+            diff_expand_sources: RwSignal::new(HashMap::new()),
+            diff_expand_request_ids: RwSignal::new(HashMap::new()),
             terminals: RwSignal::new(Vec::new()),
             active_terminal: RwSignal::new(None),
             interrupt_pending: RwSignal::new(HashSet::new()),
@@ -6442,9 +6463,20 @@ impl AppState {
             .expect("connection epoch state")
     }
 
+    /// Forget every cached full-context expansion read for `host_id`. The
+    /// source is a cache of one host's git output; keeping it across a refresh
+    /// or disconnect would let revealed context outlive the diff it came from.
+    pub fn drop_diff_expand_sources_for_host(&self, host_id: &str) {
+        self.diff_expand_sources
+            .update(|sources| sources.retain(|key, _| key.host_id != host_id));
+        self.diff_expand_request_ids
+            .update(|requests| requests.retain(|key, _| key.host_id != host_id));
+    }
+
     pub fn prepare_host_refresh(&self, host_id: &str) {
         self.diff_contents
             .update(|diffs| diffs.retain(|key, _| key.host_id != host_id));
+        self.drop_diff_expand_sources_for_host(host_id);
         self.project_view_memory.update(|memories| {
             for (project, memory) in memories.iter_mut() {
                 if project.host_id == host_id {
@@ -6732,6 +6764,7 @@ impl AppState {
         self.diff_contents.update(|map| {
             map.retain(|key, _| key.host_id != host_id);
         });
+        self.drop_diff_expand_sources_for_host(host_id);
         self.code_intel_navigate_ctx.update(|ctx| {
             if ctx.as_ref().is_some_and(|ctx| ctx.key.host_id == host_id) {
                 *ctx = None;
@@ -7352,6 +7385,12 @@ impl AppState {
             BackingResource::Diff(key) => {
                 self.diff_contents.update(|diffs| {
                     diffs.remove(key);
+                });
+                self.diff_expand_sources.update(|sources| {
+                    sources.remove(key);
+                });
+                self.diff_expand_request_ids.update(|requests| {
+                    requests.remove(key);
                 });
             }
         }
