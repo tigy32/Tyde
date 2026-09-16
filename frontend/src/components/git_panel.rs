@@ -929,15 +929,26 @@ fn GitRootSection(
 
     let ahead_behind = if root.ahead > 0 || root.behind > 0 {
         let mut parts = Vec::new();
+        let mut spelled = Vec::new();
         if root.ahead > 0 {
             parts.push(format!("\u{2191}{}", root.ahead));
+            spelled.push(format!("{} ahead", root.ahead));
         }
         if root.behind > 0 {
             parts.push(format!("\u{2193}{}", root.behind));
+            spelled.push(format!("{} behind", root.behind));
         }
-        Some(parts.join(" "))
+        Some((parts.join(" "), spelled.join(", ")))
     } else {
         None
+    };
+    // The row reserves more width for its labels when it carries counts, and
+    // that has to be stated here: inferring it in the stylesheet would rest the
+    // root name's floor on a selector the webview might not support.
+    let toggle_class = if ahead_behind.is_some() {
+        "gp-root-toggle gp-root-toggle-counted"
+    } else {
+        "gp-root-toggle"
     };
 
     // A lone root is always open. With several, dirty roots open and clean
@@ -1067,7 +1078,7 @@ fn GitRootSection(
         <section class="gp-root" data-test="gp-root" data-root=root_title.clone()>
             <div class="gp-root-header" title=root_title.clone()>
                 <button
-                    class="gp-root-toggle"
+                    class=toggle_class
                     data-test="gp-root-toggle"
                     aria-expanded=move || expanded.get().to_string()
                     on:click=on_toggle
@@ -1077,26 +1088,28 @@ fn GitRootSection(
                     </span>
                     <span class="gp-root-name" title=root_title.clone()>{root_label}</span>
                     <span class="gp-root-branch" title=branch_title>{branch_label}</span>
-                    {ahead_behind.map(|ab| view! {
-                        <span class="gp-root-ahead-behind">{ab}</span>
+                    {ahead_behind.map(|(ab, ab_title)| view! {
+                        <span class="gp-root-ahead-behind" title=ab_title>{ab}</span>
                     })}
                 </button>
-                <span class=state_label.0 data-test="gp-root-state" title=state_label.2>
-                    {state_label.1}
-                </span>
-                <button
-                    class="gp-root-history-toggle"
-                    data-test="gp-root-history-toggle"
-                    aria-pressed=move || history_on.get().to_string()
-                    aria-label="View Git history"
-                    title=move || if history_on.get() { "Back to the working tree" } else { "View Git history" }
-                    on:click=on_toggle_history
-                >
-                    <span>"History"</span>
-                    <svg width="10" height="10" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                        <path d=move || if history_on.get() { "m4 10 4-4 4 4" } else { "m4 6 4 4 4-4" } />
-                    </svg>
-                </button>
+                <div class="gp-root-meta">
+                    <span class=state_label.0 data-test="gp-root-state" title=state_label.2>
+                        {state_label.1}
+                    </span>
+                    <button
+                        class="gp-root-history-toggle"
+                        data-test="gp-root-history-toggle"
+                        aria-pressed=move || history_on.get().to_string()
+                        aria-label="View Git history"
+                        title=move || if history_on.get() { "Back to the working tree" } else { "View Git history" }
+                        on:click=on_toggle_history
+                    >
+                        <span>"History"</span>
+                        <svg width="10" height="10" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                            <path d=move || if history_on.get() { "m4 10 4-4 4 4" } else { "m4 6 4 4 4-4" } />
+                        </svg>
+                    </button>
+                </div>
             </div>
             <Show when=move || expanded.get()>
                 <Show
@@ -2265,6 +2278,89 @@ mod wasm_tests {
             .map(|element| element.dyn_into::<HtmlElement>().unwrap())
     }
 
+    /// The width of the ellipsis the browser paints in place of the text it
+    /// drops, measured in the label's own font.
+    fn ellipsis_width(element: &HtmlElement) -> f64 {
+        let window = web_sys::window().unwrap();
+        let document = window.document().unwrap();
+        let computed = window.get_computed_style(element).unwrap().unwrap();
+        let probe = document
+            .create_element("span")
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap();
+        let style = probe.style();
+        style.set_property("position", "absolute").unwrap();
+        style.set_property("visibility", "hidden").unwrap();
+        style.set_property("white-space", "pre").unwrap();
+        style.set_property("left", "-9999px").unwrap();
+        for property in [
+            "font-family",
+            "font-size",
+            "font-weight",
+            "font-style",
+            "letter-spacing",
+        ] {
+            let value = computed.get_property_value(property).unwrap();
+            style.set_property(property, &value).unwrap();
+        }
+        probe.set_text_content(Some("\u{2026}"));
+        document.body().unwrap().append_child(&probe).unwrap();
+        let width = probe.get_bounding_client_rect().width();
+        probe.remove();
+        width
+    }
+
+    /// How many leading characters of a label the user can actually read.
+    ///
+    /// Element geometry rounds to whole pixels, so a label a fraction of a
+    /// pixel too narrow still reports `scroll_width == client_width` while
+    /// rendering its last character as "…". Text advance alone is not the
+    /// answer either: once the text does not fit, the browser paints an
+    /// ellipsis in place of the tail, so a character reaches the screen only
+    /// if it and that ellipsis both fit. Measuring the text on its own credits
+    /// one character that the ellipsis has in fact replaced.
+    ///
+    /// Chrome will let the ellipsis overhang the box by a fraction of a pixel,
+    /// which this does not, so the count can fall one character short of what
+    /// is painted. It never runs over: this is a floor on what renders, which
+    /// is what the assertions want from it.
+    fn legible_chars(element: &HtmlElement) -> usize {
+        let document = web_sys::window().unwrap().document().unwrap();
+        let text_node = element.first_child().expect("label text");
+        let text = text_node.text_content().unwrap_or_default();
+        let total = text.encode_utf16().count();
+        let box_right = element.get_bounding_client_rect().right();
+        let range = document.create_range().unwrap();
+        range.set_start(&text_node, 0).unwrap();
+        range.set_end(&text_node, total as u32).unwrap();
+        if range.get_bounding_client_rect().right() <= box_right + 0.01 {
+            return total;
+        }
+        let ellipsis = ellipsis_width(element);
+        let mut legible = 0;
+        for chars in 1..=total {
+            range.set_end(&text_node, chars as u32).unwrap();
+            if range.get_bounding_client_rect().right() + ellipsis > box_right + 0.01 {
+                break;
+            }
+            legible = chars;
+        }
+        legible
+    }
+
+    /// How far two rendered boxes lie on top of each other horizontally, or
+    /// zero when they are clear of one another (including on separate lines).
+    fn overlap_px(a: &web_sys::DomRect, b: &web_sys::DomRect) -> f64 {
+        let horizontal = a.right().min(b.right()) - a.left().max(b.left());
+        let vertical = a.bottom().min(b.bottom()) - a.top().max(b.top());
+        if horizontal > 0.0 && vertical > 0.0 {
+            horizontal
+        } else {
+            0.0
+        }
+    }
+
     fn query_all(container: &HtmlElement, selector: &str) -> Vec<HtmlElement> {
         let nodes = container.query_selector_all(selector).unwrap();
         (0..nodes.length())
@@ -3102,6 +3198,11 @@ mod wasm_tests {
                 "the header must not overflow at {width}px"
             );
 
+            // Allocated width is not the same as readable text: a box a
+            // fraction of a pixel short of its text still rounds to the full
+            // width while the browser draws "…" over the last character.
+            let legible = legible_chars(&name);
+            let letters = "AXD-Automation".chars().count();
             if width > 220 {
                 assert!(
                     name.scroll_width() <= name.client_width() + 1,
@@ -3110,6 +3211,14 @@ mod wasm_tests {
                     name.client_width(),
                     name.scroll_width()
                 );
+                assert_eq!(
+                    legible,
+                    letters,
+                    "every character of the root name must render at {width}px, \
+                     not merely be allocated for: {legible} of {letters} fit \
+                     inside a {}px box",
+                    name_box.width()
+                );
             } else {
                 let shown = f64::from(name.client_width()) / f64::from(name.scroll_width());
                 assert!(
@@ -3117,7 +3226,270 @@ mod wasm_tests {
                     "at the dock minimum the root name keeps the bulk of its \
                      text; only {shown:.2} of it renders"
                 );
+                assert!(
+                    legible >= 11,
+                    "at the dock minimum the root name must still read as \
+                     itself; only {legible} of {letters} characters render"
+                );
             }
+        }
+    }
+
+    /// A root row carries more than a name and a branch: a conflict count, an
+    /// ahead/behind pair, the status chip and the history control. Those can
+    /// together want more width than a narrow dock has at a large font, and
+    /// when they do the row must still say which root it is. The name keeps an
+    /// identifying stretch of its text, the secondary labels give theirs up
+    /// first but never vanish outright, no label is ever drawn over the status
+    /// text, and where the metadata genuinely takes the row it moves to a
+    /// second line rather than pushing the name out of it.
+    ///
+    /// Widths are swept rather than sampled because the row is tightest just
+    /// before it wraps, and that threshold moves with the font size: testing
+    /// only the dock's named widths steps straight over the worst case. Each
+    /// sweep runs twice, because a populated dock scrolls and its scrollbar
+    /// takes 8px out of the row — the tightest case in the product is the
+    /// narrowest dock at the largest font with that scrollbar present.
+    #[wasm_bindgen_test]
+    async fn crowded_root_header_keeps_the_root_name_readable() {
+        struct Row {
+            font: u32,
+            width: u32,
+            legible: usize,
+            over_status: f64,
+            past_toggle: f64,
+            status_clipped: bool,
+            status_before_history: bool,
+            inside_header: bool,
+            history_width: f64,
+            counts_width: f64,
+            counts_legible: usize,
+            counts_painted: f64,
+            scrolling: bool,
+            scrolls: bool,
+            scrollbar: f64,
+        }
+
+        ensure_styles_loaded();
+        stub_recording_bridge();
+        let container = make_container();
+        let branch = "hersheys/qp-scan-isolated-05-slot-fanout-rollup";
+        let root = ProjectRootGitStatus {
+            root: ProjectRootPath("/Users/mike/src/AXD-Automation-Production".to_owned()),
+            branch: Some(branch.to_owned()),
+            head_oid: None,
+            empty_tree_oid: None,
+            ahead: 1000,
+            behind: 1000,
+            clean: false,
+            files: (0..10)
+                .map(|index| ProjectGitFileStatus {
+                    relative_path: format!("src/conflict{index}.rs"),
+                    staged: Some(ProjectGitChangeKind::Unmerged),
+                    unstaged: Some(ProjectGitChangeKind::Unmerged),
+                    untracked: false,
+                })
+                .collect(),
+            recent_commits: Vec::new(),
+            history_has_more: false,
+        };
+        let _mounted = mount_git_panel_with_root(container.clone(), false, root);
+        next_tick().await;
+
+        let header = query(&container, ".gp-root-header").expect("root header");
+        let toggle = query(&container, "[data-test=gp-root-toggle]").expect("root toggle");
+        let name = query(&container, ".gp-root-name").expect("root name");
+        let branch_el = query(&container, ".gp-root-branch").expect("branch label");
+        let ahead_behind = query(&container, ".gp-root-ahead-behind").expect("ahead/behind");
+        let state = query(&container, "[data-test=gp-root-state]").expect("state chip");
+        let history = history_toggle(&container, 0);
+
+        assert_eq!(state.text_content().as_deref(), Some("10 conflicts"));
+        assert_eq!(
+            ahead_behind.text_content().as_deref(),
+            Some("\u{2191}1000 \u{2193}1000")
+        );
+        assert_eq!(
+            ahead_behind.get_attribute("title").as_deref(),
+            Some("1000 ahead, 1000 behind"),
+            "the counts stay reachable once the label gives up its width"
+        );
+        let letters = "AXD-Automation-Production".chars().count();
+        assert_eq!(
+            name.text_content().as_deref(),
+            Some("AXD-Automation-Production")
+        );
+
+        // The font size setting scales the whole document, so every case is
+        // measured first and asserted afterwards: a failing assertion must not
+        // unwind out with the rest of the suite still rendering at 20px.
+        let root_style = web_sys::window()
+            .unwrap()
+            .document()
+            .unwrap()
+            .document_element()
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap()
+            .style();
+        let content = query(&container, ".gp-content").expect("panel content");
+        let mut rows = Vec::new();
+        // A dock with enough in it to scroll loses 8px of every row to the
+        // scrollbar, so the row is measured both ways round.
+        for scrolling in [false, true] {
+            container
+                .style()
+                .set_property("height", if scrolling { "120px" } else { "auto" })
+                .unwrap();
+            // 11px..=20px is the Font Size setting's range; these are the
+            // default and the top of it.
+            for font in [13, 20] {
+                root_style
+                    .set_property("--base-font-size", &format!("{font}px"))
+                    .unwrap();
+                // 220px is `--dock-min-width` and 320px
+                // `--dock-default-width`; the step is fine enough to land on
+                // the wrap threshold, which is where the labels are squeezed
+                // hardest.
+                for width in (220..=460).step_by(4) {
+                    container
+                        .style()
+                        .set_property("width", &format!("{width}px"))
+                        .unwrap();
+                    next_tick().await;
+
+                    let toggle_box = toggle.get_bounding_client_rect();
+                    let state_box = state.get_bounding_client_rect();
+                    let history_box = history.get_bounding_client_rect();
+                    let header_box = header.get_bounding_client_rect();
+                    let labels = [&name, &branch_el, &ahead_behind]
+                        .map(|label| label.get_bounding_client_rect());
+                    let row = Row {
+                        font,
+                        width,
+                        legible: legible_chars(&name),
+                        over_status: labels
+                            .iter()
+                            .map(|label| overlap_px(label, &state_box))
+                            .fold(0.0, f64::max),
+                        past_toggle: labels
+                            .iter()
+                            .map(|label| label.right() - toggle_box.right())
+                            .fold(f64::NEG_INFINITY, f64::max),
+                        status_clipped: state.scroll_width() > state.client_width(),
+                        status_before_history: state_box.right() <= history_box.left() + 0.5,
+                        inside_header: history_box.right() <= header_box.right() + 0.5
+                            && header.scroll_width() <= header.client_width(),
+                        history_width: history_box.width(),
+                        counts_width: labels[2].width(),
+                        counts_legible: legible_chars(&ahead_behind),
+                        // What survives the toggle's clip is what is painted,
+                        // and so what there is to point at.
+                        counts_painted: overlap_px(&labels[2], &toggle_box),
+                        scrolling,
+                        scrolls: content.scroll_height() > content.client_height(),
+                        scrollbar: content.get_bounding_client_rect().width()
+                            - f64::from(content.client_width()),
+                    };
+                    log::info!(
+                        "crowded root {width}px at {font}px (scrollbar {}px): \
+                         name reads {} of {}, counts {}px wide reading {}, over \
+                         status {}px, past toggle {}px, header {}px tall",
+                        row.scrollbar,
+                        row.legible,
+                        letters,
+                        row.counts_width,
+                        row.counts_legible,
+                        row.over_status,
+                        row.past_toggle,
+                        header_box.height()
+                    );
+                    rows.push(row);
+                }
+            }
+        }
+        container.style().remove_property("height").unwrap();
+        root_style.remove_property("--base-font-size").unwrap();
+        next_tick().await;
+
+        for row in rows {
+            let (width, font) = (row.width, row.font);
+            // A case that was meant to carry a scrollbar and does not would
+            // quietly test the roomier layout twice.
+            assert_eq!(
+                row.scrolls,
+                row.scrolling,
+                "the {}px-tall panel must {}scroll at {width}px and {font}px \
+                 text, or this case does not measure what it claims",
+                if row.scrolling { 120 } else { 0 },
+                if row.scrolling { "" } else { "not " }
+            );
+            if row.scrolling {
+                assert!(
+                    (row.scrollbar - 8.0).abs() <= 0.5,
+                    "the scrollbar must take its 8px out of the row at \
+                     {width}px and {font}px text; it took {}px",
+                    row.scrollbar
+                );
+            }
+            // The scrollbar costs the row 8px, and at the narrowest dock and
+            // the largest font that is the difference between twelve
+            // characters and eleven. Both are enough to tell roots apart,
+            // which is what the floor is for.
+            let floor = if row.scrolling { 11 } else { 12 };
+            assert!(
+                row.legible >= floor,
+                "the crowded row must still identify its root at {width}px and \
+                 {font}px text{}; only {} of {letters} characters of \
+                 \"AXD-Automation-Production\" render",
+                if row.scrolling {
+                    " with the panel scrolled"
+                } else {
+                    ""
+                },
+                row.legible
+            );
+            // Yielding width first is right; yielding all of it is not. At zero
+            // width the counts paint nothing at all — not even the ellipsis —
+            // and a box with no area answers no hit test, so the title that
+            // carries the numbers has nothing to hover and the counts become
+            // undiscoverable rather than merely truncated.
+            assert!(
+                row.counts_width > 0.0 && row.counts_painted > 0.0,
+                "the ahead/behind counts must keep a painted sliver to point \
+                 at {width}px and {font}px text; the label is {}px wide and \
+                 {}px of it survives the toggle's clip",
+                row.counts_width,
+                row.counts_painted
+            );
+            assert!(
+                row.counts_legible >= 1,
+                "the counts must show an arrow before the ellipsis at {width}px \
+                 and {font}px text, so the row says there is something to \
+                 hover; {} characters render inside {}px",
+                row.counts_legible,
+                row.counts_width
+            );
+            assert!(
+                row.over_status <= 0.0,
+                "no label may be drawn over the status text at {width}px and \
+                 {font}px text; one covers {}px of it",
+                row.over_status
+            );
+            assert!(
+                row.past_toggle <= 0.5,
+                "the labels must stay inside the toggle at {width}px and \
+                 {font}px text; one reaches {}px past its right edge",
+                row.past_toggle
+            );
+            assert!(
+                !row.status_clipped
+                    && row.status_before_history
+                    && row.history_width >= 40.0
+                    && row.inside_header,
+                "the status chip must read in full, before the history \
+                 control, inside the header at {width}px and {font}px text"
+            );
         }
     }
 

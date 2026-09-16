@@ -7577,9 +7577,25 @@ math merror {
 .gp-root-header {
     display: flex;
     align-items: center;
+    /* A conflict count, an ahead/behind pair, the status chip and the history
+       control can together want more than a narrow dock has. When they do,
+       the status chip and history control drop to a second line and the
+       labels get the first line to themselves, rather than squeezing the root
+       name out of the row. */
+    flex-wrap: wrap;
     gap: var(--space-1);
     min-height: 28px;
     padding: 0 var(--space-2) 0 var(--space-1);
+}
+
+/* Status and history move as one unit, so they never end up split across the
+   two lines, and they stay against the right edge on either. */
+.gp-root-meta {
+    display: flex;
+    align-items: center;
+    gap: var(--space-1);
+    flex-shrink: 0;
+    margin-left: auto;
 }
 
 .gp-root-toggle {
@@ -7587,7 +7603,15 @@ math merror {
     align-items: center;
     gap: var(--space-1);
     flex: 1;
-    min-width: 0;
+    /* The row wraps once the labels cannot get this much: the chevron, this
+       button's padding and the two gaps between its children (28px) plus room
+       for an identifying stretch of the name and the branch's sliver. This is
+       what keeps the name from collapsing to nothing when the metadata wants
+       the whole row. */
+    min-width: calc(7.5em + 28px);
+    /* Whatever happens, the labels are clipped at the button's own edge
+       instead of being painted over the status text beside it. */
+    overflow: hidden;
     padding: 2px var(--space-1);
     border: 0;
     border-radius: 4px;
@@ -7601,16 +7625,32 @@ math merror {
     cursor: pointer;
 }
 
+/* Counts add a fourth child, a third gap and a floor of their own, so a row
+   carrying them has to wrap sooner to leave the name the same stretch: 32px of
+   chevron, padding and gaps, then 11.5em for twelve characters of the name and
+   the ellipsis that stands in for the rest, the branch's 3ch sliver and the
+   counts' 2.5ch floor. Capped at the row's own width so the button can never
+   ask for more than the dock has and push itself out of the header.
+
+   The markup says which rows these are. Matching on the counts themselves
+   would read better, but it would leave the root name with no floor at all on
+   a webview without `:has()` — and a worse one than before this rule existed,
+   because the counts hold their own floor either way and take it out of the
+   name. */
+.gp-root-toggle.gp-root-toggle-counted {
+    min-width: min(calc(11.5em + 32px), 100%);
+}
+
 .gp-root-toggle:hover {
     background: var(--surface-hover);
     color: var(--text-primary);
 }
 
 /* The root name is how the user tells entries apart, so it outranks the
-   branch in the layout: both can shrink, but the branch's far larger shrink
-   factor means it gives way first and truncates while the name keeps its
-   full text. The branch keeps a sliver so its hover title stays reachable,
-   and only once it is down to that does the name itself start to truncate. */
+   branch and the ahead/behind pair: it takes its text width first and the
+   others divide what is left. Sharing the shrinking instead would cost the
+   name its last character, because a flex item that gives up even a fraction
+   of a pixel renders an ellipsis in place of it. */
 .gp-root-name {
     flex: 0 1 auto;
     min-width: 0;
@@ -7620,8 +7660,11 @@ math merror {
     font-family: var(--font-mono);
 }
 
+/* Grows out of the space the name leaves over, never past its own text, and
+   never below a sliver that keeps its hover title reachable. */
 .gp-root-branch {
-    flex: 0 1000 auto;
+    flex: 1 1 0;
+    max-width: max-content;
     min-width: 3ch;
     overflow: hidden;
     text-overflow: ellipsis;
@@ -7633,8 +7676,20 @@ math merror {
     text-transform: none;
 }
 
+/* Keeps its full text while the row has room and is the first label to give
+   it back when the row does not; its title carries the counts either way.
+   Truncating with an ellipsis rather than a clip matters here, because a cut
+   "↑1000" reads as a smaller number instead of a hidden one. */
 .gp-root-ahead-behind {
-    flex-shrink: 0;
+    flex: 0 100000 auto;
+    /* Never shrink away entirely: an arrow and an ellipsis keep the counts
+       visible as something to hover, and the title carries the numbers. A
+       zero-width label paints nothing and cannot be hovered, so the counts
+       would become undiscoverable rather than merely truncated. */
+    min-width: 2.5ch;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
     color: var(--text-tertiary);
     font-size: 0.692rem;
     font-weight: 600;
