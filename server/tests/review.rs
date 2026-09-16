@@ -2006,14 +2006,33 @@ async fn lightweight_review_subscribe_skips_full_root_diff_refresh() {
     fs::rename(&repo, &moved_repo).expect("move repo out from under project root");
 
     let mut lightweight = fixture.connect().await;
-    let redacted = subscribe_review_with_payload(
-        &mut lightweight,
-        &review.id,
-        ReviewSubscribePayload {
-            include_diffs: false,
-        },
-    )
-    .await;
+    lightweight
+        .review_subscribe(
+            &review.id,
+            ReviewSubscribePayload {
+                include_diffs: false,
+            },
+        )
+        .await
+        .expect("lightweight review subscribe");
+    // Moving the root produced a project_git_status error on /project/<id>,
+    // not a review error. The stored lightweight review must remain available.
+    let redacted =
+        next_frame_matching_on(&mut lightweight, "lightweight review bootstrap", |env| {
+            if env.kind == FrameKind::CommandError {
+                let error: CommandErrorPayload = env.parse_payload().expect("project root error");
+                assert_eq!(error.stream.0, format!("/project/{}", project.id.0));
+                assert_eq!(error.operation, "project_git_status");
+                assert_eq!(error.request_kind, FrameKind::ProjectFileList);
+                assert!(error.message.contains(repo.to_str().unwrap()));
+                assert!(error.fatal);
+            }
+            env.kind == FrameKind::ReviewBootstrap
+        })
+        .await
+        .parse_payload::<ReviewBootstrapPayload>()
+        .expect("lightweight review bootstrap payload")
+        .review;
     assert_eq!(redacted.id, review.id);
     assert!(
         redacted.diffs.is_empty(),

@@ -6,7 +6,9 @@ use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
-use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+use notify::{Event, EventKind};
+
+use crate::project_watch::ProjectWatcher;
 use protocol::{
     CodeIntelOverviewHeadline, CodeIntelOverviewPayload, CodeIntelOverviewSummary,
     CodeIntelProviderStatus, CodeIntelRootOverview, CodeIntelState, CommandErrorCode,
@@ -73,39 +75,11 @@ impl ProjectWatcherFailure {
     }
 }
 
-struct ProjectWatcher {
-    inner: Option<RecommendedWatcher>,
-}
-
-impl ProjectWatcher {
-    fn new(inner: RecommendedWatcher) -> Self {
-        Self { inner: Some(inner) }
-    }
-}
-
-impl Drop for ProjectWatcher {
-    fn drop(&mut self) {
-        let Some(watcher) = self.inner.take() else {
-            return;
-        };
-        match std::thread::Builder::new()
-            .name("tyde-project-watch-drop".to_owned())
-            .spawn(move || drop(watcher))
-        {
-            Ok(_) => {}
-            Err(error) => tracing::warn!(
-                %error,
-                "failed to spawn project watcher drop thread; dropping watcher inline"
-            ),
-        }
-    }
-}
-
 /// A (relative_path, kind) pair used for comparing file listings between snapshots.
 pub(crate) type RawFileEntry = (String, ProjectFileKind);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum GitAccessMode {
+pub(crate) enum GitAccessMode {
     ReadOnly,
     Mutating,
 }
@@ -480,34 +454,16 @@ fn create_project_watcher(
     watch_tx: mpsc::UnboundedSender<notify::Result<Event>>,
     force_watch_limit: bool,
 ) -> Result<ProjectWatcher, ProjectWatcherFailure> {
-    let mut watcher = RecommendedWatcher::new(
-        move |result| {
-            let _ = watch_tx.send(result);
-        },
-        Config::default(),
-    )
-    .map_err(|error| {
+    if force_watch_limit && let Some(root) = project.root_paths().first() {
+        return Err(ProjectWatcherFailure::forced_limit(root));
+    }
+    tracing::debug!(project_id = %project.id, "registering project filesystem watches");
+    ProjectWatcher::new(project, watch_tx).map_err(|error| {
         ProjectWatcherFailure::from_notify(
             "failed to create project filesystem watcher".to_owned(),
             error,
         )
-    })?;
-
-    for root in project.root_paths() {
-        if force_watch_limit {
-            return Err(ProjectWatcherFailure::forced_limit(&root));
-        }
-        watcher
-            .watch(Path::new(&root.0), RecursiveMode::Recursive)
-            .map_err(|error| {
-                ProjectWatcherFailure::from_notify(
-                    format!("failed to watch project root '{}'", root),
-                    error,
-                )
-            })?;
-    }
-
-    Ok(ProjectWatcher::new(watcher))
+    })
 }
 
 async fn background_project_read<T: Send + 'static>(
@@ -562,6 +518,7 @@ async fn run_project_subscription(
     // filesystem-watcher changes, and (transitively, via the watcher) agent
     // writes. See `dev-docs/24-code-intelligence.md` §2.4.
     let mut file_versions = HashMap::<ProjectPath, ProjectFileVersion>::new();
+    let mut observed_files = HashSet::<ProjectPath>::new();
     // Registered listeners for per-file version bumps (§M4). Each per-root
     // code-intel service registers one on spawn; closed senders are pruned on
     // broadcast. The project-stream actor is the single owner of the counter,
@@ -703,6 +660,13 @@ async fn run_project_subscription(
                                 .unwrap_or(ProjectFileVersion(0));
                             contents
                         });
+                        if let Ok(contents) = &result {
+                            observed_files.insert(contents.path.clone());
+                            if let Some(watcher) = watcher.as_mut()
+                                && let Err(error) = watcher.observe(&contents.path).await {
+                                let _ = watch_tx.send(Err(error));
+                            }
+                        }
                         let _ = reply.send(result);
                     }
                     ProjectStreamCommand::CurrentFileVersion { path, reply } => {
@@ -717,6 +681,13 @@ async fn run_project_subscription(
                         listener,
                         reply,
                     } => {
+                        if validate_project_path(&project, &path).is_ok() {
+                            observed_files.insert(path.clone());
+                            if let Some(watcher) = watcher.as_mut()
+                                && let Err(error) = watcher.observe(&path).await {
+                                let _ = watch_tx.send(Err(error));
+                            }
+                        }
                         let result = register_file_version_listener_and_current_version(
                             &project,
                             path,
@@ -731,7 +702,12 @@ async fn run_project_subscription(
             maybe_watcher = watcher_ready_rx.recv(), if watcher_initializing => {
                 watcher_initializing = false;
                 match maybe_watcher {
-                    Some(Ok(ready_watcher)) => {
+                    Some(Ok(mut ready_watcher)) => {
+                        for path in &observed_files {
+                            if let Err(error) = ready_watcher.observe(path).await {
+                                let _ = watch_tx.send(Err(error));
+                            }
+                        }
                         watcher = Some(ready_watcher);
                         if let Err(error) = refresh_project_files(
                             &project_store,
@@ -896,7 +872,7 @@ async fn run_project_subscription(
                 let metadata_result = async {
                     let latest_project = load_subscription_project(&project_store, &project_id).await?;
                     if let Some(watcher) = watcher.as_mut() {
-                        ensure_watched_roots(&latest_project, watcher, &mut watched_roots, watch_tx.clone())?;
+                        ensure_watched_roots(&latest_project, watcher, &mut watched_roots, watch_tx.clone()).await?;
                     }
                     project = latest_project;
                     if sync_code_intel_overview_roots(&mut snapshot.code_intel_overview, project.root_paths()) {
@@ -984,7 +960,7 @@ async fn refresh_project_files(
 ) -> Result<(), String> {
     let latest_project = load_subscription_project(project_store, project_id).await?;
     if let Some(watcher) = watcher {
-        ensure_watched_roots(&latest_project, watcher, watched_roots, watch_tx)?;
+        ensure_watched_roots(&latest_project, watcher, watched_roots, watch_tx).await?;
     }
     *project = latest_project;
     let current_raw = background_project_read(project, "files", scan_raw_entries).await?;
@@ -1111,7 +1087,7 @@ async fn apply_git_refresh(
     Ok(())
 }
 
-fn ensure_watched_roots(
+async fn ensure_watched_roots(
     project: &Project,
     watcher: &mut ProjectWatcher,
     watched_roots: &mut Vec<ProjectRootPath>,
@@ -1122,7 +1098,22 @@ fn ensure_watched_roots(
         return Ok(());
     }
 
-    *watcher = create_project_watcher(project, watch_tx, false).map_err(|error| error.message)?;
+    let observed = watcher.observed.clone();
+    let project = project.clone();
+    let mut replacement =
+        tokio::task::spawn_blocking(move || create_project_watcher(&project, watch_tx, false))
+            .await
+            .map_err(|error| error.to_string())?
+            .map_err(|error| error.message)?;
+    for path in observed {
+        if roots.contains(&path.root) {
+            replacement
+                .observe(&path)
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+    }
+    *watcher = replacement;
     *watched_roots = roots;
     Ok(())
 }
@@ -3483,7 +3474,11 @@ fn absolute_project_path(path: &ProjectPath) -> Result<PathBuf, String> {
     Ok(Path::new(&path.root.0).join(&path.relative_path))
 }
 
-fn run_git_mode(root: &str, args: &[&str], access_mode: GitAccessMode) -> Result<String, String> {
+pub(crate) fn run_git_mode(
+    root: &str,
+    args: &[&str],
+    access_mode: GitAccessMode,
+) -> Result<String, String> {
     run_git_mode_with_binary("git", root, args, access_mode)
 }
 

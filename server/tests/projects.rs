@@ -2667,8 +2667,66 @@ async fn project_stage_hunk_stages_only_one_hunk() {
         .await
         .expect("project_stage_hunk failed");
 
-    let file_list =
-        expect_project_file_list(&mut fixture.client, "file list after stage hunk").await;
+    // A subscribed ProjectGitDiff arrived before the next ProjectGitStatus.
+    // Collect the independent pushes without discarding either diff or status.
+    let (file_list, git_status, staged, unstaged) =
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let mut file_list = None;
+            let mut git_status = None;
+            let mut staged = None;
+            let mut unstaged = None;
+            while file_list.is_none()
+                || git_status.is_none()
+                || staged.is_none()
+                || unstaged.is_none()
+            {
+                let env = expect_next_event(&mut fixture.client, "stage hunk updates").await;
+                match env.kind {
+                    FrameKind::ProjectFileList => {
+                        file_list = Some(
+                            env.parse_payload::<ProjectFileListPayload>()
+                                .expect("staging file list"),
+                        );
+                    }
+                    FrameKind::ProjectGitStatus => {
+                        let status: ProjectGitStatusPayload =
+                            env.parse_payload().expect("staging Git status");
+                        if status.roots[0].files.iter().any(|file| {
+                            file.relative_path == "src/main.rs"
+                                && file.staged.is_some()
+                                && file.unstaged.is_some()
+                        }) {
+                            git_status = Some(status);
+                        }
+                    }
+                    FrameKind::ProjectGitDiff => {
+                        let diff: ProjectGitDiffPayload =
+                            env.parse_payload().expect("staging diff");
+                        assert_eq!(diff.root.0, project_root(&project, 0));
+                        assert_eq!(diff.path.as_deref(), Some("src/main.rs"));
+                        if diff.files.len() == 1 && diff.files[0].hunks.len() == 1 {
+                            match diff.scope {
+                                ProjectDiffScope::Staged => staged = Some(diff),
+                                ProjectDiffScope::Unstaged => unstaged = Some(diff),
+                                ProjectDiffScope::Uncommitted => {
+                                    panic!("unexpected combined diff for staging subscriptions")
+                                }
+                            }
+                        }
+                    }
+                    FrameKind::CodeIntelOverview => {}
+                    other => panic!("unexpected stage hunk update: {other:?}"),
+                }
+            }
+            (
+                file_list.unwrap(),
+                git_status.unwrap(),
+                staged.unwrap(),
+                unstaged.unwrap(),
+            )
+        })
+        .await
+        .expect("staging must push the file list, Git status, and both updated diffs");
     assert_eq!(file_list.roots.len(), 1);
     assert_eq!(file_list.roots[0].root.0, project_root(&project, 0));
     let entry = file_list.roots[0]
@@ -2677,32 +2735,31 @@ async fn project_stage_hunk_stages_only_one_hunk() {
         .find(|entry| entry.relative_path == "src/main.rs")
         .expect("staged file remains listed");
     assert_eq!(entry.op, FileEntryOp::Add);
-    let git_status = expect_project_git_status_matching(
-        &mut fixture.client,
-        "git status after stage hunk",
-        |git_status| {
-            git_status.roots[0].files.iter().any(|file| {
-                file.relative_path == "src/main.rs"
-                    && file.staged.is_some()
-                    && file.unstaged.is_some()
-            })
-        },
-    )
-    .await;
     assert_eq!(git_status.roots[0].files.len(), 1);
     assert!(git_status.roots[0].files[0].staged.is_some());
     assert!(git_status.roots[0].files[0].unstaged.is_some());
 
-    let staged = expect_project_git_diff(&mut fixture.client, "staged diff after stage hunk").await;
     assert_eq!(staged.scope, ProjectDiffScope::Staged);
     assert_eq!(staged.files.len(), 1);
     assert_eq!(staged.files[0].hunks.len(), 1);
 
-    let unstaged =
-        expect_project_git_diff(&mut fixture.client, "unstaged diff after stage hunk").await;
     assert_eq!(unstaged.scope, ProjectDiffScope::Unstaged);
     assert_eq!(unstaged.files.len(), 1);
     assert_eq!(unstaged.files[0].hunks.len(), 1);
+    assert!(
+        staged.files[0].hunks[0]
+            .lines
+            .iter()
+            .any(|line| line.kind == ProjectGitDiffLineKind::Added
+                && line.text.contains("line2 changed"))
+    );
+    assert!(
+        unstaged.files[0].hunks[0]
+            .lines
+            .iter()
+            .any(|line| line.kind == ProjectGitDiffLineKind::Added
+                && line.text.contains("line11 changed"))
+    );
 }
 
 #[tokio::test]
@@ -2844,6 +2901,354 @@ async fn project_list_dir_returns_deeper_entries() {
         deep_paths.contains(&"a/b/c/hidden.rs"),
         "a/b/c/hidden.rs should appear in list_dir response but got {deep_paths:?}"
     );
+}
+
+#[cfg(target_os = "linux")]
+fn directory_has_inotify_watch(path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let inode = format!(
+        "ino:{:x}",
+        fs::metadata(path)
+            .expect("watched directory metadata")
+            .ino()
+    );
+    fs::read_dir("/proc/self/fdinfo")
+        .expect("inotify descriptors")
+        .filter_map(Result::ok)
+        .filter_map(|entry| fs::read_to_string(entry.path()).ok())
+        .any(|info| {
+            info.lines().any(|line| {
+                line.starts_with("inotify ") && line.split_whitespace().any(|field| field == inode)
+            })
+        })
+}
+
+async fn expect_watched_change(client: &mut client::Connection, relative_path: &str) {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let env = client
+                .next_event()
+                .await
+                .expect("project event")
+                .expect("open connection");
+            assert_ne!(
+                env.kind,
+                FrameKind::CommandError,
+                "watching failed: {env:?}"
+            );
+            if env.kind == FrameKind::ProjectEvent
+                && let protocol::ProjectEventPayload::FilesChanged { files } =
+                    env.parse_payload().expect("file changes")
+                && files
+                    .iter()
+                    .any(|change| change.path.relative_path == relative_path)
+            {
+                return;
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("live update missing for {relative_path}"));
+}
+
+async fn assert_no_watched_changes(client: &mut client::Connection, paths: &[&str]) {
+    let quiet = tokio::time::timeout(Duration::from_millis(600), async {
+        loop {
+            let env = client
+                .next_event()
+                .await
+                .expect("project event")
+                .expect("open connection");
+            assert_ne!(
+                env.kind,
+                FrameKind::CommandError,
+                "watching failed: {env:?}"
+            );
+            if env.kind == FrameKind::ProjectEvent
+                && let protocol::ProjectEventPayload::FilesChanged { files } =
+                    env.parse_payload().expect("file changes")
+            {
+                for change in files {
+                    assert!(
+                        !paths.contains(&change.path.relative_path.as_str()),
+                        "ignored change escaped: {change:?}"
+                    );
+                }
+            }
+        }
+    })
+    .await;
+    assert!(quiet.is_err());
+}
+
+#[tokio::test]
+async fn project_watcher_prunes_ignored_build_trees() {
+    let mut fixture = Fixture::new().await;
+    let repo = init_git_repo(
+        "ignored-watches",
+        &[
+            ("src/main.rs", "initial\n"),
+            ("tracked/keep.rs", "tracked\n"),
+        ],
+    );
+    write_file(&repo.path().join(".gitignore"), "/target/\n/tracked/\n");
+    write_file(
+        &repo.path().join("target/other/deep/cache"),
+        "unopened artifact",
+    );
+    write_file(
+        &repo.path().join("target/debug/.fingerprint/cache"),
+        "artifact",
+    );
+    let project = create_project_with_real_roots(
+        &mut fixture.client,
+        "Ignored watches",
+        vec![repo.path().to_string_lossy().into_owned()],
+    )
+    .await;
+
+    #[cfg(target_os = "linux")]
+    {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !directory_has_inotify_watch(&repo.path().join("src")) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("source directory must be watched");
+        for directory in [
+            "target",
+            "target/debug",
+            "target/debug/.fingerprint",
+            "target/other/deep",
+        ] {
+            assert!(
+                !directory_has_inotify_watch(&repo.path().join(directory)),
+                "ignored build directories must not consume OS watches: {directory}"
+            );
+        }
+        assert!(
+            !directory_has_inotify_watch(&repo.path().join(".git/objects")),
+            "Git object storage must not consume OS watches"
+        );
+    }
+    fixture
+        .client
+        .project_read_file(
+            &project.id,
+            ProjectReadFilePayload {
+                path: ProjectPath {
+                    root: ProjectRootPath(project_root(&project, 0)),
+                    relative_path: "src/main.rs".to_owned(),
+                },
+            },
+        )
+        .await
+        .expect("read source");
+    expect_project_file_contents(&mut fixture.client, "source contents").await;
+    let source = repo.path().join("src/main.rs");
+    fs::write(&source, "source update\n").expect("edit source");
+    expect_watched_change(&mut fixture.client, "src/main.rs").await;
+
+    write_file(&repo.path().join("fresh/deep/new.rs"), "new\n");
+    expect_watched_change(&mut fixture.client, "fresh/deep/new.rs").await;
+    fs::write(repo.path().join("fresh/deep/new.rs"), "second\n").unwrap();
+    expect_watched_change(&mut fixture.client, "fresh/deep/new.rs").await;
+    fs::rename(repo.path().join("fresh"), repo.path().join("moved")).unwrap();
+    expect_watched_change(&mut fixture.client, "moved/deep/new.rs").await;
+    fs::write(repo.path().join("moved/deep/new.rs"), "after move\n").unwrap();
+    expect_watched_change(&mut fixture.client, "moved/deep/new.rs").await;
+
+    write_file(&repo.path().join("shape"), "was a file\n");
+    expect_watched_change(&mut fixture.client, "shape").await;
+    fs::remove_file(repo.path().join("shape")).unwrap();
+    write_file(&repo.path().join("shape/nested.rs"), "now a directory\n");
+    expect_watched_change(&mut fixture.client, "shape/nested.rs").await;
+    fs::write(
+        repo.path().join("shape/nested.rs"),
+        "directory contents changed\n",
+    )
+    .unwrap();
+    expect_watched_change(&mut fixture.client, "shape/nested.rs").await;
+    fs::remove_dir_all(repo.path().join("shape")).unwrap();
+    expect_watched_change(&mut fixture.client, "shape/nested.rs").await;
+    write_file(
+        &repo.path().join("shape/nested.rs"),
+        "recreated directory\n",
+    );
+    expect_watched_change(&mut fixture.client, "shape/nested.rs").await;
+    fs::write(
+        repo.path().join("shape/nested.rs"),
+        "recreated contents changed\n",
+    )
+    .unwrap();
+    expect_watched_change(&mut fixture.client, "shape/nested.rs").await;
+
+    write_file(
+        &repo.path().join(".settings/editor.toml"),
+        "enabled = true\n",
+    );
+    expect_watched_change(&mut fixture.client, ".settings/editor.toml").await;
+    fs::write(repo.path().join("tracked/keep.rs"), "tracked update\n").unwrap();
+    expect_watched_change(&mut fixture.client, "tracked/keep.rs").await;
+
+    fs::write(
+        repo.path().join(".gitignore"),
+        "/target/\n/tracked/\n/moved/\n",
+    )
+    .unwrap();
+    expect_watched_change(&mut fixture.client, ".gitignore").await;
+    #[cfg(target_os = "linux")]
+    assert!(
+        !directory_has_inotify_watch(&repo.path().join("moved/deep")),
+        "new ignore rules must release directory watches"
+    );
+    fs::write(repo.path().join("moved/deep/new.rs"), "ignored update\n").unwrap();
+    fs::write(
+        repo.path().join("target/debug/.fingerprint/cache"),
+        "new artifact",
+    )
+    .unwrap();
+    assert_no_watched_changes(
+        &mut fixture.client,
+        &["moved/deep/new.rs", "target/debug/.fingerprint/cache"],
+    )
+    .await;
+
+    fs::write(repo.path().join(".gitignore"), "/target/\n/tracked/\n").unwrap();
+    expect_watched_change(&mut fixture.client, ".gitignore").await;
+    fs::write(repo.path().join("moved/deep/new.rs"), "visible again\n").unwrap();
+    expect_watched_change(&mut fixture.client, "moved/deep/new.rs").await;
+
+    write_file(&repo.path().join("moved/.gitignore"), "deep/\n");
+    expect_watched_change(&mut fixture.client, "moved/.gitignore").await;
+    #[cfg(target_os = "linux")]
+    assert!(
+        !directory_has_inotify_watch(&repo.path().join("moved/deep")),
+        "nested ignore rules must prune existing watches"
+    );
+    fs::remove_file(repo.path().join("moved/.gitignore")).unwrap();
+    expect_watched_change(&mut fixture.client, "moved/.gitignore").await;
+    fs::write(
+        repo.path().join("moved/deep/new.rs"),
+        "nested rule removed\n",
+    )
+    .unwrap();
+    expect_watched_change(&mut fixture.client, "moved/deep/new.rs").await;
+
+    fs::write(repo.path().join(".git/info/exclude"), "moved/\n").unwrap();
+    #[cfg(target_os = "linux")]
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while directory_has_inotify_watch(&repo.path().join("moved/deep")) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("repository excludes must release watches");
+    fs::write(repo.path().join(".git/info/exclude"), "").unwrap();
+    expect_watched_change(&mut fixture.client, "moved/deep/new.rs").await;
+
+    fixture
+        .client
+        .project_read_file(
+            &project.id,
+            ProjectReadFilePayload {
+                path: ProjectPath {
+                    root: ProjectRootPath(project_root(&project, 0)),
+                    relative_path: "target/debug/.fingerprint/cache".to_owned(),
+                },
+            },
+        )
+        .await
+        .expect("explicitly open ignored file");
+    let initial = expect_project_file_contents(&mut fixture.client, "ignored file contents").await;
+    write_file(
+        &repo.path().join("target/debug/.fingerprint/replacement"),
+        "opened update",
+    );
+    fs::rename(
+        repo.path().join("target/debug/.fingerprint/replacement"),
+        repo.path().join("target/debug/.fingerprint/cache"),
+    )
+    .unwrap();
+    expect_watched_change(&mut fixture.client, "target/debug/.fingerprint/cache").await;
+    fixture
+        .client
+        .project_read_file(&project.id, ProjectReadFilePayload { path: initial.path })
+        .await
+        .unwrap();
+    let updated = expect_project_file_contents(&mut fixture.client, "updated ignored file").await;
+    assert_eq!(updated.contents.as_deref(), Some("opened update"));
+    assert!(updated.version > initial.version);
+    #[cfg(target_os = "linux")]
+    assert!(
+        !directory_has_inotify_watch(&repo.path().join("target/other/deep")),
+        "opening one ignored file must not watch sibling build trees"
+    );
+}
+
+#[tokio::test]
+async fn project_watcher_follows_worktree_git_metadata() {
+    let mut fixture = Fixture::new().await;
+    let repo = init_git_repo("worktree-watches", &[("source.rs", "initial\n")]);
+    let checkout = tempfile::tempdir().unwrap();
+    let worktree = checkout.path().join("checkout");
+    git(
+        repo.path(),
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "watch-branch",
+            worktree.to_str().unwrap(),
+        ],
+    );
+    write_file(&worktree.join(".gitignore"), "target/\n");
+    write_file(&worktree.join("target/deep/cache"), "artifact");
+    let project = create_project_with_real_roots(
+        &mut fixture.client,
+        "Worktree watches",
+        vec![worktree.to_string_lossy().into_owned()],
+    )
+    .await;
+    fs::write(worktree.join("source.rs"), "modified\n").unwrap();
+    expect_watched_change(&mut fixture.client, "source.rs").await;
+    let root = ProjectRootPath(project_root(&project, 0));
+    git(&worktree, &["add", "source.rs"]);
+    tokio::time::timeout(
+        Duration::from_secs(3),
+        expect_project_git_status_matching(
+            &mut fixture.client,
+            "worktree index update",
+            |status| {
+                status.roots.iter().any(|entry| {
+                    entry.root == root
+                        && entry
+                            .files
+                            .iter()
+                            .any(|file| file.relative_path == "source.rs" && file.staged.is_some())
+                })
+            },
+        ),
+    )
+    .await
+    .expect("external worktree index changes must push Git status promptly");
+    git(&worktree, &["branch", "-m", "renamed-watch-branch"]);
+    tokio::time::timeout(
+        Duration::from_secs(3),
+        expect_project_git_status_matching(&mut fixture.client, "worktree HEAD update", |status| {
+            status.roots[0].branch.as_deref() == Some("renamed-watch-branch")
+        }),
+    )
+    .await
+    .expect("external worktree HEAD changes must push Git status promptly");
+    #[cfg(target_os = "linux")]
+    {
+        assert!(!directory_has_inotify_watch(&worktree.join("target/deep")));
+        assert!(!directory_has_inotify_watch(
+            &repo.path().join(".git/objects")
+        ));
+    }
 }
 
 #[tokio::test]
