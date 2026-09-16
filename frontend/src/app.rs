@@ -1089,6 +1089,7 @@ pub(crate) async fn install_host_listeners(
     let recovery_state = state.clone();
     handles.push(
         bridge::listen_host_recovery(move |event| {
+            crate::components::header::resolve_host_warnings(&event.host_id);
             if !recovery_state
                 .configured_hosts
                 .with_untracked(|hosts| hosts.iter().any(|host| host.id == event.host_id))
@@ -1196,13 +1197,12 @@ pub(crate) async fn install_host_listeners(
                 );
                 return;
             }
-            log::warn!("host {} warning: {}", event.host_id, event.message);
             let label = configured_host_label(&warning_state, &event.host_id);
             let message = match label {
                 Some(label) => format!("Host “{label}” reported: {}", event.message),
                 None => format!("A host reported: {}", event.message),
             };
-            crate::components::header::report_user_warning(message);
+            crate::components::header::hold_host_warning(&warning_state, event.host_id, message);
         })
         .await?,
     );

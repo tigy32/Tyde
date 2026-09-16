@@ -1,8 +1,16 @@
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::time::Duration;
 
 use leptos::prelude::*;
 
 use crate::state::{AppState, ConnectionStatus, DockVisibility};
+
+/// ssh reports a dropped connection on stderr before the transport loss reaches
+/// the recovery listener, so an arriving host warning cannot be classified yet.
+/// Hold it this long rather than banner it immediately: a drop the host
+/// reconnects inside the window resolves the warning instead of leaving the
+/// user something to dismiss by hand.
+pub(crate) const HOST_WARNING_HOLD: Duration = Duration::from_secs(3);
 
 #[derive(Clone, PartialEq, Eq)]
 enum UserNoticeKind {
@@ -14,35 +22,114 @@ enum UserNoticeKind {
 struct UserNotice {
     id: u64,
     kind: UserNoticeKind,
+    host_id: Option<String>,
     message: String,
+}
+
+struct HeldHostWarning {
+    host_id: String,
+    timer: TimeoutHandle,
 }
 
 thread_local! {
     static USER_NOTICE: ArcRwSignal<Option<UserNotice>> =
         ArcRwSignal::new(None);
     static NEXT_USER_NOTICE_ID: Cell<u64> = const { Cell::new(0) };
+    static HELD_HOST_WARNING: RefCell<Option<HeldHostWarning>> = const { RefCell::new(None) };
 }
 
 pub(crate) fn report_user_error(message: impl Into<String>) {
     let message = message.into();
     log::error!("user-visible error: {message}");
-    report_user_notice(UserNoticeKind::Error, message);
+    report_user_notice(UserNoticeKind::Error, None, message);
 }
 
-pub(crate) fn report_user_warning(message: impl Into<String>) {
+/// Queues a host's diagnostic behind [`HOST_WARNING_HOLD`]. It reaches the
+/// banner only if the host is still connected when the hold expires, so a
+/// diagnostic that merely narrated a connection the host went on to lose or
+/// rebuild never interrupts the user.
+pub(crate) fn hold_host_warning(
+    state: &AppState,
+    host_id: impl Into<String>,
+    message: impl Into<String>,
+) {
+    let host_id = host_id.into();
     let message = message.into();
-    log::warn!("user-visible warning: {message}");
-    report_user_notice(UserNoticeKind::Warning, message);
+    log::warn!("host {host_id} warning held: {message}");
+    if let Some(previous) = take_held_host_warning() {
+        previous.timer.clear();
+    }
+
+    let state = state.clone();
+    let held_host_id = host_id.clone();
+    let timer = set_timeout_with_handle(
+        move || {
+            take_held_host_warning();
+            if !host_is_connected(&state, &held_host_id) {
+                log::warn!("host {held_host_id} warning dropped, host is not connected: {message}");
+                return;
+            }
+            report_user_notice(UserNoticeKind::Warning, Some(held_host_id), message);
+        },
+        HOST_WARNING_HOLD,
+    );
+    match timer {
+        Ok(timer) => HELD_HOST_WARNING.with(|held| {
+            *held.borrow_mut() = Some(HeldHostWarning { host_id, timer });
+        }),
+        Err(error) => log::error!("failed to hold warning for host {host_id}: {error:?}"),
+    }
 }
 
-fn report_user_notice(kind: UserNoticeKind, message: String) {
+/// Retires a host's warning once its connection moves again: the held one
+/// before it can surface, and a shown one the host has since recovered from.
+pub(crate) fn resolve_host_warnings(host_id: &str) {
+    let held = HELD_HOST_WARNING.with(|held| {
+        let mut held = held.borrow_mut();
+        match held.as_ref() {
+            Some(warning) if warning.host_id == host_id => held.take(),
+            _ => None,
+        }
+    });
+    if let Some(held) = held {
+        held.timer.clear();
+    }
+
+    USER_NOTICE.with(|notice| {
+        let shown_for_host = notice.with_untracked(|shown| {
+            shown.as_ref().is_some_and(|shown| {
+                shown.kind == UserNoticeKind::Warning && shown.host_id.as_deref() == Some(host_id)
+            })
+        });
+        if shown_for_host {
+            notice.set(None);
+        }
+    });
+}
+
+fn take_held_host_warning() -> Option<HeldHostWarning> {
+    HELD_HOST_WARNING.with(|held| held.borrow_mut().take())
+}
+
+fn host_is_connected(state: &AppState, host_id: &str) -> bool {
+    state.connection_statuses.with_untracked(|statuses| {
+        matches!(statuses.get(host_id), Some(ConnectionStatus::Connected))
+    })
+}
+
+fn report_user_notice(kind: UserNoticeKind, host_id: Option<String>, message: String) {
     let id = NEXT_USER_NOTICE_ID.with(|next| {
         let id = next.get();
         next.set(id.wrapping_add(1));
         id
     });
     USER_NOTICE.with(|notice| {
-        notice.set(Some(UserNotice { id, kind, message }));
+        notice.set(Some(UserNotice {
+            id,
+            kind,
+            host_id,
+            message,
+        }));
     });
 }
 
@@ -228,13 +315,43 @@ mod wasm_tests {
     }
 
     async fn next_tick() {
+        sleep_millis(0).await;
+    }
+
+    async fn sleep_millis(millis: i32) {
         let promise = js_sys::Promise::new(&mut |resolve, _reject| {
             web_sys::window()
                 .unwrap()
-                .set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, 0)
+                .set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, millis)
                 .unwrap();
         });
         let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+    }
+
+    async fn sleep_past_warning_hold() {
+        sleep_millis(HOST_WARNING_HOLD.as_millis() as i32 + 250).await;
+    }
+
+    fn connected_host_state(host_id: &str) -> AppState {
+        let state = AppState::new();
+        state
+            .configured_hosts
+            .set(vec![crate::bridge::ConfiguredHost {
+                id: host_id.to_owned(),
+                label: "Tyggs".to_owned(),
+                transport: crate::bridge::HostTransportConfig::LocalEmbedded,
+                auto_connect: false,
+            }]);
+        state.selected_host_id.set(Some(host_id.to_owned()));
+        state.connection_statuses.update(|statuses| {
+            statuses.insert(host_id.to_owned(), ConnectionStatus::Connected);
+        });
+        state
+    }
+
+    fn reset_notices(host_id: &str) {
+        resolve_host_warnings(host_id);
+        USER_NOTICE.with(|notice| notice.set(None));
     }
 
     #[wasm_bindgen_test]
@@ -278,7 +395,7 @@ mod wasm_tests {
 
     #[wasm_bindgen_test]
     async fn reported_warning_is_visible_without_changing_connection_status() {
-        USER_NOTICE.with(|notice| notice.set(None));
+        reset_notices("remote");
         let container = make_container();
         let state = AppState::new();
         state
@@ -299,10 +416,12 @@ mod wasm_tests {
             view! { <Header /> }
         });
 
-        report_user_warning(
+        hold_host_warning(
+            &state,
+            "remote",
             "ssh: ** WARNING: connection is not using a post-quantum key exchange algorithm.",
         );
-        next_tick().await;
+        sleep_past_warning_hold().await;
 
         let warning = container
             .query_selector(".user-notice-banner.warning")
@@ -333,6 +452,110 @@ mod wasm_tests {
         assert_eq!(
             state.connection_statuses.get_untracked().get("remote"),
             Some(&ConnectionStatus::Connected)
+        );
+    }
+
+    #[wasm_bindgen_test]
+    async fn transient_ssh_drop_never_reaches_the_banner() {
+        reset_notices("host");
+        let container = make_container();
+        let state = connected_host_state("host");
+        let state_for_view = state.clone();
+        let _handle = mount_to(container.clone(), move || {
+            provide_context(state_for_view);
+            view! { <Header /> }
+        });
+
+        hold_host_warning(
+            &state,
+            "host",
+            "Host \u{201c}Tyggs\u{201d} reported: ssh: Connection to hersheys.tycode.dev closed by remote host.",
+        );
+        next_tick().await;
+        assert!(
+            container
+                .query_selector(".user-notice-banner")
+                .unwrap()
+                .is_none(),
+            "a host diagnostic must not interrupt the user before the transport has been given a chance to recover"
+        );
+
+        resolve_host_warnings("host");
+        sleep_past_warning_hold().await;
+        assert!(
+            container
+                .query_selector(".user-notice-banner")
+                .unwrap()
+                .is_none(),
+            "a dropped connection the host reconnected must leave no banner to dismiss"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    async fn standing_host_warning_shows_then_clears_when_the_host_recovers() {
+        reset_notices("host");
+        let container = make_container();
+        let state = connected_host_state("host");
+        let state_for_view = state.clone();
+        let _handle = mount_to(container.clone(), move || {
+            provide_context(state_for_view);
+            view! { <Header /> }
+        });
+
+        hold_host_warning(
+            &state,
+            "host",
+            "Host \u{201c}Tyggs\u{201d} reported: ssh: Connection to hersheys.tycode.dev closed by remote host.",
+        );
+        sleep_past_warning_hold().await;
+        let banner = container
+            .query_selector(".user-notice-banner.warning")
+            .unwrap()
+            .expect("a diagnostic the host never recovered from must reach the user");
+        assert!(
+            banner
+                .text_content()
+                .unwrap_or_default()
+                .contains("closed by remote host"),
+            "the banner must carry the diagnostic the host reported"
+        );
+
+        resolve_host_warnings("host");
+        next_tick().await;
+        assert!(
+            container
+                .query_selector(".user-notice-banner")
+                .unwrap()
+                .is_none(),
+            "a warning the host has since recovered from must clear itself"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    async fn recovering_one_host_leaves_another_hosts_warning_alone() {
+        reset_notices("host");
+        let container = make_container();
+        let state = connected_host_state("host");
+        let state_for_view = state.clone();
+        let _handle = mount_to(container.clone(), move || {
+            provide_context(state_for_view);
+            view! { <Header /> }
+        });
+
+        hold_host_warning(
+            &state,
+            "host",
+            "Host \u{201c}Tyggs\u{201d} reported: ssh: broken pipe",
+        );
+        sleep_past_warning_hold().await;
+        resolve_host_warnings("other");
+        next_tick().await;
+        assert!(
+            container
+                .query_selector(".user-notice-banner.warning")
+                .unwrap()
+                .is_some(),
+            "one host reconnecting says nothing about a warning another host raised"
         );
     }
 }
