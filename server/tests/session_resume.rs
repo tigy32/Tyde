@@ -220,6 +220,24 @@ fn assert_bootstrap_tail_messages(
     }
 }
 
+/// Every message body a bootstrap carries, in the order the user would read
+/// them.
+fn bootstrap_message_contents(payload: &AgentBootstrapPayload) -> Vec<String> {
+    payload
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            AgentBootstrapEvent::ChatEvent(ChatEvent::MessageAdded(message)) => {
+                Some(message.content.clone())
+            }
+            AgentBootstrapEvent::ChatEvent(ChatEvent::StreamEnd(end)) => {
+                Some(end.message.content.clone())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
 fn bootstrap_agent_start(payload: &AgentBootstrapPayload) -> &AgentStartPayload {
     payload
         .events
@@ -1955,4 +1973,346 @@ async fn requested_compactions_keep_one_row_when_observed_after_completion() {
             1
         );
     }
+}
+
+/// Where the durable transcript journal for a session lives under the fixture.
+fn transcript_journal_path(fixture: &Fixture, session_id: &SessionId) -> std::path::PathBuf {
+    let safe = session_id
+        .0
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    fixture
+        .store_dir()
+        .join("transcripts")
+        .join(format!("{safe}.jsonl"))
+}
+
+fn journal_lines(path: &Path) -> Vec<String> {
+    let contents = std::fs::read_to_string(path).expect("read transcript journal");
+    contents
+        .split('\n')
+        .filter(|line| !line.trim().is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+async fn wait_for_session_id(fixture: &mut Fixture, context: &str) -> SessionId {
+    fixture
+        .client
+        .list_sessions(ListSessionsPayload::default())
+        .await
+        .expect("list_sessions failed");
+    let list = wait_for_session_list(&mut fixture.client, context).await;
+    assert_eq!(
+        list.sessions.len(),
+        1,
+        "expected exactly one stored session"
+    );
+    list.sessions[0].id.clone()
+}
+
+/// A record torn by a full disk costs its own tail and nothing more.
+///
+/// `write_all` reports `ENOSPC` after committing part of a record, so the
+/// journal ends in bytes that are not a record. Reading used to fail the whole
+/// file over those bytes, which meant one bad write made the session
+/// permanently unresumable — the history was still on disk, just unreachable.
+/// Resume must still serve the intact prefix, and the damage must be cleared so
+/// records written afterwards are readable too.
+#[tokio::test]
+async fn resume_serves_history_written_before_a_torn_transcript_record() {
+    let mut fixture = Fixture::new().await;
+
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            name: Some("torn".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::New {
+                workspace_roots: vec!["/tmp/test".to_owned()],
+                prompt: "hello".to_owned(),
+                images: None,
+                backend_kind: BackendKind::Claude,
+                launch_profile_id: None,
+                cost_hint: None,
+                access_mode: Default::default(),
+                session_settings: None,
+            },
+        })
+        .await
+        .expect("spawn agent failed");
+
+    let _ = expect_next_event(&mut fixture.client, "NewAgent").await;
+    let _ = expect_next_event(&mut fixture.client, "AgentStart").await;
+    expect_turn(&mut fixture.client, "mock backend response to: hello").await;
+
+    let session_id = wait_for_session_id(&mut fixture, "SessionList").await;
+    let journal = transcript_journal_path(&fixture, &session_id);
+    let intact_lines = journal_lines(&journal);
+    assert!(
+        !intact_lines.is_empty(),
+        "the first turn should have written transcript records to {}",
+        journal.display()
+    );
+
+    // Exactly what a full disk leaves behind: the leading bytes of a record,
+    // with no terminator and no way to finish it. The session id inside it is a
+    // sentinel, because every intact record opens with the same field and the
+    // damage has to stay tellable apart from healthy bytes.
+    let torn = br#"{"logical_session_id":"torn-by-a-full-disk","sequence":4"#;
+    let torn_sentinel = b"torn-by-a-full-disk";
+    let before_tear = std::fs::metadata(&journal).expect("stat journal").len();
+    {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&journal)
+            .expect("open journal to tear it");
+        file.write_all(torn).expect("write torn record");
+    }
+
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            name: Some("resumed".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::Resume {
+                session_id: session_id.clone(),
+                prompt: Some("after resume".to_owned()),
+            },
+        })
+        .await
+        .expect("resume agent failed");
+
+    let env = expect_next_event(&mut fixture.client, "resumed NewAgent").await;
+    let resumed: NewAgentPayload = env.parse_payload().expect("parse resumed NewAgent");
+    let env = expect_raw_event_on_stream(
+        &mut fixture.client,
+        &resumed.instance_stream,
+        FrameKind::AgentBootstrap,
+        "resumed AgentBootstrap",
+    )
+    .await;
+    let payload: AgentBootstrapPayload = env.parse_payload().expect("parse resumed AgentBootstrap");
+
+    // The history written before the tear is what the tear must not cost.
+    assert_bootstrap_tail_messages(&payload, &["hello"]);
+
+    expect_turn(
+        &mut fixture.client,
+        "mock backend response to: after resume",
+    )
+    .await;
+
+    // Appending behind torn bytes would bury every later record where no
+    // reader can reach it, so the damage has to be gone.
+    let contents = std::fs::read(&journal).expect("read journal after resume");
+    assert!(
+        !contents
+            .windows(torn_sentinel.len())
+            .any(|window| window == torn_sentinel),
+        "the torn record should have been discarded from {}",
+        journal.display()
+    );
+    assert_eq!(
+        contents.last().copied(),
+        Some(b'\n'),
+        "every retained record must be terminated"
+    );
+    let repaired_lines = journal_lines(&journal);
+    for line in &repaired_lines {
+        serde_json::from_str::<serde_json::Value>(line)
+            .expect("every retained transcript record must parse");
+    }
+    // The repair may only ever remove from the end. Anything it rewrote or
+    // dropped from the middle would be history lost to a fix meant to save it.
+    assert_eq!(
+        &repaired_lines[..intact_lines.len()],
+        &intact_lines[..],
+        "the records written before the tear must survive it unchanged"
+    );
+    assert!(
+        repaired_lines.len() > intact_lines.len(),
+        "records written after the repair should be readable: {} before, {} after",
+        intact_lines.len(),
+        repaired_lines.len()
+    );
+    assert!(
+        std::fs::metadata(&journal)
+            .expect("stat repaired journal")
+            .len()
+            >= before_tear,
+        "the repair must keep the records that were already committed"
+    );
+
+    // A journal that parses but cannot be resumed from would be a repair in
+    // name only, so read it back the way a user does: resume again and require
+    // both turns, each exactly once.
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            name: Some("resumed twice".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::Resume {
+                session_id: session_id.clone(),
+                prompt: None,
+            },
+        })
+        .await
+        .expect("second resume failed");
+
+    let env = expect_next_event(&mut fixture.client, "second resume NewAgent").await;
+    let again: NewAgentPayload = env.parse_payload().expect("parse second resume NewAgent");
+    let env = expect_raw_event_on_stream(
+        &mut fixture.client,
+        &again.instance_stream,
+        FrameKind::AgentBootstrap,
+        "second resume AgentBootstrap",
+    )
+    .await;
+    let payload: AgentBootstrapPayload = env
+        .parse_payload()
+        .expect("parse second resume AgentBootstrap");
+    let contents = bootstrap_message_contents(&payload);
+    for turn in [
+        "mock backend response to: hello",
+        "mock backend response to: after resume",
+    ] {
+        let seen = contents
+            .iter()
+            .filter(|content| content.contains(turn))
+            .count();
+        assert_eq!(
+            seen, 1,
+            "expected {turn:?} exactly once after the repair, got {contents:?}"
+        );
+    }
+    assert_eq!(
+        contents.len(),
+        2,
+        "the repaired journal must replay both turns and nothing besides: {contents:?}"
+    );
+}
+
+/// A record this build cannot read is not a record it may delete.
+///
+/// The repair exists for bytes no writer ever finished. A complete,
+/// newline-terminated record that fails to deserialize is a different thing --
+/// most likely written by a build that knows an event this one does not -- and
+/// the journal is its only copy. Reading stops there, because guessing past it
+/// would mis-sequence everything after, but the bytes have to stay on disk.
+#[tokio::test]
+async fn a_record_this_build_cannot_read_is_kept_on_disk() {
+    let mut fixture = Fixture::new().await;
+
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            name: Some("unknown schema".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::New {
+                workspace_roots: vec!["/tmp/test".to_owned()],
+                prompt: "hello".to_owned(),
+                images: None,
+                backend_kind: BackendKind::Claude,
+                launch_profile_id: None,
+                cost_hint: None,
+                access_mode: Default::default(),
+                session_settings: None,
+            },
+        })
+        .await
+        .expect("spawn agent failed");
+
+    let _ = expect_next_event(&mut fixture.client, "NewAgent").await;
+    let _ = expect_next_event(&mut fixture.client, "AgentStart").await;
+    expect_turn(&mut fixture.client, "mock backend response to: hello").await;
+
+    let session_id = wait_for_session_id(&mut fixture, "SessionList").await;
+    let journal = transcript_journal_path(&fixture, &session_id);
+    let intact_lines = journal_lines(&journal);
+
+    // Well-formed JSON, properly terminated, carrying an event this build has
+    // no variant for. A newer Tyde writing a newer event looks exactly so.
+    let unknown = format!(
+        r#"{{"logical_session_id":"{}","sequence":9999,"event_id":"from-a-newer-build","visibility":"visible","event":{{"type":"an_event_from_the_future","payload":{{"kept":true}}}},"timestamp_ms":1}}"#,
+        session_id.0
+    );
+    {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&journal)
+            .expect("open journal");
+        writeln!(file, "{unknown}").expect("write unknown record");
+    }
+    let after_write = std::fs::read_to_string(&journal).expect("read journal");
+
+    // Resuming reads the journal, and reading is what used to truncate it.
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            name: Some("resumed".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::Resume {
+                session_id: session_id.clone(),
+                prompt: Some("after resume".to_owned()),
+            },
+        })
+        .await
+        .expect("resume agent failed");
+
+    let env = expect_next_event(&mut fixture.client, "resumed NewAgent").await;
+    let resumed: NewAgentPayload = env.parse_payload().expect("parse resumed NewAgent");
+    let env = expect_raw_event_on_stream(
+        &mut fixture.client,
+        &resumed.instance_stream,
+        FrameKind::AgentBootstrap,
+        "resumed AgentBootstrap",
+    )
+    .await;
+    let payload: AgentBootstrapPayload = env.parse_payload().expect("parse resumed AgentBootstrap");
+
+    // The prefix is still served: an unreadable record costs what follows it,
+    // not what precedes it.
+    assert_bootstrap_tail_messages(&payload, &["hello"]);
+
+    expect_turn(
+        &mut fixture.client,
+        "mock backend response to: after resume",
+    )
+    .await;
+
+    let contents = std::fs::read_to_string(&journal).expect("read journal after resume");
+    assert!(
+        contents.contains("from-a-newer-build"),
+        "a record this build cannot read must not be deleted from {}",
+        journal.display()
+    );
+    assert!(
+        contents.starts_with(&after_write),
+        "the journal may only ever grow here, never be rewritten"
+    );
+    assert_eq!(
+        journal_lines(&journal)[..intact_lines.len()],
+        intact_lines[..],
+        "records written before the unreadable one must be untouched"
+    );
 }
