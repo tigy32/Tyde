@@ -12197,9 +12197,14 @@ impl HostHandle {
             Arc::clone(&state.project_store)
         };
         let project = load_project(&project_store, &project_id, OPERATION).await?;
+        // An out-of-band read answers this one request and nothing else: it
+        // must not redirect the connection's live refreshes into its own
+        // context mode, or the diff the client is actually displaying stops
+        // being refreshed at all.
+        let out_of_band = payload.out_of_band;
         let diff = read_diff(&project, payload)
             .map_err(|error| project_command_error(OPERATION, error))?;
-        if matches!(diff.revision, protocol::ProjectDiffRevision::WorkingTree) {
+        if !out_of_band && matches!(diff.revision, protocol::ProjectDiffRevision::WorkingTree) {
             handle
                 .remember_diff_context_mode(
                     connection_host_stream.clone(),
@@ -13238,6 +13243,7 @@ fn read_review_diffs(
                     revision: protocol::ProjectDiffRevision::WorkingTree,
                     path: None,
                     context_mode: protocol::DiffContextMode::FullFile,
+                    out_of_band: false,
                 };
                 diffs.push(read_diff(project, payload)?);
             }
@@ -13254,6 +13260,7 @@ fn read_review_diffs(
                 revision: protocol::ProjectDiffRevision::WorkingTree,
                 path: path.clone(),
                 context_mode: protocol::DiffContextMode::FullFile,
+                out_of_band: false,
             };
             Ok(vec![read_diff(project, payload)?])
         }
@@ -13273,6 +13280,7 @@ fn read_review_diffs(
                 },
                 path: None,
                 context_mode: protocol::DiffContextMode::FullFile,
+                out_of_band: false,
             };
             read_diff(project, payload).map(|diff| vec![diff])
         }

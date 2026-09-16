@@ -42,6 +42,15 @@ const BINARY_PREVIEW_ENCODED_LIMIT_BYTES: usize =
     (BINARY_PREVIEW_LIMIT_BYTES as usize).div_ceil(3) * 4;
 const BINARY_PREVIEW_PROTOCOL_RESERVE_BYTES: usize = 4 * 1024 * 1024;
 const TEXT_PROTOCOL_RESERVE_BYTES: usize = 64 * 1024;
+/// A diff answer has to fit one logical protocol frame. Refusing an oversized
+/// one here makes it this request's failure; letting it reach the encoder
+/// makes it the connection's, because that error ends the writer task and
+/// `run_connection` tears down the reader and the application with it. Full
+/// context turns a small hunk-mode diff into the whole file, so this is
+/// reachable from one click on "expand context".
+const DIFF_PAYLOAD_LIMIT_BYTES: usize =
+    protocol::framing::MAX_LOGICAL_HEADER - DIFF_PROTOCOL_RESERVE_BYTES;
+const DIFF_PROTOCOL_RESERVE_BYTES: usize = 128 * 1024;
 const _: () = assert!(
     BINARY_PREVIEW_ENCODED_LIMIT_BYTES + BINARY_PREVIEW_PROTOCOL_RESERVE_BYTES
         < protocol::framing::MAX_LOGICAL_HEADER
@@ -49,6 +58,9 @@ const _: () = assert!(
 const _: () = assert!(
     TEXT_READ_LIMIT_BYTES as usize + TEXT_PROTOCOL_RESERVE_BYTES
         < protocol::framing::MAX_LOGICAL_HEADER
+);
+const _: () = assert!(
+    DIFF_PAYLOAD_LIMIT_BYTES + DIFF_PROTOCOL_RESERVE_BYTES <= protocol::framing::MAX_LOGICAL_HEADER
 );
 
 struct ProjectWatcherFailure {
@@ -1724,6 +1736,7 @@ fn read_remembered_diffs(
                 revision: key.revision.clone(),
                 path: key.path.clone(),
                 context_mode: context.context_mode,
+                out_of_band: false,
             };
             RefreshedProjectDiff {
                 host_path,
@@ -2949,7 +2962,7 @@ where
         files.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
     }
 
-    Ok(ProjectGitDiffPayload {
+    let diff = ProjectGitDiffPayload {
         request_id: payload.request_id,
         root: payload.root,
         scope: payload.scope,
@@ -2957,7 +2970,39 @@ where
         path: payload.path,
         context_mode: payload.context_mode,
         files,
-    })
+    };
+    ensure_diff_is_transportable(&diff)?;
+    Ok(diff)
+}
+
+/// Counts what serializing would write without keeping any of it, so an
+/// oversized diff is rejected without first building a second copy of it in
+/// memory.
+struct SerializedLen(usize);
+
+impl std::io::Write for SerializedLen {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0 += buf.len();
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn ensure_diff_is_transportable(diff: &ProjectGitDiffPayload) -> Result<(), String> {
+    let mut length = SerializedLen(0);
+    serde_json::to_writer(&mut length, diff)
+        .map_err(|error| format!("failed to measure diff response: {error}"))?;
+    if length.0 > DIFF_PAYLOAD_LIMIT_BYTES {
+        return Err(format!(
+            "diff is too large to send: {} bytes exceeds the {DIFF_PAYLOAD_LIMIT_BYTES} byte \
+             limit for one response",
+            length.0
+        ));
+    }
+    Ok(())
 }
 
 fn validate_pinned_oid(oid: &str) -> Result<(), String> {

@@ -100,6 +100,20 @@ async fn expect_project_git_diff(
         .expect("failed to parse ProjectGitDiffPayload")
 }
 
+async fn expect_project_command_error(
+    client: &mut client::Connection,
+    context: &str,
+) -> protocol::CommandErrorPayload {
+    loop {
+        let env = expect_next_event(client, context).await;
+        if env.kind == FrameKind::CommandError {
+            return env
+                .parse_payload()
+                .expect("failed to parse CommandErrorPayload");
+        }
+    }
+}
+
 async fn expect_project_response(
     client: &mut client::Connection,
     expected: FrameKind,
@@ -1950,6 +1964,7 @@ async fn project_read_diff_returns_unstaged_diff() {
             revision: protocol::ProjectDiffRevision::WorkingTree,
             path: Some("src/main.rs".to_owned()),
             context_mode: DiffContextMode::Hunks,
+            out_of_band: false,
         },
         "project git diff",
     )
@@ -1996,6 +2011,153 @@ async fn project_read_diff_returns_unstaged_diff() {
     .expect("live diff must refresh when an already-modified file changes again");
     assert_eq!(refreshed.path.as_deref(), Some("src/main.rs"));
     assert_eq!(refreshed.context_mode, DiffContextMode::Hunks);
+
+    // "Expand context" reads the same diff at full context while the diff on
+    // screen stays in hunk mode. That read is out of band: it answers itself
+    // and leaves the refresh subscription alone. Recording its mode instead
+    // would make every later refresh arrive in a mode the client discards as
+    // stale, and the diff would silently stop updating.
+    let expansion = request_project_diff(
+        &mut fixture.client,
+        &project.id,
+        ProjectReadDiffPayload {
+            request_id: Some("expand-context".to_owned()),
+            root: protocol::ProjectRootPath(project_root(&project, 0)),
+            scope: ProjectDiffScope::Unstaged,
+            revision: protocol::ProjectDiffRevision::WorkingTree,
+            path: Some("src/main.rs".to_owned()),
+            context_mode: DiffContextMode::FullFile,
+            out_of_band: true,
+        },
+        "out-of-band full-context diff",
+    )
+    .await;
+    assert_eq!(expansion.context_mode, DiffContextMode::FullFile);
+    assert!(
+        expansion.files[0].hunks[0]
+            .lines
+            .iter()
+            .any(|line| line.text.contains("fn main()")),
+        "the out-of-band read must still answer with the full-context diff"
+    );
+
+    write_file(
+        &repo.path().join("src/main.rs"),
+        "fn main() {\n    println!(\"newest\");\n}\n",
+    );
+    let after_expansion = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let diff =
+                expect_project_git_diff(&mut fixture.client, "live diff after expansion read")
+                    .await;
+            if diff.request_id.is_none()
+                && diff
+                    .files
+                    .iter()
+                    .flat_map(|file| &file.hunks)
+                    .flat_map(|hunk| &hunk.lines)
+                    .any(|line| {
+                        line.kind == ProjectGitDiffLineKind::Added && line.text.contains("newest")
+                    })
+            {
+                return diff;
+            }
+        }
+    })
+    .await
+    .expect("live diff must keep refreshing after an out-of-band full-context read");
+    assert_eq!(
+        after_expansion.context_mode,
+        DiffContextMode::Hunks,
+        "refreshes must keep arriving in the mode the displayed diff asked for"
+    );
+}
+
+/// Full context turns a small hunk-mode diff into the whole file, and a big
+/// enough file does not fit the one logical frame a response is sent in. The
+/// encoder refuses an oversized frame by failing the writer task, and that
+/// tears down the reader and the application with it — one click on "expand
+/// context" would drop the host connection. The read has to refuse first, as
+/// this request's error, with the connection still serving.
+#[tokio::test]
+async fn an_oversized_full_context_diff_fails_the_request_not_the_connection() {
+    let mut fixture = Fixture::new().await;
+    // Small on disk, but every line becomes a JSON object carrying its kind
+    // and both line numbers, so at full context this serializes to well over
+    // the 16 MiB a frame can hold.
+    const LINES: usize = 320_000;
+    let mut committed = String::with_capacity(LINES * 3);
+    for _ in 0..LINES {
+        committed.push_str("ab\n");
+    }
+    let repo = init_git_repo("oversized-diff", &[("src/big.txt", committed.as_str())]);
+    write_file(
+        &repo.path().join("src/big.txt"),
+        &format!("changed\n{committed}"),
+    );
+
+    let project = create_project_with_real_roots(
+        &mut fixture.client,
+        "Oversized Diff",
+        vec![repo.path().to_string_lossy().to_string()],
+    )
+    .await;
+    let root = protocol::ProjectRootPath(project_root(&project, 0));
+    let read = |context_mode, request_id: Option<&str>, out_of_band| ProjectReadDiffPayload {
+        request_id: request_id.map(str::to_owned),
+        root: root.clone(),
+        scope: ProjectDiffScope::Unstaged,
+        revision: protocol::ProjectDiffRevision::WorkingTree,
+        path: Some("src/big.txt".to_owned()),
+        context_mode,
+        out_of_band,
+    };
+
+    // The diff the user is actually looking at is three lines of context and
+    // fits comfortably.
+    let hunks = request_project_diff(
+        &mut fixture.client,
+        &project.id,
+        read(DiffContextMode::Hunks, None, false),
+        "hunk-mode diff of a large file",
+    )
+    .await;
+    assert_eq!(hunks.files.len(), 1);
+    assert_eq!(hunks.files[0].relative_path, "src/big.txt");
+
+    // Expanding context asks for the same diff at full context, which does
+    // not fit. That must come back as this read's failure.
+    fixture
+        .client
+        .project_read_diff(
+            &project.id,
+            read(DiffContextMode::FullFile, Some("expand-context"), true),
+        )
+        .await
+        .expect("project_read_diff failed");
+    let error =
+        expect_project_command_error(&mut fixture.client, "oversized full-context read").await;
+    assert_eq!(error.operation, "project_read_diff");
+    assert!(
+        error.message.contains("too large"),
+        "the client has to be able to tell the user why: {}",
+        error.message
+    );
+    assert!(
+        !error.fatal,
+        "an oversized read is this request's problem, not the connection's"
+    );
+
+    // And the connection is still there, still answering.
+    let again = request_project_diff(
+        &mut fixture.client,
+        &project.id,
+        read(DiffContextMode::Hunks, Some("after-refusal"), false),
+        "hunk-mode diff after the refused expansion",
+    )
+    .await;
+    assert_eq!(again.files.len(), 1);
+    assert_eq!(again.files[0].relative_path, "src/big.txt");
 }
 
 #[tokio::test]
@@ -2027,6 +2189,7 @@ async fn project_read_diff_returns_typed_unmerged_file() {
         revision: protocol::ProjectDiffRevision::WorkingTree,
         path: Some("src/lib.rs".to_owned()),
         context_mode: DiffContextMode::Hunks,
+        out_of_band: false,
     };
 
     let diff = request_project_diff(
@@ -2080,6 +2243,7 @@ async fn project_read_diff_untracked_file_appears_as_all_added() {
             revision: protocol::ProjectDiffRevision::WorkingTree,
             path: Some("src/new.rs".to_owned()),
             context_mode: DiffContextMode::Hunks,
+            out_of_band: false,
         },
         "untracked file diff",
     )
@@ -2136,6 +2300,7 @@ async fn project_read_diff_unstaged_includes_both_modified_and_untracked() {
             revision: protocol::ProjectDiffRevision::WorkingTree,
             path: None,
             context_mode: DiffContextMode::Hunks,
+            out_of_band: false,
         },
         "mixed unstaged diff",
     )
@@ -2206,6 +2371,7 @@ async fn project_read_diff_unstaged_includes_both_modified_and_untracked() {
             revision: protocol::ProjectDiffRevision::WorkingTree,
             path: Some("src/new.rs".to_owned()),
             context_mode: DiffContextMode::Hunks,
+            out_of_band: false,
         },
         "filtered untracked diff",
     )
@@ -2252,6 +2418,7 @@ async fn project_read_diff_staged_scope_excludes_untracked() {
             revision: protocol::ProjectDiffRevision::WorkingTree,
             path: None,
             context_mode: DiffContextMode::Hunks,
+            out_of_band: false,
         },
         "staged diff excludes untracked",
     )
@@ -2293,6 +2460,7 @@ async fn project_read_diff_hunks_mode_returns_typed_line_numbers() {
             revision: protocol::ProjectDiffRevision::WorkingTree,
             path: Some("src/main.rs".to_owned()),
             context_mode: DiffContextMode::Hunks,
+            out_of_band: false,
         },
         "hunks mode diff",
     )
@@ -2388,6 +2556,7 @@ async fn project_read_diff_full_file_mode_returns_single_hunk_spanning_file() {
             revision: protocol::ProjectDiffRevision::WorkingTree,
             path: Some("src/main.rs".to_owned()),
             context_mode: DiffContextMode::FullFile,
+            out_of_band: false,
         },
         "full file mode diff",
     )
@@ -2437,6 +2606,7 @@ async fn project_read_diff_payload_echoes_context_mode() {
             revision: protocol::ProjectDiffRevision::WorkingTree,
             path: Some("src/main.rs".to_owned()),
             context_mode: DiffContextMode::Hunks,
+            out_of_band: false,
         },
         "echo hunks mode diff",
     )
@@ -2477,6 +2647,7 @@ async fn project_read_diff_payload_echoes_context_mode() {
             revision: protocol::ProjectDiffRevision::WorkingTree,
             path: Some("src/main.rs".to_owned()),
             context_mode: DiffContextMode::FullFile,
+            out_of_band: false,
         },
         "echo full file mode diff",
     )
@@ -2572,6 +2743,7 @@ async fn project_stage_file_updates_git_status_and_diffs() {
             revision: protocol::ProjectDiffRevision::WorkingTree,
             path: Some("src/main.rs".to_owned()),
             context_mode: DiffContextMode::Hunks,
+            out_of_band: false,
         },
         "staged diff after stage file",
     )
@@ -2589,6 +2761,7 @@ async fn project_stage_file_updates_git_status_and_diffs() {
             revision: protocol::ProjectDiffRevision::WorkingTree,
             path: Some("src/main.rs".to_owned()),
             context_mode: DiffContextMode::Hunks,
+            out_of_band: false,
         },
         "unstaged diff after stage file",
     )
@@ -2629,6 +2802,7 @@ async fn project_stage_hunk_stages_only_one_hunk() {
             revision: protocol::ProjectDiffRevision::WorkingTree,
             path: Some("src/main.rs".to_owned()),
             context_mode: DiffContextMode::Hunks,
+            out_of_band: false,
         },
         "initial hunk diff",
     )
@@ -2646,6 +2820,7 @@ async fn project_stage_hunk_stages_only_one_hunk() {
             revision: protocol::ProjectDiffRevision::WorkingTree,
             path: Some("src/main.rs".to_owned()),
             context_mode: DiffContextMode::Hunks,
+            out_of_band: false,
         },
         "initial staged diff before stage hunk",
     )
@@ -3471,6 +3646,7 @@ async fn recent_history_reads_exact_committed_ranges() {
             revision: revision.clone(),
             path: None,
             context_mode: DiffContextMode::Hunks,
+            out_of_band: false,
         },
         "exact committed range",
     )
@@ -3512,6 +3688,7 @@ async fn recent_history_reads_exact_committed_ranges() {
                 },
                 path: None,
                 context_mode: DiffContextMode::Hunks,
+                out_of_band: false,
             },
         )
         .await
@@ -3534,6 +3711,7 @@ async fn recent_history_reads_exact_committed_ranges() {
             },
             path: None,
             context_mode: DiffContextMode::Hunks,
+            out_of_band: false,
         },
         "root commit range",
     )
@@ -3641,6 +3819,7 @@ async fn sha256_root_history_uses_repository_empty_tree() {
             },
             path: None,
             context_mode: DiffContextMode::Hunks,
+            out_of_band: false,
         },
         "sha256 root diff",
     )

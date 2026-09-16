@@ -464,6 +464,7 @@ pub async fn request_project_diff(
             revision: protocol::ProjectDiffRevision::WorkingTree,
             path,
             context_mode,
+            out_of_band: false,
         },
     )
     .await

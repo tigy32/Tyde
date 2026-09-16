@@ -3939,6 +3939,15 @@ pub(crate) fn handle_project_delete(state: &AppState, host_id: &str, project: &p
     state.diff_contents.update(|map| {
         map.retain(|key, _| !(key.host_id == host_id && &key.project_id == deleted_id));
     });
+    // Including the full-context reads behind "expand context": they are whole
+    // file payloads for a project that no longer exists, held until the tab
+    // that opened them happens to be closed.
+    state.diff_expand_sources.update(|map| {
+        map.retain(|key, _| !(key.host_id == host_id && &key.project_id == deleted_id));
+    });
+    state.diff_expand_request_ids.update(|map| {
+        map.retain(|key, _| !(key.host_id == host_id && &key.project_id == deleted_id));
+    });
 }
 
 fn apply_project_file_list(
@@ -8808,6 +8817,77 @@ mod wasm_tests {
         assert!(
             in_flight.contains("host-b"),
             "another host's in-flight refresh must survive"
+        );
+    }
+
+    /// Removing a workbench must not leave its diffs behind. The full-context
+    /// reads behind "expand context" are whole-file payloads; keyed to a
+    /// project that no longer exists, they would be held until the tab that
+    /// opened them happened to be closed.
+    #[wasm_bindgen_test]
+    fn deleting_a_project_drops_its_cached_full_context_reads() {
+        use crate::state::DiffKey;
+        use protocol::{ProjectDiffScope, ProjectNotifyPayload, ProjectRootPath};
+
+        reset_inbound_state_for_host("diff-cache-host");
+        let state = AppState::new();
+        let host_id = "diff-cache-host";
+        let deleted = restore_project("deleted-project");
+        let kept = restore_project("kept-project");
+        let key_for = |project: &protocol::Project| {
+            DiffKey::new(
+                host_id,
+                project.id.clone(),
+                ProjectRootPath("/repo".to_owned()),
+                ProjectDiffScope::Unstaged,
+                "src/lib.rs",
+            )
+        };
+        state.diff_expand_sources.update(|sources| {
+            for project in [&deleted, &kept] {
+                sources.insert(
+                    key_for(project),
+                    crate::state::DiffExpandSource {
+                        pending: false,
+                        error: None,
+                        files: Vec::new(),
+                    },
+                );
+            }
+        });
+        state.diff_expand_request_ids.update(|requests| {
+            for project in [&deleted, &kept] {
+                requests.insert(key_for(project), "req-1".to_owned());
+            }
+        });
+
+        dispatch_envelope(
+            &state,
+            host_id,
+            host_frame(
+                FrameKind::ProjectNotify,
+                0,
+                &ProjectNotifyPayload::Delete {
+                    project: deleted.clone(),
+                },
+            ),
+        );
+
+        let sources = state.diff_expand_sources.get_untracked();
+        assert!(
+            !sources.contains_key(&key_for(&deleted)),
+            "the deleted project's full-context read must be dropped",
+        );
+        assert!(
+            sources.contains_key(&key_for(&kept)),
+            "another project's cached read must survive",
+        );
+        assert!(
+            !state
+                .diff_expand_request_ids
+                .get_untracked()
+                .contains_key(&key_for(&deleted)),
+            "and so must its in-flight read, which can never be answered now",
         );
     }
 

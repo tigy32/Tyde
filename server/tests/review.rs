@@ -739,6 +739,7 @@ async fn read_committed_diff(
                 },
                 path: None,
                 context_mode: DiffContextMode::FullFile,
+                out_of_band: false,
             },
         )
         .await

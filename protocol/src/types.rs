@@ -5465,6 +5465,15 @@ pub struct ProjectReadDiffPayload {
     pub revision: ProjectDiffRevision,
     pub path: Option<String>,
     pub context_mode: DiffContextMode,
+    /// A one-off read that must not change what this connection's automatic
+    /// diff refreshes deliver. Reading a working-tree diff normally
+    /// subscribes the connection to refreshes of that diff in the mode it
+    /// asked for; an auxiliary read behind a diff that stays in another mode
+    /// (the full-context read backing "expand context") would otherwise
+    /// redirect every later refresh into a mode the client discards as stale,
+    /// silently freezing the diff on screen.
+    #[serde(default)]
+    pub out_of_band: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

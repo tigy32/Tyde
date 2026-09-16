@@ -1375,6 +1375,7 @@ pub fn open_changed_diff_for_root(
             revision: protocol::ProjectDiffRevision::WorkingTree,
             path: None,
             context_mode,
+            out_of_band: false,
         };
         if let Err(e) = send_frame(&host, stream, FrameKind::ProjectReadDiff, &payload).await {
             log::error!("failed to send ProjectReadDiff for review surface: {e}");
@@ -1658,6 +1659,7 @@ fn open_review_location(
         revision,
         path: Some(path),
         context_mode,
+        out_of_band: false,
     };
     spawn_local(async move {
         if let Err(error) = send_frame(&host, stream, FrameKind::ProjectReadDiff, &payload).await {
@@ -1945,6 +1947,7 @@ pub fn ReviewCommentsSurface(host_id: String, project_id: ProjectId) -> impl Int
                     revision,
                     path: Some(path.clone()),
                     context_mode: DiffContextMode::Hunks,
+                    out_of_band: false,
                 };
                 spawn_local(async move {
                     if let Err(e) =

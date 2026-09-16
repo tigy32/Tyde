@@ -1792,6 +1792,7 @@ fn request_diff(state: &AppState, key: DiffKey) {
             revision: key.revision,
             path,
             context_mode,
+            out_of_band: false,
         };
         if let Err(e) = send_frame(&host_id, stream, FrameKind::ProjectReadDiff, &payload).await {
             log::error!("failed to send ProjectReadDiff: {e}");

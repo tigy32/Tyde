@@ -1980,6 +1980,7 @@ impl ReviewActor {
                 },
                 path: None,
                 context_mode: DiffContextMode::FullFile,
+                out_of_band: false,
             },
         )?;
         tracing::info!(
@@ -2468,6 +2469,7 @@ fn read_review_diffs(
                     revision: protocol::ProjectDiffRevision::WorkingTree,
                     path: None,
                     context_mode: DiffContextMode::FullFile,
+                    out_of_band: false,
                 };
                 diffs.push(read_diff(project, unstaged)?);
                 let staged = ProjectReadDiffPayload {
@@ -2477,6 +2479,7 @@ fn read_review_diffs(
                     revision: protocol::ProjectDiffRevision::WorkingTree,
                     path: None,
                     context_mode: DiffContextMode::FullFile,
+                    out_of_band: false,
                 };
                 let staged = read_diff(project, staged)?;
                 if !staged.files.is_empty() {
@@ -2496,6 +2499,7 @@ fn read_review_diffs(
                 revision: protocol::ProjectDiffRevision::WorkingTree,
                 path: path.clone(),
                 context_mode: DiffContextMode::FullFile,
+                out_of_band: false,
             };
             let mut diffs = vec![read_diff(project, unstaged)?];
             let staged = ProjectReadDiffPayload {
@@ -2505,6 +2509,7 @@ fn read_review_diffs(
                 revision: protocol::ProjectDiffRevision::WorkingTree,
                 path: path.clone(),
                 context_mode: DiffContextMode::FullFile,
+                out_of_band: false,
             };
             let staged = read_diff(project, staged)?;
             if !staged.files.is_empty() {
@@ -2529,6 +2534,7 @@ fn read_review_diffs(
                 },
                 path: None,
                 context_mode: DiffContextMode::FullFile,
+                out_of_band: false,
             },
         )
         .map(|diff| vec![diff]),

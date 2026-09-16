@@ -197,6 +197,10 @@ Rules:
 
 - `path: None` means read the full diff for that root+scope.
 - `path: Some(relative_path)` means read the diff only for that file.
+- A working-tree read also subscribes the connection to refresh pushes for that
+  diff, in the context mode it asked for. `out_of_band: true` answers the one
+  request without touching that subscription, for auxiliary reads issued behind
+  a diff the client keeps displaying in another mode.
 
 `project_git_status` includes each root's current full `head_oid`, its
 repository-native `empty_tree_oid`, and up to 100 newest-first
