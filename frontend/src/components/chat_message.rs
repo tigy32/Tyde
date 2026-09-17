@@ -255,6 +255,7 @@ pub fn ChatMessageView(
     });
 
     let copy_state = RwSignal::new("copy");
+    let copy_error = RwSignal::new(None::<String>);
 
     let entry_for_copy = entry.clone();
     let on_copy = move |_| {
@@ -263,11 +264,11 @@ pub fn ChatMessageView(
             return;
         }
         let cs = copy_state;
+        cs.set("copy");
+        copy_error.set(None);
         wasm_bindgen_futures::spawn_local(async move {
             let window = web_sys::window().unwrap();
-            let navigator = window.navigator();
-            let clipboard = navigator.clipboard();
-            match wasm_bindgen_futures::JsFuture::from(clipboard.write_text(&text)).await {
+            match crate::bridge::write_clipboard_text(&text).await {
                 Ok(_) => {
                     cs.set("copied");
                     let promise = js_sys::Promise::new(&mut |resolve, _| {
@@ -277,7 +278,9 @@ pub fn ChatMessageView(
                     let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
                     cs.set("copy");
                 }
-                Err(_) => {
+                Err(error) => {
+                    log::error!("Message clipboard write failed: {error}");
+                    copy_error.set(Some(error));
                     cs.set("failed");
                     let promise = js_sys::Promise::new(&mut |resolve, _| {
                         let _ = window
@@ -513,7 +516,15 @@ pub fn ChatMessageView(
                                             _ => "footer-copy-btn",
                                         }
                                     }
-                                    title="Copy message"
+                                    title=move || match copy_state.get() {
+                                        "copied" => "Message copied".to_owned(),
+                                        "failed" => format!(
+                                            "Copy failed: {}",
+                                            copy_error.get().unwrap_or_default()
+                                        ),
+                                        _ => "Copy message".to_owned(),
+                                    }
+                                    aria-label="Copy message"
                                     on:click=on_copy_handler
                                 >
                                     {move || match copy_state.get() {
@@ -1141,6 +1152,147 @@ mod wasm_tests {
         .forget();
         let state = mounted_state.borrow_mut().take().expect("mount ran");
         (container, state)
+    }
+
+    struct ClipboardFixture;
+
+    impl ClipboardFixture {
+        fn install() -> Self {
+            js_sys::eval(
+                r#"
+                window.__messageClipboardFixture = {
+                    tauri: window.__TAURI__,
+                    clipboard: Object.getOwnPropertyDescriptor(navigator, 'clipboard'),
+                    browserWrites: 0,
+                    calls: [],
+                };
+                const fixture = window.__messageClipboardFixture;
+                Object.defineProperty(navigator, 'clipboard', {
+                    configurable: true,
+                    value: { writeText: () => {
+                        fixture.browserWrites++;
+                        return Promise.reject(new DOMException(
+                            'Clipboard write is not allowed', 'NotAllowedError'));
+                    } },
+                });
+                window.__TAURI__ = { core: { invoke: (command, args) => {
+                    fixture.calls.push({command, args});
+                    return new Promise((resolve, reject) => {
+                        fixture.resolve = resolve;
+                        fixture.reject = reject;
+                    });
+                } } };
+            "#,
+            )
+            .unwrap();
+            Self
+        }
+    }
+
+    impl Drop for ClipboardFixture {
+        fn drop(&mut self) {
+            js_sys::eval(
+                r#"
+                const fixture = window.__messageClipboardFixture;
+                if (fixture.tauri === undefined) delete window.__TAURI__;
+                else window.__TAURI__ = fixture.tauri;
+                if (fixture.clipboard) {
+                    Object.defineProperty(navigator, 'clipboard', fixture.clipboard);
+                } else {
+                    delete navigator.clipboard;
+                }
+                delete window.__messageClipboardFixture;
+            "#,
+            )
+            .unwrap();
+        }
+    }
+
+    #[wasm_bindgen_test]
+    async fn message_copy_uses_native_clipboard_and_reports_failures() {
+        let _fixture = ClipboardFixture::install();
+        let mut entry = assistant_msg(None);
+        let content = "**Copy exactly**\n\n```rust\nlet café = \"🦀\";\n```\n";
+        entry.message.content = content.to_owned();
+        let container = mount_message(entry);
+        next_tick().await;
+        let button: HtmlElement = container
+            .query_selector("button[title='Copy message']")
+            .unwrap()
+            .expect("message copy button")
+            .dyn_into()
+            .unwrap();
+        button.click();
+        next_tick().await;
+        assert_eq!(
+            js_sys::eval("window.__messageClipboardFixture.calls.length")
+                .unwrap()
+                .as_f64(),
+            Some(1.0),
+            "message copy must reach the native clipboard even when WebKit denies browser writes"
+        );
+        assert_eq!(
+            js_sys::eval("window.__messageClipboardFixture.calls[0].command")
+                .unwrap()
+                .as_string()
+                .as_deref(),
+            Some("plugin:clipboard-manager|write_text")
+        );
+        assert_eq!(
+            js_sys::eval("window.__messageClipboardFixture.calls[0].args.text")
+                .unwrap()
+                .as_string()
+                .as_deref(),
+            Some(content),
+            "copy the original message, preserving markdown, Unicode and line breaks"
+        );
+        assert_eq!(
+            button.text_content().as_deref(),
+            Some("⧉"),
+            "do not claim success before the native write completes"
+        );
+        js_sys::eval("window.__messageClipboardFixture.resolve()").unwrap();
+        next_tick().await;
+        assert_eq!(button.text_content().as_deref(), Some("✓"));
+        button.click();
+        next_tick().await;
+        js_sys::eval("window.__messageClipboardFixture.reject('Clipboard is busy')").unwrap();
+        next_tick().await;
+        assert_eq!(button.text_content().as_deref(), Some("!"));
+        assert_eq!(
+            button.get_attribute("title").as_deref(),
+            Some("Copy failed: Clipboard is busy")
+        );
+        button.click();
+        next_tick().await;
+        js_sys::eval("window.__messageClipboardFixture.resolve()").unwrap();
+        next_tick().await;
+        assert_eq!(
+            button.text_content().as_deref(),
+            Some("✓"),
+            "copy can be retried after failure"
+        );
+        assert_eq!(
+            js_sys::eval("window.__messageClipboardFixture.browserWrites")
+                .unwrap()
+                .as_f64(),
+            Some(0.0),
+            "desktop copying must not depend on browser clipboard permission"
+        );
+        let promise = js_sys::Promise::new(&mut |resolve, _| {
+            web_sys::window()
+                .unwrap()
+                .set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, 1300)
+                .unwrap();
+        });
+        wasm_bindgen_futures::JsFuture::from(promise).await.unwrap();
+        next_tick().await;
+        assert_eq!(button.text_content().as_deref(), Some("⧉"));
+        assert_eq!(
+            button.get_attribute("title").as_deref(),
+            Some("Copy message")
+        );
+        container.remove();
     }
 
     #[wasm_bindgen_test]

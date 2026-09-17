@@ -6,6 +6,7 @@
     "core:default",
     "core:event:default",
     "dialog:default",
+    "clipboard-manager:allow-write-text",
     "app-updates:default"
   ]
 }

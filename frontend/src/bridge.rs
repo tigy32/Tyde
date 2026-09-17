@@ -314,6 +314,18 @@ pub async fn open_external_url(url: String) -> Result<(), String> {
     Ok(())
 }
 
+pub async fn write_clipboard_text(text: &str) -> Result<(), String> {
+    #[derive(Serialize)]
+    struct Args<'a> {
+        text: &'a str,
+    }
+    let args = serde_wasm_bindgen::to_value(&Args { text }).map_err(|e| e.to_string())?;
+    tauri_invoke("plugin:clipboard-manager|write_text", args)
+        .await
+        .map_err(|error| tauri_error_message("plugin:clipboard-manager|write_text", error))?;
+    Ok(())
+}
+
 /// Show a native OK/Cancel confirmation dialog via tauri-plugin-dialog.
 ///
 /// Use this instead of `web_sys::Window::confirm_with_message` — the WKWebView

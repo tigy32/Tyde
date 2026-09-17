@@ -1172,6 +1172,7 @@ pub fn run() {
     let builder = tauri::Builder::default()
         .plugin(external_link_guard())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_clipboard_manager::init())
         .on_page_load(move |webview, payload| {
             let label = webview.label().to_owned();
             let (generation, ticket) =

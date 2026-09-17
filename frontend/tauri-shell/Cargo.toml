@@ -34,6 +34,7 @@ tokio-util = "0.7"
 # channel exists, gate it to prerelease tags in CI (--features) instead.
 tauri = { version = "2.11.5", features = ["devtools"] }
 tauri-plugin-dialog = "2"
+tauri-plugin-clipboard-manager = "2"
 tracing.workspace = true
 tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
