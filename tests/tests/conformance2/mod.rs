@@ -270,7 +270,7 @@ fn result_kind(result: &ToolExecutionResult) -> &'static str {
         R::TydeAwaitAgents { .. } => "tyde_await_agents",
         R::GenerateImage { .. } => "generate_image",
         R::WebSearch => "web_search",
-        R::ViewImage => "view_image",
+        R::ViewImage { .. } => "view_image",
         R::Sleep => "sleep",
         R::Other { .. } => "other",
     }

@@ -494,6 +494,29 @@ impl MockTurn {
         })])
     }
 
+    pub fn with_view_image(self, tool_call_id: &str, path: String) -> Self {
+        self.with_appended_steps(vec![
+            MockStep::emit(BackendEvent::Chat(protocol::ChatEvent::ToolRequest(
+                protocol::ToolRequest {
+                    tool_call_id: tool_call_id.to_owned(),
+                    tool_name: "view_image".to_owned(),
+                    tool_type: protocol::ToolRequestType::ViewImage { path },
+                },
+            ))),
+            MockStep::emit(BackendEvent::Chat(
+                protocol::ChatEvent::ToolExecutionCompleted(protocol::ToolExecutionCompletedData {
+                    tool_call_id: tool_call_id.to_owned(),
+                    outcome: protocol::ToolExecutionOutcome::Succeeded {
+                        result: protocol::ToolExecutionResult::ViewImage {
+                            image: None,
+                            preview_error: None,
+                        },
+                    },
+                }),
+            )),
+        ])
+    }
+
     /// Leave a background tool call in flight and end the turn without ever
     /// collecting it: the request and a background-mode progress snapshot go
     /// out, and no completion follows. This is the state a provider leaves

@@ -4376,6 +4376,11 @@ pub(crate) fn spawn_agent_actor(
                     last_backend_event_at = Some(Instant::now());
                     let mut real_idle_transition = false;
                     let mut synthesize_idle_after_error = false;
+                    snapshot_viewed_image(
+                        &mut event,
+                        &open_tool_requests,
+                        &current_start.workspace_roots,
+                    ).await;
                     match &event {
                         ChatEvent::MessageAdded(message) => {
                             if let Some(compaction) = active_compaction.as_mut() {
@@ -7993,6 +7998,7 @@ pub(crate) fn spawn_relay_agent_actor(
         let mut pending_alias = None;
         let mut in_turn = false;
         let mut open_tool_call_ids: HashSet<String> = HashSet::new();
+        let mut open_tool_requests = HashMap::new();
         let mut pending_tool_response_ids: HashSet<String> = HashSet::new();
         let mut active_agent_await_ids: HashSet<String> = HashSet::new();
         let mut lifecycle = ActorLifecycle::Running;
@@ -8163,6 +8169,11 @@ pub(crate) fn spawn_relay_agent_actor(
                         return;
                     };
 
+                    snapshot_viewed_image(
+                        &mut event,
+                        &open_tool_requests,
+                        &current_start.workspace_roots,
+                    ).await;
                     match &event {
                         ChatEvent::MessageAdded(message) => {
                             if matches!(message.sender, MessageSender::Error) {
@@ -8215,6 +8226,7 @@ pub(crate) fn spawn_relay_agent_actor(
                         }
                         ChatEvent::ToolRequest(request) => {
                             open_tool_call_ids.insert(request.tool_call_id.clone());
+                            open_tool_requests.insert(request.tool_call_id.clone(), request.clone());
                             if matches!(
                                 &request.tool_type,
                                 protocol::ToolRequestType::TydeAwaitAgents { .. }
@@ -8238,6 +8250,7 @@ pub(crate) fn spawn_relay_agent_actor(
                         }
                         ChatEvent::ToolExecutionCompleted(completion) => {
                             open_tool_call_ids.remove(&completion.tool_call_id);
+                            open_tool_requests.remove(&completion.tool_call_id);
                             active_agent_await_ids.remove(&completion.tool_call_id);
                             let completed_pending_response =
                                 pending_tool_response_ids.remove(&completion.tool_call_id);
@@ -10030,6 +10043,91 @@ async fn append_chat_event(
         event,
     )
     .await;
+}
+
+async fn snapshot_viewed_image(
+    event: &mut ChatEvent,
+    requests: &HashMap<String, protocol::ToolRequest>,
+    workspace_roots: &[String],
+) {
+    let ChatEvent::ToolExecutionCompleted(completion) = event else {
+        return;
+    };
+    let ToolExecutionOutcome::Succeeded {
+        result:
+            ToolExecutionResult::ViewImage {
+                image,
+                preview_error,
+            },
+    } = &mut completion.outcome
+    else {
+        return;
+    };
+    if image.is_some() || preview_error.is_some() {
+        return;
+    }
+    let Some(protocol::ToolRequest {
+        tool_type: ToolRequestType::ViewImage { path },
+        ..
+    }) = requests.get(&completion.tool_call_id)
+    else {
+        *preview_error = Some("The image path was not available for this tool call.".to_owned());
+        return;
+    };
+    tracing::debug!(tool_call_id = %completion.tool_call_id, path, "Capturing viewed image for remote clients");
+    match read_viewed_image(path, workspace_roots).await {
+        Ok(preview) => *image = Some(preview),
+        Err(error) => {
+            tracing::warn!(tool_call_id = %completion.tool_call_id, path, %error, "Viewed image preview unavailable");
+            *preview_error = Some(error);
+        }
+    }
+}
+
+async fn read_viewed_image(
+    path: &str,
+    workspace_roots: &[String],
+) -> Result<protocol::ImageData, String> {
+    use base64::Engine;
+    use tokio::io::AsyncReadExt;
+
+    let path = std::path::Path::new(path);
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        let root = workspace_roots
+            .first()
+            .ok_or("The image's workspace is unavailable.")?;
+        std::path::Path::new(root).join(path)
+    };
+    let metadata = tokio::fs::metadata(&absolute)
+        .await
+        .map_err(|error| format!("Could not read the image on the server: {error}"))?;
+    if !metadata.is_file() {
+        return Err("The image path is not a regular file.".to_owned());
+    }
+    let limit = crate::project_stream::BINARY_PREVIEW_LIMIT_BYTES;
+    if metadata.len() > limit {
+        return Err("The image exceeds the 8 MiB inline preview limit.".to_owned());
+    }
+    let file = tokio::fs::File::open(&absolute)
+        .await
+        .map_err(|error| format!("Could not open the image on the server: {error}"))?;
+    let mut bytes = Vec::new();
+    file.take(limit + 1)
+        .read_to_end(&mut bytes)
+        .await
+        .map_err(|error| format!("Could not read the image on the server: {error}"))?;
+    if bytes.len() as u64 > limit {
+        return Err("The image exceeds the 8 MiB inline preview limit.".to_owned());
+    }
+    let media_type = crate::project_stream::sniff_binary_mime(&bytes)
+        .filter(|mime| mime.starts_with("image/"))
+        .ok_or("The file is not a supported image preview format.")?;
+    Ok(protocol::ImageData {
+        media_type: media_type.to_owned(),
+        data: base64::engine::general_purpose::STANDARD.encode(bytes),
+    })
 }
 
 async fn append_backend_chat_event(

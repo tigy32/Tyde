@@ -82,7 +82,7 @@ fn result_kind(result: &ToolExecutionResult) -> &'static str {
         ToolExecutionResult::TydeAwaitAgents { .. } => "TydeAwaitAgents",
         ToolExecutionResult::GenerateImage { .. } => "GenerateImage",
         ToolExecutionResult::WebSearch => "WebSearch",
-        ToolExecutionResult::ViewImage => "ViewImage",
+        ToolExecutionResult::ViewImage { .. } => "ViewImage",
         ToolExecutionResult::Sleep => "Sleep",
         ToolExecutionResult::Other { .. } => "Other",
     }

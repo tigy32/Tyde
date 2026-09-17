@@ -1427,7 +1427,7 @@ fn assert_view_image_maps_to_view_image(turn: &Turn, workspace: &Path) {
     );
     let result = result_for(turn, tool_call_id);
     assert!(
-        matches!(result, Some(ToolExecutionResult::ViewImage)),
+        matches!(result, Some(ToolExecutionResult::ViewImage { .. })),
         "{}: completed image view reported {result:?}, not ViewImage",
         turn.label()
     );

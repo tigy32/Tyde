@@ -17043,8 +17043,11 @@ fn codex_native_tool_completion(item_type: &str) -> Option<(&'static str, Value)
         )),
         "imageView" => Some((
             "view_image",
-            serde_json::to_value(protocol::ToolExecutionResult::ViewImage)
-                .expect("serialize Codex image view completion"),
+            serde_json::to_value(protocol::ToolExecutionResult::ViewImage {
+                image: None,
+                preview_error: None,
+            })
+            .expect("serialize Codex image view completion"),
         )),
         "sleep" => Some((
             "sleep",

@@ -8353,7 +8353,12 @@ pub enum ToolExecutionResult {
         image_count: u64,
     },
     WebSearch,
-    ViewImage,
+    ViewImage {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        image: Option<ImageData>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        preview_error: Option<String>,
+    },
     Sleep,
     Other {
         result: Value,

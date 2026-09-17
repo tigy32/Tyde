@@ -35,7 +35,7 @@ const PROJECT_REFRESH_DEBOUNCE: Duration = Duration::from_millis(250);
 const PROJECT_GIT_REFRESH_SPACING: Duration = Duration::from_secs(1);
 const GIT_STATUS_POLL_INTERVAL: Duration = Duration::from_secs(5);
 const RECENT_HISTORY_LIMIT: usize = 100;
-const BINARY_PREVIEW_LIMIT_BYTES: u64 = 8 * 1024 * 1024;
+pub(crate) const BINARY_PREVIEW_LIMIT_BYTES: u64 = 8 * 1024 * 1024;
 const TEXT_READ_LIMIT_BYTES: u64 = (protocol::framing::MAX_LOGICAL_HEADER - 128 * 1024) as u64;
 const FILE_READ_LIMIT_BYTES: u64 = TEXT_READ_LIMIT_BYTES + 1;
 const BINARY_PREVIEW_ENCODED_LIMIT_BYTES: usize =
@@ -2506,7 +2506,7 @@ fn binary_file_payload(
     }
 }
 
-fn sniff_binary_mime(bytes: &[u8]) -> Option<&'static str> {
+pub(crate) fn sniff_binary_mime(bytes: &[u8]) -> Option<&'static str> {
     if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
         Some("image/png")
     } else if bytes.starts_with(&[0xff, 0xd8, 0xff]) {

@@ -710,10 +710,7 @@ fn render_body(
             <div class="tool-native-detail">{query.clone()}</div>
         }
         .into_any(),
-        ToolRequestType::ViewImage { path } => view! {
-            <div class="tool-native-detail">{path.clone()}</div>
-        }
-        .into_any(),
+        ToolRequestType::ViewImage { path } => render_view_image(path, result, mode),
         ToolRequestType::Sleep { duration_ms } => view! {
             <div class="tool-native-detail">{format!("Waiting {} ms", duration_ms)}</div>
         }
@@ -721,6 +718,65 @@ fn render_body(
         ToolRequestType::Other { .. } => {
             other::render(req, result, malformed_payload, mode).into_any()
         }
+    }
+}
+
+fn render_view_image(
+    path: &str,
+    result: Option<&ToolExecutionResult>,
+    mode: ToolOutputMode,
+) -> AnyView {
+    let preview = if mode == ToolOutputMode::Summary {
+        ().into_any()
+    } else {
+        match result {
+            Some(ToolExecutionResult::ViewImage { image: Some(image), .. }) => view! {
+                <ViewedImagePreview path=path.to_owned() image=image.clone() compact=mode == ToolOutputMode::Compact />
+            }.into_any(),
+            Some(ToolExecutionResult::ViewImage { preview_error, .. }) => view! {
+                <div role="status">
+                    {preview_error.clone().unwrap_or_else(|| "No image preview was saved for this tool call.".to_owned())}
+                </div>
+            }.into_any(),
+            _ => view! { <div role="status">"Waiting for image preview…"</div> }.into_any(),
+        }
+    };
+    view! {
+        <div class="tool-native-detail">{path.to_owned()}</div>
+        {preview}
+    }
+    .into_any()
+}
+
+#[component]
+fn ViewedImagePreview(path: String, image: protocol::ImageData, compact: bool) -> impl IntoView {
+    let source = format!("data:{};base64,{}", image.media_type, image.data);
+    let sources: Arc<[String]> = vec![source.clone()].into();
+    let current = RwSignal::new(None::<usize>);
+    let failed = RwSignal::new(false);
+    view! {
+        <div class="tool-view-image" class:tool-view-image-compact=compact>
+            <Show when=move || !failed.get() fallback=|| view! {
+                <div role="alert">"Preview could not be decoded"</div>
+            }>
+                <button
+                    type="button"
+                    class="chat-card-image-button"
+                    aria-label="Open image full size"
+                    on:click=move |_| current.set(Some(0))
+                >
+                    <img
+                        src=source.clone()
+                        alt=format!("Preview of {path}")
+                        loading="lazy"
+                        on:error=move |_| failed.set(true)
+                    />
+                </button>
+            </Show>
+            <Show when=move || current.get().is_some()>
+                <crate::components::image_lightbox::ImageLightbox sources=sources.clone() current=current />
+            </Show>
+        </div>
     }
 }
 
@@ -1248,7 +1304,7 @@ pub(crate) fn completion_header_summary(
             )
         }
         ToolExecutionResult::WebSearch => "search complete".to_owned(),
-        ToolExecutionResult::ViewImage => "image viewed".to_owned(),
+        ToolExecutionResult::ViewImage { .. } => "image viewed".to_owned(),
         ToolExecutionResult::Sleep => "wait complete".to_owned(),
         ToolExecutionResult::Other { .. } => String::new(),
     }
@@ -1405,6 +1461,122 @@ mod live_card_wasm_tests {
             .expect("query completion summary")
             .and_then(|element| element.text_content())
             .unwrap_or_default()
+    }
+
+    #[wasm_bindgen_test]
+    async fn viewed_image_is_visible_in_full_mode_and_opens_full_size() {
+        let document = web_sys::window().unwrap().document().unwrap();
+        let style = document.create_element("style").unwrap();
+        style.set_text_content(Some(include_str!("../../../styles.css")));
+        document.head().unwrap().append_child(&style).unwrap();
+        let svg = "<svg xmlns='http://www.w3.org/2000/svg' width='1200' height='600'><rect width='1200' height='600' fill='red'/></svg>";
+        let mut entry = completed_other_request("viewed-image", "view_image");
+        entry.request.tool_type = ToolRequestType::ViewImage {
+            path: "/tmp/remote-preview.png".to_owned(),
+        };
+        entry.result = Some(succeeded_completion(
+            "viewed-image",
+            ToolExecutionResult::ViewImage {
+                image: Some(protocol::ImageData {
+                    media_type: "image/svg+xml".to_owned(),
+                    data: web_sys::window().unwrap().btoa(svg).unwrap(),
+                }),
+                preview_error: None,
+            },
+        ));
+        let (container, state) = mount_card(entry, None);
+        state.tool_output_mode.set(ToolOutputMode::Full);
+        next_tick().await;
+        next_tick().await;
+        let image = container
+            .query_selector("img")
+            .unwrap()
+            .expect("Full mode must show the viewed image, not just its remote path")
+            .dyn_into::<web_sys::HtmlImageElement>()
+            .unwrap();
+        wasm_bindgen_futures::JsFuture::from(image.decode())
+            .await
+            .expect("preview decodes");
+        let rect = image.get_bounding_client_rect();
+        assert!(
+            rect.width() > 300.0 && rect.width() <= 800.0,
+            "Full mode shows a readable preview within the card: {}",
+            rect.width()
+        );
+        assert!(rect.height() > 0.0 && rect.height() <= 480.0);
+        let button = container
+            .query_selector("button[aria-label='Open image full size']")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap();
+        button.click();
+        next_tick().await;
+        let viewer = document
+            .query_selector("[role='dialog'][aria-label='Image viewer']")
+            .unwrap()
+            .expect("preview opens the image viewer");
+        assert_eq!(
+            viewer
+                .query_selector("img")
+                .unwrap()
+                .unwrap()
+                .get_attribute("src"),
+            image.get_attribute("src")
+        );
+        viewer
+            .query_selector("button[aria-label='Close image viewer']")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap()
+            .click();
+        next_tick().await;
+        assert!(
+            document
+                .query_selector("[role='dialog'][aria-label='Image viewer']")
+                .unwrap()
+                .is_none()
+        );
+        state.tool_output_mode.set(ToolOutputMode::Compact);
+        next_tick().await;
+        next_tick().await;
+        let details = container
+            .query_selector("details")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<web_sys::HtmlDetailsElement>()
+            .unwrap();
+        assert!(!details.open(), "Compact mode keeps the preview collapsed");
+        let summary = container
+            .query_selector("summary")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap();
+        summary.click();
+        next_tick().await;
+        assert!(details.open());
+        let compact_image = container
+            .query_selector("img")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<web_sys::HtmlImageElement>()
+            .unwrap();
+        wasm_bindgen_futures::JsFuture::from(compact_image.decode())
+            .await
+            .unwrap();
+        assert!(
+            compact_image.get_bounding_client_rect().height() > 0.0,
+            "expanding a compact card reveals the image too"
+        );
+        compact_image
+            .dispatch_event(&web_sys::Event::new("error").unwrap())
+            .unwrap();
+        next_tick().await;
+        assert!(text(&container).contains("Preview could not be decoded"));
+        container.remove();
+        style.remove();
     }
 
     #[wasm_bindgen_test]

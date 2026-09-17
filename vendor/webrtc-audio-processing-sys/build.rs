@@ -27,8 +27,16 @@ fn out_dir() -> PathBuf {
     std::env::var("OUT_DIR").expect("OUT_DIR environment var not set.").into()
 }
 
+// Cached build scripts may move between workbenches; Cargo supplies the current
+// manifest directory when running them, not necessarily where they were built.
+fn manifest_dir() -> PathBuf {
+    env::var_os("CARGO_MANIFEST_DIR")
+        .expect("CARGO_MANIFEST_DIR environment var not set.")
+        .into()
+}
+
 fn repository_native_tool(name: &str) -> Command {
-    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let manifest = manifest_dir();
     let repository = manifest
         .parent()
         .and_then(|vendor| vendor.parent())
@@ -422,7 +430,7 @@ mod webrtc {
     // Patch with `patch`.
     #[cfg(feature = "experimental-unlink-ns")]
     fn apply_patch(patch_name: &str) -> Result<()> {
-        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let manifest = manifest_dir();
         let patch = manifest.join("patches").join(patch_name);
 
         let status = Command::new("patch")

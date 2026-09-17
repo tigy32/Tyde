@@ -9357,3 +9357,83 @@ async fn stopping_an_untracked_background_command_closes_its_card() {
         "a repeated stop closed the card twice: {next:?}"
     );
 }
+
+#[tokio::test]
+async fn viewed_images_reach_remote_clients_and_survive_file_deletion() {
+    use base64::Engine;
+
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("remote-preview.png");
+    let data = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aX1sAAAAASUVORK5CYII=";
+    std::fs::write(
+        &path,
+        base64::engine::general_purpose::STANDARD
+            .decode(data)
+            .unwrap(),
+    )
+    .unwrap();
+    let missing = directory.path().join("missing.png");
+    let invalid = directory.path().join("not-an-image.png");
+    std::fs::write(&invalid, "not an image").unwrap();
+    let oversized = directory.path().join("oversized.png");
+    std::fs::File::create(&oversized)
+        .unwrap()
+        .set_len(9 * 1024 * 1024)
+        .unwrap();
+
+    let mut fixture = Fixture::new().await;
+    let agent = fixture
+        .spawn_scripted(
+            "image-preview",
+            MockScript::one(
+                MockTurn::text("Here is the image")
+                    .with_view_image("image", path.to_string_lossy().into_owned())
+                    .with_view_image("missing", missing.to_string_lossy().into_owned())
+                    .with_view_image("invalid", invalid.to_string_lossy().into_owned())
+                    .with_view_image("oversized", oversized.to_string_lossy().into_owned()),
+            ),
+        )
+        .await;
+    let completion =
+        expect_tool_completion_on_stream(&mut fixture.client, &agent.stream, "image").await;
+    let ToolExecutionOutcome::Succeeded {
+        result:
+            ToolExecutionResult::ViewImage {
+                image,
+                preview_error,
+            },
+    } = completion.outcome
+    else {
+        panic!("image tool must remain successful");
+    };
+    assert_eq!(preview_error, None);
+    let image = image.expect("remote clients must receive image bytes, not just a server path");
+    assert_eq!(image.media_type, "image/png");
+    assert_eq!(image.data, data);
+    for id in ["missing", "invalid", "oversized"] {
+        let completion =
+            expect_tool_completion_on_stream(&mut fixture.client, &agent.stream, id).await;
+        assert!(
+            matches!(completion.outcome, ToolExecutionOutcome::Succeeded {
+            result: ToolExecutionResult::ViewImage { image: None, preview_error: Some(ref error) }
+        } if !error.is_empty()),
+            "{id} should explain preview unavailability without failing the tool"
+        );
+    }
+    std::fs::remove_file(path).unwrap();
+    let (mut late_client, bootstrap) = fixture.connect_with_bootstrap().await;
+    let replayed = bootstrapped_agent(&bootstrap, &agent.new_agent.agent_id);
+    let replay = expect_raw_agent_bootstrap_on_stream(
+        &mut late_client,
+        &replayed.instance_stream,
+        "image replay",
+    )
+    .await;
+    assert!(replay.events.iter().any(|event| matches!(event,
+        AgentBootstrapEvent::ChatEvent(ChatEvent::ToolExecutionCompleted(completion))
+            if completion.tool_call_id == "image" && matches!(&completion.outcome,
+                ToolExecutionOutcome::Succeeded { result: ToolExecutionResult::ViewImage { image: Some(replayed), .. } }
+                    if replayed == &image
+            )
+    )), "reconnecting must not depend on the temporary server file still existing");
+}

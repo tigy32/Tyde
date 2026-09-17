@@ -3171,6 +3171,27 @@ kbd {
     transform: scale(1.02);
 }
 
+.tool-view-image {
+    margin-top: var(--space-2);
+}
+
+.tool-view-image button {
+    max-width: 100%;
+}
+
+.tool-view-image img {
+    display: block;
+    max-width: 100%;
+    max-height: 480px;
+    border-radius: 6px;
+    object-fit: contain;
+}
+
+.tool-view-image-compact img {
+    max-width: min(100%, 200px);
+    max-height: 200px;
+}
+
 /* ===== Image Lightbox ===== */
 /* A photo viewer stays dark in every theme, so its chrome uses fixed light
    tints rather than theme text tokens. */
