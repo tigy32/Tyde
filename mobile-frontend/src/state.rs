@@ -998,6 +998,10 @@ pub struct AppState {
     pub agent_message_queue: RwSignal<HashMap<AgentRef, Vec<QueuedMessageEntry>>>,
     pub agent_turn_active: RwSignal<HashMap<AgentRef, bool>>,
     pub agents_with_background_work: RwSignal<HashSet<AgentRef>>,
+    pub tool_progress: RwSignal<HashMap<AgentRef, HashMap<String, protocol::ToolProgressData>>>,
+    // Completion can precede its request or be followed by replayed progress.
+    // Keep tombstones until the authoritative bootstrap replaces this agent.
+    pub completed_tool_calls: RwSignal<HashMap<AgentRef, HashSet<String>>>,
     /// The server's per-agent activity stats — the same `AgentActivityStats`
     /// frame desktop consumes, replayed on bootstrap and re-emitted on change.
     /// Mobile reads its current context occupancy.
@@ -1117,6 +1121,8 @@ impl AppState {
             agent_message_queue: RwSignal::new(HashMap::new()),
             agent_turn_active: RwSignal::new(HashMap::new()),
             agents_with_background_work: RwSignal::new(HashSet::new()),
+            tool_progress: RwSignal::new(HashMap::new()),
+            completed_tool_calls: RwSignal::new(HashMap::new()),
             agent_activity_stats: RwSignal::new(HashMap::new()),
             transient_events: RwSignal::new(HashMap::new()),
             agent_session_settings: RwSignal::new(HashMap::new()),
@@ -1833,6 +1839,12 @@ impl AppState {
         });
         self.agent_turn_active.update(|m| {
             m.retain(|k, _| k.local_host_id != *host);
+        });
+        self.tool_progress.update(|map| {
+            map.retain(|agent, _| agent.local_host_id != *host);
+        });
+        self.completed_tool_calls.update(|map| {
+            map.retain(|agent, _| agent.local_host_id != *host);
         });
         self.agents_with_background_work.update(|agents| {
             agents.retain(|agent| agent.local_host_id != *host);

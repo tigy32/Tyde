@@ -1547,6 +1547,383 @@ mod wasm_tests {
         state_handle.borrow().as_ref().unwrap().clone()
     }
 
+    async fn wait_for_drawer_motion() {
+        let promise = js_sys::Promise::new(&mut |resolve, _reject| {
+            web_sys::window()
+                .unwrap()
+                .set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, 240)
+                .unwrap();
+        });
+        wasm_bindgen_futures::JsFuture::from(promise).await.unwrap();
+    }
+
+    #[wasm_bindgen_test]
+    async fn mobile_activity_drawer_opens_agents_and_tracks_background_work() {
+        crate::components::test_styles::ensure_styles_loaded();
+        let container = make_container();
+        container.style().set_property("width", "390px").unwrap();
+        container.style().set_property("height", "700px").unwrap();
+        let state = mount_active_chat(container.clone());
+        let parent = state.active_agent.get_untracked().unwrap();
+        let owner = parent.as_agent_ref();
+        let mut child = make_agent(&owner.local_host_id, "Release verification");
+        child.agent_id = AgentId("child-1".to_owned());
+        child.parent_agent_id = Some(owner.agent_id.clone());
+        child.instance_stream = StreamPath("stream/child".to_owned());
+        let child_ref = child.agent_ref();
+        state.agents.update(|agents| agents.push(child));
+        state.agent_turn_active.update(|turns| {
+            turns.insert(child_ref.clone(), true);
+        });
+        crate::dispatch::apply_chat_event(
+            &state,
+            &owner,
+            protocol::ChatEvent::ToolProgress(protocol::ToolProgressData {
+                tool_call_id: "background-check".to_owned(),
+                execution_mode: protocol::ToolExecutionMode::Background,
+                cancellable: false,
+                update: protocol::ToolProgressUpdate::Other {
+                    payload: serde_json::json!({ "description": "./dev.sh check" }),
+                },
+            }),
+        );
+        settle_autoscroll().await;
+        let toggle = container
+            .query_selector("[data-mobile-test='activity-toggle']")
+            .unwrap()
+            .expect("background work must have a disclosure attached to the input");
+        assert!(toggle.text_content().unwrap().contains("1 agent"));
+        assert!(toggle.text_content().unwrap().contains("1 command"));
+        assert_eq!(
+            toggle.get_attribute("aria-expanded").as_deref(),
+            Some("false")
+        );
+        let element = |name: &str| {
+            container
+                .query_selector(&format!("[data-mobile-test='{name}']"))
+                .unwrap()
+                .unwrap_or_else(|| panic!("missing {name}"))
+        };
+        let click = |element: &web_sys::Element| {
+            element.dyn_ref::<HtmlElement>().unwrap().click();
+        };
+        let capsule = element("chat-input-capsule");
+        let before = capsule.get_bounding_client_rect();
+        let tab = toggle.get_bounding_client_rect();
+        assert!(
+            (tab.bottom() - before.top()).abs() < 1.0,
+            "the half-tab touches the composer"
+        );
+        assert!(
+            (tab.left() + tab.width() / 2.0 - before.left() - before.width() / 2.0).abs() < 1.0
+        );
+        assert!(tab.width() < before.width());
+        let computed = web_sys::window()
+            .unwrap()
+            .get_computed_style(&toggle)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            computed
+                .get_property_value("border-bottom-left-radius")
+                .unwrap(),
+            "0px"
+        );
+        assert_eq!(
+            computed
+                .get_property_value("border-bottom-right-radius")
+                .unwrap(),
+            "0px"
+        );
+        let list = element("activity-list");
+        assert_eq!(
+            web_sys::window()
+                .unwrap()
+                .get_computed_style(&list)
+                .unwrap()
+                .unwrap()
+                .get_property_value("visibility")
+                .unwrap(),
+            "hidden"
+        );
+        click(&toggle);
+        wait_for_drawer_motion().await;
+        assert_eq!(
+            toggle.get_attribute("aria-expanded").as_deref(),
+            Some("true")
+        );
+        let opened = element("activity-list").get_bounding_client_rect();
+        let after = capsule.get_bounding_client_rect();
+        assert!(
+            (before.top() - after.top()).abs() < 1.0,
+            "opening must not move the input"
+        );
+        assert!(opened.width() > before.width() * 0.85 && opened.width() < before.width());
+        assert!(
+            (opened.bottom() - before.top()).abs() < 1.0,
+            "the drawer slides out of the composer, not a floating bubble"
+        );
+        assert!(opened.top() < tab.top() - 80.0);
+        assert!(
+            element("activity-command")
+                .text_content()
+                .unwrap()
+                .contains("./dev.sh check")
+        );
+        let open = element("activity-open");
+        assert_eq!(
+            open.get_attribute("aria-label").as_deref(),
+            Some("Open chat with Release verification")
+        );
+        assert!(open.get_bounding_client_rect().height() >= 44.0);
+        assert_eq!(
+            container
+                .query_selector_all("[data-mobile-test='activity-agent']")
+                .unwrap()
+                .length(),
+            1
+        );
+
+        // A spawn progress snapshot must not duplicate its registered child.
+        crate::dispatch::apply_chat_event(
+            &state,
+            &owner,
+            protocol::ChatEvent::ToolProgress(protocol::ToolProgressData {
+                tool_call_id: "spawn-child".to_owned(),
+                execution_mode: protocol::ToolExecutionMode::Foreground,
+                cancellable: false,
+                update: protocol::ToolProgressUpdate::SubAgent(protocol::SubAgentProgress {
+                    agent_id: child_ref.agent_id.clone(),
+                    agent_name: "Duplicate child".to_owned(),
+                    last_tool_name: None,
+                    tool_calls: 0,
+                    completed: false,
+                    status: protocol::SubAgentProgressStatus::Running,
+                }),
+            }),
+        );
+        let foreign = AgentRef {
+            local_host_id: LocalHostId("another-host".to_owned()),
+            agent_id: owner.agent_id.clone(),
+        };
+        for (target, id, mode) in [
+            (&foreign, "foreign", protocol::ToolExecutionMode::Background),
+            (
+                &owner,
+                "foreground",
+                protocol::ToolExecutionMode::Foreground,
+            ),
+        ] {
+            crate::dispatch::apply_chat_event(
+                &state,
+                target,
+                protocol::ChatEvent::ToolProgress(protocol::ToolProgressData {
+                    tool_call_id: id.to_owned(),
+                    execution_mode: mode,
+                    cancellable: false,
+                    update: protocol::ToolProgressUpdate::Other {
+                        payload: serde_json::json!({"description": "Not in this drawer"}),
+                    },
+                }),
+            );
+        }
+        settle_autoscroll().await;
+        assert!(toggle.text_content().unwrap().contains("1 agent"));
+        assert!(toggle.text_content().unwrap().contains("1 command"));
+        assert!(!list.text_content().unwrap().contains("Not in this drawer"));
+        assert!(!list.text_content().unwrap().contains("Duplicate child"));
+
+        state.push_chat_message_entry(
+            &owner,
+            make_message(
+                MessageSender::Assistant {
+                    agent: "Coder".to_owned(),
+                },
+                "Checking",
+            ),
+        );
+        crate::dispatch::apply_chat_event(
+            &state,
+            &owner,
+            protocol::ChatEvent::ToolRequest(protocol::ToolRequest {
+                tool_call_id: "background-check".to_owned(),
+                tool_name: "run_command".to_owned(),
+                tool_type: protocol::ToolRequestType::RunCommand {
+                    command: "./dev.sh check --actual-command".to_owned(),
+                    working_directory: "/work".to_owned(),
+                },
+            }),
+        );
+        settle_autoscroll().await;
+        assert!(
+            element("activity-command")
+                .text_content()
+                .unwrap()
+                .contains("./dev.sh check --actual-command"),
+            "a late request supplies the real command"
+        );
+        click(&element("activity-open"));
+        settle_autoscroll().await;
+        assert!(
+            element("chat-title")
+                .text_content()
+                .unwrap()
+                .contains("Release verification")
+        );
+        assert!(
+            container
+                .query_selector("[data-mobile-test='activity-toggle']")
+                .unwrap()
+                .is_none(),
+            "the parent's work cannot leak into the child chat"
+        );
+        state.active_agent.set(Some(parent.clone()));
+        settle_autoscroll().await;
+        let toggle = element("activity-toggle");
+        assert_eq!(
+            toggle.get_attribute("aria-expanded").as_deref(),
+            Some("false")
+        );
+
+        click(&toggle);
+        wait_for_drawer_motion().await;
+        let init = js_sys::Object::new();
+        js_sys::Reflect::set(&init, &"key".into(), &"Escape".into()).unwrap();
+        js_sys::Reflect::set(&init, &"bubbles".into(), &wasm_bindgen::JsValue::TRUE).unwrap();
+        let ctor: js_sys::Function =
+            js_sys::Reflect::get(&js_sys::global(), &"KeyboardEvent".into())
+                .unwrap()
+                .unchecked_into();
+        let event: web_sys::Event =
+            js_sys::Reflect::construct(&ctor, &js_sys::Array::of2(&"keydown".into(), &init))
+                .unwrap()
+                .unchecked_into();
+        element("activity-open").dispatch_event(&event).unwrap();
+        wait_for_drawer_motion().await;
+        assert_eq!(
+            toggle.get_attribute("aria-expanded").as_deref(),
+            Some("false")
+        );
+        assert_eq!(
+            web_sys::window()
+                .unwrap()
+                .document()
+                .unwrap()
+                .active_element(),
+            Some(toggle.clone())
+        );
+
+        crate::dispatch::apply_chat_event(
+            &state,
+            &owner,
+            protocol::ChatEvent::ToolExecutionCompleted(protocol::ToolExecutionCompletedData {
+                tool_call_id: "background-check".to_owned(),
+                outcome: protocol::ToolExecutionOutcome::Cancelled {
+                    message: "Stopped".to_owned(),
+                },
+            }),
+        );
+        crate::dispatch::apply_chat_event(
+            &state,
+            &owner,
+            protocol::ChatEvent::ToolProgress(protocol::ToolProgressData {
+                tool_call_id: "background-check".to_owned(),
+                execution_mode: protocol::ToolExecutionMode::Background,
+                cancellable: false,
+                update: protocol::ToolProgressUpdate::Other {
+                    payload: serde_json::json!({"description": "Stale progress"}),
+                },
+            }),
+        );
+        settle_autoscroll().await;
+        assert!(
+            toggle.text_content().unwrap().contains("0 commands"),
+            "completion wins over late progress"
+        );
+        state.agent_turn_active.update(|turns| {
+            turns.remove(&child_ref);
+        });
+        settle_autoscroll().await;
+        assert!(
+            container
+                .query_selector("[data-mobile-test='activity-toggle']")
+                .unwrap()
+                .is_none(),
+            "idle children and completed commands leave the drawer"
+        );
+
+        for index in 0..20 {
+            crate::dispatch::apply_chat_event(
+                &state,
+                &owner,
+                protocol::ChatEvent::ToolProgress(protocol::ToolProgressData {
+                    tool_call_id: format!("command-{index:02}"),
+                    execution_mode: protocol::ToolExecutionMode::Background,
+                    cancellable: false,
+                    update: protocol::ToolProgressUpdate::Other {
+                        payload: serde_json::json!({"description": "A long command with enough content to wrap on a narrow phone screen without covering Open buttons or spilling outside the drawer"}),
+                    },
+                }),
+            );
+        }
+        container.style().set_property("width", "320px").unwrap();
+        container.style().set_property("height", "350px").unwrap();
+        container
+            .style()
+            .set_property("--app-height", "350px")
+            .unwrap();
+        settle_autoscroll().await;
+        click(&element("activity-toggle"));
+        wait_for_drawer_motion().await;
+        let list = element("activity-list");
+        assert!(
+            list.scroll_height() > list.client_height(),
+            "many tasks scroll inside a bounded drawer"
+        );
+        let bounds = list.get_bounding_client_rect();
+        let input_bounds = element("chat-input-capsule").get_bounding_client_rect();
+        assert!(
+            bounds.height() <= 165.0,
+            "keyboard-height layout keeps the drawer bounded"
+        );
+        assert!(bounds.left() > input_bounds.left() && bounds.right() < input_bounds.right());
+        assert!((bounds.bottom() - input_bounds.top()).abs() < 1.0);
+        assert!(input_bounds.bottom() <= container.get_bounding_client_rect().bottom());
+        crate::dispatch::reset_inbound_seq_for_host(&owner.local_host_id);
+        crate::dispatch::dispatch_envelope(&state, &owner.local_host_id, protocol::Envelope::from_payload(
+            StreamPath("stream/1".to_owned()), protocol::FrameKind::AgentBootstrap, 0,
+            &protocol::AgentBootstrapPayload {
+                events: vec![protocol::AgentBootstrapEvent::ChatEvent(protocol::ChatEvent::ToolProgress(protocol::ToolProgressData {
+                    tool_call_id: "background-check".to_owned(), execution_mode: protocol::ToolExecutionMode::Background, cancellable: false,
+                    update: protocol::ToolProgressUpdate::Other { payload: serde_json::json!({"description": "Restored running command"}) },
+                }))], latest_output: Default::default(), turn_active: false,
+            },
+        ).unwrap());
+        settle_autoscroll().await;
+        assert!(
+            element("activity-toggle")
+                .text_content()
+                .unwrap()
+                .contains("1 command"),
+            "bootstrap replaces old progress and completion tombstones"
+        );
+        assert!(
+            element("activity-command")
+                .text_content()
+                .unwrap()
+                .contains("Restored running command")
+        );
+        state.clear_host_runtime(&owner.local_host_id);
+        settle_autoscroll().await;
+        assert!(
+            container
+                .query_selector("[data-mobile-test='activity-toggle']")
+                .unwrap()
+                .is_none()
+        );
+        container.remove();
+    }
+
     fn stop_button(container: &HtmlElement) -> HtmlElement {
         container
             .query_selector("[data-mobile-test='chat-stop']")

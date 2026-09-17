@@ -1921,6 +1921,7 @@ pub fn ChatInput() -> impl IntoView {
                     }}
                 </div>
             </Show>
+            <crate::components::activity_drawer::ActivityDrawer />
             <div class="chat-input-row" data-mobile-test="chat-input-capsule">
                 <Show when=move || is_running.get()>
                     <svg

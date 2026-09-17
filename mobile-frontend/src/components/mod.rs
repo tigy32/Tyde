@@ -1,3 +1,4 @@
+mod activity_drawer;
 mod agents_view;
 mod backend_capacity;
 mod bottom_nav;

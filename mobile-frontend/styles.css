@@ -2371,6 +2371,166 @@ html[data-keyboard-open] .mobile-app {
     }
 }
 
+.activity-anchor {
+    position: relative;
+    height: 36px;
+}
+
+.activity-drawer {
+    position: absolute;
+    bottom: 0;
+    left: 4%;
+    width: 92%;
+}
+
+.activity-toggle {
+    position: relative;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 12px;
+    width: max-content;
+    min-width: 68%;
+    max-width: 100%;
+    min-height: 36px;
+    margin: 0 auto;
+    padding: 8px 18px;
+    border: 1px solid var(--border-strong);
+    border-bottom: 0;
+    border-radius: 28px 28px 0 0;
+    background: var(--surface-float);
+    color: var(--text-secondary);
+    font-size: 12px;
+    white-space: nowrap;
+}
+
+.activity-toggle::before {
+    content: "";
+    position: absolute;
+    inset: -8px 0 0;
+}
+
+.activity-toggle:focus-visible,
+.activity-open:focus-visible {
+    outline: 2px solid var(--accent-primary);
+    outline-offset: -2px;
+}
+
+.activity-chevron {
+    width: 14px;
+    height: 14px;
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 2;
+    transition: transform 180ms ease;
+}
+
+.activity-drawer.expanded .activity-chevron {
+    transform: rotate(180deg);
+}
+
+.activity-reveal {
+    display: grid;
+    grid-template-rows: 0fr;
+    transition: grid-template-rows 180ms ease;
+}
+
+.activity-drawer.expanded .activity-reveal {
+    grid-template-rows: 1fr;
+}
+
+.activity-clip {
+    min-height: 0;
+    overflow: hidden;
+    visibility: hidden;
+}
+
+.activity-drawer.expanded .activity-clip {
+    visibility: visible;
+}
+
+.activity-list {
+    max-height: min(340px, calc(var(--app-height, 100dvh) * 0.42));
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    padding: 12px 12px 16px;
+    border: 1px solid var(--border-strong);
+    border-bottom: 0;
+    border-radius: 18px 18px 0 0;
+    background: var(--surface-float);
+    box-shadow: 0 -8px 24px rgba(0, 0, 0, 0.16);
+}
+
+.activity-list h3 {
+    margin: 0 0 4px;
+    font-size: 12px;
+    font-weight: 500;
+    color: var(--text-secondary);
+}
+
+.activity-row + h3 {
+    margin-top: 8px;
+    padding-top: 10px;
+    border-top: 1px solid var(--border-default);
+}
+
+.activity-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    min-height: 48px;
+    padding: 4px 0;
+}
+
+.activity-label {
+    flex: 1;
+    min-width: 0;
+}
+
+.activity-name {
+    font-size: 13px;
+    overflow-wrap: anywhere;
+    color: var(--text-primary);
+}
+
+.activity-status {
+    margin-top: 3px;
+    font-size: 11px;
+    color: var(--text-secondary);
+}
+
+.activity-dot {
+    flex: 0 0 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--accent-success);
+}
+
+.activity-terminal {
+    flex: 0 0 14px;
+    font: 12px var(--font-mono);
+    color: var(--text-secondary);
+}
+
+.activity-open {
+    flex-shrink: 0;
+    min-width: 64px;
+    min-height: 44px;
+    padding: 8px 10px;
+    border: 1px solid var(--accent-primary);
+    border-radius: var(--radius-md);
+    background: var(--accent-soft);
+    color: var(--accent-primary-hover);
+    font-size: 13px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .activity-reveal,
+    .activity-chevron {
+        transition: none;
+    }
+}
+
 .chat-input-row {
     position: relative;
     display: flex;

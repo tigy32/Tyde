@@ -1292,6 +1292,12 @@ fn apply_agent_error(state: &AppState, agent_ref: &AgentRef, payload: &AgentErro
 }
 
 fn drop_agent_state(state: &AppState, agent_ref: &AgentRef) {
+    state.tool_progress.update(|map| {
+        map.remove(agent_ref);
+    });
+    state.completed_tool_calls.update(|map| {
+        map.remove(agent_ref);
+    });
     state.agent_load_requests.update(|m| {
         m.remove(agent_ref);
     });
@@ -2067,9 +2073,31 @@ pub fn apply_chat_event(state: &AppState, agent_ref: &AgentRef, event: ChatEvent
                 }
             });
         }
-        ChatEvent::ToolProgress(_) => {}
+        ChatEvent::ToolProgress(progress) => {
+            let completed = state.completed_tool_calls.with_untracked(|map| {
+                map.get(&agent_ref)
+                    .is_some_and(|calls| calls.contains(&progress.tool_call_id))
+            });
+            if !completed {
+                state.tool_progress.update(|map| {
+                    map.entry(agent_ref)
+                        .or_default()
+                        .insert(progress.tool_call_id.clone(), progress);
+                });
+            }
+        }
         ChatEvent::ToolExecutionCompleted(data) => {
             let call_id = data.tool_call_id.clone();
+            state.completed_tool_calls.update(|map| {
+                map.entry(agent_ref.clone())
+                    .or_default()
+                    .insert(call_id.clone());
+            });
+            state.tool_progress.update(|map| {
+                if let Some(progress) = map.get_mut(&agent_ref) {
+                    progress.remove(&call_id);
+                }
+            });
             let streaming = state
                 .streaming_text
                 .with_untracked(|map| map.get(&agent_ref).cloned());
@@ -2723,6 +2751,12 @@ fn apply_host_bootstrap(
         }));
         sort_project_infos(projects);
     });
+    state.tool_progress.update(|map| {
+        map.retain(|agent, _| agent.local_host_id != *host);
+    });
+    state.completed_tool_calls.update(|map| {
+        map.retain(|agent, _| agent.local_host_id != *host);
+    });
     state.agent_load_requests.update(|loads| {
         loads.retain(|agent_ref| agent_ref.local_host_id != *host);
     });
@@ -2945,6 +2979,12 @@ fn apply_agent_bootstrap(
     // An authoritative snapshot retires any earlier load failure for this agent.
     state.agent_load_errors.update(|m| {
         m.remove(&agent_ref);
+    });
+    state.tool_progress.update(|map| {
+        map.remove(&agent_ref);
+    });
+    state.completed_tool_calls.update(|map| {
+        map.remove(&agent_ref);
     });
     // Replace prior per-agent chat/stream/queue/task state so the bootstrap
     // snapshot is authoritative.
