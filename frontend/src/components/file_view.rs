@@ -143,6 +143,7 @@ pub fn FileView(tab_id: TabId, key: FileResourceKey) -> impl IntoView {
     });
 
     let key_for_loaded = key.clone();
+    let markdown_rendered = RwSignal::new(true);
     view! {
         <div class="file-view">
             <Show
@@ -160,6 +161,7 @@ pub fn FileView(tab_id: TabId, key: FileResourceKey) -> impl IntoView {
                                     tab_id=tab_id
                                     key=key_for_loaded.clone()
                                     version=version
+                                    markdown_rendered=markdown_rendered
                                 />
                             }
                         }
@@ -180,6 +182,7 @@ fn FileViewLoaded(
     tab_id: TabId,
     key: FileResourceKey,
     version: ProjectFileVersion,
+    markdown_rendered: RwSignal<bool>,
 ) -> impl IntoView {
     let state = expect_context::<AppState>();
     let composer = RwSignal::new(None::<ComposerState>);
@@ -267,6 +270,17 @@ fn FileViewLoaded(
     };
     let is_binary = f.is_binary;
     let binary_key = key.clone();
+    let is_markdown = !is_binary
+        && std::path::Path::new(&f.path.relative_path)
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| {
+                ["md", "markdown", "mdown", "mkd", "mkdn"]
+                    .iter()
+                    .any(|candidate| extension.eq_ignore_ascii_case(candidate))
+            });
+    let show_rendered = Memo::new(move |_| is_markdown && markdown_rendered.get());
+    let markdown_html = is_markdown.then(|| crate::markdown::render_markdown(&content));
 
     let state_for_close = state.clone();
     let on_close = move |_| state_for_close.close_tab(tab_id);
@@ -331,6 +345,7 @@ fn FileViewLoaded(
         // current tokens and dispatches a fresh request with the new
         // theme name.
         let theme_name = syntax_theme.get();
+        let preview = show_rendered.get();
 
         let my_gen = gen_for_effect.get_untracked() + 1;
         gen_for_effect.set(my_gen);
@@ -345,7 +360,7 @@ fn FileViewLoaded(
             }
         });
 
-        if total == 0 || total > HIGHLIGHT_LINE_CAP {
+        if preview || total == 0 || total > HIGHLIGHT_LINE_CAP {
             return;
         }
         let Some(syntax) = syntax_for_path(&path_for_effect) else {
@@ -474,6 +489,9 @@ fn FileViewLoaded(
         state.pending_goto_offset.set(None);
     }
     let initial_goto: Option<u32> = initial_goto_line.or(initial_goto_offset_line);
+    if initial_goto.is_some() {
+        markdown_rendered.set(false);
+    }
 
     // Virtualization geometry. Pre-seed the line and
     // viewport heights with reasonable estimates so the
@@ -499,7 +517,7 @@ fn FileViewLoaded(
     let pre_ref_for_restore = pre_ref;
     let state_for_restore = state.clone();
     Effect::new(move |_| {
-        if restored_initial_scroll_for_effect.get() {
+        if show_rendered.get() || restored_initial_scroll_for_effect.get() {
             return;
         }
         let Some(saved) = initial_scroll_state else {
@@ -521,7 +539,11 @@ fn FileViewLoaded(
     let perf_key_for_measure = format!("file:{}", f.path.relative_path);
     let measure_logged = std::rc::Rc::new(std::cell::Cell::new(false));
     Effect::new(move |_| {
+        if show_rendered.get() {
+            return;
+        }
         let Some(el) = pre_ref.get() else { return };
+        el.set_scroll_top(scroll_top.get_untracked() as i32);
         let vh = el.client_height() as f64;
         if vh > 0.0 {
             viewport_height.set(vh);
@@ -560,6 +582,7 @@ fn FileViewLoaded(
         if let Some((target, line)) = state_for_goto.pending_goto_line.get()
             && target == tab_id
         {
+            markdown_rendered.set(false);
             pending_line.set(Some(line));
             state_for_goto.pending_goto_line.set(None);
         }
@@ -575,6 +598,7 @@ fn FileViewLoaded(
             && target == tab_id
         {
             let line = lines_for_goto_offset.line_for_byte(byte) as u32 + 1;
+            markdown_rendered.set(false);
             pending_line.set(Some(line));
             state_for_goto_offset.pending_goto_offset.set(None);
         }
@@ -597,6 +621,9 @@ fn FileViewLoaded(
     let pre_ref_for_goto = pre_ref;
     let state_for_goto_scroll = state.clone();
     Effect::new(move |_| {
+        if show_rendered.get() {
+            return;
+        }
         let Some(line) = pending_line.get() else {
             return;
         };
@@ -647,6 +674,9 @@ fn FileViewLoaded(
     let scroll_hover_timer = hover_timer;
     let scroll_hovered_offset = hovered_offset;
     let on_scroll = move |_: web_sys::Event| {
+        if show_rendered.get_untracked() {
+            return;
+        }
         if let Some(el) = pre_ref.get_untracked() {
             scroll_top.set(el.scroll_top() as f64);
             let element: web_sys::Element = el.clone().unchecked_into();
@@ -805,6 +835,15 @@ fn FileViewLoaded(
     });
 
     let find_bar_open = state.find_bar_open;
+    let center_zone = state.center_zone;
+    Effect::new(move |_| {
+        if is_markdown
+            && find_bar_open.get()
+            && center_zone.with(|zone| zone.active_tab_id() == Some(tab_id))
+        {
+            markdown_rendered.set(false);
+        }
+    });
 
     // ── Visible-range prioritization hint (M3) ─────────────────────────────
     // When the visible line window changes, tell the server which byte range is
@@ -933,6 +972,23 @@ fn FileViewLoaded(
     view! {
                             <div class="file-view-header">
                                 <span class="file-view-path">{path_display.clone()}</span>
+                                {is_markdown.then(|| view! {
+                                    <div class="file-view-mode" role="group" aria-label="Markdown view">
+                                        <button
+                                            type="button"
+                                            aria-pressed=move || markdown_rendered.get().to_string()
+                                            on:click=move |_| {
+                                                find_bar_open.set(false);
+                                                markdown_rendered.set(true);
+                                            }
+                                        >"Rendered"</button>
+                                        <button
+                                            type="button"
+                                            aria-pressed=move || (!markdown_rendered.get()).to_string()
+                                            on:click=move |_| markdown_rendered.set(false)
+                                        >"Source"</button>
+                                    </div>
+                                })}
                                 {move || {
                                     let (host, review_id) = draft.get()?;
                                     let decorations = build_review_decorations(
@@ -1021,12 +1077,19 @@ fn FileViewLoaded(
                                     })
                             }}
                             {move || {
-                                if find_bar_open.get() {
+                                if find_bar_open.get() && !show_rendered.get() {
                                     Some(view! { <FindBar /> })
                                 } else {
                                     None
                                 }
                             }}
+                            {markdown_html.map(|html| view! {
+                                <div
+                                    class="file-view-markdown chat-card-body"
+                                    style:display=move || if show_rendered.get() { "" } else { "none" }
+                                    inner_html=html
+                                ></div>
+                            })}
                             {if is_binary {
                                 binary_preview.map(|binary| view! {
                                     <BinaryPreview
@@ -1038,6 +1101,7 @@ fn FileViewLoaded(
                             } else {
                                 Some(view! { <pre
                                 class="file-view-content"
+                                style:display=move || if show_rendered.get() { "none" } else { "" }
                                 node_ref=pre_ref
                                 on:scroll=on_scroll
                                 on:click=on_content_click
@@ -2645,6 +2709,141 @@ mod wasm_tests {
     }
 
     #[wasm_bindgen_test]
+    async fn markdown_preview_toggles_source_and_refreshes() {
+        ensure_styles_loaded();
+        install_send_stub();
+        for filename in ["report.md", "README.MD", "notes.markdown"] {
+            let container = make_container();
+            let path = ProjectPath {
+                root: ProjectRootPath("test-root".to_owned()),
+                relative_path: filename.to_owned(),
+            };
+            let key = file_key(path.clone());
+            let source = "# Benchmark results\n\n| Engine | Verdict |\n| --- | --- |\n| RocksDB | **Passed** |\n\n```text\nexact code\n```\n\n<script>alert('unsafe')</script>";
+            let state_slot = Rc::new(RefCell::new(None));
+            let state_for_mount = state_slot.clone();
+            let key_for_mount = key.clone();
+            let handle = mount_to(container.clone(), move || {
+                let state = AppState::new();
+                state.open_files.update(|files| {
+                    files.insert(
+                        key_for_mount.clone(),
+                        OpenFile {
+                            path: path.clone(),
+                            version: ProjectFileVersion(1),
+                            contents: Some(source.to_owned()),
+                            is_binary: false,
+                            missing: false,
+                        },
+                    );
+                });
+                *state_for_mount.borrow_mut() = Some(state.clone());
+                provide_context(state);
+                view! { <FileView tab_id=TabId(20_090) key=key_for_mount.clone() /> }
+            });
+            next_tick().await;
+            let heading = container
+                .query_selector("h1")
+                .unwrap()
+                .expect("Markdown defaults to rendered");
+            assert_eq!(heading.text_content().as_deref(), Some("Benchmark results"));
+            assert!(heading.get_bounding_client_rect().height() > 0.0);
+            assert_eq!(
+                container
+                    .query_selector_all("table tbody tr")
+                    .unwrap()
+                    .length(),
+                1
+            );
+            assert_eq!(
+                container
+                    .query_selector("td strong")
+                    .unwrap()
+                    .unwrap()
+                    .text_content()
+                    .as_deref(),
+                Some("Passed")
+            );
+            assert_eq!(
+                container
+                    .query_selector("pre code")
+                    .unwrap()
+                    .unwrap()
+                    .text_content()
+                    .as_deref(),
+                // build_code_block removes the fence separator newline; the DOM
+                // renders "exact code". Source mode below checks every raw line.
+                Some("exact code")
+            );
+            assert!(
+                container.query_selector("script").unwrap().is_none(),
+                "source HTML must not execute"
+            );
+
+            let click_mode = |label: &str| {
+                let buttons = container.query_selector_all("button").unwrap();
+                let button = (0..buttons.length())
+                    .filter_map(|i| buttons.item(i))
+                    .filter_map(|node| node.dyn_into::<HtmlElement>().ok())
+                    .find(|button| button.text_content().as_deref() == Some(label))
+                    .expect("Markdown mode button");
+                button.click();
+            };
+            click_mode("Source");
+            next_tick().await;
+            let rows = line_rows(&container);
+            assert_eq!(rows.len(), source.lines().count());
+            for (row, line) in rows.iter().zip(source.lines()) {
+                assert_eq!(row.text_content().as_deref(), Some(line));
+                assert!(row.get_bounding_client_rect().height() > 0.0);
+            }
+            assert_eq!(
+                container
+                    .query_selector("button[aria-pressed=true]")
+                    .unwrap()
+                    .unwrap()
+                    .text_content()
+                    .as_deref(),
+                Some("Source")
+            );
+
+            let state = state_slot.borrow().as_ref().unwrap().clone();
+            state.open_files.update(|files| {
+                let file = files.get_mut(&key).unwrap();
+                file.version = ProjectFileVersion(2);
+                file.contents = Some("# Updated report\n\nFresh contents".to_owned());
+            });
+            next_tick().await;
+            assert_eq!(
+                line_rows(&container)[0].text_content().as_deref(),
+                Some("# Updated report")
+            );
+            assert!(
+                line_rows(&container)[0].get_bounding_client_rect().height() > 0.0,
+                "refresh preserves Source mode"
+            );
+            click_mode("Rendered");
+            next_tick().await;
+            let heading = container.query_selector("h1").unwrap().unwrap();
+            assert_eq!(heading.text_content().as_deref(), Some("Updated report"));
+            assert!(heading.get_bounding_client_rect().height() > 0.0);
+            assert!(
+                line_rows(&container)
+                    .iter()
+                    .all(|row| row.get_bounding_client_rect().height() == 0.0)
+            );
+            state.pending_goto_line.set(Some((TabId(20_090), 3)));
+            next_tick().await;
+            assert!(
+                line_rows(&container)[2].get_bounding_client_rect().height() > 0.0,
+                "line navigation reveals source"
+            );
+            drop(handle);
+            container.remove();
+        }
+    }
+
+    #[wasm_bindgen_test]
     async fn renders_lines_single_spaced() {
         ensure_styles_loaded();
 
@@ -2681,6 +2880,12 @@ mod wasm_tests {
 
         next_tick().await;
 
+        assert!(
+            container
+                .query_selector("[aria-label=\"Markdown view\"]")
+                .unwrap()
+                .is_none()
+        );
         let rows = line_rows(&container);
         assert_eq!(
             rows.len(),

@@ -3296,6 +3296,7 @@ async fn live_watcher_refreshes_files_during_continuous_activity() {
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
     };
+    let update_started = std::time::Instant::now();
     let receive_updates = async {
         let mut listing = None;
         let mut version = None;
@@ -3306,6 +3307,12 @@ async fn live_watcher_refreshes_files_during_continuous_activity() {
                 .await
                 .expect("project event")
                 .expect("connection open");
+            eprintln!(
+                "continuous watcher update after {:?}: kind={:?} payload={}",
+                update_started.elapsed(),
+                env.kind,
+                env.payload
+            );
             match env.kind {
                 FrameKind::ProjectFileList => {
                     let files: ProjectFileListPayload = env.parse_payload().expect("file list");

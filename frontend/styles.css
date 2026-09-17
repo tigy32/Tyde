@@ -8114,6 +8114,7 @@ math merror {
 .file-view-header {
     display: flex;
     align-items: center;
+    gap: 8px;
     justify-content: space-between;
     padding: 8px 12px;
     background: var(--surface-2);
@@ -8128,6 +8129,48 @@ math merror {
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+}
+
+.file-view-mode {
+    display: flex;
+    flex-shrink: 0;
+    gap: 2px;
+    margin-left: auto;
+    padding: 2px;
+    border: 1px solid var(--border);
+    border-radius: 5px;
+}
+
+.file-view-mode button {
+    padding: 3px 8px;
+    border-radius: 3px;
+    color: var(--text-secondary);
+    font-size: 0.846rem;
+}
+
+.file-view-mode button:hover,
+.file-view-mode button[aria-pressed="true"] {
+    background: var(--surface-3);
+    color: var(--text-primary);
+}
+
+.file-view-mode button:focus-visible {
+    outline: 2px solid var(--accent-primary);
+    outline-offset: 1px;
+}
+
+.file-view-markdown {
+    flex: 1;
+    min-height: 0;
+    overflow: auto;
+    padding: 16px 24px;
+    line-height: 1.6;
+    color: var(--text-primary);
+}
+
+.file-view-markdown img {
+    max-width: 100%;
+    height: auto;
 }
 
 .file-view-code-intel-status {
