@@ -1426,6 +1426,8 @@ with open(os.environ["DEV_CHECK_TEST_LOG"], "a", encoding="utf-8") as log:
 """,
             encoding="utf-8",
         )
+        for suite in ("test_release_tooling.py", "test_release_cadence.py"):
+            (self.root / "tools" / suite).write_text("", encoding="utf-8")
         (self.root / ".gitignore").write_text("/target\n", encoding="utf-8")
         (self.root / "tracked.txt").write_text("base\n", encoding="utf-8")
 

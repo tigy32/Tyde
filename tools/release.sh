@@ -48,6 +48,7 @@ Usage:
   ./dev.sh release wait vX.Y.Z [--timeout 90m] [--interval 30]
   ./dev.sh release verify vX.Y.Z
   ./dev.sh release publish vX.Y.Z --confirm
+  ./dev.sh release promote vX.Y.Z-beta.N --confirm
   ./dev.sh release pretag dispatch SOURCE_REF --confirm
   ./dev.sh release pretag status RUN_ID
   ./dev.sh release pretag wait RUN_ID [--timeout SECONDS] [--interval SECONDS]
@@ -470,7 +471,7 @@ fetch_run_view() {
     set_temp_path select-run-error
     select_error_file="$TEMP_PATH"
     if ! gh run list --workflow release.yml --limit 100 \
-        --json databaseId,workflowName,headBranch,headSha,status,conclusion,url,createdAt \
+        --json databaseId,workflowName,headBranch,headSha,status,conclusion,url,createdAt,displayTitle \
         > "$run_list_file"; then
         return "$EXIT_TOOL"
     fi
@@ -833,7 +834,24 @@ command_publish() {
     printf 'Published beta release %s with prerelease=true and latest=false.\n' "$tag"
 }
 
+command_promote() {
+    local tag="${1:-}"
+    [[ $# -eq 2 && "$2" == "--confirm" ]] || { usage >&2; exit "$EXIT_USAGE"; }
+    require_strict_tag "$tag"
+    [[ "$tag" =~ -beta\.[0-9]+$ ]] || die "promotion requires a beta tag" "$EXIT_USAGE"
+    network_command_setup "$tag"
+    command_verify "$tag"
+    require_remote_tag_on_origin_main "$tag"
+    python3 "$PYTHON_HELPER" validate-release "$tag" --input "$RELEASE_FILE" --require-published >/dev/null
+    gh workflow run release-cadence.yml --ref main -f "promote_beta=$tag"
+    printf 'Requested promotion of %s; follow the Release cadence workflow.\n' "$tag"
+}
+
 case "${1:-}" in
+    promote)
+        shift
+        command_promote "$@"
+        ;;
     pretag)
         shift
         exec python3 -B "$SCRIPT_DIR/pretag_release_build.py" "$@"

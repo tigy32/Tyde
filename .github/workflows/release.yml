@@ -1,4 +1,9 @@
 name: Release
+run-name: Release ${{ inputs.version || github.ref_name }} @ ${{ inputs.source_sha || github.sha }}
+
+concurrency:
+  group: release-${{ inputs.version || github.ref_name }}
+  cancel-in-progress: false
 
 on:
   push:
@@ -9,6 +14,10 @@ on:
       version:
         description: 'Version tag (must start with v, e.g. v0.8.1)'
         required: true
+      source_sha:
+        description: 'Expected tagged commit (required by release cadence)'
+        type: string
+        default: ''
       publish:
         description: 'Publish after artifacts are uploaded (required before remotes can download prereleases)'
         type: boolean
@@ -27,6 +36,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ env.RELEASE_TAG }}
+          fetch-depth: 0
 
       - name: Verify release tag format
         run: |
@@ -43,8 +53,18 @@ jobs:
       - name: Verify release version matches tag
         run: python tools/check_release_version.py "${{ env.RELEASE_TAG }}"
 
+      - name: Verify tag provenance
+        env:
+          EXPECTED_SHA: ${{ inputs.source_sha }}
+        run: |
+          git fetch --no-tags origin main
+          git merge-base --is-ancestor HEAD origin/main
+          if [[ -n "$EXPECTED_SHA" && "$(git rev-parse HEAD)" != "$EXPECTED_SHA" ]]; then
+            echo '::error::Tag does not match the approved source commit'
+            exit 1
+          fi
+
       - name: Create draft release
-        if: github.event_name == 'push'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -57,10 +77,17 @@ jobs:
             create_prerelease_flag=()
           fi
 
-          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
-            gh release edit "$RELEASE_TAG" --draft --title "Tyde $RELEASE_TAG" --notes '' --target "$release_sha" "${edit_prerelease_flag[@]}"
+          # Fail closed on API/auth errors rather than treating them as absence.
+          releases=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" --slurp)
+          existing=$(jq -c --arg tag "$RELEASE_TAG" '[.[][] | select(.tag_name == $tag)]' <<< "$releases")
+          if [[ "$(jq 'length' <<< "$existing")" != 0 ]]; then
+            if [[ "$(jq -r '.[0].draft' <<< "$existing")" != true ]]; then
+              echo '::error::Published releases are immutable; refusing to rebuild'
+              exit 1
+            fi
+            gh release edit "$RELEASE_TAG" --draft --title "Tyde $RELEASE_TAG" --target "$release_sha" "${edit_prerelease_flag[@]}"
           else
-            gh release create "$RELEASE_TAG" --draft --title "Tyde $RELEASE_TAG" --notes '' --target "$release_sha" "${create_prerelease_flag[@]}"
+            gh release create "$RELEASE_TAG" --verify-tag --draft --title "Tyde $RELEASE_TAG" --generate-notes --target "$release_sha" "${create_prerelease_flag[@]}"
           fi
 
   build:

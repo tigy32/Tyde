@@ -778,7 +778,7 @@ run_check_stages() {
             run_stage_at "$n_docs" "customer documentation" 1 \
                 python3 docs/build.py --check &&
             run_stage_at "$n_contract" "dev check contract tests" 1 \
-                python3 tools/test_dev_check.py
+                bash -c 'python3 tools/test_dev_check.py && python3 tools/test_release_tooling.py && python3 tools/test_release_cadence.py'
     ) &
     tail_pid=$!
 

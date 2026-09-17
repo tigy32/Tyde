@@ -77,6 +77,56 @@ asserts every S3 destination stays under `s3://tycode-static/tyde/`.
 
 ## Local checks
 
+### Nightly betas and stable promotion
+
+`Release cadence` runs nightly at **03:00 America/Los_Angeles**, which is Seattle
+local time including daylight saving. GitHub schedules are best-effort: builds
+may start late. The workflow uses only upstream `main`. Agents must land,
+validate, and push ordinary changes there for the next beta to include them.
+
+No source changes since the newest beta means no new beta. Version values are
+normalized for this comparison; dependency changes in lockfiles still count.
+Unpublished failed builds are retried at the same tag. Successful nightly builds
+are published automatically as prereleases, never GitHub's latest stable.
+Enable automatic updates on **Preview** to receive them.
+
+Once the user approves a specific beta, run:
+
+```sh
+./dev.sh release promote v0.9.4-beta.3 --confirm
+```
+
+This dispatches `Release cadence` on `main` with that explicit beta. The same
+input can be supplied manually in GitHub Actions. There is **no automatic stable
+promotion**. The example rebuilds the selected beta's exact source, changing
+only tracked version metadata to `0.9.4`; it does not include newer main changes.
+A validated version-only snapshot is merged into main's ancestry without
+replacing newer source, and the stable tag points at that snapshot. Main advances
+to `0.9.5-beta.0`; the next beta with source changes is `0.9.5-beta.1`. The
+`.0` is bookkeeping, not a published beta. Older beta tags in the current cycle
+can be selected even when newer changes have already landed.
+
+Every prepared snapshot passes `./dev.sh check` and the release-coherence
+guard; each landing workbench and clean main also passes `./dev.sh check`. The workflow then atomically pushes main and the annotated tag,
+and explicitly dispatches the Release workflow with the expected tag SHA.
+Dispatch is necessary because pushes using `GITHUB_TOKEN` do not trigger another
+workflow. Release builds verify tag ancestry/version/SHA and never overwrite a
+published release. Stable builds retain the existing stable updater behavior;
+no client migration is needed.
+
+Repository Actions must permit `contents: write` and `actions: write`, and branch
+protection must permit the release bot's ordinary main updates. No PAT is needed.
+Existing signing and mobile-web deployment secrets remain required. If main
+moves during preparation, the run fails before pushing; rerun against current
+main. No force pushes or automatic conflict resolution occur on main.
+
+A failed build leaves a draft. Inspect Release cadence diagnostics for
+preparation failures, and the Release workflow for build/deployment failures.
+If a tag was pushed but dispatch failed, rerun the nightly for a beta, or dispatch
+Release on main manually with `version`, the exact tagged `source_sha`, and
+`publish=true` for an approved stable promotion. Never delete/recreate tags to
+recover. `release status/wait/verify` also work for SHA-bound main dispatches.
+
 The deterministic human release entry points are:
 
 ```sh
@@ -86,12 +136,13 @@ The deterministic human release entry points are:
 ./dev.sh release wait v<release> [--timeout 90m] [--interval 30]
 ./dev.sh release verify v<release>
 ./dev.sh release publish v<beta-release> --confirm
+./dev.sh release promote v<beta-release> --confirm
 ```
 
 `cut` requires the explicit `--confirm` mutation gate before it runs the
 release-coherence guard, pushes `main` before the annotated tag, and waits
-by polling GitHub unless `--no-wait` is given. Beta workflows leave a verified
-draft; `publish` is the separate beta-only publication step and also requires
+by polling GitHub unless `--no-wait` is given. Manual tag-push beta workflows leave a verified
+draft (nightly dispatches publish automatically); `publish` is the separate beta-only publication step and also requires
 `--confirm`. Neither command prompts for terminal input, and neither bypasses
 the release checks, hook, clean-tree, or `main` requirements in `AGENTS.md`.
 The `wait --timeout` deadline bounds the complete wait subprocess, including

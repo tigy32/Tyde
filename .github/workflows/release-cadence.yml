@@ -1,0 +1,150 @@
+name: Release cadence
+run-name: ${{ inputs.promote_beta && format('Promote {0}', inputs.promote_beta) || 'Nightly beta' }}
+
+on:
+  schedule:
+    - cron: '0 3 * * *'
+      timezone: America/Los_Angeles
+  workflow_dispatch:
+    inputs:
+      promote_beta:
+        description: 'Explicitly approved beta to promote (empty = nightly beta)'
+        type: string
+        default: ''
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: release-cadence
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    outputs:
+      action: ${{ steps.plan.outputs.action }}
+      plan: ${{ steps.plan.outputs.plan }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+      - name: Plan release without changing the repository
+        id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PROMOTE_BETA: ${{ inputs.promote_beta }}
+        run: |
+          gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+            --jq '.[] | {tagName: .tag_name, isDraft: .draft, isPrerelease: .prerelease}' \
+            | jq -s . > "$RUNNER_TEMP/releases.json"
+          args=()
+          if [[ -n "$PROMOTE_BETA" ]]; then args+=(--promote "$PROMOTE_BETA"); fi
+          python3 tools/release_cadence.py plan \
+            --catalog "$RUNNER_TEMP/releases.json" "${args[@]}" \
+            --output "$RUNNER_TEMP/release-plan.json"
+          echo "plan=$(jq -c . "$RUNNER_TEMP/release-plan.json")" >> "$GITHUB_OUTPUT"
+
+  release:
+    needs: plan
+    if: needs.plan.outputs.action != 'skip'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Install Linux dependencies
+        if: needs.plan.outputs.action != 'retry'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential \
+            curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev \
+            librsvg2-dev libdbus-1-dev libasound2-dev clang pkg-config patchelf musl-tools time \
+            mold
+
+      - name: Setup Python
+        if: needs.plan.outputs.action != 'retry'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Provision native audio build tools
+        if: needs.plan.outputs.action != 'retry'
+        run: |
+          python tools/provision-native-build-tools.py \
+            --root "$RUNNER_TEMP/tyde-native-build-tools" \
+            --github-path "$GITHUB_PATH" --github-env "$GITHUB_ENV"
+
+      - name: Install repository Rust toolchain
+        if: needs.plan.outputs.action != 'retry'
+        run: ./dev.sh rust-toolchain
+
+      - name: Setup Node.js
+        if: needs.plan.outputs.action != 'retry'
+        uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+          cache: npm
+
+      - name: Install frontend dependencies
+        if: needs.plan.outputs.action != 'retry'
+        run: npm ci
+
+      - name: Install cargo-nextest
+        if: needs.plan.outputs.action != 'retry'
+        uses: taiki-e/install-action@nextest
+
+      - name: Install pinned sccache
+        if: needs.plan.outputs.action != 'retry'
+        run: |
+          cargo install sccache --version 0.16.0 --locked --force
+          test "$(sccache --version)" = "sccache 0.16.0"
+
+      - name: Rust cache
+        if: needs.plan.outputs.action != 'retry'
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: . -> target
+
+      - name: Install trunk
+        if: needs.plan.outputs.action != 'retry'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: trunk@0.21.14
+
+      - name: Build frontend prerequisites
+        if: needs.plan.outputs.action != 'retry'
+        run: |
+          (cd frontend && trunk build --release)
+          (cd mobile-frontend && trunk build --release)
+
+      - name: Prepare, validate, and land the release
+        env:
+          RELEASE_PLAN: ${{ needs.plan.outputs.plan }}
+        run: |
+          git config user.name 'Tyde Release'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          tools/install-git-hooks.sh
+          printf '%s\n' "$RELEASE_PLAN" > "$RUNNER_TEMP/release-plan.json"
+          python3 tools/release_cadence.py execute --confirm \
+            --plan "$RUNNER_TEMP/release-plan.json" \
+            --directory "$RUNNER_TEMP/release-workbenches"
+
+      - name: Retain release preparation diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-cadence-diagnostics
+          path: |
+            ${{ runner.temp }}/release-plan.json
+            ${{ runner.temp }}/release-workbenches/state.json
+            target/dev-check-logs/
+          if-no-files-found: ignore

@@ -25,7 +25,11 @@ committed work lands on `main`. The workflow for every change is:
 5. **Run `./dev.sh check` on clean `main`** once the commits have landed. It
    must pass before further coordinated work or release. If it fails, fix and
    validate the cause in a workbench, never by active development on `main`.
-6. **Delete your workbench.**
+6. **Land upstream** with a normal `git push origin main` after the clean
+   `main` check passes. Fetch first; if upstream advanced, integrate it in a
+   workbench and repeat both validation gates. Never force-push or overwrite
+   someone else's work. A change is not done until it is on `origin/main`.
+7. **Delete your workbench.**
 
 The single exception is a change small and self-contained enough that the user
 explicitly tells you to skip the workbench; then edit and commit on `main`
@@ -205,12 +209,15 @@ A backend fix is incomplete until its regression test and `./dev.sh check`
 pass, and the user has approved and seen the results of the conformance runs
 that cover it.
 
-### 4. Local commits only
+### 4. Land validated changes upstream
 
-Always commit locally. Do **not** `git push`, open PRs, force-push, or take
-any action that affects the remote without explicit user approval. The same
-goes for tags, branches on the remote, or anything else that leaves the
-local machine.
+Commit locally in a workbench, then follow the landing workflow above through
+clean-main validation and `git push origin main`. This is standing approval
+for ordinary validated changes to `origin/main`; no extra push approval is
+needed. It does not authorize force pushes, remote feature branches, PRs,
+release tags, or publication outside the release policy below. If a push is
+blocked by permissions or branch protection, report the blocker; do not bypass
+it or claim the change is done.
 
 ### 5. Release pushes
 
@@ -223,9 +230,10 @@ local machine.
 > every fix that landed on `main` (or on other unmerged branches).
 >
 > **Definition of done:** a fix or feature is only "done" once it is **merged
-> into `main`**. Code sitting on an unmerged feature branch does not count as
-> done, is not in any release, and must not be assumed present. Before cutting
-> a release, confirm there is no un-merged work that belongs in it.
+> into `main`, validated, and pushed to `origin/main`**. Code sitting on an
+> unmerged feature branch does not count as done, is not in any release, and
+> must not be assumed present. Before cutting a release, confirm there is no
+> unmerged work that belongs in it.
 
 This is enforced by tooling, not just discipline: a tracked `pre-push` hook
 (`.githooks/pre-push`) **refuses** to push any release tag whose commit is not
@@ -233,8 +241,30 @@ contained in `main`, or whose tagged commit's version files are out of sync
 with the tag. Install it once per clone with `tools/install-git-hooks.sh`
 (sets `core.hooksPath` to `.githooks`).
 
-Only push a release after the user explicitly approves the release action and
-the exact target version, e.g. `vX.Y.Z`. Never force-push a release.
+The configured Release cadence workflow has standing approval to cut and
+publish nightly betas at **03:00 America/Los_Angeles** (Seattle time, including
+DST), only when source changes exist since the last beta. A failed unpublished
+beta can be retried without creating a new version. Version bookkeeping alone
+does not trigger a beta. This does not authorize agents to cut ad hoc releases.
+
+Stable promotion is **always the user's decision**. Ask for the exact beta to
+promote, then use `./dev.sh release promote vX.Y.Z-beta.N --confirm` only after
+approval. It rebuilds that beta's source with version `X.Y.Z`, without newer
+application changes; subsequent betas target `X.Y.(Z+1)`. Never force-push a
+release or rebuild an already-published release.
+
+Promotion prepares a version-only stable snapshot from the selected beta in an
+isolated workbench. After validation, an ancestry merge lands that snapshot on
+`main` while retaining newer main source and advancing its beta version. The
+stable tag identifies the validated snapshot, now an ancestor of `main`, not
+the newer main tip. This release-bookkeeping merge and snapshot are not separate
+implementation commits. Candidate, landing workbench, and clean main must all
+pass `./dev.sh check` before either main or the release tag is pushed.
+CI uses disposable Git worktrees as its isolated release workbenches; interactive
+implementation work continues to use Tyde workbenches.
+
+Other manual release cuts still require explicit approval of the release
+action and exact target version, e.g. `vX.Y.Z`.
 
 Use `./dev.sh release prepare vX.Y.Z --commit` and then
 `./dev.sh release cut vX.Y.Z` for the normal human release path. Use the
@@ -242,7 +272,7 @@ Use `./dev.sh release prepare vX.Y.Z --commit` and then
 monitoring and controlled publication instead of an ad hoc polling loop. The
 checklist below remains the hard-rule contract enforced by that tooling.
 
-After approval:
+For manual `prepare`/`cut` releases, after approval:
 
 1. Confirm the working tree is clean and you are on `main`:
    `git status --short` and `git branch --show-current`. **Stop immediately if

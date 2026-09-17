@@ -93,8 +93,10 @@ def select_run(runs: Any, tag: str, sha: str) -> dict[str, Any]:
         workflow = run.get("workflowName", run.get("name"))
         if (
             workflow == "Release"
-            and run.get("headBranch") == tag
-            and run.get("headSha") == sha
+            and (
+                (run.get("headBranch") == tag and run.get("headSha") == sha)
+                or run.get("displayTitle") == f"Release {tag} @ {sha}"
+            )
         ):
             matches.append(run)
     if not matches:
