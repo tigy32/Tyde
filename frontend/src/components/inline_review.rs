@@ -1232,6 +1232,7 @@ mod wasm_tests {
             comments,
             suggestions: vec![],
             ai_reviewer: ReviewAiReviewerState {
+                rounds: Vec::new(),
                 status: ReviewAiReviewerStatus::Idle,
                 agent_id: None,
                 error: None,

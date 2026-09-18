@@ -747,8 +747,112 @@ async fn authorize_direct_children(
     Ok(())
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct RequestReviewToolInput {
+    #[serde(default)]
+    scope: protocol::ReviewAiScope,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct GetReviewToolInput {
+    review_id: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ReviewDispositionToolInput {
+    review_id: String,
+    suggestion_id: String,
+    /// Explain what was fixed, or why this finding is not actionable.
+    reason: String,
+}
+
+fn review_tool_result(review: protocol::Review) -> Result<CallToolResult, McpError> {
+    ok_json(
+        json!({ "review_id": review.id, "status": review.ai_reviewer.status, "error": review.ai_reviewer.error,
+        "rounds": review.ai_reviewer.rounds, "findings": review.suggestions }),
+    )
+}
+
 #[tool_router]
 impl TydeAgentControlMcpServer {
+    #[tool(
+        description = "Request all enabled reviewers from Settings → Review against a frozen snapshot of your project's changes. Returns the review id immediately after launch; feedback is automatically delivered to you when all reviewers finish, without user submission. Fix actionable findings, record dispositions, then request another review after changes until nothing actionable remains. Never treat a failed review as clean. Working tree is default; committed_range requires root and exact base_oid/tip_oid. Cannot override the user's reviewers."
+    )]
+    async fn tyde_request_review(
+        &self,
+        Parameters(input): Parameters<RequestReviewToolInput>,
+        Extension(parts): Extension<axum::http::request::Parts>,
+    ) -> Result<CallToolResult, McpError> {
+        let caller = match require_authenticated_caller(self, &parts, "tyde_request_review").await {
+            Ok(caller) => caller,
+            Err(error) => return Ok(err_text(error)),
+        };
+        match self.host.request_agent_review(caller, input.scope).await {
+            Ok(review) => review_tool_result(review),
+            Err(error) => Ok(err_text(error)),
+        }
+    }
+
+    #[tool(
+        description = "Read review progress, reviewer failures, findings, prior rounds, and recorded dispositions for a review in your project. Feedback also arrives automatically when an agent-requested round finishes."
+    )]
+    async fn tyde_get_review(
+        &self,
+        Parameters(input): Parameters<GetReviewToolInput>,
+        Extension(parts): Extension<axum::http::request::Parts>,
+    ) -> Result<CallToolResult, McpError> {
+        let caller = match require_authenticated_caller(self, &parts, "tyde_get_review").await {
+            Ok(caller) => caller,
+            Err(error) => return Ok(err_text(error)),
+        };
+        let result = async {
+            self.host
+                .agent_review_handle(&caller, Some(protocol::ReviewId(input.review_id)))
+                .await?
+                .snapshot()
+                .await
+        }
+        .await;
+        match result {
+            Ok(review) => review_tool_result(review),
+            Err(error) => Ok(err_text(error)),
+        }
+    }
+
+    #[tool(
+        description = "Record a visible reason for addressing or dismissing a review finding. Only the requesting agent may do this; it does not accept the comment on the user's behalf or certify new changes. Request a fresh review after fixes."
+    )]
+    async fn tyde_review_disposition(
+        &self,
+        Parameters(input): Parameters<ReviewDispositionToolInput>,
+        Extension(parts): Extension<axum::http::request::Parts>,
+    ) -> Result<CallToolResult, McpError> {
+        let caller =
+            match require_authenticated_caller(self, &parts, "tyde_review_disposition").await {
+                Ok(caller) => caller,
+                Err(error) => return Ok(err_text(error)),
+            };
+        let result = async {
+            self.host
+                .agent_review_handle(&caller, Some(protocol::ReviewId(input.review_id)))
+                .await?
+                .disposition(
+                    caller,
+                    protocol::ReviewSuggestionId(input.suggestion_id),
+                    input.reason,
+                )
+                .await
+        }
+        .await;
+        match result {
+            Ok(review) => review_tool_result(review),
+            Err(error) => Ok(err_text(error)),
+        }
+    }
+
     #[tool(
         description = "Spawn a direct child of the authenticated caller and return immediately with its agent_id. Call tyde_list_launch_options first, then follow its ordered launch-profile preference and factual backend limits unless the user explicitly selected a backend or profile."
     )]
@@ -1089,7 +1193,7 @@ impl ServerHandler for TydeAgentControlMcpServer {
     fn get_info(&self) -> ServerInfo {
         let instructions = match self.surface {
             AgentControlMcpSurface::Control => {
-                "Tools for orchestrating direct child Tyde agents. Spawn agents, send follow-ups, read the latest visible output, inspect incremental debug events, and list direct children. Long-running waits are exposed by the separate tyde-agent-await MCP server."
+                "Tools for orchestrating direct child Tyde agents. Spawn agents, send follow-ups, read the latest visible output, inspect incremental debug events, and list direct children. Long-running waits are exposed by the separate tyde-agent-await MCP server. Use tyde_request_review for the user-configured focused reviewers; their feedback returns automatically. Record addressed or dismissed findings with tyde_review_disposition and request another round after fixes. Review configuration is managed by the user or Help agent, not by coding agents."
             }
             AgentControlMcpSurface::Await => {
                 "The dedicated long-running tyde_await_agents tool for direct child Tyde agents."

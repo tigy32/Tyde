@@ -646,6 +646,7 @@ fn is_known_backend_kind(value: &serde_json::Value) -> bool {
 
 fn empty_settings() -> HostSettings {
     HostSettings {
+        review: settings_model::ReviewSettings::default(),
         enabled_backends: Vec::new(),
         default_backend: None,
         enable_mobile_connections: false,
@@ -672,6 +673,15 @@ fn empty_settings() -> HostSettings {
 }
 
 fn validate_settings(settings: HostSettings) -> Result<HostSettings, String> {
+    for (id, reviewer) in &settings.review.agents {
+        if id.trim().is_empty()
+            || reviewer.name.trim().is_empty()
+            || reviewer.instructions.trim().is_empty()
+        {
+            return Err("Review agents require an id, name, and review instructions".to_owned());
+        }
+    }
+
     if !(1..=100).contains(&settings.usage_limits.stop_used_percent)
         || !(1..=100).contains(&settings.usage_limits.compact_context_percent)
     {
@@ -808,6 +818,7 @@ fn validate_settings(settings: HostSettings) -> Result<HostSettings, String> {
         tyde_agent_control_mcp_enabled: settings.tyde_agent_control_mcp_enabled,
         tyde_agent_control_max_depth: settings.tyde_agent_control_max_depth,
         delegation_launch_profile_order,
+        review: settings.review,
         complexity_tiers_enabled: settings.complexity_tiers_enabled,
         backend_tier_configs: settings.backend_tier_configs,
         background_agent_features: settings.background_agent_features,

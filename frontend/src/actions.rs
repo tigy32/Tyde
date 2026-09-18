@@ -1946,6 +1946,7 @@ mod wasm_tests {
             m.insert(
                 "host-a".to_owned(),
                 settings_model::HostSettings {
+                    review: Default::default(),
                     enabled_backends: vec![BackendKind::Hermes],
                     default_backend: Some(BackendKind::Hermes),
                     enable_mobile_connections: false,

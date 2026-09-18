@@ -460,6 +460,11 @@ impl Fixture {
     }
 
     #[allow(dead_code)]
+    pub async fn config_mcp_http_url(&self) -> String {
+        self.host.config_mcp_url_for_test().await
+    }
+
+    #[allow(dead_code)]
     pub async fn review_mcp_http_url(&self) -> String {
         self.host.review_mcp_url().await
     }
@@ -1178,6 +1183,14 @@ impl Fixture {
         script: server::backend::mock::MockScript,
     ) -> server::MockLaunchReservation {
         self.host.reserve_next_mock_launch(name, script).await
+    }
+
+    #[allow(dead_code)]
+    pub async fn reserve_mock_launches(
+        &self,
+        scripts: Vec<(String, server::backend::mock::MockScript)>,
+    ) -> server::MockLaunchReservation {
+        self.host.reserve_mock_launches(scripts).await
     }
 
     /// Reserve the next mock launch for `name` to fail with `message`.

@@ -663,6 +663,7 @@ fn sample_stored_review(
         comments: Vec::new(),
         suggestions: Vec::<ReviewSuggestedComment>::new(),
         ai_reviewer: ReviewAiReviewerState {
+            rounds: Vec::new(),
             status: ai_status,
             agent_id: (ai_status == ReviewAiReviewerStatus::Running)
                 .then(|| AgentId("550e8400-e29b-41d4-a716-446655440002".to_owned())),
@@ -1775,9 +1776,16 @@ async fn committed_comments_share_the_workspace_review() {
         .expect("interrupt committed AI reviewer");
     loop {
         if let ReviewEventPayload::AiReviewerChanged { state } =
-            expect_review_delta(&mut client, "committed AI reviewer completion").await
-            && state.status == ReviewAiReviewerStatus::Completed
+            expect_review_delta(&mut client, "committed AI reviewer cancellation").await
+            && state.status == ReviewAiReviewerStatus::Failed
         {
+            // OperationCancelled is evidence of an incomplete review, not approval.
+            assert!(
+                state
+                    .error
+                    .as_deref()
+                    .is_some_and(|e| e.contains("cancelled"))
+            );
             break;
         }
     }
@@ -2905,10 +2913,18 @@ async fn ai_reviewer_propose_tool_accepts_and_rejects_suggestions() {
         .await
         .expect("interrupt reviewer");
     loop {
-        match expect_review_delta(&mut client, "AI reviewer completed delta").await {
+        match expect_review_delta(&mut client, "AI reviewer cancellation delta").await {
             ReviewEventPayload::AiReviewerChanged { state }
-                if state.status == ReviewAiReviewerStatus::Completed =>
+                if state.status == ReviewAiReviewerStatus::Failed =>
             {
+                // The protocol emitted OperationCancelled, not a completed review.
+                // Keep the terminal-state guarantee and require the cancellation reason.
+                assert!(
+                    state
+                        .error
+                        .as_deref()
+                        .is_some_and(|e| e.contains("cancelled"))
+                );
                 break;
             }
             ReviewEventPayload::CommentUpsert { .. }
@@ -3741,4 +3757,433 @@ async fn mixed_source_comments_keep_identity_and_file_revision() {
     let mut cleared_observer = fixture.connect().await;
     let cleared = subscribe_review(&mut cleared_observer, &review_id).await;
     assert!(cleared.file_snapshots.is_empty());
+}
+
+async fn review_mcp_call(
+    url: &str,
+    authorization: Option<&str>,
+    name: &str,
+    arguments: serde_json::Value,
+) -> (bool, serde_json::Value) {
+    use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
+    let mut config = StreamableHttpClientTransportConfig::with_uri(url.to_owned());
+    if let Some(auth) = authorization {
+        config = config.auth_header(auth.strip_prefix("Bearer ").expect("bearer"));
+    }
+    let service =
+        ().serve(StreamableHttpClientTransport::from_config(config))
+            .await
+            .expect("connect MCP");
+    let result = tokio::time::timeout(
+        Duration::from_secs(30),
+        service.call_tool(CallToolRequestParams {
+            meta: None,
+            name: name.to_owned().into(),
+            arguments: arguments.as_object().cloned(),
+            task: None,
+        }),
+    )
+    .await
+    .expect("bounded MCP call")
+    .expect("MCP response");
+    let text = result
+        .content
+        .iter()
+        .find_map(|c| match &c.raw {
+            RawContent::Text(t) => Some(t.text.as_str()),
+            _ => None,
+        })
+        .expect("MCP content");
+    let value = serde_json::from_str(text).unwrap_or_else(|_| json!(text));
+    let failed = result.is_error.unwrap_or(false);
+    service.cancel().await.expect("close MCP");
+    (failed, value)
+}
+
+#[tokio::test]
+async fn configured_reviews_return_findings_and_iterate_without_user_submission() {
+    let fixture = Fixture::new().await;
+    let mut client = fixture.connect().await;
+    set_default_backend(&mut client, BackendKind::Claude).await;
+    client
+        .replace_setting(
+            "/enabled_backends",
+            vec![BackendKind::Claude, BackendKind::Codex],
+            vec![BackendKind::Claude],
+        )
+        .await
+        .expect("enable mixed reviewer backends");
+    expect_host_settings(&mut client, "mixed backend settings").await;
+    fixture
+        .host_for_test()
+        .set_session_schema_ready_for_test(BackendKind::Codex)
+        .await;
+    let config_url = fixture.config_mcp_http_url().await;
+    let mut definitions = Vec::new();
+    for name in ["Tests", "Comments"] {
+        let reviewer = json!({ "name": name, "description": "Focused review", "instructions": format!("Review {name} only"), "backend_kind": if name == "Tests" { "claude" } else { "codex" }, "session_settings": {}, "enabled": true });
+        let (failed, created) = review_mcp_call(
+            &config_url,
+            None,
+            "tyde_config_upsert_review_agent",
+            json!({ "reviewer": reviewer }),
+        )
+        .await;
+        assert!(!failed, "Help must be able to add reviewers: {created}");
+        definitions.push(created);
+    }
+    let mut edited = definitions[0]["reviewer"].clone();
+    edited["instructions"] = json!("Find tests that cannot detect broken user-visible behavior");
+    let (failed, result) = review_mcp_call(
+        &config_url,
+        None,
+        "tyde_config_upsert_review_agent",
+        json!({ "reviewer_id": definitions[0]["reviewer_id"], "reviewer": edited }),
+    )
+    .await;
+    assert!(!failed, "Help must be able to edit reviewers: {result}");
+    let (failed, listed) = review_mcp_call(
+        &config_url,
+        None,
+        "tyde_config_list_review_agents",
+        json!({}),
+    )
+    .await;
+    assert!(!failed);
+    assert_eq!(listed["agents"].as_object().unwrap().len(), 2);
+    let settings = expect_host_settings(&mut client, "review configuration fanout").await;
+    assert!(
+        !settings.settings.review.agents.is_empty(),
+        "MCP changes must reach protocol clients"
+    );
+    let root = tempfile::tempdir().expect("review repo");
+    seed_repo(root.path());
+    let project = create_project(&mut client, root.path()).await;
+    let (requester, _) = spawn_idle_project_agent(&mut client, &project).await;
+    let review = create_review(&mut client, &project, &requester).await;
+    let caller = fixture.agent_control_caller(&requester.agent_id).await;
+    let first_gate = MockGateHandle::new();
+    let second_gate = MockGateHandle::new();
+    let first_reservation = fixture
+        .reserve_mock_launches(vec![
+            (
+                "Review: Tests".to_owned(),
+                MockScript::one(MockTurn::gated_text("Test review finished", &first_gate)),
+            ),
+            (
+                "Review: Comments".to_owned(),
+                MockScript::one(MockTurn::gated_text(
+                    "Comment review finished",
+                    &second_gate,
+                )),
+            ),
+        ])
+        .await;
+    let (failed, started) = review_mcp_call(
+        &caller.url,
+        Some(&caller.authorization),
+        "tyde_request_review",
+        json!({}),
+    )
+    .await;
+    assert!(!failed, "request review: {started}");
+    assert_eq!(started["status"], "running");
+    let mut observed = Vec::new();
+    next_frame_matching_on(
+        &mut client,
+        "configured backends launch independently",
+        |env| {
+            if env.kind == FrameKind::NewAgent {
+                let agent: NewAgentPayload = env.parse_payload().unwrap();
+                if agent.name == "Review: Tests" {
+                    assert_eq!(agent.backend_kind, BackendKind::Claude);
+                    observed.push(agent.name);
+                } else if agent.name == "Review: Comments" {
+                    assert_eq!(agent.backend_kind, BackendKind::Codex);
+                    observed.push(agent.name);
+                }
+            }
+            observed.len() == 2
+        },
+    )
+    .await;
+    let round = &started["rounds"][0];
+    assert_eq!(round["reviewers"].as_array().unwrap().len(), 2);
+    let first_id = AgentId(
+        round["reviewers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["name"] == "Tests")
+            .unwrap()["agent_id"]
+            .as_str()
+            .unwrap()
+            .to_owned(),
+    );
+    let proposal = call_propose_review_comment_tool(
+        &fixture,
+        &first_id,
+        &review.id,
+        new_line_location(&review),
+    )
+    .await;
+    assert_eq!(proposal["status"], "success", "{proposal}");
+    first_gate.release_one();
+    next_frame_matching_on(&mut client, "one reviewer complete while the other still runs", |env| {
+        env.kind == FrameKind::ReviewEvent && matches!(env.parse_payload::<ReviewEventPayload>(), Ok(ReviewEventPayload::AiReviewerChanged { state }) if state.status == ReviewAiReviewerStatus::Running && state.rounds.last().is_some_and(|r| r.reviewers.iter().filter(|a| a.status == ReviewAiReviewerStatus::Completed).count() == 1))
+    }).await;
+    second_gate.release_one();
+    let delivered = next_frame_matching_on(
+        &mut client,
+        "automatic feedback on requester stream",
+        |env| {
+            if env.stream != requester.instance_stream || env.kind != FrameKind::ChatEvent {
+                return false;
+            }
+            let event: ChatEvent = env.parse_payload().expect("requester chat event");
+            eprintln!("automatic review feedback requester event: {event:?}");
+            // The mock echoes received feedback as a streamed assistant response,
+            // so StreamEnd proves delivery across the backend input boundary.
+            match event {
+                ChatEvent::MessageAdded(message)
+                | ChatEvent::StreamEnd(protocol::StreamEndData { message }) => {
+                    matches!(message.sender, MessageSender::Assistant { .. })
+                        && message
+                            .content
+                            .contains("Review feedback (automatically delivered")
+                }
+                _ => false,
+            }
+        },
+    )
+    .await;
+    let message = match delivered.parse_payload().unwrap() {
+        ChatEvent::MessageAdded(message)
+        | ChatEvent::StreamEnd(protocol::StreamEndData { message }) => message,
+        _ => unreachable!(),
+    };
+    assert!(message.content.contains("AI found a review issue."));
+    assert!(message.content.contains("Tests") && message.content.contains("Comments"));
+    let mut observer = fixture.connect().await;
+    let completed = subscribe_review(&mut observer, &review.id).await;
+    assert_eq!(
+        completed.ai_reviewer.status,
+        ReviewAiReviewerStatus::Completed
+    );
+    assert!(
+        completed.comments.is_empty(),
+        "Delivery must not accept suggestions on behalf of the user"
+    );
+    assert_eq!(completed.suggestions.len(), 1);
+    assert_eq!(
+        completed.suggestions[0].state,
+        ReviewSuggestionState::Pending
+    );
+    let finding = &completed.suggestions[0];
+    let (failed, disposition) = review_mcp_call(&caller.url, Some(&caller.authorization), "tyde_review_disposition", json!({ "review_id": review.id, "suggestion_id": finding.id, "reason": "Addressed: assert on the actual protocol event" })).await;
+    assert!(!failed, "record disposition: {disposition}");
+    let visible = subscribe_review(&mut observer, &review.id).await;
+    assert!(visible.ai_reviewer.rounds[0].dispositions[&finding.id.0].starts_with("Addressed:"));
+    fs::write(
+        root.path().join("src/lib.rs"),
+        "fn value() -> i32 {\n    3\n}\n",
+    )
+    .expect("fix reviewed change");
+    drop(first_reservation);
+    let next_gate = MockGateHandle::new();
+    let next_comments_gate = MockGateHandle::new();
+    let next_tests = fixture
+        .reserve_mock_launches(vec![
+            (
+                "Review: Tests".to_owned(),
+                MockScript::one(MockTurn::gated_text("No issues", &next_gate)),
+            ),
+            (
+                "Review: Comments".to_owned(),
+                MockScript::one(MockTurn::gated_text("No issues", &next_comments_gate)),
+            ),
+        ])
+        .await;
+    let (failed, second) = review_mcp_call(
+        &caller.url,
+        Some(&caller.authorization),
+        "tyde_request_review",
+        json!({}),
+    )
+    .await;
+    assert!(!failed, "request second round: {second}");
+    assert_eq!(second["rounds"].as_array().unwrap().len(), 2);
+    assert_ne!(
+        second["rounds"][0]["snapshot_id"], second["rounds"][1]["snapshot_id"],
+        "Fixes must get a fresh snapshot, not reuse old approval"
+    );
+    assert_eq!(
+        second["rounds"][0]["dispositions"][&finding.id.0],
+        "Addressed: assert on the actual protocol event"
+    );
+    let stale =
+        call_propose_review_comment_tool(&fixture, &first_id, &review.id, finding.location.clone())
+            .await;
+    assert_ne!(
+        stale["status"], "success",
+        "Previous-round reviewers cannot inject new findings"
+    );
+    next_gate.release_one();
+    next_comments_gate.release_one();
+    next_frame_matching_on(&mut observer, "second round completed", |env| {
+        env.kind == FrameKind::ReviewEvent && matches!(env.parse_payload::<ReviewEventPayload>(), Ok(ReviewEventPayload::AiReviewerChanged { state }) if state.status == ReviewAiReviewerStatus::Completed && state.rounds.len() == 2)
+    }).await;
+    drop(next_tests);
+    fixture
+        .host_for_test()
+        .set_session_schema_unavailable_for_test(BackendKind::Codex, "review model unavailable")
+        .await;
+    let (failed, third) = review_mcp_call(
+        &caller.url,
+        Some(&caller.authorization),
+        "tyde_request_review",
+        json!({}),
+    )
+    .await;
+    assert!(
+        !failed,
+        "A partial startup failure must remain inspectable: {third}"
+    );
+    next_frame_matching_on(&mut observer, "startup failure terminates the round instead of hanging", |env| {
+        env.kind == FrameKind::ReviewEvent && matches!(env.parse_payload::<ReviewEventPayload>(), Ok(ReviewEventPayload::AiReviewerChanged { state }) if state.status == ReviewAiReviewerStatus::Failed && state.rounds.len() == 3)
+    }).await;
+    let (_, failed_review) = review_mcp_call(
+        &caller.url,
+        Some(&caller.authorization),
+        "tyde_get_review",
+        json!({ "review_id": review.id }),
+    )
+    .await;
+    assert_eq!(failed_review["status"], "failed");
+    assert!(
+        failed_review["error"]
+            .as_str()
+            .unwrap()
+            .contains("review model unavailable")
+    );
+
+    let other_root = tempfile::tempdir().expect("other project repo");
+    seed_repo(other_root.path());
+    let other_project = create_project(&mut client, other_root.path()).await;
+    let (other_agent, _) = spawn_idle_project_agent(&mut client, &other_project).await;
+    let other_caller = fixture.agent_control_caller(&other_agent.agent_id).await;
+    let (failed, denied) = review_mcp_call(
+        &other_caller.url,
+        Some(&other_caller.authorization),
+        "tyde_get_review",
+        json!({ "review_id": review.id }),
+    )
+    .await;
+    assert!(
+        failed && denied.as_str().unwrap().contains("different project"),
+        "Cross-project review reads must be refused: {denied}"
+    );
+
+    fixture
+        .host_for_test()
+        .set_session_schema_ready_for_test(BackendKind::Codex)
+        .await;
+    let stop_reservation = fixture
+        .reserve_mock_launches(vec![
+            (
+                "Review: Tests".to_owned(),
+                MockScript::one(MockTurn::held_text("Waiting for cancellation")),
+            ),
+            (
+                "Review: Comments".to_owned(),
+                MockScript::one(MockTurn::held_text("Waiting for cancellation")),
+            ),
+        ])
+        .await;
+    let (failed, fourth) = review_mcp_call(
+        &caller.url,
+        Some(&caller.authorization),
+        "tyde_request_review",
+        json!({}),
+    )
+    .await;
+    assert!(!failed, "request cancellable round: {fourth}");
+    assert_eq!(fourth["status"], "running");
+    let running = subscribe_review(&mut observer, &review.id).await;
+    let mut reviewer_observers = Vec::new();
+    for reviewer in &running.ai_reviewer.rounds.last().unwrap().reviewers {
+        let (mut reviewer_client, bootstrap) = fixture.connect_with_bootstrap().await;
+        let agent_id = reviewer.agent_id.as_ref().unwrap();
+        let advertised = bootstrap
+            .agents
+            .iter()
+            .find(|agent| &agent.agent_id == agent_id)
+            .expect("running reviewer in host bootstrap");
+        next_frame_matching_on(
+            &mut reviewer_client,
+            "reviewer attached before cancellation",
+            |env| env.stream == advertised.instance_stream && env.kind == FrameKind::AgentBootstrap,
+        )
+        .await;
+        reviewer_observers.push((reviewer_client, advertised.instance_stream.clone()));
+    }
+    observer
+        .review_action(&review.id, ReviewActionPayload::StopAiReview)
+        .await
+        .expect("stop the whole round");
+    next_frame_matching_on(&mut observer, "stopped review is incomplete", |env| {
+        env.kind == FrameKind::ReviewEvent && matches!(env.parse_payload::<ReviewEventPayload>(), Ok(ReviewEventPayload::AiReviewerChanged { state }) if state.status == ReviewAiReviewerStatus::Failed && state.rounds.len() == 4 && state.rounds.last().unwrap().reviewers.iter().all(|r| r.status == ReviewAiReviewerStatus::Failed))
+    }).await;
+    for (mut reviewer_client, stream) in reviewer_observers {
+        next_frame_matching_on(
+            &mut reviewer_client,
+            "stop interrupts each real reviewer actor",
+            |env| {
+                env.stream == stream
+                    && env.kind == FrameKind::ChatEvent
+                    && matches!(
+                        env.parse_payload::<ChatEvent>(),
+                        Ok(ChatEvent::OperationCancelled(_))
+                    )
+            },
+        )
+        .await;
+    }
+    drop(stop_reservation);
+
+    let (failed, _) = review_mcp_call(
+        &config_url,
+        None,
+        "tyde_config_set_setting",
+        json!({ "setting": { "setting": "reviews_enabled", "enabled": false } }),
+    )
+    .await;
+    assert!(!failed);
+    let (failed, refusal) = review_mcp_call(
+        &caller.url,
+        Some(&caller.authorization),
+        "tyde_request_review",
+        json!({}),
+    )
+    .await;
+    assert!(
+        failed && refusal.as_str().unwrap().contains("disabled"),
+        "Master switch must stop agent requests: {refusal}"
+    );
+    let (failed, _) = review_mcp_call(
+        &config_url,
+        None,
+        "tyde_config_delete_review_agent",
+        json!({ "reviewer_id": definitions[1]["reviewer_id"] }),
+    )
+    .await;
+    assert!(!failed);
+    let (_, remaining) = review_mcp_call(
+        &config_url,
+        None,
+        "tyde_config_list_review_agents",
+        json!({}),
+    )
+    .await;
+    assert_eq!(remaining["agents"].as_object().unwrap().len(), 1);
 }

@@ -57,6 +57,27 @@ struct TydeConfigMcpServer {
 }
 
 impl TydeConfigMcpServer {
+    async fn write_review_setting(&self, op: SettingOp) -> Result<(), String> {
+        let result = self
+            .host
+            .settings_write_for_internal_caller(SettingsWritePayload {
+                write_id: SettingsWriteId(format!("review-config-{}", Uuid::new_v4())),
+                ops: vec![op],
+            })
+            .await
+            .map_err(|e| e.message)?;
+        if result.applied {
+            Ok(())
+        } else {
+            Err(result
+                .field_errors
+                .into_iter()
+                .map(|e| e.message)
+                .collect::<Vec<_>>()
+                .join("; "))
+        }
+    }
+
     fn new(host: HostHandle) -> Self {
         Self {
             host,
@@ -90,6 +111,9 @@ impl From<BackendKindInput> for BackendKind {
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "setting", rename_all = "snake_case", deny_unknown_fields)]
 enum SettingInput {
+    ReviewsEnabled {
+        enabled: bool,
+    },
     /// Replace the set of enabled backends.
     EnabledBackends {
         enabled_backends: Vec<BackendKindInput>,
@@ -99,15 +123,25 @@ enum SettingInput {
         default_backend: Option<BackendKindInput>,
     },
     /// Turn the Low/High task complexity tiers on or off.
-    ComplexityTiersEnabled { enabled: bool },
+    ComplexityTiersEnabled {
+        enabled: bool,
+    },
     /// Expose the tyde-debug MCP server to agents.
-    TydeDebugMcpEnabled { enabled: bool },
+    TydeDebugMcpEnabled {
+        enabled: bool,
+    },
     /// Expose the tyde-agent-control MCP server to agents.
-    TydeAgentControlMcpEnabled { enabled: bool },
+    TydeAgentControlMcpEnabled {
+        enabled: bool,
+    },
     /// Limit Tyde agent-control ancestry, counting the root agent as depth 1.
-    TydeAgentControlMaxDepth { depth: u8 },
+    TydeAgentControlMaxDepth {
+        depth: u8,
+    },
     /// Allow paired mobile devices to connect.
-    EnableMobileConnections { enabled: bool },
+    EnableMobileConnections {
+        enabled: bool,
+    },
     /// Set (or clear, with null) a code-intelligence language-server binary path.
     CodeIntelLanguageServerPath {
         provider: String,
@@ -119,6 +153,9 @@ impl SettingInput {
     fn into_op(self, current: &settings_model::HostSettings) -> Result<SettingOp, String> {
         let doc = serde_json::to_value(current).map_err(|error| error.to_string())?;
         let (path, value) = match self {
+            Self::ReviewsEnabled { enabled } => {
+                ("/review/enabled".to_owned(), Some(json!(enabled)))
+            }
             Self::EnabledBackends { enabled_backends } => (
                 "/enabled_backends".to_owned(),
                 Some(json!(
@@ -174,6 +211,20 @@ impl SettingInput {
             None => SettingOp::Remove { path, expected },
         })
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ReviewAgentToolInput {
+    /// Omit to add a reviewer; use an existing id to edit it.
+    reviewer_id: Option<String>,
+    reviewer: settings_model::ReviewAgentConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ReviewAgentIdToolInput {
+    reviewer_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
@@ -346,6 +397,93 @@ where
 
 #[tool_router]
 impl TydeConfigMcpServer {
+    #[tool(
+        description = "List configured review agents, the review enabled setting, and backend model/effort schemas. These are the same reviewers shown in Settings → Review."
+    )]
+    async fn tyde_config_list_review_agents(
+        &self,
+        Parameters(_input): Parameters<EmptyToolInput>,
+    ) -> Result<CallToolResult, McpError> {
+        match self.host.read_settings().await {
+            Ok(settings) => match self.host.review_session_schemas().await {
+                Ok(schemas) => ok_json(
+                    json!({ "enabled": settings.review.enabled, "agents": settings.review.agents, "session_schemas": schemas }),
+                ),
+                Err(err) => Ok(err_text(err)),
+            },
+            Err(err) => Ok(err_text(err)),
+        }
+    }
+
+    #[tool(
+        description = "Add or edit a focused review agent. Omit reviewer_id to add; supply an existing id to replace its definition. Configure name, description, instructions, backend_kind, session_settings (model/effort), and enabled. Changes appear immediately in Settings → Review. Does not run a review."
+    )]
+    async fn tyde_config_upsert_review_agent(
+        &self,
+        Parameters(input): Parameters<ReviewAgentToolInput>,
+    ) -> Result<CallToolResult, McpError> {
+        let result: Result<Value, String> = async {
+            let current = self.host.read_settings().await?;
+            let id = input
+                .reviewer_id
+                .unwrap_or_else(|| Uuid::new_v4().to_string());
+            let existing = current.review.agents.get(&id);
+            let expected = match existing {
+                Some(value) => SettingExpectation::Value {
+                    value: json!(value),
+                },
+                None => SettingExpectation::Absent,
+            };
+            let op = SettingOp::Replace {
+                path: format!(
+                    "/review/agents/{}",
+                    settings_model::escape_pointer_token(&id)
+                ),
+                value: json!(input.reviewer),
+                expected,
+            };
+            self.write_review_setting(op).await?;
+            Ok(json!({ "reviewer_id": id, "reviewer": input.reviewer }))
+        }
+        .await;
+        match result {
+            Ok(value) => ok_json(value),
+            Err(err) => Ok(err_text(err)),
+        }
+    }
+
+    #[tool(
+        description = "Delete a configured review agent by id. This affects future reviews, not running or historical rounds."
+    )]
+    async fn tyde_config_delete_review_agent(
+        &self,
+        Parameters(input): Parameters<ReviewAgentIdToolInput>,
+    ) -> Result<CallToolResult, McpError> {
+        let result = async {
+            let current = self.host.read_settings().await?;
+            let existing = current
+                .review
+                .agents
+                .get(&input.reviewer_id)
+                .ok_or_else(|| "Unknown reviewer id".to_owned())?;
+            self.write_review_setting(SettingOp::Remove {
+                path: format!(
+                    "/review/agents/{}",
+                    settings_model::escape_pointer_token(&input.reviewer_id)
+                ),
+                expected: SettingExpectation::Value {
+                    value: json!(existing),
+                },
+            })
+            .await
+        }
+        .await;
+        match result {
+            Ok(()) => ok_json(json!({"deleted": input.reviewer_id})),
+            Err(err) => Ok(err_text(err)),
+        }
+    }
+
     #[tool(description = "Read the current Tyde host settings.")]
     async fn tyde_config_get_settings(
         &self,

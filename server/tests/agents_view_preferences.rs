@@ -1276,8 +1276,21 @@ async fn agents_view_preferences_agent_groups_lifecycle_single_membership_and_pe
         },
     )
     .await;
-    let notify = expect_preferences_notify(&mut fixture.client, "move to second group").await;
+    // The failure captured a queued startup/tag snapshot containing only
+    // Review Pair, not the Solo creation. Match that creation before asserting
+    // its complete membership; unrelated notifications are not command replies.
+    let notify =
+        expect_preferences_notify_where(&mut fixture.client, "move to second group", |notify| {
+            notify
+                .snapshot
+                .groups
+                .groups
+                .iter()
+                .any(|group| group.name == "Solo")
+        })
+        .await;
     eprintln!("Group move notification: {notify:?}");
+    assert_eq!(notify.snapshot.groups.groups.len(), 2);
     let second_group_id = notify
         .snapshot
         .groups

@@ -780,11 +780,11 @@ pub(crate) struct HostState {
     removing_projects: HashSet<ProjectId>,
     #[cfg(feature = "test-support")]
     agent_name_test_gate: Option<Arc<AgentNameTestGateInner>>,
-    /// Host-scoped, single-slot mock launch reservation
+    /// Host-scoped mock launch reservations
     /// (`HostHandle::reserve_next_mock_launch`). A `std` mutex so the
     /// reservation guard's `Drop` can cancel it synchronously.
     #[cfg(feature = "test-support")]
-    mock_launch_reservation: Arc<StdMutex<Option<PendingMockLaunch>>>,
+    mock_launch_reservation: Arc<StdMutex<Vec<PendingMockLaunch>>>,
     /// Gated on `any(test, ...)` rather than the `test-support` feature alone
     /// because this crate's own `cfg(test)` build observes it. `cargo test -p
     /// server` resolves `server` with default features, so a feature-only gate
@@ -1453,7 +1453,7 @@ enum PendingMockLaunchBehavior {
 
 #[cfg(feature = "test-support")]
 pub struct MockLaunchReservation {
-    slot: Arc<StdMutex<Option<PendingMockLaunch>>>,
+    slot: Arc<StdMutex<Vec<PendingMockLaunch>>>,
     id: u64,
 }
 
@@ -1464,9 +1464,7 @@ impl Drop for MockLaunchReservation {
             .slot
             .lock()
             .expect("mock launch reservation mutex poisoned");
-        if pending.as_ref().is_some_and(|entry| entry.id == self.id) {
-            *pending = None;
-        }
+        pending.retain(|entry| entry.id != self.id);
     }
 }
 
@@ -1486,11 +1484,14 @@ fn consume_mock_launch_reservation(
         .mock_launch_reservation
         .lock()
         .expect("mock launch reservation mutex poisoned");
-    let Some(entry) = pending.as_ref() else {
+    if pending.is_empty() {
         return request;
-    };
-    if entry.expected_name == request.name {
-        let entry = pending.take().expect("reservation entry checked above");
+    }
+    if let Some(index) = pending
+        .iter()
+        .position(|entry| entry.expected_name == request.name)
+    {
+        let entry = pending.remove(index);
         match entry.behavior {
             PendingMockLaunchBehavior::Launch(launch) => {
                 request.mock_launch = Some(launch);
@@ -1503,7 +1504,11 @@ fn consume_mock_launch_reservation(
         // A mismatching spawn must not consume another spawn's reservation.
         request.startup_failure = Some(AgentStartupFailure::backend_failed(format!(
             "mock launch reservation expected the next mock spawn to be named {:?}, but this spawn is named {:?}",
-            entry.expected_name, request.name
+            pending
+                .iter()
+                .map(|entry| &entry.expected_name)
+                .collect::<Vec<_>>(),
+            request.name
         )));
     }
     request
@@ -2053,21 +2058,52 @@ impl HostHandle {
         expected_name: &str,
         behavior: PendingMockLaunchBehavior,
     ) -> MockLaunchReservation {
+        self.reserve_mock_launch_behaviors(vec![(expected_name.to_owned(), behavior)])
+            .await
+    }
+
+    #[cfg(feature = "test-support")]
+    pub async fn reserve_mock_launches(
+        &self,
+        scripts: Vec<(String, crate::backend::mock::MockScript)>,
+    ) -> MockLaunchReservation {
+        self.reserve_mock_launch_behaviors(
+            scripts
+                .into_iter()
+                .map(|(name, script)| {
+                    (
+                        name,
+                        PendingMockLaunchBehavior::Launch(
+                            crate::backend::mock::MockLaunch::Script(script),
+                        ),
+                    )
+                })
+                .collect(),
+        )
+        .await
+    }
+
+    #[cfg(feature = "test-support")]
+    async fn reserve_mock_launch_behaviors(
+        &self,
+        behaviors: Vec<(String, PendingMockLaunchBehavior)>,
+    ) -> MockLaunchReservation {
         static NEXT_RESERVATION_ID: AtomicU64 = AtomicU64::new(0);
         let slot = Arc::clone(&self.state.lock().await.mock_launch_reservation);
         let id = NEXT_RESERVATION_ID.fetch_add(1, Ordering::SeqCst);
         {
             let mut pending = slot.lock().expect("mock launch reservation mutex poisoned");
             assert!(
-                pending.is_none(),
-                "a mock launch reservation is already pending on this host \
-                 (only one unconsumed reservation is allowed)"
+                pending.is_empty(),
+                "a mock launch reservation is already pending on this host"
             );
-            *pending = Some(PendingMockLaunch {
-                id,
-                expected_name: expected_name.to_owned(),
-                behavior,
-            });
+            pending.extend(behaviors.into_iter().map(|(expected_name, behavior)| {
+                PendingMockLaunch {
+                    id,
+                    expected_name,
+                    behavior,
+                }
+            }));
         }
         MockLaunchReservation { slot, id }
     }
@@ -9669,6 +9705,15 @@ impl HostHandle {
         self.state.lock().await.settings_store.lock().await.get()
     }
 
+    pub(crate) async fn review_session_schemas(&self) -> Result<Vec<SessionSchemaEntry>, String> {
+        let state = self.state.lock().await;
+        let settings = state.settings_store.lock().await.get()?;
+        Ok(session_schemas_for_enabled_backends(
+            &state,
+            &settings.enabled_backends,
+        ))
+    }
+
     pub(crate) async fn read_launch_profile_catalog(&self) -> Result<LaunchProfileCatalog, String> {
         let state = self.state.lock().await;
         let settings = state.settings_store.lock().await.get()?;
@@ -9921,6 +9966,11 @@ impl HostHandle {
             return Err(format!("unknown agent_id {}", agent_id.0));
         }
         Ok(state.agent_control_mcp.caller(agent_id))
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn config_mcp_url_for_test(&self) -> String {
+        self.state.lock().await.config_mcp.url.clone()
     }
 
     pub async fn review_mcp_url(&self) -> String {
@@ -12447,6 +12497,23 @@ impl HostHandle {
             let state = self.state.lock().await;
             state.review_registry.clone()
         };
+        if matches!(
+            payload,
+            ReviewActionPayload::StopAiReview
+                | ReviewActionPayload::ClearComments
+                | ReviewActionPayload::Cancel
+        ) && let Ok(handle) = review_registry.handle(review_id.clone()).await
+            && let Ok(review) = handle.snapshot().await
+            && let Some(round) = review.ai_reviewer.rounds.last()
+        {
+            for reviewer in &round.reviewers {
+                if reviewer.status == protocol::ReviewAiReviewerStatus::Running
+                    && let Some(agent_id) = &reviewer.agent_id
+                {
+                    self.interrupt_agent(agent_id).await;
+                }
+            }
+        }
         review_registry
             .action(
                 review_id,
@@ -12833,21 +12900,121 @@ impl HostHandle {
         }
     }
 
-    async fn spawn_ai_reviewer(
+    pub(crate) async fn agent_review_handle(
         &self,
-        request: ReviewAiSpawnRequest,
-    ) -> (
-        oneshot::Sender<Result<AgentId, String>>,
-        Result<AgentId, String>,
-    ) {
-        let reply = request.reply;
-        let requested_backend_kind = request.backend_kind;
+        caller: &AgentId,
+        review_id: Option<ReviewId>,
+    ) -> Result<crate::review::ReviewHandle, String> {
+        let project_id = self
+            .project_id_for_agent(caller)
+            .await
+            .ok_or_else(|| "Caller has no project".to_owned())?;
+        let registry = self.state.lock().await.review_registry.clone();
+        let review_id = match review_id {
+            Some(id) => id,
+            None => registry
+                .summaries(project_id.clone())
+                .await?
+                .first()
+                .map(|s| s.id.clone())
+                .ok_or_else(|| "Project has no reviewable workspace".to_owned())?,
+        };
+        let handle = registry.handle(review_id).await?;
+        if handle.snapshot().await?.project_id != project_id {
+            return Err("Review belongs to a different project".to_owned());
+        }
+        Ok(handle)
+    }
+
+    pub(crate) async fn request_agent_review(
+        &self,
+        caller: AgentId,
+        scope: protocol::ReviewAiScope,
+    ) -> Result<protocol::Review, String> {
+        let settings = self.read_settings().await?;
+        if !settings.review.enabled {
+            return Err("Reviews are disabled in Settings → Review".to_owned());
+        }
+        if !settings.review.agents.values().any(|r| r.enabled) {
+            return Err("Add and enable reviewers in Settings → Review first".to_owned());
+        }
+        self.agent_review_handle(&caller, None)
+            .await?
+            .request_review(caller, scope)
+            .await
+    }
+
+    async fn spawn_ai_reviewers(
+        &self,
+        request: &ReviewAiSpawnRequest,
+    ) -> Result<Vec<protocol::ReviewReviewerRun>, String> {
+        tracing::info!(review_id = %request.review_id, snapshot_id = %request.snapshot_id, "launching review snapshot");
+        let settings = self.read_settings().await?;
+        if !settings.review.enabled {
+            return Err("Reviews are disabled in Settings → Review".to_owned());
+        }
+        let configured = !settings.review.agents.is_empty();
+        let mut configs = settings
+            .review
+            .agents
+            .into_iter()
+            .filter(|(_, r)| r.enabled)
+            .collect::<Vec<_>>();
+        if configs.is_empty() {
+            if request.requested_by.is_some() || configured {
+                return Err("Add and enable review agents in Settings → Review first".to_owned());
+            }
+            configs.push((
+                String::new(),
+                settings_model::ReviewAgentConfig {
+                    name: "AI Review".to_owned(),
+                    description: String::new(),
+                    enabled: true,
+                    instructions: request.instructions.clone().unwrap_or_default(),
+                    backend_kind: self
+                        .resolve_ai_reviewer_backend_kind(request.backend_kind)
+                        .await?,
+                    session_settings: Default::default(),
+                },
+            ));
+        }
+        let legacy = !configured && request.requested_by.is_none();
+        let results = futures_util::future::join_all(configs.into_iter().map(
+            |(config_id, config)| async move {
+                let result = self.spawn_ai_reviewer_member(request, &config).await;
+                protocol::ReviewReviewerRun {
+                    config_id,
+                    name: config.name,
+                    backend_kind: config.backend_kind,
+                    status: if result.is_ok() {
+                        protocol::ReviewAiReviewerStatus::Running
+                    } else {
+                        protocol::ReviewAiReviewerStatus::Failed
+                    },
+                    agent_id: result.as_ref().ok().cloned(),
+                    error: result.err(),
+                }
+            },
+        ))
+        .await;
+        if legacy && let Some(error) = results.first().and_then(|r| r.error.clone()) {
+            return Err(error);
+        }
+        Ok(results)
+    }
+
+    async fn spawn_ai_reviewer_member(
+        &self,
+        request: &ReviewAiSpawnRequest,
+        config: &settings_model::ReviewAgentConfig,
+    ) -> Result<AgentId, String> {
+        let requested_backend_kind = Some(config.backend_kind);
         let backend_kind = match self
             .resolve_ai_reviewer_backend_kind(requested_backend_kind)
             .await
         {
             Ok(backend_kind) => backend_kind,
-            Err(message) => return (reply, Err(message)),
+            Err(message) => return Err(message),
         };
         let instructions_len = request.instructions.as_ref().map_or(0, String::len);
         let roots = {
@@ -12860,13 +13027,10 @@ impl HostHandle {
             {
                 Some(project) => project,
                 None => {
-                    return (
-                        reply,
-                        Err(format!(
-                            "cannot spawn AI reviewer for missing project {}",
-                            request.review.project_id
-                        )),
-                    );
+                    return Err(format!(
+                        "cannot spawn AI reviewer for missing project {}",
+                        request.review.project_id
+                    ));
                 }
             };
             project
@@ -12895,7 +13059,7 @@ impl HostHandle {
                 backend_kind = ?backend_kind,
                 "AI reviewer spawn rejected without diff roots"
             );
-            return (reply, Err("review has no frozen diff roots".to_owned()));
+            return Err("review has no frozen diff roots".to_owned());
         }
         if stats.file_count == 0 {
             tracing::warn!(
@@ -12904,10 +13068,7 @@ impl HostHandle {
                 roots_count,
                 "AI reviewer spawn rejected without changed files"
             );
-            return (
-                reply,
-                Err("review has no changed files to review".to_owned()),
-            );
+            return Err("review has no changed files to review".to_owned());
         }
         let review_mcp_url = {
             let state = self.state.lock().await;
@@ -12919,18 +13080,15 @@ impl HostHandle {
                 backend_kind = ?backend_kind,
                 "AI reviewer spawn rejected without review MCP URL"
             );
-            return (
-                reply,
-                Err("review feedback MCP server is unavailable for AI review".to_owned()),
-            );
+            return Err("review feedback MCP server is unavailable for AI review".to_owned());
         }
         let reviewer_system_prompt = match build_reviewer_system_prompt(
             &request.review,
             &request.scope,
-            request.instructions,
+            Some(config.instructions.clone()),
         ) {
             Ok(prompt) => prompt,
-            Err(message) => return (reply, Err(message)),
+            Err(message) => return Err(message),
         };
         let reviewer_system_prompt_len = reviewer_system_prompt.len();
         let reviewer_spawn_config = ResolvedSpawnConfig {
@@ -12955,7 +13113,11 @@ impl HostHandle {
         let prompt = build_reviewer_user_prompt();
         let prompt_len = prompt.len();
         let payload = SpawnAgentPayload {
-            name: Some("AI Review".to_owned()),
+            name: Some(if config.name == "AI Review" {
+                config.name.clone()
+            } else {
+                format!("Review: {}", config.name)
+            }),
             custom_agent_id: None,
             parent_agent_id: None,
             project_id: Some(request.review.project_id.clone()),
@@ -12967,7 +13129,7 @@ impl HostHandle {
                 launch_profile_id: None,
                 cost_hint: request.cost_hint,
                 access_mode: protocol::BackendAccessMode::ReadOnly,
-                session_settings: None,
+                session_settings: Some(config.session_settings.clone()),
             },
         };
         tracing::debug!(
@@ -12989,7 +13151,7 @@ impl HostHandle {
             .map_err(|error| error.to_string());
         let agent_id = match agent_id {
             Ok(agent_id) => agent_id,
-            Err(error) => return (reply, Err(error)),
+            Err(error) => return Err(error),
         };
         if let Some(agent_handle) = self.agent_handle(&agent_id).await {
             tracing::info!(
@@ -12997,21 +13159,22 @@ impl HostHandle {
                 reviewer_agent_id = %agent_id,
                 "AI reviewer spawned; attaching tool bridge"
             );
-            ReviewerToolBridge::spawn(agent_id.clone(), agent_handle, request.review_handle);
-            (reply, Ok(agent_id))
+            ReviewerToolBridge::spawn(
+                agent_id.clone(),
+                agent_handle,
+                request.review_handle.clone(),
+            );
+            Ok(agent_id)
         } else {
             tracing::warn!(
                 review_id = %request.review_id,
                 reviewer_agent_id = %agent_id,
                 "AI reviewer spawned but tool bridge attach target was missing"
             );
-            (
-                reply,
-                Err(format!(
-                    "spawned AI reviewer {} but could not attach tool bridge",
-                    agent_id
-                )),
-            )
+            Err(format!(
+                "spawned AI reviewer {} but could not attach tool bridge",
+                agent_id
+            ))
         }
     }
 
@@ -14168,7 +14331,7 @@ fn spawn_host_inner(
             #[cfg(feature = "test-support")]
             agent_name_test_gate: None,
             #[cfg(feature = "test-support")]
-            mock_launch_reservation: Arc::new(StdMutex::new(None)),
+            mock_launch_reservation: Arc::new(StdMutex::new(Vec::new())),
             #[cfg(any(test, feature = "test-support"))]
             session_schema_probe_count: 0,
         })),
@@ -15431,8 +15594,8 @@ fn spawn_host_review_delivery_task(
 fn spawn_host_review_ai_task(host: HostHandle, mut rx: mpsc::Receiver<ReviewAiSpawnRequest>) {
     let worker = async move {
         while let Some(request) = rx.recv().await {
-            let (reply, result) = host.spawn_ai_reviewer(request).await;
-            let _ = reply.send(result);
+            let result = host.spawn_ai_reviewers(&request).await;
+            let _ = request.reply.send(result);
         }
     };
 

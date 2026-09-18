@@ -6487,7 +6487,33 @@ pub struct ReviewFileSnapshot {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewReviewerRun {
+    pub config_id: String,
+    pub name: String,
+    pub backend_kind: BackendKind,
+    pub agent_id: Option<AgentId>,
+    pub status: ReviewAiReviewerStatus,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewRound {
+    pub id: String,
+    pub snapshot_id: String,
+    pub scope: ReviewAiScope,
+    pub started_at_ms: u64,
+    pub requested_by: Option<AgentId>,
+    pub reviewers: Vec<ReviewReviewerRun>,
+    #[serde(default)]
+    pub dispositions: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    pub delivery_error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReviewAiReviewerState {
+    #[serde(default)]
+    pub rounds: Vec<ReviewRound>,
     pub status: ReviewAiReviewerStatus,
     pub agent_id: Option<AgentId>,
     pub error: Option<String>,
@@ -6498,7 +6524,7 @@ pub struct ReviewAiReviewerState {
 
 /// Which diff an AI reviewer reads. The review itself spans every target;
 /// the reviewer needs one frozen diff to work from.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ReviewAiScope {
     #[default]
@@ -6584,6 +6610,7 @@ pub enum ReviewSubmitTarget {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ReviewActionPayload {
+    StopAiReview,
     AddComment {
         location: ReviewLocation,
         body: String,
@@ -6620,6 +6647,7 @@ pub enum ReviewActionPayload {
 impl ReviewActionPayload {
     pub const fn kind_name(&self) -> &'static str {
         match self {
+            Self::StopAiReview => "stop_ai_review",
             Self::AddComment { .. } => "add_comment",
             Self::UpdateComment { .. } => "update_comment",
             Self::DeleteComment { .. } => "delete_comment",

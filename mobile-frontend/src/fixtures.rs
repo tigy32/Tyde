@@ -109,6 +109,7 @@ pub fn seed_state(state: &AppState) {
     });
     state.host_settings_by_host.update(|settings| {
         let mut host_settings = HostSettings {
+            review: Default::default(),
             enabled_backends: vec![BackendKind::Codex, BackendKind::Claude],
             default_backend: Some(BackendKind::Codex),
             ..HostSettings::default()

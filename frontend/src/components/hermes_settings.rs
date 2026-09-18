@@ -3283,6 +3283,7 @@ mod wasm_tests {
             install_doc(&state, doc.clone());
             if !disabled.is_empty() {
                 let settings = settings_model::HostSettings {
+                    review: Default::default(),
                     enabled_backends: vec![BackendKind::Hermes],
                     default_backend: None,
                     enable_mobile_connections: false,

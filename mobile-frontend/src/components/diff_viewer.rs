@@ -1532,6 +1532,7 @@ mod wasm_tests {
             }],
             suggestions: Vec::new(),
             ai_reviewer: ReviewAiReviewerState {
+                rounds: Vec::new(),
                 status: ReviewAiReviewerStatus::Idle,
                 agent_id: None,
                 error: None,
@@ -2175,6 +2176,7 @@ mod wasm_tests {
 
     fn host_settings(default: Option<BackendKind>, enabled: Vec<BackendKind>) -> HostSettings {
         HostSettings {
+            review: Default::default(),
             enabled_backends: enabled,
             default_backend: default,
             enable_mobile_connections: false,

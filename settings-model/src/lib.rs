@@ -38,7 +38,37 @@ pub struct HostLaunchProfileConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ReviewAgentConfig {
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    pub instructions: String,
+    pub backend_kind: BackendKind,
+    #[serde(default)]
+    pub session_settings: SessionSettingsValues,
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ReviewSettings {
+    pub enabled: bool,
+    #[serde(default)]
+    pub agents: BTreeMap<String, ReviewAgentConfig>,
+}
+
+impl Default for ReviewSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            agents: BTreeMap::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct HostSettings {
+    #[serde(default)]
+    pub review: ReviewSettings,
     #[serde(default)]
     pub enabled_backends: Vec<BackendKind>,
     #[serde(default)]
@@ -122,6 +152,7 @@ pub struct HostSettings {
 impl Default for HostSettings {
     fn default() -> Self {
         Self {
+            review: ReviewSettings::default(),
             enabled_backends: Vec::new(),
             default_backend: None,
             enable_mobile_connections: false,

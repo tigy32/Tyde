@@ -863,6 +863,7 @@ mod wasm_tests {
             map.insert(
                 host_id(),
                 HostSettings {
+                    review: Default::default(),
                     enabled_backends: vec![BackendKind::Claude],
                     default_backend: Some(BackendKind::Claude),
                     ..HostSettings::default()

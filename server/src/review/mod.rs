@@ -74,12 +74,53 @@ impl ReviewHandle {
             .map_err(|_| "review actor dropped AI suggestion response".to_owned())
     }
 
+    pub(crate) async fn request_review(
+        &self,
+        caller: AgentId,
+        scope: protocol::ReviewAiScope,
+    ) -> Result<Review, String> {
+        let (reply, response) = oneshot::channel();
+        self.tx
+            .send(ReviewCommand::AgentRequest {
+                caller,
+                scope,
+                reply,
+            })
+            .await
+            .map_err(|_| "review stopped".to_owned())?;
+        response
+            .await
+            .map_err(|_| "review request dropped".to_owned())?
+    }
+
+    pub(crate) async fn disposition(
+        &self,
+        caller: AgentId,
+        suggestion_id: ReviewSuggestionId,
+        reason: String,
+    ) -> Result<Review, String> {
+        let (reply, response) = oneshot::channel();
+        self.tx
+            .send(ReviewCommand::Disposition {
+                caller,
+                suggestion_id,
+                reason,
+                reply,
+            })
+            .await
+            .map_err(|_| "review stopped".to_owned())?;
+        response
+            .await
+            .map_err(|_| "review disposition dropped".to_owned())?
+    }
+
     pub(crate) async fn ai_reviewer_exited(
         &self,
+        agent_id: AgentId,
         result: Result<(), String>,
     ) -> Result<(), String> {
         self.tx
-            .send(ReviewCommand::AiReviewerExited { result })
+            .send(ReviewCommand::AiReviewerExited { agent_id, result })
             .await
             .map_err(|_| "review actor stopped".to_owned())
     }
@@ -112,7 +153,7 @@ impl ReviewHandle {
             .map_err(|_| "review actor stopped".to_owned())
     }
 
-    async fn snapshot(&self) -> Result<Review, String> {
+    pub(crate) async fn snapshot(&self) -> Result<Review, String> {
         let (reply, response) = oneshot::channel();
         self.tx
             .send(ReviewCommand::Snapshot { reply })
@@ -137,6 +178,10 @@ pub(crate) struct ReviewCreateRequest {
 }
 
 enum RegistryCommand {
+    Handle {
+        review_id: ReviewId,
+        reply: oneshot::Sender<Result<ReviewHandle, String>>,
+    },
     Create {
         request: ReviewCreateRequest,
         reply: oneshot::Sender<Result<ReviewId, String>>,
@@ -257,6 +302,17 @@ where
 }
 
 impl ReviewRegistryHandle {
+    pub(crate) async fn handle(&self, review_id: ReviewId) -> Result<ReviewHandle, String> {
+        let (reply, response) = oneshot::channel();
+        self.tx
+            .send(RegistryCommand::Handle { review_id, reply })
+            .await
+            .map_err(|_| "review registry stopped".to_owned())?;
+        response
+            .await
+            .map_err(|_| "review registry dropped response".to_owned())?
+    }
+
     pub(crate) async fn create(&self, request: ReviewCreateRequest) -> Result<ReviewId, String> {
         let (reply, response) = oneshot::channel();
         self.tx
@@ -442,6 +498,15 @@ impl ReviewRegistryActor {
     async fn run(mut self, mut rx: mpsc::Receiver<RegistryCommand>) {
         while let Some(command) = rx.recv().await {
             match command {
+                RegistryCommand::Handle { review_id, reply } => {
+                    let _ = reply.send(
+                        self.handles
+                            .get(&review_id)
+                            .cloned()
+                            .ok_or_else(|| "Unknown review".to_owned()),
+                    );
+                }
+
                 RegistryCommand::Create { request, reply } => {
                     let result = self.create(request).await;
                     let _ = reply.send(result);
@@ -570,6 +635,7 @@ impl ReviewRegistryActor {
             comments: Vec::new(),
             suggestions: Vec::new(),
             ai_reviewer: protocol::ReviewAiReviewerState {
+                rounds: Vec::new(),
                 status: ReviewAiReviewerStatus::Idle,
                 agent_id: None,
                 error: None,
@@ -746,9 +812,24 @@ impl ReviewRegistryActor {
 
 fn reset_running_ai_reviewer(review: &mut Review) -> bool {
     if matches!(review.ai_reviewer.status, ReviewAiReviewerStatus::Running) {
-        review.ai_reviewer.status = ReviewAiReviewerStatus::Idle;
-        review.ai_reviewer.agent_id = None;
-        review.ai_reviewer.error = None;
+        if review.ai_reviewer.rounds.is_empty() {
+            review.ai_reviewer.status = ReviewAiReviewerStatus::Idle;
+            review.ai_reviewer.agent_id = None;
+            review.ai_reviewer.error = None;
+            review.updated_at_ms = now_ms();
+            return true;
+        }
+        review.ai_reviewer.status = ReviewAiReviewerStatus::Failed;
+        review.ai_reviewer.error =
+            Some("Review interrupted by server restart; request a new review".to_owned());
+        if let Some(round) = review.ai_reviewer.rounds.last_mut() {
+            for reviewer in &mut round.reviewers {
+                if reviewer.status == ReviewAiReviewerStatus::Running {
+                    reviewer.status = ReviewAiReviewerStatus::Failed;
+                    reviewer.error = review.ai_reviewer.error.clone();
+                }
+            }
+        }
         review.updated_at_ms = now_ms();
         return true;
     }

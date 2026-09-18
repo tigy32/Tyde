@@ -144,6 +144,7 @@ pub fn prime_host_for_tests(state: &AppState, host_id: &str) {
     let bootstrap = BootstrapHostPayload {
         agents_with_background_work: Vec::new(),
         settings: BootstrapHostSettings {
+            review: Default::default(),
             enabled_backends: Vec::new(),
             default_backend: None,
             enable_mobile_connections: false,
@@ -7142,6 +7143,7 @@ pub(crate) mod restore_fixtures {
             &HostBootstrapPayload {
                 agents_with_background_work: Vec::new(),
                 settings: settings_model::HostSettings {
+                    review: Default::default(),
                     enabled_backends: Vec::new(),
                     default_backend: None,
                     enable_mobile_connections: false,

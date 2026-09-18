@@ -2914,6 +2914,7 @@ mod wasm_tests {
                 settings.insert(
                     host.clone(),
                     HostSettings {
+                        review: Default::default(),
                         enabled_backends: vec![
                             BackendKind::Codex,
                             BackendKind::Claude,

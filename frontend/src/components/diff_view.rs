@@ -7243,6 +7243,7 @@ mod wasm_tests {
             }],
             suggestions: vec![],
             ai_reviewer: ReviewAiReviewerState {
+                rounds: Vec::new(),
                 status: ReviewAiReviewerStatus::Idle,
                 agent_id: None,
                 error: None,

@@ -1426,6 +1426,7 @@ mod wasm_tests {
 
     fn empty_host_settings() -> settings_model::HostSettings {
         settings_model::HostSettings {
+            review: Default::default(),
             enabled_backends: Vec::new(),
             default_backend: None,
             enable_mobile_connections: false,

@@ -221,6 +221,7 @@ fn write_host_settings_with_launch_profiles(
     launch_profiles: Vec<HostLaunchProfileConfig>,
 ) {
     let settings = settings_model::HostSettings {
+        review: Default::default(),
         enabled_backends: backends.to_vec(),
         default_backend,
         enable_mobile_connections: false,

@@ -58,17 +58,30 @@ pub(crate) struct ReviewAiSpawnRequest {
     /// The review with `diffs` narrowed to `scope`, so the reviewer prompt
     /// and its size bound only see what the reviewer is asked to read.
     pub review: Review,
+    pub snapshot_id: String,
     pub scope: protocol::ReviewAiScope,
     pub backend_kind: Option<protocol::BackendKind>,
     pub cost_hint: Option<protocol::SpawnCostHint>,
     pub instructions: Option<String>,
     pub review_handle: crate::review::ReviewHandle,
-    pub reply: oneshot::Sender<Result<AgentId, String>>,
+    pub requested_by: Option<AgentId>,
+    pub reply: oneshot::Sender<Result<Vec<protocol::ReviewReviewerRun>, String>>,
 }
 
 pub(crate) type AiSuggestionResult = Result<ReviewSuggestionId, ReviewErrorPayload>;
 
 pub(crate) enum ReviewCommand {
+    AgentRequest {
+        caller: AgentId,
+        scope: protocol::ReviewAiScope,
+        reply: oneshot::Sender<Result<Review, String>>,
+    },
+    Disposition {
+        caller: AgentId,
+        suggestion_id: ReviewSuggestionId,
+        reason: String,
+        reply: oneshot::Sender<Result<Review, String>>,
+    },
     Subscribe {
         conn: ConnectionId,
         stream: Stream,
@@ -87,6 +100,7 @@ pub(crate) enum ReviewCommand {
         reply: oneshot::Sender<AiSuggestionResult>,
     },
     AiReviewerExited {
+        agent_id: AgentId,
         result: Result<(), String>,
     },
     BundleConsumed {
@@ -172,6 +186,38 @@ impl ReviewActor {
     async fn run(&mut self, mut rx: mpsc::Receiver<ReviewCommand>) {
         while let Some(command) = rx.recv().await {
             match command {
+                ReviewCommand::AgentRequest {
+                    caller,
+                    scope,
+                    reply,
+                } => {
+                    let rounds = self.review.ai_reviewer.rounds.len();
+                    self.start_ai_review(
+                        None,
+                        None,
+                        None,
+                        scope,
+                        StreamPath(format!("/review-request/{}", caller.0)),
+                        Some(caller),
+                    )
+                    .await;
+                    let result = if self.review.ai_reviewer.rounds.len() > rounds {
+                        Ok(self.review.clone())
+                    } else {
+                        Err(self.review.ai_reviewer.error.clone().unwrap_or_else(|| "Review did not start: check for an active review or an empty/invalid diff scope".to_owned()))
+                    };
+                    let _ = reply.send(result);
+                }
+                ReviewCommand::Disposition {
+                    caller,
+                    suggestion_id,
+                    reason,
+                    reply,
+                } => {
+                    let result = self.record_disposition(caller, suggestion_id, reason).await;
+                    let _ = reply.send(result);
+                }
+
                 ReviewCommand::Subscribe {
                     conn,
                     stream,
@@ -191,8 +237,8 @@ impl ReviewActor {
                     let result = self.handle_ai_suggestion(suggestion).await;
                     let _ = reply.send(result);
                 }
-                ReviewCommand::AiReviewerExited { result } => {
-                    self.handle_ai_reviewer_exited(result).await;
+                ReviewCommand::AiReviewerExited { agent_id, result } => {
+                    self.handle_ai_reviewer_exited(agent_id, result).await;
                 }
                 ReviewCommand::BundleConsumed {
                     target_agent_id,
@@ -273,6 +319,29 @@ impl ReviewActor {
             );
         }
         match action {
+            ReviewActionPayload::StopAiReview => {
+                if self.review.ai_reviewer.status != ReviewAiReviewerStatus::Running {
+                    return;
+                }
+                let previous = self.review.clone();
+                if let Some(round) = self.review.ai_reviewer.rounds.last_mut() {
+                    for reviewer in &mut round.reviewers {
+                        if reviewer.status == ReviewAiReviewerStatus::Running {
+                            reviewer.status = ReviewAiReviewerStatus::Failed;
+                            reviewer.error = Some(
+                                "Review cancelled by user; do not restart automatically".to_owned(),
+                            );
+                        }
+                    }
+                }
+                if self
+                    .persist_or_revert(previous, Some(&conn), ReviewErrorContext::StartAiReview)
+                    .await
+                {
+                    self.finish_review_round().await;
+                }
+            }
+
             ReviewActionPayload::AddComment { location, body } => {
                 self.add_comment(location, body, conn).await;
             }
@@ -297,7 +366,7 @@ impl ReviewActor {
                 instructions,
                 scope,
             } => {
-                self.start_ai_review(backend_kind, cost_hint, instructions, scope, conn)
+                self.start_ai_review(backend_kind, cost_hint, instructions, scope, conn, None)
                     .await;
             }
             ReviewActionPayload::Submit { target } => {
@@ -706,6 +775,7 @@ impl ReviewActor {
         instructions: Option<String>,
         scope: protocol::ReviewAiScope,
         conn: ConnectionId,
+        requested_by: Option<AgentId>,
     ) {
         let context = ReviewErrorContext::StartAiReview;
         // A legacy committed-range record can only ever read its own range.
@@ -793,7 +863,7 @@ impl ReviewActor {
         if diff_is_clean(&prompt_diffs) {
             let message = match &scope {
                 protocol::ReviewAiScope::WorkingTree => {
-                    "nothing to review: workspace has no unstaged changes"
+                    "nothing to review: workspace has no uncommitted changes"
                 }
                 protocol::ReviewAiScope::CommittedRange { .. } => {
                     "nothing to review: the committed range has no file changes"
@@ -819,7 +889,12 @@ impl ReviewActor {
         review_for_prompt.diffs = prompt_diffs;
 
         let (reply, response) = oneshot::channel();
+        let snapshot_id = format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&review_for_prompt.diffs).expect("diffs serialize"))
+        );
         let request = ReviewAiSpawnRequest {
+            snapshot_id: snapshot_id.clone(),
             review_id: self.review.id.clone(),
             review: review_for_prompt,
             scope: scope.clone(),
@@ -827,6 +902,7 @@ impl ReviewActor {
             cost_hint,
             instructions,
             review_handle: self.handle.clone(),
+            requested_by: requested_by.clone(),
             reply,
         };
         let spawn_wait_started = Instant::now();
@@ -853,17 +929,30 @@ impl ReviewActor {
         }
 
         match response.await {
-            Ok(Ok(agent_id)) => {
+            Ok(Ok(reviewers)) => {
+                let agent_id = reviewers.iter().find_map(|r| r.agent_id.clone());
                 tracing::info!(
                     review_id = %self.review.id,
-                    reviewer_agent_id = %agent_id,
+                    reviewer_agent_id = ?agent_id,
                     elapsed_ms = spawn_wait_started.elapsed().as_millis() as u64,
                     "AI reviewer spawn succeeded"
                 );
                 let previous = self.review.clone();
+                let mut rounds = self.review.ai_reviewer.rounds.clone();
+                rounds.push(protocol::ReviewRound {
+                    snapshot_id,
+                    id: Uuid::new_v4().to_string(),
+                    scope: scope.clone(),
+                    started_at_ms: now_ms(),
+                    requested_by,
+                    reviewers,
+                    dispositions: Default::default(),
+                    delivery_error: None,
+                });
                 self.review.ai_reviewer = ReviewAiReviewerState {
+                    rounds,
                     status: ReviewAiReviewerStatus::Running,
-                    agent_id: Some(agent_id),
+                    agent_id,
                     error: None,
                     scope: scope.clone(),
                 };
@@ -875,6 +964,7 @@ impl ReviewActor {
                     state: self.review.ai_reviewer.clone(),
                 })
                 .await;
+                self.finish_review_round().await;
             }
             Ok(Err(message)) => {
                 tracing::warn!(
@@ -886,6 +976,7 @@ impl ReviewActor {
                 );
                 let previous = self.review.clone();
                 self.review.ai_reviewer = ReviewAiReviewerState {
+                    rounds: self.review.ai_reviewer.rounds.clone(),
                     status: ReviewAiReviewerStatus::Failed,
                     agent_id: None,
                     error: Some(message.clone()),
@@ -1203,8 +1294,12 @@ impl ReviewActor {
         if !matches!(
             self.review.ai_reviewer.status,
             ReviewAiReviewerStatus::Running
-        ) || self.review.ai_reviewer.agent_id.as_ref() != Some(&suggestion.reviewer_agent_id)
-        {
+        ) || !self.review.ai_reviewer.rounds.last().is_some_and(|round| {
+            round.reviewers.iter().any(|r| {
+                r.agent_id.as_ref() == Some(&suggestion.reviewer_agent_id)
+                    && r.status == ReviewAiReviewerStatus::Running
+            })
+        }) {
             let error = review_error(
                 ReviewErrorCode::InvalidStatus,
                 format!(
@@ -1344,31 +1439,76 @@ impl ReviewActor {
         Ok(suggestion_id)
     }
 
-    async fn handle_ai_reviewer_exited(&mut self, result: Result<(), String>) {
-        tracing::info!(
-            review_id = %self.review.id,
-            current_status = self.review.ai_reviewer.status.status_label(),
-            result = if result.is_ok() { "ok" } else { "error" },
-            error_len = result.as_ref().err().map_or(0, String::len),
-            "AI reviewer exited"
-        );
-        if !matches!(
-            self.review.ai_reviewer.status,
-            ReviewAiReviewerStatus::Running
-        ) {
+    async fn record_disposition(
+        &mut self,
+        caller: AgentId,
+        suggestion_id: ReviewSuggestionId,
+        reason: String,
+    ) -> Result<Review, String> {
+        if reason.trim().is_empty() {
+            return Err("A concrete reason is required".to_owned());
+        }
+        let suggestion = self
+            .review
+            .suggestions
+            .iter()
+            .find(|s| s.id == suggestion_id)
+            .ok_or_else(|| "Unknown finding".to_owned())?;
+        let previous = self.review.clone();
+        let round = self
+            .review
+            .ai_reviewer
+            .rounds
+            .iter_mut()
+            .find(|r| {
+                r.reviewers.iter().any(|reviewer| {
+                    reviewer.agent_id.as_ref() == Some(&suggestion.reviewer_agent_id)
+                })
+            })
+            .ok_or_else(|| "Finding has no review round".to_owned())?;
+        if round.requested_by.as_ref() != Some(&caller) {
+            return Err("Only the requesting agent can record a disposition".to_owned());
+        }
+        round
+            .dispositions
+            .insert(suggestion_id.0, reason.trim().to_owned());
+        self.review.updated_at_ms = now_ms();
+        if !self
+            .persist_or_revert(previous, None, ReviewErrorContext::StartAiReview)
+            .await
+        {
+            return Err("Failed to save disposition".to_owned());
+        }
+        self.broadcast(ReviewEventPayload::AiReviewerChanged {
+            state: self.review.ai_reviewer.clone(),
+        })
+        .await;
+        Ok(self.review.clone())
+    }
+
+    async fn handle_ai_reviewer_exited(&mut self, agent_id: AgentId, result: Result<(), String>) {
+        if self.review.ai_reviewer.status != ReviewAiReviewerStatus::Running {
             return;
         }
         let previous = self.review.clone();
-        match result {
-            Ok(()) => {
-                self.review.ai_reviewer.status = ReviewAiReviewerStatus::Completed;
-                self.review.ai_reviewer.error = None;
-            }
-            Err(message) => {
-                self.review.ai_reviewer.status = ReviewAiReviewerStatus::Failed;
-                self.review.ai_reviewer.error = Some(message);
-            }
+        let Some(reviewer) = self.review.ai_reviewer.rounds.last_mut().and_then(|round| {
+            round
+                .reviewers
+                .iter_mut()
+                .find(|r| r.agent_id.as_ref() == Some(&agent_id))
+        }) else {
+            return;
+        };
+        if reviewer.status != ReviewAiReviewerStatus::Running {
+            return;
         }
+        reviewer.status = if result.is_ok() {
+            ReviewAiReviewerStatus::Completed
+        } else {
+            ReviewAiReviewerStatus::Failed
+        };
+        reviewer.error = result.err();
+        tracing::info!(review_id = %self.review.id, reviewer_agent_id = %agent_id, status = ?reviewer.status, "review member finished");
         self.review.updated_at_ms = now_ms();
         if !self
             .persist_or_revert(previous, None, ReviewErrorContext::StartAiReview)
@@ -1376,23 +1516,124 @@ impl ReviewActor {
         {
             return;
         }
+        if self.review.ai_reviewer.rounds.last().is_some_and(|round| {
+            round
+                .reviewers
+                .iter()
+                .any(|r| r.status == ReviewAiReviewerStatus::Running)
+        }) {
+            self.broadcast(ReviewEventPayload::AiReviewerChanged {
+                state: self.review.ai_reviewer.clone(),
+            })
+            .await;
+        } else {
+            self.finish_review_round().await;
+        }
+    }
+
+    async fn finish_review_round(&mut self) {
+        let Some(round) = self.review.ai_reviewer.rounds.last() else {
+            return;
+        };
+        if round
+            .reviewers
+            .iter()
+            .any(|r| r.status == ReviewAiReviewerStatus::Running)
+        {
+            return;
+        }
+        let requester = round.requested_by.clone();
+        let previous = self.review.clone();
+        let errors = round
+            .reviewers
+            .iter()
+            .filter_map(|r| r.error.as_ref().map(|e| format!("{}: {}", r.name, e)))
+            .collect::<Vec<_>>();
+        self.review.ai_reviewer.status = if errors.is_empty() {
+            ReviewAiReviewerStatus::Completed
+        } else {
+            ReviewAiReviewerStatus::Failed
+        };
+        self.review.ai_reviewer.error = if errors.is_empty() {
+            None
+        } else {
+            Some(errors.join("; "))
+        };
+        self.review.updated_at_ms = now_ms();
+        if !self
+            .persist_or_revert(previous, None, ReviewErrorContext::StartAiReview)
+            .await
+        {
+            return;
+        }
+        if let Some(agent_id) = requester {
+            let round = self.review.ai_reviewer.rounds.last().expect("round exists");
+            let findings = self
+                .review
+                .suggestions
+                .iter()
+                .filter(|s| {
+                    round
+                        .reviewers
+                        .iter()
+                        .any(|r| r.agent_id.as_ref() == Some(&s.reviewer_agent_id))
+                })
+                .collect::<Vec<_>>();
+            let feedback = serde_json::json!({ "review_id": self.review.id, "round": round, "findings": findings, "status": self.review.ai_reviewer.status });
+            let payload = SendMessagePayload {
+                message: format!(
+                    "Review feedback (automatically delivered, not user-approved). Fix actionable findings; record a reason with tyde_review_disposition for findings you address or dismiss. Call tyde_request_review again after changes. A failed reviewer means incomplete review, not success. Stop when no actionable findings remain.\n{}",
+                    feedback
+                ),
+                images: None,
+                origin: Some(MessageOrigin::Review {
+                    review_id: self.review.id.clone(),
+                }),
+                tool_response: None,
+            };
+            let (reply, response) = oneshot::channel();
+            let result = if self
+                .delivery_tx
+                .send(ReviewDeliveryRequest {
+                    review_id: self.review.id.clone(),
+                    project_id: self.review.project_id.clone(),
+                    target: ReviewSubmitTarget::ExistingAgent { agent_id },
+                    payload,
+                    reply,
+                })
+                .await
+                .is_ok()
+            {
+                response.await.ok()
+            } else {
+                None
+            };
+            let error = match result {
+                Some(ReviewDeliveryOutcome::Delivered { .. }) => None,
+                Some(ReviewDeliveryOutcome::Failed(message)) => Some(message),
+                _ => Some(
+                    "Requesting agent is unavailable; retrieve feedback with tyde_get_review"
+                        .to_owned(),
+                ),
+            };
+            let previous = self.review.clone();
+            self.review
+                .ai_reviewer
+                .rounds
+                .last_mut()
+                .expect("round exists")
+                .delivery_error = error;
+            if !self
+                .persist_or_revert(previous, None, ReviewErrorContext::StartAiReview)
+                .await
+            {
+                return;
+            }
+        }
         self.broadcast(ReviewEventPayload::AiReviewerChanged {
             state: self.review.ai_reviewer.clone(),
         })
         .await;
-        tracing::info!(
-            review_id = %self.review.id,
-            status = self.review.ai_reviewer.status.status_label(),
-            reviewer_agent_id = self
-                .review
-                .ai_reviewer
-                .agent_id
-                .as_ref()
-                .map(|id| id.0.as_str())
-                .unwrap_or("<none>"),
-            error_len = self.review.ai_reviewer.error.as_ref().map_or(0, String::len),
-            "updated AI reviewer status"
-        );
         self.notify_project_changed();
     }
 
@@ -1453,6 +1694,9 @@ impl ReviewActor {
     }
 
     async fn reset_for_clean_working_tree(&mut self, conn: Option<&ConnectionId>) {
+        if !self.review.ai_reviewer.rounds.is_empty() {
+            return;
+        }
         if review_has_non_unstaged_feedback(&self.review) {
             return;
         }
@@ -1480,6 +1724,7 @@ impl ReviewActor {
         self.review.suggestions.clear();
         self.review.file_snapshots.clear();
         self.review.ai_reviewer = ReviewAiReviewerState {
+            rounds: Vec::new(),
             status: ReviewAiReviewerStatus::Idle,
             agent_id: None,
             error: None,
@@ -1581,6 +1826,7 @@ impl ReviewActor {
                 ) && !preserve_clean
                     && unstaged_diff_is_clean(&self.review.diffs)
                     && !review_has_non_unstaged_feedback(&self.review)
+                    && self.review.ai_reviewer.rounds.is_empty()
                 {
                     self.reset_for_clean_working_tree(None).await;
                     return Ok(());

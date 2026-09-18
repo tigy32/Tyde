@@ -863,6 +863,14 @@ projects at once.
   built in: **Default** (used whenever no other agent is picked — edit it to
   customize every plain chat), **Orchestrator** (coordinates multi-backend
   plan/implement/review workflows), and **Help** (you).
+- **Review agents.** Settings → Review holds focused, read-only reviewers with
+  independent instructions, backend, and model/effort settings. Use
+  `tyde_config_list_review_agents`, `tyde_config_upsert_review_agent`, and
+  `tyde_config_delete_review_agent` to manage them. Use `reviews_enabled` in
+  `tyde_config_set_setting` for the master switch. Never run a paid review just
+  to configure it. Coding agents call `tyde_request_review`; all enabled
+  reviewers run and feedback returns automatically without manual submission.
+  Agents can record dispositions and request another round after fixes.
 - **Teams.** Settings-free multi-agent rosters: a manager coordinates report
   members, each with a role, personality, backend, and optional custom
   agent. Managed from the Teams panel.

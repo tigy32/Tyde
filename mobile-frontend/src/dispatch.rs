@@ -114,6 +114,7 @@ pub fn prime_host_for_tests(state: &AppState, host: &LocalHostId) {
     let bootstrap = BootstrapHostPayload {
         agents_with_background_work: Vec::new(),
         settings: BootstrapHostSettings {
+            review: Default::default(),
             enabled_backends: Vec::new(),
             default_backend: None,
             enable_mobile_connections: false,
@@ -3630,6 +3631,7 @@ mod wasm_tests {
             comments: Vec::new(),
             suggestions: Vec::new(),
             ai_reviewer: ReviewAiReviewerState {
+                rounds: Vec::new(),
                 status: ReviewAiReviewerStatus::Idle,
                 agent_id: None,
                 error: None,
@@ -4009,6 +4011,7 @@ mod wasm_tests {
         let bootstrap = settings_model::HostBootstrapPayload {
             agents_with_background_work: Vec::new(),
             settings: settings_model::HostSettings {
+                review: Default::default(),
                 enabled_backends: vec![protocol::BackendKind::Codex],
                 default_backend: Some(protocol::BackendKind::Codex),
                 enable_mobile_connections: false,

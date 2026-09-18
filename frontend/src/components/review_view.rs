@@ -778,6 +778,28 @@ pub(crate) fn ReviewSidebar(
             "\u{25b8}"
         }
     };
+    let config_state = state.clone();
+    let config_host = host_id.clone();
+    let configuration = Memo::new(move |_| {
+        config_state
+            .host_settings_by_host
+            .with(|settings| settings.get(&config_host).map(|s| s.review.clone()))
+    });
+    let stop_host = host_id.clone();
+    let stop_review = review_id.clone();
+    let on_stop = move |_| {
+        let host = stop_host.clone();
+        let id = stop_review.clone();
+        spawn_local(async move {
+            if let Err(error) =
+                send_review_action_inner(&host, id, ReviewActionPayload::StopAiReview).await
+            {
+                crate::components::header::report_user_error(format!(
+                    "Could not stop review: {error}"
+                ));
+            }
+        });
+    };
     view! {
         <div class="review-sidebar">
             <div class="review-sidebar-section">
@@ -785,7 +807,7 @@ pub(crate) fn ReviewSidebar(
                     <button
                         class="review-btn primary review-run-ai-btn"
                         data-test="review-run-ai"
-                        disabled=ai_disabled
+                        disabled=move || ai_disabled() || configuration.get().is_some_and(|s| !s.enabled || (!s.agents.is_empty() && !s.agents.values().any(|a| a.enabled)))
                         title=ai_reason
                         on:click=move |ev| {
                             // Opening the disclosure on Run is a UX nicety —
@@ -795,7 +817,7 @@ pub(crate) fn ReviewSidebar(
                             on_run_ai(ev);
                         }
                     >
-                        "Run AI reviewer"
+                        {move || if configuration.get().is_some_and(|s| !s.agents.is_empty()) { "Run review" } else { "Run AI reviewer" }}
                     </button>
                     <div
                         class=move || format!("review-ai-status status-{}", ai_status_kind())
@@ -809,7 +831,15 @@ pub(crate) fn ReviewSidebar(
                         })}
                     </div>
                 </div>
+                <Show when=move || live_for_ai.get().is_some_and(|r| r.ai_reviewer.status == ReviewAiReviewerStatus::Running)>
+                    <button class="review-btn" on:click=on_stop.clone()>"Stop review"</button>
+                </Show>
+                {move || live_for_ai.get().map(|review| view! { <ReviewRounds review /> })}
+                <Show when=move || configuration.get().is_some_and(|s| !s.agents.is_empty())>
+                    <p class="review-round-note">"Reviewers are configured in Settings → Review."</p>
+                </Show>
                 <details
+                    style:display=move || if configuration.get().is_some_and(|s| !s.agents.is_empty()) { "none" } else { "" }
                     class="review-ai-disclosure"
                     prop:open=ai_open_attr
                     on:toggle=move |ev: leptos::ev::Event| {
@@ -2393,6 +2423,48 @@ fn subscribe_backoff_ms(failures: u32) -> i32 {
     delay as i32
 }
 
+#[component]
+fn ReviewRounds(review: Review) -> impl IntoView {
+    let total = review.ai_reviewer.rounds.len();
+    view! {
+        <div class="review-rounds">
+            {review.ai_reviewer.rounds.into_iter().enumerate().rev().map(|(index, round)| {
+                let completed = round.reviewers.iter().filter(|r| r.status == ReviewAiReviewerStatus::Completed).count();
+                let count = round.reviewers.len();
+                let findings = review.suggestions.clone();
+                let dispositions = round.dispositions;
+                view! {
+                    <details open=index + 1 == total>
+                        <summary>{format!("Round {} · {} of {} reviewers completed", index + 1, completed, count)}</summary>
+                        <p class="review-round-note">{if round.requested_by.is_some() { "Feedback returns to the requesting agent automatically." } else { "Manual review · select suggestions to submit." }}</p>
+                        {round.delivery_error.map(|error| view! { <p role="alert">{error}</p> })}
+                        {round.reviewers.into_iter().map(|reviewer| {
+                            let reviewer_findings = findings.iter().filter(|s| reviewer.agent_id.as_ref() == Some(&s.reviewer_agent_id)).cloned().collect::<Vec<_>>();
+                            let dispositions = dispositions.clone();
+                            view! {
+                                <section class="review-round-member">
+                                    <strong>{reviewer.name}</strong><span>{reviewer.status.status_label()}</span>
+                                    {reviewer.error.map(|error| view! { <p role="alert">{error}</p> })}
+                                    {reviewer_findings.into_iter().map(|finding| {
+                                        let reason = dispositions.get(&finding.id.0).cloned();
+                                        view! {
+                                            <div class="review-round-finding">
+                                                <small>{finding.location.relative_path.clone()}</small>
+                                                <p>{finding.body}</p>
+                                                {reason.map(|reason| view! { <p class="review-round-note">"Agent response: "{reason}</p> })}
+                                            </div>
+                                        }
+                                    }).collect_view()}
+                                </section>
+                            }
+                        }).collect_view()}
+                    </details>
+                }
+            }).collect_view()}
+        </div>
+    }
+}
+
 #[cfg(all(test, target_arch = "wasm32"))]
 mod wasm_tests {
     use super::*;
@@ -2550,6 +2622,7 @@ mod wasm_tests {
             comments: vec![],
             suggestions: vec![],
             ai_reviewer: ReviewAiReviewerState {
+                rounds: Vec::new(),
                 status: ReviewAiReviewerStatus::Idle,
                 agent_id: None,
                 error: None,
@@ -3080,6 +3153,7 @@ mod wasm_tests {
             m.insert(
                 "h1".to_owned(),
                 settings_model::HostSettings {
+                    review: Default::default(),
                     enabled_backends: vec![BackendKind::Codex],
                     default_backend: Some(BackendKind::Codex),
                     enable_mobile_connections: false,
@@ -3676,6 +3750,7 @@ mod wasm_tests {
             m.insert(
                 "h1".to_owned(),
                 settings_model::HostSettings {
+                    review: Default::default(),
                     enabled_backends: enabled,
                     default_backend: default,
                     enable_mobile_connections: false,

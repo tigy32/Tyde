@@ -410,6 +410,7 @@ enum SettingsTab {
     Subagents,
     Backends,
     CustomAgents,
+    Review,
     McpServers,
     Steering,
     Skills,
@@ -441,6 +442,7 @@ impl SettingsTab {
             Self::Subagents => "Subagents",
             Self::Backends => "Backends",
             Self::CustomAgents => "Custom Agents",
+            Self::Review => "Review",
             Self::McpServers => "MCP Servers",
             Self::Steering => "Steering",
             Self::Skills => "Skills",
@@ -462,6 +464,7 @@ impl SettingsTab {
             | Self::UsageManagement
             | Self::Subagents
             | Self::Backends
+            | Self::Review
             | Self::CustomAgents
             | Self::McpServers
             | Self::Steering
@@ -631,6 +634,14 @@ impl SettingsTab {
                 "OpenAI",
                 "Google",
             ],
+            Self::Review => &[
+                "Review",
+                "Review agents",
+                "Backend",
+                "Model",
+                "Instructions",
+                "Feedback",
+            ],
             Self::CustomAgents => &[
                 "Custom Agents",
                 "Name",
@@ -705,7 +716,7 @@ impl SettingsTab {
     }
 }
 
-const ALL_TABS: [SettingsTab; 17] = [
+const ALL_TABS: [SettingsTab; 18] = [
     SettingsTab::Updates,
     SettingsTab::Hosts,
     SettingsTab::Appearance,
@@ -715,6 +726,7 @@ const ALL_TABS: [SettingsTab; 17] = [
     SettingsTab::UsageManagement,
     SettingsTab::Subagents,
     SettingsTab::Backends,
+    SettingsTab::Review,
     SettingsTab::CustomAgents,
     SettingsTab::McpServers,
     SettingsTab::Steering,
@@ -741,11 +753,12 @@ const DEVICE_GROUP_TABS: [SettingsTab; 4] = [
 /// does on its own (summaries, supervisor, subagents), what an agent is given
 /// (custom agents, steering, skills, MCP), what the host machine can do (code
 /// intelligence, voice), then reach and diagnostics (mobile, debug).
-const HOST_GROUP_TABS: [SettingsTab; 12] = [
+const HOST_GROUP_TABS: [SettingsTab; 13] = [
     SettingsTab::AiSummaries,
     SettingsTab::Supervisor,
     SettingsTab::UsageManagement,
     SettingsTab::Subagents,
+    SettingsTab::Review,
     SettingsTab::CustomAgents,
     SettingsTab::Steering,
     SettingsTab::Skills,
@@ -945,6 +958,7 @@ pub fn SettingsPanel() -> impl IntoView {
                                     SettingsTab::UsageManagement => view! { <UsageManagementTab /> }.into_any(),
                                     SettingsTab::Subagents => view! { <SubagentsTab /> }.into_any(),
                                     SettingsTab::Backends => view! { <BackendsTab /> }.into_any(),
+                                    SettingsTab::Review => view! { <ReviewSettingsTab /> }.into_any(),
                                     SettingsTab::CustomAgents => view! { <CustomAgentsTab /> }.into_any(),
                                     SettingsTab::McpServers => view! { <McpServersTab /> }.into_any(),
                                     SettingsTab::Steering => view! { <SteeringTab /> }.into_any(),
@@ -2290,6 +2304,249 @@ fn AiSummariesTab() -> impl IntoView {
                     />
                     <span class="settings-toggle-slider"></span>
                 </label>
+            </div>
+        </div>
+    }
+}
+
+#[component]
+fn ReviewSettingsTab() -> impl IntoView {
+    let state = expect_context::<AppState>();
+    let state_for_settings = state.clone();
+    let settings = Memo::new(move |_| {
+        state_for_settings
+            .selected_host_settings()
+            .map(|s| s.review)
+    });
+    let editor = RwSignal::new(None::<(String, settings_model::ReviewAgentConfig)>);
+    let deleting = RwSignal::new(None::<(String, String)>);
+    let state_for_host = state.clone();
+    Effect::new(move |_| {
+        state_for_host.selected_host_id.track();
+        editor.set(None);
+        deleting.set(None);
+    });
+    let toggle_state = state.clone();
+    let add_state = state.clone();
+    let list_state = state.clone();
+    let delete_state = state.clone();
+    view! {
+        <section class="review-settings">
+            <header class="review-settings-heading">
+                <div>
+                    <h2 class="settings-panel-title">"Review"</h2>
+                    <p class="settings-description">"Focused reviewers for the things you care about."</p>
+                </div>
+                <label class="review-settings-enabled">
+                    <input type="checkbox" role="switch" aria-label="Enable reviews"
+                        prop:checked=move || settings.get().is_some_and(|s| s.enabled)
+                        disabled=move || settings.get().is_none()
+                        on:change=move |ev| send_host_replace(&toggle_state, "/review/enabled", event_target_checked(&ev)) />
+                    "Enabled"
+                </label>
+            </header>
+            <div class="review-settings-list-heading">
+                <h3>"Review agents"</h3>
+                <span class="review-settings-count">{move || format!("{} enabled", settings.get().map_or(0, |s| s.agents.values().filter(|a| a.enabled).count()))}</span>
+                <button class="settings-btn-primary" disabled=move || settings.get().is_none()
+                    on:click=move |_| {
+                        let backend = add_state.selected_host_settings_untracked().and_then(|s| s.default_backend.or_else(|| s.enabled_backends.first().copied())).unwrap_or(BackendKind::Codex);
+                        editor.set(Some((generate_id(), settings_model::ReviewAgentConfig {
+                            name: String::new(), description: String::new(), instructions: String::new(), backend_kind: backend,
+                            session_settings: SessionSettingsValues::default(), enabled: true,
+                        })));
+                    }>"+ Add reviewer"</button>
+            </div>
+            <div class="review-settings-list">
+                {move || {
+                    let state = list_state.clone();
+                    settings.get().map(|s| s.agents.into_iter().map(|(id, reviewer)| {
+                        let edit_id = id.clone();
+                        let edit_reviewer = reviewer.clone();
+                        let delete_id = id.clone();
+                        let delete_name = reviewer.name.clone();
+                        let path = format!("/review/agents/{}/enabled", settings_model::escape_pointer_token(&id));
+                        let state = state.clone();
+                        let label = format!("Enable {}", reviewer.name);
+                        view! {
+                            <div class="review-settings-row">
+                                <input type="checkbox" role="switch" aria-label=label prop:checked=reviewer.enabled
+                                    on:change=move |ev| send_host_replace(&state, path.clone(), event_target_checked(&ev)) />
+                                <div class="review-settings-row-copy">
+                                    <strong>{reviewer.name}</strong>
+                                    <span>{reviewer.description}</span>
+                                </div>
+                                <span class="review-settings-backend">{backend_label(reviewer.backend_kind)}</span>
+                                <button class="settings-btn" on:click=move |_| editor.set(Some((edit_id.clone(), edit_reviewer.clone())))>"Edit"</button>
+                                <button class="settings-btn" on:click=move |_| deleting.set(Some((delete_id.clone(), delete_name.clone())))>"Delete"</button>
+                            </div>
+                        }
+                    }).collect_view())
+                }}
+                <Show when=move || settings.get().is_some_and(|s| s.agents.is_empty())>
+                    <div class="review-settings-empty">
+                        <strong>"What should your reviewers look for?"</strong>
+                        <p>"Add a reviewer for each focus area, such as test quality, comments, or scope."</p>
+                    </div>
+                </Show>
+            </div>
+            <p class="review-settings-note">"Agent-requested reviews return feedback automatically."</p>
+            {move || editor.get().map(|(id, reviewer)| view! { <ReviewAgentEditor id reviewer on_close=Callback::new(move |()| editor.set(None)) /> })}
+            {move || deleting.get().map(|(id, name)| {
+                let state = delete_state.clone();
+                view! { <SettingsConfirmDialog
+                    title="Delete reviewer?".to_owned() body=format!("Remove {name} from future reviews?") confirm_label="Delete reviewer".to_owned()
+                    on_cancel=Callback::new(move |()| deleting.set(None))
+                    on_confirm=Callback::new(move |()| {
+                        send_host_remove(&state, format!("/review/agents/{}", settings_model::escape_pointer_token(&id)));
+                        deleting.set(None);
+                    }) /> }
+            })}
+        </section>
+    }
+}
+
+#[component]
+fn ReviewAgentEditor(
+    id: String,
+    reviewer: settings_model::ReviewAgentConfig,
+    on_close: Callback<()>,
+) -> impl IntoView {
+    let state = expect_context::<AppState>();
+    let is_new = reviewer.name.is_empty();
+    let name = RwSignal::new(reviewer.name);
+    let description = RwSignal::new(reviewer.description);
+    let instructions = RwSignal::new(reviewer.instructions);
+    let backend = RwSignal::new(reviewer.backend_kind);
+    let values = RwSignal::new(reviewer.session_settings);
+    let enabled = reviewer.enabled;
+    let name_ref = NodeRef::<leptos::html::Input>::new();
+    let modal_ref = NodeRef::<leptos::html::Div>::new();
+    let opener: StoredValue<Option<web_sys::HtmlElement>, LocalStorage> = StoredValue::new_local(
+        web_sys::window()
+            .and_then(|w| w.document())
+            .and_then(|d| d.active_element())
+            .and_then(|e| e.dyn_into().ok()),
+    );
+    Effect::new(move |_| {
+        if let Some(input) = name_ref.get() {
+            let _ = input.focus();
+        }
+    });
+    on_cleanup(move || {
+        if let Some(el) = opener.get_value() {
+            let _ = el.focus();
+        }
+    });
+    let title_id = generate_id();
+    let labelled_by = title_id.clone();
+    let state_for_schema = state.clone();
+    let state_for_options = state.clone();
+    let path = format!(
+        "/review/agents/{}",
+        settings_model::escape_pointer_token(&id)
+    );
+    let original = state
+        .selected_host_settings_untracked()
+        .and_then(|s| s.review.agents.get(&id).cloned());
+    let save = move |_| {
+        if name.get_untracked().trim().is_empty() || instructions.get_untracked().trim().is_empty()
+        {
+            return;
+        }
+        let config = settings_model::ReviewAgentConfig {
+            name: name.get_untracked().trim().to_owned(),
+            description: description.get_untracked().trim().to_owned(),
+            instructions: instructions.get_untracked().trim().to_owned(),
+            backend_kind: backend.get_untracked(),
+            session_settings: values.get_untracked(),
+            enabled,
+        };
+        let path = path.clone();
+        let original = original.clone();
+        send_host_change(&state, move |_| {
+            Ok(vec![SettingOp::Replace {
+                path,
+                value: serde_json::to_value(config).map_err(|e| e.to_string())?,
+                expected: match original {
+                    Some(value) => SettingExpectation::Value {
+                        value: serde_json::to_value(value).map_err(|e| e.to_string())?,
+                    },
+                    None => SettingExpectation::Absent,
+                },
+            }])
+        });
+        on_close.run(());
+    };
+    let keydown = move |ev: web_sys::KeyboardEvent| {
+        if ev.key() == "Escape" {
+            ev.prevent_default();
+            ev.stop_propagation();
+            on_close.run(());
+        }
+        if ev.key() == "Tab" {
+            let Some(modal) = modal_ref.get() else {
+                return;
+            };
+            let Ok(nodes) = modal.query_selector_all("button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex='0']") else { return; };
+            let Some(first) = nodes
+                .item(0)
+                .and_then(|n| n.dyn_into::<web_sys::HtmlElement>().ok())
+            else {
+                return;
+            };
+            let Some(last) = nodes
+                .item(nodes.length().saturating_sub(1))
+                .and_then(|n| n.dyn_into::<web_sys::HtmlElement>().ok())
+            else {
+                return;
+            };
+            let active = web_sys::window()
+                .and_then(|w| w.document())
+                .and_then(|d| d.active_element());
+            if ev.shift_key()
+                && active
+                    .as_ref()
+                    .is_some_and(|e| e.is_same_node(Some(&first)))
+            {
+                ev.prevent_default();
+                let _ = last.focus();
+            } else if !ev.shift_key()
+                && active.as_ref().is_some_and(|e| e.is_same_node(Some(&last)))
+            {
+                ev.prevent_default();
+                let _ = first.focus();
+            }
+        }
+    };
+    view! {
+        <div class="settings-confirm-overlay" on:click=move |_| on_close.run(())>
+            <div class="review-agent-modal" node_ref=modal_ref role="dialog" aria-modal="true" aria-labelledby=labelled_by
+                on:click=move |ev| ev.stop_propagation() on:keydown=keydown>
+                <header><h3 id=title_id>{if is_new { "Add reviewer" } else { "Edit reviewer" }}</h3><button class="settings-btn" aria-label="Close reviewer editor" on:click=move |_| on_close.run(())>"×"</button></header>
+                <label class="settings-form-label"><span>"Name"</span><input class="settings-text-input" node_ref=name_ref prop:value=move || name.get() on:input=move |ev| name.set(event_target_value(&ev)) /></label>
+                <label class="settings-form-label"><span>"Description"</span><input class="settings-text-input" prop:value=move || description.get() on:input=move |ev| description.set(event_target_value(&ev)) /></label>
+                <label class="settings-form-label"><span>"Backend"</span>
+                    <select class="settings-select" prop:value=move || backend_value(backend.get()) on:change=move |ev| {
+                        if let Some(kind) = parse_backend_kind(&event_target_value(&ev)) { backend.set(kind); values.set(SessionSettingsValues::default()); }
+                    }>
+                        {move || {
+                            let mut backends = state_for_options.selected_host_settings().map(|s| s.enabled_backends).unwrap_or_default();
+                            if !backends.contains(&backend.get()) { backends.push(backend.get()); }
+                            backends.into_iter().map(|kind| view! { <option value=backend_value(kind)>{backend_label(kind)}</option> }).collect_view()
+                        }}
+                    </select>
+                </label>
+                {move || {
+                    let schema = state_for_schema.selected_host_id.get().and_then(|host| state_for_schema.session_schemas.get().get(&host).and_then(|schemas| schemas.get(&backend.get())).cloned());
+                    match schema {
+                        Some(SessionSchemaEntry::Ready { schema }) => view! { <SessionSettingsControls schema values=Signal::derive(move || values.get()) on_change=Callback::new(move |v| values.set(v)) /> }.into_any(),
+                        _ => view! { <p class="settings-description">"Model options are unavailable until this backend is ready. Existing selections are preserved."</p> }.into_any(),
+                    }
+                }}
+                <label class="settings-form-label"><span>"Review instructions"</span><textarea class="settings-text-input" rows="6" prop:value=move || instructions.get() on:input=move |ev| instructions.set(event_target_value(&ev)) /></label>
+                <p class="review-settings-note">"Only report concrete issues. No findings is a valid result."</p>
+                <footer><button class="settings-btn" on:click=move |_| on_close.run(())>"Cancel"</button><button class="settings-btn-primary" disabled=move || name.get().trim().is_empty() || instructions.get().trim().is_empty() on:click=save>"Save reviewer"</button></footer>
             </div>
         </div>
     }
@@ -9100,6 +9357,7 @@ mod wasm_tests {
             m.insert(
                 host_id,
                 settings_model::HostSettings {
+                    review: Default::default(),
                     enabled_backends: vec![protocol::BackendKind::Claude],
                     default_backend: Some(protocol::BackendKind::Claude),
                     enable_mobile_connections: enabled,
@@ -10518,6 +10776,7 @@ mod wasm_tests {
             m.insert(
                 host_id,
                 settings_model::HostSettings {
+                    review: Default::default(),
                     enabled_backends: vec![protocol::BackendKind::Claude],
                     default_backend: Some(protocol::BackendKind::Claude),
                     enable_mobile_connections: false,
@@ -11294,6 +11553,7 @@ mod wasm_tests {
         enabled_backends: Vec<BackendKind>,
     ) -> settings_model::HostSettings {
         settings_model::HostSettings {
+            review: Default::default(),
             enabled_backends,
             default_backend: Some(BackendKind::Hermes),
             enable_mobile_connections: false,
@@ -13432,6 +13692,7 @@ mod wasm_tests {
             m.insert(
                 host_id.clone(),
                 settings_model::HostSettings {
+                    review: Default::default(),
                     enabled_backends: vec![BackendKind::Hermes],
                     default_backend: Some(BackendKind::Hermes),
                     enable_mobile_connections: false,
@@ -16417,5 +16678,202 @@ mod wasm_tests {
             Some("true"),
             "the module tab is still marked selected after the snapshot"
         );
+    }
+    #[wasm_bindgen_test]
+    async fn review_settings_manage_focused_reviewers_through_modal() {
+        let calls = install_settings_send_stub();
+        let container = make_container();
+        let document = web_sys::window().unwrap().document().unwrap();
+        let style = document.create_element("style").unwrap();
+        style.set_text_content(Some(include_str!("../../styles.css")));
+        document.head().unwrap().append_child(&style).unwrap();
+        container.set_attribute("style", "width: 1000px").unwrap();
+        let state = AppState::new();
+        install_launch_profile_host(&state, Vec::new());
+        let host = state.selected_host_id.get_untracked().unwrap();
+        let mounted_state = state.clone();
+        let handle = mount_to(container.clone(), move || {
+            provide_context(mounted_state.clone());
+            view! { <ReviewSettingsTab /> }
+        });
+        next_tick().await;
+        assert!(
+            container
+                .text_content()
+                .unwrap()
+                .contains("What should your reviewers look for?")
+        );
+        assert!(
+            !container
+                .text_content()
+                .unwrap()
+                .contains("Concurrent reviewers")
+        );
+        assert!(
+            !container
+                .text_content()
+                .unwrap()
+                .contains("Maximum review rounds")
+        );
+        let add = find_button_by_text(&container, "+ Add reviewer").unwrap();
+        add.focus().unwrap();
+        add.click();
+        next_tick().await;
+        let dialog = container
+            .query_selector("[role='dialog']")
+            .unwrap()
+            .unwrap();
+        assert!(dialog.text_content().unwrap().contains("Add reviewer"));
+        let fields = dialog.query_selector_all("input").unwrap();
+        let name: HtmlInputElement = fields.item(0).unwrap().dyn_into().unwrap();
+        assert!(document.active_element().unwrap().is_same_node(Some(&name)));
+        let save: web_sys::HtmlButtonElement = find_button_by_text(&container, "Save reviewer")
+            .unwrap()
+            .dyn_into()
+            .unwrap();
+        assert!(save.disabled(), "An empty reviewer must not be saveable");
+        set_input_value(&name, "Meaningful tests");
+        let description: HtmlInputElement = fields.item(1).unwrap().dyn_into().unwrap();
+        set_input_value(&description, "Catch actual regressions");
+        let instructions: web_sys::HtmlTextAreaElement = dialog
+            .query_selector("textarea")
+            .unwrap()
+            .unwrap()
+            .dyn_into()
+            .unwrap();
+        instructions.set_value("Find tests that still pass when behavior is broken");
+        dispatch_event_from_js(instructions.unchecked_ref(), "input", None);
+        next_tick().await;
+        let model: HtmlSelectElement = dialog
+            .query_selector_all("select")
+            .unwrap()
+            .item(1)
+            .expect("real model selector")
+            .dyn_into()
+            .unwrap();
+        model.set_value("opus");
+        dispatch_event_from_js(model.unchecked_ref(), "change", None);
+        next_tick().await;
+        assert!(!save.disabled());
+        save.click();
+        for _ in 0..3 {
+            next_tick().await;
+        }
+        let writes = recorded_settings_write_ops(&calls);
+        let op = writes.last().expect("save reviewer write");
+        assert!(op["path"].as_str().unwrap().starts_with("/review/agents/"));
+        assert_eq!(op["value"]["session_settings"]["model"]["string"], "opus");
+        let id = op["path"]
+            .as_str()
+            .unwrap()
+            .strip_prefix("/review/agents/")
+            .unwrap()
+            .to_owned();
+        let config: settings_model::ReviewAgentConfig =
+            serde_json::from_value(op["value"].clone()).unwrap();
+        state.host_settings_by_host.update(|hosts| {
+            hosts
+                .get_mut(&host)
+                .unwrap()
+                .review
+                .agents
+                .insert(id.clone(), config);
+        });
+        next_tick().await;
+        assert!(
+            container
+                .query_selector("[role='dialog']")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            container
+                .text_content()
+                .unwrap()
+                .contains("Meaningful tests")
+        );
+        assert!(document.active_element().unwrap().is_same_node(Some(&add)));
+        let edit = find_button_by_text(&container, "Edit").unwrap();
+        let delete = find_button_by_text(&container, "Delete").unwrap();
+        let edit_rect = edit.get_bounding_client_rect();
+        let delete_rect = delete.get_bounding_client_rect();
+        assert!(
+            (edit_rect.y() - delete_rect.y()).abs() < 2.0,
+            "Edit and Delete must share a row"
+        );
+        edit.click();
+        next_tick().await;
+        let dialog = container
+            .query_selector("[role='dialog']")
+            .unwrap()
+            .unwrap();
+        assert!(dialog.text_content().unwrap().contains("Edit reviewer"));
+        let name: HtmlInputElement = dialog
+            .query_selector("input")
+            .unwrap()
+            .unwrap()
+            .dyn_into()
+            .unwrap();
+        assert_eq!(name.value(), "Meaningful tests");
+        set_input_value(&name, "Regression coverage");
+        find_button_by_text(&container, "Save reviewer")
+            .unwrap()
+            .click();
+        for _ in 0..3 {
+            next_tick().await;
+        }
+        let edits = recorded_settings_write_ops(&calls);
+        let edited = edits.last().unwrap();
+        assert_eq!(edited["value"]["name"], "Regression coverage");
+        assert_eq!(
+            edited["expected"]["value"]["name"], "Meaningful tests",
+            "Editing must detect concurrent Help-agent changes"
+        );
+        state.host_settings_by_host.update(|hosts| {
+            hosts.get_mut(&host).unwrap().review.agents.insert(
+                id.clone(),
+                serde_json::from_value(edited["value"].clone()).unwrap(),
+            );
+        });
+        next_tick().await;
+        find_button_by_text(&container, "Delete").unwrap().click();
+        next_tick().await;
+        assert!(
+            container
+                .query_selector("[role='alertdialog']")
+                .unwrap()
+                .is_some()
+        );
+        find_button_by_text(&container, "Cancel").unwrap().click();
+        next_tick().await;
+        assert!(
+            container
+                .text_content()
+                .unwrap()
+                .contains("Regression coverage")
+        );
+        find_button_by_text(&container, "Delete").unwrap().click();
+        next_tick().await;
+        find_button_by_text(&container, "Delete reviewer")
+            .unwrap()
+            .click();
+        for _ in 0..3 {
+            next_tick().await;
+        }
+        let writes = recorded_settings_write_ops(&calls);
+        assert_eq!(writes.last().unwrap()["op"], "remove");
+        state.host_settings_by_host.update(|hosts| {
+            hosts.get_mut(&host).unwrap().review.agents.remove(&id);
+        });
+        next_tick().await;
+        assert!(
+            !container
+                .text_content()
+                .unwrap()
+                .contains("Regression coverage")
+        );
+        drop(handle);
+        container.remove();
+        style.remove();
     }
 }

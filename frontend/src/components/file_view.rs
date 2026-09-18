@@ -3045,6 +3045,7 @@ mod wasm_tests {
                         }],
                         suggestions: Vec::new(),
                         ai_reviewer: protocol::ReviewAiReviewerState {
+                            rounds: Vec::new(),
                             status: protocol::ReviewAiReviewerStatus::Idle,
                             agent_id: None,
                             error: None,
