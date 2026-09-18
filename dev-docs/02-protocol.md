@@ -293,9 +293,9 @@ Examples:
 
 - `terminal_send` after exit -> `terminal_error { fatal: false }`
 - backend turn failure on an agent stream -> `agent_error { fatal: false|true }`
-- project file read or directory listing failure -> `project_error { fatal: false }`
+- project file read or directory listing failure -> `command_error { fatal: false }`
 - project subscription becomes invalid because the project was deleted ->
-  `project_error { fatal: true }`
+  `command_error { fatal: true }`
 
 ### 6.3 Stream ownership
 
@@ -306,7 +306,7 @@ context differs by domain:
 - agent stream: `agent_error`
 - terminal stream: `terminal_error`
 - host browse stream: `host_browse_error`
-- project stream: `project_error`
+- project stream: `command_error`
 
 The common contract is:
 
@@ -319,6 +319,78 @@ The common contract is:
 The protocol must not swallow errors. Surfacing an error on a stream is not
 "softening" it; it is preserving diagnostics without turning a routine runtime
 failure into a connection-wide or process-wide outage.
+
+### 6.5 Banner audit (2026-09-17)
+
+The wire classifies **cause and stream liveness**, not notification placement.
+`CommandErrorCode` has `InvalidInput`, `NotFound`, `Conflict`, `Internal`, and
+`ProtocolViolation`. `CommandErrorPayload` adds the operation, request kind,
+stream, optional request ID, message, and `fatal`. Agent, terminal, browse,
+code-intelligence, review, settings, capacity, mobile-access, client, and voice
+failures also have domain-specific codes. Voice additionally has `retryable`.
+There is no shared severity, background/user-action origin, or presentation
+policy. Non-fatal does not mean harmless: a failed save still needs feedback.
+
+Project failures use `CommandError`, not a separate `ProjectError` frame.
+Both watcher warnings and fatal scan failures use `Internal`, distinguished by `fatal`.
+Classification is also uneven: `host.rs::project_command_error` still infers
+categories from message prefixes and falls back to `InvalidInput` for many
+filesystem failures, rather than preserving a typed I/O cause.
+The frontend's `dispatch.rs` banners **every** `CommandError`, regardless of
+code, `fatal`, or whether an owning view already displays it. It also records
+that message as the host's last error. All error notices say "Action failed";
+warning notices currently say "SSH warning".
+
+Inventory: **42 production calls to `report_user_error`**, excluding its
+function definition and the header's DOM test. These are call sites, not 42
+unique error conditions: the generic command/send handlers each cover many
+operations. The following is a presentation recommendation, not a count of
+observed incidents or a claim that the underlying failures are all harmless.
+
+| Recommended destination | Calls | Locations / behavior |
+| --- | ---: | --- |
+| Global banner | 3 | `app.rs`: desktop readiness acknowledgement, host event-listener installation, configured-host loading. These prevent reliable app startup. |
+| Owning view / control | 33 | `actions.rs` session resume (2); `chat_input.rs` send/cancel/steer/goal (5); `chat_view.rs` goal control (1); `host_browser.rs` folder selection, prerequisites, and submit (7); `review_view.rs` stop review (1); `settings_panel.rs` loading, edit/save/setup/skills failures (15); `terminal_view.rs` create prerequisites (1); `dispatch.rs` rejected settings write (1). Preserve visible feedback, but show it where the failed action occurred; loading/invalid selection should normally disable the control. Some destinations need new inline state before removing their banner. |
+| Context-dependent; cannot blanket-banner or blanket-hide | 6 | `app.rs` host error, prepare failure, connect failure (3); `dispatch.rs` command error and terminal error (2); `send.rs` generic send failure (1). Consider the active host/view, whether an explicit action failed, existing recovery, and whether another surface owns the error. |
+
+SSH diagnostics follow a separate warning route with a three-second hold;
+recovered/disconnected-host warnings are already retired. Agent errors are
+already scoped to the agent transcript; browse, review, voice and code-intel
+have local error handling rather than universally calling the header.
+
+Concrete priority findings:
+
+1. **Disappearing scan entries:** normal filesystem churn, not a failed user
+   operation. Skip vanished descendants, retain debug diagnostics, and keep
+   publishing file updates. Missing project roots, access failures, and other
+   real I/O failures must still surface. Do not filter ENOENT strings in UI.
+2. **Watcher resource exhaustion:** currently emitted as a non-fatal
+   `project_watch` command error and rendered red. Live updates really are
+   disabled; show a persistent project-scoped degraded-status warning with
+   recovery guidance, not "Action failed" and not silence.
+3. **Terminal `NotRunning`:** send/resize racing normal process exit currently
+   gets "Terminal failed". Use terminal-local exited state; distinguish failed
+   user input from an automatic resize. Keep actual PTY I/O failures visible.
+4. **Duplicate local failures:** workflow commands already populate
+   `workflow_command_errors`; diff requests/expansions populate inline error
+   state; workbench creation records modal error state; workbench removal
+   opens a confirmation/error dialog; native settings saves retain failed-save
+   state. The unconditional command/settings banner duplicates those surfaces.
+5. **Generic transport failures:** `report_send_failure` handles automatic
+   refreshes and explicit commands alike. Resume and stop-review callers also
+   report the same send failure again. Recovery should own background sends;
+   an explicit action still needs one visible failure at its origin.
+6. **Request correlation is incomplete:** read-file and workbench error
+   handling cannot reliably identify the initiating path/action and uses
+   host-wide or oldest-pending fallbacks. Add typed request/resource correlation
+   before suppressing errors based on inferred intent. Error-message matching
+   is not a notification taxonomy.
+
+Follow-up policy: recover expected churn at the producer; show rejected actions
+inline; show persistent degradation on the affected resource; reserve global
+banners for failures needing attention outside an owning view. Keep typed
+cause, retryability, liveness, and UI placement separate. This audit does not
+silently change the 42 call sites or declare their failures safe to discard.
 
 ---
 

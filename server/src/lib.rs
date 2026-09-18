@@ -60,6 +60,8 @@ pub use host::{
     MockLaunchReservation, UsageWakeupLaunchForTest,
 };
 pub use process_env::init_process_env;
+#[cfg(feature = "test-support")]
+pub use project_stream::scan_test_support::{InstalledScanHook, ScanPoint};
 
 use std::collections::HashMap;
 

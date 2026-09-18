@@ -119,6 +119,17 @@ pub struct Fixture {
 }
 
 impl Fixture {
+    // Each integration binary compiles this shared fixture, but only project flows use scan hooks.
+    #[allow(dead_code)]
+    pub fn on_project_scan(
+        &self,
+        path: PathBuf,
+        point: server::ScanPoint,
+        action: impl FnOnce() + Send + 'static,
+    ) -> server::InstalledScanHook {
+        server::InstalledScanHook::install(path, point, Box::new(action))
+    }
+
     #[allow(dead_code)]
     pub async fn new() -> Self {
         Self::new_with_runtime_config(server::HostRuntimeConfig::default()).await

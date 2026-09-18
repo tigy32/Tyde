@@ -3313,15 +3313,89 @@ pub(crate) fn commit(
     Ok(hash.trim().to_owned())
 }
 
+#[cfg(feature = "test-support")]
+pub mod scan_test_support {
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Mutex, OnceLock};
+
+    #[derive(Clone, Copy, PartialEq, Eq, Hash)]
+    pub enum ScanPoint {
+        Metadata,
+        ReadDirectory,
+    }
+
+    type ScanKey = (PathBuf, ScanPoint);
+    type ScanAction = Box<dyn FnOnce() + Send>;
+    static HOOKS: OnceLock<Mutex<HashMap<ScanKey, ScanAction>>> = OnceLock::new();
+
+    pub struct InstalledScanHook {
+        key: ScanKey,
+    }
+
+    impl InstalledScanHook {
+        pub fn install(path: PathBuf, point: ScanPoint, action: ScanAction) -> Self {
+            let key = (path, point);
+            let mut hooks = HOOKS.get_or_init(Mutex::default).lock().unwrap();
+            assert!(!hooks.contains_key(&key), "scan hook already installed");
+            hooks.insert(key.clone(), action);
+            Self { key }
+        }
+    }
+
+    impl Drop for InstalledScanHook {
+        fn drop(&mut self) {
+            HOOKS
+                .get_or_init(Mutex::default)
+                .lock()
+                .unwrap()
+                .remove(&self.key);
+        }
+    }
+
+    pub(super) fn run(path: &Path, point: ScanPoint) {
+        let action = HOOKS
+            .get_or_init(Mutex::default)
+            .lock()
+            .unwrap()
+            .remove(&(path.to_owned(), point));
+        if let Some(action) = action {
+            action();
+        }
+    }
+}
+
+/// A vanished descendant returns false so its parent omits the directory entry.
 fn collect_raw_entries(
     root: &Path,
     current: &Path,
     out: &mut Vec<RawFileEntry>,
     depth: usize,
     max_depth: usize,
-) -> Result<(), String> {
-    let mut entries = fs::read_dir(current)
-        .map_err(|err| format!("Failed to read directory '{}': {err}", current.display()))?
+) -> Result<bool, String> {
+    #[cfg(feature = "test-support")]
+    scan_test_support::run(current, scan_test_support::ScanPoint::ReadDirectory);
+    let directory = match fs::read_dir(current) {
+        Ok(directory) => directory,
+        Err(error) if depth > 0 && error.kind() == std::io::ErrorKind::NotFound => {
+            tracing::debug!(path = %current.display(), %error, "project scan directory disappeared before descent");
+            return Ok(false);
+        }
+        Err(error) => {
+            return Err(format!(
+                "Failed to read directory '{}': {error}",
+                current.display()
+            ));
+        }
+    };
+    let mut entries = directory
+        .filter_map(|entry| match entry {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                tracing::debug!(path = %current.display(), %error, "project scan entry disappeared during enumeration");
+                None
+            }
+            entry => Some(entry),
+        })
         .collect::<Result<Vec<_>, _>>()
         .map_err(|err| format!("Failed to iterate directory '{}': {err}", current.display()))?;
     entries.sort_by_key(|entry| entry.path());
@@ -3333,8 +3407,18 @@ fn collect_raw_entries(
             continue;
         }
 
-        let metadata = fs::symlink_metadata(&path)
-            .map_err(|err| format!("Failed to stat path '{}': {err}", path.display()))?;
+        #[cfg(feature = "test-support")]
+        scan_test_support::run(&path, scan_test_support::ScanPoint::Metadata);
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                tracing::debug!(path = %path.display(), %error, "project scan metadata failed after directory enumeration");
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    continue;
+                }
+                return Err(format!("Failed to stat path '{}': {error}", path.display()));
+            }
+        };
         let relative_path = path
             .strip_prefix(root)
             .map_err(|err| {
@@ -3356,14 +3440,15 @@ fn collect_raw_entries(
         };
 
         out.push((relative_path, kind));
-
-        // Recurse into directories only if within depth limit
-        if metadata.is_dir() && depth < max_depth {
-            collect_raw_entries(root, &path, out, depth + 1, max_depth)?;
+        if metadata.is_dir()
+            && depth < max_depth
+            && !collect_raw_entries(root, &path, out, depth + 1, max_depth)?
+        {
+            out.pop();
         }
     }
 
-    Ok(())
+    Ok(true)
 }
 
 fn validate_root(project: &Project, root: &ProjectRootPath) -> Result<(), String> {

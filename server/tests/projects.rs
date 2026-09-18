@@ -3457,6 +3457,71 @@ async fn live_watcher_refreshes_files_during_continuous_activity() {
         .expect("read initial file");
     let initial = expect_project_file_contents(&mut fixture.client, "initial contents").await;
 
+    // Delete real paths at the two scan race boundaries, not before a scan starts.
+    for (relative, point, directory) in [
+        ("vanishing.tmp", server::ScanPoint::Metadata, false),
+        ("vanishing-dir", server::ScanPoint::ReadDirectory, true),
+    ] {
+        let path = repo.path().join(relative);
+        let remove_path = path.clone();
+        let (removed_tx, removed_rx) = tokio::sync::oneshot::channel();
+        let hook = fixture.on_project_scan(path.clone(), point, move || {
+            if directory {
+                fs::remove_dir_all(&remove_path).expect("delete directory during scan");
+            } else {
+                fs::remove_file(&remove_path).expect("delete file during scan");
+            }
+            eprintln!("removed {} during project scan", remove_path.display());
+            removed_tx.send(()).expect("scan observer still waiting");
+        });
+        if directory {
+            fs::create_dir(&path).expect("create transient directory");
+        } else {
+            fs::write(&path, "temporary").expect("create transient file");
+        }
+        tokio::time::timeout(Duration::from_secs(5), removed_rx)
+            .await
+            .expect("watcher must scan the transient path")
+            .expect("scan hook must delete the path");
+        let marker = format!("survived-{relative}");
+        fs::write(repo.path().join(&marker), "still watching").expect("write scan marker");
+        let listing = expect_project_file_list_matching(
+            &mut fixture.client,
+            "live file listing after a path disappears during scan",
+            |listing| {
+                listing.roots[0]
+                    .entries
+                    .iter()
+                    .any(|entry| entry.relative_path == marker)
+            },
+        )
+        .await;
+        assert!(
+            listing.roots[0].entries.iter().all(|entry| {
+                entry.relative_path != relative
+                    && !entry.relative_path.starts_with(&format!("{relative}/"))
+            }),
+            "deleted paths must not remain in the listing: {listing:?}"
+        );
+        drop(hook);
+    }
+
+    fixture
+        .client
+        .project_list_dir(
+            &project.id,
+            ProjectListDirPayload {
+                root: ProjectRootPath(project_root(&project, 0)),
+                path: "vanishing-dir".to_owned(),
+            },
+        )
+        .await
+        .expect("request deleted directory");
+    let error = expect_command_error(&mut fixture.client, "explicit missing directory").await;
+    assert_eq!(error.operation, "project_list_dir");
+    assert!(!error.fatal);
+    assert!(error.message.contains("vanishing-dir"));
+
     fs::remove_file(repo.path().join("remove_me.rs")).expect("failed to delete remove_me.rs");
     fs::write(repo.path().join("keep.rs"), "// updated\n").expect("update keep.rs");
 
@@ -3510,6 +3575,7 @@ async fn live_watcher_refreshes_files_during_continuous_activity() {
                         }
                     }
                 }
+                FrameKind::CommandError => panic!("normal filesystem activity failed: {env:?}"),
                 _ => {}
             }
         }
@@ -3546,6 +3612,29 @@ async fn live_watcher_refreshes_files_during_continuous_activity() {
         entries.iter().all(|e| e.op == FileEntryOp::Add),
         "full snapshots contain only Add entries: {entries:?}"
     );
+
+    let root = repo.path().to_path_buf();
+    let remove_root = root.clone();
+    let (removed_tx, removed_rx) = tokio::sync::oneshot::channel();
+    let root_hook =
+        fixture.on_project_scan(root.clone(), server::ScanPoint::ReadDirectory, move || {
+            fs::remove_dir_all(&remove_root).expect("remove project root during scan");
+            removed_tx
+                .send(())
+                .expect("root scan observer still waiting");
+        });
+    fs::write(root.join("trigger-root-scan"), "refresh").expect("trigger root scan");
+    tokio::time::timeout(Duration::from_secs(5), removed_rx)
+        .await
+        .expect("root scan must run")
+        .expect("root removed");
+    let error = expect_command_error(&mut fixture.client, "missing project root is fatal").await;
+    assert_eq!(error.operation, "project_watch");
+    assert_eq!(error.code, CommandErrorCode::Internal);
+    assert!(error.fatal);
+    assert!(error.message.contains("Failed to read directory"));
+    assert!(error.message.contains(root.to_str().unwrap()));
+    drop(root_hook);
 }
 
 #[tokio::test]
