@@ -13,7 +13,7 @@ use serde_json::Value;
 /// `protocol::TydeReleaseVersion`.
 pub use host_config::{LOCAL_HOST_ID, TydeReleaseVersion};
 
-pub const PROTOCOL_VERSION: u32 = 62;
+pub const PROTOCOL_VERSION: u32 = 63;
 
 // Exported verbatim to TydeMobileService by tools/export-mobile-rtc.py.
 pub mod mobile_rtc {
@@ -7416,7 +7416,24 @@ pub enum CommandErrorCode {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CommandErrorContext {
+    ProjectFile {
+        path: ProjectPath,
+    },
+    WorkbenchCreate {
+        parent_project_id: ProjectId,
+        branch: GitBranchName,
+    },
+    WorkbenchRemove {
+        project_id: ProjectId,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CommandErrorPayload {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<CommandErrorContext>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_id: Option<String>,
     pub stream: StreamPath,

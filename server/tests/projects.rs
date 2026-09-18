@@ -1904,6 +1904,10 @@ async fn project_read_file_outside_project_does_not_crash_host() {
         .expect("project_read_file failed");
 
     let error = expect_command_error(&mut fixture.client, "invalid absolute project read").await;
+    assert!(
+        matches!(&error.context, Some(protocol::CommandErrorContext::ProjectFile { path })
+        if path.relative_path == "/tmp/not-in-project.rs:12" && path.root.0 == project_root(&project, 0))
+    );
     assert_eq!(error.operation, "project_read_file");
     assert_eq!(error.code, CommandErrorCode::InvalidInput);
     assert!(

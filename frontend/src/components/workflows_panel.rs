@@ -675,6 +675,8 @@ pub fn WorkflowsPanel() -> impl IntoView {
 
     view! {
         <div class="workflows-panel">
+            <crate::notices::InlineNotices scopes=Signal::derive(move || active_host.get()
+                .map(|host| vec![crate::notices::NoticeScope::Workflows(host)]).unwrap_or_default()) />
             <div class="panel-header workflows-panel-header">
                 <div>
                     <div class="panel-title">"Workflows"</div>

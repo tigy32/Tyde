@@ -1226,7 +1226,7 @@ mod wasm_tests {
     //! CLAUDE.md).
 
     use super::*;
-    use crate::state::{AppState, ProjectInfo, WorkbenchRemovePrompt, sort_project_infos};
+    use crate::state::{AppState, ProjectInfo, sort_project_infos};
     use host_config::{ConfiguredHost, HostTransportConfig};
     use leptos::mount::mount_to;
     use protocol::{
@@ -1585,17 +1585,43 @@ mod wasm_tests {
                     protocol::StreamPath("/host/a".to_owned()),
                 );
             });
-            state
-                .workbench_remove_prompt
-                .set(Some(WorkbenchRemovePrompt {
-                    host_id: "host-a".to_owned(),
-                    project_id: ProjectId("wb-feat".to_owned()),
-                    project_name: "feature-login".to_owned(),
-                    message: "dirty root:\n?? implementation.md".to_owned(),
-                }));
+            crate::dispatch::clear_host_seqs("host-a");
+            crate::components::header::reset_user_notice_for_tests();
+            state.pending_workbench_removes.update(|pending| {
+                for (id, name) in [("wb-fix", "bugfix-x"), ("wb-feat", "feature-login")] {
+                    pending.push(crate::state::PendingWorkbenchRemove {
+                        host_id: "host-a".to_owned(),
+                        project_id: ProjectId(id.to_owned()),
+                        project_name: name.to_owned(),
+                        force: false,
+                    });
+                }
+            });
+            crate::dispatch::dispatch_envelope(
+                &state,
+                "host-a",
+                protocol::Envelope::from_payload(
+                    protocol::StreamPath("/host/a".to_owned()),
+                    protocol::FrameKind::CommandError,
+                    0,
+                    &protocol::CommandErrorPayload {
+                        context: Some(protocol::CommandErrorContext::WorkbenchRemove {
+                            project_id: ProjectId("wb-feat".to_owned()),
+                        }),
+                        request_id: None,
+                        stream: protocol::StreamPath("/host/a".to_owned()),
+                        request_kind: protocol::FrameKind::WorkbenchRemove,
+                        operation: "workbench_remove".to_owned(),
+                        code: protocol::CommandErrorCode::Conflict,
+                        message: "worktree roots are dirty:\n?? implementation.md".to_owned(),
+                        fatal: false,
+                    },
+                )
+                .unwrap(),
+            );
             state_signal.set_value(Some(state.clone()));
             provide_context(state);
-            view! { <ProjectRail /> }
+            view! { <crate::components::header::Header /> <ProjectRail /> }
         });
         next_tick().await;
 
@@ -1610,6 +1636,19 @@ mod wasm_tests {
                 .unwrap_or_default()
                 .contains("?? implementation.md")
         );
+        assert!(
+            modal.text_content().unwrap().contains("feature-login"),
+            "the error must not target the older pending workbench"
+        );
+        assert!(
+            container
+                .query_selector(".user-notice-banner")
+                .unwrap()
+                .is_none(),
+            "the removal dialog already owns this error"
+        );
+        assert!(state_signal.get_value().unwrap().pending_workbench_removes.with_untracked(|pending|
+            pending.len() == 1 && pending[0].project_id.0 == "wb-fix"));
         let buttons = modal.query_selector_all("button").unwrap();
         let labels = (0..buttons.length())
             .filter_map(|index| buttons.item(index)?.text_content())

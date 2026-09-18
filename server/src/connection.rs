@@ -746,7 +746,8 @@ async fn app_loop(resources: AppLoopResources) -> Result<(), FrameError> {
                     continue;
                 }
 
-                let request_stream = envelope.stream.clone();
+                let request_context = command_error_context(&envelope);
+        let request_stream = envelope.stream.clone();
                 let request_kind = envelope.kind;
                 let request_id = envelope
                     .payload
@@ -764,6 +765,7 @@ async fn app_loop(resources: AppLoopResources) -> Result<(), FrameError> {
                         request_stream,
                         request_kind,
                         request_id,
+                        request_context,
                         &error,
                     );
                     first_request.notify_one();
@@ -783,7 +785,7 @@ async fn app_loop(resources: AppLoopResources) -> Result<(), FrameError> {
                     });
                     if queue.try_send(envelope).is_err() {
                         let error = AppError::invalid("project_request", "project request queue is full or closed");
-                        emit_command_error(&host_output_stream, request_stream, request_kind, request_id, &error);
+                        emit_command_error(&host_output_stream, request_stream, request_kind, request_id, request_context, &error);
                     }
                     first_request.notify_one();
                     continue;
@@ -804,6 +806,7 @@ async fn app_loop(resources: AppLoopResources) -> Result<(), FrameError> {
                         request_stream,
                         request_kind,
                         request_id,
+                        request_context,
                         &error,
                     );
 
@@ -826,6 +829,7 @@ async fn route_project_requests(
     mut requests: mpsc::Receiver<Envelope>,
 ) {
     while let Some(envelope) = requests.recv().await {
+        let request_context = command_error_context(&envelope);
         let request_stream = envelope.stream.clone();
         let request_kind = envelope.kind;
         let request_id = envelope
@@ -836,7 +840,14 @@ async fn route_project_requests(
         if let Err(error) =
             route_client_envelope(&host, &host_stream, &output, &origin, envelope).await
         {
-            emit_command_error(&output, request_stream, request_kind, request_id, &error);
+            emit_command_error(
+                &output,
+                request_stream,
+                request_kind,
+                request_id,
+                request_context,
+                &error,
+            );
             if error.fatal {
                 cancel.cancel();
                 return;
@@ -876,11 +887,35 @@ fn is_high_volume_code_intel_frame(kind: FrameKind) -> bool {
     )
 }
 
+fn command_error_context(envelope: &Envelope) -> Option<protocol::CommandErrorContext> {
+    match envelope.kind {
+        FrameKind::ProjectReadFile => envelope
+            .parse_payload::<protocol::ProjectReadFilePayload>()
+            .ok()
+            .map(|payload| protocol::CommandErrorContext::ProjectFile { path: payload.path }),
+        FrameKind::WorkbenchCreate => envelope
+            .parse_payload::<protocol::WorkbenchCreatePayload>()
+            .ok()
+            .map(|payload| protocol::CommandErrorContext::WorkbenchCreate {
+                parent_project_id: payload.parent_project_id,
+                branch: payload.branch,
+            }),
+        FrameKind::WorkbenchRemove => envelope
+            .parse_payload::<protocol::WorkbenchRemovePayload>()
+            .ok()
+            .map(|payload| protocol::CommandErrorContext::WorkbenchRemove {
+                project_id: payload.id,
+            }),
+        _ => None,
+    }
+}
+
 pub(crate) fn emit_command_error(
     host_output_stream: &Stream,
     request_stream: protocol::StreamPath,
     request_kind: FrameKind,
     request_id: Option<String>,
+    context: Option<protocol::CommandErrorContext>,
     error: &AppError,
 ) {
     if let Some(source) = error.source.as_ref() {
@@ -908,6 +943,7 @@ pub(crate) fn emit_command_error(
 
     let mut payload = error.to_payload(request_stream, request_kind);
     payload.request_id = request_id;
+    payload.context = context;
     let payload = match serde_json::to_value(&payload) {
         Ok(value) => value,
         Err(err) => {

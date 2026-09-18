@@ -276,9 +276,9 @@ pub fn ChatView(
             let state = goal_action_state.clone();
             wasm_bindgen_futures::spawn_local(async move {
                 if let Err(error) =
-                    crate::actions::control_native_goal(&state, agent, control).await
+                    crate::actions::control_native_goal(&state, agent.clone(), control).await
                 {
-                    crate::components::header::report_user_error(&error);
+                    crate::notices::report_agent_error(&agent, &error);
                 }
             });
         }
@@ -905,6 +905,9 @@ pub fn ChatView(
 
     view! {
         <div class="chat-view">
+          <crate::notices::InlineNotices scopes=Signal::derive(move || agent_ref.get()
+              .map(|agent| vec![crate::notices::NoticeScope::Agent(agent.host_id, agent.agent_id)])
+              .unwrap_or_default()) />
           <div class="chat-view-body">
             <div class="chat-view-main">
             <Show

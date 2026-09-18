@@ -15644,3 +15644,9 @@ pre.tool-error-pre {
 .review-round-member p { margin: 6px 0; overflow-wrap: anywhere; }
 .review-round-finding { border-left: 2px solid var(--border-primary); padding-left: 10px; margin-top: 12px; }
 .review-round-finding small { color: var(--accent-link); }
+
+.inline-notice { display: flex; gap: 8px; align-items: flex-start; padding: 8px 10px; margin: 6px; border: 1px solid currentColor; border-radius: 4px; font-size: 12px; overflow-wrap: anywhere; }
+.inline-notice.error { color: var(--color-error, #e57560); }
+.inline-notice.warning { color: var(--color-warning, #d3a64d); }
+.inline-notice > span { flex: 1; min-width: 0; }
+.inline-notice > button { color: inherit; background: transparent; border: 0; cursor: pointer; }

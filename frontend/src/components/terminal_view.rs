@@ -23,6 +23,7 @@ pub fn TerminalView() -> impl IntoView {
     view! {
         <div class="terminal-view">
             <TerminalTabBar />
+            <crate::notices::InlineNotices scopes=vec![crate::notices::NoticeScope::Terminals] />
             <div class="terminal-body">
                 <Show when=show_empty>
                     <div class="terminal-empty">
@@ -74,7 +75,7 @@ fn TerminalTabBar() -> impl IntoView {
         ) {
             Ok(request) => request,
             Err(message) => {
-                crate::components::header::report_user_error(message);
+                crate::notices::report_error(crate::notices::NoticeScope::Terminals, message);
                 return;
             }
         };
@@ -315,6 +316,8 @@ fn TerminalTab(host_id: String, terminal_id: TerminalId) -> impl IntoView {
 
 #[component]
 fn TerminalContent(term: TerminalInfo) -> impl IntoView {
+    let notice_scope =
+        crate::notices::NoticeScope::Terminal(term.host_id.clone(), term.stream.clone());
     let state = expect_context::<AppState>();
     let stream = term.stream.clone();
     let tid = term.terminal_id.clone();
@@ -532,6 +535,7 @@ fn TerminalContent(term: TerminalInfo) -> impl IntoView {
                 <span class="terminal-info-text">{info_text}</span>
                 <span class=status_class>{status_text}</span>
             </div>
+            <crate::notices::InlineNotices scopes=vec![notice_scope] />
             <div class="terminal-xterm" node_ref=container_ref></div>
         </div>
     }
@@ -665,7 +669,126 @@ mod wasm_tests {
     }
 
     #[wasm_bindgen_test]
+    async fn terminal_exit_race_is_status_but_io_failure_is_visible() {
+        install_send_stub();
+        crate::components::header::reset_user_notice_for_tests();
+        crate::notices::clear_scope(&crate::notices::NoticeScope::Terminals);
+        let state = AppState::new();
+        crate::dispatch::prime_host_for_tests(&state, "terminal-notices");
+        let stream = StreamPath("/terminal/notice-terminal".to_owned());
+        let terminal_id = TerminalId("notice-terminal".to_owned());
+        crate::dispatch::dispatch_envelope(
+            &state,
+            "terminal-notices",
+            protocol::Envelope::from_payload(
+                stream.clone(),
+                FrameKind::TerminalBootstrap,
+                0,
+                &protocol::TerminalBootstrapPayload {
+                    terminal_id: terminal_id.clone(),
+                    start: protocol::TerminalStartPayload {
+                        project_id: None,
+                        root: None,
+                        cwd: "/repo".to_owned(),
+                        shell: "/bin/sh".to_owned(),
+                        cols: 80,
+                        rows: 24,
+                        created_at_ms: 0,
+                    },
+                },
+            )
+            .unwrap(),
+        );
+        state
+            .active_terminal
+            .set(Some(crate::state::ActiveTerminalRef {
+                host_id: "terminal-notices".to_owned(),
+                terminal_id,
+            }));
+        let container = make_container();
+        let view_state = state.clone();
+        let _handle = mount_to(container.clone(), move || {
+            provide_context(view_state);
+            view! { <crate::components::header::Header /> <TerminalView /> }
+        });
+        next_tick().await;
+        assert!(container.text_content().unwrap().contains("Running"));
+        crate::dispatch::dispatch_envelope(
+            &state,
+            "terminal-notices",
+            protocol::Envelope::from_payload(
+                stream.clone(),
+                FrameKind::TerminalError,
+                1,
+                &protocol::TerminalErrorPayload {
+                    code: protocol::TerminalErrorCode::NotRunning,
+                    message: "process exited before resize".to_owned(),
+                    fatal: false,
+                },
+            )
+            .unwrap(),
+        );
+        next_tick().await;
+        assert!(container.text_content().unwrap().contains("Exited"));
+        assert!(
+            container
+                .query_selector(".terminal-view [role=alert]")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            container
+                .query_selector(".user-notice-banner")
+                .unwrap()
+                .is_none()
+        );
+        crate::dispatch::dispatch_envelope(
+            &state,
+            "terminal-notices",
+            protocol::Envelope::from_payload(
+                stream,
+                FrameKind::TerminalError,
+                2,
+                &protocol::TerminalErrorPayload {
+                    code: protocol::TerminalErrorCode::IoFailed,
+                    message: "PTY write failed".to_owned(),
+                    fatal: true,
+                },
+            )
+            .unwrap(),
+        );
+        next_tick().await;
+        let error = container
+            .query_selector(".terminal-view [role=alert]")
+            .unwrap()
+            .expect("PTY failures remain visible locally");
+        assert!(error.text_content().unwrap().contains("PTY write failed"));
+        assert!(
+            container
+                .query_selector(".user-notice-banner")
+                .unwrap()
+                .is_none()
+        );
+        error
+            .query_selector("button")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap()
+            .click();
+        next_tick().await;
+        assert!(
+            container
+                .query_selector(".terminal-view [role=alert]")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[wasm_bindgen_test]
     async fn unavailable_home_terminal_explains_why() {
+        crate::components::header::reset_user_notice_for_tests();
+        crate::notices::clear_scope(&crate::notices::NoticeScope::Terminals);
         let container = make_container();
         let _handle = mount_to(container.clone(), move || {
             provide_context(AppState::new());
@@ -686,9 +809,16 @@ mod wasm_tests {
         next_tick().await;
 
         let banner = container
-            .query_selector(".user-notice-banner.error")
+            .query_selector(".terminal-view [role=alert]")
             .unwrap()
             .expect("terminal refusal must render a visible explanation");
+        assert!(
+            container
+                .query_selector(".user-notice-banner.error")
+                .unwrap()
+                .is_none(),
+            "terminal refusal belongs to the terminal, not the global header"
+        );
         let text = banner.text_content().unwrap_or_default();
         assert!(
             text.contains("no host is selected"),

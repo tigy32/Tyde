@@ -1794,7 +1794,14 @@ fn request_diff(state: &AppState, key: DiffKey) {
             context_mode,
             out_of_band: false,
         };
-        if let Err(e) = send_frame(&host_id, stream, FrameKind::ProjectReadDiff, &payload).await {
+        if let Err(e) = crate::send::send_frame_unreported(
+            &host_id,
+            stream,
+            FrameKind::ProjectReadDiff,
+            &payload,
+        )
+        .await
+        {
             log::error!("failed to send ProjectReadDiff: {e}");
             let is_current = failure_state
                 .diff_request_ids
@@ -2767,6 +2774,7 @@ mod wasm_tests {
             FrameKind::CommandError,
             0,
             &CommandErrorPayload {
+                context: None,
                 request_id: Some(request_id.clone()),
                 stream: StreamPath("/project/proj-1".to_owned()),
                 request_kind: FrameKind::ProjectReadDiff,

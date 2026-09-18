@@ -794,14 +794,13 @@ pub(crate) fn ReviewSidebar(
             if let Err(error) =
                 send_review_action_inner(&host, id, ReviewActionPayload::StopAiReview).await
             {
-                crate::components::header::report_user_error(format!(
-                    "Could not stop review: {error}"
-                ));
+                log::error!("Could not stop review: {error}");
             }
         });
     };
     view! {
         <div class="review-sidebar">
+            <crate::notices::InlineNotices scopes=vec![crate::notices::NoticeScope::Review(host_id.clone(), review_id.clone())] />
             <div class="review-sidebar-section">
                 <div class="review-ai-row">
                     <button

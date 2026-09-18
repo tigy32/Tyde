@@ -3438,6 +3438,7 @@ mod wasm_tests {
                 FrameKind::CommandError,
                 0,
                 &protocol::CommandErrorPayload {
+                    context: None,
                     request_id: None,
                     stream: StreamPath("/host/mobile-session-list-error".to_owned()),
                     request_kind: FrameKind::ListSessions,
@@ -4371,6 +4372,7 @@ mod wasm_tests {
                 FrameKind::CommandError,
                 1,
                 &CommandErrorPayload {
+                    context: None,
                     request_id: None,
                     stream: instance_stream.clone(),
                     request_kind: FrameKind::LoadAgent,
@@ -4427,6 +4429,7 @@ mod wasm_tests {
                 FrameKind::CommandError,
                 2,
                 &CommandErrorPayload {
+                    context: None,
                     request_id: None,
                     stream: instance_stream.clone(),
                     request_kind: FrameKind::LoadAgent,
@@ -4485,6 +4488,7 @@ mod wasm_tests {
                 FrameKind::CommandError,
                 1,
                 &CommandErrorPayload {
+                    context: None,
                     request_id: None,
                     stream: instance_stream.clone(),
                     request_kind: FrameKind::FetchSessionHistory,

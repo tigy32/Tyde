@@ -383,6 +383,8 @@ pub fn SessionsPanel() -> impl IntoView {
 
     view! {
         <div class="panel sessions-panel">
+            <crate::notices::InlineNotices scopes=Signal::derive(move || state.configured_hosts.get().into_iter()
+                .map(|host| crate::notices::NoticeScope::Sessions(host.id)).collect::<Vec<_>>()) />
             <div class="panel-search">
                 <input
                     type="text"

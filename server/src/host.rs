@@ -15503,6 +15503,7 @@ fn emit_spawn_operation_error(terminal: &SpawnOperationTerminal, error: &AppErro
         terminal.request_stream.clone(),
         FrameKind::SpawnAgent,
         None,
+        None,
         error,
     );
 }

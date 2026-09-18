@@ -3357,12 +3357,10 @@ pub struct ActiveTerminalRef {
 /// Upsert`. The dispatcher correlates by `(host_id, parent_project_id, branch)`
 /// — see §3.3 of `dev-docs/18-workbenches.md` — and on a match switches the
 /// active project to the new workbench id, then removes the entry. A
-/// `CommandError` for `WorkbenchCreate` marks the oldest non-failed entry for
-/// the host with the error message (the error carries no parent/branch
-/// correlation); the create modal consumes errored entries to surface the
-/// failure inline. Entries are time-bounded by
-/// [`PENDING_WORKBENCH_CREATE_TTL_MS`] so a mis-correlated or orphaned entry
-/// cannot linger and trigger a spurious active-project switch much later.
+/// `CommandError` matches the host, parent, and branch from typed resource
+/// context. The create modal consumes the matching error inline. Entries
+/// expire after [`PENDING_WORKBENCH_CREATE_TTL_MS`] so an orphaned request
+/// cannot trigger a spurious active-project switch much later.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PendingWorkbenchCreate {
     pub host_id: String,
@@ -3462,6 +3460,7 @@ pub struct WorkflowPanelError {
 /// closed tab.
 #[derive(Clone)]
 pub struct ComposerHandle {
+    pub error: ArcRwSignal<Option<String>>,
     pub text: ArcRwSignal<String>,
     pub backend_override: ArcRwSignal<Option<BackendKind>>,
     pub custom_agent_id: ArcRwSignal<Option<CustomAgentId>>,
@@ -3481,6 +3480,7 @@ pub struct ComposerHandle {
 impl Default for ComposerHandle {
     fn default() -> Self {
         Self {
+            error: ArcRwSignal::new(None),
             text: ArcRwSignal::new(String::new()),
             backend_override: ArcRwSignal::new(None),
             custom_agent_id: ArcRwSignal::new(None),
@@ -5462,11 +5462,6 @@ impl AppState {
             .get(&host_id)
             .cloned()
             .unwrap_or(ConnectionStatus::Disconnected)
-    }
-
-    pub fn selected_host_command_error(&self) -> Option<String> {
-        let host_id = self.selected_host_id.get()?;
-        self.command_errors_by_host.get().get(&host_id).cloned()
     }
 
     /// Apply a server-emitted Add-report shuffle suggestion notify. Each

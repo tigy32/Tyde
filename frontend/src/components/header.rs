@@ -38,6 +38,11 @@ thread_local! {
     static HELD_HOST_WARNING: RefCell<Option<HeldHostWarning>> = const { RefCell::new(None) };
 }
 
+#[cfg(all(test, target_arch = "wasm32"))]
+pub(crate) fn reset_user_notice_for_tests() {
+    USER_NOTICE.with(|notice| notice.set(None));
+}
+
 pub(crate) fn report_user_error(message: impl Into<String>) {
     let message = message.into();
     log::error!("user-visible error: {message}");
@@ -152,18 +157,13 @@ pub fn Header() -> impl IntoView {
 
         let selected = status_text_state.selected_host();
         let selected_status = status_text_state.selected_host_connection_status();
-        let selected_command_error = status_text_state.selected_host_command_error();
         let selected_label = selected
             .map(|host| host.label)
             .unwrap_or_else(|| "No host".to_string());
 
         match selected_status {
             ConnectionStatus::Connected => {
-                let base = format!("{connected}/{total} hosts connected · {selected_label}");
-                match selected_command_error {
-                    Some(error) => format!("{base} · last error: {error}"),
-                    None => base,
-                }
+                format!("{connected}/{total} hosts connected · {selected_label}")
             }
             ConnectionStatus::Reconnecting {
                 attempt,
@@ -350,8 +350,240 @@ mod wasm_tests {
     }
 
     fn reset_notices(host_id: &str) {
+        crate::notices::clear_host(host_id);
         resolve_host_warnings(host_id);
         USER_NOTICE.with(|notice| notice.set(None));
+    }
+
+    #[wasm_bindgen_test]
+    async fn project_degradation_is_local_not_a_failed_action() {
+        reset_notices("notice-host");
+        let container = make_container();
+        let state = connected_host_state("notice-host");
+        crate::dispatch::prime_host_for_tests(&state, "notice-host");
+        state
+            .active_project
+            .set(Some(crate::state::ActiveProjectRef {
+                host_id: "notice-host".to_owned(),
+                project_id: protocol::ProjectId("notice-project".to_owned()),
+            }));
+        let view_state = state.clone();
+        let _handle = mount_to(container.clone(), move || {
+            provide_context(view_state);
+            view! { <Header /> <crate::components::file_explorer::FileExplorer /> }
+        });
+        let error = protocol::CommandErrorPayload {
+            context: None,
+            request_id: None,
+            stream: protocol::StreamPath("/project/notice-project".to_owned()),
+            request_kind: protocol::FrameKind::ProjectFileList,
+            operation: "project_watch".to_owned(),
+            code: protocol::CommandErrorCode::Internal,
+            message: "Live project file updates are disabled. Increase the watch limit.".to_owned(),
+            fatal: false,
+        };
+        crate::dispatch::dispatch_envelope(
+            &state,
+            "notice-host",
+            protocol::Envelope::from_payload(
+                protocol::StreamPath("/host/notice-host".to_owned()),
+                protocol::FrameKind::CommandError,
+                0,
+                &error,
+            )
+            .unwrap(),
+        );
+        next_tick().await;
+        assert!(
+            container
+                .query_selector(".user-notice-banner")
+                .unwrap()
+                .is_none(),
+            "background degradation must not become a global failed-action banner"
+        );
+        let project = container.query_selector(".file-explorer").unwrap().unwrap();
+        let warning = project
+            .query_selector("[role=status]")
+            .unwrap()
+            .expect("the affected project must explain its degraded live updates");
+        assert!(
+            warning
+                .text_content()
+                .unwrap()
+                .contains("Increase the watch limit")
+        );
+        assert!(
+            !container
+                .query_selector("header")
+                .unwrap()
+                .unwrap()
+                .text_content()
+                .unwrap()
+                .contains("last error")
+        );
+        let first = crate::state::FileResourceKey {
+            host_id: "notice-host".to_owned(),
+            project_id: protocol::ProjectId("notice-project".to_owned()),
+            path: protocol::ProjectPath {
+                root: protocol::ProjectRootPath("/repo".to_owned()),
+                relative_path: "deleted.rs".to_owned(),
+            },
+        };
+        let mut second = first.clone();
+        second.path.relative_path = "still-loading.rs".to_owned();
+        state.pending_file_opens.update(|pending| {
+            pending.insert(first.clone(), crate::state::PendingFileOpen::RefreshInPlace);
+            pending.insert(
+                second.clone(),
+                crate::state::PendingFileOpen::RefreshInPlace,
+            );
+        });
+        let mut failure = error.clone();
+        failure.request_kind = protocol::FrameKind::ProjectReadFile;
+        failure.context = Some(protocol::CommandErrorContext::ProjectFile {
+            path: first.path.clone(),
+        });
+        failure.operation = "project_read_file".to_owned();
+        failure.message = "Could not read deleted.rs".to_owned();
+        for seq in 1..=2 {
+            crate::dispatch::dispatch_envelope(
+                &state,
+                "notice-host",
+                protocol::Envelope::from_payload(
+                    protocol::StreamPath("/host/notice-host".to_owned()),
+                    protocol::FrameKind::CommandError,
+                    seq,
+                    &failure,
+                )
+                .unwrap(),
+            );
+        }
+        next_tick().await;
+        assert_eq!(
+            project.query_selector_all("[role=alert]").unwrap().length(),
+            1,
+            "a repeated action failure should be shown once, in its project"
+        );
+        assert!(
+            project
+                .query_selector("[role=alert]")
+                .unwrap()
+                .unwrap()
+                .text_content()
+                .unwrap()
+                .contains("deleted.rs")
+        );
+        assert!(
+            !state
+                .pending_file_opens
+                .with_untracked(|pending| pending.contains_key(&first))
+        );
+        assert!(
+            state
+                .pending_file_opens
+                .with_untracked(|pending| pending.contains_key(&second)),
+            "one failed read must not release another file's in-flight reload"
+        );
+        assert!(
+            container
+                .query_selector(".user-notice-banner")
+                .unwrap()
+                .is_none()
+        );
+        state
+            .active_project
+            .set(Some(crate::state::ActiveProjectRef {
+                host_id: "notice-host".to_owned(),
+                project_id: protocol::ProjectId("other-project".to_owned()),
+            }));
+        next_tick().await;
+        assert!(
+            !project
+                .text_content()
+                .unwrap()
+                .contains("Increase the watch limit")
+        );
+        assert!(
+            !project
+                .text_content()
+                .unwrap()
+                .contains("Could not read deleted.rs")
+        );
+        state
+            .active_project
+            .set(Some(crate::state::ActiveProjectRef {
+                host_id: "notice-host".to_owned(),
+                project_id: first.project_id.clone(),
+            }));
+        next_tick().await;
+        assert!(
+            project
+                .text_content()
+                .unwrap()
+                .contains("Increase the watch limit")
+        );
+        crate::dispatch::dispatch_envelope(
+            &state,
+            "notice-host",
+            protocol::Envelope::from_payload(
+                protocol::StreamPath("/project/notice-project".to_owned()),
+                protocol::FrameKind::ProjectBootstrap,
+                0,
+                &protocol::ProjectBootstrapPayload {
+                    project: protocol::Project {
+                        id: first.project_id,
+                        name: "Notice project".to_owned(),
+                        sort_order: 0,
+                        source: protocol::ProjectSource::Standalone {
+                            roots: vec![protocol::ProjectRootPath("/repo".to_owned())],
+                        },
+                    },
+                    file_list: protocol::ProjectFileListPayload {
+                        incremental: false,
+                        roots: Vec::new(),
+                    },
+                    git_status: protocol::ProjectGitStatusPayload { roots: Vec::new() },
+                    review_summaries: Vec::new(),
+                },
+            )
+            .unwrap(),
+        );
+        next_tick().await;
+        assert!(
+            !project
+                .text_content()
+                .unwrap()
+                .contains("Increase the watch limit"),
+            "a fresh project subscription retires the previous degradation"
+        );
+        let mut uncorrelated = failure;
+        uncorrelated.context = None;
+        uncorrelated.stream = protocol::StreamPath("/host/notice-host".to_owned());
+        uncorrelated.request_kind = protocol::FrameKind::SpawnAgent;
+        uncorrelated.message = "The requested agent could not start".to_owned();
+        crate::dispatch::dispatch_envelope(
+            &state,
+            "notice-host",
+            protocol::Envelope::from_payload(
+                uncorrelated.stream.clone(),
+                protocol::FrameKind::CommandError,
+                3,
+                &uncorrelated,
+            )
+            .unwrap(),
+        );
+        next_tick().await;
+        assert!(
+            container
+                .query_selector(".user-notice-banner")
+                .unwrap()
+                .unwrap()
+                .text_content()
+                .unwrap()
+                .contains("could not start"),
+            "an uncorrelated spawn failure must not disappear into an unrelated sessions panel"
+        );
+        reset_notices("notice-host");
     }
 
     #[wasm_bindgen_test]

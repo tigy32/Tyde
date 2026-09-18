@@ -456,6 +456,10 @@ async fn workbench_create_rejects_path_collision_and_existing_branch() {
         .await
         .expect("workbench_create write failed");
     let error = expect_command_error(&mut fixture.client, "existing branch").await;
+    assert!(
+        matches!(&error.context, Some(protocol::CommandErrorContext::WorkbenchCreate { parent_project_id, branch })
+        if parent_project_id == &parent.id && branch.0 == "already-there")
+    );
     assert_eq!(error.operation, "workbench_create");
     assert_eq!(error.code, CommandErrorCode::Conflict);
     assert!(error.message.contains("already exists"));
@@ -521,6 +525,9 @@ async fn workbench_remove_rejects_dirty_worktree_unless_forced() {
         .await
         .expect("workbench_remove write failed");
     let error = expect_command_error(&mut fixture.client, "dirty worktree remove").await;
+    assert!(
+        matches!(&error.context, Some(protocol::CommandErrorContext::WorkbenchRemove { project_id }) if project_id == &workbench.id)
+    );
     assert_eq!(error.operation, "workbench_remove");
     assert_eq!(error.code, CommandErrorCode::Conflict);
     assert!(

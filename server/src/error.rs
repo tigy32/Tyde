@@ -86,6 +86,7 @@ impl AppError {
         request_kind: FrameKind,
     ) -> CommandErrorPayload {
         CommandErrorPayload {
+            context: None,
             request_id: None,
             stream: request_stream,
             request_kind,

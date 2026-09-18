@@ -1825,6 +1825,7 @@ async fn emit_project_command_error(
     fatal: bool,
 ) {
     let payload = CommandErrorPayload {
+        context: None,
         request_id: None,
         stream: stream.path().clone(),
         request_kind,

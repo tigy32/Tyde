@@ -272,6 +272,25 @@ pub async fn send_frame<T: Serialize>(
     kind: FrameKind,
     payload: &T,
 ) -> Result<(), String> {
+    let result = send_frame_unreported(host_id, stream.clone(), kind, payload).await;
+    if let Err(error) = &result {
+        crate::notices::report_send_failure(host_id, &stream, kind, error);
+    }
+    result
+}
+
+pub async fn send_frame_unreported<T: Serialize>(
+    host_id: &str,
+    stream: StreamPath,
+    kind: FrameKind,
+    payload: &T,
+) -> Result<(), String> {
+    let scope = crate::notices::request_scope(host_id, &stream, kind);
+    if !crate::notices::is_background_send(kind)
+        && let Some(scope) = &scope
+    {
+        crate::notices::clear_request(scope, kind);
+    }
     let _send_lock = acquire_send_lock(host_id, &stream).await;
     let reservation = reserve_seq(host_id, &stream);
     let seq = reservation.seq;
@@ -287,7 +306,6 @@ pub async fn send_frame<T: Serialize>(
         Err(error) => {
             release_seq_if_last(host_id, &stream, reservation);
             let error = error.to_string();
-            report_send_failure(host_id, kind, &error);
             return Err(error);
         }
     };
@@ -296,7 +314,6 @@ pub async fn send_frame<T: Serialize>(
         Err(error) => {
             release_seq_if_last(host_id, &stream, reservation);
             let error = error.to_string();
-            report_send_failure(host_id, kind, &error);
             return Err(error);
         }
     };
@@ -317,17 +334,9 @@ pub async fn send_frame<T: Serialize>(
                 kind,
                 e
             );
-            report_send_failure(host_id, kind, &e);
             Err(e)
         }
     }
-}
-
-fn report_send_failure(host_id: &str, kind: FrameKind, error: &str) {
-    let action = kind.to_string().replace('_', " ");
-    crate::components::header::report_user_error(format!(
-        "Tyde could not send “{action}” to host “{host_id}”. {error}"
-    ));
 }
 
 /// Send an Agents-view preference mutation to the primary local host. The

@@ -388,10 +388,10 @@ fn submit_chat_input(
                     "submit_chat_input: host stream missing for {host}",
                     host = pending.host_id
                 );
-                crate::components::header::report_user_error(format!(
+                composer.error.set(Some(format!(
                     "Tyde could not send the message because host “{}” is not connected.",
                     pending.host_id
-                ));
+                )));
                 return;
             };
             composer.text.set(String::new());
@@ -423,7 +423,11 @@ fn submit_chat_input(
         let restore_composer = composer.clone();
         let restore_draft = draft.clone();
         let restore_images = images.clone();
-        if spawn_new_chat(state, composer, text, payload_images, move |_| {
+        composer.error.set(None);
+        if spawn_new_chat(state, composer, text, payload_images, move |error| {
+            restore_composer
+                .error
+                .set(Some(format!("Could not start chat: {error}")));
             restore_submitted_input(
                 &restore_composer,
                 pending_images,
@@ -450,7 +454,8 @@ fn submit_chat_input(
         Some(stream) => stream,
         None => {
             log::error!("submit_chat_input: active agent stream missing");
-            crate::components::header::report_user_error(
+            crate::notices::report_agent_error(
+                &active_agent,
                 "Tyde could not send the message because the agent is no longer connected.",
             );
             return;
@@ -515,12 +520,13 @@ fn interrupt_target_turn(state: &AppState, agent_ref: Signal<Option<ActiveAgentR
     let Some(active_agent) = agent_ref.get_untracked() else {
         return;
     };
-    let host_id = active_agent.host_id;
+    let host_id = active_agent.host_id.clone();
 
     let instance_stream = match target_instance_stream(state, agent_ref) {
         Some(stream) => stream,
         None => {
-            crate::components::header::report_user_error(
+            crate::notices::report_agent_error(
+                &active_agent,
                 "Tyde could not cancel the turn because the agent is no longer connected.",
             );
             return;
@@ -591,16 +597,17 @@ fn steer_chat_input(
         return;
     }
 
-    let host_id = match agent_ref.get_untracked() {
-        Some(active_agent) => active_agent.host_id,
-        None => return,
+    let Some(active_agent) = agent_ref.get_untracked() else {
+        return;
     };
+    let host_id = active_agent.host_id.clone();
 
     let instance_stream = match target_instance_stream(state, agent_ref) {
         Some(stream) => stream,
         None => {
             log::error!("steer_chat_input: active agent stream missing");
-            crate::components::header::report_user_error(
+            crate::notices::report_agent_error(
+                &active_agent,
                 "Tyde could not steer the agent because it is no longer connected.",
             );
             return;
@@ -875,6 +882,7 @@ pub fn ChatInput(
         })
     });
     let composer = composer.unwrap_or_else(|| state.composer_untracked());
+    let action_error = composer.error.clone();
     let refresh_state = state.clone();
     let refresh_composer = composer.clone();
     let draft_host = Memo::new(move |_| {
@@ -1250,7 +1258,7 @@ pub fn ChatInput(
         spawn_local(async move {
             match crate::actions::control_native_goal(
                 &goal_state,
-                agent,
+                agent.clone(),
                 protocol::GoalControl::Set {
                     objective: objective.clone(),
                 },
@@ -1262,7 +1270,7 @@ pub fn ChatInput(
                         composer.text.set(String::new());
                     }
                 }
-                Err(error) => crate::components::header::report_user_error(&error),
+                Err(error) => crate::notices::report_agent_error(&agent, &error),
             }
         });
     });
@@ -1490,6 +1498,7 @@ pub fn ChatInput(
             on:dragleave=on_dragleave
             on:drop=on_drop
         >
+            <crate::notices::ActionError error=action_error />
             <Show when=move || usage_pause.get().is_some() && !is_terminated.get()>
                 <div class="chat-backend-notice" role="status">
                     <span>{move || if usage_pause.get().is_some_and(|pause| pause.compaction_failed) {

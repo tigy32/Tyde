@@ -9,6 +9,7 @@ mod dispatch;
 mod highlight_worker;
 mod line_source;
 mod markdown;
+mod notices;
 mod perf;
 mod send;
 mod state;

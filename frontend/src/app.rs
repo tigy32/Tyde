@@ -1166,10 +1166,10 @@ pub(crate) async fn install_host_listeners(
             }
             log::error!("host {} error: {}", event.host_id, event.message);
             let label = configured_host_label(&error_state, &event.host_id);
-            crate::components::header::report_user_error(reported_host_error_message(
-                label.as_deref(),
-                &event.message,
-            ));
+            log::warn!(
+                "{}",
+                reported_host_error_message(label.as_deref(), &event.message)
+            );
             error_state.connection_statuses.update(|statuses| {
                 statuses.insert(event.host_id, ConnectionStatus::Error(event.message));
             });
@@ -1374,10 +1374,10 @@ async fn connect_host_attempt(state: AppState, host_id: String, epoch: u64) {
             Err(error) => {
                 log::error!("failed to prepare remote host {}: {}", host_id, error);
                 if !recovering {
-                    crate::components::header::report_user_error(prepare_host_failure_message(
-                        target_label.as_deref(),
-                        &error,
-                    ));
+                    log::warn!(
+                        "{}",
+                        prepare_host_failure_message(target_label.as_deref(), &error)
+                    );
                 }
                 state.host_lifecycle_statuses.update(|statuses| {
                     statuses.insert(
@@ -1408,10 +1408,10 @@ async fn connect_host_attempt(state: AppState, host_id: String, epoch: u64) {
     if let Err(error) = connected {
         log::error!("failed to connect host {}: {}", host_id, error);
         if !recovering {
-            crate::components::header::report_user_error(connect_host_failure_message(
-                target_label.as_deref(),
-                &error,
-            ));
+            log::warn!(
+                "{}",
+                connect_host_failure_message(target_label.as_deref(), &error)
+            );
         }
         state.connection_statuses.update(|statuses| {
             statuses.insert(host_id, ConnectionStatus::Error(error));

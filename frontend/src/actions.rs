@@ -54,6 +54,7 @@ pub fn resume_session(
     // An explicit New Chat outranks a restore still waiting on its host.
     state.retire_pending_restores();
     state.open_tab(TabContent::empty_chat(), "New Chat".to_owned(), true);
+    let error_notice = state.composer_untracked().error;
     let state = state.clone();
     spawn_local(async move {
         // Both failure paths must be USER-visible: a silent failure here
@@ -62,10 +63,10 @@ pub fn resume_session(
         // beta.59 voice QA disconnects).
         let Some(host_stream) = state.host_stream_untracked(&host_id) else {
             log::error!("resume_session: host stream missing for {host_id}");
-            crate::components::header::report_user_error(format!(
+            error_notice.set(Some(format!(
                 "Tyde could not load the session because host “{host_id}” is not \
                  connected. Reconnect and pick the session again."
-            ));
+            )));
             return;
         };
         let payload = SpawnAgentPayload {
@@ -78,13 +79,19 @@ pub fn resume_session(
                 prompt: None,
             },
         };
-        if let Err(error) = send_frame(&host_id, host_stream, FrameKind::SpawnAgent, &payload).await
+        if let Err(error) = crate::send::send_frame_unreported(
+            &host_id,
+            host_stream,
+            FrameKind::SpawnAgent,
+            &payload,
+        )
+        .await
         {
             log::error!("failed to send SpawnAgent (resume): {error}");
-            crate::components::header::report_user_error(format!(
+            error_notice.set(Some(format!(
                 "Tyde could not load the session from host “{host_id}”: {error}. \
                  Reconnect and pick the session again."
-            ));
+            )));
         }
     });
 }
@@ -411,7 +418,13 @@ pub fn spawn_new_chat(
                 session_settings,
             },
         };
-        if let Err(error) = send_frame(&host_id, host_stream, FrameKind::SpawnAgent, &payload).await
+        if let Err(error) = crate::send::send_frame_unreported(
+            &host_id,
+            host_stream,
+            FrameKind::SpawnAgent,
+            &payload,
+        )
+        .await
         {
             pending_state.discard_pending_agent_session_settings(
                 &host_id,
@@ -1524,8 +1537,13 @@ pub fn create_workbench(
     };
     let state = state.clone();
     spawn_local(async move {
-        if let Err(error) =
-            send_frame(&host_id, host_stream, FrameKind::WorkbenchCreate, &payload).await
+        if let Err(error) = crate::send::send_frame_unreported(
+            &host_id,
+            host_stream,
+            FrameKind::WorkbenchCreate,
+            &payload,
+        )
+        .await
         {
             log::error!("failed to send WorkbenchCreate: {error}");
             // The request never reached the host: drop the pending entry so
@@ -1576,8 +1594,13 @@ pub fn remove_workbench(
     };
     let state = state.clone();
     spawn_local(async move {
-        if let Err(error) =
-            send_frame(&host_id, host_stream, FrameKind::WorkbenchRemove, &payload).await
+        if let Err(error) = crate::send::send_frame_unreported(
+            &host_id,
+            host_stream,
+            FrameKind::WorkbenchRemove,
+            &payload,
+        )
+        .await
         {
             log::error!("failed to send WorkbenchRemove: {error}");
             state.pending_workbench_removes.update(|entries| {
@@ -2312,6 +2335,10 @@ pub async fn control_native_goal(
     agent: ActiveAgentRef,
     control: protocol::GoalControl,
 ) -> Result<(), String> {
+    crate::notices::clear_request(
+        &crate::notices::NoticeScope::Agent(agent.host_id.clone(), agent.agent_id.clone()),
+        FrameKind::GoalControl,
+    );
     let stream = state
         .agents
         .with_untracked(|agents| {
@@ -2321,5 +2348,6 @@ pub async fn control_native_goal(
                 .map(|entry| entry.instance_stream.clone())
         })
         .ok_or_else(|| "Agent is no longer connected".to_owned())?;
-    send_frame(&agent.host_id, stream, FrameKind::GoalControl, &control).await
+    crate::send::send_frame_unreported(&agent.host_id, stream, FrameKind::GoalControl, &control)
+        .await
 }

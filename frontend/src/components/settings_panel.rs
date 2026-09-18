@@ -857,6 +857,7 @@ fn backend_page_matches_query(state: &AppState, kind: BackendKind, query: &str) 
 #[component]
 pub fn SettingsPanel() -> impl IntoView {
     let state = expect_context::<AppState>();
+    let notice_host = state.selected_host_id;
     let nav_state = state.clone();
     let host_group_title =
         Signal::derive(move || format!("Host · {}", selected_host_label(&nav_state)));
@@ -947,6 +948,11 @@ pub fn SettingsPanel() -> impl IntoView {
                         </nav>
 
                         <div class="settings-content">
+                            <crate::notices::InlineNotices scopes=Signal::derive(move || {
+                                let mut scopes = vec![crate::notices::NoticeScope::Settings(None)];
+                                if let Some(host) = notice_host.get() { scopes.push(crate::notices::NoticeScope::Settings(Some(host))); }
+                                scopes
+                            }) />
                             {move || match active_page.get() {
                                 SettingsPage::Tab(tab) => match tab {
                                     SettingsTab::Hosts => view! { <HostsTab /> }.into_any(),
@@ -4481,9 +4487,12 @@ fn commit_native_setting(
         log::error!(
             "cannot edit backend-native settings for {kind:?}: no current settings document"
         );
-        crate::components::header::report_user_error(format!(
-            "Tyde cannot edit {kind:?} settings because their current values have not loaded."
-        ));
+        crate::notices::report_settings_error(
+            state,
+            format!(
+                "Tyde cannot edit {kind:?} settings because their current values have not loaded."
+            ),
+        );
         return;
     };
     let root = match profile {
@@ -4513,16 +4522,22 @@ fn commit_native_setting(
                 log::error!(
                     "cannot edit {kind:?} settings: profile '{name}' is not in the current document"
                 );
-                crate::components::header::report_user_error(format!(
-                    "Tyde cannot edit profile “{name}” because it is no longer in the current {kind:?} settings."
-                ));
+                crate::notices::report_settings_error(
+                    state,
+                    format!(
+                        "Tyde cannot edit profile “{name}” because it is no longer in the current {kind:?} settings."
+                    ),
+                );
                 return;
             };
             let Some(original) = entry.get("settings").cloned() else {
                 log::error!("cannot edit {kind:?} settings: profile '{name}' has no settings");
-                crate::components::header::report_user_error(format!(
-                    "Tyde cannot edit profile “{name}” because its {kind:?} settings are missing."
-                ));
+                crate::notices::report_settings_error(
+                    state,
+                    format!(
+                        "Tyde cannot edit profile “{name}” because its {kind:?} settings are missing."
+                    ),
+                );
                 return;
             };
             let mut edited = original.clone();
@@ -4554,9 +4569,12 @@ fn commit_native_setting(
 fn send_native_settings_document(state: &AppState, kind: BackendKind, base: Value, root: Value) {
     let Some((host_id, host_stream)) = state.selected_host_stream_untracked() else {
         log::error!("cannot save backend-native settings for {kind:?}: no selected host stream");
-        crate::components::header::report_user_error(format!(
-            "Tyde cannot save {kind:?} settings because the selected host is not connected."
-        ));
+        crate::notices::report_settings_error(
+            state,
+            format!(
+                "Tyde cannot save {kind:?} settings because the selected host is not connected."
+            ),
+        );
         return;
     };
     // Guard the wire path: if a save against this same base is already in
@@ -4593,7 +4611,7 @@ fn send_native_settings_document(state: &AppState, kind: BackendKind, base: Valu
             backend: kind,
             settings: root,
         };
-        if let Err(error) = send_frame(
+        if let Err(error) = crate::send::send_frame_unreported(
             &host_id,
             host_stream,
             FrameKind::BackendNativeSettingsWrite,
@@ -4624,13 +4642,15 @@ fn send_tycode_profile_action(
     let kind = BackendKind::Tycode;
     let Some(base) = native_settings_root(state, kind) else {
         log::error!("cannot modify Tycode profiles: no current settings document");
-        crate::components::header::report_user_error(
+        crate::notices::report_settings_error(
+            state,
             "Tyde cannot change Tycode profiles because their current values have not loaded.",
         );
         return;
     };
     let Some((host_id, host_stream)) = state.selected_host_stream_untracked() else {
-        crate::components::header::report_user_error(
+        crate::notices::report_settings_error(
+            state,
             "Tyde cannot change Tycode profiles because the selected host is not connected.",
         );
         return;
@@ -4655,7 +4675,7 @@ fn send_tycode_profile_action(
             action: action.to_owned(),
             arguments,
         };
-        if let Err(error) = send_frame(
+        if let Err(error) = crate::send::send_frame_unreported(
             &host_id,
             host_stream,
             FrameKind::InvokeSettingsAction,
@@ -6811,7 +6831,8 @@ fn BackendCard(kind: BackendKind) -> impl IntoView {
             let input: web_sys::HtmlInputElement = target.unchecked_into();
             let Some(settings) = state.selected_host_settings_untracked() else {
                 log::error!("backend toggle fired before host settings loaded");
-                crate::components::header::report_user_error(
+                crate::notices::report_settings_error(
+                    &state,
                     "Tyde cannot change this backend yet because host settings are still loading.",
                 );
                 return;
@@ -6943,7 +6964,8 @@ fn BackendCard(kind: BackendKind) -> impl IntoView {
 fn send_run_backend_setup(state: &AppState, backend_kind: BackendKind, action: BackendSetupAction) {
     let Some((host_id, host_stream)) = state.selected_host_stream_untracked() else {
         log::error!("send_run_backend_setup called without a selected host stream");
-        crate::components::header::report_user_error(
+        crate::notices::report_settings_error(
+            state,
             "Tyde cannot run backend setup because the selected host is not connected.",
         );
         return;
@@ -7039,13 +7061,15 @@ fn send_host_change(
 ) {
     let Some((host_id, host_stream)) = state.selected_host_stream_untracked() else {
         log::error!("settings write requested without a selected host stream");
-        crate::components::header::report_user_error(
+        crate::notices::report_settings_error(
+            state,
             "Tyde cannot save this setting because the selected host is not connected.",
         );
         return;
     };
     let Some(settings) = state.selected_host_settings_untracked() else {
-        crate::components::header::report_user_error(
+        crate::notices::report_settings_error(
+            state,
             "Tyde cannot save this setting because its current value is unavailable.",
         );
         return;
@@ -7054,7 +7078,8 @@ fn send_host_change(
         Ok(doc) => doc,
         Err(error) => {
             log::error!("failed to serialize current settings: {error}");
-            crate::components::header::report_user_error(
+            crate::notices::report_settings_error(
+                state,
                 "Tyde could not prepare this settings change.",
             );
             return;
@@ -7064,7 +7089,8 @@ fn send_host_change(
         Ok(ops) => ops,
         Err(error) => {
             log::error!("failed to prepare settings write: {error}");
-            crate::components::header::report_user_error(
+            crate::notices::report_settings_error(
+                state,
                 "Tyde could not prepare this settings change.",
             );
             return;
@@ -7121,7 +7147,8 @@ pub(super) fn send_host_replace(
         Ok(value) => value,
         Err(error) => {
             log::error!("failed to serialize settings value: {error}");
-            crate::components::header::report_user_error(
+            crate::notices::report_settings_error(
+                state,
                 "Tyde could not prepare this settings change.",
             );
             return;
@@ -8905,16 +8932,18 @@ fn SkillsTab() -> impl IntoView {
     let on_refresh = move |_| {
         let Some(host_id) = state_for_refresh.selected_host_id.get_untracked() else {
             log::error!("skills: refresh clicked without a selected host");
-            crate::components::header::report_user_error(
+            crate::notices::report_settings_error(
+                &state_for_refresh,
                 "Tyde cannot refresh skills because no host is selected.",
             );
             return;
         };
         let Some((host_id, host_stream)) = host_stream_with_id(&state_for_refresh, &host_id) else {
             log::error!("skills: refresh clicked without a host stream");
-            crate::components::header::report_user_error(format!(
-                "Tyde cannot refresh skills because host “{host_id}” is not connected."
-            ));
+            crate::notices::report_settings_error(
+                &state_for_refresh,
+                format!("Tyde cannot refresh skills because host “{host_id}” is not connected."),
+            );
             return;
         };
         spawn_local(async move {
@@ -16063,6 +16092,7 @@ mod wasm_tests {
     /// the page stays stuck in "Saving…" forever.
     #[wasm_bindgen_test]
     async fn tycode_native_settings_server_rejection_unlocks_and_shows_error() {
+        crate::components::header::reset_user_notice_for_tests();
         let container = make_container();
         let state = AppState::new();
         // Prime the inbound validators first (this dispatches a synthetic
@@ -16090,7 +16120,9 @@ mod wasm_tests {
         let state_for_mount = state.clone();
         let _handle = mount_to(container.clone(), move || {
             provide_context(state_for_mount.clone());
-            view! { <BackendSettingsPage kind=BackendKind::Tycode /> }
+            view! { <crate::components::header::Header />
+            <crate::notices::InlineNotices scopes=vec![crate::notices::NoticeScope::Settings(Some("host-tyc-native".to_owned()))] />
+            <BackendSettingsPage kind=BackendKind::Tycode /> }
         });
         next_tick().await;
 
@@ -16150,6 +16182,20 @@ mod wasm_tests {
         assert!(
             !select.disabled(),
             "controls must unlock after a server rejection so the user can retry"
+        );
+        assert!(
+            container
+                .query_selector(".user-notice-banner")
+                .unwrap()
+                .is_none(),
+            "a native editor rejection must not also become a global failure"
+        );
+        assert!(
+            container
+                .query_selector(".inline-notice")
+                .unwrap()
+                .is_none(),
+            "the native editor already owns this failure; do not show it twice"
         );
     }
 

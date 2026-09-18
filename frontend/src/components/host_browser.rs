@@ -44,7 +44,8 @@ fn pick_initial_host(state: &AppState) -> Option<(String, StreamPath)> {
 pub fn open_project_browser(state: &AppState) {
     let Some((host_id, host_stream)) = pick_initial_host(state) else {
         log::error!("cannot open browser: no connected host available");
-        crate::components::header::report_user_error(
+        crate::notices::report_error(
+            crate::notices::NoticeScope::Browser,
             "Tyde cannot open the folder browser because no host is connected.",
         );
         return;
@@ -55,7 +56,8 @@ pub fn open_project_browser(state: &AppState) {
 pub fn open_add_root_browser(state: &AppState) {
     let Some(active_project) = state.active_project_ref_untracked() else {
         log::error!("cannot add a root without an active project");
-        crate::components::header::report_user_error(
+        crate::notices::report_error(
+            crate::notices::NoticeScope::Browser,
             "Tyde cannot add a folder because no project is active.",
         );
         return;
@@ -70,7 +72,8 @@ pub fn open_add_root_browser(state: &AppState) {
             "cannot add a root for project {}: workbench or parent-of-workbench",
             active_project.project_id
         );
-        crate::components::header::report_user_error(
+        crate::notices::report_error(
+            crate::notices::NoticeScope::Browser,
             "Folders cannot be changed for a workbench or for a project that currently has workbenches.",
         );
         return;
@@ -80,10 +83,13 @@ pub fn open_add_root_browser(state: &AppState) {
             "cannot add a root: host {} has no active stream",
             active_project.host_id
         );
-        crate::components::header::report_user_error(format!(
-            "Tyde cannot add a folder because host “{}” is not connected.",
-            active_project.host_id
-        ));
+        crate::notices::report_error(
+            crate::notices::NoticeScope::Browser,
+            format!(
+                "Tyde cannot add a folder because host “{}” is not connected.",
+                active_project.host_id
+            ),
+        );
         return;
     };
     open_browser_for(
@@ -102,6 +108,7 @@ fn open_browser_for(
     host_stream: StreamPath,
     purpose: BrowsePurpose,
 ) {
+    crate::notices::clear_scope(&crate::notices::NoticeScope::Browser);
     let browse_stream = new_browse_stream();
     let initial = match &purpose {
         BrowsePurpose::OpenProject => HostBrowseInitial::Home,
@@ -129,7 +136,7 @@ fn open_browser_for(
     let host_id_for_err = host_id.clone();
     let browse_stream_for_err = browse_stream.clone();
     spawn_local(async move {
-        if let Err(error) = send_frame(
+        if let Err(error) = crate::send::send_frame_unreported(
             &host_id,
             host_stream,
             FrameKind::HostBrowseStart,
@@ -162,7 +169,7 @@ fn send_list(
     let host_id_for_err = host_id.clone();
     let browse_stream_for_err = browse_stream.clone();
     spawn_local(async move {
-        if let Err(error) = send_frame(
+        if let Err(error) = crate::send::send_frame_unreported(
             &host_id,
             browse_stream.clone(),
             FrameKind::HostBrowseList,
@@ -212,6 +219,7 @@ fn surface_transport_error(
 }
 
 fn close_dialog(state: &AppState) {
+    crate::notices::clear_scope(&crate::notices::NoticeScope::Browser);
     let Some(dialog) = state.browse_dialog.get_untracked() else {
         return;
     };
@@ -287,7 +295,7 @@ fn switch_host(state: &AppState, dialog: &BrowseDialogState, new_host_id: String
     let new_host_id_for_task = new_host_id;
     let new_browse_stream_for_task = new_browse_stream;
     spawn_local(async move {
-        if let Err(error) = send_frame(
+        if let Err(error) = crate::send::send_frame_unreported(
             &new_host_id_for_task,
             new_host_stream,
             FrameKind::HostBrowseStart,
@@ -326,8 +334,17 @@ fn switch_host(state: &AppState, dialog: &BrowseDialogState, new_host_id: String
 #[component]
 pub fn HostBrowser() -> impl IntoView {
     let state = expect_context::<AppState>();
+    let dialog_open = state.browse_dialog;
 
     view! {
+        <Show when=move || dialog_open.get().is_none() && crate::notices::has_notice(&crate::notices::NoticeScope::Browser)>
+            <div class="browser-backdrop">
+                <div class="browser-modal" role="dialog" aria-label="Folder browser">
+                    <crate::notices::InlineNotices scopes=vec![crate::notices::NoticeScope::Browser] />
+                    <button type="button" on:click=move |_| crate::notices::clear_scope(&crate::notices::NoticeScope::Browser)>"Close"</button>
+                </div>
+            </div>
+        </Show>
         {move || {
             state.browse_dialog.with(|dialog| {
                 dialog.as_ref().map(|d| {
@@ -448,7 +465,8 @@ fn HostBrowserModal(dialog: BrowseDialogState) -> impl IntoView {
     let host_id_for_confirm = host_id_signal.clone();
     let on_confirm = move |_| {
         let Some(path) = current_path_for_confirm.get_untracked() else {
-            crate::components::header::report_user_error(
+            crate::notices::report_error(
+                crate::notices::NoticeScope::Browser,
                 "Tyde cannot use this folder because no folder is selected.",
             );
             return;
@@ -464,9 +482,12 @@ fn HostBrowserModal(dialog: BrowseDialogState) -> impl IntoView {
                 let host_id = host_id_for_confirm.get_untracked();
                 let Some(host_stream) = state_for_confirm.host_stream_untracked(&host_id) else {
                     log::error!("cannot create project without a connected dialog host");
-                    crate::components::header::report_user_error(format!(
-                        "Tyde cannot create the project because host “{host_id}” is not connected."
-                    ));
+                    crate::notices::report_error(
+                        crate::notices::NoticeScope::Browser,
+                        format!(
+                            "Tyde cannot create the project because host “{host_id}” is not connected."
+                        ),
+                    );
                     return;
                 };
                 spawn_local(async move {
@@ -490,9 +511,12 @@ fn HostBrowserModal(dialog: BrowseDialogState) -> impl IntoView {
                 let host_id = host_id_for_confirm.get_untracked();
                 let Some(host_stream) = state_for_confirm.host_stream_untracked(&host_id) else {
                     log::error!("cannot add root without a connected dialog host");
-                    crate::components::header::report_user_error(format!(
-                        "Tyde cannot add the folder because host “{host_id}” is not connected."
-                    ));
+                    crate::notices::report_error(
+                        crate::notices::NoticeScope::Browser,
+                        format!(
+                            "Tyde cannot add the folder because host “{host_id}” is not connected."
+                        ),
+                    );
                     return;
                 };
                 spawn_local(async move {
@@ -709,6 +733,7 @@ fn HostBrowserModal(dialog: BrowseDialogState) -> impl IntoView {
                 </div>
                 <div class="browser-host-row">{dropdown_view}</div>
                 <div class="browser-path">{path_display}</div>
+                <crate::notices::InlineNotices scopes=vec![crate::notices::NoticeScope::Browser] />
                 {error_view}
                 {loading_view}
                 <div class="browser-entries">{entries_view}</div>

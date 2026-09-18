@@ -331,6 +331,7 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                     payload.release_version.as_ref(),
                 );
             }
+            crate::notices::clear_host(host_id);
             state.command_errors_by_host.update(|errors| {
                 errors.remove(host_id);
             });
@@ -388,7 +389,13 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                 return;
             };
             match envelope.parse_payload::<ProjectBootstrapPayload>() {
-                Ok(payload) => apply_project_bootstrap(state, host_id, project_id, payload),
+                Ok(payload) => {
+                    crate::notices::clear_scope(&crate::notices::NoticeScope::Project(
+                        host_id.to_owned(),
+                        project_id.clone(),
+                    ));
+                    apply_project_bootstrap(state, host_id, project_id, payload);
+                }
                 Err(error) => report_dispatch_error(
                     state,
                     host_id,
@@ -553,7 +560,7 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                     payload.code,
                     payload.message
                 );
-                crate::components::header::report_user_error(message.clone());
+                crate::notices::report_command_error(state, host_id, &payload);
                 state.command_errors_by_host.update(|errors| {
                     errors.insert(host_id.to_string(), message);
                 });
@@ -616,23 +623,15 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                 // `ReviewEvent::Snapshot`, neither of which fires for
                 // a rejected request.
                 clear_review_pending_on_error(state, host_id, &payload);
-                // CommandError carries no parent/branch correlation — its
-                // `stream` is the host stream the request was sent on — so
-                // when creates under *different* parents run concurrently
-                // (the server lock is only per parent) we cannot tell which
-                // one failed. Best effort: mark the oldest in-flight entry
-                // for this host with the message so the create modal can
-                // surface it inline. Entries are additionally time-bounded
-                // (PENDING_WORKBENCH_CREATE_TTL_MS) so a mis-correlated or
-                // unconsumed entry cannot linger and cause a spurious
-                // active-project switch later.
                 if matches!(payload.request_kind, FrameKind::WorkbenchCreate) {
                     let now = crate::state::now_ms();
                     state.pending_workbench_creates.update(|pending| {
                         pending.retain(|p| !p.is_stale(now));
                         if let Some(entry) = pending
                             .iter_mut()
-                            .find(|p| p.host_id == host_id && p.error.is_none())
+                            .find(|p| p.host_id == host_id && p.error.is_none() && matches!(&payload.context,
+                                Some(protocol::CommandErrorContext::WorkbenchCreate { parent_project_id, branch })
+                                if &p.parent_project_id == parent_project_id && &p.branch == branch))
                         {
                             entry.error = Some(payload.message.clone());
                         }
@@ -642,7 +641,8 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                     let mut removal = None;
                     state.pending_workbench_removes.update(|pending| {
                         if let Some(index) =
-                            pending.iter().position(|entry| entry.host_id == host_id)
+                            pending.iter().position(|entry| entry.host_id == host_id && matches!(&payload.context,
+                                Some(protocol::CommandErrorContext::WorkbenchRemove { project_id }) if &entry.project_id == project_id))
                         {
                             removal = Some(pending.remove(index));
                         }
@@ -679,20 +679,18 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                         });
                     }
                 }
-                // A failed `ProjectReadFile` (e.g. the file was deleted on disk
-                // between a watcher-driven version bump and the refresh read)
-                // must release the in-flight refresh markers for this host.
-                // `CommandErrorPayload` carries no path, so this clears every
-                // `RefreshInPlace` marker (never a user-driven `Open` intent —
-                // those own tab placement): a marker left behind would block
-                // every future watcher-driven reload of its file, including the
-                // reload after the file is re-created.
-                if matches!(payload.request_kind, FrameKind::ProjectReadFile) {
+                if payload.request_kind == FrameKind::ProjectReadFile
+                    && let Some(protocol::CommandErrorContext::ProjectFile { path }) =
+                        &payload.context
+                    && let Some(project_id) = resolve_project_id(&payload.stream)
+                {
+                    let key = crate::state::FileResourceKey {
+                        host_id: host_id.to_owned(),
+                        project_id,
+                        path: path.clone(),
+                    };
                     state.pending_file_opens.update(|pending| {
-                        pending.retain(|key, intent| {
-                            !(key.host_id == host_id
-                                && matches!(intent, crate::state::PendingFileOpen::RefreshInPlace))
-                        });
+                        pending.remove(&key);
                     });
                 }
                 // Surface workflow command failures inline in the Workflows
@@ -754,6 +752,9 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
         FrameKind::SettingsWriteResult => {
             match envelope.parse_payload::<protocol::SettingsWriteResultPayload>() {
                 Ok(payload) if !payload.applied => {
+                    let inline = state.native_settings_save_state.with_untracked(|states| states.get(host_id)
+                        .is_some_and(|saves| saves.values().any(|save| matches!(save,
+                            NativeSettingsSaveState::Pending { write_id, .. } if write_id == &payload.write_id))));
                     apply_native_settings_write_result(state, host_id, &payload);
                     let message = payload
                         .field_errors
@@ -766,12 +767,21 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                     } else {
                         message
                     };
-                    crate::components::header::report_user_error(message.clone());
+                    if !inline {
+                        crate::notices::report_error(
+                            crate::notices::NoticeScope::Settings(Some(host_id.to_owned())),
+                            message.clone(),
+                        );
+                    }
                     state.command_errors_by_host.update(|errors| {
                         errors.insert(host_id.to_owned(), message);
                     });
                 }
                 Ok(payload) => {
+                    crate::notices::clear_request(
+                        &crate::notices::NoticeScope::Settings(Some(host_id.to_owned())),
+                        FrameKind::SettingsWrite,
+                    );
                     apply_native_settings_write_result(state, host_id, &payload);
                 }
                 Err(error) => report_dispatch_error(
@@ -2551,11 +2561,17 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
         FrameKind::TerminalError => match envelope.parse_payload::<TerminalErrorPayload>() {
             Ok(payload) => {
                 log::error!("terminal error ({:?}): {}", payload.code, payload.message);
-                crate::components::header::report_user_error(format!(
-                    "Terminal failed: {}",
-                    payload.message
-                ));
-                if payload.fatal {
+                let stopped = payload.code == protocol::TerminalErrorCode::NotRunning;
+                if !stopped {
+                    crate::notices::report_error(
+                        crate::notices::NoticeScope::Terminal(
+                            host_id.to_owned(),
+                            envelope.stream.clone(),
+                        ),
+                        format!("Terminal failed: {}", payload.message),
+                    );
+                }
+                if payload.fatal || stopped {
                     state.terminals.update(|terminals| {
                         if let Some(terminal) = terminals.iter_mut().find(|terminal| {
                             terminal.host_id == host_id && terminal.stream == envelope.stream
@@ -8753,6 +8769,9 @@ mod wasm_tests {
             FrameKind::CommandError,
             0,
             &CommandErrorPayload {
+                context: Some(protocol::CommandErrorContext::WorkbenchRemove {
+                    project_id: ProjectId("workbench-a".to_owned()),
+                }),
                 request_id: None,
                 stream: StreamPath("/host/local".to_owned()),
                 request_kind: FrameKind::WorkbenchRemove,
@@ -8797,6 +8816,7 @@ mod wasm_tests {
             FrameKind::CommandError,
             0,
             &CommandErrorPayload {
+                context: None,
                 request_id: None,
                 stream: StreamPath("/host/local".to_owned()),
                 request_kind: FrameKind::ListSessions,
@@ -8907,6 +8927,7 @@ mod wasm_tests {
             FrameKind::CommandError,
             0,
             &CommandErrorPayload {
+                context: None,
                 request_id: None,
                 stream: StreamPath("/host/local".to_owned()),
                 request_kind: FrameKind::DeleteSession,

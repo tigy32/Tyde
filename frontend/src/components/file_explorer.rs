@@ -183,6 +183,9 @@ pub fn FileExplorer() -> impl IntoView {
 
     view! {
         <div class="file-explorer">
+            <crate::notices::InlineNotices scopes=Signal::derive(move || state.active_project.get()
+                .map(|project| vec![crate::notices::NoticeScope::Project(project.host_id, project.project_id)])
+                .unwrap_or_default()) />
             <div class="fe-header">
                 <span class="fe-breadcrumb" title=move || project_header.get().map(|(_, title)| title).unwrap_or_default()>
                     {move || {

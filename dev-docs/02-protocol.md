@@ -320,7 +320,7 @@ The protocol must not swallow errors. Surfacing an error on a stream is not
 "softening" it; it is preserving diagnostics without turning a routine runtime
 failure into a connection-wide or process-wide outage.
 
-### 6.5 Banner audit (2026-09-17)
+### 6.5 Banner audit baseline (2026-09-17)
 
 The wire classifies **cause and stream liveness**, not notification placement.
 `CommandErrorCode` has `InvalidInput`, `NotFound`, `Conflict`, `Internal`, and
@@ -391,6 +391,51 @@ inline; show persistent degradation on the affected resource; reserve global
 banners for failures needing attention outside an owning view. Keep typed
 cause, retryability, liveness, and UI placement separate. This audit does not
 silently change the 42 call sites or declare their failures safe to discard.
+
+### 6.6 Scoped error presentation (2026-09-18)
+
+The audit above describes the pre-fix inventory. Desktop presentation now lives
+in `frontend/src/notices.rs`: settings, sessions, projects, chats, reviews,
+terminals, workflows, and the folder browser own their failures. Repeated
+failures replace the notice for that scope and operation; users can dismiss
+notices and retries clear the corresponding old notice. Existing native-save,
+diff, workflow, and workbench error surfaces are reused rather than duplicated.
+Draft transport send/resume failures stay with the originating composer's
+error state. Uncorrelated server-side spawn failures retain the global fallback:
+a host-level spawn error cannot safely identify a particular draft or session.
+
+Non-fatal `ProjectFileList` command errors are server-pushed subscription
+warnings, shown as project-local degraded status. A fresh project bootstrap
+clears the previous degradation. Fatal scan failures and rejected explicit
+operations remain errors. This uses typed frame kind and liveness, not message
+matching or the assumption that every non-fatal error is harmless.
+
+Terminal `NotRunning` transitions the terminal to Exited; actual PTY failures
+remain visible beside the terminal. Transport failures on resize, unsubscribe,
+cancellation cleanup, and access bookkeeping are logged without interruption.
+Host connection failures remain in the recoverable connection status, and a
+command failure no longer contaminates the header with a stale "last error".
+Startup failures and unclassified commands retain a global fallback so unknown
+failures are not silently discarded. Existing held SSH diagnostics are unchanged.
+
+Protocol 63 adds optional `CommandErrorContext`, containing only typed resource
+identity: `ProjectFile { path }`, `WorkbenchCreate { parent_project_id, branch }`,
+or `WorkbenchRemove { project_id }`. The server captures this context before
+routing the request; the client matches it with the originating host and stream.
+A failed file read releases only that file's pending marker, and workbench
+failures no longer pick the oldest unrelated request on the same host. No
+arbitrary request payload or secrets are echoed into error context. Cause codes
+and fatality remain independent of UI presentation; there is still no wire-level
+"show a banner" flag.
+
+The project-warning DOM regression fails on the old global-banner path. The
+extended flow checks local action errors, deduplication, project isolation,
+file-read correlation, and recovery. Terminal and native-settings DOM flows
+check that expected exit races are quiet and genuine failures remain visible
+without duplicate banners. Real-server protocol flows verify resource context.
+The terminal preflight test now asserts the same actionable message in its
+terminal view instead of pinning the old global-header placement, and explicitly
+asserts that no duplicate global banner appears.
 
 ---
 

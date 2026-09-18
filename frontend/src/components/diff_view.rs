@@ -393,7 +393,13 @@ pub fn DiffView(
         let failure_state = effect_state.clone();
         let failure_key = key.clone();
         spawn_local(async move {
-            if let Err(e) = send_frame(&host_id, stream, FrameKind::ProjectReadDiff, &payload).await
+            if let Err(e) = crate::send::send_frame_unreported(
+                &host_id,
+                stream,
+                FrameKind::ProjectReadDiff,
+                &payload,
+            )
+            .await
             {
                 log::error!("failed to send ProjectReadDiff on context-mode change: {e}");
                 let is_current = failure_state
@@ -4183,7 +4189,13 @@ fn request_expand_source(state: &AppState, expand: &DiffExpandContext) {
     let key = expand.key.clone();
     let state = state.clone();
     spawn_local(async move {
-        let Err(error) = send_frame(&host_id, stream, FrameKind::ProjectReadDiff, &payload).await
+        let Err(error) = crate::send::send_frame_unreported(
+            &host_id,
+            stream,
+            FrameKind::ProjectReadDiff,
+            &payload,
+        )
+        .await
         else {
             return;
         };
