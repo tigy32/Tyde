@@ -157,7 +157,7 @@ def stage(root: pathlib.Path, plan: dict, directory: pathlib.Path) -> dict:
     branch = f"release-cadence-{plan['tag']}"
     git(root, "worktree", "add", "-b", branch, str(candidate), plan["source"])
     bump(candidate, plan["tag"], f"Prepare {plan['tag']}",
-         f"Prepare the validated release candidate for {plan['tag']}.")
+         f"Prepare the release candidate for {plan['tag']}.")
     sha = git(candidate, "rev-parse", "HEAD")
     if source_digest(root, sha) != source_digest(root, plan["source"]):
         raise ValueError("release candidate changed more than version metadata")
@@ -194,8 +194,9 @@ def land(root: pathlib.Path, state: dict) -> None:
     landing = pathlib.Path(state["landing"])
     if git(candidate, "rev-parse", "HEAD") != state["release_sha"]:
         raise ValueError("release candidate moved after staging")
-    validate(root, candidate)
-    subprocess.run(["tools/release_check.sh", state["tag"]], cwd=candidate, check=True)
+    if state["action"] != "beta":
+        validate(root, candidate)
+        subprocess.run(["tools/release_check.sh", state["tag"]], cwd=candidate, check=True)
     clean(candidate)
     if landing != candidate:
         validate(root, landing)
@@ -211,7 +212,9 @@ def land(root: pathlib.Path, state: dict) -> None:
     run(candidate, sys.executable, "tools/check_release_version.py", state["tag"])
     verify_plan(root, state)
     git(root, "merge", "--ff-only", landing_sha)
-    validate(root, root)
+    if state["action"] != "beta":
+        validate(root, root)
+    clean(root)
     for path, branch in dict([(str(candidate), state["branch"]),
                               (str(landing), state["landing_branch"])]).items():
         git(root, "worktree", "remove", path)

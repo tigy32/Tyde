@@ -106,9 +106,14 @@ to `0.9.5-beta.0`; the next beta with source changes is `0.9.5-beta.1`. The
 `.0` is bookkeeping, not a published beta. Older beta tags in the current cycle
 can be selected even when newer changes have already landed.
 
-Every prepared snapshot passes `./dev.sh check` and the release-coherence
-guard; each landing workbench and clean main also passes `./dev.sh check`. The workflow then atomically pushes main and the annotated tag,
-and explicitly dispatches the Release workflow with the expected tag SHA.
+Nightly beta preparation only changes version metadata and does not rerun
+`./dev.sh check` or the local release guard. Implementation changes still need
+the mandatory workbench and clean-main validation before they reach upstream.
+Stable promotion retains `./dev.sh check` and the release-coherence guard for
+the selected snapshot, plus `./dev.sh check` for the landing workbench and clean
+main. Both paths require clean trees, unchanged source, coherent versions, and
+main ancestry. The workflow atomically pushes main and the annotated tag, then
+explicitly dispatches the Release workflow with the expected tag SHA.
 Dispatch is necessary because pushes using `GITHUB_TOKEN` do not trigger another
 workflow. Release builds verify tag ancestry/version/SHA and never overwrite a
 published release. Stable builds retain the existing stable updater behavior;

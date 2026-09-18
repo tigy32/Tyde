@@ -124,14 +124,25 @@ if [ "${CADENCE_FAIL_BRANCH:-}" = "$(git branch --show-current)" ]; then exit 19
         state_path, state = self.stage()
         self.assertEqual(self.git("rev-parse", "HEAD"), before)
         self.assertEqual(self.git("rev-parse", "origin/main"), before)
+        source = pathlib.Path(state["candidate"]) / "application.txt"
+        original = source.read_text()
+        source.write_text("uncommitted candidate change\n")
+        result = self.tool("land", "--state", str(state_path), "--confirm", ok=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.git("rev-parse", "HEAD"), before)
+        source.write_text(original)
+        state_path.write_text(json.dumps({**state, "tag": "v1.2.3-beta.11"}))
+        result = self.tool("land", "--state", str(state_path), "--confirm", ok=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.git("rev-parse", "HEAD"), before)
+        self.assertEqual(self.git("tag", "--list", plan["tag"]), "")
+        state_path.write_text(json.dumps(state))
         self.tool("land", "--state", str(state_path), "--confirm")
         self.assertEqual(self.git("rev-parse", "HEAD"), state["release_sha"])
         self.assertEqual(self.git("status", "--porcelain"), "")
         self.assertFalse(pathlib.Path(state["candidate"]).exists())
-        log = (self.directory / "checks").read_text().splitlines()
-        self.assertEqual(len(log), 3)
-        self.assertTrue(log[0].startswith("release-cadence-v1.2.3-beta.10 "))
-        self.assertTrue(log[2].startswith("main "))
+        self.assertFalse((self.directory / "checks").exists(),
+                         "Nightly beta bookkeeping must not rerun repository validation")
         self.assertEqual(self.git("rev-parse", "origin/main"), before, "Landing alone must not push")
         self.git("tag", "-a", plan["tag"], "-m", "Beta")
         self.sync()
@@ -191,12 +202,12 @@ if [ "${CADENCE_FAIL_BRANCH:-}" = "$(git branch --show-current)" ]; then exit 19
         self.sync()
         self.assertEqual(self.plan()["tag"], "v1.2.4-beta.1")
 
-    def test_failed_gates_and_moved_main_never_land(self):
+    def test_failed_promotion_gates_and_moved_main_never_land(self):
         (self.root / "application.txt").write_text("new code\n")
         self.commit("Change source")
         self.sync()
         before = self.git("rev-parse", "HEAD")
-        self.plan()
+        self.plan("v1.2.3-beta.2")
         state_path, state = self.stage()
         result = self.tool("land", "--state", str(state_path), "--confirm", ok=False,
                            env={**self.env, "CADENCE_FAIL_BRANCH": state["branch"]})
@@ -213,7 +224,7 @@ if [ "${CADENCE_FAIL_BRANCH:-}" = "$(git branch --show-current)" ]; then exit 19
         self.assertEqual(self.git("status", "--porcelain"), "")
         self.assertNotEqual(self.plan(ok=False).returncode, 0, "Unpushed main must not be released")
 
-    def test_execute_pushes_validated_main_and_tag_before_dispatch(self):
+    def test_execute_pushes_beta_main_and_tag_without_checks_before_dispatch(self):
         self.plan()
         self.tool("execute", "--plan", str(self.plan_path), "--directory",
                   str(self.directory / "unused"), "--confirm")
@@ -237,6 +248,8 @@ if [ "${CADENCE_FAIL_BRANCH:-}" = "$(git branch --show-current)" ]; then exit 19
         env = {**self.env, "PATH": f"{binary}:{self.env['PATH']}"}
         self.tool("execute", "--plan", str(self.plan_path), "--directory",
                   str(self.directory / "run"), "--confirm", env=env)
+        self.assertFalse((self.directory / "checks").exists(),
+                         "Beta execution must not invoke the full suite or local release guard")
         sha = self.git("rev-parse", f"{plan['tag']}^{{commit}}")
         self.assertEqual(self.git("rev-parse", "origin/main"), sha)
         remote = self.git("ls-remote", "origin", f"refs/tags/{plan['tag']}^{{}}")

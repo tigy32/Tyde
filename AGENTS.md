@@ -247,6 +247,13 @@ DST), only when source changes exist since the last beta. A failed unpublished
 beta can be retried without creating a new version. Version bookkeeping alone
 does not trigger a beta. This does not authorize agents to cut ad hoc releases.
 
+Nightly beta cuts are version-only release bookkeeping and do not rerun
+`./dev.sh check` or the local release guard. They retain clean-tree, source,
+version, ancestry, and upstream-race checks before pushing main and the tag.
+This exception applies only to beta preparation in Release cadence, not to
+implementation workbench/main validation, stable promotion, or manual release
+cuts through the local release guard.
+
 Stable promotion is **always the user's decision**. Ask for the exact beta to
 promote, then use `./dev.sh release promote vX.Y.Z-beta.N --confirm` only after
 approval. It rebuilds that beta's source with version `X.Y.Z`, without newer
