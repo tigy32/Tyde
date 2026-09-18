@@ -79,7 +79,20 @@ fn install_app_height_probe() {
         return;
     };
     std::mem::forget(listen_for_app_height(&window));
-    install_document_scroll_guard(&window);
+}
+
+fn schedule_app_height_frame(
+    window: &web_sys::Window,
+    pending: &std::cell::Cell<Option<i32>>,
+    callback: &wasm_bindgen::closure::Closure<dyn FnMut()>,
+) {
+    if pending.get().is_none() {
+        pending.set(
+            window
+                .request_animation_frame(callback.as_ref().unchecked_ref())
+                .ok(),
+        );
+    }
 }
 
 fn listen_for_app_height(window: &web_sys::Window) -> impl FnOnce() {
@@ -87,23 +100,47 @@ fn listen_for_app_height(window: &web_sys::Window) -> impl FnOnce() {
     let pending_frame = std::rc::Rc::new(std::cell::Cell::new(None));
     let frame_pending = pending_frame.clone();
     let frame_target = window.clone();
-    let on_frame = wasm_bindgen::closure::Closure::<dyn FnMut()>::new(move || {
-        frame_pending.set(None);
-        apply_app_height(&frame_target);
-        log::debug!("Mobile viewport animation frame; {}", viewport_metrics());
-    });
+    let on_frame = std::rc::Rc::new(wasm_bindgen::closure::Closure::<dyn FnMut()>::new(
+        move || {
+            frame_pending.set(None);
+            apply_app_height(&frame_target);
+            log::debug!("Mobile viewport animation frame; {}", viewport_metrics());
+        },
+    ));
+    // Match Tychat's bounded settling window: Home Screen keyboard geometry
+    // can finish changing after both its resize event and the first frame.
+    let timers = std::rc::Rc::new([50, 150, 300, 600].map(|delay| {
+        let handle = std::rc::Rc::new(std::cell::Cell::new(None::<i32>));
+        let timer_handle = handle.clone();
+        let timer_target = window.clone();
+        let timer_pending = pending_frame.clone();
+        let timer_frame = on_frame.clone();
+        let callback = wasm_bindgen::closure::Closure::<dyn FnMut()>::new(move || {
+            timer_handle.set(None);
+            apply_app_height(&timer_target);
+            log::debug!("Mobile viewport settle {delay}ms; {}", viewport_metrics());
+            schedule_app_height_frame(&timer_target, &timer_pending, &timer_frame);
+        });
+        (delay, handle, callback)
+    }));
     let resize_target = window.clone();
     let resize_pending = pending_frame.clone();
+    let resize_timers = timers.clone();
     let on_resize = wasm_bindgen::closure::Closure::<dyn FnMut(web_sys::Event)>::new(
         move |event: web_sys::Event| {
             apply_app_height(&resize_target);
             log::debug!("Mobile viewport {}; {}", event.type_(), viewport_metrics());
-            // WebKit can fire resize before updating its height (bug 254861).
-            // Keep the immediate keyboard response, then read the settled frame.
-            if resize_pending.get().is_none() {
-                resize_pending.set(
+            schedule_app_height_frame(&resize_target, &resize_pending, &on_frame);
+            for (delay, handle, callback) in resize_timers.iter() {
+                if let Some(previous) = handle.take() {
+                    resize_target.clear_timeout_with_handle(previous);
+                }
+                handle.set(
                     resize_target
-                        .request_animation_frame(on_frame.as_ref().unchecked_ref())
+                        .set_timeout_with_callback_and_timeout_and_arguments_0(
+                            callback.as_ref().unchecked_ref(),
+                            *delay,
+                        )
                         .ok(),
                 );
             }
@@ -114,7 +151,13 @@ fn listen_for_app_height(window: &web_sys::Window) -> impl FnOnce() {
         (window.clone().into(), "resize"),
     ];
     if let Some(viewport) = window.visual_viewport() {
-        targets.push((viewport.into(), "resize"));
+        targets.push((viewport.clone().into(), "resize"));
+        targets.push((viewport.into(), "scroll"));
+    }
+    if let Some(document) = window.document() {
+        for event in ["focusin", "focusout", "visibilitychange"] {
+            targets.push((document.clone().into(), event));
+        }
     }
     for (target, event) in &targets {
         let _ = target.add_event_listener_with_callback(event, on_resize.as_ref().unchecked_ref());
@@ -123,6 +166,11 @@ fn listen_for_app_height(window: &web_sys::Window) -> impl FnOnce() {
     move || {
         if let Some(frame) = pending_frame.take() {
             let _ = cleanup_window.cancel_animation_frame(frame);
+        }
+        for (_, handle, _) in timers.iter() {
+            if let Some(timer) = handle.take() {
+                cleanup_window.clear_timeout_with_handle(timer);
+            }
         }
         for (target, event) in targets {
             let _ = target
@@ -262,6 +310,14 @@ fn clamp_to_paintable(published: f64, paintable: Option<f64>) -> f64 {
 }
 
 fn apply_app_height(window: &web_sys::Window) {
+    // The transcript owns scrolling, never the document. Restore a leftover
+    // reveal pan before sampling, even when WebKit omitted a scroll event.
+    if let Ok(offset) = window.scroll_y()
+        && offset.abs() > 0.5
+    {
+        log::debug!("Mobile viewport resetting document scroll_y={offset}");
+        window.scroll_to_with_x_and_y(0.0, 0.0);
+    }
     let viewport = window.visual_viewport();
     let measured = viewport
         .as_ref()
@@ -327,29 +383,6 @@ fn apply_app_height(window: &web_sys::Window) {
     }
 }
 
-/// The shell never scrolls as a whole — the transcript is the only scroller —
-/// so a non-zero document scroll offset is always the browser panning the page
-/// to reveal the focused composer. Sizing the shell to the visible viewport
-/// removes the reason to pan; this undoes any pan that still happens (WebKit
-/// can scroll before it reports the matching viewport resize) so the header is
-/// never left stranded off screen.
-fn install_document_scroll_guard(window: &web_sys::Window) {
-    let Some(viewport) = window.visual_viewport() else {
-        return;
-    };
-    let guard_target = window.clone();
-    let on_scroll = wasm_bindgen::closure::Closure::<dyn FnMut()>::new(move || {
-        if guard_target
-            .scroll_y()
-            .is_ok_and(|offset| offset.abs() > 0.5)
-        {
-            guard_target.scroll_to_with_x_and_y(0.0, 0.0);
-        }
-    });
-    let _ = viewport.add_event_listener_with_callback("scroll", on_scroll.as_ref().unchecked_ref());
-    on_scroll.forget();
-}
-
 /// Viewport and chrome geometry for the browser console, without chat content.
 fn viewport_metrics() -> String {
     let Some(window) = web_sys::window() else {
@@ -388,6 +421,7 @@ fn viewport_metrics() -> String {
         .and_then(|element| element.dyn_into::<web_sys::HtmlElement>().ok())
         .and_then(|root| root.style().get_property_value("--app-height").ok())
         .unwrap_or_default();
+    let scroll_y = window.scroll_y().unwrap_or(-1.0);
     let baseline_height = VIEWPORT_BASELINE.with(|cell| cell.get().1);
     let document = window.document();
     let root = document
@@ -418,7 +452,7 @@ fn viewport_metrics() -> String {
     format!(
         "viewport: inner_h={inner_height} visual_h={visual_height} screen_h={screen_height} \
          client_h={client_height} standalone={standalone} app_height={app_height} \
-         keyboard={keyboard} baseline_h={baseline_height} visual_top={visual_top} shell_bottom={shell_bottom} \
+         keyboard={keyboard} scroll_y={scroll_y} baseline_h={baseline_height} visual_top={visual_top} shell_bottom={shell_bottom} \
          dock_bottom={dock_bottom} dock_inset={dock_inset}"
     )
 }
@@ -601,7 +635,46 @@ mod wasm_tests {
             viewport_metrics()
         );
 
+        // The installed app can finish dismissal after the resize event and
+        // its first animation frame. Tychat keeps sampling across this window.
+        input.focus().unwrap();
+        visible_height.set(keyboard_height);
+        viewport
+            .dispatch_event(&web_sys::Event::new("resize").unwrap())
+            .unwrap();
+        tyde_time::sleep(std::time::Duration::from_millis(700)).await;
+        input.blur().unwrap();
+        next_frame().await;
+        tyde_time::sleep(std::time::Duration::from_millis(100)).await;
+        visible_height.set(full_height);
+        tyde_time::sleep(std::time::Duration::from_millis(650)).await;
+        next_frame().await;
+        let settled_bottom = dock.get_bounding_client_rect().bottom();
+        wasm_bindgen_test::console_log!(
+            "Home Screen late dismissal: before={initial_bottom} restored={settled_bottom}; {}",
+            viewport_metrics()
+        );
+
+        let spacer = document.create_element("div").unwrap();
+        spacer
+            .set_attribute("style", "height:calc(100vh + 200px)")
+            .unwrap();
+        document.body().unwrap().append_child(&spacer).unwrap();
+        window.scroll_to_with_x_and_y(0.0, 40.0);
+        let panned = window.scroll_y().unwrap();
+        window
+            .dispatch_event(&web_sys::Event::new("resize").unwrap())
+            .unwrap();
+        next_frame().await;
+        let recovered_scroll = window.scroll_y().unwrap();
+        wasm_bindgen_test::console_log!(
+            "Document reveal pan: before={panned} restored={recovered_scroll}"
+        );
+        // Tear down with settle timers still pending to catch leaked listeners
+        // or callbacks changing the next mounted screen.
         cleanup();
+        spacer.remove();
+        window.scroll_to_with_x_and_y(0.0, 0.0);
         if original.is_undefined() {
             js_sys::Reflect::delete_property(viewport.as_ref(), &"height".into()).unwrap();
         } else {
@@ -643,6 +716,18 @@ mod wasm_tests {
         assert!(
             (initial_bottom - window_restored_bottom).abs() <= 1.0,
             "a window resize must restore the tabs without a visual resize: before={initial_bottom} after={window_restored_bottom}"
+        );
+        assert!(
+            (initial_bottom - settled_bottom).abs() <= 1.0,
+            "focus-only dismissal must restore tabs when dimensions settle after the first frame: before={initial_bottom} after={settled_bottom}"
+        );
+        assert!(
+            panned > 1.0,
+            "the document must really scroll before recovery"
+        );
+        assert!(
+            recovered_scroll.abs() <= 0.5,
+            "a viewport sample must clear the document reveal pan: {recovered_scroll}"
         );
     }
 
