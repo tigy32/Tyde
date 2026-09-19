@@ -205,9 +205,10 @@ input, textarea, select {
    shell ends exactly at the keyboard and the transcript stays the only
    scroller.
 
-   main.rs sets data-keyboard-open only on a >100px drop from the tallest
-   viewport seen at the current width, so a short standalone-launch reading is
-   never mistaken for a keyboard and still takes the max() path above. */
+   main.rs sets data-keyboard-open only while more than 100px of the layout
+   viewport's bottom edge is occluded in the current sample, so a short
+   standalone-launch reading is never mistaken for a keyboard and still takes
+   the max() path above. */
 html[data-keyboard-open] .mobile-app {
     height: var(--app-height, 100dvh);
 }

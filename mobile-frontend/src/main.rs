@@ -64,12 +64,14 @@ fn main() {
 ///    the app scrolls off screen. The measurement has to *lower* the shell.
 ///
 /// A plain `max()` serves 1 and breaks 2; a plain `min()` does the reverse. So
-/// we do not classify by the height itself but by its DELTA: track the tallest
-/// visual viewport seen at the current width (the baseline) and treat a drop of
-/// more than `KEYBOARD_MIN_INSET_PX` as the keyboard. A short but *stable*
-/// reading — the bogus standalone-launch measurement — establishes the baseline
-/// instead of looking like a keyboard, so case 1 still resolves through the
-/// `max()` floor in CSS and only case 2 shrinks the shell.
+/// the keyboard is measured the way Tychat measures it, from the CURRENT sample
+/// alone: the part of the layout viewport the visual viewport no longer covers
+/// at its bottom edge (`innerHeight - visualViewport.height - offsetTop`). More
+/// than `KEYBOARD_MIN_INSET_PX` of that is the keyboard and shrinks the shell;
+/// anything else — including the bogus standalone-launch measurement, where
+/// both viewports are short together — resolves through the `max()` floor in
+/// CSS. Nothing is remembered between samples, so a transient reading taken
+/// while the keyboard animates cannot leave the shell believing it is open.
 ///
 /// This must run from the app (not the bundle's index.html): the production
 /// loader injects only stylesheet links and the entry script, so inline markup
@@ -184,27 +186,19 @@ fn listen_for_app_height(window: &web_sys::Window) -> impl FnOnce() {
 /// (~300px+), so this cleanly separates the two without measuring the keyboard.
 const KEYBOARD_MIN_INSET_PX: f64 = 100.0;
 
-thread_local! {
-    /// `(width, tallest height seen at that width)`.
-    static VIEWPORT_BASELINE: std::cell::Cell<(f64, f64)> =
-        const { std::cell::Cell::new((0.0, 0.0)) };
-}
-
-/// The tallest visual viewport seen at this width. A width change (rotation) or
-/// the absence of any prior baseline restarts it: heights are not comparable
-/// across orientations, and carrying a landscape baseline into portrait would
-/// read as a permanently open keyboard.
-fn next_baseline(previous: (f64, f64), width: f64, height: f64) -> f64 {
-    let (previous_width, previous_baseline) = previous;
-    if previous_baseline <= 0.0 || (previous_width - width).abs() > 1.0 {
-        height
-    } else {
-        previous_baseline.max(height)
+/// How much of the layout viewport's bottom edge the visual viewport no longer
+/// covers. `offset_top` is a browser reveal pan: it moves the visible region
+/// down the layout viewport, so it is not occlusion. A pinch zoom shrinks the
+/// visual viewport without covering anything and never becomes keyboard state.
+fn keyboard_inset(inner_height: f64, visual_height: f64, offset_top: f64, scale: f64) -> f64 {
+    if scale > 1.0 {
+        return 0.0;
     }
+    (inner_height - visual_height - offset_top).round().max(0.0)
 }
 
-fn keyboard_is_open(baseline: f64, height: f64) -> bool {
-    baseline - height > KEYBOARD_MIN_INSET_PX
+fn keyboard_is_open(inset: f64) -> bool {
+    inset > KEYBOARD_MIN_INSET_PX
 }
 
 /// The largest viewport shortfall we are willing to blame on the standalone
@@ -333,8 +327,6 @@ fn apply_app_height(window: &web_sys::Window) {
     let Some(height) = measured else {
         return;
     };
-    // Width only ever selects which baseline is in play, so a browser that
-    // reports no width simply keeps one baseline for every orientation.
     let width = viewport
         .as_ref()
         .map(web_sys::VisualViewport::width)
@@ -347,12 +339,21 @@ fn apply_app_height(window: &web_sys::Window) {
                 .filter(usable)
         })
         .unwrap_or(0.0);
-
-    let baseline = VIEWPORT_BASELINE.with(|cell| {
-        let baseline = next_baseline(cell.get(), width, height);
-        cell.set((width, baseline));
-        baseline
-    });
+    let offset_top = viewport
+        .as_ref()
+        .map(web_sys::VisualViewport::offset_top)
+        .filter(|value| value.is_finite())
+        .unwrap_or(0.0)
+        .max(0.0);
+    let inset = match (
+        &viewport,
+        window.inner_height().ok().and_then(|v| v.as_f64()),
+    ) {
+        (Some(viewport), Some(inner_height)) if usable(&inner_height) => {
+            keyboard_inset(inner_height, height, offset_top, viewport.scale())
+        }
+        _ => 0.0,
+    };
 
     let Some(root) = window
         .document()
@@ -361,7 +362,7 @@ fn apply_app_height(window: &web_sys::Window) {
     else {
         return;
     };
-    let keyboard = keyboard_is_open(baseline, height);
+    let keyboard = keyboard_is_open(inset);
     // Only an installed app with the keyboard closed can be short for the
     // standalone reason; in a browser the missing height belongs to chrome the
     // app must stay clear of, and with the keyboard up the measurement is the
@@ -370,6 +371,9 @@ fn apply_app_height(window: &web_sys::Window) {
         Some((screen_width, screen_height)) if !keyboard && is_standalone_display(window) => {
             recovered_standalone_height(height, width, screen_width, screen_height)
         }
+        // A reveal pan moves the visible region down the layout viewport, so
+        // the shell has to reach the visible bottom, not just match its height.
+        _ if keyboard => height + offset_top,
         _ => height,
     };
     let published = clamp_to_paintable(measured_or_recovered, paintable_height(&root));
@@ -422,7 +426,6 @@ fn viewport_metrics() -> String {
         .and_then(|root| root.style().get_property_value("--app-height").ok())
         .unwrap_or_default();
     let scroll_y = window.scroll_y().unwrap_or(-1.0);
-    let baseline_height = VIEWPORT_BASELINE.with(|cell| cell.get().1);
     let document = window.document();
     let root = document
         .as_ref()
@@ -434,6 +437,16 @@ fn viewport_metrics() -> String {
         .visual_viewport()
         .map(|viewport| viewport.offset_top())
         .unwrap_or(-1.0);
+    let visual_scale = window
+        .visual_viewport()
+        .map(|viewport| viewport.scale())
+        .unwrap_or(-1.0);
+    let inset = keyboard_inset(
+        inner_height,
+        visual_height,
+        visual_top.max(0.0),
+        visual_scale,
+    );
     let bottom = |selector| {
         document
             .as_ref()
@@ -452,7 +465,7 @@ fn viewport_metrics() -> String {
     format!(
         "viewport: inner_h={inner_height} visual_h={visual_height} screen_h={screen_height} \
          client_h={client_height} standalone={standalone} app_height={app_height} \
-         keyboard={keyboard} scroll_y={scroll_y} baseline_h={baseline_height} visual_top={visual_top} shell_bottom={shell_bottom} \
+         keyboard={keyboard} keyboard_inset={inset} scroll_y={scroll_y} visual_top={visual_top} visual_scale={visual_scale} shell_bottom={shell_bottom} \
          dock_bottom={dock_bottom} dock_inset={dock_inset}"
     )
 }
@@ -532,7 +545,6 @@ mod wasm_tests {
             .into_iter()
             .map(|name| (name, root.get_attribute(name)))
             .collect();
-        let baseline = VIEWPORT_BASELINE.with(|cell| cell.replace((0.0, 0.0)));
         root.remove_attribute("data-keyboard-open").unwrap();
         root.set_attribute("data-theme", "dark").unwrap();
         root.style()
@@ -655,6 +667,26 @@ mod wasm_tests {
             viewport_metrics()
         );
 
+        // Dismissal can report a viewport taller than the layout viewport
+        // before it settles. A sample taken inside that window must not leave
+        // the shell believing the keyboard is still open once it has.
+        visible_height.set(full_height + 150.0);
+        viewport
+            .dispatch_event(&web_sys::Event::new("resize").unwrap())
+            .unwrap();
+        next_frame().await;
+        visible_height.set(full_height);
+        viewport
+            .dispatch_event(&web_sys::Event::new("resize").unwrap())
+            .unwrap();
+        next_frame().await;
+        let after_transient_bottom = dock.get_bounding_client_rect().bottom();
+        let keyboard_after_transient = root.has_attribute("data-keyboard-open");
+        wasm_bindgen_test::console_log!(
+            "Tall transient: before={initial_bottom} after={after_transient_bottom}; {}",
+            viewport_metrics()
+        );
+
         let spacer = document.create_element("div").unwrap();
         spacer
             .set_attribute("style", "height:calc(100vh + 200px)")
@@ -695,7 +727,6 @@ mod wasm_tests {
                 root.remove_attribute(name).unwrap();
             }
         }
-        VIEWPORT_BASELINE.with(|cell| cell.set(baseline));
 
         assert!(
             (initial_bottom - (full_height - 26.0)).abs() <= 1.0,
@@ -722,6 +753,10 @@ mod wasm_tests {
             "focus-only dismissal must restore tabs when dimensions settle after the first frame: before={initial_bottom} after={settled_bottom}"
         );
         assert!(
+            !keyboard_after_transient && (initial_bottom - after_transient_bottom).abs() <= 1.0,
+            "a transient tall reading must not strand the tabs in keyboard state: before={initial_bottom} after={after_transient_bottom} keyboard={keyboard_after_transient}"
+        );
+        assert!(
             panned > 1.0,
             "the document must really scroll before recovery"
         );
@@ -738,35 +773,26 @@ mod wasm_tests {
 
     #[wasm_bindgen_test]
     fn keyboard_shrinkage_is_recognized() {
-        let baseline = next_baseline((0.0, 0.0), WIDTH, TALL);
-        assert_eq!(
-            baseline, TALL,
-            "the first measurement establishes the baseline"
-        );
         assert!(
-            !keyboard_is_open(baseline, TALL),
+            !keyboard_is_open(keyboard_inset(TALL, TALL, 0.0, 1.0)),
             "a full-height viewport is not a keyboard"
         );
-
-        let baseline = next_baseline((WIDTH, baseline), WIDTH, WITH_KEYBOARD);
-        assert_eq!(baseline, TALL, "the keyboard must not lower the baseline");
         assert!(
-            keyboard_is_open(baseline, WITH_KEYBOARD),
+            keyboard_is_open(keyboard_inset(TALL, WITH_KEYBOARD, 0.0, 1.0)),
             "a {}px drop must read as the keyboard",
             TALL - WITH_KEYBOARD
         );
     }
 
     /// The regression that made the floor-only design necessary in the first
-    /// place: a standalone launch can report a bogus SHORT height. It is short
-    /// but stable, so it becomes the baseline rather than looking like a
+    /// place: a standalone launch can report a bogus SHORT height. Both
+    /// viewports are short together, so nothing is occluded and it is not a
     /// keyboard — otherwise the shell would collapse at launch.
     #[wasm_bindgen_test]
     fn a_short_launch_measurement_is_not_a_keyboard() {
-        let baseline = next_baseline((0.0, 0.0), WIDTH, 180.0);
         assert!(
-            !keyboard_is_open(baseline, 180.0),
-            "a short first measurement must establish the baseline, not a keyboard"
+            !keyboard_is_open(keyboard_inset(180.0, 180.0, 0.0, 1.0)),
+            "a short launch measurement must not read as a keyboard"
         );
     }
 
@@ -775,27 +801,32 @@ mod wasm_tests {
     /// merely scrolling.
     #[wasm_bindgen_test]
     fn browser_chrome_is_not_a_keyboard() {
-        let baseline = next_baseline((0.0, 0.0), WIDTH, TALL);
-        let with_url_bar = TALL - 90.0;
-        let baseline = next_baseline((WIDTH, baseline), WIDTH, with_url_bar);
         assert!(
-            !keyboard_is_open(baseline, with_url_bar),
+            !keyboard_is_open(keyboard_inset(TALL, TALL - 90.0, 0.0, 1.0)),
             "a 90px chrome change must not read as the keyboard"
         );
     }
 
-    /// Rotation changes the width, and a landscape baseline carried into
-    /// portrait would look like a permanently open keyboard.
+    /// A landscape height followed by a portrait one used to need the history
+    /// restarted; with none kept, each orientation is judged on its own.
     #[wasm_bindgen_test]
-    fn rotation_restarts_the_baseline() {
-        let landscape = next_baseline((0.0, 0.0), TALL, WIDTH);
-        assert_eq!(landscape, WIDTH);
-
-        let portrait = next_baseline((TALL, landscape), WIDTH, TALL);
-        assert_eq!(portrait, TALL, "a width change must restart the baseline");
+    fn rotation_does_not_read_as_a_keyboard() {
+        assert!(!keyboard_is_open(keyboard_inset(WIDTH, WIDTH, 0.0, 1.0)));
         assert!(
-            !keyboard_is_open(portrait, TALL),
+            !keyboard_is_open(keyboard_inset(TALL, TALL, 0.0, 1.0)),
             "rotating must not leave the shell believing a keyboard is open"
+        );
+    }
+
+    /// A reveal pan moves the visible region down the layout viewport; only
+    /// what is still covered below it is the keyboard. A pinch zoom shrinks
+    /// the visual viewport without covering anything.
+    #[wasm_bindgen_test]
+    fn pans_and_zoom_are_not_keyboard_occlusion() {
+        assert_eq!(keyboard_inset(TALL, WITH_KEYBOARD, 100.0, 1.0), 236.0);
+        assert!(
+            !keyboard_is_open(keyboard_inset(TALL, TALL / 2.0, 0.0, 2.0)),
+            "a pinch zoom must never become keyboard state"
         );
     }
 
@@ -849,15 +880,24 @@ mod wasm_tests {
         );
     }
 
-    /// Closing the keyboard must restore the shell: the baseline is retained,
-    /// so the full-height measurement reads as closed again.
+    /// Closing the keyboard must restore the shell, whatever was sampled on
+    /// the way: a reading taller than the layout viewport is not remembered.
     #[wasm_bindgen_test]
     fn closing_the_keyboard_restores_full_height() {
-        let baseline = next_baseline((0.0, 0.0), WIDTH, TALL);
-        let baseline = next_baseline((WIDTH, baseline), WIDTH, WITH_KEYBOARD);
-        let baseline = next_baseline((WIDTH, baseline), WIDTH, TALL);
+        assert!(keyboard_is_open(keyboard_inset(
+            TALL,
+            WITH_KEYBOARD,
+            0.0,
+            1.0
+        )));
+        assert!(!keyboard_is_open(keyboard_inset(
+            TALL,
+            TALL + 150.0,
+            0.0,
+            1.0
+        )));
         assert!(
-            !keyboard_is_open(baseline, TALL),
+            !keyboard_is_open(keyboard_inset(TALL, TALL, 0.0, 1.0)),
             "the shell must return to full height once the keyboard closes"
         );
     }
