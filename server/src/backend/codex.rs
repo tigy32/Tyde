@@ -2096,12 +2096,22 @@ impl CodexSession {
             .ok_or_else(|| format!("Codex {method} response missing thread.id"))?
             .to_string();
         let session_id = SessionId(thread_id.clone());
-        let strict_response_splitting = method == "thread/start";
-        let mut response_splitters = HashMap::new();
-        response_splitters.insert(
-            thread_id.clone(),
-            CodexResponseSplitter::new(&thread_id, strict_response_splitting),
-        );
+        let projection = match method {
+            "thread/start" => {
+                CodexResponseProjection::Responses(Box::new(CodexResponseSplitter::new(&thread_id)))
+            }
+            "thread/fork" => CodexResponseProjection::Items {
+                last_token_usage: None,
+            },
+            _ => {
+                return Err(format!(
+                    "Codex response projection is undefined for {method}"
+                ));
+            }
+        };
+        let strict_response_splitting = matches!(projection, CodexResponseProjection::Responses(_));
+        let mut response_projections = HashMap::new();
+        response_projections.insert(thread_id.clone(), projection);
 
         let model = thread_response
             .get("model")
@@ -2120,7 +2130,7 @@ impl CodexSession {
             emitter,
             state: Mutex::new(initial_codex_state(
                 thread_id,
-                response_splitters,
+                response_projections,
                 model,
                 config.access_mode,
                 config.execution_mode,
@@ -3045,8 +3055,121 @@ struct ClosedCodexProviderResponse {
     failed: bool,
 }
 
+#[derive(Clone, Copy, Debug)]
+enum CodexResponseEvent {
+    Started(CodexProviderItemKind),
+    Delta(CodexProviderItemKind),
+    Completed(CodexProviderItemKind),
+    ReasoningPartAdded,
+}
+
+impl CodexResponseEvent {
+    fn from_notification(method: &str, params: &Value) -> Option<Self> {
+        match method {
+            "item/started" | "item/completed" => {
+                let kind = match params.pointer("/item/type").and_then(Value::as_str)? {
+                    "agentMessage" => CodexProviderItemKind::AgentMessage,
+                    "reasoning" => CodexProviderItemKind::Reasoning,
+                    _ => return None,
+                };
+                Some(if method == "item/started" {
+                    Self::Started(kind)
+                } else {
+                    Self::Completed(kind)
+                })
+            }
+            "item/agentMessage/delta" => Some(Self::Delta(CodexProviderItemKind::AgentMessage)),
+            "item/reasoning/summaryPartAdded" => Some(Self::ReasoningPartAdded),
+            method if is_reasoning_notification_method(method) => {
+                Some(Self::Delta(CodexProviderItemKind::Reasoning))
+            }
+            method
+                if method.starts_with("codex/event/")
+                    && extract_codex_event_type(method, params)
+                        .is_some_and(|event_type| is_codex_event_reasoning_type(&event_type)) =>
+            {
+                Some(Self::Delta(CodexProviderItemKind::Reasoning))
+            }
+            _ => None,
+        }
+    }
+}
+
+enum CodexResponseDispatch {
+    Other,
+    ProviderItem,
+    ProviderResponse,
+}
+
+#[derive(Debug)]
+enum CodexResponseProjectionError {
+    ThreadId,
+    Projection,
+    Emitter,
+    OpenResponse,
+    TextDelta,
+}
+
+impl std::fmt::Display for CodexResponseProjectionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::ThreadId => "response notification omitted its thread id",
+            Self::Projection => "response notification has no registered projection",
+            Self::Emitter => "response notification has no registered emitter",
+            Self::OpenResponse => "response projection lost its open provider response",
+            Self::TextDelta => "response delta omitted its text",
+        })
+    }
+}
+
+enum CodexResponseProjection {
+    Responses(Box<CodexResponseSplitter>),
+    Items { last_token_usage: Option<Value> },
+}
+
+impl CodexResponseProjection {
+    fn responses(&self) -> Option<&CodexResponseSplitter> {
+        match self {
+            Self::Responses(splitter) => Some(splitter),
+            Self::Items { .. } => None,
+        }
+    }
+
+    fn responses_mut(&mut self) -> Option<&mut CodexResponseSplitter> {
+        match self {
+            Self::Responses(splitter) => Some(splitter),
+            Self::Items { .. } => None,
+        }
+    }
+
+    fn token_usage_boundary_reached(&mut self, usage: Option<&Value>) -> bool {
+        match self {
+            Self::Responses(splitter) => splitter.token_usage_boundary_reached(usage),
+            Self::Items { last_token_usage } => {
+                *last_token_usage = usage.cloned();
+                false
+            }
+        }
+    }
+
+    fn last_token_usage(&self) -> Option<&Value> {
+        match self {
+            Self::Responses(splitter) => splitter.last_token_usage.as_ref(),
+            Self::Items { last_token_usage } => last_token_usage.as_ref(),
+        }
+    }
+
+    fn for_child(&self, thread_id: &str) -> Self {
+        match self {
+            Self::Responses(_) => Self::Responses(Box::new(CodexResponseSplitter::new(thread_id))),
+            Self::Items { .. } => Self::Items {
+                last_token_usage: None,
+            },
+        }
+    }
+}
+
 struct CodexResponseSplitter {
-    enabled: bool,
     stream_epoch: u64,
     next_ordinal: u64,
     open: Option<OpenCodexProviderResponse>,
@@ -3089,9 +3212,8 @@ struct FinalizedCodexProviderResponse {
 }
 
 impl CodexResponseSplitter {
-    fn new(thread_id: &str, enabled: bool) -> Self {
+    fn new(thread_id: &str) -> Self {
         Self {
-            enabled,
             stream_epoch: codex_generated_identity_epoch(thread_id),
             next_ordinal: 1,
             open: None,
@@ -3124,9 +3246,6 @@ impl CodexResponseSplitter {
         &mut self,
         turn_id: Option<&str>,
     ) -> Option<(Option<CodexProviderResponseIdentity>, ChatMessageId)> {
-        if !self.enabled {
-            return None;
-        }
         let opened = if self.open.is_none() {
             let identity = CodexProviderResponseIdentity {
                 origin: CodexProviderResponseOrigin::IdlessProviderResponseItem,
@@ -3491,9 +3610,6 @@ impl CodexResponseSplitter {
         arguments: Value,
         tool_type: Value,
     ) -> Option<u32> {
-        if !self.enabled {
-            return None;
-        }
         // Opens the response rather than requiring one: a resumed thread gets no
         // raw events, so nothing else has opened it, and bailing here is what
         // sent every tool down the one-card-per-tool path.
@@ -4297,7 +4413,7 @@ enum CodexNotificationOwner {
 struct CodexState {
     thread_id: String,
     workspace_roots_override: Option<Vec<String>>,
-    response_splitters: HashMap<String, CodexResponseSplitter>,
+    response_projections: HashMap<String, CodexResponseProjection>,
     pending_resume_thread_id: Option<String>,
     effective_model: Option<String>,
     model_override: Option<String>,
@@ -4431,7 +4547,7 @@ fn codex_review_target(args: &str) -> Value {
 
 fn initial_codex_state(
     thread_id: String,
-    response_splitters: HashMap<String, CodexResponseSplitter>,
+    response_projections: HashMap<String, CodexResponseProjection>,
     model: Option<String>,
     access_mode: BackendAccessMode,
     execution_mode: BackendExecutionMode,
@@ -4439,13 +4555,14 @@ fn initial_codex_state(
     subagent_emitter: Option<Arc<dyn SubAgentEmitter>>,
 ) -> CodexState {
     let generated_identity_epoch = codex_generated_identity_epoch(&thread_id);
-    let strict_response_splitting = response_splitters
-        .get(&thread_id)
-        .is_some_and(|splitter| splitter.enabled);
+    let strict_response_splitting = matches!(
+        response_projections.get(&thread_id),
+        Some(CodexResponseProjection::Responses(_))
+    );
     CodexState {
         thread_id,
         workspace_roots_override: None,
-        response_splitters,
+        response_projections,
         pending_resume_thread_id: None,
         effective_model: model,
         model_override: None,
@@ -4855,8 +4972,9 @@ impl CodexInner {
         };
         let mut state = self.state.lock().await;
         let owner = state
-            .response_splitters
+            .response_projections
             .get(&thread_id)
+            .and_then(CodexResponseProjection::responses)
             .and_then(|splitter| splitter.raw_tool_owner(call_id));
         let Some(owner) = owner else {
             return Vec::new();
@@ -4940,7 +5058,11 @@ impl CodexInner {
                 );
             }
         }
-        if let Some(splitter) = state.response_splitters.get_mut(&thread_id) {
+        if let Some(splitter) = state
+            .response_projections
+            .get_mut(&thread_id)
+            .and_then(CodexResponseProjection::responses_mut)
+        {
             splitter.claim_raw_tool_call(&owner.tool_call_id);
         }
         session_ids
@@ -4975,12 +5097,14 @@ impl CodexInner {
         let snapshot = {
             let state = self.state.lock().await;
             let owner = state
-                .response_splitters
+                .response_projections
                 .get(&thread_id)
+                .and_then(CodexResponseProjection::responses)
                 .and_then(|splitter| splitter.raw_tool_owner(call_id));
             let owner_count = state
-                .response_splitters
+                .response_projections
                 .get(&thread_id)
+                .and_then(CodexResponseProjection::responses)
                 .map(|splitter| splitter.pending_raw_owner_count_for_turn(&turn_id))
                 .unwrap_or(0);
             let candidates = state
@@ -5016,7 +5140,11 @@ impl CodexInner {
                     turn_id: command.turn_id,
                 },
             );
-            if let Some(splitter) = state.response_splitters.get_mut(&thread_id) {
+            if let Some(splitter) = state
+                .response_projections
+                .get_mut(&thread_id)
+                .and_then(CodexResponseProjection::responses_mut)
+            {
                 splitter.claim_raw_tool_call(&owner.tool_call_id);
             }
             return CodexUnlinkedRawToolResolution::Correlated(process_id);
@@ -5044,8 +5172,9 @@ impl CodexInner {
         let resolution = {
             let mut state = self.state.lock().await;
             let owner_count = state
-                .response_splitters
+                .response_projections
                 .get(&thread_id)
+                .and_then(CodexResponseProjection::responses)
                 .map(|splitter| splitter.pending_raw_owner_count_for_turn(&turn_id))
                 .unwrap_or(0);
             let candidates = state
@@ -5092,7 +5221,11 @@ impl CodexInner {
                         turn_id: command.turn_id,
                     },
                 );
-                if let Some(splitter) = state.response_splitters.get_mut(&thread_id) {
+                if let Some(splitter) = state
+                    .response_projections
+                    .get_mut(&thread_id)
+                    .and_then(CodexResponseProjection::responses_mut)
+                {
                     splitter.claim_raw_tool_call(&owner.tool_call_id);
                 }
                 Some(process_id)
@@ -5124,8 +5257,9 @@ impl CodexInner {
             .state
             .lock()
             .await
-            .response_splitters
+            .response_projections
             .get_mut(&thread_id)
+            .and_then(CodexResponseProjection::responses_mut)
         {
             splitter.remove_raw_tool_owner(call_id);
         }
@@ -8162,16 +8296,18 @@ impl CodexInner {
             state.pending_resume_thread_id = None;
             state.thread_id = resumed_thread_id;
             let resumed_thread_id = state.thread_id.clone();
-            state.response_splitters.clear();
+            state.response_projections.clear();
             // A resumed thread gets no `rawResponse*` of any kind — Codex
             // 0.146.0 accepts `experimentalRawEvents` on `thread/resume` and
             // ignores it (openai/codex#34353). Splitting still runs, because the
             // boundary it finalizes on is a `thread/tokenUsage/updated` change,
             // which a resumed thread does emit. Leaving it off is what gave each
             // tool call its own chat message.
-            state.response_splitters.insert(
+            state.response_projections.insert(
                 resumed_thread_id.clone(),
-                CodexResponseSplitter::new(&resumed_thread_id, true),
+                CodexResponseProjection::Responses(Box::new(CodexResponseSplitter::new(
+                    &resumed_thread_id,
+                ))),
             );
             state.experimental_raw_events_requested = false;
             if let Some(model) = resumed_model.clone() {
@@ -8650,36 +8786,19 @@ impl CodexInner {
         }
     }
 
-    /// The emitter and model for a thread, for code that projects *provider
-    /// responses*. Strict-splitting only: returns `None` for a thread whose
-    /// splitter is disabled, because there are no provider-response boundaries
-    /// to project there.
-    ///
-    /// Do not use this to emit a tool card. Tool cards exist on every thread,
-    /// including the resumed and forked ones this returns `None` for — use
-    /// [`Self::tool_projection_target`].
     async fn response_projection_target(
         &self,
         thread_id: &str,
     ) -> Option<(Arc<TurnEmitter>, String)> {
-        if !self
-            .state
+        self.state
             .lock()
             .await
-            .response_splitters
+            .response_projections
             .get(thread_id)
-            .is_some_and(|splitter| splitter.enabled)
-        {
-            return None;
-        }
+            .and_then(CodexResponseProjection::responses)?;
         self.tool_projection_target(thread_id).await
     }
 
-    /// The emitter and model for a thread, with no strict-splitting condition.
-    ///
-    /// A resumed or forked thread has its splitter disabled — Codex sends it no
-    /// `rawResponse*` notifications — but it still runs tools, and those tool
-    /// cards still belong to the user's chat.
     async fn tool_projection_target(&self, thread_id: &str) -> Option<(Arc<TurnEmitter>, String)> {
         let state = self.state.lock().await;
         let model = state
@@ -8714,8 +8833,9 @@ impl CodexInner {
         // neither of which is observable from the splitter.
         let state = self.state.lock().await;
         state
-            .response_splitters
+            .response_projections
             .get(thread_id)
+            .and_then(CodexResponseProjection::responses)
             .and_then(|splitter| splitter.open.as_ref())?;
         Some(emitter.ensure_open_response(Some(model)))
     }
@@ -8744,8 +8864,9 @@ impl CodexInner {
         {
             let mut state = self.state.lock().await;
             state
-                .response_splitters
+                .response_projections
                 .get_mut(&thread_id)
+                .and_then(CodexResponseProjection::responses_mut)
                 .and_then(|splitter| {
                     splitter.observe_typed_item_started(
                         turn_id.as_deref(),
@@ -8759,8 +8880,9 @@ impl CodexInner {
             let state = self.state.lock().await;
             item_id.is_some_and(|item_id| {
                 state
-                    .response_splitters
+                    .response_projections
                     .get(&thread_id)
+                    .and_then(CodexResponseProjection::responses)
                     .is_some_and(|splitter| splitter.provider_typed_tool_item_ids.contains(item_id))
             })
         };
@@ -8775,8 +8897,9 @@ impl CodexInner {
         let item_id = params.pointer("/item/id").and_then(Value::as_str);
         let mut state = self.state.lock().await;
         state
-            .response_splitters
-            .get_mut(&thread_id)?
+            .response_projections
+            .get_mut(&thread_id)
+            .and_then(CodexResponseProjection::responses_mut)?
             .take_execution_only_typed_tool_owner(item_id)
     }
 
@@ -8868,120 +8991,199 @@ impl CodexInner {
         }
     }
 
-    async fn handle_strict_response_delta(&self, method: &str, params: &Value) -> bool {
-        let (reasoning, delta) = if method == "item/agentMessage/delta" {
-            (
-                false,
-                params
-                    .get("delta")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_owned(),
-            )
-        } else if is_reasoning_notification_method(method) {
-            let Some(delta) = extract_codex_reasoning_delta_text(params) else {
-                return false;
+    async fn dispatch_response_notification(
+        &self,
+        method: &str,
+        params: &Value,
+    ) -> Result<CodexResponseDispatch, CodexResponseProjectionError> {
+        let Some(event) = CodexResponseEvent::from_notification(method, params) else {
+            return Ok(CodexResponseDispatch::Other);
+        };
+        let thread_id =
+            extract_notification_thread_id(params).ok_or(CodexResponseProjectionError::ThreadId)?;
+        let (emitter, model, root) = {
+            let state = self.state.lock().await;
+            match state
+                .response_projections
+                .get(&thread_id)
+                .ok_or(CodexResponseProjectionError::Projection)?
+            {
+                CodexResponseProjection::Items { .. } => {
+                    return Ok(CodexResponseDispatch::ProviderItem);
+                }
+                CodexResponseProjection::Responses(_) => {}
+            }
+            let root = thread_id == state.thread_id;
+            let emitter = if root {
+                Arc::clone(&self.emitter)
+            } else {
+                state
+                    .subagent_streams
+                    .get(&thread_id)
+                    .map(|stream| Arc::clone(&stream.emitter))
+                    .or_else(|| {
+                        state
+                            .completed_subagent_streams
+                            .get(&thread_id)
+                            .map(|stream| Arc::clone(&stream.emitter))
+                    })
+                    .ok_or(CodexResponseProjectionError::Emitter)?
             };
-            (true, delta)
-        } else {
-            return false;
+            (
+                emitter,
+                state
+                    .effective_model
+                    .clone()
+                    .unwrap_or_else(|| "codex".to_owned()),
+                root,
+            )
         };
-        let Some(thread_id) = extract_notification_thread_id(params) else {
-            return false;
-        };
-        let Some((emitter, model)) = self.response_projection_target(&thread_id).await else {
-            return false;
-        };
-        if delta.is_empty() {
-            return true;
+        if root
+            && matches!(
+                event,
+                CodexResponseEvent::Started(CodexProviderItemKind::AgentMessage)
+            )
+        {
+            self.promote_root_commands_before_agent_response(params)
+                .await;
         }
-        let item_id = params
-            .get("itemId")
-            .or_else(|| params.get("item_id"))
-            .and_then(Value::as_str);
-        let turn_id = extract_turn_id(params);
-        let emission = {
-            let mut state = self.state.lock().await;
-            state
-                .response_splitters
-                .get_mut(&thread_id)
-                .and_then(|splitter| {
-                    splitter.observe_delta(turn_id.as_deref(), item_id, &delta, reasoning)
-                })
-        };
-        let Some(emission) = emission else {
-            return false;
-        };
-        let Some(response) = self
-            .ensure_strict_response_handle(&thread_id, emitter.as_ref(), &model)
-            .await
-        else {
-            return false;
-        };
-        if reasoning {
-            emitter.stream_reasoning_delta(&response, &emission.delta);
-        } else {
-            emitter.stream_delta(&response, &emission.delta);
-        }
-        true
+        self.project_response_notification(&thread_id, &emitter, &model, event, params)
+            .await?;
+        Ok(CodexResponseDispatch::ProviderResponse)
     }
 
-    async fn handle_strict_response_item_completed(&self, params: &Value) -> bool {
-        let Some(item) = params.get("item") else {
-            return false;
-        };
-        let item_type = item.get("type").and_then(Value::as_str).unwrap_or_default();
-        if !matches!(item_type, "agentMessage" | "reasoning") {
-            return false;
-        }
-        let Some(thread_id) = extract_notification_thread_id(params) else {
-            return false;
-        };
-        let Some((emitter, model)) = self.response_projection_target(&thread_id).await else {
-            return false;
-        };
-        let reasoning = item_type == "reasoning";
-        let completed = if reasoning {
-            extract_codex_item_reasoning(item).unwrap_or_default()
-        } else {
-            item.get("text")
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-                .unwrap_or_else(|| extract_codex_item_text(item))
-        };
-        let item_id = item.get("id").and_then(Value::as_str);
+    async fn project_response_notification(
+        &self,
+        thread_id: &str,
+        emitter: &TurnEmitter,
+        model: &str,
+        event: CodexResponseEvent,
+        params: &Value,
+    ) -> Result<(), CodexResponseProjectionError> {
         let turn_id = extract_turn_id(params);
-        let emission = {
-            let mut state = self.state.lock().await;
-            state
-                .response_splitters
-                .get_mut(&thread_id)
-                .and_then(|splitter| {
-                    splitter.observe_item_completed(
-                        turn_id.as_deref(),
-                        item_id,
-                        &completed,
-                        reasoning,
-                    )
-                })
+        let item_id = params
+            .pointer("/item/id")
+            .and_then(Value::as_str)
+            .or_else(|| params.get("itemId").and_then(Value::as_str))
+            .or_else(|| params.get("item_id").and_then(Value::as_str));
+        let mut state = self.state.lock().await;
+        let pending_images = if thread_id == state.thread_id {
+            state.tool_container_images.len()
+        } else {
+            state.subagent_streams.get(thread_id).map_or(0, |stream| {
+                stream.tool_container_images.len() + stream.current_images.len()
+            })
         };
-        let Some(emission) = emission else {
-            return false;
+        let splitter = state
+            .response_projections
+            .get_mut(thread_id)
+            .and_then(CodexResponseProjection::responses_mut)
+            .ok_or(CodexResponseProjectionError::Projection)?;
+        let (emission, reasoning) = match event {
+            CodexResponseEvent::ReasoningPartAdded => (None, true),
+            CodexResponseEvent::Started(kind) => {
+                let item_type = match kind {
+                    CodexProviderItemKind::AgentMessage => "agentMessage",
+                    CodexProviderItemKind::Reasoning => "reasoning",
+                };
+                splitter.observe_typed_item_started(turn_id.as_deref(), item_id, None, item_type);
+                (None, kind == CodexProviderItemKind::Reasoning)
+            }
+            CodexResponseEvent::Delta(kind) => {
+                let reasoning = kind == CodexProviderItemKind::Reasoning;
+                let delta = match kind {
+                    CodexProviderItemKind::AgentMessage => params
+                        .get("delta")
+                        .and_then(Value::as_str)
+                        .ok_or(CodexResponseProjectionError::TextDelta)?
+                        .to_owned(),
+                    CodexProviderItemKind::Reasoning => {
+                        match params.get("delta").and_then(Value::as_str) {
+                            Some(delta) => delta.to_owned(),
+                            None => extract_codex_reasoning_delta_text(params)
+                                .ok_or(CodexResponseProjectionError::TextDelta)?,
+                        }
+                    }
+                };
+                let emission = if delta.is_empty() {
+                    None
+                } else {
+                    splitter.observe_delta(turn_id.as_deref(), item_id, &delta, reasoning)
+                };
+                (emission, reasoning)
+            }
+            CodexResponseEvent::Completed(kind) => {
+                let item = &params["item"];
+                let reasoning = kind == CodexProviderItemKind::Reasoning;
+                let completed = match kind {
+                    CodexProviderItemKind::AgentMessage => extract_codex_item_text(item),
+                    CodexProviderItemKind::Reasoning => {
+                        extract_codex_item_reasoning(item).unwrap_or_default()
+                    }
+                };
+                let emission = splitter.observe_item_completed(
+                    turn_id.as_deref(),
+                    item_id,
+                    &completed,
+                    reasoning,
+                );
+                tracing::debug!(
+                    thread_id, ?turn_id, ?item_id, ?kind,
+                    has_visible_content = contains_non_whitespace(&completed),
+                    message_id = ?emitter.open_response().map(|response| response.message_id()),
+                    pending_tools = splitter.open.as_ref().map_or(0, |response| response.tool_requests.len()),
+                    pending_images,
+                    "Codex provider-response projection consumed item completion"
+                );
+                (emission, reasoning)
+            }
         };
-        let Some(response) = self
-            .ensure_strict_response_handle(&thread_id, emitter.as_ref(), &model)
-            .await
-        else {
-            return false;
-        };
-        if !emission.delta.is_empty() {
+        if let Some(emission) = emission
+            && !emission.delta.is_empty()
+        {
+            if splitter.open.is_none() {
+                return Err(CodexResponseProjectionError::OpenResponse);
+            }
+            let response = emitter.ensure_open_response(Some(model));
             if reasoning {
                 emitter.stream_reasoning_delta(&response, &emission.delta);
             } else {
                 emitter.stream_delta(&response, &emission.delta);
             }
         }
-        true
+        Ok(())
+    }
+
+    async fn report_response_projection_error(
+        &self,
+        method: &str,
+        params: &Value,
+        error: CodexResponseProjectionError,
+    ) {
+        let thread_id = extract_notification_thread_id(params);
+        let turn_id = extract_turn_id(params);
+        let item_id = params
+            .pointer("/item/id")
+            .and_then(Value::as_str)
+            .or_else(|| params.get("itemId").and_then(Value::as_str));
+        tracing::error!(
+            method,
+            ?thread_id,
+            ?turn_id,
+            ?item_id,
+            ?error,
+            "Codex response projection failed"
+        );
+        let message = format!(
+            "Codex response projection failed: {error}; method={method}, thread={thread_id:?}, turn={turn_id:?}, item={item_id:?}"
+        );
+        match thread_id {
+            Some(thread_id) => match self.tool_projection_target(&thread_id).await {
+                Some((emitter, _)) => emitter.backend_error(&message),
+                None => self.emitter.backend_error(&message),
+            },
+            None => self.emitter.backend_error(&message),
+        }
     }
 
     async fn finish_strict_typed_tool(
@@ -8996,10 +9198,11 @@ impl CodexInner {
         let thread_id = extract_notification_thread_id(params)?;
         let item_id = item.get("id").and_then(Value::as_str);
         let mut state = self.state.lock().await;
-        let splitter = state.response_splitters.get_mut(&thread_id)?;
-        splitter
-            .enabled
-            .then(|| splitter.finish_typed_tool(item_id))?
+        let splitter = state
+            .response_projections
+            .get_mut(&thread_id)
+            .and_then(CodexResponseProjection::responses_mut)?;
+        splitter.finish_typed_tool(item_id)
     }
 
     async fn complete_strict_raw_tool_output(&self, params: &Value) -> bool {
@@ -9021,7 +9224,10 @@ impl CodexInner {
         };
         let (owner, suppressed_owner, typed_owns_call) = {
             let state = self.state.lock().await;
-            let splitter = state.response_splitters.get(&thread_id);
+            let splitter = state
+                .response_projections
+                .get(&thread_id)
+                .and_then(CodexResponseProjection::responses);
             (
                 splitter.and_then(|splitter| splitter.raw_tool_owner_for_completion(call_id)),
                 splitter.and_then(|splitter| splitter.suppressed_raw_tool_request(call_id)),
@@ -9044,8 +9250,9 @@ impl CodexInner {
                     .state
                     .lock()
                     .await
-                    .response_splitters
+                    .response_projections
                     .get_mut(&thread_id)
+                    .and_then(CodexResponseProjection::responses_mut)
                 {
                     splitter.remove_suppressed_raw_tool_request(call_id);
                 }
@@ -9122,8 +9329,9 @@ impl CodexInner {
                 .state
                 .lock()
                 .await
-                .response_splitters
+                .response_projections
                 .get_mut(&thread_id)
+                .and_then(CodexResponseProjection::responses_mut)
             {
                 splitter.complete_raw_tool_call(call_id);
             }
@@ -9134,7 +9342,11 @@ impl CodexInner {
             let native_subagent = state
                 .native_subagent_tool_call_ids
                 .contains(&owner.tool_call_id);
-            if native_subagent && let Some(splitter) = state.response_splitters.get_mut(&thread_id)
+            if native_subagent
+                && let Some(splitter) = state
+                    .response_projections
+                    .get_mut(&thread_id)
+                    .and_then(CodexResponseProjection::responses_mut)
             {
                 splitter.complete_raw_tool_call(call_id);
             }
@@ -9153,7 +9365,12 @@ impl CodexInner {
                     .any(|((owner_thread_id, _), command)| {
                         owner_thread_id == &thread_id && command.tool_call_id == owner.tool_call_id
                     });
-            if correlated && let Some(splitter) = state.response_splitters.get_mut(&thread_id) {
+            if correlated
+                && let Some(splitter) = state
+                    .response_projections
+                    .get_mut(&thread_id)
+                    .and_then(CodexResponseProjection::responses_mut)
+            {
                 splitter.complete_raw_tool_call(call_id);
             }
             correlated
@@ -9179,7 +9396,12 @@ impl CodexInner {
                             owner_thread_id == &thread_id && command.task_id == *session_id
                         })
                 });
-                if correlated && let Some(splitter) = state.response_splitters.get_mut(&thread_id) {
+                if correlated
+                    && let Some(splitter) = state
+                        .response_projections
+                        .get_mut(&thread_id)
+                        .and_then(CodexResponseProjection::responses_mut)
+                {
                     splitter.complete_raw_tool_call(call_id);
                 }
                 correlated
@@ -9214,7 +9436,11 @@ impl CodexInner {
                             .as_ref()
                             .is_none_or(|process_id| !yielded_session_ids.contains(process_id))
                 });
-            if let Some(splitter) = state.response_splitters.get_mut(&thread_id) {
+            if let Some(splitter) = state
+                .response_projections
+                .get_mut(&thread_id)
+                .and_then(CodexResponseProjection::responses_mut)
+            {
                 splitter.complete_raw_tool_call(call_id);
             }
             return true;
@@ -9230,8 +9456,9 @@ impl CodexInner {
                 .state
                 .lock()
                 .await
-                .response_splitters
+                .response_projections
                 .get_mut(&thread_id)
+                .and_then(CodexResponseProjection::responses_mut)
             {
                 splitter.complete_raw_tool_call(call_id);
             }
@@ -9260,8 +9487,9 @@ impl CodexInner {
             .state
             .lock()
             .await
-            .response_splitters
+            .response_projections
             .get_mut(&thread_id)
+            .and_then(CodexResponseProjection::responses_mut)
         {
             splitter.complete_raw_tool_call(call_id);
             splitter.remove_suppressed_raw_tool_request(call_id);
@@ -9404,8 +9632,9 @@ impl CodexInner {
                     .state
                     .lock()
                     .await
-                    .response_splitters
+                    .response_projections
                     .get_mut(&thread_id)
+                    .and_then(CodexResponseProjection::responses_mut)
                 {
                     splitter.remove_raw_tool_owner_by_tool_call_id(&tool_call_id);
                 }
@@ -9459,8 +9688,9 @@ impl CodexInner {
         {
             let mut state = self.state.lock().await;
             state
-                .response_splitters
+                .response_projections
                 .get_mut(&thread_id)
+                .and_then(CodexResponseProjection::responses_mut)
                 .and_then(|splitter| splitter.observe_raw_item(turn_id.as_deref(), item));
         }
     }
@@ -9497,8 +9727,9 @@ impl CodexInner {
         let content_offset = {
             let mut state = self.state.lock().await;
             state
-                .response_splitters
+                .response_projections
                 .get_mut(thread_id)
+                .and_then(CodexResponseProjection::responses_mut)
                 .and_then(|splitter| {
                     splitter.buffer_tool_request(
                         turn_id.as_deref(),
@@ -9596,9 +9827,20 @@ impl CodexInner {
             normalize_token_usage_with_envelope(usage, Some(params), Some(&model))
         });
         let turn_id = extract_turn_id(params);
-        let (finalized, retained_raw_owners, claimed_raw_calls) = {
+        let (finalized, retained_raw_owners, claimed_raw_calls, pending_images) = {
             let mut state = self.state.lock().await;
-            let Some(splitter) = state.response_splitters.get_mut(&thread_id) else {
+            let pending_images = if thread_id == state.thread_id {
+                state.tool_container_images.len()
+            } else {
+                state.subagent_streams.get(&thread_id).map_or(0, |stream| {
+                    stream.current_images.len() + stream.tool_container_images.len()
+                })
+            };
+            let Some(splitter) = state
+                .response_projections
+                .get_mut(&thread_id)
+                .and_then(CodexResponseProjection::responses_mut)
+            else {
                 return false;
             };
             let finalized = splitter.finalize(turn_id.as_deref(), usage, failed);
@@ -9606,6 +9848,7 @@ impl CodexInner {
                 finalized,
                 splitter.pending_raw_tool_owners.len(),
                 splitter.claimed_raw_tool_calls.len(),
+                pending_images,
             )
         };
         let Some(finalized) = finalized else {
@@ -9645,7 +9888,8 @@ impl CodexInner {
                 .reasoning
                 .as_deref()
                 .is_some_and(contains_non_whitespace)
-            || !finalized.tool_requests.is_empty();
+            || !finalized.tool_requests.is_empty()
+            || (!failed && pending_images > 0);
         let response = emitter
             .open_response()
             .or_else(|| renderable.then(|| emitter.ensure_open_response(Some(&model))));
@@ -9720,8 +9964,9 @@ impl CodexInner {
         let retained_completed_owners = {
             let state = self.state.lock().await;
             state
-                .response_splitters
+                .response_projections
                 .get(&thread_id)
+                .and_then(CodexResponseProjection::responses)
                 .into_iter()
                 .flat_map(|splitter| splitter.pending_raw_tool_owners.values())
                 .filter(|owner| {
@@ -9764,7 +10009,11 @@ impl CodexInner {
         };
         let turn_id = extract_turn_id(params);
         let mut state = self.state.lock().await;
-        if let Some(splitter) = state.response_splitters.get_mut(&thread_id) {
+        if let Some(splitter) = state
+            .response_projections
+            .get_mut(&thread_id)
+            .and_then(CodexResponseProjection::responses_mut)
+        {
             splitter.observe_raw_response_completed(turn_id.as_deref(), response_id);
         }
     }
@@ -9785,9 +10034,9 @@ impl CodexInner {
         let boundary = {
             let mut state = self.state.lock().await;
             state
-                .response_splitters
+                .response_projections
                 .get_mut(&thread_id)
-                .is_some_and(|splitter| splitter.token_usage_boundary_reached(usage.as_ref()))
+                .is_some_and(|projection| projection.token_usage_boundary_reached(usage.as_ref()))
         };
         if !boundary {
             return;
@@ -9832,10 +10081,11 @@ impl CodexInner {
         let open_responses = {
             let state = self.state.lock().await;
             state
-                .response_splitters
+                .response_projections
                 .iter()
-                .filter_map(|(thread_id, splitter)| {
-                    splitter
+                .filter_map(|(thread_id, projection)| {
+                    projection
+                        .responses()?
                         .open
                         .as_ref()
                         .map(|response| (thread_id.clone(), response.turn_id.clone()))
@@ -9977,9 +10227,6 @@ impl CodexInner {
             if !strict_raw_completion {
                 self.handle_raw_modify_completion(params).await;
             }
-            return;
-        }
-        if self.handle_strict_response_delta(method, params).await {
             return;
         }
         if method == "error"
@@ -10127,6 +10374,15 @@ impl CodexInner {
             .await
         {
             return;
+        }
+        match self.dispatch_response_notification(method, params).await {
+            Ok(CodexResponseDispatch::ProviderResponse) => return,
+            Ok(CodexResponseDispatch::ProviderItem | CodexResponseDispatch::Other) => {}
+            Err(error) => {
+                self.report_response_projection_error(method, params, error)
+                    .await;
+                return;
+            }
         }
         match method {
             "account/rateLimits/updated" => {
@@ -10942,6 +11198,15 @@ impl CodexInner {
                 return;
             }
         }
+        match self.dispatch_response_notification(method, params).await {
+            Ok(CodexResponseDispatch::ProviderResponse) => return,
+            Ok(CodexResponseDispatch::ProviderItem | CodexResponseDispatch::Other) => {}
+            Err(error) => {
+                self.report_response_projection_error(method, params, error)
+                    .await;
+                return;
+            }
+        }
         match method {
             "turn/started" => {
                 self.close_subagent_tool_container_if_open(stream_key).await;
@@ -11325,9 +11590,6 @@ impl CodexInner {
                     "reasoning" => Some(CodexProviderItemKind::Reasoning),
                     _ => None,
                 };
-                if strict_response && provider_kind.is_some() {
-                    return;
-                }
                 if strict_response && is_codex_provider_tool_item_type(item_type) && !provider_tool
                 {
                     self.handle_strict_execution_only_tool_started(params).await;
@@ -11507,9 +11769,6 @@ impl CodexInner {
                 {
                     self.handle_strict_execution_only_tool_completed(params, owner)
                         .await;
-                    return;
-                }
-                if self.handle_strict_response_item_completed(params).await {
                     return;
                 }
                 self.handle_subagent_item_completed(params, stream_key, model)
@@ -13344,6 +13603,15 @@ impl CodexInner {
             self.emitter.retry_attempt(retry);
             return;
         }
+        match self.dispatch_response_notification(method, params).await {
+            Ok(CodexResponseDispatch::ProviderResponse) => return,
+            Ok(CodexResponseDispatch::ProviderItem | CodexResponseDispatch::Other) => {}
+            Err(error) => {
+                self.report_response_projection_error(method, params, error)
+                    .await;
+                return;
+            }
+        }
         let Some(delta) = extract_reasoning_delta_from_legacy_codex_event(method, params) else {
             return;
         };
@@ -13727,22 +13995,7 @@ impl CodexInner {
         let notification_thread_id = extract_notification_thread_id(params);
         let notification_turn_id = extract_turn_id(params);
         self.state.lock().await.foreground_response_completed = false;
-        let (strict_response, provider_tool) =
-            self.observe_strict_response_item_started(params).await;
-        if strict_response && matches!(item_type, "agentMessage" | "reasoning") {
-            // The response beginning while a command is still running is what
-            // makes that command a background one, and it is true whether or
-            // not the splitter owns this message. The `agentMessage` arm below
-            // is unreachable for a strict response, so promoting there alone
-            // left a still-running command marked foreground until the turn
-            // went idle underneath it.
-            if item_type == "agentMessage" {
-                self.promote_root_commands_before_agent_response(params)
-                    .await;
-            }
-            return;
-        }
-        let _ = provider_tool;
+        self.observe_strict_response_item_started(params).await;
 
         match item_type {
             "agentMessage" => {
@@ -13911,7 +14164,12 @@ impl CodexInner {
                         let state = self.state.lock().await;
                         notification_thread_id
                             .as_deref()
-                            .and_then(|thread_id| state.response_splitters.get(thread_id))
+                            .and_then(|thread_id| {
+                                state
+                                    .response_projections
+                                    .get(thread_id)
+                                    .and_then(CodexResponseProjection::responses)
+                            })
                             .and_then(CodexResponseSplitter::suppressed_web_search_query)
                             .unwrap_or_default()
                     }
@@ -14144,9 +14402,6 @@ impl CodexInner {
         // Clears the splitter's per-item bookkeeping; the card itself is
         // completed by the typed handler below, which owns it.
         let _ = self.finish_strict_typed_tool(params).await;
-        if self.handle_strict_response_item_completed(params).await {
-            return;
-        }
 
         match item_type {
             "agentMessage" => {
@@ -15055,14 +15310,17 @@ impl CodexInner {
                     sender_thread_id = sender_thread_id.as_str(),
                     "Registered authoritative Codex child thread"
                 );
-                let strict_response_splitting = state
-                    .response_splitters
-                    .get(&state.thread_id)
-                    .is_some_and(|splitter| splitter.enabled);
-                state.response_splitters.insert(
-                    thread_id.clone(),
-                    CodexResponseSplitter::new(&thread_id, strict_response_splitting),
-                );
+                let Some(parent_projection) = state.response_projections.get(&state.thread_id)
+                else {
+                    self.emitter.backend_error(
+                        "Codex child registration has no parent response projection",
+                    );
+                    return;
+                };
+                let projection = parent_projection.for_child(&thread_id);
+                state
+                    .response_projections
+                    .insert(thread_id.clone(), projection);
                 state.subagent_streams.insert(
                     thread_id.clone(),
                     CodexSubAgentStream {
@@ -15832,12 +16090,6 @@ impl CodexInner {
         {
             return;
         }
-        // Not `response_projection_target`: that one is `None` for a thread with
-        // strict splitting off, which is every resumed and forked thread. Using
-        // it here meant a resumed session dropped *every* tool card silently at
-        // birth, while the completion path — which resolves its emitter without
-        // that condition — still fired, so each tool produced a
-        // `completion_without_request` and no card at all.
         let Some((emitter, model)) = self.tool_projection_target(thread_id).await else {
             tracing::error!(
                 thread_id,
@@ -15977,9 +16229,10 @@ impl CodexInner {
                 state.approval_policy.clone(),
                 state.access_mode,
                 state
-                    .response_splitters
+                    .response_projections
                     .get(thread_id)
-                    .and_then(|splitter| splitter.last_token_usage.clone()),
+                    .and_then(CodexResponseProjection::last_token_usage)
+                    .cloned(),
             )
         };
         let mut lines = vec!["**Session**".to_owned(), format!("- Thread: `{thread_id}`")];

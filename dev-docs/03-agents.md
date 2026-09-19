@@ -103,11 +103,13 @@ A backend may reserve an authoritative provider message identity before it has
 renderable evidence. It publishes `StreamStart` only once text, reasoning, an
 explicit tool container, or images supplied by that backend's authoritative
 schema make the response visible. The shared message model treats schema-backed
-images as renderable, but the current Codex item and `thread/resume` schemas
-expose no authoritative assistant-image path; Codex therefore neither publishes
-nor reconstructs image-only responses, and must not infer them. A truly
-contentless authoritative completion publishes no stream, metadata patch, or
-durable message row. Clients preserve reasoning/tool/image-only messages as
+images as renderable. Codex's completed `imageGeneration` items supply generated
+image payloads; those images remain renderable even without accompanying text.
+An empty reasoning item completes only that item, not its containing provider
+response. Each thread selects one response projection at startup or resume;
+no-output completions and projection errors never select a second handler.
+A truly contentless authoritative completion publishes no stream, metadata
+patch, or durable message row. Clients preserve reasoning/tool/image-only messages as
 received and never synthesize fallback response text.
 
 This means:

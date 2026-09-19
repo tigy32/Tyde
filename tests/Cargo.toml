@@ -32,6 +32,7 @@ tokio-rustls = "0.26"
 rcgen = "0.14"
 
 [dev-dependencies]
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }
 proc-macro2 = "1"
 syn = { version = "2", features = ["full", "visit"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

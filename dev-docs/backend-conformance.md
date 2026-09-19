@@ -47,6 +47,50 @@ Server-only guarantees remain in `server/tests/session_resume.rs`: history pagin
 
 Normal validation is `./dev.sh check`; it builds the test binary and MCP bridge without running paid cases. Real cases are ignored and additionally require `TYDE_RUN_REAL_AI_TESTS=1`; `TYDE_REAL_BACKENDS` selects providers. Follow the authorization rules in `AGENTS.md` before running them.
 
+## Generated-image response ownership
+
+`real_generated_image_preserves_tool_ownership` runs on backends declaring
+`GenericGenerateImage`. It asks for native image generation alongside a real
+shell command, then decodes the generated image and checks command output, typed image
+completion, and exactly one durable response owner and terminal outcome for
+every tool request. Codex and Antigravity currently declare that capability.
+
+The Codex profile for this case uses `gpt-6-astra` with low reasoning effort.
+Luna runs missed the triggering interleaving or failed the requested file/poll
+orchestration. Astra reproduced the original bug on 2026-09-19: image completion
+at 16:50:36.561 UTC was followed by empty reasoning at 16:50:36.769. The adapter
+then redeclared the command under a different message owner, with unchanged
+name, arguments, and offset. The durable-owner assertion failed with zero
+owners for that command. This establishes the adapter ownership regression
+independently of command execution success.
+
+The final prompt keeps the marker command running for 60 seconds and copies
+its native image in a separate tool call. The earlier 15-second command could
+finish before generation, missing the overlap. With the same final test on
+both builds, the unfixed adapter failed at 21:29:49 UTC with another owner
+conflict and zero durable owners. The fixed adapter passed after consuming
+empty reasoning at 21:27:43 with one pending image and one pending tool; it
+retained that response's owner in the persisted message, including its image
+and command declaration. The same final scenario also passed on Antigravity.
+Codex resume/grouped-tool and native-child scenarios passed, and disposable
+live UI QA retained the image and completed cards through reload and fork.
+
+The initial PNG-signature assertion rejected Antigravity's real 1024×1024 JPEG
+(`blue_square_1789837123865.jpg`), although native generation and its typed
+completion succeeded. `GenericGenerateImage` does not specify PNG encoding.
+The oracle now fully decodes the provider's image instead of accepting only a
+PNG header; the unique-owner and completion assertions are unchanged.
+
+For the Codex contentless-reasoning regression, retain provider notification
+traces and confirm the image completion, command declaration, and empty
+reasoning completion interleaved before the provider-response boundary. A
+successful run without that trigger does not establish regression coverage.
+The unfixed baseline must fail the ownership assertion or report the protocol
+violation before the fixed run can certify the fix. Live UI/reconnect QA also
+checks retained image rendering; tool-generation capability alone does not
+promise that every backend exposes image attachments in assistant messages.
+Paid runs require separate approval under `AGENTS.md`.
+
 ## Exhausted-account regression
 
 `real_exhausted_account_stays_open` requires an authenticated real account

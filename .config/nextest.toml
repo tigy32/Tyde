@@ -33,6 +33,11 @@ threads-required = "num-test-threads"
 filter = 'binary_id(server::side_questions) & test(btw_sessions_recover_after_model_catalog_changes)'
 success-output = "final"
 
+# Retain the live-vs-bootstrap evidence for the plan-approval setup race.
+[[profile.default.overrides]]
+filter = 'binary_id(server::agents) & test(agent_control_http_await_stays_active_after_exit_plan_mode_approval)'
+success-output = "final"
+
 [profile.default]
 # The native suite is a fast local gate, not a background job. Crossing five
 # minutes is a test failure that must be fixed rather than normalized.

@@ -952,6 +952,16 @@ impl TurnEmitterState {
                     accepted.push(declaration);
                     continue;
                 }
+                tracing::error!(
+                    tool_call_id,
+                    existing_owner = existing.owner.0,
+                    incoming_owner = owner.0,
+                    name_changed = existing.declaration.name != declaration.name,
+                    arguments_changed = existing.declaration.arguments != declaration.arguments,
+                    offset_changed =
+                        existing.declaration.content_offset != declaration.content_offset,
+                    "Conflicting tool declaration ownership or data"
+                );
                 self.violation(
                     "conflicting_tool_declaration",
                     format!(

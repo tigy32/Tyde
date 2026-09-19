@@ -1559,6 +1559,7 @@ async fn wait_for_exit_plan_mode_pause_on_stream(
     loop {
         let env = expect_chat_event_on_stream(client, stream, "ExitPlanMode pause").await;
         let event: ChatEvent = env.parse_payload().expect("failed to parse ChatEvent");
+        eprintln!("EXIT PLAN PAUSE stream={stream} saw_pause={saw_pause} event={event:?}");
         match event {
             ChatEvent::ToolRequest(request) => {
                 assert_eq!(fixture::tool_request_name(&request), "ExitPlanMode");
@@ -4209,18 +4210,20 @@ async fn agent_control_http_await_stays_active_after_exit_plan_mode_approval() {
     let parent = spawn_agent_control_parent(&mut fixture, "resuming-await-parent").await;
     let caller = fixture.agent_control_caller(&parent.agent_id).await;
 
+    let startup_gate = MockGateHandle::new();
     let gate_before_completion = MockGateHandle::new();
     let gate_after_completion = MockGateHandle::new();
     let reservation = fixture
         .reserve_next_mock_launch(
             "await-exit-plan-mode-resume",
-            MockScript::one(MockTurn::exit_plan_request_stream_end_first(
-                "mock-exit-plan-tool",
-                "# Plan\n\nApprove the mock plan.",
-                &gate_before_completion,
-                &gate_after_completion,
-            ))
-            .then(MockTurn::text("mock ExitPlanMode approved")),
+            MockScript::one(MockTurn::gated_text("plan agent ready", &startup_gate))
+                .then(MockTurn::exit_plan_request_stream_end_first(
+                    "mock-exit-plan-tool",
+                    "# Plan\n\nApprove the mock plan.",
+                    &gate_before_completion,
+                    &gate_after_completion,
+                ))
+                .then(MockTurn::text("mock ExitPlanMode approved")),
         )
         .await;
     fixture
@@ -4232,7 +4235,7 @@ async fn agent_control_http_await_stays_active_after_exit_plan_mode_approval() {
             project_id: None,
             params: SpawnAgentParams::New {
                 workspace_roots: vec!["/tmp/await-exit-plan-mode-resume".to_owned()],
-                prompt: "request plan approval".to_owned(),
+                prompt: "initialize plan agent".to_owned(),
                 images: None,
                 backend_kind: BackendKind::Claude,
                 launch_profile_id: None,
@@ -4262,6 +4265,25 @@ async fn agent_control_http_await_stays_active_after_exit_plan_mode_approval() {
     .await;
     assert_eq!(start.agent_id, new_agent.agent_id);
     drop(reservation);
+
+    // A paused startup turn can be replayed without its historical typing(false).
+    // Attach before the plan request so the live pause assertion is deterministic.
+    startup_gate.wait_until_entered().await;
+    startup_gate.release_one();
+    expect_turn_on_stream(
+        &mut fixture.client,
+        &new_agent.instance_stream,
+        "plan agent ready",
+    )
+    .await;
+    fixture
+        .client
+        .send_message(
+            &new_agent.instance_stream,
+            "request plan approval".to_owned(),
+        )
+        .await
+        .expect("request plan approval after subscription");
 
     let request =
         wait_for_exit_plan_mode_pause_on_stream(&mut fixture.client, &new_agent.instance_stream)
