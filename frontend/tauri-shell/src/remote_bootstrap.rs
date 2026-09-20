@@ -1,10 +1,9 @@
-use std::collections::HashMap;
-
+pub(crate) use host_config::managed_host::shell_quote;
 use host_config::{
     ConfiguredHost, HostLifecycleEvent, HostTransportConfig, RemoteArchitecture,
     RemoteHostLifecycleConfig, RemoteHostLifecycleSnapshot, RemoteHostLifecycleStatus,
     RemoteHostLifecycleStep, RemoteOperatingSystem, RemotePlatform, RemoteTydeRunningState,
-    TydeReleaseVersion,
+    TydeReleaseVersion, managed_host,
 };
 use tauri::{AppHandle, Emitter};
 
@@ -477,117 +476,9 @@ async fn probe_snapshot(
     platform: RemotePlatform,
     target_version: TydeReleaseVersion,
 ) -> Result<RemoteHostLifecycleSnapshot, String> {
-    let target_version_sh = shell_quote(target_version.as_str());
-    let command = format!(
-        r#"set -eu
-target_version={target_version_sh}
-if [ -x "$HOME/.tyde/bin/$target_version/tyde-server" ]; then
-  echo installed_target=1
-else
-  echo installed_target=0
-fi
-if [ -L "$HOME/.tyde/bin/current" ]; then
-  printf 'current_link_version=%s\n' "$(readlink "$HOME/.tyde/bin/current")"
-else
-  echo current_link_version=
-fi
-pid_file="$HOME/.tyde/run/tyde-host.pid"
-version_file="$HOME/.tyde/run/tyde-host-version"
-socket="$HOME/.tyde/tyde.sock"
-if [ -f "$pid_file" ]; then
-  pid="$(cat "$pid_file" 2>/dev/null || true)"
-  if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && [ -S "$socket" ]; then
-    echo running=managed
-    if [ -f "$version_file" ]; then
-      printf 'running_version=%s\n' "$(cat "$version_file" 2>/dev/null || true)"
-    else
-      echo running_version=
-    fi
-  else
-    echo running=not_running
-    echo running_version=
-  fi
-elif [ -S "$socket" ]; then
-  echo running=unknown_socket
-  echo running_version=
-else
-  echo running=not_running
-  echo running_version=
-fi
-"#
-    );
-
+    let command = managed_host::probe_script(&target_version);
     let output = ssh_capture(ssh_destination, &command).await?;
-    let parsed = parse_key_value_lines(&output)?;
-    let installed_target = parse_bool_field(&parsed, "installed_target")?;
-    let current_link_version =
-        parse_optional_release_version_path_result(parsed.get("current_link_version"))?;
-    let running = match parsed.get("running").map(String::as_str) {
-        Some("not_running") => RemoteTydeRunningState::NotRunning,
-        Some("unknown_socket") => RemoteTydeRunningState::UnknownSocket,
-        Some("managed") => {
-            let version =
-                parse_optional_release_version_path_result(parsed.get("running_version"))?
-                    .ok_or_else(|| {
-                        "managed remote Tyde process is missing its version file".to_string()
-                    })?;
-            RemoteTydeRunningState::Managed { version }
-        }
-        Some(other) => return Err(format!("unexpected remote running state {other:?}")),
-        None => return Err("remote status probe did not return running state".to_string()),
-    };
-
-    Ok(RemoteHostLifecycleSnapshot {
-        target_version,
-        installed_target,
-        current_link_version,
-        running,
-        platform,
-    })
-}
-
-fn parse_key_value_lines(output: &str) -> Result<HashMap<String, String>, String> {
-    let mut parsed = HashMap::new();
-    for line in output.lines() {
-        let Some((key, value)) = line.split_once('=') else {
-            return Err(format!("remote status line is not key=value: {line:?}"));
-        };
-        parsed.insert(key.to_string(), value.to_string());
-    }
-    Ok(parsed)
-}
-
-fn parse_bool_field(parsed: &HashMap<String, String>, key: &str) -> Result<bool, String> {
-    match parsed.get(key).map(String::as_str) {
-        Some("1") => Ok(true),
-        Some("0") => Ok(false),
-        Some(value) => Err(format!(
-            "remote status field {key} is not boolean: {value:?}"
-        )),
-        None => Err(format!("remote status is missing field {key}")),
-    }
-}
-
-pub(crate) fn shell_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\\''"))
-}
-
-fn parse_optional_release_version_path(value: &str) -> Option<Result<TydeReleaseVersion, String>> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    let last_component = trimmed.rsplit('/').next().unwrap_or(trimmed);
-    Some(last_component.parse::<TydeReleaseVersion>())
-}
-
-fn parse_optional_release_version_path_result(
-    value: Option<&String>,
-) -> Result<Option<TydeReleaseVersion>, String> {
-    match value {
-        Some(value) => parse_optional_release_version_path(value).transpose(),
-        None => Ok(None),
-    }
+    managed_host::parse_probe_output(&output, platform, target_version)
 }
 
 async fn install_release_on_remote(
@@ -649,98 +540,15 @@ ln -sfn "$version" "$HOME/.tyde/bin/current"
 }
 
 async fn stop_managed_server(ssh_destination: &str) -> Result<(), String> {
-    let command = r#"set -eu
-pid_file="$HOME/.tyde/run/tyde-host.pid"
-version_file="$HOME/.tyde/run/tyde-host-version"
-if [ ! -f "$pid_file" ]; then
-  exit 0
-fi
-pid="$(cat "$pid_file" 2>/dev/null || true)"
-if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-  kill "$pid"
-  i=0
-  while [ "$i" -lt 50 ]; do
-    if ! kill -0 "$pid" 2>/dev/null; then
-      rm -f "$pid_file" "$version_file"
-      exit 0
-    fi
-    i=$((i + 1))
-    sleep 0.1
-  done
-  echo "managed Tyde host process $pid did not stop" >&2
-  exit 1
-fi
-rm -f "$pid_file" "$version_file"
-"#;
-    ssh_capture(ssh_destination, command).await.map(|_| ())
+    ssh_capture(ssh_destination, &managed_host::stop_script())
+        .await
+        .map(|_| ())
 }
 
 async fn launch_server(ssh_destination: &str, version: &TydeReleaseVersion) -> Result<(), String> {
-    let version_sh = shell_quote(version.as_str());
-    let command = format!(
-        r#"set -eu
-version={version_sh}
-bin="$HOME/.tyde/bin/$version/tyde-server"
-socket="$HOME/.tyde/tyde.sock"
-pid_file="$HOME/.tyde/run/tyde-host.pid"
-version_file="$HOME/.tyde/run/tyde-host-version"
-log_file="$HOME/.tyde/logs/tyde-host-$version.log"
-mkdir -p "$HOME/.tyde/logs" "$HOME/.tyde/run"
-launch_lock="$HOME/.tyde/run/tyde-host-launch.lock"
-i=0
-while ! mkdir "$launch_lock" 2>/dev/null; do
-  if [ -f "$launch_lock/pid" ]; then
-    lock_pid=$(cat "$launch_lock/pid" 2>/dev/null || true)
-    if [ -n "$lock_pid" ] && ! kill -0 "$lock_pid" 2>/dev/null; then
-      rm -rf "$launch_lock"
-      continue
-    fi
-  fi
-  if [ "$i" -ge 100 ]; then
-    echo "timed out waiting for another managed Tyde launch" >&2
-    exit 1
-  fi
-  i=$((i + 1))
-  sleep 0.1
-done
-printf '%s\n' "$$" > "$launch_lock/pid"
-trap 'rm -rf "$launch_lock"' EXIT
-if [ ! -x "$bin" ]; then
-  echo "managed tyde-server binary is not executable: $bin" >&2
-  exit 1
-fi
-tail_launch_log() {{
-  if [ -f "$log_file" ]; then
-    echo "last tyde-server launch log lines from $log_file:" >&2
-    tail -n 80 "$log_file" >&2 || true
-  fi
-}}
-nohup "$bin" host --uds >> "$log_file" 2>&1 < /dev/null &
-pid=$!
-i=0
-while [ "$i" -lt 50 ]; do
-  if kill -0 "$pid" 2>/dev/null && [ -S "$socket" ]; then
-    printf '%s\n' "$pid" > "$pid_file"
-    printf '%s\n' "$version" > "$version_file"
-    ln -sfn "$version" "$HOME/.tyde/bin/current"
-    rm -rf "$launch_lock"
-    trap - EXIT
-    exit 0
-  fi
-  if ! kill -0 "$pid" 2>/dev/null; then
-    echo "managed tyde-server process exited before socket became ready" >&2
-    tail_launch_log
-    exit 1
-  fi
-  i=$((i + 1))
-  sleep 0.1
-done
-echo "managed tyde-server did not create $socket" >&2
-tail_launch_log
-exit 1
-"#
-    );
-    ssh_capture(ssh_destination, &command).await.map(|_| ())
+    ssh_capture(ssh_destination, &managed_host::launch_script(version))
+        .await
+        .map(|_| ())
 }
 
 async fn ssh_capture(ssh_destination: &str, remote_command: &str) -> Result<String, String> {

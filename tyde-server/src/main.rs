@@ -12,7 +12,7 @@ const HOST_SOCKET_PATH_ENV: &str = "TYDE_SOCKET_PATH";
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum CliMode {
     HostStdio,
-    HostUds,
+    HostUds { managed: bool },
     HostStatusUds,
     HostLaunchUds,
     HostBridgeUds,
@@ -33,7 +33,7 @@ fn main() {
     raise_fd_limit();
     match parse_cli_mode(std::env::args().skip(1)) {
         CliMode::HostStdio => exit_on_error(run_host_stdio()),
-        CliMode::HostUds => exit_on_error(run_host_uds()),
+        CliMode::HostUds { managed } => exit_on_error(run_host_uds(managed)),
         CliMode::HostStatusUds => exit_on_error(run_host_status_uds()),
         CliMode::HostLaunchUds => exit_on_error(run_host_launch_uds()),
         CliMode::HostBridgeUds => exit_on_error(run_host_bridge_uds()),
@@ -111,7 +111,11 @@ where
     }
 
     if args.as_slice() == ["host", "--uds"] || args.as_slice() == ["--uds"] {
-        return CliMode::HostUds;
+        return CliMode::HostUds { managed: false };
+    }
+
+    if args.as_slice() == ["host", "--uds", "--managed"] {
+        return CliMode::HostUds { managed: true };
     }
 
     if args.as_slice() == ["host", "--status-uds"] || args.as_slice() == ["--status-uds"] {
@@ -147,6 +151,10 @@ fn print_usage() {
     println!("  tyde-server --version          Print the Tyde server binary version");
     println!("  tyde-server host --stdio       Run a Tyde host over stdin/stdout");
     println!("  tyde-server host --uds         Run a Tyde host over ~/.tyde/tyde.sock");
+    println!("  tyde-server host --uds --managed");
+    println!(
+        "                                 Same, recording ~/.tyde/run/tyde-host.pid once bound"
+    );
     println!("  tyde-server host --status-uds  Check whether the Tyde UDS host is reachable");
     println!("  tyde-server host --launch-uds  Launch the Tyde UDS host in the background");
     println!("  tyde-server host --bridge-uds  Bridge stdin/stdout to a running Tyde UDS host");
@@ -220,9 +228,10 @@ async fn bind_host_socket_before_start<T>(
     Ok((listener, host))
 }
 
-fn run_host_uds() -> Result<(), String> {
+fn run_host_uds(managed: bool) -> Result<(), String> {
     #[cfg(not(unix))]
     {
+        let _ = managed;
         return Err("host UDS mode requires Unix domain sockets".to_string());
     }
 
@@ -240,6 +249,9 @@ fn run_host_uds() -> Result<(), String> {
 
         runtime.block_on(async move {
             let (listener, host) = bind_host_socket_before_start(&socket_path, spawn_host).await?;
+            if managed {
+                record_managed_host_process()?;
+            }
             server::serve_uds(listener, server::ServerConfig::current(), host)
                 .await
                 .map_err(|err| {
@@ -250,6 +262,37 @@ fn run_host_uds() -> Result<(), String> {
                 })
         })
     }
+}
+
+/// Publishes this process as the managed host. Only the server that bound the
+/// socket gets here, so the pid file can never name a process that lost the
+/// bind; the lifecycle scripts in `host_config::managed_host` rely on that.
+/// The pid file is written last because it is what a launch waits for.
+#[cfg(unix)]
+fn record_managed_host_process() -> Result<(), String> {
+    let run_dir = home_dir()?.join(".tyde").join("run");
+    std::fs::create_dir_all(&run_dir).map_err(|err| {
+        format!(
+            "failed to create Tyde run directory {}: {err}",
+            run_dir.display()
+        )
+    })?;
+    replace_run_file(
+        &run_dir.join("tyde-host-version"),
+        env!("CARGO_PKG_VERSION"),
+    )?;
+    replace_run_file(
+        &run_dir.join("tyde-host.pid"),
+        &std::process::id().to_string(),
+    )
+}
+
+#[cfg(unix)]
+fn replace_run_file(path: &std::path::Path, value: &str) -> Result<(), String> {
+    let staged = path.with_extension(format!("{}.tmp", std::process::id()));
+    std::fs::write(&staged, format!("{value}\n"))
+        .and_then(|()| std::fs::rename(&staged, path))
+        .map_err(|err| format!("failed to write {}: {err}", path.display()))
 }
 
 fn run_host_status_uds() -> Result<(), String> {

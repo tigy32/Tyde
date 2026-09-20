@@ -19,6 +19,30 @@ The compatibility gate is the remote lifecycle snapshot read over SSH:
 - `~/.tyde/tyde.sock` plus the managed pid file distinguishes managed, stopped,
   and unknown-socket states.
 
+The pid file is owned by the server, not by the launch script. A managed
+launch runs `tyde-server host --uds --managed`, and that process writes
+`tyde-host-version` and then `tyde-host.pid` only after it has bound
+`~/.tyde/tyde.sock`. A server that loses the bind never records itself, so the
+pid file always names the socket owner. The launch script succeeds only when
+the pid file names the process it started; the mere existence of a socket
+proves nothing, because another server may own it.
+
+Launches are serialized by `~/.tyde/run/tyde-host-launch.pid`, created with a
+shell noclobber redirection (`O_EXCL`). Do not use `mkdir` as the lock: uutils
+coreutils reports success when it loses the create race. With the lock held, a launch that finds a live socket settles on the recorded server instead
+of starting a second one against a bound socket.
+
+Releases before the server-owned pid file could record a server that then
+failed to bind, leaving the real owner running but untracked. When the socket
+is live and the pid file names no live process, the probe and the launch adopt
+the owner if exactly one process launched from `~/.tyde/bin/<release>/` is
+running `host --uds`, rewriting the pid and version files. A live socket with no
+such process is an unknown socket. A socket file nothing listens on is a stopped
+host: SIGTERM does not remove it, and the next server replaces it.
+
+The scripts live in `host_config::managed_host` and are exercised against the
+real binary by `tyde-server/tests/managed_host_lifecycle.rs`.
+
 GitHub release metadata is not part of compatibility detection. It is only an
 install source when a launch or upgrade genuinely needs the target binary.
 

@@ -9291,8 +9291,10 @@ dependencies = [
 name = "tyde-server"
 version = "0.9.4-beta.3"
 dependencies = [
+ "host-config",
  "rlimit",
  "server",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",

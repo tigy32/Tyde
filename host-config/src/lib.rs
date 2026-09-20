@@ -16,6 +16,7 @@
 //! `dev-docs/12-remote-hosts.md`; they are not NDJSON frame payloads for a
 //! connected host.
 
+pub mod managed_host;
 pub mod updates;
 
 use std::cmp::Ordering;
