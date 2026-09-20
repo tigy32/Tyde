@@ -11,13 +11,101 @@ use crate::store::mcp_servers::{McpServerStore, RESERVED_MCP_SERVER_NAMES};
 use crate::store::skills::SkillStore;
 use crate::store::steering::SteeringStore;
 
-pub use crate::backend::customization::{ResolvedSkill, ResolvedSpawnConfig, SkillSelection};
+use crate::backend::customization::SkillDelivery;
+pub use crate::backend::customization::{ResolvedSkill, SkillSelection};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedSpawnConfig {
+    policy: SpawnConfigPolicy,
+    pub instructions: Option<String>,
+    pub steering_body: String,
+    /// Steering Tyde injects itself, kept apart from the user's steering
+    /// records because it is a property of the session Tyde built, not
+    /// something the user wrote or can see in Settings.
+    ///
+    /// Derived by the resolver from the same MCP list used to start the session.
+    pub builtin_steering: String,
+    pub skills: Vec<ResolvedSkill>,
+    pub skill_selection: SkillSelection,
+    pub skill_delivery: SkillDelivery,
+    pub mcp_servers: Vec<McpServerConfig>,
+    pub tool_policy: ToolPolicy,
+    pub access_mode: BackendAccessMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SpawnConfigPolicy {
+    User,
+    Reviewer,
+    InferenceOnly,
+    FailedStartup,
+    BackendOnly,
+}
+
+impl ResolvedSpawnConfig {
+    fn empty(policy: SpawnConfigPolicy) -> Self {
+        Self {
+            policy,
+            instructions: None,
+            steering_body: String::new(),
+            builtin_steering: String::new(),
+            skills: Vec::new(),
+            skill_selection: SkillSelection::Explicit,
+            skill_delivery: SkillDelivery::NamesOnly,
+            mcp_servers: Vec::new(),
+            tool_policy: ToolPolicy::Unrestricted,
+            access_mode: BackendAccessMode::Unrestricted,
+        }
+    }
+
+    /// Low-level Backend callers have no host stores. Host sessions must use
+    /// resolve_spawn_config instead; this policy cannot start an agent actor.
+    pub fn for_backend_session() -> Self {
+        Self::empty(SpawnConfigPolicy::BackendOnly)
+    }
+
+    /// Naming, summaries, compaction inference, supervision and quota wakeups
+    /// are isolated utility turns, not user agents: no steering, skills or MCP.
+    pub(crate) fn inference_only() -> Self {
+        let mut resolved = Self::empty(SpawnConfigPolicy::InferenceOnly);
+        resolved.tool_policy = ToolPolicy::AllowList { tools: Vec::new() };
+        resolved.access_mode = BackendAccessMode::ReadOnly;
+        resolved
+    }
+
+    /// A failed agent record never reaches a backend, even if its source
+    /// session or customization no longer exists.
+    pub(crate) fn failed_startup() -> Self {
+        Self::empty(SpawnConfigPolicy::FailedStartup)
+    }
+
+    pub(crate) fn assert_session_policy(&self, startup_failed: bool) {
+        assert!(
+            matches!(
+                self.policy,
+                SpawnConfigPolicy::User | SpawnConfigPolicy::Reviewer
+            ) || (startup_failed && self.policy == SpawnConfigPolicy::FailedStartup),
+            "agent session bypassed spawn resolution: {:?}",
+            self.policy
+        );
+        tracing::debug!(policy = ?self.policy, startup_failed, "resolved session spawn policy");
+    }
+}
+
+pub(crate) enum SpawnCustomization<'a> {
+    /// Includes Default (when no agent is selected), workspace/store skills,
+    /// user MCP servers, and host/project steering. Workflows are user agents.
+    User(Option<&'a CustomAgentId>),
+    /// The review role retains user steering, but only its dedicated prompt,
+    /// read-only tools and review MCP: no Default role, skills or user MCP.
+    Reviewer { instructions: String },
+}
 
 pub(crate) struct ResolveSpawnConfigRequest<'a> {
     pub backend_kind: BackendKind,
     pub project_id: Option<&'a ProjectId>,
     pub workspace_roots: &'a [String],
-    pub custom_agent_id: Option<&'a CustomAgentId>,
+    pub customization: SpawnCustomization<'a>,
     pub built_in_mcp_servers: &'a [StartupMcpServer],
     pub custom_agent_store: &'a CustomAgentStore,
     pub mcp_server_store: &'a McpServerStore,
@@ -28,11 +116,40 @@ pub(crate) struct ResolveSpawnConfigRequest<'a> {
 pub(crate) fn resolve_spawn_config(
     request: ResolveSpawnConfigRequest<'_>,
 ) -> Result<ResolvedSpawnConfig, String> {
-    let mut mcp_servers = request
+    let policy = match &request.customization {
+        SpawnCustomization::User(_) => SpawnConfigPolicy::User,
+        SpawnCustomization::Reviewer { .. } => SpawnConfigPolicy::Reviewer,
+    };
+    let mut resolved = ResolvedSpawnConfig::empty(policy);
+    resolved.mcp_servers = request
         .built_in_mcp_servers
         .iter()
         .map(startup_mcp_server_to_protocol)
-        .collect::<Vec<_>>();
+        .collect();
+    resolved.steering_body = resolve_steering_body(request.steering_store, request.project_id)?;
+    resolved.skill_delivery = crate::backend::skill_delivery(request.backend_kind);
+    match &request.customization {
+        SpawnCustomization::User(custom_agent_id) => {
+            resolve_user_customization(&request, *custom_agent_id, &mut resolved)?;
+        }
+        SpawnCustomization::Reviewer { instructions } => {
+            resolved.instructions = Some(instructions.clone());
+            resolved.tool_policy = crate::review::reviewer::reviewer_tool_policy();
+            resolved.access_mode = BackendAccessMode::ReadOnly;
+        }
+    }
+    resolved.builtin_steering = crate::backend::builtin_steering_for_tools(
+        &protocol_mcp_servers_to_startup(&resolved.mcp_servers),
+    );
+    Ok(resolved)
+}
+
+fn resolve_user_customization(
+    request: &ResolveSpawnConfigRequest<'_>,
+    custom_agent_id: Option<&CustomAgentId>,
+    resolved: &mut ResolvedSpawnConfig,
+) -> Result<(), String> {
+    let mut mcp_servers = std::mem::take(&mut resolved.mcp_servers);
     let mut mcp_names = mcp_servers
         .iter()
         .map(|server| (server.name.clone(), server.id.clone()))
@@ -41,7 +158,6 @@ pub(crate) fn resolve_spawn_config(
     let mut instructions = None;
     let mut skills = Vec::new();
     let mut skill_selection = SkillSelection::Explicit;
-    let skill_delivery = crate::backend::skill_delivery(request.backend_kind);
     let mut tool_policy = ToolPolicy::Unrestricted;
 
     let project_skills = crate::store::skills::scan_workspace_skills(request.workspace_roots)?;
@@ -54,7 +170,7 @@ pub(crate) fn resolve_spawn_config(
     // builtin, so users can customize every plain chat from Settings →
     // Custom Agents. An explicit selection must exist; the implicit default
     // is best-effort (a deleted Default agent means no customization).
-    let custom_agent = match request.custom_agent_id {
+    let custom_agent = match custom_agent_id {
         Some(custom_agent_id) => Some(
             request
                 .custom_agent_store
@@ -123,21 +239,11 @@ pub(crate) fn resolve_spawn_config(
 
     crate::backend::validate_tool_policy(request.backend_kind, &tool_policy)?;
 
-    let steering_body = resolve_steering_body(request.steering_store, request.project_id)?;
-
-    let resolved = ResolvedSpawnConfig {
-        instructions,
-        steering_body,
-        // Stamped for every session, resolved or hand-built, where the agent
-        // actor assembles the spawn config.
-        builtin_steering: String::new(),
-        skills,
-        skill_selection,
-        skill_delivery,
-        mcp_servers,
-        tool_policy,
-        access_mode: BackendAccessMode::Unrestricted,
-    };
+    resolved.instructions = instructions;
+    resolved.skills = skills;
+    resolved.skill_selection = skill_selection;
+    resolved.mcp_servers = mcp_servers;
+    resolved.tool_policy = tool_policy;
 
     if !resolved.skills.is_empty() {
         // When a skill fails to show up in a session, this is the line that
@@ -164,7 +270,7 @@ pub(crate) fn resolve_spawn_config(
         );
     }
 
-    Ok(resolved)
+    Ok(())
 }
 
 pub(crate) fn protocol_mcp_servers_to_startup(

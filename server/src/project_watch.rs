@@ -43,9 +43,11 @@ impl ProjectWatcher {
         let roots = project
             .root_paths()
             .into_iter()
-            .map(|root| fs::canonicalize(root.0))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(notify::Error::io)?;
+            .map(|root| {
+                fs::canonicalize(&root.0)
+                    .map_err(|error| notify::Error::io(error).add_path(PathBuf::from(root.0)))
+            })
+            .collect::<notify::Result<Vec<_>>>()?;
         let mut state = WatchState {
             watcher,
             roots,

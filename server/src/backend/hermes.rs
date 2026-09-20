@@ -1450,7 +1450,7 @@ impl Backend for HermesBackend {
             &[],
             &protocol::ToolPolicy::Unrestricted,
             &profile,
-            &ResolvedSpawnConfig::default(),
+            &ResolvedSpawnConfig::for_backend_session(),
             false,
         )
         .await?;
@@ -1689,7 +1689,7 @@ pub(crate) async fn probe_profile_surfaces(
         &[],
         &protocol::ToolPolicy::Unrestricted,
         profile,
-        &ResolvedSpawnConfig::default(),
+        &ResolvedSpawnConfig::for_backend_session(),
         false,
     )
     .await;
@@ -2082,7 +2082,7 @@ async fn run_credential_actions_for_profile(
         &[],
         &protocol::ToolPolicy::Unrestricted,
         profile,
-        &ResolvedSpawnConfig::default(),
+        &ResolvedSpawnConfig::for_backend_session(),
         false,
     )
     .await?;

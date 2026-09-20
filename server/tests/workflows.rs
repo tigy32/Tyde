@@ -403,6 +403,88 @@ async fn trigger_workflow_spawns_workflow_origin_coordinator() {
     write_workflow(tmp.path(), "read_only");
     let mut fixture = Fixture::new().await;
     let project = create_project(&mut fixture.client, &tmp.path().display().to_string()).await;
+    let other_root = tempfile::tempdir().expect("other project root");
+    let other_project = create_project(
+        &mut fixture.client,
+        &other_root.path().display().to_string(),
+    )
+    .await;
+    for (id, scope, content) in [
+        (
+            "workflow-host",
+            protocol::SteeringScope::Host,
+            "Workflow host steering",
+        ),
+        (
+            "workflow-project",
+            protocol::SteeringScope::Project(project.id.clone()),
+            "Workflow project steering",
+        ),
+        (
+            "workflow-other",
+            protocol::SteeringScope::Project(other_project.id.clone()),
+            "Unrelated steering",
+        ),
+    ] {
+        fixture
+            .client
+            .steering_upsert(protocol::SteeringUpsertPayload {
+                steering: protocol::Steering {
+                    id: protocol::SteeringId(id.to_owned()),
+                    scope,
+                    title: id.to_owned(),
+                    content: content.to_owned(),
+                },
+            })
+            .await
+            .expect("save workflow steering");
+        next_frame_matching_on(&mut fixture.client, "steering saved", |env| {
+            env.kind == FrameKind::SteeringNotify
+        })
+        .await;
+    }
+    fixture
+        .client
+        .custom_agent_upsert(protocol::CustomAgentUpsertPayload {
+            custom_agent: protocol::CustomAgent {
+                id: protocol::CustomAgentId("tyde-default".to_owned()),
+                name: "Default".to_owned(),
+                description: "Customization regression fixture".to_owned(),
+                instructions: Some("Default workflow instructions".to_owned()),
+                skill_ids: Vec::new(),
+                mcp_server_ids: Vec::new(),
+                tool_policy: protocol::ToolPolicy::Unrestricted,
+            },
+        })
+        .await
+        .expect("save default customization");
+    next_frame_matching_on(&mut fixture.client, "default saved", |env| {
+        env.kind == FrameKind::CustomAgentNotify
+    })
+    .await;
+    let skill_dir = tmp.path().join(".agents/skills/workflow-skill");
+    std::fs::create_dir_all(&skill_dir).expect("create workspace skill");
+    std::fs::write(skill_dir.join("SKILL.md"), "Workflow skill instructions").expect("write skill");
+    fixture
+        .client
+        .mcp_server_upsert(protocol::McpServerUpsertPayload {
+            mcp_server: protocol::McpServerConfig {
+                id: protocol::McpServerId("workflow-user-tool".to_owned()),
+                name: "workflow-user-tool".to_owned(),
+                supports_parallel_tool_calls: false,
+                transport: protocol::McpTransportConfig::Http {
+                    url: "http://127.0.0.1:9/mcp".to_owned(),
+                    headers: HashMap::new(),
+                    bearer_token_env_var: None,
+                },
+            },
+        })
+        .await
+        .expect("save user MCP");
+    next_frame_matching_on(&mut fixture.client, "MCP saved", |env| {
+        env.kind == FrameKind::McpServerNotify
+    })
+    .await;
     fixture
         .client
         .workflow_refresh(protocol::WorkflowRefreshPayload::default())
@@ -417,9 +499,6 @@ async fn trigger_workflow_spawns_workflow_origin_coordinator() {
     assert_eq!(metadata.workflow_id, WorkflowId("build".to_owned()));
     assert_eq!(metadata.workflow_run_id, run_id);
 
-    // A coordinator's spawn config is assembled by the workflow path rather
-    // than resolved from the stores, so it is the session most likely to be
-    // handed agent control without the steering that governs its use.
     let response = collect_turn_delta_text(&mut fixture.client, &coordinator_stream).await;
     assert!(
         response.contains("[startup_mcp_servers: tyde-agent-control(http)"),
@@ -431,6 +510,34 @@ async fn trigger_workflow_spawns_workflow_origin_coordinator() {
             server::backend::AGENT_CONTROL_SPAWN_STEERING
         )),
         "coordinator holds agent control without the steering for it: {response}"
+    );
+    assert!(
+        response.contains("[steering: Workflow host steering\\n\\nWorkflow project steering]"),
+        "coordinator lost user steering: {response}"
+    );
+    assert!(
+        !response.contains("Unrelated steering"),
+        "wrong project steering: {response}"
+    );
+    assert!(
+        response.contains("[instructions: Default workflow instructions]"),
+        "coordinator lost Default instructions: {response}"
+    );
+    assert!(
+        response.contains("[skills: workflow-skill]"),
+        "coordinator lost workspace skill: {response}"
+    );
+    assert!(
+        response.contains("workflow-user-tool(http)"),
+        "coordinator lost user MCP: {response}"
+    );
+    assert!(
+        response.contains("tyde-workflow"),
+        "coordinator lost workflow MCP: {response}"
+    );
+    assert!(
+        response.contains("[access_mode: ReadOnly]"),
+        "coordinator lost workflow access mode: {response}"
     );
 }
 

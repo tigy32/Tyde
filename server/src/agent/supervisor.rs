@@ -19,8 +19,8 @@ use tokio::sync::mpsc;
 
 use super::registry::AgentStatus;
 use super::{
-    AgentId, BackendAccessMode, BackendExecutionMode, BackendKind, BackendSpawnConfig, EventStream,
-    HostCapacityTx, HostSubAgentEmitterContext, SpawnCostHint, ToolPolicy, spawn_backend,
+    AgentId, BackendExecutionMode, BackendKind, BackendSpawnConfig, EventStream, HostCapacityTx,
+    HostSubAgentEmitterContext, SpawnCostHint, spawn_backend,
 };
 
 /// Byte caps for ancillary supervision prompt sections, so one huge message
@@ -840,11 +840,7 @@ fn supervision_spawn_config(
         backend_config: Default::default(),
         subagent_emitter: None,
         mock_launch: None,
-        resolved_spawn_config: super::customization::ResolvedSpawnConfig {
-            tool_policy: ToolPolicy::AllowList { tools: Vec::new() },
-            access_mode: BackendAccessMode::ReadOnly,
-            ..Default::default()
-        },
+        resolved_spawn_config: super::customization::ResolvedSpawnConfig::inference_only(),
     }
 }
 

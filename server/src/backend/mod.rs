@@ -448,7 +448,7 @@ impl BackendStorage {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct BackendSpawnConfig {
     pub execution_mode: BackendExecutionMode,
     pub cost_hint: Option<SpawnCostHint>,
@@ -475,6 +475,25 @@ pub struct BackendSpawnConfig {
     /// the mock backend. Real backends ignore it.
     pub(crate) mock_launch: Option<mock::MockLaunch>,
     pub resolved_spawn_config: ResolvedSpawnConfig,
+}
+
+impl Default for BackendSpawnConfig {
+    fn default() -> Self {
+        Self {
+            execution_mode: BackendExecutionMode::default(),
+            cost_hint: None,
+            custom_agent_id: None,
+            startup_mcp_servers: Vec::new(),
+            session_settings: None,
+            provider_version: None,
+            backend_storage: BackendStorage::default(),
+            backend_config: BackendConfigValues::default(),
+            acp_agent: None,
+            subagent_emitter: None,
+            mock_launch: None,
+            resolved_spawn_config: ResolvedSpawnConfig::for_backend_session(),
+        }
+    }
 }
 
 /// Output stream from a backend session. The agent actor receives both chat

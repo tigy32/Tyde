@@ -19,11 +19,10 @@ use crate::agent::{
 use crate::agent_control_mcp::{
     AGENT_CONTROL_AWAIT_MCP_SERVER_NAME, AGENT_CONTROL_MCP_SERVER_NAME, AgentControlMcpHandle,
 };
-use crate::backend::StartupMcpServer;
-use crate::backend::StartupMcpTransport;
 use crate::host::mcp_url_for_agent;
 use crate::review_mcp::REVIEW_FEEDBACK_MCP_SERVER_NAME;
 use crate::workflows::mcp::WORKFLOW_PROGRESS_MCP_SERVER_NAME;
+use protocol::McpTransportConfig;
 
 /// Bounded so a stalled consumer cannot grow the queue without limit. A
 /// consumer that overruns it sees `Lagged` and reports the gap.
@@ -219,7 +218,6 @@ pub(crate) struct ResolvedSpawnRequest {
     /// Which ACP agent to launch, resolved from `launch_profile_id`. Only set
     /// for [`BackendKind::Kiro`].
     pub acp_agent: Option<protocol::AcpAgentSpec>,
-    pub startup_mcp_servers: Vec<StartupMcpServer>,
     pub resolved_spawn_config: ResolvedSpawnConfig,
     pub resume_session_id: Option<SessionId>,
     pub fork_from_session_id: Option<SessionId>,
@@ -311,7 +309,7 @@ impl AgentRegistry {
         runtime: AgentActorRuntimeResources,
     ) -> SpawnedAgent {
         let agent_id = AgentId(Uuid::new_v4().to_string());
-        for server in &mut request.startup_mcp_servers {
+        for server in &mut request.resolved_spawn_config.mcp_servers {
             if !matches!(
                 server.name.as_str(),
                 AGENT_CONTROL_MCP_SERVER_NAME
@@ -321,7 +319,7 @@ impl AgentRegistry {
             ) {
                 continue;
             }
-            let StartupMcpTransport::Http { url, headers, .. } = &mut server.transport else {
+            let McpTransportConfig::Http { url, headers, .. } = &mut server.transport else {
                 panic!("Tyde injected MCP servers must use HTTP transport");
             };
             if matches!(

@@ -113,7 +113,7 @@ pub struct MockTurn {
 #[derive(Debug, Clone)]
 pub(super) enum MockTurnBody {
     Steps(Vec<MockStep>),
-    RenderedEcho,
+    RenderedEcho(Option<MockGate>),
     RenderedHistoryJoin,
 }
 
@@ -279,7 +279,14 @@ impl MockTurn {
 
     pub fn echo() -> Self {
         Self {
-            body: MockTurnBody::RenderedEcho,
+            body: MockTurnBody::RenderedEcho(None),
+            finish: MockTurnFinish::Done,
+        }
+    }
+
+    pub fn gated_echo(gate: &MockGateHandle) -> Self {
+        Self {
+            body: MockTurnBody::RenderedEcho(Some(gate.gate())),
             finish: MockTurnFinish::Done,
         }
     }
@@ -446,7 +453,7 @@ impl MockTurn {
                     protocol::ChatEvent::GoalChanged(Some(goal)),
                 )),
             ),
-            MockTurnBody::RenderedEcho | MockTurnBody::RenderedHistoryJoin => {
+            MockTurnBody::RenderedEcho(_) | MockTurnBody::RenderedHistoryJoin => {
                 panic!("goal state requires a frozen turn")
             }
         }
@@ -556,7 +563,7 @@ impl MockTurn {
     fn with_appended_steps(mut self, extra: Vec<MockStep>) -> Self {
         match &mut self.body {
             MockTurnBody::Steps(steps) => steps.extend(extra),
-            MockTurnBody::RenderedEcho | MockTurnBody::RenderedHistoryJoin => {
+            MockTurnBody::RenderedEcho(_) | MockTurnBody::RenderedHistoryJoin => {
                 panic!("post-idle step builders apply to frozen turns, not rendered ones")
             }
         }
@@ -598,12 +605,15 @@ impl MockTurn {
     ) -> (Vec<MockStep>, MockTurnFinish) {
         let steps = match self.body {
             MockTurnBody::Steps(steps) => steps,
-            MockTurnBody::RenderedEcho => text_steps(
+            MockTurnBody::RenderedEcho(gate) => text_steps(
                 format!(
                     "{}mock backend response to: {input}",
                     startup_mcp_response_prefix(session_id)
                 ),
-                TextShape::default(),
+                TextShape {
+                    gate,
+                    ..TextShape::default()
+                },
             ),
             MockTurnBody::RenderedHistoryJoin => text_steps(
                 format!(

@@ -345,10 +345,35 @@ references skills and MCP servers by ID, and agents carry `custom_agent_id`.
 
 ## 5. Spawn-Time Resolution
 
-Resolve customization once, on the server, before a backend session starts. A
-good home is `server/src/agent/customization.rs`, called from `host.rs` before
-backend spawn. The important rule is that resolution is server-owned and typed,
-not reconstructed in the frontend.
+Every live host session is assembled by `resolve_spawn_config` in
+`server/src/agent/customization.rs`. `ResolvedSpawnConfig` has no `Default`
+and cannot be constructed with a literal outside that module. Callers choose
+`SpawnCustomization::User` or `SpawnCustomization::Reviewer` explicitly.
+
+- **User sessions**, including workflow coordinators, inherit the selected
+  custom agent (implicitly Default), skills, MCP servers and host/project
+  steering. Coordinators perform user work and need the same user-configured
+  environment as their children; the workflow's prompt and access mode remain
+  authoritative inputs. The workflow-progress MCP is added to the resolver's
+  built-in MCP set rather than carried in a second list.
+- **Reviewers** inherit host/project steering, but retain their dedicated
+  review prompt, read-only tool allowlist and review-feedback MCP only.
+  Default instructions could replace the review role, while skills and
+  arbitrary MCP servers expand a deliberately restricted review environment.
+- **Inference-only utilities** (naming, activity and compaction summaries,
+  supervision, usage wakeups) use the named `inference_only` policy: no user
+  instructions, steering, skills or MCP, read-only access and no tools.
+- **Failed startup records**, including forks/resumes whose source is missing,
+  use `failed_startup`. They never start a backend; the actor rejects this
+  policy without a startup failure.
+- **Low-level backend consumers**, including conformance and Hermes metadata
+  probes, use `for_backend_session` without host stores. This preserves the
+  unconfigured Backend API default and is rejected by the host agent actor.
+
+The resolved MCP list is the session's only MCP source. The registry binds
+caller authorization into it, then the actor derives backend startup MCPs from
+it. Built-in agent-control steering is resolved from this same tool set, kept
+separate from user steering, and never added to Settings.
 
 At spawn:
 
@@ -373,7 +398,7 @@ At spawn:
 Important separation:
 
 - custom-agent `instructions` are the selected agent identity
-- steering is universal host/project guidance applied to every spawn
+- steering is host/project guidance applied to every live user/reviewer session
 
 Some backends ultimately merge those into one prompt surface, but the resolver
 keeps them separate so selection, replay, and resume stay explicit.

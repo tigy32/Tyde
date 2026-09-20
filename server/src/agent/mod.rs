@@ -9,9 +9,9 @@ use protocol::{
     AgentActivityStats, AgentActivityStatsPayload, AgentActivitySummary, AgentBootstrapEvent,
     AgentBootstrapPayload, AgentControlLatestOutput, AgentControlOutput, AgentErrorCode,
     AgentErrorPayload, AgentId, AgentInput, AgentOrigin, AgentRenamedPayload, AgentStartPayload,
-    BackendAccessMode, BackendKind, ChatEvent, ChatMessage, ChatMessageId, CompactionMethod,
-    CompactionMetrics, CompactionMutation, CompactionObservationId, CompactionOperationId,
-    CompactionStage, CompactionTrigger, ContextBreakdown, ContextCompactionCapabilityPayload,
+    BackendKind, ChatEvent, ChatMessage, ChatMessageId, CompactionMethod, CompactionMetrics,
+    CompactionMutation, CompactionObservationId, CompactionOperationId, CompactionStage,
+    CompactionTrigger, ContextBreakdown, ContextCompactionCapabilityPayload,
     ContextCompactionNotifyPayload, ContextCompactionStatus, ContextCompactionTimelineEvent,
     ContextCompactionTimelineStatus, Envelope, FrameKind, MessageMetadataUpdateData, MessageOrigin,
     MessageSender, MessageTokenUsage, ModelRequestId, ModelRequestTokenUsage, QueuedMessageEntry,
@@ -21,7 +21,7 @@ use protocol::{
     StreamTextDeltaData, TaskTokenUsageAmount, TaskTokenUsageScope,
     TaskTokenUsageUnavailableReason, TokenUsage, TokenUsageScope, TokenUsageUnavailableReason,
     ToolExecutionCompletedData, ToolExecutionMode, ToolExecutionOutcome, ToolExecutionResult,
-    ToolPolicy, ToolRequestType,
+    ToolRequestType,
 };
 use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use uuid::Uuid;
@@ -2007,11 +2007,7 @@ pub(crate) fn agent_name_generation_spawn_config(
         acp_agent: None,
         subagent_emitter: None,
         mock_launch: None,
-        resolved_spawn_config: customization::ResolvedSpawnConfig {
-            tool_policy: ToolPolicy::AllowList { tools: Vec::new() },
-            access_mode: BackendAccessMode::ReadOnly,
-            ..Default::default()
-        },
+        resolved_spawn_config: customization::ResolvedSpawnConfig::inference_only(),
     }
 }
 
@@ -2732,7 +2728,6 @@ pub(crate) fn spawn_agent_actor(
             session_settings_schema,
             backend_config,
             acp_agent,
-            startup_mcp_servers,
             resolved_spawn_config,
             resume_session_id,
             fork_from_session_id,
@@ -2743,16 +2738,9 @@ pub(crate) fn spawn_agent_actor(
             mock_launch,
             ..
         } = request;
-        // Every agent session converges here, whether its spawn config came
-        // from resolution or was built by hand (workflow coordinators, BTW
-        // agents, reviewers). Tyde's own steering is a property of the tools
-        // the session actually holds rather than of the user's steering
-        // records, so it is stamped once at this seam: a spawn path that
-        // assembles its own config cannot silently drop it.
-        let mut resolved_spawn_config = resolved_spawn_config;
-        resolved_spawn_config.builtin_steering =
-            crate::backend::builtin_steering_for_tools(&startup_mcp_servers);
-        let resolved_spawn_config = resolved_spawn_config;
+        resolved_spawn_config.assert_session_policy(startup_failure.is_some());
+        let startup_mcp_servers =
+            customization::protocol_mcp_servers_to_startup(&resolved_spawn_config.mcp_servers);
         let mut current_start = start.clone();
         let session_resumability_config = resolved_spawn_config.clone();
         let workspace_emitter = Arc::new(

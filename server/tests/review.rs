@@ -878,10 +878,7 @@ async fn project_bootstrap_exposes_one_active_workspace_review() {
     let _reservation = fixture
         .reserve_next_mock_launch(
             "AI Review",
-            MockScript::one(MockTurn::gated_text(
-                "mock review of both roots",
-                &reviewer_gate,
-            )),
+            MockScript::one(MockTurn::gated_echo(&reviewer_gate)),
         )
         .await;
     let mut client = fixture.client;
@@ -932,6 +929,82 @@ async fn project_bootstrap_exposes_one_active_workspace_review() {
             .all(|diff| diff.scope == ProjectDiffScope::Unstaged)
     );
 
+    let other_root = tempfile::tempdir().expect("other project root");
+    let other_project = create_project(&mut client, other_root.path()).await;
+    for (id, scope, content) in [
+        (
+            "review-host",
+            protocol::SteeringScope::Host,
+            "Reviewer host steering",
+        ),
+        (
+            "review-project",
+            protocol::SteeringScope::Project(project.id.clone()),
+            "Reviewer project steering",
+        ),
+        (
+            "review-other",
+            protocol::SteeringScope::Project(other_project.id.clone()),
+            "Unrelated reviewer steering",
+        ),
+    ] {
+        client
+            .steering_upsert(protocol::SteeringUpsertPayload {
+                steering: protocol::Steering {
+                    id: protocol::SteeringId(id.to_owned()),
+                    scope,
+                    title: id.to_owned(),
+                    content: content.to_owned(),
+                },
+            })
+            .await
+            .expect("save reviewer steering");
+        next_frame_matching_on(&mut client, "steering saved", |env| {
+            env.kind == FrameKind::SteeringNotify
+        })
+        .await;
+    }
+    client
+        .custom_agent_upsert(protocol::CustomAgentUpsertPayload {
+            custom_agent: protocol::CustomAgent {
+                id: protocol::CustomAgentId("tyde-default".to_owned()),
+                name: "Default".to_owned(),
+                description: "Customization regression fixture".to_owned(),
+                instructions: Some("Default instructions excluded from reviewer".to_owned()),
+                skill_ids: Vec::new(),
+                mcp_server_ids: Vec::new(),
+                tool_policy: protocol::ToolPolicy::Unrestricted,
+            },
+        })
+        .await
+        .expect("save default customization");
+    next_frame_matching_on(&mut client, "default saved", |env| {
+        env.kind == FrameKind::CustomAgentNotify
+    })
+    .await;
+    let skill_dir = repo_a.join(".agents/skills/not-for-reviewer");
+    fs::create_dir_all(&skill_dir).expect("create workspace skill");
+    fs::write(skill_dir.join("SKILL.md"), "Skill excluded from reviewer").expect("write skill");
+    client
+        .mcp_server_upsert(protocol::McpServerUpsertPayload {
+            mcp_server: protocol::McpServerConfig {
+                id: protocol::McpServerId("not-for-reviewer".to_owned()),
+                name: "not-for-reviewer".to_owned(),
+                supports_parallel_tool_calls: false,
+                transport: protocol::McpTransportConfig::Http {
+                    url: "http://127.0.0.1:9/mcp".to_owned(),
+                    headers: Default::default(),
+                    bearer_token_env_var: None,
+                },
+            },
+        })
+        .await
+        .expect("save user MCP");
+    next_frame_matching_on(&mut client, "MCP saved", |env| {
+        env.kind == FrameKind::McpServerNotify
+    })
+    .await;
+
     client
         .review_action(
             &summary.id,
@@ -945,10 +1018,15 @@ async fn project_bootstrap_exposes_one_active_workspace_review() {
         .await
         .expect("start workspace AI review");
 
+    let mut reviewer_frames = Vec::new();
     let mut new_agent = None;
     let mut running = None;
     next_frame_matching_on(&mut client, "workspace AI reviewer start", |env| {
         match env.kind {
+            FrameKind::AgentBootstrap => {
+                reviewer_frames.extend(fixture::agent_bootstrap_frames(env))
+            }
+            FrameKind::ChatEvent => reviewer_frames.push(env.clone()),
             FrameKind::NewAgent => {
                 let payload: NewAgentPayload = env.parse_payload().expect("new agent payload");
                 assert_eq!(payload.name, "AI Review");
@@ -981,9 +1059,56 @@ async fn project_bootstrap_exposes_one_active_workspace_review() {
         new_agent.is_some() && running.is_some()
     })
     .await;
+    fixture::push_pending_frames_on(&client, reviewer_frames);
     let new_agent = new_agent.expect("new AI Review agent");
     let running = running.expect("running AI reviewer state");
     assert_eq!(running.agent_id, Some(new_agent.agent_id.clone()));
+    reviewer_gate.release_one();
+    let response = fixture::finish_turn_on(&mut client, &new_agent.instance_stream)
+        .await
+        .chat_events()
+        .into_iter()
+        .filter_map(|event| match event {
+            ChatEvent::StreamEnd(end) => Some(end.message.content),
+            _ => None,
+        })
+        .collect::<String>();
+    assert!(
+        response.contains("[steering: Reviewer host steering\\n\\nReviewer project steering]"),
+        "reviewer lost user steering: {response}"
+    );
+    assert!(
+        !response.contains("Unrelated reviewer steering"),
+        "wrong project steering: {response}"
+    );
+    assert!(
+        response.contains("Check both roots."),
+        "reviewer lost dedicated prompt: {response}"
+    );
+    assert!(
+        !response.contains("Default instructions excluded from reviewer"),
+        "reviewer inherited Default role: {response}"
+    );
+    assert!(
+        !response.contains("[skills:"),
+        "reviewer inherited skills: {response}"
+    );
+    assert!(
+        response.contains("[startup_mcp_servers: tyde-review-feedback(http)]"),
+        "reviewer must have only review MCP: {response}"
+    );
+    assert!(
+        !response.contains("[builtin_steering:"),
+        "reviewer has no agent control: {response}"
+    );
+    assert!(
+        response.contains("[access_mode: ReadOnly]"),
+        "reviewer lost read-only mode: {response}"
+    );
+    assert!(
+        response.contains("[tool_policy: AllowList"),
+        "reviewer lost tool restrictions: {response}"
+    );
     drop(reviewer_gate);
     close_agent_and_wait(&mut client, &new_agent.instance_stream).await;
 }

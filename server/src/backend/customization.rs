@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use protocol::{BackendAccessMode, McpServerConfig, SkillId, ToolPolicy};
+use protocol::SkillId;
 
 /// One skill selected for a session: identity and canonical on-disk location.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -84,39 +84,4 @@ pub enum SkillDelivery {
     NamesOnly,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ResolvedSpawnConfig {
-    pub instructions: Option<String>,
-    pub steering_body: String,
-    /// Steering Tyde injects itself, kept apart from the user's steering
-    /// records because it is a property of the session Tyde built, not
-    /// something the user wrote or can see in Settings.
-    ///
-    /// Written by the agent actor from the session's startup MCP servers, not
-    /// by whoever assembled this config. Leave it empty when constructing one.
-    pub builtin_steering: String,
-    pub skills: Vec<ResolvedSkill>,
-    pub skill_selection: SkillSelection,
-    pub skill_delivery: SkillDelivery,
-    pub mcp_servers: Vec<McpServerConfig>,
-    pub tool_policy: ToolPolicy,
-    pub access_mode: BackendAccessMode,
-}
-
-impl Default for ResolvedSpawnConfig {
-    fn default() -> Self {
-        Self {
-            instructions: None,
-            steering_body: String::new(),
-            builtin_steering: String::new(),
-            skills: Vec::new(),
-            // Explicit is the safe default: an adapter must never advertise
-            // skills it was not handed.
-            skill_selection: SkillSelection::Explicit,
-            skill_delivery: SkillDelivery::NamesOnly,
-            mcp_servers: Vec::new(),
-            tool_policy: ToolPolicy::Unrestricted,
-            access_mode: BackendAccessMode::Unrestricted,
-        }
-    }
-}
+pub use crate::agent::customization::ResolvedSpawnConfig;

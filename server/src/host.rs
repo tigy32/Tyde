@@ -35,11 +35,10 @@ use protocol::{
     HostBootstrapPayload, HostBrowseInitial, HostBrowseListPayload, HostBrowseStartPayload,
     HostFilterId, HostSettingsPayload, ImageData, LOCAL_HOST_ID, LaunchProfile,
     LaunchProfileCatalog, LaunchProfileCatalogPayload, LaunchProfileEntry, LaunchProfileId,
-    LaunchProfileKind, ListSessionsPayload, MAX_SESSION_LIST_PAGE_LIMIT, McpServerConfig,
-    McpServerDeletePayload, McpServerId, McpServerNotifyPayload, McpServerUpsertPayload,
-    McpTransportConfig, MessageSender, MobileDeviceRenamePayload, MobileDeviceRevokePayload,
-    MobilePairingCancelPayload, NewAgentPayload, Project, ProjectAddRootPayload,
-    ProjectCreatePayload, ProjectDeletePayload, ProjectDeleteRootPayload,
+    LaunchProfileKind, ListSessionsPayload, MAX_SESSION_LIST_PAGE_LIMIT, McpServerDeletePayload,
+    McpServerNotifyPayload, McpServerUpsertPayload, MessageSender, MobileDeviceRenamePayload,
+    MobileDeviceRevokePayload, MobilePairingCancelPayload, NewAgentPayload, Project,
+    ProjectAddRootPayload, ProjectCreatePayload, ProjectDeletePayload, ProjectDeleteRootPayload,
     ProjectDiscardFilePayload, ProjectGitCommitPayload, ProjectGitCommitResultPayload, ProjectId,
     ProjectListDirPayload, ProjectNotifyPayload, ProjectOpenPathPayload, ProjectPath,
     ProjectReadDiffPayload, ProjectReadFilePayload, ProjectRenamePayload, ProjectReorderPayload,
@@ -81,8 +80,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::agent::customization::{
-    ResolveSpawnConfigRequest, ResolvedSpawnConfig, SkillSelection,
-    protocol_mcp_servers_to_startup, resolve_spawn_config,
+    ResolveSpawnConfigRequest, ResolvedSpawnConfig, SpawnCustomization, resolve_spawn_config,
 };
 use crate::agent::registry::{
     AgentRegistry, AgentStartupFailure, AgentStatusTransition, InitialAgentAlias,
@@ -134,7 +132,6 @@ use crate::project_stream::{
 use crate::review::actor::{ReviewAiSpawnRequest, ReviewDeliveryOutcome, ReviewDeliveryRequest};
 use crate::review::reviewer::{
     ReviewerToolBridge, build_reviewer_system_prompt, build_reviewer_user_prompt,
-    reviewer_tool_policy,
 };
 use crate::review::{
     ReviewRegistry, ReviewRegistryHandle, build_create_request, review_create_selection,
@@ -4477,7 +4474,7 @@ impl HostHandle {
                 ) = if let Some(err) = missing_project_failure {
                     (
                         requested_custom_agent_id,
-                        ResolvedSpawnConfig::default(),
+                        ResolvedSpawnConfig::failed_startup(),
                         None,
                         Some(AgentStartupFailure::backend_failed(err)),
                     )
@@ -4492,7 +4489,7 @@ impl HostHandle {
                         backend_kind,
                         project_id: project_id.as_ref(),
                         workspace_roots: &workspace_roots,
-                        custom_agent_id: requested_custom_agent_id.as_ref(),
+                        customization: SpawnCustomization::User(requested_custom_agent_id.as_ref()),
                         built_in_mcp_servers: &startup_mcp_servers,
                         custom_agent_store: &custom_agents,
                         mcp_server_store: &mcp_servers,
@@ -4502,7 +4499,7 @@ impl HostHandle {
                         Ok(resolved) => (requested_custom_agent_id, resolved, None, None),
                         Err(err) => (
                             requested_custom_agent_id,
-                            ResolvedSpawnConfig::default(),
+                            ResolvedSpawnConfig::failed_startup(),
                             None,
                             Some(AgentStartupFailure::internal(err)),
                         ),
@@ -4511,8 +4508,6 @@ impl HostHandle {
                 if resolved_spawn_config_override.is_none() {
                     resolved_spawn_config.access_mode = access_mode;
                 }
-                let startup_mcp_servers =
-                    protocol_mcp_servers_to_startup(&resolved_spawn_config.mcp_servers);
                 let (session_settings_schema, schema_failure) = match self
                     .resolve_session_schema_for_spawn(backend_kind, launch_profile_id.as_ref())
                     .await
@@ -4590,7 +4585,6 @@ impl HostHandle {
                     session_settings_schema,
                     backend_config: resolve_backend_config_for_spawn(&host_settings, backend_kind),
                     acp_agent: None,
-                    startup_mcp_servers,
                     resolved_spawn_config,
                     resume_session_id: None,
                     fork_from_session_id: None,
@@ -4642,8 +4636,7 @@ impl HostHandle {
                             session_settings_schema: None,
                             backend_config: Default::default(),
                             acp_agent: None,
-                            startup_mcp_servers: Vec::new(),
-                            resolved_spawn_config: ResolvedSpawnConfig::default(),
+                            resolved_spawn_config: ResolvedSpawnConfig::failed_startup(),
                             resume_session_id: Some(session_id.clone()),
                             fork_from_session_id: None,
                             startup_warning: None,
@@ -4695,8 +4688,7 @@ impl HostHandle {
                             session_settings_schema: None,
                             backend_config: Default::default(),
                             acp_agent: None,
-                            startup_mcp_servers: Vec::new(),
-                            resolved_spawn_config: ResolvedSpawnConfig::default(),
+                            resolved_spawn_config: ResolvedSpawnConfig::failed_startup(),
                             resume_session_id: Some(session_id.clone()),
                             fork_from_session_id: None,
                             startup_warning: None,
@@ -4771,7 +4763,7 @@ impl HostHandle {
                                 backend_kind: record.backend_kind,
                                 project_id: project_id.as_ref(),
                                 workspace_roots: &record.workspace_roots,
-                                custom_agent_id: None,
+                                customization: SpawnCustomization::User(None),
                                 built_in_mcp_servers: &startup_mcp_servers,
                                 custom_agent_store: &custom_agents,
                                 mcp_server_store: &mcp_servers,
@@ -4799,7 +4791,7 @@ impl HostHandle {
                             backend_kind: record.backend_kind,
                             project_id: project_id.as_ref(),
                             workspace_roots: &record.workspace_roots,
-                            custom_agent_id: Some(stored_custom_agent_id),
+                            customization: SpawnCustomization::User(Some(stored_custom_agent_id)),
                             built_in_mcp_servers: &startup_mcp_servers,
                             custom_agent_store: &custom_agents,
                             mcp_server_store: &mcp_servers,
@@ -4811,7 +4803,7 @@ impl HostHandle {
                             }
                             Err(err) => (
                                 Some(stored_custom_agent_id.clone()),
-                                ResolvedSpawnConfig::default(),
+                                ResolvedSpawnConfig::failed_startup(),
                                 None,
                                 Some(AgentStartupFailure::internal(err)),
                             ),
@@ -4826,7 +4818,7 @@ impl HostHandle {
                         backend_kind: record.backend_kind,
                         project_id: project_id.as_ref(),
                         workspace_roots: &record.workspace_roots,
-                        custom_agent_id: None,
+                        customization: SpawnCustomization::User(None),
                         built_in_mcp_servers: &startup_mcp_servers,
                         custom_agent_store: &custom_agents,
                         mcp_server_store: &mcp_servers,
@@ -4836,14 +4828,12 @@ impl HostHandle {
                         Ok(resolved) => (None, resolved, None, None),
                         Err(err) => (
                             None,
-                            ResolvedSpawnConfig::default(),
+                            ResolvedSpawnConfig::failed_startup(),
                             None,
                             Some(AgentStartupFailure::internal(err)),
                         ),
                     }
                 };
-                let startup_mcp_servers =
-                    protocol_mcp_servers_to_startup(&resolved_spawn_config.mcp_servers);
                 let (session_settings_schema, schema_failure) = match self
                     .resolve_session_schema_for_spawn(
                         record.backend_kind,
@@ -4914,7 +4904,6 @@ impl HostHandle {
                         record.backend_kind,
                     ),
                     acp_agent: None,
-                    startup_mcp_servers,
                     resolved_spawn_config,
                     resume_session_id: Some(session_id),
                     fork_from_session_id: None,
@@ -4945,10 +4934,8 @@ impl HostHandle {
                             InitialAgentAliasPersistence::GeneratedIfNoUserAlias
                         },
                     });
-                    let resolved_spawn_config = ResolvedSpawnConfig {
-                        access_mode: access_mode.unwrap_or_default(),
-                        ..Default::default()
-                    };
+                    let mut resolved_spawn_config = ResolvedSpawnConfig::failed_startup();
+                    resolved_spawn_config.access_mode = access_mode.unwrap_or_default();
                     return Ok(self
                         .spawn_resolved_agent(ResolvedSpawnRequest {
                             name: resolved_name,
@@ -4974,7 +4961,6 @@ impl HostHandle {
                             session_settings_schema: None,
                             backend_config: Default::default(),
                             acp_agent: None,
-                            startup_mcp_servers: Vec::new(),
                             resolved_spawn_config,
                             resume_session_id: None,
                             fork_from_session_id: None,
@@ -5057,7 +5043,7 @@ impl HostHandle {
                                 backend_kind,
                                 project_id: project_id.as_ref(),
                                 workspace_roots: &workspace_roots,
-                                custom_agent_id: None,
+                                customization: SpawnCustomization::User(None),
                                 built_in_mcp_servers: &startup_mcp_servers,
                                 custom_agent_store: &custom_agents,
                                 mcp_server_store: &mcp_servers,
@@ -5085,7 +5071,7 @@ impl HostHandle {
                             backend_kind,
                             project_id: project_id.as_ref(),
                             workspace_roots: &workspace_roots,
-                            custom_agent_id: Some(stored_custom_agent_id),
+                            customization: SpawnCustomization::User(Some(stored_custom_agent_id)),
                             built_in_mcp_servers: &startup_mcp_servers,
                             custom_agent_store: &custom_agents,
                             mcp_server_store: &mcp_servers,
@@ -5097,7 +5083,7 @@ impl HostHandle {
                             }
                             Err(err) => (
                                 Some(stored_custom_agent_id.clone()),
-                                ResolvedSpawnConfig::default(),
+                                ResolvedSpawnConfig::failed_startup(),
                                 None,
                                 Some(AgentStartupFailure::internal(err)),
                             ),
@@ -5114,7 +5100,7 @@ impl HostHandle {
                         backend_kind,
                         project_id: project_id.as_ref(),
                         workspace_roots: &workspace_roots,
-                        custom_agent_id: None,
+                        customization: SpawnCustomization::User(None),
                         built_in_mcp_servers: &startup_mcp_servers,
                         custom_agent_store: &custom_agents,
                         mcp_server_store: &mcp_servers,
@@ -5124,15 +5110,13 @@ impl HostHandle {
                         Ok(resolved) => (None, resolved, None, None),
                         Err(err) => (
                             None,
-                            ResolvedSpawnConfig::default(),
+                            ResolvedSpawnConfig::failed_startup(),
                             None,
                             Some(AgentStartupFailure::internal(err)),
                         ),
                     }
                 };
                 resolved_spawn_config.access_mode = access_mode.unwrap_or(record.access_mode);
-                let startup_mcp_servers =
-                    protocol_mcp_servers_to_startup(&resolved_spawn_config.mcp_servers);
                 let backend_support_failure = (!use_mock_backend
                     && !crate::backend::capabilities_for_backend_kind(backend_kind)
                         .contains(tyde_agent_adapter::BackendCapability::ForkSession))
@@ -5240,7 +5224,6 @@ impl HostHandle {
                         record.backend_kind,
                     ),
                     acp_agent: None,
-                    startup_mcp_servers,
                     resolved_spawn_config,
                     resume_session_id: None,
                     fork_from_session_id: Some(from_session_id),
@@ -5259,7 +5242,7 @@ impl HostHandle {
         tracing::info!(
             backend_kind = ?request.backend_kind,
             workspace_roots = ?request.workspace_roots,
-            startup_mcp_servers = request.startup_mcp_servers.len(),
+            startup_mcp_servers = request.resolved_spawn_config.mcp_servers.len(),
             resume_session_id = ?request.resume_session_id,
             fork_from_session_id = ?request.fork_from_session_id,
             "host spawn_agent resolved request"
@@ -5729,7 +5712,7 @@ impl HostHandle {
         tracing::info!(
             backend_kind = ?request.backend_kind,
             workspace_roots = ?request.workspace_roots,
-            startup_mcp_servers = request.startup_mcp_servers.len(),
+            startup_mcp_servers = request.resolved_spawn_config.mcp_servers.len(),
             resume_session_id = ?request.resume_session_id,
             fork_from_session_id = ?request.fork_from_session_id,
             "host spawn_agent resolved request"
@@ -10580,10 +10563,31 @@ impl HostHandle {
                 },
             });
         }
-        let resolved_spawn_config = ResolvedSpawnConfig {
-            access_mode: definition.summary.coordinator.access_mode,
-            ..Default::default()
+        let resolved_spawn_config = {
+            let state = self.state.lock().await;
+            let custom_agents = state.custom_agent_store.lock().await;
+            let mcp_servers = state.mcp_server_store.lock().await;
+            let steering = state.steering_store.lock().await;
+            let skills = state.skill_store.lock().await;
+            resolve_spawn_config(ResolveSpawnConfigRequest {
+                backend_kind: definition.summary.coordinator.backend,
+                project_id: project_id.as_ref(),
+                workspace_roots: &workspace_roots,
+                customization: SpawnCustomization::User(None),
+                built_in_mcp_servers: &startup_mcp_servers,
+                custom_agent_store: &custom_agents,
+                mcp_server_store: &mcp_servers,
+                steering_store: &steering,
+                skill_store: &skills,
+            })
         };
+        let startup_failure = resolved_spawn_config
+            .as_ref()
+            .err()
+            .map(|err| AgentStartupFailure::internal(err.clone()));
+        let mut resolved_spawn_config =
+            resolved_spawn_config.unwrap_or_else(|_| ResolvedSpawnConfig::failed_startup());
+        resolved_spawn_config.access_mode = definition.summary.coordinator.access_mode;
         let request = ResolvedSpawnRequest {
             name: format!("Workflow: {}", definition.summary.name),
             origin: AgentOrigin::Workflow,
@@ -10608,12 +10612,11 @@ impl HostHandle {
             session_settings_schema: None,
             backend_config: Default::default(),
             acp_agent: None,
-            startup_mcp_servers,
             resolved_spawn_config,
             resume_session_id: None,
             fork_from_session_id: None,
             startup_warning: None,
-            startup_failure: None,
+            startup_failure,
             initial_alias: Some(InitialAgentAlias {
                 name: format!("Workflow: {}", definition.summary.name),
                 persistence: InitialAgentAliasPersistence::User,
@@ -12776,7 +12779,7 @@ impl HostHandle {
                 backend_kind,
                 project_id: Some(&project_id),
                 workspace_roots: &project_roots,
-                custom_agent_id: custom_agent_id.as_ref(),
+                customization: SpawnCustomization::User(custom_agent_id.as_ref()),
                 built_in_mcp_servers: &startup_mcp_servers,
                 custom_agent_store: &custom_agents,
                 mcp_server_store: &mcp_servers,
@@ -12786,8 +12789,6 @@ impl HostHandle {
             .map_err(|error| format!("failed to resolve review target agent config: {error}"))?
         };
         resolved_spawn_config.access_mode = protocol::BackendAccessMode::Unrestricted;
-        let startup_mcp_servers =
-            protocol_mcp_servers_to_startup(&resolved_spawn_config.mcp_servers);
         let session_settings_schema = {
             let state = self.state.lock().await;
             session_schema_for_backend(&state, backend_kind, None)
@@ -12832,7 +12833,6 @@ impl HostHandle {
             session_settings_schema,
             backend_config: Default::default(),
             acp_agent: None,
-            startup_mcp_servers,
             resolved_spawn_config,
             resume_session_id: None,
             fork_from_session_id: None,
@@ -13096,25 +13096,34 @@ impl HostHandle {
             Err(message) => return Err(message),
         };
         let reviewer_system_prompt_len = reviewer_system_prompt.len();
-        let reviewer_spawn_config = ResolvedSpawnConfig {
-            instructions: Some(reviewer_system_prompt),
-            steering_body: String::new(),
-            builtin_steering: String::new(),
-            skills: Vec::new(),
-            skill_selection: SkillSelection::Explicit,
-            skill_delivery: crate::backend::skill_delivery(backend_kind),
-            mcp_servers: vec![McpServerConfig {
-                id: McpServerId("tyde-review-feedback".to_owned()),
-                name: REVIEW_FEEDBACK_MCP_SERVER_NAME.to_owned(),
-                supports_parallel_tool_calls: false,
-                transport: McpTransportConfig::Http {
-                    url: review_mcp_url,
-                    headers: HashMap::new(),
-                    bearer_token_env_var: None,
+        let reviewer_mcp_servers = vec![StartupMcpServer {
+            name: REVIEW_FEEDBACK_MCP_SERVER_NAME.to_owned(),
+            supports_parallel_tool_calls: false,
+            transport: StartupMcpTransport::Http {
+                url: review_mcp_url,
+                headers: HashMap::new(),
+                bearer_token_env_var: None,
+            },
+        }];
+        let reviewer_spawn_config = {
+            let state = self.state.lock().await;
+            let custom_agents = state.custom_agent_store.lock().await;
+            let mcp_servers = state.mcp_server_store.lock().await;
+            let steering = state.steering_store.lock().await;
+            let skills = state.skill_store.lock().await;
+            resolve_spawn_config(ResolveSpawnConfigRequest {
+                backend_kind,
+                project_id: Some(&request.review.project_id),
+                workspace_roots: &roots,
+                customization: SpawnCustomization::Reviewer {
+                    instructions: reviewer_system_prompt,
                 },
-            }],
-            tool_policy: reviewer_tool_policy(),
-            access_mode: protocol::BackendAccessMode::ReadOnly,
+                built_in_mcp_servers: &reviewer_mcp_servers,
+                custom_agent_store: &custom_agents,
+                mcp_server_store: &mcp_servers,
+                steering_store: &steering,
+                skill_store: &skills,
+            })?
         };
         let prompt = build_reviewer_user_prompt();
         let prompt_len = prompt.len();
