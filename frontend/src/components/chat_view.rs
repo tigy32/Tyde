@@ -1999,6 +1999,114 @@ mod wasm_tests {
     }
 
     #[wasm_bindgen_test]
+    async fn streaming_reply_keeps_its_gap_when_completed() {
+        ensure_styles_loaded();
+        let container = make_container();
+        let state_handle: std::rc::Rc<std::cell::RefCell<Option<AppState>>> =
+            std::rc::Rc::new(std::cell::RefCell::new(None));
+        let setup_handle = state_handle.clone();
+        let agent_id = AgentId("agent-stream-spacing".to_owned());
+        let bound = ActiveAgentRef {
+            host_id: "host-spacing".to_owned(),
+            agent_id: agent_id.clone(),
+        };
+        let bound_for_mount = bound.clone();
+        let handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            *setup_handle.borrow_mut() = Some(state.clone());
+            provide_context(state);
+            let bound = bound_for_mount.clone();
+            view! {
+                <ChatView
+                    tab_id=TabId(10_004)
+                    agent_ref=Signal::derive(move || Some(bound.clone()))
+                    is_active=Signal::derive(|| true)
+                />
+            }
+        });
+        next_tick().await;
+        let state = state_handle.borrow().clone().expect("mounted state");
+        let dispatch = |event| {
+            crate::dispatch::apply_chat_event(&state, &bound.host_id, &agent_id, event);
+        };
+        let mut previous = mk_user_msg("Previous assistant reply").message;
+        previous.sender = MessageSender::Assistant {
+            agent: "claude".to_owned(),
+        };
+        dispatch(ChatEvent::MessageAdded(previous));
+        dispatch(ChatEvent::StreamStart(protocol::StreamStartData {
+            agent: "claude".to_owned(),
+            model: Some("claude-test".to_owned()),
+        }));
+
+        async fn settle_layout() {
+            let promise = js_sys::Promise::new(&mut |resolve, _reject| {
+                web_sys::window()
+                    .unwrap()
+                    .set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, 200)
+                    .unwrap();
+            });
+            wasm_bindgen_futures::JsFuture::from(promise).await.unwrap();
+        }
+
+        let measure_gap = |phase: &str| {
+            let cards = container
+                .query_selector_all(".chat-card-assistant")
+                .unwrap();
+            assert_eq!(cards.length(), 2, "{phase}: both replies must be visible");
+            let previous = cards.item(0).unwrap().dyn_into::<Element>().unwrap();
+            let current = cards.item(1).unwrap().dyn_into::<Element>().unwrap();
+            let gap = current.get_bounding_client_rect().top()
+                - previous.get_bounding_client_rect().bottom();
+            console_log!("Reply spacing during {phase}: {gap}px");
+            assert!(
+                (gap - ROW_GAP_PX).abs() < 0.5,
+                "{phase}: replies must retain the normal {ROW_GAP_PX}px gap, got {gap}px"
+            );
+            gap
+        };
+
+        settle_layout().await;
+        assert!(
+            container
+                .text_content()
+                .unwrap()
+                .contains("Thinking\u{2026}")
+        );
+        let thinking_gap = measure_gap("thinking");
+        dispatch(ChatEvent::StreamDelta(protocol::StreamTextDeltaData {
+            text: "The reply is arriving".to_owned(),
+        }));
+        settle_layout().await;
+        assert!(
+            container
+                .text_content()
+                .unwrap()
+                .contains("The reply is arriving")
+        );
+        let streaming_gap = measure_gap("streaming");
+        dispatch(ChatEvent::StreamDelta(protocol::StreamTextDeltaData {
+            text: " and is now complete.".to_owned(),
+        }));
+        settle_layout().await;
+        measure_gap("last delta");
+        let mut completed = mk_user_msg("The reply is arriving and is now complete.").message;
+        completed.sender = MessageSender::Assistant {
+            agent: "claude".to_owned(),
+        };
+        dispatch(ChatEvent::StreamEnd(protocol::StreamEndData {
+            message: completed,
+        }));
+        settle_layout().await;
+        assert!(query(&container, ".chat-card-streaming").is_none());
+        let completed_gap = measure_gap("completed");
+        assert!((thinking_gap - completed_gap).abs() < 0.5);
+        assert!((streaming_gap - completed_gap).abs() < 0.5);
+        drop(handle);
+        container.remove();
+    }
+
+    #[wasm_bindgen_test]
     async fn appending_a_message_preserves_existing_row_identity() {
         let agent_id = AgentId("agent-1".to_owned());
         let host_id = "host-a".to_owned();
