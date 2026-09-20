@@ -972,6 +972,7 @@ pub enum FrameKind {
     ListSessions,
     DeleteSession,
     SendMessage,
+    SteerMessage,
     GoalControl,
     EditQueuedMessage,
     CancelQueuedMessage,
@@ -1175,6 +1176,7 @@ impl fmt::Display for FrameKind {
             Self::ListSessions => f.write_str("list_sessions"),
             Self::DeleteSession => f.write_str("delete_session"),
             Self::SendMessage => f.write_str("send_message"),
+            Self::SteerMessage => f.write_str("steer_message"),
             Self::GoalControl => f.write_str("goal_control"),
             Self::EditQueuedMessage => f.write_str("edit_queued_message"),
             Self::CancelQueuedMessage => f.write_str("cancel_queued_message"),
@@ -3914,6 +3916,7 @@ pub struct SessionSummaryCountUpdatedPayload {
 #[derive(Debug, Clone)]
 pub enum AgentInput {
     SendMessage(SendMessagePayload),
+    SteerMessage(SendMessagePayload),
     GoalControl(GoalControl),
     EditQueuedMessage(EditQueuedMessagePayload),
     CancelQueuedMessage(CancelQueuedMessagePayload),

@@ -621,24 +621,6 @@ fn steer_chat_input(
     let restore_images = images.clone();
 
     spawn_local(async move {
-        if let Err(e) = send_frame(
-            &host_id,
-            instance_stream.clone(),
-            FrameKind::Interrupt,
-            &InterruptPayload::default(),
-        )
-        .await
-        {
-            log::error!("failed to interrupt conversation for steer: {e}");
-            restore_submitted_input(
-                &restore_composer,
-                pending_images,
-                restore_draft,
-                restore_images,
-            );
-            return;
-        }
-
         let payload = SendMessagePayload {
             message: text,
             images: payload_images,
@@ -646,7 +628,7 @@ fn steer_chat_input(
             tool_response: None,
         };
         if let Err(e) =
-            send_frame(&host_id, instance_stream, FrameKind::SendMessage, &payload).await
+            send_frame(&host_id, instance_stream, FrameKind::SteerMessage, &payload).await
         {
             log::error!("failed to send steer message: {e}");
             restore_submitted_input(
@@ -1782,7 +1764,7 @@ pub fn ChatInput(
                                     class="chat-send-menu-item"
                                     role="menuitem"
                                     data-test="chat-send-menu-steer"
-                                    title="Interrupt current turn and redirect with your message"
+                                    title="Send your message into the current turn now"
                                     on:click=on_menu_steer
                                 >
                                     <span class="chat-send-menu-label">"Steer"</span>
@@ -3460,6 +3442,93 @@ mod wasm_tests {
             "redirect this",
             "Cmd+Enter must not steer a read-only backend-native agent"
         );
+    }
+
+    /// Steer is one atomic `steer_message` frame carrying the draft. The server
+    /// decides whether the running turn absorbs it or has to be interrupted, so
+    /// the client must never send its own Interrupt. Both entry points — the
+    /// dropdown item and Cmd+Enter — share that contract.
+    #[wasm_bindgen_test]
+    async fn steer_sends_one_steer_message_frame_without_interrupt() {
+        let state = AppState::new();
+        configure(&state, false, true, "use the other parser");
+        let mount_state = state.clone();
+        let container = make_container();
+        let _h = mount_to(container.clone(), move || {
+            provide_context(mount_state.clone());
+            view! { <ChatInput /> }
+        });
+        next_tick().await;
+        let calls = stub_send_recording();
+
+        open_menu(&container).await;
+        query(&container, "[data-test='chat-send-menu-steer']")
+            .expect("steer item must be present while thinking with a draft")
+            .dyn_into::<HtmlElement>()
+            .unwrap()
+            .click();
+        next_tick().await;
+        next_tick().await;
+
+        assert_eq!(
+            calls.length(),
+            1,
+            "Steer from the menu must send exactly one frame"
+        );
+        let args: JsonValue = serde_json::from_str(&calls.get(0).as_string().unwrap()).unwrap();
+        let envelope: JsonValue =
+            serde_json::from_str(args["line"].as_str().expect("outgoing frame")).unwrap();
+        assert_eq!(envelope["kind"], "steer_message");
+        assert_eq!(envelope["payload"]["message"], "use the other parser");
+        assert_eq!(
+            interrupt_frames(&calls),
+            0,
+            "Steer must not send a client-side Interrupt"
+        );
+        assert_eq!(
+            state.composer_untracked().text.get_untracked(),
+            "",
+            "Steer must clear the draft"
+        );
+        let field: web_sys::HtmlTextAreaElement = textarea(&container).dyn_into().unwrap();
+        assert_eq!(
+            field.value(),
+            "",
+            "the visible composer must be empty after Steer"
+        );
+
+        state
+            .composer_untracked()
+            .text
+            .set("and keep the old tests".to_owned());
+        next_tick().await;
+        dispatch_keydown(&textarea(&container), "Enter", true, false);
+        next_tick().await;
+        next_tick().await;
+
+        assert_eq!(
+            calls.length(),
+            2,
+            "Cmd+Enter while thinking must send exactly one more frame"
+        );
+        let args: JsonValue = serde_json::from_str(&calls.get(1).as_string().unwrap()).unwrap();
+        let envelope: JsonValue =
+            serde_json::from_str(args["line"].as_str().expect("outgoing frame")).unwrap();
+        assert_eq!(envelope["kind"], "steer_message");
+        assert_eq!(envelope["payload"]["message"], "and keep the old tests");
+        assert_eq!(
+            interrupt_frames(&calls),
+            0,
+            "Cmd+Enter steer must not send a client-side Interrupt"
+        );
+        assert_eq!(
+            state.composer_untracked().text.get_untracked(),
+            "",
+            "Cmd+Enter steer must clear the draft"
+        );
+
+        stub_send_host_line();
+        container.remove();
     }
 
     /// The Steer and Fork + send items render their keyboard-shortcut hints,

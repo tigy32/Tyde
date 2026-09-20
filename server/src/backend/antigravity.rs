@@ -1200,7 +1200,8 @@ impl Supervisor {
             AgentInput::GoalControl(_)
             | AgentInput::EditQueuedMessage(_)
             | AgentInput::CancelQueuedMessage(_)
-            | AgentInput::SendQueuedMessageNow(_) => {
+            | AgentInput::SendQueuedMessageNow(_)
+            | AgentInput::SteerMessage(_) => {
                 panic!(
                     "queued-message inputs must be handled by the agent actor before reaching the \
                      backend"

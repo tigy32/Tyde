@@ -1053,6 +1053,29 @@ pub enum SendOutcome {
     Closed,
 }
 
+/// Outcome of offering a user message to the turn a backend is already running
+/// via `Backend::steer`.
+///
+/// Steering never interrupts: the running turn keeps its tools and output, and
+/// the provider reads the message at its next model step. Every outcome except
+/// `Accepted` and `Closed` hands the payload back untouched, so the caller can
+/// deliver it another way; a backend must never return the payload after the
+/// provider has consumed it.
+#[derive(Debug)]
+pub enum SteerOutcome {
+    /// The provider took the message into the running turn, and the backend
+    /// has emitted the user message for it.
+    Accepted,
+    /// No turn is running that the provider would steer (it ended, or never
+    /// started). Nothing was delivered or emitted.
+    NoActiveTurn(protocol::SendMessagePayload),
+    /// This backend, or this provider session, cannot take input mid-turn, or
+    /// cannot carry this payload mid-turn. Nothing was delivered or emitted.
+    Unsupported(protocol::SendMessagePayload),
+    /// The backend has terminated and can't accept input.
+    Closed,
+}
+
 /// What came of asking a backend to stop one background command.
 ///
 /// The three answers are not interchangeable, and collapsing them to a boolean
@@ -1570,6 +1593,23 @@ pub trait Backend: Send + Sync + 'static {
     #[cfg(feature = "test-support")]
     fn mock_control(&self) -> Option<mock::MockControl> {
         None
+    }
+
+    /// Deliver a user message into the turn that is already running, without
+    /// interrupting it. Backends that implement this declare
+    /// `BackendCapability::MidTurnSteering`.
+    ///
+    /// Contract: like sends, steers are serialized by a single caller (the
+    /// agent actor). On `Accepted` the backend has emitted the user message
+    /// exactly once and the running turn carries on; the message is answered
+    /// inside that turn, or in a turn the provider opens for it on its own if
+    /// the running one ended first. A steer never closes, restarts, or
+    /// cancels a turn.
+    fn steer(
+        &self,
+        payload: protocol::SendMessagePayload,
+    ) -> impl std::future::Future<Output = SteerOutcome> + Send {
+        std::future::ready(SteerOutcome::Unsupported(payload))
     }
 
     /// Request interruption of the currently active turn, if any.

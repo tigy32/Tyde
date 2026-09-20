@@ -1065,6 +1065,23 @@ impl Connection {
         write_envelope(&mut self.writer, &envelope).await
     }
 
+    pub async fn steer_message_payload(
+        &mut self,
+        stream: &StreamPath,
+        payload: SendMessagePayload,
+    ) -> Result<(), FrameError> {
+        let seq = self
+            .outgoing_seq
+            .get(stream)
+            .copied()
+            .expect("steer_message on unknown stream — AgentStart must be received first");
+        let envelope =
+            Envelope::from_payload(stream.clone(), FrameKind::SteerMessage, seq, &payload)
+                .map_err(FrameError::Json)?;
+        self.outgoing_seq.insert(stream.clone(), seq + 1);
+        write_envelope(&mut self.writer, &envelope).await
+    }
+
     pub async fn fetch_session_history(
         &mut self,
         stream: &StreamPath,

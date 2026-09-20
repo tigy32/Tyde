@@ -600,6 +600,21 @@ pub(crate) async fn route_client_envelope(
                 )
                 .await;
             }
+            FrameKind::SteerMessage => {
+                let stream_path = envelope.stream.clone();
+                let agent_id = parse_agent_id(&stream_path)?;
+                let payload: SendMessagePayload = parse_payload(&envelope, "steer_message")?;
+                validate_message_images("steer_message", payload.images.as_deref())?;
+
+                deliver_agent_input(
+                    host,
+                    agent_id,
+                    AgentInput::SteerMessage(payload),
+                    stream_path,
+                    host_output_stream,
+                )
+                .await;
+            }
             FrameKind::GoalControl => {
                 let stream_path = envelope.stream.clone();
                 let agent_id = parse_agent_id(&stream_path)?;

@@ -29,7 +29,7 @@ use uuid::Uuid;
 use crate::backend::mock::MockBackend;
 use crate::backend::{
     Backend, BackendEvent, BackendExecutionMode, BackendSession, BackendSpawnConfig,
-    BackendStartupError, EventStream, SendOutcome, apply_session_settings_update,
+    BackendStartupError, EventStream, SendOutcome, SteerOutcome, apply_session_settings_update,
     resolve_backend_session_settings, validate_runtime_session_settings_update,
     validate_session_settings_values, validate_startup_mcp_configuration, with_backend_type,
 };
@@ -5595,6 +5595,20 @@ pub(crate) fn spawn_agent_actor(
                                 .await;
                                 continue;
                             }
+                            // Steering only means something while a turn the
+                            // backend could take it into is running; everywhere
+                            // else a steer is an ordinary send.
+                            let input = match input {
+                                AgentInput::SteerMessage(payload)
+                                    if payload.tool_response.is_some()
+                                        || !in_turn
+                                        || usage_paused
+                                        || context_compaction.is_some() =>
+                                {
+                                    AgentInput::SendMessage(payload)
+                                }
+                                input => input,
+                            };
                             if usage_paused && matches!(&input, AgentInput::SendMessage(msg) if msg.tool_response.is_some()) {
                                 pending_inputs.push_back(input);
                                 if let Some(reply) = delivery_ack.take() { let _ = reply.send(Ok(())); }
@@ -6036,6 +6050,98 @@ pub(crate) fn spawn_agent_actor(
                                         }
                                     }
                                 }
+                                AgentInput::SteerMessage(msg) => {
+                                    let review_origin = match msg.origin.as_ref() {
+                                        Some(MessageOrigin::Review { review_id }) => {
+                                            Some(review_id.clone())
+                                        }
+                                        Some(MessageOrigin::User) | Some(MessageOrigin::Supervisor) | None => None,
+                                    };
+                                    status_handle
+                                        .update(|status| {
+                                            status.activity_counter =
+                                                status.activity_counter.saturating_add(1);
+                                        })
+                                        .await;
+                                    let outcome = backend
+                                        .as_ref()
+                                        .expect("backend must exist while actor is running")
+                                        .steer(msg)
+                                        .await;
+                                    let (payload, interrupt_turn) = match outcome {
+                                        SteerOutcome::Accepted => {
+                                            if let Some(reply) = delivery_ack.take() {
+                                                mark_agent_turn_active(&status_handle).await;
+                                                let _ = reply.send(Ok(()));
+                                            }
+                                            if let Some(review_id) = review_origin {
+                                                notify_review_bundle_consumed(
+                                                    &review_registry,
+                                                    review_id,
+                                                    &current_start.agent_id,
+                                                )
+                                                .await;
+                                            }
+                                            continue;
+                                        }
+                                        SteerOutcome::Closed => {
+                                            // The closed event stream drives the
+                                            // terminal transition; only the
+                                            // caller's refusal is owed here.
+                                            reject_agent_delivery(
+                                                delivery_ack.take(),
+                                                DELIVERY_REJECTED_BACKEND_CLOSED,
+                                            );
+                                            continue;
+                                        }
+                                        // The turn ended under the steer: the
+                                        // idle drain sends it next.
+                                        SteerOutcome::NoActiveTurn(payload) => (payload, false),
+                                        SteerOutcome::Unsupported(payload) => (payload, true),
+                                    };
+                                    let sequence = next_queue_sequence;
+                                    next_queue_sequence = next_queue_sequence.saturating_add(1);
+                                    queue.push_front(SequencedQueuedMessage {
+                                        sequence,
+                                        entry: queued_entry_from_send_payload(payload),
+                                    });
+                                    update_queued_messages_snapshot(
+                                        &canonical_stream,
+                                        &mut event_log,
+                                        &mut subscribers,
+                                        &queue,
+                                        &session_store,
+                                        &status_handle,
+                                    )
+                                    .await;
+                                    if let Some(reply) = delivery_ack.take() {
+                                        mark_agent_turn_active(&status_handle).await;
+                                        let _ = reply.send(Ok(()));
+                                    }
+                                    if interrupt_turn
+                                        && !backend
+                                            .as_ref()
+                                            .expect("backend must exist while actor is running")
+                                            .interrupt()
+                                            .await
+                                    {
+                                        let payload = AgentErrorPayload {
+                                            agent_id: current_start.agent_id.clone(),
+                                            code: AgentErrorCode::Internal,
+                                            message: "agent backend does not support interrupt"
+                                                .to_owned(),
+                                            fatal: false,
+                                        };
+                                        append_event(
+                                            &canonical_stream,
+                                            &mut event_log,
+                                            &mut subscribers,
+                                            FrameKind::AgentError,
+                                            &payload,
+                                        )
+                                        .await;
+                                    }
+                                }
                                 AgentInput::EditQueuedMessage(payload) => {
                                     let Some(index) =
                                         queue.iter().position(|entry| entry.id == payload.id)
@@ -6139,6 +6245,35 @@ pub(crate) fn spawn_agent_actor(
                                             images_count = queued.images.len(),
                                             "moved review-origin bundle to front of queue"
                                         );
+                                    }
+                                    if in_turn && !usage_paused && context_compaction.is_none() {
+                                        let outcome = backend
+                                            .as_ref()
+                                            .expect("backend must exist while actor is running")
+                                            .steer(queued.clone().into_send_payload())
+                                            .await;
+                                        if matches!(outcome, SteerOutcome::Accepted) {
+                                            update_queued_messages_snapshot(
+                                                &canonical_stream,
+                                                &mut event_log,
+                                                &mut subscribers,
+                                                &queue,
+                                                &session_store,
+                                                &status_handle,
+                                            )
+                                            .await;
+                                            if let Some(MessageOrigin::Review { review_id }) =
+                                                queued.origin.clone()
+                                            {
+                                                notify_review_bundle_consumed(
+                                                    &review_registry,
+                                                    review_id,
+                                                    &current_start.agent_id,
+                                                )
+                                                .await;
+                                            }
+                                            continue;
+                                        }
                                     }
                                     queue.push_front(queued);
                                     update_queued_messages_snapshot(

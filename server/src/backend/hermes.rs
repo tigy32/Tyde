@@ -41,7 +41,7 @@ use crate::backend::{
     BackendCompactionUnavailableReason, BackendCompactionUserFocus,
     BackendCompactionUserFocusProvenance, BackendEvent, BackendObservedCompaction, BackendSession,
     BackendSpawnConfig, BackendStartupError, CancelBackgroundTaskOutcome, EventStream,
-    PostCompactionTokenCount, StartupMcpServer, StartupMcpTransport,
+    PostCompactionTokenCount, StartupMcpServer, StartupMcpTransport, SteerOutcome,
     backend_fork_unsupported_message, normalize_mcp_call_tool_result,
     render_combined_spawn_instructions, resolve_settings as resolve_backend_settings,
     tyde_owned_no_root_cwd,
@@ -452,6 +452,7 @@ enum HermesBackendCommand {
     SetWorkspaceRoots(Vec<String>, oneshot::Sender<Result<(), String>>),
     ReadSessionSettings(oneshot::Sender<Result<SessionSettingsValues, String>>),
     Input(AgentInput),
+    Steer(protocol::SendMessagePayload, oneshot::Sender<SteerOutcome>),
     UpdateSessionSettings(
         protocol::SetSessionSettingsPayload,
         oneshot::Sender<Result<(), String>>,
@@ -1156,6 +1157,7 @@ impl Backend for HermesBackend {
             tyde_agent_adapter::BackendCapability::BackgroundTasks,
             tyde_agent_adapter::BackendCapability::CancelsBackgroundTasks,
             tyde_agent_adapter::BackendCapability::AgentInitiatedTurns,
+            tyde_agent_adapter::BackendCapability::MidTurnSteering,
             tyde_agent_adapter::BackendCapability::TaskUpdates,
             tyde_agent_adapter::BackendCapability::TaskListReplacement,
             tyde_agent_adapter::BackendCapability::TaskListClear,
@@ -1523,7 +1525,8 @@ impl Backend for HermesBackend {
             AgentInput::GoalControl(_)
             | AgentInput::EditQueuedMessage(_)
             | AgentInput::CancelQueuedMessage(_)
-            | AgentInput::SendQueuedMessageNow(_) => {
+            | AgentInput::SendQueuedMessageNow(_)
+            | AgentInput::SteerMessage(_) => {
                 tracing::error!("queued-message inputs reached Hermes backend");
                 false
             }
@@ -1572,6 +1575,18 @@ impl Backend for HermesBackend {
         reply_rx
             .await
             .map_err(|_| "Hermes terminated while applying session settings".to_owned())?
+    }
+
+    async fn steer(&self, payload: protocol::SendMessagePayload) -> SteerOutcome {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        if self
+            .command_tx
+            .send(HermesBackendCommand::Steer(payload, reply_tx))
+            .is_err()
+        {
+            return SteerOutcome::Closed;
+        }
+        reply_rx.await.unwrap_or(SteerOutcome::Closed)
     }
 
     async fn interrupt(&self) -> bool {
@@ -2596,6 +2611,10 @@ impl HermesSessionActor {
                     let Some(command) = maybe_command else { break; };
                     match command {
                         HermesBackendCommand::Input(input) => self.handle_input(input).await,
+                        HermesBackendCommand::Steer(payload, reply) => {
+                            let outcome = self.handle_steer(payload).await;
+                            let _ = reply.send(outcome);
+                        }
                         HermesBackendCommand::SetWorkspaceRoots(roots, reply) => {
                             let result = self.set_workspace_roots(roots).await;
                             let _ = reply.send(result);
@@ -2810,7 +2829,8 @@ impl HermesSessionActor {
             AgentInput::GoalControl(_)
             | AgentInput::EditQueuedMessage(_)
             | AgentInput::CancelQueuedMessage(_)
-            | AgentInput::SendQueuedMessageNow(_) => {
+            | AgentInput::SendQueuedMessageNow(_)
+            | AgentInput::SteerMessage(_) => {
                 self.emit_error("queued-message inputs reached Hermes backend");
             }
         }
@@ -2874,6 +2894,65 @@ impl HermesSessionActor {
             Err(err) => {
                 self.detach_images(attached_paths).await;
                 self.emit_turn_failure(format!("Hermes prompt.submit failed: {err}"));
+            }
+        }
+    }
+
+    /// `session.steer` answers "queued" for any non-empty text, idle session
+    /// included, and an idle agent's pending steer is wiped by the next turn's
+    /// `clear_interrupt`. So whether a turn is running is decided here, from
+    /// `typing_active`, which an interrupt has already cleared by the time a
+    /// steer behind it is handled.
+    async fn handle_steer(&self, payload: protocol::SendMessagePayload) -> SteerOutcome {
+        // The steer channel is text only, and a slash command is run by the
+        // gateway rather than read by the model.
+        if payload.tool_response.is_some()
+            || !payload.images.as_deref().unwrap_or_default().is_empty()
+            || payload.message.trim().is_empty()
+            || super::invokes_slash_command(self.slash_commands.as_ref(), &payload.message)
+        {
+            return SteerOutcome::Unsupported(payload);
+        }
+        if !self.mapper.typing_active {
+            return SteerOutcome::NoActiveTurn(payload);
+        }
+        let steered = self
+            .gateway
+            .request_typed(
+                "session.steer",
+                json!({
+                    "session_id": self.live_session_id,
+                    "text": payload.message,
+                }),
+            )
+            .await;
+        match steered {
+            Ok(result) => match optional_string(&result, &["status"]).as_deref() {
+                Some("queued") => {
+                    self.emit(ChatEvent::MessageAdded(user_message(
+                        &payload.message,
+                        None,
+                    )));
+                    SteerOutcome::Accepted
+                }
+                Some("rejected") => SteerOutcome::NoActiveTurn(payload),
+                status => {
+                    tracing::warn!(
+                        ?status,
+                        "Hermes session.steer returned an unexpected status"
+                    );
+                    SteerOutcome::NoActiveTurn(payload)
+                }
+            },
+            // 4010: this session's agent has no steer channel.
+            Err(error) if error.code == Some(4010) => SteerOutcome::Unsupported(payload),
+            Err(error) if error.code.is_none() && self.gateway.tx.is_closed() => {
+                tracing::warn!(%error, "Hermes gateway closed before answering session.steer");
+                SteerOutcome::Closed
+            }
+            Err(error) => {
+                tracing::warn!(%error, "Hermes session.steer failed");
+                SteerOutcome::NoActiveTurn(payload)
             }
         }
     }

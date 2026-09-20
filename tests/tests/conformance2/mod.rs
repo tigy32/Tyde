@@ -7,7 +7,9 @@ use protocol::{
     SessionSettingsValues, TaskList, ToolExecutionCompletedData, ToolExecutionOutcome,
     ToolExecutionResult, ToolRequest, ToolRequestType, ToolUseData,
 };
-use server::backend::{Backend, BackendEvent, BackendSpawnConfig, EventStream, SendOutcome};
+use server::backend::{
+    Backend, BackendEvent, BackendSpawnConfig, EventStream, SendOutcome, SteerOutcome,
+};
 use std::path::Path;
 use std::time::Duration;
 use tyde_agent_adapter::BackendCapability;
@@ -950,6 +952,110 @@ pub async fn interrupt_turn<B: Backend>(
         turn,
         after_completed_response,
         settled_in,
+    }
+}
+
+/// Runs `prompt` as a turn and, once its shell command is running, hands the
+/// backend `steer` through `Backend::steer`. Returns everything up to the first
+/// idle: a steer accepted this early has the rest of the command to be read in,
+/// so its answer belongs to this turn and not to a later one.
+pub async fn steer_turn<B: Backend>(
+    host: &mut Harness<B>,
+    agent: &Agent,
+    prompt: &str,
+    steer: &str,
+) -> Turn {
+    send_prompt(host, agent, prompt).await;
+    let mut turn = host.turn(prompt);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(240);
+    let mut steer_at = None;
+    let mut steered = false;
+    loop {
+        let stream = host
+            .events
+            .as_mut()
+            .expect("backend event stream must be open");
+        let next = match steer_at {
+            Some(at) if !steered => tokio::time::timeout_at(at, stream.recv_backend()).await,
+            _ => Ok(tokio::time::timeout_at(deadline, stream.recv_backend())
+                .await
+                .unwrap_or_else(|_| panic!("{}: timed out collecting steered turn", turn.label()))),
+        };
+        let Ok(event) = next else {
+            let outcome = host
+                .backend
+                .as_ref()
+                .expect("backend must be running")
+                .steer(user_message(steer))
+                .await;
+            assert!(
+                matches!(outcome, SteerOutcome::Accepted),
+                "{}: backend did not take a message into its running turn: {outcome:?}",
+                turn.label()
+            );
+            steered = true;
+            continue;
+        };
+        let event = event.unwrap_or_else(|| panic!("{}: backend closed mid-turn", turn.label()));
+        eprintln!("{} {event:?}", turn.label());
+        match event {
+            BackendEvent::Chat(event) => {
+                if steer_at.is_none()
+                    && matches!(
+                        &event,
+                        ChatEvent::ToolRequest(request)
+                            if matches!(request.tool_type, ToolRequestType::RunCommand { .. })
+                    )
+                {
+                    steer_at = Some(tokio::time::Instant::now() + TOOL_STARTUP_GRACE);
+                }
+                let idle = matches!(event, ChatEvent::TypingStatusChanged(false));
+                turn.events.push(event);
+                if idle {
+                    assert!(
+                        steered,
+                        "{}: turn went idle before a shell command was running to steer into",
+                        turn.label()
+                    );
+                    return turn;
+                }
+            }
+            BackendEvent::ModelRequestTokenUsage(usage) => {
+                if usage
+                    .current_context_usage
+                    .as_ref()
+                    .and_then(|value| value.known())
+                    .is_some()
+                {
+                    turn.context_usage_event_positions.push(turn.events.len());
+                }
+                turn.model_requests.push(usage);
+            }
+            BackendEvent::Compaction(_) => {}
+        }
+    }
+}
+
+/// Offers `message` to a backend with no turn running. It must come straight
+/// back: a backend that swallowed it, or showed it, has lost or invented input.
+pub async fn steer_expecting_no_active_turn<B: Backend>(host: &mut Harness<B>, message: &str) {
+    let outcome = host
+        .backend
+        .as_ref()
+        .expect("backend must be running")
+        .steer(user_message(message))
+        .await;
+    match outcome {
+        SteerOutcome::NoActiveTurn(returned) => assert_eq!(
+            returned.message,
+            message,
+            "{:?}: an idle steer must hand its payload back untouched",
+            host.backend()
+        ),
+        outcome => panic!(
+            "{:?}: steered with no turn running, expected NoActiveTurn, got {outcome:?}",
+            host.backend()
+        ),
     }
 }
 

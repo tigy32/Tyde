@@ -184,6 +184,10 @@ impl ClaudeCommandHandle {
         .await
     }
 
+    async fn steer(&self, payload: protocol::SendMessagePayload) -> crate::backend::SteerOutcome {
+        self.inner.steer(payload).await
+    }
+
     fn compaction_capability(&self) -> BackendCompactionCapability {
         self.inner
             .state
@@ -567,6 +571,7 @@ impl ClaudeSession {
             skill_readiness: watch::channel(ClaudeSkillReadiness::NotRequired).0,
             skill_verification_abandoned: std::sync::atomic::AtomicBool::new(false),
             pending_cli_wake: std::sync::atomic::AtomicBool::new(false),
+            pending_steer_turn: std::sync::atomic::AtomicBool::new(false),
             background_work_active: std::sync::atomic::AtomicBool::new(false),
             typing_active: std::sync::atomic::AtomicBool::new(false),
         });
@@ -620,6 +625,9 @@ struct ActiveTurn {
     id: u64,
     owner: ClaudeTurnOwner,
     outcome_tx: Option<oneshot::Sender<TurnOutcome>>,
+    /// The turn is installed before its prompt reaches the CLI. A steer written
+    /// ahead of that prompt would become the turn, so steering waits for this.
+    prompt_written: bool,
     interrupt_requested: bool,
     pending_ask_user_question: Option<PendingAskUserQuestionControl>,
     pending_exit_plan_mode: Option<PendingExitPlanModeControl>,
@@ -887,6 +895,12 @@ struct ClaudeInner {
     /// token, so a stray frame arriving after a `result` can never open one.
     /// Atomic because the reader consults it synchronously per frame.
     pending_cli_wake: std::sync::atomic::AtomicBool,
+    /// Armed when a steer is written. The CLI answers a steer inside the
+    /// running turn and says nothing about it, unless the turn ended first:
+    /// then it opens a turn of its own for the message, and adopting that turn
+    /// needs a token just as a wake does. Nothing reports which happened, so
+    /// the token outlives a steer answered in-turn until the next turn opens.
+    pending_steer_turn: std::sync::atomic::AtomicBool,
     /// True while provider-owned work can continue after the foreground turn
     /// that launched it has ended. Typing is the public activity contract, so
     /// a foreground `result` must not make the agent appear idle while this is
@@ -2007,6 +2021,7 @@ impl ClaudeInner {
                 id: turn_id,
                 owner: ClaudeTurnOwner::User,
                 outcome_tx: Some(outcome_tx),
+                prompt_written: false,
                 interrupt_requested: false,
                 pending_ask_user_question: None,
                 pending_exit_plan_mode: None,
@@ -2014,6 +2029,9 @@ impl ClaudeInner {
             });
             (turn_id, state.model.clone(), state.ephemeral, outcome_rx)
         };
+        // A steer token only covers a turn the CLI opens before the next user
+        // turn; past this point it could only adopt a stray frame.
+        self.take_pending_steer_turn();
 
         // The user bubble is emitted only once the turn is admitted, so a
         // busy hand-back (which redispatches later) can never duplicate it and
@@ -2061,6 +2079,77 @@ impl ClaudeInner {
         ClaudeSendAdmission::Handled
     }
 
+    /// Offer a user message to the turn that is already running. The CLI reads
+    /// a user frame written mid-turn at its next model step, answers it inside
+    /// that turn under the same `result`, and emits no frame of its own for it.
+    async fn steer(
+        self: &Arc<Self>,
+        payload: protocol::SendMessagePayload,
+    ) -> crate::backend::SteerOutcome {
+        use crate::backend::SteerOutcome;
+
+        if payload.tool_response.is_some() {
+            return SteerOutcome::Unsupported(payload);
+        }
+        let stdin = {
+            let runtime = self.runtime.lock().await;
+            runtime.as_ref().map(|runtime| Arc::clone(&runtime.stdin))
+        };
+        let (written, images) = {
+            // Held through the stdin write so neither an interrupt nor a
+            // blocking tool request can slip in between the checks and the
+            // write.
+            let state = self.state.lock().await;
+            if state.closing {
+                return SteerOutcome::Closed;
+            }
+            let Some(active) = state.active_turn.as_ref() else {
+                return SteerOutcome::NoActiveTurn(payload);
+            };
+            let running = matches!(active.owner, ClaudeTurnOwner::User)
+                && active.prompt_written
+                && active.outcome_tx.is_some()
+                && !active.interrupt_requested
+                && state.resume_bootstrap.is_none();
+            if !running {
+                return SteerOutcome::NoActiveTurn(payload);
+            }
+            // A turn blocked on the user's own answer takes that answer, not a
+            // new message; a slash command is only recognized at the head of a
+            // turn; and a process due to restart after this turn would take a
+            // late steer down with it.
+            if active.pending_ask_user_question.is_some()
+                || active.pending_exit_plan_mode.is_some()
+                || state.restart_process_after_turn
+                || super::invokes_slash_command(state.slash_commands.as_ref(), &payload.message)
+            {
+                return SteerOutcome::Unsupported(payload);
+            }
+            let Some(stdin) = stdin else {
+                return SteerOutcome::NoActiveTurn(payload);
+            };
+            // Workspace roots cannot change while a turn runs, so the context
+            // `write_turn_to_persistent_process` prepends is already current.
+            let images = protocol_images_to_attachments(payload.images.clone()).unwrap_or_default();
+            let input = build_stream_json_user_message(&payload.message, &images);
+            // Armed before the write: a turn the CLI opens for this message
+            // must never reach the reader ahead of its token.
+            self.arm_steer_turn();
+            (write_json_line_to_stdin(&stdin, &input).await, images)
+        };
+        if let Err(err) = written {
+            self.take_pending_steer_turn();
+            tracing::error!("Failed to steer Claude turn: {err}");
+            return SteerOutcome::Closed;
+        }
+
+        self.emit_user_message_added(
+            &payload.message,
+            (!images.is_empty()).then_some(images.as_slice()),
+        );
+        SteerOutcome::Accepted
+    }
+
     async fn begin_compaction(
         self: Arc<Self>,
         request: BackendCompactionRequest,
@@ -2102,6 +2191,7 @@ impl ClaudeInner {
                 id: turn_id,
                 owner: ClaudeTurnOwner::Compaction(request.operation_id.clone()),
                 outcome_tx: None,
+                prompt_written: false,
                 interrupt_requested: false,
                 pending_ask_user_question: None,
                 pending_exit_plan_mode: None,
@@ -2345,6 +2435,21 @@ impl ClaudeInner {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    fn arm_steer_turn(&self) {
+        self.pending_steer_turn
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn take_pending_steer_turn(&self) -> bool {
+        self.pending_steer_turn
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn has_pending_steer_turn(&self) -> bool {
+        self.pending_steer_turn
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     fn set_background_work_active(&self, active: bool) -> bool {
         self.background_work_active
             .swap(active, std::sync::atomic::Ordering::Relaxed)
@@ -2419,6 +2524,7 @@ impl ClaudeInner {
                 id: turn_id,
                 owner: ClaudeTurnOwner::User,
                 outcome_tx: Some(outcome_tx),
+                prompt_written: true,
                 interrupt_requested: false,
                 pending_ask_user_question: None,
                 pending_exit_plan_mode: None,
@@ -2834,6 +2940,11 @@ impl ClaudeInner {
             let written = write_json_line_to_stdin(&stdin, &input_message).await;
             if written.is_ok() {
                 state.resume_bootstrap_required = true;
+                if let Some(active) = state.active_turn.as_mut()
+                    && active.id == turn_id
+                {
+                    active.prompt_written = true;
+                }
             }
             (generation, receiver, written)
         };
@@ -4412,6 +4523,8 @@ impl ClaudeInner {
         self.background_work_active
             .store(false, std::sync::atomic::Ordering::Relaxed);
         self.pending_cli_wake
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        self.pending_steer_turn
             .store(false, std::sync::atomic::Ordering::Relaxed);
     }
 
@@ -6393,7 +6506,7 @@ async fn read_claude_stdout_persistent(
                         recent_system_subtypes.warn_once_on_dropped_frame(&value);
                         continue;
                     }
-                    if !inner.has_pending_cli_wake() {
+                    if !inner.has_pending_cli_wake() && !inner.has_pending_steer_turn() {
                         recent_system_subtypes.warn_once_on_dropped_turn_start(&value);
                         continue;
                     }
@@ -6421,6 +6534,7 @@ async fn read_claude_stdout_persistent(
                         }
                     }
                     inner.take_pending_cli_wake();
+                    inner.take_pending_steer_turn();
                     match prepare_persistent_stdout_turn(&inner, &mut turn_state).await {
                         Some(turn) => turn,
                         None => continue,
@@ -7633,6 +7747,7 @@ async fn ensure_subagent_stream(
         skill_readiness: watch::channel(ClaudeSkillReadiness::NotRequired).0,
         skill_verification_abandoned: std::sync::atomic::AtomicBool::new(false),
         pending_cli_wake: std::sync::atomic::AtomicBool::new(false),
+        pending_steer_turn: std::sync::atomic::AtomicBool::new(false),
         background_work_active: std::sync::atomic::AtomicBool::new(false),
         typing_active: std::sync::atomic::AtomicBool::new(false),
     });
@@ -13739,7 +13854,8 @@ impl ClaudeBackend {
                             }
                             AgentInput::GoalControl(_) | AgentInput::EditQueuedMessage(_)
                             | AgentInput::CancelQueuedMessage(_)
-                            | AgentInput::SendQueuedMessageNow(_) => {
+                            | AgentInput::SendQueuedMessageNow(_)
+                            | AgentInput::SteerMessage(_) => {
                                 panic!(
                                     "queued-message inputs must be handled by the agent actor before reaching the backend"
                                 );
@@ -14564,6 +14680,7 @@ impl Backend for ClaudeBackend {
             // fills it -- so deliberately no `ContextBreakdownReported`.
             tyde_agent_adapter::BackendCapability::ContextUsageReported,
             tyde_agent_adapter::BackendCapability::SlashCommands,
+            tyde_agent_adapter::BackendCapability::MidTurnSteering,
         ]
         .into()
     }
@@ -14847,7 +14964,8 @@ impl Backend for ClaudeBackend {
                             }
                             AgentInput::GoalControl(_) | AgentInput::EditQueuedMessage(_)
                             | AgentInput::CancelQueuedMessage(_)
-                            | AgentInput::SendQueuedMessageNow(_) => {
+                            | AgentInput::SendQueuedMessageNow(_)
+                            | AgentInput::SteerMessage(_) => {
                                 panic!(
                                     "queued-message inputs must be handled by the agent actor before reaching the backend"
                                 );
@@ -14979,6 +15097,18 @@ impl Backend for ClaudeBackend {
                 tracing::error!("Failed to send Claude message: {err}");
                 SendOutcome::Closed
             }
+        }
+    }
+
+    async fn steer(&self, payload: protocol::SendMessagePayload) -> crate::backend::SteerOutcome {
+        let handle = self
+            .command_handle
+            .lock()
+            .expect("Claude command handle slot poisoned")
+            .clone();
+        match handle {
+            Some(handle) => handle.steer(payload).await,
+            None => crate::backend::SteerOutcome::NoActiveTurn(payload),
         }
     }
 

@@ -6,7 +6,7 @@ use protocol::{
     ImageData, MessageOrigin, QueuedMessageId, QueuedMessagesPayload, SendMessagePayload,
     SendMessageToolResponse, SendQueuedMessageNowPayload, StreamPath,
 };
-use server::backend::mock::{MockGateHandle, MockScript, MockTurn};
+use server::backend::mock::{MockGateHandle, MockRequest, MockScript, MockTurn};
 
 async fn assert_queue_not_emptied_before_next_typing_true(
     client: &mut client::Connection,
@@ -577,6 +577,187 @@ async fn send_queued_message_now_reorders() {
     );
     assert_eq!(snapshot_ba.messages[0].message, "order B");
     assert_eq!(snapshot_ba.messages[1].message, "order A");
+}
+
+fn steer_payload(message: &str) -> SendMessagePayload {
+    SendMessagePayload {
+        message: message.to_owned(),
+        images: None,
+        origin: None,
+        tool_response: None,
+    }
+}
+
+fn is_user_message(event: &ChatEvent, content: &str) -> bool {
+    matches!(
+        event,
+        ChatEvent::MessageAdded(message)
+            if matches!(message.sender, protocol::MessageSender::User) && message.content == content
+    )
+}
+
+/// A steer, and a queued message sent "now", join the running turn on a
+/// backend that can take input mid-turn: the turn is never interrupted and
+/// nothing waits in the queue. Once idle, a steer is an ordinary send.
+#[tokio::test(start_paused = true)]
+async fn steer_message_joins_running_turn_without_interrupt() {
+    let mut fixture = Fixture::new().await;
+    let gate = MockGateHandle::new();
+    let agent = fixture
+        .spawn_scripted(
+            "queue-steer",
+            MockScript::one(MockTurn::gated_text("launch reply", &gate))
+                .then(MockTurn::text("idle steer reply"))
+                .with_user_bubbles()
+                .with_mid_turn_steering(),
+        )
+        .await;
+    fixture
+        .next_chat_event_matching(&agent, "TypingStatusChanged(true)", |event| {
+            matches!(event, ChatEvent::TypingStatusChanged(true))
+        })
+        .await;
+    gate.wait_until_entered().await;
+
+    fixture
+        .client
+        .send_message(&agent.stream, "queued behind the turn".to_owned())
+        .await
+        .expect("send queued message");
+    let queued = fixture.expect_queued_messages(&agent, 1).await;
+
+    fixture
+        .client
+        .steer_message_payload(&agent.stream, steer_payload("steer into the turn"))
+        .await
+        .expect("steer_message failed");
+    fixture
+        .next_chat_event_matching(&agent, "steered user message", |event| {
+            is_user_message(event, "steer into the turn")
+        })
+        .await;
+
+    fixture
+        .client
+        .send_queued_message_now(
+            &agent.stream,
+            SendQueuedMessageNowPayload {
+                id: queued.messages[0].id.clone(),
+            },
+        )
+        .await
+        .expect("send_queued_message_now failed");
+    fixture.expect_queued_messages(&agent, 0).await;
+    fixture
+        .next_chat_event_matching(&agent, "send-now user message", |event| {
+            is_user_message(event, "queued behind the turn")
+        })
+        .await;
+
+    let mock = fixture.mock(&agent).await;
+    let requests = mock.requests().await;
+    assert!(
+        matches!(
+            requests.as_slice(),
+            [
+                MockRequest::Launch { .. },
+                MockRequest::Steer(first),
+                MockRequest::Steer(second),
+            ] if first.message == "steer into the turn" && second.message == "queued behind the turn"
+        ),
+        "both messages must reach the running turn as steers, with no interrupt: {requests:?}"
+    );
+
+    gate.release_one();
+    fixture
+        .next_chat_event_matching(&agent, "launch turn idle", |event| {
+            matches!(event, ChatEvent::TypingStatusChanged(false))
+        })
+        .await;
+
+    fixture
+        .client
+        .steer_message_payload(&agent.stream, steer_payload("steer while idle"))
+        .await
+        .expect("idle steer_message failed");
+    fixture
+        .next_chat_event_matching(&agent, "idle steer turn idle", |event| {
+            matches!(event, ChatEvent::TypingStatusChanged(false))
+        })
+        .await;
+    let requests = mock.requests().await;
+    assert!(
+        matches!(
+            requests.last(),
+            Some(MockRequest::Input(payload)) if payload.message == "steer while idle"
+        ),
+        "an idle steer must be delivered as an ordinary send: {requests:?}"
+    );
+    mock.assert_clean().await;
+}
+
+/// A backend that cannot take input mid-turn still honours a steer: the server
+/// queues the message first, interrupts the turn, and sends it once idle.
+#[tokio::test(start_paused = true)]
+async fn steer_message_interrupts_when_backend_cannot_steer() {
+    let mut fixture = Fixture::new().await;
+    let agent = fixture
+        .spawn_scripted(
+            "queue-steer-fallback",
+            MockScript::one(MockTurn::held_text("holding"))
+                .then(MockTurn::text("redirected reply"))
+                .then(MockTurn::text("queued reply"))
+                .with_user_bubbles(),
+        )
+        .await;
+    fixture
+        .next_chat_event_matching(&agent, "TypingStatusChanged(true)", |event| {
+            matches!(event, ChatEvent::TypingStatusChanged(true))
+        })
+        .await;
+
+    fixture
+        .client
+        .send_message(&agent.stream, "queued earlier".to_owned())
+        .await
+        .expect("send queued message");
+    fixture.expect_queued_messages(&agent, 1).await;
+
+    fixture
+        .client
+        .steer_message_payload(&agent.stream, steer_payload("redirect now"))
+        .await
+        .expect("steer_message failed");
+    let snapshot = fixture.expect_queued_messages(&agent, 2).await;
+    assert_eq!(
+        snapshot.messages[0].message, "redirect now",
+        "a steer that falls back must jump the queue"
+    );
+
+    fixture
+        .next_chat_event_matching(&agent, "OperationCancelled", |event| {
+            matches!(event, ChatEvent::OperationCancelled(_))
+        })
+        .await;
+    fixture
+        .next_chat_event_matching(&agent, "redirected user message", |event| {
+            is_user_message(event, "redirect now")
+        })
+        .await;
+
+    let requests = fixture.mock(&agent).await.requests().await;
+    assert!(
+        matches!(
+            requests.as_slice(),
+            [
+                MockRequest::Launch { .. },
+                MockRequest::Interrupt,
+                MockRequest::Input(payload),
+                ..
+            ] if payload.message == "redirect now"
+        ),
+        "the fallback must interrupt, then send the steered message first: {requests:?}"
+    );
 }
 
 #[tokio::test(start_paused = true)]

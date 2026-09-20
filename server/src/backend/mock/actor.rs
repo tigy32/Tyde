@@ -219,7 +219,8 @@ impl MockActor {
                         MockCommand::Input(AgentInput::GoalControl(_)) => false,
                         MockCommand::Input(AgentInput::EditQueuedMessage(_))
                         | MockCommand::Input(AgentInput::CancelQueuedMessage(_))
-                        | MockCommand::Input(AgentInput::SendQueuedMessageNow(_)) => {
+                        | MockCommand::Input(AgentInput::SendQueuedMessageNow(_))
+                        | MockCommand::Input(AgentInput::SteerMessage(_)) => {
                             panic!(
                                 "queued-message inputs must be handled by the agent actor before reaching the backend"
                             );
@@ -241,6 +242,18 @@ impl MockActor {
             MockControlCommand::Enqueue { turns, ack } => {
                 self.script.extend(turns);
                 let _ = ack.send(());
+            }
+            MockControlCommand::Steer { payload, reply } => {
+                let in_turn = self.parked_at_gate || !matches!(self.phase, TurnPhase::Idle);
+                let outcome = if !in_turn {
+                    crate::backend::SteerOutcome::NoActiveTurn(payload)
+                } else if self.user_bubbles && !self.emit_user_bubble(&payload.message) {
+                    crate::backend::SteerOutcome::Closed
+                } else {
+                    self.requests.push(MockRequest::Steer(payload));
+                    crate::backend::SteerOutcome::Accepted
+                };
+                let _ = reply.send(outcome);
             }
             MockControlCommand::ReadRequests { reply } => {
                 let _ = reply.send(self.requests.clone());

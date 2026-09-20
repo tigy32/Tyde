@@ -105,6 +105,7 @@ pub struct MockBackend {
     #[cfg_attr(not(feature = "test-support"), allow(dead_code))]
     control: MockControl,
     scripted_busy_self_turn: bool,
+    mid_turn_steering: bool,
     shutdown_gate: Option<gate::MockGate>,
     compaction_observation_gates: Option<(gate::MockGate, gate::MockGate)>,
     compaction_failure: Option<MockCompactionFailure>,
@@ -137,6 +138,7 @@ impl MockBackend {
             }
         };
         let scripted_busy_self_turn = launch_script.busy_self_turn_once;
+        let mid_turn_steering = launch_script.mid_turn_steering;
         let shutdown_gate = launch_script.shutdown_gate.clone();
         let compaction_observation_gates = launch_script.compaction_observation_gates.clone();
         let compaction_failure = launch_script.compaction_failure;
@@ -211,6 +213,7 @@ impl MockBackend {
                 compaction_capability,
                 control,
                 scripted_busy_self_turn,
+                mid_turn_steering,
                 shutdown_gate: shutdown_gate.clone(),
                 compaction_observation_gates: compaction_observation_gates.clone(),
                 compaction_failure,
@@ -234,6 +237,7 @@ impl MockBackend {
             Some(MockLaunch::CloseBeforeResumeBarrier) => (default_mock_script(), true),
         };
         let scripted_busy_self_turn = launch_script.busy_self_turn_once;
+        let mid_turn_steering = launch_script.mid_turn_steering;
         let shutdown_gate = launch_script.shutdown_gate.clone();
         let compaction_observation_gates = launch_script.compaction_observation_gates.clone();
         let compaction_failure = launch_script.compaction_failure;
@@ -290,6 +294,7 @@ impl MockBackend {
                     compaction_capability,
                     control,
                     scripted_busy_self_turn,
+                    mid_turn_steering,
                     shutdown_gate: shutdown_gate.clone(),
                     compaction_observation_gates: compaction_observation_gates.clone(),
                     compaction_failure,
@@ -335,6 +340,7 @@ impl MockBackend {
                 compaction_capability,
                 control,
                 scripted_busy_self_turn,
+                mid_turn_steering,
                 shutdown_gate: shutdown_gate.clone(),
                 compaction_observation_gates: compaction_observation_gates.clone(),
                 compaction_failure,
@@ -365,6 +371,7 @@ impl MockBackend {
             }
         };
         let scripted_busy_self_turn = launch_script.busy_self_turn_once;
+        let mid_turn_steering = launch_script.mid_turn_steering;
         let shutdown_gate = launch_script.shutdown_gate.clone();
         let compaction_observation_gates = launch_script.compaction_observation_gates.clone();
         let compaction_failure = launch_script.compaction_failure;
@@ -442,6 +449,7 @@ impl MockBackend {
                 compaction_capability,
                 control,
                 scripted_busy_self_turn,
+                mid_turn_steering,
                 shutdown_gate: shutdown_gate.clone(),
                 compaction_observation_gates: compaction_observation_gates.clone(),
                 compaction_failure,
@@ -778,6 +786,13 @@ impl Backend for MockBackend {
         } else {
             SendOutcome::Closed
         }
+    }
+
+    async fn steer(&self, payload: protocol::SendMessagePayload) -> crate::backend::SteerOutcome {
+        if !self.mid_turn_steering || payload.tool_response.is_some() {
+            return crate::backend::SteerOutcome::Unsupported(payload);
+        }
+        self.control.steer(payload).await
     }
 
     async fn interrupt(&self) -> bool {

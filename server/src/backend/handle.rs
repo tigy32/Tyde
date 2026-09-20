@@ -27,6 +27,10 @@ pub(crate) trait BackendSender: Send + Sync + 'static {
         &'a mut self,
         payload: protocol::SetSessionSettingsPayload,
     ) -> Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>>;
+    fn steer<'a>(
+        &'a self,
+        payload: protocol::SendMessagePayload,
+    ) -> Pin<Box<dyn std::future::Future<Output = crate::backend::SteerOutcome> + Send + 'a>>;
     fn interrupt<'a>(&'a self) -> Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>>;
     fn cancel_background_task<'a>(
         &'a self,
@@ -76,6 +80,13 @@ impl<B: Backend> BackendSender for B {
         payload: protocol::SetSessionSettingsPayload,
     ) -> Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>> {
         Box::pin(Backend::update_session_settings(self, payload))
+    }
+
+    fn steer<'a>(
+        &'a self,
+        payload: protocol::SendMessagePayload,
+    ) -> Pin<Box<dyn std::future::Future<Output = crate::backend::SteerOutcome> + Send + 'a>> {
+        Box::pin(Backend::steer(self, payload))
     }
 
     fn interrupt<'a>(&'a self) -> Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {

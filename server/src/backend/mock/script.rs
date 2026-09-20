@@ -25,6 +25,7 @@ pub struct MockScript {
     pub(super) unbounded_echo: bool,
     pub(super) user_bubbles: bool,
     pub(super) busy_self_turn_once: bool,
+    pub(super) mid_turn_steering: bool,
     pub(super) shutdown_gate: Option<MockGate>,
     pub(super) compaction_observation_gates: Option<(MockGate, MockGate)>,
     /// Advertised as the session's slash-command set before the launch turn.
@@ -73,6 +74,13 @@ impl MockScript {
 
     pub fn with_busy_self_turn_once(mut self) -> Self {
         self.busy_self_turn_once = true;
+        self
+    }
+
+    /// Take `Backend::steer` into the running turn instead of reporting it
+    /// unsupported.
+    pub fn with_mid_turn_steering(mut self) -> Self {
+        self.mid_turn_steering = true;
         self
     }
 

@@ -62,8 +62,12 @@ impl MockViolation {
 /// One thing the server handed this backend instance, captured in arrival order.
 #[derive(Debug, Clone)]
 pub enum MockRequest {
-    Launch { message: String },
+    Launch {
+        message: String,
+    },
     Input(SendMessagePayload),
+    /// A message taken into the running turn through `Backend::steer`.
+    Steer(SendMessagePayload),
     ToolResponse(SendMessageToolResponse),
     Interrupt,
 }
@@ -73,6 +77,10 @@ pub(super) enum MockControlCommand {
     Enqueue {
         turns: Vec<MockTurn>,
         ack: oneshot::Sender<()>,
+    },
+    Steer {
+        payload: SendMessagePayload,
+        reply: oneshot::Sender<crate::backend::SteerOutcome>,
     },
     ReadRequests {
         reply: oneshot::Sender<Vec<MockRequest>>,
@@ -158,6 +166,20 @@ impl MockControl {
             })
             .expect(CONTROL_CLOSED);
         installed.await.expect(CONTROL_CLOSED);
+    }
+
+    pub(super) async fn steer(&self, payload: SendMessagePayload) -> crate::backend::SteerOutcome {
+        let (reply, outcome) = oneshot::channel();
+        if self
+            .tx
+            .send(MockControlCommand::Steer { payload, reply })
+            .is_err()
+        {
+            return crate::backend::SteerOutcome::Closed;
+        }
+        outcome
+            .await
+            .unwrap_or(crate::backend::SteerOutcome::Closed)
     }
 
     /// Everything the server has handed this backend instance, in order.

@@ -2,11 +2,11 @@
 
 The backend conformance suite is `tests/tests/conformance2.rs`. Its harness calls the production `Backend` trait directly. It runs real installed providers and checks normalized events, native history, settings, and filesystem results. Server protocol behavior belongs in the mock-server simulations.
 
-The 30 scenarios below retain the original scenario names. Native-provider configuration and filesystem regressions also retain their original provider-specific oracles. Capability exclusions come from backend declarations; they are not passing backend runs.
+The 31 scenarios below retain the original scenario names. Native-provider configuration and filesystem regressions also retain their original provider-specific oracles. Capability exclusions come from backend declarations; they are not passing backend runs.
 
 ## Migration coverage
 
-Passing real runs recorded on 2026-09-09; `real_slash_commands` was recorded on 2026-09-14 (Claude, Codex, Antigravity) and 2026-09-15 (Kiro, Grok, OpenCode, Hermes). A dash means the backend does not declare the case’s required capabilities or native skill delivery. The existing Codex configuration case applies only to Codex.
+Passing real runs recorded on 2026-09-09; `real_slash_commands` was recorded on 2026-09-14 (Claude, Codex, Antigravity) and 2026-09-15 (Kiro, Grok, OpenCode, Hermes); `real_mid_turn_steering` was recorded on 2026-09-20. A dash means the backend does not declare the case’s required capabilities or native skill delivery. The existing Codex configuration case applies only to Codex.
 
 | Scenario | Claude | Codex | Kiro | Antigravity | Grok | OpenCode | Hermes |
 |---|---|---|---|---|---|---|---|
@@ -18,6 +18,7 @@ Passing real runs recorded on 2026-09-09; `real_slash_commands` was recorded on 
 | `real_session_speed` | Pass | Pass | — | — | — | — | — |
 | `real_tool_type_mappings` | Pass | Pass | Pass | Pass | Pass | Pass | Pass |
 | `real_interruption` | Pass | Pass | — | Pass | Pass | — | Pass |
+| `real_mid_turn_steering` | Pass | Pass | — | — | — | — | Pass |
 | `real_interrupt_after_background_response` | Pass | Pass | — | — | — | — | Pass |
 | `real_conversation_on_resumed_session` | Pass | Pass | Pass | Pass | Pass | Pass | Pass |
 | `real_resumed_session_groups_parallel_tool_calls` | Pass | Pass | Pass | Pass | Pass | Pass | Pass |

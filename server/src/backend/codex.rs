@@ -47,7 +47,7 @@ use crate::backend::turn_emitter::{
 };
 use crate::backend::{
     BackendExecutionMode, BackendStartupError, CancelBackgroundTaskOutcome, SessionCommand,
-    StartupMcpServer, StartupMcpTransport, normalize_mcp_call_tool_result,
+    StartupMcpServer, StartupMcpTransport, SteerOutcome, normalize_mcp_call_tool_result,
     render_combined_spawn_instructions,
 };
 use crate::process_env;
@@ -148,6 +148,10 @@ impl CodexCommandHandle {
 
     async fn cancel_background_task(&self, tool_call_id: &str) -> CancelBackgroundTaskOutcome {
         self.inner.cancel_background_task(tool_call_id).await
+    }
+
+    async fn steer(&self, payload: protocol::SendMessagePayload) -> SteerOutcome {
+        self.inner.steer(payload).await
     }
 
     async fn control_goal(&self, control: protocol::GoalControl) -> Result<(), String> {
@@ -7950,6 +7954,68 @@ impl CodexInner {
         }
     }
 
+    async fn steer(&self, payload: protocol::SendMessagePayload) -> SteerOutcome {
+        // A slash command is run by this backend rather than read by the
+        // model, so it goes back to the caller for the ordinary send path.
+        if payload.tool_response.is_some()
+            || codex_slash_commands()
+                .invoked_by(&payload.message)
+                .is_some()
+        {
+            return SteerOutcome::Unsupported(payload);
+        }
+        let (thread_id, turn_id) = {
+            let state = self.state.lock().await;
+            let turn_id = match state.active_turn_id.clone() {
+                Some(turn_id)
+                    if !state.awaiting_root_turn_start && state.pending_compaction.is_none() =>
+                {
+                    turn_id
+                }
+                _ => return SteerOutcome::NoActiveTurn(payload),
+            };
+            (state.thread_id.clone(), turn_id)
+        };
+        let images = protocol_images_to_attachments(payload.images.clone());
+        let input_items = match codex_user_input_items(&payload.message, images.as_deref()).await {
+            Ok(input_items) => input_items,
+            Err(error) => {
+                tracing::warn!(error, "Codex could not stage a steered message's images");
+                return SteerOutcome::Unsupported(payload);
+            }
+        };
+        let steered = self
+            .rpc
+            .request_typed(
+                "turn/steer",
+                json!({
+                    "threadId": thread_id,
+                    "expectedTurnId": turn_id,
+                    "input": input_items,
+                    "clientUserMessageId": uuid::Uuid::new_v4().to_string()
+                }),
+            )
+            .await;
+        match steered {
+            Ok(_) => {
+                self.emit_user_message_added(&payload.message, images.as_deref());
+                SteerOutcome::Accepted
+            }
+            Err(error) if error.code.is_none() => {
+                tracing::warn!(%error, turn_id, "Codex went away during turn/steer");
+                SteerOutcome::Closed
+            }
+            Err(error) if error.method_unavailable("turn/steer") => {
+                tracing::warn!(%error, "Codex app-server has no turn/steer");
+                SteerOutcome::Unsupported(payload)
+            }
+            Err(error) => {
+                tracing::warn!(%error, turn_id, "Codex declined turn/steer");
+                SteerOutcome::NoActiveTurn(payload)
+            }
+        }
+    }
+
     async fn execute(&self, command: SessionCommand) -> Result<(), String> {
         match command {
             SessionCommand::SendMessage { message, images } => {
@@ -7997,21 +8063,7 @@ impl CodexInner {
                     )
                 };
 
-                let mut input_items = vec![json!({
-                    "type": "text",
-                    "text": message,
-                    "text_elements": []
-                })];
-
-                if let Some(imgs) = images {
-                    for image in imgs {
-                        let path = persist_temp_image(&image).await?;
-                        input_items.push(json!({
-                            "type": "localImage",
-                            "path": path
-                        }));
-                    }
-                }
+                let input_items = codex_user_input_items(&message, images.as_deref()).await?;
 
                 let mut params = json!({
                     "threadId": thread_id,
@@ -18550,6 +18602,25 @@ fn codex_runtime_workspace_roots(workspace_roots: &[String], cwd: &str) -> Vec<S
     roots
 }
 
+async fn codex_user_input_items(
+    message: &str,
+    images: Option<&[ImageAttachment]>,
+) -> Result<Vec<Value>, String> {
+    let mut input_items = vec![json!({
+        "type": "text",
+        "text": message,
+        "text_elements": []
+    })];
+    for image in images.unwrap_or_default() {
+        let path = persist_temp_image(image).await?;
+        input_items.push(json!({
+            "type": "localImage",
+            "path": path
+        }));
+    }
+    Ok(input_items)
+}
+
 async fn persist_temp_image(image: &ImageAttachment) -> Result<String, String> {
     static IMAGE_COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -19574,6 +19645,7 @@ pub struct CodexBackend {
     settings_tx: mpsc::UnboundedSender<CodexSettingsUpdate>,
     interrupt_tx: mpsc::UnboundedSender<CodexInterrupt>,
     cancel_task_tx: mpsc::UnboundedSender<CodexCancelBackgroundTask>,
+    steer_tx: mpsc::UnboundedSender<CodexSteer>,
     session_id: Arc<std::sync::Mutex<Option<SessionId>>>,
     compaction_handle: Arc<std::sync::Mutex<Option<CodexCommandHandle>>>,
 }
@@ -19586,6 +19658,11 @@ struct CodexSettingsUpdate {
 struct CodexCancelBackgroundTask {
     tool_call_id: String,
     reply: oneshot::Sender<CancelBackgroundTaskOutcome>,
+}
+
+struct CodexSteer {
+    payload: protocol::SendMessagePayload,
+    reply: oneshot::Sender<SteerOutcome>,
 }
 
 struct CodexInterrupt {
@@ -19612,6 +19689,7 @@ impl CodexBackend {
         let (settings_tx, mut settings_rx) = mpsc::unbounded_channel::<CodexSettingsUpdate>();
         let (cancel_task_tx, mut cancel_task_rx) =
             mpsc::unbounded_channel::<CodexCancelBackgroundTask>();
+        let (steer_tx, mut steer_rx) = mpsc::unbounded_channel::<CodexSteer>();
         let (interrupt_tx, mut interrupt_rx) = mpsc::unbounded_channel::<CodexInterrupt>();
         let (events_tx, events_rx) = mpsc::unbounded_channel::<BackendEvent>();
         let (ready_tx, ready_rx) = oneshot::channel::<Result<SessionId, String>>();
@@ -19889,7 +19967,8 @@ impl CodexBackend {
                             AgentInput::UpdateSessionSettings(_) => {}
                             AgentInput::EditQueuedMessage(_)
                             | AgentInput::CancelQueuedMessage(_)
-                            | AgentInput::SendQueuedMessageNow(_) => {
+                            | AgentInput::SendQueuedMessageNow(_)
+                            | AgentInput::SteerMessage(_) => {
                                 panic!("queued-message inputs must be handled by the agent actor before reaching the backend");
                             }
                         }
@@ -19900,6 +19979,11 @@ impl CodexBackend {
                             .cancel_background_task(&cancel.tool_call_id)
                             .await;
                         let _ = cancel.reply.send(outcome);
+                    }
+                    steer = steer_rx.recv() => {
+                        let Some(steer) = steer else { break; };
+                        let outcome = handle.steer(steer.payload).await;
+                        let _ = steer.reply.send(outcome);
                     }
                     update = settings_rx.recv() => {
                         let Some(update) = update else { break; };
@@ -19943,6 +20027,7 @@ impl CodexBackend {
                 settings_tx,
                 interrupt_tx,
                 cancel_task_tx,
+                steer_tx,
                 session_id: backend_session_id,
                 compaction_handle,
             },
@@ -20981,6 +21066,7 @@ impl Backend for CodexBackend {
             tyde_agent_adapter::BackendCapability::YieldsRunningCommands,
             tyde_agent_adapter::BackendCapability::NativeGoals,
             tyde_agent_adapter::BackendCapability::AgentInitiatedTurns,
+            tyde_agent_adapter::BackendCapability::MidTurnSteering,
             tyde_agent_adapter::BackendCapability::ReasoningDeltas,
             tyde_agent_adapter::BackendCapability::TaskUpdates,
             tyde_agent_adapter::BackendCapability::TaskListReplacement,
@@ -21024,6 +21110,7 @@ impl Backend for CodexBackend {
         let (settings_tx, mut settings_rx) = mpsc::unbounded_channel::<CodexSettingsUpdate>();
         let (cancel_task_tx, mut cancel_task_rx) =
             mpsc::unbounded_channel::<CodexCancelBackgroundTask>();
+        let (steer_tx, mut steer_rx) = mpsc::unbounded_channel::<CodexSteer>();
         let (interrupt_tx, mut interrupt_rx) = mpsc::unbounded_channel::<CodexInterrupt>();
         let (events_tx, events_rx) = mpsc::unbounded_channel::<BackendEvent>();
         let (resume_replay_complete_tx, resume_replay_complete_rx) =
@@ -21199,7 +21286,8 @@ impl Backend for CodexBackend {
                             AgentInput::UpdateSessionSettings(_) => {}
                             AgentInput::EditQueuedMessage(_)
                             | AgentInput::CancelQueuedMessage(_)
-                            | AgentInput::SendQueuedMessageNow(_) => {
+                            | AgentInput::SendQueuedMessageNow(_)
+                            | AgentInput::SteerMessage(_) => {
                                 panic!(
                                     "queued-message inputs must be handled by the agent actor before reaching the backend"
                                 );
@@ -21212,6 +21300,11 @@ impl Backend for CodexBackend {
                             .cancel_background_task(&cancel.tool_call_id)
                             .await;
                         let _ = cancel.reply.send(outcome);
+                    }
+                    steer = steer_rx.recv() => {
+                        let Some(steer) = steer else { break; };
+                        let outcome = handle.steer(steer.payload).await;
+                        let _ = steer.reply.send(outcome);
                     }
                     update = settings_rx.recv() => {
                         let Some(update) = update else { break };
@@ -21245,6 +21338,7 @@ impl Backend for CodexBackend {
                 settings_tx,
                 interrupt_tx,
                 cancel_task_tx,
+                steer_tx,
                 session_id: backend_session_id,
                 compaction_handle,
             },
@@ -21273,6 +21367,7 @@ impl Backend for CodexBackend {
         let (settings_tx, mut settings_rx) = mpsc::unbounded_channel::<CodexSettingsUpdate>();
         let (cancel_task_tx, mut cancel_task_rx) =
             mpsc::unbounded_channel::<CodexCancelBackgroundTask>();
+        let (steer_tx, mut steer_rx) = mpsc::unbounded_channel::<CodexSteer>();
         let (interrupt_tx, mut interrupt_rx) = mpsc::unbounded_channel::<CodexInterrupt>();
         let (events_tx, events_rx) = mpsc::unbounded_channel::<BackendEvent>();
         let initial_emitter = config.subagent_emitter.clone();
@@ -21464,7 +21559,8 @@ impl Backend for CodexBackend {
                             AgentInput::UpdateSessionSettings(_) => {}
                             AgentInput::EditQueuedMessage(_)
                             | AgentInput::CancelQueuedMessage(_)
-                            | AgentInput::SendQueuedMessageNow(_) => {
+                            | AgentInput::SendQueuedMessageNow(_)
+                            | AgentInput::SteerMessage(_) => {
                                 panic!(
                                     "queued-message inputs must be handled by the agent actor before reaching the backend"
                                 );
@@ -21477,6 +21573,11 @@ impl Backend for CodexBackend {
                             .cancel_background_task(&cancel.tool_call_id)
                             .await;
                         let _ = cancel.reply.send(outcome);
+                    }
+                    steer = steer_rx.recv() => {
+                        let Some(steer) = steer else { break; };
+                        let outcome = handle.steer(steer.payload).await;
+                        let _ = steer.reply.send(outcome);
                     }
                     update = settings_rx.recv() => {
                         let Some(update) = update else { break };
@@ -21523,6 +21624,7 @@ impl Backend for CodexBackend {
                 settings_tx,
                 interrupt_tx,
                 cancel_task_tx,
+                steer_tx,
                 session_id: backend_session_id,
                 compaction_handle,
             },
@@ -21720,6 +21822,14 @@ impl Backend for CodexBackend {
         result
             .await
             .map_err(|_| "Codex settings update response channel closed".to_owned())?
+    }
+
+    async fn steer(&self, payload: protocol::SendMessagePayload) -> SteerOutcome {
+        let (reply, done) = oneshot::channel();
+        if self.steer_tx.send(CodexSteer { payload, reply }).is_err() {
+            return SteerOutcome::Closed;
+        }
+        done.await.unwrap_or(SteerOutcome::Closed)
     }
 
     async fn interrupt(&self) -> bool {

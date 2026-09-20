@@ -1335,23 +1335,21 @@ pub fn ChatInput() -> impl IntoView {
             let state = state.clone();
             composer.begin();
             spawn_local(async move {
-                // The composer keeps the draft across both sends. The interrupt
-                // carries no user text, so only the message that follows it
-                // becomes a recovery record.
-                if let Err(error) = crate::send::send_frame(
-                    &active.local_host_id,
-                    stream.clone(),
-                    protocol::FrameKind::Interrupt,
-                    &protocol::InterruptPayload {},
-                )
-                .await
-                {
-                    composer.finish();
-                    report_send_error(&state, format!("Failed to interrupt current turn: {error}"));
-                    return;
-                }
                 if text.is_empty() && images.is_empty() {
+                    let outcome = crate::send::send_frame(
+                        &active.local_host_id,
+                        stream,
+                        protocol::FrameKind::Interrupt,
+                        &protocol::InterruptPayload {},
+                    )
+                    .await;
                     composer.finish();
+                    if let Err(error) = outcome {
+                        report_send_error(
+                            &state,
+                            format!("Failed to interrupt current turn: {error}"),
+                        );
+                    }
                     return;
                 }
                 let payload = protocol::SendMessagePayload {
@@ -1363,7 +1361,7 @@ pub fn ChatInput() -> impl IntoView {
                 let outcome = crate::send::send_frame(
                     &active.local_host_id,
                     stream,
-                    protocol::FrameKind::SendMessage,
+                    protocol::FrameKind::SteerMessage,
                     &payload,
                 )
                 .await;
@@ -1386,7 +1384,7 @@ pub fn ChatInput() -> impl IntoView {
 
     // Plain interrupt: stop the current turn without sending the draft. The
     // menu's "Interrupt" item can appear while a draft exists, so it needs a
-    // handler distinct from steer (which interrupts *and* sends the draft).
+    // handler distinct from steer (which sends the draft into the turn).
     let do_interrupt = {
         let state = state.clone();
         move || {
@@ -3967,6 +3965,103 @@ mod wasm_tests {
                 "Cancel".to_owned()
             ],
             "thinking+input menu must include utilities before turn actions"
+        );
+    }
+
+    /// Steer is one atomic `steer_message` frame carrying the draft. The server
+    /// decides whether the running turn absorbs it or has to be interrupted, so
+    /// the client must never send its own Interrupt.
+    #[wasm_bindgen_test]
+    async fn steer_sends_one_steer_message_frame_without_interrupt() {
+        let _guard = crate::bridge::test_capture_sends();
+        let host = LocalHostId("host-1".to_owned());
+        let agent_id = AgentId("agent-1".to_owned());
+        let state = AppState::new();
+        state.active_local_host_id.set(Some(host.clone()));
+        state.agents.set(vec![AgentInfo {
+            local_host_id: host.clone(),
+            agent_id: agent_id.clone(),
+            name: "Agent".to_owned(),
+            origin: AgentOrigin::User,
+            backend_kind: BackendKind::Claude,
+            workspace_roots: Vec::new(),
+            project_id: None,
+            parent_agent_id: None,
+            session_id: None,
+            custom_agent_id: None,
+            created_at_ms: 0,
+            instance_stream: StreamPath("/agent/agent-1/inst".to_owned()),
+            started: true,
+            fatal_error: None,
+        }]);
+        state.active_agent.set(Some(crate::state::ActiveAgentRef {
+            local_host_id: host.clone(),
+            agent_id: agent_id.clone(),
+        }));
+        state.agent_turn_active.update(|m| {
+            m.insert(
+                AgentRef {
+                    local_host_id: host.clone(),
+                    agent_id: agent_id.clone(),
+                },
+                true,
+            );
+        });
+        let container = make_container();
+        let mount_state = state.clone();
+        let _h = mount_to(container.clone(), move || {
+            provide_context(mount_state);
+            view! { <ChatInput /> }
+        });
+        next_tick().await;
+
+        type_text(&container, "use the other parser");
+        next_tick().await;
+
+        open_menu(&container).await;
+        let steer: HtmlElement = container
+            .query_selector("[data-mobile-test='chat-send-menu-steer']")
+            .unwrap()
+            .expect("Steer item must be present while thinking with a draft")
+            .dyn_into()
+            .unwrap();
+        steer.click();
+        next_tick().await;
+        next_tick().await;
+
+        assert_eq!(
+            crate::bridge::test_send_attempts(),
+            1,
+            "Steer must emit exactly one frame"
+        );
+        let frames: Vec<serde_json::Value> = crate::bridge::test_sent_lines()
+            .iter()
+            .map(|line| serde_json::from_str(line).expect("sent frame json"))
+            .collect();
+        assert_eq!(frames.len(), 1, "Steer must emit exactly one frame");
+        assert_eq!(frames[0]["kind"], "steer_message");
+        assert_eq!(frames[0]["stream"], "/agent/agent-1/inst");
+        assert_eq!(frames[0]["payload"]["message"], "use the other parser");
+        assert!(
+            frames.iter().all(|frame| frame["kind"] != "interrupt"),
+            "Steer must not send a client-side Interrupt"
+        );
+
+        assert_eq!(
+            state.chat_input.get_untracked(),
+            "",
+            "once admitted, the steered text must leave the composer"
+        );
+        let input: web_sys::HtmlTextAreaElement = container
+            .query_selector("[data-mobile-test='chat-input']")
+            .unwrap()
+            .unwrap()
+            .dyn_into()
+            .unwrap();
+        assert_eq!(
+            input.value(),
+            "",
+            "the visible composer must be empty after Steer"
         );
     }
 

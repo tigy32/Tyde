@@ -2641,6 +2641,89 @@ async fn real_interruption<B: Backend>(host: &mut Harness<B>) {
     assert_clean_close(host, &agent).await;
 }
 
+const STEER_PROOF_FILE: &str = "steer_proof.txt";
+const STEER_IDLE_SETTLE: Duration = Duration::from_secs(5);
+
+fn steerable_command_prompt(proof: &Path) -> String {
+    format!(
+        "Run this exact shell command in the foreground and wait for it to finish — do not run it \
+         in the background: python3 -c \"import time; time.sleep({SLOW_COMMAND_SECONDS}); \
+         open('{}', 'w').write('proof')\"\nWhile it runs I will send you one more message \
+         containing a secret word. After the command finishes, reply with exactly \
+         WORD=<the secret word> and nothing else. If no such message has arrived by then, reply \
+         with exactly WORD=NONE.",
+        proof.display()
+    )
+}
+
+/// A message steered into a running turn is read by that turn, and costs it
+/// nothing: the command it arrived under runs to completion, nothing is
+/// cancelled, and the answer that uses it closes the same turn.
+async fn real_mid_turn_steering<B: Backend>(host: &mut Harness<B>) {
+    let agent = spawn_agent(host, &launch_prompt()).await;
+    let launched = collect_turn(host, &agent, &launch_prompt()).await;
+    assert_ready_handshake(&launched);
+
+    let proof = host.workspace().join(STEER_PROOF_FILE);
+    let secret = unique_payload();
+    let prompt = steerable_command_prompt(&proof);
+    let steer = format!("The secret word is {secret}.");
+    let steered = steer_turn(host, &agent, &prompt, &steer).await;
+
+    assert_final_text_contains(&steered, &format!("WORD={secret}"));
+    assert_eq!(
+        steered
+            .user_messages()
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>(),
+        vec![prompt.as_str(), steer.as_str()],
+        "{}: the steered message must be shown exactly once, after the prompt it joined",
+        steered.label()
+    );
+    let cancellations = steered
+        .events()
+        .iter()
+        .filter(|event| matches!(event, ChatEvent::OperationCancelled(_)))
+        .count();
+    assert_eq!(
+        cancellations,
+        0,
+        "{}: steering cancelled the turn it was meant to join",
+        steered.label()
+    );
+    assert_foreground_command_stayed_foreground(&steered);
+    assert_eq!(
+        std::fs::read_to_string(&proof).ok().as_deref(),
+        Some("proof"),
+        "{}: the command running when the steer arrived did not run to completion",
+        steered.label()
+    );
+
+    let idle_steer = format!("The secret word is {}.", unique_payload());
+    steer_expecting_no_active_turn(host, &idle_steer).await;
+    let after_idle_steer = drain_events_for(host, STEER_IDLE_SETTLE).await;
+    let leaked = after_idle_steer
+        .iter()
+        .filter(|event| {
+            matches!(
+                event,
+                ChatEvent::TypingStatusChanged(true) | ChatEvent::MessageAdded(_)
+            )
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        leaked.is_empty(),
+        "{:?}: a steer refused for want of a turn still reached the conversation: {leaked:?}",
+        host.backend()
+    );
+
+    let after = ask_expecting_delivery(host, &agent, &launch_prompt()).await;
+    assert_ready_handshake(&after);
+
+    assert_universal_contract(&[launched, steered, after]);
+    assert_clean_close(host, &agent).await;
+}
+
 async fn real_interrupt_after_background_response<B: Backend>(host: &mut Harness<B>) {
     let agent = spawn_agent(host, &launch_prompt()).await;
     let launched = collect_turn(host, &agent, &launch_prompt()).await;
@@ -3340,6 +3423,7 @@ conformance2_scenario!(
     ]
 );
 conformance2_scenario!(real_interruption, [BackendCapability::Interrupt]);
+conformance2_scenario!(real_mid_turn_steering, [BackendCapability::MidTurnSteering]);
 conformance2_scenario!(
     real_interrupt_after_background_response,
     [
