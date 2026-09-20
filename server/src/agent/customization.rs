@@ -124,12 +124,13 @@ pub(crate) fn resolve_spawn_config(
     crate::backend::validate_tool_policy(request.backend_kind, &tool_policy)?;
 
     let steering_body = resolve_steering_body(request.steering_store, request.project_id)?;
-    let builtin_steering = resolve_builtin_steering(request.built_in_mcp_servers);
 
     let resolved = ResolvedSpawnConfig {
         instructions,
         steering_body,
-        builtin_steering,
+        // Stamped for every session, resolved or hand-built, where the agent
+        // actor assembles the spawn config.
+        builtin_steering: String::new(),
         skills,
         skill_selection,
         skill_delivery,
@@ -256,21 +257,6 @@ fn resolve_skill(skill_store: &SkillStore, skill_id: &SkillId) -> Result<Resolve
         paths.source_dir,
         paths.skill_md,
     ))
-}
-
-/// Tyde-owned steering for this session. The agent-control rule is tied to the
-/// tools it talks about: the server only installs that MCP when the setting is
-/// on and the agent is under the depth limit, so an agent that cannot use
-/// agent control is never told to.
-fn resolve_builtin_steering(built_in_mcp_servers: &[StartupMcpServer]) -> String {
-    let has_agent_control = built_in_mcp_servers
-        .iter()
-        .any(|server| server.name == crate::agent_control_mcp::AGENT_CONTROL_MCP_SERVER_NAME);
-    if has_agent_control {
-        crate::backend::AGENT_CONTROL_SPAWN_STEERING.to_owned()
-    } else {
-        String::new()
-    }
 }
 
 fn resolve_steering_body(

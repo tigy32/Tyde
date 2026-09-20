@@ -91,6 +91,9 @@ pub struct ResolvedSpawnConfig {
     /// Steering Tyde injects itself, kept apart from the user's steering
     /// records because it is a property of the session Tyde built, not
     /// something the user wrote or can see in Settings.
+    ///
+    /// Written by the agent actor from the session's startup MCP servers, not
+    /// by whoever assembled this config. Leave it empty when constructing one.
     pub builtin_steering: String,
     pub skills: Vec<ResolvedSkill>,
     pub skill_selection: SkillSelection,

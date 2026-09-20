@@ -2743,6 +2743,16 @@ pub(crate) fn spawn_agent_actor(
             mock_launch,
             ..
         } = request;
+        // Every agent session converges here, whether its spawn config came
+        // from resolution or was built by hand (workflow coordinators, BTW
+        // agents, reviewers). Tyde's own steering is a property of the tools
+        // the session actually holds rather than of the user's steering
+        // records, so it is stamped once at this seam: a spawn path that
+        // assembles its own config cannot silently drop it.
+        let mut resolved_spawn_config = resolved_spawn_config;
+        resolved_spawn_config.builtin_steering =
+            crate::backend::builtin_steering_for_tools(&startup_mcp_servers);
+        let resolved_spawn_config = resolved_spawn_config;
         let mut current_start = start.clone();
         let session_resumability_config = resolved_spawn_config.clone();
         let workspace_emitter = Arc::new(

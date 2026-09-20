@@ -74,6 +74,22 @@ pub const AGENT_CONTROL_SPAWN_STEERING: &str = concat!(
     "own backend can use whatever native mechanism you already have."
 );
 
+/// Tyde's own steering for a session holding `startup_mcp_servers`.
+///
+/// Keyed on the tools themselves rather than on the setting behind them: the
+/// host only installs agent control when it is enabled and the agent is under
+/// the depth limit, so an agent that cannot spawn is never told to.
+pub(crate) fn builtin_steering_for_tools(startup_mcp_servers: &[StartupMcpServer]) -> String {
+    let has_agent_control = startup_mcp_servers
+        .iter()
+        .any(|server| server.name == crate::agent_control_mcp::AGENT_CONTROL_MCP_SERVER_NAME);
+    if has_agent_control {
+        AGENT_CONTROL_SPAWN_STEERING.to_owned()
+    } else {
+        String::new()
+    }
+}
+
 pub(crate) const READ_ONLY_ACCESS_MODE_INSTRUCTIONS: &str = concat!(
     "Backend access mode is read-only (best effort). Treat the workspace as ",
     "read-only: do not create, edit, or delete files, and do not run commands ",

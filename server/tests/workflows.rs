@@ -412,9 +412,26 @@ async fn trigger_workflow_spawns_workflow_origin_coordinator() {
 
     let (run_id, coordinator) =
         trigger_workflow_and_wait_for_coordinator(&mut fixture.client, project.id).await;
+    let coordinator_stream = coordinator.instance_stream.clone();
     let metadata = coordinator.workflow.expect("workflow metadata missing");
     assert_eq!(metadata.workflow_id, WorkflowId("build".to_owned()));
     assert_eq!(metadata.workflow_run_id, run_id);
+
+    // A coordinator's spawn config is assembled by the workflow path rather
+    // than resolved from the stores, so it is the session most likely to be
+    // handed agent control without the steering that governs its use.
+    let response = collect_turn_delta_text(&mut fixture.client, &coordinator_stream).await;
+    assert!(
+        response.contains("[startup_mcp_servers: tyde-agent-control(http)"),
+        "coordinator spawns agents, so it must hold agent control: {response}"
+    );
+    assert!(
+        response.contains(&format!(
+            "[builtin_steering: {}]",
+            server::backend::AGENT_CONTROL_SPAWN_STEERING
+        )),
+        "coordinator holds agent control without the steering for it: {response}"
+    );
 }
 
 #[tokio::test]
