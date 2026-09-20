@@ -1547,14 +1547,56 @@ mod wasm_tests {
         state_handle.borrow().as_ref().unwrap().clone()
     }
 
-    async fn wait_for_drawer_motion() {
+    async fn sleep_ms(millis: i32) {
         let promise = js_sys::Promise::new(&mut |resolve, _reject| {
             web_sys::window()
                 .unwrap()
-                .set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, 240)
+                .set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, millis)
                 .unwrap();
         });
         wasm_bindgen_futures::JsFuture::from(promise).await.unwrap();
+    }
+
+    /// Wait until the reveal has actually stopped moving.
+    ///
+    /// The reveal is a 180ms `grid-template-rows` transition, so waiting a
+    /// fixed 240ms was a bet that the animation frames arrive on time. On a
+    /// loaded machine they do not: the sample lands mid-motion, with the
+    /// drawer still short of the composer it is supposed to be flush against.
+    /// Sample the drawer's geometry until it repeats instead, which is the
+    /// signal the wait was always reaching for.
+    async fn wait_for_drawer_motion(container: &HtmlElement) {
+        const SAMPLE_MS: i32 = 16;
+        const STILL_SAMPLES: u32 = 4;
+        const MAX_SAMPLES: u32 = 200;
+
+        // Let the click's reactive DOM patch land, so the first sample is
+        // taken against a drawer that is already animating.
+        next_tick().await;
+        next_tick().await;
+
+        let mut previous = f64::NAN;
+        let mut still = 0;
+        for _ in 0..MAX_SAMPLES {
+            sleep_ms(SAMPLE_MS).await;
+            let Some(drawer) = container
+                .query_selector("[data-mobile-test='activity-drawer']")
+                .unwrap()
+            else {
+                return;
+            };
+            let top = drawer.get_bounding_client_rect().top();
+            if (top - previous).abs() < 0.01 {
+                still += 1;
+                if still == STILL_SAMPLES {
+                    return;
+                }
+            } else {
+                still = 0;
+            }
+            previous = top;
+        }
+        panic!("activity drawer never stopped moving");
     }
 
     #[wasm_bindgen_test]
@@ -1647,7 +1689,7 @@ mod wasm_tests {
             "hidden"
         );
         click(&toggle);
-        wait_for_drawer_motion().await;
+        wait_for_drawer_motion(&container).await;
         assert_eq!(
             toggle.get_attribute("aria-expanded").as_deref(),
             Some("true")
@@ -1786,7 +1828,7 @@ mod wasm_tests {
         );
 
         click(&toggle);
-        wait_for_drawer_motion().await;
+        wait_for_drawer_motion(&container).await;
         let init = js_sys::Object::new();
         js_sys::Reflect::set(&init, &"key".into(), &"Escape".into()).unwrap();
         js_sys::Reflect::set(&init, &"bubbles".into(), &wasm_bindgen::JsValue::TRUE).unwrap();
@@ -1799,7 +1841,7 @@ mod wasm_tests {
                 .unwrap()
                 .unchecked_into();
         element("activity-open").dispatch_event(&event).unwrap();
-        wait_for_drawer_motion().await;
+        wait_for_drawer_motion(&container).await;
         assert_eq!(
             toggle.get_attribute("aria-expanded").as_deref(),
             Some("false")
@@ -1874,7 +1916,7 @@ mod wasm_tests {
             .unwrap();
         settle_autoscroll().await;
         click(&element("activity-toggle"));
-        wait_for_drawer_motion().await;
+        wait_for_drawer_motion(&container).await;
         let list = element("activity-list");
         assert!(
             list.scroll_height() > list.client_height(),

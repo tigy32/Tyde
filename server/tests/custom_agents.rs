@@ -10,7 +10,8 @@ use protocol::{
     CustomAgent, CustomAgentDeletePayload, CustomAgentId, CustomAgentNotifyPayload,
     CustomAgentUpsertPayload, Envelope, FrameKind, McpServerConfig, McpServerDeletePayload,
     McpServerId, McpServerNotifyPayload, McpServerUpsertPayload, McpTransportConfig,
-    NewAgentPayload, ProjectCreatePayload, ProjectNotifyPayload, ProjectRootPath, Skill, SkillId,
+    NewAgentPayload, ProjectCreatePayload, ProjectNotifyPayload, ProjectRootPath,
+    SettingExpectation, SettingOp, SettingsWriteId, SettingsWritePayload, Skill, SkillId,
     SkillNotifyPayload, SkillRefreshPayload, SpawnAgentParams, SpawnAgentPayload, Steering,
     SteeringDeletePayload, SteeringId, SteeringNotifyPayload, SteeringScope, SteeringUpsertPayload,
     ToolPolicy,
@@ -1488,6 +1489,104 @@ async fn steering_ordering_combines_host_and_project_by_title() {
     let _ = expect_next_event(&mut fixture.client, "AgentStart").await;
     let text = expect_turn_text(&mut fixture.client, "steering turn").await;
     assert!(text.contains("[steering: project alpha\\n\\nhost zulu]"));
+}
+
+/// Agents reach for another backend's CLI unless told otherwise, and a
+/// shell-spawned agent never appears in Tyde. Every session that is handed the
+/// agent-control MCP is handed the rule that goes with it, and a session
+/// without those tools is not.
+#[tokio::test(start_paused = true)]
+async fn agent_control_spawn_steering_follows_the_agent_control_mcp() {
+    let mut fixture = Fixture::new().await;
+
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            name: Some("with-agent-control".to_string()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::New {
+                workspace_roots: vec!["/tmp/agent-control-steering".to_string()],
+                prompt: "spawn something".to_string(),
+                images: None,
+                backend_kind: BackendKind::Claude,
+                launch_profile_id: None,
+                cost_hint: None,
+                access_mode: Default::default(),
+                session_settings: None,
+            },
+        })
+        .await
+        .expect("spawn_agent failed");
+    let _ = expect_next_event(&mut fixture.client, "NewAgent").await;
+    let _ = expect_next_event(&mut fixture.client, "AgentStart").await;
+    let text = expect_turn_text(&mut fixture.client, "agent control steering turn").await;
+    assert!(
+        text.contains("[startup_mcp_servers: tyde-agent-control(http)"),
+        "agent control MCP is the precondition for this steering: {text}"
+    );
+    assert!(
+        text.contains(&format!(
+            "[builtin_steering: {}]",
+            server::backend::AGENT_CONTROL_SPAWN_STEERING
+        )),
+        "spawn config lost the agent-control steering: {text}"
+    );
+
+    let write_id = SettingsWriteId("disable-agent-control".to_string());
+    fixture
+        .client
+        .settings_write(SettingsWritePayload {
+            write_id: write_id.clone(),
+            ops: vec![SettingOp::Replace {
+                path: "/tyde_agent_control_mcp_enabled".to_string(),
+                value: serde_json::Value::Bool(false),
+                expected: SettingExpectation::Value {
+                    value: serde_json::Value::Bool(true),
+                },
+            }],
+        })
+        .await
+        .expect("settings_write failed");
+    let _ = fixture::expect_settings_write_applied(
+        &mut fixture.client,
+        &write_id,
+        "disable agent control MCP",
+    )
+    .await;
+
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            name: Some("without-agent-control".to_string()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::New {
+                workspace_roots: vec!["/tmp/agent-control-steering".to_string()],
+                prompt: "spawn something".to_string(),
+                images: None,
+                backend_kind: BackendKind::Claude,
+                launch_profile_id: None,
+                cost_hint: None,
+                access_mode: Default::default(),
+                session_settings: None,
+            },
+        })
+        .await
+        .expect("second spawn_agent failed");
+    let _ = expect_next_event(&mut fixture.client, "second NewAgent").await;
+    let _ = expect_next_event(&mut fixture.client, "second AgentStart").await;
+    let text = expect_turn_text(&mut fixture.client, "disabled agent control turn").await;
+    assert!(
+        !text.contains("tyde-agent-control"),
+        "agent control MCP survived the setting: {text}"
+    );
+    assert!(
+        !text.contains("[builtin_steering:"),
+        "steering about tools the session does not have: {text}"
+    );
 }
 
 fn write_project_skill(workspace_dir: &Path, rel_dir: &str, skill_name: &str, body: &str) {

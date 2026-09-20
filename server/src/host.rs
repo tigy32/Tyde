@@ -13099,6 +13099,7 @@ impl HostHandle {
         let reviewer_spawn_config = ResolvedSpawnConfig {
             instructions: Some(reviewer_system_prompt),
             steering_body: String::new(),
+            builtin_steering: String::new(),
             skills: Vec::new(),
             skill_selection: SkillSelection::Explicit,
             skill_delivery: crate::backend::skill_delivery(backend_kind),

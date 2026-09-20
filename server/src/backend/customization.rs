@@ -88,6 +88,10 @@ pub enum SkillDelivery {
 pub struct ResolvedSpawnConfig {
     pub instructions: Option<String>,
     pub steering_body: String,
+    /// Steering Tyde injects itself, kept apart from the user's steering
+    /// records because it is a property of the session Tyde built, not
+    /// something the user wrote or can see in Settings.
+    pub builtin_steering: String,
     pub skills: Vec<ResolvedSkill>,
     pub skill_selection: SkillSelection,
     pub skill_delivery: SkillDelivery,
@@ -101,6 +105,7 @@ impl Default for ResolvedSpawnConfig {
         Self {
             instructions: None,
             steering_body: String::new(),
+            builtin_steering: String::new(),
             skills: Vec::new(),
             // Explicit is the safe default: an adapter must never advertise
             // skills it was not handed.

@@ -237,7 +237,9 @@ async fn assert_no_parent_reentry(
 
 fn mock_turn_text(prompt: &str) -> String {
     format!(
-        "[startup_mcp_servers: tyde-agent-control(http), tyde-agent-await(http)] mock backend response to: {prompt}"
+        "[startup_mcp_servers: tyde-agent-control(http), tyde-agent-await(http)] \
+         [builtin_steering: {}] mock backend response to: {prompt}",
+        server::backend::AGENT_CONTROL_SPAWN_STEERING
     )
 }
 

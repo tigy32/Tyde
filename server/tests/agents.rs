@@ -7316,10 +7316,17 @@ async fn detached_spawn_bootstraps_before_follow_up_is_admitted() {
         "startup input admission must not synthesize an error"
     );
 
+    let mock_turn_text = |prompt: &str| {
+        format!(
+            "[startup_mcp_servers: tyde-agent-control(http), tyde-agent-await(http)] \
+             [builtin_steering: {}] mock backend response to: {prompt}",
+            server::backend::AGENT_CONTROL_SPAWN_STEERING
+        )
+    };
     let expected = [
-        "[startup_mcp_servers: tyde-agent-control(http), tyde-agent-await(http)] mock backend response to: initial detached spawn turn",
-        "[startup_mcp_servers: tyde-agent-control(http), tyde-agent-await(http)] mock backend response to: first immediate follow-up",
-        "[startup_mcp_servers: tyde-agent-control(http), tyde-agent-await(http)] mock backend response to: second immediate follow-up",
+        mock_turn_text("initial detached spawn turn"),
+        mock_turn_text("first immediate follow-up"),
+        mock_turn_text("second immediate follow-up"),
     ];
     let mut completed = Vec::new();
     while completed.len() < expected.len() {
@@ -7343,8 +7350,7 @@ async fn detached_spawn_bootstraps_before_follow_up_is_admitted() {
         }
     }
     assert_eq!(
-        completed,
-        expected.map(|value| value.to_owned()),
+        completed, expected,
         "initial turn must stay first and startup inputs must drain FIFO"
     );
 }

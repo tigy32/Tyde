@@ -79,6 +79,7 @@ struct MockSessionRecord {
     startup_mcp_servers: Vec<String>,
     instructions: Option<String>,
     steering_body: String,
+    builtin_steering: String,
     skills: Vec<String>,
     tool_policy: ToolPolicy,
     access_mode: BackendAccessMode,
@@ -163,6 +164,7 @@ impl MockBackend {
                     startup_mcp_servers: startup_mcp_servers.clone(),
                     instructions: resolved_spawn_config.instructions,
                     steering_body: resolved_spawn_config.steering_body,
+                    builtin_steering: resolved_spawn_config.builtin_steering,
                     skills: resolved_spawn_config
                         .skills
                         .into_iter()
@@ -252,6 +254,7 @@ impl MockBackend {
             record.startup_mcp_servers = startup_mcp_servers;
             record.instructions = resolved_spawn_config.instructions;
             record.steering_body = resolved_spawn_config.steering_body;
+            record.builtin_steering = resolved_spawn_config.builtin_steering;
             record.skills = resolved_spawn_config
                 .skills
                 .into_iter()
@@ -392,6 +395,7 @@ impl MockBackend {
                     startup_mcp_servers,
                     instructions: resolved_spawn_config.instructions,
                     steering_body: resolved_spawn_config.steering_body,
+                    builtin_steering: resolved_spawn_config.builtin_steering,
                     skills: resolved_spawn_config
                         .skills
                         .into_iter()
@@ -875,6 +879,12 @@ fn startup_mcp_response_prefix(session_id: &SessionId) -> String {
         parts.push(format!(
             "[steering: {}]",
             summarize_text(&record.steering_body)
+        ));
+    }
+    if !record.builtin_steering.trim().is_empty() {
+        parts.push(format!(
+            "[builtin_steering: {}]",
+            summarize_text(&record.builtin_steering)
         ));
     }
     if !record.skills.is_empty() {

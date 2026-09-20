@@ -61,6 +61,19 @@ pub use compaction::{
     BackendCompactionStart,
 };
 
+/// Injected whenever a session is handed the agent-control MCP. Models reach
+/// for another backend's CLI out of habit, and a shell-spawned agent is
+/// invisible to every Tyde surface: no bubble, no steering, no review, no
+/// resume. The closing sentence is load-bearing in the other direction: a
+/// model's own native sub-agents stay visible, so the rule must not scare it
+/// off them.
+pub const AGENT_CONTROL_SPAWN_STEERING: &str = concat!(
+    "To run work on a different agent backend than your own, spawn it with the ",
+    "tyde-agent-control MCP tools, never by invoking that backend's CLI from ",
+    "the shell: a shell-spawned agent is invisible to Tyde. Sub-agents on your ",
+    "own backend can use whatever native mechanism you already have."
+);
+
 pub(crate) const READ_ONLY_ACCESS_MODE_INSTRUCTIONS: &str = concat!(
     "Backend access mode is read-only (best effort). Treat the workspace as ",
     "read-only: do not create, edit, or delete files, and do not run commands ",
@@ -2302,6 +2315,9 @@ pub(crate) fn render_combined_spawn_instructions(config: &ResolvedSpawnConfig) -
     let mut sections = Vec::new();
     if config.access_mode == BackendAccessMode::ReadOnly {
         sections.push(READ_ONLY_ACCESS_MODE_INSTRUCTIONS.to_string());
+    }
+    if !config.builtin_steering.trim().is_empty() {
+        sections.push(config.builtin_steering.trim().to_string());
     }
     if let Some(instructions) = config
         .instructions

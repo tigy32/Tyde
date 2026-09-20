@@ -13887,6 +13887,20 @@ fn claude_steering_content(
     if config.resolved_spawn_config.access_mode == BackendAccessMode::ReadOnly {
         sections.push(READ_ONLY_ACCESS_MODE_INSTRUCTIONS.to_string());
     }
+    if !config
+        .resolved_spawn_config
+        .builtin_steering
+        .trim()
+        .is_empty()
+    {
+        sections.push(
+            config
+                .resolved_spawn_config
+                .builtin_steering
+                .trim()
+                .to_string(),
+        );
+    }
     if !config.resolved_spawn_config.steering_body.trim().is_empty() {
         sections.push(
             config
