@@ -4393,10 +4393,53 @@ pub struct AgentTurnStateNotifyPayload {
     pub turn_active: bool,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UsageLimitPausePhase {
+    #[default]
+    WaitingForQuota,
+    CompactionDeferred,
+    WaitingForIdle,
+    Compacting,
+    RecoveryFailed,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UsageLimitPauseState {
     pub resume_interrupted_turn: bool,
     pub compaction_failed: bool,
+    #[serde(default)]
+    pub phase: UsageLimitPausePhase,
+    #[serde(default = "usage_resume_below_percent")]
+    pub resume_below_percent: u8,
+}
+
+pub const fn usage_resume_below_percent() -> u8 {
+    50
+}
+
+impl UsageLimitPauseState {
+    pub fn status_message(&self) -> String {
+        if self.compaction_failed || self.phase == UsageLimitPausePhase::RecoveryFailed {
+            return "Usage pause: Recovery failed. Compaction could not complete; automatic continuation is held. Disable usage management in host Settings to release held work.".to_owned();
+        }
+        match self.phase {
+            UsageLimitPausePhase::CompactionDeferred => format!(
+                "Usage pause: Compaction deferred until quota recovers. Waiting for fresh usage below {}% before compacting and releasing held work.",
+                self.resume_below_percent
+            ),
+            UsageLimitPausePhase::Compacting => {
+                "Usage pause: Compacting before releasing held work.".to_owned()
+            }
+            UsageLimitPausePhase::WaitingForIdle => {
+                "Usage pause: Waiting for the interrupted turn and tools to settle.".to_owned()
+            }
+            _ => format!(
+                "Usage pause: Waiting for quota reset or fresh usage below {}%. Queued work remains held.",
+                self.resume_below_percent
+            ),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

@@ -1483,11 +1483,7 @@ pub fn ChatInput(
             <crate::notices::ActionError error=action_error />
             <Show when=move || usage_pause.get().is_some() && !is_terminated.get()>
                 <div class="chat-backend-notice" role="status">
-                    <span>{move || if usage_pause.get().is_some_and(|pause| pause.compaction_failed) {
-                        "Usage pause: compaction failed. Disable usage management in Settings to release held work."
-                    } else {
-                        "Usage pause: queued work will resume when fresh usage is below the pause threshold."
-                    }}</span>
+                    <span>{move || usage_pause.get().map(|pause| pause.status_message())}</span>
                     <Show when=move || usage_pause.get().is_some_and(|pause| pause.resume_interrupted_turn)>
                         <button type="button" class="chat-backend-notice-cta" on:click={move |_| cancel_usage.run(())}>
                             "Cancel continuation"
@@ -2473,6 +2469,8 @@ mod wasm_tests {
                     usage_limit_pause: Some(protocol::UsageLimitPauseState {
                         resume_interrupted_turn: true,
                         compaction_failed: false,
+                        phase: protocol::UsageLimitPausePhase::WaitingForQuota,
+                        resume_below_percent: 50,
                     }),
                     ..Default::default()
                 },
@@ -2491,7 +2489,7 @@ mod wasm_tests {
             container
                 .text_content()
                 .unwrap()
-                .contains("below the pause threshold")
+                .contains("fresh usage below 50%")
         );
         assert!(
             container
@@ -2526,6 +2524,36 @@ mod wasm_tests {
                 .contains("Cancel continuation")
         );
         assert!(container.text_content().unwrap().contains("Usage pause:"));
+        for (phase, text) in [
+            (
+                protocol::UsageLimitPausePhase::CompactionDeferred,
+                "Compaction deferred until quota recovers",
+            ),
+            (
+                protocol::UsageLimitPausePhase::Compacting,
+                "Compacting before releasing held work",
+            ),
+            (
+                protocol::UsageLimitPausePhase::WaitingForIdle,
+                "Waiting for the interrupted turn and tools to settle",
+            ),
+            (
+                protocol::UsageLimitPausePhase::RecoveryFailed,
+                "Recovery failed",
+            ),
+        ] {
+            state.agent_activity_stats.update(|stats| {
+                stats
+                    .get_mut(&agent)
+                    .unwrap()
+                    .usage_limit_pause
+                    .as_mut()
+                    .unwrap()
+                    .phase = phase;
+            });
+            next_tick().await;
+            assert!(container.text_content().unwrap().contains(text));
+        }
         state.agent_activity_stats.update(|stats| {
             stats.get_mut(&agent).unwrap().usage_limit_pause = None;
         });

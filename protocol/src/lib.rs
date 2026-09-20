@@ -159,10 +159,10 @@ pub use types::{
     ToolExecutionNormalizationFailure, ToolExecutionOutcome, ToolExecutionResult, ToolPolicy,
     ToolProgressData, ToolProgressUpdate, ToolRequest, ToolRequestType, ToolUseData,
     TriggerSurface, TriggerWorkflowPayload, TycodeModel, TydeAgentWaitStatus,
-    UNAVAILABLE_OPTION_SUFFIX, UsageLimitPauseState, UserSmartViewId, ValueProvenance,
-    VapidPrivateKey, VapidPublicKey, Version, WelcomePayload, WorkbenchCreatePayload,
-    WorkbenchRemovePayload, WorkbenchRoot, WorkflowAgentState, WorkflowAgentStatus,
-    WorkflowCatalogLocation, WorkflowCoordinatorSpec, WorkflowDiagnostic,
+    UNAVAILABLE_OPTION_SUFFIX, UsageLimitPausePhase, UsageLimitPauseState, UserSmartViewId,
+    ValueProvenance, VapidPrivateKey, VapidPublicKey, Version, WelcomePayload,
+    WorkbenchCreatePayload, WorkbenchRemovePayload, WorkbenchRoot, WorkflowAgentState,
+    WorkflowAgentStatus, WorkflowCatalogLocation, WorkflowCoordinatorSpec, WorkflowDiagnostic,
     WorkflowDiagnosticSeverity, WorkflowId, WorkflowInputControl, WorkflowInputOption,
     WorkflowInputSpec, WorkflowNotifyPayload, WorkflowRefreshPayload, WorkflowRunId,
     WorkflowRunNotifyPayload, WorkflowRunSnapshot, WorkflowRunSnapshotStatus, WorkflowRunState,
@@ -170,7 +170,7 @@ pub use types::{
     WorkflowSaveTarget, WorkflowSource, WorkflowSourceScope, WorkflowStepRunId,
     WorkflowStepRunSnapshot, WorkflowStepRunSnapshotStatus, WorkflowSummary,
     WorkflowTargetDirectory, WorkflowTargetsResponse, clear_invalid_dependent_select_values,
-    options_including_current, parse_json_pointer, slash_command_name,
+    options_including_current, parse_json_pointer, slash_command_name, usage_resume_below_percent,
 };
 pub use types::{
     BrowserAecStatus, MAX_VOICE_AUDIO_BYTES, MAX_VOICE_PACKETS_PER_FRAME, VOICE_PROTOCOL_VERSION,

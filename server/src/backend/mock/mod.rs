@@ -108,7 +108,7 @@ pub struct MockBackend {
     mid_turn_steering: bool,
     shutdown_gate: Option<gate::MockGate>,
     compaction_observation_gates: Option<(gate::MockGate, gate::MockGate)>,
-    compaction_failure: Option<MockCompactionFailure>,
+    compaction_failure: Mutex<Option<MockCompactionFailure>>,
     resume_replay_guard: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
@@ -141,7 +141,7 @@ impl MockBackend {
         let mid_turn_steering = launch_script.mid_turn_steering;
         let shutdown_gate = launch_script.shutdown_gate.clone();
         let compaction_observation_gates = launch_script.compaction_observation_gates.clone();
-        let compaction_failure = launch_script.compaction_failure;
+        let compaction_failure = Mutex::new(launch_script.compaction_failure);
         let initial_message = initial_input.message;
         let agent_control_await_mcp = emit::agent_control_await_mcp(&config.startup_mcp_servers);
         let startup_mcp_servers = summarize_startup_mcp_servers(&config);
@@ -240,7 +240,7 @@ impl MockBackend {
         let mid_turn_steering = launch_script.mid_turn_steering;
         let shutdown_gate = launch_script.shutdown_gate.clone();
         let compaction_observation_gates = launch_script.compaction_observation_gates.clone();
-        let compaction_failure = launch_script.compaction_failure;
+        let compaction_failure = Mutex::new(launch_script.compaction_failure);
         let agent_control_await_mcp = emit::agent_control_await_mcp(&config.startup_mcp_servers);
         let startup_mcp_servers = summarize_startup_mcp_servers(&config);
         let resolved_spawn_config = config.resolved_spawn_config.clone();
@@ -374,7 +374,7 @@ impl MockBackend {
         let mid_turn_steering = launch_script.mid_turn_steering;
         let shutdown_gate = launch_script.shutdown_gate.clone();
         let compaction_observation_gates = launch_script.compaction_observation_gates.clone();
-        let compaction_failure = launch_script.compaction_failure;
+        let compaction_failure = Mutex::new(launch_script.compaction_failure);
         let initial_message = initial_input.message;
         let agent_control_await_mcp = emit::agent_control_await_mcp(&config.startup_mcp_servers);
         let startup_mcp_servers = summarize_startup_mcp_servers(&config);
@@ -612,7 +612,19 @@ impl Backend for MockBackend {
                 reason: BackendCompactionDeferredReason::AnotherCompactionActive,
             };
         }
-        if let Some(failure) = self.compaction_failure {
+        self.control.record_compaction_attempt();
+        let failure = {
+            let mut failure = self
+                .compaction_failure
+                .lock()
+                .expect("mock compaction failure mutex");
+            let current = *failure;
+            if matches!(current, Some(MockCompactionFailure::QuotaExceededOnce)) {
+                *failure = None;
+            }
+            current
+        };
+        if let Some(failure) = failure {
             if matches!(failure, MockCompactionFailure::NotDispatched) {
                 return BackendCompactionStart::NotDispatched {
                     reason: BackendCompactionNotDispatchedReason::InvalidFocus,
@@ -626,7 +638,11 @@ impl Backend for MockBackend {
                 mutation: BackendCompactionMutationState::NotObserved,
                 outcome: Err(super::BackendCompactionFailure {
                     kind: super::BackendCompactionFailureKind::ProviderRejected,
-                    message: "mock native compaction rejected".to_owned(),
+                    message: match failure {
+                        MockCompactionFailure::QuotaExceeded | MockCompactionFailure::QuotaExceededOnce =>
+                            "Error during compaction: You've hit your session limit · resets 2:10pm (America/Los_Angeles)",
+                        _ => "mock native compaction rejected",
+                    }.to_owned(),
                 }),
                 provider_session_id: Some(self.session_id.clone()),
                 metrics: CompactionMetrics::default(),

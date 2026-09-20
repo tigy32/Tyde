@@ -124,6 +124,7 @@ const TERMINAL_REPORT_MISSING: &str =
 pub struct MockControl {
     tx: mpsc::UnboundedSender<MockControlCommand>,
     terminal: MockTerminalReportSlot,
+    compaction_attempts: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl MockControl {
@@ -138,10 +139,21 @@ impl MockControl {
             Self {
                 tx,
                 terminal: Arc::clone(&terminal),
+                compaction_attempts: Arc::default(),
             },
             rx,
             terminal,
         )
+    }
+
+    pub(super) fn record_compaction_attempt(&self) {
+        self.compaction_attempts
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub fn compaction_attempts(&self) -> usize {
+        self.compaction_attempts
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     fn terminal_report(&self) -> MockTerminalReport {

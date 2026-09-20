@@ -564,14 +564,20 @@ compaction can consume quota, so the threshold is not a hard spending cap.
 
 When enabled and context occupancy is known to exceed its threshold, automatic
 compaction uses the existing context-compaction coordinator after the turn and
-tools settle. It does not run a supervisor verdict. Failed compaction holds
-automatic continuation and shows an explanation. Disabling usage management
-releases held work. Unknown context occupancy does not trigger compaction.
+tools settle. It does not run a supervisor verdict. At 100% or without a fresh
+quota reading, compaction waits for recovery rather than spending against an
+exhausted account. A quota-rejected compaction with no observed session mutation
+may retry once after a newer report confirms recovery. Other failures, uncertain
+mutation, or a failed retry hold automatic continuation with an explanation.
+Disabling usage management releases held work after any in-flight compaction
+settles. Unknown context occupancy does not trigger compaction.
 
-Resumption requires a fresh, below-threshold percentage for every held bucket,
-with no other bucket at or above the current threshold. Reset timestamps are
-informational: corrected readings, replenished credits and threshold changes
-can restore capacity without a new reset marker. Missing buckets, unknown
+Resumption requires fresh usage strictly below 50% for every held bucket (or
+below the configured pause percentage if it is lower), with no other bucket at
+or above the pause threshold. A small dip below the pause percentage, or raising
+that percentage, does not release an existing pause. Reset timestamps remain
+informational: a sufficiently low corrected reading can restore capacity without
+a new reset marker. Missing buckets, unknown
 magnitudes, expired timestamps and unavailable readings alone never release
 work. Both collection age and any supplied observation age must be at most two
 minutes. A provider that silently returns cached data without observation
@@ -588,6 +594,13 @@ The server must remain running for the pause and continuation cycle; automatic
 continuation state is not restored after a server restart. Queued messages use
 the existing persisted queue.
 
+Desktop and mobile chat distinguish waiting for quota, deferred compaction,
+waiting for tools to settle, compacting, and failed recovery. The coordinator
+finishes compaction before releasing queued work. Queued user work supersedes
+supervisor nudges; otherwise repeated nudges coalesce into one continuation.
+Supervision results arriving during a pause cannot start a competing recovery.
+An empty queue with no interrupted turn reports that no continuation is pending.
+
 Desktop and mobile chat display the pause. “Cancel continuation” cancels the
 interrupted task's automatic follow-up; explicitly queued messages remain queued.
 Idle agents do not receive unsolicited continuation prompts.
@@ -600,3 +613,10 @@ partial-report regression replayed an obsolete Fable value of 42% instead of the
 new 21%. The delayed-observation regression showed an older 1% reading replacing
 a newer 98% reading and dispatching held work. Browser tests cover the opt-in
 controls, recovery explanation and cancellation from an idle composer.
+
+The September 20 quota-recovery regressions failed against the previous policy:
+the real-server flow dispatched held work at 89% after pausing at 98%, and a
+quota-rejected compaction never entered deferred recovery. The previous test
+expecting a raised pause threshold to release 95% usage was updated for the
+explicit below-50% recovery contract; it now verifies that raising the threshold
+keeps work held and a 49% reading releases it exactly once.

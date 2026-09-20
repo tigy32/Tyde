@@ -582,7 +582,7 @@ fn decorate_host_settings_schema(schema: &mut Value) {
             10,
             "toggle",
             "Enable usage limit management",
-            "Pause agents sharing a reported quota at the configured usage percentage and resume when a fresh report confirms usage is below that percentage. Off by default.",
+            "Pause agents sharing a reported quota at the configured usage percentage and resume when a fresh report confirms each blocking quota is below 50% (or below the pause percentage if lower). Off by default.",
         ),
         (
             "stop_used_percent",
@@ -596,7 +596,7 @@ fn decorate_host_settings_schema(schema: &mut Value) {
             30,
             "toggle",
             "Compact before waiting for reset",
-            "Automatically compact paused agents whose context exceeds the threshold. Compaction can consume quota. Off by default.",
+            "Automatically compact paused agents whose context exceeds the threshold. Compaction can consume quota; exhausted quotas defer it until recovery. Quota-rejected compaction can retry once after a newer low-usage report. Off by default.",
         ),
         (
             "compact_context_percent",

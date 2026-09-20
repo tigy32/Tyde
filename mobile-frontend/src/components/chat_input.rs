@@ -1788,11 +1788,7 @@ pub fn ChatInput() -> impl IntoView {
             </div>
             <Show when=move || usage_pause.get().is_some() && !is_terminated.get()>
                 <div class="chat-input-queued-title" role="status">
-                    <span>{move || if usage_pause.get().is_some_and(|pause| pause.compaction_failed) {
-                        "Usage pause: compaction failed. Disable usage management on the host to release held work."
-                    } else {
-                        "Usage pause: queued work will resume after the quota resets."
-                    }}</span>
+                    <span>{move || usage_pause.get().map(|pause| pause.status_message())}</span>
                     <Show when=move || usage_pause.get().is_some_and(|pause| pause.resume_interrupted_turn)>
                         <button type="button" on:click={move |_| cancel_usage_continuation.run(())}>
                             "Cancel continuation"
@@ -2263,6 +2259,71 @@ mod wasm_tests {
             connection_instance_id: 7,
             local_submission_id: LocalSubmissionId(id),
         }
+    }
+
+    #[wasm_bindgen_test]
+    async fn usage_recovery_status_is_visible_in_the_composer() {
+        let state = AppState::new();
+        let agent = AgentRef {
+            local_host_id: LocalHostId("host-1".to_owned()),
+            agent_id: AgentId("agent-1".to_owned()),
+        };
+        state.active_agent.set(Some(crate::state::ActiveAgentRef {
+            local_host_id: agent.local_host_id.clone(),
+            agent_id: agent.agent_id.clone(),
+        }));
+        let container = make_container();
+        let mount_state = state.clone();
+        let _h = mount_to(container.clone(), move || {
+            provide_context(mount_state);
+            view! { <ChatInput /> }
+        });
+        for (phase, text) in [
+            (
+                protocol::UsageLimitPausePhase::WaitingForQuota,
+                "fresh usage below 50%",
+            ),
+            (
+                protocol::UsageLimitPausePhase::CompactionDeferred,
+                "Compaction deferred until quota recovers",
+            ),
+            (
+                protocol::UsageLimitPausePhase::Compacting,
+                "Compacting before releasing held work",
+            ),
+            (
+                protocol::UsageLimitPausePhase::WaitingForIdle,
+                "Waiting for the interrupted turn and tools to settle",
+            ),
+            (
+                protocol::UsageLimitPausePhase::RecoveryFailed,
+                "Recovery failed",
+            ),
+        ] {
+            state.agent_activity_stats.update(|stats| {
+                stats.insert(
+                    agent.clone(),
+                    protocol::AgentActivityStats {
+                        usage_limit_pause: Some(protocol::UsageLimitPauseState {
+                            resume_interrupted_turn: true,
+                            compaction_failed: false,
+                            phase,
+                            resume_below_percent: 50,
+                        }),
+                        ..Default::default()
+                    },
+                );
+            });
+            next_tick().await;
+            let visible = container.text_content().unwrap();
+            assert!(visible.contains(text), "missing recovery status: {visible}");
+            assert!(visible.contains("Cancel continuation"));
+        }
+        state.agent_activity_stats.update(|stats| {
+            stats.get_mut(&agent).unwrap().usage_limit_pause = None;
+        });
+        next_tick().await;
+        assert!(!container.text_content().unwrap().contains("Usage pause:"));
     }
 
     /// The regression test for the bug this whole model exists to kill.

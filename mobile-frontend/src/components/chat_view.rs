@@ -1557,14 +1557,10 @@ mod wasm_tests {
         wasm_bindgen_futures::JsFuture::from(promise).await.unwrap();
     }
 
-    /// Wait until the reveal has actually stopped moving.
-    ///
-    /// The reveal is a 180ms `grid-template-rows` transition, so waiting a
-    /// fixed 240ms was a bet that the animation frames arrive on time. On a
-    /// loaded machine they do not: the sample lands mid-motion, with the
-    /// drawer still short of the composer it is supposed to be flush against.
-    /// Sample the drawer's geometry until it repeats instead, which is the
-    /// signal the wait was always reaching for.
+    /// Four identical geometry samples can precede the first animation frame:
+    /// Chrome reported a running reveal at time=0 with the list bottom 147px
+    /// below the composer. Require the reveal transition to finish as well;
+    /// the original flush-edge and bounded-height assertions remain unchanged.
     async fn wait_for_drawer_motion(container: &HtmlElement) {
         const SAMPLE_MS: i32 = 16;
         const STILL_SAMPLES: u32 = 4;
@@ -1589,7 +1585,33 @@ mod wasm_tests {
             if (top - previous).abs() < 0.01 {
                 still += 1;
                 if still == STILL_SAMPLES {
-                    return;
+                    let animation_state = js_sys::Function::new_with_args("drawer", "return JSON.stringify(drawer.getAnimations({subtree:true}).map(a => ({state:a.playState,time:a.currentTime,timing:a.effect.getComputedTiming()})))")
+                        .call1(&wasm_bindgen::JsValue::NULL, &drawer).unwrap();
+                    let list = container
+                        .query_selector("[data-mobile-test='activity-list']")
+                        .unwrap()
+                        .unwrap();
+                    let input = container
+                        .query_selector("[data-mobile-test='chat-input-capsule']")
+                        .unwrap()
+                        .unwrap();
+                    let list_bounds = list.get_bounding_client_rect();
+                    let input_bounds = input.get_bounding_client_rect();
+                    console_log!(
+                        "DRAWER STABILITY top={} list_bottom={} input_top={} gap={} animations={:?}",
+                        top,
+                        list_bounds.bottom(),
+                        input_bounds.top(),
+                        list_bounds.bottom() - input_bounds.top(),
+                        animation_state.as_string()
+                    );
+                    let reveal_running = js_sys::Function::new_with_args("drawer", "return drawer.querySelector('.activity-reveal').getAnimations().some(a => a.pending || a.playState === 'running')")
+                        .call1(&wasm_bindgen::JsValue::NULL, &drawer).unwrap().as_bool().unwrap();
+                    if reveal_running {
+                        still = 0;
+                    } else {
+                        return;
+                    }
                 }
             } else {
                 still = 0;
@@ -1929,7 +1951,13 @@ mod wasm_tests {
             "keyboard-height layout keeps the drawer bounded"
         );
         assert!(bounds.left() > input_bounds.left() && bounds.right() < input_bounds.right());
-        assert!((bounds.bottom() - input_bounds.top()).abs() < 1.0);
+        assert!(
+            (bounds.bottom() - input_bounds.top()).abs() < 1.0,
+            "drawer bottom={} composer top={} gap={}",
+            bounds.bottom(),
+            input_bounds.top(),
+            bounds.bottom() - input_bounds.top()
+        );
         assert!(input_bounds.bottom() <= container.get_bounding_client_rect().bottom());
         crate::dispatch::reset_inbound_seq_for_host(&owner.local_host_id);
         crate::dispatch::dispatch_envelope(&state, &owner.local_host_id, protocol::Envelope::from_payload(

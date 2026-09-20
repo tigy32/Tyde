@@ -507,6 +507,154 @@ async fn usage_limits_hold_compact_and_release_queued_work() {
         server::backend::mock::MockRequest::Input(message) if message.message == "held after failed compaction")).count(), 1);
 }
 
+async fn queue_supervisor(fixture: &mut Fixture, agent: &fixture::TestAgent, message: &str) {
+    fixture
+        .client
+        .send_message_payload(
+            &agent.stream,
+            protocol::SendMessagePayload {
+                message: message.to_owned(),
+                images: None,
+                origin: Some(protocol::MessageOrigin::Supervisor),
+                tool_response: None,
+            },
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn usage_compaction_recovers_once_after_quota_rejection() {
+    use server::backend::mock::{MockCompactionFailure, MockRequest, MockScript, MockTurn};
+    for (failure, used, succeeds) in [
+        (Some(MockCompactionFailure::QuotaExceededOnce), 95, true),
+        (Some(MockCompactionFailure::QuotaExceeded), 95, false),
+        (None, 100, true),
+    ] {
+        let mut fixture = Fixture::new().await;
+        let mut script =
+            MockScript::one(MockTurn::text("large context").with_context_usage(250_000, 300_000))
+                .with_unbounded_echo();
+        if let Some(failure) = failure {
+            script = script.with_compaction_failure(failure);
+        }
+        let agent = fixture
+            .spawn_scripted("quota compaction retry", script)
+            .await;
+        fixture.finish_turn(&agent).await;
+        set_usage_setting(&mut fixture, "/usage_limits/compact_enabled", true).await;
+        set_usage_setting(&mut fixture, "/usage_limits/enabled", true).await;
+        quota(&fixture, used, wall_ms() + 18_000_000).await;
+        usage_notice(
+            &mut fixture,
+            &agent,
+            "Compaction deferred until quota recovers",
+        )
+        .await;
+        queue_supervisor(&mut fixture, &agent, "stale supervisor nudge").await;
+        fixture
+            .client
+            .send_message(&agent.stream, "continue queued work once".to_owned())
+            .await
+            .unwrap();
+        queue_supervisor(&mut fixture, &agent, "duplicate supervisor nudge").await;
+        fixture.expect_queued_messages(&agent, 3).await;
+        let control = fixture.mock(&agent).await;
+        let initial_attempts = usize::from(failure.is_some());
+        assert_eq!(control.compaction_attempts(), initial_attempts);
+        for used in [89, 50] {
+            quota(&fixture, used, wall_ms() + 18_000_000).await;
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            assert_eq!(
+                control.compaction_attempts(),
+                initial_attempts,
+                "do not retry on insufficient recovery"
+            );
+            assert!(
+                !control
+                    .requests()
+                    .await
+                    .iter()
+                    .any(|r| matches!(r, MockRequest::Input(_)))
+            );
+        }
+        quota(&fixture, 49, wall_ms() + 18_000_000).await;
+        if succeeds {
+            fixture
+                .next_frame_matching(
+                    "quota recovery compacts before releasing queued work",
+                    |env| {
+                        if env.stream != agent.stream {
+                            return false;
+                        }
+                        if env.kind == FrameKind::ChatEvent {
+                            let event: protocol::ChatEvent = env.parse_payload().unwrap();
+                            assert!(!matches!(event, protocol::ChatEvent::MessageAdded(message)
+                        if matches!(message.sender, protocol::MessageSender::User)));
+                        }
+                        env.kind == FrameKind::ContextCompactionNotify
+                            && env
+                                .parse_payload::<protocol::ContextCompactionNotifyPayload>()
+                                .is_ok_and(|p| {
+                                    p.status == protocol::ContextCompactionStatus::Completed
+                                })
+                    },
+                )
+                .await;
+            usage_notice(&mut fixture, &agent, "Usage limit pause ended").await;
+            fixture.finish_turn(&agent).await;
+        } else {
+            usage_notice(&mut fixture, &agent, "Usage limit compaction failed").await;
+            fixture
+                .next_frame_matching("bounded retry exposes failed recovery", |env| {
+                    env.kind == FrameKind::AgentActivityStats
+                        && env
+                            .parse_payload::<protocol::AgentActivityStatsPayload>()
+                            .is_ok_and(|p| {
+                                p.agent_id == agent.new_agent.agent_id
+                                    && p.stats.usage_limit_pause.is_some_and(|pause| {
+                                        pause.compaction_failed
+                                            && pause.phase
+                                                == protocol::UsageLimitPausePhase::RecoveryFailed
+                                    })
+                            })
+                })
+                .await;
+        }
+        for used in [1, 2, 0] {
+            quota(&fixture, used, wall_ms() + 18_000_000).await;
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert_eq!(
+            control.compaction_attempts(),
+            initial_attempts + 1,
+            "at most one recovery attempt; no retry loop"
+        );
+        let inputs: Vec<_> = control
+            .requests()
+            .await
+            .into_iter()
+            .filter_map(|r| match r {
+                MockRequest::Input(message) => Some(message.message),
+                _ => None,
+            })
+            .collect();
+        if succeeds {
+            assert_eq!(
+                inputs,
+                ["continue queued work once"],
+                "queued user work replaces supervisor continuations"
+            );
+        } else {
+            assert!(
+                inputs.is_empty(),
+                "failed recovery must not dispatch held work"
+            );
+        }
+        control.assert_clean().await;
+    }
+}
+
 #[tokio::test]
 async fn usage_limits_resume_only_the_interrupted_work() {
     use server::backend::mock::{MockRequest, MockScript, MockTurn};
@@ -556,6 +704,8 @@ async fn usage_limits_resume_only_the_interrupted_work() {
     }).await;
     quota(&fixture, 95, wall_ms().saturating_sub(1)).await;
     usage_notice(&mut fixture, &agent, "Usage limit pause:").await;
+    queue_supervisor(&mut fixture, &agent, "do not continue after cancellation").await;
+    fixture.expect_queued_messages(&agent, 1).await;
     fixture.client.interrupt(&agent.stream).await.unwrap();
     fixture
         .next_frame_matching("manual cancellation of usage continuation", |env| {
@@ -639,7 +789,23 @@ async fn usage_limits_recover_from_corrections_without_reset_markers() {
                 .count(),
             cycle
         );
-        report.buckets[0].measure = used_percent(3);
+        for used in [97, 89, 50] {
+            report.buckets[0].measure = used_percent(used);
+            record(&fixture, report.clone()).await;
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            assert_eq!(
+                control
+                    .requests()
+                    .await
+                    .iter()
+                    .filter(|request| matches!(request,
+                MockRequest::Input(message) if message.message == "held for corrected reading"))
+                    .count(),
+                cycle,
+                "a paused agent must not resume at {used}% usage"
+            );
+        }
+        report.buckets[0].measure = used_percent(49);
         record(&fixture, report).await;
         usage_notice(&mut fixture, &agent, "Usage limit pause ended").await;
         fixture.finish_turn(&agent).await;
@@ -658,7 +824,10 @@ async fn usage_limits_recover_from_corrections_without_reset_markers() {
     usage_notice(&mut fixture, &agent, "Usage limit pause:").await;
     fixture
         .client
-        .send_message(&agent.stream, "held until threshold raised".to_owned())
+        .send_message(
+            &agent.stream,
+            "held until below recovery threshold".to_owned(),
+        )
         .await
         .unwrap();
     fixture.expect_queued_messages(&agent, 1).await;
@@ -667,6 +836,16 @@ async fn usage_limits_recover_from_corrections_without_reset_markers() {
         .replace_setting("/usage_limits/stop_used_percent", 100u8, 90u8)
         .await
         .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(
+        !control
+            .requests()
+            .await
+            .iter()
+            .any(|request| matches!(request,
+        MockRequest::Input(message) if message.message == "held until below recovery threshold"))
+    );
+    quota(&fixture, 49, wall_ms() + 18_000_000).await;
     usage_notice(&mut fixture, &agent, "Usage limit pause ended").await;
     fixture.finish_turn(&agent).await;
     assert_eq!(
@@ -675,7 +854,7 @@ async fn usage_limits_recover_from_corrections_without_reset_markers() {
             .await
             .iter()
             .filter(|request| matches!(request,
-        MockRequest::Input(message) if message.message == "held until threshold raised"))
+        MockRequest::Input(message) if message.message == "held until below recovery threshold"))
             .count(),
         1
     );

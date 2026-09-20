@@ -15,6 +15,8 @@ use super::{mock_prompt_history, startup_mcp_response_prefix};
 pub enum MockCompactionFailure {
     NotDispatched,
     Rejected,
+    QuotaExceeded,
+    QuotaExceededOnce,
 }
 
 #[derive(Debug, Clone, Default)]
