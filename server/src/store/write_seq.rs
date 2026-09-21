@@ -2,7 +2,6 @@ use std::fs::File;
 use std::io::{BufReader, Cursor, Read};
 use std::path::Path;
 
-pub(crate) const CAS_ATTEMPTS: usize = 4;
 const PEEK_BYTES: usize = 256;
 
 #[derive(serde::Deserialize)]

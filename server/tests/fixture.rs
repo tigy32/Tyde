@@ -214,9 +214,34 @@ impl Fixture {
             true,
             None,
             true,
-            Some((sessions, projects)),
+            Some((sessions, projects, None)),
         )
         .await
+    }
+
+    // Shared fixture is compiled separately for each integration test binary.
+    #[allow(dead_code)]
+    pub async fn new_with_session_import(sessions: &str, tasks: &str) -> Self {
+        Self::new_with_store_files_inner(
+            server::HostRuntimeConfig::default(),
+            true,
+            None,
+            true,
+            Some((sessions, r#"{"version":2,"records":{}}"#, Some(tasks))),
+        )
+        .await
+    }
+
+    // Shared fixture is compiled separately for each integration test binary.
+    #[allow(dead_code)]
+    pub fn on_next_session_commit(
+        &self,
+        hook: impl FnOnce() + Send + 'static,
+    ) -> server::store::session::commit_hooks::InstalledHook {
+        server::store::session::commit_hooks::InstalledHook::install(
+            server::store::session::SessionStore::database_path(&self.session_store_path()),
+            Box::new(hook),
+        )
     }
 
     async fn new_with_store_files_inner(
@@ -224,7 +249,7 @@ impl Fixture {
         skip_real_backend_probe: bool,
         enabled_backends: Option<Vec<BackendKind>>,
         use_mock_backend: bool,
-        store_files: Option<(&str, &str)>,
+        store_files: Option<(&str, &str, Option<&str>)>,
     ) -> Self {
         init_tracing();
 
@@ -245,7 +270,11 @@ impl Fixture {
         let session_path = session_store_dir.path().join("sessions.json");
         let project_path = session_store_dir.path().join("projects.json");
         let settings_path = session_store_dir.path().join("settings.json");
-        if let Some((sessions, projects)) = store_files {
+        if let Some((sessions, projects, tasks)) = store_files {
+            if let Some(tasks) = tasks {
+                std::fs::write(session_path.with_extension("task-lists.json"), tasks)
+                    .expect("seed session task lists");
+            }
             std::fs::write(&session_path, sessions).expect("seed sessions.json");
             std::fs::write(&project_path, projects).expect("seed projects.json");
         }
@@ -1382,7 +1411,7 @@ pub async fn connect_host(host: server::HostHandle) -> (client::Connection, Host
     connect_client_with_bootstrap(host).await
 }
 
-async fn connect_client(host: server::HostHandle) -> client::Connection {
+pub async fn connect_client(host: server::HostHandle) -> client::Connection {
     connect_client_with_bootstrap(host).await.0
 }
 

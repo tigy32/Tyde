@@ -146,7 +146,8 @@ use crate::store::mobile_pairings::MobilePairingsStore;
 use crate::store::project::{ProjectStore, ProjectStoreError};
 use crate::store::review::ReviewStore;
 use crate::store::session::{
-    SessionRecord, SessionStore, session_record_is_resumable, session_summary_matches_scope,
+    SessionRecord, SessionStore, SessionStoreHandle, session_record_is_resumable,
+    session_summary_matches_scope,
 };
 use crate::store::settings::HostSettingsStore;
 use crate::store::skills::SkillStore;
@@ -684,7 +685,7 @@ struct AgentCompaction {
     old_session_id: SessionId,
     access_mode: protocol::BackendAccessMode,
     old_record: SessionRecord,
-    session_store: Arc<Mutex<SessionStore>>,
+    session_store: Arc<SessionStoreHandle>,
     team_registry: TeamRegistryHandle,
     stream: Stream,
     summary_rx: oneshot::Receiver<Result<CompactionSummary, String>>,
@@ -706,7 +707,7 @@ pub(crate) struct HostState {
     pub project_store: Arc<Mutex<ProjectStore>>,
     pub settings_store: Arc<Mutex<HostSettingsStore>>,
     pub agents_view_preferences_store: Option<Arc<Mutex<AgentsViewPreferencesStore>>>,
-    pub session_store: Arc<Mutex<SessionStore>>,
+    pub session_store: Arc<SessionStoreHandle>,
     pub transcript_store: TranscriptStore,
     pub custom_agent_store: Arc<Mutex<CustomAgentStore>>,
     pub mcp_server_store: Arc<Mutex<McpServerStore>>,
@@ -1988,9 +1989,8 @@ impl HostHandle {
             )
         };
         let durable_queues = session_store
-            .lock()
-            .await
             .list()
+            .await
             .unwrap_or_default()
             .into_iter()
             .filter(|record| !record.queued_messages.is_empty())
@@ -2001,9 +2001,12 @@ impl HostHandle {
             handle.close().await;
         }
         for (session_id, queued_messages) in durable_queues {
-            if let Err(error) = session_store.lock().await.update(&session_id, |record| {
-                record.queued_messages = queued_messages
-            }) {
+            if let Err(error) = session_store
+                .update(&session_id, move |record| {
+                    record.queued_messages = queued_messages
+                })
+                .await
+            {
                 eprintln!(
                     "TYDE CONFORMANCE RESTART QUEUE RESTORE session={} error={}",
                     session_id.0, error
@@ -2794,9 +2797,8 @@ impl HostHandle {
         };
         let session_summaries = state
             .session_store
-            .lock()
-            .await
             .summaries_for_scope_with_backend_storage(session_list_scope, &state.backend_storage)
+            .await
             .unwrap_or_else(|err| panic!("failed to list sessions for host registration: {err}"));
         let (sessions, session_list) = {
             let subscriber = state.host_streams.get_mut(&host_path).unwrap_or_else(|| {
@@ -3958,7 +3960,7 @@ impl HostHandle {
             );
             return Ok(None);
         }
-        let old_record = match session_store.lock().await.get(&old_session_id) {
+        let old_record = match session_store.get(&old_session_id).await {
             Some(record) => record,
             None => {
                 send_agent_compact_notify(
@@ -4308,11 +4310,10 @@ impl HostHandle {
             }
         }
 
-        if let Err(error) = session_store.lock().await.mark_compacted(
-            &old_session_id,
-            &new_session_id,
-            summary_preview.clone(),
-        ) {
+        if let Err(error) = session_store
+            .mark_compacted(&old_session_id, &new_session_id, summary_preview.clone())
+            .await
+        {
             if let Some(context) = team_context.as_ref() {
                 let rollback_refs_result = {
                     let state = self.state.lock().await;
@@ -4723,7 +4724,7 @@ impl HostHandle {
                 }
             }
             SpawnAgentParams::Resume { session_id, prompt } => {
-                let record = session_store.lock().await.get(&session_id);
+                let record = session_store.get(&session_id).await;
                 let Some(record) = record else {
                     let resolved_name = payload
                         .name
@@ -5053,7 +5054,7 @@ impl HostHandle {
                 images,
                 access_mode,
             } => {
-                let record = session_store.lock().await.get(&from_session_id);
+                let record = session_store.get(&from_session_id).await;
                 let Some(record) = record else {
                     let resolved_name = payload.name.clone().unwrap_or_else(|| {
                         let prompt_name = derive_agent_name(&prompt);
@@ -6343,9 +6344,8 @@ impl HostHandle {
             .map_err(|error| AppError::internal(OPERATION, anyhow!(error)))?;
         let detached_session_ids = state
             .session_store
-            .lock()
-            .await
             .detach_project(&payload.id)
+            .await
             .map_err(|error| AppError::internal(OPERATION, anyhow!(error)))?;
         let team_refs = agent_team_validation_refs(&state, OPERATION).await?;
         let team_events = state
@@ -6678,9 +6678,8 @@ impl HostHandle {
             let state = self.state.lock().await;
             let deleted_session_ids = state
                 .session_store
-                .lock()
-                .await
                 .delete_for_project(&payload.id)
+                .await
                 .map_err(|error| AppError::internal(OPERATION, anyhow!(error)))?;
             (
                 deleted_session_ids,
@@ -7558,9 +7557,8 @@ impl HostHandle {
             )
         };
         let record = session_store
-            .lock()
-            .await
             .list()
+            .await
             .map_err(|error| format!("failed to load sessions before team resume: {error}"))?
             .into_iter()
             .find(|record| record.id == *session_id)
@@ -7855,9 +7853,8 @@ impl HostHandle {
             };
             let sessions = state
                 .session_store
-                .lock()
-                .await
                 .summaries_for_scope_with_backend_storage(scope, &state.backend_storage)
+                .await
                 .map_err(|error| AppError::internal(OPERATION, anyhow!(error)))?;
             let subscriber = state
                 .host_streams
@@ -7915,9 +7912,8 @@ impl HostHandle {
             )
         };
         session_store
-            .lock()
-            .await
             .delete(&session_id)
+            .await
             .map_err(|error| session_store_error(OPERATION, error))?;
         if let Some(store) = annotations_store {
             store
@@ -9956,7 +9952,7 @@ impl HostHandle {
     async fn withdraw_unowned_restoration_markers(
         &self,
         sessions: &HashSet<SessionId>,
-        session_store: &Arc<Mutex<SessionStore>>,
+        session_store: &Arc<SessionStoreHandle>,
         context: &'static str,
     ) {
         if sessions.is_empty() {
@@ -9995,7 +9991,7 @@ impl HostHandle {
         }
 
         if !orphaned.is_empty()
-            && let Err(error) = session_store.lock().await.clear_restore_states(&orphaned)
+            && let Err(error) = session_store.clear_restore_states(&orphaned).await
         {
             tracing::error!(
                 error = %error,
@@ -11796,22 +11792,24 @@ impl HostHandle {
             .collect::<Vec<_>>();
         let fanout_guard = NewAgentFanoutBatchGuard::new(Arc::clone(&self.state), fanout_paths);
 
-        let persist_result = session_store.lock().await.upsert_backend_session(
-            &BackendSession {
-                id: session_id.clone(),
-                backend_kind: start.backend_kind,
-                workspace_roots: start.workspace_roots.clone(),
-                title: Some(start.name.clone()),
-                token_count: None,
-                created_at_ms: Some(start.created_at_ms),
-                updated_at_ms: Some(start.created_at_ms),
-                resumable: false,
-            },
-            Some(parent_session_id),
-            start.project_id.clone(),
-            start.custom_agent_id.clone(),
-            start.launch_profile_id.clone(),
-        );
+        let persist_result = session_store
+            .upsert_backend_session(
+                &BackendSession {
+                    id: session_id.clone(),
+                    backend_kind: start.backend_kind,
+                    workspace_roots: start.workspace_roots.clone(),
+                    title: Some(start.name.clone()),
+                    token_count: None,
+                    created_at_ms: Some(start.created_at_ms),
+                    updated_at_ms: Some(start.created_at_ms),
+                    resumable: false,
+                },
+                Some(parent_session_id),
+                start.project_id.clone(),
+                start.custom_agent_id.clone(),
+                start.launch_profile_id.clone(),
+            )
+            .await;
         if let Err(err) = persist_result {
             let message = format!(
                 "failed to persist backend-native child session {}: {err}",
@@ -14683,7 +14681,7 @@ fn spawn_host_inner(
             settings_store: Arc::new(Mutex::new(settings_store)),
             agents_view_preferences_store: agents_view_preferences_store
                 .map(|store| Arc::new(Mutex::new(store))),
-            session_store: Arc::new(Mutex::new(session_store)),
+            session_store: Arc::new(SessionStoreHandle::new(session_store)),
             transcript_store,
             custom_agent_store: Arc::new(Mutex::new(custom_agent_store)),
             mcp_server_store: Arc::new(Mutex::new(mcp_server_store)),
@@ -15013,9 +15011,8 @@ impl HostHandle {
             )
         };
         let mut records = session_store
-            .lock()
-            .await
             .list()
+            .await
             .map_err(|error| format!("failed to load open agent sessions: {error}"))?
             .into_iter()
             .filter(|record| record.restore_state.is_some())
@@ -15134,9 +15131,8 @@ impl HostHandle {
             // the marker, and reconstructing the card anyway would reopen an
             // agent the user explicitly closed.
             let still_marked = session_store
-                .lock()
-                .await
                 .get(&record.id)
+                .await
                 .is_some_and(|current| current.restore_state.is_some());
             if !still_marked {
                 tracing::info!(
@@ -15755,7 +15751,7 @@ async fn start_due_activity_summary_calls(
         let source_session_settings = match context.start.session_id.as_ref() {
             Some(session_id) => {
                 let session_store = { Arc::clone(&host.state.lock().await.session_store) };
-                let record = session_store.lock().await.get(session_id);
+                let record = session_store.get(session_id).await;
                 record.and_then(|record| record.session_settings)
             }
             None => None,
@@ -17720,12 +17716,11 @@ fn page_session_summaries(
 async fn fan_out_session_lists(state: &mut HostState) {
     let sessions = state
         .session_store
-        .lock()
-        .await
         .summaries_for_scope_with_backend_storage(
             SessionListScope::AllSessions,
             &state.backend_storage,
         )
+        .await
         .unwrap_or_else(|err| panic!("failed to list sessions for fanout: {err}"));
 
     let paths: Vec<StreamPath> = state.host_streams.keys().cloned().collect();

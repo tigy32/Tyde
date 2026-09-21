@@ -242,17 +242,85 @@ This is critical for:
 
 ## 8. Tyde-Owned Session Store
 
-Tyde needs its own persistent session store under something like
-`server/src/store/session.rs`.
+Session metadata and task lists live in SQLite, implemented in
+`server/src/store/session.rs`. Transcripts remain separate per-session JSONL
+journals; no provider-owned files are migrated.
 
-This should be copied and adapted from the old implementation rather than
-rewritten from scratch. The old code already had the right shape:
+### Storage and concurrency
 
-- persistent JSON file
-- Tyde session records
-- parent relationships
-- alias/user alias fields
-- atomic writes
+The existing `TYDE_SESSION_STORE_PATH` setting still identifies the legacy JSON
+location (default `~/.tyde/sessions.json`). The database is the adjacent path with
+the extension replaced by `.sqlite3` (default `~/.tyde/sessions.sqlite3`).
+
+- `sessions`: one JSON record per session, keyed by session ID.
+- `session_tasks`: one task-list JSON document per session.
+- `archived_sessions`: obsolete Gemini records retained rather than destroyed.
+- `PRAGMA user_version`: the transactional schema/import version.
+
+WAL mode and `synchronous=FULL` preserve durable acknowledgments. A mutation
+reads its affected session rows inside an immediate transaction and writes only
+changed rows. Compaction's multi-session changes and session/task deletion share
+one transaction. Project-wide operations and lineage queries can still read
+multiple rows; ordinary single-session updates do not rewrite other sessions.
+
+Runtime access uses a bounded blocking-I/O admission layer: one writer and a
+separate four-reader budget. Readers use separate read-only connections, not the
+writer mutex, so an uncommitted transaction cannot expose partial state or make
+session reads wait for its flush. The writer connection stays open to avoid a
+last-connection checkpoint after every operation. Transaction timings and row
+counts are logged without session identifiers or conversation content.
+
+This does not make saturated storage fast. Commits still await durable storage,
+reads can still experience disk latency, and broader host critical sections in
+cross-store operations remain a separate concern.
+
+### One-time JSON import and operational safety
+
+On first open, schema creation, import of `sessions.json` and its
+`sessions.task-lists.json` sidecar, and the import marker commit together.
+Malformed records or task lists fail startup and roll back the import. Retrying
+after correcting the source retries the entire transaction; an empty database
+file left by an interrupted attempt is not treated as a completed import.
+
+The original JSON files are never rewritten, renamed, or deleted. Existing
+legacy backend normalization remains in effect, but retired Gemini records are
+archived in SQLite as well as retained in the original file. Unknown top-level
+record fields survive import and later session updates. Once imported, SQLite
+is authoritative: later starts do not merge or overwrite it with stale JSON.
+An unsupported newer database schema fails closed.
+
+Stop all older Tyde processes sharing this directory before upgrading. Older
+binaries only understand JSON and must not run alongside SQLite writers. The
+retained JSON is a **pre-upgrade backup**, not an up-to-date downgrade export.
+Do not delete the database to downgrade: doing so discards post-import changes.
+Back up the stopped server's complete store directory, or use SQLite's online
+backup mechanism; copying only the `.sqlite3` file from a running server can
+miss committed data still in its `-wal` file.
+
+### Incremental migration plan
+
+Migrate one consistency domain at a time, each with an atomic, restart-safe
+import, retained source files, and real-server protocol regressions:
+
+1. **Session records and task lists** (this change): remove whole-store rewrites
+   and reader/writer mutex contention. Leave transcripts untouched.
+2. **Projects, teams and references**: explicitly design cross-store deletion
+   and assignment transactions before changing their ownership or lock scopes.
+3. **Preferences and configuration**: migrate each store separately, preserving
+   revision checks, secret-file permissions and external-edit behavior.
+4. **Reviews and workflow runs**: account for large snapshots and restart state.
+5. **Transcripts**: evaluate separately using measured flush/read costs. A
+   migration would use indexed event rows and preserve sequence, deduplication,
+   compaction and durability contracts; do not replace incremental append with
+   whole-transcript blobs.
+6. **Skills, pairings and operational files**: decide per domain. Provider skill
+   files, workspace files and provider-owned databases remain external files;
+   moving metadata into SQLite cannot atomically commit those filesystem effects.
+
+Do not create a universal delta language or an all-filesystem actor. Existing
+store operations can perform read-modify-write inside transactions. Decide
+whether later domains share a database based on required atomicity and workload,
+not merely because their old JSON files happened to be next to one another.
 
 ### Store-first principle
 

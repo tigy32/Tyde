@@ -478,13 +478,16 @@ async fn list_sessions_and_resume_agent() {
     let _ = expect_next_event(&mut fixture.client, "AgentStart").await;
     expect_turn(&mut fixture.client, "mock backend response to: hello").await;
 
-    fixture
-        .client
+    // A spawn also sends an unsolicited list (observed with message_count=0)
+    // that may remain queued after StreamEnd on the separate agent stream.
+    // Assert on a requested current snapshot, not that older notification.
+    let mut list_client = fixture.connect().await;
+    list_client
         .list_sessions(ListSessionsPayload::default())
         .await
         .expect("list_sessions failed");
 
-    let list = wait_for_session_list(&mut fixture.client, "SessionList").await;
+    let list = wait_for_session_list(&mut list_client, "SessionList").await;
     assert_eq!(list.sessions.len(), 1, "expected one stored session");
     let session = &list.sessions[0];
     assert_eq!(session.backend_kind, BackendKind::Claude);
@@ -528,13 +531,13 @@ async fn list_sessions_and_resume_agent() {
     )
     .await;
 
-    fixture
-        .client
+    let mut list_client = fixture.connect().await;
+    list_client
         .list_sessions(ListSessionsPayload::default())
         .await
         .expect("list_sessions after resume failed");
 
-    let list = wait_for_session_list(&mut fixture.client, "SessionList after resume").await;
+    let list = wait_for_session_list(&mut list_client, "SessionList after resume").await;
     assert_eq!(
         list.sessions.len(),
         1,
@@ -544,37 +547,28 @@ async fn list_sessions_and_resume_agent() {
     assert_eq!(list.sessions[0].message_count, 2);
 }
 
-fn rewrite_sessions_json_with_foreign_record(path: &Path, foreign_id: &str) {
-    let contents = std::fs::read_to_string(path).expect("read sessions.json");
-    let value: serde_json::Value = serde_json::from_str(&contents).expect("parse sessions.json");
-    let write_seq = value
-        .get("write_seq")
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or(0);
-    let Some(serde_json::Value::Object(mut records)) = value.get("records").cloned() else {
-        panic!("sessions.json records must be an object");
-    };
-    records.insert(
-        foreign_id.to_owned(),
-        serde_json::json!({
-            "id": foreign_id,
-            "backend_kind": "claude",
-            "workspace_roots": ["/tmp/foreign"],
-            "created_at_ms": 1,
-            "updated_at_ms": 1,
-        }),
-    );
-    #[derive(serde::Serialize)]
-    struct SessionsFile<'a> {
-        records: &'a serde_json::Map<String, serde_json::Value>,
-        write_seq: u64,
-    }
-    let body = serde_json::to_string(&SessionsFile {
-        write_seq: write_seq + 1,
-        records: &records,
-    })
-    .expect("serialize foreign sessions.json");
-    std::fs::write(path, body).expect("write sessions.json");
+fn insert_foreign_session(path: &Path, foreign_id: &str) {
+    // The contract is another writer's committed session surviving a live turn,
+    // not the legacy JSON representation. SQLite is now authoritative.
+    let store = SessionStore::load(path.to_owned()).expect("open independent session writer");
+    store
+        .upsert_backend_session(
+            &server::backend::BackendSession {
+                id: SessionId(foreign_id.to_owned()),
+                backend_kind: BackendKind::Claude,
+                workspace_roots: vec!["/tmp/foreign".to_owned()],
+                title: None,
+                token_count: None,
+                created_at_ms: Some(1),
+                updated_at_ms: Some(1),
+                resumable: true,
+            },
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("persist independent session");
 }
 
 #[tokio::test]
@@ -623,7 +617,7 @@ async fn session_store_keeps_foreign_records_across_turn() {
     assert_eq!(list.sessions[0].message_count, 1);
 
     let sessions_path = fixture.store_dir().join("sessions.json");
-    rewrite_sessions_json_with_foreign_record(&sessions_path, "foreign-session");
+    insert_foreign_session(&sessions_path, "foreign-session");
 
     fixture
         .client
@@ -3721,5 +3715,341 @@ async fn restart_does_not_resurrect_backend_native_children() {
     assert!(
         !live_sessions.contains(&child_session),
         "backend-native child session must not be reconstructed after restart"
+    );
+}
+
+#[tokio::test]
+async fn session_sqlite_import_preserves_json_and_survives_restart() {
+    let mut original = Fixture::new().await;
+    original
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            name: Some("Pre-migration conversation".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::New {
+                workspace_roots: vec!["/tmp/test".to_owned()],
+                prompt: "before migration".to_owned(),
+                images: None,
+                backend_kind: BackendKind::Claude,
+                launch_profile_id: None,
+                cost_hint: None,
+                access_mode: BackendAccessMode::ReadOnly,
+                session_settings: None,
+            },
+        })
+        .await
+        .expect("create provider session before import");
+    let agent: NewAgentPayload = expect_next_event(&mut original.client, "pre-import NewAgent")
+        .await
+        .parse_payload()
+        .expect("parse original agent");
+    let start = expect_agent_start_on_stream(
+        &mut original.client,
+        &agent.instance_stream,
+        "pre-import AgentStart",
+    )
+    .await;
+    let session_id = start.session_id.expect("original provider session");
+    expect_turn_on_stream(
+        &mut original.client,
+        &agent.instance_stream,
+        "mock backend response to: before migration",
+    )
+    .await;
+    original
+        .client
+        .close_agent(&agent.instance_stream)
+        .await
+        .expect("close original session");
+    fixture::next_frame_matching_on(&mut original.client, "original session closed", |env| {
+        env.kind == FrameKind::AgentClosed
+    })
+    .await;
+
+    let sessions = r#"{"write_seq":9,"records":{"imported":{"id":"imported","backend_kind":"claude","workspace_roots":["/tmp/test"],"alias":"Imported conversation","user_alias":"My saved name","created_at_ms":1,"updated_at_ms":2,"message_count":7,"token_count":123,"access_mode":"read_only","queued_messages":[],"future_metadata":{"preserve":true}}}}"#;
+    let tasks = r#"{"records":{"imported":{"title":"Saved tasks","tasks":[{"id":1,"description":"Keep this task","status":"pending"}]}}}"#;
+    let sessions = sessions.replace("imported", &session_id.0);
+    let tasks = tasks.replace("imported", &session_id.0);
+    let mut fixture = Fixture::new_with_session_import(&sessions, &tasks).await;
+    let legacy = fixture.store_dir().join("sessions.json");
+    let database = SessionStore::database_path(&legacy);
+    assert!(
+        database.is_file(),
+        "startup must create the session database"
+    );
+    assert!(
+        std::fs::read_to_string(&legacy).expect("read preserved JSON") == sessions,
+        "session source must remain byte-for-byte unchanged"
+    );
+    assert!(
+        std::fs::read_to_string(legacy.with_extension("task-lists.json"))
+            .expect("read preserved task JSON")
+            == tasks,
+        "task source must remain byte-for-byte unchanged"
+    );
+    fixture
+        .client
+        .list_sessions(ListSessionsPayload::default())
+        .await
+        .expect("list imported sessions");
+    let list = wait_for_session_list(&mut fixture.client, "imported sessions").await;
+    assert_eq!(list.sessions.len(), 1);
+    let imported = &list.sessions[0];
+    assert!(
+        imported.id == session_id,
+        "imported session identity must survive"
+    );
+    assert!(
+        imported.user_alias.as_deref() == Some("My saved name"),
+        "imported alias must survive"
+    );
+    assert_eq!(imported.message_count, 7);
+    assert_eq!(imported.token_count, Some(123));
+
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            name: None,
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::Resume {
+                session_id: session_id.clone(),
+                prompt: None,
+            },
+        })
+        .await
+        .expect("resume imported session");
+    let env = expect_next_event(&mut fixture.client, "imported NewAgent").await;
+    let agent: NewAgentPayload = env.parse_payload().expect("parse imported agent");
+    let task_event = fixture::next_chat_event_matching_on(
+        &mut fixture.client,
+        &agent.instance_stream,
+        "imported tasks",
+        |event| matches!(event, ChatEvent::TaskUpdate(_)),
+    )
+    .await;
+    assert!(
+        matches!(task_event, ChatEvent::TaskUpdate(list) if list.title == "Saved tasks" && list.tasks.len() == 1 && list.tasks[0].description == "Keep this task"),
+        "resume must expose imported tasks"
+    );
+
+    fixture
+        .client
+        .set_agent_name(&agent.instance_stream, "Changed in SQLite".to_owned())
+        .await
+        .expect("rename imported session");
+    fixture::next_frame_matching_on(&mut fixture.client, "persisted rename", |env| {
+        env.kind == FrameKind::AgentRenamed
+    })
+    .await;
+    fixture
+        .client
+        .close_agent(&agent.instance_stream)
+        .await
+        .expect("close imported session");
+    fixture::next_frame_matching_on(&mut fixture.client, "closed imported session", |env| {
+        env.kind == FrameKind::AgentClosed
+    })
+    .await;
+    fixture.restart_host().await;
+    fixture
+        .client
+        .list_sessions(ListSessionsPayload::default())
+        .await
+        .expect("list after restart");
+    let list = wait_for_session_list(&mut fixture.client, "restarted imported sessions").await;
+    assert!(
+        list.sessions
+            .iter()
+            .any(|session| session.user_alias.as_deref() == Some("Changed in SQLite")),
+        "restart must not reimport stale JSON over committed state"
+    );
+    let connection = rusqlite::Connection::open(&database).expect("inspect imported database");
+    let json: String = connection
+        .query_row(
+            "SELECT record FROM sessions WHERE id=?1",
+            [&session_id.0],
+            |row| row.get(0),
+        )
+        .expect("read imported row");
+    let json: serde_json::Value = serde_json::from_str(&json).expect("decode imported row");
+    assert_eq!(
+        json["future_metadata"]["preserve"], true,
+        "unknown metadata must survive subsequent writes"
+    );
+    assert!(
+        std::fs::read_to_string(&legacy).expect("read preserved JSON after restart") == sessions,
+        "runtime writes must not modify the legacy backup"
+    );
+}
+
+#[tokio::test]
+async fn session_reads_remain_responsive_during_uncommitted_write() {
+    let mut fixture = Fixture::new_with_store_files(
+        r#"{"records":{"saved":{"id":"saved","backend_kind":"claude","workspace_roots":["/tmp/test"],"created_at_ms":1,"updated_at_ms":1}}}"#,
+        r#"{"version":2,"records":{}}"#,
+    ).await;
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            name: Some("Before commit".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::New {
+                workspace_roots: vec!["/tmp/test".to_owned()],
+                prompt: "hello".to_owned(),
+                images: None,
+                backend_kind: BackendKind::Claude,
+                launch_profile_id: None,
+                cost_hint: None,
+                access_mode: Default::default(),
+                session_settings: None,
+            },
+        })
+        .await
+        .expect("spawn persistence test agent");
+    let env = expect_next_event(&mut fixture.client, "persistence NewAgent").await;
+    let agent: NewAgentPayload = env.parse_payload().expect("parse persistence agent");
+    let start = expect_agent_start_on_stream(
+        &mut fixture.client,
+        &agent.instance_stream,
+        "persistence start",
+    )
+    .await;
+    let session = start.session_id.expect("session identity present");
+    expect_turn_on_stream(
+        &mut fixture.client,
+        &agent.instance_stream,
+        "mock backend response to: hello",
+    )
+    .await;
+    // The writer is a host-level deletion, not a command on the live agent:
+    // bootstrap also asks live actors for usage, independently of session I/O.
+    let mut deleting_client = fixture.connect().await;
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let hook = fixture.on_next_session_commit(move || {
+        let _ = entered_tx.send(());
+        let _ = release_rx.recv_timeout(Duration::from_secs(15));
+    });
+    deleting_client
+        .delete_session(DeleteSessionPayload {
+            session_id: SessionId("saved".to_owned()),
+        })
+        .await
+        .expect("submit saved-session deletion");
+    tokio::time::timeout(Duration::from_secs(5), entered_rx)
+        .await
+        .expect("writer must enter transaction")
+        .expect("commit hook signal");
+
+    let mut observer = tokio::time::timeout(Duration::from_secs(2), fixture.connect())
+        .await
+        .expect("host bootstrap must not wait for session commit");
+    observer
+        .list_sessions(ListSessionsPayload::default())
+        .await
+        .expect("list while commit is paused");
+    let list = tokio::time::timeout(
+        Duration::from_secs(2),
+        wait_for_session_list(&mut observer, "list during stalled commit"),
+    )
+    .await
+    .expect("session read must not wait for writer");
+    assert!(
+        list.sessions.iter().any(|record| record.id == session),
+        "unrelated live session remains visible"
+    );
+    assert!(
+        list.sessions.iter().any(|record| record.id.0 == "saved"),
+        "read must not expose an uncommitted deletion"
+    );
+    assert_eq!(list.sessions.len(), 2);
+    release_tx.send(()).expect("release session commit");
+    drop(hook);
+    deleting_client
+        .list_sessions(ListSessionsPayload::default())
+        .await
+        .expect("list committed deletion");
+    let list = wait_for_session_list(&mut deleting_client, "list after commit").await;
+    assert_eq!(list.sessions.len(), 1);
+    assert!(
+        list.sessions[0].id == session,
+        "only the unrelated session remains"
+    );
+    fixture.restart_host().await;
+    fixture
+        .client
+        .list_sessions(ListSessionsPayload::default())
+        .await
+        .expect("list recovered deletion");
+    let list = wait_for_session_list(&mut fixture.client, "list recovered commit").await;
+    assert_eq!(list.sessions.len(), 1);
+    assert!(
+        list.sessions[0].id == session,
+        "restart must not resurrect a deleted session from legacy JSON"
+    );
+}
+
+#[tokio::test]
+async fn session_import_failure_rolls_back_and_retries_without_data_loss() {
+    let directory = tempfile::tempdir().expect("create import directory");
+    let legacy = directory.path().join("sessions.json");
+    let tasks = legacy.with_extension("task-lists.json");
+    let source = r#"{"records":{"retained":{"id":"retained","backend_kind":"claude","workspace_roots":["/tmp/test"],"created_at_ms":1,"updated_at_ms":1}}}"#;
+    std::fs::write(&legacy, source).expect("seed session import");
+    std::fs::write(&tasks, r#"{"records":{"retained":{"title":42}}}"#)
+        .expect("seed invalid task import");
+    let start = || {
+        server::spawn_host_with_mock_backend_and_runtime_config(
+            legacy.clone(),
+            directory.path().join("projects.json"),
+            directory.path().join("settings.json"),
+            server::HostRuntimeConfig {
+                skip_real_backend_probe: true,
+                ..Default::default()
+            },
+        )
+    };
+    assert!(
+        start().is_err(),
+        "invalid task import must fail server startup"
+    );
+    assert!(
+        std::fs::read_to_string(&legacy).expect("read original import") == source,
+        "failed import must not modify original sessions"
+    );
+    let database = SessionStore::database_path(&legacy);
+    let connection = rusqlite::Connection::open(&database).expect("inspect failed import");
+    let version: u32 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .expect("read import marker");
+    assert_eq!(version, 0, "failed import must not mark migration complete");
+    let tables: u32 = connection.query_row("SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ('sessions','session_tasks','archived_sessions')", [], |row| row.get(0)).expect("inspect rollback");
+    assert_eq!(
+        tables, 0,
+        "failed import must roll back schema and imported rows together"
+    );
+    drop(connection);
+    std::fs::write(
+        &tasks,
+        r#"{"records":{"retained":{"title":"Recovered tasks","tasks":[]}}}"#,
+    )
+    .expect("repair task import");
+    let host = start().expect("retry complete import");
+    let mut client = fixture::connect_client(host).await;
+    client
+        .list_sessions(ListSessionsPayload::default())
+        .await
+        .expect("list retried import");
+    let list = wait_for_session_list(&mut client, "retried import").await;
+    assert_eq!(list.sessions.len(), 1);
+    assert!(
+        list.sessions[0].id.0 == "retained",
+        "retry must retain the original session"
     );
 }

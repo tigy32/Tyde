@@ -1,11 +1,10 @@
-use std::cell::{Cell, RefCell};
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
-use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use super::write_seq::{CAS_ATTEMPTS, peek_write_seq};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 
 use protocol::{
     AgentOrigin, AgentWorkflowMetadata, BackendKind, CompactionMethod, CompactionMetrics,
@@ -160,48 +159,90 @@ pub struct SessionRecord {
     pub(crate) restore_state: Option<SessionRestoreState>,
 }
 
-#[derive(Debug, Deserialize)]
-struct StoreFile {
-    #[serde(default)]
-    write_seq: u64,
-    records: HashMap<String, SessionRecord>,
-}
-
-#[derive(Debug, Serialize)]
-struct StoreFileRef<'a> {
-    write_seq: u64,
-    records: &'a HashMap<String, SessionRecord>,
-}
-
-#[derive(Debug, Default, Serialize, Deserialize)]
-struct TaskStateFile {
-    records: HashMap<String, TaskList>,
-}
-
 #[derive(Debug)]
 pub struct SessionStore {
     path: PathBuf,
-    records: RefCell<HashMap<String, SessionRecord>>,
-    write_seq: Cell<u64>,
+    writer: Mutex<Connection>,
 }
 
 impl SessionStore {
     pub fn load(path: PathBuf) -> Result<Self, String> {
-        Self::load_with_migration(path).map(|(store, _purged_gemini_session_ids)| store)
+        Self::load_with_migration(path).map(|(store, _)| store)
     }
 
-    pub fn load_with_migration(path: PathBuf) -> Result<(Self, HashSet<SessionId>), String> {
-        let purged_gemini_session_ids = Self::purge_legacy_gemini_sessions(&path)?;
-        Self::mark_non_native_antigravity_sessions_non_resumable(&path)?;
-        Self::migrate_legacy_kiro_sessions(&path)?;
-        let (write_seq, records) = Self::read_from_disk(&path)?;
+    pub fn database_path(legacy_path: &Path) -> PathBuf {
+        legacy_path.with_extension("sqlite3")
+    }
+
+    pub fn load_with_migration(legacy_path: PathBuf) -> Result<(Self, HashSet<SessionId>), String> {
+        let path = Self::database_path(&legacy_path);
+        let parent = path.parent().ok_or("session database has no parent")?;
+        std::fs::create_dir_all(parent)
+            .map_err(|error| format!("create session directory: {error}"))?;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        match options.open(&path) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(format!("create session database: {error}")),
+        }
+        let mut connection = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_WRITE)
+            .map_err(sql_error)?;
+        connection
+            .busy_timeout(Duration::from_secs(5))
+            .map_err(sql_error)?;
+        let mode: String = connection
+            .query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))
+            .map_err(sql_error)?;
+        if !mode.eq_ignore_ascii_case("wal") {
+            return Err("session database requires WAL mode".to_owned());
+        }
+        connection
+            .pragma_update(None, "synchronous", "FULL")
+            .map_err(sql_error)?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql_error)?;
+        let version: u32 = transaction
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .map_err(sql_error)?;
+        match version {
+            0 => {
+                transaction.execute_batch(
+                    "CREATE TABLE sessions (id TEXT PRIMARY KEY NOT NULL, record TEXT NOT NULL);
+                     CREATE TABLE session_tasks (id TEXT PRIMARY KEY NOT NULL, record TEXT NOT NULL);
+                     CREATE TABLE archived_sessions (id TEXT PRIMARY KEY NOT NULL, record TEXT NOT NULL);"
+                ).map_err(sql_error)?;
+                import_json(&transaction, &legacy_path)?;
+                transaction
+                    .pragma_update(None, "user_version", 1)
+                    .map_err(sql_error)?;
+            }
+            1 => {}
+            _ => return Err("session database schema is newer than this server".to_owned()),
+        }
+        let purged = {
+            let mut statement = transaction
+                .prepare("SELECT id FROM archived_sessions")
+                .map_err(sql_error)?;
+            statement
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(sql_error)?
+                .map(|row| row.map(SessionId).map_err(sql_error))
+                .collect::<Result<HashSet<_>, _>>()?
+        };
+        transaction.commit().map_err(sql_error)?;
         let store = Self {
             path,
-            records: RefCell::new(records),
-            write_seq: Cell::new(write_seq),
+            writer: Mutex::new(connection),
         };
-        let _ = store.reconcile_incomplete_compactions()?;
-        Ok((store, purged_gemini_session_ids))
+        store.reconcile_incomplete_compactions()?;
+        Ok((store, purged))
     }
 
     pub fn default_path() -> Result<PathBuf, String> {
@@ -218,46 +259,36 @@ impl SessionStore {
     }
 
     pub fn list(&self) -> Result<Vec<SessionRecord>, String> {
-        self.refresh_if_stale()?;
-        let mut out: Vec<_> = self.records.borrow().values().cloned().collect();
+        let records = read_records(&self.reader()?, &[])?;
+        let mut out: Vec<_> = records.into_values().collect();
         out.sort_by_key(|record| Reverse(record.updated_at_ms));
         Ok(out)
     }
 
     pub fn get(&self, id: &SessionId) -> Option<SessionRecord> {
-        self.refresh_if_stale().ok()?;
-        self.records.borrow().get(&id.0).cloned()
+        read_records(&self.reader().ok()?, &[id])
+            .ok()?
+            .remove(&id.0)
     }
 
     pub fn get_task_list(&self, id: &SessionId) -> Option<TaskList> {
-        self.read_task_state()
-            .ok()
-            .and_then(|state| state.records.get(&id.0).cloned())
+        let connection = self.reader().ok()?;
+        let json: String = connection
+            .query_row(
+                "SELECT record FROM session_tasks WHERE id=?1",
+                [&id.0],
+                |row| row.get(0),
+            )
+            .ok()?;
+        serde_json::from_str(&json).ok()
     }
 
     pub fn set_task_list(&self, id: &SessionId, task_list: TaskList) -> Result<(), String> {
-        let mut state = self.read_task_state()?;
-        state.records.insert(id.0.clone(), task_list);
-        let value = serde_json::to_value(state)
-            .map_err(|err| format!("Failed to serialize task state: {err}"))?;
-        write_json_value_atomically(&self.task_state_path(), &value)
-    }
-
-    fn task_state_path(&self) -> PathBuf {
-        self.path.with_extension("task-lists.json")
-    }
-
-    fn read_task_state(&self) -> Result<TaskStateFile, String> {
-        let path = self.task_state_path();
-        match std::fs::read_to_string(&path) {
-            Ok(contents) => serde_json::from_str(&contents)
-                .map_err(|err| format!("Failed to parse task state {}: {err}", path.display())),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(TaskStateFile::default()),
-            Err(err) => Err(format!(
-                "Failed to read task state {}: {err}",
-                path.display()
-            )),
-        }
+        let json = serde_json::to_string(&task_list)
+            .map_err(|error| format!("encode task list: {error}"))?;
+        let connection = self.writer.lock().map_err(|_| "session writer poisoned")?;
+        connection.execute("INSERT INTO session_tasks (id, record) VALUES (?1, ?2) ON CONFLICT(id) DO UPDATE SET record=excluded.record", params![id.0, json]).map_err(sql_error)?;
+        Ok(())
     }
 
     pub fn upsert_backend_session(
@@ -269,7 +300,7 @@ impl SessionStore {
         launch_profile_id: Option<LaunchProfileId>,
     ) -> Result<SessionRecord, String> {
         let now = now_ms();
-        self.read_modify_write(|records| {
+        self.read_modify_write(&[&session.id], |records| {
             let entry = records
                 .entry(session.id.0.clone())
                 .or_insert_with(|| SessionRecord {
@@ -337,7 +368,7 @@ impl SessionStore {
                 entry.active_backend_binding_generation = 0;
             }
 
-            entry.clone()
+            Ok(entry.clone())
         })
     }
 
@@ -346,7 +377,7 @@ impl SessionStore {
         session_id: &SessionId,
         access_mode: protocol::BackendAccessMode,
     ) -> Result<(), String> {
-        self.cas(|records| {
+        self.cas(&[session_id], |records| {
             let Some(record) = records.get_mut(&session_id.0) else {
                 return Err(format!("Session not found: {}", session_id.0));
             };
@@ -359,20 +390,11 @@ impl SessionStore {
     where
         F: FnOnce(&mut SessionRecord),
     {
-        let mut update = Some(update);
-        let mut snapshot: Option<SessionRecord> = None;
-        self.cas(|records| {
-            if let Some(existing) = snapshot.as_ref() {
-                records.insert(session_id.0.clone(), existing.clone());
-                return Ok(((), true));
-            }
+        self.cas(&[session_id], |records| {
             let Some(record) = records.get_mut(&session_id.0) else {
                 return Ok(((), false));
             };
-            if let Some(update) = update.take() {
-                update(record);
-            }
-            snapshot = Some(record.clone());
+            update(record);
             Ok(((), true))
         })
     }
@@ -409,7 +431,7 @@ impl SessionStore {
         session_id: &SessionId,
         alias: String,
     ) -> Result<bool, String> {
-        self.cas(|records| {
+        self.cas(&[session_id], |records| {
             let Some(record) = records.get_mut(&session_id.0) else {
                 return Ok((false, false));
             };
@@ -462,14 +484,11 @@ impl SessionStore {
         })
     }
 
-    /// Clears the marker for a whole closing subtree in a single store write.
-    /// Each `cas` rewrites and fsyncs the entire store, so a per-session loop
-    /// here costs one full rewrite per descendant.
     pub(crate) fn clear_restore_states(
         &self,
         session_ids: &HashSet<SessionId>,
     ) -> Result<(), String> {
-        self.cas(|records| {
+        self.cas(&[], |records| {
             let mut changed = false;
             for session_id in session_ids {
                 if let Some(record) = records.get_mut(&session_id.0)
@@ -483,7 +502,7 @@ impl SessionStore {
     }
 
     pub fn detach_project(&self, project_id: &ProjectId) -> Result<Vec<SessionId>, String> {
-        self.cas(|records| {
+        self.cas(&[], |records| {
             let mut detached = Vec::new();
             for record in records.values_mut() {
                 if record.project_id.as_ref() == Some(project_id) {
@@ -500,7 +519,7 @@ impl SessionStore {
     }
 
     pub fn delete_for_project(&self, project_id: &ProjectId) -> Result<Vec<SessionId>, String> {
-        let deleted = self.cas(|records| {
+        self.cas(&[], |records| {
             let mut deleted = records
                 .values()
                 .filter(|record| record.project_id.as_ref() == Some(project_id))
@@ -514,26 +533,11 @@ impl SessionStore {
             }
             deleted.sort_by(|left, right| left.0.cmp(&right.0));
             Ok((deleted, true))
-        })?;
-        if deleted.is_empty() {
-            return Ok(deleted);
-        }
-
-        let mut task_state = self.read_task_state()?;
-        let original_task_count = task_state.records.len();
-        for id in &deleted {
-            task_state.records.remove(&id.0);
-        }
-        if task_state.records.len() != original_task_count {
-            let value = serde_json::to_value(task_state)
-                .map_err(|err| format!("Failed to serialize task state: {err}"))?;
-            write_json_value_atomically(&self.task_state_path(), &value)?;
-        }
-        Ok(deleted)
+        })
     }
 
     pub fn delete(&self, session_id: &SessionId) -> Result<(), String> {
-        self.cas(|records| {
+        self.cas(&[session_id], |records| {
             let changed = records.remove(&session_id.0).is_some();
             Ok(((), changed))
         })
@@ -550,7 +554,7 @@ impl SessionStore {
                 "cannot compact session {old_session_id} into itself"
             ));
         }
-        self.read_modify_write(|records| {
+        self.read_modify_write(&[old_session_id, new_session_id], |records| {
             if !records.contains_key(&old_session_id.0) {
                 return Err(format!(
                     "cannot compact missing old session {old_session_id}"
@@ -580,7 +584,7 @@ impl SessionStore {
             new_record.compaction_summary_preview = Some(summary_preview.clone());
             new_record.updated_at_ms = now;
             Ok(())
-        })?
+        })
     }
 
     pub(crate) fn compaction_operation(
@@ -601,7 +605,7 @@ impl SessionStore {
         session_id: &SessionId,
         operation: CompactionOperationRecord,
     ) -> Result<(), String> {
-        self.read_modify_write(|records| {
+        self.read_modify_write(&[session_id], |records| {
             let record = records
                 .get_mut(&session_id.0)
                 .ok_or_else(|| format!("missing session {session_id}"))?;
@@ -622,7 +626,7 @@ impl SessionStore {
             }
             record.updated_at_ms = now_ms();
             Ok(())
-        })?
+        })
     }
 
     pub(crate) fn finish_compaction_operation(
@@ -645,7 +649,7 @@ impl SessionStore {
         ) {
             return Err("terminal compaction state required".to_owned());
         }
-        self.read_modify_write(|records| {
+        self.read_modify_write(&[session_id], |records| {
             let record = records
                 .get_mut(&session_id.0)
                 .ok_or_else(|| format!("missing session {session_id}"))?;
@@ -667,7 +671,7 @@ impl SessionStore {
             record.compaction_epoch = record.compaction_epoch.saturating_add(1);
             record.updated_at_ms = now_ms();
             Ok(operation.clone())
-        })?
+        })
     }
 
     pub(crate) fn commit_compacted_binding(
@@ -683,7 +687,7 @@ impl SessionStore {
             metrics,
             message,
         } = commit;
-        self.read_modify_write(|records| {
+        self.read_modify_write(&[session_id], |records| {
             let record = records
                 .get_mut(&session_id.0)
                 .ok_or_else(|| format!("missing session {session_id}"))?;
@@ -729,13 +733,13 @@ impl SessionStore {
             operation.message = message.clone();
             operation.finished_at_ms = Some(now_ms());
             Ok((binding, operation.clone()))
-        })?
+        })
     }
 
     pub(crate) fn reconcile_incomplete_compactions(
         &self,
     ) -> Result<Vec<CompactionOperationRecord>, String> {
-        self.cas(|records| {
+        self.cas(&[], |records| {
             let mut reconciled = Vec::new();
             let mut changed = false;
             for record in records.values_mut() {
@@ -784,8 +788,7 @@ impl SessionStore {
         &self,
         session_id: &SessionId,
     ) -> Result<Vec<SessionId>, String> {
-        self.refresh_if_stale()?;
-        let records = self.records.borrow();
+        let records = read_records(&self.reader()?, &[])?;
         let mut out = Vec::new();
         let mut current = session_id.clone();
         let mut seen = std::collections::HashSet::new();
@@ -810,8 +813,7 @@ impl SessionStore {
         &self,
         session_id: &SessionId,
     ) -> Result<Vec<SessionId>, String> {
-        self.refresh_if_stale()?;
-        let records = self.records.borrow();
+        let records = read_records(&self.reader()?, &[])?;
         let mut out = Vec::new();
         let mut current = session_id.clone();
         let mut seen = std::collections::HashSet::new();
@@ -857,8 +859,7 @@ impl SessionStore {
         scope: SessionListScope,
         backend_storage: &crate::backend::BackendStorage,
     ) -> Result<Vec<SessionSummary>, String> {
-        self.refresh_if_stale()?;
-        let records = self.records.borrow();
+        let records = read_records(&self.reader()?, &[])?;
         let mut summaries: Vec<SessionSummary> = records
             .values()
             .filter(|record| session_record_matches_scope(record, scope))
@@ -889,300 +890,527 @@ impl SessionStore {
         Ok(summaries)
     }
 
-    fn purge_legacy_gemini_sessions(path: &Path) -> Result<HashSet<SessionId>, String> {
-        let contents = match std::fs::read_to_string(path) {
-            Ok(contents) => contents,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(HashSet::new()),
-            Err(err) => {
-                return Err(format!(
-                    "Failed to read session store {}: {err}",
-                    path.display()
-                ));
-            }
-        };
-        let mut value = serde_json::from_str::<Value>(&contents)
-            .map_err(|err| format!("Failed to parse session store {}: {err}", path.display()))?;
-        let records = value
-            .get_mut("records")
-            .and_then(Value::as_object_mut)
-            .ok_or_else(|| {
-                format!(
-                    "Failed to migrate session store {}: records must be an object",
-                    path.display()
-                )
-            })?;
-        let mut purged = HashSet::new();
-        records.retain(|session_id, record| {
-            let is_gemini = record.get("backend_kind").and_then(Value::as_str) == Some("gemini");
-            if is_gemini {
-                purged.insert(SessionId(session_id.clone()));
-                return false;
-            }
-            true
-        });
-        if !purged.is_empty() {
-            write_json_value_atomically(path, &value).map_err(|err| {
-                format!(
-                    "Failed to rewrite migrated session store {}: {err}",
-                    path.display()
-                )
-            })?;
-        }
-        Ok(purged)
+    fn reader(&self) -> Result<Connection, String> {
+        let connection = Connection::open_with_flags(&self.path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(sql_error)?;
+        connection
+            .busy_timeout(Duration::from_secs(5))
+            .map_err(sql_error)?;
+        Ok(connection)
     }
 
-    /// Repoint Kiro sessions at the ACP backend.
-    ///
-    /// Unlike the Gemini migration these sessions are *not* purged — the
-    /// underlying Kiro session files are untouched and still resumable. They
-    /// just need the new backend kind, and a launch profile binding so the
-    /// backend knows which ACP agent to start. A session that already names a
-    /// profile keeps it.
-    fn migrate_legacy_kiro_sessions(path: &Path) -> Result<(), String> {
-        let contents = match std::fs::read_to_string(path) {
-            Ok(contents) => contents,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(err) => {
-                return Err(format!(
-                    "Failed to read session store {}: {err}",
-                    path.display()
-                ));
-            }
-        };
-        let mut value = serde_json::from_str::<Value>(&contents)
-            .map_err(|err| format!("Failed to parse session store {}: {err}", path.display()))?;
-        let records = value
-            .get_mut("records")
-            .and_then(Value::as_object_mut)
-            .ok_or_else(|| {
-                format!(
-                    "Failed to migrate session store {}: records must be an object",
-                    path.display()
-                )
-            })?;
+    fn read_modify_write<T>(
+        &self,
+        ids: &[&SessionId],
+        modify: impl FnOnce(&mut HashMap<String, SessionRecord>) -> Result<T, String>,
+    ) -> Result<T, String> {
+        self.cas(ids, |records| Ok((modify(records)?, true)))
+    }
 
-        let mut changed = false;
-        for record in records.values_mut() {
-            let Some(record) = record.as_object_mut() else {
-                continue;
-            };
-            // Two legacy shapes converge here, and each needs a different
-            // half of the fix. A record spelled `acp` was written after the
-            // backend was named for the protocol: it already carries a launch
-            // profile, and only the spelling is stale. A record spelled `kiro`
-            // predates that rename entirely: the spelling is canonical again,
-            // but it was written before the built-in profile existed, so it is
-            // the one that needs the profile filled in. Doing both to both
-            // would hand the built-in Kiro profile to a modern record whose
-            // custom profile was deliberately removed.
-            match record.get("backend_kind").and_then(Value::as_str) {
-                Some(LEGACY_ACP_BACKEND) => {
-                    record.insert(
-                        "backend_kind".to_string(),
-                        Value::String(KIRO_BACKEND.to_string()),
-                    );
-                    changed = true;
-                }
-                Some(KIRO_BACKEND) => {
-                    let needs_profile = !matches!(
-                        record.get("launch_profile_id"),
-                        Some(Value::String(existing)) if !existing.trim().is_empty()
-                    );
-                    if needs_profile {
-                        record.insert(
-                            "launch_profile_id".to_string(),
-                            Value::String(KIRO_LAUNCH_PROFILE_ID.to_string()),
-                        );
-                        changed = true;
-                    }
-                }
-                _ => continue,
-            }
-        }
-
+    fn cas<T>(
+        &self,
+        ids: &[&SessionId],
+        body: impl FnOnce(&mut HashMap<String, SessionRecord>) -> Result<(T, bool), String>,
+    ) -> Result<T, String> {
+        let started = Instant::now();
+        let mut connection = self.writer.lock().map_err(|_| "session writer poisoned")?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql_error)?;
+        let acquired = Instant::now();
+        let original = read_raw_records(&transaction, ids)?;
+        let mut records = decode_records(&original)?;
+        let (result, changed) = body(&mut records)?;
+        let mut writes = 0;
         if changed {
-            write_json_value_atomically(path, &value).map_err(|err| {
-                format!(
-                    "Failed to rewrite migrated session store {}: {err}",
-                    path.display()
-                )
-            })?;
-        }
-        Ok(())
-    }
-
-    fn mark_non_native_antigravity_sessions_non_resumable(path: &Path) -> Result<(), String> {
-        let contents = match std::fs::read_to_string(path) {
-            Ok(contents) => contents,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(err) => {
-                return Err(format!(
-                    "Failed to read session store {}: {err}",
-                    path.display()
-                ));
+            for id in original.keys().filter(|id| !records.contains_key(*id)) {
+                transaction
+                    .execute("DELETE FROM sessions WHERE id=?1", [id])
+                    .map_err(sql_error)?;
+                transaction
+                    .execute("DELETE FROM session_tasks WHERE id=?1", [id])
+                    .map_err(sql_error)?;
+                writes += 1;
             }
-        };
-        let mut value = serde_json::from_str::<Value>(&contents)
-            .map_err(|err| format!("Failed to parse session store {}: {err}", path.display()))?;
-        let records = value
-            .get_mut("records")
-            .and_then(Value::as_object_mut)
-            .ok_or_else(|| {
-                format!(
-                    "Failed to migrate session store {}: records must be an object",
-                    path.display()
-                )
-            })?;
-
-        let mut changed = false;
-        for (session_id, record) in records {
-            let Some(record) = record.as_object_mut() else {
-                return Err(format!(
-                    "Failed to migrate session store {}: record {session_id} must be an object",
-                    path.display()
-                ));
-            };
-            let invalid_native_id = record
-                .get("backend_kind")
-                .and_then(|kind| serde_json::from_value::<BackendKind>(kind.clone()).ok())
-                .is_some_and(|kind| {
-                    !crate::backend::native_session_id_is_valid(
-                        kind,
-                        &SessionId(session_id.clone()),
-                    )
-                });
-            if invalid_native_id && record.get("resumable").and_then(Value::as_bool) != Some(false)
-            {
-                record.insert("resumable".to_string(), Value::Bool(false));
-                changed = true;
+            for (id, record) in records {
+                let mut value = original
+                    .get(&id)
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!({}));
+                merge_record(&mut value, &record)?;
+                if original.get(&id) == Some(&value) {
+                    continue;
+                }
+                transaction.execute("INSERT INTO sessions (id, record) VALUES (?1, ?2) ON CONFLICT(id) DO UPDATE SET record=excluded.record", params![id, value.to_string()]).map_err(sql_error)?;
+                writes += 1;
             }
         }
-
-        if changed {
-            write_json_value_atomically(path, &value).map_err(|err| {
-                format!(
-                    "Failed to rewrite migrated session store {}: {err}",
-                    path.display()
-                )
-            })?;
+        #[cfg(feature = "test-support")]
+        if writes > 0 {
+            commit_hooks::run(&self.path);
         }
-        Ok(())
+        transaction.commit().map_err(sql_error)?;
+        tracing::debug!(
+            wait_ms = acquired.duration_since(started).as_millis(),
+            transaction_ms = acquired.elapsed().as_millis(),
+            records_written = writes,
+            "committed session transaction"
+        );
+        Ok(result)
     }
+}
 
-    fn read_from_disk(path: &Path) -> Result<(u64, HashMap<String, SessionRecord>), String> {
-        match std::fs::read_to_string(path) {
-            Ok(contents) => serde_json::from_str::<StoreFile>(&contents)
-                .map(|mut store| {
-                    for record in store.records.values_mut() {
-                        ensure_backend_binding(record);
-                    }
-                    (store.write_seq, store.records)
-                })
-                .map_err(|err| format!("Failed to parse session store {}: {err}", path.display())),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok((0, HashMap::new())),
-            Err(err) => Err(format!(
-                "Failed to read session store {}: {err}",
-                path.display()
-            )),
+#[derive(Debug)]
+pub struct SessionStoreHandle {
+    store: Arc<SessionStore>,
+    readers: Arc<tokio::sync::Semaphore>,
+    writers: Arc<tokio::sync::Semaphore>,
+}
+
+impl SessionStoreHandle {
+    pub(crate) fn new(store: SessionStore) -> Self {
+        Self {
+            store: Arc::new(store),
+            readers: Arc::new(tokio::sync::Semaphore::new(4)),
+            writers: Arc::new(tokio::sync::Semaphore::new(1)),
         }
     }
 
-    fn refresh_if_stale(&self) -> Result<(), String> {
-        let disk_seq = peek_write_seq(&self.path)?;
-        if disk_seq == self.write_seq.get() {
-            return Ok(());
-        }
-        self.reload()
-    }
-
-    fn reload(&self) -> Result<(), String> {
-        let (write_seq, records) = Self::read_from_disk(&self.path)?;
-        self.records.replace(records);
-        self.write_seq.set(write_seq);
-        Ok(())
-    }
-
-    fn read_modify_write<T, F>(&self, mut modify: F) -> Result<T, String>
+    pub(crate) async fn call<T, F>(&self, operation: F) -> Result<T, String>
     where
-        F: FnMut(&mut HashMap<String, SessionRecord>) -> T,
+        T: Send + 'static,
+        F: FnOnce(&SessionStore) -> Result<T, String> + Send + 'static,
     {
-        self.cas(|records| Ok((modify(records), true)))
+        self.run(Arc::clone(&self.writers), operation).await
     }
 
-    fn cas<T, F>(&self, mut body: F) -> Result<T, String>
+    async fn read<T, F>(&self, operation: F) -> Result<T, String>
     where
-        F: FnMut(&mut HashMap<String, SessionRecord>) -> Result<(T, bool), String>,
+        T: Send + 'static,
+        F: FnOnce(&SessionStore) -> Result<T, String> + Send + 'static,
     {
-        for _ in 0..CAS_ATTEMPTS {
-            self.refresh_if_stale()?;
-            let seq = peek_write_seq(&self.path)?;
-            if seq != self.write_seq.get() {
-                tracing::warn!(
-                    path = %self.path.display(),
-                    disk_seq = seq,
-                    loaded_seq = self.write_seq.get(),
-                    "Session store sequence peek disagrees with loaded JSON"
-                );
-                continue;
-            }
-
-            let (result, changed) = {
-                let mut records = self.records.borrow_mut();
-                body(&mut records)?
-            };
-
-            let peeked = peek_write_seq(&self.path)?;
-            if peeked != seq {
-                self.reload()?;
-                continue;
-            }
-            if !changed {
-                return Ok(result);
-            }
-
-            let new_seq = seq.saturating_add(1);
-            Self::save(&self.path, new_seq, &self.records.borrow())?;
-            self.write_seq.set(new_seq);
-            return Ok(result);
-        }
-        Err("session store write_seq changed during save".to_owned())
+        self.run(Arc::clone(&self.readers), operation).await
     }
 
-    fn save(
-        path: &Path,
-        write_seq: u64,
-        records: &HashMap<String, SessionRecord>,
-    ) -> Result<(), String> {
-        let json = serde_json::to_string(&StoreFileRef { write_seq, records })
-            .map_err(|err| format!("Failed to serialize session store: {err}"))?;
+    async fn run<T, F>(
+        &self,
+        admission: Arc<tokio::sync::Semaphore>,
+        operation: F,
+    ) -> Result<T, String>
+    where
+        T: Send + 'static,
+        F: FnOnce(&SessionStore) -> Result<T, String> + Send + 'static,
+    {
+        let permit = admission
+            .acquire_owned()
+            .await
+            .map_err(|_| "session storage closed")?;
+        let store = Arc::clone(&self.store);
+        tokio::task::spawn_blocking(move || {
+            let result = operation(&store);
+            drop(permit);
+            result
+        })
+        .await
+        .map_err(|error| format!("session storage task failed: {error}"))?
+    }
 
-        let parent = path
-            .parent()
-            .ok_or_else(|| format!("Session store path has no parent: {}", path.display()))?;
-        std::fs::create_dir_all(parent)
-            .map_err(|err| format!("Failed to create session store directory: {err}"))?;
+    pub async fn update<F>(&self, session_id: &SessionId, update: F) -> Result<(), String>
+    where
+        F: FnOnce(&mut SessionRecord) + Send + 'static,
+    {
+        let session_id = session_id.clone();
+        self.call(move |store| store.update(&session_id, update))
+            .await
+    }
 
-        let tmp_path = parent.join(format!(
-            ".{}.tmp.{}",
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("sessions.json"),
-            now_ms()
-        ));
-        let mut file = std::fs::File::create(&tmp_path)
-            .map_err(|err| format!("Failed to create temp session store file: {err}"))?;
-        file.write_all(json.as_bytes())
-            .map_err(|err| format!("Failed to write temp session store file: {err}"))?;
-        file.sync_all()
-            .map_err(|err| format!("Failed to sync temp session store file: {err}"))?;
-        std::fs::rename(&tmp_path, path).map_err(|err| {
-            format!(
-                "Failed to atomically replace session store {}: {err}",
-                path.display()
+    pub async fn list(&self) -> Result<Vec<SessionRecord>, String> {
+        self.read(move |store| store.list()).await
+    }
+
+    pub async fn get(&self, id: &SessionId) -> Option<SessionRecord> {
+        let id = id.clone();
+        self.read(move |store| Ok(store.get(&id)))
+            .await
+            .ok()
+            .flatten()
+    }
+
+    pub async fn get_task_list(&self, id: &SessionId) -> Option<TaskList> {
+        let id = id.clone();
+        self.read(move |store| Ok(store.get_task_list(&id)))
+            .await
+            .ok()
+            .flatten()
+    }
+
+    pub async fn set_task_list(&self, id: &SessionId, task_list: TaskList) -> Result<(), String> {
+        let id = id.clone();
+        self.call(move |store| store.set_task_list(&id, task_list))
+            .await
+    }
+
+    pub async fn upsert_backend_session(
+        &self,
+        session: &BackendSession,
+        parent_id: Option<SessionId>,
+        project_id: Option<ProjectId>,
+        custom_agent_id: Option<CustomAgentId>,
+        launch_profile_id: Option<LaunchProfileId>,
+    ) -> Result<SessionRecord, String> {
+        let session = session.clone();
+        self.call(move |store| {
+            store.upsert_backend_session(
+                &session,
+                parent_id,
+                project_id,
+                custom_agent_id,
+                launch_profile_id,
             )
-        })?;
-        Ok(())
+        })
+        .await
     }
+
+    pub async fn set_access_mode(
+        &self,
+        session_id: &SessionId,
+        access_mode: protocol::BackendAccessMode,
+    ) -> Result<(), String> {
+        let session_id = session_id.clone();
+        self.call(move |store| store.set_access_mode(&session_id, access_mode))
+            .await
+    }
+
+    pub async fn set_alias(&self, session_id: &SessionId, alias: String) -> Result<(), String> {
+        let session_id = session_id.clone();
+        self.call(move |store| store.set_alias(&session_id, alias))
+            .await
+    }
+
+    pub async fn set_alias_if_missing(
+        &self,
+        session_id: &SessionId,
+        alias: String,
+    ) -> Result<(), String> {
+        let session_id = session_id.clone();
+        self.call(move |store| store.set_alias_if_missing(&session_id, alias))
+            .await
+    }
+
+    pub async fn set_user_alias(
+        &self,
+        session_id: &SessionId,
+        user_alias: String,
+    ) -> Result<(), String> {
+        let session_id = session_id.clone();
+        self.call(move |store| store.set_user_alias(&session_id, user_alias))
+            .await
+    }
+
+    pub async fn set_generated_alias_if_no_user_alias(
+        &self,
+        session_id: &SessionId,
+        alias: String,
+    ) -> Result<bool, String> {
+        let session_id = session_id.clone();
+        self.call(move |store| store.set_generated_alias_if_no_user_alias(&session_id, alias))
+            .await
+    }
+
+    pub async fn set_session_settings(
+        &self,
+        session_id: &SessionId,
+        settings: SessionSettingsValues,
+    ) -> Result<(), String> {
+        let session_id = session_id.clone();
+        self.call(move |store| store.set_session_settings(&session_id, settings))
+            .await
+    }
+
+    pub async fn move_to_project(
+        &self,
+        session_id: &SessionId,
+        project_id: Option<ProjectId>,
+        roots: Vec<String>,
+    ) -> Result<(), String> {
+        let session_id = session_id.clone();
+        self.call(move |store| store.move_to_project(&session_id, project_id, roots))
+            .await
+    }
+
+    pub(crate) async fn set_restore_state(
+        &self,
+        session_id: &SessionId,
+        restore_state: SessionRestoreState,
+    ) -> Result<(), String> {
+        let session_id = session_id.clone();
+        self.call(move |store| store.set_restore_state(&session_id, restore_state))
+            .await
+    }
+
+    pub(crate) async fn clear_restore_states(
+        &self,
+        session_ids: &HashSet<SessionId>,
+    ) -> Result<(), String> {
+        let session_ids = session_ids.clone();
+        self.call(move |store| store.clear_restore_states(&session_ids))
+            .await
+    }
+
+    pub async fn detach_project(&self, project_id: &ProjectId) -> Result<Vec<SessionId>, String> {
+        let project_id = project_id.clone();
+        self.call(move |store| store.detach_project(&project_id))
+            .await
+    }
+
+    pub async fn delete_for_project(
+        &self,
+        project_id: &ProjectId,
+    ) -> Result<Vec<SessionId>, String> {
+        let project_id = project_id.clone();
+        self.call(move |store| store.delete_for_project(&project_id))
+            .await
+    }
+
+    pub async fn delete(&self, session_id: &SessionId) -> Result<(), String> {
+        let session_id = session_id.clone();
+        self.call(move |store| store.delete(&session_id)).await
+    }
+
+    pub async fn mark_compacted(
+        &self,
+        old_session_id: &SessionId,
+        new_session_id: &SessionId,
+        summary_preview: String,
+    ) -> Result<(), String> {
+        let old_session_id = old_session_id.clone();
+        let new_session_id = new_session_id.clone();
+        self.call(move |store| {
+            store.mark_compacted(&old_session_id, &new_session_id, summary_preview)
+        })
+        .await
+    }
+
+    pub async fn compacted_successor_chain(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Vec<SessionId>, String> {
+        let session_id = session_id.clone();
+        self.read(move |store| store.compacted_successor_chain(&session_id))
+            .await
+    }
+
+    pub async fn compacted_ancestor_chain(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Vec<SessionId>, String> {
+        let session_id = session_id.clone();
+        self.read(move |store| store.compacted_ancestor_chain(&session_id))
+            .await
+    }
+
+    pub async fn effective_name(&self, session_id: &SessionId) -> Option<String> {
+        let session_id = session_id.clone();
+        self.read(move |store| Ok(store.effective_name(&session_id)))
+            .await
+            .ok()
+            .flatten()
+    }
+
+    pub async fn summaries(&self) -> Result<Vec<SessionSummary>, String> {
+        self.read(move |store| store.summaries()).await
+    }
+
+    pub async fn summaries_for_scope(
+        &self,
+        scope: SessionListScope,
+    ) -> Result<Vec<SessionSummary>, String> {
+        self.read(move |store| store.summaries_for_scope(scope))
+            .await
+    }
+
+    pub(crate) async fn summaries_for_scope_with_backend_storage(
+        &self,
+        scope: SessionListScope,
+        backend_storage: &crate::backend::BackendStorage,
+    ) -> Result<Vec<SessionSummary>, String> {
+        let backend_storage = backend_storage.clone();
+        self.read(move |store| {
+            store.summaries_for_scope_with_backend_storage(scope, &backend_storage)
+        })
+        .await
+    }
+}
+
+fn sql_error(error: rusqlite::Error) -> String {
+    format!("session database: {error}")
+}
+
+fn read_raw_records(
+    connection: &Connection,
+    ids: &[&SessionId],
+) -> Result<HashMap<String, Value>, String> {
+    let mut records = HashMap::new();
+    if ids.is_empty() {
+        let mut statement = connection
+            .prepare("SELECT id, record FROM sessions")
+            .map_err(sql_error)?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(sql_error)?;
+        for row in rows {
+            let (id, json) = row.map_err(sql_error)?;
+            records.insert(
+                id,
+                serde_json::from_str(&json)
+                    .map_err(|error| format!("decode session JSON: {error}"))?,
+            );
+        }
+    } else {
+        let mut statement = connection
+            .prepare("SELECT record FROM sessions WHERE id=?1")
+            .map_err(sql_error)?;
+        for id in ids {
+            let json: Option<String> = statement
+                .query_row([&id.0], |row| row.get(0))
+                .optional()
+                .map_err(sql_error)?;
+            if let Some(json) = json {
+                records.insert(
+                    id.0.clone(),
+                    serde_json::from_str(&json)
+                        .map_err(|error| format!("decode session JSON: {error}"))?,
+                );
+            }
+        }
+    }
+    Ok(records)
+}
+
+fn decode_records(raw: &HashMap<String, Value>) -> Result<HashMap<String, SessionRecord>, String> {
+    raw.iter()
+        .map(|(id, value)| {
+            let mut record: SessionRecord = serde_json::from_value(value.clone())
+                .map_err(|error| format!("decode session record: {error}"))?;
+            if record.id.0 != *id {
+                return Err("session record ID differs from its key".to_owned());
+            }
+            ensure_backend_binding(&mut record);
+            Ok((id.clone(), record))
+        })
+        .collect()
+}
+
+fn read_records(
+    connection: &Connection,
+    ids: &[&SessionId],
+) -> Result<HashMap<String, SessionRecord>, String> {
+    decode_records(&read_raw_records(connection, ids)?)
+}
+
+fn merge_record(value: &mut Value, record: &SessionRecord) -> Result<(), String> {
+    let encoded =
+        serde_json::to_value(record).map_err(|error| format!("encode session: {error}"))?;
+    let object = value
+        .as_object_mut()
+        .ok_or("session record must be an object")?;
+    object.extend(
+        encoded
+            .as_object()
+            .ok_or("encoded session must be an object")?
+            .clone(),
+    );
+    Ok(())
+}
+
+fn legacy_records(path: &Path) -> Result<serde_json::Map<String, Value>, String> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Default::default()),
+        Err(error) => return Err(format!("read legacy session data: {error}")),
+    };
+    let value: Value = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("parse legacy session data: {error}"))?;
+    value
+        .get("records")
+        .and_then(Value::as_object)
+        .cloned()
+        .ok_or_else(|| "legacy session records must be an object".to_owned())
+}
+
+fn import_json(connection: &Connection, path: &Path) -> Result<(), String> {
+    let records = legacy_records(path)?;
+    let tasks = legacy_records(&path.with_extension("task-lists.json"))?;
+    let mut imported = 0;
+    let mut archived = 0;
+    for (id, mut value) in records {
+        let object = value
+            .as_object_mut()
+            .ok_or("legacy session record must be an object")?;
+        if object.get("backend_kind").and_then(Value::as_str) == Some("gemini") {
+            connection
+                .execute(
+                    "INSERT INTO archived_sessions VALUES (?1, ?2)",
+                    params![id, value.to_string()],
+                )
+                .map_err(sql_error)?;
+            archived += 1;
+            continue;
+        }
+        match object.get("backend_kind").and_then(Value::as_str) {
+            Some(LEGACY_ACP_BACKEND) => {
+                object.insert(
+                    "backend_kind".to_owned(),
+                    Value::String(KIRO_BACKEND.to_owned()),
+                );
+            }
+            Some(KIRO_BACKEND) if !matches!(object.get("launch_profile_id"), Some(Value::String(profile)) if !profile.trim().is_empty()) =>
+            {
+                object.insert(
+                    "launch_profile_id".to_owned(),
+                    Value::String(KIRO_LAUNCH_PROFILE_ID.to_owned()),
+                );
+            }
+            _ => {}
+        }
+        let mut record: SessionRecord = serde_json::from_value(value.clone())
+            .map_err(|error| format!("import session record: {error}"))?;
+        if record.id.0 != id {
+            return Err("legacy session record ID differs from its key".to_owned());
+        }
+        if !crate::backend::native_session_id_is_valid(record.backend_kind, &record.id) {
+            record.resumable = false;
+        }
+        ensure_backend_binding(&mut record);
+        merge_record(&mut value, &record)?;
+        connection
+            .execute(
+                "INSERT INTO sessions VALUES (?1, ?2)",
+                params![id, value.to_string()],
+            )
+            .map_err(sql_error)?;
+        imported += 1;
+    }
+    let task_count = tasks.len();
+    for (id, value) in tasks {
+        serde_json::from_value::<TaskList>(value.clone())
+            .map_err(|error| format!("import task list: {error}"))?;
+        connection
+            .execute(
+                "INSERT INTO session_tasks VALUES (?1, ?2)",
+                params![id, value.to_string()],
+            )
+            .map_err(sql_error)?;
+    }
+    tracing::info!(
+        sessions = imported,
+        archived_sessions = archived,
+        task_lists = task_count,
+        "staged legacy session import; original JSON retained"
+    );
+    Ok(())
 }
 
 fn ensure_backend_binding(record: &mut SessionRecord) {
@@ -1196,35 +1424,6 @@ fn ensure_backend_binding(record: &mut SessionRecord) {
         });
         record.active_backend_binding_generation = 0;
     }
-}
-
-fn write_json_value_atomically(path: &Path, value: &Value) -> Result<(), String> {
-    let json = serde_json::to_string_pretty(value)
-        .map_err(|err| format!("Failed to serialize migrated session store: {err}"))?;
-    let parent = path
-        .parent()
-        .ok_or_else(|| format!("Session store path has no parent: {}", path.display()))?;
-    std::fs::create_dir_all(parent)
-        .map_err(|err| format!("Failed to create session store directory: {err}"))?;
-    let tmp_path = parent.join(format!(
-        ".{}.tmp.{}",
-        path.file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("sessions.json"),
-        now_ms()
-    ));
-    let mut file = std::fs::File::create(&tmp_path)
-        .map_err(|err| format!("Failed to create temp session store file: {err}"))?;
-    file.write_all(json.as_bytes())
-        .map_err(|err| format!("Failed to write temp session store file: {err}"))?;
-    file.sync_all()
-        .map_err(|err| format!("Failed to sync temp session store file: {err}"))?;
-    std::fs::rename(&tmp_path, path).map_err(|err| {
-        format!(
-            "Failed to atomically replace session store {}: {err}",
-            path.display()
-        )
-    })
 }
 
 fn now_ms() -> u64 {
@@ -1262,5 +1461,50 @@ fn session_record_matches_scope(record: &SessionRecord, scope: SessionListScope)
     match scope {
         SessionListScope::RootSessions => record.parent_id.is_none(),
         SessionListScope::AllSessions => true,
+    }
+}
+
+#[cfg(feature = "test-support")]
+pub mod commit_hooks {
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Mutex, OnceLock};
+
+    type Hook = Box<dyn FnOnce() + Send>;
+    static HOOKS: OnceLock<Mutex<HashMap<PathBuf, Hook>>> = OnceLock::new();
+
+    pub struct InstalledHook(PathBuf);
+
+    impl InstalledHook {
+        pub fn install(path: PathBuf, hook: Hook) -> Self {
+            let previous = HOOKS
+                .get_or_init(Mutex::default)
+                .lock()
+                .unwrap()
+                .insert(path.clone(), hook);
+            assert!(previous.is_none(), "session commit hook already installed");
+            Self(path)
+        }
+    }
+
+    impl Drop for InstalledHook {
+        fn drop(&mut self) {
+            HOOKS
+                .get_or_init(Mutex::default)
+                .lock()
+                .unwrap()
+                .remove(&self.0);
+        }
+    }
+
+    pub(super) fn run(path: &Path) {
+        let hook = HOOKS
+            .get_or_init(Mutex::default)
+            .lock()
+            .unwrap()
+            .remove(path);
+        if let Some(hook) = hook {
+            hook();
+        }
     }
 }

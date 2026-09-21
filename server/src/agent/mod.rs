@@ -23,7 +23,7 @@ use protocol::{
     ToolExecutionCompletedData, ToolExecutionMode, ToolExecutionOutcome, ToolExecutionResult,
     ToolRequestType,
 };
-use tokio::sync::{Mutex, mpsc, oneshot, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 use uuid::Uuid;
 
 use crate::backend::mock::MockBackend;
@@ -40,7 +40,7 @@ use crate::host::{
 use crate::review::ReviewRegistryHandle;
 use crate::store::session::{
     CommitCompactedBinding, CompactionOperationRecord, FinishCompactionOperation,
-    SessionRestoreState, SessionStore, StoredCompactionState,
+    SessionRestoreState, SessionStore, SessionStoreHandle, StoredCompactionState,
 };
 use crate::store::transcript::{SessionJournal, TranscriptStore};
 use crate::stream::Stream;
@@ -135,13 +135,13 @@ struct TerminalFailureContext<'a> {
     replay_state: &'a mut AgentReplayState,
     subscribers: &'a mut Vec<Stream>,
     queue: &'a mut VecDeque<SequencedQueuedMessage>,
-    session_store: &'a Arc<Mutex<SessionStore>>,
+    session_store: &'a Arc<SessionStoreHandle>,
     compaction: Option<TerminalCompactionFailureContext<'a>>,
 }
 
 struct TerminalCompactionFailureContext<'a> {
     flight: &'a mut Option<CompactionFlight>,
-    session_store: &'a Arc<Mutex<SessionStore>>,
+    session_store: &'a Arc<SessionStoreHandle>,
     session_id: &'a SessionId,
     start: &'a AgentStartPayload,
     activity_stats: &'a mut AgentActivityStatsTracker,
@@ -151,7 +151,7 @@ struct InitialFollowUpContext<'a> {
     backend: &'a mut Option<BackendHandle>,
     in_turn: &'a mut bool,
     idle_transition_armed: &'a mut bool,
-    session_store: &'a Arc<Mutex<SessionStore>>,
+    session_store: &'a Arc<SessionStoreHandle>,
     transcript_store: &'a TranscriptStore,
     current_session_id: Option<&'a SessionId>,
     pending_alias: &'a mut Option<InitialAgentAlias>,
@@ -178,7 +178,7 @@ struct QueueDispatchTerminalContext<'a> {
     replay_state: &'a mut AgentReplayState,
     subscribers: &'a mut Vec<Stream>,
     queue: &'a mut VecDeque<SequencedQueuedMessage>,
-    session_store: &'a Arc<Mutex<SessionStore>>,
+    session_store: &'a Arc<SessionStoreHandle>,
     transcript_store: &'a TranscriptStore,
     context_compaction: &'a mut Option<CompactionFlight>,
     activity_stats: &'a mut AgentActivityStatsTracker,
@@ -195,7 +195,7 @@ struct QueueDispatchTerminalContext<'a> {
 }
 
 struct AgentNameChangeContext<'a> {
-    session_store: &'a Arc<Mutex<SessionStore>>,
+    session_store: &'a Arc<SessionStoreHandle>,
     session_id: Option<&'a SessionId>,
     pending_alias: &'a mut Option<InitialAgentAlias>,
     current_start: &'a mut AgentStartPayload,
@@ -205,7 +205,7 @@ struct AgentNameChangeContext<'a> {
 }
 
 pub(crate) struct AgentActorRuntimeContext {
-    pub(crate) session_store: Arc<Mutex<SessionStore>>,
+    pub(crate) session_store: Arc<SessionStoreHandle>,
     pub(crate) transcript_store: TranscriptStore,
     pub(crate) host_sub_agent_spawn_tx: HostSubAgentSpawnTx,
     pub(crate) capacity_tx: HostCapacityTx,
@@ -221,7 +221,7 @@ pub(crate) struct AgentActorRuntimeContext {
 }
 
 pub(crate) struct AgentActorRuntimeResources {
-    pub(crate) session_store: Arc<Mutex<SessionStore>>,
+    pub(crate) session_store: Arc<SessionStoreHandle>,
     pub(crate) transcript_store: TranscriptStore,
     pub(crate) host_sub_agent_spawn_tx: HostSubAgentSpawnTx,
     pub(crate) capacity_tx: HostCapacityTx,
@@ -2798,9 +2798,8 @@ pub(crate) fn spawn_agent_actor(
         );
         let persisted_queue = if let Some(session_id) = resume_session_id.as_ref() {
             session_store
-                .lock()
-                .await
                 .get(session_id)
+                .await
                 .map(|record| record.queued_messages)
                 .unwrap_or_default()
         } else {
@@ -3262,7 +3261,7 @@ pub(crate) fn spawn_agent_actor(
             );
         }
         let mut persisted_resume_task_list = if is_resume {
-            session_store.lock().await.get_task_list(&actor_session_id)
+            session_store.get_task_list(&actor_session_id).await
         } else {
             None
         };
@@ -3930,7 +3929,7 @@ pub(crate) fn spawn_agent_actor(
                     if let supervisor::SupervisorAction::LaunchVerdict { attempts_started } = action {
                         let context = supervisor::supervision_context_snapshot(&event_log);
                         let record = match current_session_id.as_ref() {
-                            Some(session_id) => session_store.lock().await.get(session_id),
+                            Some(session_id) => session_store.get(session_id).await,
                             None => None,
                         };
                         let allowed = supervisor::supervision_record_allows_action(
@@ -3952,7 +3951,7 @@ pub(crate) fn spawn_agent_actor(
                             {
                                 let task_list = match current_session_id.as_ref() {
                                     Some(session_id) => {
-                                        session_store.lock().await.get_task_list(session_id)
+                                        session_store.get_task_list(session_id).await
                                     }
                                     None => None,
                                 };
@@ -4003,7 +4002,7 @@ pub(crate) fn spawn_agent_actor(
                     if action == supervisor::SupervisorAction::RequestCompaction {
                         let context = supervisor::supervision_context_snapshot(&event_log);
                         let record = match current_session_id.as_ref() {
-                            Some(session_id) => session_store.lock().await.get(session_id),
+                            Some(session_id) => session_store.get(session_id).await,
                             None => None,
                         };
                         let current_context_input_tokens = match activity_stats
@@ -6752,15 +6751,12 @@ pub(crate) fn spawn_agent_actor(
                                         continue;
                                     }
                                     current_session_settings = updated_session_settings;
-                                    if let Err(err) = session_store
-                                        .lock()
-                                        .await
-                                        .set_session_settings(
+                                    if let Err(err) = session_store.set_session_settings(
                                             current_session_id
                                                 .as_ref()
                                                 .expect("live agent must have session_id"),
                                             current_session_settings.clone(),
-                                        )
+                                        ).await
                                     {
                                         tracing::error!(
                                             "failed to persist session settings for {}: {}",
@@ -7793,7 +7789,7 @@ pub(crate) fn spawn_agent_actor(
                                 tracing::info!(%agent_id, ?project_id, ?roots, "Moving agent workspace and project");
                                 let moved = live.set_workspace_roots(roots.clone()).await;
                                 let moved = match moved {
-                                    Ok(()) => session_store.lock().await.move_to_project(session_id, Some(project_id.clone()), roots.clone()),
+                                    Ok(()) => session_store.move_to_project(session_id, Some(project_id.clone()), roots.clone()).await,
                                     Err(error) => Err(error),
                                 };
                                 match moved {
@@ -8333,7 +8329,7 @@ pub(crate) struct RelayEventReceivers {
 }
 
 pub(crate) struct RelayAgentRuntimeResources {
-    pub session_store: Arc<Mutex<SessionStore>>,
+    pub session_store: Arc<SessionStoreHandle>,
     pub transcript_store: TranscriptStore,
     pub session_summary_count_tx: HostSessionSummaryCountTx,
 }
@@ -9031,20 +9027,14 @@ pub(crate) fn now_ms() -> u64 {
 }
 
 async fn run_session_store_io<T, F>(
-    session_store: &Arc<Mutex<SessionStore>>,
+    session_store: &Arc<SessionStoreHandle>,
     operation: F,
 ) -> Result<T, String>
 where
     T: Send + 'static,
     F: FnOnce(&SessionStore) -> Result<T, String> + Send + 'static,
 {
-    let session_store = Arc::clone(session_store);
-    tokio::task::spawn_blocking(move || {
-        let store = session_store.blocking_lock();
-        operation(&store)
-    })
-    .await
-    .map_err(|error| format!("session persistence task failed: {error}"))?
+    session_store.call(operation).await
 }
 
 async fn transcript_is_authoritative(store: &TranscriptStore, session_id: &SessionId) -> bool {
@@ -9593,7 +9583,7 @@ async fn next_agent_command(
 
 #[allow(clippy::too_many_arguments)]
 async fn park_terminal_agent(
-    session_store: &Arc<Mutex<SessionStore>>,
+    session_store: &Arc<SessionStoreHandle>,
     transcript_store: &TranscriptStore,
     session_id: Option<&SessionId>,
     pending_alias: &mut Option<InitialAgentAlias>,
@@ -9789,7 +9779,7 @@ async fn park_terminal_agent(
 
 #[allow(clippy::too_many_arguments)]
 async fn park_relay_terminal_agent(
-    session_store: &Arc<Mutex<SessionStore>>,
+    session_store: &Arc<SessionStoreHandle>,
     transcript_store: &TranscriptStore,
     session_id: &SessionId,
     pending_alias: &mut Option<InitialAgentAlias>,
@@ -10016,9 +10006,8 @@ async fn apply_generated_agent_name(
     let applied = if let Some(session_id) = context.session_id {
         match context
             .session_store
-            .lock()
-            .await
             .set_generated_alias_if_no_user_alias(session_id, trimmed.to_owned())
+            .await
         {
             Ok(applied) => applied,
             Err(error) => {
@@ -10082,13 +10071,16 @@ async fn apply_agent_name_change(
 
     if let Some(session_id) = context.session_id {
         let persist_result = {
-            let store = context.session_store.lock().await;
+            let store = context.session_store.as_ref();
             match persistence {
                 InitialAgentAliasPersistence::User => store
                     .set_user_alias(session_id, trimmed.to_string())
+                    .await
                     .map(|()| true),
                 InitialAgentAliasPersistence::GeneratedIfNoUserAlias => {
-                    store.set_generated_alias_if_no_user_alias(session_id, trimmed.to_string())
+                    store
+                        .set_generated_alias_if_no_user_alias(session_id, trimmed.to_string())
+                        .await
                 }
             }
         };
@@ -10312,7 +10304,7 @@ async fn emit_uneditable_queued_message_error(
 }
 
 async fn persist_agent_session(
-    session_store: &Arc<Mutex<SessionStore>>,
+    session_store: &Arc<SessionStoreHandle>,
     session_id: &SessionId,
     parent_session_id: Option<SessionId>,
     current_start: &AgentStartPayload,
@@ -10338,16 +10330,22 @@ async fn persist_agent_session(
     };
 
     {
-        let store = session_store.lock().await;
-        store.upsert_backend_session(
-            &session,
-            parent_session_id,
-            current_start.project_id.clone(),
-            current_start.custom_agent_id.clone(),
-            current_start.launch_profile_id.clone(),
-        )?;
-        store.set_access_mode(session_id, resolved_spawn_config.access_mode)?;
-        store.set_session_settings(session_id, current_session_settings.clone())?;
+        let store = session_store.as_ref();
+        store
+            .upsert_backend_session(
+                &session,
+                parent_session_id,
+                current_start.project_id.clone(),
+                current_start.custom_agent_id.clone(),
+                current_start.launch_profile_id.clone(),
+            )
+            .await?;
+        store
+            .set_access_mode(session_id, resolved_spawn_config.access_mode)
+            .await?;
+        store
+            .set_session_settings(session_id, current_session_settings.clone())
+            .await?;
         // Only a session that can actually be resumed earns a marker. Marking
         // one that cannot means the next launch reconstructs it through the
         // resume path, which rejects it and leaves the user a failed card to
@@ -10356,21 +10354,25 @@ async fn persist_agent_session(
         // agent with none of its restrictions, which is worse than not coming
         // back at all.
         if session.resumable && resolved_spawn_config.is_rebuilt_by_resume() {
-            store.set_restore_state(
-                session_id,
-                SessionRestoreState {
-                    origin: current_start.origin,
-                    workflow: current_start.workflow.clone(),
-                },
-            )?;
+            store
+                .set_restore_state(
+                    session_id,
+                    SessionRestoreState {
+                        origin: current_start.origin,
+                        workflow: current_start.workflow.clone(),
+                    },
+                )
+                .await?;
         }
         if let Some(alias) = pending_alias.take() {
             match alias.persistence {
                 InitialAgentAliasPersistence::GeneratedIfNoUserAlias => {
-                    let _ = store.set_generated_alias_if_no_user_alias(session_id, alias.name)?;
+                    let _ = store
+                        .set_generated_alias_if_no_user_alias(session_id, alias.name)
+                        .await?;
                 }
                 InitialAgentAliasPersistence::User => {
-                    store.set_user_alias(session_id, alias.name)?;
+                    store.set_user_alias(session_id, alias.name).await?;
                 }
             }
         }
@@ -12018,7 +12020,7 @@ async fn update_queued_messages_snapshot(
     event_log: &mut Vec<Envelope>,
     subscribers: &mut Vec<Stream>,
     queue: &VecDeque<SequencedQueuedMessage>,
-    session_store: &Arc<Mutex<SessionStore>>,
+    session_store: &Arc<SessionStoreHandle>,
     status_handle: &registry::AgentStatusHandle,
 ) {
     // The single funnel for queue changes, so the status flag cannot drift from
@@ -12069,7 +12071,7 @@ async fn update_queued_messages_snapshot(
 struct ContextCompactionDispatchContext<'a> {
     actor_tx: &'a mpsc::UnboundedSender<AgentCommand>,
     backend: &'a dyn BackendSender,
-    session_store: &'a Arc<Mutex<SessionStore>>,
+    session_store: &'a Arc<SessionStoreHandle>,
     transcript_store: &'a TranscriptStore,
     session_id: &'a SessionId,
     start: &'a AgentStartPayload,
@@ -12108,7 +12110,7 @@ struct ContextCompactionTerminalRecord {
 async fn record_context_compaction_terminal(
     mut flight: CompactionFlight,
     terminal: ContextCompactionTerminalRecord,
-    session_store: &Arc<Mutex<SessionStore>>,
+    session_store: &Arc<SessionStoreHandle>,
     session_id: &SessionId,
     start: &AgentStartPayload,
     canonical_stream: &str,
@@ -12258,7 +12260,7 @@ async fn release_context_compaction_barrier(
     event_log: &mut Vec<Envelope>,
     subscribers: &mut Vec<Stream>,
     agent_id: &AgentId,
-    session_store: &Arc<Mutex<SessionStore>>,
+    session_store: &Arc<SessionStoreHandle>,
     status_handle: &registry::AgentStatusHandle,
     review_registry: &ReviewRegistryHandle,
     usage_paused: bool,
@@ -12299,7 +12301,7 @@ struct QueuedMessageDispatchContext<'a> {
     event_log: &'a mut Vec<Envelope>,
     subscribers: &'a mut Vec<Stream>,
     agent_id: &'a AgentId,
-    session_store: &'a Arc<Mutex<SessionStore>>,
+    session_store: &'a Arc<SessionStoreHandle>,
     status_handle: &'a registry::AgentStatusHandle,
     review_registry: &'a ReviewRegistryHandle,
 }
@@ -13403,7 +13405,7 @@ fn agent_bootstrap_event_from_envelope(envelope: &Envelope) -> AgentBootstrapEve
 }
 
 async fn apply_runtime_session_updates(
-    session_store: &Arc<Mutex<SessionStore>>,
+    session_store: &Arc<SessionStoreHandle>,
     session_id: &SessionId,
     event: &ChatEvent,
 ) -> Option<SessionSummaryCountUpdatedPayload> {
