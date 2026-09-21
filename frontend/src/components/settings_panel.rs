@@ -2354,7 +2354,7 @@ fn ReviewSettingsTab() -> impl IntoView {
             <div class="review-settings-list-heading">
                 <h3>"Review agents"</h3>
                 <span class="review-settings-count">{move || format!("{} enabled", settings.get().map_or(0, |s| s.agents.values().filter(|a| a.enabled).count()))}</span>
-                <button class="settings-btn-primary" disabled=move || settings.get().is_none()
+                <button class="settings-btn settings-btn-primary" disabled=move || settings.get().is_none()
                     on:click=move |_| {
                         let backend = add_state.selected_host_settings_untracked().and_then(|s| s.default_backend.or_else(|| s.enabled_backends.first().copied())).unwrap_or(BackendKind::Codex);
                         editor.set(Some((generate_id(), settings_model::ReviewAgentConfig {
@@ -2428,6 +2428,7 @@ fn ReviewAgentEditor(
     let enabled = reviewer.enabled;
     let name_ref = NodeRef::<leptos::html::Input>::new();
     let modal_ref = NodeRef::<leptos::html::Div>::new();
+    let backdrop_press = RwSignal::new(false);
     let opener: StoredValue<Option<web_sys::HtmlElement>, LocalStorage> = StoredValue::new_local(
         web_sys::window()
             .and_then(|w| w.document())
@@ -2526,7 +2527,16 @@ fn ReviewAgentEditor(
         }
     };
     view! {
-        <div class="settings-confirm-overlay" on:click=move |_| on_close.run(())>
+        <div class="settings-confirm-overlay"
+            on:pointerdown=move |ev| backdrop_press.set(ev.target() == ev.current_target())
+            on:pointercancel=move |_| backdrop_press.set(false)
+            on:click=move |ev| {
+                // A drag released outside also clicks the backdrop; only a press
+                // that started there should discard the editor's unsaved draft.
+                let dismiss = backdrop_press.get_untracked() && ev.target() == ev.current_target();
+                backdrop_press.set(false);
+                if dismiss { on_close.run(()); }
+            }>
             <div class="review-agent-modal" node_ref=modal_ref role="dialog" aria-modal="true" aria-labelledby=labelled_by
                 on:click=move |ev| ev.stop_propagation() on:keydown=keydown>
                 <header><h3 id=title_id>{if is_new { "Add reviewer" } else { "Edit reviewer" }}</h3><button class="settings-btn" aria-label="Close reviewer editor" on:click=move |_| on_close.run(())>"×"</button></header>
@@ -2552,7 +2562,7 @@ fn ReviewAgentEditor(
                 }}
                 <label class="settings-form-label"><span>"Review instructions"</span><textarea class="settings-text-input" rows="6" prop:value=move || instructions.get() on:input=move |ev| instructions.set(event_target_value(&ev)) /></label>
                 <p class="review-settings-note">"Only report concrete issues. No findings is a valid result."</p>
-                <footer><button class="settings-btn" on:click=move |_| on_close.run(())>"Cancel"</button><button class="settings-btn-primary" disabled=move || name.get().trim().is_empty() || instructions.get().trim().is_empty() on:click=save>"Save reviewer"</button></footer>
+                <footer><button class="settings-btn" on:click=move |_| on_close.run(())>"Cancel"</button><button class="settings-btn settings-btn-primary" disabled=move || name.get().trim().is_empty() || instructions.get().trim().is_empty() on:click=save>"Save reviewer"</button></footer>
             </div>
         </div>
     }
@@ -16726,6 +16736,146 @@ mod wasm_tests {
         );
     }
     #[wasm_bindgen_test]
+    async fn review_effort_drag_keeps_editor_and_unsaved_values() {
+        let calls = install_settings_send_stub();
+        let container = make_container();
+        let state = AppState::new();
+        install_launch_profile_host(&state, Vec::new());
+        let host = state.selected_host_id.get_untracked().unwrap();
+        state.session_schemas.update(|hosts| {
+            let SessionSchemaEntry::Ready { schema } = hosts
+                .get_mut(&host)
+                .unwrap()
+                .get_mut(&BackendKind::Hermes)
+                .unwrap()
+            else {
+                panic!("review schema must be ready");
+            };
+            schema.fields.push(SessionSettingField {
+                key: "effort".to_owned(),
+                label: "Effort".to_owned(),
+                description: None,
+                field_type: SessionSettingFieldType::Select {
+                    options: vec![
+                        SelectOption {
+                            value: "low".to_owned(),
+                            label: "Low".to_owned(),
+                        },
+                        SelectOption {
+                            value: "high".to_owned(),
+                            label: "High".to_owned(),
+                        },
+                    ],
+                    default: Some("low".to_owned()),
+                    nullable: false,
+                },
+                use_slider: true,
+                select_options_by_setting: None,
+            });
+        });
+        let handle = mount_to(container.clone(), move || {
+            provide_context(state.clone());
+            view! { <ReviewSettingsTab /> }
+        });
+        next_tick().await;
+        let add = find_button_by_text(&container, "+ Add reviewer").unwrap();
+        add.click();
+        next_tick().await;
+        let dialog = container
+            .query_selector("[role='dialog']")
+            .unwrap()
+            .unwrap();
+        let overlay = dialog.parent_element().unwrap();
+        let name: HtmlInputElement = dialog
+            .query_selector("input")
+            .unwrap()
+            .unwrap()
+            .dyn_into()
+            .unwrap();
+        set_input_value(&name, "Keep my draft");
+        let instructions: web_sys::HtmlTextAreaElement = dialog
+            .query_selector("textarea")
+            .unwrap()
+            .unwrap()
+            .dyn_into()
+            .unwrap();
+        instructions.set_value("Look for concrete regressions");
+        dispatch_event_from_js(instructions.unchecked_ref(), "input", None);
+        let slider: HtmlInputElement = dialog
+            .query_selector("input[type='range']")
+            .unwrap()
+            .unwrap()
+            .dyn_into()
+            .unwrap();
+        let pointer = |target: &web_sys::Element, kind: &str| {
+            let init = web_sys::PointerEventInit::new();
+            init.set_bubbles(true);
+            init.set_pointer_type("mouse");
+            target
+                .dispatch_event(
+                    &web_sys::PointerEvent::new_with_event_init_dict(kind, &init).unwrap(),
+                )
+                .unwrap();
+        };
+        pointer(&slider, "pointerdown");
+        set_input_value(&slider, "1");
+        next_tick().await;
+        assert!(dialog.text_content().unwrap().contains("High"));
+        pointer(&overlay, "pointerup");
+        // A press inside and release outside targets their common ancestor.
+        overlay.unchecked_ref::<web_sys::HtmlElement>().click();
+        next_tick().await;
+        wasm_bindgen_test::console_log!(
+            "Review slider release on backdrop: editor_present={}",
+            container
+                .query_selector("[role='dialog']")
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            container
+                .query_selector("[role='dialog']")
+                .unwrap()
+                .is_some(),
+            "Releasing an effort drag outside must not discard the reviewer draft"
+        );
+        assert_eq!(name.value(), "Keep my draft");
+        find_button_by_text(&container, "Save reviewer")
+            .unwrap()
+            .click();
+        for _ in 0..3 {
+            next_tick().await;
+        }
+        let writes = recorded_settings_write_ops(&calls);
+        let saved = writes.last().unwrap();
+        assert_eq!(saved["value"]["name"], "Keep my draft");
+        assert_eq!(
+            saved["value"]["session_settings"]["effort"]["string"],
+            "high"
+        );
+        add.click();
+        next_tick().await;
+        let dialog = container
+            .query_selector("[role='dialog']")
+            .unwrap()
+            .unwrap();
+        let overlay = dialog.parent_element().unwrap();
+        pointer(&overlay, "pointerdown");
+        pointer(&overlay, "pointerup");
+        overlay.unchecked_ref::<web_sys::HtmlElement>().click();
+        next_tick().await;
+        assert!(
+            container
+                .query_selector("[role='dialog']")
+                .unwrap()
+                .is_none(),
+            "A deliberate backdrop click must still close the editor"
+        );
+        drop(handle);
+        container.remove();
+    }
+
+    #[wasm_bindgen_test]
     async fn review_settings_manage_focused_reviewers_through_modal() {
         let calls = install_settings_send_stub();
         let container = make_container();
@@ -16761,7 +16911,46 @@ mod wasm_tests {
                 .unwrap()
                 .contains("Maximum review rounds")
         );
+        let assert_button_surface = |button: &web_sys::HtmlElement| {
+            let rect = button.get_bounding_client_rect();
+            let computed = web_sys::window()
+                .unwrap()
+                .get_computed_style(button)
+                .unwrap()
+                .unwrap();
+            let pixels = |property| {
+                computed
+                    .get_property_value(property)
+                    .unwrap()
+                    .trim_end_matches("px")
+                    .parse::<f64>()
+                    .unwrap()
+            };
+            wasm_bindgen_test::console_log!(
+                "Review action surface: height={}, padding={}, radius={}",
+                rect.height(),
+                pixels("padding-left"),
+                pixels("border-top-left-radius")
+            );
+            assert!(
+                rect.height() >= 30.0,
+                "Review actions need a full button hit area"
+            );
+            assert!(
+                pixels("padding-left") >= 12.0,
+                "Button text needs horizontal breathing room"
+            );
+            assert!(
+                pixels("padding-right") >= 12.0,
+                "Button text needs horizontal breathing room"
+            );
+            assert!(
+                pixels("border-top-left-radius") >= 6.0,
+                "Review actions need rounded button surfaces"
+            );
+        };
         let add = find_button_by_text(&container, "+ Add reviewer").unwrap();
+        assert_button_surface(&add);
         add.focus().unwrap();
         add.click();
         next_tick().await;
@@ -16778,6 +16967,21 @@ mod wasm_tests {
             .dyn_into()
             .unwrap();
         assert!(save.disabled(), "An empty reviewer must not be saveable");
+        assert_button_surface(save.unchecked_ref());
+        let disabled_style = web_sys::window()
+            .unwrap()
+            .get_computed_style(&save)
+            .unwrap()
+            .unwrap();
+        assert!(
+            disabled_style
+                .get_property_value("opacity")
+                .unwrap()
+                .parse::<f64>()
+                .unwrap()
+                < 1.0,
+            "An unavailable Save action must look disabled"
+        );
         set_input_value(&name, "Meaningful tests");
         let description: HtmlInputElement = fields.item(1).unwrap().dyn_into().unwrap();
         set_input_value(&description, "Catch actual regressions");
