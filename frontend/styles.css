@@ -4156,24 +4156,37 @@ kbd {
 .chat-input-area.thinking::before {
     content: "";
     position: absolute;
-    top: 0;
-    left: 0;
-    right: 0;
-    height: 1px;
+    inset: 0;
+    z-index: 3;
+    pointer-events: none;
+    border-radius: inherit;
+    padding: 1px;
     background: linear-gradient(
         90deg,
         transparent 0%,
         #4a9eff 40%,
-        #6cb4ff 60%,
+        #4a9eff 60%,
         transparent 100%
     );
     background-size: 200% 100%;
-    animation: thinking-shimmer 1.5s ease-in-out infinite;
+    -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+    -webkit-mask-composite: xor;
+    mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+    mask-composite: exclude;
+    animation: thinking-shimmer 1.6s ease-in-out infinite;
 }
 
 @keyframes thinking-shimmer {
     0% { background-position: 100% 0; }
     100% { background-position: -100% 0; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .chat-input-area.thinking::before {
+        animation: none;
+        background: #4a9eff;
+        opacity: 0.45;
+    }
 }
 
 .chat-textarea,

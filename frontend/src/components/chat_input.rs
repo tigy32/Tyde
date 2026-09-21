@@ -2778,11 +2778,12 @@ mod wasm_tests {
     // Primary "Cancel" enabled; caret visible but disabled; no dropdown.
     #[wasm_bindgen_test]
     async fn thinking_empty_primary_cancel_caret_disabled() {
-        let container = make_container();
+        let container = make_styled_container();
+        let state = AppState::new();
+        configure(&state, false, true, "");
+        let mount_state = state.clone();
         let _h = mount_to(container.clone(), move || {
-            let state = AppState::new();
-            configure(&state, false, true, "");
-            provide_context(state);
+            provide_context(mount_state);
             view! { <ChatInput /> }
         });
         next_tick().await;
@@ -2803,6 +2804,47 @@ mod wasm_tests {
             c.has_attribute("disabled"),
             "caret must be disabled when no menu items (thinking+empty)"
         );
+
+        let composer = query(&container, ".chat-input-area").expect("composer");
+        let window = web_sys::window().unwrap();
+        let style = window
+            .get_computed_style_with_pseudo_elt(&composer, "::before")
+            .unwrap()
+            .unwrap();
+        let prop = |name: &str| style.get_property_value(name).unwrap();
+        let height: f64 = prop("height").trim_end_matches("px").parse().unwrap();
+        assert!(
+            height > 32.0,
+            "the shimmer surrounds the composer, not just its top edge: {height}px"
+        );
+        for edge in ["top", "right", "bottom", "left"] {
+            assert_eq!(prop(edge), "0px", "cover the full {edge} edge");
+            assert_eq!(prop(&format!("padding-{edge}")), "1px");
+        }
+        // Chrome computes one composite per mask layer: "exclude, exclude".
+        assert_eq!(
+            prop("mask-composite"),
+            "exclude, exclude",
+            "keep the center clear"
+        );
+        assert!(prop("mask-clip").starts_with("content-box"));
+        assert_eq!(prop("mask-image").matches("linear-gradient").count(), 2);
+        assert!(prop("background-image").contains("rgb(74, 158, 255)"));
+        assert_eq!(prop("pointer-events"), "none");
+        assert_ne!(prop("animation-name"), "none");
+        assert_eq!(prop("animation-duration"), "1.6s");
+        assert_eq!(prop("animation-timing-function"), "ease-in-out");
+
+        state.agent_turn_active.update(|active| {
+            active.remove(&AgentId(AGENT.to_owned()));
+        });
+        next_tick().await;
+        let idle_style = window
+            .get_computed_style_with_pseudo_elt(&composer, "::before")
+            .unwrap()
+            .unwrap();
+        assert_eq!(idle_style.get_property_value("content").unwrap(), "none");
+        assert_eq!(primary(&container).text_content().unwrap().trim(), "Send");
     }
 
     // ── State matrix row 5: Thinking + input, no session ─────────────────────

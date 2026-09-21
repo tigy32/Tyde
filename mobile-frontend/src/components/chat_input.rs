@@ -1923,20 +1923,11 @@ pub fn ChatInput() -> impl IntoView {
             <crate::components::activity_drawer::ActivityDrawer />
             <div class="chat-input-row tws-composer" data-mobile-test="chat-input-capsule">
                 <Show when=move || is_running.get()>
-                    <svg
+                    <div
                         class="chat-thinking-ring"
                         data-mobile-test="chat-thinking-ring"
                         aria-hidden="true"
-                    >
-                        <rect
-                            class="chat-thinking-ring-tail"
-                            {..leptos::attr::custom::custom_attribute("pathLength", "100")}
-                        />
-                        <rect
-                            class="chat-thinking-ring-head"
-                            {..leptos::attr::custom::custom_attribute("pathLength", "100")}
-                        />
-                    </svg>
+                    ></div>
                 </Show>
                 <textarea
                     class="chat-input-field"
@@ -4779,10 +4770,6 @@ mod wasm_tests {
         assert_eq!(menu_item_texts(&container), vec!["Add photos".to_owned()]);
     }
 
-    /// The composer carries desktop's thinking indicator, grown from a line
-    /// along its top edge into a lit segment that orbits the whole composer
-    /// capsule while the active agent's turn is running, and drops it the
-    /// moment the turn ends.
     #[wasm_bindgen_test]
     async fn a_running_turn_lights_the_composer_rim_and_idle_puts_it_out() {
         crate::components::test_styles::ensure_styles_loaded();
@@ -4845,46 +4832,41 @@ mod wasm_tests {
             .trim_end_matches("px")
             .parse()
             .expect("capsule radius in px");
-        let strokes = ring_el.query_selector_all("rect").unwrap();
-        assert!(strokes.length() > 0, "the ring is stroked outlines");
-        for i in 0..strokes.length() {
-            let stroke: web_sys::Element = strokes.get(i).unwrap().dyn_into().unwrap();
-            let style = window
-                .get_computed_style(&stroke)
-                .unwrap()
-                .expect("stroke style");
-            let prop = |name: &str| style.get_property_value(name).unwrap();
-            assert_eq!(prop("fill"), "none", "an outline, not a filled shape");
-            let width: f64 = prop("stroke-width")
-                .trim_end_matches("px")
-                .parse()
-                .expect("stroke width in px");
-            assert!(
-                (0.5..=2.0).contains(&width),
-                "a hairline, like desktop's one-pixel edge line: {width}px"
-            );
-            let radius: f64 = prop("rx").trim_end_matches("px").parse().expect("rx in px");
-            assert!(
-                (radius - (capsule_radius - 1.0)).abs() < 1.0,
-                "the outline follows the capsule's corner radius ({radius} vs {capsule_radius})"
-            );
-            let dashes = prop("stroke-dasharray");
-            let lit: f64 = dashes
-                .split([',', ' '])
-                .filter(|part| !part.is_empty())
-                .map(|part| {
-                    part.trim_end_matches("px")
-                        .parse::<f64>()
-                        .expect("dash length")
-                })
-                .step_by(2)
-                .sum();
-            assert!(
-                lit > 0.0 && lit < 50.0,
-                "a lit segment that leaves most of the rim dark, got {dashes}"
-            );
-            assert_ne!(prop("animation-name"), "none", "the segment orbits the rim");
+        // The requested Sidequest treatment is a masked gradient, not SVG
+        // dashes. Keep guarding the visible hairline and rounded, empty center.
+        let style = window.get_computed_style(&ring_el).unwrap().unwrap();
+        let prop = |name: &str| style.get_property_value(name).unwrap();
+        assert!(
+            prop("background-image").contains("linear-gradient"),
+            "the rim must shimmer with a smooth gradient, not a glowing dash"
+        );
+        assert!(
+            prop("background-image").contains("rgb(74, 158, 255)"),
+            "retain Tyde's blue instead of Sidequest's white"
+        );
+        assert_eq!(prop("background-size"), "200% 100%");
+        assert_eq!(prop("filter"), "none", "no glowing orbit");
+        // Chrome computes one composite per mask layer: "exclude, exclude".
+        assert_eq!(
+            prop("mask-composite"),
+            "exclude, exclude",
+            "leave the center clear"
+        );
+        assert!(prop("mask-clip").starts_with("content-box"));
+        assert_eq!(prop("mask-image").matches("linear-gradient").count(), 2);
+        for edge in ["top", "right", "bottom", "left"] {
+            assert_eq!(prop(&format!("padding-{edge}")), "1px", "a hairline rim");
         }
+        let radius: f64 = prop("border-top-left-radius")
+            .trim_end_matches("px")
+            .parse()
+            .expect("rim radius in px");
+        assert_eq!(radius, capsule_radius, "follow the capsule's corners");
+        assert_eq!(prop("pointer-events"), "none", "do not block composing");
+        assert_ne!(prop("animation-name"), "none");
+        assert_eq!(prop("animation-duration"), "1.6s");
+        assert_eq!(prop("animation-timing-function"), "ease-in-out");
+        assert_eq!(prop("animation-iteration-count"), "infinite");
 
         state.agent_turn_active.update(|m| {
             m.remove(&agent_ref);
