@@ -263,6 +263,7 @@ pub fn SettingsView() -> impl IntoView {
                 <h1 class="view-title">"Settings"</h1>
             </div>
             <div class="view-body settings-body">
+                <div class="shell-flow">
                 <section class="settings-section" data-mobile-test="settings-appearance">
                     <h2 class="settings-section-title">"Appearance"</h2>
                     <div class="settings-group">
@@ -439,6 +440,7 @@ pub fn SettingsView() -> impl IntoView {
                         </SettingsRow>
                     </div>
                 </section>
+                </div>
             </div>
         </div>
     }

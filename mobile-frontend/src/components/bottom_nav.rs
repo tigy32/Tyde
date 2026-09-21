@@ -39,7 +39,7 @@ pub fn BottomNav() -> impl IntoView {
 
     view! {
         <nav
-            class="bottom-nav"
+            class="bottom-nav tws-tabs"
             role="tablist"
             aria-label="Primary navigation"
             data-mobile-test="bottom-nav"

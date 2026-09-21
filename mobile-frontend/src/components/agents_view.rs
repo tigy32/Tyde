@@ -91,6 +91,7 @@ pub fn AgentsView() -> impl IntoView {
 
     view! {
         <div class="view agents-view" data-mobile-test="agents-view">
+            <div class="shell-header tws-header">
             <header class="view-header">
                 <h1 class="view-title">"Agents"</h1>
                 <Button
@@ -131,13 +132,16 @@ pub fn AgentsView() -> impl IntoView {
                     }
                 }
             </div>
+            </div>
             <div class="view-body">
+                <div class="shell-flow">
                 {move || {
                     if segment.get() == AgentsSegment::Teams {
                         return view! { <TeamsView /> }.into_any();
                     }
                     render_agents_body(&state, hide_sub_agents, collapsed_parents)
                 }}
+                </div>
             </div>
         </div>
     }

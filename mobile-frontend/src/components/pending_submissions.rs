@@ -571,7 +571,7 @@ pub fn AgentPendingSubmissions(agent_ref: AgentRef) -> impl IntoView {
         {move || {
             let rows = records.get();
             if rows.is_empty() {
-                return view! { <div></div> }.into_any();
+                return ().into_any();
             }
             view! {
                 // These rows materialise without the user doing anything, so a

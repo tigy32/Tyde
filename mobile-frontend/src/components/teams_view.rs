@@ -18,6 +18,7 @@ pub fn TeamsView() -> impl IntoView {
     view! {
         <div class="teams-view" data-mobile-test="teams-view">
             <div class="view-body">
+                <div class="shell-flow">
                 {move || {
                     let Some(host) = state.active_local_host_id.get() else {
                         return view! {
@@ -53,6 +54,7 @@ pub fn TeamsView() -> impl IntoView {
                         </div>
                     }.into_any()
                 }}
+                </div>
             </div>
         </div>
     }

@@ -17,7 +17,7 @@
 //
 // Bump LOADER_CACHE when the precache list or shell logic changes.
 
-const LOADER_CACHE = "tyde-loader-v8";
+const LOADER_CACHE = "tyde-loader-v9";
 const BUNDLE_CACHE = "tyde-bundle-v1"; // shared with loader.js
 
 // Paths are relative to the SW scope (`/tyde/`).

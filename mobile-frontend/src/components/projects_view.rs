@@ -44,6 +44,7 @@ pub fn ProjectsView() -> impl IntoView {
                 <h1 class="view-title">"Projects"</h1>
             </header>
             <div class="view-body">
+                <div class="shell-flow">
                 {move || {
                     let active_host = state.active_local_host_id.get();
                     let projects: Vec<_> = state
@@ -306,6 +307,7 @@ pub fn ProjectsView() -> impl IntoView {
                         }}
                     }.into_any()
                 }}
+                </div>
             </div>
         </div>
     }

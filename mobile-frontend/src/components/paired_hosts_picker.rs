@@ -30,6 +30,7 @@ pub fn PairedHostsPicker() -> impl IntoView {
                 <h1 class="view-title">"Pick a Host"</h1>
             </div>
             <div class="view-body">
+                <div class="shell-flow">
                 {move || {
                     let hosts = state_for_rows.paired_hosts.get();
                     if hosts.is_empty() {
@@ -154,6 +155,7 @@ pub fn PairedHostsPicker() -> impl IntoView {
                     class="picker-pair-another"
                     on_click=on_pair_another
                 />
+                </div>
             </div>
         </div>
     }

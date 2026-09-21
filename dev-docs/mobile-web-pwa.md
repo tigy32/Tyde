@@ -96,3 +96,54 @@ MQTT implementation or transport fallback. Mobile fetch deadlines, foreground
 recovery and the manual Reconnect control cancel stalled attempts. Production
 behavior is covered through real DOM, service HTTP and TURN/server boundaries
 in `./dev.sh check`.
+
+## Shared mobile layout
+
+The Rust/Leptos UI imports Tyggs Web Shell through `wasm-bindgen`; it does not
+copy the viewport algorithm. The pinned revision is
+`78dfe04bd2ca60dd3c101875e1f4443fa9566e7a`, from Tychat's checked-in archive.
+`mobile-frontend/vendor/web-shell/PROVENANCE.md` records its checksum. The
+unmodified JS is a local wasm-bindgen module, so Trunk includes it under each
+versioned bundle and the existing executable-integrity manifest covers it.
+The shared CSS loads before Tyde's appearance styles.
+
+`mobile-frontend/src/shell.rs` attaches one document owner after mounting and
+rebinds only when navigation replaces its header, scroller, or bottom region.
+Component cleanup disconnects the navigation observer and destroys the owner.
+Keyboard changes never remount the textarea. The shared textarea helper owns
+composer sizing; programmatic draft updates synchronize the native field before
+notifying it. Queued-message editing retains its separate existing behavior.
+
+The shared shell owns viewport geometry, safe areas, covered tabs, and measured
+composer priority. Tyde supplies nested pane layout and glass appearance.
+Measured start/end clearance is applied once, to the scroller's inner flow,
+not to the scroller's own box. An empty pending-submission surface renders no
+layout item. `followEnd: false` leaves transcript history anchoring with Tyde.
+There is no legacy app-height controller or SafeArea wrapper alongside it.
+
+The app-surface browser test exercises real mounted components through iframe
+resizes (including 51px), draft/focus/selection retention, end clearance,
+reading-history anchoring, all tabs, compact tab coverage/restoration, and
+unmount cleanup. Existing composer, queued-editor, and transcript tests remain
+part of `./dev.sh check`. The migration exposed and fixed programmatic draft
+notification ordering, queued-editor CSS inheritance, and a compact footer gap
+from an empty pending-submission element. These are DOM integration checks,
+not evidence of native keyboard or existing-installation acceptance.
+
+### Existing-installation acceptance still required
+
+The document uses zoom-enabled viewport metadata with
+`interactive-widget=resizes-content`, `viewport-fit=cover`, and the standard
+`apple-mobile-web-app-status-bar-style=default`. The loader cache revision is
+advanced; IndexedDB, pairing identities, bundle selection, and transport are
+unchanged. Do not clear storage, unregister the worker, or reinstall to test it.
+
+After the approved release is deployed, open the existing Home Screen icon and
+verify the matching host/bundle version, retained pairings, and metadata update.
+Exercise alphabet/emoji/search transitions without blurring, multiline drafts,
+dismissal, history reading, rotation, background/resume, and lock/unlock. Check
+visible pixels and touch reachability, including covered/restored tabs and the
+absence of an extra message gap. Record hardware, OS, browser, and release.
+Library device coverage does not certify Tyde's integration. Intermittent
+startup/storage failures and Tychat's separate spacing deployment are not
+claimed resolved by this migration.

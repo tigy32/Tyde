@@ -1,0 +1,37 @@
+{
+  "name": "@tyggs/web-shell",
+  "version": "0.1.0-alpha.1",
+  "private": true,
+  "description": "Shared floating-glass PWA shell for Tyggs web applications",
+  "license": "UNLICENSED",
+  "type": "module",
+  "main": "./dist/shell.js",
+  "types": "./dist/shell.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/shell.d.ts",
+      "import": "./dist/shell.js"
+    },
+    "./shell.css": "./dist/shell.css"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "tsc && node scripts/build.mjs",
+    "dev": "node scripts/serve.mjs",
+    "test": "playwright test",
+    "check": "npm run build && tsc -p tsconfig.demo.json && tsc -p tsconfig.tests.json && npm test",
+    "check:rust": "npm run build && bash scripts/build-rust.sh && TWS_RUST=1 playwright test tests/rust.spec.ts"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.62.1",
+    "@types/node": "24.13.3",
+    "typescript": "6.0.3"
+  }
+}

@@ -1,6 +1,6 @@
 use crate::components::ui::{
-    Button, ButtonSize, ButtonVariant, Card, EmptyState, Pill, PillTone, SafeArea, Skeleton,
-    StatusDot, StatusTone,
+    Button, ButtonSize, ButtonVariant, Card, EmptyState, Pill, PillTone, Skeleton, StatusDot,
+    StatusTone,
 };
 use crate::state::{ActiveAgentRef, AgentInfo, AppState, ConnectionStatus, MobileTab};
 use leptos::prelude::*;
@@ -146,179 +146,179 @@ pub fn HomeView() -> impl IntoView {
     let initial_loading = move || s_loading.host_snapshot_pending();
 
     view! {
-        <SafeArea inset_top=true inset_bottom=false data_mobile_test="home-safe-area">
         <div class="view home-view" data-mobile-test="home-view">
-            <header class="home-hero">
-                <p class="home-hero-greeting">"Welcome back"</p>
-                <h1 class="home-hero-host">
-                    {move || {
-                        let (_, _, pill_tone, pill_label) = connection_tone.get();
-                        view! {
-                            <span>{host_label}</span>
-                            <Pill
-                                label=pill_label.to_string()
-                                tone=pill_tone
-                                data_mobile_test="home-connection-pill"
-                            />
-                        }
-                    }}
-                </h1>
-                <div class="home-hero-status" data-mobile-test="home-hero-status">
-                    {move || {
-                        let (dot, label, _, _) = connection_tone.get();
-                        view! {
-                            <StatusDot
-                                label=label.to_string()
-                                tone=dot
-                                data_mobile_test="home-status-dot"
-                            />
-                            <span class="home-hero-status-label">{label}</span>
-                        }
-                    }}
-                </div>
-            </header>
-
-            {move || {
-                if !has_active_host() {
-                    view! {
-                        <EmptyState
-                            title="No host connected"
-                            body="Pair a Tyde desktop to bring agent chats and sessions onto your phone."
-                            icon="\u{1F517}"
-                            data_mobile_test="home-empty-no-host"
-                        />
-                    }
-                    .into_any()
-                } else if initial_loading() {
-                    // Server hasn't pushed HostSettings yet — show a
-                    // skeleton so the dashboard doesn't pop in.
-                    view! {
-                        <div class="home-grid" data-mobile-test="home-loading">
-                            <Skeleton width="100%".to_string() height="64px".to_string() rounded=false />
-                            <Skeleton width="100%".to_string() height="64px".to_string() rounded=false />
-                            <Skeleton width="100%".to_string() height="64px".to_string() rounded=false />
-                            <Skeleton width="100%".to_string() height="64px".to_string() rounded=false />
-                        </div>
-                    }.into_any()
-                } else {
-                    view! {
-                        <div class="home-grid" data-mobile-test="home-stats">
-                            <Card data_mobile_test="home-stat-agents" dense=true>
-                                <div class="home-stat-card">
-                                    <div class="home-stat-value">{active_agent_count}</div>
-                                    <p class="home-stat-label">"Active agents"</p>
-                                </div>
-                            </Card>
-                            <Card data_mobile_test="home-stat-sessions" dense=true>
-                                <div class="home-stat-card">
-                                    <div class="home-stat-value">{session_count}</div>
-                                    <p class="home-stat-label">"Sessions"</p>
-                                </div>
-                            </Card>
-                            <Card data_mobile_test="home-stat-host" dense=true>
-                                <div class="home-stat-card">
-                                    <div class="home-stat-value" style="font-size: var(--text-lg);">
-                                        {move || {
-                                            let (_, label, _, _) = connection_tone.get();
-                                            label.to_string()
-                                        }}
-                                    </div>
-                                    <p class="home-stat-label">"Connection"</p>
-                                </div>
-                            </Card>
-                        </div>
-
-                        <div class="home-quick-actions">
-                            <p class="home-quick-actions-title">"Quick actions"</p>
-                            <Button
-                                label="New chat"
-                                variant=ButtonVariant::Primary
-                                size=ButtonSize::Large
-                                full_width=true
-                                data_mobile_test="home-new-chat"
-                                on_click=on_new_chat
-                            />
-                            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: var(--space-2);">
-                                <Button
-                                    label="Agents"
-                                    variant=ButtonVariant::Secondary
-                                    full_width=true
-                                    data_mobile_test="home-view-agents"
-                                    on_click=on_view_agents
-                                />
-                                <Button
-                                    label="Sessions"
-                                    variant=ButtonVariant::Secondary
-                                    full_width=true
-                                    data_mobile_test="home-view-sessions"
-                                    on_click=on_view_sessions
-                                />
-                            </div>
-                        </div>
-                    }
-                    .into_any()
-                }
-            }}
-
-            {move || {
-                let agents = recent_agents();
-                if agents.is_empty() || !has_active_host() {
-                    None
-                } else {
-                    let s = state.clone();
-                    Some(view! {
-                        <div class="section-heading">
-                            <span>"Active agents"</span>
-                            <span class="section-heading-trailing">
+            <div class="shell-flow">
+                <header class="home-hero">
+                    <p class="home-hero-greeting">"Welcome back"</p>
+                    <h1 class="home-hero-host">
+                        {move || {
+                            let (_, _, pill_tone, pill_label) = connection_tone.get();
+                            view! {
+                                <span>{host_label}</span>
                                 <Pill
-                                    label=format!("{}", agents.len())
-                                    tone=PillTone::Accent
-                                    data_mobile_test="home-active-count"
+                                    label=pill_label.to_string()
+                                    tone=pill_tone
+                                    data_mobile_test="home-connection-pill"
                                 />
-                            </span>
-                        </div>
-                        <div class="agent-list compact" data-mobile-test="home-recent-agents">
-                            {agents.into_iter().map(|agent| {
-                                let agent_id = agent.agent_id.clone();
-                                let host_id = agent.local_host_id.clone();
-                                let name = agent.name.clone();
-                                let backend = format!("{:?}", agent.backend_kind);
-                                let s_row = s.clone();
-                                let on_click = Callback::new(move |_: ()| {
-                                    s_row.active_agent.set(Some(ActiveAgentRef {
-                                        local_host_id: host_id.clone(),
-                                        agent_id: agent_id.clone(),
-                                    }));
-                                    s_row.viewing_chat.set(true);
-                                });
-                                view! {
-                                    <Card
-                                        data_mobile_test="home-recent-agent-row"
-                                        interactive=true
-                                        dense=true
-                                        on_click=on_click
-                                        aria_label=format!("Open chat with {name}")
-                                    >
-                                        <div class="list-row list-row-flush">
-                                            <StatusDot
-                                                label="Active".to_string()
-                                                tone=StatusTone::Active
-                                            />
-                                            <div class="list-row-primary">
-                                                <div class="list-row-title">{name}</div>
-                                                <div class="list-row-subtitle">{backend}</div>
-                                            </div>
-                                            <span class="list-row-chevron" aria-hidden="true">"\u{203A}"</span>
+                            }
+                        }}
+                    </h1>
+                    <div class="home-hero-status" data-mobile-test="home-hero-status">
+                        {move || {
+                            let (dot, label, _, _) = connection_tone.get();
+                            view! {
+                                <StatusDot
+                                    label=label.to_string()
+                                    tone=dot
+                                    data_mobile_test="home-status-dot"
+                                />
+                                <span class="home-hero-status-label">{label}</span>
+                            }
+                        }}
+                    </div>
+                </header>
+
+                {move || {
+                    if !has_active_host() {
+                        view! {
+                            <EmptyState
+                                title="No host connected"
+                                body="Pair a Tyde desktop to bring agent chats and sessions onto your phone."
+                                icon="\u{1F517}"
+                                data_mobile_test="home-empty-no-host"
+                            />
+                        }
+                        .into_any()
+                    } else if initial_loading() {
+                        // Server hasn't pushed HostSettings yet — show a
+                        // skeleton so the dashboard doesn't pop in.
+                        view! {
+                            <div class="home-grid" data-mobile-test="home-loading">
+                                <Skeleton width="100%".to_string() height="64px".to_string() rounded=false />
+                                <Skeleton width="100%".to_string() height="64px".to_string() rounded=false />
+                                <Skeleton width="100%".to_string() height="64px".to_string() rounded=false />
+                                <Skeleton width="100%".to_string() height="64px".to_string() rounded=false />
+                            </div>
+                        }.into_any()
+                    } else {
+                        view! {
+                            <div class="home-grid" data-mobile-test="home-stats">
+                                <Card data_mobile_test="home-stat-agents" dense=true>
+                                    <div class="home-stat-card">
+                                        <div class="home-stat-value">{active_agent_count}</div>
+                                        <p class="home-stat-label">"Active agents"</p>
+                                    </div>
+                                </Card>
+                                <Card data_mobile_test="home-stat-sessions" dense=true>
+                                    <div class="home-stat-card">
+                                        <div class="home-stat-value">{session_count}</div>
+                                        <p class="home-stat-label">"Sessions"</p>
+                                    </div>
+                                </Card>
+                                <Card data_mobile_test="home-stat-host" dense=true>
+                                    <div class="home-stat-card">
+                                        <div class="home-stat-value" style="font-size: var(--text-lg);">
+                                            {move || {
+                                                let (_, label, _, _) = connection_tone.get();
+                                                label.to_string()
+                                            }}
                                         </div>
-                                    </Card>
-                                }
-                            }).collect::<Vec<_>>()}
-                        </div>
-                    })
-                }
-            }}
+                                        <p class="home-stat-label">"Connection"</p>
+                                    </div>
+                                </Card>
+                            </div>
+
+                            <div class="home-quick-actions">
+                                <p class="home-quick-actions-title">"Quick actions"</p>
+                                <Button
+                                    label="New chat"
+                                    variant=ButtonVariant::Primary
+                                    size=ButtonSize::Large
+                                    full_width=true
+                                    data_mobile_test="home-new-chat"
+                                    on_click=on_new_chat
+                                />
+                                <div style="display: grid; grid-template-columns: 1fr 1fr; gap: var(--space-2);">
+                                    <Button
+                                        label="Agents"
+                                        variant=ButtonVariant::Secondary
+                                        full_width=true
+                                        data_mobile_test="home-view-agents"
+                                        on_click=on_view_agents
+                                    />
+                                    <Button
+                                        label="Sessions"
+                                        variant=ButtonVariant::Secondary
+                                        full_width=true
+                                        data_mobile_test="home-view-sessions"
+                                        on_click=on_view_sessions
+                                    />
+                                </div>
+                            </div>
+                        }
+                        .into_any()
+                    }
+                }}
+
+                {move || {
+                    let agents = recent_agents();
+                    if agents.is_empty() || !has_active_host() {
+                        None
+                    } else {
+                        let s = state.clone();
+                        Some(view! {
+                            <div class="section-heading">
+                                <span>"Active agents"</span>
+                                <span class="section-heading-trailing">
+                                    <Pill
+                                        label=format!("{}", agents.len())
+                                        tone=PillTone::Accent
+                                        data_mobile_test="home-active-count"
+                                    />
+                                </span>
+                            </div>
+                            <div class="agent-list compact" data-mobile-test="home-recent-agents">
+                                {agents.into_iter().map(|agent| {
+                                    let agent_id = agent.agent_id.clone();
+                                    let host_id = agent.local_host_id.clone();
+                                    let name = agent.name.clone();
+                                    let backend = format!("{:?}", agent.backend_kind);
+                                    let s_row = s.clone();
+                                    let on_click = Callback::new(move |_: ()| {
+                                        s_row.active_agent.set(Some(ActiveAgentRef {
+                                            local_host_id: host_id.clone(),
+                                            agent_id: agent_id.clone(),
+                                        }));
+                                        s_row.viewing_chat.set(true);
+                                    });
+                                    view! {
+                                        <Card
+                                            data_mobile_test="home-recent-agent-row"
+                                            interactive=true
+                                            dense=true
+                                            on_click=on_click
+                                            aria_label=format!("Open chat with {name}")
+                                        >
+                                            <div class="list-row list-row-flush">
+                                                <StatusDot
+                                                    label="Active".to_string()
+                                                    tone=StatusTone::Active
+                                                />
+                                                <div class="list-row-primary">
+                                                    <div class="list-row-title">{name}</div>
+                                                    <div class="list-row-subtitle">{backend}</div>
+                                                </div>
+                                                <span class="list-row-chevron" aria-hidden="true">"\u{203A}"</span>
+                                            </div>
+                                        </Card>
+                                    }
+                                }).collect::<Vec<_>>()}
+                            </div>
+                        })
+                    }
+                }}
+            </div>
         </div>
-        </SafeArea>
     }
 }
 

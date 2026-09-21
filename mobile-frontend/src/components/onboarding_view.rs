@@ -30,6 +30,7 @@ pub fn OnboardingView() -> impl IntoView {
                 <h1 class="view-title">"Welcome to Tyde"</h1>
             </div>
             <div class="view-body">
+                <div class="shell-flow">
                 <div class="onboarding-instructions">
                     <h2 class="onboarding-step">"1. Open Tyde on your computer"</h2>
                     // Mobile pairing lives under Settings → **Mobile** (the tab
@@ -72,6 +73,7 @@ pub fn OnboardingView() -> impl IntoView {
                         full_width=true
                         on_click=on_paste
                     />
+                </div>
                 </div>
             </div>
         </div>

@@ -20,28 +20,8 @@
     /* Inset the floating chrome (header capsule, tab dock, composer) keeps
        from the screen edges. One token so they stay on the same rails. */
     --chrome-gutter: 12px;
-    /* The layout height a floating top capsule occupies: the gap above it, the
-       capsule, and the gap below. Scrollers cancel it with a negative margin so
-       their content runs underneath, and add it back as padding so nothing
-       starts life hidden. */
-    --top-chrome-height: calc(var(--space-2) + var(--header-height) + var(--space-2));
     --safe-area-top: env(safe-area-inset-top, 0px);
     --safe-area-bottom: env(safe-area-inset-bottom, 0px);
-    /* The home-indicator inset only needs clearing while it is actually on
-       screen. With the keyboard up the keyboard covers it, so reserving it
-       again would float the composer above a dead band. */
-    --active-safe-area-bottom: var(--safe-area-bottom);
-    /* How far the bottom capsules ride above the screen edge. The home
-       indicator has to stay clear, but reserving the whole inset under a
-       capsule that is already floating reads as a dead band, so the capsule
-       sits just inside it. */
-    --bottom-chrome-inset: max(var(--space-2), calc(var(--active-safe-area-bottom) - var(--space-2)));
-    /* The tab dock's full layout height, including the gaps it floats in. */
-    --bottom-nav-height: calc(var(--space-2) + var(--nav-height) + var(--bottom-chrome-inset));
-}
-
-html[data-keyboard-open] {
-    --active-safe-area-bottom: 0px;
 }
 
 [data-theme="dark"] {
@@ -149,9 +129,7 @@ html, body {
 }
 
 body {
-    /* The recovered app can exceed iOS’s percentage-height containing block.
-       Grow this clipping ancestor with it so the composer stays paintable. */
-    height: auto;
+    height: 100%;
     background: var(--bg-base);
     color: var(--text-primary);
 }
@@ -175,42 +153,16 @@ input, textarea, select {
 .mobile-app {
     display: flex;
     flex-direction: column;
-    height: 100vh;
-    height: 100dvh;
-    /* Home-screen (standalone) launches can compute 100dvh short of the
-       real visible viewport, stranding the bottom nav above a dead band.
-       The app measures the visual viewport at mount and publishes it as
-       --app-height (main.rs install_app_height_probe); max() lets that
-       measurement recover the missing height.
-       Viewport units only — percentage heights have no resolvable chain in
-       the production loader page, which drops the bundle's index.html. */
-    height: max(100dvh, var(--app-height, 0px));
     min-height: 0;
     overflow: hidden;
-    padding-top: var(--safe-area-top);
+    --tws-ink: var(--text-primary);
+    --tws-focus: var(--accent-primary);
     background: var(--bg-base);
     /* The shell states its own colour rather than inheriting one from the page
        it was mounted into: the theme lives on this element, so anything the
        host page set (the bundle's boot screen carries a hard-coded dark
        `data-theme`) would otherwise win for every element that only inherits. */
     color: var(--text-primary);
-}
-
-/* Software keyboard up. iOS WebKit ignores interactive-widget=resizes-content
-   (that key is a Chromium-only mitigation): it leaves the layout viewport — and
-   therefore 100dvh — at full screen height and shrinks only the VISUAL
-   viewport. The max() floor above would then hold the composer underneath the
-   keyboard, and WebKit pans the entire app off screen to reach the caret. With
-   the keyboard up the measurement is the truth rather than a floor, so the
-   shell ends exactly at the keyboard and the transcript stays the only
-   scroller.
-
-   main.rs sets data-keyboard-open only while more than 100px of the layout
-   viewport's bottom edge is occluded in the current sample, so a short
-   standalone-launch reading is never mistaken for a keyboard and still takes
-   the max() path above. */
-html[data-keyboard-open] .mobile-app {
-    height: var(--app-height, 100dvh);
 }
 
 /* ── Floating chrome ────────────────────────────────────────────────── */
@@ -251,63 +203,6 @@ html[data-keyboard-open] .mobile-app {
         backdrop-filter: saturate(180%) blur(20px);
         -webkit-backdrop-filter: saturate(180%) blur(20px);
     }
-}
-
-/* The iOS "scroll edge" fade: content dissolves into the base colour as it
-   passes behind a capsule instead of sliding out from under it mid-glyph.
-   It belongs to the surface the chrome floats over, not to the capsule — a
-   pseudo-element inside a capsule paints over that capsule's own background,
-   which would erase the glass it is there to protect. Sits at z-index 2:
-   above the scroller, below the capsules at 3. */
-.view,
-.mobile-content {
-    position: relative;
-}
-
-.view:has(> .view-header)::before,
-.chat-view::before,
-.mobile-content:has(~ .bottom-nav)::after,
-.chat-view::after {
-    content: "";
-    position: absolute;
-    left: 0;
-    right: 0;
-    z-index: 2;
-    pointer-events: none;
-}
-
-.view:has(> .view-header)::before,
-.chat-view::before {
-    top: 0;
-    height: calc(var(--view-top-chrome) + var(--space-4));
-    background: linear-gradient(
-        to bottom,
-        var(--bg-base) 0%,
-        var(--bg-base) 70%,
-        transparent 100%
-    );
-}
-
-.mobile-content:has(~ .bottom-nav)::after {
-    bottom: 0;
-    height: calc(var(--bottom-nav-height) + var(--space-4));
-    background: linear-gradient(
-        to top,
-        var(--bg-base) 0%,
-        var(--bg-base) 70%,
-        transparent 100%
-    );
-}
-
-.chat-view::after {
-    bottom: 0;
-    height: calc(var(--chat-dock-height, 0px) + var(--space-4));
-    background: linear-gradient(
-        to top,
-        var(--bg-base) 0%,
-        var(--bg-base) 70%,
-        transparent 100%
-    );
 }
 
 /* ── Mobile Shell Error Banner ──────────────────────────────────────── */
@@ -544,21 +439,12 @@ html[data-keyboard-open] .mobile-app {
 
 /* ── Bottom Navigation ──────────────────────────────────────────────── */
 
-/* The dock stays in the shell's flex column — so the keyboard/viewport height
-   math above is untouched — but hands back every pixel it occupies through a
-   negative top margin. The content above it therefore grows to the full shell
-   and the dock floats over its last rows; `.view-body` pads itself by
-   --bottom-nav-height so no list ends underneath it. */
 .bottom-nav {
-    display: flex;
     align-items: stretch;
     gap: var(--space-1);
     height: var(--nav-height);
     flex-shrink: 0;
-    margin:
-        calc(-1 * (var(--nav-height) + var(--bottom-chrome-inset)))
-        var(--chrome-gutter)
-        var(--bottom-chrome-inset);
+    margin: 0;
     padding: var(--space-1);
     border-radius: var(--radius-full);
     box-shadow: var(--rim-float), var(--shadow-float);
@@ -606,8 +492,8 @@ html[data-keyboard-open] .mobile-app {
 /* ── View ───────────────────────────────────────────────────────────── */
 
 .view {
-    display: flex;
-    flex-direction: column;
+    display: grid;
+    grid-template: minmax(0, 1fr) / minmax(0, 1fr);
     height: 100%;
     min-height: 0;
     overflow: hidden;
@@ -619,7 +505,7 @@ html[data-keyboard-open] .mobile-app {
     justify-content: space-between;
     gap: var(--space-2);
     height: var(--header-height);
-    margin: var(--space-2) var(--chrome-gutter);
+    margin: max(var(--tws-gap), var(--tws-safe-top)) calc(var(--tws-edge) + var(--tws-safe-right)) 0 calc(var(--tws-edge) + var(--tws-safe-left));
     padding: 0 var(--space-1) 0 var(--space-4);
     border-radius: var(--radius-full);
     box-shadow: var(--rim-float), var(--shadow-float);
@@ -660,38 +546,19 @@ html[data-keyboard-open] .mobile-app {
     overflow-y: auto;
     overflow-x: hidden;
     -webkit-overflow-scrolling: touch;
-    padding: var(--space-2) var(--space-4) var(--space-4);
-    /* Clears the tab dock, which floats over the bottom of every tab view.
-       Views reached without the dock (pairing, onboarding) simply end with
-       more room under their last row. */
-    padding-bottom: calc(var(--space-4) + var(--bottom-nav-height));
-    scroll-padding-bottom: var(--bottom-nav-height);
+    padding: 0;
 }
 
-/* Each view names the top chrome its body has to clear: the header capsule,
-   plus whatever second row the view floats beneath it. */
-.view {
-    --view-top-chrome: var(--top-chrome-height);
+.shell-header .view-header { margin: 0; }
+.shell-header .agents-segmented, .shell-header .search-bar { margin-inline: 0; }
+.shell-bottom { position: absolute; inset-inline: 0; bottom: 0; }
+.home-view {
+    display: flex;
+    flex-direction: column;
+    overflow-y: auto;
+    padding: 0;
 }
-
-.agents-view {
-    --view-top-chrome: calc(
-        var(--top-chrome-height) + var(--button-height-compact) + var(--space-2) + var(--space-2)
-    );
-}
-
-.sessions-view {
-    --view-top-chrome: calc(var(--top-chrome-height) + var(--search-bar-height));
-}
-
-/* The scroller reclaims the space the top chrome took in the flex column so
-   its content passes behind the capsules, then pads the same amount back so
-   the first row still starts below them. */
-.view:has(> .view-header) > .view-body {
-    margin-top: calc(-1 * var(--view-top-chrome));
-    padding-top: calc(var(--view-top-chrome) + var(--space-2));
-    scroll-padding-top: var(--view-top-chrome);
-}
+.home-view > * { flex-shrink: 0; }
 
 .view-loading {
     display: flex;
@@ -1300,7 +1167,7 @@ html[data-keyboard-open] .mobile-app {
     display: flex;
     align-items: center;
     height: var(--header-height);
-    margin: var(--space-2) var(--chrome-gutter);
+    margin: max(var(--tws-gap), var(--tws-safe-top)) calc(var(--tws-edge) + var(--tws-safe-right)) 0 calc(var(--tws-edge) + var(--tws-safe-left));
     padding: 0 var(--space-2);
     border-radius: var(--radius-full);
     box-shadow: var(--rim-float), var(--shadow-float);
@@ -1488,34 +1355,16 @@ html[data-keyboard-open] .mobile-app {
     gap: var(--space-1);
 }
 
-/* The transcript is the only scroller in a chat, and it runs the full height
-   of the view: it reclaims the header's row with a negative margin and clears
-   the floating dock at the other end with padding. --chat-dock-height is
-   published by `chat_view.rs` (the dock grows with attachments, queued
-   messages and the new-chat options, so its height cannot be a constant). */
-.chat-messages {
-    flex: 1;
-    min-height: 0;
-    overflow-y: auto;
-    overscroll-behavior-y: contain;
-    -webkit-overflow-scrolling: touch;
-    margin-top: calc(-1 * var(--top-chrome-height));
-    padding:
-        calc(var(--top-chrome-height) + var(--space-2))
-        var(--space-2)
-        calc(var(--chat-dock-height, 0px) + var(--space-2));
-    scroll-padding-top: var(--top-chrome-height);
-    scroll-padding-bottom: var(--chat-dock-height, 0px);
-}
+/* The shared shell measures clearance; Tyde alone owns history anchoring. */
+.chat-messages { padding: 0; }
 
-/* The pending-submission surface and the composer travel together: one dock,
-   floating over the end of the transcript. The negative margin is its own
-   measured height, so the flex column hands the whole shell to the transcript
-   and the dock overlays the bottom of it. */
-.chat-bottom-dock {
-    flex-shrink: 0;
-    margin-top: calc(-1 * var(--chat-dock-height, 0px));
+.shell-flow { display: flow-root; }
+.tws-content > .shell-flow {
+    padding: var(--tws-clear-top, 12px) var(--space-4) var(--tws-clear-bottom, 12px);
 }
+.chat-messages > .shell-flow { padding-inline: var(--space-2); }
+
+.chat-bottom-dock { overflow: visible; }
 
 .chat-transcript {
     display: flex;
@@ -2314,7 +2163,8 @@ html[data-keyboard-open] .mobile-app {
 .chat-input-container {
     position: relative;
     flex-shrink: 0;
-    padding: var(--space-2) var(--chrome-gutter) var(--bottom-chrome-inset);
+    padding: 0;
+    display: block;
     background: transparent;
 }
 
@@ -2451,7 +2301,7 @@ html[data-keyboard-open] .mobile-app {
 }
 
 .activity-list {
-    max-height: min(340px, calc(var(--app-height, 100dvh) * 0.42));
+    max-height: min(340px, 42cqh);
     overflow-y: auto;
     overscroll-behavior: contain;
     padding: 12px 12px 16px;
@@ -2537,7 +2387,6 @@ html[data-keyboard-open] .mobile-app {
     display: flex;
     align-items: flex-end;
     gap: var(--space-1);
-    padding: var(--space-1);
     border-radius: var(--radius-xl);
     box-shadow: var(--rim-float), var(--shadow-float);
 }
@@ -2605,22 +2454,9 @@ html[data-keyboard-open] .mobile-app {
     font-size: var(--text-xs);
 }
 
-/* One line of text fills exactly --composer-control-height: 22px of line box
-   plus 9px above and below. The field and the send cluster are then the same
-   height, so the placeholder sits on the send label's midline instead of
-   riding low against a taller button. */
 .chat-input-field {
-    flex: 1;
-    min-height: var(--composer-control-height);
-    max-height: 132px;
-    padding: 9px var(--space-3);
     background: transparent;
-    border: none;
-    resize: none;
-    font-size: 16px;
-    line-height: 22px;
     outline: none;
-    overflow-y: hidden;
 }
 
 .chat-input-field:disabled {
@@ -2880,7 +2716,8 @@ html[data-keyboard-open] .mobile-app {
     gap: var(--space-2);
 }
 
-.chat-input-queued-textarea {
+.chat-input-container .chat-input-queued-textarea {
+    flex: none;
     box-sizing: border-box;
     width: 100%;
     min-height: 39px;
@@ -3314,7 +3151,7 @@ html[data-keyboard-open] .mobile-app {
     --button-height-compact: 40px;
     /* The composer's field and send cluster share one height so a single line
        of draft text is centred against the send label. */
-    --composer-control-height: 40px;
+    --composer-control-height: 44px;
     --button-height-icon: 44px;
     --button-pad-x: var(--space-4);          /* 16px */
     --button-pad-x-compact: var(--space-3);  /* 12px */
@@ -3647,19 +3484,6 @@ html[data-keyboard-open] .mobile-app {
     .ui-status-dot-active {
         animation: none;
     }
-}
-
-/* Safe area */
-.ui-safe-area {
-    width: 100%;
-}
-
-.ui-safe-area-top {
-    padding-top: var(--safe-area-top);
-}
-
-.ui-safe-area-bottom {
-    padding-bottom: var(--safe-area-bottom);
 }
 
 /* ── Polished feature surfaces (home, sessions, agents) ─────────────── */
@@ -5140,7 +4964,7 @@ html[data-keyboard-open] .mobile-app {
  * surface MUST be `flex-shrink: 0` — otherwise it gets crushed to nothing — and
  * it MUST cap its own height, or a handful of failed messages squeeze the
  * content (or the composer) off the screen entirely. The shell shrinks to the
- * visible viewport when the software keyboard opens (`html[data-keyboard-open]`
+ * visible viewport through the shared shell when the keyboard opens
  * above — NOT `100dvh`, which iOS WebKit leaves at full height), so the cap is
  * what keeps the composer reachable with the keyboard up.
  */

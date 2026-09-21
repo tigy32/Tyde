@@ -122,6 +122,7 @@ fn ScannerScreen() -> impl IntoView {
                 >"Cancel"</button>
             </div>
             <div class="view-body">
+                <div class="shell-flow">
                 // The QR lives under Settings → Mobile, not Settings → Hosts.
                 // `aria-label` carries the same path in words: the arrow is a
                 // visual breadcrumb, and screen readers announce it
@@ -163,6 +164,7 @@ fn ScannerScreen() -> impl IntoView {
                     data_mobile_test="pairing-scanner-paste"
                     on_click=on_paste
                 />
+                </div>
             </div>
         </div>
     }
@@ -207,6 +209,7 @@ fn ManualPasteScreen() -> impl IntoView {
                 >"Cancel"</button>
             </div>
             <div class="view-body">
+                <div class="shell-flow">
                 <textarea
                     class="pairing-paste-input"
                     rows=4
@@ -235,6 +238,7 @@ fn ManualPasteScreen() -> impl IntoView {
                         {move || if pending.get() { "Checking…" } else { "Continue" }}
                     </span>
                 </button>
+                </div>
             </div>
         </div>
     }
@@ -346,6 +350,7 @@ fn ServiceAuthScreen(
                 >"Cancel"</button>
             </div>
             <div class="view-body">
+                <div class="shell-flow">
                 {move || view! {
                     <ServiceAuthCard
                         auth=auth.get()
@@ -354,6 +359,7 @@ fn ServiceAuthScreen(
                         on_sign_in=on_sign_in
                     />
                 }}
+                </div>
             </div>
         </div>
     }
@@ -401,6 +407,7 @@ fn ServiceAuthStatusScreen(initial_auth: MobileServiceAuthState) -> impl IntoVie
                 >"Cancel"</button>
             </div>
             <div class="view-body">
+                <div class="shell-flow">
                 {move || view! {
                     <ServiceAuthCard
                         auth=auth.get()
@@ -409,6 +416,7 @@ fn ServiceAuthStatusScreen(initial_auth: MobileServiceAuthState) -> impl IntoVie
                         on_sign_in=on_sign_in
                     />
                 }}
+                </div>
             </div>
         </div>
     }
@@ -613,6 +621,7 @@ fn SelfHostedConfirmScreen(qr_uri: String, host_label: String) -> impl IntoView 
                 <h1 class="view-title">"Pair with this Tyde"</h1>
             </div>
             <div class="view-body">
+                <div class="shell-flow">
                 <div class="pairing-card" data-mobile-test="pairing-self-hosted-confirm">
                     <p class="pairing-card-title">{host_label}</p>
                     <p class="pairing-card-body">
@@ -629,6 +638,7 @@ fn SelfHostedConfirmScreen(qr_uri: String, host_label: String) -> impl IntoView 
                     variant=ButtonVariant::Secondary
                     on_click=on_cancel
                 />
+                </div>
             </div>
         </div>
     }
@@ -642,6 +652,7 @@ fn SelfHostedPairingScreen(host_label: String) -> impl IntoView {
                 <h1 class="view-title">"Pairing"</h1>
             </div>
             <div class="view-body">
+                <div class="shell-flow">
                 <div
                     class="pairing-card"
                     role="status"
@@ -649,6 +660,7 @@ fn SelfHostedPairingScreen(host_label: String) -> impl IntoView {
                 >
                     <Spinner />
                     <p class="pairing-card-body">{format!("Connecting to {host_label}…")}</p>
+                </div>
                 </div>
             </div>
         </div>
@@ -673,6 +685,7 @@ fn RepairRequiredScreen(message: String) -> impl IntoView {
                 <h1 class="view-title">"Re-pair required"</h1>
             </div>
             <div class="view-body">
+                <div class="shell-flow">
                 // Terminal, and unrecoverable without acting on what this says — so
                 // it is announced on arrival rather than left for the user to go
                 // looking for. The card wraps only the message, so nothing else is
@@ -697,6 +710,7 @@ fn RepairRequiredScreen(message: String) -> impl IntoView {
                     full_width=true
                     on_click=on_cancel
                 />
+                </div>
             </div>
         </div>
     }
@@ -719,6 +733,7 @@ fn FailedScreen(message: String) -> impl IntoView {
                 <h1 class="view-title">"Pairing failed"</h1>
             </div>
             <div class="view-body">
+                <div class="shell-flow">
                 <p
                     class="pairing-error"
                     role="alert"
@@ -738,6 +753,7 @@ fn FailedScreen(message: String) -> impl IntoView {
                     full_width=true
                     on_click=on_cancel
                 />
+                </div>
             </div>
         </div>
     }

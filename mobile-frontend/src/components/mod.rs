@@ -45,7 +45,10 @@ pub use settings_view::SettingsView;
 /// pseudo-elements — what the user actually sees — rather than class names.
 #[cfg(all(test, target_arch = "wasm32"))]
 pub(crate) mod test_styles {
-    const PROD_STYLES: &str = include_str!("../../styles.css");
+    const PROD_STYLES: &str = concat!(
+        include_str!("../../vendor/web-shell/shell.css"),
+        include_str!("../../styles.css")
+    );
 
     pub(crate) fn ensure_styles_loaded() {
         let document = web_sys::window().unwrap().document().unwrap();

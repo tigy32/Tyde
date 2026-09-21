@@ -65,9 +65,12 @@ pub fn FixtureApp() -> impl IntoView {
 fn AppSurface() -> impl IntoView {
     let state = use_context::<AppState>().unwrap();
     mirror_theme_to_document(state.clone());
+    let root = NodeRef::<leptos::html::Div>::new();
+    crate::shell::install(root);
     view! {
         <div
-            class="mobile-app"
+            class="mobile-app tws-shell"
+            node_ref=root
             data-theme=move || state.theme.get()
             data-mobile-fixture={
                 #[cfg(all(feature = "ui-fixtures", debug_assertions))]
@@ -76,6 +79,8 @@ fn AppSurface() -> impl IntoView {
                 { String::new() }
             }
         >
+            <header class="shell-empty-header" hidden />
+            <footer class="shell-empty-bottom" hidden />
             // Mounted in every app mode so a paste-failed-during-pairing or
             // listener-registration failure stays visible. (Phase C HIGH 4.)
             <components::MobileShellErrorBanner />
@@ -315,7 +320,9 @@ fn ActiveHostShell() -> impl IntoView {
             }}
         </div>
         <Show when=move || !state.viewing_chat.get()>
-            <components::BottomNav />
+            <footer class="shell-bottom tws-bottom">
+                <components::BottomNav />
+            </footer>
         </Show>
         // Outside the content column so the sheet covers the tab dock too: a
         // modal the user can navigate out from underneath is not modal.
@@ -1479,8 +1486,8 @@ mod wasm_tests {
         let frame_document = frame.content_document().unwrap();
         let style = frame_document.create_element("style").unwrap();
         style.set_text_content(Some(concat!(
-            include_str!("../styles.css"),
-            "\nhtml {height:793px; --app-height:852px;}"
+            include_str!("../vendor/web-shell/shell.css"),
+            include_str!("../styles.css")
         )));
         frame_document.body().unwrap().append_child(&style).unwrap();
         let container = document
@@ -1488,7 +1495,6 @@ mod wasm_tests {
             .unwrap()
             .dyn_into::<HtmlElement>()
             .unwrap();
-        container.set_class_name("mobile-app");
         frame_document
             .body()
             .unwrap()
@@ -1549,12 +1555,19 @@ mod wasm_tests {
                 tool_requests: Vec::new(),
             },
         );
+        let entry = state
+            .chat_messages
+            .with_untracked(|messages| messages[&agent_ref][0].clone());
+        for _ in 0..40 {
+            state.push_chat_message_entry(&agent_ref, entry.clone());
+        }
+        state.app_mode.set(AppMode::Workspace);
         state.viewing_chat.set(true);
         state.chat_input.set("preserved draft".to_owned());
         let state_for_mount = state.clone();
         let mount = mount_to(container.clone(), move || {
             provide_context(state_for_mount.clone());
-            view! { <ActiveHostShell /> }
+            view! { <AppSurface /> }
         });
         next_tick().await;
 
@@ -1589,41 +1602,158 @@ mod wasm_tests {
                 )
                 .is_some_and(|hit| send.contains(Some(&hit)))
         };
-        // Reproduce the old clipping ancestor: geometry alone still says the
-        // button is on screen, but hit testing proves it cannot be reached.
-        let body = frame_document.body().unwrap();
-        body.style().set_property("height", "100%").unwrap();
-        assert!(
-            !reachable(),
-            "the short body must reproduce the blocked composer"
+        wasm_bindgen_test::console_log!(
+            "Mounted shell geometry: shell={} send={} input={} content={}",
+            container
+                .query_selector(".mobile-app")
+                .unwrap()
+                .unwrap()
+                .outer_html()
+                .split('>')
+                .next()
+                .unwrap_or_default(),
+            send.get_bounding_client_rect().bottom(),
+            input.get_bounding_client_rect().bottom(),
+            transcript.get_bounding_client_rect().bottom()
         );
-        body.style().remove_property("height").unwrap();
+        assert!(reachable(), "the shared shell composer is reachable");
+        sleep(Duration::from_millis(100)).await;
+        let scroller: HtmlElement = container
+            .query_selector("[data-mobile-test='chat-messages']")
+            .unwrap()
+            .unwrap()
+            .unchecked_into();
+        scroller.set_scroll_top(scroller.scroll_height());
+        sleep(Duration::from_millis(100)).await;
+        let dock = container
+            .query_selector("[data-mobile-test='chat-bottom-dock']")
+            .unwrap()
+            .unwrap();
+        let clearance =
+            dock.get_bounding_client_rect().top() - transcript.get_bounding_client_rect().bottom();
+        wasm_bindgen_test::console_log!("Transcript end clearance={clearance}");
         assert!(
-            reachable(),
-            "the recovered composer must be visible and reachable"
+            (clearance - 12.0).abs() <= 1.0,
+            "exactly one measured end clearance, no empty typing spacer: {clearance}"
         );
-
-        // The iframe root is an HTMLElement from a different JS realm;
-        // parent-window instanceof checks reject that valid element.
-        let root: HtmlElement = frame_document.document_element().unwrap().unchecked_into();
-        root.set_attribute("data-keyboard-open", "").unwrap();
-        root.style().set_property("--app-height", "516px").unwrap();
-        next_tick().await;
+        scroller.set_scroll_top(100);
+        scroller
+            .dispatch_event(&web_sys::Event::new("scroll").unwrap())
+            .unwrap();
+        state.push_chat_message_entry(&agent_ref, entry);
+        sleep(Duration::from_millis(100)).await;
         assert!(
-            reachable(),
-            "the composer stays reachable above the keyboard"
+            (scroller.scroll_top() - 100).abs() <= 1,
+            "shared shell leaves history anchoring to Tyde"
         );
-        assert!(send.get_bounding_client_rect().bottom() <= 516.0);
-        root.remove_attribute("data-keyboard-open").unwrap();
-        root.style().set_property("--app-height", "852px").unwrap();
-        next_tick().await;
+        input.focus().unwrap();
+        input.set_selection_range(2, 8).unwrap();
+        let original_input = input.clone();
+        // Real iframe resizing replaces the retired controller's synthetic
+        // --app-height writes. It proves layout, not native IME coverage.
+        for (width, height) in [(393, 516), (852, 130), (852, 51), (393, 852)] {
+            frame
+                .set_attribute(
+                    "style",
+                    &format!("width:{width}px;height:{height}px;border:0"),
+                )
+                .unwrap();
+            sleep(Duration::from_millis(100)).await;
+            let current = container
+                .query_selector("[data-mobile-test='chat-input']")
+                .unwrap()
+                .unwrap();
+            assert!(
+                original_input.is_same_node(Some(&current)),
+                "resize must retain the actual textarea"
+            );
+            assert_eq!(input.value(), "preserved draft");
+            assert_eq!(input.selection_start().unwrap(), Some(2));
+            assert_eq!(input.selection_end().unwrap(), Some(8));
+            assert!(
+                reachable(),
+                "composer hit target is reachable at {width}x{height}"
+            );
+            wasm_bindgen_test::console_log!(
+                "Shell resize {width}x{height}: send_top={} send_bottom={} shell={} viewport={} document_h={}",
+                send.get_bounding_client_rect().top(),
+                send.get_bounding_client_rect().bottom(),
+                container
+                    .query_selector(".mobile-app")
+                    .unwrap()
+                    .unwrap()
+                    .get_attribute("style")
+                    .unwrap_or_default(),
+                frame
+                    .content_window()
+                    .unwrap()
+                    .visual_viewport()
+                    .unwrap()
+                    .height(),
+                frame_document.document_element().unwrap().client_height()
+            );
+            assert!(send.get_bounding_client_rect().bottom() <= f64::from(height));
+            assert!(
+                frame_document
+                    .active_element()
+                    .unwrap()
+                    .is_same_node(Some(&input))
+            );
+        }
+        input.blur().unwrap();
+        state.viewing_chat.set(false);
+        for tab in [
+            MobileTab::Home,
+            MobileTab::Agents,
+            MobileTab::Sessions,
+            MobileTab::Settings,
+        ] {
+            state.active_tab.set(tab);
+            sleep(Duration::from_millis(100)).await;
+            let nav = container
+                .query_selector("[data-mobile-test='bottom-nav']")
+                .unwrap()
+                .unwrap();
+            let bounds = nav.get_bounding_client_rect();
+            assert!(bounds.height() >= 44.0 && bounds.bottom() <= 852.0);
+            assert!(
+                frame_document
+                    .element_from_point(
+                        (bounds.x() + bounds.width() / 2.0) as f32,
+                        (bounds.bottom() - 6.0) as f32
+                    )
+                    .is_some_and(|hit| nav.contains(Some(&hit)))
+            );
+        }
+        frame
+            .set_attribute("style", "width:852px;height:130px;border:0")
+            .unwrap();
+        sleep(Duration::from_millis(100)).await;
+        let nav = container
+            .query_selector("[data-mobile-test='bottom-nav']")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            nav.get_bounding_client_rect().height(),
+            0.0,
+            "compact shell covers tabs rather than competing with content"
+        );
+        frame
+            .set_attribute("style", "width:393px;height:852px;border:0")
+            .unwrap();
+        sleep(Duration::from_millis(100)).await;
         assert!(
-            reachable(),
-            "closing the keyboard must not restore the clipping"
+            nav.get_bounding_client_rect().height() >= 44.0,
+            "tabs return after expansion"
         );
-        assert_eq!(input.value(), "preserved draft");
-
         drop(mount);
+        assert!(
+            !frame_document
+                .document_element()
+                .unwrap()
+                .has_attribute("data-tws-document"),
+            "unmount releases document ownership"
+        );
         frame.remove();
     }
 

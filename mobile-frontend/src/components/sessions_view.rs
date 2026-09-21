@@ -52,6 +52,7 @@ pub fn SessionsView() -> impl IntoView {
     let state_for_count = state.clone();
     view! {
         <div class="view sessions-view" data-mobile-test="sessions-view">
+            <div class="shell-header tws-header">
             <header class="view-header">
                 <h1 class="view-title">"Sessions"</h1>
                 {move || {
@@ -86,7 +87,9 @@ pub fn SessionsView() -> impl IntoView {
                     on:input=on_search_input
                 />
             </div>
+            </div>
             <div class="view-body">
+                <div class="shell-flow">
                 {move || {
                     let sessions = filtered.get();
                     if sessions.is_empty() {
@@ -259,6 +262,7 @@ pub fn SessionsView() -> impl IntoView {
                         </div>
                     }.into_any()
                 }}
+                </div>
             </div>
         </div>
     }

@@ -10,8 +10,6 @@ use crate::state::{
     AgentRef, AppState, LocalHostId, PendingSubmission, PendingSubmissionState, SubmissionTarget,
 };
 
-const CHAT_INPUT_MIN_HEIGHT_PX: i32 = 40;
-const CHAT_INPUT_MAX_HEIGHT_PX: i32 = 132;
 const QUEUED_EDIT_MIN_HEIGHT_PX: i32 = 39;
 const QUEUED_EDIT_MAX_HEIGHT_PX: i32 = 240;
 
@@ -1473,10 +1471,17 @@ pub fn ChatInput() -> impl IntoView {
     let send_for_menu = do_send.clone();
 
     let s_input = state.clone();
+    crate::shell::install_textarea(textarea_ref);
     let textarea_ref_for_effect = textarea_ref;
     Effect::new(move |_| {
-        let _ = s_input.chat_input.get();
+        let draft = s_input.chat_input.get();
         if let Some(textarea) = textarea_ref_for_effect.get() {
+            if textarea.value() != draft {
+                log::debug!(
+                    "Shared composer sizing: synchronizing programmatic draft before input notification"
+                );
+                textarea.set_value(&draft);
+            }
             resize_chat_input(&textarea);
         }
     });
@@ -1772,7 +1777,7 @@ pub fn ChatInput() -> impl IntoView {
 
     view! {
         <div
-            class="chat-input-container"
+            class="chat-input-container tws-composer"
             data-mobile-test="chat-input-container"
         >
             // The composer emptying itself is visible feedback for a sighted
@@ -1916,7 +1921,7 @@ pub fn ChatInput() -> impl IntoView {
                 </div>
             </Show>
             <crate::components::activity_drawer::ActivityDrawer />
-            <div class="chat-input-row" data-mobile-test="chat-input-capsule">
+            <div class="chat-input-row tws-composer" data-mobile-test="chat-input-capsule">
                 <Show when=move || is_running.get()>
                     <svg
                         class="chat-thinking-ring"
@@ -1952,8 +1957,9 @@ pub fn ChatInput() -> impl IntoView {
                     on:input=move |ev| {
                         let textarea = event_target::<web_sys::HtmlTextAreaElement>(&ev);
                         let val = textarea.value();
-                        s_input.chat_input.set(val);
-                        resize_chat_input(&textarea);
+                        if s_input.chat_input.get_untracked() != val {
+                            s_input.chat_input.set(val);
+                        }
                     }
                     on:keydown=on_keydown
                 />
@@ -2114,19 +2120,9 @@ pub fn ChatInput() -> impl IntoView {
 }
 
 fn resize_chat_input(textarea: &web_sys::HtmlTextAreaElement) {
-    let html_el: web_sys::HtmlElement = textarea.clone().unchecked_into();
-    let _ = textarea.set_attribute("style", "height: auto; overflow-y: hidden;");
-    let scroll_height = html_el.scroll_height();
-    let target_height = scroll_height.clamp(CHAT_INPUT_MIN_HEIGHT_PX, CHAT_INPUT_MAX_HEIGHT_PX);
-    let overflow = if scroll_height > CHAT_INPUT_MAX_HEIGHT_PX {
-        "auto"
-    } else {
-        "hidden"
-    };
-    let _ = textarea.set_attribute(
-        "style",
-        &format!("height: {target_height}px; overflow-y: {overflow};"),
-    );
+    if let Ok(event) = web_sys::Event::new("input") {
+        let _ = textarea.dispatch_event(&event);
+    }
 }
 
 fn resize_queued_editor(textarea: &web_sys::HtmlTextAreaElement) {
@@ -2751,7 +2747,10 @@ mod wasm_tests {
     }
 
     /// The real stylesheet, so geometry assertions measure what users see.
-    const PROD_STYLES: &str = include_str!("../../styles.css");
+    const PROD_STYLES: &str = concat!(
+        include_str!("../../vendor/web-shell/shell.css"),
+        include_str!("../../styles.css")
+    );
 
     fn ensure_styles_loaded() {
         let document = web_sys::window().unwrap().document().unwrap();
@@ -3437,6 +3436,17 @@ mod wasm_tests {
             ),
         );
         let grown_height = editor.get_bounding_client_rect().height();
+        console_log!(
+            "Queued editor geometry: one_line={} grown={} scroll={} client={} min={} max={} width={} style={}",
+            one_line_height,
+            grown_height,
+            editor.scroll_height(),
+            editor.client_height(),
+            computed.get_property_value("min-height").unwrap(),
+            computed.get_property_value("max-height").unwrap(),
+            editor.get_bounding_client_rect().width(),
+            editor.get_attribute("style").unwrap_or_default()
+        );
         assert!(grown_height > one_line_height);
         set_queued_editor_value(
             &editor,
