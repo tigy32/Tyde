@@ -6,7 +6,6 @@ use protocol::{Envelope, FrameKind, ProtocolFrame, StreamPath, VoiceAudioPayload
 use tokio::sync::Notify;
 
 const CONTROL_LIMIT: usize = 64;
-const CHAT_LIMIT: usize = 256;
 const BULK_LIMIT: usize = 256;
 const AUDIO_PACKET_LIMIT: usize = 8;
 const CONTROL_BYTE_LIMIT: usize = 1024 * 1024;
@@ -213,9 +212,9 @@ impl OutputQueue {
             return Ok(());
         }
         let (limit, byte_limit) = match output.lane {
-            OutputLane::Control => (CONTROL_LIMIT, CONTROL_BYTE_LIMIT),
-            OutputLane::Chat => (CHAT_LIMIT, CHAT_BYTE_LIMIT),
-            OutputLane::Bulk => (BULK_LIMIT, BULK_BYTE_LIMIT),
+            OutputLane::Control => (Some(CONTROL_LIMIT), CONTROL_BYTE_LIMIT),
+            OutputLane::Chat => (None, CHAT_BYTE_LIMIT),
+            OutputLane::Bulk => (Some(BULK_LIMIT), BULK_BYTE_LIMIT),
             OutputLane::Audio => unreachable!(),
         };
         if Self::lane_bytes(&queues, output.lane).saturating_add(output.bytes) > byte_limit {
@@ -233,7 +232,9 @@ impl OutputQueue {
         }
         let lane = output.lane;
         let bytes = output.bytes;
-        if Self::queue_mut(&mut queues, lane).len() >= limit {
+        if let Some(limit) = limit
+            && Self::queue(&queues, lane).len() >= limit
+        {
             tracing::warn!(stream = %output.frame.envelope.stream, kind = %output.frame.envelope.kind,
                 ?lane, limit, "closing connection after output frame limit exceeded");
             if lane == OutputLane::Control {

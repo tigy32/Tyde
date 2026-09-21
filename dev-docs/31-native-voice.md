@@ -74,8 +74,9 @@ boundary. Nova's 24 kHz PCM is encoded directly with libopus. Dictation sends
 100 ms chunks and has no encoder or downlink. There is no standalone
 resampler. Provider PCM exists only inside the server adapter.
 
-The connection writer has separate bounded control (64), chat (256), bulk
-(256), and audio lanes. Control is highest priority; after eight consecutive
+The connection writer has separate bounded control (64 frames / 1 MiB), chat
+(8 MiB, no frame-count limit), bulk (256 frames / 32 MiB), and audio lanes.
+Control is highest priority; after eight consecutive
 audio records the scheduler forces chat/bulk progress and alternates those
 lower lanes. Audio drops oldest packets
 to remain at eight packets (about 160 ms). A stop or interrupt purges queued

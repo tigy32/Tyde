@@ -629,6 +629,82 @@ async fn project_store_keeps_foreign_records_across_rename() {
 }
 
 #[tokio::test]
+async fn slow_client_chat_backlog_is_bounded_by_bytes_not_frames() {
+    for (name_bytes, updates, should_close) in [(32, 512, false), (64 * 1024, 140, true)] {
+        let mut fixture = Fixture::new().await;
+        let project = create_project(
+            &mut fixture.client,
+            &"p".repeat(name_bytes),
+            vec!["/tmp/chat-backlog".to_owned()],
+        )
+        .await;
+        let mut slow = fixture.connect().await;
+
+        // The fixture transport holds only 8 KiB. Not reading this client
+        // forces the remaining notifications into the server's chat queue.
+        // Reorders fan out chat notifications without a control-lane burst.
+        for _ in 0..updates {
+            fixture
+                .client
+                .project_reorder(ProjectReorderPayload {
+                    scope: ProjectReorderScope::TopLevel,
+                    project_ids: vec![project.id.clone()],
+                })
+                .await
+                .expect("send backlog-producing reorder");
+            let notification =
+                expect_project_notify(&mut fixture.client, "healthy client reorder").await;
+            assert!(
+                matches!(notification, ProjectNotifyPayload::Upsert { project: updated }
+                    if updated.id == project.id && updated.name == project.name),
+                "healthy client must receive every update unchanged"
+            );
+        }
+
+        let mut received = 0;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let Some(envelope) = slow.next_event().await.expect("read slow client") else {
+                    assert!(
+                        should_close,
+                        "small chat updates must not disconnect the client"
+                    );
+                    break;
+                };
+                if envelope.kind != FrameKind::ProjectNotify {
+                    continue;
+                }
+                let notification: ProjectNotifyPayload = envelope
+                    .parse_payload()
+                    .expect("parse queued project update");
+                assert!(
+                    matches!(notification, ProjectNotifyPayload::Upsert { project: updated }
+                        if updated.id == project.id && updated.name == project.name),
+                    "queued update must retain its complete payload"
+                );
+                received += 1;
+                if !should_close && received == updates {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("slow client must drain or close within the byte budget");
+        if should_close {
+            assert!(
+                received > 0 && received < updates,
+                "byte overflow must stop delivery"
+            );
+        } else {
+            assert_eq!(
+                received, updates,
+                "all small updates must survive the backlog"
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn reorder_projects_persists_and_replays_in_custom_order() {
     let mut fixture = Fixture::new().await;
     let project_a =
