@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::OnceLock;
 
-use fixture::{Fixture, finish_turn_on, next_frame_matching_on};
+use fixture::{Fixture, assert_no_interesting_frame_on, finish_turn_on, next_frame_matching_on};
 use protocol::{
     AgentId, AgentOrigin, BackendAccessMode, BackendKind, CancelWorkflowPayload, ChatEvent,
     CommandErrorCode, CommandErrorPayload, FrameKind, NewAgentPayload, Project,
@@ -1395,6 +1395,25 @@ async fn workflow_watcher_auto_updates_direct_markdown_changes() {
     })
     .await;
 
+    assert_no_interesting_frame_on(
+        &mut fixture.client,
+        std::time::Duration::from_secs(1),
+        "catalog discovery must not trigger another workflow refresh",
+        |env| env.kind != FrameKind::WorkflowNotify,
+    )
+    .await;
+
+    for _ in 0..256 {
+        std::fs::read(&path).expect("read watched workflow");
+    }
+    assert_no_interesting_frame_on(
+        &mut fixture.client,
+        std::time::Duration::from_secs(1),
+        "read-only access must not refresh workflows, even in a burst",
+        |env| env.kind != FrameKind::WorkflowNotify,
+    )
+    .await;
+
     std::fs::write(
         &path,
         workflow_markdown("watched", "Watched Two", "Second body."),
@@ -1405,6 +1424,27 @@ async fn workflow_watcher_auto_updates_direct_markdown_changes() {
             summary.id == WorkflowId("watched".to_owned()) && summary.name == "Watched Two"
         })
     })
+    .await;
+
+    let replacement = dir.join("replacement.tmp");
+    std::fs::write(
+        &replacement,
+        workflow_markdown("watched", "Watched Three", "Atomically replaced body."),
+    )
+    .expect("write replacement workflow");
+    std::fs::rename(&replacement, &path).expect("atomically replace watched workflow");
+    wait_for_workflow_notify(&mut fixture.client, "watcher atomic replace", |payload| {
+        payload.summaries.iter().any(|summary| {
+            summary.id == WorkflowId("watched".to_owned()) && summary.name == "Watched Three"
+        })
+    })
+    .await;
+    assert_no_interesting_frame_on(
+        &mut fixture.client,
+        std::time::Duration::from_secs(1),
+        "catalog reads after real changes must not start a refresh loop",
+        |env| env.kind != FrameKind::WorkflowNotify,
+    )
     .await;
 
     std::fs::remove_file(&path).expect("remove watched workflow");

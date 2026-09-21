@@ -171,7 +171,7 @@ async fn run_workflow_watcher(
                 };
                 match event_result {
                     Ok(event) => {
-                        if event_mentions_markdown(&event) {
+                        if event.need_rescan() || event_mentions_markdown(&event) {
                             debounce_active = true;
                             debounce_sleep.as_mut().reset(Instant::now() + WORKFLOW_REFRESH_DEBOUNCE);
                         }
@@ -233,7 +233,20 @@ async fn rebuild_watcher(
 ) -> Option<WorkflowWatcher> {
     missing_targets.clear();
     let mut watcher = match RecommendedWatcher::new(
-        move |result| {
+        move |result: notify::Result<Event>| {
+            if let Ok(event) = &result {
+                let ignored_access = event.kind.is_access() && !event.need_rescan();
+                tracing::debug!(
+                    kind = ?event.kind,
+                    path_count = event.paths.len(),
+                    ignored_access,
+                    "workflow filesystem event"
+                );
+                // Catalog reads must not enqueue refreshes or overflow the queue.
+                if ignored_access {
+                    return;
+                }
+            }
             if watch_tx.try_send(result).is_err() {
                 watch_overflow.store(true, Ordering::Release);
             }
