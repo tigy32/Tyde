@@ -1522,6 +1522,14 @@ async fn agent_control_spawn_steering_follows_the_agent_control_mcp() {
     let _ = expect_next_event(&mut fixture.client, "NewAgent").await;
     let _ = expect_next_event(&mut fixture.client, "AgentStart").await;
     let text = expect_turn_text(&mut fixture.client, "agent control steering turn").await;
+    assert!(text.contains("tyde-agent-control MCP tools by default."));
+    assert!(text.contains(
+        "Do not invoke that backend's CLI from the shell unless the user explicitly requests that launch method."
+    ));
+    assert!(text.contains("A shell-spawned agent is invisible to Tyde."));
+    assert!(text.contains(
+        "Sub-agents on your own backend can use whatever native mechanism you already have."
+    ));
     assert!(
         text.contains("[startup_mcp_servers: tyde-agent-control(http)"),
         "agent control MCP is the precondition for this steering: {text}"

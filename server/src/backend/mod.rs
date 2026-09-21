@@ -66,11 +66,12 @@ pub use compaction::{
 /// invisible to every Tyde surface: no bubble, no steering, no review, no
 /// resume. The closing sentence is load-bearing in the other direction: a
 /// model's own native sub-agents stay visible, so the rule must not scare it
-/// off them.
+/// off them. Explicit user requests can override the default launch method.
 pub const AGENT_CONTROL_SPAWN_STEERING: &str = concat!(
     "To run work on a different agent backend than your own, spawn it with the ",
-    "tyde-agent-control MCP tools, never by invoking that backend's CLI from ",
-    "the shell: a shell-spawned agent is invisible to Tyde. Sub-agents on your ",
+    "tyde-agent-control MCP tools by default. Do not invoke that backend's CLI ",
+    "from the shell unless the user explicitly requests that launch method. ",
+    "A shell-spawned agent is invisible to Tyde. Sub-agents on your ",
     "own backend can use whatever native mechanism you already have."
 );
 
