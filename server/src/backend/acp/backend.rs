@@ -2294,7 +2294,7 @@ impl KiroInner {
                 if let Some(child) = child {
                     child.handle_notification(method, params).await;
                 } else {
-                    eprintln!("TYDE ACP BUFFER CHILD session={session_id} method={method}");
+                    eprintln!("TYDE ACP BUFFER CHILD method={method}");
                     self.native_sessions
                         .pending
                         .lock()
@@ -2492,10 +2492,7 @@ impl KiroInner {
                 }
             }
         });
-        eprintln!(
-            "TYDE ACP NATIVE SESSION ROUTE session={} tool={tool_call_id}",
-            session_id.0
-        );
+        eprintln!("TYDE ACP NATIVE SESSION ROUTE tool={tool_call_id}");
         let pending = self
             .native_sessions
             .pending

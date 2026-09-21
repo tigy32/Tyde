@@ -465,6 +465,21 @@ When something is broken, **do not guess at the fix**. The expected loop:
 Do not try a speculative change just to see if it works. Do not remove
 logs you added until the user has signed off on the fix.
 
+## Security scanner recurrence
+
+Keep CodeQL enabled for production, test, and vendored code. Fix recurring
+findings in source rather than repeatedly dismissing them or excluding rules.
+
+- Do not print raw session identifiers, credentials, or conversation/codeword
+  content in diagnostics, including test failure messages. Report event context,
+  presence, or counts instead; keep the behavioral assertions unchanged.
+- For HKDF-derived AEAD material, use the cipher's typed `Key` and `Nonce`
+  output buffers and pass them directly to the cipher. Expand successfully into
+  the entire buffer before use. Do not substitute random bytes for the
+  protocol-derived key or nonce, or pass literal arrays as cipher material.
+- Verify the fresh GitHub scan for the pushed commit before calling a scanner
+  fix complete. Existing dismissals do not prevent new findings at new sites.
+
 ## Style and scope
 
 - Prefer editing existing files over creating new ones.

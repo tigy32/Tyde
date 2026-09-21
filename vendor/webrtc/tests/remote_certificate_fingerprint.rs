@@ -206,7 +206,7 @@ async fn run() -> Result<()> {
     assert_eq!(
         offerer_sees.split(':').count(),
         32,
-        "expected 32 colon-separated bytes, got {offerer_sees:?}"
+        "expected 32 colon-separated bytes in the remote certificate fingerprint"
     );
 
     Ok(())

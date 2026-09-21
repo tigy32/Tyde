@@ -1376,7 +1376,7 @@ pub async fn stored_session<B: Backend>(host: &mut Harness<B>) -> server::backen
     assert_eq!(
         matches.len(),
         1,
-        "provider session catalog must list {id:?} exactly once"
+        "provider session catalog must list the spawned session exactly once"
     );
     let session = matches.remove(0);
     assert_eq!(session.backend_kind, host.backend());

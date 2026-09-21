@@ -153,11 +153,11 @@ fn encrypt(
     fill_random(&mut salt);
 
     let hkdf = Hkdf::<Sha256>::new(Some(&salt), &ikm);
-    let mut cek = [0u8; 16];
-    hkdf.expand(b"Content-Encoding: aes128gcm\0", &mut cek)
+    let mut cek = Key::<Aes128Gcm>::default();
+    hkdf.expand(b"Content-Encoding: aes128gcm\0", &mut cek[..])
         .map_err(|error| PushSendError::Encryption(format!("expand cek: {error}")))?;
-    let mut nonce = [0u8; 12];
-    hkdf.expand(b"Content-Encoding: nonce\0", &mut nonce)
+    let mut nonce = Nonce::default();
+    hkdf.expand(b"Content-Encoding: nonce\0", &mut nonce[..])
         .map_err(|error| PushSendError::Encryption(format!("expand nonce: {error}")))?;
 
     // A single record, so the padding delimiter is 0x02 ("last record").
@@ -165,10 +165,10 @@ fn encrypt(
     record.extend_from_slice(plaintext);
     record.push(0x02);
 
-    let cipher = Aes128Gcm::new(Key::<Aes128Gcm>::from_slice(&cek));
+    let cipher = Aes128Gcm::new(&cek);
     let ciphertext = cipher
         .encrypt(
-            Nonce::from_slice(&nonce),
+            &nonce,
             Payload {
                 msg: &record,
                 aad: b"",

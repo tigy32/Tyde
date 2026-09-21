@@ -1562,7 +1562,7 @@ fn assert_final_text_contains(turn: &Turn, needle: &str) {
     let final_text = turn.final_text();
     assert!(
         final_text.contains(needle),
-        "{}: final response {final_text:?} does not contain {needle:?}",
+        "{}: final response does not contain the expected marker",
         turn.label()
     );
 }

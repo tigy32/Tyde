@@ -105,17 +105,17 @@ impl DeviceKeys {
             .expect("expand ikm");
 
         let hkdf = Hkdf::<Sha256>::new(Some(salt), &ikm);
-        let mut cek = [0u8; 16];
-        hkdf.expand(b"Content-Encoding: aes128gcm\0", &mut cek)
+        let mut cek = Key::<Aes128Gcm>::default();
+        hkdf.expand(b"Content-Encoding: aes128gcm\0", &mut cek[..])
             .expect("expand cek");
-        let mut nonce = [0u8; 12];
-        hkdf.expand(b"Content-Encoding: nonce\0", &mut nonce)
+        let mut nonce = Nonce::default();
+        hkdf.expand(b"Content-Encoding: nonce\0", &mut nonce[..])
             .expect("expand nonce");
 
-        let cipher = Aes128Gcm::new(Key::<Aes128Gcm>::from_slice(&cek));
+        let cipher = Aes128Gcm::new(&cek);
         let mut plaintext = cipher
             .decrypt(
-                Nonce::from_slice(&nonce),
+                &nonce,
                 Payload {
                     msg: ciphertext,
                     aad: b"",

@@ -955,7 +955,7 @@ async fn btw_sessions_recover_after_model_catalog_changes() {
                 .find(|record| record.id == session_id)
                 .expect("resumed record");
             assert_eq!(record.session_settings.as_ref(), Some(&expected));
-            eprintln!("BTW RESTART resumed id={session_id} catalog={model}");
+            eprintln!("BTW RESTART resumed catalog={model}");
             client
                 .close_agent(&agent.instance_stream)
                 .await

@@ -554,7 +554,11 @@ async fn expect_promoted_group_assignment(
             _ => {}
         }
 
-        eprintln!("TYDE GROUP PROMOTION WAIT session={session_id:?} notify={latest_notify:?}");
+        eprintln!(
+            "TYDE GROUP PROMOTION WAIT session_present={} notify_present={}",
+            session_id.is_some(),
+            latest_notify.is_some()
+        );
         if let (Some(session_id), Some(notify)) = (session_id.clone(), latest_notify.as_ref()) {
             let Some(group) = notify
                 .snapshot
