@@ -3552,13 +3552,42 @@ mod wasm_tests {
         settle().await;
         let items = query_all(&container, ".context-menu [role=\"menuitem\"]");
         assert!(!items.is_empty(), "the tab menu lists its commands");
+        let sidebar_container = web_sys::window()
+            .unwrap()
+            .document()
+            .unwrap()
+            .create_element("div")
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap();
+        container.append_child(&sidebar_container).unwrap();
+        let _sidebar_handle = mount_to(sidebar_container.clone(), move || {
+            use crate::components::card_menu::CardContextMenu;
+            view! {
+                <CardContextMenu
+                    menu=RwSignal::new(Some((8.0, 8.0)))
+                    label="Agent actions"
+                    anchor=NodeRef::new()
+                >
+                    <button class="context-menu-item" role="menuitem">"Rename agent"</button>
+                </CardContextMenu>
+            }
+        });
+        settle_styles().await;
+        let sidebar_item = query(&sidebar_container, "[role=menuitem]").unwrap();
+        let compact_height = sidebar_item.get_bounding_client_rect().height();
+        assert!(compact_height > 0.0, "the sidebar item must be visible");
+        assert_eq!(items.len(), 4, "all four tab commands remain visible");
         for item in &items {
-            let rect = item.get_bounding_client_rect();
+            let height = item.get_bounding_client_rect().height();
+            wasm_bindgen_test::console_log!(
+                "Menu row geometry: tab={height}px, sidebar={compact_height}px"
+            );
+            // The old 32–36px bound rejected the sidebar's correct 22.4px rows
+            // and preserved the tab-only spacing that this flow should prevent.
             assert!(
-                (32.0..=36.0).contains(&rect.height()),
-                "desktop menu items must stay compact but clickable: expected \
-                 32-36px tall, got {}px",
-                rect.height()
+                (height - compact_height).abs() < 0.5,
+                "tab commands must share compact sidebar spacing: tab={height}px, sidebar={compact_height}px"
             );
         }
     }

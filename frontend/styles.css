@@ -1490,16 +1490,6 @@ details summary:focus:not(:focus-visible) {
     z-index: 1001;
 }
 
-/* Keep desktop tab commands compact without making the hit area fiddly. */
-.center-menu .context-menu-item {
-    display: flex;
-    flex-direction: column;
-    justify-content: center;
-    gap: 2px;
-    min-height: 34px;
-    padding: 5px 10px;
-}
-
 /* Screen-reader-only live region: announcements without visible chrome. */
 .visually-hidden {
     position: absolute;
