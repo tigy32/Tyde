@@ -4132,7 +4132,17 @@ kbd {
 }
 
 /* ===== Chat Input ===== */
+.chat-composer {
+    flex-shrink: 0;
+    min-width: 0;
+    background: var(--surface-1);
+}
+
 .chat-input-area {
+    position: relative;
+}
+
+.chat-input-content {
     display: flex;
     flex-direction: column;
     align-items: stretch;
@@ -4371,7 +4381,7 @@ kbd {
 /* ── In-flight tray ──────────────────────────────────────────────────
    The single live surface for a chat's background work (child agents,
    sub-agents, workflows) plus its queued messages. A full-width dock
-   attached to the top of the composer (.chat-input-area supplies the
+   attached to the top of the composer (.chat-input-content supplies the
    divider between them) — not a floating box. Expanded by default with
    a collapsible one-line header; renders nothing when idle. Row
    internals reuse the .tool-live-agent-* styles below. */
@@ -11848,16 +11858,10 @@ math merror {
 /*
  * Accordion container — sits below the chat input row.
  * Toggle header is at the top; controls expand downward below it.
- * Negative h-margins bleed to the edges of the parent's padding;
- * negative bottom margin cancels the parent's bottom padding so the
- * accordion sits flush.
  */
 .session-settings-accordion {
     display: flex;
     flex-direction: column;
-    margin-left: calc(-1 * var(--space-3));
-    margin-right: calc(-1 * var(--space-3));
-    margin-bottom: calc(-1 * var(--space-2));
     border-top: 1px solid var(--border-primary);
 }
 

@@ -7,6 +7,7 @@ use wasm_bindgen::{JsCast, JsValue, closure::Closure};
 use wasm_bindgen_futures::{JsFuture, spawn_local};
 
 use crate::actions::spawn_new_chat;
+use crate::components::inflight_tray::InflightTray;
 use crate::components::session_settings::SessionSettingsBar;
 use crate::send::send_frame;
 use crate::state::{ActiveAgentRef, AppState, ComposerHandle, ConnectionStatus, PendingTeamMember};
@@ -1472,6 +1473,7 @@ pub fn ChatInput(
     let notice_state = state.clone();
 
     view! {
+        <div class="chat-composer">
         <div
             class="chat-input-area"
             class:thinking=is_thinking
@@ -1480,6 +1482,8 @@ pub fn ChatInput(
             on:dragleave=on_dragleave
             on:drop=on_drop
         >
+            <InflightTray agent_ref=agent_ref />
+            <div class="chat-input-content">
             <crate::notices::ActionError error=action_error />
             <Show when=move || usage_pause.get().is_some() && !is_terminated.get()>
                 <div class="chat-backend-notice" role="status">
@@ -1810,6 +1814,8 @@ pub fn ChatInput(
                     </Show>
                 </div>
             </div>
+            </div>
+        </div>
             <SessionSettingsBar agent_ref=agent_ref composer=composer.clone() />
         </div>
     }
@@ -2781,6 +2787,26 @@ mod wasm_tests {
         let container = make_styled_container();
         let state = AppState::new();
         configure(&state, false, true, "");
+        state.session_schemas.update(|schemas| {
+            schemas.entry(HOST.to_owned()).or_default().insert(
+                BackendKind::Claude,
+                protocol::SessionSchemaEntry::Ready {
+                    schema: protocol::SessionSettingsSchema {
+                        backend_kind: BackendKind::Claude,
+                        fields: vec![protocol::SessionSettingField {
+                            key: "verbose".to_owned(),
+                            label: "Verbose".to_owned(),
+                            description: None,
+                            field_type: protocol::SessionSettingFieldType::Toggle {
+                                default: false,
+                            },
+                            use_slider: false,
+                            select_options_by_setting: None,
+                        }],
+                    },
+                },
+            );
+        });
         let mount_state = state.clone();
         let _h = mount_to(container.clone(), move || {
             provide_context(mount_state);
@@ -2834,6 +2860,87 @@ mod wasm_tests {
         assert_ne!(prop("animation-name"), "none");
         assert_eq!(prop("animation-duration"), "1.6s");
         assert_eq!(prop("animation-timing-function"), "ease-in-out");
+
+        let assert_outline_bounds = || {
+            let outline = composer.get_bounding_client_rect();
+            let input = query(&container, "textarea")
+                .unwrap()
+                .get_bounding_client_rect();
+            let settings = query(&container, ".session-settings-accordion")
+                .expect("session settings footer")
+                .get_bounding_client_rect();
+            assert!(outline.top() <= input.top() && outline.bottom() >= input.bottom());
+            assert!(
+                outline.bottom() <= settings.top() + 0.5,
+                "the activity outline must stop above Session Settings"
+            );
+            if let Some(tray) = query(&container, ".inflight-tray") {
+                let tray = tray.get_bounding_client_rect();
+                assert!(
+                    (outline.top() - tray.top()).abs() < 0.5,
+                    "the outline starts above the background-task chevron"
+                );
+                assert!(tray.bottom() <= input.top());
+                assert!((outline.left() - tray.left()).abs() < 0.5);
+                assert!((outline.right() - tray.right()).abs() < 0.5);
+            }
+        };
+        assert_outline_bounds();
+        let settings_toggle = query(&container, ".session-settings-toggle")
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap();
+        let input_height = composer.get_bounding_client_rect().height();
+        settings_toggle.click();
+        next_tick().await;
+        assert!(container.text_content().unwrap().contains("Verbose"));
+        assert_outline_bounds();
+        assert!((composer.get_bounding_client_rect().height() - input_height).abs() < 0.5);
+        settings_toggle.click();
+        next_tick().await;
+
+        let mut child = state.agents.get_untracked()[0].clone();
+        child.agent_id = AgentId("outline-child".to_owned());
+        child.name = "Background builder".to_owned();
+        child.parent_agent_id = Some(AgentId(AGENT.to_owned()));
+        child.origin = AgentOrigin::AgentControl;
+        let child_id = child.agent_id.clone();
+        state.agents.update(|agents| agents.push(child));
+        state.agent_turn_active.update(|active| {
+            active.insert(child_id.clone(), true);
+        });
+        next_tick().await;
+        let header = query(&container, ".inflight-tray-header")
+            .expect("background work stays attached to the composer")
+            .dyn_into::<HtmlElement>()
+            .unwrap();
+        if query(&container, ".inflight-tray-body").is_none() {
+            header.click();
+            next_tick().await;
+        }
+        assert!(
+            container
+                .text_content()
+                .unwrap()
+                .contains("Background builder")
+        );
+        assert_outline_bounds();
+        let expanded_height = composer.get_bounding_client_rect().height();
+        header.click();
+        next_tick().await;
+        assert!(query(&container, ".inflight-tray-body").is_none());
+        assert!(composer.get_bounding_client_rect().height() < expanded_height);
+        assert_outline_bounds();
+        header.click();
+        next_tick().await;
+        assert!(query(&container, ".inflight-tray-body").is_some());
+        assert_outline_bounds();
+        state.agent_turn_active.update(|active| {
+            active.remove(&child_id);
+        });
+        next_tick().await;
+        assert!(query(&container, ".inflight-tray").is_none());
+        assert_outline_bounds();
 
         state.agent_turn_active.update(|active| {
             active.remove(&AgentId(AGENT.to_owned()));

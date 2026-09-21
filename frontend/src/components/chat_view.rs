@@ -1097,13 +1097,9 @@ pub fn ChatView(
                     </Show>
                 </div>
             </Show>
-            // The In-flight tray sits between the transcript and the
-            // composer: the single live surface for this chat's background
-            // work (child agents, sub-agents, workflows) and its queued
-            // messages. It renders nothing when the agent has nothing in
-            // flight, and is deliberately independent of the tool-output
-            // mode — live operational state is not transcript history.
-            <InflightTray agent_ref=agent_ref />
+            <Show when=move || !has_composer.get()>
+                <InflightTray agent_ref=agent_ref />
+            </Show>
             // Every visible chat mounts its own composer. A chat beside another
             // chat is directly repliable; neither pane has to be focused first,
             // and neither pane's draft, backend choice, or session settings can
