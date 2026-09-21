@@ -5,12 +5,15 @@ Rust/WASM web apps. One floating glass title bar, a full-window scroller, and a
 floating bottom stack containing a composer and/or tabs.
 
 **`0.1.0-alpha.1`: migration candidate for the tested matrix, not a universal guarantee.**
-The current runtime passed 342 desktop browser and three compiled Rust/WASM checks,
-plus full 18-case matrices in iOS 26.5 Safari, iOS 26.5 Home Screen mode and installed
+The current runtime passed 345 desktop browser and three compiled Rust/WASM checks.
+The core viewport/CSS implementation was verified with full 18-case matrices in iOS 26.5 Safari, iOS 26.5 Home Screen mode and installed
 Android 16. The final document settings also passed the iPhone 15 Pro/iOS 18.1
 critical keyboard path. Android browser resume and iOS 26.6 critical transitions
 have explicit screenshot verification where native automation data was missing.
-No production apps have been migrated; integration still needs each app's gate.
+Tychat now has a commit-pinned integration in its own repository; its release and
+phone acceptance remain governed by Tychat's gates. Tyde integration is separate.
+The nested-workspace addition has browser/Rust coverage; native reports retain
+their original source hashes and are not relabeled as tests of the new integration.
 See [verification](TESTING.md) and [continued device testing](design/devicefarm-continuation-2026-09-20.md).
 
 ## What belongs here
@@ -22,7 +25,7 @@ See [verification](TESTING.md) and [continued device testing](design/devicefarm-
 
 No React dependency, router, app state, message handling, telemetry, network,
 storage, keyboard replacement, or separate Rust layout implementation.
-The maintained runtime source is `src/shell.ts` + `src/shell.css` (423 lines; 4,812 bytes gzip for the combined
+The maintained runtime source is `src/shell.ts` + `src/shell.css` (426 lines; 4,897 bytes gzip for the combined
 built JS and CSS in the current candidate).
 The demo and tests are deliberately separate from that runtime.
 

@@ -153,14 +153,6 @@ export function attachShell(root, options = {}) {
         target.addEventListener(name, callback, capture);
         registrations.push([target, name, callback, capture]);
     };
-    const pointer = (event) => {
-        const pointer = event;
-        if (!pointer.isTrusted || !pointer.isPrimary || pointer.button !== 0)
-            return;
-        const element = event.target?.closest("input, textarea, [contenteditable]") ?? null;
-        if (editable(element) && element !== document.activeElement)
-            element.focus({ preventScroll: true });
-    };
     const visibility = () => {
         if (document.hidden && frame !== 0) {
             window.cancelAnimationFrame(frame);
@@ -181,7 +173,6 @@ export function attachShell(root, options = {}) {
     for (const name of ["focusin", "focusout"])
         listen(document, name, settle);
     listen(document, "visibilitychange", visibility);
-    listen(root, "pointerdown", pointer, true);
     listen(content, "scroll", scroll);
     owners.set(document, root);
     html.setAttribute("data-tws-document", "");

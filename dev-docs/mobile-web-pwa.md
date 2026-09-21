@@ -101,7 +101,7 @@ in `./dev.sh check`.
 
 The Rust/Leptos UI imports Tyggs Web Shell through `wasm-bindgen`; it does not
 copy the viewport algorithm. The pinned revision is
-`78dfe04bd2ca60dd3c101875e1f4443fa9566e7a`, from Tychat's checked-in archive.
+`b7b25b117b379c49e0419c612e3a8fbeef060241`, from Tychat's checked-in archive.
 `mobile-frontend/vendor/web-shell/PROVENANCE.md` records its checksum. The
 unmodified JS is a local wasm-bindgen module, so Trunk includes it under each
 versioned bundle and the existing executable-integrity manifest covers it.
@@ -147,3 +147,20 @@ absence of an extra message gap. Record hardware, OS, browser, and release.
 Library device coverage does not certify Tyde's integration. Intermittent
 startup/storage failures and Tychat's separate spacing deployment are not
 claimed resolved by this migration.
+
+
+### Completed-tap focus dependency update
+
+The pinned shared-shell revision lets the browser focus an editable field after
+its native tap completes. It removes capture-phase pointerdown focus, which
+could start viewport movement during contact and lose focus on finger release.
+Keyboard measurement, CSS, Rust bindings, draft ownership and explicit send
+refocus are unchanged. Do not add a Tyde-only focus workaround.
+
+The upstream regression reproduces the focus loss with trusted Chromium touch
+and a real viewport contraction, and passes six reopen cycles after removal.
+Its library checks pass 346 browser cases and three Rust/WASM cases. Four native
+iOS 26.5 PWA contacts retain focus until intentional dismissal, but keyboard
+bounds were not exposed to accessibility, so that farm run is not a full geometry
+pass. Tyde's canonical workbench and clean-main gates remain required; a source
+pin update is not a deployed Tyde release or exact-device acceptance.
