@@ -365,6 +365,7 @@ enum RaCommand {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Phase {
     Cold,
+    Disabled,
     Starting,
     Indexing,
     Ready,
@@ -375,6 +376,7 @@ enum Phase {
 impl Phase {
     fn wire_state(self) -> CodeIntelState {
         match self {
+            Phase::Disabled => CodeIntelState::Disabled,
             Phase::Cold | Phase::Starting => CodeIntelState::Starting,
             Phase::Indexing => CodeIntelState::Indexing,
             Phase::Ready => CodeIntelState::Ready,
@@ -680,7 +682,7 @@ impl RaActor {
                         }
                         Err(failure) => self.emit_start_failure(failure, true),
                     },
-                    Phase::Unavailable | Phase::Failed => {
+                    Phase::Disabled | Phase::Unavailable | Phase::Failed => {
                         // `Unavailable` means the binary was missing at the
                         // last probe — the user may have installed it since, so
                         // retry discovery (backed off) instead of staying
@@ -724,7 +726,7 @@ impl RaActor {
                     Phase::Unavailable if self.discovery_retry_due() => {
                         self.retry_unavailable_start().await;
                     }
-                    Phase::Unavailable | Phase::Failed => {}
+                    Phase::Disabled | Phase::Unavailable | Phase::Failed => {}
                 }
             }
             RaCommand::Unsubscribe { path } => {
@@ -789,7 +791,7 @@ impl RaActor {
                         self.reopen_file(&path).await;
                         self.ensure_file_models();
                     }
-                    Phase::Cold | Phase::Unavailable | Phase::Failed => {
+                    Phase::Cold | Phase::Disabled | Phase::Unavailable | Phase::Failed => {
                         // No live analysis to sync; the new version is recorded
                         // and a later start/subscribe resolves against it.
                     }
@@ -843,14 +845,28 @@ impl RaActor {
     }
 
     async fn reconfigure(&mut self, config: LanguageServerConfig) {
+        self.resolutions.clear();
+        self.references_active.store(0, Ordering::SeqCst);
+        self.navigate_active.store(0, Ordering::SeqCst);
+        self.hover_active.store(0, Ordering::SeqCst);
         if let Some(client) = self.client.take() {
             self.notifications = None;
-            client.shutdown().await;
+            if config.enabled {
+                client.shutdown().await;
+            } else {
+                client.terminate().await;
+            }
         } else {
             self.notifications = None;
         }
 
+        tracing::info!(
+            provider = %config.provider_id,
+            enabled = config.enabled,
+            "code-intel: applying language-server settings"
+        );
         self.config = config;
+        self.published_diagnostics.clear();
         self.restart_attempts = 0;
         self.phase = Phase::Cold;
         self.message = None;
@@ -858,15 +874,18 @@ impl RaActor {
         self.opened.clear();
         self.active_progress.clear();
         self.last_progress_status_at = None;
-        self.resolutions.clear();
-        self.references_active.store(0, Ordering::SeqCst);
-        self.navigate_active.store(0, Ordering::SeqCst);
-        self.hover_active.store(0, Ordering::SeqCst);
         for file in self.files.values_mut() {
             file.text.clear();
             file.model_version = None;
         }
 
+        if !self.config.enabled {
+            self.set_phase(
+                Phase::Disabled,
+                Some("Code intelligence is off in Settings".to_owned()),
+            );
+            return;
+        }
         if self.files.is_empty() && !self.warmed {
             return;
         }
@@ -891,7 +910,7 @@ impl RaActor {
     /// backed-off attempt until the budget is spent, at which point we surface a
     /// fatal `ProviderCrashed`.
     async fn restart(&mut self) {
-        if self.files.is_empty() && !self.warmed {
+        if !self.config.enabled || (self.files.is_empty() && !self.warmed) {
             return;
         }
         // Cold restart: the new child has nothing open and no legend yet.
@@ -932,7 +951,9 @@ impl RaActor {
     /// was scheduled (so the caller can decide between a recoverable and a
     /// fatal crash error).
     fn schedule_restart(&mut self) -> bool {
-        if (self.files.is_empty() && !self.warmed) || self.restart_attempts >= MAX_RESTART_ATTEMPTS
+        if !self.config.enabled
+            || (self.files.is_empty() && !self.warmed)
+            || self.restart_attempts >= MAX_RESTART_ATTEMPTS
         {
             return false;
         }
@@ -1286,6 +1307,17 @@ impl RaActor {
     /// caller so restart attempts can mark failures fatal only after the bounded
     /// retry budget is exhausted.
     async fn start(&mut self) -> Result<(), StartFailure> {
+        if !self.config.enabled {
+            tracing::debug!(
+                provider = %self.config.provider_id,
+                "code-intel: language-server startup disabled"
+            );
+            self.set_phase(
+                Phase::Disabled,
+                Some("Code intelligence is off in Settings".to_owned()),
+            );
+            return Ok(());
+        }
         self.set_phase(Phase::Starting, None);
 
         let discover = self.config.discover;
@@ -1385,7 +1417,7 @@ impl RaActor {
     }
 
     async fn open_file(&mut self, path: ProjectPath) {
-        if self.opened.contains(&path) {
+        if !self.config.enabled || self.opened.contains(&path) {
             return;
         }
         let absolute = absolute_path(&path);

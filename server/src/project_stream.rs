@@ -1204,6 +1204,7 @@ fn provider_status_sort_key(status: &CodeIntelProviderStatus) -> (&str, &str) {
 }
 
 fn summarize_code_intel_overview(roots: &[CodeIntelRootOverview]) -> CodeIntelOverviewSummary {
+    let mut disabled = 0;
     let mut ready = 0;
     let mut indexing = 0;
     let mut starting = 0;
@@ -1213,6 +1214,7 @@ fn summarize_code_intel_overview(roots: &[CodeIntelRootOverview]) -> CodeIntelOv
     let mut warning_count = 0;
     for provider in roots.iter().flat_map(|root| root.providers.iter()) {
         match provider.state {
+            CodeIntelState::Disabled => disabled += 1,
             CodeIntelState::Ready => ready += 1,
             CodeIntelState::Indexing => indexing += 1,
             CodeIntelState::Starting => starting += 1,
@@ -1225,7 +1227,9 @@ fn summarize_code_intel_overview(roots: &[CodeIntelRootOverview]) -> CodeIntelOv
     }
 
     let provider_count = ready + indexing + starting + unavailable + failed;
-    let headline = if provider_count == 0 {
+    let headline = if provider_count == 0 && disabled > 0 {
+        CodeIntelOverviewHeadline::Disabled
+    } else if provider_count == 0 {
         CodeIntelOverviewHeadline::NotStarted
     } else if failed > 0 {
         CodeIntelOverviewHeadline::Failed
@@ -1249,6 +1253,9 @@ fn summarize_code_intel_overview(roots: &[CodeIntelRootOverview]) -> CodeIntelOv
             .and_then(|provider| provider.message.clone())
     };
     let message = match headline {
+        CodeIntelOverviewHeadline::Disabled => {
+            Some("Code intelligence is off in Settings".to_owned())
+        }
         CodeIntelOverviewHeadline::NotStarted => Some(
             "No language server running — select the project or launch an agent to index"
                 .to_owned(),

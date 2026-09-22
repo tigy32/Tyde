@@ -397,7 +397,12 @@ impl CodeIntelService {
             }
             CodeIntelCommand::UpdateSettings { settings } => {
                 for (language, provider) in &mut self.providers {
-                    if language_server_path_changed(*language, &self.code_intel_settings, &settings)
+                    if self.code_intel_settings.enabled != settings.enabled
+                        || language_server_path_changed(
+                            *language,
+                            &self.code_intel_settings,
+                            &settings,
+                        )
                     {
                         provider.reconfigure(language.config(&settings));
                     }

@@ -258,10 +258,25 @@ impl Default for VoiceSettings {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct CodeIntelSettings {
+    #[serde(default = "default_code_intel_enabled")]
+    pub enabled: bool,
     #[serde(default)]
     pub language_server_paths: HashMap<CodeIntelProviderId, HostExecutablePath>,
+}
+
+fn default_code_intel_enabled() -> bool {
+    true
+}
+
+impl Default for CodeIntelSettings {
+    fn default() -> Self {
+        Self {
+            enabled: default_code_intel_enabled(),
+            language_server_paths: HashMap::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]

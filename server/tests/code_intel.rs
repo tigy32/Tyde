@@ -1001,6 +1001,31 @@ async fn configured_invalid_rust_analyzer_path_fails_without_fallback() {
 }
 
 #[cfg(unix)]
+async fn expect_released_build_lock(lock: &fs::File) {
+    // waitpid reaps our direct child, not its descendants. In the regression
+    // run the leader was reaped while the SIGKILLed child still held its fd.
+    // Require the actual lock to become usable within two seconds.
+    let stopped_at = tokio::time::Instant::now();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            match fs2::FileExt::try_lock_exclusive(lock) {
+                Ok(()) => break,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                Err(error) => panic!("Failed to acquire released build lock: {error}"),
+            }
+        }
+    })
+    .await
+    .expect("Resumed provider must promptly release descendant build locks");
+    eprintln!(
+        "Code intelligence descendant lock released after {:?}",
+        stopped_at.elapsed()
+    );
+}
+
+#[cfg(unix)]
 #[tokio::test]
 async fn updating_configured_rust_analyzer_path_rediscovers_existing_provider() {
     let mut fixture = Fixture::new().await;
@@ -1028,7 +1053,7 @@ async fn updating_configured_rust_analyzer_path_rediscovers_existing_provider() 
         relative_path: "src/main.rs".to_owned(),
     };
 
-    send_code_intel_subscribe(&mut fixture.client, &project.id, path).await;
+    send_code_intel_subscribe(&mut fixture.client, &project.id, path.clone()).await;
     let (status, error) = wait_for_code_intel_unavailable(&mut fixture.client).await;
     assert!(
         status
@@ -1046,12 +1071,24 @@ async fn updating_configured_rust_analyzer_path_rediscovers_existing_provider() 
     write_executable(
         &valid_path,
         r#"#!/usr/bin/env python3
+import fcntl
 import json
+import pathlib
+import subprocess
 import sys
 
 if len(sys.argv) > 1 and sys.argv[1] == "--version":
     print("rust-analyzer fake")
     sys.exit(0)
+
+lock = open(pathlib.Path(__file__).with_suffix(".lock"), "w")
+fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+child = subprocess.Popen(
+    [sys.executable, "-c", "import time; time.sleep(120)"],
+    pass_fds=(lock.fileno(),),
+)
+with open(pathlib.Path(__file__).with_suffix(".starts"), "a") as starts:
+    starts.write("started\n")
 
 def send(payload):
     data = json.dumps(payload, separators=(",", ":")).encode()
@@ -1124,4 +1161,117 @@ while True:
             .unwrap_or(true),
         "hot-reloaded status must not keep the old bad-path message, got {status:?}"
     );
+
+    if status.state == CodeIntelState::Starting {
+        wait_for_code_intel_status_matching(
+            &mut fixture.client,
+            "language server initialized",
+            |status| status.state == CodeIntelState::Indexing,
+        )
+        .await;
+    }
+    let lock = fs::File::open(valid_path.with_extension("lock")).expect("open provider lock");
+    assert!(
+        fs2::FileExt::try_lock_exclusive(&lock).is_err(),
+        "The live server holds the build lock"
+    );
+
+    fixture
+        .client
+        .replace_setting("/code_intel/enabled", false, Some(true))
+        .await
+        .expect("disable code intelligence");
+    let mut file_disabled = false;
+    let mut overview_disabled = false;
+    fixture::next_frame_matching_on(&mut fixture.client, "disabled file and overview", |env| {
+        if env.kind == FrameKind::CodeIntelStatus {
+            let status: CodeIntelStatusPayload = env.parse_payload().expect("parse status");
+            file_disabled |= status.state == CodeIntelState::Disabled;
+        } else if env.kind == FrameKind::CodeIntelOverview {
+            let overview: CodeIntelOverviewPayload = env.parse_payload().expect("parse overview");
+            overview_disabled |= overview.summary.headline == CodeIntelOverviewHeadline::Disabled;
+        }
+        file_disabled && overview_disabled
+    })
+    .await;
+    expect_released_build_lock(&lock).await;
+    fs2::FileExt::unlock(&lock).expect("release test lock");
+
+    fixture
+        .client
+        .project_accessed(&project.id)
+        .await
+        .expect("access disabled project");
+    send_code_intel_subscribe(&mut fixture.client, &project.id, path.clone()).await;
+    wait_for_code_intel_status_matching(&mut fixture.client, "disabled resubscribe", |status| {
+        status.state == CodeIntelState::Disabled
+    })
+    .await;
+    assert_eq!(
+        fs::read_to_string(valid_path.with_extension("starts"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+
+    let bootstrap = fixture.restart_host().await;
+    expect_project_bootstrap(&mut fixture.client, "project restored after restart").await;
+    drain_initial_project_state_pushes(&mut fixture.client, "restored project pushes").await;
+    assert!(
+        !bootstrap.settings.code_intel.enabled,
+        "Disabled setting survives a host restart"
+    );
+    fixture
+        .client
+        .project_accessed(&project.id)
+        .await
+        .expect("access project after restart");
+    send_code_intel_subscribe(&mut fixture.client, &project.id, path).await;
+    wait_for_code_intel_status_matching(
+        &mut fixture.client,
+        "disabled after host restart",
+        |status| status.state == CodeIntelState::Disabled,
+    )
+    .await;
+    assert_eq!(
+        fs::read_to_string(valid_path.with_extension("starts"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+
+    fixture
+        .client
+        .replace_setting("/code_intel/enabled", true, Some(false))
+        .await
+        .expect("enable code intelligence");
+    wait_for_code_intel_status_matching(
+        &mut fixture.client,
+        "existing subscription resumed",
+        |status| status.state == CodeIntelState::Indexing,
+    )
+    .await;
+    assert_eq!(
+        fs::read_to_string(valid_path.with_extension("starts"))
+            .unwrap()
+            .lines()
+            .count(),
+        2
+    );
+    assert!(fs2::FileExt::try_lock_exclusive(&lock).is_err());
+
+    fixture
+        .client
+        .replace_setting("/code_intel/enabled", false, Some(true))
+        .await
+        .expect("stop resumed provider");
+    wait_for_code_intel_status_matching(
+        &mut fixture.client,
+        "resumed provider stopped",
+        |status| status.state == CodeIntelState::Disabled,
+    )
+    .await;
+    expect_released_build_lock(&lock).await;
 }

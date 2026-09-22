@@ -563,6 +563,7 @@ impl SettingsTab {
             ],
             Self::CodeIntelligence => &[
                 "Code Intelligence",
+                "Enable code intelligence",
                 "Language server",
                 "LSP",
                 "rust-analyzer binary path",
@@ -2092,7 +2093,7 @@ fn CodeIntelligenceTab() -> impl IntoView {
         <h2 class="settings-panel-title">"Code Intelligence"</h2>
 
         <p class="settings-description settings-panel-intro">
-            "Tyde runs language servers on the host to power go-to-definition, find-references, hover types, and diagnostics in the file and diff viewers. A language server is found on the host's PATH automatically; the settings here are for telling Tyde where to look when that is not good enough."
+            "Navigation, references, hover types, and diagnostics, powered by language servers on this host."
         </p>
 
         <CodeIntelSettingsSection />
@@ -2115,6 +2116,20 @@ fn CodeIntelSettingsSection() -> impl IntoView {
     let state_for_commit = state.clone();
     let state_for_keydown = state.clone();
     let state_for_clear = state.clone();
+    let state_for_enabled = state.clone();
+    let state_for_toggle_disabled = state.clone();
+    let state_for_toggle = state.clone();
+
+    let enabled = move || {
+        state_for_enabled
+            .selected_host_settings()
+            .is_some_and(|settings| settings.code_intel.enabled)
+    };
+    let toggle_disabled = move || state_for_toggle_disabled.selected_host_settings().is_none();
+    let on_toggle = move |ev: web_sys::Event| {
+        let input: web_sys::HtmlInputElement = event_target(&ev);
+        send_host_replace(&state_for_toggle, "/code_intel/enabled", input.checked());
+    };
 
     let path_value = move || {
         state_for_value
@@ -2169,12 +2184,36 @@ fn CodeIntelSettingsSection() -> impl IntoView {
     };
 
     view! {
+        <div class="settings-field">
+            <div class="settings-toggle-row">
+                <div>
+                    <label class="settings-label" for="code-intel-enabled">"Enable code intelligence"</label>
+                    <p class="settings-description">
+                        "Applies to all projects on this host. Turning off stops language servers; file browsing still works."
+                    </p>
+                    <p class="settings-description">
+                        "Rust analysis runs Cargo checks and build scripts, which can compete with your builds."
+                    </p>
+                </div>
+                <label class="settings-toggle">
+                    <input
+                        id="code-intel-enabled"
+                        type="checkbox"
+                        prop:checked=enabled
+                        disabled=toggle_disabled
+                        on:change=on_toggle
+                    />
+                    <span class="settings-toggle-slider"></span>
+                </label>
+            </div>
+        </div>
+
         <h3 class="settings-section-title">"Rust"</h3>
 
         <div class="settings-field">
             <label class="settings-label">"rust-analyzer binary path"</label>
             <p class="settings-description">
-                "Where to find rust-analyzer, the language server that provides Rust navigation and diagnostics. Leave this empty and Tyde uses the rustup proxy in ~/.cargo/bin, which is correct for almost every setup. Set an absolute path when you are on a custom toolchain that rustup cannot install rust-analyzer for, or when you need a specific build. The path is checked on the host, not on this device, so it must be valid there."
+                "Optional absolute path on the host. Leave blank to find rust-analyzer automatically."
             </p>
             <div class="settings-mobile-connection-row">
                 <input
@@ -11515,16 +11554,55 @@ mod wasm_tests {
     async fn code_intelligence_tab_rust_analyzer_path_commits_set_and_clear() {
         let calls = install_settings_send_stub();
         let container = make_container();
+        let state = AppState::new();
+        install_general_host_settings(&state, true, false, Some("/old/rust-analyzer"));
+        state.settings_open.set(true);
+        let mounted_state = state.clone();
         let _handle = mount_to(container.clone(), move || {
-            let state = AppState::new();
-            install_general_host_settings(&state, true, false, Some("/old/rust-analyzer"));
-            state.settings_open.set(true);
-            provide_context(state);
+            provide_context(mounted_state);
             view! { <SettingsPanel /> }
         });
         next_tick().await;
         click_tab(&container, "Code Intelligence");
         next_tick().await;
+
+        let enabled = toggle_for_label(&container, "Enable code intelligence");
+        assert!(enabled.checked(), "Code intelligence defaults on");
+        enabled.set_checked(false);
+        enabled
+            .dispatch_event(&web_sys::Event::new("change").unwrap())
+            .unwrap();
+        for _ in 0..4 {
+            next_tick().await;
+        }
+        assert!(
+            recorded_settings_write_ops(&calls).iter().any(|op| {
+                replacement_value(op, "/code_intel/enabled").and_then(Value::as_bool) == Some(false)
+            }),
+            "Turning off must persist the host setting"
+        );
+
+        state.host_settings_by_host.update(|hosts| {
+            hosts.get_mut("host-general").unwrap().code_intel.enabled = false;
+        });
+        next_tick().await;
+        assert!(
+            !enabled.checked(),
+            "The toggle reflects the saved host setting"
+        );
+        enabled.set_checked(true);
+        enabled
+            .dispatch_event(&web_sys::Event::new("change").unwrap())
+            .unwrap();
+        for _ in 0..4 {
+            next_tick().await;
+        }
+        assert!(
+            recorded_settings_write_ops(&calls).iter().any(|op| {
+                replacement_value(op, "/code_intel/enabled").and_then(Value::as_bool) == Some(true)
+            }),
+            "Turning on must persist the host setting"
+        );
 
         let input = rust_analyzer_path_input(&container);
         assert_eq!(

@@ -35,6 +35,7 @@ fn code_intel_state_label(state: CodeIntelState) -> &'static str {
         CodeIntelState::Unavailable => "Unavailable",
         CodeIntelState::Starting => "Starting…",
         CodeIntelState::Indexing => "Indexing…",
+        CodeIntelState::Disabled => "Off",
         CodeIntelState::Ready => "Ready",
         CodeIntelState::Failed => "Failed",
     }
@@ -3948,8 +3949,10 @@ mod wasm_tests {
         let mount_path = path.clone();
         let mount_host = host_id.to_owned();
         let mount_project = project_id.clone();
+        let state = AppState::new();
+        let mounted_state = state.clone();
         let _handle = mount_to(container.clone(), move || {
-            let state = AppState::new();
+            let state = mounted_state;
             let file_path = mount_path.clone();
             state.open_files.update(|files| {
                 files.insert(
@@ -4076,6 +4079,78 @@ mod wasm_tests {
                 .length(),
             0,
             "line without a diagnostic must not get a squiggle"
+        );
+        let stream = protocol::StreamPath(format!("/project/{}", project_id.0));
+        crate::dispatch::clear_stream_seq_for_tests(host_id, &stream);
+        crate::dispatch::dispatch_envelope(
+            &state,
+            host_id,
+            protocol::Envelope::from_payload(
+                stream.clone(),
+                protocol::FrameKind::CodeIntelStatus,
+                0,
+                &protocol::CodeIntelStatusPayload {
+                    scope: protocol::CodeIntelStatusScope::File {
+                        path: path.clone(),
+                        version: ProjectFileVersion(1),
+                    },
+                    state: CodeIntelState::Disabled,
+                    resource_mode: protocol::CodeIntelResourceMode::Full,
+                    work_done: None,
+                    total_work: None,
+                    message: Some("Code intelligence is off in Settings".to_owned()),
+                },
+            )
+            .unwrap(),
+        );
+        next_tick().await;
+        assert!(container.text_content().unwrap_or_default().contains("Off"));
+        assert_eq!(
+            container
+                .query_selector_all(".code-intel-squiggle")
+                .unwrap()
+                .length(),
+            0
+        );
+        assert_eq!(
+            container
+                .query_selector_all(".file-view-content > .file-line")
+                .unwrap()
+                .item(1)
+                .unwrap()
+                .text_content()
+                .unwrap_or_default(),
+            "    let bad: i32 = 5;"
+        );
+
+        crate::dispatch::dispatch_envelope(
+            &state,
+            host_id,
+            protocol::Envelope::from_payload(
+                stream,
+                protocol::FrameKind::CodeIntelDiagnostics,
+                1,
+                &protocol::CodeIntelDiagnosticsPayload {
+                    path,
+                    version: ProjectFileVersion(1),
+                    diagnostics: vec![CodeIntelDiagnostic {
+                        range: ByteRange { start: 20, end: 23 },
+                        severity: CodeIntelSeverity::Error,
+                        message: "late diagnostic".to_owned(),
+                        source: Some("rustc".to_owned()),
+                    }],
+                },
+            )
+            .unwrap(),
+        );
+        next_tick().await;
+        assert_eq!(
+            container
+                .query_selector_all(".code-intel-squiggle")
+                .unwrap()
+                .length(),
+            0,
+            "Late diagnostics must not restore disabled analysis"
         );
     }
 

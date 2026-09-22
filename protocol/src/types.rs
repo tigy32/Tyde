@@ -5846,6 +5846,7 @@ pub enum CodeIntelStatusScope {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CodeIntelState {
+    Disabled,
     /// No provider matches this language.
     Unsupported,
     /// A provider exists but the backing binary is absent.
@@ -5896,6 +5897,7 @@ pub struct CodeIntelRootOverview {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CodeIntelOverviewHeadline {
+    Disabled,
     NotStarted,
     Starting,
     Indexing,

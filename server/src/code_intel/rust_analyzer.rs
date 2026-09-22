@@ -20,6 +20,7 @@ pub(crate) fn rust_config(settings: &CodeIntelSettings) -> LanguageServerConfig 
     let provider_id = CodeIntelProviderId("rust-analyzer".to_owned());
     let configured_path = settings.language_server_paths.get(&provider_id).cloned();
     LanguageServerConfig {
+        enabled: settings.enabled,
         language: CodeIntelLanguageId("rust".to_owned()),
         provider_id,
         lsp_language_id: "rust",

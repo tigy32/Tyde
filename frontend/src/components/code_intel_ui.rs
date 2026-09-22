@@ -130,6 +130,7 @@ pub fn status_disabled_reason(
             return Some(format!("Code intelligence failed: {}", error.message));
         }
         match data.status.as_ref()?.state {
+            CodeIntelState::Disabled => Some("Code intelligence is off in Settings".to_owned()),
             CodeIntelState::Unsupported => {
                 Some("Code intelligence unsupported for this file".to_owned())
             }

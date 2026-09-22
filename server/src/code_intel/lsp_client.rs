@@ -447,6 +447,18 @@ impl LspClient {
             .map_err(|_| "LSP client stopped".to_owned())
     }
 
+    /// Disabling code intelligence must release Cargo locks, including those
+    /// held by descendants, without waiting for a busy server's LSP response.
+    pub(crate) async fn terminate(self) {
+        if let Some(child) = &self.child {
+            let mut guard = child.lock().await;
+            if let Some(mut process) = guard.take() {
+                let _ = process.start_kill();
+                let _ = process.wait().await;
+            }
+        }
+    }
+
     /// Graceful LSP teardown: `shutdown` request (bounded), `exit`
     /// notification, then kill+reap the process group. Bounded everywhere so a
     /// wedged server can never hang teardown.

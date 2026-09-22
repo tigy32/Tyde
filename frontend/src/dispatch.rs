@@ -2251,7 +2251,13 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                         state.code_intel.update(|map| {
                             map.entry(key)
                                 .or_default()
-                                .merge_versioned(version, |data| data.merge_model(payload));
+                                .merge_versioned(version, |data| {
+                                    if !data.status.as_ref().is_some_and(|status| {
+                                        status.state == protocol::CodeIntelState::Disabled
+                                    }) {
+                                        data.merge_model(payload);
+                                    }
+                                });
                         });
                     } else {
                         log::debug!(
@@ -2294,7 +2300,11 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                             map.entry(key)
                                 .or_default()
                                 .merge_versioned(version, |data| {
-                                    data.diagnostics = payload.diagnostics;
+                                    if !data.status.as_ref().is_some_and(|status| {
+                                        status.state == protocol::CodeIntelState::Disabled
+                                    }) {
+                                        data.diagnostics = payload.diagnostics;
+                                    }
                                 });
                         });
                     } else {
@@ -3046,7 +3056,15 @@ fn apply_code_intel_status(
     state.code_intel.update(|map| {
         map.entry(key)
             .or_default()
-            .merge_versioned(version, |data| data.status = Some(payload));
+            .merge_versioned(version, |data| {
+                if matches!(
+                    payload.state,
+                    protocol::CodeIntelState::Disabled | protocol::CodeIntelState::Starting
+                ) {
+                    *data = Default::default();
+                }
+                data.status = Some(payload);
+            });
     });
 }
 
@@ -3131,7 +3149,15 @@ fn record_code_intel_error_for_path(
     state.code_intel.update(|map| {
         map.entry(key)
             .or_default()
-            .merge_versioned(version, |data| data.error = Some(payload));
+            .merge_versioned(version, |data| {
+                if !data
+                    .status
+                    .as_ref()
+                    .is_some_and(|status| status.state == protocol::CodeIntelState::Disabled)
+                {
+                    data.error = Some(payload);
+                }
+            });
     });
 }
 

@@ -61,6 +61,7 @@ impl ServerDiscovery {
 /// by this; nothing language-specific leaks into the shared machinery.
 #[derive(Clone)]
 pub(crate) struct LanguageServerConfig {
+    pub enabled: bool,
     /// Open wire language id, e.g. `"rust"`, `"python"`. Rendered opaquely by the
     /// frontend; never a closed enum on the wire.
     pub language: CodeIntelLanguageId,

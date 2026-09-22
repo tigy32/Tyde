@@ -274,6 +274,7 @@ pub fn FileExplorer() -> impl IntoView {
 /// pure rendering of the enum, not an inference about provider behavior.
 fn state_label(state: CodeIntelState) -> &'static str {
     match state {
+        CodeIntelState::Disabled => "Off",
         CodeIntelState::Ready => "Ready",
         CodeIntelState::Indexing => "Indexing",
         CodeIntelState::Starting => "Starting",
@@ -285,6 +286,7 @@ fn state_label(state: CodeIntelState) -> &'static str {
 
 fn state_dot_class(state: CodeIntelState) -> &'static str {
     match state {
+        CodeIntelState::Disabled => "idle",
         CodeIntelState::Ready => "ready",
         CodeIntelState::Indexing => "indexing",
         CodeIntelState::Starting => "starting",
@@ -296,7 +298,7 @@ fn state_dot_class(state: CodeIntelState) -> &'static str {
 
 fn headline_dot_class(headline: CodeIntelOverviewHeadline) -> &'static str {
     match headline {
-        CodeIntelOverviewHeadline::NotStarted => "idle",
+        CodeIntelOverviewHeadline::Disabled | CodeIntelOverviewHeadline::NotStarted => "idle",
         CodeIntelOverviewHeadline::Starting => "starting",
         CodeIntelOverviewHeadline::Indexing => "indexing",
         CodeIntelOverviewHeadline::Ready => "ready",
@@ -313,6 +315,7 @@ fn headline_dot_class(headline: CodeIntelOverviewHeadline) -> &'static str {
 fn aggregate_label(summary: &CodeIntelOverviewSummary) -> (String, &'static str) {
     let class = headline_dot_class(summary.headline);
     let mut label = match summary.headline {
+        CodeIntelOverviewHeadline::Disabled => "Off".to_owned(),
         CodeIntelOverviewHeadline::NotStarted => "Not started".to_owned(),
         CodeIntelOverviewHeadline::Starting => "Starting".to_owned(),
         CodeIntelOverviewHeadline::Indexing => {

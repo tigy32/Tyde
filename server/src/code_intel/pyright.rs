@@ -32,6 +32,7 @@ pub(crate) fn pyright_config(settings: &CodeIntelSettings) -> LanguageServerConf
     let provider_id = CodeIntelProviderId("pyright".to_owned());
     let configured_path = settings.language_server_paths.get(&provider_id).cloned();
     LanguageServerConfig {
+        enabled: settings.enabled,
         language: CodeIntelLanguageId("python".to_owned()),
         provider_id,
         lsp_language_id: "python",
