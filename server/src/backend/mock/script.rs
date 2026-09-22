@@ -294,6 +294,15 @@ impl MockTurn {
         }
     }
 
+    pub fn held_echo() -> Self {
+        Self {
+            body: MockTurnBody::RenderedEcho(None),
+            finish: MockTurnFinish::Held {
+                interruptible: true,
+            },
+        }
+    }
+
     pub fn gated_echo(gate: &MockGateHandle) -> Self {
         Self {
             body: MockTurnBody::RenderedEcho(Some(gate.gate())),
@@ -615,16 +624,23 @@ impl MockTurn {
     ) -> (Vec<MockStep>, MockTurnFinish) {
         let steps = match self.body {
             MockTurnBody::Steps(steps) => steps,
-            MockTurnBody::RenderedEcho(gate) => text_steps(
-                format!(
+            MockTurnBody::RenderedEcho(gate) => {
+                let text = format!(
                     "{}mock backend response to: {input}",
                     startup_mcp_response_prefix(session_id)
-                ),
-                TextShape {
-                    gate,
-                    ..TextShape::default()
-                },
-            ),
+                );
+                if matches!(self.finish, MockTurnFinish::Held { .. }) {
+                    held_steps(text)
+                } else {
+                    text_steps(
+                        text,
+                        TextShape {
+                            gate,
+                            ..TextShape::default()
+                        },
+                    )
+                }
+            }
             MockTurnBody::RenderedHistoryJoin => text_steps(
                 format!(
                     "mock history: {}",

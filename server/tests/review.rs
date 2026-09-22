@@ -928,10 +928,12 @@ async fn project_bootstrap_exposes_one_active_workspace_review() {
     let fixture = Fixture::new().await;
     // Keep the reviewer running while its bootstrap state is inspected.
     let reviewer_gate = MockGateHandle::new();
+    let followup_gate = MockGateHandle::new();
     let _reservation = fixture
         .reserve_next_mock_launch(
             "AI Review",
-            MockScript::one(MockTurn::gated_echo(&reviewer_gate)),
+            MockScript::one(MockTurn::gated_echo(&reviewer_gate))
+                .then(MockTurn::gated_echo(&followup_gate)),
         )
         .await;
     let mut client = fixture.client;
@@ -1215,8 +1217,31 @@ async fn project_bootstrap_exposes_one_active_workspace_review() {
         response.contains("[tool_policy: AllowList"),
         "reviewer lost tool restrictions: {response}"
     );
+    client
+        .send_message(
+            &new_agent.instance_stream,
+            "Explain the frozen review again.".to_owned(),
+        )
+        .await
+        .expect("ask reviewer follow-up");
+    let (_, followup_path, followup_manifest) =
+        reviewer_context_before_idle(&mut client, &new_agent.instance_stream).await;
+    assert!(
+        followup_path == manifest_path,
+        "follow-up lost its original context address"
+    );
+    assert!(
+        followup_manifest == manifest,
+        "follow-up must read the original frozen manifest"
+    );
+    followup_gate.release_one();
+    fixture::finish_turn_on(&mut client, &new_agent.instance_stream).await;
     drop(reviewer_gate);
     close_agent_and_wait(&mut client, &new_agent.instance_stream).await;
+    assert!(
+        !directory.exists(),
+        "closing a reviewer must delete its snapshot directory"
+    );
 }
 
 #[tokio::test]
@@ -1315,12 +1340,8 @@ async fn start_ai_review_on_clean_workspace_errors_without_spawning_agent() {
 #[tokio::test]
 async fn committed_ai_review_addresses_large_frozen_context_without_inline_diff() {
     let fixture = Fixture::new().await;
-    let reviewer_gate = MockGateHandle::new();
     let _reservation = fixture
-        .reserve_next_mock_launch(
-            "AI Review",
-            MockScript::one(MockTurn::gated_echo(&reviewer_gate)),
-        )
+        .reserve_next_mock_launch("AI Review", MockScript::one(MockTurn::held_echo()))
         .await;
     let mut client = fixture.client;
     set_default_backend(&mut client, BackendKind::Claude).await;
@@ -1436,9 +1457,127 @@ async fn committed_ai_review_addresses_large_frozen_context_without_inline_diff(
         fs::read_to_string(&diff_path).expect("reread frozen diff") == frozen,
         "committed snapshot changed after a working-tree edit"
     );
-    reviewer_gate.release_one();
+    client
+        .interrupt(&reviewer.instance_stream)
+        .await
+        .expect("cancel large review");
     fixture::finish_turn_on(&mut client, &reviewer.instance_stream).await;
+    let snapshot = subscribe_review(&mut client, &review_id).await;
+    let mut terminal = snapshot.ai_reviewer;
+    if terminal.status == ReviewAiReviewerStatus::Running {
+        next_frame_matching_on(&mut client, "cancelled review terminal state", |env| {
+            if env.kind != FrameKind::ReviewEvent {
+                return false;
+            }
+            if let ReviewEventPayload::AiReviewerChanged { state } =
+                env.parse_payload().expect("review event")
+                && state.status != ReviewAiReviewerStatus::Running
+            {
+                terminal = state;
+                return true;
+            }
+            false
+        })
+        .await;
+    }
+    assert_eq!(
+        terminal.status,
+        ReviewAiReviewerStatus::Failed,
+        "cancellation must not look like a clean review"
+    );
+    assert!(
+        terminal
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("cancelled"))
+    );
+    assert!(fs::read_to_string(&diff_path).expect("cancelled reviewer retains context") == frozen);
     close_agent_and_wait(&mut client, &reviewer.instance_stream).await;
+    assert!(
+        !manifest_path.parent().expect("manifest directory").exists(),
+        "closing a cancelled reviewer must delete its snapshot directory"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn review_context_path_errors_are_recoverable_and_leave_no_artifacts() {
+    use std::os::unix::ffi::OsStringExt;
+
+    let root = tempfile::tempdir().expect("temp root");
+    // The checkout's filesystem may reject non-UTF-8 names (e.g. utf8only ZFS).
+    let raw_path_root = tempfile::tempdir_in("/dev/shm").expect("raw filename filesystem");
+    let context_parent = raw_path_root.path().join(std::ffi::OsString::from_vec(
+        b"review-context-\xff".to_vec(),
+    ));
+    fs::create_dir(&context_parent).expect("create non-UTF-8 context parent");
+    let fixture = Fixture::new_with_runtime_config(server::HostRuntimeConfig {
+        review_context_parent: context_parent.clone(),
+        ..Default::default()
+    })
+    .await;
+    let mut client = fixture.client;
+    set_default_backend(&mut client, BackendKind::Claude).await;
+    let repo = root.path().join("review-root");
+    fs::create_dir(&repo).expect("create repo");
+    seed_repo(&repo);
+    let project = create_project(&mut client, &repo).await;
+    let bootstrap = expect_project_bootstrap(&mut client, &project).await;
+    let review_id = bootstrap.review_summaries[0].id.clone();
+    subscribe_review(&mut client, &review_id).await;
+
+    for attempt in 0..3 {
+        if attempt == 2 {
+            fs::remove_dir(&context_parent)
+                .expect("remove context parent to exercise write failure");
+        }
+        client
+            .review_action(
+                &review_id,
+                ReviewActionPayload::StartAiReview {
+                    backend_kind: None,
+                    cost_hint: None,
+                    instructions: None,
+                    scope: ReviewAiScope::WorkingTree,
+                },
+            )
+            .await
+            .expect("start review with invalid context path");
+        next_frame_matching_on(&mut client, "recoverable review context error", |env| {
+            assert_ne!(
+                env.kind,
+                FrameKind::NewAgent,
+                "invalid context must fail before spawn"
+            );
+            if env.kind != FrameKind::ReviewEvent {
+                return false;
+            }
+            match env.parse_payload().expect("review event") {
+                ReviewEventPayload::Error { error } => {
+                    assert!(
+                        error.message.contains(if attempt < 2 {
+                            "UTF-8"
+                        } else {
+                            "cannot create frozen review context"
+                        }),
+                        "each request must report its path error without losing the spawn worker"
+                    );
+                    true
+                }
+                _ => false,
+            }
+        })
+        .await;
+        if attempt < 2 {
+            assert_eq!(
+                fs::read_dir(&context_parent)
+                    .expect("read context parent")
+                    .count(),
+                0,
+                "failed review must clean up partial artifacts"
+            );
+        }
+    }
 }
 
 #[tokio::test]

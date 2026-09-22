@@ -363,6 +363,7 @@ pub struct HostRuntimeConfig {
     pub debug_mcp_bind_addr: Option<std::net::SocketAddr>,
     pub agent_control_mcp_bind_addr: Option<std::net::SocketAddr>,
     pub review_mcp_bind_addr: Option<std::net::SocketAddr>,
+    pub review_context_parent: PathBuf,
     pub workflow_mcp_bind_addr: Option<std::net::SocketAddr>,
     pub backend_storage_roots: HashMap<BackendKind, PathBuf>,
     pub backend_probe_programs: HashMap<BackendKind, String>,
@@ -401,6 +402,7 @@ impl Default for HostRuntimeConfig {
             debug_mcp_bind_addr: None,
             agent_control_mcp_bind_addr: None,
             review_mcp_bind_addr: None,
+            review_context_parent: std::env::temp_dir(),
             workflow_mcp_bind_addr: None,
             backend_storage_roots: HashMap::new(),
             backend_probe_programs: HashMap::new(),
@@ -761,6 +763,7 @@ pub(crate) struct HostState {
     pub agent_control_mcp: AgentControlMcpHandle,
     pub config_mcp: ConfigMcpHandle,
     pub review_mcp: ReviewMcpHandle,
+    review_context_parent: PathBuf,
     pub workflow_mcp: WorkflowMcpHandle,
     pub workflow_watcher: WorkflowWatcherHandle,
     pub workflow_catalog: WorkflowCatalog,
@@ -9720,6 +9723,19 @@ impl HostHandle {
             )
             .await;
 
+            let review_context = self
+                .state
+                .lock()
+                .await
+                .registry
+                .take_review_context(&target_agent_id);
+            if let Some(context) = review_context {
+                if let Err(error) = context.close() {
+                    tracing::warn!(%error, "failed to remove closed reviewer context");
+                } else {
+                    tracing::debug!("removed closed reviewer context");
+                }
+            }
             let payload = AgentClosedPayload {
                 agent_id: target_agent_id,
             };
@@ -13500,10 +13516,16 @@ impl HostHandle {
             );
             return Err("review feedback MCP server is unavailable for AI review".to_owned());
         }
-        let context_directory =
-            prepare_reviewer_context(&request.review, &request.scope, &config.instructions).await?;
+        let context_parent = self.state.lock().await.review_context_parent.clone();
+        let context_directory = prepare_reviewer_context(
+            &request.review,
+            &request.scope,
+            &config.instructions,
+            &context_parent,
+        )
+        .await?;
         let reviewer_system_prompt =
-            build_reviewer_system_prompt(&context_directory.path().join("review.md"));
+            build_reviewer_system_prompt(&context_directory.path().join("review.md"))?;
         let reviewer_system_prompt_len = reviewer_system_prompt.len();
         let reviewer_mcp_servers = vec![StartupMcpServer {
             name: REVIEW_FEEDBACK_MCP_SERVER_NAME.to_owned(),
@@ -13577,7 +13599,13 @@ impl HostHandle {
             Ok(agent_id) => agent_id,
             Err(error) => return Err(error),
         };
-        if let Some(agent_handle) = self.agent_handle(&agent_id).await {
+        let agent_handle = self
+            .state
+            .lock()
+            .await
+            .registry
+            .retain_review_context(&agent_id, context_directory);
+        if let Some(agent_handle) = agent_handle {
             tracing::info!(
                 review_id = %request.review_id,
                 reviewer_agent_id = %agent_id,
@@ -13587,7 +13615,6 @@ impl HostHandle {
                 agent_id.clone(),
                 agent_handle,
                 request.review_handle.clone(),
-                context_directory,
             );
             Ok(agent_id)
         } else {
@@ -14719,6 +14746,7 @@ fn spawn_host_inner(
             agent_control_mcp: agent_control_mcp_placeholder,
             config_mcp: config_mcp_placeholder,
             review_mcp: review_mcp_placeholder,
+            review_context_parent: runtime_config.review_context_parent.clone(),
             workflow_mcp: workflow_mcp_placeholder,
             workflow_watcher,
             workflow_catalog,

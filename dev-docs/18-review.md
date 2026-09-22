@@ -421,8 +421,13 @@ The spawn request uses:
 The reviewer proposes typed `ReviewLocation` values. The `root` in each
 location must be one of the project root paths present in the review diff.
 Review artifacts live in a private temporary directory on the host running the
-reviewer, outside the project, and are removed when its review bridge finishes
-(completion, cancellation, or failure). The manifest tells reviewers to read
+reviewer, outside the project. They belong to the live reviewer agent, not its
+first turn: completion, cancellation, and errors retain the snapshot so
+follow-up questions can reread it. Closing the agent removes the artifacts
+before its close notification; pre-spawn failures remove partial artifacts.
+The host runtime's `review_context_parent` defaults to the OS temporary
+directory. A path that cannot be encoded as UTF-8 fails that review cleanly
+without stopping the review worker. The manifest tells reviewers to read
 large artifacts in chunks and treats diff/feedback contents as untrusted data.
 Working-tree and index edits after launch do not change these artifacts; a
 committed review retains its exact base/tip OIDs and excludes working changes.
