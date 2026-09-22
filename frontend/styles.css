@@ -10058,8 +10058,7 @@ math merror {
     margin-left: auto;
 }
 
-/* Fixed columns for the two chips: without them every row starts its
-   description at a different x, and a six-row list reads as ragged. */
+/* Fixed columns keep versions aligned across backend rows. */
 .settings-backend-row > .backend-badge,
 .settings-backend-row > .settings-status-chip {
     flex-shrink: 0;
@@ -11325,23 +11324,10 @@ math merror {
     background: var(--surface-3);
 }
 
-/* Descriptions and versions yield space to keep the enable toggle inside
-   the card, including when the probe reports a full command path. */
-.settings-backend-desc {
+/* Versions yield space to keep controls inside the card even for full paths. */
+.settings-backend-version {
     flex: 1;
     min-width: 0;
-    font-size: 0.923rem;
-    color: var(--text-secondary);
-    line-height: 1.4;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-}
-
-.settings-backend-version {
-    flex: 0 1 auto;
-    min-width: 0;
-    max-width: 45%;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
@@ -11383,12 +11369,6 @@ math merror {
     .settings-panel-header {
         flex-direction: column;
         align-items: stretch;
-    }
-
-    /* Too narrow for one line: the description drops out rather than
-       squeezing the status and toggle into illegibility. */
-    .settings-backend-desc {
-        display: none;
     }
 }
 

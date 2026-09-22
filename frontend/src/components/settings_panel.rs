@@ -2675,7 +2675,6 @@ fn BackendsTab() -> impl IntoView {
 
         <div class="settings-field">
             <label class="settings-label">"Enabled Backends"</label>
-            <p class="settings-description">"Which backends are offered when creating an agent. A backend has to be installed on this host before it can do anything, so each row reports what the host probe found and offers the install command when one is available."</p>
             <div class="settings-backend-list">
                 {all_backends()
                     .into_iter()
@@ -6810,7 +6809,6 @@ fn MobileDirectField(
 fn BackendCard(kind: BackendKind) -> impl IntoView {
     let state = expect_context::<AppState>();
     let name = backend_label(kind);
-    let description = backend_description(kind);
     let badge_class = backend_badge_class(kind);
     let state_for_checked = state.clone();
     let state_for_disable = state.clone();
@@ -6870,7 +6868,6 @@ fn BackendCard(kind: BackendKind) -> impl IntoView {
                 <span class=move || backend_setup_status_class(setup_info_for_status().as_ref())>
                     {move || backend_setup_status_label(setup_info_for_label().as_ref())}
                 </span>
-                <span class="settings-backend-desc" title=description>{description}</span>
                 <span
                     class="settings-backend-version"
                     title=move || setup_info_for_version_title().and_then(|info| info.installed_version)
@@ -7319,19 +7316,6 @@ fn backend_label(kind: BackendKind) -> &'static str {
         BackendKind::Hermes => "Hermes",
         BackendKind::Grok => "Grok",
         BackendKind::Opencode => "OpenCode",
-    }
-}
-
-fn backend_description(kind: BackendKind) -> &'static str {
-    match kind {
-        BackendKind::Tycode => "Tycode subprocess backend",
-        BackendKind::Kiro => "Kiro — and any other agent that speaks ACP",
-        BackendKind::Claude => "Anthropic Claude — advanced reasoning and coding",
-        BackendKind::Codex => "OpenAI Codex — code completion and generation",
-        BackendKind::Antigravity => "Google Antigravity CLI — agentic coding assistant",
-        BackendKind::Hermes => "Hermes — native JSON-RPC agent backend",
-        BackendKind::Grok => "Grok Build — ACP coding agent",
-        BackendKind::Opencode => "OpenCode — free multimodal ACP coding agent",
     }
 }
 
@@ -12835,12 +12819,16 @@ mod wasm_tests {
         document.head().unwrap().append_child(&style).unwrap();
         let container = make_container();
         let versions = [
-            (BackendKind::Codex, "codex-cli 0.153.4"),
+            (BackendKind::Codex, Some("codex-cli 0.153.4")),
             (
                 BackendKind::Hermes,
-                "/Users/mike/.hermes/tyde-hermes-python -m tui_gateway.entry",
+                Some("/Users/mike/.hermes/tyde-hermes-python -m tui_gateway.entry"),
             ),
-            (BackendKind::Grok, "grok 1.0.25 (f7e67d6988e2) [stable]"),
+            (
+                BackendKind::Grok,
+                Some("grok 1.0.25 (f7e67d6988e2) [stable]"),
+            ),
+            (BackendKind::Claude, None),
         ];
         let handle = mount_to(container.clone(), move || {
             let state = AppState::new();
@@ -12856,7 +12844,7 @@ mod wasm_tests {
                         .iter()
                         .map(|(kind, version)| {
                             let mut info = backend_setup_info(*kind, BackendSetupStatus::Installed);
-                            info.installed_version = Some((*version).to_owned());
+                            info.installed_version = version.map(str::to_owned);
                             info
                         })
                         .collect(),
@@ -12887,6 +12875,21 @@ mod wasm_tests {
                     .unwrap()
                     .dyn_into()
                     .unwrap();
+                let (kind, version) = versions[i as usize];
+                assert_eq!(
+                    row.text_content()
+                        .unwrap()
+                        .split_whitespace()
+                        .collect::<String>(),
+                    format!(
+                        "{}Installed{}",
+                        backend_label(kind),
+                        version.unwrap_or_default()
+                    )
+                    .split_whitespace()
+                    .collect::<String>(),
+                    "backend rows must show only identity, status, and an optional version"
+                );
                 let toggle = card
                     .query_selector(".settings-toggle")
                     .unwrap()

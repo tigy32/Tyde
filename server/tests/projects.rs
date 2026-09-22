@@ -2874,8 +2874,12 @@ fn project_git_preserves_path_wrapper_without_forking_host() {
         )
     }
     fn executable(path: &Path, body: &str) {
-        fs::write(path, body).expect("write wrapper");
-        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).expect("chmod wrapper");
+        // A preceding server flow can still be executing this inode.
+        let replacement = path.with_extension("replacement");
+        fs::write(&replacement, body).expect("write wrapper");
+        fs::set_permissions(&replacement, fs::Permissions::from_mode(0o755))
+            .expect("chmod wrapper");
+        fs::rename(&replacement, path).expect("replace wrapper");
     }
 
     let original_path = std::env::var_os("PATH").expect("test PATH");
@@ -2992,13 +2996,12 @@ fn project_git_preserves_path_wrapper_without_forking_host() {
         // glibc execvp accepts executable shell wrappers without a shebang.
         // The optimization must fall back rather than break an existing host setup.
         let wrapper_script = fs::read_to_string(&wrapper).expect("read wrapper");
-        fs::write(
+        executable(
             &wrapper,
             wrapper_script
                 .strip_prefix("#!/bin/sh\n")
                 .expect("wrapper shebang"),
-        )
-        .expect("write shell-fallback wrapper");
+        );
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -3009,7 +3012,7 @@ fn project_git_preserves_path_wrapper_without_forking_host() {
             "legacy shell fallback must remain available"
         );
 
-        fs::write(&wrapper, wrapper_script).expect("restore wrapper");
+        executable(&wrapper, &wrapper_script);
     }
     executable(
         &denied.join("git"),
