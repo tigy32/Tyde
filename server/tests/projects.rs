@@ -2755,6 +2755,10 @@ async fn project_read_diff_payload_echoes_context_mode() {
 
 #[tokio::test]
 async fn project_stage_file_updates_git_status_and_diffs() {
+    assert_project_stage_file_updates_git_status_and_diffs().await;
+}
+
+async fn assert_project_stage_file_updates_git_status_and_diffs() {
     let mut fixture = Fixture::new().await;
     let repo = init_git_repo(
         "stage-file",
@@ -2848,6 +2852,174 @@ async fn project_stage_file_updates_git_status_and_diffs() {
     .await;
     assert_eq!(unstaged.scope, ProjectDiffScope::Unstaged);
     assert!(unstaged.files.is_empty());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn project_git_preserves_path_wrapper_without_forking_host() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static FORKS: AtomicUsize = AtomicUsize::new(0);
+    extern "C" fn count_fork() {
+        FORKS.fetch_add(1, Ordering::Relaxed);
+    }
+    fn shell_quote(value: &std::ffi::OsStr) -> String {
+        format!(
+            "'{}'",
+            value
+                .to_str()
+                .expect("test path UTF-8")
+                .replace('\'', "'\\''")
+        )
+    }
+    fn executable(path: &Path, body: &str) {
+        fs::write(path, body).expect("write wrapper");
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).expect("chmod wrapper");
+    }
+
+    let original_path = std::env::var_os("PATH").expect("test PATH");
+    let real_git = std::env::split_paths(&original_path)
+        .map(|dir| dir.join("git"))
+        .find(|path| {
+            path.is_file()
+                && rustix::fs::accessat(
+                    rustix::fs::CWD,
+                    path,
+                    rustix::fs::Access::EXEC_OK,
+                    rustix::fs::AtFlags::EACCESS,
+                )
+                .is_ok()
+        })
+        .expect("real Git installed");
+    let real_git = std::path::absolute(real_git).expect("absolute real Git");
+    let wrappers = tempfile::Builder::new()
+        .prefix("git spawn wrappers ")
+        .tempdir()
+        .expect("wrapper directory");
+    let denied = wrappers.path().join("not executable");
+    let selected = wrappers.path().join("selected");
+    fs::create_dir_all(&denied).expect("denied directory");
+    fs::create_dir_all(&selected).expect("selected directory");
+    fs::write(denied.join("git"), "not executable").expect("non-executable PATH entry");
+    fs::set_permissions(denied.join("git"), fs::Permissions::from_mode(0o644))
+        .expect("chmod non-executable entry");
+    let calls = wrappers.path().join("calls");
+    let wrapper = wrappers.path().join("host-git-wrapper");
+    executable(
+        &wrapper,
+        &format!(
+            "#!/bin/sh\n[ \"$LC_ALL\" = C ] || exit 91\nprintf '%s|%s\\n' \"$0\" \"$*\" >> {}\nexec {} \"$@\"\n",
+            shell_quote(calls.as_os_str()),
+            shell_quote(real_git.as_os_str()),
+        ),
+    );
+    symlink(&wrapper, selected.join("git")).expect("symlink custom Git");
+    let resolved_path = std::env::join_paths(
+        [denied.clone(), selected.clone()]
+            .into_iter()
+            .chain(std::env::split_paths(&original_path)),
+    )
+    .expect("custom login PATH");
+    let shell = wrappers.path().join("login-shell");
+    executable(
+        &shell,
+        &format!(
+            "#!/bin/sh\nprintf 'TYDE_SHELL_PROBE_BEGIN_7f3c9a2e=%s=TYDE_SHELL_PROBE_END_7f3c9a2e\\n' {}\n",
+            shell_quote(&resolved_path),
+        ),
+    );
+    // Nextest isolates each test in its own process. Set the login shell before
+    // starting the runtime; the inherited PATH deliberately does not select our wrapper.
+    unsafe {
+        std::env::set_var("SHELL", &shell);
+    }
+    server::process_env::initialize_process_env().expect("resolve login PATH");
+    // A prepare handler observes actual libc forks in this host process, not
+    // forks that Git or the selected wrapper may perform after exec.
+    assert_eq!(
+        unsafe { libc::pthread_atfork(Some(count_fork), None, None) },
+        0
+    );
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("test runtime")
+        .block_on(assert_project_stage_file_updates_git_status_and_diffs());
+
+    let calls = fs::read_to_string(calls).expect("custom Git was invoked");
+    let lines = calls.lines().collect::<Vec<_>>();
+    assert!(
+        !lines.is_empty(),
+        "Git must use the host's login PATH wrapper"
+    );
+    let selected_prefix = format!("{}|", selected.join("git").display());
+    assert!(
+        lines.iter().all(|line| line.starts_with(&selected_prefix)),
+        "preserve the executable symlink, not its canonical target"
+    );
+    for command in ["status", "hash-object", "log", "diff", "add"] {
+        assert!(
+            lines.iter().any(|line| line
+                .split_once('|')
+                .expect("wrapper log entry")
+                .1
+                .split_whitespace()
+                .any(|arg| arg == command)),
+            "protocol flow must exercise {command}"
+        );
+    }
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("|--no-optional-locks ")),
+        "preserve read-only flags"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains(" add ") && !line.contains("--no-optional-locks")),
+        "preserve mutating flags"
+    );
+    assert_eq!(
+        FORKS.load(Ordering::Relaxed),
+        0,
+        "project Git operations must not run the host allocator's fork handlers"
+    );
+
+    #[cfg(target_env = "gnu")]
+    {
+        // glibc execvp accepts executable shell wrappers without a shebang.
+        // The optimization must fall back rather than break an existing host setup.
+        let wrapper_script = fs::read_to_string(&wrapper).expect("read wrapper");
+        fs::write(
+            &wrapper,
+            wrapper_script
+                .strip_prefix("#!/bin/sh\n")
+                .expect("wrapper shebang"),
+        )
+        .expect("write shell-fallback wrapper");
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("fallback runtime")
+            .block_on(assert_project_stage_file_updates_git_status_and_diffs());
+        assert!(
+            FORKS.load(Ordering::Relaxed) > 0,
+            "legacy shell fallback must remain available"
+        );
+
+        fs::write(&wrapper, wrapper_script).expect("restore wrapper");
+    }
+    executable(
+        &denied.join("git"),
+        "#!/tyde-test-missing-interpreter\nexit 99\n",
+    );
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("PATH fallback runtime")
+        .block_on(assert_project_stage_file_updates_git_status_and_diffs());
 }
 
 #[tokio::test]

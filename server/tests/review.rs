@@ -874,16 +874,32 @@ async fn reviewer_context_before_idle(
     client: &mut client::Connection,
     stream: &protocol::StreamPath,
 ) -> (String, std::path::PathBuf, String) {
-    let frame =
-        fixture::next_logical_frame_matching_on(client, "reviewer startup context", |env| {
-            env.stream == *stream
-                && env.kind == FrameKind::ChatEvent
-                && matches!(
-                    env.parse_payload::<ChatEvent>(),
-                    Ok(ChatEvent::StreamEnd(_))
-                )
-        })
-        .await;
+    // The StreamEnd-only matcher discarded live TypingStatusChanged(true),
+    // but kept it when it was already buffered. The subsequent finish_turn_on
+    // requires that busy event before it can accept idle, explaining its timeout.
+    // Preserve the observed startup sequence for the same busy-to-idle oracle.
+    let mut startup_frames = Vec::new();
+    let frame = loop {
+        let frame =
+            fixture::next_logical_frame_matching_on(client, "reviewer startup context", |env| {
+                env.stream == *stream
+            })
+            .await;
+        let ended = frame.kind == FrameKind::ChatEvent
+            && matches!(
+                frame.parse_payload::<ChatEvent>(),
+                Ok(ChatEvent::StreamEnd(_))
+            );
+        if frame.kind == FrameKind::ChatEvent
+            && let Ok(ChatEvent::TypingStatusChanged(active)) = frame.parse_payload::<ChatEvent>()
+        {
+            eprintln!("REVIEW STARTUP retained activity event active={active}");
+        }
+        startup_frames.push(frame.clone());
+        if ended {
+            break frame;
+        }
+    };
     let ChatEvent::StreamEnd(end) = frame
         .parse_payload::<ChatEvent>()
         .expect("reviewer response")
@@ -891,7 +907,7 @@ async fn reviewer_context_before_idle(
         unreachable!();
     };
     let response = end.message.content;
-    fixture::push_pending_frame_on(client, frame);
+    fixture::push_pending_frames_on(client, startup_frames);
     let encoded_path = response
         .split_once("Review manifest: ")
         .expect("review startup must address a manifest instead of embedding the diff")

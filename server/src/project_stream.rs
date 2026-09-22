@@ -3618,8 +3618,8 @@ fn run_git_lossy_mode(
     args: &[&str],
     access_mode: GitAccessMode,
 ) -> Result<String, String> {
-    let output = git_command("git", root, args, access_mode)?
-        .output()
+    let output = spawn_git_command("git", root, args, access_mode, false)?
+        .wait_with_output()
         .map_err(|err| format!("Failed to run git in '{}': {err}", root))?;
     if !output.status.success() {
         return Err(format!(
@@ -3638,8 +3638,8 @@ fn run_git_mode_with_binary(
     args: &[&str],
     access_mode: GitAccessMode,
 ) -> Result<String, String> {
-    let output = git_command(git_binary, root, args, access_mode)?
-        .output()
+    let output = spawn_git_command(git_binary, root, args, access_mode, false)?
+        .wait_with_output()
         .map_err(|err| format!("Failed to run git in '{}': {err}", root))?;
     if !output.status.success() {
         return Err(format!(
@@ -3669,12 +3669,7 @@ fn run_git_with_stdin_mode_with_binary(
     stdin: &str,
     access_mode: GitAccessMode,
 ) -> Result<String, String> {
-    let mut child = git_command(git_binary, root, args, access_mode)?
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|err| format!("Failed to start git in '{}': {err}", root))?;
+    let mut child = spawn_git_command(git_binary, root, args, access_mode, true)?;
 
     use std::io::Write;
     let mut stdin_pipe = child
@@ -3699,6 +3694,66 @@ fn run_git_with_stdin_mode_with_binary(
     }
     String::from_utf8(output.stdout)
         .map_err(|err| format!("git output was not valid UTF-8 in '{}': {err}", root))
+}
+
+fn spawn_git_command(
+    git_binary: impl AsRef<std::ffi::OsStr>,
+    root: &str,
+    args: &[&str],
+    access_mode: GitAccessMode,
+    pipe_stdin: bool,
+) -> Result<std::process::Child, String> {
+    let git_binary = git_binary.as_ref();
+    let spawn = |program: &std::ffi::OsStr| {
+        let mut command = git_command(program, root, args, access_mode)?;
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::process::CommandExt;
+            command.arg0(git_binary);
+        }
+        command
+            .stdin(if pipe_stdin {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|err| format!("Failed to start git in '{root}': {err}"))
+    };
+    #[cfg(target_os = "linux")]
+    if !git_binary.as_encoded_bytes().contains(&b'/') {
+        // A bare program plus an overridden PATH makes Rust fall back from
+        // posix_spawn to fork. Resolve against the same login PATH, retaining
+        // symlinks so custom Git launchers keep their selected invocation path.
+        let path = crate::process_env::initialize_process_env()?;
+        let program = std::env::split_paths(path)
+            .map(|dir| dir.join(git_binary))
+            .find(|candidate| {
+                candidate.is_file()
+                    && rustix::fs::accessat(
+                        rustix::fs::CWD,
+                        candidate,
+                        rustix::fs::Access::EXEC_OK,
+                        rustix::fs::AtFlags::EACCESS,
+                    )
+                    .is_ok()
+            })
+            .and_then(|candidate| std::path::absolute(candidate).ok());
+        if let Some(program) = program {
+            match spawn(program.as_os_str()) {
+                Ok(child) => return Ok(child),
+                // Preserve execvp's PATH search and shell fallback for unusual
+                // launchers (e.g. no shebang or a missing interpreter). Retry
+                // only a failed spawn, never a Git command that ran and failed.
+                Err(error) => {
+                    tracing::debug!(%error, "absolute Git spawn failed; retrying PATH launch")
+                }
+            }
+        }
+    }
+    spawn(git_binary)
 }
 
 fn git_command(

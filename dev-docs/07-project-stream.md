@@ -114,6 +114,15 @@ repositories with different branches and different dirty states.
 So `project_git_status` is a list of per-root git snapshots, not one flattened
 global status.
 
+On Linux (glibc and musl), project Git commands resolve the executable through
+Tyde's login-shell PATH before spawning it. An absolute program path lets Rust use
+`posix_spawn` rather than forking the multi-threaded host just because PATH was
+overridden. Selection is not cached or canonicalized: custom wrappers and
+symlink invocation paths remain supported. A failed absolute-path spawn retries
+the previous PATH-based launch, preserving shell-wrapper and PATH-search error
+handling; a command that starts is never retried based on its exit status.
+Other platforms, Git arguments/environment, and refresh scheduling are unchanged.
+
 ---
 
 ## 4. Event Model

@@ -7578,6 +7578,7 @@ dependencies = [
  "hmac 0.12.1",
  "ignore",
  "indexmap 2.14.0",
+ "libc",
  "mobile-pairing",
  "notify",
  "opus",

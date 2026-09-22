@@ -787,7 +787,22 @@ const MOCK_NATIVE_CHILD_TOKEN_TOTAL: u64 = 330;
 
 async fn spawn_agent_control_parent(fixture: &mut Fixture, name: &str) -> NewAgentPayload {
     let prompt = format!("initialize {name}");
+    // Completed-turn bootstrap omits historical typing transitions. The strict
+    // live-turn oracle below needs an attached observer before output begins.
+    let gate = MockGateHandle::new();
+    let reservation = fixture
+        .reserve_next_mock_launch(
+            name,
+            MockScript::one(MockTurn::text_after_gate(
+                format!("mock backend response to: {prompt}"),
+                &gate,
+            )),
+        )
+        .await;
     let agent = fixture.spawn(name, &prompt).await;
+    drop(reservation);
+    eprintln!("AGENT CONTROL FIXTURE attached before releasing initial turn");
+    gate.release_one();
     expect_strict_mock_turn(
         &mut fixture.client,
         &agent.stream,

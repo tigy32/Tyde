@@ -80,3 +80,6 @@ serde_json.workspace = true
 tempfile = "3"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid.workspace = true
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+libc = "0.2"

@@ -412,8 +412,23 @@ async fn backend_native_child_does_not_enqueue_completion_notice() {
 async fn idle_parent_does_not_reenter_turn_for_child_completion() {
     let mut fixture = Fixture::new().await;
 
+    // spawn_agent consumes AgentBootstrap for AgentStart, discarding any turn
+    // already replayed inside it. Hold output until the completion observer is
+    // ready, as in the busy-parent case, without dropping completion assertions.
+    let parent_gate = MockGateHandle::new();
+    let parent_reservation = fixture
+        .reserve_next_mock_launch(
+            "idle-parent",
+            MockScript::one(MockTurn::text_after_gate(
+                mock_turn_text("parent idle"),
+                &parent_gate,
+            )),
+        )
+        .await;
     let (parent_new, _) =
         spawn_agent(&mut fixture.client, "idle-parent", "parent idle", None).await;
+    drop(parent_reservation);
+    parent_gate.release_one();
     expect_completed_turn_without_parent_queue(
         &mut fixture.client,
         &parent_new.instance_stream,
@@ -422,6 +437,16 @@ async fn idle_parent_does_not_reenter_turn_for_child_completion() {
     )
     .await;
 
+    let child_gate = MockGateHandle::new();
+    let child_reservation = fixture
+        .reserve_next_mock_launch(
+            "idle-parent-child",
+            MockScript::one(MockTurn::text_after_gate(
+                mock_turn_text("child stays separate"),
+                &child_gate,
+            )),
+        )
+        .await;
     let (child_new, _) = spawn_agent(
         &mut fixture.client,
         "idle-parent-child",
@@ -429,6 +454,8 @@ async fn idle_parent_does_not_reenter_turn_for_child_completion() {
         Some(parent_new.agent_id.clone()),
     )
     .await;
+    drop(child_reservation);
+    child_gate.release_one();
 
     expect_completed_turn_without_parent_queue(
         &mut fixture.client,
