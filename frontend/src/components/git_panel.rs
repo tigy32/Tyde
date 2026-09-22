@@ -4,7 +4,6 @@ use leptos::prelude::*;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::spawn_local;
 
-use crate::components::review_view::ReviewSidebar;
 use crate::send::send_frame;
 use crate::state::{AppState, DiffKey, DiffViewState, next_client_request_id, root_display_name};
 
@@ -139,12 +138,6 @@ pub fn GitPanel() -> impl IntoView {
     }
 }
 
-/// The project's workspace review card: a one-line status header (live
-/// counts, an AI-running marker, and the way into the full comments surface)
-/// over the draft's controls — the AI reviewer form, the submit target, and
-/// Clear. The controls sit here, next to the working tree they act on; the
-/// comments surface the header opens reads and threads feedback only.
-///
 /// Hidden while there is nothing to review and nothing reviewed, so a clean
 /// project pays no vertical cost.
 #[component]
@@ -164,7 +157,7 @@ fn ReviewCard() -> impl IntoView {
     crate::components::review_view::subscribe_review_reactive(&state, target);
 
     let counts_state = state.clone();
-    let counts: Memo<Option<(u32, u32, bool)>> = Memo::new(move |_| {
+    let counts: Memo<Option<(u32, u32, protocol::ReviewAiReviewerStatus)>> = Memo::new(move |_| {
         let (_, rid) = target.get()?;
         let from_record = counts_state.reviews.with(|map| {
             map.get(&rid).map(|review| {
@@ -175,10 +168,7 @@ fn ReviewCard() -> impl IntoView {
                         .iter()
                         .filter(|s| matches!(s.state, protocol::ReviewSuggestionState::Pending))
                         .count() as u32,
-                    matches!(
-                        review.ai_reviewer.status,
-                        protocol::ReviewAiReviewerStatus::Running
-                    ),
+                    review.ai_reviewer.status,
                 )
             })
         });
@@ -194,7 +184,7 @@ fn ReviewCard() -> impl IntoView {
                         (
                             summary.user_comment_count,
                             summary.pending_suggestion_count,
-                            false,
+                            protocol::ReviewAiReviewerStatus::Idle,
                         )
                     })
             })
@@ -212,47 +202,11 @@ fn ReviewCard() -> impl IntoView {
         })
     });
     let visible = Memo::new(move |_| {
-        counts
-            .get()
-            .is_some_and(|(comments, suggestions, running)| {
-                comments > 0 || suggestions > 0 || running || has_dirty_root.get()
-            })
-    });
-
-    // The controls mount only once the full record is loaded. Reviews track
-    // unstaged state, so the AI reviewer is gated on some root having an
-    // unstaged or untracked change; staged-only edits would hand it an empty
-    // diff.
-    let loaded_state = state.clone();
-    let loaded = Memo::new(move |_| {
-        let Some((_, rid)) = target.get() else {
-            return false;
-        };
-        loaded_state.reviews.with(|map| map.contains_key(&rid))
-    });
-    let isdraft_state = state.clone();
-    let is_draft = Memo::new(move |_| {
-        let Some((_, rid)) = target.get() else {
-            return false;
-        };
-        isdraft_state.reviews.with(|map| {
-            map.get(&rid)
-                .is_none_or(|review| matches!(review.status, protocol::ReviewStatus::Draft))
-        })
-    });
-    let changes_state = state.clone();
-    let has_reviewable_changes = Memo::new(move |_| {
-        let Some(ap) = changes_state.active_project.get() else {
-            return false;
-        };
-        changes_state.git_status.with(|map| {
-            map.get(&ap.project_id).is_some_and(|roots| {
-                roots.iter().any(|root| {
-                    root.files
-                        .iter()
-                        .any(|f| f.unstaged.is_some() || f.untracked)
-                })
-            })
+        counts.get().is_some_and(|(comments, suggestions, status)| {
+            comments > 0
+                || suggestions > 0
+                || status != protocol::ReviewAiReviewerStatus::Idle
+                || has_dirty_root.get()
         })
     });
 
@@ -290,68 +244,33 @@ fn ReviewCard() -> impl IntoView {
                         }}
                     </span>
                     {move || {
-                        counts.get().is_some_and(|(_, _, running)| running).then(|| view! {
+                        counts.get().filter(|(_, _, status)| *status != protocol::ReviewAiReviewerStatus::Idle).map(|(_, _, status)| view! {
                             <span
                                 class="gp-review-ai"
                                 data-test="gp-review-ai"
-                                title="The AI reviewer is running"
+                                title="Review status"
                             >
-                                "reviewing\u{2026}"
+                                {match status {
+                                    protocol::ReviewAiReviewerStatus::Running => "Reviewing…",
+                                    protocol::ReviewAiReviewerStatus::Completed => "Completed",
+                                    protocol::ReviewAiReviewerStatus::Failed => "Incomplete",
+                                    protocol::ReviewAiReviewerStatus::Idle => "Idle",
+                                }}
                             </span>
                         })
                     }}
                     <button
                         class="gp-review-open-btn"
                         data-test="gp-review-open"
-                        title="Open every review comment, grouped by root"
+                        title="Open review findings and actions in the main workspace"
                         on:click=on_open.clone()
                     >
-                        "Open"
+                        "Open review"
                     </button>
                 </div>
-                {move || {
-                    if !loaded.get() {
-                        return None;
-                    }
-                    let (host_id, review_id) = target.get()?;
-                    Some(view! {
-                        <ReviewCardControls
-                            host_id=host_id
-                            review_id=review_id
-                            is_draft=is_draft
-                            can_run_ai=has_reviewable_changes
-                        />
-                    })
-                }}
             </div>
         </Show>
     }
-}
-
-/// The review card's controls, mounted once the full record is loaded. Split
-/// out so `ReviewSidebar` gets its seed record read untracked: the card body
-/// must not re-render (and reset the reviewer's in-progress form) every time
-/// a comment lands.
-#[component]
-fn ReviewCardControls(
-    host_id: String,
-    review_id: ReviewId,
-    is_draft: Memo<bool>,
-    can_run_ai: Memo<bool>,
-) -> impl IntoView {
-    let state = expect_context::<AppState>();
-    let seed = state
-        .reviews
-        .with_untracked(|map| map.get(&review_id).cloned())?;
-    Some(view! {
-        <ReviewSidebar
-            review=seed
-            host_id=host_id
-            review_id=review_id
-            is_draft=is_draft
-            can_run_ai=can_run_ai
-        />
-    })
 }
 
 /// Ask the AI reviewer to read one committed range. Its suggestions land in
@@ -3685,14 +3604,52 @@ mod wasm_tests {
         );
     }
 
-    /// A Draft review ⇒ exactly one review card for the project: a one-line
-    /// status header carrying the workspace-wide counts and the way into the
-    /// comments surface, over the draft's own controls.
+    // The old test bounded only the header while twelve long findings made
+    // the card taller than the entire Git dock. Bound the whole card, and
+    // preserve access to the actions and findings in the main review surface.
     #[wasm_bindgen_test]
-    async fn draft_shows_one_review_card_with_counts_and_controls() {
+    async fn draft_keeps_git_compact_and_opens_full_review_controls() {
         ensure_styles_loaded();
         let container = make_container();
-        let _mounted = mount_git_panel(container.clone(), true);
+        stub_recording_bridge();
+        container.style().set_property("width", "320px").unwrap();
+        let mounted = mount_git_panel(container.clone(), true);
+        let state = mounted.borrow().clone().unwrap();
+        let finding_body = "Long review finding with actionable source context. ".repeat(80);
+        state.reviews.update(|reviews| {
+            let review = reviews.get_mut(&ReviewId("rev-1".to_owned())).unwrap();
+            review.suggestions = (0..12)
+                .map(|index| protocol::ReviewSuggestedComment {
+                    id: protocol::ReviewSuggestionId(format!("finding-{index}")),
+                    location: review.comments[0].location.clone(),
+                    anchor_status: protocol::ReviewAnchorStatus::Current,
+                    body: finding_body.clone(),
+                    rationale: None,
+                    severity: protocol::ReviewSeverity::Warn,
+                    state: protocol::ReviewSuggestionState::Pending,
+                    reviewer_agent_id: AgentId("reviewer".to_owned()),
+                    created_at_ms: 1,
+                })
+                .collect();
+            review.ai_reviewer.status = protocol::ReviewAiReviewerStatus::Completed;
+            review.ai_reviewer.rounds.push(protocol::ReviewRound {
+                id: "round-1".to_owned(),
+                snapshot_id: "snapshot-1".to_owned(),
+                scope: Default::default(),
+                started_at_ms: 1,
+                requested_by: Some(AgentId("requester".to_owned())),
+                reviewers: vec![protocol::ReviewReviewerRun {
+                    config_id: "focused".to_owned(),
+                    name: "Test coverage".to_owned(),
+                    backend_kind: protocol::BackendKind::Codex,
+                    agent_id: Some(AgentId("reviewer".to_owned())),
+                    status: protocol::ReviewAiReviewerStatus::Completed,
+                    error: None,
+                }],
+                dispositions: Default::default(),
+                delivery_error: None,
+            });
+        });
         next_tick().await;
 
         let rows = query_all(&container, "[data-test=gp-review-status]");
@@ -3705,18 +3662,70 @@ mod wasm_tests {
             text.contains("1 comment"),
             "expected the workspace comment count in the row; got: {text}"
         );
-        assert!(query(&container, "[data-test=gp-review-open]").is_some());
+        assert!(text.contains("12 AI"));
+        let card = query(&container, "[data-test=gp-review-card]").expect("review card");
+        let card_height = card.get_bounding_client_rect().height();
+        web_sys::console::log_1(
+            &format!("Git review card height with 12 long findings: {card_height}px").into(),
+        );
         assert!(
-            query(&container, "[data-test=review-run-ai]").is_some()
-                && query(&container, "[data-test=review-submit-target]").is_some()
-                && query(&container, ".review-submit-btn").is_some()
-                && query(&container, "[data-test=review-clear-btn]").is_some(),
-            "the card hosts the draft's AI reviewer, submit, and clear controls"
+            card_height > 0.0 && card_height <= 80.0,
+            "The whole review card must stay compact, not just its header: {card_height}px"
+        );
+        assert!(
+            !container
+                .text_content()
+                .unwrap_or_default()
+                .contains(&finding_body),
+            "Detailed findings belong in the main review tab, never the Git sidebar"
+        );
+        let open = query(&container, "[data-test=gp-review-open]").expect("Open review button");
+        assert_eq!(open.text_content().as_deref(), Some("Open review"));
+        click(&open);
+        next_tick().await;
+        assert!(
+            state
+                .center_zone
+                .with_untracked(|zone| zone.all_tabs().any(|(_, tab)| {
+                    matches!(&tab.content, TabContent::Comments { host_id, project_id }
+                if host_id == "h1" && project_id.0 == "proj-1")
+                }))
+        );
+        let main = make_container();
+        main.style().set_property("width", "1000px").unwrap();
+        main.style().set_property("height", "800px").unwrap();
+        let main_state = state.clone();
+        let handle = mount_to(main.clone(), move || {
+            provide_context(main_state);
+            view! { <crate::components::review_view::ReviewCommentsSurface
+            host_id="h1".to_owned() project_id=ProjectId("proj-1".to_owned()) /> }
+        });
+        let _main_mounted = Mounted::new(handle, ());
+        next_tick().await;
+        assert!(
+            main.inner_text()
+                .contains("Long review finding with actionable source context."),
+            "Full findings must remain visible in the main review surface"
+        );
+        click(
+            &query(&main, "[data-test=review-actions-toggle]").expect("Review actions disclosure"),
+        );
+        next_tick().await;
+        assert!(
+            query(&main, "[data-test=review-run-ai]").is_some()
+                && query(&main, "[data-test=review-submit-target]").is_some()
+                && query(&main, ".review-submit-btn").is_some()
+                && query(&main, "[data-test=review-clear-btn]").is_some(),
+            "The main review surface retains the AI reviewer, submit, and clear controls"
+        );
+        assert!(
+            query(&container, "[data-test=review-run-ai]").is_none(),
+            "Review controls must not crowd the Git file navigation"
         );
         let height = rows[0].get_bounding_client_rect().height();
         assert!(
             height > 0.0 && height <= 32.0,
-            "the status header stays one line above the controls; got {height}px"
+            "the status header stays one line; got {height}px"
         );
     }
 

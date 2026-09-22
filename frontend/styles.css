@@ -7464,10 +7464,6 @@ math merror {
     padding: var(--space-1) 0;
 }
 
-/* Workspace review card at the top of the panel: a one-line status header
- * over the draft's controls. It reuses `ReviewSidebar` for the AI reviewer,
- * submit, and Clear, so it neutralizes that component's docked-pane chrome
- * (left border, own scroll container) to sit flush in the narrow panel. */
 .gp-review-card {
     display: flex;
     flex-direction: column;
@@ -7484,21 +7480,6 @@ math merror {
     align-items: center;
     gap: var(--space-2);
     min-height: 24px;
-}
-
-.gp-review-card .review-sidebar {
-    border-left: 0;
-    background: transparent;
-    padding: 0;
-    overflow: visible;
-    gap: var(--space-2);
-}
-
-/* Hairline between the AI-reviewer block and the submit block so the two
- * halves of the card read as separate steps. */
-.gp-review-card .review-sidebar-section + .review-sidebar-section {
-    border-top: 1px solid var(--border-primary);
-    padding-top: var(--space-2);
 }
 
 .gp-review-status-title {
@@ -13385,6 +13366,30 @@ pre.tool-error-pre {
     align-items: center;
     justify-content: space-between;
     gap: var(--space-2);
+}
+
+.review-actions,
+.review-history {
+    flex-shrink: 0;
+    border: 1px solid var(--border-primary);
+    border-radius: var(--radius-md);
+}
+
+.review-actions > summary,
+.review-history > summary {
+    padding: var(--space-2) var(--space-3);
+    cursor: pointer;
+    font-weight: 550;
+}
+
+.review-actions .review-sidebar {
+    border-left: 0;
+    overflow: visible;
+}
+
+.review-history .review-rounds {
+    margin: 0;
+    padding: 0 var(--space-3) var(--space-3);
 }
 
 .review-comments-title {

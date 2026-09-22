@@ -5,12 +5,8 @@
 //! (`ReviewableDiffView` in `diff_view.rs`). There is one active workspace
 //! review per project spanning every root plus exact committed-range drafts;
 //! each per-root diff tab renders its own slice.
-//! What remains here is the shared action sidebar (`ReviewSidebar` — the
-//! AI-reviewer form, submit-target picker, Clear) that the review comments
-//! surface hosts for the workspace draft and the git panel's expanded commit
-//! block hosts for a committed-range draft, plus the subscribe/diff-open/
-//! feedback helpers used across the integrated flow. The git panel itself
-//! only shows a one-line review status row.
+//! Review actions and round history live in the main comments surface.
+//! The Git panel only shows a compact review status and navigation row.
 //!
 //! Reactivity rules (`dev-docs/01-philosophy.md`):
 //! * No optimistic UI: action buttons disable on click and re-enable when
@@ -105,9 +101,8 @@ fn format_elapsed(start_ms: u64) -> String {
 
 /// Action sidebar for a Draft review: live counts, the AI-reviewer form,
 /// the submit-target picker (with full gating), and Clear. Public to the
-/// crate so the git-panel review hub can mount the exact same controls
-/// without re-implementing submit-target gating. Reviews are always-on, so
-/// there is no Cancel/discard-review affordance here.
+/// crate so the main review surface can reuse submit-target gating. Reviews
+/// are always-on, so there is no Cancel/discard-review affordance here.
 ///
 /// `can_run_ai` is an optional extra gate on the AI reviewer: when supplied
 /// and `false`, "Run AI reviewer" is disabled (e.g. the workspace has no
@@ -833,7 +828,6 @@ pub(crate) fn ReviewSidebar(
                 <Show when=move || live_for_ai.get().is_some_and(|r| r.ai_reviewer.status == ReviewAiReviewerStatus::Running)>
                     <button class="review-btn" on:click=on_stop.clone()>"Stop review"</button>
                 </Show>
-                {move || live_for_ai.get().map(|review| view! { <ReviewRounds review /> })}
                 <Show when=move || configuration.get().is_some_and(|s| !s.agents.is_empty())>
                     <p class="review-round-note">"Reviewers are configured in Settings → Review."</p>
                 </Show>
@@ -2023,6 +2017,35 @@ pub fn ReviewCommentsSurface(host_id: String, project_id: ProjectId) -> impl Int
 
     let has_entries = Memo::new(move |_| !groups.get().is_empty());
 
+    let controls_state = state.clone();
+    let controls_target = Memo::new(move |_| {
+        let target = draft.get()?;
+        controls_state
+            .reviews
+            .with(|reviews| reviews.contains_key(&target.1))
+            .then_some(target)
+    });
+    let changes_state = state.clone();
+    let changes_project = project_id.clone();
+    let can_run_ai = Memo::new(move |_| {
+        changes_state.git_status.with(|statuses| {
+            statuses
+                .get(&changes_project)
+                .is_some_and(|roots| roots.iter().any(root_has_reviewable_changes))
+        })
+    });
+    let actions_state = state.clone();
+    let rounds_state = state.clone();
+    let review_with_rounds = Memo::new(move |_| {
+        let (_, id) = draft.get()?;
+        rounds_state.reviews.with(|reviews| {
+            reviews
+                .get(&id)
+                .filter(|review| !review.ai_reviewer.rounds.is_empty())
+                .cloned()
+        })
+    });
+
     let toolbar_state = state.clone();
     let toolbar_host = host_id.clone();
     let toolbar_pid = project_id.clone();
@@ -2049,6 +2072,21 @@ pub fn ReviewCommentsSurface(host_id: String, project_id: ProjectId) -> impl Int
                     }
                 })}
             </div>
+            {move || controls_target.get().and_then(|(host, id)| {
+                let review = actions_state.reviews.with_untracked(|reviews| reviews.get(&id).cloned())?;
+                Some(view! {
+                    <details class="review-actions">
+                        <summary data-test="review-actions-toggle">"Review actions"</summary>
+                        <ReviewSidebar review host_id=host review_id=id is_draft can_run_ai />
+                    </details>
+                })
+            })}
+            <Show when=move || review_with_rounds.get().is_some()>
+                <details class="review-history">
+                    <summary>"Review rounds"</summary>
+                    {move || review_with_rounds.get().map(|review| view! { <ReviewRounds review /> })}
+                </details>
+            </Show>
             <Show
                 when=move || has_entries.get()
                 fallback=move || view! {
@@ -3469,12 +3507,12 @@ mod wasm_tests {
         );
     }
 
-    /// The comments surface reads and threads feedback; the draft's write
-    /// controls live on the git panel's review card, so a loaded draft with
-    /// feedback still offers neither the AI reviewer nor the submit target
-    /// here, and navigating to a comment's source keeps working.
+    // Review actions now live here instead of expanding the Git sidebar.
+    // Keep feedback uncluttered until the user opens actions, without losing
+    // either the controls or navigation to the exact commented source.
     #[wasm_bindgen_test]
     async fn comments_surface_opens_the_staged_comment_source() {
+        ensure_styles_loaded();
         let container = make_container();
         let mut review = make_review();
         let mut staged = comment_at_line(2, "staged");
@@ -3483,13 +3521,25 @@ mod wasm_tests {
         let holder = mount_comments_surface(container.clone(), review, false);
 
         next_tick().await;
-        for control in ["review-run-ai", "review-submit-target", "review-clear-btn"] {
+        // inner_text reports the label's production text-transform: uppercase.
+        for label in ["Run AI reviewer", "SEND FEEDBACK TO", "Clear comments"] {
             assert!(
-                container
-                    .query_selector(&format!("[data-test=\"{control}\"]"))
-                    .unwrap()
-                    .is_none(),
-                "{control} belongs on the git panel's review card, not the comments surface"
+                !container.inner_text().contains(label),
+                "{label} stays collapsed while reading feedback"
+            );
+        }
+        container
+            .query_selector("[data-test=review-actions-toggle]")
+            .unwrap()
+            .expect("Review actions disclosure")
+            .dyn_ref::<HtmlElement>()
+            .unwrap()
+            .click();
+        next_tick().await;
+        for label in ["Run AI reviewer", "SEND FEEDBACK TO", "Clear comments"] {
+            assert!(
+                container.inner_text().contains(label),
+                "Opening actions reveals {label}"
             );
         }
         container
@@ -4145,10 +4195,10 @@ mod wasm_tests {
         None
     }
 
-    /// Mount the git panel over a project whose workspace draft is `review`
-    /// and whose git status is `roots`. The panel's review card is where the
-    /// draft's write controls (AI reviewer, submit target, Clear) live.
-    fn mount_git_panel_review_card(
+    // Preserve the existing dispatch and clean-workspace gating tests on the
+    // main review surface: those actions were moved out of the Git card after
+    // its twelve-finding regression measured a 22,616px-tall sidebar card.
+    fn mount_review_actions_surface(
         container: HtmlElement,
         roots: Vec<protocol::ProjectRootGitStatus>,
         review: Review,
@@ -4196,7 +4246,7 @@ mod wasm_tests {
             seed_host_settings(&state, Some(BackendKind::Codex), vec![BackendKind::Codex]);
             *holder_for_mount.borrow_mut() = Some(state.clone());
             provide_context(state.clone());
-            view! { <crate::components::git_panel::GitPanel /> }
+            view! { <ReviewCommentsSurface host_id="h1".to_owned() project_id=pid /> }
         });
         Mounted::new(handle, holder)
     }
@@ -4210,15 +4260,15 @@ mod wasm_tests {
         )
     }
 
-    /// The git panel's review card hosts the AI reviewer: with a draft, a
+    /// The main review surface hosts the AI reviewer: with a draft, a
     /// backend, and a reviewable change in any root, Run sends
     /// `StartAiReview` on the single workspace review stream regardless of
     /// how many roots there are.
     #[wasm_bindgen_test]
-    async fn git_panel_review_card_run_ai_targets_workspace_review() {
+    async fn main_review_actions_run_ai_targets_workspace_review() {
         record_bridge();
         let container = make_container();
-        let _mounted = mount_git_panel_review_card(
+        let _mounted = mount_review_actions_surface(
             container.clone(),
             vec![dirty_root("/repo-a"), dirty_root("/repo-b")],
             make_review(),
@@ -4226,10 +4276,19 @@ mod wasm_tests {
         next_tick().await;
         next_tick().await;
 
+        container
+            .query_selector("[data-test=review-actions-toggle]")
+            .unwrap()
+            .expect("Review actions disclosure")
+            .dyn_ref::<HtmlElement>()
+            .unwrap()
+            .click();
+        next_tick().await;
+
         let btn = container
             .query_selector("[data-test=\"review-run-ai\"]")
             .unwrap()
-            .expect("Run AI button must render on the git panel's review card");
+            .expect("Run AI button must render in the main review actions");
         let btn: HtmlElement = btn.dyn_into().unwrap();
         assert!(
             !btn.has_attribute("disabled"),
@@ -4252,20 +4311,28 @@ mod wasm_tests {
 
     /// With a draft but a clean tree there is nothing for the reviewer to
     /// read, so Run is disabled and a click sends nothing; it enables
-    /// reactively once a root gains an unstaged change. The card is on screen
-    /// throughout because the draft already carries a comment.
+    /// reactively once a root gains an unstaged change.
     #[wasm_bindgen_test]
-    async fn git_panel_review_card_run_ai_disabled_without_reviewable_changes() {
+    async fn main_review_actions_run_ai_disabled_without_reviewable_changes() {
         record_bridge();
         let container = make_container();
         let mut review = make_review();
         review.comments.push(comment_at_line(2, "already reviewed"));
-        let holder = mount_git_panel_review_card(
+        let holder = mount_review_actions_surface(
             container.clone(),
             vec![root_status("/repo", None, None, false)],
             review,
         );
         next_tick().await;
+        next_tick().await;
+
+        container
+            .query_selector("[data-test=review-actions-toggle]")
+            .unwrap()
+            .expect("Review actions disclosure")
+            .dyn_ref::<HtmlElement>()
+            .unwrap()
+            .click();
         next_tick().await;
 
         let btn = container
