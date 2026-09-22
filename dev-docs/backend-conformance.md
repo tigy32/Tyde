@@ -48,6 +48,36 @@ Server-only guarantees remain in `server/tests/session_resume.rs`: history pagin
 
 Normal validation is `./dev.sh check`; it builds the test binary and MCP bridge without running paid cases. Real cases are ignored and additionally require `TYDE_RUN_REAL_AI_TESTS=1`; `TYDE_REAL_BACKENDS` selects providers. Follow the authorization rules in `AGENTS.md` before running them.
 
+## Resumed native-goal running state
+
+`real_resumed_native_goal_reports_running` requires `NativeGoals` and
+`ResumeSession`; Codex is currently the only eligible backend. It executes an
+unfinished native goal, closes and resumes its session, sends an ordinary
+follow-up, and observes consecutive working turns before releasing the goal's
+filesystem prerequisite. Every live response and tool request must arrive
+while the client's last typing state is active.
+
+The transparent CLI fixture forwards genuine provider traffic unchanged,
+holding the `thread/resume` reply until the provider's real `turn/started`
+notification has been forwarded. It retains proof of that ordering and fails
+if the provider never produces the trigger. It fabricates no provider events,
+responses, or command outcomes. Private run logs and content-free transport
+proof are retained in the reported `tyde-real-resume-race-*` directory.
+
+On 2026-09-22, two uncontrolled baseline runs passed because they did not hit
+the startup interleaving. The controlled unfixed run failed in 29.15 seconds:
+after one completed working turn and an accepted follow-up, a real
+`StreamStart` arrived while the client was idle. The transport proof confirmed
+the native start was forwarded before the resume reply. The integrated case
+reproduced the same failure in 32.74 seconds.
+
+The fixed Codex adapter passed the unchanged controlled case in 70.29 seconds
+on 2026-09-22, including the same proven start-before-reply interleaving, two
+working turns after an accepted follow-up, and completion of the real goal.
+Resume initialization and history replay now finish before inbound events can
+mutate the resumed live state. Ordinary turn, streaming, and tool mapping are
+unchanged outside that resume boundary.
+
 ## Generated-image response ownership
 
 `real_generated_image_preserves_tool_ownership` runs on backends declaring

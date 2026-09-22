@@ -4956,6 +4956,144 @@ conformance2_scenario!(
     ]
 );
 
+async fn real_resumed_native_goal_reports_running<B: Backend>(host: &mut Harness<B>) {
+    use server::backend::SendOutcome;
+
+    if !real_resume_start_race_child(host).await {
+        return;
+    }
+    let ready = "Reply READY and wait for the next instruction.";
+    let agent = spawn_agent(host, ready).await;
+    collect_turn(host, &agent, ready).await;
+    control_native_goal(
+        host,
+        &agent,
+        protocol::GoalControl::Set {
+            objective: "The goal is goal-result.txt containing exactly complete. At the start of EVERY turn, run a foreground shell command that sleeps for 3 seconds and checks whether goal-release.txt exists. If it is absent, report that the prerequisite is missing and END THAT TURN with a final answer, leaving the goal active. Do not wait or poll within the turn, and never create goal-release.txt yourself. Once it exists, write complete to goal-result.txt and mark the goal complete. Follow ordinary user corrections without pausing or clearing the goal.".to_owned(),
+        },
+    )
+    .await;
+    wait_native_goal(host, &agent, Some(protocol::GoalStatus::Active)).await;
+    collect_turn(
+        host,
+        &agent,
+        "Let the active goal finish its first working turn",
+    )
+    .await;
+    close_agent(host, &agent).await;
+    let resumed = resume_agent(host, &agent.session_id).await;
+    let mut running = resumed
+        .replayed_history
+        .iter()
+        .rev()
+        .find_map(|event| match event {
+            ChatEvent::TypingStatusChanged(running) => Some(*running),
+            _ => None,
+        })
+        .unwrap_or(false);
+    let followup = "Continue the existing goal. Keep checking its prerequisite once per turn; do not pause, clear, or replace it.";
+    let mut followup_sent = false;
+    let mut try_followup = false;
+    let mut response_in_turn = false;
+    let mut tools_in_turn = 0;
+    let mut completed_turns = 0;
+    let mut released = false;
+    let mut completion_notices = 0;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(240);
+    loop {
+        if try_followup && !followup_sent {
+            match try_send_prompt(host, &resumed, followup).await {
+                SendOutcome::Accepted => followup_sent = true,
+                SendOutcome::Busy(_) => {}
+                SendOutcome::Closed => panic!("resumed goal refused its follow-up"),
+            }
+            try_followup = false;
+        }
+        let event = host
+            .next_chat(deadline)
+            .await
+            .expect("resumed goal must execute consecutive turns and finish after release");
+        match &event {
+            ChatEvent::TypingStatusChanged(active) => {
+                running = *active;
+                eprintln!(
+                    "Resumed goal activity: running={running}, completed_turns={completed_turns}, tools_in_turn={tools_in_turn}, followup_sent={followup_sent}"
+                );
+                if !running {
+                    if response_in_turn && tools_in_turn > 0 && followup_sent {
+                        completed_turns += 1;
+                    }
+                    response_in_turn = false;
+                    tools_in_turn = 0;
+                    try_followup = true;
+                    if completed_turns >= 2 && !released {
+                        std::fs::write(host.workspace().join("goal-release.txt"), "ready")
+                            .expect("release goal after two observed working turns");
+                        released = true;
+                    }
+                    if completion_notices > 0 {
+                        break;
+                    }
+                }
+            }
+            ChatEvent::StreamStart(_)
+            | ChatEvent::StreamDelta(_)
+            | ChatEvent::StreamReasoningDelta(_)
+            | ChatEvent::StreamEnd(_)
+            | ChatEvent::ToolRequest(_) => {
+                let kind = serde_json::to_value(&event).expect("serialize event kind");
+                assert!(
+                    running,
+                    "resumed goal emitted {} while the client was idle; completed_turns={completed_turns}, followup_sent={followup_sent}",
+                    kind["kind"]
+                );
+                response_in_turn |= matches!(event, ChatEvent::StreamEnd(_));
+                tools_in_turn += usize::from(matches!(event, ChatEvent::ToolRequest(_)));
+                if matches!(event, ChatEvent::ToolRequest(_)) {
+                    try_followup = true;
+                }
+            }
+            ChatEvent::GoalCompleted(_) => {
+                assert!(
+                    released,
+                    "goal must not complete before its prerequisite exists"
+                );
+                completion_notices += 1;
+            }
+            ChatEvent::MessageAdded(message) if matches!(message.sender, MessageSender::Error) => {
+                panic!("resumed goal emitted a backend error before lifecycle verification");
+            }
+            ChatEvent::OperationCancelled(_) => {
+                panic!("resumed goal was cancelled without a cancellation request");
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        followup_sent,
+        "ordinary input must be accepted during an active goal"
+    );
+    assert!(
+        completed_turns >= 2,
+        "goal must continue across multiple working turns"
+    );
+    assert_eq!(completion_notices, 1, "goal must complete exactly once");
+    assert_eq!(
+        std::fs::read_to_string(host.workspace().join("goal-result.txt"))
+            .expect("completed goal must produce its real output")
+            .trim(),
+        "complete"
+    );
+}
+
+conformance2_scenario!(
+    real_resumed_native_goal_reports_running,
+    [
+        BackendCapability::NativeGoals,
+        BackendCapability::ResumeSession,
+    ]
+);
+
 const DELETED_MARKER: &str = "TYDE_DELETED";
 async fn real_conversation<B: Backend>(host: &mut Harness<B>) {
     let workspace = host.workspace().to_path_buf();

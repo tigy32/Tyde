@@ -2132,6 +2132,7 @@ impl CodexSession {
         let inner = Arc::new(CodexInner {
             rpc,
             emitter,
+            inbound_gate: Mutex::new(()),
             state: Mutex::new(initial_codex_state(
                 thread_id,
                 response_projections,
@@ -4796,6 +4797,7 @@ struct CodexInner {
     rpc: CodexRpc,
     emitter: Arc<TurnEmitter>,
     state: Mutex<CodexState>,
+    inbound_gate: Mutex<()>,
     steering_tempfile: Option<std::path::PathBuf>,
     skill_projection: std::sync::Mutex<Option<CodexSkillProjection>>,
 }
@@ -8296,6 +8298,9 @@ impl CodexInner {
     }
 
     async fn resume_session(&self, session_id: String) -> Result<(), String> {
+        // Notifications can precede the resume reply. Replay must finish before
+        // they mutate live state; RPC replies are read independently of this gate.
+        let inbound_guard = self.inbound_gate.lock().await;
         self.state.lock().await.pending_resume_thread_id = Some(session_id.clone());
         let resumed = async {
             let developer_instructions = self
@@ -8399,6 +8404,11 @@ impl CodexInner {
 
         let model = resumed_model.unwrap_or_else(|| "codex".to_string());
         self.emit_resumed_thread_history(&turns, &model).await;
+        tracing::debug!(
+            history_turns = turns.len(),
+            "Codex resume replay finished; releasing live events"
+        );
+        drop(inbound_guard);
 
         Ok(())
     }
@@ -8709,6 +8719,7 @@ impl CodexInner {
     }
 
     async fn handle_inbound(self: &Arc<Self>, inbound: CodexInbound) {
+        let inbound_guard = self.inbound_gate.lock().await;
         match inbound {
             CodexInbound::Stderr(line) => {
                 if let Some((attempt, max_retries)) = parse_codex_reconnecting_attempt(&line) {
@@ -8762,6 +8773,7 @@ impl CodexInner {
                 self.handle_server_request(id, &method, &params).await;
             }
         }
+        drop(inbound_guard);
     }
 
     async fn handle_rollout_trace_event(&self, event: CodexRolloutTraceEvent) {

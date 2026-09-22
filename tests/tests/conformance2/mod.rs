@@ -16,6 +16,27 @@ use tyde_agent_adapter::BackendCapability;
 
 pub const SCRATCH_DIR: &str = "scratch";
 
+pub async fn real_resume_start_race_child<B: Backend>(host: &Harness<B>) -> bool {
+    if std::env::var_os("TYDE_RESUME_RACE_PROOF").is_some() {
+        return true;
+    }
+    let script = host.workspace().join("resume_proxy.py");
+    std::fs::write(&script, include_str!("resume_proxy.py"))
+        .expect("write real provider resume-race fixture");
+    let status = tokio::process::Command::new("python3")
+        .arg(script)
+        .arg(std::env::current_exe().expect("conformance executable"))
+        .arg(&host.test_name)
+        .status()
+        .await
+        .expect("run isolated real-provider resume race");
+    assert!(
+        status.success(),
+        "real-provider resume race failed; see the retained fixture diagnostics"
+    );
+    false
+}
+
 pub async fn real_stream_disconnect_child<B: Backend>(host: &Harness<B>) -> bool {
     if std::env::var_os("TYDE_REAL_STREAM_FAULT_MARKER").is_some() {
         return true;
@@ -821,7 +842,7 @@ impl<B: Backend> Harness<B> {
         }
     }
 
-    async fn next_chat(&mut self, deadline: tokio::time::Instant) -> Option<ChatEvent> {
+    pub async fn next_chat(&mut self, deadline: tokio::time::Instant) -> Option<ChatEvent> {
         let events = self
             .events
             .as_mut()
@@ -829,7 +850,8 @@ impl<B: Backend> Harness<B> {
         loop {
             match tokio::time::timeout_at(deadline, events.recv_backend()).await {
                 Ok(Some(BackendEvent::Chat(event))) => {
-                    eprintln!("{} {event:?}", self.test_name);
+                    let kind = serde_json::to_value(&event).expect("serialize event kind");
+                    eprintln!("{} event={}", self.test_name, kind["kind"]);
                     return Some(event);
                 }
                 Ok(Some(BackendEvent::ModelRequestTokenUsage(_) | BackendEvent::Compaction(_))) => {
@@ -842,17 +864,28 @@ impl<B: Backend> Harness<B> {
 }
 
 pub async fn send_prompt<B: Backend>(host: &mut Harness<B>, agent: &Agent, prompt: &str) {
-    let backend = host.backend.as_ref().expect("backend must be running");
-    assert_eq!(backend.session_id(), agent.session_id);
     assert!(
         matches!(
-            backend
-                .send_with_outcome(AgentInput::SendMessage(user_message(prompt)))
-                .await,
+            try_send_prompt(host, agent, prompt).await,
             SendOutcome::Accepted
         ),
         "backend did not accept {prompt:?}"
     );
+}
+
+pub async fn try_send_prompt<B: Backend>(
+    host: &Harness<B>,
+    agent: &Agent,
+    prompt: &str,
+) -> SendOutcome {
+    let backend = host.backend.as_ref().expect("backend must be running");
+    assert!(
+        backend.session_id() == agent.session_id,
+        "input must address the resumed session"
+    );
+    backend
+        .send_with_outcome(AgentInput::SendMessage(user_message(prompt)))
+        .await
 }
 
 pub async fn drain_events_for<B: Backend>(
