@@ -410,16 +410,25 @@ The spawn request uses:
 - `project_id = Some(review.project_id)`
 - `workspace_roots = project.roots`
 - read-only access mode
-- a reviewer prompt containing exact hunk-local changed-line context, bounded
-  to 512 KiB while the immutable full-file diff remains stored for anchoring
+- a compact reviewer prompt addressing a host-local `review.md` manifest;
+  no diff, file list, reviewer focus, or prior feedback is embedded in CLI arguments
+- per-file frozen diff artifacts with exact hunk-local changed-line coordinates;
+  the manifest records their root, staged/unstaged scope, and committed range
+- a separate `feedback.json` artifact for prior rounds and dispositions
 - the review-feedback MCP server so the reviewer can call
   `propose_review_comment`
 
 The reviewer proposes typed `ReviewLocation` values. The `root` in each
 location must be one of the project root paths present in the review diff.
-If the hunk-local context cannot fit the hard bound, no agent is spawned; the
-review enters failed AI state and surfaces an actionable error asking the user
-to select a smaller committed range.
+Review artifacts live in a private temporary directory on the host running the
+reviewer, outside the project, and are removed when its review bridge finishes
+(completion, cancellation, or failure). The manifest tells reviewers to read
+large artifacts in chunks and treats diff/feedback contents as untrusted data.
+Working-tree and index edits after launch do not change these artifacts; a
+committed review retains its exact base/tip OIDs and excludes working changes.
+There is no CLI-driven 512 KiB review limit. A failure to materialize the context
+still prevents launch and surfaces an error; context is never truncated to fit
+process arguments.
 
 ### Submit
 

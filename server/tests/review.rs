@@ -870,6 +870,43 @@ async fn close_agent_and_wait(client: &mut client::Connection, stream: &protocol
     .await;
 }
 
+async fn reviewer_context_before_idle(
+    client: &mut client::Connection,
+    stream: &protocol::StreamPath,
+) -> (String, std::path::PathBuf, String) {
+    let frame =
+        fixture::next_logical_frame_matching_on(client, "reviewer startup context", |env| {
+            env.stream == *stream
+                && env.kind == FrameKind::ChatEvent
+                && matches!(
+                    env.parse_payload::<ChatEvent>(),
+                    Ok(ChatEvent::StreamEnd(_))
+                )
+        })
+        .await;
+    let ChatEvent::StreamEnd(end) = frame
+        .parse_payload::<ChatEvent>()
+        .expect("reviewer response")
+    else {
+        unreachable!();
+    };
+    let response = end.message.content;
+    fixture::push_pending_frame_on(client, frame);
+    let encoded_path = response
+        .split_once("Review manifest: ")
+        .expect("review startup must address a manifest instead of embedding the diff")
+        .1;
+    let path: String = serde_json::Deserializer::from_str(encoded_path)
+        .into_iter::<String>()
+        .next()
+        .expect("manifest path")
+        .expect("JSON-encoded manifest path");
+    let path = std::path::PathBuf::from(path);
+    assert!(path.is_absolute());
+    let manifest = fs::read_to_string(&path).expect("read live review manifest");
+    (response, path, manifest)
+}
+
 #[tokio::test]
 async fn project_bootstrap_exposes_one_active_workspace_review() {
     let fixture = Fixture::new().await;
@@ -1005,6 +1042,7 @@ async fn project_bootstrap_exposes_one_active_workspace_review() {
     })
     .await;
 
+    git(&repo_b, &["add", "src/lib.rs"]);
     client
         .review_action(
             &summary.id,
@@ -1063,16 +1101,68 @@ async fn project_bootstrap_exposes_one_active_workspace_review() {
     let new_agent = new_agent.expect("new AI Review agent");
     let running = running.expect("running AI reviewer state");
     assert_eq!(running.agent_id, Some(new_agent.agent_id.clone()));
+    let (response, manifest_path, manifest) =
+        reviewer_context_before_idle(&mut client, &new_agent.instance_stream).await;
+    assert!(
+        response.len() < 8192,
+        "review startup should contain only references"
+    );
+    assert!(
+        !response.contains("fn extra()"),
+        "diff leaked into startup instructions"
+    );
+    let directory = manifest_path.parent().expect("manifest directory");
+    let entries = manifest
+        .lines()
+        .filter(|line| line.starts_with("- scope:"))
+        .collect::<Vec<_>>();
+    // The untracked skill fixture is also a reviewed file, not a loaded skill.
+    assert_eq!(entries.len(), 3);
+    let skill_entry = entries
+        .iter()
+        .find(|entry| entry.contains(".agents/skills/not-for-reviewer/SKILL.md"))
+        .expect("untracked skill diff reference");
+    let skill_artifact = skill_entry
+        .rsplit_once(" snapshot: ")
+        .expect("skill artifact address")
+        .1;
+    assert!(
+        fs::read_to_string(directory.join(skill_artifact))
+            .expect("read untracked snapshot")
+            .contains("Skill excluded from reviewer")
+    );
+    for (index, repo) in [&repo_a, &repo_b].into_iter().enumerate() {
+        let entry = entries
+            .iter()
+            .find(|entry| {
+                entry.contains(repo.to_str().expect("root path"))
+                    && entry.contains("relative_path: \"src/lib.rs\"")
+            })
+            .expect("root's changed file reference");
+        let artifact = entry
+            .rsplit_once(" snapshot: ")
+            .expect("diff artifact address")
+            .1;
+        let diff_path = directory.join(artifact);
+        let frozen = fs::read_to_string(&diff_path).expect("read frozen diff");
+        assert!(frozen.contains("fn extra()"));
+        assert!(frozen.contains("old=- new=5"));
+        assert!(frozen.contains(if index == 0 {
+            "scope: Unstaged"
+        } else {
+            "scope: Staged"
+        }));
+        assert!(frozen.contains(repo.to_str().expect("root path")));
+        fs::write(repo.join("src/lib.rs"), "later working tree edits\n")
+            .expect("edit during review");
+        git(repo, &["add", "src/lib.rs"]);
+        assert!(
+            fs::read_to_string(&diff_path).expect("reread snapshot") == frozen,
+            "snapshot changed after working-tree and index edits"
+        );
+    }
     reviewer_gate.release_one();
-    let response = fixture::finish_turn_on(&mut client, &new_agent.instance_stream)
-        .await
-        .chat_events()
-        .into_iter()
-        .filter_map(|event| match event {
-            ChatEvent::StreamEnd(end) => Some(end.message.content),
-            _ => None,
-        })
-        .collect::<String>();
+    fixture::finish_turn_on(&mut client, &new_agent.instance_stream).await;
     assert!(
         response.contains("[steering: Reviewer host steering\\n\\nReviewer project steering]"),
         "reviewer lost user steering: {response}"
@@ -1082,7 +1172,7 @@ async fn project_bootstrap_exposes_one_active_workspace_review() {
         "wrong project steering: {response}"
     );
     assert!(
-        response.contains("Check both roots."),
+        manifest.contains("Check both roots."),
         "reviewer lost dedicated prompt: {response}"
     );
     assert!(
@@ -1207,8 +1297,15 @@ async fn start_ai_review_on_clean_workspace_errors_without_spawning_agent() {
 }
 
 #[tokio::test]
-async fn committed_ai_review_rejects_oversized_frozen_context_before_spawn() {
+async fn committed_ai_review_addresses_large_frozen_context_without_inline_diff() {
     let fixture = Fixture::new().await;
+    let reviewer_gate = MockGateHandle::new();
+    let _reservation = fixture
+        .reserve_next_mock_launch(
+            "AI Review",
+            MockScript::one(MockTurn::gated_echo(&reviewer_gate)),
+        )
+        .await;
     let mut client = fixture.client;
     set_default_backend(&mut client, BackendKind::Claude).await;
     let root = tempfile::tempdir().expect("temp root");
@@ -1222,6 +1319,11 @@ async fn committed_ai_review_rejects_oversized_frozen_context_before_spawn() {
     git(&repo, &["add", "."]);
     git(&repo, &["commit", "-m", "Add oversized review fixture"]);
     let tip_oid = git_stdout(&repo, &["rev-parse", "HEAD"]);
+    fs::write(
+        repo.join("src/lib.rs"),
+        "outside the selected committed range\n",
+    )
+    .expect("unrelated live change");
 
     let project = create_project(&mut client, &repo).await;
     let bootstrap = expect_project_bootstrap(&mut client, &project).await;
@@ -1233,7 +1335,7 @@ async fn committed_ai_review_rejects_oversized_frozen_context_before_spawn() {
             .expect("serialize frozen oversized diff")
             .len()
             > 512 * 1024,
-        "fixture must cross the reviewer prompt hard bound"
+        "fixture must exceed the former inline prompt limit"
     );
     subscribe_review(&mut client, &review_id).await;
 
@@ -1254,55 +1356,73 @@ async fn committed_ai_review_rejects_oversized_frozen_context_before_spawn() {
         .await
         .expect("start oversized committed AI review");
 
-    let mut failed_state = None;
-    let mut visible_error = None;
-    next_frame_matching_on(&mut client, "oversized committed AI review error", |env| {
+    let mut reviewer_frames = Vec::new();
+    let mut reviewer = None;
+    let mut running = false;
+    next_frame_matching_on(&mut client, "large committed review starts", |env| {
         match env.kind {
-            FrameKind::NewAgent => {
-                let payload: NewAgentPayload = env.parse_payload().expect("new agent payload");
-                assert_ne!(
-                    payload.name, "AI Review",
-                    "oversized frozen context must fail before an AI reviewer is spawned"
-                );
+            FrameKind::AgentBootstrap => {
+                reviewer_frames.extend(fixture::agent_bootstrap_frames(env))
             }
-            FrameKind::ReviewEvent => match env.parse_payload().expect("review event payload") {
-                ReviewEventPayload::AiReviewerChanged { state }
-                    if state.status == ReviewAiReviewerStatus::Failed =>
-                {
-                    assert!(
-                        matches!(state.scope, ReviewAiScope::CommittedRange { .. }),
-                        "the failed reviewer state records the committed scope"
+            FrameKind::ChatEvent => reviewer_frames.push(env.clone()),
+            FrameKind::NewAgent => {
+                reviewer = Some(env.parse_payload::<NewAgentPayload>().expect("reviewer"))
+            }
+            FrameKind::ReviewEvent => match env.parse_payload().expect("review event") {
+                ReviewEventPayload::AiReviewerChanged { state } => {
+                    assert_ne!(
+                        state.status,
+                        ReviewAiReviewerStatus::Failed,
+                        "large reviews must launch"
                     );
-                    failed_state = state.error;
+                    running |= state.status == ReviewAiReviewerStatus::Running;
+                    assert!(matches!(state.scope, ReviewAiScope::CommittedRange { .. }));
                 }
-                ReviewEventPayload::Error { error } => {
-                    assert!(matches!(
-                        error.context,
-                        protocol::ReviewErrorContext::StartAiReview
-                    ));
-                    visible_error = Some(error.message);
-                }
+                ReviewEventPayload::Error { .. } => panic!("large committed review rejected"),
                 _ => {}
             },
             _ => {}
         }
-        failed_state.is_some() && visible_error.is_some()
+        reviewer.is_some() && running
     })
     .await;
-    for message in [
-        failed_state.expect("failed AI state error"),
-        visible_error.expect("visible review error"),
-    ] {
-        assert!(
-            message.contains("512 KiB"),
-            "unexpected bound error: {message}"
-        );
-        assert!(
-            message.contains("smaller committed range"),
-            "bound error must offer an actionable recovery: {message}"
-        );
-    }
-    assert_no_ai_review_spawned(&mut client, "oversized committed prompt").await;
+    fixture::push_pending_frames_on(&client, reviewer_frames);
+    let reviewer = reviewer.expect("reviewer");
+    let (response, manifest_path, manifest) =
+        reviewer_context_before_idle(&mut client, &reviewer.instance_stream).await;
+    assert!(
+        response.len() < 8192,
+        "large diff must not inflate startup instructions"
+    );
+    assert!(
+        !response.contains(&"x".repeat(1024)),
+        "diff leaked into startup instructions"
+    );
+    assert!(manifest.contains(&base_oid));
+    assert!(manifest.contains(&tip_oid));
+    assert!(
+        !manifest.contains("src/lib.rs"),
+        "committed review must exclude unrelated working changes"
+    );
+    let diff_path = manifest_path
+        .parent()
+        .expect("manifest directory")
+        .join("diff-0.txt");
+    let frozen = fs::read_to_string(&diff_path).expect("read large frozen diff");
+    assert!(
+        frozen.contains(&"x".repeat(600 * 1024)),
+        "snapshot must retain the entire changed line"
+    );
+    assert!(frozen.contains("old=- new=1"));
+    fs::write(repo.join("src/large.rs"), "changed after review started\n")
+        .expect("change live file");
+    assert!(
+        fs::read_to_string(&diff_path).expect("reread frozen diff") == frozen,
+        "committed snapshot changed after a working-tree edit"
+    );
+    reviewer_gate.release_one();
+    fixture::finish_turn_on(&mut client, &reviewer.instance_stream).await;
+    close_agent_and_wait(&mut client, &reviewer.instance_stream).await;
 }
 
 #[tokio::test]

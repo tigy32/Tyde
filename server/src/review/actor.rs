@@ -55,8 +55,7 @@ pub(crate) struct ReviewDeliveryRequest {
 
 pub(crate) struct ReviewAiSpawnRequest {
     pub review_id: ReviewId,
-    /// The review with `diffs` narrowed to `scope`, so the reviewer prompt
-    /// and its size bound only see what the reviewer is asked to read.
+    /// Only the selected scope is materialized for the reviewer to read.
     pub review: Review,
     pub snapshot_id: String,
     pub scope: protocol::ReviewAiScope,

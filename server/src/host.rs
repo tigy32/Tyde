@@ -132,6 +132,7 @@ use crate::project_stream::{
 use crate::review::actor::{ReviewAiSpawnRequest, ReviewDeliveryOutcome, ReviewDeliveryRequest};
 use crate::review::reviewer::{
     ReviewerToolBridge, build_reviewer_system_prompt, build_reviewer_user_prompt,
+    prepare_reviewer_context,
 };
 use crate::review::{
     ReviewRegistry, ReviewRegistryHandle, build_create_request, review_create_selection,
@@ -13499,14 +13500,10 @@ impl HostHandle {
             );
             return Err("review feedback MCP server is unavailable for AI review".to_owned());
         }
-        let reviewer_system_prompt = match build_reviewer_system_prompt(
-            &request.review,
-            &request.scope,
-            Some(config.instructions.clone()),
-        ) {
-            Ok(prompt) => prompt,
-            Err(message) => return Err(message),
-        };
+        let context_directory =
+            prepare_reviewer_context(&request.review, &request.scope, &config.instructions).await?;
+        let reviewer_system_prompt =
+            build_reviewer_system_prompt(&context_directory.path().join("review.md"));
         let reviewer_system_prompt_len = reviewer_system_prompt.len();
         let reviewer_mcp_servers = vec![StartupMcpServer {
             name: REVIEW_FEEDBACK_MCP_SERVER_NAME.to_owned(),
@@ -13590,6 +13587,7 @@ impl HostHandle {
                 agent_id.clone(),
                 agent_handle,
                 request.review_handle.clone(),
+                context_directory,
             );
             Ok(agent_id)
         } else {
