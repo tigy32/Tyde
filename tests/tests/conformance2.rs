@@ -2769,6 +2769,105 @@ async fn real_interrupt_after_background_response<B: Backend>(host: &mut Harness
     assert_universal_contract(&[launched, follow_up]);
 }
 
+async fn real_running_command_survives_response_retry<B: Backend>(host: &mut Harness<B>) {
+    if !real_stream_disconnect_child(host).await {
+        return;
+    }
+    let proof = std::env::var("TYDE_REAL_STREAM_FAULT_PROOF")
+        .expect("real stream-disconnect fixture completion path");
+    let prompt = format!(
+        "In {}, run this exact shell command once using exec_command with \
+         yield_time_ms=1000: printf 'started\\n' >> retry-launches.txt; sleep 20; \
+         printf 'DONE\\n' > {proof}; printf '{BG_OUTPUT_MARKER}\\n'. \
+         Do not use &, nohup, disown, a detached shell, or any other command. \
+         When the call returns a running session, reply with exactly {BG_MARKER}. \
+         Do not poll or wait for the command. If the connection retries, do not rerun it.",
+        workspace_root(host.workspace())
+    );
+    let agent = spawn_agent(host, &prompt).await;
+    let events = drain_events_for(host, Duration::from_secs(60)).await;
+    let fault: Value = serde_json::from_str(
+        &std::fs::read_to_string(
+            std::env::var("TYDE_REAL_STREAM_FAULT_MARKER").expect("fault evidence path"),
+        )
+        .expect("read real stream-disconnect evidence"),
+    )
+    .expect("parse real stream-disconnect evidence");
+    assert_eq!(fault["cuts"].as_u64(), Some(1), "no real stream was cut");
+    assert!(
+        fault["recovery_requests_before_completion"]
+            .as_u64()
+            .is_some_and(|count| count > 0),
+        "the provider did not reconnect while the command remained unfinished"
+    );
+    assert!(
+        std::fs::read_to_string(host.workspace().join("retry-launches.txt"))
+            .is_ok_and(|contents| contents.lines().count() == 1),
+        "the command must execute once, including across the provider retry"
+    );
+    assert!(
+        std::fs::read_to_string(proof).is_ok_and(|contents| contents.trim() == "DONE"),
+        "the original command did not finish its filesystem write"
+    );
+    let requests = events
+        .iter()
+        .filter_map(|event| match event {
+            ChatEvent::ToolRequest(request)
+                if matches!(&request.tool_type, ToolRequestType::RunCommand { command, .. }
+                    if command.contains("retry-launches.txt")) =>
+            {
+                Some(request)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(requests.len(), 1, "expected one original command card");
+    let completions = events
+        .iter()
+        .filter_map(|event| match event {
+            ChatEvent::ToolExecutionCompleted(completion)
+                if completion.tool_call_id == requests[0].tool_call_id =>
+            {
+                Some(completion)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let conflicts = events
+        .iter()
+        .filter(|event| {
+            matches!(event, ChatEvent::MessageAdded(message)
+                if message.content.contains("conflicting_duplicate_completion"))
+        })
+        .count();
+    eprintln!(
+        "REAL RETRY EVIDENCE requests={} completions={} conflicts={}",
+        requests.len(),
+        completions.len(),
+        conflicts
+    );
+    assert_eq!(conflicts, 0, "retry caused conflicting tool completions");
+    assert_eq!(completions.len(), 1, "command must complete exactly once");
+    assert!(
+        matches!(&completions[0].outcome,
+            ToolExecutionOutcome::Succeeded {
+                result: ToolExecutionResult::RunCommand { exit_code: 0, stdout, .. }
+            } if stdout.contains(BG_OUTPUT_MARKER)),
+        "the finished command lost its real successful result across the retry"
+    );
+    let errors = events
+        .iter()
+        .filter(|event| {
+            matches!(event, ChatEvent::MessageAdded(message)
+                if matches!(message.sender, MessageSender::Error))
+        })
+        .count();
+    assert_eq!(errors, 0, "provider retry exposed error messages");
+    let follow_up = ask_expecting_delivery(host, &agent, &launch_prompt()).await;
+    assert_ready_handshake(&follow_up);
+    assert_universal_contract(&[follow_up]);
+}
+
 async fn real_user_question<B: Backend>(host: &mut Harness<B>) {
     let agent = spawn_agent(host, &launch_prompt()).await;
     let launched = collect_turn(host, &agent, &launch_prompt()).await;
@@ -3423,6 +3522,10 @@ conformance2_scenario!(
     ]
 );
 conformance2_scenario!(real_interruption, [BackendCapability::Interrupt]);
+conformance2_scenario!(
+    real_running_command_survives_response_retry,
+    [BackendCapability::YieldsRunningCommands]
+);
 conformance2_scenario!(real_mid_turn_steering, [BackendCapability::MidTurnSteering]);
 conformance2_scenario!(
     real_interrupt_after_background_response,

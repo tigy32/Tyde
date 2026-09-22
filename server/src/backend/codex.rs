@@ -3052,6 +3052,13 @@ struct OpenCodexProviderResponse {
     raw_tool_requests: Vec<BufferedCodexToolRequest>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CodexResponseEnd {
+    Completed,
+    RetryableFailure,
+    Abandoned,
+}
+
 struct ClosedCodexProviderResponse {
     message_id: ChatMessageId,
     response_id: Option<String>,
@@ -3668,8 +3675,9 @@ impl CodexResponseSplitter {
         &mut self,
         turn_id: Option<&str>,
         usage: Option<Value>,
-        failed: bool,
+        ending: CodexResponseEnd,
     ) -> Option<FinalizedCodexProviderResponse> {
+        let failed = ending != CodexResponseEnd::Completed;
         let mut response = self.open.take()?;
         if response.turn_id == "turn"
             && let Some(turn_id) = turn_id
@@ -3706,7 +3714,9 @@ impl CodexResponseSplitter {
         // minted a *second* card for the same command and completed that one,
         // leaving the declared card open until the idle sweep cancelled it.
         for request in &tool_requests {
-            if !failed && let Some(call_id) = request.provider_call_id.as_ref() {
+            if ending != CodexResponseEnd::Abandoned
+                && let Some(call_id) = request.provider_call_id.as_ref()
+            {
                 if !self.completed_raw_tool_call_ids.remove(call_id) {
                     self.pending_raw_tool_owners
                         .insert(call_id.clone(), request.clone());
@@ -9868,7 +9878,8 @@ impl CodexInner {
         }
     }
 
-    async fn finalize_strict_response(&self, params: &Value, failed: bool) -> bool {
+    async fn finalize_strict_response(&self, params: &Value, ending: CodexResponseEnd) -> bool {
+        let failed = ending != CodexResponseEnd::Completed;
         let Some(thread_id) = extract_notification_thread_id(params) else {
             return false;
         };
@@ -9895,7 +9906,7 @@ impl CodexInner {
             else {
                 return false;
             };
-            let finalized = splitter.finalize(turn_id.as_deref(), usage, failed);
+            let finalized = splitter.finalize(turn_id.as_deref(), usage, ending);
             (
                 finalized,
                 splitter.pending_raw_tool_owners.len(),
@@ -10002,7 +10013,8 @@ impl CodexInner {
                 &request.tool_call_id,
                 codex_tool_request_type(request.tool_type.clone()),
             );
-            if finalized.failed {
+            // A failed response can be retried while its command is still running.
+            if ending == CodexResponseEnd::Abandoned {
                 emitter.fail_pending_tool(
                     &request.tool_call_id,
                     "Codex provider response ended before the tool completed",
@@ -10039,6 +10051,11 @@ impl CodexInner {
             message_id = finalized.message_id.0,
             response_id = ?finalized.response_id,
             failed = finalized.failed,
+            ending = ?ending,
+            retained_raw_owners,
+            pending_tools = finalized.tool_requests.iter().filter(|request| {
+                emitter.has_pending_tool_request(&request.tool_call_id)
+            }).count(),
             "Finalized Codex provider response boundary"
         );
         true
@@ -10097,7 +10114,8 @@ impl CodexInner {
         if let Some(last) = params.pointer("/tokenUsage/last").cloned() {
             params["usage"] = last;
         }
-        self.finalize_strict_response(&params, false).await;
+        self.finalize_strict_response(&params, CodexResponseEnd::Completed)
+            .await;
     }
 
     /// Close a response the turn left open, reporting `reason` unless it is
@@ -10115,7 +10133,10 @@ impl CodexInner {
             return false;
         };
         let target = self.response_projection_target(&thread_id).await;
-        if !self.finalize_strict_response(params, true).await {
+        if !self
+            .finalize_strict_response(params, CodexResponseEnd::Abandoned)
+            .await
+        {
             return false;
         }
         if let Some((emitter, _)) = target
@@ -10288,7 +10309,8 @@ impl CodexInner {
                 .and_then(Value::as_bool)
                 == Some(true)
         {
-            self.finalize_strict_response(params, true).await;
+            self.finalize_strict_response(params, CodexResponseEnd::RetryableFailure)
+                .await;
         }
         if method == "turn/completed" {
             self.finalize_incomplete_strict_response(
@@ -15596,7 +15618,8 @@ impl CodexInner {
         // their cards above opens a response after the pre-routing terminal
         // sweep has already run, so close that response before this handler
         // reports the turn idle.
-        self.finalize_strict_response(params, false).await;
+        self.finalize_strict_response(params, CodexResponseEnd::Completed)
+            .await;
         let consumed_terminated_turn = {
             let mut state = self.state.lock().await;
             match completed_turn_id.as_ref() {

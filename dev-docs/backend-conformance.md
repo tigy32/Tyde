@@ -207,3 +207,35 @@ The extended scenario passed on Claude (Haiku), Codex (`gpt-5.6-luna`),
 Antigravity, Grok (`grok-4.6`), and Hermes (`openai/gpt-4.1-mini` through
 OpenRouter). Claude's first attempt failed at the opening handshake because
 its OAuth session had expired; the approved retry passed after reauthentication.
+
+## Running commands across response retries
+
+`real_running_command_survives_response_retry` exercises the real CLI through
+an isolated loopback HTTP proxy. The proxy forwards genuine upstream traffic
+unchanged, then closes one response stream after a real tool-call item and
+before its response-completed event. It supplies no fabricated provider events.
+The case requires a real retryable `responseStreamDisconnected` notification,
+a recovery request before the command's completion write, exactly one command
+execution, exactly one successful typed completion, and a working follow-up
+turn. A healthy run without the injected disconnect cannot pass.
+
+The case requires `YieldsRunningCommands`; Codex is currently the only eligible
+backend. Its transport fixture uses the authenticated Codex subscription
+endpoint and temporarily isolates `CODEX_HOME`, preserving the installed login
+without changing the user's configuration. Python 3 is required. Fixture
+metadata and private provider diagnostics remain in the printed temporary
+directory; credentials copied into the isolated home are removed afterward.
+Do not share the raw diagnostic log without redacting it.
+
+On 2026-09-22, the unchanged adapter failed this exact case: the command ran
+once and finished its filesystem write, but its tool card retained the
+synthetic failure instead of the genuine successful result. The fixed adapter
+passed with one real disconnect, one retry before command completion, one
+successful completion, and zero conflicting outcomes. This reproduction caught
+the premature terminalization; unlike the reported production incident, it did
+not emit a conflicting-duplicate warning. The fix distinguishes retryable
+response failure from abandoned execution, retaining pending tool ownership
+without concealing the failed response or changing terminal teardown.
+Codex's existing `real_background_task_outlives_its_turn` and
+`real_background_task_cancel` also passed against the fixed adapter, covering
+normal late completion and explicit cancellation beside the retry path.

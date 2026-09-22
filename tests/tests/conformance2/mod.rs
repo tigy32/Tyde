@@ -16,6 +16,27 @@ use tyde_agent_adapter::BackendCapability;
 
 pub const SCRATCH_DIR: &str = "scratch";
 
+pub async fn real_stream_disconnect_child<B: Backend>(host: &Harness<B>) -> bool {
+    if std::env::var_os("TYDE_REAL_STREAM_FAULT_MARKER").is_some() {
+        return true;
+    }
+    let script = host.workspace().join("retry_proxy.py");
+    std::fs::write(&script, include_str!("retry_proxy.py"))
+        .expect("write real provider stream-disconnect fixture");
+    let status = tokio::process::Command::new("python3")
+        .arg(script)
+        .arg(std::env::current_exe().expect("conformance executable"))
+        .arg(&host.test_name)
+        .status()
+        .await
+        .expect("run isolated real-provider disconnect scenario");
+    assert!(
+        status.success(),
+        "real-provider disconnect scenario failed; see the retained fixture diagnostics"
+    );
+    false
+}
+
 pub struct Turn {
     pub backend: BackendKind,
     pub capabilities: tyde_agent_adapter::BackendCapabilities,
