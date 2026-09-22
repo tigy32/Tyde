@@ -1975,6 +1975,7 @@ mod live_card_wasm_tests {
             text: ArcRwSignal::new(text.to_owned()),
             reasoning: ArcRwSignal::new(String::new()),
             tool_requests: ArcRwSignal::new(Vec::new()),
+            ..StreamingState::new("codex".to_owned(), None)
         }
     }
 

@@ -2318,6 +2318,7 @@ pub fn new_history_request_id() -> String {
 #[derive(Clone, Debug)]
 pub enum ChatRowContent {
     Message(ArcRwSignal<ChatMessageEntry>),
+    Streaming(StreamingState),
     /// Signal-backed for the same reason messages are: the windowed list keys
     /// rows by `ChatRowId`, so a row whose content is refreshed in place —
     /// a later, richer sighting of the same marker — would otherwise keep
@@ -2370,14 +2371,18 @@ impl ChatRowHandle {
     pub fn message_entry(&self) -> Option<&ArcRwSignal<ChatMessageEntry>> {
         match &self.content {
             ChatRowContent::Message(entry) => Some(entry),
-            ChatRowContent::ContextCompaction(_) | ChatRowContent::Notice(_) => None,
+            ChatRowContent::ContextCompaction(_)
+            | ChatRowContent::Notice(_)
+            | ChatRowContent::Streaming(_) => None,
         }
     }
 
     pub fn compaction_marker(&self) -> Option<&ArcRwSignal<ContextCompactionTimelineEvent>> {
         match &self.content {
             ChatRowContent::ContextCompaction(event) => Some(event),
-            ChatRowContent::Message(_) | ChatRowContent::Notice(_) => None,
+            ChatRowContent::Message(_)
+            | ChatRowContent::Notice(_)
+            | ChatRowContent::Streaming(_) => None,
         }
     }
 }
@@ -3027,11 +3032,38 @@ pub fn reduce_diff_response(
 
 #[derive(Clone, Debug)]
 pub struct StreamingState {
+    pub row_id: ChatRowId,
+    // A steer may append rows before this response finishes. Keep its start position.
+    pub after_row: Option<ChatRowId>,
     pub agent_name: String,
     pub model: Option<String>,
     pub text: ArcRwSignal<String>,
     pub reasoning: ArcRwSignal<String>,
     pub tool_requests: ArcRwSignal<Vec<StreamingToolRequest>>,
+}
+
+impl StreamingState {
+    pub fn new(agent_name: String, model: Option<String>) -> Self {
+        Self {
+            row_id: next_chat_row_id(),
+            after_row: None,
+            agent_name,
+            model,
+            text: ArcRwSignal::new(String::new()),
+            reasoning: ArcRwSignal::new(String::new()),
+            tool_requests: ArcRwSignal::new(Vec::new()),
+        }
+    }
+
+    pub fn insertion_index(&self, rows: &[ChatRowHandle]) -> usize {
+        match self.after_row {
+            Some(id) => rows
+                .iter()
+                .position(|row| row.id == id)
+                .map_or(rows.len(), |i| i + 1),
+            None => 0,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -5208,6 +5240,13 @@ impl AppState {
         if rows.is_empty() {
             return;
         }
+        self.streaming_text.update(|map| {
+            if let Some(streaming) = map.get_mut(agent_id)
+                && streaming.after_row.is_none()
+            {
+                streaming.after_row = rows.last().map(|row| row.id);
+            }
+        });
         let markers: Vec<(CompactionObservationId, ChatRowId)> = rows
             .iter()
             .filter_map(|row| {
@@ -5234,6 +5273,15 @@ impl AppState {
     }
 
     pub fn push_chat_entry(&self, agent_id: AgentId, entry: ChatMessageEntry) -> ChatRowHandle {
+        self.insert_chat_entry(agent_id, entry, None)
+    }
+
+    pub fn insert_chat_entry(
+        &self,
+        agent_id: AgentId,
+        entry: ChatMessageEntry,
+        stream: Option<&StreamingState>,
+    ) -> ChatRowHandle {
         let handle = ChatRowHandle::new(entry);
         let entry_signal = handle
             .message_entry()
@@ -5252,7 +5300,10 @@ impl AppState {
 
         self.chat_rows.update(|rows| {
             let agent_rows = rows.entry(agent_id.clone()).or_default();
-            agent_rows.push(handle.clone());
+            let index = stream.map_or(agent_rows.len(), |stream| {
+                stream.insertion_index(agent_rows)
+            });
+            agent_rows.insert(index, handle.clone());
         });
 
         if !indexed_tool_call_ids.is_empty() {

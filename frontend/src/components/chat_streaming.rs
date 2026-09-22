@@ -239,6 +239,7 @@ mod wasm_tests {
             text: ArcRwSignal::new(String::new()),
             reasoning: reasoning.clone(),
             tool_requests: ArcRwSignal::new(Vec::new()),
+            ..StreamingState::new("codex".to_owned(), None)
         };
         let _handle = mount_to(container.clone(), move || {
             view! {
@@ -310,6 +311,7 @@ mod wasm_tests {
                         text: text_for_mount.clone(),
                         reasoning: ArcRwSignal::new(String::new()),
                         tool_requests: ArcRwSignal::new(Vec::new()),
+                        ..StreamingState::new("codex".to_owned(), None)
                     }
                 />
             }

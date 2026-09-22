@@ -178,9 +178,20 @@ pub fn ChatView(
         let Some(id) = active_agent_id() else {
             return Vec::new();
         };
-        state
+        let mut rows = state
             .chat_rows
-            .with(|m| m.get(&id).cloned().unwrap_or_default())
+            .with(|m| m.get(&id).cloned().unwrap_or_default());
+        if let Some(stream) = state.streaming_text.with(|m| m.get(&id).cloned()) {
+            let index = stream.insertion_index(&rows);
+            rows.insert(
+                index,
+                ChatRowHandle {
+                    id: stream.row_id,
+                    content: ChatRowContent::Streaming(stream),
+                },
+            );
+        }
+        rows
     };
 
     let prior_history: Signal<Option<crate::state::SessionHistoryState>> =
@@ -1078,9 +1089,6 @@ pub fn ChatView(
 
                         <OrchestrationView records=orchestration_records />
 
-                        {move || {
-                            streaming().map(|ss| view! { <ChatStreamingView agent_ref=agent_ref streaming=ss /> })
-                        }}
                     </div>
 
                     // Scroll-to-bottom button
@@ -1249,6 +1257,9 @@ fn MeasuredRow(
     view! {
         <div class="virt-row" node_ref=node_ref>
             {match row.content {
+                ChatRowContent::Streaming(streaming) => {
+                    view! { <ChatStreamingView agent_ref=agent_ref streaming=streaming /> }.into_any()
+                }
                 ChatRowContent::Message(entry) => {
                     view! { <ChatMessageView agent_ref=agent_ref entry=entry /> }.into_any()
                 }
@@ -2100,6 +2111,110 @@ mod wasm_tests {
         assert!((streaming_gap - completed_gap).abs() < 0.5);
         drop(handle);
         container.remove();
+    }
+
+    #[wasm_bindgen_test]
+    async fn steering_preserves_the_position_of_a_running_tool_response() {
+        ensure_styles_loaded();
+        let container = make_container();
+        let state_handle = std::rc::Rc::new(std::cell::RefCell::new(None::<AppState>));
+        let setup_handle = state_handle.clone();
+        let agent_id = AgentId("agent-steer-order".to_owned());
+        let bound = ActiveAgentRef {
+            host_id: "host-steer-order".to_owned(),
+            agent_id: agent_id.clone(),
+        };
+        let bound_for_mount = bound.clone();
+        let handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            *setup_handle.borrow_mut() = Some(state.clone());
+            provide_context(state);
+            view! {
+                <ChatView
+                    tab_id=TabId(10_005)
+                    agent_ref=Signal::derive(move || Some(bound_for_mount.clone()))
+                    is_active=Signal::derive(|| true)
+                />
+            }
+        });
+        next_tick().await;
+        let state = state_handle.borrow().clone().expect("mounted state");
+        let dispatch = |event| {
+            crate::dispatch::apply_chat_event(&state, &bound.host_id, &agent_id, event);
+        };
+        dispatch(ChatEvent::TypingStatusChanged(true));
+        dispatch(ChatEvent::StreamStart(protocol::StreamStartData {
+            agent: "codex".to_owned(),
+            model: None,
+        }));
+        dispatch(ChatEvent::StreamDelta(protocol::StreamTextDeltaData {
+            text: "The original task is still running".to_owned(),
+        }));
+        dispatch(ChatEvent::ToolRequest(protocol::ToolRequest {
+            tool_call_id: "steer-order-sleep".to_owned(),
+            tool_name: "sleep".to_owned(),
+            tool_type: protocol::ToolRequestType::Sleep {
+                duration_ms: 230000,
+            },
+        }));
+        next_tick().await;
+        next_animation_frame().await;
+        assert!(container.text_content().unwrap().contains("sleep"));
+
+        dispatch(ChatEvent::MessageAdded(
+            mk_user_msg("Summarize the task for handoff").message,
+        ));
+        next_tick().await;
+        next_animation_frame().await;
+        let measure_order = |phase: &str| {
+            let assistant = query(&container, ".chat-card-assistant")
+                .expect("the original response remains visible");
+            let user =
+                query(&container, ".chat-card-user").expect("the steering message is visible");
+            assert!(assistant.text_content().unwrap().contains("sleep"));
+            assert!(
+                user.text_content()
+                    .unwrap()
+                    .contains("Summarize the task for handoff")
+            );
+            let gap = user.get_bounding_client_rect().top()
+                - assistant.get_bounding_client_rect().bottom();
+            console_log!("Steering transcript order: phase={phase}, gap={gap}px");
+            gap
+        };
+        let running_gap = measure_order("running");
+
+        dispatch(ChatEvent::ToolExecutionCompleted(
+            protocol::ToolExecutionCompletedData {
+                tool_call_id: "steer-order-sleep".to_owned(),
+                outcome: protocol::ToolExecutionOutcome::Succeeded {
+                    result: protocol::ToolExecutionResult::Sleep,
+                },
+            },
+        ));
+        let mut completed = mk_user_msg("The original task is still running").message;
+        completed.sender = MessageSender::Assistant {
+            agent: "codex".to_owned(),
+        };
+        completed.tool_calls.push(protocol::ToolUseData {
+            tool_call_id: "steer-order-sleep".to_owned(),
+            name: "sleep".to_owned(),
+            arguments: serde_json::json!({"duration_ms": 230000}),
+            content_offset: None,
+        });
+        dispatch(ChatEvent::StreamEnd(protocol::StreamEndData {
+            message: completed,
+        }));
+        next_tick().await;
+        next_animation_frame().await;
+        let completed_gap = measure_order("completed");
+        assert!(container.text_content().unwrap().contains("Done"));
+        drop(handle);
+        container.remove();
+        assert!(
+            running_gap >= 0.0 && completed_gap >= 0.0,
+            "a steer must stay below the response already executing its tool, both while running and after completion: running gap={running_gap}px, completed gap={completed_gap}px"
+        );
     }
 
     #[wasm_bindgen_test]

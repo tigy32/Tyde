@@ -5844,13 +5844,12 @@ pub fn apply_chat_event_from(
             state.last_turn_cancelled.update(|set| {
                 set.remove(&agent_id);
             });
-            let streaming = StreamingState {
-                agent_name: data.agent,
-                model: data.model,
-                text: leptos::prelude::ArcRwSignal::new(String::new()),
-                reasoning: leptos::prelude::ArcRwSignal::new(String::new()),
-                tool_requests: leptos::prelude::ArcRwSignal::new(Vec::new()),
-            };
+            let mut streaming = StreamingState::new(data.agent, data.model);
+            streaming.after_row = state.chat_rows.with_untracked(|rows| {
+                rows.get(&agent_id)
+                    .and_then(|rows| rows.last())
+                    .map(|row| row.id)
+            });
             state.streaming_text.update(|map| {
                 map.insert(agent_id.clone(), streaming);
             });
@@ -5893,13 +5892,11 @@ pub fn apply_chat_event_from(
                 data.message.content.len(),
                 data.message.tool_calls.len()
             );
-            // Read the stream's tool_requests without cloning the
-            // surrounding StreamingState (which carries `agent_name`
-            // and `model` strings we don't need here).
             let active_stream = state
                 .streaming_text
                 .with_untracked(|map| map.get(&agent_id).cloned());
             let tool_requests = active_stream
+                .as_ref()
                 .map(|streaming| {
                     streaming.tool_requests.with_untracked(|tools| {
                         tools
@@ -5916,7 +5913,7 @@ pub fn apply_chat_event_from(
                 message: data.message,
                 tool_requests,
             };
-            state.push_chat_entry(agent_id.clone(), entry);
+            state.insert_chat_entry(agent_id.clone(), entry, active_stream.as_ref());
         }
         ChatEvent::ToolRequest(request) => {
             let tool_call_id = request.tool_call_id.clone();
