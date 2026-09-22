@@ -762,6 +762,21 @@ struct GetReviewToolInput {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
+struct AwaitReviewToolInput {
+    review_id: String,
+    /// The round id returned by tyde_request_review, not the snapshot id.
+    round_id: String,
+}
+
+#[derive(Debug, Serialize)]
+struct AwaitReviewResult {
+    review_id: protocol::ReviewId,
+    round_id: String,
+    status: protocol::ReviewAiReviewerStatus,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct ReviewDispositionToolInput {
     review_id: String,
     suggestion_id: String,
@@ -770,8 +785,13 @@ struct ReviewDispositionToolInput {
 }
 
 fn review_tool_result(review: protocol::Review) -> Result<CallToolResult, McpError> {
+    let round_id = review
+        .ai_reviewer
+        .rounds
+        .last()
+        .map(|round| round.id.clone());
     ok_json(
-        json!({ "review_id": review.id, "status": review.ai_reviewer.status, "error": review.ai_reviewer.error,
+        json!({ "review_id": review.id, "round_id": round_id, "status": review.ai_reviewer.status, "error": review.ai_reviewer.error,
         "rounds": review.ai_reviewer.rounds, "findings": review.suggestions }),
     )
 }
@@ -779,7 +799,7 @@ fn review_tool_result(review: protocol::Review) -> Result<CallToolResult, McpErr
 #[tool_router]
 impl TydeAgentControlMcpServer {
     #[tool(
-        description = "Request all enabled reviewers from Settings → Review against a frozen snapshot of your project's changes. Returns the review id immediately after launch; feedback is automatically delivered to you when all reviewers finish, without user submission. Fix actionable findings, record dispositions, then request another review after changes until nothing actionable remains. Never treat a failed review as clean. Working tree is default; committed_range requires root and exact base_oid/tip_oid. Cannot override the user's reviewers."
+        description = "Request all enabled reviewers from Settings → Review against a frozen snapshot of your project's changes. Returns review_id and round_id after launch. Call tyde_await_review on the await server for that round, then tyde_get_review for findings. No feedback is injected into your conversation. Fix actionable findings, record dispositions, then request another review after changes until nothing actionable remains. Never treat a failed review as clean. Working tree is default; committed_range requires root and exact base_oid/tip_oid. Cannot override the user's reviewers."
     )]
     async fn tyde_request_review(
         &self,
@@ -797,7 +817,7 @@ impl TydeAgentControlMcpServer {
     }
 
     #[tool(
-        description = "Read review progress, reviewer failures, findings, prior rounds, and recorded dispositions for a review in your project. Feedback also arrives automatically when an agent-requested round finishes."
+        description = "Read review progress, reviewer failures, findings, prior rounds, and recorded dispositions for a review in your project. Use tyde_await_review to wait for your requested round without polling. This tool reads findings; it does not send a message or accept suggestions."
     )]
     async fn tyde_get_review(
         &self,
@@ -818,6 +838,50 @@ impl TydeAgentControlMcpServer {
         .await;
         match result {
             Ok(review) => review_tool_result(review),
+            Err(error) => Ok(err_text(error)),
+        }
+    }
+
+    #[tool(
+        description = "Wait without a Tyde tool timer until every reviewer in your requested round has completed or failed. Supply review_id and round_id from tyde_request_review. Only the requesting agent may await the round. Returns status, not findings; call tyde_get_review afterwards. A failed or cancelled reviewer means incomplete review, never success. No messages are injected into your conversation."
+    )]
+    async fn tyde_await_review(
+        &self,
+        Parameters(input): Parameters<AwaitReviewToolInput>,
+        Extension(parts): Extension<axum::http::request::Parts>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let _active_request = ActiveAwaitRequestGuard::new(Arc::clone(&self.active_await_requests));
+        let caller = match require_authenticated_caller(self, &parts, "tyde_await_review").await {
+            Ok(caller) => caller,
+            Err(error) => return Ok(err_text(error)),
+        };
+        let (_cancellation_guard, host_cancellation) = AgentAwaitCancellationGuard::register(
+            Arc::clone(&self.await_request_cancellations),
+            caller.clone(),
+        );
+        let wait = async {
+            let handle = self
+                .host
+                .agent_review_handle(&caller, Some(protocol::ReviewId(input.review_id)))
+                .await?;
+            await_review_round(
+                handle,
+                caller,
+                input.round_id,
+                AwaitProgressReporter::from_context(&context),
+            )
+            .await
+        };
+        let result = tokio::select! {
+            biased;
+            _ = self.await_expiration.cancelled() => Err("review await expired because the host stopped".to_owned()),
+            _ = host_cancellation.cancelled() => Err("review await request cancelled".to_owned()),
+            _ = context.ct.cancelled() => Err("review await request cancelled".to_owned()),
+            result = wait => result,
+        };
+        match result {
+            Ok(result) => ok_json(result),
             Err(error) => Ok(err_text(error)),
         }
     }
@@ -1193,10 +1257,10 @@ impl ServerHandler for TydeAgentControlMcpServer {
     fn get_info(&self) -> ServerInfo {
         let instructions = match self.surface {
             AgentControlMcpSurface::Control => {
-                "Tools for orchestrating direct child Tyde agents. Spawn agents, send follow-ups, read the latest visible output, inspect incremental debug events, and list direct children. Long-running waits are exposed by the separate tyde-agent-await MCP server. Use tyde_request_review for the user-configured focused reviewers; their feedback returns automatically. Record addressed or dismissed findings with tyde_review_disposition and request another round after fixes. Review configuration is managed by the user or Help agent, not by coding agents."
+                "Tools for orchestrating direct child Tyde agents. Spawn agents, send follow-ups, read the latest visible output, inspect incremental debug events, and list direct children. Long-running waits are exposed by the separate tyde-agent-await MCP server. Use tyde_request_review for the user-configured focused reviewers; call tyde_await_review with the returned review_id and round_id, then tyde_get_review to read findings. Review results never arrive as injected messages. Record addressed or dismissed findings with tyde_review_disposition and request another round after fixes. Review configuration is managed by the user or Help agent, not by coding agents."
             }
             AgentControlMcpSurface::Await => {
-                "The dedicated long-running tyde_await_agents tool for direct child Tyde agents."
+                "Long-running tools for awaiting direct child agents and requested review rounds. tyde_await_review waits for all reviewers in the specified round; use tyde_get_review on the control server to read findings."
             }
         };
         ServerInfo {
@@ -1218,8 +1282,14 @@ impl ServerHandler for TydeAgentControlMcpServer {
     ) -> Result<ListToolsResult, McpError> {
         let mut tools = self.tool_router.list_all();
         tools.retain(|tool| match self.surface {
-            AgentControlMcpSurface::Control => tool.name != "tyde_await_agents",
-            AgentControlMcpSurface::Await => tool.name == "tyde_await_agents",
+            AgentControlMcpSurface::Control => !matches!(
+                tool.name.as_ref(),
+                "tyde_await_agents" | "tyde_await_review"
+            ),
+            AgentControlMcpSurface::Await => matches!(
+                tool.name.as_ref(),
+                "tyde_await_agents" | "tyde_await_review"
+            ),
         });
         let tiers_enabled = self
             .host
@@ -1253,8 +1323,14 @@ impl ServerHandler for TydeAgentControlMcpServer {
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         let allowed = match self.surface {
-            AgentControlMcpSurface::Control => request.name != "tyde_await_agents",
-            AgentControlMcpSurface::Await => request.name == "tyde_await_agents",
+            AgentControlMcpSurface::Control => !matches!(
+                request.name.as_ref(),
+                "tyde_await_agents" | "tyde_await_review"
+            ),
+            AgentControlMcpSurface::Await => matches!(
+                request.name.as_ref(),
+                "tyde_await_agents" | "tyde_await_review"
+            ),
         };
         if !allowed {
             return Ok(err_text(format!(
@@ -1972,6 +2048,65 @@ async fn do_list_agents(
     }
     overviews.sort_by_key(|o| o.created_at_ms);
     Ok(overviews)
+}
+
+async fn await_review_round(
+    handle: crate::review::ReviewHandle,
+    caller: AgentId,
+    round_id: String,
+    progress_reporter: Option<AwaitProgressReporter>,
+) -> Result<AwaitReviewResult, String> {
+    let mut changes = handle.changes.clone();
+    let interval = progress_reporter
+        .as_ref()
+        .map_or(AWAIT_TOOL_PROGRESS_INTERVAL, |reporter| reporter.interval);
+    let mut progress_tick = tokio::time::interval_at(Instant::now() + interval, interval);
+    progress_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut progress = 0.0;
+    loop {
+        changes.borrow_and_update();
+        let review = handle.snapshot().await?;
+        let round = review
+            .ai_reviewer
+            .rounds
+            .iter()
+            .find(|round| round.id == round_id)
+            .ok_or_else(|| "Unknown review round".to_owned())?;
+        if round.requested_by.as_ref() != Some(&caller) {
+            return Err("Only the requesting agent may await a review round".to_owned());
+        }
+        let running = round
+            .reviewers
+            .iter()
+            .filter(|reviewer| reviewer.status == protocol::ReviewAiReviewerStatus::Running)
+            .count();
+        if running == 0 {
+            let completed = !round.reviewers.is_empty()
+                && round
+                    .reviewers
+                    .iter()
+                    .all(|reviewer| reviewer.status == protocol::ReviewAiReviewerStatus::Completed);
+            return Ok(AwaitReviewResult {
+                review_id: review.id,
+                round_id,
+                status: if completed {
+                    protocol::ReviewAiReviewerStatus::Completed
+                } else {
+                    protocol::ReviewAiReviewerStatus::Failed
+                },
+            });
+        }
+        if let Some(reporter) = &progress_reporter {
+            progress += 1.0;
+            reporter.notify(progress, running).await;
+        }
+        tokio::select! {
+            changed = changes.changed() => {
+                changed.map_err(|_| "review actor stopped".to_owned())?;
+            }
+            _ = progress_tick.tick(), if progress_reporter.is_some() => {}
+        }
+    }
 }
 
 async fn do_await_agents(

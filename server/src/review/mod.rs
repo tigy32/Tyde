@@ -13,7 +13,7 @@ use protocol::{
     ReviewDiffSelection, ReviewErrorContext, ReviewErrorPayload, ReviewId, ReviewStatus,
     ReviewSuggestionId, ReviewSummary, SessionId, StreamPath,
 };
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use uuid::Uuid;
 
 use crate::agent::now_ms;
@@ -25,6 +25,7 @@ use crate::stream::Stream;
 #[derive(Clone)]
 pub(crate) struct ReviewHandle {
     pub(crate) tx: mpsc::Sender<ReviewCommand>,
+    pub(crate) changes: watch::Receiver<()>,
 }
 
 impl ReviewHandle {

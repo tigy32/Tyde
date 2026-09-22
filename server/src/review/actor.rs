@@ -16,7 +16,7 @@ use protocol::{
     ReviewSuggestionState, ReviewSummaryScope, ReviewTarget, SendMessagePayload, StreamPath,
 };
 use sha2::{Digest, Sha256};
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use uuid::Uuid;
 
 use crate::agent::now_ms;
@@ -126,7 +126,11 @@ pub(crate) fn spawn_review_actor(
     project_update_tx: mpsc::UnboundedSender<protocol::ProjectId>,
 ) -> crate::review::ReviewHandle {
     let (tx, rx) = mpsc::channel(64);
-    let handle = crate::review::ReviewHandle { tx };
+    let (changes, changes_rx) = watch::channel(());
+    let handle = crate::review::ReviewHandle {
+        tx,
+        changes: changes_rx,
+    };
     let actor_handle = handle.clone();
     spawn_review_task("tyde-review-actor", async move {
         let mut actor = ReviewActor {
@@ -138,6 +142,7 @@ pub(crate) fn spawn_review_actor(
             ai_spawn_tx,
             project_update_tx,
             handle: actor_handle,
+            changes,
         };
         actor.run(rx).await;
     });
@@ -174,6 +179,7 @@ struct ReviewActor {
     ai_spawn_tx: mpsc::Sender<ReviewAiSpawnRequest>,
     project_update_tx: mpsc::UnboundedSender<protocol::ProjectId>,
     handle: crate::review::ReviewHandle,
+    changes: watch::Sender<()>,
 }
 
 #[derive(Clone)]
@@ -1542,7 +1548,6 @@ impl ReviewActor {
         {
             return;
         }
-        let requester = round.requested_by.clone();
         let previous = self.review.clone();
         let errors = round
             .reviewers
@@ -1565,70 +1570,6 @@ impl ReviewActor {
             .await
         {
             return;
-        }
-        if let Some(agent_id) = requester {
-            let round = self.review.ai_reviewer.rounds.last().expect("round exists");
-            let findings = self
-                .review
-                .suggestions
-                .iter()
-                .filter(|s| {
-                    round
-                        .reviewers
-                        .iter()
-                        .any(|r| r.agent_id.as_ref() == Some(&s.reviewer_agent_id))
-                })
-                .collect::<Vec<_>>();
-            let feedback = serde_json::json!({ "review_id": self.review.id, "round": round, "findings": findings, "status": self.review.ai_reviewer.status });
-            let payload = SendMessagePayload {
-                message: format!(
-                    "Review feedback (automatically delivered, not user-approved). Fix actionable findings; record a reason with tyde_review_disposition for findings you address or dismiss. Call tyde_request_review again after changes. A failed reviewer means incomplete review, not success. Stop when no actionable findings remain.\n{}",
-                    feedback
-                ),
-                images: None,
-                origin: Some(MessageOrigin::Review {
-                    review_id: self.review.id.clone(),
-                }),
-                tool_response: None,
-            };
-            let (reply, response) = oneshot::channel();
-            let result = if self
-                .delivery_tx
-                .send(ReviewDeliveryRequest {
-                    review_id: self.review.id.clone(),
-                    project_id: self.review.project_id.clone(),
-                    target: ReviewSubmitTarget::ExistingAgent { agent_id },
-                    payload,
-                    reply,
-                })
-                .await
-                .is_ok()
-            {
-                response.await.ok()
-            } else {
-                None
-            };
-            let error = match result {
-                Some(ReviewDeliveryOutcome::Delivered { .. }) => None,
-                Some(ReviewDeliveryOutcome::Failed(message)) => Some(message),
-                _ => Some(
-                    "Requesting agent is unavailable; retrieve feedback with tyde_get_review"
-                        .to_owned(),
-                ),
-            };
-            let previous = self.review.clone();
-            self.review
-                .ai_reviewer
-                .rounds
-                .last_mut()
-                .expect("round exists")
-                .delivery_error = error;
-            if !self
-                .persist_or_revert(previous, None, ReviewErrorContext::StartAiReview)
-                .await
-            {
-                return;
-            }
         }
         self.broadcast(ReviewEventPayload::AiReviewerChanged {
             state: self.review.ai_reviewer.clone(),
@@ -2057,6 +1998,7 @@ impl ReviewActor {
     }
 
     async fn broadcast(&mut self, payload: ReviewEventPayload) {
+        self.changes.send_replace(());
         let mut dead = Vec::new();
         let event_kind = payload.kind_name();
         let subscribers = self

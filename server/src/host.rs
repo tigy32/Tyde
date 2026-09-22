@@ -10368,6 +10368,28 @@ impl HostHandle {
         registry.ai_suggestion(review_id, suggestion).await
     }
 
+    async fn validate_sub_agent_depth(&self, parent_agent_id: &AgentId) -> Result<(), String> {
+        let (parent_depth, settings_store) = {
+            let state = self.state.lock().await;
+            let parent_depth = state.registry.agent_depth(parent_agent_id).ok_or_else(|| {
+                format!("cannot determine agent-control depth for {parent_agent_id}")
+            })?;
+            (parent_depth, Arc::clone(&state.settings_store))
+        };
+        let max_depth = settings_store
+            .lock()
+            .await
+            .get()
+            .map_err(|error| format!("failed to load host settings: {error}"))?
+            .tyde_agent_control_max_depth;
+        if parent_depth >= max_depth {
+            return Err(format!(
+                "Tyde sub-agent depth limit of {max_depth} reached; agent {parent_agent_id} cannot spawn another level"
+            ));
+        }
+        Ok(())
+    }
+
     /// Spawn an agent from agent-control MCP, inheriting workflow context and
     /// project ownership from the calling or parent agent when applicable.
     pub(crate) async fn spawn_agent_from_agent_control(
@@ -10376,25 +10398,7 @@ impl HostHandle {
         caller_agent_id: Option<&AgentId>,
     ) -> Result<AgentId, String> {
         if let Some(parent_agent_id) = payload.parent_agent_id.as_ref().or(caller_agent_id) {
-            let (parent_depth, settings_store) = {
-                let state = self.state.lock().await;
-                let parent_depth =
-                    state.registry.agent_depth(parent_agent_id).ok_or_else(|| {
-                        format!("cannot determine agent-control depth for {parent_agent_id}")
-                    })?;
-                (parent_depth, Arc::clone(&state.settings_store))
-            };
-            let max_depth = settings_store
-                .lock()
-                .await
-                .get()
-                .map_err(|error| format!("failed to load host settings: {error}"))?
-                .tyde_agent_control_max_depth;
-            if parent_depth >= max_depth {
-                return Err(format!(
-                    "Tyde sub-agent depth limit of {max_depth} reached; agent {parent_agent_id} cannot spawn another level"
-                ));
-            }
+            self.validate_sub_agent_depth(parent_agent_id).await?;
         }
         // A closing agent must not grow the subtree being torn down.
         // `close_agent` snapshots the subtree once, so a child spawned after
@@ -13350,6 +13354,7 @@ impl HostHandle {
         if !settings.review.agents.values().any(|r| r.enabled) {
             return Err("Add and enable reviewers in Settings → Review first".to_owned());
         }
+        self.validate_sub_agent_depth(&caller).await?;
         self.agent_review_handle(&caller, None)
             .await?
             .request_review(caller, scope)
@@ -13541,7 +13546,7 @@ impl HostHandle {
                 format!("Review: {}", config.name)
             }),
             custom_agent_id: None,
-            parent_agent_id: None,
+            parent_agent_id: request.requested_by.clone(),
             project_id: Some(request.review.project_id.clone()),
             params: SpawnAgentParams::New {
                 workspace_roots: roots,

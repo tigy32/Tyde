@@ -1882,6 +1882,10 @@ async fn committed_comments_share_the_workspace_review() {
     let reviewer = reviewer.expect("committed AI reviewer agent");
     let reviewer_agent_id = reviewer_agent_id.expect("committed AI reviewer agent id");
     assert_eq!(reviewer.agent_id, reviewer_agent_id);
+    assert!(
+        reviewer.parent_agent_id.is_none(),
+        "Manual reviews have no requesting parent"
+    );
     let tool_result = call_propose_review_comment_tool(
         &fixture,
         &reviewer_agent_id,
@@ -3927,7 +3931,7 @@ async fn review_mcp_call(
 }
 
 #[tokio::test]
-async fn configured_reviews_return_findings_and_iterate_without_user_submission() {
+async fn configured_reviews_are_awaited_without_injecting_parent_messages() {
     let fixture = Fixture::new().await;
     let mut client = fixture.connect().await;
     set_default_backend(&mut client, BackendKind::Claude).await;
@@ -3985,7 +3989,14 @@ async fn configured_reviews_return_findings_and_iterate_without_user_submission(
     let root = tempfile::tempdir().expect("review repo");
     seed_repo(root.path());
     let project = create_project(&mut client, root.path()).await;
-    let (requester, _) = spawn_idle_project_agent(&mut client, &project).await;
+    let requester_reservation = fixture
+        .reserve_next_mock_launch(
+            "Review Origin",
+            MockScript::one(MockTurn::held_text("Requester continues its own work")),
+        )
+        .await;
+    let (requester, requester_session) = spawn_project_agent(&mut client, &project).await;
+    drop(requester_reservation);
     let review = create_review(&mut client, &project, &requester).await;
     let caller = fixture.agent_control_caller(&requester.agent_id).await;
     let first_gate = MockGateHandle::new();
@@ -4021,6 +4032,18 @@ async fn configured_reviews_return_findings_and_iterate_without_user_submission(
         |env| {
             if env.kind == FrameKind::NewAgent {
                 let agent: NewAgentPayload = env.parse_payload().unwrap();
+                if agent.name == "Review: Tests" || agent.name == "Review: Comments" {
+                    eprintln!(
+                        "reviewer ownership: parent_present={}, requester_matches={}",
+                        agent.parent_agent_id.is_some(),
+                        agent.parent_agent_id.as_ref() == Some(&requester.agent_id)
+                    );
+                    assert_eq!(
+                        agent.parent_agent_id.as_ref(),
+                        Some(&requester.agent_id),
+                        "Agent-requested reviewers must be children of the requesting agent"
+                    );
+                }
                 if agent.name == "Review: Tests" {
                     assert_eq!(agent.backend_kind, BackendKind::Claude);
                     observed.push(agent.name);
@@ -4033,6 +4056,44 @@ async fn configured_reviews_return_findings_and_iterate_without_user_submission(
         },
     )
     .await;
+    let (mut reconnected, bootstrap) = fixture.connect_with_bootstrap().await;
+    let reviewers = bootstrap
+        .agents
+        .iter()
+        .filter(|agent| agent.name.starts_with("Review: "))
+        .collect::<Vec<_>>();
+    assert_eq!(reviewers.len(), 2);
+    for reviewer in reviewers {
+        assert_eq!(reviewer.parent_agent_id.as_ref(), Some(&requester.agent_id));
+    }
+    reconnected
+        .list_sessions(protocol::ListSessionsPayload::default())
+        .await
+        .expect("list reviewer sessions");
+    let sessions = next_frame_matching_on(&mut reconnected, "reviewer session lineage", |env| {
+        env.kind == FrameKind::SessionList
+    })
+    .await
+    .parse_payload::<SessionListPayload>()
+    .expect("session list");
+    let children = sessions
+        .sessions
+        .iter()
+        .filter(|session| session.parent_id.as_ref() == Some(&requester_session))
+        .count();
+    assert_eq!(
+        children, 2,
+        "Both reviewers must retain parent session lineage"
+    );
+    let (failed, children) = review_mcp_call(
+        &caller.url,
+        Some(&caller.authorization),
+        "tyde_list_agents",
+        json!({}),
+    )
+    .await;
+    assert!(!failed);
+    assert_eq!(children.as_array().map(Vec::len), Some(2));
     let round = &started["rounds"][0];
     assert_eq!(round["reviewers"].as_array().unwrap().len(), 2);
     let first_id = AgentId(
@@ -4059,37 +4120,72 @@ async fn configured_reviews_return_findings_and_iterate_without_user_submission(
         env.kind == FrameKind::ReviewEvent && matches!(env.parse_payload::<ReviewEventPayload>(), Ok(ReviewEventPayload::AiReviewerChanged { state }) if state.status == ReviewAiReviewerStatus::Running && state.rounds.last().is_some_and(|r| r.reviewers.iter().filter(|a| a.status == ReviewAiReviewerStatus::Completed).count() == 1))
     }).await;
     second_gate.release_one();
-    let delivered = next_frame_matching_on(
-        &mut client,
-        "automatic feedback on requester stream",
-        |env| {
-            if env.stream != requester.instance_stream || env.kind != FrameKind::ChatEvent {
-                return false;
-            }
-            let event: ChatEvent = env.parse_payload().expect("requester chat event");
-            eprintln!("automatic review feedback requester event: {event:?}");
-            // The mock echoes received feedback as a streamed assistant response,
-            // so StreamEnd proves delivery across the backend input boundary.
-            match event {
-                ChatEvent::MessageAdded(message)
-                | ChatEvent::StreamEnd(protocol::StreamEndData { message }) => {
-                    matches!(message.sender, MessageSender::Assistant { .. })
-                        && message
-                            .content
-                            .contains("Review feedback (automatically delivered")
-                }
-                _ => false,
-            }
-        },
+    let mut injected_messages = 0;
+    next_frame_matching_on(&mut client, "review completes without messaging its requester", |env| {
+        if env.stream == requester.instance_stream && env.kind == FrameKind::ChatEvent
+            && matches!(env.parse_payload::<ChatEvent>(), Ok(ChatEvent::MessageAdded(message)) if matches!(message.sender, MessageSender::User)) {
+            injected_messages += 1;
+        }
+        if env.stream == requester.instance_stream && env.kind == FrameKind::QueuedMessages {
+            let queue: QueuedMessagesPayload = env.parse_payload().expect("requester queue");
+            assert!(queue.messages.is_empty(), "Review completion must not enqueue parent input");
+        }
+        env.kind == FrameKind::ReviewEvent && matches!(env.parse_payload::<ReviewEventPayload>(), Ok(ReviewEventPayload::AiReviewerChanged { state }) if state.status == ReviewAiReviewerStatus::Completed)
+    }).await;
+    eprintln!("Review completion injected requester messages: {injected_messages}");
+    assert_eq!(
+        injected_messages, 0,
+        "Review results must be read through tools, not injected as user messages"
+    );
+    let (mut parent_observer, parent_host) = fixture.connect_with_bootstrap().await;
+    let parent_stream = parent_host
+        .agents
+        .iter()
+        .find(|agent| agent.agent_id == requester.agent_id)
+        .expect("requester")
+        .instance_stream
+        .clone();
+    let parent_snapshot = next_frame_matching_on(
+        &mut parent_observer,
+        "requester queue after review completion",
+        |env| env.kind == FrameKind::AgentBootstrap && env.stream == parent_stream,
+    )
+    .await
+    .parse_payload::<protocol::AgentBootstrapPayload>()
+    .expect("requester bootstrap");
+    assert!(
+        parent_snapshot.turn_active,
+        "Review completion must not interrupt the requester's own work"
+    );
+    for event in parent_snapshot.events {
+        if let AgentBootstrapEvent::QueuedMessages(queue) = event {
+            eprintln!(
+                "Requester queued messages after review completion: {}",
+                queue.messages.len()
+            );
+            assert!(
+                queue.messages.is_empty(),
+                "Review completion must not inject a queued user message"
+            );
+        }
+    }
+    let (failed, feedback) = review_mcp_call(
+        &caller.url,
+        Some(&caller.authorization),
+        "tyde_get_review",
+        json!({ "review_id": review.id }),
     )
     .await;
-    let message = match delivered.parse_payload().unwrap() {
-        ChatEvent::MessageAdded(message)
-        | ChatEvent::StreamEnd(protocol::StreamEndData { message }) => message,
-        _ => unreachable!(),
-    };
-    assert!(message.content.contains("AI found a review issue."));
-    assert!(message.content.contains("Tests") && message.content.contains("Comments"));
+    assert!(!failed);
+    assert_eq!(feedback["status"], "completed");
+    assert!(
+        feedback["findings"][0]["body"].as_str() == Some("AI found a review issue."),
+        "Structured reads must retain the finding body"
+    );
+    assert_eq!(
+        feedback["rounds"][0]["reviewers"].as_array().map(Vec::len),
+        Some(2)
+    );
     let mut observer = fixture.connect().await;
     let completed = subscribe_review(&mut observer, &review.id).await;
     assert_eq!(
@@ -4098,7 +4194,7 @@ async fn configured_reviews_return_findings_and_iterate_without_user_submission(
     );
     assert!(
         completed.comments.is_empty(),
-        "Delivery must not accept suggestions on behalf of the user"
+        "Reading findings must not accept suggestions on behalf of the user"
     );
     assert_eq!(completed.suggestions.len(), 1);
     assert_eq!(
@@ -4154,8 +4250,34 @@ async fn configured_reviews_return_findings_and_iterate_without_user_submission(
         stale["status"], "success",
         "Previous-round reviewers cannot inject new findings"
     );
+    let wait = review_mcp_call(
+        &caller.await_url,
+        Some(&caller.authorization),
+        "tyde_await_review",
+        json!({ "review_id": review.id, "round_id": second["rounds"][1]["id"] }),
+    );
+    tokio::pin!(wait);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), &mut wait)
+            .await
+            .is_err(),
+        "Await must stay pending while both reviewers are running"
+    );
     next_gate.release_one();
+    next_frame_matching_on(&mut observer, "await waits for the whole round", |env| {
+        env.kind == FrameKind::ReviewEvent && matches!(env.parse_payload::<ReviewEventPayload>(), Ok(ReviewEventPayload::AiReviewerChanged { state }) if state.rounds.len() == 2 && state.status == ReviewAiReviewerStatus::Running && state.rounds[1].reviewers.iter().filter(|r| r.status == ReviewAiReviewerStatus::Completed).count() == 1)
+    }).await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), &mut wait)
+            .await
+            .is_err(),
+        "One finished reviewer must not complete a multi-reviewer await"
+    );
     next_comments_gate.release_one();
+    let (failed, awaited) = wait.await;
+    assert!(!failed);
+    assert_eq!(awaited["status"], "completed");
+    assert_eq!(awaited["round_id"], second["rounds"][1]["id"]);
     next_frame_matching_on(&mut observer, "second round completed", |env| {
         env.kind == FrameKind::ReviewEvent && matches!(env.parse_payload::<ReviewEventPayload>(), Ok(ReviewEventPayload::AiReviewerChanged { state }) if state.status == ReviewAiReviewerStatus::Completed && state.rounds.len() == 2)
     }).await;
@@ -4186,6 +4308,39 @@ async fn configured_reviews_return_findings_and_iterate_without_user_submission(
     )
     .await;
     assert_eq!(failed_review["status"], "failed");
+    let (failed, awaited) = review_mcp_call(
+        &caller.await_url,
+        Some(&caller.authorization),
+        "tyde_await_review",
+        json!({ "review_id": review.id, "round_id": third["rounds"][2]["id"] }),
+    )
+    .await;
+    assert!(!failed);
+    assert_eq!(
+        awaited["status"], "failed",
+        "Incomplete review is never success"
+    );
+    let (failed, earlier) = review_mcp_call(
+        &caller.await_url,
+        Some(&caller.authorization),
+        "tyde_await_review",
+        json!({ "review_id": review.id, "round_id": started["rounds"][0]["id"] }),
+    )
+    .await;
+    assert!(!failed);
+    assert_eq!(
+        earlier["status"], "completed",
+        "Await is scoped to its requested round"
+    );
+    let (failed, _) = review_mcp_call(
+        &caller.await_url,
+        Some(&caller.authorization),
+        "tyde_await_review",
+        json!({ "review_id": review.id, "round_id": "missing-round" }),
+    )
+    .await;
+    assert!(failed, "Unknown rounds must fail promptly");
+
     assert!(
         failed_review["error"]
             .as_str()
@@ -4208,6 +4363,34 @@ async fn configured_reviews_return_findings_and_iterate_without_user_submission(
     assert!(
         failed && denied.as_str().unwrap().contains("different project"),
         "Cross-project review reads must be refused: {denied}"
+    );
+
+    let (failed, denied) = review_mcp_call(
+        &other_caller.await_url,
+        Some(&other_caller.authorization),
+        "tyde_await_review",
+        json!({ "review_id": review.id, "round_id": started["rounds"][0]["id"] }),
+    )
+    .await;
+    assert!(
+        failed
+            && denied
+                .as_str()
+                .is_some_and(|s| s.contains("different project"))
+    );
+    let reviewer_caller = fixture.agent_control_caller(&first_id).await;
+    let (failed, denied) = review_mcp_call(
+        &reviewer_caller.await_url,
+        Some(&reviewer_caller.authorization),
+        "tyde_await_review",
+        json!({ "review_id": review.id, "round_id": started["rounds"][0]["id"] }),
+    )
+    .await;
+    assert!(
+        failed
+            && denied
+                .as_str()
+                .is_some_and(|s| s.contains("requesting agent"))
     );
 
     fixture
@@ -4253,6 +4436,18 @@ async fn configured_reviews_return_findings_and_iterate_without_user_submission(
         .await;
         reviewer_observers.push((reviewer_client, advertised.instance_stream.clone()));
     }
+    let stopped_wait = review_mcp_call(
+        &caller.await_url,
+        Some(&caller.authorization),
+        "tyde_await_review",
+        json!({ "review_id": review.id, "round_id": fourth["rounds"][3]["id"] }),
+    );
+    tokio::pin!(stopped_wait);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), &mut stopped_wait)
+            .await
+            .is_err()
+    );
     observer
         .review_action(&review.id, ReviewActionPayload::StopAiReview)
         .await
@@ -4260,6 +4455,9 @@ async fn configured_reviews_return_findings_and_iterate_without_user_submission(
     next_frame_matching_on(&mut observer, "stopped review is incomplete", |env| {
         env.kind == FrameKind::ReviewEvent && matches!(env.parse_payload::<ReviewEventPayload>(), Ok(ReviewEventPayload::AiReviewerChanged { state }) if state.status == ReviewAiReviewerStatus::Failed && state.rounds.len() == 4 && state.rounds.last().unwrap().reviewers.iter().all(|r| r.status == ReviewAiReviewerStatus::Failed))
     }).await;
+    let (failed, stopped) = stopped_wait.await;
+    assert!(!failed);
+    assert_eq!(stopped["status"], "failed");
     for (mut reviewer_client, stream) in reviewer_observers {
         next_frame_matching_on(
             &mut reviewer_client,
@@ -4276,6 +4474,26 @@ async fn configured_reviews_return_findings_and_iterate_without_user_submission(
         .await;
     }
     drop(stop_reservation);
+
+    let max_depth = settings.settings.tyde_agent_control_max_depth;
+    client
+        .replace_setting("/tyde_agent_control_max_depth", 1u8, max_depth)
+        .await
+        .expect("restrict child depth");
+    expect_host_settings(&mut client, "depth limit settings").await;
+    let (failed, refusal) = review_mcp_call(
+        &caller.url,
+        Some(&caller.authorization),
+        "tyde_request_review",
+        json!({}),
+    )
+    .await;
+    assert!(failed && refusal.as_str().is_some_and(|s| s.contains("depth limit")));
+    client
+        .replace_setting("/tyde_agent_control_max_depth", max_depth, 1u8)
+        .await
+        .expect("restore child depth");
+    expect_host_settings(&mut client, "restored depth settings").await;
 
     let (failed, _) = review_mcp_call(
         &config_url,
@@ -4312,4 +4530,82 @@ async fn configured_reviews_return_findings_and_iterate_without_user_submission(
     )
     .await;
     assert_eq!(remaining["agents"].as_object().unwrap().len(), 1);
+
+    let (failed, _) = review_mcp_call(
+        &config_url,
+        None,
+        "tyde_config_set_setting",
+        json!({ "setting": { "setting": "reviews_enabled", "enabled": true } }),
+    )
+    .await;
+    assert!(!failed);
+    let close_reservation = fixture
+        .reserve_next_mock_launch(
+            "Review: Tests",
+            MockScript::one(MockTurn::held_text("Waiting for parent close")),
+        )
+        .await;
+    let (failed, last) = review_mcp_call(
+        &caller.url,
+        Some(&caller.authorization),
+        "tyde_request_review",
+        json!({}),
+    )
+    .await;
+    assert!(!failed);
+    assert_eq!(last["status"], "running");
+    let (mut closing_client, before_close) = fixture.connect_with_bootstrap().await;
+    let expected_closed = before_close
+        .agents
+        .iter()
+        .filter(|a| {
+            a.agent_id == requester.agent_id
+                || a.parent_agent_id.as_ref() == Some(&requester.agent_id)
+        })
+        .map(|a| a.agent_id.clone())
+        .collect::<std::collections::HashSet<_>>();
+    assert!(expected_closed.len() > 1);
+    let requester_stream = before_close
+        .agents
+        .iter()
+        .find(|a| a.agent_id == requester.agent_id)
+        .expect("requester in reconnect")
+        .instance_stream
+        .clone();
+    next_frame_matching_on(
+        &mut closing_client,
+        "requester attached before close",
+        |env| env.stream == requester_stream && env.kind == FrameKind::AgentBootstrap,
+    )
+    .await;
+    closing_client
+        .close_agent(&requester_stream)
+        .await
+        .expect("close review requester");
+    let mut closed = std::collections::HashSet::new();
+    next_frame_matching_on(
+        &mut closing_client,
+        "requester closes its reviewers",
+        |env| {
+            if env.kind == FrameKind::AgentClosed {
+                let payload: protocol::AgentClosedPayload =
+                    env.parse_payload().expect("closed agent");
+                closed.insert(payload.agent_id);
+            }
+            expected_closed.is_subset(&closed)
+        },
+    )
+    .await;
+    next_frame_matching_on(&mut observer, "parent close marks review incomplete", |env| {
+        env.kind == FrameKind::ReviewEvent && matches!(env.parse_payload::<ReviewEventPayload>(), Ok(ReviewEventPayload::AiReviewerChanged { state }) if state.status == ReviewAiReviewerStatus::Failed && state.rounds.len() == 5)
+    }).await;
+    let (reconnected, after_close) = fixture.connect_with_bootstrap().await;
+    assert!(
+        after_close
+            .agents
+            .iter()
+            .all(|a| !expected_closed.contains(&a.agent_id))
+    );
+    drop(reconnected);
+    drop(close_reservation);
 }

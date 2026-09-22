@@ -262,6 +262,19 @@ async fn child_completion_does_not_enqueue_on_parent_queue() {
     drop(reservation);
     wait_for_typing_true(&mut fixture.client, &parent_new.instance_stream).await;
 
+    // Startup replay can already contain a fast child's completed turn.
+    // Hold its output until the completion observer is attached, rather than
+    // discarding that evidence while waiting for AgentStart.
+    let child_gate = MockGateHandle::new();
+    let child_reservation = fixture
+        .reserve_next_mock_launch(
+            "child-complete",
+            MockScript::one(MockTurn::text_after_gate(
+                mock_turn_text("child completed"),
+                &child_gate,
+            )),
+        )
+        .await;
     let (child_new, _) = spawn_agent(
         &mut fixture.client,
         "child-complete",
@@ -269,6 +282,9 @@ async fn child_completion_does_not_enqueue_on_parent_queue() {
         Some(parent_new.agent_id.clone()),
     )
     .await;
+
+    drop(child_reservation);
+    child_gate.release_one();
 
     expect_completed_turn_without_parent_queue(
         &mut fixture.client,

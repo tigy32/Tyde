@@ -2438,7 +2438,7 @@ fn ReviewRounds(review: Review) -> impl IntoView {
                 view! {
                     <details open=index + 1 == total>
                         <summary>{format!("Round {} · {} of {} reviewers completed", index + 1, completed, count)}</summary>
-                        <p class="review-round-note">{if round.requested_by.is_some() { "Feedback returns to the requesting agent automatically." } else { "Manual review · select suggestions to submit." }}</p>
+                        <p class="review-round-note">{if round.requested_by.is_some() { "The requesting agent awaits this round and reads findings through tools." } else { "Manual review · select suggestions to submit." }}</p>
                         {round.delivery_error.map(|error| view! { <p role="alert">{error}</p> })}
                         {round.reviewers.into_iter().map(|reviewer| {
                             let reviewer_findings = findings.iter().filter(|s| reviewer.agent_id.as_ref() == Some(&s.reviewer_agent_id)).cloned().collect::<Vec<_>>();
