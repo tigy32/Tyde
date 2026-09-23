@@ -1175,6 +1175,7 @@ impl Backend for HermesBackend {
 
     fn session_settings_schema() -> SessionSettingsSchema {
         SessionSettingsSchema {
+            model_resolutions: Default::default(),
             backend_kind: BackendKind::Hermes,
             fields: hermes_base_session_fields(),
         }
@@ -2333,6 +2334,7 @@ fn session_schema_probe_from_model_options(
 
     Ok(HermesSessionSchemaProbe {
         schema: SessionSettingsSchema {
+            model_resolutions: Default::default(),
             backend_kind: BackendKind::Hermes,
             fields,
         },
@@ -3275,12 +3277,36 @@ impl HermesSessionActor {
                         .await
                     {
                         Ok(result) => {
-                            self.mapper.model =
-                                optional_string(&result, &["value"]).or(Some(selection.model));
+                            // The stdout pump queues session.info before resolving config.set.
+                            // Apply those notifications before the newer RPC result, not after it.
+                            let queued_events = self.gateway_events_rx.len();
+                            for _ in 0..queued_events {
+                                let event = self.gateway_events_rx.recv().await.ok_or(
+                                    "Hermes gateway closed while applying model selection",
+                                )?;
+                                if !self.handle_gateway_event(event).await {
+                                    return Err(
+                                        "Hermes gateway stopped while applying model selection"
+                                            .to_owned(),
+                                    );
+                                }
+                            }
+                            tracing::debug!(
+                                queued_events,
+                                "Synchronized Hermes model-selection notifications"
+                            );
+                            if result.get("confirm_required").and_then(Value::as_bool) == Some(true)
+                            {
+                                return Err("Hermes requires native model-selection confirmation before applying this model".to_owned());
+                            }
+                            self.mapper.model = Some(
+                                optional_string(&result, &["value"])
+                                    .ok_or("Hermes model switch omitted the applied model")?,
+                            );
                             if let Some(provider) = selection.provider {
                                 self.mapper.provider = Some(provider);
                             }
-                            self.refresh_provider_info().await;
+                            tracing::debug!("Applied Hermes session-scoped model selection");
                         }
                         Err(err) => return Err(format!("Hermes config.set model failed: {err}")),
                     }
@@ -3328,21 +3354,6 @@ impl HermesSessionActor {
             }
         }
         Ok(())
-    }
-
-    async fn refresh_provider_info(&mut self) {
-        match self
-            .gateway
-            .request("config.get", json!({ "key": "provider" }))
-            .await
-        {
-            Ok(result) => {
-                self.mapper.model =
-                    optional_string(&result, &["model"]).or(self.mapper.model.take());
-                self.mapper.provider = optional_string(&result, &["provider"]);
-            }
-            Err(err) => self.emit_error(format!("Hermes config.get provider failed: {err}")),
-        }
     }
 
     async fn handle_interrupt(&mut self) -> bool {

@@ -2114,6 +2114,7 @@ pub(crate) fn backend_fork_unsupported_message(backend_kind: BackendKind) -> Str
 
 pub(crate) fn empty_session_settings_schema(backend_kind: BackendKind) -> SessionSettingsSchema {
     SessionSettingsSchema {
+        model_resolutions: Default::default(),
         backend_kind,
         fields: Vec::new(),
     }

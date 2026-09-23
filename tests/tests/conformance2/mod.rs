@@ -1702,13 +1702,6 @@ pub async fn save_native_settings<B: Backend>(
     (outcome.result, saved)
 }
 
-pub fn model_setting_aliases(model: &str) -> Vec<String> {
-    match model {
-        "opus" => vec!["opus".to_owned(), "claude-opus-5".to_owned()],
-        _ => vec![model.to_owned()],
-    }
-}
-
 pub async fn await_session_schema<B: Backend>(
     host: &mut Harness<B>,
 ) -> protocol::SessionSettingsSchema {

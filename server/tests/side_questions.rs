@@ -662,6 +662,7 @@ fn mock_model_discovery(model: &str, efforts: &[&str]) -> server::backend::Backe
     });
     server::backend::BackendDiscovery {
         schema: protocol::SessionSettingsSchema {
+            model_resolutions: Default::default(),
             backend_kind: BackendKind::Codex,
             fields: vec![field("model", &[model]), reasoning],
         },

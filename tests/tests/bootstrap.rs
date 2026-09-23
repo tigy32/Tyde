@@ -298,7 +298,11 @@ fn hermes_claude_launch_profile() -> HostLaunchProfileConfig {
     }
 }
 
-fn mock_model_discovery(model: &str, efforts: &[&str]) -> server::backend::BackendDiscovery {
+fn mock_model_discovery(
+    backend_kind: BackendKind,
+    model: &str,
+    efforts: &[&str],
+) -> server::backend::BackendDiscovery {
     let field = |key: &str, values: &[&str]| protocol::SessionSettingField {
         key: key.to_owned(),
         label: key.to_owned(),
@@ -319,7 +323,8 @@ fn mock_model_discovery(model: &str, efforts: &[&str]) -> server::backend::Backe
     };
     server::backend::BackendDiscovery {
         schema: protocol::SessionSettingsSchema {
-            backend_kind: BackendKind::Codex,
+            model_resolutions: Default::default(),
+            backend_kind,
             fields: vec![field("model", &[model]), field("reasoning_effort", efforts)],
         },
         launch_profiles: Vec::new(),
@@ -931,6 +936,24 @@ async fn host_bootstrap_includes_launch_profile_catalog() {
     );
     assert_eq!(
         ready_launch_profile_ids(&bootstrap.launch_profile_catalog),
+        vec!["claude:default".to_owned(), "codex:default".to_owned()]
+    );
+    assert!(matches!(
+        launch_profile_entry(&bootstrap.launch_profile_catalog, "claude:haiku"),
+        LaunchProfileEntry::Unavailable { .. }
+    ));
+    // Native discovery follows bootstrap; a pinned profile is not usable until
+    // its model has been verified against the discovered catalog.
+    let discovered: LaunchProfileCatalogPayload = next_kind(
+        &mut client,
+        FrameKind::LaunchProfileCatalogNotify,
+        "discovered Claude launch profiles",
+    )
+    .await
+    .parse_payload()
+    .expect("discovered launch profile catalog");
+    assert_eq!(
+        ready_launch_profile_ids(&discovered.catalog),
         vec![
             "claude:default".to_owned(),
             "codex:default".to_owned(),
@@ -942,7 +965,7 @@ async fn host_bootstrap_includes_launch_profile_catalog() {
         LaunchProfileKind::BackendDefault
     );
     assert_eq!(
-        launch_profile_entry(&bootstrap.launch_profile_catalog, "claude:haiku").kind(),
+        launch_profile_entry(&discovered.catalog, "claude:haiku").kind(),
         LaunchProfileKind::Custom
     );
     let migrated: serde_json::Value =
@@ -1113,37 +1136,57 @@ async fn stable_reconnect_does_not_emit_unchanged_session_schemas_after_bootstra
 
 #[tokio::test]
 async fn session_schema_refresh_replaces_models_and_surfaces_errors() {
+    for backend_kind in [
+        BackendKind::Codex,
+        BackendKind::Grok,
+        BackendKind::Opencode,
+        BackendKind::Claude,
+        BackendKind::Antigravity,
+    ] {
+        exercise_model_schema_refresh(backend_kind).await;
+    }
+}
+
+async fn exercise_model_schema_refresh(backend_kind: BackendKind) {
     let dir = tempfile::tempdir().expect("tempdir");
     let settings_path = dir.path().join("settings.json");
     let mut profile_settings = SessionSettingsValues::default();
     profile_settings.0.insert(
         "model".to_owned(),
-        SessionSettingValue::String("gpt-5.6".to_owned()),
+        SessionSettingValue::String("catalog-model-new".to_owned()),
     );
     write_host_settings_with_launch_profiles(
         &settings_path,
-        &[BackendKind::Codex],
-        Some(BackendKind::Codex),
+        &[backend_kind],
+        Some(backend_kind),
         vec![HostLaunchProfileConfig {
-            id: LaunchProfileId("codex:gpt-5.6".to_owned()),
-            label: "Codex GPT-5.6".to_owned(),
+            id: LaunchProfileId("custom:catalog-model-new".to_owned()),
+            label: "Catalog model".to_owned(),
             description: None,
-            backend_kind: BackendKind::Codex,
+            backend_kind,
             session_settings: profile_settings,
             acp: None,
         }],
     );
     let discovery = server::backend::mock::MockDiscovery::new(vec![
-        Ok(mock_model_discovery("gpt-5.5", &["low", "high"])),
-        Ok(mock_model_discovery("gpt-5.6", &["low", "xhigh", "max"])),
-        Err("Codex model/list RPC failed: model metadata unavailable".to_owned()),
+        Ok(mock_model_discovery(
+            backend_kind,
+            "catalog-model-old",
+            &["low", "high"],
+        )),
+        Ok(mock_model_discovery(
+            backend_kind,
+            "catalog-model-new",
+            &["low", "xhigh", "max"],
+        )),
+        Err("Backend model discovery failed: model metadata unavailable".to_owned()),
     ]);
     let host = server::spawn_host_with_mock_backend_and_runtime_config(
         dir.path().join("sessions.json"),
         dir.path().join("projects.json"),
         settings_path,
         server::HostRuntimeConfig {
-            mock_backend_discovery: [(BackendKind::Codex, discovery)].into_iter().collect(),
+            mock_backend_discovery: [(backend_kind, discovery)].into_iter().collect(),
             skip_real_backend_probe: true,
             ..Default::default()
         },
@@ -1151,55 +1194,56 @@ async fn session_schema_refresh_replaces_models_and_surfaces_errors() {
     .expect("spawn host");
     let mut client = connect_raw(host).await;
 
-    let bootstrap_env = next_env(&mut client, "Codex host bootstrap").await;
+    let bootstrap_env = next_env(&mut client, "Backend host bootstrap").await;
     let bootstrap: HostBootstrapPayload = bootstrap_env
         .parse_payload()
-        .expect("Codex HostBootstrap payload");
+        .expect("Backend HostBootstrap payload");
     assert!(matches!(
         bootstrap.session_schemas.as_slice(),
         [protocol::SessionSchemaEntry::Pending {
-            backend_kind: BackendKind::Codex
-        }]
+            backend_kind: observed
+        }] if *observed == backend_kind
     ));
     assert!(matches!(
-        launch_profile_entry(&bootstrap.launch_profile_catalog, "codex:gpt-5.6"),
+        launch_profile_entry(&bootstrap.launch_profile_catalog, "custom:catalog-model-new"),
         LaunchProfileEntry::Unavailable { message, .. } if message.contains("still loading")
     ));
 
     let first_schemas_env = next_kind(
         &mut client,
         FrameKind::SessionSchemas,
-        "initial Codex model schema",
+        "initial Backend model schema",
     )
     .await;
     let first_schemas: SessionSchemasPayload = first_schemas_env
         .parse_payload()
-        .expect("initial Codex SessionSchemas");
+        .expect("initial Backend SessionSchemas");
     let protocol::SessionSchemaEntry::Ready {
         schema: first_schema,
     } = &first_schemas.schemas[0]
     else {
-        panic!("initial Codex schema should be ready: {first_schemas:?}");
+        panic!("initial Backend schema should be ready: {first_schemas:?}");
     };
+    assert_eq!(first_schema.backend_kind, backend_kind);
     let first_model_field = first_schema
         .fields
         .iter()
         .find(|field| field.key == "model")
-        .expect("initial Codex model field");
+        .expect("initial Backend model field");
     let protocol::SessionSettingFieldType::Select {
         options,
         default,
         nullable,
     } = &first_model_field.field_type
     else {
-        panic!("Codex model field should be a select");
+        panic!("Backend model field should be a select");
     };
     assert_eq!(
         options
             .iter()
             .map(|option| option.value.as_str())
             .collect::<Vec<_>>(),
-        vec!["gpt-5.5"]
+        vec!["catalog-model-old"]
     );
     assert_eq!(default, &None, "Auto must remain the model default");
     assert!(*nullable, "Auto must remain representable as null");
@@ -1207,7 +1251,7 @@ async fn session_schema_refresh_replaces_models_and_surfaces_errors() {
         .fields
         .iter()
         .find(|field| field.key == "reasoning_effort")
-        .expect("initial Codex reasoning field");
+        .expect("initial Backend reasoning field");
     assert_eq!(
         first_reasoning_field
             .select_options(&SessionSettingsValues::default())
@@ -1221,15 +1265,15 @@ async fn session_schema_refresh_replaces_models_and_surfaces_errors() {
     let first_catalog_env = next_kind(
         &mut client,
         FrameKind::LaunchProfileCatalogNotify,
-        "initial Codex launch profile catalog",
+        "initial Backend launch profile catalog",
     )
     .await;
     let first_catalog: LaunchProfileCatalogPayload = first_catalog_env
         .parse_payload()
-        .expect("initial Codex LaunchProfileCatalog");
+        .expect("initial Backend LaunchProfileCatalog");
     assert!(matches!(
-        launch_profile_entry(&first_catalog.catalog, "codex:gpt-5.6"),
-        LaunchProfileEntry::Unavailable { message, .. } if message.contains("invalid session setting 'model' value 'gpt-5.6'")
+        launch_profile_entry(&first_catalog.catalog, "custom:catalog-model-new"),
+        LaunchProfileEntry::Unavailable { message, .. } if message.contains("invalid session setting 'model' value 'catalog-model-new'")
     ));
 
     let mut invalid_low = SessionSettingsValues::default();
@@ -1243,20 +1287,26 @@ async fn session_schema_refresh_replaces_models_and_surfaces_errors() {
     };
     let write_id = client
         .replace_setting(
-            "/backend_tier_configs/codex",
+            &format!(
+                "/backend_tier_configs/{}",
+                serde_json::to_value(backend_kind)
+                    .expect("backend kind")
+                    .as_str()
+                    .expect("backend slug")
+            ),
             &invalid_config,
             serde_json::Value::Null,
         )
         .await
-        .expect("write invalid Codex tier config");
+        .expect("write invalid Backend tier config");
     let tier_error = next_kind(
         &mut client,
         FrameKind::SettingsWriteResult,
-        "invalid Codex tier SettingsWriteResult",
+        "invalid Backend tier SettingsWriteResult",
     )
     .await
     .parse_payload::<SettingsWriteResultPayload>()
-    .expect("parse invalid Codex tier SettingsWriteResult");
+    .expect("parse invalid Backend tier SettingsWriteResult");
     assert_eq!(tier_error.write_id, write_id);
     assert!(!tier_error.applied);
     let tier_message = &tier_error.field_errors[0].message;
@@ -1265,52 +1315,49 @@ async fn session_schema_refresh_replaces_models_and_surfaces_errors() {
     assert!(tier_message.contains("max"));
 
     client
-        .replace_setting(
-            "/enabled_backends",
-            vec![BackendKind::Codex],
-            vec![BackendKind::Codex],
-        )
+        .replace_setting("/enabled_backends", vec![backend_kind], vec![backend_kind])
         .await
-        .expect("refresh Codex session schema");
+        .expect("refresh Backend session schema");
 
     let refreshed_schemas_env = next_kind(
         &mut client,
         FrameKind::SessionSchemas,
-        "refreshed Codex model schema",
+        "refreshed Backend model schema",
     )
     .await;
     let refreshed_schemas: SessionSchemasPayload = refreshed_schemas_env
         .parse_payload()
-        .expect("refreshed Codex SessionSchemas");
+        .expect("refreshed Backend SessionSchemas");
     let protocol::SessionSchemaEntry::Ready {
         schema: refreshed_schema,
     } = &refreshed_schemas.schemas[0]
     else {
-        panic!("refreshed Codex schema should be ready: {refreshed_schemas:?}");
+        panic!("refreshed Backend schema should be ready: {refreshed_schemas:?}");
     };
+    assert_eq!(refreshed_schema.backend_kind, backend_kind);
     let refreshed_model_field = refreshed_schema
         .fields
         .iter()
         .find(|field| field.key == "model")
-        .expect("refreshed Codex model field");
+        .expect("refreshed Backend model field");
     let protocol::SessionSettingFieldType::Select { options, .. } =
         &refreshed_model_field.field_type
     else {
-        panic!("refreshed Codex model field should be a select");
+        panic!("refreshed Backend model field should be a select");
     };
     assert_eq!(
         options
             .iter()
             .map(|option| option.value.as_str())
             .collect::<Vec<_>>(),
-        vec!["gpt-5.6"],
+        vec!["catalog-model-new"],
         "refreshed metadata must replace the old process-lifetime model list"
     );
     let refreshed_reasoning_field = refreshed_schema
         .fields
         .iter()
         .find(|field| field.key == "reasoning_effort")
-        .expect("refreshed Codex reasoning field");
+        .expect("refreshed Backend reasoning field");
     assert_eq!(
         refreshed_reasoning_field
             .select_options(&SessionSettingsValues::default())
@@ -1319,47 +1366,43 @@ async fn session_schema_refresh_replaces_models_and_surfaces_errors() {
             .map(|option| option.value.as_str())
             .collect::<Vec<_>>(),
         vec!["low", "xhigh", "max"],
-        "Codex reasoning options must preserve model metadata order and max"
+        "Backend reasoning options must preserve model metadata order and max"
     );
 
     let refreshed_catalog_env = next_kind(
         &mut client,
         FrameKind::LaunchProfileCatalogNotify,
-        "refreshed Codex launch profile catalog",
+        "refreshed Backend launch profile catalog",
     )
     .await;
     let refreshed_catalog: LaunchProfileCatalogPayload = refreshed_catalog_env
         .parse_payload()
-        .expect("refreshed Codex LaunchProfileCatalog");
+        .expect("refreshed Backend LaunchProfileCatalog");
     assert!(matches!(
-        launch_profile_entry(&refreshed_catalog.catalog, "codex:gpt-5.6"),
+        launch_profile_entry(&refreshed_catalog.catalog, "custom:catalog-model-new"),
         LaunchProfileEntry::Ready { .. }
     ));
 
     client
-        .replace_setting(
-            "/enabled_backends",
-            vec![BackendKind::Codex],
-            vec![BackendKind::Codex],
-        )
+        .replace_setting("/enabled_backends", vec![backend_kind], vec![backend_kind])
         .await
-        .expect("refresh failing Codex session schema");
+        .expect("refresh failing Backend session schema");
 
     let unavailable_schemas_env = next_kind(
         &mut client,
         FrameKind::SessionSchemas,
-        "unavailable Codex model schema",
+        "unavailable Backend model schema",
     )
     .await;
     let unavailable_schemas: SessionSchemasPayload = unavailable_schemas_env
         .parse_payload()
-        .expect("unavailable Codex SessionSchemas");
+        .expect("unavailable Backend SessionSchemas");
     assert!(matches!(
         unavailable_schemas.schemas.as_slice(),
         [protocol::SessionSchemaEntry::Unavailable {
-            backend_kind: BackendKind::Codex,
+            backend_kind: observed,
             message,
-        }] if message.contains("model/list RPC failed") && message.contains("model metadata unavailable")
+        }] if *observed == backend_kind && message.contains("model discovery failed") && message.contains("model metadata unavailable")
     ));
 }
 
@@ -1384,9 +1427,25 @@ async fn changed_session_schemas_still_emit_live_after_host_bootstrap() {
         bootstrap.session_schemas[0].backend_kind(),
         BackendKind::Claude
     );
-    let protocol::SessionSchemaEntry::Ready { schema } = &bootstrap.session_schemas[0] else {
-        panic!("Claude session schema should be ready");
+    assert!(matches!(
+        bootstrap.session_schemas[0],
+        protocol::SessionSchemaEntry::Pending {
+            backend_kind: BackendKind::Claude
+        }
+    ));
+    let discovered: SessionSchemasPayload = next_kind(
+        &mut client,
+        FrameKind::SessionSchemas,
+        "discovered Claude session schema",
+    )
+    .await
+    .parse_payload()
+    .expect("discovered session schema");
+    assert_eq!(discovered.schemas.len(), 1);
+    let protocol::SessionSchemaEntry::Ready { schema } = &discovered.schemas[0] else {
+        panic!("Claude session schema should be ready after discovery");
     };
+    assert_eq!(schema.backend_kind, BackendKind::Claude);
     let effort_field = schema
         .fields
         .iter()

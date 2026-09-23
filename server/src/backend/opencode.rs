@@ -1,20 +1,7 @@
-use protocol::{
-    AcpAdapterId, AcpAgentSpec, BackendKind, SessionId, SessionSettingValue, SpawnCostHint,
-};
+use protocol::{AcpAdapterId, AcpAgentSpec, BackendKind, SessionId};
 use tyde_agent_adapter::{BackendCapabilities, BackendCapability};
 
 use crate::backend::{BackendSpawnConfig, resolve_settings};
-
-const DEFAULT_FREE_MODEL: &str = "opencode/mimo-v2.5-free";
-
-pub(crate) fn model_context_window(model: &str) -> Option<u64> {
-    match model {
-        "opencode/mimo-v2.5-free" | "opencode/big-pickle" => Some(200_000),
-        "opencode/muse-spark-1.3-contributor-free" => Some(1_048_576),
-        "opencode/nemotron-3-ultra-free" => Some(1_000_000),
-        _ => None,
-    }
-}
 
 pub(crate) fn agent_spec() -> AcpAgentSpec {
     AcpAgentSpec {
@@ -211,76 +198,32 @@ async fn list_workspace_sessions(
 
 pub(crate) fn session_settings_schema() -> protocol::SessionSettingsSchema {
     protocol::SessionSettingsSchema {
+        model_resolutions: Default::default(),
         backend_kind: BackendKind::Opencode,
-        fields: [
-            (
-                "model",
-                "Model",
-                vec![
-                    ("opencode/mimo-v2.5-free", "MiMo V2.5 (free, multimodal)"),
-                    (
-                        "opencode/muse-spark-1.3-contributor-free",
-                        "Muse Spark 1.3 (free, multimodal)",
-                    ),
-                    ("opencode/nemotron-3-ultra-free", "Nemotron 3 Ultra (free)"),
-                    ("opencode/big-pickle", "Big Pickle (free)"),
-                ],
-                Some(DEFAULT_FREE_MODEL),
-            ),
-            (
-                "mode",
-                "Mode",
-                vec![("build", "Build"), ("plan", "Plan")],
-                Some("build"),
-            ),
-        ]
-        .into_iter()
-        .map(
-            |(key, label, options, default)| protocol::SessionSettingField {
+        fields: [("model", "Model"), ("mode", "Mode")]
+            .into_iter()
+            .map(|(key, label)| protocol::SessionSettingField {
                 key: key.to_owned(),
                 label: label.to_owned(),
                 description: None,
                 use_slider: false,
                 select_options_by_setting: None,
                 field_type: protocol::SessionSettingFieldType::Select {
-                    options: options
-                        .into_iter()
-                        .map(|(value, label)| protocol::SelectOption {
-                            value: value.to_owned(),
-                            label: label.to_owned(),
-                        })
-                        .collect(),
-                    default: default.map(str::to_owned),
+                    options: Vec::new(),
+                    default: None,
                     nullable: true,
                 },
-            },
-        )
-        .collect(),
+            })
+            .collect(),
     }
-}
-
-fn cost_hint_defaults(_cost_hint: SpawnCostHint) -> protocol::SessionSettingsValues {
-    let mut values = protocol::SessionSettingsValues::default();
-    values.0.insert(
-        "model".to_owned(),
-        SessionSettingValue::String(DEFAULT_FREE_MODEL.to_owned()),
-    );
-    values.0.insert(
-        "mode".to_owned(),
-        SessionSettingValue::String("build".to_owned()),
-    );
-    values
 }
 
 pub(crate) fn resolve_session_settings(
     config: &BackendSpawnConfig,
 ) -> protocol::SessionSettingsValues {
-    let mut resolved = resolve_settings(config, &session_settings_schema(), cost_hint_defaults);
-    resolved
-        .0
-        .entry("model".to_owned())
-        .or_insert_with(|| SessionSettingValue::String(DEFAULT_FREE_MODEL.to_owned()));
-    resolved
+    resolve_settings(config, &session_settings_schema(), |_| {
+        protocol::SessionSettingsValues::default()
+    })
 }
 
 pub struct OpencodeBackend(crate::backend::acp::backend::KiroBackend);
@@ -321,6 +264,34 @@ impl crate::backend::Backend for OpencodeBackend {
 
     fn session_settings_schema() -> protocol::SessionSettingsSchema {
         session_settings_schema()
+    }
+
+    fn has_dynamic_session_schema() -> bool {
+        true
+    }
+
+    async fn discover(
+        context: &crate::backend::BackendProbeContext,
+    ) -> Result<crate::backend::BackendDiscovery, String> {
+        let mut spec = context.launch.clone().unwrap_or_else(agent_spec);
+        if let Some(program) = &context.program {
+            spec.command.clone_from(program);
+        }
+        let mut schema = crate::backend::acp::backend::probe_session_settings_schema(
+            &context.workspace_roots,
+            None,
+            Some(&spec),
+        )
+        .await?;
+        schema.backend_kind = BackendKind::Opencode;
+        if !schema.fields.iter().any(|field| field.key == "model") {
+            return Err("OpenCode reported no selectable models".to_owned());
+        }
+        tracing::info!("Discovered OpenCode settings from its native ACP catalog");
+        Ok(crate::backend::BackendDiscovery {
+            schema,
+            launch_profiles: Vec::new(),
+        })
     }
 
     async fn spawn(

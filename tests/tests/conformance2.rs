@@ -14,9 +14,8 @@ use protocol::{
     AgentControlProgressKind, AgentControlProgressStatus, AgentId, AgentOrigin,
     BackendCapacityState, BackendKind, CapacityMeasure, CapacitySource, ChatEvent,
     CurrentContextUsage, ImageData, MessageSender, MessageTokenUsage, SessionId,
-    SessionSettingFieldType, SessionSettingsValues, SlashCommandCatalog, TaskStatus, TokenUsage,
-    ToolExecutionMode, ToolExecutionOutcome, ToolExecutionResult, ToolProgressUpdate,
-    ToolRequestType,
+    SessionSettingsValues, SlashCommandCatalog, TaskStatus, TokenUsage, ToolExecutionMode,
+    ToolExecutionOutcome, ToolExecutionResult, ToolProgressUpdate, ToolRequestType,
 };
 use serde_json::Value;
 use server::backend::Backend;
@@ -165,10 +164,7 @@ macro_rules! conformance2_scenario {
             provider!(
                 opencode,
                 server::backend::opencode::OpencodeBackend,
-                Profile::new(
-                    &["opencode/mimo-v2.5-free"],
-                    &[("model", "opencode/mimo-v2.5-free"), ("mode", "build")]
-                )
+                Profile::new(&[], &[("mode", "build")])
             );
         }
     };
@@ -5877,6 +5873,11 @@ conformance2_scenario!(real_session_settings, [BackendCapability::SessionSetting
 async fn real_session_settings<B: Backend>(host: &mut Harness<B>) {
     let schema = await_session_schema(host).await;
     assert!(
+        B::has_dynamic_session_schema(),
+        "{:?}: the model picker must discover its catalog rather than publish a fixed list",
+        host.backend()
+    );
+    assert!(
         !schema.fields.is_empty(),
         "{:?}: declared SessionSettings but published an empty schema",
         host.backend()
@@ -5887,51 +5888,39 @@ async fn real_session_settings<B: Backend>(host: &mut Harness<B>) {
     assert_ready_handshake(&launched);
 
     let mut current = SessionSettingsValues::default();
-    let selectable = |field: &&protocol::SessionSettingField| {
-        matches!(field.field_type, SessionSettingFieldType::Select { .. })
-            && field
+    // Profiles select a provider before launch; model and mode are live settings.
+    let fields = ["model", "mode"]
+        .into_iter()
+        .filter_map(|key| schema.fields.iter().find(|field| field.key == key))
+        .filter(|field| {
+            field
                 .select_options(&current)
                 .is_some_and(|options| options.len() >= 2)
-    };
-    // Hermes publishes `profile` in the schema but rejects changing it
-    // after launch. Model and mode are the shared live settings contract.
-    let field = ["mode", "model"]
-        .into_iter()
-        .find_map(|key| {
-            schema
-                .fields
-                .iter()
-                .find(|field| field.key == key && selectable(field))
         })
-        .or_else(|| schema.fields.iter().find(selectable))
-        .unwrap_or_else(|| {
-            panic!(
-                "{:?}: session settings schema offered no selectable setting with two values",
-                host.backend()
-            )
-        });
-    let options = field
-        .select_options(&current)
-        .expect("selected field has options")
-        .iter()
-        .map(|option| option.value.clone())
         .collect::<Vec<_>>();
-    current = set_session_setting(host, &agent, &field.key, &options[0]).await;
-    assert_eq!(
-        current.0.get(&field.key),
-        Some(&protocol::SessionSettingValue::String(options[0].clone())),
-        "{:?}: session setting {:?} did not retain its first selected value",
-        host.backend(),
-        field.key
+    assert!(
+        !fields.is_empty(),
+        "backend offered no model or mode with two values"
     );
-    current = set_session_setting(host, &agent, &field.key, &options[1]).await;
-    assert_eq!(
-        current.0.get(&field.key),
-        Some(&protocol::SessionSettingValue::String(options[1].clone())),
-        "{:?}: session setting {:?} did not retain its second selected value",
-        host.backend(),
-        field.key
-    );
+    for field in fields {
+        let options = field
+            .select_options(&current)
+            .expect("selectable field")
+            .iter()
+            .take(2)
+            .map(|option| option.value.clone())
+            .collect::<Vec<_>>();
+        for option in options {
+            current = set_session_setting(host, &agent, &field.key, &option).await;
+            assert_eq!(
+                current.0.get(&field.key),
+                Some(&protocol::SessionSettingValue::String(option)),
+                "{:?}: session setting {:?} did not retain its native catalog selection",
+                host.backend(),
+                field.key
+            );
+        }
+    }
 
     assert_universal_contract(&[launched]);
     assert_clean_close(host, &agent).await;
@@ -5991,7 +5980,12 @@ async fn real_session_speed<B: Backend>(host: &mut Harness<B>) {
         Some(protocol::SessionSettingValue::String(model)) => model.clone(),
         _ => panic!("speed scenario must pin its selected model"),
     };
-    let expected_models = model_setting_aliases(&selected_model);
+    // A selectable alias (including the native default) is not a pinned model
+    // ID. Verify its native resolution, not a version guessed by this test.
+    let mut expected_models = vec![selected_model.clone()];
+    if let Some(resolved) = schema.model_resolutions.get(&selected_model) {
+        expected_models.push(resolved.clone());
+    }
     let fast = &fast_options[0].value;
     settings.0.insert(
         "speed".to_owned(),
@@ -6022,8 +6016,6 @@ async fn real_session_speed<B: Backend>(host: &mut Harness<B>) {
     let reset = ask(host, &resumed, prompt).await;
     assert_final_text_contains(&reset, "TYDE_SPEED_READY");
     turns.push(reset);
-    // The CLI reports claude-opus-5 for the selected opus alias. The
-    // shared Haiku pin rejects that correct explicit model selection.
     assert_universal_contract_with_models(&turns, &expected_models);
     assert_clean_close(host, &resumed).await;
 }

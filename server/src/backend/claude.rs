@@ -515,6 +515,8 @@ impl ClaudeSession {
             )),
             active_response: StdMutex::new(None),
             state: Mutex::new(ClaudeState {
+                program: None,
+                native_models: None,
                 workspace_root,
                 workspace_roots: configured_workspace_roots,
                 ssh_host: resolved_ssh_host,
@@ -523,7 +525,7 @@ impl ClaudeSession {
                 resume_bootstrap_required: true,
                 ephemeral: mode.no_session_persistence,
                 model: None,
-                effort: Some(ClaudeEffort::High),
+                effort: None,
                 fast_mode: None,
                 permission_mode: Some(
                     claude_permission_mode_for_access_mode(mode.access_mode).to_string(),
@@ -709,16 +711,6 @@ impl ClaudeEffort {
         }
     }
 
-    fn label(self) -> &'static str {
-        match self {
-            Self::Low => "Low",
-            Self::Medium => "Medium",
-            Self::High => "High",
-            Self::XHigh => "XHigh",
-            Self::Max => "Max",
-        }
-    }
-
     fn parse(value: &str) -> Result<Self, String> {
         match value.trim().to_ascii_lowercase().as_str() {
             "low" => Ok(Self::Low),
@@ -739,6 +731,8 @@ impl ClaudeEffort {
 }
 
 struct ClaudeState {
+    program: Option<String>,
+    native_models: Option<Vec<ClaudeModelMetadata>>,
     workspace_root: String,
     workspace_roots: Option<Vec<String>>,
     ssh_host: Option<String>,
@@ -809,6 +803,8 @@ enum ClaudeCapacityAccess {
 impl Default for ClaudeState {
     fn default() -> Self {
         Self {
+            program: None,
+            native_models: None,
             workspace_root: String::new(),
             workspace_roots: None,
             ssh_host: None,
@@ -1748,6 +1744,7 @@ enum TurnStartError {
 }
 
 struct ClaudeProcessSpawnConfig {
+    program: Option<String>,
     workspace_root: String,
     workspace_roots: Option<Vec<String>>,
     ssh_host: Option<String>,
@@ -1900,7 +1897,24 @@ impl ClaudeInner {
                 Ok(())
             }
             SessionCommand::ListModels => {
-                this.emitter.models_list(claude_known_models());
+                this.ensure_process_ready().await?;
+                let state = this.state.lock().await;
+                let models = state
+                    .native_models
+                    .as_ref()
+                    .ok_or("Claude model catalog unavailable")?;
+                this.emitter.models_list(
+                    models
+                        .iter()
+                        .map(|model| {
+                            json!({
+                                "id": model.value,
+                                "displayName": model.display_name,
+                                "description": model.description,
+                            })
+                        })
+                        .collect(),
+                );
                 Ok(())
             }
             SessionCommand::UpdateSettings {
@@ -3345,7 +3359,9 @@ impl ClaudeInner {
                 None,
                 BackendCompactionCapabilityEvidence::None,
             );
+            state.native_models = None;
             let config = ClaudeProcessSpawnConfig {
+                program: state.program.clone(),
                 workspace_root: state.workspace_root.clone(),
                 workspace_roots: state.workspace_roots.clone(),
                 ssh_host: state.ssh_host.clone(),
@@ -3435,6 +3451,30 @@ impl ClaudeInner {
         .await
         {
             Ok(Ok(response)) => {
+                let models = response
+                    .get("models")
+                    .ok_or_else(|| "Claude initialization omitted models".to_owned())
+                    .and_then(|models| {
+                        serde_json::from_value::<Vec<ClaudeModelMetadata>>(models.clone())
+                            .map_err(|error| format!("Invalid Claude model catalog: {error}"))
+                    });
+                match models {
+                    Ok(models) if !models.is_empty() => {
+                        tracing::info!(
+                            model_count = models.len(),
+                            "Discovered Claude native models"
+                        );
+                        self.state.lock().await.native_models = Some(models);
+                    }
+                    Ok(_) => {
+                        self.shutdown_process().await;
+                        return Err("Claude reported no selectable models".to_owned());
+                    }
+                    Err(error) => {
+                        self.shutdown_process().await;
+                        return Err(error);
+                    }
+                }
                 self.configure_capacity_from_initialize(&response).await;
                 self.schedule_capacity_refresh().await;
                 if !startup_mcp_names.is_empty()
@@ -3938,7 +3978,8 @@ impl ClaudeInner {
             .await
             .map_err(|err| format!("Failed to start Claude CLI over SSH: {err}"))?
         } else {
-            let mut cmd = crate::process_env::command(claude_binary())?;
+            let program = config.program.clone().unwrap_or_else(claude_binary);
+            let mut cmd = crate::process_env::command(program)?;
             for arg in &cli_args {
                 cmd.arg(arg);
             }
@@ -13377,28 +13418,90 @@ fn extract_images_from_content(content: &Value) -> Vec<Value> {
     images
 }
 
-fn claude_known_models() -> Vec<Value> {
-    // Use the CLI's family aliases rather than pinned model IDs so we always
-    // resolve to whatever the installed CLI considers the latest opus/sonnet/
-    // haiku. The concrete model is reported back in the stream-start event, and
-    // the context-window lookup keys off the family hint, so no pinned IDs are
-    // needed here.
-    let models = [
-        ("opus", "Opus (latest)", true),
-        ("sonnet", "Sonnet (latest)", false),
-        ("haiku", "Haiku (latest)", false),
-    ];
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ClaudeModelMetadata {
+    value: String,
+    resolved_model: String,
+    display_name: String,
+    description: String,
+    #[serde(default)]
+    supported_effort_levels: Vec<String>,
+    #[serde(default)]
+    supports_fast_mode: bool,
+}
 
-    models
-        .iter()
-        .map(|(id, display_name, is_default)| {
-            json!({
-                "id": id,
-                "displayName": display_name,
-                "isDefault": is_default,
-            })
+fn claude_session_schema(models: &[ClaudeModelMetadata]) -> SessionSettingsSchema {
+    let field =
+        |key: &str, label: &str, options: Vec<SelectOption>, conditional| SessionSettingField {
+            key: key.to_owned(),
+            label: label.to_owned(),
+            description: None,
+            use_slider: key == "effort",
+            select_options_by_setting: conditional,
+            field_type: SessionSettingFieldType::Select {
+                options,
+                default: None,
+                nullable: true,
+            },
+        };
+    let conditional = |options: fn(&ClaudeModelMetadata) -> Vec<SelectOption>| {
+        Some(protocol::SelectOptionsBySetting {
+            setting_key: "model".to_owned(),
+            values: models
+                .iter()
+                .map(|model| protocol::SelectOptionsForValue {
+                    setting_value: model.value.clone(),
+                    options: options(model),
+                })
+                .collect(),
         })
-        .collect()
+    };
+    let efforts = |model: &ClaudeModelMetadata| {
+        model
+            .supported_effort_levels
+            .iter()
+            .map(|effort| SelectOption {
+                value: effort.clone(),
+                label: effort.clone(),
+            })
+            .collect()
+    };
+    let speeds = |model: &ClaudeModelMetadata| claude_speed_options(model.supports_fast_mode);
+    let native_default = models.iter().find(|model| model.value == "default");
+    SessionSettingsSchema {
+        model_resolutions: models
+            .iter()
+            .map(|model| (model.value.clone(), model.resolved_model.clone()))
+            .collect(),
+        backend_kind: BackendKind::Claude,
+        fields: vec![
+            field(
+                "model",
+                "Model",
+                models
+                    .iter()
+                    .map(|model| SelectOption {
+                        value: model.value.clone(),
+                        label: model.display_name.clone(),
+                    })
+                    .collect(),
+                None,
+            ),
+            field(
+                "speed",
+                "Speed",
+                native_default.map(speeds).unwrap_or_default(),
+                conditional(speeds),
+            ),
+            field(
+                "effort",
+                "Effort",
+                native_default.map(efforts).unwrap_or_default(),
+                conditional(efforts),
+            ),
+        ],
+    }
 }
 
 fn system_time_to_ms(time: SystemTime) -> u64 {
@@ -13890,36 +13993,14 @@ impl ClaudeBackend {
     }
 }
 
-fn claude_backend_defaults(
-    cost_hint: Option<SpawnCostHint>,
-) -> (Option<&'static str>, Option<ClaudeEffort>) {
-    match cost_hint {
-        Some(SpawnCostHint::Low) => (Some("haiku"), Some(ClaudeEffort::Low)),
-        // Medium is a legacy no-op: spawn on the backend's own defaults.
-        Some(SpawnCostHint::Medium) => (None, None),
-        Some(SpawnCostHint::High) => (Some("opus"), Some(ClaudeEffort::Max)),
-        None => (None, None),
-    }
-}
-
 pub(crate) fn claude_cost_hint_defaults(
     cost_hint: SpawnCostHint,
 ) -> protocol::SessionSettingsValues {
-    let (model, effort) = claude_backend_defaults(Some(cost_hint));
-    let mut values = protocol::SessionSettingsValues::default();
-    if let Some(model) = model {
-        values.0.insert(
-            "model".to_string(),
-            SessionSettingValue::String(model.to_string()),
-        );
+    match cost_hint {
+        SpawnCostHint::Low | SpawnCostHint::Medium | SpawnCostHint::High => {
+            protocol::SessionSettingsValues::default()
+        }
     }
-    if let Some(effort) = effort {
-        values.0.insert(
-            "effort".to_string(),
-            SessionSettingValue::String(effort.as_str().to_string()),
-        );
-    }
-    values
 }
 
 fn claude_speed_options(supports_fast: bool) -> Vec<SelectOption> {
@@ -14686,78 +14767,50 @@ impl Backend for ClaudeBackend {
     }
 
     fn session_settings_schema() -> SessionSettingsSchema {
-        SessionSettingsSchema {
-            backend_kind: BackendKind::Claude,
-            fields: vec![
-                SessionSettingField {
-                    key: "model".to_string(),
-                    label: "Model".to_string(),
-                    description: None,
-                    use_slider: false,
-                    select_options_by_setting: None,
-                    field_type: SessionSettingFieldType::Select {
-                        options: vec![
-                            SelectOption {
-                                value: "haiku".to_string(),
-                                label: "Haiku".to_string(),
-                            },
-                            SelectOption {
-                                value: "sonnet".to_string(),
-                                label: "Sonnet".to_string(),
-                            },
-                            SelectOption {
-                                value: "opus".to_string(),
-                                label: "Opus".to_string(),
-                            },
-                            SelectOption {
-                                value: "fable".to_string(),
-                                label: "Fable".to_string(),
-                            },
-                        ],
-                        default: None,
-                        nullable: true,
-                    },
-                },
-                SessionSettingField {
-                    key: "speed".to_owned(),
-                    label: "Speed".to_owned(),
-                    description: Some("Fast requires a supported Opus model and account access, uses additional credits, and applies from the next turn.".to_owned()),
-                    use_slider: false,
-                    select_options_by_setting: Some(protocol::SelectOptionsBySetting {
-                        setting_key: "model".to_owned(),
-                        values: ["haiku", "sonnet", "opus", "fable"].into_iter().map(|model| {
-                            protocol::SelectOptionsForValue {
-                                setting_value: model.to_owned(),
-                                options: claude_speed_options(model == "opus"),
-                            }
-                        }).collect(),
-                    }),
-                    field_type: SessionSettingFieldType::Select {
-                        options: claude_speed_options(true),
-                        default: None,
-                        nullable: true,
-                    },
-                },
-                SessionSettingField {
-                    key: "effort".to_string(),
-                    label: "Effort".to_string(),
-                    description: None,
-                    use_slider: true,
-                    select_options_by_setting: None,
-                    field_type: SessionSettingFieldType::Select {
-                        options: ClaudeEffort::ALL
-                            .iter()
-                            .map(|effort| SelectOption {
-                                value: effort.as_str().to_string(),
-                                label: effort.label().to_string(),
-                            })
-                            .collect(),
-                        default: None,
-                        nullable: true,
-                    },
-                },
-            ],
-        }
+        claude_session_schema(&[])
+    }
+
+    fn has_dynamic_session_schema() -> bool {
+        true
+    }
+
+    async fn discover(
+        context: &crate::backend::BackendProbeContext,
+    ) -> Result<crate::backend::BackendDiscovery, String> {
+        let (session, events) = ClaudeSession::spawn_ephemeral(
+            &context.workspace_roots,
+            None,
+            &[],
+            None,
+            None,
+            ToolPolicy::Unrestricted,
+            BackendAccessMode::ReadOnly,
+        )
+        .await?;
+        drop(events);
+        session
+            .inner
+            .state
+            .lock()
+            .await
+            .program
+            .clone_from(&context.program);
+        let result = match session.inner.ensure_process_ready().await {
+            Ok(()) => {
+                let state = session.inner.state.lock().await;
+                state
+                    .native_models
+                    .as_ref()
+                    .ok_or_else(|| "Claude model catalog unavailable".to_owned())
+                    .map(|models| crate::backend::BackendDiscovery {
+                        schema: claude_session_schema(models),
+                        launch_profiles: Vec::new(),
+                    })
+            }
+            Err(error) => Err(error),
+        };
+        session.shutdown().await;
+        result
     }
 
     async fn spawn(

@@ -247,52 +247,23 @@ pub(crate) async fn list_sessions(
 
 pub(crate) fn session_settings_schema() -> protocol::SessionSettingsSchema {
     protocol::SessionSettingsSchema {
+        model_resolutions: Default::default(),
         backend_kind: BackendKind::Grok,
-        fields: [
-            (
-                "model",
-                "Model",
-                vec![
-                    protocol::SelectOption {
-                        value: "grok-4.6".to_owned(),
-                        label: "Grok 4.6".to_owned(),
-                    },
-                    protocol::SelectOption {
-                        value: "grok-4.5".to_owned(),
-                        label: "Grok 4.5".to_owned(),
-                    },
-                ],
-                Some("grok-4.6".to_owned()),
-            ),
-            (
-                "mode",
-                "Reasoning effort",
-                ["low", "medium", "high", "xhigh"]
-                    .into_iter()
-                    .map(|value| protocol::SelectOption {
-                        value: value.to_owned(),
-                        label: value.to_owned(),
-                    })
-                    .collect(),
-                Some("high".to_owned()),
-            ),
-        ]
-        .into_iter()
-        .map(
-            |(key, label, options, default)| protocol::SessionSettingField {
+        fields: [("model", "Model"), ("mode", "Reasoning effort")]
+            .into_iter()
+            .map(|(key, label)| protocol::SessionSettingField {
                 key: key.to_owned(),
                 label: label.to_owned(),
                 description: None,
                 use_slider: false,
                 select_options_by_setting: None,
                 field_type: protocol::SessionSettingFieldType::Select {
-                    options,
-                    default,
+                    options: Vec::new(),
+                    default: None,
                     nullable: true,
                 },
-            },
-        )
-        .collect(),
+            })
+            .collect(),
     }
 }
 
@@ -359,6 +330,47 @@ impl crate::backend::Backend for GrokBackend {
 
     fn session_settings_schema() -> protocol::SessionSettingsSchema {
         session_settings_schema()
+    }
+
+    fn has_dynamic_session_schema() -> bool {
+        true
+    }
+
+    async fn discover(
+        context: &crate::backend::BackendProbeContext,
+    ) -> Result<crate::backend::BackendDiscovery, String> {
+        let mut spec = context.launch.clone().unwrap_or_else(agent_spec);
+        if let Some(program) = &context.program {
+            spec.command.clone_from(program);
+        }
+        let mut schema = crate::backend::acp::backend::probe_session_settings_schema(
+            &context.workspace_roots,
+            None,
+            Some(&spec),
+        )
+        .await?;
+        schema.backend_kind = BackendKind::Grok;
+        let model = schema
+            .fields
+            .iter()
+            .find(|field| field.key == "model")
+            .ok_or("Grok reported no selectable models")?;
+        let model_count = model
+            .select_options(&protocol::SessionSettingsValues::default())
+            .map_or(0, |options| options.len());
+        tracing::info!(
+            model_count,
+            "Discovered Grok models from the native ACP catalog"
+        );
+        for field in &mut schema.fields {
+            if field.key == "mode" {
+                field.label = "Reasoning effort".to_owned();
+            }
+        }
+        Ok(crate::backend::BackendDiscovery {
+            schema,
+            launch_profiles: Vec::new(),
+        })
     }
 
     async fn spawn(

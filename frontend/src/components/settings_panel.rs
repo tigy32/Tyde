@@ -14065,6 +14065,7 @@ mod wasm_tests {
                 BackendKind::Hermes,
                 SessionSchemaEntry::Ready {
                     schema: SessionSettingsSchema {
+                        model_resolutions: Default::default(),
                         backend_kind: BackendKind::Hermes,
                         fields: vec![protocol::SessionSettingField {
                             key: "model".to_owned(),

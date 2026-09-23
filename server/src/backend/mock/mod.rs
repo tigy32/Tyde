@@ -953,6 +953,67 @@ pub(crate) fn disabled_discovery(
     context: &super::BackendProbeContext,
 ) -> Result<super::BackendDiscovery, String> {
     match kind {
+        BackendKind::Claude => Ok(super::BackendDiscovery {
+            schema: protocol::SessionSettingsSchema {
+                model_resolutions: Default::default(),
+                backend_kind: kind,
+                fields: [
+                    ("model", "Model", vec!["haiku", "sonnet", "opus", "fable"]),
+                    (
+                        "effort",
+                        "Effort",
+                        vec!["low", "medium", "high", "xhigh", "max"],
+                    ),
+                    ("speed", "Speed", vec!["standard", "fast"]),
+                ]
+                .into_iter()
+                .map(|(key, label, values)| protocol::SessionSettingField {
+                    key: key.to_owned(),
+                    label: label.to_owned(),
+                    description: None,
+                    use_slider: key == "effort",
+                    select_options_by_setting: None,
+                    field_type: protocol::SessionSettingFieldType::Select {
+                        options: values
+                            .into_iter()
+                            .map(|value| protocol::SelectOption {
+                                value: value.to_owned(),
+                                label: value.to_owned(),
+                            })
+                            .collect(),
+                        default: None,
+                        nullable: true,
+                    },
+                })
+                .collect(),
+            },
+            launch_profiles: Vec::new(),
+        }),
+        BackendKind::Antigravity => Ok(super::BackendDiscovery {
+            schema: protocol::SessionSettingsSchema {
+                model_resolutions: Default::default(),
+                backend_kind: kind,
+                fields: vec![protocol::SessionSettingField {
+                    key: "model".to_owned(),
+                    label: "Model".to_owned(),
+                    description: None,
+                    use_slider: false,
+                    select_options_by_setting: None,
+                    field_type: protocol::SessionSettingFieldType::Select {
+                        options: ["Gemini 3.7 Flash (Low)", "Claude Sonnet 4.6 (Thinking)"]
+                            .into_iter()
+                            .map(|model| protocol::SelectOption {
+                                value: model.to_owned(),
+                                label: model.to_owned(),
+                            })
+                            .collect(),
+                        default: None,
+                        nullable: true,
+                    },
+                }],
+            },
+            launch_profiles: Vec::new(),
+        }),
         BackendKind::Hermes => Ok(super::BackendDiscovery {
             schema: mock_filtered_model_schema(kind, context),
             launch_profiles: Vec::new(),

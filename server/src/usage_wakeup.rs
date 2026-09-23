@@ -3,11 +3,10 @@ use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::backend::Backend;
 use protocol::{
     BackendKind, CapacityBucket, CapacityBucketId, CapacityBucketStatus, CapacityMeasure,
     CapacityReport, CapacityReset, CapacityWindow, ClaudeLimitType, CodexLimitSlot,
-    SessionSettingValue, SessionSettingsValues, SpawnCostHint,
+    SessionSettingValue, SessionSettingsValues,
 };
 use serde::{Deserialize, Serialize};
 use settings_model::UsageLimitSettings;
@@ -305,38 +304,21 @@ fn wakeup_model(backend: BackendKind, bucket: &CapacityBucketId) -> Option<Optio
             _ => None,
         },
         (BackendKind::Claude, CapacityBucketId::ClaudeModel { name }) => {
-            let field = crate::backend::claude::ClaudeBackend::session_settings_schema()
-                .fields
+            // Preserve the existing wake-up policy independently of discovery.
+            ["haiku", "sonnet", "opus", "fable"]
                 .into_iter()
-                .find(|field| field.key == "model")?;
-            let protocol::SessionSettingFieldType::Select { options, .. } = field.field_type else {
-                return None;
-            };
-            options
-                .into_iter()
-                .find(|option| {
-                    option.value.eq_ignore_ascii_case(name)
-                        || option.label.eq_ignore_ascii_case(name)
-                })
-                .map(|option| Some(option.value))
+                .find(|model| model.eq_ignore_ascii_case(name))
+                .map(|model| Some(model.to_owned()))
         }
         (BackendKind::Antigravity, CapacityBucketId::Antigravity { bucket })
             if bucket.starts_with("gemini-") =>
         {
-            let settings =
-                crate::backend::antigravity::antigravity_cost_hint_defaults(SpawnCostHint::Low);
-            match settings.0.get("model") {
-                Some(SessionSettingValue::String(model)) => Some(Some(model.clone())),
-                _ => None,
-            }
+            Some(Some("Gemini 3.7 Flash (Low)".to_owned()))
         }
         (BackendKind::Antigravity, CapacityBucketId::Antigravity { bucket })
             if bucket.starts_with("3p-") =>
         {
-            crate::backend::antigravity::antigravity_known_models()
-                .into_iter()
-                .find(|model| model.value.starts_with("Claude Sonnet "))
-                .map(|model| Some(model.value))
+            Some(Some("Claude Sonnet 4.6 (Thinking)".to_owned()))
         }
         (BackendKind::Codex, CapacityBucketId::Codex { .. })
         | (BackendKind::Grok, CapacityBucketId::Grok { .. }) => Some(None),

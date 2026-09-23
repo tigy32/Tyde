@@ -4028,6 +4028,9 @@ pub fn slash_command_name(message: &str) -> Option<&str> {
 pub struct SessionSettingsSchema {
     pub backend_kind: BackendKind,
     pub fields: Vec<SessionSettingField>,
+    /// Native model identities behind selectable aliases; never inferred from names.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub model_resolutions: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

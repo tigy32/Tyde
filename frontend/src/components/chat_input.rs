@@ -2892,6 +2892,7 @@ mod wasm_tests {
                 BackendKind::Claude,
                 protocol::SessionSchemaEntry::Ready {
                     schema: protocol::SessionSettingsSchema {
+                        model_resolutions: Default::default(),
                         backend_kind: BackendKind::Claude,
                         fields: vec![protocol::SessionSettingField {
                             key: "verbose".to_owned(),

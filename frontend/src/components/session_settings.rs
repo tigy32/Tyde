@@ -1111,6 +1111,7 @@ mod wasm_tests {
     async fn named_profile_absent_from_schema_is_not_displayed_as_default() {
         let container = make_container();
         let schema = SessionSettingsSchema {
+            model_resolutions: Default::default(),
             backend_kind: BackendKind::Hermes,
             fields: vec![SessionSettingField {
                 key: "profile".to_owned(),
@@ -1174,6 +1175,7 @@ mod wasm_tests {
     async fn unavailable_option_is_rendered_disabled_and_is_not_committable() {
         let container = make_container();
         let schema = SessionSettingsSchema {
+            model_resolutions: Default::default(),
             backend_kind: BackendKind::Hermes,
             fields: vec![SessionSettingField {
                 key: "profile".to_owned(),
@@ -1262,6 +1264,7 @@ mod wasm_tests {
     async fn schema_unavailable_profile_renders_disabled_and_is_not_committable() {
         let container = make_container();
         let schema = SessionSettingsSchema {
+            model_resolutions: Default::default(),
             backend_kind: BackendKind::Hermes,
             fields: vec![SessionSettingField {
                 key: "profile".to_owned(),
@@ -1361,6 +1364,7 @@ mod wasm_tests {
     async fn slider_does_not_commit_an_unavailable_value() {
         let container = make_container();
         let schema = SessionSettingsSchema {
+            model_resolutions: Default::default(),
             backend_kind: BackendKind::Codex,
             fields: vec![SessionSettingField {
                 key: "effort".to_owned(),
@@ -1435,6 +1439,7 @@ mod wasm_tests {
     async fn select_adopts_an_option_that_arrives_after_mount() {
         let container = make_container();
         let schema = SessionSettingsSchema {
+            model_resolutions: Default::default(),
             backend_kind: BackendKind::Hermes,
             fields: vec![SessionSettingField {
                 key: "model".to_owned(),
@@ -1526,6 +1531,7 @@ mod wasm_tests {
     async fn slider_does_not_coerce_an_unknown_value_to_the_first_option() {
         let container = make_container();
         let schema = SessionSettingsSchema {
+            model_resolutions: Default::default(),
             backend_kind: BackendKind::Codex,
             fields: vec![SessionSettingField {
                 key: "effort".to_owned(),
@@ -1679,6 +1685,7 @@ mod wasm_tests {
                 backend_kind,
                 SessionSchemaEntry::Ready {
                     schema: SessionSettingsSchema {
+                        model_resolutions: Default::default(),
                         backend_kind,
                         fields,
                     },
@@ -1725,6 +1732,7 @@ mod wasm_tests {
                 BackendKind::Kiro,
                 SessionSchemaEntry::Ready {
                     schema: SessionSettingsSchema {
+                        model_resolutions: Default::default(),
                         backend_kind: BackendKind::Kiro,
                         fields: vec![SessionSettingField {
                             key: "model".to_owned(),

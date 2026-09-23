@@ -76,9 +76,6 @@ const ANTIGRAVITY_GRACEFUL_EXIT_TIMEOUT: Duration = Duration::from_secs(15);
 /// tasks are not aborted by arbitrary provider-side turn deadlines. Unresponsive or
 /// wedged provider processes are recovered via user manual interrupt or session shutdown.
 const ANTIGRAVITY_PRINT_TIMEOUT: &str = "720h";
-const ANTIGRAVITY_DEFAULT_MODEL: &str = "Gemini 3.7 Flash (Medium)";
-const ANTIGRAVITY_LOW_MODEL: &str = "Gemini 3.7 Flash (Low)";
-const ANTIGRAVITY_HIGH_MODEL: &str = "Gemini 3.1 Pro (High)";
 const ANTIGRAVITY_SKILLS_ROOT_PREFIX: &str = "tyde-antigravity-skills-";
 
 const ANTIGRAVITY_SKILL_PROJECTION: ProjectionPolicy = ProjectionPolicy {
@@ -1147,7 +1144,7 @@ impl Supervisor {
         emitter.typing_status_changed(true);
         let model = self.launch.model.clone();
         let cwd = PathBuf::from(&self.launch.primary_root);
-        match run_antigravity_cli_command(&model, Some(&cwd), message.trim()).await {
+        match run_antigravity_cli_command("agy", Some(&model), Some(&cwd), message.trim()).await {
             Ok(output) if output.error.is_none() => {
                 let text = output.response.trim_end().to_owned();
                 let response = emitter.stream_start(Some(&model));
@@ -1465,16 +1462,13 @@ impl Supervisor {
         {
             return;
         }
-        let (emitter, model) = {
-            let state = self.inner.state.lock().await;
-            (state.subagent_emitter.clone(), state.model.clone())
-        };
+        let emitter = self.inner.state.lock().await.subagent_emitter.clone();
         let Some(emitter) = emitter else {
             return;
         };
         self.capacity_read_at = Some(std::time::Instant::now());
         tokio::spawn(async move {
-            let state = match read_antigravity_capacity(&model).await {
+            let state = match read_antigravity_capacity().await {
                 Ok(report) => protocol::BackendCapacityState::Known { report },
                 Err(reason) => protocol::BackendCapacityState::Unavailable { reason },
             };
@@ -1554,7 +1548,7 @@ impl Supervisor {
         process: &mut AgyProcess,
         values: SessionSettingsValues,
     ) -> Result<(), String> {
-        let model = selected_model(&values)?;
+        let model = selected_model(&values, Some(Path::new(&self.launch.primary_root))).await?;
         {
             let mut state = self.inner.state.lock().await;
             if state.model == model {
@@ -1676,20 +1670,17 @@ struct AgyCommandOutput {
 /// in print mode: the stream-json process refuses them with "run it as its own
 /// --print /help invocation".
 async fn run_antigravity_cli_command(
-    model: &str,
+    program: &str,
+    model: Option<&str>,
     cwd: Option<&Path>,
     command: &str,
 ) -> Result<AgyCommandOutput, String> {
-    let mut process = crate::process_env::command("agy")
+    let mut process = crate::process_env::command(program)
         .map_err(|err| format!("Antigravity CLI is unavailable: {err:?}"))?;
-    process.args([
-        "--output-format",
-        "stream-json",
-        "--model",
-        model,
-        "-p",
-        command,
-    ]);
+    process.args(["--output-format", "stream-json", "-p", command]);
+    if let Some(model) = model {
+        process.args(["--model", model]);
+    }
     if let Some(path) = process_env::resolved_child_process_path() {
         process.env("PATH", path);
     }
@@ -1710,6 +1701,12 @@ async fn run_antigravity_cli_command(
             )
         })?
         .map_err(|err| format!("Antigravity could not run {command}: {err}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "Antigravity {command} failed with {}",
+            output.status
+        ));
+    }
     let mut answer = AgyCommandOutput::default();
     for line in String::from_utf8_lossy(&output.stdout).lines() {
         let Ok(frame) = parse_frame(line.trim()) else {
@@ -1736,7 +1733,7 @@ async fn run_antigravity_cli_command(
 /// The commands the CLI itself answers, read from its own `/help`, minus the
 /// configuration commands Tyde owns per session.
 async fn read_antigravity_slash_commands(model: String) -> Option<protocol::SlashCommandCatalog> {
-    let output = match run_antigravity_cli_command(&model, None, "/help").await {
+    let output = match run_antigravity_cli_command("agy", Some(&model), None, "/help").await {
         Ok(output) => output,
         Err(error) => {
             tracing::warn!(%error, "Antigravity /help failed; slash commands unavailable");
@@ -1779,10 +1776,9 @@ async fn read_antigravity_slash_commands(model: String) -> Option<protocol::Slas
 
 /// Reads the account's remaining quota with no conversation and no live agent.
 ///
-/// `/usage` is answered by print mode without a model request, so the probe
-/// only needs a model name for the launch flag — it never reaches the model.
+/// `/usage` is answered by print mode without a model request or selection.
 pub(crate) async fn read_capacity_out_of_band() -> protocol::BackendCapacityState {
-    match read_antigravity_capacity(ANTIGRAVITY_DEFAULT_MODEL).await {
+    match read_antigravity_capacity().await {
         Ok(report) => protocol::BackendCapacityState::Known { report },
         Err(reason) => protocol::BackendCapacityState::Unavailable { reason },
     }
@@ -1792,19 +1788,10 @@ pub(crate) async fn read_capacity_out_of_band() -> protocol::BackendCapacityStat
 ///
 /// `/usage` is answered by print mode directly — no model request, no turn,
 /// zero tokens — so this costs a short-lived process and nothing else.
-async fn read_antigravity_capacity(
-    model: &str,
-) -> Result<CapacityReport, CapacityUnavailableReason> {
+async fn read_antigravity_capacity() -> Result<CapacityReport, CapacityUnavailableReason> {
     let mut command = crate::process_env::command("agy")
         .map_err(|_| CapacityUnavailableReason::SourceUnreachable)?;
-    command.args([
-        "--output-format",
-        "stream-json",
-        "--model",
-        model,
-        "-p",
-        "/usage",
-    ]);
+    command.args(["--output-format", "stream-json", "-p", "/usage"]);
     if let Some(path) = process_env::resolved_child_process_path() {
         command.env("PATH", path);
     }
@@ -2530,6 +2517,7 @@ impl Backend for AntigravityBackend {
 
     fn session_settings_schema() -> SessionSettingsSchema {
         SessionSettingsSchema {
+            model_resolutions: Default::default(),
             backend_kind: BackendKind::Antigravity,
             fields: vec![SessionSettingField {
                 key: "model".to_string(),
@@ -2538,12 +2526,44 @@ impl Backend for AntigravityBackend {
                 use_slider: false,
                 select_options_by_setting: None,
                 field_type: SessionSettingFieldType::Select {
-                    options: antigravity_known_models(),
-                    default: Some(ANTIGRAVITY_DEFAULT_MODEL.to_string()),
-                    nullable: false,
+                    options: Vec::new(),
+                    default: None,
+                    nullable: true,
                 },
             }],
         }
+    }
+
+    fn has_dynamic_session_schema() -> bool {
+        true
+    }
+
+    async fn discover(
+        context: &crate::backend::BackendProbeContext,
+    ) -> Result<crate::backend::BackendDiscovery, String> {
+        let program = context.program.as_deref().unwrap_or("agy");
+        let (cwd, _) = resolve_workspace_roots(&context.workspace_roots)?;
+        let options = antigravity_model_catalog(program, Path::new(&cwd)).await?;
+        let default = antigravity_default_model(program, Some(Path::new(&cwd))).await?;
+        if !options.iter().any(|option| option.value == default) {
+            return Err(
+                "Antigravity's selected model is absent from its native catalog".to_owned(),
+            );
+        }
+        tracing::info!(
+            model_count = options.len(),
+            "Discovered Antigravity native models"
+        );
+        let mut schema = Self::session_settings_schema();
+        schema.fields[0].field_type = SessionSettingFieldType::Select {
+            options,
+            default: Some(default),
+            nullable: true,
+        };
+        Ok(crate::backend::BackendDiscovery {
+            schema,
+            launch_profiles: Vec::new(),
+        })
     }
 
     fn compaction_capability(&self) -> BackendCompactionCapability {
@@ -2719,7 +2739,7 @@ impl AntigravityBackend {
 
         let (primary_root, extra_roots) = resolve_workspace_roots(&workspace_roots)?;
         let settings = resolve_session_settings(&config);
-        let model = selected_model(&settings)?;
+        let model = selected_model(&settings, Some(Path::new(&primary_root))).await?;
         let combined_instructions =
             render_combined_spawn_instructions(&config.resolved_spawn_config);
         let mut skill_setup = prepare_antigravity_skills(&config.resolved_spawn_config.skills)?;
@@ -3059,42 +3079,72 @@ pub(crate) fn resolve_antigravity_conversations_dir(
     }
 }
 
-pub(crate) fn antigravity_known_models() -> Vec<SelectOption> {
-    // `--model` takes the display label, not the id, and these are the labels
-    // `agy models` reports for agy 1.1.20.
-    [
-        ANTIGRAVITY_LOW_MODEL,
-        ANTIGRAVITY_DEFAULT_MODEL,
-        "Gemini 3.7 Flash (High)",
-        "Gemini 3.6 Flash (Low)",
-        "Gemini 3.6 Flash (Medium)",
-        "Gemini 3.6 Flash (High)",
-        "Gemini 3.1 Pro (Low)",
-        ANTIGRAVITY_HIGH_MODEL,
-        "Claude Sonnet 4.6 (Thinking)",
-        "Claude Opus 4.6 (Thinking)",
-        "GPT-OSS 120B (Medium)",
-    ]
-    .into_iter()
-    .map(|label| SelectOption {
-        value: label.to_string(),
-        label: label.to_string(),
-    })
-    .collect()
+async fn antigravity_model_catalog(program: &str, cwd: &Path) -> Result<Vec<SelectOption>, String> {
+    let mut command = crate::process_env::command(program)?;
+    command
+        .arg("models")
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    let output = tokio::time::timeout(ANTIGRAVITY_COMMAND_TIMEOUT, command.output())
+        .await
+        .map_err(|_| "Antigravity model catalog timed out".to_owned())?
+        .map_err(|error| format!("Cannot read Antigravity model catalog: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "Antigravity model catalog failed with {}",
+            output.status
+        ));
+    }
+    let text = String::from_utf8(output.stdout)
+        .map_err(|error| format!("Invalid Antigravity model catalog encoding: {error}"))?;
+    let mut models = Vec::new();
+    let mut seen = BTreeSet::new();
+    for line in text.lines().filter(|line| !line.trim().is_empty()) {
+        let (id, label) = line
+            .split_once('\t')
+            .ok_or_else(|| "Antigravity model catalog row is not ID-tab-label".to_owned())?;
+        if id.is_empty()
+            || label.is_empty()
+            || label.contains('\t')
+            || !seen.insert(label.to_owned())
+        {
+            return Err("Antigravity model catalog has an invalid or duplicate label".to_owned());
+        }
+        models.push(SelectOption {
+            value: label.to_owned(),
+            label: label.to_owned(),
+        });
+    }
+    if models.is_empty() {
+        return Err("Antigravity reported no selectable models".to_owned());
+    }
+    Ok(models)
+}
+
+async fn antigravity_default_model(program: &str, cwd: Option<&Path>) -> Result<String, String> {
+    let output = run_antigravity_cli_command(program, None, cwd, "/model").await?;
+    if let Some(error) = output.error {
+        return Err(error);
+    }
+    output
+        .command
+        .as_ref()
+        .and_then(|command| command.pointer("/data/label"))
+        .and_then(Value::as_str)
+        .filter(|label| !label.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| "Antigravity /model omitted the selected model label".to_owned())
 }
 
 pub(crate) fn antigravity_cost_hint_defaults(cost_hint: SpawnCostHint) -> SessionSettingsValues {
-    let model = match cost_hint {
-        SpawnCostHint::Low => ANTIGRAVITY_LOW_MODEL,
-        SpawnCostHint::Medium => ANTIGRAVITY_DEFAULT_MODEL,
-        SpawnCostHint::High => ANTIGRAVITY_HIGH_MODEL,
-    };
-    let mut values = SessionSettingsValues::default();
-    values.0.insert(
-        "model".to_string(),
-        SessionSettingValue::String(model.to_string()),
-    );
-    values
+    match cost_hint {
+        SpawnCostHint::Low | SpawnCostHint::Medium | SpawnCostHint::High => {
+            SessionSettingsValues::default()
+        }
+    }
 }
 
 pub(crate) fn resolve_session_settings(config: &BackendSpawnConfig) -> SessionSettingsValues {
@@ -3105,23 +3155,15 @@ pub(crate) fn resolve_session_settings(config: &BackendSpawnConfig) -> SessionSe
     )
 }
 
-fn selected_model(values: &SessionSettingsValues) -> Result<String, String> {
+async fn selected_model(
+    values: &SessionSettingsValues,
+    cwd: Option<&Path>,
+) -> Result<String, String> {
     match values.0.get("model") {
-        Some(SessionSettingValue::String(value)) if is_known_model(value) => Ok(value.clone()),
-        Some(SessionSettingValue::String(value)) => Err(format!(
-            "unknown Antigravity model label {value:?}; expected one of the known agy model labels"
-        )),
-        Some(other) => Err(format!(
-            "Antigravity model setting must be a string, got {other:?}"
-        )),
-        None => Ok(ANTIGRAVITY_DEFAULT_MODEL.to_string()),
+        Some(SessionSettingValue::String(value)) if !value.trim().is_empty() => Ok(value.clone()),
+        None | Some(SessionSettingValue::Null) => antigravity_default_model("agy", cwd).await,
+        Some(_) => Err("Antigravity model setting must be a nonempty string".to_owned()),
     }
-}
-
-fn is_known_model(value: &str) -> bool {
-    antigravity_known_models()
-        .into_iter()
-        .any(|option| option.value == value)
 }
 
 fn build_prompt(instructions: Option<&str>, message: &str) -> String {

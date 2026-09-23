@@ -548,8 +548,9 @@ impl KiroSession {
 
         let (session_id, session_started) = session_result?;
 
+        let backend_kind = adapter.backend_kind();
         let initial_model = extract_current_model(&session_started);
-        let initial_mode = extract_current_mode(&session_started);
+        let initial_mode = extract_current_mode(&session_started, backend_kind);
 
         let (event_tx, event_rx) = mpsc::unbounded_channel();
 
@@ -583,7 +584,9 @@ impl KiroSession {
                 model: initial_model,
                 mode: initial_mode,
                 known_models: extract_known_models(&session_started),
-                known_modes: extract_known_modes(&session_started),
+                known_modes: extract_known_modes(&session_started, backend_kind),
+                model_config_id: acp_config_id(&session_started, "model"),
+                mode_config_id: acp_config_id(&session_started, acp_mode_category(backend_kind)),
                 slash_commands: None,
                 active_response: None,
                 active_stream_text: String::new(),
@@ -663,6 +666,8 @@ struct KiroState {
     mode: Option<String>,
     known_models: Vec<Value>,
     known_modes: Vec<Value>,
+    model_config_id: Option<String>,
+    mode_config_id: Option<String>,
     /// The set last advertised on the stream. Consulted to deliver an invoking
     /// message verbatim, and so only a real change is published again.
     slash_commands: Option<SlashCommandCatalog>,
@@ -1019,13 +1024,14 @@ impl KiroInner {
         }
         {
             let mut state = self.state.lock().await;
+            apply_acp_config_options(&mut state, &response, self.adapter.backend_kind());
             state.workspace_root = cwd.clone();
             state.workspace_roots = Some(roots.clone());
             let models = extract_known_models(&response);
             if !models.is_empty() {
                 state.known_models = models;
             }
-            let modes = extract_known_modes(&response);
+            let modes = extract_known_modes(&response, self.adapter.backend_kind());
             if !modes.is_empty() {
                 state.known_modes = modes;
             }
@@ -1367,7 +1373,7 @@ impl KiroInner {
                     let mut state = self.state.lock().await;
                     state.model = Some(model);
                 }
-                if let Some(mode) = extract_current_mode(&response) {
+                if let Some(mode) = extract_current_mode(&response, self.adapter.backend_kind()) {
                     let mut state = self.state.lock().await;
                     state.mode = Some(mode);
                 }
@@ -1376,7 +1382,7 @@ impl KiroInner {
                     let mut state = self.state.lock().await;
                     state.known_models = known_models;
                 }
-                let known_modes = extract_known_modes(&response);
+                let known_modes = extract_known_modes(&response, self.adapter.backend_kind());
                 if !known_modes.is_empty() {
                     let mut state = self.state.lock().await;
                     state.known_modes = known_modes;
@@ -1482,16 +1488,27 @@ impl KiroInner {
                         let session_id = self.state.lock().await.session_id.clone();
                         match next_model.clone() {
                             Some(model_id) => {
-                                self.bridge
-                                    .request(
+                                let config_id = self.state.lock().await.model_config_id.clone();
+                                let (method, params) = match config_id {
+                                    Some(config_id) => (
+                                        "session/set_config_option",
+                                        json!({
+                                            "sessionId": session_id, "configId": config_id, "value": model_id,
+                                        }),
+                                    ),
+                                    None => (
                                         "session/set_model",
                                         json!({
-                                            "sessionId": session_id,
-                                            "modelId": model_id,
-                                            "model": model_id,
+                                            "sessionId": session_id, "modelId": model_id, "model": model_id,
                                         }),
-                                    )
-                                    .await?;
+                                    ),
+                                };
+                                let response = self.bridge.request(method, params).await?;
+                                apply_acp_config_options(
+                                    &mut *self.state.lock().await,
+                                    &response,
+                                    self.adapter.backend_kind(),
+                                );
                             }
                             None => {
                                 // Let backend fallback to default model.
@@ -1505,16 +1522,27 @@ impl KiroInner {
                         let next_mode = normalize_optional_string(mode_value);
                         let session_id = self.state.lock().await.session_id.clone();
                         if let Some(mode_id) = next_mode.clone() {
-                            self.bridge
-                                .request(
+                            let config_id = self.state.lock().await.mode_config_id.clone();
+                            let (method, params) = match config_id {
+                                Some(config_id) => (
+                                    "session/set_config_option",
+                                    json!({
+                                        "sessionId": session_id, "configId": config_id, "value": mode_id,
+                                    }),
+                                ),
+                                None => (
                                     "session/set_mode",
                                     json!({
-                                        "sessionId": session_id,
-                                        "modeId": mode_id,
-                                        "mode": mode_id,
+                                        "sessionId": session_id, "modeId": mode_id, "mode": mode_id,
                                     }),
-                                )
-                                .await?;
+                                ),
+                            };
+                            let response = self.bridge.request(method, params).await?;
+                            apply_acp_config_options(
+                                &mut *self.state.lock().await,
+                                &response,
+                                self.adapter.backend_kind(),
+                            );
                         }
                         let mut state = self.state.lock().await;
                         state.mode = next_mode;
@@ -1776,17 +1804,18 @@ impl KiroInner {
                 ));
             }
             state.session_id = session_id;
+            apply_acp_config_options(&mut state, &response, self.adapter.backend_kind());
             if let Some(model) = extract_current_model(&response) {
                 state.model = Some(model);
             }
-            if let Some(mode) = extract_current_mode(&response) {
+            if let Some(mode) = extract_current_mode(&response, self.adapter.backend_kind()) {
                 state.mode = Some(mode);
             }
             let known_models = extract_known_models(&response);
             if !known_models.is_empty() {
                 state.known_models = known_models;
             }
-            let known_modes = extract_known_modes(&response);
+            let known_modes = extract_known_modes(&response, self.adapter.backend_kind());
             if !known_modes.is_empty() {
                 state.known_modes = known_modes;
             }
@@ -2690,26 +2719,17 @@ impl KiroInner {
             "grok_compact_failed" => self.record_grok_compact_failed(update).await,
             "grok_compact_cancelled" => self.record_grok_compact_failed(update).await,
             "current_mode_update" => {
-                if let Some(mode) = extract_current_mode(update) {
+                if let Some(mode) = extract_current_mode(update, self.adapter.backend_kind()) {
                     let mut state = self.state.lock().await;
                     state.mode = Some(mode);
                 }
             }
             "config_option_update" => {
-                if let Some(model) = extract_current_model(update) {
-                    let mut state = self.state.lock().await;
-                    state.model = Some(model);
-                }
-                let models = extract_known_models(update);
-                if !models.is_empty() {
-                    let mut state = self.state.lock().await;
-                    state.known_models = models;
-                }
-                let modes = extract_known_modes(update);
-                if !modes.is_empty() {
-                    let mut state = self.state.lock().await;
-                    state.known_modes = modes;
-                }
+                apply_acp_config_options(
+                    &mut *self.state.lock().await,
+                    update,
+                    self.adapter.backend_kind(),
+                );
             }
             _ => {}
         }
@@ -4000,8 +4020,22 @@ impl KiroInner {
         }
         add_token_usage(&mut state.opencode_cumulative_usage, &usage);
         let model = state.model.as_deref().unwrap_or("opencode");
-        let current_context_usage = opencode_context_usage(model, &usage)
-            .or_else(|| state.opencode_current_context_usage.clone());
+        let current_context_usage = state
+            .opencode_current_context_usage
+            .as_ref()
+            .and_then(|context| context.known())
+            .and_then(|(_, context_window)| {
+                let input_tokens = usage
+                    .input_tokens
+                    .saturating_add(usage.cached_prompt_tokens.unwrap_or(0))
+                    .saturating_add(usage.cache_creation_input_tokens.unwrap_or(0));
+                (input_tokens > 0 && input_tokens <= context_window).then_some(
+                    CurrentContextUsage::Known {
+                        input_tokens,
+                        context_window,
+                    },
+                )
+            });
         let request_id = ModelRequestId {
             turn_id: ModelTurnId(format!(
                 "{}:{}",
@@ -4011,7 +4045,7 @@ impl KiroInner {
         };
         tracing::debug!(
             model,
-            ?request_id,
+            request_sequence = request_id.sequence,
             request = ?usage,
             ?current_context_usage,
             "OpenCode request context usage diagnostic"
@@ -4447,18 +4481,6 @@ impl KiroInner {
         });
         self.emitter.user_message(content, image_payload);
     }
-}
-
-fn opencode_context_usage(model: &str, usage: &TokenUsage) -> Option<CurrentContextUsage> {
-    let context_window = crate::backend::opencode::model_context_window(model)?;
-    let input_tokens = usage
-        .input_tokens
-        .saturating_add(usage.cached_prompt_tokens.unwrap_or(0))
-        .saturating_add(usage.cache_creation_input_tokens.unwrap_or(0));
-    (input_tokens > 0 && input_tokens <= context_window).then_some(CurrentContextUsage::Known {
-        input_tokens,
-        context_window,
-    })
 }
 
 fn kiro_plan_status_to_task_status(raw: &str) -> protocol::TaskStatus {
@@ -5368,7 +5390,85 @@ pub(crate) fn estimate_context_breakdown_from_usage(token_usage: &Value) -> Valu
     })
 }
 
+fn acp_mode_category(backend: protocol::BackendKind) -> &'static str {
+    match backend {
+        protocol::BackendKind::Grok => "thought_level",
+        _ => "mode",
+    }
+}
+
+fn acp_config_option<'a>(value: &'a Value, key: &str) -> Option<&'a Value> {
+    value
+        .get("configOptions")?
+        .as_array()?
+        .iter()
+        .find(|option| {
+            let category = option.get("category").and_then(Value::as_str);
+            category == Some(key)
+        })
+}
+
+fn acp_config_id(value: &Value, key: &str) -> Option<String> {
+    acp_config_option(value, key)?
+        .get("id")?
+        .as_str()
+        .map(str::to_owned)
+}
+
+fn acp_config_choices(value: &Value, key: &str) -> Vec<Value> {
+    let Some(option) = acp_config_option(value, key) else {
+        return Vec::new();
+    };
+    let Some(choices) = option.get("options").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    choices
+        .iter()
+        .flat_map(
+            |choice| match choice.get("options").and_then(Value::as_array) {
+                Some(group) => group.iter().collect::<Vec<_>>(),
+                None => vec![choice],
+            },
+        )
+        .map(|choice| {
+            json!({
+                "id": choice.get("value"),
+                "displayName": choice.get("name"),
+                "isDefault": choice.get("value") == option.get("currentValue"),
+            })
+        })
+        .collect()
+}
+
+fn apply_acp_config_options(state: &mut KiroState, value: &Value, backend: protocol::BackendKind) {
+    if value.get("configOptions").is_none() {
+        return;
+    }
+    state.model_config_id = acp_config_id(value, "model");
+    state.mode_config_id = acp_config_id(value, acp_mode_category(backend));
+    let model = extract_current_model(value);
+    if model != state.model {
+        state.opencode_current_context_usage = None;
+    }
+    state.model = model;
+    state.mode = extract_current_mode(value, backend);
+    state.known_models = extract_known_models(value);
+    state.known_modes = extract_known_modes(value, backend);
+    tracing::debug!(
+        model_count = state.known_models.len(),
+        mode_count = state.known_modes.len(),
+        "Applied ACP native config options"
+    );
+}
+
 fn extract_current_model(value: &Value) -> Option<String> {
+    if value.get("configOptions").is_some() {
+        return acp_config_option(value, "model")?
+            .get("currentValue")?
+            .as_str()
+            .map(str::to_owned);
+    }
+
     value
         .get("model")
         .or_else(|| value.get("currentModelId"))
@@ -5413,7 +5513,14 @@ fn acp_available_commands(update: &Value) -> Option<Vec<SlashCommand>> {
     )
 }
 
-fn extract_current_mode(value: &Value) -> Option<String> {
+fn extract_current_mode(value: &Value, backend: protocol::BackendKind) -> Option<String> {
+    if value.get("configOptions").is_some() {
+        return acp_config_option(value, acp_mode_category(backend))?
+            .get("currentValue")?
+            .as_str()
+            .map(str::to_owned);
+    }
+
     value
         .get("mode")
         .or_else(|| value.get("currentModeId"))
@@ -5429,6 +5536,10 @@ fn extract_current_mode(value: &Value) -> Option<String> {
 }
 
 fn extract_known_models(value: &Value) -> Vec<Value> {
+    if value.get("configOptions").is_some() {
+        return acp_config_choices(value, "model");
+    }
+
     let current_model = extract_current_model(value);
     let models = value
         .get("models")
@@ -5507,8 +5618,12 @@ fn extract_known_models(value: &Value) -> Vec<Value> {
     deduped
 }
 
-fn extract_known_modes(value: &Value) -> Vec<Value> {
-    let current_mode = extract_current_mode(value);
+fn extract_known_modes(value: &Value, backend: protocol::BackendKind) -> Vec<Value> {
+    if value.get("configOptions").is_some() {
+        return acp_config_choices(value, acp_mode_category(backend));
+    }
+
+    let current_mode = extract_current_mode(value, backend);
     let raw_modes = value
         .get("modes")
         .and_then(|modes| {
@@ -5619,6 +5734,7 @@ fn session_settings_schema_from_known_options(
         fields.push(select_field("mode", "Mode", known_modes)?);
     }
     Ok(protocol::SessionSettingsSchema {
+        model_resolutions: Default::default(),
         backend_kind: protocol::BackendKind::Kiro,
         fields,
     })
@@ -6347,8 +6463,8 @@ pub(crate) fn extract_session_timestamp(metadata: &Value) -> u64 {
 // ---------------------------------------------------------------------------
 
 use protocol::{
-    AgentInput, BackendKind, ChatEvent, ChatMessage, MessageSender, SessionId, SessionSettingValue,
-    SpawnCostHint, StreamEndData, StreamStartData, StreamTextDeltaData,
+    AgentInput, BackendKind, ChatEvent, ChatMessage, MessageSender, SessionId, SpawnCostHint,
+    StreamEndData, StreamStartData, StreamTextDeltaData,
 };
 
 use crate::backend::{
@@ -6386,25 +6502,12 @@ impl Drop for KiroStartupTaskGuard {
     }
 }
 
-fn kiro_backend_model(cost_hint: Option<SpawnCostHint>) -> Option<&'static str> {
-    match cost_hint {
-        Some(SpawnCostHint::Low) => Some("claude-haiku-4.5"),
-        // Medium is a legacy no-op: spawn on the backend's own defaults.
-        Some(SpawnCostHint::Medium) => None,
-        Some(SpawnCostHint::High) => Some("claude-sonnet-4.5"),
-        None => None,
-    }
-}
-
 pub(crate) fn kiro_cost_hint_defaults(cost_hint: SpawnCostHint) -> protocol::SessionSettingsValues {
-    let mut values = protocol::SessionSettingsValues::default();
-    if let Some(model) = kiro_backend_model(Some(cost_hint)) {
-        values.0.insert(
-            "model".to_string(),
-            SessionSettingValue::String(model.to_string()),
-        );
+    match cost_hint {
+        SpawnCostHint::Low | SpawnCostHint::Medium | SpawnCostHint::High => {
+            protocol::SessionSettingsValues::default()
+        }
     }
-    values
 }
 
 pub(crate) fn resolve_session_settings(
@@ -6541,6 +6644,7 @@ impl Backend for KiroBackend {
 
     fn session_settings_schema() -> protocol::SessionSettingsSchema {
         protocol::SessionSettingsSchema {
+            model_resolutions: Default::default(),
             backend_kind: BackendKind::Kiro,
             fields: [("model", "Model"), ("mode", "Mode")]
                 .into_iter()

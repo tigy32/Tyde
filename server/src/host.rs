@@ -9002,7 +9002,7 @@ impl HostHandle {
             {
                 continue;
             }
-            if !settings.enabled_backends.contains(&kind) {
+            if !settings.enabled_backends.contains(&kind) && only != Some(kind) {
                 schemas.retain(|(stored, _), _| *stored != kind);
                 profiles.remove(&kind);
                 continue;

@@ -547,6 +547,7 @@ mod wasm_tests {
     /// possible, and the reason the commit path clears one.
     fn schema() -> SessionSettingsSchema {
         SessionSettingsSchema {
+            model_resolutions: Default::default(),
             backend_kind: BackendKind::Claude,
             fields: vec![
                 SessionSettingField {

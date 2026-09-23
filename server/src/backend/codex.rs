@@ -56,12 +56,6 @@ use crate::sub_agent::SubAgentEmitter;
 use crate::subprocess::ImageAttachment;
 
 const CODEX_AGENT_NAME: &str = "codex";
-const CODEX_ESTIMATED_CONTEXT_WINDOW_DEFAULT: u64 = 200_000;
-// The entire GPT-5 family (gpt-5, gpt-5.x, their -codex and -mini variants)
-// ships a 400k context window per OpenAI's model docs. `codex-mini-latest` is
-// the lone exception at 200k. This is only a pre-first-turn fallback — once a
-// turn reports `context_window` in token usage we use that instead.
-const CODEX_ESTIMATED_CONTEXT_WINDOW_GPT5_FAMILY: u64 = 400_000;
 const CODEX_FORCED_APPROVAL_POLICY: &str = "never";
 const CODEX_INFERENCE_APPROVAL_POLICY: &str = "untrusted";
 const CODEX_UNRESTRICTED_SANDBOX: &str = "danger-full-access";
@@ -18128,13 +18122,6 @@ fn normalize_token_usage_with_envelope(
     } else {
         usage_u64(source, &["input_tokens", "inputTokens", "prompt_tokens"]).unwrap_or(0)
     };
-    let prompt_tokens_total = if raw_input_tokens > 0 {
-        raw_input_tokens
-    } else {
-        input_tokens
-            .saturating_add(cached_prompt_tokens)
-            .saturating_add(cache_creation_input_tokens)
-    };
 
     // OpenAI convention: `outputTokens` includes reasoning.  Our contract
     // treats `reasoning_tokens` as an informational subset of `output_tokens`,
@@ -18150,12 +18137,13 @@ fn normalize_token_usage_with_envelope(
     // total_tokens = input_tokens + output_tokens (no double-counting).
     let total_tokens =
         usage_u64(source, &["totalTokens", "total_tokens"]).unwrap_or(input_tokens + output_tokens);
-    let context_window = context_window_from_token_usage(raw, source, envelope)
-        .filter(|window| *window > 0)
-        .unwrap_or_else(|| {
-            let model_estimate = codex_estimated_context_window_for_model(model_hint);
-            std::cmp::max(model_estimate, prompt_tokens_total.max(1))
-        });
+    let context_window =
+        context_window_from_token_usage(raw, source, envelope).filter(|window| *window > 0);
+    tracing::debug!(
+        model = model_hint,
+        context_window,
+        "Codex context limit comes only from native usage metadata"
+    );
 
     Some(json!({
         "input_tokens": input_tokens,
@@ -18219,25 +18207,6 @@ fn find_context_window_in_value(value: &Value, keys: &[&str], depth: usize) -> O
     }
 
     None
-}
-
-fn codex_estimated_context_window_for_model(model_hint: Option<&str>) -> u64 {
-    let Some(model) = model_hint else {
-        return CODEX_ESTIMATED_CONTEXT_WINDOW_DEFAULT;
-    };
-    let normalized = model.trim().to_ascii_lowercase();
-    // `codex-mini-latest` is the one GPT-5-era model with a 200k window, so it
-    // must be checked before the broader gpt-5 family match below.
-    if normalized.contains("codex-mini") {
-        return CODEX_ESTIMATED_CONTEXT_WINDOW_DEFAULT;
-    }
-    // Match the whole gpt-5 family by substring so this stays correct across
-    // version bumps, `-codex`/`-mini` suffixes, and provider prefixes (the CLI
-    // now reports ids like `openai.gpt-5.5`).
-    if normalized.contains("gpt-5") {
-        return CODEX_ESTIMATED_CONTEXT_WINDOW_GPT5_FAMILY;
-    }
-    CODEX_ESTIMATED_CONTEXT_WINDOW_DEFAULT
 }
 
 fn codex_process_id(item: &Value) -> Option<String> {
@@ -20332,6 +20301,7 @@ fn codex_session_settings_schema(models: Vec<CodexModelMetadata>) -> SessionSett
             .collect(),
     };
     SessionSettingsSchema {
+        model_resolutions: Default::default(),
         backend_kind: protocol::BackendKind::Codex,
         fields: vec![
             SessionSettingField {
