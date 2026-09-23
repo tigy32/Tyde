@@ -583,18 +583,24 @@ fn claim_interrupt_slot(state: &AppState, agent_id: &protocol::AgentId) -> bool 
         .unwrap_or(false)
 }
 
-fn steer_chat_input(
+#[derive(Clone, Copy)]
+enum RunningSendAction {
+    CancelAndSend,
+    Steer,
+}
+
+fn send_running_chat_input(
     state: &AppState,
     composer: &ComposerHandle,
     agent_ref: Signal<Option<ActiveAgentRef>>,
     pending_images: RwSignal<Vec<PendingImage>>,
+    action: RunningSendAction,
 ) {
     let draft = composer.text.get_untracked();
     let text = draft.trim().to_owned();
     let images = pending_images.get_untracked();
     let payload_images = pending_images_to_payload(&images);
     if text.is_empty() && payload_images.is_none() {
-        interrupt_target_turn(state, agent_ref);
         return;
     }
 
@@ -606,14 +612,21 @@ fn steer_chat_input(
     let instance_stream = match target_instance_stream(state, agent_ref) {
         Some(stream) => stream,
         None => {
-            log::error!("steer_chat_input: active agent stream missing");
+            log::error!("send_running_chat_input: active agent stream missing");
             crate::notices::report_agent_error(
                 &active_agent,
-                "Tyde could not steer the agent because it is no longer connected.",
+                "Tyde could not send the message because it is no longer connected.",
             );
             return;
         }
     };
+
+    let agent_id = active_agent.agent_id;
+    if matches!(action, RunningSendAction::CancelAndSend) && !claim_interrupt_slot(state, &agent_id)
+    {
+        return;
+    }
+    let pending_interrupt = state.interrupt_pending;
 
     composer.text.set(String::new());
     pending_images.set(Vec::new());
@@ -622,16 +635,40 @@ fn steer_chat_input(
     let restore_images = images.clone();
 
     spawn_local(async move {
+        let frame_kind = match action {
+            RunningSendAction::CancelAndSend => {
+                if let Err(error) = send_frame(
+                    &host_id,
+                    instance_stream.clone(),
+                    FrameKind::Interrupt,
+                    &InterruptPayload::default(),
+                )
+                .await
+                {
+                    log::error!("failed to interrupt conversation for Cancel + send: {error}");
+                    let _ = pending_interrupt.try_update(|pending| {
+                        pending.remove(&agent_id);
+                    });
+                    restore_submitted_input(
+                        &restore_composer,
+                        pending_images,
+                        restore_draft,
+                        restore_images,
+                    );
+                    return;
+                }
+                FrameKind::SendMessage
+            }
+            RunningSendAction::Steer => FrameKind::SteerMessage,
+        };
         let payload = SendMessagePayload {
             message: text,
             images: payload_images,
             origin: None,
             tool_response: None,
         };
-        if let Err(e) =
-            send_frame(&host_id, instance_stream, FrameKind::SteerMessage, &payload).await
-        {
-            log::error!("failed to send steer message: {e}");
+        if let Err(e) = send_frame(&host_id, instance_stream, frame_kind, &payload).await {
+            log::error!("failed to send running-turn message: {e}");
             restore_submitted_input(
                 &restore_composer,
                 pending_images,
@@ -933,7 +970,7 @@ pub fn ChatInput(
         let send_enabled = is_connected && has_input && target_ready;
         let interrupt_enabled = is_connected && is_thinking && target_ready;
         // (send_enabled, interrupt_enabled, is_steer). `is_steer` (running with
-        // input) gates the secondary Steer and Cancel items in the dropdown.
+        // input) gates the secondary Cancel + send, Steer, and Cancel items in the dropdown.
         (
             send_enabled,
             interrupt_enabled,
@@ -985,7 +1022,7 @@ pub fn ChatInput(
 
     // The dropdown holds items only in specific states (see state matrix):
     // - Fork + send: idle or thinking + input + session
-    // - Steer + Cancel: thinking + input (with or without session)
+    // - Cancel + send, Steer, Cancel: thinking + input (with or without session)
     let goal_text = composer.text.clone();
     let can_set_goal = Memo::new(move |_| {
         let Some(agent) = agent_ref.get() else {
@@ -1152,17 +1189,18 @@ pub fn ChatInput(
                     );
                 }
             } else if is_steer.get_untracked() {
-                // Cmd/Ctrl+Enter while thinking with input → steer, mirroring
-                // the dropdown Steer item's exact gate (`can_interrupt() &&
-                // is_steer`), which excludes read-only backend-native agents.
-                // If steer isn't actionable, no-op — do NOT fall through to
-                // send (the dropdown offers nothing actionable here either).
                 if ui_mode.get_untracked().1 && !is_readonly.get_untracked() {
-                    steer_chat_input(
+                    let action = if ev.alt_key() {
+                        RunningSendAction::Steer
+                    } else {
+                        RunningSendAction::CancelAndSend
+                    };
+                    send_running_chat_input(
                         &on_keydown_state,
                         &on_keydown_composer,
                         agent_ref,
                         on_keydown_images,
+                        action,
                     );
                 }
             } else if ui_mode.get_untracked().0 {
@@ -1257,10 +1295,28 @@ pub fn ChatInput(
             }
         });
     });
+    let on_menu_cancel_send = move |_| {
+        menu_open.set(false);
+        menu_state.with_value(|(state, composer)| {
+            send_running_chat_input(
+                state,
+                composer,
+                agent_ref,
+                menu_images,
+                RunningSendAction::CancelAndSend,
+            )
+        });
+    };
     let on_menu_steer = move |_| {
         menu_open.set(false);
         menu_state.with_value(|(state, composer)| {
-            steer_chat_input(state, composer, agent_ref, menu_images)
+            send_running_chat_input(
+                state,
+                composer,
+                agent_ref,
+                menu_images,
+                RunningSendAction::Steer,
+            )
         });
     };
     let on_menu_cancel = move |_| {
@@ -1763,13 +1819,29 @@ pub fn ChatInput(
                                     type="button"
                                     class="chat-send-menu-item"
                                     role="menuitem"
+                                    data-test="chat-send-menu-cancel-send"
+                                    disabled=move || interrupt_in_flight.get()
+                                    title="Cancel the current turn and send your message (Cmd/Ctrl+Enter)"
+                                    on:click=on_menu_cancel_send
+                                >
+                                    <span class="chat-send-menu-label">"Cancel + send"</span>
+                                    <span class="chat-send-menu-shortcut" aria-hidden="true">
+                                        "⌘↵"
+                                    </span>
+                                </button>
+                            </Show>
+                            <Show when=move || can_interrupt() && is_steer.get()>
+                                <button
+                                    type="button"
+                                    class="chat-send-menu-item"
+                                    role="menuitem"
                                     data-test="chat-send-menu-steer"
-                                    title="Send your message into the current turn now"
+                                    title="Steer between model requests when supported (Cmd/Ctrl+Alt+Enter)"
                                     on:click=on_menu_steer
                                 >
                                     <span class="chat-send-menu-label">"Steer"</span>
                                     <span class="chat-send-menu-shortcut" aria-hidden="true">
-                                        "⌘↵"
+                                        "⌘⌥↵"
                                     </span>
                                 </button>
                             </Show>
@@ -2254,9 +2326,22 @@ mod wasm_tests {
     /// `web_sys::KeyboardEvent` binding isn't an enabled feature). Returns
     /// whether the event's default action was *not* prevented.
     fn dispatch_keydown(target: &web_sys::Element, key: &str, meta: bool, shift: bool) {
+        dispatch_keydown_modifiers(target, key, meta, false, shift, false);
+    }
+
+    fn dispatch_keydown_modifiers(
+        target: &web_sys::Element,
+        key: &str,
+        meta: bool,
+        ctrl: bool,
+        shift: bool,
+        alt: bool,
+    ) {
         let init = js_sys::Object::new();
         js_sys::Reflect::set(&init, &"key".into(), &key.into()).unwrap();
         js_sys::Reflect::set(&init, &"metaKey".into(), &JsValue::from_bool(meta)).unwrap();
+        js_sys::Reflect::set(&init, &"ctrlKey".into(), &JsValue::from_bool(ctrl)).unwrap();
+        js_sys::Reflect::set(&init, &"altKey".into(), &JsValue::from_bool(alt)).unwrap();
         js_sys::Reflect::set(&init, &"shiftKey".into(), &JsValue::from_bool(shift)).unwrap();
         js_sys::Reflect::set(&init, &"bubbles".into(), &JsValue::TRUE).unwrap();
         js_sys::Reflect::set(&init, &"cancelable".into(), &JsValue::TRUE).unwrap();
@@ -2955,7 +3040,7 @@ mod wasm_tests {
     }
 
     // ── State matrix row 5: Thinking + input, no session ─────────────────────
-    // Primary "Queue" enabled; caret enabled; dropdown has "Steer", "Cancel".
+    // Primary "Queue" enabled; caret enabled; dropdown has "Cancel + send", "Steer", "Cancel".
     #[wasm_bindgen_test]
     async fn thinking_input_no_session_queue_primary_steer_cancel_menu() {
         let container = make_container();
@@ -2981,13 +3066,17 @@ mod wasm_tests {
         open_menu(&container).await;
         assert_eq!(
             menu_item_texts(&container),
-            vec!["Steer".to_owned(), "Cancel".to_owned()],
-            "thinking+input menu must be exactly Steer then Cancel"
+            vec![
+                "Cancel + send".to_owned(),
+                "Steer".to_owned(),
+                "Cancel".to_owned()
+            ],
+            "thinking+input menu must be exactly Cancel + send, Steer, Cancel"
         );
     }
 
     // ── State matrix row 6: Thinking + input + session ───────────────────────
-    // Primary "Queue" enabled; caret enabled; dropdown has "Steer", "Fork + send", "Cancel".
+    // Primary "Queue" enabled; caret enabled; dropdown has "Cancel + send", "Steer", "Fork + send", "Cancel".
     #[wasm_bindgen_test]
     async fn thinking_input_with_session_queue_primary_full_menu() {
         let container = make_container();
@@ -3011,11 +3100,12 @@ mod wasm_tests {
         assert_eq!(
             menu_item_texts(&container),
             vec![
+                "Cancel + send".to_owned(),
                 "Steer".to_owned(),
                 "Fork + send".to_owned(),
                 "Cancel".to_owned(),
             ],
-            "thinking+session+input menu must be Steer, Fork + send, Cancel"
+            "thinking+session+input menu must be Cancel + send, Steer, Fork + send, Cancel"
         );
     }
 
@@ -3318,7 +3408,7 @@ mod wasm_tests {
         let container = make_container();
         let _h = mount_to(container.clone(), move || {
             let state = AppState::new();
-            // thinking+input+session → primary=Queue, menu=Steer/Fork + send/Cancel
+            // thinking+input+session → primary=Queue, menu=Cancel + send/Steer/Fork + send/Cancel
             configure(&state, true, true, "redirect");
             provide_context(state);
             view! { <ChatInput /> }
@@ -3590,12 +3680,9 @@ mod wasm_tests {
         );
     }
 
-    /// Cmd+Enter while thinking with input must NOT steer a read-only
-    /// backend-native agent — the shortcut mirrors the dropdown Steer item,
-    /// which is hidden in this state. Observable proxy: steer would clear the
-    /// draft, so an unchanged draft proves the shortcut no-op'd.
+    /// Neither running-turn send action may submit to a read-only agent.
     #[wasm_bindgen_test]
-    async fn cmd_enter_readonly_thinking_does_not_steer() {
+    async fn running_send_shortcuts_do_not_submit_to_readonly_agents() {
         let state = AppState::new();
         // thinking + session + input, then mark the agent backend-native so the
         // composer is read-only (matches `active_agent_is_backend_native`).
@@ -3611,22 +3698,31 @@ mod wasm_tests {
         });
         next_tick().await;
 
-        dispatch_keydown(&textarea(&container), "Enter", true, false);
-        next_tick().await;
+        let calls = stub_send_recording();
+        for (meta, ctrl) in [(true, false), (false, true)] {
+            for alt in [false, true] {
+                dispatch_keydown_modifiers(&textarea(&container), "Enter", meta, ctrl, false, alt);
+                next_tick().await;
+            }
+        }
+        assert_eq!(
+            calls.length(),
+            0,
+            "Read-only shortcuts must not send frames"
+        );
+        stub_send_host_line();
 
         assert_eq!(
             state.composer_untracked().text.get_untracked(),
             "redirect this",
-            "Cmd+Enter must not steer a read-only backend-native agent"
+            "Neither shortcut may submit to a read-only backend-native agent"
         );
     }
 
-    /// Steer is one atomic `steer_message` frame carrying the draft. The server
-    /// decides whether the running turn absorbs it or has to be interrupted, so
-    /// the client must never send its own Interrupt. Both entry points — the
-    /// dropdown item and Cmd+Enter — share that contract.
+    /// Cancel + send restores Interrupt then SendMessage; Steer retains the
+    /// server-owned steering contract on its own menu item and Alt chord.
     #[wasm_bindgen_test]
-    async fn steer_sends_one_steer_message_frame_without_interrupt() {
+    async fn cancel_send_and_steer_have_distinct_delivery_paths() {
         let state = AppState::new();
         configure(&state, false, true, "use the other parser");
         let mount_state = state.clone();
@@ -3679,14 +3775,14 @@ mod wasm_tests {
             .text
             .set("and keep the old tests".to_owned());
         next_tick().await;
-        dispatch_keydown(&textarea(&container), "Enter", true, false);
+        dispatch_keydown_modifiers(&textarea(&container), "Enter", true, false, false, true);
         next_tick().await;
         next_tick().await;
 
         assert_eq!(
             calls.length(),
             2,
-            "Cmd+Enter while thinking must send exactly one more frame"
+            "Cmd+Alt+Enter while thinking must send exactly one more frame"
         );
         let args: JsonValue = serde_json::from_str(&calls.get(1).as_string().unwrap()).unwrap();
         let envelope: JsonValue =
@@ -3696,26 +3792,162 @@ mod wasm_tests {
         assert_eq!(
             interrupt_frames(&calls),
             0,
-            "Cmd+Enter steer must not send a client-side Interrupt"
+            "Cmd+Alt+Enter steer must not send a client-side Interrupt"
         );
         assert_eq!(
             state.composer_untracked().text.get_untracked(),
             "",
-            "Cmd+Enter steer must clear the draft"
+            "Cmd+Alt+Enter steer must clear the draft"
         );
+
+        for (menu, ctrl) in [(true, false), (false, false), (false, true)] {
+            let calls = stub_send_recording();
+            state
+                .composer_untracked()
+                .text
+                .set("stop and redirect".to_owned());
+            next_tick().await;
+            if menu {
+                open_menu(&container).await;
+                query(&container, "[data-test='chat-send-menu-cancel-send']")
+                    .expect("Cancel + send must be offered")
+                    .dyn_into::<HtmlElement>()
+                    .unwrap()
+                    .click();
+            } else {
+                dispatch_keydown_modifiers(
+                    &textarea(&container),
+                    "Enter",
+                    !ctrl,
+                    ctrl,
+                    false,
+                    false,
+                );
+            }
+            next_tick().await;
+            next_tick().await;
+            assert_eq!(
+                calls.length(),
+                2,
+                "Cancel + send must send exactly two frames"
+            );
+            for (index, kind) in [(0, "interrupt"), (1, "send_message")] {
+                let args: JsonValue =
+                    serde_json::from_str(&calls.get(index).as_string().unwrap()).unwrap();
+                let envelope: JsonValue =
+                    serde_json::from_str(args["line"].as_str().unwrap()).unwrap();
+                assert_eq!(envelope["kind"], kind, "Cancel must precede send");
+                if index == 1 {
+                    assert_eq!(envelope["payload"]["message"], "stop and redirect");
+                }
+            }
+            let field: web_sys::HtmlTextAreaElement = textarea(&container).dyn_into().unwrap();
+            assert_eq!(
+                field.value(),
+                "",
+                "Cancel + send must clear the visible draft"
+            );
+            state
+                .composer_untracked()
+                .text
+                .set("keep the next draft".to_owned());
+            next_tick().await;
+            open_menu(&container).await;
+            assert!(
+                query(&container, "[data-test='chat-send-menu-cancel-send']")
+                    .unwrap()
+                    .has_attribute("disabled")
+            );
+            caret(&container).dyn_into::<HtmlElement>().unwrap().click();
+            dispatch_keydown(&textarea(&container), "Enter", true, false);
+            next_tick().await;
+            assert_eq!(
+                calls.length(),
+                2,
+                "An unanswered interrupt must not be repeated"
+            );
+            assert_eq!(field.value(), "keep the next draft");
+            state.interrupt_pending.update(|pending| {
+                pending.remove(&AgentId(AGENT.to_owned()));
+            });
+        }
+
+        let calls = stub_send_recording();
+        state
+            .composer_untracked()
+            .text
+            .set("steer with control".to_owned());
+        next_tick().await;
+        dispatch_keydown_modifiers(&textarea(&container), "Enter", false, true, false, true);
+        next_tick().await;
+        next_tick().await;
+        assert_eq!(calls.length(), 1);
+        let args: JsonValue = serde_json::from_str(&calls.get(0).as_string().unwrap()).unwrap();
+        let envelope: JsonValue = serde_json::from_str(args["line"].as_str().unwrap()).unwrap();
+        assert_eq!(envelope["kind"], "steer_message");
+        assert_eq!(envelope["payload"]["message"], "steer with control");
+
+        for (failure_kind, alt, expected_calls) in [
+            ("interrupt", false, 1),
+            ("send_message", false, 2),
+            ("steer_message", true, 1),
+        ] {
+            let calls = stub_send_recording();
+            js_sys::eval(&format!(r#"
+                (function() {{
+                const recordingInvoke = window.__TAURI__.core.invoke;
+                window.__TAURI__.core.invoke = function(cmd, args) {{
+                    const result = recordingInvoke(cmd, args);
+                    if (cmd === 'send_host_line' && JSON.parse(args.line).kind === '{failure_kind}') {{
+                        return Promise.reject('test transport failure');
+                    }}
+                    return result;
+                }};
+                }})();
+            "#)).unwrap();
+            state
+                .composer_untracked()
+                .text
+                .set("preserve failed draft".to_owned());
+            next_tick().await;
+            dispatch_keydown_modifiers(&textarea(&container), "Enter", true, false, false, alt);
+            for _ in 0..4 {
+                next_tick().await;
+            }
+            assert_eq!(
+                calls.length(),
+                expected_calls,
+                "Stop sending after a transport failure"
+            );
+            let field: web_sys::HtmlTextAreaElement = textarea(&container).dyn_into().unwrap();
+            assert_eq!(field.value(), "preserve failed draft");
+            if failure_kind == "interrupt" {
+                open_menu(&container).await;
+                assert!(
+                    !query(&container, "[data-test='chat-send-menu-cancel-send']")
+                        .unwrap()
+                        .has_attribute("disabled"),
+                    "Failed interrupt must permit retry"
+                );
+                caret(&container).dyn_into::<HtmlElement>().unwrap().click();
+            }
+            state.interrupt_pending.update(|pending| {
+                pending.remove(&AgentId(AGENT.to_owned()));
+            });
+        }
 
         stub_send_host_line();
         container.remove();
     }
 
-    /// The Steer and Fork + send items render their keyboard-shortcut hints,
+    /// The three send actions render distinct keyboard-shortcut hints,
     /// while Cancel renders none.
     #[wasm_bindgen_test]
     async fn menu_items_render_shortcut_hints() {
         let container = make_container();
         let _h = mount_to(container.clone(), move || {
             let state = AppState::new();
-            // thinking + session + input → Steer, Fork + send, Cancel.
+            // thinking + session + input → Cancel + send, Steer, Fork + send, Cancel.
             configure(&state, true, true, "redirect");
             provide_context(state);
             view! { <ChatInput /> }
@@ -3724,11 +3956,20 @@ mod wasm_tests {
 
         open_menu(&container).await;
 
+        let cancel_send = query(&container, "[data-test='chat-send-menu-cancel-send']")
+            .expect("Cancel + send item must be present");
+        assert!(
+            cancel_send
+                .text_content()
+                .unwrap_or_default()
+                .contains("⌘↵")
+        );
+
         let steer = query(&container, "[data-test='chat-send-menu-steer']")
             .expect("steer item must be present");
         assert!(
-            steer.text_content().unwrap_or_default().contains("⌘↵"),
-            "Steer item must show the ⌘↵ shortcut hint"
+            steer.text_content().unwrap_or_default().contains("⌘⌥↵"),
+            "Steer item must show the ⌘⌥↵ shortcut hint"
         );
 
         let fork = query(&container, "[data-test='chat-send-menu-ask-aside']")

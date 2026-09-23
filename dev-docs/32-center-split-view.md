@@ -553,9 +553,10 @@ and references results. It is a typed contextual result activation, not a
 targetless palette `CommandId`, and is never registered as a global `app.rs`
 keydown binding. In the chat composer, existing chords keep their meanings:
 `Command/Ctrl+Enter` sends
-normally or steers while the agent is thinking, and
+normally or performs Cancel + send while the agent is thinking;
+`Command/Ctrl+Alt+Enter` steers using the existing backend steering path, and
 `Command/Ctrl+Shift+Enter` performs Fork + send when available. Resource-row
-handling must not intercept or reinterpret either composer chord.
+handling must not intercept or reinterpret these composer chords.
 
 Context menus use menu semantics and remain within the viewport. Overflowing
 tab strips support horizontal wheel scrolling. Pane focus and
@@ -673,7 +674,8 @@ side-by-side layout without losing the clamped ratio.
 
 Keyboard coverage verifies that Open to the Side fires from focused resource
 list items only, that no global app binding claims `Command/Ctrl+Enter`, and
-that chat `Command/Ctrl+Enter` send/steer plus
+that chat `Command/Ctrl+Enter` send/Cancel + send,
+`Command/Ctrl+Alt+Enter` Steer, and
 `Command/Ctrl+Shift+Enter` Fork + send remain unchanged. It also verifies the
 global Move binding and hint are `Command/Ctrl+Shift+\`, including the shifted
 `|` event spelling.
