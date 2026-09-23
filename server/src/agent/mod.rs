@@ -266,7 +266,7 @@ enum AgentCommand {
     /// See [`AgentHandle::deliver_message`] for the contract; the mailbox
     /// accepting this command is deliberately *not* the commit point.
     DeliverMessage {
-        payload: SendMessagePayload,
+        input: AgentInput,
         reply: oneshot::Sender<Result<(), String>>,
     },
     Compact {
@@ -1288,6 +1288,17 @@ impl AgentHandle {
     /// without touching the target's status and without appending a second
     /// transcript error for a message that was never seen.
     pub(crate) async fn deliver_message(&self, payload: SendMessagePayload) -> Result<(), String> {
+        self.deliver_input(AgentInput::SendMessage(payload)).await
+    }
+
+    pub(crate) async fn deliver_steer_message(
+        &self,
+        payload: SendMessagePayload,
+    ) -> Result<(), String> {
+        self.deliver_input(AgentInput::SteerMessage(payload)).await
+    }
+
+    async fn deliver_input(&self, input: AgentInput) -> Result<(), String> {
         if self.closing.load(Ordering::SeqCst) {
             return Err(DELIVERY_REJECTED_CLOSING.to_owned());
         }
@@ -1295,7 +1306,7 @@ impl AgentHandle {
         if self
             .tx
             .send(AgentCommand::DeliverMessage {
-                payload,
+                input,
                 reply: reply_tx,
             })
             .is_err()
@@ -3071,14 +3082,14 @@ pub(crate) fn spawn_agent_actor(
                         AgentCommand::SendInput(input) => {
                             pending_inputs.push_back(input);
                         }
-                        AgentCommand::DeliverMessage { payload, reply } => {
+                        AgentCommand::DeliverMessage { input, reply } => {
                             // Accepted: a starting agent is already active
                             // (`started` is false), and the message is queued
                             // for dispatch once the backend is up. Rejecting it
                             // here would make spawn-then-send racy for no gain.
                             acknowledged_gated_deliveries =
                                 acknowledged_gated_deliveries.saturating_add(1);
-                            pending_inputs.push_back(AgentInput::SendMessage(payload));
+                            pending_inputs.push_back(input);
                             let _ = reply.send(Ok(()));
                         }
                         AgentCommand::ResumeReplayBarrier { .. } => {}
@@ -5229,9 +5240,9 @@ pub(crate) fn spawn_agent_actor(
                     // which the caller reads as a failed delivery.
                     let mut delivery_ack: Option<oneshot::Sender<Result<(), String>>> = None;
                     let command = match command {
-                        AgentCommand::DeliverMessage { payload, reply } => {
+                        AgentCommand::DeliverMessage { input, reply } => {
                             delivery_ack = Some(reply);
-                            AgentCommand::SendInput(AgentInput::SendMessage(payload))
+                            AgentCommand::SendInput(input)
                         }
                         command => command,
                     };

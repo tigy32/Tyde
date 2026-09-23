@@ -30,7 +30,12 @@ pub(crate) fn render(
     result: Option<&ToolExecutionResult>,
     mode: ToolOutputMode,
 ) -> AnyView {
-    let ToolRequestType::TydeSendAgentMessage { agent_id, message } = req else {
+    let ToolRequestType::TydeSendAgentMessage {
+        agent_id,
+        message,
+        interrupt,
+    } = req
+    else {
         unreachable!("tyde_send_agent_message::render dispatched on a non-send request");
     };
 
@@ -64,6 +69,7 @@ pub(crate) fn render(
             body_id=format!("tool-send-message-{tool_call_id}")
             agent_id=agent_id.clone()
             message=message.clone()
+            interrupt=*interrupt
             mismatch=mismatch
             raw=raw
         />
@@ -94,6 +100,7 @@ fn SendAgentMessageCard(
     body_id: String,
     agent_id: AgentId,
     message: String,
+    interrupt: bool,
     mismatch: Option<String>,
     raw: Option<String>,
 ) -> impl IntoView {
@@ -164,7 +171,7 @@ fn SendAgentMessageCard(
     view! {
         <div class="tool-send-message">
             <div class="tool-send-message-header">
-                <span class="tool-send-message-label">"To"</span>
+                <span class="tool-send-message-label">{if interrupt { "Interrupt and redirect" } else { "To" }}</span>
                 <span class="tool-send-message-recipient">{move || handle.display_name.get()}</span>
                 {agent_open_action(state, handle.resolution, "tool-live-link")}
             </div>
@@ -265,6 +272,7 @@ mod wasm_tests {
         ToolRequestType::TydeSendAgentMessage {
             agent_id: AgentId("f0f48002-841c-4c76-8eea-2ecbc97f7993".to_owned()),
             message: message.to_owned(),
+            interrupt: false,
         }
     }
 
@@ -296,12 +304,20 @@ mod wasm_tests {
         mode: ToolOutputMode,
         setup: impl FnOnce(&AppState) + 'static,
     ) -> (HtmlElement, AppState) {
+        mount_send_request(send_req(message), result, mode, setup)
+    }
+
+    fn mount_send_request(
+        req: ToolRequestType,
+        result: Option<ToolExecutionResult>,
+        mode: ToolOutputMode,
+        setup: impl FnOnce(&AppState) + 'static,
+    ) -> (HtmlElement, AppState) {
         ensure_styles_loaded();
         let state = AppState::new();
         setup(&state);
         let container = make_container();
         let mount_state = state.clone();
-        let req = send_req(message);
         let handle = mount_to(container.clone(), move || {
             provide_context(mount_state);
             let agent_ref = Signal::derive(|| Some(parent_ref()));
@@ -372,6 +388,21 @@ mod wasm_tests {
             0,
             "the ack result has no JSON panel"
         );
+        assert!(!body.contains("Interrupt and redirect"));
+        let mut req = send_req(MESSAGE);
+        if let ToolRequestType::TydeSendAgentMessage { interrupt, .. } = &mut req {
+            *interrupt = true;
+        }
+        let (redirect, _) = mount_send_request(
+            req,
+            Some(ToolExecutionResult::TydeSendAgentMessage),
+            ToolOutputMode::Compact,
+            |_| {},
+        );
+        next_tick().await;
+        assert!(text(&redirect).contains("Interrupt and redirect"));
+        assert_eq!(count(&redirect, "h2"), 1);
+        assert_eq!(count(&redirect, "li"), 2);
     }
 
     /// Summary is the tightest mode and must still be JSON-free while showing

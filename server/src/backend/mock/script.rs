@@ -400,9 +400,13 @@ impl MockTurn {
         Self::done(steps)
     }
 
-    pub fn agent_control_send_message(agent_id: AgentId, message: impl Into<String>) -> Self {
+    pub fn agent_control_send_message(
+        agent_id: AgentId,
+        message: impl Into<String>,
+        interrupt: bool,
+    ) -> Self {
         Self::done(
-            emit::agent_control_send_message_frames(agent_id, message.into())
+            emit::agent_control_send_message_frames(agent_id, message.into(), interrupt)
                 .into_iter()
                 .map(MockStep::emit)
                 .collect(),

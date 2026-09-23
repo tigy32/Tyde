@@ -422,6 +422,10 @@ struct SendAgentMessageToolInput {
     agent_id: String,
     #[schemars(length(min = 1))]
     message: String,
+    /// Redirect active work through native steering, or interrupt and send next
+    /// when steering is unsupported. False queues until the current turn ends.
+    #[serde(default)]
+    interrupt: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
@@ -1114,7 +1118,9 @@ impl TydeAgentControlMcpServer {
         }
     }
 
-    #[tool(description = "Send a follow-up message to a direct child of the authenticated caller.")]
+    #[tool(
+        description = "Send a follow-up to a direct child. Queues by default; interrupt=true redirects active work using native steering or interrupt-and-send fallback. Idle children start immediately. Await then read to collect output."
+    )]
     async fn tyde_send_agent_message(
         &self,
         Parameters(input): Parameters<SendAgentMessageToolInput>,
@@ -1149,7 +1155,7 @@ impl TydeAgentControlMcpServer {
             }
             released.await;
         }
-        match do_send_message(&self.host, &agent_id, input.message).await {
+        match do_send_message(&self.host, &agent_id, input.message, input.interrupt).await {
             Ok(()) => ok_json(json!({ "ok": true })),
             Err(err) => Ok(err_text(err)),
         }
@@ -1846,20 +1852,24 @@ async fn do_send_message(
     host: &HostHandle,
     agent_id: &AgentId,
     message: String,
+    interrupt: bool,
 ) -> Result<(), String> {
     let handle = host
         .agent_handle(agent_id)
         .await
         .ok_or_else(|| format!("unknown agent_id {}", agent_id.0))?;
 
-    handle
-        .deliver_message(SendMessagePayload {
-            message,
-            images: None,
-            origin: None,
-            tool_response: None,
-        })
-        .await
+    let payload = SendMessagePayload {
+        message,
+        images: None,
+        origin: None,
+        tool_response: None,
+    };
+    if interrupt {
+        handle.deliver_steer_message(payload).await
+    } else {
+        handle.deliver_message(payload).await
+    }
 }
 
 async fn do_team_describe(

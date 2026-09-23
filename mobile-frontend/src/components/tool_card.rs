@@ -171,8 +171,11 @@ pub fn ToolCardView(owner_agent_ref: AgentRef, entry: ToolRequestEntry) -> impl 
             "running"
         };
 
-        if let ToolRequestType::TydeSendAgentMessage { agent_id, message } =
-            &entry.request.tool_type
+        if let ToolRequestType::TydeSendAgentMessage {
+            agent_id,
+            message,
+            interrupt,
+        } = &entry.request.tool_type
         {
             let agent_id = agent_id.clone();
             let message = message.clone();
@@ -203,6 +206,7 @@ pub fn ToolCardView(owner_agent_ref: AgentRef, entry: ToolRequestEntry) -> impl 
                         owner_agent_ref=owner_agent_ref
                         agent_id=agent_id
                         message=message
+                        interrupt=*interrupt
                         mismatch=mismatch
                         normalization_failed=normalization_failed
                         typed_request=typed_request
@@ -688,6 +692,7 @@ fn SendAgentMessageCard(
     owner_agent_ref: AgentRef,
     agent_id: AgentId,
     message: String,
+    interrupt: bool,
     mismatch: bool,
     normalization_failed: bool,
     typed_request: String,
@@ -725,7 +730,7 @@ fn SendAgentMessageCard(
     view! {
         <div class="send-agent-message-body" data-mobile-test="send-message-body">
             <div class="send-agent-message-to">
-                <span class="send-agent-message-label">"To"</span>
+                <span class="send-agent-message-label">{if interrupt { "Interrupt and redirect" } else { "To" }}</span>
                 <span
                     class="send-agent-message-recipient"
                     data-mobile-test="send-message-recipient"
@@ -3609,6 +3614,7 @@ mod wasm_tests {
                 tool_type: ToolRequestType::TydeSendAgentMessage {
                     agent_id: AgentId("agent-sub".to_owned()),
                     message: SEND_MESSAGE.to_owned(),
+                    interrupt: false,
                 },
             },
             result: result.map(|tool_result| {
@@ -3700,6 +3706,19 @@ mod wasm_tests {
             "no Rust Debug dump: {body}"
         );
         assert!(!body.contains("agent_id"), "no raw JSON keys: {body}");
+        assert!(!body.contains("Interrupt and redirect"));
+        let mut entry = send_message_entry(Some(ToolExecutionResult::TydeSendAgentMessage), true);
+        if let ToolRequestType::TydeSendAgentMessage { interrupt, .. } =
+            &mut entry.request.tool_type
+        {
+            *interrupt = true;
+        }
+        let redirect = mount_card_with_setup(entry, with_child_agent);
+        next_tick().await;
+        let visible = redirect.text_content().unwrap_or_default();
+        assert!(visible.contains("Interrupt and redirect"));
+        assert!(visible.contains("Agent state bugs"));
+        assert!(redirect.query_selector("h2").unwrap().is_some());
     }
 
     /// The recipient is a pure projection of server-owned state: renaming the
@@ -3843,6 +3862,7 @@ mod wasm_tests {
         entry.request.tool_type = ToolRequestType::TydeSendAgentMessage {
             agent_id: AgentId("agent-sub".to_owned()),
             message: message.to_owned(),
+            interrupt: false,
         };
         mount_card_with_setup(entry, with_child_agent)
     }

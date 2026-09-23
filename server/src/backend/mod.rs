@@ -61,18 +61,15 @@ pub use compaction::{
     BackendCompactionStart,
 };
 
-/// Injected whenever a session is handed the agent-control MCP. Models reach
-/// for another backend's CLI out of habit, and a shell-spawned agent is
-/// invisible to every Tyde surface: no bubble, no steering, no review, no
-/// resume. The closing sentence is load-bearing in the other direction: a
-/// model's own native sub-agents stay visible, so the rule must not scare it
-/// off them. Explicit user requests can override the default launch method.
+/// Injected whenever a session is handed the agent-control MCP.
 pub const AGENT_CONTROL_SPAWN_STEERING: &str = concat!(
-    "To run work on a different agent backend than your own, spawn it with the ",
-    "tyde-agent-control MCP tools by default. Do not invoke that backend's CLI ",
-    "from the shell unless the user explicitly requests that launch method. ",
-    "A shell-spawned agent is invisible to Tyde. Sub-agents on your ",
-    "own backend can use whatever native mechanism you already have."
+    "Use Tyde MCP for cross-backend delegation, never shell CLIs unless explicitly requested. ",
+    "For your own backend, native subagents or Tyde are both fine; native agent-count limits ",
+    "don't apply to Tyde. Check `tyde_list_launch_options`, then spawn tasks. ",
+    "`tyde_send_agent_message` queues by default; use `interrupt: true` to interrupt and ",
+    "redirect active work. Call `tyde_await_agents` with all pending child IDs: like select, ",
+    "it returns when any is ready. Read ready children with `tyde_read_agent`, act on their ",
+    "output, then await remaining work. Don't poll or expect injected results."
 );
 
 /// Tyde's own steering for a session holding `startup_mcp_servers`.

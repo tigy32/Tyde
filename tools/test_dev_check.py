@@ -2879,7 +2879,11 @@ class TestingBehaviorContractTests(unittest.TestCase):
             "assert_eq!(error.request_kind, FrameKind::ProjectFileList)",
             'assert_eq!(error.operation, "project_watch")',
             "assert_eq!(error.code, CommandErrorCode::Internal)",
-            "assert!(error.fatal",
+            # Missing-root watcher startup now emits a recoverable warning;
+            # retain the exact recovery guard as well as the fatal-error path.
+            "if !error.fatal {",
+            "assert!(error.message.ends_with(",
+            "The project remains available; automatic recovery will retry in a few seconds.",
             "error.message.contains(deleted_root.as_ref())",
         ):
             self.assertIn(exact_match, test_body)

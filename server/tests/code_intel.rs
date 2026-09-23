@@ -12,9 +12,9 @@ use protocol::{
     CodeIntelErrorCode, CodeIntelErrorContext, CodeIntelErrorPayload, CodeIntelLanguageId,
     CodeIntelOverviewHeadline, CodeIntelOverviewPayload, CodeIntelProviderId,
     CodeIntelProviderStatus, CodeIntelState, CodeIntelStatusPayload, CodeIntelStatusScope,
-    CodeIntelSubscribeFilePayload, Envelope, FrameKind, Project, ProjectCreatePayload,
-    ProjectFileVersion, ProjectId, ProjectNotifyPayload, ProjectPath, ProjectRootPath,
-    SpawnAgentParams, SpawnAgentPayload, StreamPath, write_envelope,
+    CodeIntelSubscribeFilePayload, Envelope, FrameKind, Project, ProjectCreatePayload, ProjectId,
+    ProjectNotifyPayload, ProjectPath, ProjectRootPath, SpawnAgentParams, SpawnAgentPayload,
+    StreamPath, write_envelope,
 };
 use settings_model::HostExecutablePath;
 
@@ -707,6 +707,27 @@ async fn project_accessed_warms_code_intel_without_file_subscribe_and_is_idempot
         .expect("second project_accessed failed");
     assert_no_code_intel_warm_events(&mut fixture.client, "second project access").await;
 
+    // Watcher catch-up can already have advanced this file to version 1.
+    // Correlate semantic status with the actual text snapshot, not a fixed 0.
+    fixture
+        .client
+        .project_read_file(
+            &project.id,
+            protocol::ProjectReadFilePayload {
+                path: file_path.clone(),
+            },
+        )
+        .await
+        .expect("read warmed file");
+    let contents =
+        fixture::next_frame_matching_on(&mut fixture.client, "warmed file snapshot", |env| {
+            env.kind == FrameKind::ProjectFileContents
+        })
+        .await;
+    let contents: protocol::ProjectFileContentsPayload =
+        contents.parse_payload().expect("warmed file contents");
+    assert_eq!(contents.path, file_path);
+    assert_eq!(contents.contents.as_deref(), Some("fn main() {}\n"));
     send_code_intel_subscribe(&mut fixture.client, &project.id, file_path.clone()).await;
     let status = wait_for_code_intel_status_matching(
         &mut fixture.client,
@@ -716,7 +737,7 @@ async fn project_accessed_warms_code_intel_without_file_subscribe_and_is_idempot
                 && matches!(
                     &status.scope,
                     CodeIntelStatusScope::File { path, version }
-                        if path == &file_path && *version == ProjectFileVersion(0)
+                        if path == &file_path && *version == contents.version
                 )
         },
     )

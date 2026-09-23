@@ -8161,6 +8161,8 @@ pub enum ToolRequestType {
     TydeSendAgentMessage {
         agent_id: AgentId,
         message: String,
+        #[serde(default)]
+        interrupt: bool,
     },
     /// `tyde_await_agents`: the watched child agents. Everything else the await
     /// card shows (live name, status, usage) is resolved from server-owned agent

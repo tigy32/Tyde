@@ -2651,6 +2651,7 @@ mod live_card_wasm_tests {
                 tool_type: ToolRequestType::TydeSendAgentMessage {
                     agent_id: AgentId("agent-sub".to_owned()),
                     message: message.to_owned(),
+                    interrupt: false,
                 },
             },
             result: outcome.map(|outcome| ToolExecutionCompletedData {

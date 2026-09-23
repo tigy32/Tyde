@@ -302,6 +302,7 @@ pub(super) fn mock_turn_token_usage() -> TokenUsage {
 pub(super) fn agent_control_send_message_frames(
     agent_id: AgentId,
     message: String,
+    interrupt: bool,
 ) -> Vec<BackendEvent> {
     let tool_call_id = format!("mock-agent-control-send-message-{}", Uuid::new_v4());
     let response_text = "mock agent-control message delivered".to_owned();
@@ -312,7 +313,11 @@ pub(super) fn agent_control_send_message_frames(
         tool_request(ToolRequest {
             tool_call_id: tool_call_id.clone(),
             tool_name: "tyde_send_agent_message".to_owned(),
-            tool_type: ToolRequestType::TydeSendAgentMessage { agent_id, message },
+            tool_type: ToolRequestType::TydeSendAgentMessage {
+                agent_id,
+                message,
+                interrupt,
+            },
         }),
         tool_completed(ToolExecutionCompletedData {
             tool_call_id,

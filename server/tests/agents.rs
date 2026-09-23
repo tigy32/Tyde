@@ -4846,6 +4846,11 @@ async fn agent_control_http_credentials_scope_every_child_tool() {
             json!({ "agent_id": child_b.0, "message": "spoofed" }),
         ),
         (
+            "tyde_send_agent_message",
+            false,
+            json!({ "agent_id": child_b.0, "message": "spoofed", "interrupt": true }),
+        ),
+        (
             "tyde_await_agents",
             true,
             json!({ "agent_ids": [child_b.0] }),
@@ -5379,6 +5384,182 @@ async fn agent_control_await_tool_call_emits_correlated_completion_when_child_be
 }
 
 #[tokio::test]
+async fn agent_control_interrupt_redirects_without_losing_queued_messages() {
+    for native_steering in [false, true] {
+        let mut fixture = Fixture::new().await;
+        let parent = spawn_agent_control_parent(&mut fixture, "interrupt-parent").await;
+        let caller = fixture.agent_control_caller(&parent.agent_id).await;
+        let active_gate = MockGateHandle::new();
+        let redirect_gate = MockGateHandle::new();
+        let idle_gate = MockGateHandle::new();
+        // A gate services fixture controls, not backend interrupt commands.
+        // The fallback needs an interruptible held turn, as in the UI steer flow.
+        let script = if native_steering {
+            MockScript::one(MockTurn::gated_text("initial reply", &active_gate))
+                .with_mid_turn_steering()
+        } else {
+            MockScript::one(MockTurn::held_text("initial reply"))
+                .then(MockTurn::gated_text("redirect reply", &redirect_gate))
+        };
+        let script = script
+            .then(MockTurn::text("default queued reply"))
+            .then(MockTurn::text("explicit queued reply"))
+            .then(MockTurn::gated_text("idle redirect reply", &idle_gate))
+            .with_user_bubbles();
+        let reservation = fixture
+            .reserve_next_mock_launch("interrupt-child", script)
+            .await;
+        let child = mcp_spawn_agent_as(
+            &caller,
+            json!({
+                "workspace_roots": ["/tmp/interrupt-child"],
+                "prompt": "start held turn",
+                "name": "interrupt-child",
+                "backend_kind": "claude"
+            }),
+        )
+        .await;
+        drop(reservation);
+        if native_steering {
+            active_gate.wait_until_entered().await;
+        }
+        let child_new =
+            expect_replayed_new_agent(&mut fixture.client, &child, "interrupt child").await;
+        let stream = &child_new.instance_stream;
+
+        for arguments in [
+            json!({ "agent_id": child.0, "message": "default queued" }),
+            json!({ "agent_id": child.0, "message": "explicit queued", "interrupt": false }),
+        ] {
+            let response =
+                mcp_tool_call_as(&caller, false, "tyde_send_agent_message", arguments).await;
+            assert!(
+                !mcp_result_is_error(&response),
+                "queued delivery must be accepted"
+            );
+        }
+        let queued =
+            fixture::next_frame_matching_on(&mut fixture.client, "both messages queued", |env| {
+                env.stream == *stream
+                    && env.kind == FrameKind::QueuedMessages
+                    && env
+                        .parse_payload::<protocol::QueuedMessagesPayload>()
+                        .is_ok_and(|payload| payload.messages.len() == 2)
+            })
+            .await;
+        let queued: protocol::QueuedMessagesPayload =
+            queued.parse_payload().expect("queue snapshot");
+        assert!(queued.messages[0].message == "default queued");
+        assert!(queued.messages[1].message == "explicit queued");
+
+        let redirected = mcp_tool_call_as(
+            &caller,
+            false,
+            "tyde_send_agent_message",
+            json!({
+                "agent_id": child.0, "message": "redirect now", "interrupt": true
+            }),
+        )
+        .await;
+        assert!(
+            !mcp_result_is_error(&redirected),
+            "interrupt delivery must be accepted"
+        );
+        if !native_steering {
+            fixture::next_chat_event_matching_on(
+                &mut fixture.client,
+                stream,
+                "interrupt cancellation",
+                |event| matches!(event, ChatEvent::OperationCancelled(_)),
+            )
+            .await;
+            redirect_gate.wait_until_entered().await;
+        }
+        fixture::next_chat_event_matching_on(
+            &mut fixture.client,
+            stream,
+            "redirected input",
+            |event| {
+                matches!(event, ChatEvent::MessageAdded(message)
+                if matches!(message.sender, MessageSender::User) && message.content == "redirect now")
+            },
+        )
+        .await;
+
+        let await_redirect = mcp_await_agent(&caller, &child);
+        tokio::pin!(await_redirect);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut await_redirect)
+                .await
+                .is_err(),
+            "await must not report idle while the redirected turn is held"
+        );
+        if native_steering {
+            active_gate.release_one();
+        } else {
+            redirect_gate.release_one();
+        }
+        let ready = await_redirect.await;
+        assert_await_result_ready(&ready, &child);
+        for expected in ["default queued", "explicit queued"] {
+            fixture::next_chat_event_matching_on(
+                &mut fixture.client,
+                stream,
+                "preserved queued input",
+                |event| {
+                    matches!(event, ChatEvent::MessageAdded(message)
+                    if matches!(message.sender, MessageSender::User) && message.content == expected)
+                },
+            )
+            .await;
+        }
+        let read = mcp_tool_call_as(
+            &caller,
+            false,
+            "tyde_read_agent",
+            json!({ "agent_id": child.0 }),
+        )
+        .await;
+        let read = mcp_success_json(&read);
+        assert!(read["output"]["text"].as_str() == Some("explicit queued reply"));
+
+        let idle = mcp_tool_call_as(
+            &caller,
+            false,
+            "tyde_send_agent_message",
+            json!({
+                "agent_id": child.0, "message": "redirect while idle", "interrupt": true
+            }),
+        )
+        .await;
+        assert!(
+            !mcp_result_is_error(&idle),
+            "idle interrupt must start a turn"
+        );
+        idle_gate.wait_until_entered().await;
+        let await_idle = mcp_await_agent(&caller, &child);
+        tokio::pin!(await_idle);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut await_idle)
+                .await
+                .is_err(),
+            "acknowledgment must publish the newly active turn before await"
+        );
+        idle_gate.release_one();
+        assert_await_result_ready(&await_idle.await, &child);
+        let read = mcp_tool_call_as(
+            &caller,
+            false,
+            "tyde_read_agent",
+            json!({ "agent_id": child.0 }),
+        )
+        .await;
+        assert!(mcp_success_json(&read)["output"]["text"].as_str() == Some("idle redirect reply"));
+        fixture.mock_by_id(&child).await.assert_clean().await;
+    }
+}
+
+#[tokio::test]
 async fn agent_control_send_message_is_typed_live_and_on_replay() {
     let mut fixture = Fixture::new().await;
     let parent = spawn_agent_control_parent(&mut fixture, "typed-send-parent").await;
@@ -5391,6 +5572,7 @@ async fn agent_control_send_message_is_typed_live_and_on_replay() {
         .enqueue(MockTurn::agent_control_send_message(
             recipient.clone(),
             message,
+            true,
         ))
         .await;
     fixture
@@ -5424,6 +5606,7 @@ async fn agent_control_send_message_is_typed_live_and_on_replay() {
         ToolRequestType::TydeSendAgentMessage {
             agent_id: recipient.clone(),
             message: message.to_owned(),
+            interrupt: true,
         }
     );
     let event = fixture::next_chat_event_matching_on(
@@ -5489,7 +5672,7 @@ async fn agent_control_send_message_is_typed_live_and_on_replay() {
         event,
         AgentBootstrapEvent::ChatEvent(ChatEvent::ToolRequest(ToolRequest {
             tool_call_id,
-            tool_type: ToolRequestType::TydeSendAgentMessage { agent_id, message: replayed },
+            tool_type: ToolRequestType::TydeSendAgentMessage { agent_id, message: replayed, interrupt: true },
             ..
         })) if tool_call_id == &request.tool_call_id
             && agent_id == &recipient

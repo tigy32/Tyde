@@ -1522,14 +1522,20 @@ async fn agent_control_spawn_steering_follows_the_agent_control_mcp() {
     let _ = expect_next_event(&mut fixture.client, "NewAgent").await;
     let _ = expect_next_event(&mut fixture.client, "AgentStart").await;
     let text = expect_turn_text(&mut fixture.client, "agent control steering turn").await;
-    assert!(text.contains("tyde-agent-control MCP tools by default."));
-    assert!(text.contains(
-        "Do not invoke that backend's CLI from the shell unless the user explicitly requests that launch method."
-    ));
-    assert!(text.contains("A shell-spawned agent is invisible to Tyde."));
-    assert!(text.contains(
-        "Sub-agents on your own backend can use whatever native mechanism you already have."
-    ));
+    for instruction in [
+        "Use Tyde MCP for cross-backend delegation, never shell CLIs unless explicitly requested.",
+        "For your own backend, native subagents or Tyde are both fine",
+        "native agent-count limits don't apply to Tyde",
+        "`tyde_send_agent_message` queues by default; use `interrupt: true`",
+        "`tyde_await_agents` with all pending child IDs: like select, it returns when any is ready",
+        "Read ready children with `tyde_read_agent`",
+        "then await remaining work. Don't poll or expect injected results.",
+    ] {
+        assert!(
+            text.contains(instruction),
+            "missing agent-control instruction"
+        );
+    }
     assert!(
         text.contains("[startup_mcp_servers: tyde-agent-control(http)"),
         "agent control MCP is the precondition for this steering: {text}"

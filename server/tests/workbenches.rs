@@ -815,7 +815,13 @@ async fn workbench_remove_succeeds_when_worktree_dir_was_deleted_out_of_band() {
                     assert_eq!(error.request_kind, FrameKind::ProjectFileList);
                     assert_eq!(error.operation, "project_watch");
                     assert_eq!(error.code, CommandErrorCode::Internal);
-                    assert!(error.fatal, "watcher error must be fatal");
+                    // Watcher startup reports a recoverable missing-root warning;
+                    // a later refresh can instead terminate the project stream.
+                    if !error.fatal {
+                        assert!(error.message.ends_with(
+                            "The project remains available; automatic recovery will retry in a few seconds."
+                        ), "nonfatal watcher error must describe automatic recovery");
+                    }
                     assert!(
                         error.message.contains(deleted_root.as_ref()),
                         "watcher error must name the exact deleted worktree path: path={deleted_root:?}, message={:?}",

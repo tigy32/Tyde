@@ -111,6 +111,7 @@ pub(crate) fn tyde_tool_request_type(
         return Some(ToolRequestType::TydeSendAgentMessage {
             agent_id: AgentId(agent_id),
             message,
+            interrupt: find_bool_field(arguments, "interrupt", 0).unwrap_or(false),
         });
     }
     None
@@ -138,6 +139,28 @@ fn find_string_field(value: &Value, key: &str, depth: usize) -> Option<String> {
         Value::String(text) => {
             let parsed = parse_embedded_json(text)?;
             find_string_field(&parsed, key, depth + 1)
+        }
+        _ => None,
+    }
+}
+
+fn find_bool_field(value: &Value, key: &str, depth: usize) -> Option<bool> {
+    if depth > MAX_PARSE_DEPTH {
+        return None;
+    }
+    match value {
+        Value::Object(map) => {
+            if let Some(found) = map.get(key).and_then(Value::as_bool) {
+                return Some(found);
+            }
+            ARGUMENT_WRAPPER_KEYS
+                .iter()
+                .filter_map(|wrapper| map.get(*wrapper))
+                .find_map(|nested| find_bool_field(nested, key, depth + 1))
+        }
+        Value::String(text) => {
+            let parsed = parse_embedded_json(text)?;
+            find_bool_field(&parsed, key, depth + 1)
         }
         _ => None,
     }

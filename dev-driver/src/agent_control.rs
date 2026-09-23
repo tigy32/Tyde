@@ -134,6 +134,7 @@ enum Command {
     SendMessage {
         agent_id: AgentId,
         message: String,
+        interrupt: bool,
         reply: oneshot::Sender<Result<(), String>>,
     },
     Interrupt {
@@ -264,12 +265,23 @@ impl AgentControlHandle {
     }
 
     pub async fn send_message(&self, agent_id: AgentId, message: String) -> Result<(), String> {
+        self.send_message_with_interrupt(agent_id, message, false)
+            .await
+    }
+
+    pub async fn send_message_with_interrupt(
+        &self,
+        agent_id: AgentId,
+        message: String,
+        interrupt: bool,
+    ) -> Result<(), String> {
         self.authorize_target(&agent_id)?;
         let (reply_tx, reply_rx) = oneshot::channel();
         self.command_tx
             .send(Command::SendMessage {
                 agent_id,
                 message,
+                interrupt,
                 reply: reply_tx,
             })
             .await
@@ -677,7 +689,7 @@ async fn run_runtime(
                             reply,
                         });
                     }
-                    Command::SendMessage { agent_id, message, reply } => {
+                    Command::SendMessage { agent_id, message, interrupt, reply } => {
                         let Some(stream) = state
                             .snapshot
                             .agents
@@ -687,15 +699,18 @@ async fn run_runtime(
                             let _ = reply.send(Err(format!("unknown agent_id {}", agent_id.0)));
                             continue;
                         };
-                        match connection.send_message_payload(
-                            &stream,
-                            SendMessagePayload {
-                                message,
-                                images: None,
-                                origin: None,
-                                tool_response: None,
-                            },
-                        ).await {
+                        let payload = SendMessagePayload {
+                            message,
+                            images: None,
+                            origin: None,
+                            tool_response: None,
+                        };
+                        let result = if interrupt {
+                            connection.steer_message_payload(&stream, payload).await
+                        } else {
+                            connection.send_message_payload(&stream, payload).await
+                        };
+                        match result {
                             Ok(()) => {
                                 let agent = state
                                     .snapshot
@@ -1351,6 +1366,8 @@ struct AwaitAgentsToolInput {
 struct SendAgentMessageToolInput {
     agent_id: String,
     message: String,
+    #[serde(default)]
+    interrupt: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1617,7 +1634,7 @@ fn tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "tyde_send_agent_message",
-            description: "Send a follow-up message to an existing Tyde agent.",
+            description: "Send a follow-up to a Tyde agent. Queues by default; interrupt=true redirects active work using native steering or interrupt-and-send fallback. Idle agents start immediately. Await then read to collect output.",
             input_schema: send_message_schema(),
         },
         ToolDefinition {
@@ -1752,7 +1769,8 @@ fn send_message_schema() -> Value {
         "type": "object",
         "properties": {
             "agent_id": { "type": "string" },
-            "message": { "type": "string" }
+            "message": { "type": "string" },
+            "interrupt": { "type": "boolean", "default": false }
         },
         "required": ["agent_id", "message"],
         "additionalProperties": false
@@ -1835,7 +1853,10 @@ async fn dispatch_tool(control: &AgentControlHandle, params: CallToolParams) -> 
             if input.message.trim().is_empty() {
                 return ToolCallResult::text_error("message must not be empty");
             }
-            match control.send_message(agent_id, input.message).await {
+            match control
+                .send_message_with_interrupt(agent_id, input.message, input.interrupt)
+                .await
+            {
                 Ok(()) => ToolCallResult::json(json!({ "ok": true })),
                 Err(err) => ToolCallResult::text_error(err),
             }

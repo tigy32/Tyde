@@ -336,12 +336,25 @@ It returns status only. Call `tyde_read_agent` to inspect output.
 #### `tyde_send_agent_message`
 
 Sends a follow-up message to an existing agent. This does not return agent
-output.
+output. By default, a busy child queues the message until its current turn ends.
+With `interrupt: true`, Tyde redirects active work through the same path as the
+UI's steer action: native in-turn steering when supported, otherwise queue at
+the front and interrupt the current turn. An idle child starts immediately in
+either mode. Existing queued messages are preserved. Acceptance is acknowledged
+by the actor before the tool returns, so an immediate await sees pending work.
 
 Input:
 
 - `agent_id`
 - `message`
+- `interrupt`: optional boolean, default `false`
+
+Schedule tasks, call `tyde_await_agents` with all pending child IDs, read each
+ready child with `tyde_read_agent`, act on the output, then await the remaining
+work. Await is select-like, not an all-children join; results are not injected.
+Native subagent-count limits do not apply to Tyde children. Native subagents are
+also permitted for same-backend work; cross-backend delegation uses Tyde MCP
+unless the user explicitly requests a shell CLI.
 
 Await, read, debug-read, send, and list centrally authorize targets against the
 server-owned direct-child relation. Knowing another agent id is insufficient.
@@ -432,7 +445,7 @@ frontend parses tool arguments.
 
 | Tool | `ToolRequestType` | `ToolExecutionResult` |
 | --- | --- | --- |
-| `tyde_send_agent_message` | `TydeSendAgentMessage { agent_id, message }` | `TydeSendAgentMessage` (unit) |
+| `tyde_send_agent_message` | `TydeSendAgentMessage { agent_id, message, interrupt }` | `TydeSendAgentMessage` (unit) |
 | `tyde_await_agents` | `TydeAwaitAgents { agent_ids }` | `TydeAwaitAgents { ready, still_thinking }` of `TydeAgentWaitStatus { agent_id, status }` |
 
 The send completion is a **unit variant** on purpose: the MCP tool returns
