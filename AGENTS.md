@@ -4,6 +4,14 @@ Guidance for AI coding agents working in the Tyde2 repository. The conventions
 in this file apply to every agent (Claude, Codex, Gemini, etc.) that touches
 this codebase.
 
+## Architecture: read dev-docs/01-philosophy.md first
+
+The server owns behavior; the UI renders typed, server-emitted state.
+Never reconstruct live status from transcript/history or add fallback
+lookups, inferred semantics, or parallel state. If required state is missing,
+fix its server/protocol source. Passing tests does not excuse an architecture
+violation. Check every fix against `dev-docs/01-philosophy.md` before landing.
+
 ## Branch hygiene: never develop on `main`
 
 `main` is always kept clean. **Do not do active development directly against

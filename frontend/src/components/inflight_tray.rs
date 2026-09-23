@@ -49,7 +49,7 @@ use crate::components::tool_card::{
 };
 use crate::components::workflow_view::run_status_label;
 use crate::send::send_frame;
-use crate::state::{ActiveAgentRef, AppState, TabContent, ToolCallId, ToolRequestEntry};
+use crate::state::{ActiveAgentRef, AppState, TabContent, ToolCallId};
 
 const STORAGE_INFLIGHT_TRAY_EXPANDED: &str = "tyde-inflight-tray-expanded";
 
@@ -622,53 +622,50 @@ pub fn InflightTray(agent_ref: Signal<Option<ActiveAgentRef>>) -> impl IntoView 
         }
     });
 
-    // A response can end while its await is still running (Codex exec yields).
-    // Follow pending requests into history until ToolExecutionCompleted.
     let waiting = Signal::derive({
         let state = state.clone();
         move || -> Option<String> {
             let parent = agent_ref.get()?;
-            let pending_tool = |entry: &ToolRequestEntry| {
-                entry
-                    .result
-                    .is_none()
-                    .then(|| entry.request.tool_type.clone())
-            };
-            let pending = state
-                .streaming_text
-                .with(|map| map.get(&parent.agent_id).map(|s| s.tool_requests.clone()))
-                .and_then(|requests| {
-                    requests.with(|requests| {
-                        requests
-                            .iter()
-                            .rev()
-                            .find_map(|request| request.entry.with(pending_tool))
-                    })
-                })
-                .or_else(|| {
-                    state.chat_rows.with(|rows| {
-                        rows.get(&parent.agent_id)?
-                            .iter()
-                            .rev()
-                            .filter_map(|row| row.message_entry())
-                            .find_map(|entry| {
-                                entry.with(|entry| {
-                                    entry.tool_requests.iter().rev().find_map(pending_tool)
-                                })
-                            })
-                    })
-                })?;
-            match &pending {
-                ToolRequestType::TydeAwaitAgents { agent_ids } => {
-                    let names = agent_ids
-                        .iter()
-                        .map(|id| agent_display_name(&state, Some(parent.clone()), id, None))
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    Some(format!("waiting on {names}"))
+            let mut agents = state.tool_progress.with(|map| {
+                let mut agents = Vec::new();
+                for ((owner, _), progress) in map {
+                    if *owner != parent.agent_id {
+                        continue;
+                    }
+                    progress.with(|progress| {
+                        if let ToolProgressUpdate::AgentControl(progress) = &progress.update
+                            && progress.progress_kind == protocol::AgentControlProgressKind::Await
+                            && progress.status == protocol::AgentControlProgressStatus::Running
+                        {
+                            agents.extend(progress.agents.iter().cloned());
+                        }
+                    });
                 }
-                _ => None,
+                agents
+            });
+            if agents.is_empty() {
+                return None;
             }
+            agents.sort_by(|left, right| {
+                left.agent_id
+                    .0
+                    .cmp(&right.agent_id.0)
+                    .then_with(|| left.name.cmp(&right.name))
+            });
+            agents.dedup_by(|left, right| left.agent_id == right.agent_id);
+            let names = agents
+                .iter()
+                .map(|agent| {
+                    agent_display_name(
+                        &state,
+                        Some(parent.clone()),
+                        &agent.agent_id,
+                        agent.name.as_deref(),
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            Some(format!("waiting on {names}"))
         }
     });
 
@@ -2860,6 +2857,31 @@ mod wasm_tests {
                 .update(|agents| agents.push(child_agent("agent-a", "Awaited Worker")));
             set_turn_active(state, "agent-a");
         });
+        let progress = |status| {
+            ChatEvent::ToolProgress(ToolProgressData {
+                tool_call_id: "await-held".to_owned(),
+                execution_mode: ToolExecutionMode::Foreground,
+                cancellable: false,
+                update: ToolProgressUpdate::AgentControl(protocol::AgentControlProgress {
+                    progress_kind: AgentControlProgressKind::Await,
+                    agents: vec![protocol::AgentControlAgentRef {
+                        agent_id: AgentId("agent-a".to_owned()),
+                        name: None,
+                    }],
+                    status,
+                }),
+            })
+        };
+        // Bootstrap supplies active progress independently of paged history.
+        apply_replay(
+            &state,
+            progress(protocol::AgentControlProgressStatus::Running),
+        );
+        next_tick().await;
+        assert!(
+            text(&container).contains("waiting on Awaited Worker"),
+            "server-owned active wait must render without transcript entries"
+        );
         let start = ChatEvent::StreamStart(protocol::StreamStartData {
             agent: "codex".to_owned(),
             model: None,
@@ -2913,6 +2935,26 @@ mod wasm_tests {
             text(&container).contains("waiting on Awaited Worker"),
             "the next response must not displace the outstanding wait"
         );
+
+        for status in [
+            protocol::AgentControlProgressStatus::Completed,
+            protocol::AgentControlProgressStatus::Failed,
+            protocol::AgentControlProgressStatus::Stopped,
+            protocol::AgentControlProgressStatus::Unknown,
+        ] {
+            apply_live(&state, progress(status));
+            next_tick().await;
+            assert!(
+                !text(&container).contains("waiting on"),
+                "a request without a result must not override server wait status"
+            );
+            apply_live(
+                &state,
+                progress(protocol::AgentControlProgressStatus::Running),
+            );
+            next_tick().await;
+            assert!(text(&container).contains("waiting on Awaited Worker"));
+        }
 
         apply_live(
             &state,
