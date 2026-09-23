@@ -2174,32 +2174,44 @@ input, textarea, select {
     z-index: 3;
     pointer-events: none;
     border-radius: inherit;
-    padding: 1px;
-    background: linear-gradient(
-        90deg,
-        transparent 0%,
-        #4a9eff 40%,
-        #4a9eff 60%,
-        transparent 100%
-    );
-    background-size: 200% 100%;
-    -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
-    -webkit-mask-composite: xor;
-    mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
-    mask-composite: exclude;
-    animation: thinking-shimmer 1.6s ease-in-out infinite;
 }
 
-@keyframes thinking-shimmer {
-    from { background-position: 100% 0; }
-    to { background-position: -100% 0; }
+.chat-thinking-particle {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 5px;
+    height: 2px;
+    border-radius: 50%;
+    background: #4a9eff;
+    box-shadow: 0 0 4px #4a9eff;
+    offset-path: inset(1px round calc(var(--radius-xl) - 1px));
+    offset-anchor: center;
+    animation: thinking-orbit 4s linear infinite;
+    animation-delay: var(--orbit-delay);
+}
+
+.chat-thinking-head {
+    width: 4px;
+    height: 4px;
+    background: #cce7ff;
+    box-shadow: 0 0 3px #4a9eff, 0 0 7px #4a9eff;
+}
+
+@keyframes thinking-orbit {
+    from { offset-distance: calc(0% - var(--trail-distance)); }
+    to { offset-distance: calc(100% - var(--trail-distance)); }
 }
 
 @media (prefers-reduced-motion: reduce) {
     .chat-thinking-ring {
-        animation: none;
-        background: #4a9eff;
+        box-shadow: inset 0 0 0 1px #4a9eff;
         opacity: 0.45;
+    }
+
+    .chat-thinking-particle {
+        display: none;
+        animation: none;
     }
 }
 

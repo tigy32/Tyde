@@ -1927,7 +1927,21 @@ pub fn ChatInput() -> impl IntoView {
                         class="chat-thinking-ring"
                         data-mobile-test="chat-thinking-ring"
                         aria-hidden="true"
-                    ></div>
+                    >
+                        {(0..2).flat_map(|orbit| (0..=24).map(move |segment| {
+                            let head = segment == 0;
+                            let opacity = if head { 1.0 } else {
+                                0.7 * (1.0 - f64::from(segment) / 25.0).powi(2)
+                            };
+                            view! {
+                                <span
+                                    class=if head { "chat-thinking-particle chat-thinking-head" } else { "chat-thinking-particle" }
+                                    data-mobile-test=if head { "chat-thinking-head" } else { "chat-thinking-trail" }
+                                    style=format!("--trail-distance: {}px; --orbit-delay: {}s; opacity: {opacity}", segment * 3, -1.72 * f64::from(orbit))
+                                ></span>
+                            }
+                        })).collect::<Vec<_>>()}
+                    </div>
                 </Show>
                 <textarea
                     class="chat-input-field"
@@ -4832,41 +4846,131 @@ mod wasm_tests {
             .trim_end_matches("px")
             .parse()
             .expect("capsule radius in px");
-        // The requested Sidequest treatment is a masked gradient, not SVG
-        // dashes. Keep guarding the visible hairline and rounded, empty center.
         let style = window.get_computed_style(&ring_el).unwrap().unwrap();
-        let prop = |name: &str| style.get_property_value(name).unwrap();
-        assert!(
-            prop("background-image").contains("linear-gradient"),
-            "the rim must shimmer with a smooth gradient, not a glowing dash"
-        );
-        assert!(
-            prop("background-image").contains("rgb(74, 158, 255)"),
-            "retain Tyde's blue instead of Sidequest's white"
-        );
-        assert_eq!(prop("background-size"), "200% 100%");
-        assert_eq!(prop("filter"), "none", "no glowing orbit");
-        // Chrome computes one composite per mask layer: "exclude, exclude".
-        assert_eq!(
-            prop("mask-composite"),
-            "exclude, exclude",
-            "leave the center clear"
-        );
-        assert!(prop("mask-clip").starts_with("content-box"));
-        assert_eq!(prop("mask-image").matches("linear-gradient").count(), 2);
-        for edge in ["top", "right", "bottom", "left"] {
-            assert_eq!(prop(&format!("padding-{edge}")), "1px", "a hairline rim");
-        }
-        let radius: f64 = prop("border-top-left-radius")
+        assert_eq!(style.get_property_value("pointer-events").unwrap(), "none");
+        let radius: f64 = style
+            .get_property_value("border-top-left-radius")
+            .unwrap()
             .trim_end_matches("px")
             .parse()
-            .expect("rim radius in px");
+            .unwrap();
         assert_eq!(radius, capsule_radius, "follow the capsule's corners");
-        assert_eq!(prop("pointer-events"), "none", "do not block composing");
-        assert_ne!(prop("animation-name"), "none");
-        assert_eq!(prop("animation-duration"), "1.6s");
-        assert_eq!(prop("animation-timing-function"), "ease-in-out");
-        assert_eq!(prop("animation-iteration-count"), "infinite");
+
+        let heads = ring_el
+            .query_selector_all("[data-mobile-test='chat-thinking-head']")
+            .unwrap();
+        assert_eq!(heads.length(), 2, "two bright heads orbit the composer");
+        let particles = ring_el.query_selector_all("span").unwrap();
+        let mut moving = Vec::new();
+        for index in 0..particles.length() {
+            let particle: HtmlElement = particles.item(index).unwrap().dyn_into().unwrap();
+            let style = window.get_computed_style(&particle).unwrap().unwrap();
+            let duration: f64 = style
+                .get_property_value("animation-duration")
+                .unwrap()
+                .trim_end_matches('s')
+                .parse()
+                .unwrap();
+            let delay: f64 = style
+                .get_property_value("animation-delay")
+                .unwrap()
+                .trim_end_matches('s')
+                .parse()
+                .unwrap();
+            assert!(duration > 0.0, "the perimeter indicator must move");
+            particle
+                .style()
+                .set_property("animation-play-state", "paused")
+                .unwrap();
+            moving.push((particle, duration, delay));
+        }
+        let head_center = |index| {
+            let head: web_sys::Element = heads.item(index).unwrap().dyn_into().unwrap();
+            let rect = head.get_bounding_client_rect();
+            (
+                rect.x() + rect.width() / 2.0,
+                rect.y() + rect.height() / 2.0,
+            )
+        };
+        let seek = |phase: f64| {
+            for (particle, duration, delay) in &moving {
+                particle
+                    .style()
+                    .set_property("animation-delay", &format!("{}s", delay - phase * duration))
+                    .unwrap();
+            }
+        };
+
+        // The old horizontal gradient moved both edges together. Sample the
+        // rendered heads on phone, desktop, and expanded multiline composers.
+        for (width, height) in [(390, 64), (900, 64), (390, 160)] {
+            container
+                .style()
+                .set_property("width", &format!("{width}px"))
+                .unwrap();
+            let capsule: HtmlElement = capsule.clone().dyn_into().unwrap();
+            capsule
+                .style()
+                .set_property("height", &format!("{height}px"))
+                .unwrap();
+            next_tick().await;
+            let bounds = capsule.get_bounding_client_rect();
+            seek(0.12);
+            let top_before = head_center(0);
+            let bottom_before = head_center(1);
+            seek(0.22);
+            let top_after = head_center(0);
+            let bottom_after = head_center(1);
+            assert!(top_after.0 > top_before.0 + 20.0, "top head travels right");
+            assert!(
+                bottom_after.0 < bottom_before.0 - 20.0,
+                "bottom head travels left, not in sync with the top"
+            );
+            assert!((top_after.1 - bounds.top()).abs() < 3.0);
+            assert!((bottom_after.1 - bounds.bottom()).abs() < 3.0);
+
+            for step in 0..32 {
+                seek(f64::from(step) / 32.0);
+                for index in 0..2 {
+                    let (x, y) = head_center(index);
+                    let dx = ((x - (bounds.x() + bounds.width() / 2.0)).abs()
+                        - (bounds.width() / 2.0 - radius))
+                        .max(0.0);
+                    let dy = ((y - (bounds.y() + bounds.height() / 2.0)).abs()
+                        - (bounds.height() / 2.0 - radius))
+                        .max(0.0);
+                    assert!(
+                        (dx.hypot(dy) - (radius - 1.0)).abs() < 1.0,
+                        "heads follow every edge and rounded corner, never cross the input: {x}, {y}"
+                    );
+                }
+            }
+        }
+        seek(0.2);
+        let head = head_center(0);
+        let tails = ring_el
+            .query_selector_all("[data-mobile-test='chat-thinking-trail']")
+            .unwrap();
+        assert!(tails.length() >= 2, "heads have a trailing glow");
+        let mut last_x = head.0;
+        let mut last_opacity = 1.0;
+        for index in 0..tails.length() / 2 {
+            let tail: web_sys::Element = tails.item(index).unwrap().dyn_into().unwrap();
+            let rect = tail.get_bounding_client_rect();
+            let x = rect.x() + rect.width() / 2.0;
+            let opacity: f64 = window
+                .get_computed_style(&tail)
+                .unwrap()
+                .unwrap()
+                .get_property_value("opacity")
+                .unwrap()
+                .parse()
+                .unwrap();
+            assert!(x < last_x, "the glow trails behind the head");
+            assert!(opacity < last_opacity, "the trail fades toward its tail");
+            last_x = x;
+            last_opacity = opacity;
+        }
 
         state.agent_turn_active.update(|m| {
             m.remove(&agent_ref);
