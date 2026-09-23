@@ -96,6 +96,7 @@ thread_local! {
     static APP_LISTENERS_ACTIVE: Cell<bool> = const { Cell::new(false) };
     static APP_LISTENER_TOKEN: Cell<u64> = const { Cell::new(0) };
     static HOST_LISTENER_HANDLES: RefCell<Vec<bridge::UnlistenHandle>> = const { RefCell::new(Vec::new()) };
+    static SETTINGS_MENU_LISTENER_HANDLE: RefCell<Option<bridge::UnlistenHandle>> = const { RefCell::new(None) };
     static DEVTOOLS_LISTENER_HANDLE: RefCell<Option<bridge::UnlistenHandle>> = const { RefCell::new(None) };
     static KEYDOWN_LISTENER_HANDLE: RefCell<Option<EventListenerHandle>> = const { RefCell::new(None) };
     static KEYUP_LISTENER_HANDLE: RefCell<Option<EventListenerHandle>> = const { RefCell::new(None) };
@@ -137,6 +138,11 @@ pub(crate) fn clear_app_listeners() {
     set_app_listeners_active(false);
     HOST_LISTENER_HANDLES.with(|handles| {
         for handle in handles.borrow_mut().drain(..) {
+            handle.remove();
+        }
+    });
+    SETTINGS_MENU_LISTENER_HANDLE.with(|handle| {
+        if let Some(handle) = handle.borrow_mut().take() {
             handle.remove();
         }
     });
@@ -880,6 +886,27 @@ pub fn App() -> impl IntoView {
         });
     });
 
+    let state_for_settings_menu = state.clone();
+    Effect::new(move |_| {
+        let state = state_for_settings_menu.clone();
+        spawn_local(async move {
+            match install_settings_menu_listener(state).await {
+                Ok(handle) => {
+                    if app_listener_token_is_current(listener_token) {
+                        SETTINGS_MENU_LISTENER_HANDLE.with(|slot| {
+                            if let Some(existing) = slot.borrow_mut().replace(handle) {
+                                existing.remove();
+                            }
+                        });
+                    } else {
+                        handle.remove();
+                    }
+                }
+                Err(error) => log::error!("failed to install Settings menu listener: {error}"),
+            }
+        });
+    });
+
     // Tab LRU tracker. Whenever the active tab changes, push it to the front
     // of `tab_lru`. Any tab that falls outside `TAB_LRU_CAPACITY` will
     // unmount on the next `<For>` re-render in `CenterZone`. This is the
@@ -1043,6 +1070,17 @@ fn reported_host_error_message(label: Option<&str>, error: &str) -> String {
         Some(label) => format!("Host “{label}” reported an error. {error}"),
         None => format!("A host reported an error. {error}"),
     }
+}
+
+pub(crate) async fn install_settings_menu_listener(
+    state: AppState,
+) -> Result<bridge::UnlistenHandle, String> {
+    bridge::listen_open_settings(move || {
+        log::info!("app_menu event=open_settings_received");
+        state.command_palette_open.set(false);
+        state.settings_open.set(true);
+    })
+    .await
 }
 
 pub(crate) async fn install_host_listeners(

@@ -511,6 +511,10 @@ impl UnlistenHandle {
     }
 }
 
+pub async fn listen_open_settings(callback: impl Fn() + 'static) -> Result<UnlistenHandle, String> {
+    listen_event("tyde://open-settings", move |_| callback()).await
+}
+
 pub async fn listen_host_line(
     callback: impl Fn(HostLineEvent) + 'static,
 ) -> Result<UnlistenHandle, String> {

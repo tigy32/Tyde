@@ -1151,6 +1151,42 @@ macro_rules! other_production_invoke_handler {
     };
 }
 
+#[cfg(desktop)]
+fn settings_menu(app: &AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::Wry>> {
+    #[cfg(not(target_os = "macos"))]
+    use tauri::menu::Submenu;
+    use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
+
+    let menu = Menu::default(app)?;
+    let settings = MenuItem::with_id(app, "settings", "Settings…", true, Some("CmdOrCtrl+,"))?;
+    #[cfg(target_os = "macos")]
+    {
+        let items = menu.items()?;
+        let app_menu = items
+            .first()
+            .and_then(|item| item.as_submenu())
+            .ok_or_else(|| {
+                std::io::Error::other("the default macOS menu is missing its application submenu")
+            })?;
+        app_menu.insert_items(&[&settings, &PredefinedMenuItem::separator(app)?], 2)?;
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let app_menu = Submenu::with_items(
+            app,
+            "Tyde",
+            true,
+            &[
+                &settings,
+                &PredefinedMenuItem::separator(app)?,
+                &PredefinedMenuItem::quit(app, None)?,
+            ],
+        )?;
+        menu.prepend(&app_menu)?;
+    }
+    Ok(menu)
+}
+
 pub fn run() {
     #[cfg(target_os = "macos")]
     macos_webview_defaults::apply();
@@ -1337,6 +1373,18 @@ pub fn run() {
             }
         })
     };
+
+    #[cfg(desktop)]
+    let builder = builder.menu(settings_menu).on_menu_event(|app, event| {
+        use tauri::Emitter;
+
+        if event.id().as_ref() == "settings" {
+            tracing::info!("app_menu event=open_settings");
+            if let Err(error) = app.emit_to("main", "tyde://open-settings", ()) {
+                tracing::error!("failed to open Settings from the app menu: {error}");
+            }
+        }
+    });
 
     let app = builder
         .setup(move |app| {

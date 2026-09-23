@@ -9626,6 +9626,91 @@ mod wasm_tests {
         );
     }
 
+    #[wasm_bindgen_test]
+    async fn native_settings_menu_opens_keeps_open_and_reopens_settings() {
+        install_settings_send_stub();
+        js_sys::eval(
+            r#"
+            window.__settings_menu_events = {};
+            window.__TAURI__.event.listen = (name, callback) => {
+                window.__settings_menu_events[name] = callback;
+                return Promise.resolve(() => delete window.__settings_menu_events[name]);
+            };
+        "#,
+        )
+        .unwrap();
+        let state = AppState::new();
+        let _keys = GlobalListeners::install(&state);
+        let listener = crate::app::install_settings_menu_listener(state.clone())
+            .await
+            .unwrap();
+        let container = make_container();
+        let handle = mount_to(container.clone(), move || {
+            provide_context(state.clone());
+            view! { <SettingsPanel /> }
+        });
+        next_tick().await;
+        assert!(container.text_content().unwrap().is_empty());
+
+        for _ in 0..2 {
+            js_sys::eval(
+                "window.__settings_menu_events['tyde://open-settings']({ payload: null })",
+            )
+            .unwrap();
+            next_tick().await;
+            assert!(
+                container.text_content().unwrap().contains("Appearance"),
+                "the native menu must open Settings, and never close an already-open panel"
+            );
+            let close = container
+                .query_selector("button[title='Close settings']")
+                .unwrap()
+                .unwrap()
+                .get_bounding_client_rect();
+            assert!(close.width() > 0.0 && close.height() > 0.0);
+        }
+
+        let close = container
+            .query_selector("button[title='Close settings']")
+            .unwrap()
+            .unwrap();
+        close.dispatch_event(&key_event("Escape", false)).unwrap();
+        next_tick().await;
+        assert!(
+            container.text_content().unwrap().is_empty(),
+            "Escape must still dismiss Settings"
+        );
+
+        js_sys::eval("window.__settings_menu_events['tyde://open-settings']({ payload: null })")
+            .unwrap();
+        next_tick().await;
+        assert!(
+            container.text_content().unwrap().contains("Appearance"),
+            "the menu must reopen dismissed Settings"
+        );
+        container
+            .query_selector("button[title='Close settings']")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<HtmlElement>()
+            .unwrap()
+            .click();
+        next_tick().await;
+        assert!(
+            container.text_content().unwrap().is_empty(),
+            "the close button must still dismiss Settings"
+        );
+        listener.remove();
+        assert!(
+            js_sys::eval("Object.keys(window.__settings_menu_events).length === 0")
+                .unwrap()
+                .as_bool()
+                .unwrap()
+        );
+        drop(handle);
+        container.remove();
+    }
+
     // ---- Mobile tab: send-frame behaviour + inline validation ----
 
     /// Stub `window.__TAURI__.core.invoke` to record every call into
