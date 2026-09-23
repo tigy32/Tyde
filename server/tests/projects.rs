@@ -2132,6 +2132,19 @@ async fn project_recovers_from_filesystem_and_git_failures_without_reconnecting(
             )
             .await;
         }
+        let healthy_repo = init_git_repo("healthy-during-recovery", &[("healthy.rs", "before\n")]);
+        let healthy = if !force_project_watch_limit {
+            Some(
+                create_project_with_real_roots(
+                    &mut fixture.client,
+                    "Healthy during recovery",
+                    vec![healthy_repo.path().to_string_lossy().into_owned()],
+                )
+                .await,
+            )
+        } else {
+            None
+        };
         let index = repo.path().join(".git/index");
         let saved_index = fs::read(&index).unwrap();
         fs::write(&index, "temporarily unreadable Git index").unwrap();
@@ -2141,7 +2154,14 @@ async fn project_recovers_from_filesystem_and_git_failures_without_reconnecting(
             &mut fixture.client,
             "background I/O failure",
             Duration::from_secs(10),
-            |event| event.kind == FrameKind::CommandError,
+            |event| {
+                event.kind == FrameKind::CommandError
+                    && event.stream == StreamPath(format!("/project/{}", project.id))
+                    && (force_project_watch_limit
+                        || event
+                            .parse_payload::<CommandErrorPayload>()
+                            .is_ok_and(|error| error.operation == "project_watch"))
+            },
         )
         .await;
         let error: CommandErrorPayload = error.parse_payload().unwrap();
@@ -2184,6 +2204,24 @@ async fn project_recovers_from_filesystem_and_git_failures_without_reconnecting(
         assert_eq!(during.contents, before.contents);
         assert_eq!(during.version, before.version);
 
+        if let Some(healthy) = &healthy {
+            fs::write(
+                healthy_repo.path().join("healthy.rs"),
+                "healthy while another watcher fails\n",
+            )
+            .unwrap();
+            next_frame_matching_on(&mut fixture.client, "healthy watcher survives another project's failure", |event| {
+                if event.kind == FrameKind::CommandError {
+                    assert_eq!(event.stream, StreamPath(format!("/project/{}", project.id)));
+                    assert!(!event.parse_payload::<CommandErrorPayload>().unwrap().fatal);
+                }
+                event.stream == StreamPath(format!("/project/{}", healthy.id))
+                    && event.kind == FrameKind::ProjectEvent
+                    && matches!(event.parse_payload::<protocol::ProjectEventPayload>(), Ok(protocol::ProjectEventPayload::FilesChanged { files }) if files.iter().any(|file| file.path.relative_path == "healthy.rs"))
+            }).await;
+            #[cfg(target_os = "linux")]
+            expect_inotify_instances(2).await;
+        }
         fs::write(repo.path().join("file.rs"), "// recovered\n").unwrap();
         fs::write(&index, saved_index).unwrap();
         let mut got_git = false;
@@ -2204,7 +2242,8 @@ async fn project_recovers_from_filesystem_and_git_failures_without_reconnecting(
                     }
                     FrameKind::ProjectGitStatus => {
                         let status: ProjectGitStatusPayload = event.parse_payload().unwrap();
-                        got_git |= status.roots.iter().any(|root| !root.clean);
+                        got_git |= event.stream == StreamPath(format!("/project/{}", project.id))
+                            && status.roots.iter().any(|root| !root.clean);
                     }
                     FrameKind::ProjectEvent => {
                         if let protocol::ProjectEventPayload::FilesChanged { files } =
@@ -3747,6 +3786,401 @@ async fn assert_no_watched_changes(client: &mut client::Connection, paths: &[&st
     assert!(quiet.is_err());
 }
 
+#[cfg(target_os = "linux")]
+async fn expect_inotify_instances(expected: usize) {
+    let count = || {
+        fs::read_dir("/proc/self/fd")
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                fs::read_link(entry.path())
+                    .is_ok_and(|path| path == Path::new("anon_inode:inotify"))
+            })
+            .count()
+    };
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while count() != expected {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("expected {expected} inotify instances, found {}", count()));
+}
+
+#[tokio::test]
+async fn projects_share_native_watches_and_release_only_their_own_paths() {
+    fixture::init_tracing();
+    let mut fixture = Fixture::new().await;
+    let mut repos = Vec::new();
+    let mut projects = Vec::new();
+    for index in 0..30 {
+        let repo = init_git_repo(
+            "shared-watches",
+            &[("src/file.rs", "initial\n"), ("src/dir/leaf.rs", "leaf\n")],
+        );
+        let project = create_project_with_real_roots(
+            &mut fixture.client,
+            &format!("Shared Watch {index}"),
+            vec![repo.path().to_string_lossy().into_owned()],
+        )
+        .await;
+        repos.push(repo);
+        projects.push(project);
+    }
+    let nested = create_project_with_real_roots(
+        &mut fixture.client,
+        "Nested Root",
+        vec![repos[0].path().join("src").to_string_lossy().into_owned()],
+    )
+    .await;
+    #[cfg(target_os = "linux")]
+    expect_inotify_instances(2).await;
+
+    let expected = [projects[0].clone(), nested.clone()];
+    for project in &expected {
+        let path = ProjectPath {
+            root: ProjectRootPath(project_root(project, 0)),
+            relative_path: if project.id == nested.id {
+                "file.rs"
+            } else {
+                "src/file.rs"
+            }
+            .to_owned(),
+        };
+        fixture
+            .client
+            .project_read_file(&project.id, ProjectReadFilePayload { path })
+            .await
+            .unwrap();
+        let event = next_frame_matching_on(&mut fixture.client, "observe shared file", |event| {
+            event.kind == FrameKind::ProjectFileContents
+                && event.stream == StreamPath(format!("/project/{}", project.id))
+        })
+        .await;
+        assert_eq!(
+            event
+                .parse_payload::<ProjectFileContentsPayload>()
+                .unwrap()
+                .contents
+                .as_deref(),
+            Some("initial\n")
+        );
+    }
+    fs::write(repos[0].path().join("src/file.rs"), "updated\n").unwrap();
+    let mut remaining: std::collections::HashSet<_> = expected
+        .iter()
+        .map(|project| StreamPath(format!("/project/{}", project.id)))
+        .collect();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !remaining.is_empty() {
+            let event = fixture.client.next_event().await.unwrap().unwrap();
+            assert_ne!(event.kind, FrameKind::CommandError);
+            if event.kind == FrameKind::ProjectEvent
+                && let protocol::ProjectEventPayload::FilesChanged { files } =
+                    event.parse_payload().unwrap()
+                && files
+                    .iter()
+                    .any(|file| file.path.relative_path.ends_with("file.rs"))
+            {
+                let project = expected
+                    .iter()
+                    .find(|project| event.stream == StreamPath(format!("/project/{}", project.id)))
+                    .expect("changes must not leak into unrelated projects");
+                assert!(
+                    files
+                        .iter()
+                        .any(|file| file.path.root.0 == project_root(project, 0)
+                            && file.version.0 > 0)
+                );
+                remaining.remove(&event.stream);
+            }
+        }
+    })
+    .await
+    .expect("all owners receive shared-file changes");
+
+    #[cfg(target_os = "linux")]
+    {
+        let slow_path = ProjectPath {
+            root: ProjectRootPath(project_root(&projects[1], 0)),
+            relative_path: "src/file.rs".to_owned(),
+        };
+        fixture
+            .client
+            .project_read_file(
+                &projects[1].id,
+                ProjectReadFilePayload {
+                    path: slow_path.clone(),
+                },
+            )
+            .await
+            .unwrap();
+        let before =
+            expect_project_file_contents(&mut fixture.client, "observe slow project").await;
+        let (blocked_tx, blocked_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let blocked = fixture.on_project_scan(
+            repos[1].path().to_owned(),
+            server::ScanPoint::WatcherProcess,
+            move || {
+                let _ = blocked_tx.send(());
+                release_rx
+                    .recv_timeout(Duration::from_secs(20))
+                    .expect("release stalled project worker");
+            },
+        );
+        fs::write(repos[1].path().join("src/dir/leaf.rs"), "stall worker\n").unwrap();
+        tokio::time::timeout(Duration::from_secs(5), blocked_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        let (overflow_tx, overflow_rx) = tokio::sync::oneshot::channel();
+        let overflow = fixture.on_project_scan(
+            repos[1].path().to_owned(),
+            server::ScanPoint::WatcherOverflow,
+            move || {
+                let _ = overflow_tx.send(());
+            },
+        );
+        for index in 0..300 {
+            fs::write(
+                repos[1].path().join(format!("src/burst-{index}.rs")),
+                "burst\n",
+            )
+            .unwrap();
+        }
+        tokio::time::timeout(Duration::from_secs(5), overflow_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        fs::write(
+            repos[1].path().join("src/file.rs"),
+            "changed during overflow\n",
+        )
+        .unwrap();
+        fs::write(repos[2].path().join("src/file.rs"), "healthy project\n").unwrap();
+        next_frame_matching_on(&mut fixture.client, "healthy project while another worker is stalled", |event| {
+        assert_ne!(event.kind, FrameKind::CommandError);
+        event.stream == StreamPath(format!("/project/{}", projects[2].id))
+            && event.kind == FrameKind::ProjectEvent
+            && matches!(event.parse_payload::<protocol::ProjectEventPayload>(), Ok(protocol::ProjectEventPayload::FilesChanged { files }) if files.iter().any(|file| file.path.relative_path == "src/file.rs"))
+    }).await;
+        release_tx.send(()).unwrap();
+        drop(blocked);
+        drop(overflow);
+        next_frame_matching_on(&mut fixture.client, "overflow rescan invalidates observed file", |event| {
+        assert_ne!(event.kind, FrameKind::CommandError);
+        event.stream == StreamPath(format!("/project/{}", projects[1].id))
+            && event.kind == FrameKind::ProjectEvent
+            && matches!(event.parse_payload::<protocol::ProjectEventPayload>(), Ok(protocol::ProjectEventPayload::FilesChanged { files }) if files.iter().any(|file| file.path == slow_path && file.version > before.version))
+    }).await;
+        fixture
+            .client
+            .project_read_file(&projects[1].id, ProjectReadFilePayload { path: slow_path })
+            .await
+            .unwrap();
+        let recovered =
+            expect_project_file_contents(&mut fixture.client, "overflow file contents").await;
+        assert_eq!(
+            recovered.contents.as_deref(),
+            Some("changed during overflow\n")
+        );
+        assert!(recovered.version > before.version);
+        fs::write(repos[1].path().join("src/burst-299.rs"), "after overflow\n").unwrap();
+        expect_watched_change(&mut fixture.client, "src/burst-299.rs").await;
+    }
+
+    {
+        let project = &projects[0];
+        fixture
+            .client
+            .project_delete(ProjectDeletePayload {
+                id: project.id.clone(),
+            })
+            .await
+            .unwrap();
+        next_frame_matching_on(&mut fixture.client, "delete shared owner", |event| {
+            event.kind == FrameKind::ProjectNotify && matches!(event.parse_payload::<ProjectNotifyPayload>(), Ok(ProjectNotifyPayload::Delete { project: deleted }) if deleted.id == project.id)
+        }).await;
+    }
+    fs::rename(
+        repos[0].path().join("src/dir"),
+        repos[0].path().join("src/renamed"),
+    )
+    .unwrap();
+    next_frame_matching_on(
+        &mut fixture.client,
+        "remaining owner sees rename",
+        |event| {
+            event.stream == StreamPath(format!("/project/{}", nested.id))
+                && event.kind == FrameKind::ProjectFileList
+                && event
+                    .parse_payload::<ProjectFileListPayload>()
+                    .is_ok_and(|listing| {
+                        listing.roots[0]
+                            .entries
+                            .iter()
+                            .any(|entry| entry.relative_path == "renamed/leaf.rs")
+                    })
+        },
+    )
+    .await;
+    fs::write(
+        repos[0].path().join("src/renamed/leaf.rs"),
+        "after rename\n",
+    )
+    .unwrap();
+    next_frame_matching_on(&mut fixture.client, "remaining owner still watches renamed directory", |event| {
+        event.stream == StreamPath(format!("/project/{}", nested.id)) && event.kind == FrameKind::ProjectEvent
+            && matches!(event.parse_payload::<protocol::ProjectEventPayload>(), Ok(protocol::ProjectEventPayload::FilesChanged { files }) if files.iter().any(|file| file.path.relative_path == "renamed/leaf.rs"))
+    }).await;
+    for project in std::iter::once(&nested).chain(projects[1..28].iter()) {
+        fixture
+            .client
+            .project_delete(ProjectDeletePayload {
+                id: project.id.clone(),
+            })
+            .await
+            .unwrap();
+        next_frame_matching_on(&mut fixture.client, "delete remaining watch owner", |event| {
+            event.kind == FrameKind::ProjectNotify && matches!(event.parse_payload::<ProjectNotifyPayload>(), Ok(ProjectNotifyPayload::Delete { project: deleted }) if deleted.id == project.id)
+        }).await;
+    }
+    let survivors = &projects[28..];
+    let mut before_failure = std::collections::HashMap::new();
+    for project in survivors {
+        fixture
+            .client
+            .project_read_file(
+                &project.id,
+                ProjectReadFilePayload {
+                    path: ProjectPath {
+                        root: ProjectRootPath(project_root(project, 0)),
+                        relative_path: "src/file.rs".to_owned(),
+                    },
+                },
+            )
+            .await
+            .unwrap();
+        let before =
+            expect_project_file_contents(&mut fixture.client, "observe before shared failure")
+                .await;
+        before_failure.insert(
+            StreamPath(format!("/project/{}", project.id)),
+            before.version,
+        );
+    }
+    let fault = fixture.on_project_scan(
+        repos[28].path().join("src/file.rs"),
+        server::ScanPoint::WatcherFailure,
+        || {},
+    );
+    fs::write(
+        repos[28].path().join("src/file.rs"),
+        "trigger native failure\n",
+    )
+    .unwrap();
+    let mut warned = std::collections::HashSet::new();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while warned.len() < survivors.len() {
+            let event = fixture.client.next_event().await.unwrap().unwrap();
+            if event.kind == FrameKind::CommandError {
+                let error: CommandErrorPayload = event.parse_payload().unwrap();
+                assert_eq!(error.operation, "project_watch");
+                assert!(!error.fatal);
+                assert!(error.message.contains("automatic recovery"));
+                assert!(
+                    error
+                        .message
+                        .contains("injected native filesystem watcher failure")
+                );
+                assert!(before_failure.contains_key(&event.stream));
+                warned.insert(event.stream);
+            }
+        }
+    })
+    .await
+    .expect("shared native failure reaches every remaining project");
+    drop(fault);
+    for repo in &repos[28..] {
+        fs::write(
+            repo.path().join("src/file.rs"),
+            "changed during native failure\n",
+        )
+        .unwrap();
+    }
+    let mut recovered = std::collections::HashSet::new();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while recovered.len() < survivors.len() {
+            let event = fixture.client.next_event().await.unwrap().unwrap();
+            assert_ne!(event.kind, FrameKind::ProjectBootstrap);
+            assert_ne!(event.kind, FrameKind::CommandError);
+            if event.kind == FrameKind::ProjectEvent
+                && let protocol::ProjectEventPayload::FilesChanged { files } =
+                    event.parse_payload().unwrap()
+                && files.iter().any(|file| {
+                    file.path.relative_path == "src/file.rs"
+                        && file.version > before_failure[&event.stream]
+                })
+            {
+                recovered.insert(event.stream);
+            }
+        }
+    })
+    .await
+    .expect("all projects recover through one replacement native watcher");
+    #[cfg(target_os = "linux")]
+    expect_inotify_instances(2).await;
+    for project in survivors {
+        fixture
+            .client
+            .project_read_file(
+                &project.id,
+                ProjectReadFilePayload {
+                    path: ProjectPath {
+                        root: ProjectRootPath(project_root(project, 0)),
+                        relative_path: "src/file.rs".to_owned(),
+                    },
+                },
+            )
+            .await
+            .unwrap();
+        let after =
+            expect_project_file_contents(&mut fixture.client, "read after shared recovery").await;
+        assert_eq!(
+            after.contents.as_deref(),
+            Some("changed during native failure\n")
+        );
+        assert!(after.version > before_failure[&StreamPath(format!("/project/{}", project.id))]);
+        fs::write(
+            Path::new(&project_root(project, 0)).join("src/file.rs"),
+            "watching after recovery\n",
+        )
+        .unwrap();
+        next_frame_matching_on(&mut fixture.client, "native events resume after shared recovery", |event| {
+            event.stream == StreamPath(format!("/project/{}", project.id)) && event.kind == FrameKind::ProjectEvent
+                && matches!(event.parse_payload::<protocol::ProjectEventPayload>(), Ok(protocol::ProjectEventPayload::FilesChanged { files }) if files.iter().any(|file| file.path.relative_path == "src/file.rs" && file.version > after.version))
+        }).await;
+        fixture
+            .client
+            .project_delete(ProjectDeletePayload {
+                id: project.id.clone(),
+            })
+            .await
+            .unwrap();
+        next_frame_matching_on(&mut fixture.client, "delete recovered watch owner", |event| {
+            event.kind == FrameKind::ProjectNotify && matches!(event.parse_payload::<ProjectNotifyPayload>(), Ok(ProjectNotifyPayload::Delete { project: deleted }) if deleted.id == project.id)
+        }).await;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        expect_inotify_instances(1).await;
+        assert!(!directory_has_inotify_watch(
+            &repos[0].path().join("src/renamed")
+        ));
+    }
+}
+
 #[tokio::test]
 async fn project_watcher_prunes_ignored_build_trees() {
     let mut fixture = Fixture::new().await;
@@ -3971,12 +4405,45 @@ async fn project_watcher_follows_worktree_git_metadata() {
     );
     write_file(&worktree.join(".gitignore"), "target/\n");
     write_file(&worktree.join("target/deep/cache"), "artifact");
+    let primary = create_project_with_real_roots(
+        &mut fixture.client,
+        "Primary shared Git watches",
+        vec![repo.path().to_string_lossy().into_owned()],
+    )
+    .await;
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let ready = fixture.on_project_scan(
+        worktree.clone(),
+        server::ScanPoint::WatcherReady,
+        move || {
+            let _ = ready_tx.send(());
+        },
+    );
     let project = create_project_with_real_roots(
         &mut fixture.client,
         "Worktree watches",
         vec![worktree.to_string_lossy().into_owned()],
     )
     .await;
+    // Bootstrap and a quiet 100 ms do not imply the background Git/ignore walk
+    // has installed watches. The unmodified test lost its first write under load.
+    tokio::time::timeout(Duration::from_secs(5), ready_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    drop(ready);
+    #[cfg(target_os = "linux")]
+    expect_inotify_instances(2).await;
+    fixture
+        .client
+        .project_delete(ProjectDeletePayload {
+            id: primary.id.clone(),
+        })
+        .await
+        .unwrap();
+    next_frame_matching_on(&mut fixture.client, "remove shared Git owner", |event| {
+        event.kind == FrameKind::ProjectNotify && matches!(event.parse_payload::<ProjectNotifyPayload>(), Ok(ProjectNotifyPayload::Delete { project }) if project.id == primary.id)
+    }).await;
     fs::write(worktree.join("source.rs"), "modified\n").unwrap();
     expect_watched_change(&mut fixture.client, "source.rs").await;
     let root = ProjectRootPath(project_root(&project, 0));

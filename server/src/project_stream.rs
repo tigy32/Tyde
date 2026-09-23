@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use notify::{Event, EventKind};
 
-use crate::project_watch::ProjectWatcher;
+use crate::project_watch::{ProjectWatcher, SharedProjectWatcher};
 use protocol::{
     CodeIntelOverviewHeadline, CodeIntelOverviewPayload, CodeIntelOverviewSummary,
     CodeIntelProviderStatus, CodeIntelRootOverview, CodeIntelState, CommandErrorCode,
@@ -117,6 +117,12 @@ pub(crate) struct ProjectDiffRequestKey {
 pub(crate) struct ProjectStreamSubscription {
     pub task: JoinHandle<()>,
     pub handle: ProjectStreamHandle,
+}
+
+impl Drop for ProjectStreamSubscription {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
 }
 
 /// A single advance of the centralized per-file version counter, broadcast to
@@ -397,6 +403,7 @@ impl ProjectStreamHandle {
 }
 
 pub(crate) async fn spawn_project_subscription(
+    shared_watcher: SharedProjectWatcher,
     project_store: Arc<Mutex<ProjectStore>>,
     project_id: ProjectId,
     review_registry: ReviewRegistryHandle,
@@ -411,6 +418,7 @@ pub(crate) async fn spawn_project_subscription(
 
     let task = tokio::spawn(async move {
         run_project_subscription(
+            shared_watcher,
             project_store,
             project_id,
             project,
@@ -430,6 +438,7 @@ pub(crate) async fn spawn_project_subscription(
 }
 
 fn start_project_watcher(
+    shared_watcher: SharedProjectWatcher,
     project: &Project,
     watch_tx: mpsc::UnboundedSender<notify::Result<Event>>,
     force_watch_limit: bool,
@@ -442,7 +451,8 @@ fn start_project_watcher(
         if let Err(error) = std::thread::Builder::new()
             .name("tyde-project-watch-init".to_owned())
             .spawn(move || {
-                let result = create_project_watcher(&project, watch_tx, force_watch_limit);
+                let result =
+                    create_project_watcher(shared_watcher, &project, watch_tx, force_watch_limit);
                 let _ = tx.send(result);
             })
         {
@@ -471,6 +481,7 @@ async fn load_subscription_project(
 }
 
 fn create_project_watcher(
+    shared_watcher: SharedProjectWatcher,
     project: &Project,
     watch_tx: mpsc::UnboundedSender<notify::Result<Event>>,
     force_watch_limit: bool,
@@ -479,7 +490,7 @@ fn create_project_watcher(
         return Err(ProjectWatcherFailure::forced_limit(root));
     }
     tracing::debug!(project_id = %project.id, "registering project filesystem watches");
-    ProjectWatcher::new(project, watch_tx).map_err(|error| {
+    ProjectWatcher::new(shared_watcher, project, watch_tx).map_err(|error| {
         ProjectWatcherFailure::from_notify(
             "failed to create project filesystem watcher".to_owned(),
             error,
@@ -521,6 +532,7 @@ fn initialize_snapshot(project: &Project) -> Result<ProjectSnapshotState, String
 
 #[allow(clippy::too_many_arguments)]
 async fn run_project_subscription(
+    shared_watcher: SharedProjectWatcher,
     project_store: Arc<Mutex<ProjectStore>>,
     project_id: ProjectId,
     mut project: Project,
@@ -552,7 +564,12 @@ async fn run_project_subscription(
     // on every event.
     let mut watcher_roots = WatcherRootPaths::new(project.root_paths());
     let mut pending_update = PendingProjectUpdate::default();
-    let mut watcher_ready_rx = start_project_watcher(&project, watch_tx.clone(), force_watch_limit);
+    let mut watcher_ready_rx = start_project_watcher(
+        shared_watcher.clone(),
+        &project,
+        watch_tx.clone(),
+        force_watch_limit,
+    );
     let mut watcher_initializing = true;
     let mut watcher_retry = Instant::now();
     let mut watcher_warning = None::<String>;
@@ -739,7 +756,7 @@ async fn run_project_subscription(
             }
             _ = sleep_until(watcher_retry), if watcher.is_none() && !watcher_initializing => {
                 tracing::debug!(%project_id, "retrying project filesystem watcher initialization");
-                watcher_ready_rx = start_project_watcher(&project, watch_tx.clone(), force_watch_limit);
+                watcher_ready_rx = start_project_watcher(shared_watcher.clone(), &project, watch_tx.clone(), force_watch_limit);
                 watcher_initializing = true;
             }
             maybe_watcher = watcher_ready_rx.recv(), if watcher_initializing => {
@@ -1137,13 +1154,15 @@ async fn ensure_watched_roots(
         return Ok(());
     }
 
+    let shared_watcher = watcher.shared.clone();
     let observed = watcher.observed.clone();
     let project = project.clone();
-    let mut replacement =
-        tokio::task::spawn_blocking(move || create_project_watcher(&project, watch_tx, false))
-            .await
-            .map_err(|error| error.to_string())?
-            .map_err(|error| error.message)?;
+    let mut replacement = tokio::task::spawn_blocking(move || {
+        create_project_watcher(shared_watcher, &project, watch_tx, false)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+    .map_err(|error| error.message)?;
     for path in observed {
         if roots.contains(&path.root) {
             replacement
@@ -3379,6 +3398,10 @@ pub mod scan_test_support {
         ReadDirectory,
         WatcherInitialize,
         WatcherInitialized,
+        WatcherReady,
+        WatcherProcess,
+        WatcherOverflow,
+        WatcherFailure,
     }
 
     type ScanKey = (PathBuf, ScanPoint);
@@ -3409,7 +3432,7 @@ pub mod scan_test_support {
         }
     }
 
-    pub(crate) fn run(path: &Path, point: ScanPoint) {
+    pub(crate) fn run(path: &Path, point: ScanPoint) -> bool {
         let action = HOOKS
             .get_or_init(Mutex::default)
             .lock()
@@ -3417,6 +3440,9 @@ pub mod scan_test_support {
             .remove(&(path.to_owned(), point));
         if let Some(action) = action {
             action();
+            true
+        } else {
+            false
         }
     }
 }

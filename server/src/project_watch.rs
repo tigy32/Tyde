@@ -1,7 +1,9 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc as sync;
+use std::sync::{Arc, Mutex};
 
 use ignore::WalkBuilder;
 use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
@@ -11,13 +13,287 @@ use tokio::sync::{mpsc, oneshot};
 use crate::project_stream::{GitAccessMode, root_is_git_repository, run_git_mode};
 
 enum Command {
-    Event(notify::Result<Event>),
+    Event(Event),
+    Rescan,
+    Failure(String),
     Observe(PathBuf, oneshot::Sender<notify::Result<()>>),
     Stop,
 }
 
+#[derive(Clone)]
+struct EventSink {
+    tx: sync::Sender<Command>,
+    pending: Arc<AtomicUsize>,
+    rescan: Arc<AtomicBool>,
+    #[cfg(feature = "test-support")]
+    roots: Vec<PathBuf>,
+}
+
+impl EventSink {
+    fn send(&self, event: &Event) {
+        if self.pending.fetch_add(1, Ordering::Relaxed) < 128 {
+            if self.tx.send(Command::Event(event.clone())).is_err() {
+                self.pending.fetch_sub(1, Ordering::Relaxed);
+            }
+        } else {
+            self.pending.fetch_sub(1, Ordering::Relaxed);
+            if !self.rescan.swap(true, Ordering::Relaxed) {
+                tracing::warn!("project watch queue full; scheduling catch-up rescan");
+                let _ = self.tx.send(Command::Rescan);
+                #[cfg(feature = "test-support")]
+                for root in &self.roots {
+                    crate::project_stream::scan_test_support::run(
+                        root,
+                        crate::project_stream::scan_test_support::ScanPoint::WatcherOverflow,
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct SharedProjectWatcher {
+    inner: Arc<Mutex<SharedState>>,
+}
+
+#[derive(Default)]
+struct SharedState {
+    watcher: Option<RecommendedWatcher>,
+    routes: Arc<Mutex<Routes>>,
+    next_id: u64,
+}
+
+#[derive(Default)]
+struct Routes {
+    generation: u64,
+    failed: bool,
+    owners: BTreeMap<PathBuf, HashSet<u64>>,
+    subscribers: HashMap<u64, EventSink>,
+    invalidated: HashSet<PathBuf>,
+}
+
+impl Routes {
+    fn dispatch(&mut self, generation: u64, result: notify::Result<Event>) {
+        if self.generation != generation || self.failed {
+            return;
+        }
+        let event = match result {
+            Ok(event) => event,
+            Err(error) => {
+                self.failed = true;
+                tracing::warn!(%error, "shared project filesystem watcher failed");
+                for sink in self.subscribers.values() {
+                    let _ = sink.tx.send(Command::Failure(error.to_string()));
+                }
+                return;
+            }
+        };
+        if !event.need_rescan()
+            && matches!(
+                event.kind,
+                EventKind::Access(_) | EventKind::Modify(notify::event::ModifyKind::Metadata(_))
+            )
+        {
+            return;
+        }
+        #[cfg(feature = "test-support")]
+        if event.paths.iter().any(|path| {
+            crate::project_stream::scan_test_support::run(
+                path,
+                crate::project_stream::scan_test_support::ScanPoint::WatcherFailure,
+            )
+        }) {
+            self.dispatch(
+                generation,
+                Err(watch_error("injected native filesystem watcher failure")),
+            );
+            return;
+        }
+        let mut recipients = HashSet::new();
+        if event.need_rescan() {
+            self.invalidated.extend(self.owners.keys().cloned());
+            recipients.extend(self.subscribers.keys().copied());
+        } else {
+            for path in &event.paths {
+                for directory in std::iter::once(path.as_path()).chain(path.parent()) {
+                    if let Some(owners) = self.owners.get(directory) {
+                        recipients.extend(owners);
+                    }
+                }
+                if matches!(
+                    event.kind,
+                    EventKind::Remove(_) | EventKind::Modify(notify::event::ModifyKind::Name(_))
+                ) {
+                    for (directory, owners) in self
+                        .owners
+                        .range(path.clone()..)
+                        .take_while(|(directory, _)| directory.starts_with(path))
+                    {
+                        self.invalidated.insert(directory.clone());
+                        recipients.extend(owners);
+                    }
+                }
+            }
+        }
+        for owner in recipients {
+            if let Some(sink) = self.subscribers.get(&owner) {
+                sink.send(&event);
+            }
+        }
+    }
+}
+
+impl SharedProjectWatcher {
+    fn subscribe(&self, project: &Project, sink: EventSink) -> notify::Result<WatchLease> {
+        let mut state = self.inner.lock().unwrap();
+        let failed = state.routes.lock().unwrap().failed;
+        if failed {
+            let mut routes = state.routes.lock().unwrap();
+            routes.generation += 1;
+            routes.subscribers.clear();
+            routes.owners.clear();
+            routes.invalidated.clear();
+            routes.failed = false;
+            drop(routes);
+            state.watcher = None;
+        }
+        if state.watcher.is_none() {
+            let routes = Arc::clone(&state.routes);
+            let generation = routes.lock().unwrap().generation;
+            #[cfg(feature = "test-support")]
+            for root in project.root_paths() {
+                crate::project_stream::scan_test_support::run(
+                    Path::new(&root.0),
+                    crate::project_stream::scan_test_support::ScanPoint::WatcherInitialize,
+                );
+            }
+            tracing::debug!(
+                roots = project.root_paths().len(),
+                "creating shared project filesystem watcher"
+            );
+            let watcher = RecommendedWatcher::new(
+                move |event| routes.lock().unwrap().dispatch(generation, event),
+                Config::default().with_follow_symlinks(false),
+            );
+            #[cfg(feature = "test-support")]
+            for root in project.root_paths() {
+                crate::project_stream::scan_test_support::run(
+                    Path::new(&root.0),
+                    crate::project_stream::scan_test_support::ScanPoint::WatcherInitialized,
+                );
+            }
+            #[cfg(target_os = "linux")]
+            let watcher = watcher.map_err(watcher_creation_error);
+            state.watcher = Some(watcher?);
+        }
+        state.next_id += 1;
+        let id = state.next_id;
+        state.routes.lock().unwrap().subscribers.insert(id, sink);
+        Ok(WatchLease {
+            shared: self.clone(),
+            id,
+            registered: HashSet::new(),
+        })
+    }
+}
+
+struct WatchLease {
+    shared: SharedProjectWatcher,
+    id: u64,
+    registered: HashSet<PathBuf>,
+}
+
+impl WatchLease {
+    fn watch(&mut self, path: &Path, mode: RecursiveMode) -> notify::Result<()> {
+        let mut state = self.shared.inner.lock().unwrap();
+        let mut routes = state.routes.lock().unwrap();
+        if routes.failed || !routes.subscribers.contains_key(&self.id) {
+            return Err(watch_error("shared project filesystem watcher restarting"));
+        }
+        let invalidated = routes.invalidated.remove(path);
+        let owners = routes.owners.entry(path.to_owned()).or_default();
+        let register = owners.is_empty() || invalidated;
+        owners.insert(self.id);
+        // The native watcher invokes its callback while servicing watch commands.
+        // Never hold the routing lock across a synchronous native watch/unwatch.
+        drop(routes);
+        if register {
+            let watcher = state.watcher.as_mut().expect("active watch lease");
+            if invalidated {
+                let _ = watcher.unwatch(path);
+            }
+            if let Err(error) = watcher.watch(path, mode) {
+                let mut routes = state.routes.lock().unwrap();
+                if let Some(owners) = routes.owners.get_mut(path) {
+                    owners.remove(&self.id);
+                    if owners.is_empty() {
+                        routes.owners.remove(path);
+                    } else {
+                        routes.invalidated.insert(path.to_owned());
+                    }
+                }
+                return Err(error);
+            }
+        }
+        self.registered.insert(path.to_owned());
+        Ok(())
+    }
+
+    fn unwatch(&mut self, path: &Path) -> notify::Result<()> {
+        self.registered.remove(path);
+        let mut state = self.shared.inner.lock().unwrap();
+        let mut routes = state.routes.lock().unwrap();
+        let Some(owners) = routes.owners.get_mut(path) else {
+            return Ok(());
+        };
+        if !owners.remove(&self.id) || !owners.is_empty() {
+            return Ok(());
+        }
+        routes.owners.remove(path);
+        routes.invalidated.remove(path);
+        drop(routes);
+        if let Some(watcher) = state.watcher.as_mut()
+            && let Err(error) = watcher.unwatch(path)
+        {
+            if !matches!(error.kind, notify::ErrorKind::WatchNotFound) {
+                let mut routes = state.routes.lock().unwrap();
+                let generation = routes.generation;
+                routes.dispatch(generation, Err(watch_error(&error)));
+            }
+            return Err(error);
+        }
+        Ok(())
+    }
+}
+
+impl Drop for WatchLease {
+    fn drop(&mut self) {
+        for path in self.registered.clone() {
+            if let Err(error) = self.unwatch(&path)
+                && !matches!(error.kind, notify::ErrorKind::WatchNotFound)
+            {
+                tracing::warn!(%error, "failed to release project filesystem watch");
+            }
+        }
+        let mut state = self.shared.inner.lock().unwrap();
+        let mut routes = state.routes.lock().unwrap();
+        routes.subscribers.remove(&self.id);
+        if routes.subscribers.is_empty() {
+            routes.generation += 1;
+            routes.owners.clear();
+            routes.invalidated.clear();
+            routes.failed = false;
+            drop(routes);
+            state.watcher = None;
+            tracing::debug!("released last shared project filesystem watcher lease");
+        }
+    }
+}
+
 pub(crate) struct ProjectWatcher {
     tx: sync::Sender<Command>,
+    pub(crate) shared: SharedProjectWatcher,
     pub(crate) observed: HashSet<ProjectPath>,
 }
 
@@ -29,34 +305,23 @@ impl Drop for ProjectWatcher {
 
 impl ProjectWatcher {
     pub(crate) fn new(
+        shared: SharedProjectWatcher,
         project: &Project,
         events: mpsc::UnboundedSender<notify::Result<Event>>,
     ) -> notify::Result<Self> {
         let (tx, rx) = sync::channel();
-        let callback = tx.clone();
-        #[cfg(feature = "test-support")]
-        for root in project.root_paths() {
-            crate::project_stream::scan_test_support::run(
-                Path::new(&root.0),
-                crate::project_stream::scan_test_support::ScanPoint::WatcherInitialize,
-            );
-        }
-        let watcher = RecommendedWatcher::new(
-            move |event| {
-                let _ = callback.send(Command::Event(event));
-            },
-            Config::default().with_follow_symlinks(false),
-        );
-        #[cfg(feature = "test-support")]
-        for root in project.root_paths() {
-            crate::project_stream::scan_test_support::run(
-                Path::new(&root.0),
-                crate::project_stream::scan_test_support::ScanPoint::WatcherInitialized,
-            );
-        }
-        #[cfg(target_os = "linux")]
-        let watcher = watcher.map_err(watcher_creation_error);
-        let watcher = watcher?;
+        let sink = EventSink {
+            tx: tx.clone(),
+            pending: Arc::default(),
+            rescan: Arc::default(),
+            #[cfg(feature = "test-support")]
+            roots: project
+                .root_paths()
+                .into_iter()
+                .map(|root| PathBuf::from(root.0))
+                .collect(),
+        };
+        let watcher = shared.subscribe(project, sink.clone())?;
         let roots = project
             .root_paths()
             .into_iter()
@@ -73,29 +338,52 @@ impl ProjectWatcher {
             inventory: Inventory::default(),
         };
         state.reconcile()?;
+        #[cfg(feature = "test-support")]
+        for root in &state.roots {
+            crate::project_stream::scan_test_support::run(
+                root,
+                crate::project_stream::scan_test_support::ScanPoint::WatcherReady,
+            );
+        }
         std::thread::Builder::new()
             .name("tyde-project-watch".to_owned())
             .spawn(move || {
                 while let Ok(command) = rx.recv() {
-                    match command {
+                    let event = match command {
                         Command::Stop => break,
                         Command::Observe(path, reply) => {
                             let result = state.observe(path);
                             let _ = reply.send(result);
+                            continue;
                         }
-                        Command::Event(Ok(event)) => match state.process(event) {
-                            Ok(Some(event)) => {
-                                if events.send(Ok(event)).is_err() {
-                                    break;
-                                }
-                            }
-                            Ok(None) => {}
-                            Err(error) => {
-                                let _ = events.send(Err(error));
+                        Command::Event(event) => {
+                            sink.pending.fetch_sub(1, Ordering::Relaxed);
+                            event
+                        }
+                        Command::Rescan => {
+                            sink.rescan.store(false, Ordering::Relaxed);
+                            Event::new(EventKind::Other).set_flag(notify::event::Flag::Rescan)
+                        }
+                        Command::Failure(error) => {
+                            let _ = events.send(Err(watch_error(error)));
+                            break;
+                        }
+                    };
+                    #[cfg(feature = "test-support")]
+                    for root in &state.roots {
+                        crate::project_stream::scan_test_support::run(
+                            root,
+                            crate::project_stream::scan_test_support::ScanPoint::WatcherProcess,
+                        );
+                    }
+                    match state.process(event) {
+                        Ok(Some(event)) => {
+                            if events.send(Ok(event)).is_err() {
                                 break;
                             }
-                        },
-                        Command::Event(Err(error)) => {
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
                             let _ = events.send(Err(error));
                             break;
                         }
@@ -105,6 +393,7 @@ impl ProjectWatcher {
             .map_err(notify::Error::io)?;
         Ok(Self {
             tx,
+            shared,
             observed: HashSet::new(),
         })
     }
@@ -150,7 +439,7 @@ struct Inventory {
 }
 
 struct WatchState {
-    watcher: RecommendedWatcher,
+    watcher: WatchLease,
     roots: Vec<PathBuf>,
     registered: HashSet<PathBuf>,
     explicit: HashSet<PathBuf>,
@@ -368,10 +657,12 @@ impl WatchState {
     }
 
     fn process(&mut self, mut event: Event) -> notify::Result<Option<Event>> {
-        if matches!(
-            event.kind,
-            EventKind::Access(_) | EventKind::Modify(notify::event::ModifyKind::Metadata(_))
-        ) {
+        if !event.need_rescan()
+            && matches!(
+                event.kind,
+                EventKind::Access(_) | EventKind::Modify(notify::event::ModifyKind::Metadata(_))
+            )
+        {
             return Ok(None);
         }
         let mut relevant = Vec::new();
@@ -447,15 +738,18 @@ impl WatchState {
             }
         }
         if reconcile {
-            if matches!(
-                event.kind,
-                EventKind::Remove(_) | EventKind::Modify(notify::event::ModifyKind::Name(_))
-            ) {
+            if event.need_rescan()
+                || matches!(
+                    event.kind,
+                    EventKind::Remove(_) | EventKind::Modify(notify::event::ModifyKind::Name(_))
+                )
+            {
                 let removed: Vec<_> = self
                     .registered
                     .iter()
                     .filter(|registered| {
-                        event.paths.iter().any(|path| registered.starts_with(path))
+                        event.need_rescan()
+                            || event.paths.iter().any(|path| registered.starts_with(path))
                     })
                     .cloned()
                     .collect();

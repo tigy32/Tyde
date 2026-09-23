@@ -802,6 +802,7 @@ pub(crate) struct HostState {
     restore_marker_withdraw_test_gate: Option<Arc<SpawnOperationTestGateInner>>,
     host_streams: HashMap<StreamPath, HostSubscriber>,
     project_streams: HashMap<ProjectId, ProjectStreamSubscription>,
+    project_watcher: crate::project_watch::SharedProjectWatcher,
     terminal_streams: HashMap<(StreamPath, TerminalId), TerminalHandle>,
     browse_streams: HashMap<(StreamPath, StreamPath), Stream>,
     workbench_parent_locks: HashMap<ProjectId, Weak<Mutex<()>>>,
@@ -14789,6 +14790,7 @@ fn spawn_host_inner(
             restore_marker_withdraw_test_gate: None,
             host_streams: HashMap::new(),
             project_streams: HashMap::new(),
+            project_watcher: crate::project_watch::SharedProjectWatcher::default(),
             terminal_streams: HashMap::new(),
             browse_streams: HashMap::new(),
             workbench_parent_locks: HashMap::new(),
@@ -18660,6 +18662,7 @@ async fn ensure_project_actor(
     }
 
     let subscription = spawn_project_subscription(
+        state.project_watcher.clone(),
         Arc::clone(&state.project_store),
         project_id.clone(),
         state.review_registry.clone(),

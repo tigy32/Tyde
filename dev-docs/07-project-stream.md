@@ -633,6 +633,22 @@ Ordinary directory-scan failures do not get this inotify advice, and exhausted
 watch registrations retain the separate `fs.inotify.max_user_watches` guidance.
 Tyde does not change host-wide sysctls automatically.
 
+All projects in a host share one lazily created native filesystem watcher
+(one inotify instance on Linux), independent of the workflow watcher. Directory
+registrations are reference-counted across overlapping roots, Git worktrees,
+ignore controls, and explicitly opened files. Removing a project releases only
+its registrations; the last project releases the native watcher. Disconnected
+UI subscribers do not stop project actors still used by agents/code intelligence.
+
+Event routing and watch registration are shared; ignore filtering, directory
+scans, and Git commands remain in independent project workers. Each worker queues
+at most 128 native events before coalescing overflow into a catch-up rescan that
+also invalidates observed files. Kernel overflow broadcasts a rescan to every
+project and rebuilds registrations. A project-local scan/Git failure does not
+restart healthy projects' watches; a native watcher failure notifies all owners
+and their existing recovery paths recreate one shared watcher. Callbacks from
+an old watcher generation cannot affect its replacement.
+
 Failed watchers are recreated with a five-second retry delay, including watch
 limit failures. Failed scans retain their pending updates and retry after five
 seconds without requiring another filesystem event. Git refresh retries on its

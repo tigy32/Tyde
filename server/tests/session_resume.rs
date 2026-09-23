@@ -17,7 +17,10 @@ use std::time::Duration;
 async fn expect_next_event(client: &mut client::Connection, context: &str) -> Envelope {
     loop {
         let env = fixture::next_logical_frame_on(client, context).await;
-        eprintln!("TYDE SESSION RESUME WAIT context={context} frame={env:?}");
+        eprintln!(
+            "TYDE SESSION RESUME WAIT context={context} kind={} seq={}",
+            env.kind, env.seq
+        );
         if fixture::is_routine_control_plane_frame(&env)
             || matches!(
                 env.kind,
@@ -1605,6 +1608,21 @@ async fn restart_keeps_a_read_only_agent_read_only() {
 #[tokio::test]
 async fn restart_restores_open_agents_and_preserves_settings() {
     let mut fixture = Fixture::new().await;
+    // The failing child replay contained StreamStart/Delta/End at bootstrap
+    // seq 0, already idle, so no later TypingStatusChanged(false) was due.
+    // Hold each turn until subscription to preserve every live-turn assertion.
+    let parent_gate = server::backend::mock::MockGateHandle::new();
+    let child_gate = server::backend::mock::MockGateHandle::new();
+    let closed_gate = server::backend::mock::MockGateHandle::new();
+    let parent_reservation = fixture
+        .reserve_next_mock_launch(
+            "survives restart",
+            MockScript::one(MockTurn::text_after_gate(
+                "mock backend response to: remember this turn",
+                &parent_gate,
+            )),
+        )
+        .await;
     let mut settings = SessionSettingsValues::default();
     settings.0.insert(
         "effort".to_owned(),
@@ -1642,6 +1660,8 @@ async fn restart_restores_open_agents_and_preserves_settings() {
     )
     .await;
     let survivor_session = survivor_start.session_id.expect("survivor session id");
+    parent_gate.release_one();
+    drop(parent_reservation);
     expect_turn_on_stream(
         &mut fixture.client,
         &survivor.instance_stream,
@@ -1649,6 +1669,15 @@ async fn restart_restores_open_agents_and_preserves_settings() {
     )
     .await;
 
+    let child_reservation = fixture
+        .reserve_next_mock_launch(
+            "child survives restart",
+            MockScript::one(MockTurn::text_after_gate(
+                "mock backend response to: child turn",
+                &child_gate,
+            )),
+        )
+        .await;
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
@@ -1683,6 +1712,8 @@ async fn restart_restores_open_agents_and_preserves_settings() {
     let survivor_child_session = survivor_child_start
         .session_id
         .expect("survivor child session id");
+    child_gate.release_one();
+    drop(child_reservation);
     expect_turn_on_stream(
         &mut fixture.client,
         &survivor_child.instance_stream,
@@ -1690,6 +1721,15 @@ async fn restart_restores_open_agents_and_preserves_settings() {
     )
     .await;
 
+    let closed_reservation = fixture
+        .reserve_next_mock_launch(
+            "closed before restart",
+            MockScript::one(MockTurn::text_after_gate(
+                "mock backend response to: do not restore me",
+                &closed_gate,
+            )),
+        )
+        .await;
     fixture
         .client
         .spawn_agent(SpawnAgentPayload {
@@ -1720,6 +1760,8 @@ async fn restart_restores_open_agents_and_preserves_settings() {
         "closed agent start",
     )
     .await;
+    closed_gate.release_one();
+    drop(closed_reservation);
     expect_turn_on_stream(
         &mut fixture.client,
         &closed.instance_stream,
