@@ -1,6 +1,6 @@
 mod fixture;
 
-use settings_model::HostSettingsPayload;
+use settings_model::{HostBootstrapPayload, HostSettingsPayload};
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -5397,6 +5397,7 @@ async fn configured_reviews_are_awaited_without_injecting_parent_messages() {
         before_parent_close.ai_reviewer.status,
         ReviewAiReviewerStatus::Running
     );
+    let (mut backlogged, release_output) = fixture.connect_with_paused_output().await;
     closing_client
         .close_agent(&requester_stream)
         .await
@@ -5415,6 +5416,44 @@ async fn configured_reviews_are_awaited_without_injecting_parent_messages() {
         },
     )
     .await;
+    release_output
+        .send(())
+        .expect("release backlogged observer");
+    let backlogged_host =
+        next_frame_matching_on(&mut backlogged, "backlogged registration", |env| {
+            env.kind == FrameKind::HostBootstrap
+        })
+        .await
+        .parse_payload::<HostBootstrapPayload>()
+        .expect("backlogged host bootstrap");
+    let mut backlogged_bootstraps = std::collections::HashSet::new();
+    let mut backlogged_closed = std::collections::HashSet::new();
+    next_frame_matching_on(&mut backlogged, "backlogged reviewer closure", |env| {
+        if env.kind == FrameKind::AgentBootstrap {
+            backlogged_bootstraps.insert(env.stream.clone());
+        }
+        if env.kind == FrameKind::AgentClosed {
+            let payload: protocol::AgentClosedPayload = env.parse_payload().expect("closed agent");
+            let advertised = backlogged_host
+                .agents
+                .iter()
+                .find(|a| a.agent_id == payload.agent_id);
+            if let Some(advertised) = advertised {
+                assert!(
+                    backlogged_bootstraps.contains(&advertised.instance_stream),
+                    "AgentClosed must follow the advertised agent bootstrap even with backpressure"
+                );
+            }
+            backlogged_closed.insert(payload.agent_id);
+        }
+        expected_closed.is_subset(&backlogged_closed)
+    })
+    .await;
+    eprintln!(
+        "Backlogged reviewer lifecycle: bootstraps={}, closures={}",
+        backlogged_bootstraps.len(),
+        backlogged_closed.len()
+    );
     // The added light round makes ordinal counts stale; assert the exact final round instead.
     let last_round_id = last["rounds"].as_array().unwrap().last().unwrap()["id"]
         .as_str()

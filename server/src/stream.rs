@@ -171,6 +171,31 @@ impl OutputQueue {
             .position(|candidate| Self::eligible(queues, candidate));
         let item = position.and_then(|position| Self::queue_mut(queues, lane).remove(position));
         if let Some(item) = &item {
+            if item.frame.envelope.kind == FrameKind::AgentClosed {
+                let payload: protocol::AgentClosedPayload = item
+                    .frame
+                    .envelope
+                    .parse_payload()
+                    .expect("server emitted invalid AgentClosed payload");
+                let prefix = format!("/agent/{}/", payload.agent_id);
+                let pending_bootstraps = queues
+                    .pending_tokens
+                    .keys()
+                    .filter(|token| {
+                        matches!(token, SchedulerToken::Bootstrapped(path) if path.0.starts_with(&prefix))
+                    })
+                    .count();
+                if pending_bootstraps != 0 {
+                    tracing::error!(
+                        pending_bootstraps,
+                        "agent closure overtook pending bootstrap delivery"
+                    );
+                }
+                debug_assert_eq!(
+                    pending_bootstraps, 0,
+                    "agent closure must follow pending bootstrap delivery"
+                );
+            }
             if lane == OutputLane::Audio {
                 queues.audio_packets = queues.audio_packets.saturating_sub(item.audio_packets)
             } else {
@@ -180,7 +205,7 @@ impl OutputQueue {
         item
     }
 
-    pub fn try_push(&self, output: QueuedOutput) -> Result<(), StreamClosed> {
+    pub fn try_push(&self, mut output: QueuedOutput) -> Result<(), StreamClosed> {
         let mut queues = self.inner.lock().expect("output queue lock poisoned");
         if queues.closed || queues.fatal_overflow {
             return Err(StreamClosed);
@@ -244,6 +269,25 @@ impl OutputQueue {
             }
             self.ready.notify_waiters();
             return Err(StreamClosed);
+        }
+        if output.frame.envelope.kind == FrameKind::AgentClosed {
+            let payload: protocol::AgentClosedPayload = output
+                .frame
+                .envelope
+                .parse_payload()
+                .expect("server emitted invalid AgentClosed payload");
+            let prefix = format!("/agent/{}/", payload.agent_id);
+            // Closing an actor flushes its bootstrap before acknowledging close,
+            // but the chat lane can otherwise overtake that queued bulk frame.
+            output.prerequisites.extend(
+                queues
+                    .pending_tokens
+                    .keys()
+                    .filter(|token| {
+                        matches!(token, SchedulerToken::Bootstrapped(path) if path.0.starts_with(&prefix))
+                    })
+                    .cloned(),
+            );
         }
         for token in &output.completions {
             *queues.pending_tokens.entry(token.clone()).or_default() += 1;

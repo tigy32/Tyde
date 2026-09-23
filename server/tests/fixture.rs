@@ -107,6 +107,50 @@ pub fn init_tracing() {
         .try_init();
 }
 
+// Pause only transport writes; host registration and actor attachment keep running.
+struct PausedWriter {
+    writer: Box<dyn tokio::io::AsyncWrite + Unpin + Send>,
+    release: tokio::sync::oneshot::Receiver<()>,
+    entered: Option<tokio::sync::oneshot::Sender<()>>,
+    released: bool,
+}
+
+impl tokio::io::AsyncWrite for PausedWriter {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        if !self.released {
+            if let Some(entered) = self.entered.take() {
+                let _ = entered.send(());
+            }
+            match std::future::Future::poll(std::pin::Pin::new(&mut self.release), cx) {
+                std::task::Poll::Pending => return std::task::Poll::Pending,
+                std::task::Poll::Ready(Ok(())) => self.released = true,
+                std::task::Poll::Ready(Err(_)) => {
+                    return std::task::Poll::Ready(Err(std::io::ErrorKind::BrokenPipe.into()));
+                }
+            }
+        }
+        std::pin::Pin::new(&mut self.writer).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.writer).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.writer).poll_shutdown(cx)
+    }
+}
+
 pub struct Fixture {
     pub client: client::Connection,
     #[allow(dead_code)]
@@ -403,6 +447,39 @@ impl Fixture {
     #[allow(dead_code)]
     pub async fn reconnect(&mut self) {
         self.client = connect_client(self.host.clone()).await;
+    }
+
+    // Shared fixture compiled into every sim binary; only lifecycle flows pause output.
+    #[allow(dead_code)]
+    pub async fn connect_with_paused_output(
+        &self,
+    ) -> (client::Connection, tokio::sync::oneshot::Sender<()>) {
+        let (client_stream, server_stream) = tokio::io::duplex(8192);
+        let (release, released) = tokio::sync::oneshot::channel();
+        let (entered, blocked) = tokio::sync::oneshot::channel();
+        let host = self.host.clone();
+        tokio::spawn(async move {
+            let mut connection = server::accept(&server::ServerConfig::current(), server_stream)
+                .await
+                .expect("paused connection handshake");
+            connection.writer = Box::new(PausedWriter {
+                writer: connection.writer,
+                release: released,
+                entered: Some(entered),
+                released: false,
+            });
+            if server::run_connection(connection, host).await.is_err() {
+                eprintln!("Paused connection ended with a protocol error");
+            }
+        });
+        let client = client::connect(&client::ClientConfig::current(), client_stream)
+            .await
+            .expect("paused client handshake");
+        tokio::time::timeout(EVENT_TIMEOUT, blocked)
+            .await
+            .expect("server must reach paused output")
+            .expect("paused writer must remain alive");
+        (client, release)
     }
 
     #[allow(dead_code)]
