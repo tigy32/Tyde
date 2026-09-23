@@ -2171,47 +2171,49 @@ input, textarea, select {
 .chat-thinking-ring {
     position: absolute;
     inset: 0;
-    z-index: 3;
+    width: 100%;
+    height: 100%;
+    overflow: visible;
     pointer-events: none;
-    border-radius: inherit;
+    filter: drop-shadow(0 0 4px rgba(74, 158, 255, 0.7));
 }
 
-.chat-thinking-particle {
-    position: absolute;
-    top: 0;
-    left: 0;
-    width: 5px;
-    height: 2px;
-    border-radius: 50%;
-    background: #4a9eff;
-    box-shadow: 0 0 4px #4a9eff;
-    offset-path: inset(1px round calc(var(--radius-xl) - 1px));
-    offset-anchor: center;
-    animation: thinking-orbit 4s linear infinite;
-    animation-delay: var(--orbit-delay);
+.chat-thinking-ring rect {
+    x: 1px;
+    y: 1px;
+    width: calc(100% - 2px);
+    height: calc(100% - 2px);
+    rx: calc(var(--radius-xl) - 1px);
+    fill: none;
+    stroke-width: 1.5px;
+    animation: thinking-orbit 2.4s linear infinite;
 }
 
-.chat-thinking-head {
-    width: 4px;
-    height: 4px;
-    background: #cce7ff;
-    box-shadow: 0 0 3px #4a9eff, 0 0 7px #4a9eff;
+.chat-thinking-ring-tail {
+    stroke: #4a9eff;
+    stroke-linecap: round;
+    stroke-dasharray: 22 78;
+    opacity: 0.55;
+}
+
+/* The head sits at the leading end of the tail: a zero-length first dash
+   and a 14-unit gap place its 8 units at 14–22 of the same pattern. Butt caps
+   keep the zero-length dash from drawing a dot. */
+.chat-thinking-ring-head {
+    stroke: #6cb4ff;
+    stroke-linecap: butt;
+    stroke-dasharray: 0 14 8 78;
 }
 
 @keyframes thinking-orbit {
-    from { offset-distance: calc(0% - var(--trail-distance)); }
-    to { offset-distance: calc(100% - var(--trail-distance)); }
+    from { stroke-dashoffset: 100; }
+    to { stroke-dashoffset: 0; }
 }
 
 @media (prefers-reduced-motion: reduce) {
-    .chat-thinking-ring {
-        box-shadow: inset 0 0 0 1px #4a9eff;
-        opacity: 0.45;
-    }
-
-    .chat-thinking-particle {
-        display: none;
+    .chat-thinking-ring rect {
         animation: none;
+        stroke-dashoffset: 0;
     }
 }
 

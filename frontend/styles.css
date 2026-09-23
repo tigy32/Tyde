@@ -4153,39 +4153,53 @@ kbd {
     position: relative;
 }
 
-.chat-input-area.thinking::before {
-    content: "";
+.chat-thinking-ring {
     position: absolute;
-    inset: 0;
     z-index: 3;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    overflow: visible;
     pointer-events: none;
-    border-radius: inherit;
-    padding: 1px;
-    background: linear-gradient(
-        90deg,
-        transparent 0%,
-        #4a9eff 40%,
-        #4a9eff 60%,
-        transparent 100%
-    );
-    background-size: 200% 100%;
-    -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
-    -webkit-mask-composite: xor;
-    mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
-    mask-composite: exclude;
-    animation: thinking-shimmer 1.6s ease-in-out infinite;
+    filter: drop-shadow(0 0 4px rgba(74, 158, 255, 0.7));
 }
 
-@keyframes thinking-shimmer {
-    0% { background-position: 100% 0; }
-    100% { background-position: -100% 0; }
+.chat-thinking-ring rect {
+    x: 1px;
+    y: 1px;
+    width: calc(100% - 2px);
+    height: calc(100% - 2px);
+    rx: 0;
+    fill: none;
+    stroke-width: 1.5px;
+    animation: thinking-orbit 2.4s linear infinite;
+}
+
+.chat-thinking-ring-tail {
+    stroke: #4a9eff;
+    stroke-linecap: round;
+    stroke-dasharray: 22 78;
+    opacity: 0.55;
+}
+
+/* The head sits at the leading end of the tail: a zero-length first dash
+   and a 14-unit gap place its 8 units at 14–22 of the same pattern. Butt caps
+   keep the zero-length dash from drawing a dot. */
+.chat-thinking-ring-head {
+    stroke: #6cb4ff;
+    stroke-linecap: butt;
+    stroke-dasharray: 0 14 8 78;
+}
+
+@keyframes thinking-orbit {
+    from { stroke-dashoffset: 100; }
+    to { stroke-dashoffset: 0; }
 }
 
 @media (prefers-reduced-motion: reduce) {
-    .chat-input-area.thinking::before {
+    .chat-thinking-ring rect {
         animation: none;
-        background: #4a9eff;
-        opacity: 0.45;
+        stroke-dashoffset: 0;
     }
 }
 

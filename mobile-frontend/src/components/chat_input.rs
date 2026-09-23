@@ -1923,25 +1923,20 @@ pub fn ChatInput() -> impl IntoView {
             <crate::components::activity_drawer::ActivityDrawer />
             <div class="chat-input-row tws-composer" data-mobile-test="chat-input-capsule">
                 <Show when=move || is_running.get()>
-                    <div
+                    <svg
                         class="chat-thinking-ring"
                         data-mobile-test="chat-thinking-ring"
                         aria-hidden="true"
                     >
-                        {(0..2).flat_map(|orbit| (0..=24).map(move |segment| {
-                            let head = segment == 0;
-                            let opacity = if head { 1.0 } else {
-                                0.7 * (1.0 - f64::from(segment) / 25.0).powi(2)
-                            };
-                            view! {
-                                <span
-                                    class=if head { "chat-thinking-particle chat-thinking-head" } else { "chat-thinking-particle" }
-                                    data-mobile-test=if head { "chat-thinking-head" } else { "chat-thinking-trail" }
-                                    style=format!("--trail-distance: {}px; --orbit-delay: {}s; opacity: {opacity}", segment * 3, -1.72 * f64::from(orbit))
-                                ></span>
-                            }
-                        })).collect::<Vec<_>>()}
-                    </div>
+                        <rect
+                            class="chat-thinking-ring-tail"
+                            {..leptos::attr::custom::custom_attribute("pathLength", "100")}
+                        />
+                        <rect
+                            class="chat-thinking-ring-head"
+                            {..leptos::attr::custom::custom_attribute("pathLength", "100")}
+                        />
+                    </svg>
                 </Show>
                 <textarea
                     class="chat-input-field"
@@ -4846,130 +4841,45 @@ mod wasm_tests {
             .trim_end_matches("px")
             .parse()
             .expect("capsule radius in px");
-        let style = window.get_computed_style(&ring_el).unwrap().unwrap();
-        assert_eq!(style.get_property_value("pointer-events").unwrap(), "none");
-        let radius: f64 = style
-            .get_property_value("border-top-left-radius")
-            .unwrap()
-            .trim_end_matches("px")
-            .parse()
-            .unwrap();
-        assert_eq!(radius, capsule_radius, "follow the capsule's corners");
-
-        let heads = ring_el
-            .query_selector_all("[data-mobile-test='chat-thinking-head']")
-            .unwrap();
-        assert_eq!(heads.length(), 2, "two bright heads orbit the composer");
-        let particles = ring_el.query_selector_all("span").unwrap();
-        let mut moving = Vec::new();
-        for index in 0..particles.length() {
-            let particle: HtmlElement = particles.item(index).unwrap().dyn_into().unwrap();
-            let style = window.get_computed_style(&particle).unwrap().unwrap();
-            let duration: f64 = style
-                .get_property_value("animation-duration")
+        let strokes = ring_el.query_selector_all("rect").unwrap();
+        assert!(strokes.length() > 0, "the ring is stroked outlines");
+        for i in 0..strokes.length() {
+            let stroke: web_sys::Element = strokes.get(i).unwrap().dyn_into().unwrap();
+            let style = window
+                .get_computed_style(&stroke)
                 .unwrap()
-                .trim_end_matches('s')
+                .expect("stroke style");
+            let prop = |name: &str| style.get_property_value(name).unwrap();
+            assert_eq!(prop("fill"), "none", "an outline, not a filled shape");
+            let width: f64 = prop("stroke-width")
+                .trim_end_matches("px")
                 .parse()
-                .unwrap();
-            let delay: f64 = style
-                .get_property_value("animation-delay")
-                .unwrap()
-                .trim_end_matches('s')
-                .parse()
-                .unwrap();
-            assert!(duration > 0.0, "the perimeter indicator must move");
-            particle
-                .style()
-                .set_property("animation-play-state", "paused")
-                .unwrap();
-            moving.push((particle, duration, delay));
-        }
-        let head_center = |index| {
-            let head: web_sys::Element = heads.item(index).unwrap().dyn_into().unwrap();
-            let rect = head.get_bounding_client_rect();
-            (
-                rect.x() + rect.width() / 2.0,
-                rect.y() + rect.height() / 2.0,
-            )
-        };
-        let seek = |phase: f64| {
-            for (particle, duration, delay) in &moving {
-                particle
-                    .style()
-                    .set_property("animation-delay", &format!("{}s", delay - phase * duration))
-                    .unwrap();
-            }
-        };
-
-        // The old horizontal gradient moved both edges together. Sample the
-        // rendered heads on phone, desktop, and expanded multiline composers.
-        for (width, height) in [(390, 64), (900, 64), (390, 160)] {
-            container
-                .style()
-                .set_property("width", &format!("{width}px"))
-                .unwrap();
-            let capsule: HtmlElement = capsule.clone().dyn_into().unwrap();
-            capsule
-                .style()
-                .set_property("height", &format!("{height}px"))
-                .unwrap();
-            next_tick().await;
-            let bounds = capsule.get_bounding_client_rect();
-            seek(0.12);
-            let top_before = head_center(0);
-            let bottom_before = head_center(1);
-            seek(0.22);
-            let top_after = head_center(0);
-            let bottom_after = head_center(1);
-            assert!(top_after.0 > top_before.0 + 20.0, "top head travels right");
+                .expect("stroke width in px");
             assert!(
-                bottom_after.0 < bottom_before.0 - 20.0,
-                "bottom head travels left, not in sync with the top"
+                (0.5..=2.0).contains(&width),
+                "a hairline, like desktop's one-pixel edge line: {width}px"
             );
-            assert!((top_after.1 - bounds.top()).abs() < 3.0);
-            assert!((bottom_after.1 - bounds.bottom()).abs() < 3.0);
-
-            for step in 0..32 {
-                seek(f64::from(step) / 32.0);
-                for index in 0..2 {
-                    let (x, y) = head_center(index);
-                    let dx = ((x - (bounds.x() + bounds.width() / 2.0)).abs()
-                        - (bounds.width() / 2.0 - radius))
-                        .max(0.0);
-                    let dy = ((y - (bounds.y() + bounds.height() / 2.0)).abs()
-                        - (bounds.height() / 2.0 - radius))
-                        .max(0.0);
-                    assert!(
-                        (dx.hypot(dy) - (radius - 1.0)).abs() < 1.0,
-                        "heads follow every edge and rounded corner, never cross the input: {x}, {y}"
-                    );
-                }
-            }
-        }
-        seek(0.2);
-        let head = head_center(0);
-        let tails = ring_el
-            .query_selector_all("[data-mobile-test='chat-thinking-trail']")
-            .unwrap();
-        assert!(tails.length() >= 2, "heads have a trailing glow");
-        let mut last_x = head.0;
-        let mut last_opacity = 1.0;
-        for index in 0..tails.length() / 2 {
-            let tail: web_sys::Element = tails.item(index).unwrap().dyn_into().unwrap();
-            let rect = tail.get_bounding_client_rect();
-            let x = rect.x() + rect.width() / 2.0;
-            let opacity: f64 = window
-                .get_computed_style(&tail)
-                .unwrap()
-                .unwrap()
-                .get_property_value("opacity")
-                .unwrap()
-                .parse()
-                .unwrap();
-            assert!(x < last_x, "the glow trails behind the head");
-            assert!(opacity < last_opacity, "the trail fades toward its tail");
-            last_x = x;
-            last_opacity = opacity;
+            let radius: f64 = prop("rx").trim_end_matches("px").parse().expect("rx in px");
+            assert!(
+                (radius - (capsule_radius - 1.0)).abs() < 1.0,
+                "the outline follows the capsule's corner radius ({radius} vs {capsule_radius})"
+            );
+            let dashes = prop("stroke-dasharray");
+            let lit: f64 = dashes
+                .split([',', ' '])
+                .filter(|part| !part.is_empty())
+                .map(|part| {
+                    part.trim_end_matches("px")
+                        .parse::<f64>()
+                        .expect("dash length")
+                })
+                .step_by(2)
+                .sum();
+            assert!(
+                lit > 0.0 && lit < 50.0,
+                "a lit segment that leaves most of the rim dark, got {dashes}"
+            );
+            assert_ne!(prop("animation-name"), "none", "the segment orbits the rim");
         }
 
         state.agent_turn_active.update(|m| {

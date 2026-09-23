@@ -1532,12 +1532,27 @@ pub fn ChatInput(
         <div class="chat-composer">
         <div
             class="chat-input-area"
-            class:thinking=is_thinking
             on:dragenter=on_dragenter
             on:dragover=on_dragover
             on:dragleave=on_dragleave
             on:drop=on_drop
         >
+            <Show when=is_thinking>
+                    <svg
+                        class="chat-thinking-ring"
+                        data-testid="chat-thinking-ring"
+                        aria-hidden="true"
+                    >
+                        <rect
+                            class="chat-thinking-ring-tail"
+                            {..leptos::attr::custom::custom_attribute("pathLength", "100")}
+                        />
+                        <rect
+                            class="chat-thinking-ring-head"
+                            {..leptos::attr::custom::custom_attribute("pathLength", "100")}
+                        />
+                    </svg>
+            </Show>
             <InflightTray agent_ref=agent_ref />
             <div class="chat-input-content">
             <crate::notices::ActionError error=action_error />
@@ -2918,36 +2933,48 @@ mod wasm_tests {
 
         let composer = query(&container, ".chat-input-area").expect("composer");
         let window = web_sys::window().unwrap();
-        let style = window
-            .get_computed_style_with_pseudo_elt(&composer, "::before")
-            .unwrap()
-            .unwrap();
-        let prop = |name: &str| style.get_property_value(name).unwrap();
-        let height: f64 = prop("height").trim_end_matches("px").parse().unwrap();
-        assert!(
-            height > 32.0,
-            "the shimmer surrounds the composer, not just its top edge: {height}px"
-        );
-        for edge in ["top", "right", "bottom", "left"] {
-            assert_eq!(prop(edge), "0px", "cover the full {edge} edge");
-            assert_eq!(prop(&format!("padding-{edge}")), "1px");
+        let ring = query(&container, "[data-testid='chat-thinking-ring']")
+            .expect("desktop uses the original mobile orbit");
+        let style = window.get_computed_style(&ring).unwrap().unwrap();
+        assert_eq!(style.get_property_value("pointer-events").unwrap(), "none");
+        let strokes = ring.query_selector_all("rect").unwrap();
+        assert_eq!(strokes.length(), 2, "one bright head and its dim tail");
+        for index in 0..strokes.length() {
+            let stroke: web_sys::Element = strokes.item(index).unwrap().dyn_into().unwrap();
+            let style = window.get_computed_style(&stroke).unwrap().unwrap();
+            let prop = |name: &str| style.get_property_value(name).unwrap();
+            assert_eq!(prop("fill"), "none", "leave the composer center clear");
+            assert_eq!(prop("stroke-width"), "1.5px", "retain the mobile hairline");
+            assert_eq!(stroke.get_attribute("pathLength").as_deref(), Some("100"));
+            assert_eq!(prop("animation-duration"), "2.4s");
+            assert_eq!(prop("animation-timing-function"), "linear");
+            assert_eq!(prop("animation-iteration-count"), "infinite");
+            if index == 0 {
+                assert_eq!(prop("stroke"), "rgb(74, 158, 255)");
+                assert_eq!(prop("stroke-dasharray"), "22px, 78px");
+                assert_eq!(prop("opacity"), "0.55");
+            } else {
+                assert_eq!(prop("stroke"), "rgb(108, 180, 255)");
+                assert_eq!(prop("stroke-dasharray"), "0px, 14px, 8px, 78px");
+                assert_eq!(prop("stroke-linecap"), "butt", "no extra dot at the tail");
+            }
         }
-        // Chrome computes one composite per mask layer: "exclude, exclude".
-        assert_eq!(
-            prop("mask-composite"),
-            "exclude, exclude",
-            "keep the center clear"
-        );
-        assert!(prop("mask-clip").starts_with("content-box"));
-        assert_eq!(prop("mask-image").matches("linear-gradient").count(), 2);
-        assert!(prop("background-image").contains("rgb(74, 158, 255)"));
-        assert_eq!(prop("pointer-events"), "none");
-        assert_ne!(prop("animation-name"), "none");
-        assert_eq!(prop("animation-duration"), "1.6s");
-        assert_eq!(prop("animation-timing-function"), "ease-in-out");
 
         let assert_outline_bounds = || {
             let outline = composer.get_bounding_client_rect();
+            let ring_box = ring.get_bounding_client_rect();
+            for (actual, expected) in [
+                (ring_box.top(), outline.top()),
+                (ring_box.bottom(), outline.bottom()),
+                (ring_box.left(), outline.left()),
+                (ring_box.right(), outline.right()),
+            ] {
+                assert!(
+                    (actual - expected).abs() < 0.5,
+                    "the orbit hugs the whole composer"
+                );
+            }
+
             let input = query(&container, "textarea")
                 .unwrap()
                 .get_bounding_client_rect();
@@ -3031,11 +3058,10 @@ mod wasm_tests {
             active.remove(&AgentId(AGENT.to_owned()));
         });
         next_tick().await;
-        let idle_style = window
-            .get_computed_style_with_pseudo_elt(&composer, "::before")
-            .unwrap()
-            .unwrap();
-        assert_eq!(idle_style.get_property_value("content").unwrap(), "none");
+        assert!(
+            query(&container, "[data-testid='chat-thinking-ring']").is_none(),
+            "idle composers have no orbit"
+        );
         assert_eq!(primary(&container).text_content().unwrap().trim(), "Send");
     }
 
