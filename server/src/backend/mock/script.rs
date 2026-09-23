@@ -27,6 +27,8 @@ pub struct MockScript {
     pub(super) unbounded_echo: bool,
     pub(super) user_bubbles: bool,
     pub(super) busy_self_turn_once: bool,
+    pub(super) resume_continuation: Option<(MockGate, MockGate)>,
+    pub(super) resume_replay: Option<MockResumeReplay>,
     pub(super) mid_turn_steering: bool,
     pub(super) shutdown_gate: Option<MockGate>,
     pub(super) compaction_observation_gates: Option<(MockGate, MockGate)>,
@@ -74,6 +76,20 @@ impl MockScript {
         self
     }
 
+    pub fn with_resume_continuation(
+        mut self,
+        replay: &MockGateHandle,
+        finish: &MockGateHandle,
+    ) -> Self {
+        self.resume_continuation = Some((replay.gate(), finish.gate()));
+        self
+    }
+
+    pub fn with_controlled_resume_replay(mut self, replay: &MockResumeReplay) -> Self {
+        self.resume_replay = Some(replay.clone());
+        self
+    }
+
     pub fn with_busy_self_turn_once(mut self) -> Self {
         self.busy_self_turn_once = true;
         self
@@ -105,6 +121,49 @@ impl MockScript {
     pub fn with_shutdown_gate(mut self, gate: &MockGateHandle) -> Self {
         self.shutdown_gate = Some(gate.gate());
         self
+    }
+}
+
+/// Synchronous replay production lets a sim queue history before advancing its
+/// paused clock, without scheduling the server between those two operations.
+#[derive(Debug, Clone, Default)]
+pub struct MockResumeReplay {
+    ready: std::sync::Arc<tokio::sync::Notify>,
+    sender:
+        std::sync::Arc<std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<BackendEvent>>>>,
+}
+
+impl MockResumeReplay {
+    pub(super) fn bind(&self, sender: tokio::sync::mpsc::UnboundedSender<BackendEvent>) {
+        *self.sender.lock().expect("mock replay sender mutex") = Some(sender);
+        self.ready.notify_one();
+    }
+
+    pub async fn wait_until_started(&self) {
+        self.ready.notified().await;
+    }
+
+    pub fn history_batch(&self, count: usize) {
+        let sender = self.sender.lock().expect("mock replay sender mutex");
+        let sender = sender.as_ref().expect("mock resume has not started");
+        for _ in 0..count {
+            sender
+                .send(emit::message_added(emit::mock_assistant_message(
+                    Some(ChatMessageId(Uuid::new_v4().to_string())),
+                    "replayed history".to_owned(),
+                )))
+                .expect("mock replay stream closed");
+        }
+    }
+
+    pub fn complete(&self) {
+        self.sender
+            .lock()
+            .expect("mock replay sender mutex")
+            .as_ref()
+            .expect("mock resume has not started")
+            .send(BackendEvent::ResumeReplayComplete(Ok(())))
+            .expect("mock replay stream closed");
     }
 }
 

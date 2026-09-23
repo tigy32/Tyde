@@ -385,6 +385,10 @@ impl TurnEmitter {
         }));
     }
 
+    pub(crate) fn resume_replay_complete(&self) {
+        self.lock().send(json!({ "kind": "ResumeReplayComplete" }));
+    }
+
     pub(crate) fn compaction_event(&self, event: &super::compaction::BackendCompactionEvent) {
         let data = serde_json::to_value(event).expect("backend compaction event must serialize");
         self.lock().send(json!({

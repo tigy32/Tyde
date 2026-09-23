@@ -37,7 +37,7 @@ use protocol::{
 };
 use serde_json::Value;
 use settings_model::BackendTierConfig;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 use tyde_agent_adapter::{BackendCapabilities, BackendCapability};
 
 use self::subprocess::ImageAttachment;
@@ -502,6 +502,9 @@ pub enum BackendEvent {
     Chat(ChatEvent),
     ModelRequestTokenUsage(ModelRequestTokenUsage),
     Compaction(BackendCompactionEvent),
+    /// Exactly one per resume, after all history and before any live event.
+    /// Failure terminates startup instead of admitting a partial replay.
+    ResumeReplayComplete(Result<(), String>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -591,7 +594,6 @@ struct OpenToolCall {
 pub struct EventStream {
     rx: EventStreamReceiver,
     buffered: VecDeque<BackendEvent>,
-    resume_replay_complete: Option<oneshot::Receiver<()>>,
     transcript_metadata_projector: Option<BackendTranscriptMetadataProjector>,
     pending_delta: Option<PendingDelta>,
     /// Whether the open response has already had a delta emitted.
@@ -614,7 +616,6 @@ impl EventStream {
             pending_delta: None,
             response_started_streaming: false,
             open_tool_names: HashMap::new(),
-            resume_replay_complete: None,
             transcript_metadata_projector: None,
         }
     }
@@ -626,7 +627,6 @@ impl EventStream {
             pending_delta: None,
             response_started_streaming: false,
             open_tool_names: HashMap::new(),
-            resume_replay_complete: None,
             transcript_metadata_projector: None,
         }
     }
@@ -641,53 +641,6 @@ impl EventStream {
             pending_delta: None,
             response_started_streaming: false,
             open_tool_names: HashMap::new(),
-            resume_replay_complete: None,
-            transcript_metadata_projector: Some(Arc::new(projector)),
-        }
-    }
-
-    pub fn new_with_resume_replay_barrier(
-        rx: mpsc::UnboundedReceiver<ChatEvent>,
-        resume_replay_complete: oneshot::Receiver<()>,
-    ) -> Self {
-        Self {
-            rx: EventStreamReceiver::Chat(rx),
-            buffered: VecDeque::new(),
-            pending_delta: None,
-            response_started_streaming: false,
-            open_tool_names: HashMap::new(),
-            resume_replay_complete: Some(resume_replay_complete),
-            transcript_metadata_projector: None,
-        }
-    }
-
-    pub(crate) fn new_backend_with_resume_replay_barrier(
-        rx: mpsc::UnboundedReceiver<BackendEvent>,
-        resume_replay_complete: oneshot::Receiver<()>,
-    ) -> Self {
-        Self {
-            rx: EventStreamReceiver::Backend(rx),
-            buffered: VecDeque::new(),
-            pending_delta: None,
-            response_started_streaming: false,
-            open_tool_names: HashMap::new(),
-            resume_replay_complete: Some(resume_replay_complete),
-            transcript_metadata_projector: None,
-        }
-    }
-
-    pub(crate) fn new_backend_with_resume_replay_barrier_and_transcript_metadata(
-        rx: mpsc::UnboundedReceiver<BackendEvent>,
-        resume_replay_complete: oneshot::Receiver<()>,
-        projector: impl Fn(&ChatEvent) -> BackendTranscriptEventMetadata + Send + Sync + 'static,
-    ) -> Self {
-        Self {
-            rx: EventStreamReceiver::Backend(rx),
-            buffered: VecDeque::new(),
-            pending_delta: None,
-            response_started_streaming: false,
-            open_tool_names: HashMap::new(),
-            resume_replay_complete: Some(resume_replay_complete),
             transcript_metadata_projector: Some(Arc::new(projector)),
         }
     }
@@ -698,39 +651,45 @@ impl EventStream {
         loop {
             match self.recv_backend().await? {
                 BackendEvent::Chat(event) => return Some(event),
-                BackendEvent::ModelRequestTokenUsage(_) | BackendEvent::Compaction(_) => {}
+                BackendEvent::ModelRequestTokenUsage(_)
+                | BackendEvent::Compaction(_)
+                | BackendEvent::ResumeReplayComplete(_) => {}
             }
         }
     }
 
     /// Receive the next normalized event for adapter conformance testing.
     pub async fn recv_observation(&mut self) -> Option<tyde_agent_adapter::BackendObservation> {
-        self.recv_backend().await.map(|event| match event {
-            BackendEvent::Chat(event) => tyde_agent_adapter::BackendObservation::Chat(event),
-            BackendEvent::ModelRequestTokenUsage(usage) => {
-                tyde_agent_adapter::BackendObservation::ModelRequestTokenUsage(usage)
-            }
-            BackendEvent::Compaction(event) => {
-                tyde_agent_adapter::BackendObservation::Compaction(match event {
-                    BackendCompactionEvent::Progress(progress) => {
-                        tyde_agent_adapter::BackendCompactionObservation::Progress {
-                            operation_id: progress.operation_id,
-                            stage: progress.stage,
-                            elapsed_ms: progress.elapsed_ms,
+        loop {
+            let observation = match self.recv_backend().await? {
+                BackendEvent::Chat(event) => tyde_agent_adapter::BackendObservation::Chat(event),
+                BackendEvent::ModelRequestTokenUsage(usage) => {
+                    tyde_agent_adapter::BackendObservation::ModelRequestTokenUsage(usage)
+                }
+                BackendEvent::Compaction(event) => {
+                    tyde_agent_adapter::BackendObservation::Compaction(match event {
+                        BackendCompactionEvent::Progress(progress) => {
+                            tyde_agent_adapter::BackendCompactionObservation::Progress {
+                                operation_id: progress.operation_id,
+                                stage: progress.stage,
+                                elapsed_ms: progress.elapsed_ms,
+                            }
                         }
-                    }
-                    BackendCompactionEvent::Observed(observed) => {
-                        tyde_agent_adapter::BackendCompactionObservation::Observed {
-                            observation_id: observed.observation_id,
-                            trigger: observed.trigger,
-                            method: observed.method,
-                            provider_session_id: observed.provider_session_id,
-                            metrics: observed.metrics,
+                        BackendCompactionEvent::Observed(observed) => {
+                            tyde_agent_adapter::BackendCompactionObservation::Observed {
+                                observation_id: observed.observation_id,
+                                trigger: observed.trigger,
+                                method: observed.method,
+                                provider_session_id: observed.provider_session_id,
+                                metrics: observed.metrics,
+                            }
                         }
-                    }
-                })
-            }
-        })
+                    })
+                }
+                BackendEvent::ResumeReplayComplete(_) => continue,
+            };
+            return Some(observation);
+        }
     }
 
     /// Non-blocking receive used to drain already-buffered backend events
@@ -739,7 +698,9 @@ impl EventStream {
         loop {
             match self.try_recv_backend()? {
                 BackendEvent::Chat(event) => return Ok(event),
-                BackendEvent::ModelRequestTokenUsage(_) | BackendEvent::Compaction(_) => {}
+                BackendEvent::ModelRequestTokenUsage(_)
+                | BackendEvent::Compaction(_)
+                | BackendEvent::ResumeReplayComplete(_) => {}
             }
         }
     }
@@ -995,10 +956,6 @@ impl EventStream {
             "backend transcript provider identity must be complete"
         );
         metadata
-    }
-
-    pub fn take_resume_replay_complete(&mut self) -> Option<oneshot::Receiver<()>> {
-        self.resume_replay_complete.take()
     }
 }
 
@@ -1441,6 +1398,9 @@ pub trait Backend: Send + Sync + 'static {
         Self: Sized;
 
     /// Resume an existing backend session.
+    /// The returned stream must emit exactly one ResumeReplayComplete after
+    /// history and before live work, including provider-initiated turns.
+    /// Startup failures after returning the stream use its Err form.
     fn resume(
         workspace_roots: Vec<String>,
         config: BackendSpawnConfig,
@@ -1920,22 +1880,7 @@ async fn prepare_concrete_backend_binding<B: Backend>(
             provider_session_id: identity_after.clone(),
             message,
         })?;
-    if let Some(replay_ready) = events.take_resume_replay_complete() {
-        match tokio::time::timeout(std::time::Duration::from_secs(300), replay_ready).await {
-            Ok(Ok(())) => {}
-            Ok(Err(_)) => {
-                backend.shutdown().await;
-                return Err(BackendBindingPrepareError::BootstrapStreamClosed {
-                    backend_kind: kind,
-                });
-            }
-            Err(_) => {
-                backend.shutdown().await;
-                return Err(BackendBindingPrepareError::BootstrapTimedOut { backend_kind: kind });
-            }
-        }
-    }
-    if let Err(error) = drain_prepared_binding_replay(kind, &mut events) {
+    if let Err(error) = drain_prepared_binding_replay(kind, &mut events).await {
         backend.shutdown().await;
         return Err(error);
     }
@@ -2032,6 +1977,12 @@ async fn drain_prepared_binding_bootstrap(
                         activity: "provider task state".to_owned(),
                     });
                 }
+                BackendEvent::ResumeReplayComplete(_) => {
+                    return Err(BackendBindingPrepareError::BootstrapFailed {
+                        backend_kind: kind,
+                        message: "unexpected resume boundary during bootstrap".to_owned(),
+                    });
+                }
                 BackendEvent::Chat(_)
                 | BackendEvent::ModelRequestTokenUsage(_)
                 | BackendEvent::Compaction(_) => {}
@@ -2044,68 +1995,78 @@ async fn drain_prepared_binding_bootstrap(
         .map_err(|_| BackendBindingPrepareError::BootstrapTimedOut { backend_kind: kind })?
 }
 
-fn drain_prepared_binding_replay(
+async fn drain_prepared_binding_replay(
     kind: BackendKind,
     events: &mut EventStream,
 ) -> Result<(), BackendBindingPrepareError> {
-    loop {
-        match events.try_recv_backend() {
-            Ok(BackendEvent::Chat(ChatEvent::MessageAdded(message)))
-                if matches!(
-                    message.sender,
-                    protocol::MessageSender::Error | protocol::MessageSender::Warning
-                ) =>
-            {
-                return Err(BackendBindingPrepareError::BootstrapFailed {
-                    backend_kind: kind,
-                    message: message.content,
-                });
-            }
-            Ok(BackendEvent::Chat(ChatEvent::OperationCancelled(cancelled))) => {
-                return Err(BackendBindingPrepareError::BootstrapFailed {
-                    backend_kind: kind,
-                    message: cancelled.message,
-                });
-            }
-            Ok(BackendEvent::Chat(ChatEvent::ToolRequest(request))) => {
-                return Err(BackendBindingPrepareError::BootstrapUnsafeActivity {
-                    backend_kind: kind,
-                    activity: format!("replayed tool request {}", request.tool_call_id),
-                });
-            }
-            Ok(BackendEvent::Chat(ChatEvent::ToolExecutionCompleted(completion))) => {
-                return Err(BackendBindingPrepareError::BootstrapUnsafeActivity {
-                    backend_kind: kind,
-                    activity: format!("replayed tool completion {}", completion.tool_call_id),
-                });
-            }
-            Ok(BackendEvent::Chat(ChatEvent::ToolProgress(progress))) => {
-                return Err(BackendBindingPrepareError::BootstrapUnsafeActivity {
-                    backend_kind: kind,
-                    activity: format!("replayed tool progress {:?}", progress.update),
-                });
-            }
-            Ok(BackendEvent::Chat(
-                ChatEvent::GoalChanged(Some(_)) | ChatEvent::GoalCompleted(_),
-            ))
-            | Ok(BackendEvent::Chat(ChatEvent::TaskUpdate(_)))
-            | Ok(BackendEvent::Chat(ChatEvent::Orchestration(_))) => {
-                return Err(BackendBindingPrepareError::BootstrapUnsafeActivity {
-                    backend_kind: kind,
-                    activity: "replayed provider task or orchestration state".to_owned(),
-                });
-            }
-            Ok(BackendEvent::Chat(_))
-            | Ok(BackendEvent::ModelRequestTokenUsage(_))
-            | Ok(BackendEvent::Compaction(_)) => {}
-            Err(mpsc::error::TryRecvError::Empty) => return Ok(()),
-            Err(mpsc::error::TryRecvError::Disconnected) => {
-                return Err(BackendBindingPrepareError::BootstrapStreamClosed {
-                    backend_kind: kind,
-                });
+    let drain = async {
+        loop {
+            match events.recv_backend().await {
+                Some(BackendEvent::Chat(ChatEvent::MessageAdded(message)))
+                    if matches!(
+                        message.sender,
+                        protocol::MessageSender::Error | protocol::MessageSender::Warning
+                    ) =>
+                {
+                    return Err(BackendBindingPrepareError::BootstrapFailed {
+                        backend_kind: kind,
+                        message: message.content,
+                    });
+                }
+                Some(BackendEvent::Chat(ChatEvent::OperationCancelled(cancelled))) => {
+                    return Err(BackendBindingPrepareError::BootstrapFailed {
+                        backend_kind: kind,
+                        message: cancelled.message,
+                    });
+                }
+                Some(BackendEvent::Chat(ChatEvent::ToolRequest(request))) => {
+                    return Err(BackendBindingPrepareError::BootstrapUnsafeActivity {
+                        backend_kind: kind,
+                        activity: format!("replayed tool request {}", request.tool_call_id),
+                    });
+                }
+                Some(BackendEvent::Chat(ChatEvent::ToolExecutionCompleted(completion))) => {
+                    return Err(BackendBindingPrepareError::BootstrapUnsafeActivity {
+                        backend_kind: kind,
+                        activity: format!("replayed tool completion {}", completion.tool_call_id),
+                    });
+                }
+                Some(BackendEvent::Chat(ChatEvent::ToolProgress(progress))) => {
+                    return Err(BackendBindingPrepareError::BootstrapUnsafeActivity {
+                        backend_kind: kind,
+                        activity: format!("replayed tool progress {:?}", progress.update),
+                    });
+                }
+                Some(BackendEvent::Chat(
+                    ChatEvent::GoalChanged(Some(_)) | ChatEvent::GoalCompleted(_),
+                ))
+                | Some(BackendEvent::Chat(ChatEvent::TaskUpdate(_)))
+                | Some(BackendEvent::Chat(ChatEvent::Orchestration(_))) => {
+                    return Err(BackendBindingPrepareError::BootstrapUnsafeActivity {
+                        backend_kind: kind,
+                        activity: "replayed provider task or orchestration state".to_owned(),
+                    });
+                }
+                Some(BackendEvent::Chat(_))
+                | Some(BackendEvent::ModelRequestTokenUsage(_))
+                | Some(BackendEvent::Compaction(_)) => {}
+                Some(BackendEvent::ResumeReplayComplete(result)) => {
+                    return result.map_err(|message| BackendBindingPrepareError::BootstrapFailed {
+                        backend_kind: kind,
+                        message,
+                    });
+                }
+                None => {
+                    return Err(BackendBindingPrepareError::BootstrapStreamClosed {
+                        backend_kind: kind,
+                    });
+                }
             }
         }
-    }
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(300), drain)
+        .await
+        .map_err(|_| BackendBindingPrepareError::BootstrapTimedOut { backend_kind: kind })?
 }
 
 pub(crate) fn backend_fork_unsupported_message(backend_kind: BackendKind) -> String {

@@ -1380,7 +1380,6 @@ impl Backend for HermesBackend {
                 warning_message(notice),
             )));
         }
-        let (resume_replay_complete_tx, resume_replay_complete_rx) = oneshot::channel();
         let stored_session_id = Arc::new(std::sync::Mutex::new(SessionId(resumed)));
         let compaction_capability = Arc::new(std::sync::Mutex::new(hermes_compaction_capability(
             gateway.provider_version.as_deref(),
@@ -1411,11 +1410,7 @@ impl Backend for HermesBackend {
             synthetic_subagent_ids: HashMap::new(),
             recent_stderr: VecDeque::new(),
         };
-        tokio::spawn(actor.run(
-            None,
-            Some((replay_events, resume_replay_complete_tx)),
-            Vec::new(),
-        ));
+        tokio::spawn(actor.run(None, Some(replay_events), Vec::new()));
 
         Ok((
             Self {
@@ -1426,10 +1421,7 @@ impl Backend for HermesBackend {
                 compaction_capability,
                 active_compaction,
             },
-            EventStream::new_backend_with_resume_replay_barrier(
-                events_rx,
-                resume_replay_complete_rx,
-            ),
+            EventStream::new_backend(events_rx),
         ))
     }
 
@@ -2567,18 +2559,24 @@ impl HermesSessionActor {
     async fn run(
         mut self,
         initial_input: Option<protocol::SendMessagePayload>,
-        replay: Option<(Vec<ChatEvent>, oneshot::Sender<()>)>,
+        replay: Option<Vec<ChatEvent>>,
         startup_gateway_events: Vec<HermesGatewayEvent>,
     ) {
-        if let Some((events, barrier)) = replay {
+        if let Some(events) = replay {
             for event in events {
                 if self.events_tx.send(BackendEvent::Chat(event)).is_err() {
-                    let _ = barrier.send(());
                     self.gateway.shutdown().await;
                     return;
                 }
             }
-            let _ = barrier.send(());
+            if self
+                .events_tx
+                .send(BackendEvent::ResumeReplayComplete(Ok(())))
+                .is_err()
+            {
+                self.gateway.shutdown().await;
+                return;
+            }
         }
 
         for event in startup_gateway_events {

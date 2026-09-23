@@ -239,6 +239,9 @@ impl<B: Backend> ControlService<B> {
                             }
                             BackendEvent::ModelRequestTokenUsage(usage) => child.requests.push(usage),
                             BackendEvent::Compaction(_) => {}
+                            BackendEvent::ResumeReplayComplete(_) => {
+                                child.failure = Some("unexpected resume boundary in a newly spawned child".to_owned());
+                            }
                         }
                         drop(children);
                         service.changed();

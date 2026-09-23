@@ -345,9 +345,6 @@ enum AgentCommand {
         limit: usize,
         reply: oneshot::Sender<SessionHistoryWindow>,
     },
-    ResumeReplayBarrier {
-        result: Result<(), String>,
-    },
     ReadActivityHistory {
         after_seq: Option<u64>,
         max_events: usize,
@@ -3092,7 +3089,6 @@ pub(crate) fn spawn_agent_actor(
                             pending_inputs.push_back(input);
                             let _ = reply.send(Ok(()));
                         }
-                        AgentCommand::ResumeReplayBarrier { .. } => {}
                         #[cfg(feature = "test-support")]
                         AgentCommand::ForceBackendShutdownForConformance { reply } => {
                             let _ = reply.send(true);
@@ -3240,18 +3236,12 @@ pub(crate) fn spawn_agent_actor(
         replay_state.journal_agent_id = Some(current_start.agent_id.clone());
         current_start.session_id = Some(actor_session_id.clone());
         let _ = start_tx.send(current_start.clone());
-        let mut resume_replay_gate_pending = false;
+        let mut resume_replay_gate_pending = is_resume;
+        let resume_replay_deadline = tokio::time::Instant::now() + RESUME_REPLAY_BARRIER_TIMEOUT;
         let mut deferred_authoritative_resume_events = Vec::new();
         let mut pending_resume_attaches: Vec<(Stream, oneshot::Sender<bool>)> = Vec::new();
-        let mut resume_replay_barrier_task = None;
-        if is_resume && let Some(barrier_rx) = events.take_resume_replay_complete() {
-            resume_replay_gate_pending = true;
+        if is_resume {
             pending_resume_attaches.append(&mut pending_startup_attaches);
-            resume_replay_barrier_task = Some(spawn_resume_replay_barrier_task(
-                actor_tx.clone(),
-                barrier_rx,
-                current_start.agent_id.clone(),
-            ));
         }
         if let Err(err) = persist_agent_session(
             &session_store,
@@ -3454,7 +3444,6 @@ pub(crate) fn spawn_agent_actor(
             )
             .await
         {
-            abort_resume_replay_barrier_task(&mut resume_replay_barrier_task);
             return;
         }
         let mut supervisor_state = supervisor::SupervisorState::new(
@@ -4194,7 +4183,25 @@ pub(crate) fn spawn_agent_actor(
                         last_stall_interrupt_at = Some(now);
                     }
                 }
-                maybe_event = events.recv_backend() => {
+                maybe_event = async {
+                    if resume_replay_gate_pending {
+                        match tokio::time::timeout_at(
+                            resume_replay_deadline,
+                            events.recv_backend(),
+                        ).await {
+                            Ok(event) if tokio::time::Instant::now() < resume_replay_deadline => event,
+                            _ => {
+                                tracing::warn!("resume replay deadline expired before boundary");
+                                Some(BackendEvent::ResumeReplayComplete(Err(format!(
+                                    "timed out after {}s waiting for resume replay to complete",
+                                    RESUME_REPLAY_BARRIER_TIMEOUT.as_secs(),
+                                ))))
+                            }
+                        }
+                    } else {
+                        events.recv_backend().await
+                    }
+                } => {
                     let Some(event) = maybe_event else {
                         if let Some(compaction) = active_compaction.take() {
                             let _ = compaction
@@ -4302,7 +4309,6 @@ pub(crate) fn spawn_agent_actor(
                                 &status_handle,
                             )
                             .await;
-                            abort_resume_replay_barrier_task(&mut resume_replay_barrier_task);
                             if let Some(backend) = backend.take() {
                                 backend.shutdown()
                                     .await;
@@ -4330,7 +4336,6 @@ pub(crate) fn spawn_agent_actor(
                             if let Some(backend) = backend.take() {
                                 backend.shutdown().await;
                             }
-                            abort_resume_replay_barrier_task(&mut resume_replay_barrier_task);
                             terminalize_live_activity(
                                 LiveActivityTerminalContext {
                                     canonical_stream: &canonical_stream,
@@ -4407,32 +4412,352 @@ pub(crate) fn spawn_agent_actor(
                         .await;
                         return;
                     };
-                    if resume_replay_gate_pending
-                        && restore_native_goal_snapshot(&event, &status_handle).await
-                    {
-                        if let BackendEvent::Chat(event) = event {
-                            remember_slash_commands(&mut latest_slash_commands, &event);
-                            append_chat_event(&canonical_stream, &mut event_log, &mut subscribers, &mut replay_state, &event).await;
+                    let mut event = match event {
+                        BackendEvent::ResumeReplayComplete(result) => {
+                            let result = if resume_replay_gate_pending {
+                                result
+                            } else {
+                                Err("unexpected resume replay boundary".to_owned())
+                            };
+                            tracing::info!(
+                                succeeded = result.is_ok(),
+                                authoritative_history = resume_uses_authoritative_transcript,
+                                backend_typing,
+                                in_turn,
+                                "resume replay boundary reached in backend stream order"
+                            );
+                            events.restore_backend_events(
+                                deferred_authoritative_resume_events.drain(..),
+                            );
+                            if result.is_ok()
+                                && let Some(task_list) = persisted_resume_task_list.take()
+                                && !replay_log_latest_task_snapshot_is(&event_log, &task_list)
+                            {
+                                let mut event = ChatEvent::TaskUpdate(task_list);
+                                ingest_gated_replay_event(
+                                    &mut event,
+                                    &canonical_stream,
+                                    &current_start.agent_id,
+                                    &mut event_log,
+                                    &mut subscribers,
+                                    &mut replay_state,
+                                    &mut activity_stats,
+                                    &mut active_stream_text,
+                                    &mut activity_event_seq,
+                                )
+                                .await;
+                            }
+                            resume_replay_gate_pending = false;
+                            match result {
+                                Ok(()) => {
+                                    let session_id = current_session_id
+                                        .as_ref()
+                                        .expect("live agent must have session_id");
+                                    mark_transcript_authoritative(&transcript_store, session_id)
+                                        .await;
+                                    let capability = backend
+                                        .as_ref()
+                                        .expect(
+                                            "backend must exist after replay barrier",
+                                        )
+                                        .compaction_capability();
+                                    upsert_context_compaction_capability(
+                                        &canonical_stream,
+                                        &mut event_log,
+                                        &mut subscribers,
+                                        &ContextCompactionCapabilityPayload {
+                                            agent_id:
+                                                current_start.agent_id.clone(),
+                                            logical_session_id:
+                                                session_id.clone(),
+                                            availability: crate::host::requested_compaction_availability(
+                                                    &capability,
+                                                    &crate::host::CompactionRoutingPolicy::default(),
+                                                    transcript_is_authoritative(
+                                                        &transcript_store,
+                                                        session_id,
+                                                    )
+                                                    .await,
+                                                ),
+                                        },
+                                    )
+                                    .await;
+                                    accepting_input_task.store(true, Ordering::SeqCst);
+                                    // Settling the resumed agent to Idle is only
+                                    // honest when nothing is waiting to run. An
+                                    // initial follow-up already suppressed it;
+                                    // a checked delivery accepted behind this
+                                    // gate is the same situation — the caller
+                                    // was told the message was accepted, so
+                                    // publishing Idle here would let its very
+                                    // next wait return before the turn starts.
+                                    if initial_follow_up.is_none()
+                                        && acknowledged_gated_deliveries == 0
+                                        && queue.is_empty()
+                                    {
+                                        publish_resumed_agent_idle(
+                                            &status_handle,
+                                            &canonical_stream,
+                                            &mut event_log,
+                                            &mut subscribers,
+                                            &mut replay_state,
+                                        )
+                                        .await;
+                                    }
+                                    flush_pending_agent_attaches(
+                                        &event_log,
+                                        Some(&replay_state),
+                                        &mut latest_output,
+                                        latest_slash_commands.as_ref(),
+                                        &mut subscribers,
+                                        &mut pending_resume_attaches,
+                                        &status_handle,
+                                    )
+                                    .await;
+                                    if initial_follow_up.is_none()
+                                        && acknowledged_gated_deliveries == 0
+                                        && !queue.is_empty()
+                                        && !usage_paused
+                                        && !compaction_blocked
+                                        && context_compaction.as_ref().is_none_or(|flight| {
+                                            queue.front().is_some_and(|queued| {
+                                                flight.admits_queue_sequence(queued.sequence)
+                                            })
+                                        })
+                                    {
+                                        let forced_closed =
+                                            hold_resume_queue_dispatch_boundary(
+                                                &current_start.name,
+                                                &mut backend,
+                                                &actor_tx,
+                                                &mut rx,
+                                            )
+                                            .await;
+                                        let dispatch = if forced_closed {
+                                            QueuedMessageDispatchOutcome::Closed
+                                        } else {
+                                            dispatch_queued_message(
+                                                QueuedMessageDispatchContext {
+                                                    backend: backend.as_ref().expect(
+                                                        "backend must exist after replay barrier",
+                                                    ),
+                                                queue: &mut queue,
+                                                in_turn: &mut in_turn,
+                                                idle_transition_armed:
+                                                    &mut idle_transition_armed,
+                                                canonical_stream: &canonical_stream,
+                                                event_log: &mut event_log,
+                                                subscribers: &mut subscribers,
+                                                agent_id: &current_start.agent_id,
+                                                session_store: &session_store,
+                                                status_handle: &status_handle,
+                                                review_registry: &review_registry,
+                                                },
+                                            )
+                                            .await
+                                        };
+                                        if dispatch == QueuedMessageDispatchOutcome::Closed {
+                                            let payload = AgentErrorPayload {
+                                                agent_id: current_start.agent_id.clone(),
+                                                code: AgentErrorCode::Internal,
+                                                message: "agent backend closed".to_owned(),
+                                                fatal: true,
+                                            };
+                                            terminalize_live_activity(
+                                                LiveActivityTerminalContext {
+                                                    canonical_stream: &canonical_stream,
+                                                    event_log: &mut event_log,
+                                                    replay_state: &mut replay_state,
+                                                    subscribers: &mut subscribers,
+                                                    open_tool_call_ids:
+                                                        &mut open_tool_call_ids,
+                                                    pending_tool_response_ids:
+                                                        &mut pending_tool_response_ids,
+                                                    active_agent_await_ids:
+                                                        &mut active_agent_await_ids,
+                                                },
+                                                LiveActivityTerminalStatus::Failed,
+                                                &payload.message,
+                                            )
+                                            .await;
+                                            enter_terminal_failure(
+                                                TerminalFailureContext {
+                                                    accepting_input: &accepting_input_task,
+                                                    status_handle: &status_handle,
+                                                    canonical_stream: &canonical_stream,
+                                                    event_log: &mut event_log,
+                                                    replay_state: &mut replay_state,
+                                                    subscribers: &mut subscribers,
+                                                    queue: &mut queue,
+                                                    session_store: &session_store,
+                                                    compaction: Some(
+                                                        TerminalCompactionFailureContext {
+                                                            flight: &mut context_compaction,
+                                                            session_store: &session_store,
+                                                            session_id: current_session_id
+                                                                .as_ref()
+                                                                .expect(
+                                                                    "live agent must have session_id",
+                                                                ),
+                                                            start: &current_start,
+                                                            activity_stats: &mut activity_stats,
+                                                        },
+                                                    ),
+                                                },
+                                                &payload,
+                                            )
+                                            .await;
+                                            park_terminal_agent(
+                                                &session_store,
+                                                &transcript_store,
+                                                current_session_id.as_ref(),
+                                                &mut pending_alias,
+                                                &mut current_start,
+                                                &start_tx,
+                                                &mut event_log,
+                                                &mut latest_output,
+                                                &mut subscribers,
+                                                &mut pending_inputs,
+                                                &mut rx,
+                                            )
+                                            .await;
+                                            return;
+                                        }
+                                    }
+                                    if !usage_paused && let Some(input) = initial_follow_up.take()
+                                        && !send_initial_follow_up_or_park(
+                                            input,
+                                            InitialFollowUpContext {
+                                                backend: &mut backend,
+                                                in_turn: &mut in_turn,
+                                                idle_transition_armed: &mut idle_transition_armed,
+                                                session_store: &session_store,
+                                                transcript_store: &transcript_store,
+                                                current_session_id: current_session_id.as_ref(),
+                                                pending_alias: &mut pending_alias,
+                                                current_start: &mut current_start,
+                                                start_tx: &start_tx,
+                                                accepting_input: &accepting_input_task,
+                                                status_handle: &status_handle,
+                                                canonical_stream: &canonical_stream,
+                                                event_log: &mut event_log,
+                                                latest_output: &mut latest_output,
+                                                replay_state: &mut replay_state,
+                                                subscribers: &mut subscribers,
+                                                queue: &mut queue,
+                                                next_queue_sequence:
+                                                    &mut next_queue_sequence,
+                                                pending_inputs: &mut pending_inputs,
+                                                rx: &mut rx,
+                                            },
+                                        )
+                                        .await
+                                    {
+                                        return;
+                                    }
+                                }
+                                Err(err) => {
+                                    accepting_input_task.store(false, Ordering::SeqCst);
+                                    let payload = AgentErrorPayload {
+                                        agent_id: current_start.agent_id.clone(),
+                                        code: AgentErrorCode::BackendFailed,
+                                        message: format!(
+                                            "failed to resume agent history before live replay boundary: {err}"
+                                        ),
+                                        fatal: true,
+                                    };
+                                    terminalize_live_activity(
+                                        LiveActivityTerminalContext {
+                                            canonical_stream: &canonical_stream,
+                                            event_log: &mut event_log,
+                                            replay_state: &mut replay_state,
+                                            subscribers: &mut subscribers,
+                                            open_tool_call_ids: &mut open_tool_call_ids,
+                                            pending_tool_response_ids: &mut pending_tool_response_ids,
+                                            active_agent_await_ids: &mut active_agent_await_ids,
+                                        },
+                                        LiveActivityTerminalStatus::Failed,
+                                        &payload.message,
+                                    )
+                                    .await;
+                                    enter_terminal_failure(
+                                        TerminalFailureContext {
+                                            accepting_input: &accepting_input_task,
+                                            status_handle: &status_handle,
+                                            canonical_stream: &canonical_stream,
+                                            event_log: &mut event_log,
+                                            replay_state: &mut replay_state,
+                                            subscribers: &mut subscribers,
+                                            queue: &mut queue,
+                                            session_store: &session_store,
+                                            compaction: Some(TerminalCompactionFailureContext {
+                                                flight: &mut context_compaction,
+                                                session_store: &session_store,
+                                                session_id: current_session_id
+                                                    .as_ref()
+                                                    .expect("live agent must have session_id"),
+                                                start: &current_start,
+                                                activity_stats: &mut activity_stats,
+                                            }),
+                                        },
+                                        &payload,
+                                    )
+                                    .await;
+                                    flush_pending_agent_attaches(
+                                        &event_log,
+                                        None,
+                                        &mut latest_output,
+                                        latest_slash_commands.as_ref(),
+                                        &mut subscribers,
+                                        &mut pending_resume_attaches,
+                                        &status_handle,
+                                    )
+                                    .await;
+                                    if let Some(backend) = backend.take() {
+                                        backend.shutdown()
+                                        .await;
+                                    }
+                                    park_terminal_agent(
+                                        &session_store,
+                                        &transcript_store,
+                                        current_session_id.as_ref(),
+                                        &mut pending_alias,
+                                        &mut current_start,
+                                        &start_tx,
+                                        &mut event_log,
+                                        &mut latest_output,
+                                        &mut subscribers,
+                                        &mut pending_inputs,
+                                        &mut rx,
+                                    )
+                                    .await;
+                                    return;
+                                }
+                            }
+                            continue;
                         }
-                        continue;
-                    }
-                    if resume_replay_gate_pending && resume_uses_authoritative_transcript {
-                        // The backend owns this barrier and closes it before it
-                        // accepts live conversation work. Chat events on its
-                        // pre-barrier side are provider replay even when their
-                        // normalized shape differs from the authoritative
-                        // journal. Compaction observations on this side are
-                        // replay too: restoring them as live events duplicates
-                        // the authoritative timeline with provider-local ids.
-                        match event {
-                            event @ BackendEvent::ModelRequestTokenUsage(_) => {
+                        event if resume_replay_gate_pending
+                            && restore_native_goal_snapshot(&event, &status_handle).await =>
+                        {
+                            if let BackendEvent::Chat(event) = event {
+                                remember_slash_commands(&mut latest_slash_commands, &event);
+                                append_chat_event(&canonical_stream, &mut event_log, &mut subscribers, &mut replay_state, &event).await;
+                            }
+                            continue;
+                        }
+                        event if resume_replay_gate_pending && resume_uses_authoritative_transcript => {
+                            // The backend owns this barrier and closes it before it
+                            // accepts live conversation work. Chat events on its
+                            // pre-barrier side are provider replay even when their
+                            // normalized shape differs from the authoritative
+                            // journal. Compaction observations on this side are
+                            // replay too: restoring them as live events duplicates
+                            // the authoritative timeline with provider-local ids.
+                            if matches!(event, BackendEvent::ModelRequestTokenUsage(_)) {
                                 deferred_authoritative_resume_events.push(event);
                             }
-                            BackendEvent::Chat(_) | BackendEvent::Compaction(_) => {}
+                            continue;
                         }
-                        continue;
-                    }
-                    let mut event = match event {
                         BackendEvent::Chat(event) => event,
                         BackendEvent::ModelRequestTokenUsage(usage) => {
                             let source_seq = activity_event_seq;
@@ -4994,7 +5319,6 @@ pub(crate) fn spawn_agent_actor(
                             .take()
                             .expect("backend must exist while closing a live actor");
                         backend.shutdown().await;
-                        abort_resume_replay_barrier_task(&mut resume_replay_barrier_task);
                         terminalize_live_activity(
                             LiveActivityTerminalContext {
                                 canonical_stream: &canonical_stream,
@@ -5247,436 +5571,6 @@ pub(crate) fn spawn_agent_actor(
                         command => command,
                     };
                     match command {
-                        AgentCommand::ResumeReplayBarrier { result } => {
-                            if !resume_replay_gate_pending {
-                                continue;
-                            }
-                            tracing::info!(
-                                agent_id = %current_start.agent_id,
-                                replay_result = ?result,
-                                has_initial_follow_up = initial_follow_up.is_some(),
-                                "resume replay barrier settled"
-                            );
-                            // Drain any replay events already buffered on the
-                            // backend stream before closing the gate. The
-                            // select! is unbiased, so the barrier command can be
-                            // selected while replay events are still queued;
-                            // ingesting them here (rather than leaving them for a
-                            // now-ungated `events.recv()`) keeps the full resume
-                            // transcript off the live broadcast path.
-                            while let Ok(event) = events.try_recv_backend() {
-                                if restore_native_goal_snapshot(&event, &status_handle).await {
-                                    if let BackendEvent::Chat(event) = event {
-                                        remember_slash_commands(&mut latest_slash_commands, &event);
-                                        append_chat_event(&canonical_stream, &mut event_log, &mut subscribers, &mut replay_state, &event).await;
-                                    }
-                                    continue;
-                                }
-                                if resume_uses_authoritative_transcript {
-                                    // See the gated receive path above: the
-                                    // barrier, not event serialization, is the
-                                    // authoritative replay/live boundary.
-                                    match event {
-                                        event @ BackendEvent::ModelRequestTokenUsage(_) => {
-                                            deferred_authoritative_resume_events.push(event);
-                                        }
-                                        BackendEvent::Chat(_) | BackendEvent::Compaction(_) => {}
-                                    }
-                                    continue;
-                                }
-                                match event {
-                                    BackendEvent::Chat(mut event) => {
-                                        ingest_gated_replay_event(
-                                            &mut event,
-                                            &canonical_stream,
-                                            &current_start.agent_id,
-                                            &mut event_log,
-                                            &mut subscribers,
-                                            &mut replay_state,
-                                            &mut activity_stats,
-                                            &mut active_stream_text,
-                                            &mut activity_event_seq,
-                                        )
-                                        .await;
-                                    }
-                                    BackendEvent::ModelRequestTokenUsage(usage) => {
-                                        let source_seq = activity_event_seq;
-                                        activity_event_seq = activity_event_seq.saturating_add(1);
-                                        if activity_stats
-                                            .observe_model_request_token_usage(usage, source_seq)
-                                        {
-                                            upsert_activity_stats_snapshot(
-                                                &canonical_stream,
-                                                &mut event_log,
-                                                &mut subscribers,
-                                                &current_start.agent_id,
-                                                activity_stats.snapshot(),
-                                            )
-                                            .await;
-                                        }
-                                    }
-                                    BackendEvent::Compaction(
-                                        crate::backend::BackendCompactionEvent::Observed(
-                                            observed,
-                                        ),
-                                    ) => {
-                                        let activity_stats_changed = activity_stats
-                                            .clear_current_context_usage(activity_event_seq);
-                                        activity_event_seq =
-                                            activity_event_seq.saturating_add(1);
-                                        if activity_stats_changed {
-                                            upsert_activity_stats_snapshot(
-                                                &canonical_stream,
-                                                &mut event_log,
-                                                &mut subscribers,
-                                                &current_start.agent_id,
-                                                activity_stats.snapshot(),
-                                            )
-                                            .await;
-                                        }
-                                        let marker =
-                                            ContextCompactionTimelineEvent {
-                                                marker_id: observed.observation_id,
-                                                operation_id: None,
-                                                trigger: observed.trigger,
-                                                method: observed.method,
-                                                backend_kind,
-                                                provider_session_id:
-                                                    observed.provider_session_id,
-                                                status:
-                                                    ContextCompactionTimelineStatus::Completed,
-                                                mutation:
-                                                    CompactionMutation::Completed,
-                                                metrics: observed.metrics,
-                                                message: None,
-                                                timestamp: now_ms(),
-                                            };
-                                        let _ = append_compaction_marker_once(
-                                            &canonical_stream,
-                                            &mut event_log,
-                                            &mut subscribers,
-                                            &mut replay_state,
-                                            &marker,
-                                        )
-                                        .await;
-                                    }
-                                    BackendEvent::Compaction(
-                                        crate::backend::BackendCompactionEvent::Progress(_),
-                                    ) => {}
-                                }
-                            }
-                            events.restore_backend_events(
-                                deferred_authoritative_resume_events.drain(..),
-                            );
-                            if result.is_ok()
-                                && let Some(task_list) = persisted_resume_task_list.take()
-                                && !replay_log_latest_task_snapshot_is(&event_log, &task_list)
-                            {
-                                let mut event = ChatEvent::TaskUpdate(task_list);
-                                ingest_gated_replay_event(
-                                    &mut event,
-                                    &canonical_stream,
-                                    &current_start.agent_id,
-                                    &mut event_log,
-                                    &mut subscribers,
-                                    &mut replay_state,
-                                    &mut activity_stats,
-                                    &mut active_stream_text,
-                                    &mut activity_event_seq,
-                                )
-                                .await;
-                            }
-                            resume_replay_gate_pending = false;
-                            match result {
-                                Ok(()) => {
-                                    let session_id = current_session_id
-                                        .as_ref()
-                                        .expect("live agent must have session_id");
-                                    mark_transcript_authoritative(&transcript_store, session_id)
-                                        .await;
-                                    let capability = backend
-                                        .as_ref()
-                                        .expect(
-                                            "backend must exist after replay barrier",
-                                        )
-                                        .compaction_capability();
-                                    upsert_context_compaction_capability(
-                                        &canonical_stream,
-                                        &mut event_log,
-                                        &mut subscribers,
-                                        &ContextCompactionCapabilityPayload {
-                                            agent_id:
-                                                current_start.agent_id.clone(),
-                                            logical_session_id:
-                                                session_id.clone(),
-                                            availability: crate::host::requested_compaction_availability(
-                                                    &capability,
-                                                    &crate::host::CompactionRoutingPolicy::default(),
-                                                    transcript_is_authoritative(
-                                                        &transcript_store,
-                                                        session_id,
-                                                    )
-                                                    .await,
-                                                ),
-                                        },
-                                    )
-                                    .await;
-                                    accepting_input_task.store(true, Ordering::SeqCst);
-                                    // Settling the resumed agent to Idle is only
-                                    // honest when nothing is waiting to run. An
-                                    // initial follow-up already suppressed it;
-                                    // a checked delivery accepted behind this
-                                    // gate is the same situation — the caller
-                                    // was told the message was accepted, so
-                                    // publishing Idle here would let its very
-                                    // next wait return before the turn starts.
-                                    if initial_follow_up.is_none()
-                                        && acknowledged_gated_deliveries == 0
-                                        && queue.is_empty()
-                                    {
-                                        publish_resumed_agent_idle(
-                                            &status_handle,
-                                            &canonical_stream,
-                                            &mut event_log,
-                                            &mut subscribers,
-                                            &mut replay_state,
-                                        )
-                                        .await;
-                                    }
-                                    flush_pending_agent_attaches(
-                                        &event_log,
-                                        Some(&replay_state),
-                                        &mut latest_output,
-                                        latest_slash_commands.as_ref(),
-                                        &mut subscribers,
-                                        &mut pending_resume_attaches,
-                                        &status_handle,
-                                    )
-                                    .await;
-                                    if initial_follow_up.is_none()
-                                        && acknowledged_gated_deliveries == 0
-                                        && !queue.is_empty()
-                                        && !usage_paused
-                                        && !compaction_blocked
-                                        && context_compaction.as_ref().is_none_or(|flight| {
-                                            queue.front().is_some_and(|queued| {
-                                                flight.admits_queue_sequence(queued.sequence)
-                                            })
-                                        })
-                                    {
-                                        let forced_closed =
-                                            hold_resume_queue_dispatch_boundary(
-                                                &current_start.name,
-                                                &mut backend,
-                                                &actor_tx,
-                                                &mut rx,
-                                            )
-                                            .await;
-                                        let dispatch = if forced_closed {
-                                            QueuedMessageDispatchOutcome::Closed
-                                        } else {
-                                            dispatch_queued_message(
-                                                QueuedMessageDispatchContext {
-                                                    backend: backend.as_ref().expect(
-                                                        "backend must exist after replay barrier",
-                                                    ),
-                                                queue: &mut queue,
-                                                in_turn: &mut in_turn,
-                                                idle_transition_armed:
-                                                    &mut idle_transition_armed,
-                                                canonical_stream: &canonical_stream,
-                                                event_log: &mut event_log,
-                                                subscribers: &mut subscribers,
-                                                agent_id: &current_start.agent_id,
-                                                session_store: &session_store,
-                                                status_handle: &status_handle,
-                                                review_registry: &review_registry,
-                                                },
-                                            )
-                                            .await
-                                        };
-                                        if dispatch == QueuedMessageDispatchOutcome::Closed {
-                                            let payload = AgentErrorPayload {
-                                                agent_id: current_start.agent_id.clone(),
-                                                code: AgentErrorCode::Internal,
-                                                message: "agent backend closed".to_owned(),
-                                                fatal: true,
-                                            };
-                                            terminalize_live_activity(
-                                                LiveActivityTerminalContext {
-                                                    canonical_stream: &canonical_stream,
-                                                    event_log: &mut event_log,
-                                                    replay_state: &mut replay_state,
-                                                    subscribers: &mut subscribers,
-                                                    open_tool_call_ids:
-                                                        &mut open_tool_call_ids,
-                                                    pending_tool_response_ids:
-                                                        &mut pending_tool_response_ids,
-                                                    active_agent_await_ids:
-                                                        &mut active_agent_await_ids,
-                                                },
-                                                LiveActivityTerminalStatus::Failed,
-                                                &payload.message,
-                                            )
-                                            .await;
-                                            enter_terminal_failure(
-                                                TerminalFailureContext {
-                                                    accepting_input: &accepting_input_task,
-                                                    status_handle: &status_handle,
-                                                    canonical_stream: &canonical_stream,
-                                                    event_log: &mut event_log,
-                                                    replay_state: &mut replay_state,
-                                                    subscribers: &mut subscribers,
-                                                    queue: &mut queue,
-                                                    session_store: &session_store,
-                                                    compaction: Some(
-                                                        TerminalCompactionFailureContext {
-                                                            flight: &mut context_compaction,
-                                                            session_store: &session_store,
-                                                            session_id: current_session_id
-                                                                .as_ref()
-                                                                .expect(
-                                                                    "live agent must have session_id",
-                                                                ),
-                                                            start: &current_start,
-                                                            activity_stats: &mut activity_stats,
-                                                        },
-                                                    ),
-                                                },
-                                                &payload,
-                                            )
-                                            .await;
-                                            park_terminal_agent(
-                                                &session_store,
-                                                &transcript_store,
-                                                current_session_id.as_ref(),
-                                                &mut pending_alias,
-                                                &mut current_start,
-                                                &start_tx,
-                                                &mut event_log,
-                                                &mut latest_output,
-                                                &mut subscribers,
-                                                &mut pending_inputs,
-                                                &mut rx,
-                                            )
-                                            .await;
-                                            return;
-                                        }
-                                    }
-                                    if !usage_paused && let Some(input) = initial_follow_up.take()
-                                        && !send_initial_follow_up_or_park(
-                                            input,
-                                            InitialFollowUpContext {
-                                                backend: &mut backend,
-                                                in_turn: &mut in_turn,
-                                                idle_transition_armed: &mut idle_transition_armed,
-                                                session_store: &session_store,
-                                                transcript_store: &transcript_store,
-                                                current_session_id: current_session_id.as_ref(),
-                                                pending_alias: &mut pending_alias,
-                                                current_start: &mut current_start,
-                                                start_tx: &start_tx,
-                                                accepting_input: &accepting_input_task,
-                                                status_handle: &status_handle,
-                                                canonical_stream: &canonical_stream,
-                                                event_log: &mut event_log,
-                                                latest_output: &mut latest_output,
-                                                replay_state: &mut replay_state,
-                                                subscribers: &mut subscribers,
-                                                queue: &mut queue,
-                                                next_queue_sequence:
-                                                    &mut next_queue_sequence,
-                                                pending_inputs: &mut pending_inputs,
-                                                rx: &mut rx,
-                                            },
-                                        )
-                                        .await
-                                    {
-                                        abort_resume_replay_barrier_task(
-                                            &mut resume_replay_barrier_task,
-                                        );
-                                        return;
-                                    }
-                                }
-                                Err(err) => {
-                                    accepting_input_task.store(false, Ordering::SeqCst);
-                                    let payload = AgentErrorPayload {
-                                        agent_id: current_start.agent_id.clone(),
-                                        code: AgentErrorCode::BackendFailed,
-                                        message: format!(
-                                            "failed to resume agent history before live replay boundary: {err}"
-                                        ),
-                                        fatal: true,
-                                    };
-                                    terminalize_live_activity(
-                                        LiveActivityTerminalContext {
-                                            canonical_stream: &canonical_stream,
-                                            event_log: &mut event_log,
-                                            replay_state: &mut replay_state,
-                                            subscribers: &mut subscribers,
-                                            open_tool_call_ids: &mut open_tool_call_ids,
-                                            pending_tool_response_ids: &mut pending_tool_response_ids,
-                                            active_agent_await_ids: &mut active_agent_await_ids,
-                                        },
-                                        LiveActivityTerminalStatus::Failed,
-                                        &payload.message,
-                                    )
-                                    .await;
-                                    enter_terminal_failure(
-                                        TerminalFailureContext {
-                                            accepting_input: &accepting_input_task,
-                                            status_handle: &status_handle,
-                                            canonical_stream: &canonical_stream,
-                                            event_log: &mut event_log,
-                                            replay_state: &mut replay_state,
-                                            subscribers: &mut subscribers,
-                                            queue: &mut queue,
-                                            session_store: &session_store,
-                                            compaction: Some(TerminalCompactionFailureContext {
-                                                flight: &mut context_compaction,
-                                                session_store: &session_store,
-                                                session_id: current_session_id
-                                                    .as_ref()
-                                                    .expect("live agent must have session_id"),
-                                                start: &current_start,
-                                                activity_stats: &mut activity_stats,
-                                            }),
-                                        },
-                                        &payload,
-                                    )
-                                    .await;
-                                    flush_pending_agent_attaches(
-                                        &event_log,
-                                        None,
-                                        &mut latest_output,
-                                        latest_slash_commands.as_ref(),
-                                        &mut subscribers,
-                                        &mut pending_resume_attaches,
-                                        &status_handle,
-                                    )
-                                    .await;
-                                    if let Some(backend) = backend.take() {
-                                        backend.shutdown()
-                                        .await;
-                                    }
-                                    park_terminal_agent(
-                                        &session_store,
-                                        &transcript_store,
-                                        current_session_id.as_ref(),
-                                        &mut pending_alias,
-                                        &mut current_start,
-                                        &start_tx,
-                                        &mut event_log,
-                                        &mut latest_output,
-                                        &mut subscribers,
-                                        &mut pending_inputs,
-                                        &mut rx,
-                                    )
-                                    .await;
-                                    return;
-                                }
-                            }
-                        }
                         AgentCommand::DeliverMessage { reply, .. } => {
                             // Normalization above rewrites every delivery into
                             // `SendInput`, so this is unreachable. Fail closed
@@ -8191,7 +8085,6 @@ pub(crate) fn spawn_agent_actor(
                                     .take()
                                     .expect("backend must exist while closing a live actor");
                                 backend.shutdown().await;
-                                abort_resume_replay_barrier_task(&mut resume_replay_barrier_task);
                                 terminalize_live_activity(
                                     LiveActivityTerminalContext {
                                         canonical_stream: &canonical_stream,
@@ -8273,7 +8166,6 @@ pub(crate) fn spawn_agent_actor(
                     if let Some(backend) = backend.take() {
                         backend.shutdown().await;
                     }
-                    abort_resume_replay_barrier_task(&mut resume_replay_barrier_task);
                     terminalize_live_activity(
                         LiveActivityTerminalContext {
                             canonical_stream: &canonical_stream,
@@ -8730,7 +8622,6 @@ pub(crate) fn spawn_relay_agent_actor(
                             let _ =
                                 reply.send(crate::backend::CancelBackgroundTaskOutcome::NotTracked);
                         }
-                        AgentCommand::ResumeReplayBarrier { .. } => {}
                         AgentCommand::Compact { reply, .. } => {
                             let _ = reply.send(Err("backend-native agents cannot be compacted".to_owned()));
                         }
@@ -9617,7 +9508,6 @@ async fn park_terminal_agent(
             AgentCommand::CancelBackgroundTask { reply, .. } => {
                 let _ = reply.send(crate::backend::CancelBackgroundTaskOutcome::NotTracked);
             }
-            AgentCommand::ResumeReplayBarrier { .. } => {}
             AgentCommand::MoveToProject { reply, .. } => {
                 let _ = reply.send(Err("This agent cannot move in its current state".to_owned()));
             }
@@ -9815,7 +9705,6 @@ async fn park_relay_terminal_agent(
             AgentCommand::CancelBackgroundTask { reply, .. } => {
                 let _ = reply.send(crate::backend::CancelBackgroundTaskOutcome::NotTracked);
             }
-            AgentCommand::ResumeReplayBarrier { .. } => {}
             AgentCommand::MoveToProject { reply, .. } => {
                 let _ = reply.send(Err("This agent cannot move in its current state".to_owned()));
             }
@@ -11030,33 +10919,6 @@ async fn upsert_activity_stats_snapshot(
     broadcast_live_event(subscribers, FrameKind::AgentActivityStats, &payload).await;
 }
 
-fn spawn_resume_replay_barrier_task(
-    tx: mpsc::UnboundedSender<AgentCommand>,
-    barrier_rx: oneshot::Receiver<()>,
-    agent_id: AgentId,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        let result = match tokio::time::timeout(RESUME_REPLAY_BARRIER_TIMEOUT, barrier_rx).await {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(_)) => Err("agent backend ended before resume replay completed".to_owned()),
-            Err(_) => Err(format!(
-                "timed out after {}s waiting for resume replay to complete",
-                RESUME_REPLAY_BARRIER_TIMEOUT.as_secs()
-            )),
-        };
-        if result.is_err() {
-            tracing::warn!(agent_id = %agent_id, "resume replay barrier failed");
-        }
-        let _ = tx.send(AgentCommand::ResumeReplayBarrier { result });
-    })
-}
-
-fn abort_resume_replay_barrier_task(task: &mut Option<tokio::task::JoinHandle<()>>) {
-    if let Some(task) = task.take() {
-        task.abort();
-    }
-}
-
 async fn flush_pending_agent_attaches(
     event_log: &[Envelope],
     replay_state: Option<&AgentReplayState>,
@@ -11315,6 +11177,10 @@ async fn publish_resumed_agent_idle(
     subscribers: &mut Vec<Stream>,
     replay_state: &mut AgentReplayState,
 ) {
+    if status_handle.snapshot().await.is_active() {
+        tracing::debug!("skipping resumed idle publication for an active turn");
+        return;
+    }
     status_handle
         .update(|status| {
             status.is_thinking = false;
@@ -11337,12 +11203,6 @@ async fn publish_resumed_agent_idle(
 /// pending: update activity stats and record it into the event log via the
 /// replay state, but never broadcast it to subscribers as a live event.
 ///
-/// Shared by the gated `events.recv()` branch and the drain that runs when the
-/// resume-replay barrier fires. The resume loop's `select!` is unbiased, so the
-/// barrier command can be handled while replay events are still buffered on the
-/// backend stream; routing both paths through here guarantees a buffered replay
-/// event can never leak onto the live broadcast just because the gate closed
-/// first.
 #[allow(clippy::too_many_arguments)]
 async fn ingest_gated_replay_event(
     event: &mut ChatEvent,

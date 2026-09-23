@@ -78,6 +78,25 @@ Resume initialization and history replay now finish before inbound events can
 mutate the resumed live state. Ordinary turn, streaming, and tool mapping are
 unchanged outside that resume boundary.
 
+## Ordered resume replay boundary
+
+Every successful `Backend::resume` stream now contains exactly one internal
+`BackendEvent::ResumeReplayComplete(Ok(()))`, after history and before live
+events. Codex places it before releasing its inbound guard; ACP holds its
+inbound gate through replay flush, marker emission, and the switch to live
+handling. Claude emits it after explicit history loading, before starting the
+CLI; process readiness does not wait for live turns to finish. Hermes,
+Antigravity, and the mock emit it before forwarding or accepting live work.
+Grok and OpenCode share the ACP producer. Asynchronous resume startup errors
+use the marker's `Err` form. No client protocol or frontend inference is
+involved.
+
+The actor settles replay inline, preserves its 30-second deadline and fatal
+close handling, and never drains a temporarily empty queue to infer the
+boundary. Its idle publication cannot clear an active registry turn or its
+stream. Binding preparation and the conformance harness likewise consume
+only through the marker, leaving subsequent live events unread.
+
 ## Generated-image response ownership
 
 `real_generated_image_preserves_tool_ownership` runs on backends declaring

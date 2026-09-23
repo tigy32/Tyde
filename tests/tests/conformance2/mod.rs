@@ -530,6 +530,9 @@ impl<B: Backend> Harness<B> {
                     Some(BackendEvent::Chat(event)) => closing.push(event),
                     Some(BackendEvent::ModelRequestTokenUsage(_) | BackendEvent::Compaction(_)) => {
                     }
+                    Some(BackendEvent::ResumeReplayComplete(_)) => {
+                        panic!("unexpected resume boundary during shutdown")
+                    }
                     None => break,
                 }
             }
@@ -645,6 +648,9 @@ pub async fn collect_turn<B: Backend>(host: &mut Harness<B>, _agent: &Agent, pro
                 turn.model_requests.push(usage);
             }
             BackendEvent::Compaction(_) => {}
+            BackendEvent::ResumeReplayComplete(_) => {
+                panic!("unexpected resume boundary in live events")
+            }
         }
     }
 }
@@ -855,6 +861,9 @@ impl<B: Backend> Harness<B> {
                     return Some(event);
                 }
                 Ok(Some(BackendEvent::ModelRequestTokenUsage(_) | BackendEvent::Compaction(_))) => {
+                }
+                Ok(Some(BackendEvent::ResumeReplayComplete(_))) => {
+                    panic!("unexpected resume boundary in live events")
                 }
                 Ok(None) => panic!("{}: backend closed its event stream", self.test_name),
                 Err(_) => return None,
@@ -1086,6 +1095,9 @@ pub async fn steer_turn<B: Backend>(
                 turn.model_requests.push(usage);
             }
             BackendEvent::Compaction(_) => {}
+            BackendEvent::ResumeReplayComplete(_) => {
+                panic!("unexpected resume boundary in live events")
+            }
         }
     }
 }
@@ -1458,21 +1470,33 @@ pub async fn resume_agent_at_roots<B: Backend>(
         id,
         "resume silently changed the provider session identity"
     );
-    if let Some(ready) = events.take_resume_replay_complete() {
-        tokio::time::timeout(Duration::from_secs(300), ready)
-            .await
-            .expect("resume replay timed out")
-            .expect("resume replay failed");
-    }
     let mut replayed_history = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(300);
     loop {
-        match events.try_recv_backend() {
-            Ok(BackendEvent::Chat(event)) => replayed_history.push(event),
-            Ok(BackendEvent::ModelRequestTokenUsage(_) | BackendEvent::Compaction(_)) => {}
-            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
-            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
-                panic!("backend disconnected during resume")
+        let event = tokio::time::timeout_at(deadline, events.recv_backend())
+            .await
+            .expect("resume replay timed out before its ordered boundary")
+            .expect("backend disconnected before its resume boundary");
+        match event {
+            BackendEvent::ResumeReplayComplete(result) => {
+                assert!(result.is_ok(), "backend reported resume replay failure");
+                break;
             }
+            BackendEvent::Chat(event) => {
+                assert!(
+                    !matches!(
+                        event,
+                        ChatEvent::TypingStatusChanged(true)
+                            | ChatEvent::StreamStart(_)
+                            | ChatEvent::StreamDelta(_)
+                            | ChatEvent::StreamReasoningDelta(_)
+                            | ChatEvent::StreamEnd(_)
+                    ),
+                    "live turn events must follow the ordered resume boundary"
+                );
+                replayed_history.push(event);
+            }
+            BackendEvent::ModelRequestTokenUsage(_) | BackendEvent::Compaction(_) => {}
         }
     }
     host.backend = Some(backend);
@@ -1934,6 +1958,7 @@ pub async fn compact<B: Backend>(host: &mut Harness<B>, agent: &Agent) -> Compac
                     BackendEvent::Compaction(BackendCompactionEvent::Observed(observation)) => observations.push(*observation),
                     BackendEvent::Compaction(BackendCompactionEvent::Progress(progress)) => assert_eq!(progress.operation_id, operation_id),
                     BackendEvent::ModelRequestTokenUsage(_) => {},
+                    BackendEvent::ResumeReplayComplete(_) => panic!("unexpected resume boundary during compaction"),
                 }
             }
             _ = tokio::time::sleep_until(deadline) => panic!("native compaction did not complete"),
@@ -1960,6 +1985,9 @@ pub async fn compact<B: Backend>(host: &mut Harness<B>, agent: &Agent) -> Compac
                 assert_eq!(progress.operation_id, operation_id)
             }
             BackendEvent::ModelRequestTokenUsage(_) => {}
+            BackendEvent::ResumeReplayComplete(_) => {
+                panic!("unexpected resume boundary after compaction")
+            }
         }
     }
     Compaction {
@@ -2201,6 +2229,9 @@ pub async fn ask_through_final_response<B: Backend>(
                 turn.model_requests.push(usage);
             }
             BackendEvent::Compaction(_) => {}
+            BackendEvent::ResumeReplayComplete(_) => {
+                panic!("unexpected resume boundary in live events")
+            }
         }
     }
 }

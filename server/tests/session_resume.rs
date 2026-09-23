@@ -1606,6 +1606,213 @@ async fn restart_keeps_a_read_only_agent_read_only() {
 }
 
 #[tokio::test]
+async fn restart_restores_a_backend_continued_turn_as_running() {
+    for authoritative in [true, false] {
+        let mut fixture = Fixture::new().await;
+        let replay = server::backend::mock::MockGateHandle::new();
+        let finish = server::backend::mock::MockGateHandle::new();
+        let source = fixture
+            .spawn_scripted(
+                "continued on resume",
+                MockScript::one(MockTurn::text("completed history"))
+                    .with_resume_continuation(&replay, &finish),
+            )
+            .await;
+        fixture
+            .next_chat_event_matching(&source, "seed turn idle", |event| {
+                matches!(event, ChatEvent::TypingStatusChanged(false))
+            })
+            .await;
+        let session_id = fixture
+            .agent_session_ids()
+            .await
+            .into_iter()
+            .next()
+            .expect("source session");
+        if !authoritative {
+            let journal = transcript_journal_path(&fixture, &session_id);
+            std::fs::remove_file(journal.with_extension("authoritative"))
+                .expect("remove authoritative marker to exercise provider history");
+            std::fs::remove_file(journal).expect("remove authoritative transcript");
+        }
+
+        let restarted = fixture.restart_host().await;
+        replay.wait_until_entered().await;
+        let restored_id = fixture
+            .agent_ids()
+            .await
+            .into_iter()
+            .next()
+            .expect("restored agent registered");
+        // NewAgent can truthfully advertise startup as active before the actor
+        // initializes. A mailbox round trip observes initialization, not replay.
+        fixture.mock_by_id(&restored_id).await;
+        let (mut mobile, mobile_initial) = fixture::connect_mobile_client_with_bootstrap(
+            fixture.host_for_test(),
+            "resume-status-phone",
+        )
+        .await;
+        let restored = match mobile_initial.agents.first() {
+            Some(agent) => agent.clone(),
+            None => fixture::next_frame_matching_on(&mut mobile, "restored NewAgent", |env| {
+                env.kind == FrameKind::NewAgent
+            })
+            .await
+            .parse_payload::<NewAgentPayload>()
+            .expect("parse restored NewAgent"),
+        };
+        assert!(!restored.turn_active, "replay alone is not a live turn");
+        replay.release_one();
+        finish.wait_until_entered().await;
+        let (agents, bootstraps) =
+            collect_restart_replay(&mut fixture, &restarted, std::slice::from_ref(&session_id))
+                .await;
+        let eager = agents.get(&session_id).expect("restored eager agent");
+        let bootstrap = &bootstraps[&eager.instance_stream];
+        assert!(
+            bootstrap.events.iter().all(|event| !matches!(
+                event,
+                AgentBootstrapEvent::ChatEvent(ChatEvent::StreamReasoningDelta(_))
+            )),
+            "post-replay reasoning must not be swallowed into history"
+        );
+
+        let event = expect_chat_event_on_stream(
+            &mut fixture.client,
+            &eager.instance_stream,
+            "continued turn typing before stream",
+        )
+        .await;
+        assert!(
+            matches!(event, ChatEvent::TypingStatusChanged(true)),
+            "resumed live turn must publish typing(true) before its stream"
+        );
+        let event = expect_chat_event_on_stream(
+            &mut fixture.client,
+            &eager.instance_stream,
+            "continued StreamStart",
+        )
+        .await;
+        assert!(matches!(event, ChatEvent::StreamStart(_)));
+        let event = expect_chat_event_on_stream(
+            &mut fixture.client,
+            &eager.instance_stream,
+            "continued reasoning",
+        )
+        .await;
+        assert!(matches!(event, ChatEvent::StreamReasoningDelta(_)));
+
+        let state =
+            fixture::next_frame_matching_on(&mut mobile, "continued turn host liveness", |env| {
+                assert!(
+                    !env.stream.0.starts_with("/agent/"),
+                    "unattached mobile must not receive agent history or live output"
+                );
+                env.kind == FrameKind::AgentTurnStateNotify
+                    && env
+                        .parse_payload::<protocol::AgentTurnStateNotifyPayload>()
+                        .expect("parse turn state")
+                        .agent_id
+                        == restored.agent_id
+            })
+            .await
+            .parse_payload::<protocol::AgentTurnStateNotifyPayload>()
+            .expect("parse running state");
+        assert!(
+            state.turn_active,
+            "continued turn must announce running to mobile"
+        );
+
+        let (mut late_mobile, late_host) = fixture::connect_mobile_client_with_bootstrap(
+            fixture.host_for_test(),
+            "late-resume-status-phone",
+        )
+        .await;
+        let late = late_host
+            .agents
+            .iter()
+            .find(|agent| agent.agent_id == restored.agent_id)
+            .expect("late mobile descriptor");
+        assert!(
+            late.turn_active,
+            "HostBootstrap/NewAgent descriptor must report running"
+        );
+        fixture::send_load_agent_on(&mut late_mobile, &late.instance_stream).await;
+        let late_bootstrap = fixture::next_frame_matching_on(
+            &mut late_mobile,
+            "continued turn lazy bootstrap",
+            |env| env.kind == FrameKind::AgentBootstrap && env.stream == late.instance_stream,
+        )
+        .await
+        .parse_payload::<AgentBootstrapPayload>()
+        .expect("parse lazy bootstrap");
+        assert!(
+            late_bootstrap.turn_active,
+            "AgentBootstrap must preserve the active turn"
+        );
+        assert!(
+            late_bootstrap.events.iter().any(|event| matches!(
+                event,
+                AgentBootstrapEvent::ChatEvent(ChatEvent::StreamReasoningDelta(_))
+            )),
+            "late attach must retain the active reasoning stream"
+        );
+        let control = fixture.connect_agent_control().await;
+        let awaiting = control.await_agents(Some(vec![restored.agent_id.clone()]));
+        tokio::pin!(awaiting);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut awaiting)
+                .await
+                .is_err(),
+            "agent-control await must stay pending while the resumed turn is thinking"
+        );
+        expect_no_chat_event_on_stream(
+            &mut fixture.client,
+            &eager.instance_stream,
+            Duration::from_millis(100),
+            "continued turn must not publish idle or replay history before release",
+        )
+        .await;
+
+        finish.release_one();
+        let event = expect_chat_event_on_stream(
+            &mut fixture.client,
+            &eager.instance_stream,
+            "continued StreamEnd",
+        )
+        .await;
+        assert!(matches!(event, ChatEvent::StreamEnd(_)));
+        let event = expect_chat_event_on_stream(
+            &mut fixture.client,
+            &eager.instance_stream,
+            "continued idle after end",
+        )
+        .await;
+        assert!(matches!(event, ChatEvent::TypingStatusChanged(false)));
+        let state =
+            fixture::next_frame_matching_on(&mut mobile, "continued turn finished", |env| {
+                env.kind == FrameKind::AgentTurnStateNotify
+                    && env
+                        .parse_payload::<protocol::AgentTurnStateNotifyPayload>()
+                        .expect("parse turn state")
+                        .agent_id
+                        == restored.agent_id
+            })
+            .await
+            .parse_payload::<protocol::AgentTurnStateNotifyPayload>()
+            .expect("parse idle state");
+        assert!(!state.turn_active);
+        let settled = tokio::time::timeout(Duration::from_secs(5), awaiting)
+            .await
+            .expect("agent-control await completes after the turn")
+            .expect("agent-control await succeeds");
+        assert_eq!(settled.ready.len(), 1);
+        assert_eq!(settled.ready[0].status, protocol::AgentControlStatus::Idle);
+        assert!(settled.still_thinking.is_empty());
+    }
+}
+
+#[tokio::test]
 async fn restart_restores_open_agents_and_preserves_settings() {
     let mut fixture = Fixture::new().await;
     // The failing child replay contained StreamStart/Delta/End at bootstrap
@@ -2267,6 +2474,87 @@ async fn async_resume_replay_history_is_ingested_without_live_broadcast() {
         "mock backend response to: new turn after resume",
     )
     .await;
+}
+
+#[tokio::test]
+async fn resume_replay_deadline_rejects_ready_history_and_late_boundary() {
+    for late_boundary in [true, false] {
+        let mut fixture = Fixture::new().await;
+        let replay = server::backend::mock::MockResumeReplay::default();
+        let source = fixture
+            .spawn_scripted(
+                "replay deadline",
+                MockScript::one(MockTurn::text("completed history"))
+                    .with_controlled_resume_replay(&replay),
+            )
+            .await;
+        fixture.finish_turn(&source).await;
+        let restarted = fixture.restart_host().await;
+        let restored_id = if let Some(agent) = restarted.agents.first() {
+            agent.agent_id.clone()
+        } else {
+            fixture::next_frame_matching_on(&mut fixture.client, "restored NewAgent", |env| {
+                env.kind == FrameKind::NewAgent
+            })
+            .await
+            .parse_payload::<NewAgentPayload>()
+            .expect("parse restored NewAgent")
+            .agent_id
+        };
+        replay.wait_until_started().await;
+        fixture.mock_by_id(&restored_id).await;
+
+        tokio::time::pause();
+
+        // Each burst stays ready across the clock advance. A late marker behind
+        // the final burst must not turn an expired replay into a successful attach.
+        for _ in 0..2 {
+            replay.history_batch(8);
+            tokio::time::advance(Duration::from_secs(10)).await;
+            fixture.mock_by_id(&restored_id).await;
+        }
+        replay.history_batch(8);
+        if late_boundary {
+            replay.complete();
+        }
+        tokio::time::advance(Duration::from_secs(11)).await;
+        let env = fixture::next_frame_matching_on(
+            &mut fixture.client,
+            "expired replay eager bootstrap",
+            |env| env.kind == FrameKind::AgentBootstrap,
+        )
+        .await;
+        let bootstrap: AgentBootstrapPayload = env.parse_payload().expect("parse AgentBootstrap");
+        let error = bootstrap.events.iter().find_map(|event| match event {
+            AgentBootstrapEvent::AgentError(error) => Some(error),
+            _ => None,
+        });
+        assert!(
+            error.is_some(),
+            "ready replay history and a late boundary must not bypass the 30s deadline"
+        );
+        let error = error.expect("fatal replay timeout");
+        assert!(error.fatal);
+        assert_eq!(error.code, protocol::AgentErrorCode::BackendFailed);
+        assert_eq!(
+            error.message,
+            "failed to resume agent history before live replay boundary: timed out after 30s waiting for resume replay to complete"
+        );
+        assert_bootstrap_has_no_prior_history_indicator(&bootstrap);
+        // The fatal bootstrap retains the saved authoritative StreamEnd.
+        // Require that completed turn, not the unfinished provider replay.
+        let messages = bootstrap_message_contents(&bootstrap);
+        assert_eq!(messages.len(), 1, "only the saved turn belongs in history");
+        assert_eq!(
+            messages[0], "completed history",
+            "saved history must survive timeout"
+        );
+        assert!(
+            !bootstrap.turn_active,
+            "timed-out replay must not be running"
+        );
+        tokio::time::resume();
+    }
 }
 
 #[tokio::test]

@@ -8521,6 +8521,7 @@ impl CodexInner {
 
         let model = resumed_model.unwrap_or_else(|| "codex".to_string());
         self.emit_resumed_thread_history(&turns, &model).await;
+        self.emitter.resume_replay_complete();
         tracing::debug!(
             history_turns = turns.len(),
             "Codex resume replay finished; releasing live events"
@@ -20425,14 +20426,10 @@ fn backend_error_message(content: String) -> ChatEvent {
 
 fn emit_codex_resume_startup_error(
     events_tx: &mpsc::UnboundedSender<BackendEvent>,
-    replay_complete_tx: &mut Option<oneshot::Sender<()>>,
     message: String,
 ) {
     tracing::error!("{message}");
-    let _ = events_tx.send(BackendEvent::Chat(backend_error_message(message)));
-    if let Some(tx) = replay_complete_tx.take() {
-        let _ = tx.send(());
-    }
+    let _ = events_tx.send(BackendEvent::ResumeReplayComplete(Err(message)));
 }
 
 fn backend_warning_message(content: String) -> ChatEvent {
@@ -20894,6 +20891,11 @@ fn forward_codex_backend_stream_event(
     events_tx: &mpsc::UnboundedSender<BackendEvent>,
     normalization_failures: &mut HashMap<String, PendingToolNormalizationFailure>,
 ) -> bool {
+    if raw.get("kind").and_then(Value::as_str) == Some("ResumeReplayComplete") {
+        return events_tx
+            .send(BackendEvent::ResumeReplayComplete(Ok(())))
+            .is_ok();
+    }
     if raw.get("kind").and_then(Value::as_str) == Some("BackendCompaction") {
         let Some(data) = raw.get("data") else {
             return true;
@@ -21328,8 +21330,6 @@ impl Backend for CodexBackend {
         let (steer_tx, mut steer_rx) = mpsc::unbounded_channel::<CodexSteer>();
         let (interrupt_tx, mut interrupt_rx) = mpsc::unbounded_channel::<CodexInterrupt>();
         let (events_tx, events_rx) = mpsc::unbounded_channel::<BackendEvent>();
-        let (resume_replay_complete_tx, resume_replay_complete_rx) =
-            tokio::sync::oneshot::channel();
         let initial_emitter = config.subagent_emitter.clone();
         let compaction_handle = Arc::new(std::sync::Mutex::new(None::<CodexCommandHandle>));
         let task_compaction_handle = Arc::clone(&compaction_handle);
@@ -21340,7 +21340,6 @@ impl Backend for CodexBackend {
         let transcript_session_id = Arc::clone(&backend_session_id);
 
         tokio::spawn(async move {
-            let mut resume_replay_complete_tx = Some(resume_replay_complete_tx);
             let combined_instructions =
                 render_combined_spawn_instructions(&config.resolved_spawn_config);
             let (session, mut raw_events) = match CodexSession::spawn_with_mode(
@@ -21364,7 +21363,6 @@ impl Backend for CodexBackend {
                 Err(err) => {
                     emit_codex_resume_startup_error(
                         &events_tx,
-                        &mut resume_replay_complete_tx,
                         format!("Failed to spawn Codex resume session: {err}"),
                     );
                     return;
@@ -21378,7 +21376,6 @@ impl Backend for CodexBackend {
             {
                 emit_codex_resume_startup_error(
                     &events_tx,
-                    &mut resume_replay_complete_tx,
                     format!("Failed to install Codex sub-agent emitter for resumed session: {err}"),
                 );
                 session.shutdown().await;
@@ -21399,7 +21396,6 @@ impl Backend for CodexBackend {
             {
                 emit_codex_resume_startup_error(
                     &events_tx,
-                    &mut resume_replay_complete_tx,
                     format!("Failed to resume Codex session: {err}"),
                 );
                 session.shutdown().await;
@@ -21427,7 +21423,6 @@ impl Backend for CodexBackend {
                 {
                     emit_codex_resume_startup_error(
                         &events_tx,
-                        &mut resume_replay_complete_tx,
                         format!("Failed to configure resumed Codex session: {err}"),
                     );
                     session.shutdown().await;
@@ -21436,22 +21431,9 @@ impl Backend for CodexBackend {
             }
 
             let mut normalization_failures = HashMap::new();
-            while let Ok(raw) = raw_events.try_recv() {
-                if !forward_codex_backend_stream_event(raw, &events_tx, &mut normalization_failures)
-                {
-                    if let Some(tx) = resume_replay_complete_tx.take() {
-                        let _ = tx.send(());
-                    }
-                    session.shutdown().await;
-                    return;
-                }
-            }
             *task_compaction_handle
                 .lock()
                 .expect("Codex compaction handle mutex poisoned") = Some(handle.clone());
-            if let Some(tx) = resume_replay_complete_tx.take() {
-                let _ = tx.send(());
-            }
 
             loop {
                 tokio::select! {
@@ -21551,11 +21533,9 @@ impl Backend for CodexBackend {
                 session_id: backend_session_id,
                 compaction_handle,
             },
-            EventStream::new_backend_with_resume_replay_barrier_and_transcript_metadata(
-                events_rx,
-                resume_replay_complete_rx,
-                move |event| codex_transcript_event_metadata(&transcript_session_id, event),
-            ),
+            EventStream::new_backend_with_transcript_metadata(events_rx, move |event| {
+                codex_transcript_event_metadata(&transcript_session_id, event)
+            }),
         ))
     }
 

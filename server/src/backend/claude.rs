@@ -4930,6 +4930,8 @@ impl ClaudeInner {
         state.cumulative_usage = replay.cumulative_usage;
         state.cumulative_usage_complete = replay.cumulative_usage_complete;
         state.resume_bootstrap_required = resume_bootstrap_required;
+        self.emitter.resume_replay_complete();
+        tracing::info!("Claude history replay boundary emitted before process initialization");
         Ok(())
     }
 
@@ -7610,8 +7612,6 @@ fn consume_subagent_event(stream: &mut SubAgentStream, value: &Value) {
 /// Minimum interval between live-status updates on the parent's Task
 /// tool card while routing a sub-agent's events.
 const SUBAGENT_PROGRESS_EMIT_INTERVAL: Duration = Duration::from_millis(250);
-const RESUME_REPLAY_SETTLE_QUIET: Duration = Duration::from_secs(1);
-const RESUME_REPLAY_TURN_QUIESCE: Duration = Duration::from_secs(30);
 
 fn subagent_progress_data(stream: &mut SubAgentStream, completed: bool) -> ToolProgressData {
     // The emitted request owns the card's identity. The cached name can be
@@ -14179,6 +14179,11 @@ async fn forward_claude_backend_event(
     }
 
     match raw.get("kind").and_then(Value::as_str).unwrap_or_default() {
+        "ResumeReplayComplete" => {
+            return events_tx
+                .send(BackendEvent::ResumeReplayComplete(Ok(())))
+                .is_ok();
+        }
         "ModelRequestTokenUsage" => {
             let Some(data) = raw.get("data") else {
                 return true;
@@ -14829,8 +14834,6 @@ impl Backend for ClaudeBackend {
         let (input_tx, mut input_rx) = mpsc::unbounded_channel::<AgentInput>();
         let (interrupt_tx, mut interrupt_rx) = mpsc::unbounded_channel::<ClaudeInterrupt>();
         let (events_tx, events_rx) = mpsc::unbounded_channel::<BackendEvent>();
-        let (resume_replay_complete_tx, resume_replay_complete_rx) =
-            tokio::sync::oneshot::channel();
         let session_id = session_id.0;
         let backend_session_id =
             Arc::new(std::sync::Mutex::new(Some(SessionId(session_id.clone()))));
@@ -14910,9 +14913,8 @@ impl Backend for ClaudeBackend {
             session.shutdown().await;
             return Err(format!("Failed to resume Claude session: {err}"));
         }
-        // The agent starts its replay-barrier timeout only after `resume`
-        // returns, so the CLI's independent initialization window must finish
-        // before the EventStream and its ready barrier become observable.
+        // Process readiness has its own initialization deadline. It is not a
+        // replay boundary: the CLI may already be running a new wake turn.
         if let Err(err) = session.inner.ensure_process_ready().await {
             startup_guard.disarm();
             session.shutdown().await;
@@ -14921,47 +14923,6 @@ impl Backend for ClaudeBackend {
             ));
         }
 
-        loop {
-            match tokio::time::timeout(RESUME_REPLAY_SETTLE_QUIET, raw_events.recv()).await {
-                Ok(Some(raw)) => {
-                    if !forward_claude_backend_event(
-                        raw,
-                        &events_tx,
-                        &backend_session_id_task,
-                        None,
-                    )
-                    .await
-                    {
-                        startup_guard.disarm();
-                        session.shutdown().await;
-                        return Err("Claude resume event stream closed during replay".to_string());
-                    }
-                }
-                Ok(None) => {
-                    startup_guard.disarm();
-                    session.shutdown().await;
-                    return Err("Claude resume event stream closed during replay".to_string());
-                }
-                Err(_) => {
-                    if session
-                        .inner
-                        .await_active_turn_quiesced(RESUME_REPLAY_TURN_QUIESCE)
-                        .await
-                    {
-                        break;
-                    }
-                }
-            }
-        }
-        eprintln!(
-            "TYDE CLAUDE RESUME REPLAY SETTLED session={}",
-            backend_session_id_task
-                .lock()
-                .expect("Claude backend session id mutex poisoned")
-                .as_ref()
-                .map_or("<none>", |session_id| session_id.0.as_str()),
-        );
-        let _ = resume_replay_complete_tx.send(());
         startup_guard.disarm();
 
         tokio::spawn(async move {
@@ -15039,10 +15000,7 @@ impl Backend for ClaudeBackend {
                 session_id: backend_session_id,
                 command_handle: Arc::new(StdMutex::new(Some(backend_command_handle))),
             },
-            EventStream::new_backend_with_resume_replay_barrier(
-                events_rx,
-                resume_replay_complete_rx,
-            ),
+            EventStream::new_backend(events_rx),
         ))
     }
 

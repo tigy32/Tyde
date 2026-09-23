@@ -35,7 +35,7 @@ use emit::{MockEventSender, WeakMockEventSender};
 
 pub use control::{MockControl, MockRequest, MockViolation};
 pub use gate::MockGateHandle;
-pub use script::{MockCompactionFailure, MockLaunch, MockScript, MockTurn};
+pub use script::{MockCompactionFailure, MockLaunch, MockResumeReplay, MockScript, MockTurn};
 
 #[cfg(any(test, feature = "test-support"))]
 #[derive(Debug, Clone)]
@@ -74,6 +74,8 @@ const MOCK_MODEL: &str = "mock";
 struct MockSessionRecord {
     workspace_roots: Vec<String>,
     prompts: Vec<String>,
+    resume_continuation: Option<(gate::MockGate, gate::MockGate)>,
+    resume_replay: Option<MockResumeReplay>,
     /// Sticky across resume and fork.
     user_bubbles: bool,
     startup_mcp_servers: Vec<String>,
@@ -109,7 +111,6 @@ pub struct MockBackend {
     shutdown_gate: Option<gate::MockGate>,
     compaction_observation_gates: Option<(gate::MockGate, gate::MockGate)>,
     compaction_failure: Mutex<Option<MockCompactionFailure>>,
-    resume_replay_guard: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
 struct MockCompactionFlight {
@@ -162,6 +163,8 @@ impl MockBackend {
                 MockSessionRecord {
                     workspace_roots,
                     prompts: Vec::new(),
+                    resume_continuation: launch_script.resume_continuation.clone(),
+                    resume_replay: launch_script.resume_replay.clone(),
                     user_bubbles: launch_script.user_bubbles,
                     startup_mcp_servers: startup_mcp_servers.clone(),
                     instructions: resolved_spawn_config.instructions,
@@ -217,7 +220,6 @@ impl MockBackend {
                 shutdown_gate: shutdown_gate.clone(),
                 compaction_observation_gates: compaction_observation_gates.clone(),
                 compaction_failure,
-                resume_replay_guard: None,
             },
             EventStream::new_backend(events_rx),
         ))
@@ -244,7 +246,13 @@ impl MockBackend {
         let agent_control_await_mcp = emit::agent_control_await_mcp(&config.startup_mcp_servers);
         let startup_mcp_servers = summarize_startup_mcp_servers(&config);
         let resolved_spawn_config = config.resolved_spawn_config.clone();
-        let (replay_prompts, session_user_bubbles, compaction_capability) = {
+        let (
+            replay_prompts,
+            session_user_bubbles,
+            compaction_capability,
+            resume_continuation,
+            resume_replay,
+        ) = {
             let mut store = session_store()
                 .lock()
                 .expect("mock backend session store mutex poisoned");
@@ -271,14 +279,17 @@ impl MockBackend {
                 replay_prompts,
                 user_bubbles,
                 record.compaction_capability.clone(),
+                record.resume_continuation.take(),
+                record.resume_replay.take(),
             )
         };
 
         let (command_tx, command_rx) = mpsc::unbounded_channel::<MockCommand>();
         let (backend_events_tx, events_rx) = mpsc::unbounded_channel::<BackendEvent>();
+        if let Some(replay) = &resume_replay {
+            replay.bind(backend_events_tx.clone());
+        }
         let events_tx = MockEventSender::new(backend_events_tx);
-        let (resume_replay_complete_tx, resume_replay_complete_rx) =
-            tokio::sync::oneshot::channel();
         let subagent_emitter = config.subagent_emitter.clone();
         let (control, control_rx, terminal_report) = MockControl::channel();
         let session_id_for_task = session_id.clone();
@@ -298,37 +309,60 @@ impl MockBackend {
                     shutdown_gate: shutdown_gate.clone(),
                     compaction_observation_gates: compaction_observation_gates.clone(),
                     compaction_failure,
-                    resume_replay_guard: Some(resume_replay_complete_tx),
                 },
-                EventStream::new_backend_with_resume_replay_barrier(
-                    events_rx,
-                    resume_replay_complete_rx,
-                ),
+                EventStream::new_backend(events_rx),
             ));
         }
 
-        start_mock_command_loop(
-            session_id_for_task,
-            command_rx,
-            events_tx.clone(),
-            subagent_emitter,
-            control_rx,
-            terminal_report,
-            MockLoopConfig {
-                initial_message: None,
-                user_bubbles_from_history: session_user_bubbles,
-                agent_control_await_mcp,
-                launch_script,
-            },
-        );
+        let replay_tx = events_tx.clone();
+        let replay_session_id = session_id.clone();
+        tokio::spawn(async move {
+            if let Some((replay, _)) = &resume_continuation {
+                replay.wait().await;
+            }
+            if resume_replay.is_none() {
+                emit_resume_history(
+                    &replay_tx,
+                    &replay_session_id,
+                    &replay_prompts,
+                    session_user_bubbles,
+                );
+                replay_tx.send_event(BackendEvent::ResumeReplayComplete(Ok(())));
+            }
+            start_mock_command_loop(
+                session_id_for_task,
+                command_rx,
+                replay_tx.clone(),
+                subagent_emitter,
+                control_rx,
+                terminal_report,
+                MockLoopConfig {
+                    initial_message: None,
+                    user_bubbles_from_history: session_user_bubbles,
+                    agent_control_await_mcp,
+                    launch_script,
+                },
+            );
 
-        emit_resume_history(
-            &events_tx,
-            &session_id,
-            &replay_prompts,
-            session_user_bubbles,
-        );
-        let _ = resume_replay_complete_tx.send(());
+            if let Some((_, finish)) = resume_continuation {
+                // Queue the first live events without yielding after replay,
+                // just as a provider can continue work while resume returns.
+                replay_tx.send_event(emit::typing(true));
+                replay_tx.send_event(emit::stream_start("mock", Some(MOCK_MODEL.to_owned())));
+                replay_tx.send_event(BackendEvent::Chat(
+                    protocol::ChatEvent::StreamReasoningDelta(protocol::StreamTextDeltaData {
+                        text: "continued reasoning".to_owned(),
+                    }),
+                ));
+                tracing::info!("mock resume queued live typing and reasoning after replay");
+                finish.wait().await;
+                replay_tx.send_event(emit::stream_end(emit::mock_assistant_message(
+                    Some(ChatMessageId(Uuid::new_v4().to_string())),
+                    "continued response".to_owned(),
+                )));
+                replay_tx.send_event(emit::typing(false));
+            }
+        });
 
         Ok((
             Self {
@@ -344,12 +378,8 @@ impl MockBackend {
                 shutdown_gate: shutdown_gate.clone(),
                 compaction_observation_gates: compaction_observation_gates.clone(),
                 compaction_failure,
-                resume_replay_guard: None,
             },
-            EventStream::new_backend_with_resume_replay_barrier(
-                events_rx,
-                resume_replay_complete_rx,
-            ),
+            EventStream::new_backend(events_rx),
         ))
     }
 
@@ -398,6 +428,8 @@ impl MockBackend {
                 MockSessionRecord {
                     workspace_roots,
                     prompts: source.prompts,
+                    resume_continuation: launch_script.resume_continuation.clone(),
+                    resume_replay: launch_script.resume_replay.clone(),
                     user_bubbles: source.user_bubbles || launch_script.user_bubbles,
                     startup_mcp_servers,
                     instructions: resolved_spawn_config.instructions,
@@ -453,7 +485,6 @@ impl MockBackend {
                 shutdown_gate: shutdown_gate.clone(),
                 compaction_observation_gates: compaction_observation_gates.clone(),
                 compaction_failure,
-                resume_replay_guard: None,
             },
             EventStream::new_backend(events_rx),
         ))
@@ -819,7 +850,6 @@ impl Backend for MockBackend {
         if let Some(gate) = self.shutdown_gate.take() {
             gate.wait().await;
         }
-        drop(self.resume_replay_guard.take());
     }
 }
 

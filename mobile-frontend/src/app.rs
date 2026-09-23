@@ -1670,10 +1670,6 @@ mod wasm_tests {
             assert_eq!(input.value(), "preserved draft");
             assert_eq!(input.selection_start().unwrap(), Some(2));
             assert_eq!(input.selection_end().unwrap(), Some(8));
-            assert!(
-                reachable(),
-                "composer hit target is reachable at {width}x{height}"
-            );
             wasm_bindgen_test::console_log!(
                 "Shell resize {width}x{height}: send_top={} send_bottom={} shell={} viewport={} document_h={}",
                 send.get_bounding_client_rect().top(),
@@ -1691,6 +1687,23 @@ mod wasm_tests {
                     .unwrap()
                     .height(),
                 frame_document.document_element().unwrap().client_height()
+            );
+            let send_bounds = send.get_bounding_client_rect();
+            let hit = frame_document.element_from_point(
+                (send_bounds.x() + send_bounds.width() / 2.0) as f32,
+                (send_bounds.y() + send_bounds.height() / 2.0) as f32,
+            );
+            wasm_bindgen_test::console_log!(
+                "Composer hit test: send_left={} send_width={} hit_tag={:?} hit_class={:?} frame_hidden={}",
+                send_bounds.left(),
+                send_bounds.width(),
+                hit.as_ref().map(web_sys::Element::tag_name),
+                hit.as_ref().map(web_sys::Element::class_name),
+                frame_document.hidden()
+            );
+            assert!(
+                reachable(),
+                "composer hit target is reachable at {width}x{height}"
             );
             assert!(send.get_bounding_client_rect().bottom() <= f64::from(height));
             assert!(

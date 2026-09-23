@@ -5110,15 +5110,9 @@ async fn real_resumed_native_goal_reports_running<B: Backend>(host: &mut Harness
     .await;
     close_agent(host, &agent).await;
     let resumed = resume_agent(host, &agent.session_id).await;
-    let mut running = resumed
-        .replayed_history
-        .iter()
-        .rev()
-        .find_map(|event| match event {
-            ChatEvent::TypingStatusChanged(running) => Some(*running),
-            _ => None,
-        })
-        .unwrap_or(false);
+    // The harness stops at the in-band boundary, not at a temporarily empty
+    // queue. Only a subsequent live typing edge can make this turn active.
+    let mut running = false;
     let followup = "Continue the existing goal. Keep checking its prerequisite once per turn; do not pause, clear, or replace it.";
     let mut followup_sent = false;
     let mut try_followup = false;

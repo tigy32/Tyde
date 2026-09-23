@@ -559,6 +559,7 @@ impl KiroSession {
             .flatten();
         let agent_name = adapter.agent_name().to_owned();
         let inner = Arc::new(KiroInner {
+            inbound_gate: Mutex::new(()),
             adapter,
             capabilities,
             bridge: Arc::new(bridge),
@@ -875,6 +876,7 @@ struct KiroInner {
     bridge: Arc<AcpBridge>,
     emitter: Arc<TurnEmitter>,
     state: Mutex<KiroState>,
+    inbound_gate: Mutex<()>,
     shutting_down: AtomicBool,
     workspace_reload_in_progress: AtomicBool,
     ssh_host: Option<String>,
@@ -1746,6 +1748,10 @@ impl KiroInner {
             return Err(format!("Failed to finish ACP session replay: {err}"));
         }
 
+        // Acquire only after the inbound barrier has been handled. Holding this
+        // through the flush and marker keeps inbound chunks on one side of the
+        // replay/live transition, including handlers that await the state lock.
+        let _inbound_guard = self.inbound_gate.lock().await;
         if self.adapter.backend_kind() == protocol::BackendKind::Grok {
             let unresolved = {
                 let mut state = self.state.lock().await;
@@ -1819,15 +1825,17 @@ impl KiroInner {
             if !known_modes.is_empty() {
                 state.known_modes = known_modes;
             }
-            state.replaying_history = false;
-
             // Emit SessionStarted so forward_events sets backend_session_id on resume
             self.emitter.session_started(&state.session_id);
         }
 
         self.flush_replay_assistant_message().await;
-        self.state.lock().await.replay_session_id = None;
+        let mut state = self.state.lock().await;
+        state.replay_session_id = None;
         self.emitter.typing_status_changed(false);
+        self.emitter.resume_replay_complete();
+        state.replaying_history = false;
+        tracing::info!("ACP replay flushed and boundary emitted before releasing inbound handling");
         Ok(())
     }
 
@@ -2242,6 +2250,7 @@ impl KiroInner {
     }
 
     async fn handle_inbound(&self, inbound: AcpInbound) {
+        let _inbound_guard = self.inbound_gate.lock().await;
         match inbound {
             AcpInbound::Stderr(line) => {
                 self.emitter.subprocess_stderr(&line);
@@ -2440,6 +2449,7 @@ impl KiroInner {
         };
         let (events_tx, mut events_rx) = mpsc::unbounded_channel();
         let child = Arc::new(KiroInner {
+            inbound_gate: Mutex::new(()),
             adapter: Arc::clone(&self.adapter),
             capabilities: self.capabilities.clone(),
             bridge: Arc::clone(&self.bridge),
@@ -6863,8 +6873,6 @@ impl Backend for KiroBackend {
         let (input_tx, mut input_rx) = mpsc::unbounded_channel::<AgentInput>();
         let (interrupt_tx, mut interrupt_rx) = mpsc::unbounded_channel::<()>();
         let (events_tx, events_rx) = mpsc::unbounded_channel::<BackendEvent>();
-        let (resume_replay_complete_tx, resume_replay_complete_rx) =
-            tokio::sync::oneshot::channel();
         let events_tx_task = events_tx.clone();
         let known_session_id = Arc::new(std::sync::Mutex::new(Some(session_id.clone())));
         let known_session_id_task = Arc::clone(&known_session_id);
@@ -6935,15 +6943,6 @@ impl Backend for KiroBackend {
             if let Some(emitter) = initial_emitter {
                 session.set_subagent_emitter(emitter).await;
             }
-            while let Ok(raw) = raw_events.try_recv() {
-                if let Some(event) = map_kiro_value_to_backend_event(&raw)
-                    && events_tx_task.send(event).is_err()
-                {
-                    session.shutdown().await;
-                    return;
-                }
-            }
-            let _ = resume_replay_complete_tx.send(());
 
             if let Some(tx) = ready_tx.take() {
                 let _ = tx.send(Ok(handle.clone()));
@@ -7040,10 +7039,7 @@ impl Backend for KiroBackend {
                 interrupt_tx,
                 session_id: known_session_id,
             },
-            EventStream::new_backend_with_resume_replay_barrier(
-                events_rx,
-                resume_replay_complete_rx,
-            ),
+            EventStream::new_backend(events_rx),
         ))
     }
 
@@ -7233,6 +7229,9 @@ fn json_u64(value: &Value, keys: &[&str]) -> Option<u64> {
 }
 
 fn map_kiro_value_to_backend_event(value: &Value) -> Option<BackendEvent> {
+    if value.get("kind").and_then(Value::as_str) == Some("ResumeReplayComplete") {
+        return Some(BackendEvent::ResumeReplayComplete(Ok(())));
+    }
     match value.get("kind").and_then(Value::as_str) {
         Some("ModelRequestTokenUsage") => serde_json::from_value(value.get("data")?.clone())
             .ok()

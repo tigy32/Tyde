@@ -2909,6 +2909,11 @@ impl AntigravityBackend {
                     .map_err(|_| "Antigravity replay receiver closed")?;
             }
         }
+        if resume.is_some() {
+            backend_tx
+                .send(BackendEvent::ResumeReplayComplete(Ok(())))
+                .map_err(|_| "Antigravity replay receiver closed")?;
+        }
         tokio::spawn(async move {
             let mut event_rx = event_rx;
             while let Some(raw) = event_rx.recv().await {
