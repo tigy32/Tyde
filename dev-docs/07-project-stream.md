@@ -633,8 +633,13 @@ Ordinary directory-scan failures do not get this inotify advice, and exhausted
 watch registrations retain the separate `fs.inotify.max_user_watches` guidance.
 Tyde does not change host-wide sysctls automatically.
 
-All projects in a host share one lazily created native filesystem watcher
-(one inotify instance on Linux), independent of the workflow watcher. Directory
+On Linux, all projects in a host share one lazily created native filesystem
+watcher (one inotify instance), independent of the workflow watcher. Other
+platforms retain project-local native watchers: notify's macOS FSEvents backend
+restarts from "now" when registrations change, so sharing would spread its
+event gap to unrelated projects. Non-Linux replacements use a fresh native
+watcher while the old watcher stays live, then close the old instance directly
+rather than removing its directory registrations one by one. On Linux, directory
 registrations are reference-counted across overlapping roots, Git worktrees,
 ignore controls, and explicitly opened files. Removing a project releases only
 its registrations; the last project releases the native watcher. Disconnected
@@ -643,11 +648,23 @@ UI subscribers do not stop project actors still used by agents/code intelligence
 Event routing and watch registration are shared; ignore filtering, directory
 scans, and Git commands remain in independent project workers. Each worker queues
 at most 128 native events before coalescing overflow into a catch-up rescan that
-also invalidates observed files. Kernel overflow broadcasts a rescan to every
-project and rebuilds registrations. A project-local scan/Git failure does not
-restart healthy projects' watches; a native watcher failure notifies all owners
+also invalidates observed files. Userspace overflow retains healthy kernel
+registrations, rebuilding only paths invalidated before events were dropped.
+Kernel overflow broadcasts a rescan to every owner of that watcher. On Linux
+it also invalidates all registrations because dropped deletion events can leave
+dead descriptors. Non-Linux rescan hints retain healthy path subscriptions;
+only actual removals/renames invalidate their reported paths.
+Native watch-removal errors stay project-local,
+including stale descriptors for directories that have disappeared.
+A project-local scan/Git failure does not restart healthy projects' watches;
+a native watcher failure notifies all owners
 and their existing recovery paths recreate one shared watcher. Callbacks from
 an old watcher generation cannot affect its replacement.
+
+Sharing also shares one kernel event queue (`fs.inotify.max_queued_events`), not
+one queue per project. Event storms can overflow it; recovery must catch up all
+projects, including deletions whose native events were dropped. Tyde does not
+raise this host setting automatically.
 
 Failed watchers are recreated with a five-second retry delay, including watch
 limit failures. Failed scans retain their pending updates and retry after five

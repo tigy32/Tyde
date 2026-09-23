@@ -3709,6 +3709,272 @@ async fn project_list_dir_returns_deeper_entries() {
 }
 
 #[cfg(target_os = "linux")]
+fn directory_watch_ids(path: &Path) -> Vec<(i32, i32)> {
+    use std::os::unix::fs::MetadataExt;
+    let inode = format!("ino:{:x}", fs::metadata(path).unwrap().ino());
+    let mut watches = Vec::new();
+    for entry in fs::read_dir("/proc/self/fdinfo")
+        .unwrap()
+        .filter_map(Result::ok)
+    {
+        let Ok(info) = fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        for line in info.lines().filter(|line| line.starts_with("inotify ")) {
+            if line.split_whitespace().any(|field| field == inode) {
+                let wd = line
+                    .split_whitespace()
+                    .find_map(|field| field.strip_prefix("wd:"))
+                    .unwrap();
+                watches.push((
+                    entry.file_name().to_str().unwrap().parse().unwrap(),
+                    i32::from_str_radix(wd, 16).unwrap(),
+                ));
+            }
+        }
+    }
+    watches.sort();
+    watches
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn project_watch_failures_keep_other_projects_live() {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    let mut fixture = Fixture::new().await;
+    let removed_repo = init_git_repo("stale-watch", &[("src/file.rs", "before\n")]);
+    let healthy_repo = init_git_repo("healthy-watch", &[("src/file.rs", "before\n")]);
+    let mut projects = Vec::new();
+    for (name, repo) in [("Removed", &removed_repo), ("Healthy", &healthy_repo)] {
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let ready = fixture.on_project_scan(
+            repo.path().to_owned(),
+            server::ScanPoint::WatcherReady,
+            move || {
+                let _ = ready_tx.send(());
+            },
+        );
+        projects.push(
+            create_project_with_real_roots(
+                &mut fixture.client,
+                name,
+                vec![repo.path().to_string_lossy().into_owned()],
+            )
+            .await,
+        );
+        tokio::time::timeout(Duration::from_secs(5), ready_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        drop(ready);
+    }
+    let healthy_watches = directory_watch_ids(&healthy_repo.path().join("src"));
+    assert_eq!(healthy_watches.len(), 1);
+    let removed_path = removed_repo.path().join("src");
+    let watches = directory_watch_ids(&removed_path);
+    assert_eq!(watches.len(), 1);
+    // Keep our own reference to the live inotify instance, then remove the
+    // kernel watch without updating notify's map, as after a lost deletion.
+    let duplicate = unsafe { libc::fcntl(watches[0].0, libc::F_DUPFD_CLOEXEC, 0) };
+    assert!(duplicate >= 0);
+    let duplicate = unsafe { OwnedFd::from_raw_fd(duplicate) };
+    assert_eq!(
+        unsafe { libc::inotify_rm_watch(duplicate.as_raw_fd(), watches[0].1) },
+        0
+    );
+    drop(duplicate);
+    let (failed_tx, failed_rx) = tokio::sync::oneshot::channel();
+    let failure = fixture.on_project_scan(
+        removed_path,
+        server::ScanPoint::WatcherUnwatchFailed,
+        move || {
+            let _ = failed_tx.send(());
+        },
+    );
+    fixture
+        .client
+        .project_delete(ProjectDeletePayload {
+            id: projects[0].id.clone(),
+        })
+        .await
+        .unwrap();
+    next_frame_matching_on(&mut fixture.client, "delete stale watch owner", |event| {
+        assert_ne!(event.kind, FrameKind::CommandError);
+        event.kind == FrameKind::ProjectNotify && matches!(event.parse_payload::<ProjectNotifyPayload>(), Ok(ProjectNotifyPayload::Delete { project }) if project.id == projects[0].id)
+    }).await;
+    tokio::time::timeout(Duration::from_secs(5), failed_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    drop(failure);
+    fs::remove_dir_all(removed_repo.path()).unwrap();
+    fs::write(healthy_repo.path().join("src/file.rs"), "still watching\n").unwrap();
+    expect_watched_change(&mut fixture.client, "src/file.rs").await;
+    assert_no_watched_changes(&mut fixture.client, &[]).await;
+    assert_eq!(
+        directory_watch_ids(&healthy_repo.path().join("src")),
+        healthy_watches,
+        "unrelated native registrations must survive another project's teardown error"
+    );
+    expect_inotify_instances(2).await;
+    let storm_repo = init_git_repo(
+        "kernel-overflow",
+        &[("a.rs", "a\n"), ("b.rs", "b\n"), ("gone/leaf.rs", "gone\n")],
+    );
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let ready = fixture.on_project_scan(
+        storm_repo.path().to_owned(),
+        server::ScanPoint::WatcherReady,
+        move || {
+            let _ = ready_tx.send(());
+        },
+    );
+    let storm = create_project_with_real_roots(
+        &mut fixture.client,
+        "Kernel overflow",
+        vec![storm_repo.path().to_string_lossy().into_owned()],
+    )
+    .await;
+    tokio::time::timeout(Duration::from_secs(5), ready_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    drop(ready);
+    fixture
+        .client
+        .project_read_file(
+            &projects[1].id,
+            ProjectReadFilePayload {
+                path: ProjectPath {
+                    root: ProjectRootPath(project_root(&projects[1], 0)),
+                    relative_path: "src/file.rs".to_owned(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+    let before =
+        expect_project_file_contents(&mut fixture.client, "observe before kernel overflow").await;
+    let (paused_tx, paused_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let paused = fixture.on_project_scan(
+        storm_repo.path().join("a.rs"),
+        server::ScanPoint::WatcherDispatch,
+        move || {
+            let _ = paused_tx.send(());
+            release_rx
+                .recv_timeout(Duration::from_secs(60))
+                .expect("release paused native event drain");
+        },
+    );
+    let (overflow_tx, overflow_rx) = tokio::sync::oneshot::channel();
+    let overflow = fixture.on_project_scan(
+        healthy_repo.path().to_owned(),
+        server::ScanPoint::WatcherKernelRescan,
+        move || {
+            let _ = overflow_tx.send(());
+        },
+    );
+    fs::write(storm_repo.path().join("a.rs"), "pause\n").unwrap();
+    tokio::time::timeout(Duration::from_secs(5), paused_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    let queue_capacity: usize = fs::read_to_string("/proc/sys/fs/inotify/max_queued_events")
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let started = std::time::Instant::now();
+    for index in 0..queue_capacity + 128 {
+        fs::write(
+            storm_repo
+                .path()
+                .join(if index % 2 == 0 { "a.rs" } else { "b.rs" }),
+            "overflow\n",
+        )
+        .unwrap();
+    }
+    fs::remove_dir_all(storm_repo.path().join("gone")).unwrap();
+    write_file(
+        &storm_repo.path().join("new/leaf.rs"),
+        "created while kernel queue full\n",
+    );
+    fs::write(
+        healthy_repo.path().join("src/file.rs"),
+        "changed while kernel queue full\n",
+    )
+    .unwrap();
+    eprintln!(
+        "kernel overflow: queue_capacity={queue_capacity} write_count={} elapsed_ms={}",
+        queue_capacity + 128,
+        started.elapsed().as_millis()
+    );
+    release_tx.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(10), overflow_rx)
+        .await
+        .unwrap()
+        .expect("real native Q_OVERFLOW must be observed");
+    drop(paused);
+    drop(overflow);
+    let mut changed = false;
+    let mut listed = false;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !changed || !listed {
+            let event = fixture.client.next_event().await.unwrap().unwrap();
+            assert_ne!(event.kind, FrameKind::CommandError);
+            assert_ne!(event.kind, FrameKind::ProjectBootstrap);
+            if event.stream == StreamPath(format!("/project/{}", projects[1].id))
+                && event.kind == FrameKind::ProjectEvent
+                && let protocol::ProjectEventPayload::FilesChanged { files } =
+                    event.parse_payload().unwrap()
+            {
+                changed |= files
+                    .iter()
+                    .any(|file| file.path == before.path && file.version > before.version);
+            }
+            if event.stream == StreamPath(format!("/project/{}", storm.id))
+                && event.kind == FrameKind::ProjectFileList
+            {
+                let listing: ProjectFileListPayload = event.parse_payload().unwrap();
+                listed |= listing.roots[0]
+                    .entries
+                    .iter()
+                    .any(|entry| entry.relative_path == "new/leaf.rs")
+                    && !listing.roots[0]
+                        .entries
+                        .iter()
+                        .any(|entry| entry.relative_path == "gone/leaf.rs");
+            }
+        }
+    })
+    .await
+    .expect("kernel overflow catches up every project without restarting streams");
+    fs::write(
+        storm_repo.path().join("new/leaf.rs"),
+        "native watch restored\n",
+    )
+    .unwrap();
+    expect_watched_change(&mut fixture.client, "new/leaf.rs").await;
+    fixture
+        .client
+        .project_read_file(
+            &projects[1].id,
+            ProjectReadFilePayload { path: before.path },
+        )
+        .await
+        .unwrap();
+    let after =
+        expect_project_file_contents(&mut fixture.client, "read after kernel overflow").await;
+    assert_eq!(
+        after.contents.as_deref(),
+        Some("changed while kernel queue full\n")
+    );
+    assert!(after.version > before.version);
+    expect_inotify_instances(2).await;
+}
+
+#[cfg(target_os = "linux")]
 fn directory_has_inotify_watch(path: &Path) -> bool {
     use std::os::unix::fs::MetadataExt;
     let inode = format!(
@@ -3901,6 +4167,8 @@ async fn projects_share_native_watches_and_release_only_their_own_paths() {
 
     #[cfg(target_os = "linux")]
     {
+        let healthy_registration = directory_watch_ids(&repos[1].path().join("src"));
+        assert_eq!(healthy_registration.len(), 1);
         let slow_path = ProjectPath {
             root: ProjectRootPath(project_root(&projects[1], 0)),
             relative_path: "src/file.rs".to_owned(),
@@ -3953,6 +4221,11 @@ async fn projects_share_native_watches_and_release_only_their_own_paths() {
             .await
             .unwrap()
             .unwrap();
+        fs::remove_dir_all(repos[1].path().join("src/dir")).unwrap();
+        write_file(
+            &repos[1].path().join("src/dir/leaf.rs"),
+            "recreated during overflow\n",
+        );
         fs::write(
             repos[1].path().join("src/file.rs"),
             "changed during overflow\n",
@@ -3986,6 +4259,17 @@ async fn projects_share_native_watches_and_release_only_their_own_paths() {
             Some("changed during overflow\n")
         );
         assert!(recovered.version > before.version);
+        assert_eq!(
+            directory_watch_ids(&repos[1].path().join("src")),
+            healthy_registration,
+            "userspace overflow must retain healthy kernel registrations"
+        );
+        fs::write(
+            repos[1].path().join("src/dir/leaf.rs"),
+            "watch restored after dropped deletion\n",
+        )
+        .unwrap();
+        expect_watched_change(&mut fixture.client, "src/dir/leaf.rs").await;
         fs::write(repos[1].path().join("src/burst-299.rs"), "after overflow\n").unwrap();
         expect_watched_change(&mut fixture.client, "src/burst-299.rs").await;
     }
@@ -4070,16 +4354,28 @@ async fn projects_share_native_watches_and_release_only_their_own_paths() {
             before.version,
         );
     }
-    let fault = fixture.on_project_scan(
-        repos[28].path().join("src/file.rs"),
-        server::ScanPoint::WatcherFailure,
-        || {},
-    );
-    fs::write(
-        repos[28].path().join("src/file.rs"),
-        "trigger native failure\n",
-    )
-    .unwrap();
+    let fault_indices = if cfg!(target_os = "linux") {
+        vec![28]
+    } else {
+        vec![28, 29]
+    };
+    let faults: Vec<_> = fault_indices
+        .iter()
+        .map(|index| {
+            fixture.on_project_scan(
+                repos[*index].path().join("src/file.rs"),
+                server::ScanPoint::WatcherFailure,
+                || {},
+            )
+        })
+        .collect();
+    for index in fault_indices {
+        fs::write(
+            repos[index].path().join("src/file.rs"),
+            "trigger native failure\n",
+        )
+        .unwrap();
+    }
     let mut warned = std::collections::HashSet::new();
     tokio::time::timeout(Duration::from_secs(5), async {
         while warned.len() < survivors.len() {
@@ -4100,8 +4396,8 @@ async fn projects_share_native_watches_and_release_only_their_own_paths() {
         }
     })
     .await
-    .expect("shared native failure reaches every remaining project");
-    drop(fault);
+    .expect("native failure reaches every affected project");
+    drop(faults);
     for repo in &repos[28..] {
         fs::write(
             repo.path().join("src/file.rs"),
@@ -4128,7 +4424,7 @@ async fn projects_share_native_watches_and_release_only_their_own_paths() {
         }
     })
     .await
-    .expect("all projects recover through one replacement native watcher");
+    .expect("all affected projects recover their native watchers");
     #[cfg(target_os = "linux")]
     expect_inotify_instances(2).await;
     for project in survivors {

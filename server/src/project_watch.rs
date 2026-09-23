@@ -110,9 +110,33 @@ impl Routes {
             );
             return;
         }
+        #[cfg(feature = "test-support")]
+        for path in &event.paths {
+            crate::project_stream::scan_test_support::run(
+                path,
+                crate::project_stream::scan_test_support::ScanPoint::WatcherDispatch,
+            );
+        }
         let mut recipients = HashSet::new();
         if event.need_rescan() {
-            self.invalidated.extend(self.owners.keys().cloned());
+            tracing::warn!(
+                projects = self.subscribers.len(),
+                "native project watcher lost events; scheduling catch-up rescans"
+            );
+            #[cfg(feature = "test-support")]
+            for sink in self.subscribers.values() {
+                for root in &sink.roots {
+                    crate::project_stream::scan_test_support::run(
+                        root,
+                        crate::project_stream::scan_test_support::ScanPoint::WatcherKernelRescan,
+                    );
+                }
+            }
+            // Only inotify can retain dead kernel descriptors after lost events.
+            // FSEvents path subscriptions need a rescan, not a stream restart.
+            if cfg!(target_os = "linux") {
+                self.invalidated.extend(self.owners.keys().cloned());
+            }
             recipients.extend(self.subscribers.keys().copied());
         } else {
             for path in &event.paths {
@@ -145,6 +169,16 @@ impl Routes {
 }
 
 impl SharedProjectWatcher {
+    fn for_watcher(&self) -> Self {
+        // FSEvents restarts from "now" on registration changes. A replacement
+        // must not disturb the old project's watcher while it is still live.
+        if cfg!(target_os = "linux") {
+            self.clone()
+        } else {
+            Self::default()
+        }
+    }
+
     fn subscribe(&self, project: &Project, sink: EventSink) -> notify::Result<WatchLease> {
         let mut state = self.inner.lock().unwrap();
         let failed = state.routes.lock().unwrap().failed;
@@ -205,6 +239,15 @@ struct WatchLease {
 }
 
 impl WatchLease {
+    fn invalidated(&self) -> HashSet<PathBuf> {
+        let state = self.shared.inner.lock().unwrap();
+        let routes = state.routes.lock().unwrap();
+        self.registered
+            .intersection(&routes.invalidated)
+            .cloned()
+            .collect()
+    }
+
     fn watch(&mut self, path: &Path, mode: RecursiveMode) -> notify::Result<()> {
         let mut state = self.shared.inner.lock().unwrap();
         let mut routes = state.routes.lock().unwrap();
@@ -256,11 +299,12 @@ impl WatchLease {
         if let Some(watcher) = state.watcher.as_mut()
             && let Err(error) = watcher.unwatch(path)
         {
-            if !matches!(error.kind, notify::ErrorKind::WatchNotFound) {
-                let mut routes = state.routes.lock().unwrap();
-                let generation = routes.generation;
-                routes.dispatch(generation, Err(watch_error(&error)));
-            }
+            tracing::debug!(path = %path.display(), %error, "native project watch removal failed");
+            #[cfg(feature = "test-support")]
+            crate::project_stream::scan_test_support::run(
+                path,
+                crate::project_stream::scan_test_support::ScanPoint::WatcherUnwatchFailed,
+            );
             return Err(error);
         }
         Ok(())
@@ -269,13 +313,6 @@ impl WatchLease {
 
 impl Drop for WatchLease {
     fn drop(&mut self) {
-        for path in self.registered.clone() {
-            if let Err(error) = self.unwatch(&path)
-                && !matches!(error.kind, notify::ErrorKind::WatchNotFound)
-            {
-                tracing::warn!(%error, "failed to release project filesystem watch");
-            }
-        }
         let mut state = self.shared.inner.lock().unwrap();
         let mut routes = state.routes.lock().unwrap();
         routes.subscribers.remove(&self.id);
@@ -285,8 +322,20 @@ impl Drop for WatchLease {
             routes.invalidated.clear();
             routes.failed = false;
             drop(routes);
-            state.watcher = None;
+            let watcher = state.watcher.take();
+            drop(state);
+            drop(watcher);
             tracing::debug!("released last shared project filesystem watcher lease");
+            return;
+        }
+        drop(routes);
+        drop(state);
+        for path in self.registered.clone() {
+            if let Err(error) = self.unwatch(&path)
+                && !matches!(error.kind, notify::ErrorKind::WatchNotFound)
+            {
+                tracing::warn!(%error, "failed to release project filesystem watch");
+            }
         }
     }
 }
@@ -309,6 +358,7 @@ impl ProjectWatcher {
         project: &Project,
         events: mpsc::UnboundedSender<notify::Result<Event>>,
     ) -> notify::Result<Self> {
+        let shared = shared.for_watcher();
         let (tx, rx) = sync::channel();
         let sink = EventSink {
             tx: tx.clone(),
@@ -738,18 +788,23 @@ impl WatchState {
             }
         }
         if reconcile {
-            if event.need_rescan()
-                || matches!(
-                    event.kind,
-                    EventKind::Remove(_) | EventKind::Modify(notify::event::ModifyKind::Name(_))
-                )
-            {
+            let removes_paths = matches!(
+                event.kind,
+                EventKind::Remove(_) | EventKind::Modify(notify::event::ModifyKind::Name(_))
+            );
+            if event.need_rescan() || removes_paths {
+                let invalidated = if event.need_rescan() {
+                    self.watcher.invalidated()
+                } else {
+                    HashSet::new()
+                };
                 let removed: Vec<_> = self
                     .registered
                     .iter()
                     .filter(|registered| {
-                        event.need_rescan()
-                            || event.paths.iter().any(|path| registered.starts_with(path))
+                        (event.need_rescan() && invalidated.contains(*registered))
+                            || (removes_paths
+                                && event.paths.iter().any(|path| registered.starts_with(path)))
                     })
                     .cloned()
                     .collect();

@@ -3402,6 +3402,9 @@ pub mod scan_test_support {
         WatcherProcess,
         WatcherOverflow,
         WatcherFailure,
+        WatcherUnwatchFailed,
+        WatcherDispatch,
+        WatcherKernelRescan,
     }
 
     type ScanKey = (PathBuf, ScanPoint);
