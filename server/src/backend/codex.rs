@@ -94,10 +94,13 @@ const CODEX_SKILL_MANIFEST_MAX_ENTRIES: usize = 100_000;
 const CODEX_SKILL_MANIFEST_MAX_BYTES: u64 = 1024 * 1024 * 1024;
 #[cfg(feature = "test-support")]
 const CODEX_LEGACY_DYNAMIC_AWAIT_MARKER: &str = ".tyde-conformance-legacy-dynamic-await";
-const CODEX_RAW_EVENTS_UNAVAILABLE_WARNING: &str = "This resumed or forked Codex thread cannot expose per-response raw boundaries with the installed app-server. Tyde is retaining the legacy tool-container projection for this thread; start a new Codex session for strict provider-response message identity.";
+const CODEX_RAW_EVENTS_UNAVAILABLE_WARNING: &str = "The installed Codex app-server does not deliver raw tool events for resumed or forked sessions. Some tool activity, including process polling and plan updates, cannot appear in chat. Start a new Codex session to receive those events.";
 
 fn emit_codex_raw_events_warning_if_needed(emitter: &TurnEmitter, strict: bool) {
     if !strict {
+        tracing::warn!(
+            "Codex resumed or forked without raw event delivery; raw-only tool activity is unavailable"
+        );
         emitter.warning_message(CODEX_RAW_EVENTS_UNAVAILABLE_WARNING);
     }
 }
@@ -8423,19 +8426,30 @@ impl CodexInner {
                 steering_bytes = developer_instructions.as_deref().map_or(0, str::len),
                 "Reapplying Tyde steering to resumed Codex thread"
             );
-            let mut params = json!({ "threadId": session_id });
+            let mut params = json!({
+                "threadId": session_id,
+                "experimentalRawEvents": CODEX_ENABLE_EXPERIMENTAL_RAW_EVENTS,
+            });
             if let Some(developer_instructions) = developer_instructions {
                 params["developerInstructions"] = Value::String(developer_instructions);
             }
-            let response = self
-                .rpc
-                // Deliberately *not* passing `experimentalRawEvents` here.
-                // `ThreadResumeParams` does carry the field (codex 0.146.0), but
-                // sending it changes nothing: a resumed thread still emits only
-                // typed `item/*` notifications and never a single `rawResponse*`
-                // one. Measured, not assumed — see the splitter below.
-                .request("thread/resume", params)
-                .await?;
+            let response = self.rpc.request("thread/resume", params).await?;
+
+            // Older app-servers ignore the opt-in and omit its acknowledgement.
+            let raw_events_enabled = match response.get("experimentalRawEvents") {
+                Some(Value::Bool(enabled)) => *enabled,
+                None => false,
+                Some(_) => {
+                    return Err(
+                        "Codex thread/resume response has invalid experimentalRawEvents".to_owned(),
+                    );
+                }
+            };
+            tracing::info!(
+                raw_events_requested = CODEX_ENABLE_EXPERIMENTAL_RAW_EVENTS,
+                raw_events_enabled,
+                "Codex resume raw event negotiation"
+            );
 
             let thread = response
                 .get("thread")
@@ -8454,10 +8468,10 @@ impl CodexInner {
                 .and_then(Value::as_array)
                 .cloned()
                 .ok_or_else(|| "Codex resume response missing 'turns' array".to_string())?;
-            Ok::<_, String>((resumed_thread_id, resumed_model, turns))
+            Ok::<_, String>((resumed_thread_id, resumed_model, turns, raw_events_enabled))
         }
         .await;
-        let (resumed_thread_id, resumed_model, turns) = match resumed {
+        let (resumed_thread_id, resumed_model, turns, raw_events_enabled) = match resumed {
             Ok(resumed) => resumed,
             Err(error) => {
                 self.state.lock().await.pending_resume_thread_id = None;
@@ -8474,19 +8488,17 @@ impl CodexInner {
             state.thread_id = resumed_thread_id;
             let resumed_thread_id = state.thread_id.clone();
             state.response_projections.clear();
-            // A resumed thread gets no `rawResponse*` of any kind — Codex
-            // 0.146.0 accepts `experimentalRawEvents` on `thread/resume` and
-            // ignores it (openai/codex#34353). Splitting still runs, because the
-            // boundary it finalizes on is a `thread/tokenUsage/updated` change,
-            // which a resumed thread does emit. Leaving it off is what gave each
-            // tool call its own chat message.
+            // Usage boundaries still group typed items on older app-servers
+            // that cannot deliver raw tool declarations after resume.
             state.response_projections.insert(
                 resumed_thread_id.clone(),
                 CodexResponseProjection::Responses(Box::new(CodexResponseSplitter::new(
                     &resumed_thread_id,
                 ))),
             );
-            state.experimental_raw_events_requested = false;
+            state.experimental_raw_events_requested = CODEX_ENABLE_EXPERIMENTAL_RAW_EVENTS;
+            state.raw_response_item_completed_seen = false;
+            state.raw_contract_drift_warned = false;
             if let Some(model) = resumed_model.clone() {
                 state.effective_model = Some(model);
             }
@@ -8510,7 +8522,7 @@ impl CodexInner {
         }
 
         self.emitter.conversation_cleared();
-        emit_codex_raw_events_warning_if_needed(self.emitter.as_ref(), false);
+        emit_codex_raw_events_warning_if_needed(self.emitter.as_ref(), raw_events_enabled);
         self.emitter.typing_status_changed(false);
 
         let model = resumed_model.unwrap_or_else(|| "codex".to_string());
@@ -20559,19 +20571,6 @@ fn raw_codex_tool_request(item_id: &str, item: &Value) -> Option<BufferedCodexTo
 /// a card carrying its JSON: if it turns out to have a typed item too the user
 /// sees it twice, which is visible and fixable, rather than not at all.
 fn codex_raw_call_is_rendered_elsewhere(tool_name: &str, arguments: &Value) -> bool {
-    // Code-mode `wait` does not start new work. It only resumes a yielded
-    // `exec` cell whose underlying typed item owns the user-visible card. For
-    // image generation Codex 0.146.0 emits the completed imageGeneration item,
-    // then this raw continuation with only a cell id; showing both makes one
-    // image request look like two independent tools.
-    if tool_name == "wait"
-        && arguments
-            .get("cell_id")
-            .and_then(Value::as_str)
-            .is_some_and(|cell_id| !cell_id.trim().is_empty())
-    {
-        return true;
-    }
     // The same call reaches Tyde in two shapes, and which one the model picks
     // varies run to run: `exec_command` called directly, with JSON arguments,
     // and `exec` called with a source string that calls it. Reading only the

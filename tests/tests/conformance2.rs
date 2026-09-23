@@ -1786,23 +1786,51 @@ async fn real_watched_command_shows_every_interaction<B: Backend>(host: &mut Har
     let agent = spawn_agent(host, &prompt).await;
     let turn = collect_turn(host, &agent, &prompt).await;
 
+    assert_watched_command_interactions(&turn);
+    assert_universal_contract(&[turn]);
+    let session = stored_session(host).await;
+    assert!(
+        session.resumable,
+        "watched command session must be resumable"
+    );
+    assert_clean_close(host, &agent).await;
+
+    let resumed = resume_agent(host, &session.id).await;
+    assert_replayed_history_is_not_empty(&resumed, host.backend());
+    let turn = ask(host, &resumed, &prompt).await;
+    assert_watched_command_interactions(&turn);
+    assert_universal_contract(&[turn]);
+    assert_clean_close(host, &resumed).await;
+}
+
+fn assert_watched_command_interactions(turn: &Turn) {
     // A backend that never ran the command finishes fast and satisfies
     // every structural assertion below, so establish it did the work
     // before reading anything into the card count.
-    assert_final_text_contains(&turn, WATCHED_MARKER);
+    assert_final_text_contains(turn, WATCHED_MARKER);
 
     let requests = turn.tool_requests().count();
     assert!(
-        requests >= 2,
+        requests >= 3,
         "{}: the model started a command and watched it to completion but only {requests} \
          tool card(s) were rendered, so at least one thing it did is invisible to the \
-         user. Cards: {:?}",
+         user",
         turn.label(),
-        turn.tool_request_names(),
     );
 
-    assert_universal_contract(&[turn]);
-    assert_clean_close(host, &agent).await;
+    assert_eq!(
+        turn.tool_requests()
+            .filter(|request| matches!(request.tool_type, ToolRequestType::RunCommand { .. }))
+            .count(),
+        1,
+        "watching one command must not duplicate its execution card"
+    );
+    for message in turn.assistant_messages() {
+        assert!(
+            !message.content.trim().is_empty() || !message.tool_calls.is_empty(),
+            "a watched-command response must show its action, not only a Thinking disclosure"
+        );
+    }
 }
 
 async fn real_mcp_tool_call<B: Backend>(host: &mut Harness<B>) {
@@ -1974,8 +2002,10 @@ fn watched_command_prompt(backend_kind: BackendKind) -> String {
         BackendKind::Codex => format!(
             "Run this exact shell command as an ordinary foreground command: for i in $(seq 1 \
              {WATCHED_SECONDS}); do echo tick $i; sleep 1; done; echo {WATCHED_MARKER}. It takes \
-             about {WATCHED_SECONDS} seconds, so it will not finish in one go — keep checking on \
-             it until it is done."
+             about {WATCHED_SECONDS} seconds. Call exec_command exactly once with yield_time_ms=1000. \
+             Then call write_stdin with yield_time_ms=300000 inside a code-mode exec cell with \
+             a 1000 ms exec yield. Resume that yielded cell with the code-mode wait tool until \
+             it finishes. Do not start another command and do not use a background job."
         ),
         // Claude reaches for a background monitor and ends the turn on "I'll
         // wait for the notifications", which finishes the turn before the
@@ -2234,7 +2264,10 @@ fn assert_mcp_results_came_back(turn: &Turn, expected: &[&str]) {
 conformance2_scenario!(real_image_input, [BackendCapability::ImageInput]);
 conformance2_scenario!(
     real_watched_command_shows_every_interaction,
-    [BackendCapability::YieldsRunningCommands]
+    [
+        BackendCapability::YieldsRunningCommands,
+        BackendCapability::ResumeSession
+    ]
 );
 conformance2_scenario!(real_mcp_tool_call, [BackendCapability::StartupMcpServers]);
 conformance2_scenario!(

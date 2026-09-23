@@ -143,6 +143,12 @@ fn throttled_string_signal(
             move || {
                 timer_id.store(-1, Ordering::Relaxed);
                 pending.set(false);
+                #[cfg(all(test, target_arch = "wasm32"))]
+                wasm_bindgen_test::console_log!(
+                    "stream render callback: time_ms={} source_bytes={}",
+                    js_sys::Date::now(),
+                    src.with_untracked(String::len)
+                );
                 dest.set(src.with_untracked(|text| transform(text)));
             },
         ))
@@ -162,6 +168,12 @@ fn throttled_string_signal(
             return;
         }
         render_pending.set(true);
+        #[cfg(all(test, target_arch = "wasm32"))]
+        wasm_bindgen_test::console_log!(
+            "stream render scheduled: time_ms={} source_bytes={}",
+            js_sys::Date::now(),
+            source_for_effect.with_untracked(String::len)
+        );
         if let Some(window) = web_sys::window() {
             match window.set_timeout_with_callback_and_timeout_and_arguments_0(
                 timer_cb_for_effect.as_ref().as_ref().unchecked_ref(),
@@ -217,6 +229,10 @@ mod wasm_tests {
     wasm_bindgen_test_configure!(run_in_browser);
 
     async fn next_tick() {
+        // Effect::new arms the 33 ms render timer on an executor tick. Starting
+        // this 50 ms timer first let the assertion see an empty preview before
+        // the render timer was due when the browser's task was delayed.
+        leptos::task::tick().await;
         let promise = js_sys::Promise::new(&mut |resolve, _reject| {
             web_sys::window()
                 .unwrap()
@@ -263,6 +279,7 @@ mod wasm_tests {
         );
 
         reasoning.set("inspect the first item".to_owned());
+        console_log!("reasoning changed: time_ms={}", js_sys::Date::now());
         next_tick().await;
         let details = container
             .query_selector(".chat-card-reasoning")
@@ -275,6 +292,11 @@ mod wasm_tests {
             .query_selector(".reasoning-content")
             .unwrap()
             .expect("visible live reasoning content");
+        console_log!(
+            "reasoning DOM assertion: time_ms={} rendered_bytes={}",
+            js_sys::Date::now(),
+            content.text_content().unwrap().len()
+        );
         assert!(
             content
                 .text_content()
