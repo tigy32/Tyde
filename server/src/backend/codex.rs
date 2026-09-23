@@ -1616,6 +1616,7 @@ pub struct CodexSession {
 }
 
 struct CodexThreadResponseConfig<'a> {
+    cwd: String,
     startup_mcp_servers: &'a [StartupMcpServer],
     access_mode: BackendAccessMode,
     execution_mode: BackendExecutionMode,
@@ -1949,6 +1950,7 @@ impl CodexSession {
                 skill_setup,
             },
             CodexThreadResponseConfig {
+                cwd,
                 startup_mcp_servers,
                 access_mode,
                 execution_mode,
@@ -2139,6 +2141,7 @@ impl CodexSession {
                 skill_setup,
             },
             CodexThreadResponseConfig {
+                cwd,
                 startup_mcp_servers,
                 access_mode,
                 execution_mode: BackendExecutionMode::Agent,
@@ -2201,6 +2204,7 @@ impl CodexSession {
 
         let initial_capacity_emitter = subagent_emitter.clone();
         let inner = Arc::new(CodexInner {
+            launch_cwd: config.cwd,
             rpc,
             emitter,
             inbound_gate: Mutex::new(()),
@@ -4878,6 +4882,7 @@ impl CodexToolCallIdentities {
 }
 
 struct CodexInner {
+    launch_cwd: String,
     rpc: CodexRpc,
     emitter: Arc<TurnEmitter>,
     state: Mutex<CodexState>,
@@ -8373,7 +8378,9 @@ impl CodexInner {
                 Ok(())
             }
             SessionCommand::ListSessions => self.list_sessions().await,
-            SessionCommand::ResumeSession { session_id } => self.resume_session(session_id).await,
+            SessionCommand::ResumeSession { session_id } => {
+                self.resume_session(session_id, &json!({})).await
+            }
             SessionCommand::DeleteSession { session_id } => self.delete_session(session_id).await,
             SessionCommand::ListProfiles => {
                 // Phase 6 handles profiles parity.
@@ -8404,7 +8411,7 @@ impl CodexInner {
         Ok(())
     }
 
-    async fn resume_session(&self, session_id: String) -> Result<(), String> {
+    async fn resume_session(&self, session_id: String, settings: &Value) -> Result<(), String> {
         // Notifications can precede the resume reply. Replay must finish before
         // they mutate live state; RPC replies are read independently of this gate.
         let inbound_guard = self.inbound_gate.lock().await;
@@ -8420,10 +8427,32 @@ impl CodexInner {
                 steering_bytes = developer_instructions.as_deref().map_or(0, str::len),
                 "Reapplying Tyde steering to resumed Codex thread"
             );
-            let mut params = json!({
-                "threadId": session_id,
-                "experimentalRawEvents": CODEX_ENABLE_EXPERIMENTAL_RAW_EVENTS,
-            });
+            let mut params = codex_thread_settings_update_params(&session_id, settings)?;
+            if let Some(effort) = params
+                .as_object_mut()
+                .and_then(|params| params.remove("effort"))
+                && let Some(effort) = effort.as_str().and_then(normalize_reasoning_effort)
+            {
+                params["config"] = json!({ "model_reasoning_effort": effort });
+            }
+            {
+                let state = self.state.lock().await;
+                params["cwd"] = json!(self.launch_cwd);
+                params["runtimeWorkspaceRoots"] =
+                    json!(state.workspace_roots_override.as_deref().unwrap_or(&[]));
+                params["sandbox"] =
+                    json!(codex_sandbox_mode(state.access_mode, state.execution_mode));
+                params["approvalPolicy"] = json!(codex_approval_policy(state.execution_mode));
+            }
+            params["experimentalRawEvents"] = json!(CODEX_ENABLE_EXPERIMENTAL_RAW_EVENTS);
+            tracing::info!(
+                sandbox = params["sandbox"].as_str(),
+                workspace_root_count = params["runtimeWorkspaceRoots"].as_array().map(Vec::len),
+                model_override = params.get("model").is_some_and(|model| model.is_string()),
+                effort_override = params.get("config").is_some(),
+                service_tier_override = params.get("serviceTier").is_some(),
+                "Applying Codex execution settings atomically with resume"
+            );
             if let Some(developer_instructions) = developer_instructions {
                 params["developerInstructions"] = Value::String(developer_instructions);
             }
@@ -8514,6 +8543,8 @@ impl CodexInner {
             state.pending_request = None;
             state.pending_async_questions.clear();
         }
+
+        self.apply_local_settings(settings).await;
 
         self.emitter.conversation_cleared();
         emit_codex_raw_events_warning_if_needed(self.emitter.as_ref(), raw_events_enabled);
@@ -21381,53 +21412,14 @@ impl Backend for CodexBackend {
                 session.shutdown().await;
                 return;
             }
-            let resolved_settings = resolve_session_settings(&config);
-            let model_override = match resolved_settings.0.get("model") {
-                Some(SessionSettingValue::String(value)) => Some(value.clone()),
-                _ => None,
-            };
-            let effort_override = match resolved_settings.0.get("reasoning_effort") {
-                Some(SessionSettingValue::String(value)) => Some(value.clone()),
-                _ => None,
-            };
-            if let Err(err) = handle
-                .execute(SessionCommand::ResumeSession { session_id })
-                .await
-            {
+            let settings = session_settings_to_json(&resolve_session_settings(&config));
+            if let Err(err) = handle.inner.resume_session(session_id, &settings).await {
                 emit_codex_resume_startup_error(
                     &events_tx,
                     format!("Failed to resume Codex session: {err}"),
                 );
                 session.shutdown().await;
                 return;
-            }
-            if model_override.is_some()
-                || effort_override.is_some()
-                || resolved_settings.0.contains_key("speed")
-            {
-                let mut settings = json!({
-                    "model": model_override,
-                    "reasoning_effort": effort_override,
-                    "approval_policy": CODEX_FORCED_APPROVAL_POLICY,
-                });
-                if resolved_settings.0.contains_key("speed") {
-                    settings["speed"] =
-                        session_settings_to_json(&resolved_settings)["speed"].clone();
-                }
-                if let Err(err) = handle
-                    .execute(SessionCommand::UpdateSettings {
-                        settings,
-                        persist: false,
-                    })
-                    .await
-                {
-                    emit_codex_resume_startup_error(
-                        &events_tx,
-                        format!("Failed to configure resumed Codex session: {err}"),
-                    );
-                    session.shutdown().await;
-                    return;
-                }
             }
 
             let mut normalization_failures = HashMap::new();

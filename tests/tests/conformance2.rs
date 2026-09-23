@@ -5090,6 +5090,28 @@ async fn real_resumed_native_goal_reports_running<B: Backend>(host: &mut Harness
     if !real_resume_start_race_child(host).await {
         return;
     }
+    let proof_dir = tempfile::Builder::new()
+        .prefix("tyde-resumed-goal-proof-")
+        .tempdir_in(std::env::var_os("HOME").expect("home for outside-workspace proof"))
+        .expect("create owned outside-workspace proof directory");
+    let proof = proof_dir
+        .path()
+        .canonicalize()
+        .expect("resolve proof directory")
+        .join("proof");
+    assert!(
+        !proof.starts_with(host.workspace())
+            && !proof.starts_with(std::env::temp_dir())
+            && !proof.starts_with("/tmp"),
+        "sandbox proof must be outside the workspace and writable temporary roots"
+    );
+    let quoted_proof = format!(
+        "'{}'",
+        proof
+            .to_str()
+            .expect("proof path is UTF-8")
+            .replace('\'', "'\"'\"'")
+    );
     let ready = "Reply READY and wait for the next instruction.";
     let agent = spawn_agent(host, ready).await;
     collect_turn(host, &agent, ready).await;
@@ -5097,7 +5119,7 @@ async fn real_resumed_native_goal_reports_running<B: Backend>(host: &mut Harness
         host,
         &agent,
         protocol::GoalControl::Set {
-            objective: "The goal is goal-result.txt containing exactly complete. At the start of EVERY turn, run a foreground shell command that sleeps for 3 seconds and checks whether goal-release.txt exists. If it is absent, report that the prerequisite is missing and END THAT TURN with a final answer, leaving the goal active. Do not wait or poll within the turn, and never create goal-release.txt yourself. Once it exists, write complete to goal-result.txt and mark the goal complete. Follow ordinary user corrections without pausing or clearing the goal.".to_owned(),
+            objective: format!("The goal is goal-result.txt containing exactly complete. At the start of EVERY turn, run this foreground shell command exactly: `sleep 3; printf ready > {quoted_proof} && if test -f goal-release.txt; then printf present; else printf missing; fi`. The proof write is harmless and authorized in an owned disposable directory. If the prerequisite is absent, report that it is missing and END THAT TURN with a final answer, leaving the goal active. Do not wait or poll within the turn, and never create goal-release.txt yourself. Once it exists, write complete to goal-result.txt and mark the goal complete. Follow ordinary user corrections without pausing or clearing the goal."),
         },
     )
     .await;
@@ -5109,13 +5131,20 @@ async fn real_resumed_native_goal_reports_running<B: Backend>(host: &mut Harness
     )
     .await;
     close_agent(host, &agent).await;
+    assert!(
+        proof.is_file(),
+        "original goal must establish the command proof"
+    );
+    std::fs::remove_file(&proof).expect("clear original command proof before resume");
     let resumed = resume_agent(host, &agent.session_id).await;
     // The harness stops at the in-band boundary, not at a temporarily empty
     // queue. Only a subsequent live typing edge can make this turn active.
     let mut running = false;
     let followup = "Continue the existing goal. Keep checking its prerequisite once per turn; do not pause, clear, or replace it.";
     let mut followup_sent = false;
-    let mut try_followup = false;
+    let mut pending_followup = Some(user_message(followup));
+    let mut autonomous_commands = BTreeSet::new();
+    let mut autonomous_command_succeeded = false;
     let mut response_in_turn = false;
     let mut tools_in_turn = 0;
     let mut completed_turns = 0;
@@ -5123,14 +5152,6 @@ async fn real_resumed_native_goal_reports_running<B: Backend>(host: &mut Harness
     let mut completion_notices = 0;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(240);
     loop {
-        if try_followup && !followup_sent {
-            match try_send_prompt(host, &resumed, followup).await {
-                SendOutcome::Accepted => followup_sent = true,
-                SendOutcome::Busy(_) => {}
-                SendOutcome::Closed => panic!("resumed goal refused its follow-up"),
-            }
-            try_followup = false;
-        }
         let event = host
             .next_chat(deadline)
             .await
@@ -5147,7 +5168,6 @@ async fn real_resumed_native_goal_reports_running<B: Backend>(host: &mut Harness
                     }
                     response_in_turn = false;
                     tools_in_turn = 0;
-                    try_followup = true;
                     if completed_turns >= 2 && !released {
                         std::fs::write(host.workspace().join("goal-release.txt"), "ready")
                             .expect("release goal after two observed working turns");
@@ -5171,9 +5191,37 @@ async fn real_resumed_native_goal_reports_running<B: Backend>(host: &mut Harness
                 );
                 response_in_turn |= matches!(event, ChatEvent::StreamEnd(_));
                 tools_in_turn += usize::from(matches!(event, ChatEvent::ToolRequest(_)));
-                if matches!(event, ChatEvent::ToolRequest(_)) {
-                    try_followup = true;
+                if !followup_sent
+                    && let ChatEvent::ToolRequest(request) = &event
+                    && let ToolRequestType::RunCommand { command, .. } = &request.tool_type
+                    && command.contains(proof.to_str().expect("proof path is UTF-8"))
+                {
+                    autonomous_commands.insert(request.tool_call_id.clone());
+                    eprintln!("Resumed autonomous sandbox command: live request observed");
                 }
+            }
+            ChatEvent::ToolExecutionCompleted(completion)
+                if !followup_sent && autonomous_commands.remove(&completion.tool_call_id) =>
+            {
+                let succeeded = matches!(
+                    &completion.outcome,
+                    ToolExecutionOutcome::Succeeded {
+                        result: ToolExecutionResult::RunCommand { exit_code: 0, .. }
+                    }
+                );
+                eprintln!(
+                    "Resumed autonomous sandbox command: correlated completion succeeded={succeeded}"
+                );
+                assert!(
+                    succeeded,
+                    "resumed autonomous sandbox command must succeed before any Tyde input"
+                );
+                assert!(
+                    std::fs::read(&proof).expect("autonomous command must recreate cleared proof")
+                        == b"ready",
+                    "autonomous command must write its outside-workspace proof"
+                );
+                autonomous_command_succeeded = true;
             }
             ChatEvent::GoalCompleted(_) => {
                 assert!(
@@ -5190,7 +5238,25 @@ async fn real_resumed_native_goal_reports_running<B: Backend>(host: &mut Harness
             }
             _ => {}
         }
+        if autonomous_command_succeeded && let Some(payload) = pending_followup.take() {
+            match try_deliver_message(host, &resumed, payload, running).await {
+                SendOutcome::Accepted => {
+                    followup_sent = true;
+                    eprintln!("Resumed goal follow-up: accepted");
+                }
+                SendOutcome::Busy(protocol::AgentInput::SendMessage(payload)) => {
+                    pending_followup = Some(payload);
+                    eprintln!("Resumed goal follow-up: retained for next event");
+                }
+                SendOutcome::Busy(_) => panic!("follow-up delivery returned a non-message input"),
+                SendOutcome::Closed => panic!("resumed goal refused its follow-up"),
+            }
+        }
     }
+    assert!(
+        autonomous_command_succeeded,
+        "resume must preserve autonomous command access"
+    );
     assert!(
         followup_sent,
         "ordinary input must be accepted during an active goal"

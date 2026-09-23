@@ -897,6 +897,33 @@ pub async fn try_send_prompt<B: Backend>(
         .await
 }
 
+pub async fn try_deliver_message<B: Backend>(
+    host: &Harness<B>,
+    agent: &Agent,
+    payload: SendMessagePayload,
+    running: bool,
+) -> SendOutcome {
+    let backend = host.backend.as_ref().expect("backend must be running");
+    assert!(
+        backend.session_id() == agent.session_id,
+        "input must address the resumed session"
+    );
+    if running {
+        match backend.steer(payload).await {
+            SteerOutcome::Accepted => SendOutcome::Accepted,
+            SteerOutcome::NoActiveTurn(payload) => {
+                SendOutcome::Busy(AgentInput::SendMessage(payload))
+            }
+            SteerOutcome::Closed => SendOutcome::Closed,
+            SteerOutcome::Unsupported(_) => panic!("native goal follow-up requires steering"),
+        }
+    } else {
+        backend
+            .send_with_outcome(AgentInput::SendMessage(payload))
+            .await
+    }
+}
+
 pub async fn drain_events_for<B: Backend>(
     host: &mut Harness<B>,
     window: Duration,
