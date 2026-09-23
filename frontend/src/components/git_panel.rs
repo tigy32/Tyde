@@ -340,6 +340,7 @@ fn CommittedAiReviewButton(selection: HistoricalSelection) -> impl IntoView {
         base_oid: selection.base_oid.clone(),
         tip_oid: selection.tip_oid.clone(),
     };
+    let review_mode = RwSignal::new(None::<protocol::ReviewMode>);
     let click_state = state.clone();
     let on_click = move |_| {
         if !reason().is_empty() {
@@ -360,6 +361,7 @@ fn CommittedAiReviewButton(selection: HistoricalSelection) -> impl IntoView {
             return;
         }
         let payload = protocol::ReviewActionPayload::StartAiReview {
+            mode: review_mode.get_untracked(),
             backend_kind: None,
             cost_hint: None,
             instructions: None,
@@ -387,6 +389,7 @@ fn CommittedAiReviewButton(selection: HistoricalSelection) -> impl IntoView {
         });
     };
     view! {
+        <crate::components::review_view::ReviewModePicker selection=review_mode />
         <button
             class="gp-review-open-btn gp-commit-ai-review"
             data-test="gp-commit-ai-review"
@@ -3633,14 +3636,20 @@ mod wasm_tests {
                 .collect();
             review.ai_reviewer.status = protocol::ReviewAiReviewerStatus::Completed;
             review.ai_reviewer.rounds.push(protocol::ReviewRound {
+                mode: Some(protocol::ReviewMode::Deep),
                 id: "round-1".to_owned(),
                 snapshot_id: "snapshot-1".to_owned(),
                 scope: Default::default(),
                 started_at_ms: 1,
                 requested_by: Some(AgentId("requester".to_owned())),
                 reviewers: vec![protocol::ReviewReviewerRun {
-                    config_id: "focused".to_owned(),
-                    name: "Test coverage".to_owned(),
+                    aspects: vec![protocol::ReviewAspectSnapshot {
+                        id: "tests".to_owned(),
+                        name: "Test quality".to_owned(),
+                        description: "Catch regressions".to_owned(),
+                        instructions: "Frozen original test instructions".to_owned(),
+                    }],
+                    name: "Test coverage · Codex".to_owned(),
                     backend_kind: protocol::BackendKind::Codex,
                     agent_id: Some(AgentId("reviewer".to_owned())),
                     status: protocol::ReviewAiReviewerStatus::Completed,
@@ -3649,6 +3658,12 @@ mod wasm_tests {
                 dispositions: Default::default(),
                 delivery_error: None,
             });
+            let round = review.ai_reviewer.rounds.last_mut().unwrap();
+            let mut claude = round.reviewers[0].clone();
+            claude.name = "Test coverage · Claude".to_owned();
+            claude.backend_kind = protocol::BackendKind::Claude;
+            claude.agent_id = Some(AgentId("claude-reviewer".to_owned()));
+            round.reviewers.push(claude);
         });
         next_tick().await;
 
@@ -3706,6 +3721,40 @@ mod wasm_tests {
             main.inner_text()
                 .contains("Long review finding with actionable source context."),
             "Full findings must remain visible in the main review surface"
+        );
+        // History is intentionally collapsed; open it before asserting visible round text.
+        let history = query(&main, ".review-history").unwrap();
+        wasm_bindgen_test::console_log!(
+            "Review history initially open={}",
+            history.has_attribute("open")
+        );
+        click(
+            history
+                .query_selector("summary")
+                .unwrap()
+                .unwrap()
+                .unchecked_ref(),
+        );
+        next_tick().await;
+        assert!(history.has_attribute("open"));
+        let groups = main
+            .query_selector_all("[aria-label='Review aspect results']")
+            .unwrap();
+        assert_eq!(
+            groups.length(),
+            1,
+            "Both independent reviewers must be grouped under their aspect"
+        );
+        let group = groups.item(0).unwrap().text_content().unwrap();
+        assert!(
+            group.contains("Test quality")
+                && group.contains("Test coverage · Claude")
+                && group.contains("Test coverage · Codex")
+        );
+        assert!(group.contains("Frozen original test instructions"));
+        assert!(
+            main.inner_text()
+                .contains("Deep · 2 of 2 reviewers completed")
         );
         click(
             &query(&main, "[data-test=review-actions-toggle]").expect("Review actions disclosure"),

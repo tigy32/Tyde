@@ -6543,9 +6543,35 @@ pub struct ReviewFileSnapshot {
     pub lines: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewMode {
+    #[default]
+    Light,
+    Deep,
+}
+
+impl ReviewMode {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Light => "Light",
+            Self::Deep => "Deep",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewAspectSnapshot {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub instructions: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReviewReviewerRun {
-    pub config_id: String,
+    #[serde(default)]
+    pub aspects: Vec<ReviewAspectSnapshot>,
     pub name: String,
     pub backend_kind: BackendKind,
     pub agent_id: Option<AgentId>,
@@ -6555,6 +6581,8 @@ pub struct ReviewReviewerRun {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReviewRound {
+    #[serde(default)]
+    pub mode: Option<ReviewMode>,
     pub id: String,
     pub snapshot_id: String,
     pub scope: ReviewAiScope,
@@ -6687,6 +6715,8 @@ pub enum ReviewActionPayload {
         suggestion_id: ReviewSuggestionId,
     },
     StartAiReview {
+        #[serde(default)]
+        mode: Option<ReviewMode>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         backend_kind: Option<BackendKind>,
         cost_hint: Option<SpawnCostHint>,

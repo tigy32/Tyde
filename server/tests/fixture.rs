@@ -202,6 +202,7 @@ impl Fixture {
             enabled_backends,
             use_mock_backend,
             None,
+            None,
         )
         .await
     }
@@ -215,6 +216,7 @@ impl Fixture {
             None,
             true,
             Some((sessions, projects, None)),
+            None,
         )
         .await
     }
@@ -228,6 +230,7 @@ impl Fixture {
             None,
             true,
             Some((sessions, r#"{"version":2,"records":{}}"#, Some(tasks))),
+            None,
         )
         .await
     }
@@ -244,12 +247,27 @@ impl Fixture {
         )
     }
 
+    // Each integration binary compiles this shared fixture independently.
+    #[allow(dead_code)]
+    pub async fn new_with_settings_file(settings: &str) -> Self {
+        Self::new_with_store_files_inner(
+            server::HostRuntimeConfig::default(),
+            true,
+            None,
+            true,
+            None,
+            Some(settings),
+        )
+        .await
+    }
+
     async fn new_with_store_files_inner(
         mut runtime_config: server::HostRuntimeConfig,
         skip_real_backend_probe: bool,
         enabled_backends: Option<Vec<BackendKind>>,
         use_mock_backend: bool,
         store_files: Option<(&str, &str, Option<&str>)>,
+        settings_file: Option<&str>,
     ) -> Self {
         init_tracing();
 
@@ -277,6 +295,9 @@ impl Fixture {
             }
             std::fs::write(&session_path, sessions).expect("seed sessions.json");
             std::fs::write(&project_path, projects).expect("seed projects.json");
+        }
+        if let Some(settings) = settings_file {
+            std::fs::write(&settings_path, settings).expect("seed settings.json");
         }
         if let Some(enabled_backends) = enabled_backends {
             let store = server::store::settings::HostSettingsStore::load(settings_path.clone())

@@ -1065,6 +1065,7 @@ async fn project_bootstrap_exposes_one_active_workspace_review() {
         .review_action(
             &summary.id,
             ReviewActionPayload::StartAiReview {
+                mode: None,
                 backend_kind: None,
                 cost_hint: None,
                 instructions: Some("Check both roots.".to_owned()),
@@ -1280,6 +1281,7 @@ async fn start_ai_review_on_clean_workspace_errors_without_spawning_agent() {
         .review_action(
             &review.id,
             ReviewActionPayload::StartAiReview {
+                mode: None,
                 backend_kind: None,
                 cost_hint: None,
                 instructions: Some("There should be nothing to review.".to_owned()),
@@ -1380,6 +1382,7 @@ async fn committed_ai_review_addresses_large_frozen_context_without_inline_diff(
         .review_action(
             &review_id,
             ReviewActionPayload::StartAiReview {
+                mode: None,
                 backend_kind: None,
                 cost_hint: None,
                 instructions: Some("Review this committed range.".to_owned()),
@@ -1535,6 +1538,7 @@ async fn review_context_path_errors_are_recoverable_and_leave_no_artifacts() {
             .review_action(
                 &review_id,
                 ReviewActionPayload::StartAiReview {
+                    mode: None,
                     backend_kind: None,
                     cost_hint: None,
                     instructions: None,
@@ -2122,6 +2126,7 @@ async fn committed_comments_share_the_workspace_review() {
         .review_action(
             &review_id,
             ReviewActionPayload::StartAiReview {
+                mode: None,
                 backend_kind: None,
                 cost_hint: None,
                 instructions: Some("Review the selected committed range.".to_owned()),
@@ -3052,6 +3057,7 @@ async fn ai_reviewer_propose_tool_accepts_and_rejects_suggestions() {
         .review_action(
             &review.id,
             ReviewActionPayload::StartAiReview {
+                mode: None,
                 backend_kind: None,
                 cost_hint: None,
                 instructions: Some("Look for changed return values.".to_owned()),
@@ -4214,7 +4220,18 @@ async fn review_mcp_call(
 
 #[tokio::test]
 async fn configured_reviews_are_awaited_without_injecting_parent_messages() {
-    let fixture = Fixture::new().await;
+    let fixture = Fixture::new_with_settings_file(&json!({"settings": {
+        "review": { "enabled": true, "agents": {
+            "disabled-legacy": { "name": "Disabled aspect", "description": "Preserved", "instructions": "Do not review this disabled focus", "backend_kind": "claude", "session_settings": {}, "enabled": false }
+        }}
+    }}).to_string()).await;
+    let migrated = &fixture.bootstrap.settings.review.aspects;
+    assert_eq!(
+        migrated["disabled-legacy"].instructions,
+        "Do not review this disabled focus"
+    );
+    assert!(!migrated["disabled-legacy"].enabled);
+
     let mut client = fixture.connect().await;
     set_default_backend(&mut client, BackendKind::Claude).await;
     client
@@ -4230,42 +4247,47 @@ async fn configured_reviews_are_awaited_without_injecting_parent_messages() {
         .host_for_test()
         .set_session_schema_ready_for_test(BackendKind::Codex)
         .await;
+    client
+        .replace_setting("/review/default_mode", "deep", "light")
+        .await
+        .expect("select deep reviews");
+    expect_host_settings(&mut client, "default review depth").await;
     let config_url = fixture.config_mcp_http_url().await;
     let mut definitions = Vec::new();
     for name in ["Tests", "Comments"] {
-        let reviewer = json!({ "name": name, "description": "Focused review", "instructions": format!("Review {name} only"), "backend_kind": if name == "Tests" { "claude" } else { "codex" }, "session_settings": {}, "enabled": true });
+        let reviewer = json!({ "name": name, "description": "Focused review", "instructions": format!("Review {name} only"), "enabled": true });
         let (failed, created) = review_mcp_call(
             &config_url,
             None,
-            "tyde_config_upsert_review_agent",
-            json!({ "reviewer": reviewer }),
+            "tyde_config_upsert_review_aspect",
+            json!({ "aspect": reviewer }),
         )
         .await;
         assert!(!failed, "Help must be able to add reviewers: {created}");
         definitions.push(created);
     }
-    let mut edited = definitions[0]["reviewer"].clone();
+    let mut edited = definitions[0]["aspect"].clone();
     edited["instructions"] = json!("Find tests that cannot detect broken user-visible behavior");
     let (failed, result) = review_mcp_call(
         &config_url,
         None,
-        "tyde_config_upsert_review_agent",
-        json!({ "reviewer_id": definitions[0]["reviewer_id"], "reviewer": edited }),
+        "tyde_config_upsert_review_aspect",
+        json!({ "aspect_id": definitions[0]["aspect_id"], "aspect": edited }),
     )
     .await;
     assert!(!failed, "Help must be able to edit reviewers: {result}");
     let (failed, listed) = review_mcp_call(
         &config_url,
         None,
-        "tyde_config_list_review_agents",
+        "tyde_config_list_review_aspects",
         json!({}),
     )
     .await;
     assert!(!failed);
-    assert_eq!(listed["agents"].as_object().unwrap().len(), 2);
+    assert_eq!(listed["aspects"].as_object().unwrap().len(), 3);
     let settings = expect_host_settings(&mut client, "review configuration fanout").await;
     assert!(
-        !settings.settings.review.agents.is_empty(),
+        !settings.settings.review.aspects.is_empty(),
         "MCP changes must reach protocol clients"
     );
     let root = tempfile::tempdir().expect("review repo");
@@ -4286,11 +4308,25 @@ async fn configured_reviews_are_awaited_without_injecting_parent_messages() {
     let first_reservation = fixture
         .reserve_mock_launches(vec![
             (
-                "Review: Tests".to_owned(),
-                MockScript::one(MockTurn::gated_text("Test review finished", &first_gate)),
+                "Review: Tests · Claude".to_owned(),
+                MockScript::one(MockTurn::gated_echo(&first_gate)),
             ),
             (
-                "Review: Comments".to_owned(),
+                "Review: Tests · Codex".to_owned(),
+                MockScript::one(MockTurn::gated_text(
+                    "Independent test review",
+                    &second_gate,
+                )),
+            ),
+            (
+                "Review: Comments · Claude".to_owned(),
+                MockScript::one(MockTurn::gated_text(
+                    "Independent comment review",
+                    &second_gate,
+                )),
+            ),
+            (
+                "Review: Comments · Codex".to_owned(),
                 MockScript::one(MockTurn::gated_text(
                     "Comment review finished",
                     &second_gate,
@@ -4307,6 +4343,11 @@ async fn configured_reviews_are_awaited_without_injecting_parent_messages() {
     .await;
     assert!(!failed, "request review: {started}");
     assert_eq!(started["status"], "running");
+    assert_eq!(
+        started["rounds"][0]["reviewers"].as_array().unwrap().len(),
+        4,
+        "Deep review must launch both backends for every enabled aspect"
+    );
     let mut observed = Vec::new();
     next_frame_matching_on(
         &mut client,
@@ -4314,7 +4355,7 @@ async fn configured_reviews_are_awaited_without_injecting_parent_messages() {
         |env| {
             if env.kind == FrameKind::NewAgent {
                 let agent: NewAgentPayload = env.parse_payload().unwrap();
-                if agent.name == "Review: Tests" || agent.name == "Review: Comments" {
+                if agent.name.starts_with("Review: ") {
                     eprintln!(
                         "reviewer ownership: parent_present={}, requester_matches={}",
                         agent.parent_agent_id.is_some(),
@@ -4326,15 +4367,19 @@ async fn configured_reviews_are_awaited_without_injecting_parent_messages() {
                         "Agent-requested reviewers must be children of the requesting agent"
                     );
                 }
-                if agent.name == "Review: Tests" {
-                    assert_eq!(agent.backend_kind, BackendKind::Claude);
-                    observed.push(agent.name);
-                } else if agent.name == "Review: Comments" {
-                    assert_eq!(agent.backend_kind, BackendKind::Codex);
+                if agent.name.starts_with("Review: ") {
+                    assert_eq!(
+                        agent.backend_kind,
+                        if agent.name.ends_with("Claude") {
+                            BackendKind::Claude
+                        } else {
+                            BackendKind::Codex
+                        }
+                    );
                     observed.push(agent.name);
                 }
             }
-            observed.len() == 2
+            observed.len() == 4
         },
     )
     .await;
@@ -4344,7 +4389,7 @@ async fn configured_reviews_are_awaited_without_injecting_parent_messages() {
         .iter()
         .filter(|agent| agent.name.starts_with("Review: "))
         .collect::<Vec<_>>();
-    assert_eq!(reviewers.len(), 2);
+    assert_eq!(reviewers.len(), 4);
     for reviewer in reviewers {
         assert_eq!(reviewer.parent_agent_id.as_ref(), Some(&requester.agent_id));
     }
@@ -4364,7 +4409,7 @@ async fn configured_reviews_are_awaited_without_injecting_parent_messages() {
         .filter(|session| session.parent_id.as_ref() == Some(&requester_session))
         .count();
     assert_eq!(
-        children, 2,
+        children, 4,
         "Both reviewers must retain parent session lineage"
     );
     let (failed, children) = review_mcp_call(
@@ -4375,19 +4420,44 @@ async fn configured_reviews_are_awaited_without_injecting_parent_messages() {
     )
     .await;
     assert!(!failed);
-    assert_eq!(children.as_array().map(Vec::len), Some(2));
+    assert_eq!(children.as_array().map(Vec::len), Some(4));
     let round = &started["rounds"][0];
-    assert_eq!(round["reviewers"].as_array().unwrap().len(), 2);
+    assert_eq!(round["reviewers"].as_array().unwrap().len(), 4);
+    assert_eq!(round["mode"], "deep");
+    for reviewer in round["reviewers"].as_array().unwrap() {
+        assert_eq!(reviewer["aspects"].as_array().unwrap().len(), 1);
+        assert!(
+            !reviewer["aspects"][0]["instructions"]
+                .as_str()
+                .unwrap()
+                .is_empty()
+        );
+    }
     let first_id = AgentId(
         round["reviewers"]
             .as_array()
             .unwrap()
             .iter()
-            .find(|r| r["name"] == "Tests")
+            .find(|r| r["name"] == "Tests · Claude")
             .unwrap()["agent_id"]
             .as_str()
             .unwrap()
             .to_owned(),
+    );
+    let (mut focus_client, focus_bootstrap) = fixture.connect_with_bootstrap().await;
+    let focused = focus_bootstrap
+        .agents
+        .iter()
+        .find(|a| a.agent_id == first_id)
+        .unwrap();
+    let (_, _, focused_manifest) =
+        reviewer_context_before_idle(&mut focus_client, &focused.instance_stream).await;
+    assert!(
+        focused_manifest.contains("Find tests that cannot detect broken user-visible behavior")
+    );
+    assert!(
+        !focused_manifest.contains("Review Comments only"),
+        "Deep reviewers must receive only their assigned aspect"
     );
     let proposal = call_propose_review_comment_tool(
         &fixture,
@@ -4401,6 +4471,8 @@ async fn configured_reviews_are_awaited_without_injecting_parent_messages() {
     next_frame_matching_on(&mut client, "one reviewer complete while the other still runs", |env| {
         env.kind == FrameKind::ReviewEvent && matches!(env.parse_payload::<ReviewEventPayload>(), Ok(ReviewEventPayload::AiReviewerChanged { state }) if state.status == ReviewAiReviewerStatus::Running && state.rounds.last().is_some_and(|r| r.reviewers.iter().filter(|a| a.status == ReviewAiReviewerStatus::Completed).count() == 1))
     }).await;
+    second_gate.release_one();
+    second_gate.release_one();
     second_gate.release_one();
     let mut injected_messages = 0;
     next_frame_matching_on(&mut client, "review completes without messaging its requester", |env| {
@@ -4466,7 +4538,7 @@ async fn configured_reviews_are_awaited_without_injecting_parent_messages() {
     );
     assert_eq!(
         feedback["rounds"][0]["reviewers"].as_array().map(Vec::len),
-        Some(2)
+        Some(4)
     );
     let mut observer = fixture.connect().await;
     let completed = subscribe_review(&mut observer, &review.id).await;
@@ -4499,11 +4571,19 @@ async fn configured_reviews_are_awaited_without_injecting_parent_messages() {
     let next_tests = fixture
         .reserve_mock_launches(vec![
             (
-                "Review: Tests".to_owned(),
+                "Review: Tests · Claude".to_owned(),
                 MockScript::one(MockTurn::gated_text("No issues", &next_gate)),
             ),
             (
-                "Review: Comments".to_owned(),
+                "Review: Tests · Codex".to_owned(),
+                MockScript::one(MockTurn::gated_text("No issues", &next_comments_gate)),
+            ),
+            (
+                "Review: Comments · Claude".to_owned(),
+                MockScript::one(MockTurn::gated_text("No issues", &next_comments_gate)),
+            ),
+            (
+                "Review: Comments · Codex".to_owned(),
                 MockScript::one(MockTurn::gated_text("No issues", &next_comments_gate)),
             ),
         ])
@@ -4556,6 +4636,8 @@ async fn configured_reviews_are_awaited_without_injecting_parent_messages() {
         "One finished reviewer must not complete a multi-reviewer await"
     );
     next_comments_gate.release_one();
+    next_comments_gate.release_one();
+    next_comments_gate.release_one();
     let (failed, awaited) = wait.await;
     assert!(!failed);
     assert_eq!(awaited["status"], "completed");
@@ -4590,6 +4672,16 @@ async fn configured_reviews_are_awaited_without_injecting_parent_messages() {
     )
     .await;
     assert_eq!(failed_review["status"], "failed");
+    assert_eq!(
+        failed_review["rounds"][2]["reviewers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|r| r["status"] == "failed" && r["backend_kind"] == "codex")
+            .count(),
+        2,
+        "Each missing Codex review must remain visible"
+    );
     let (failed, awaited) = review_mcp_call(
         &caller.await_url,
         Some(&caller.authorization),
@@ -4682,11 +4774,19 @@ async fn configured_reviews_are_awaited_without_injecting_parent_messages() {
     let stop_reservation = fixture
         .reserve_mock_launches(vec![
             (
-                "Review: Tests".to_owned(),
+                "Review: Tests · Claude".to_owned(),
                 MockScript::one(MockTurn::held_text("Waiting for cancellation")),
             ),
             (
-                "Review: Comments".to_owned(),
+                "Review: Tests · Codex".to_owned(),
+                MockScript::one(MockTurn::held_text("Waiting for cancellation")),
+            ),
+            (
+                "Review: Comments · Claude".to_owned(),
+                MockScript::one(MockTurn::held_text("Waiting for cancellation")),
+            ),
+            (
+                "Review: Comments · Codex".to_owned(),
                 MockScript::one(MockTurn::held_text("Waiting for cancellation")),
             ),
         ])
@@ -4757,6 +4857,119 @@ async fn configured_reviews_are_awaited_without_injecting_parent_messages() {
     }
     drop(stop_reservation);
 
+    let (failed, _) = review_mcp_call(&config_url, None, "tyde_config_set_setting", json!({"setting": {"setting": "review_light_execution", "config": {"backend_kind": "claude", "session_settings": {"model": {"string": "sonnet"}, "effort": {"string": "high"}}}}})).await;
+    assert!(!failed, "Help must configure shared execution settings");
+    expect_host_settings(&mut client, "shared light execution").await;
+    let light_gate = MockGateHandle::new();
+    let light_reservation = fixture
+        .reserve_next_mock_launch(
+            "AI Review",
+            MockScript::one(MockTurn::gated_echo(&light_gate)),
+        )
+        .await;
+    let (failed, light) = review_mcp_call(
+        &caller.url,
+        Some(&caller.authorization),
+        "tyde_request_review",
+        json!({"mode": "light"}),
+    )
+    .await;
+    assert!(!failed, "Light override must work with a deep default");
+    let light_round = light["rounds"].as_array().unwrap().last().unwrap();
+    assert_eq!(light_round["mode"], "light");
+    assert_eq!(light_round["reviewers"].as_array().unwrap().len(), 1);
+    let assigned = light_round["reviewers"][0]["aspects"].as_array().unwrap();
+    assert_eq!(
+        assigned.len(),
+        2,
+        "One light reviewer receives both enabled aspects"
+    );
+    assert!(assigned.iter().all(|a| a["id"] != "disabled-legacy"));
+    let (mut light_client, light_bootstrap) = fixture.connect_with_bootstrap().await;
+    let light_agent = light_bootstrap
+        .agents
+        .iter()
+        .find(|a| a.name == "AI Review")
+        .unwrap();
+    assert_eq!(light_agent.backend_kind, BackendKind::Claude);
+    let boot_frame = next_frame_matching_on(
+        &mut light_client,
+        "light execution settings after launch",
+        |env| env.stream == light_agent.instance_stream && env.kind == FrameKind::AgentBootstrap,
+    )
+    .await;
+    let boot: protocol::AgentBootstrapPayload = boot_frame.parse_payload().unwrap();
+    let values = boot
+        .events
+        .iter()
+        .find_map(|event| match event {
+            AgentBootstrapEvent::SessionSettings(settings) => Some(&settings.values),
+            _ => None,
+        })
+        .expect("effective reviewer settings");
+    assert!(
+        values.0.get("model") == Some(&protocol::SessionSettingValue::String("sonnet".to_owned()))
+    );
+    assert!(
+        values.0.get("effort") == Some(&protocol::SessionSettingValue::String("high".to_owned()))
+    );
+    fixture::push_pending_frames_on(&light_client, fixture::agent_bootstrap_frames(&boot_frame));
+    let (startup, manifest_path, manifest) =
+        reviewer_context_before_idle(&mut light_client, &light_agent.instance_stream).await;
+    assert!(
+        startup.contains("ReadOnly"),
+        "Combined review must retain read-only access"
+    );
+    assert!(manifest.contains("Find tests that cannot detect broken user-visible behavior"));
+    assert!(manifest.contains("Review Comments only"));
+    assert!(!manifest.contains("Do not review this disabled focus"));
+    let mut changed_aspect = edited.clone();
+    changed_aspect["instructions"] = json!("Changed instructions for future rounds");
+    let (failed, _) = review_mcp_call(
+        &config_url,
+        None,
+        "tyde_config_upsert_review_aspect",
+        json!({"aspect_id": definitions[0]["aspect_id"], "aspect": changed_aspect}),
+    )
+    .await;
+    assert!(!failed);
+    assert!(
+        fs::read_to_string(manifest_path).unwrap() == manifest,
+        "Editing an aspect cannot change a running review snapshot"
+    );
+    light_gate.release_one();
+    let (failed, light_done) = review_mcp_call(
+        &caller.await_url,
+        Some(&caller.authorization),
+        "tyde_await_review",
+        json!({"review_id": review.id, "round_id": light_round["id"]}),
+    )
+    .await;
+    assert!(!failed);
+    assert_eq!(light_done["status"], "completed");
+    let (_, retained) = review_mcp_call(
+        &caller.url,
+        Some(&caller.authorization),
+        "tyde_get_review",
+        json!({"review_id": review.id}),
+    )
+    .await;
+    let historical = started["rounds"][0]["reviewers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| {
+            let mut r = r.clone();
+            r["status"] = json!("completed");
+            r
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        retained["rounds"][0]["reviewers"].as_array().unwrap() == &historical,
+        "Earlier rounds must retain the original aspect definitions"
+    );
+    drop(light_reservation);
+
     let max_depth = settings.settings.tyde_agent_control_max_depth;
     client
         .replace_setting("/tyde_agent_control_max_depth", 1u8, max_depth)
@@ -4799,19 +5012,19 @@ async fn configured_reviews_are_awaited_without_injecting_parent_messages() {
     let (failed, _) = review_mcp_call(
         &config_url,
         None,
-        "tyde_config_delete_review_agent",
-        json!({ "reviewer_id": definitions[1]["reviewer_id"] }),
+        "tyde_config_delete_review_aspect",
+        json!({ "aspect_id": definitions[1]["aspect_id"] }),
     )
     .await;
     assert!(!failed);
     let (_, remaining) = review_mcp_call(
         &config_url,
         None,
-        "tyde_config_list_review_agents",
+        "tyde_config_list_review_aspects",
         json!({}),
     )
     .await;
-    assert_eq!(remaining["agents"].as_object().unwrap().len(), 1);
+    assert_eq!(remaining["aspects"].as_object().unwrap().len(), 2);
 
     let (failed, _) = review_mcp_call(
         &config_url,
@@ -4823,7 +5036,7 @@ async fn configured_reviews_are_awaited_without_injecting_parent_messages() {
     assert!(!failed);
     let close_reservation = fixture
         .reserve_next_mock_launch(
-            "Review: Tests",
+            "Review: Tests · Claude",
             MockScript::one(MockTurn::held_text("Waiting for parent close")),
         )
         .await;
@@ -4878,8 +5091,15 @@ async fn configured_reviews_are_awaited_without_injecting_parent_messages() {
         },
     )
     .await;
+    // The added light round makes ordinal counts stale; assert the exact final round instead.
+    let last_round_id = last["rounds"].as_array().unwrap().last().unwrap()["id"]
+        .as_str()
+        .unwrap();
     next_frame_matching_on(&mut observer, "parent close marks review incomplete", |env| {
-        env.kind == FrameKind::ReviewEvent && matches!(env.parse_payload::<ReviewEventPayload>(), Ok(ReviewEventPayload::AiReviewerChanged { state }) if state.status == ReviewAiReviewerStatus::Failed && state.rounds.len() == 5)
+        if let Ok(ReviewEventPayload::AiReviewerChanged { state }) = env.parse_payload::<ReviewEventPayload>() {
+            eprintln!("Parent close review state: rounds={}, status={:?}", state.rounds.len(), state.status);
+        }
+        env.kind == FrameKind::ReviewEvent && matches!(env.parse_payload::<ReviewEventPayload>(), Ok(ReviewEventPayload::AiReviewerChanged { state }) if state.status == ReviewAiReviewerStatus::Failed && state.rounds.last().is_some_and(|r| r.id == last_round_id))
     }).await;
     let (reconnected, after_close) = fixture.connect_with_bootstrap().await;
     assert!(

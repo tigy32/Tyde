@@ -13364,62 +13364,100 @@ impl HostHandle {
         &self,
         caller: AgentId,
         scope: protocol::ReviewAiScope,
+        mode: Option<protocol::ReviewMode>,
     ) -> Result<protocol::Review, String> {
         let settings = self.read_settings().await?;
         if !settings.review.enabled {
             return Err("Reviews are disabled in Settings → Review".to_owned());
         }
-        if !settings.review.agents.values().any(|r| r.enabled) {
-            return Err("Add and enable reviewers in Settings → Review first".to_owned());
+        if !settings.review.aspects.values().any(|r| r.enabled) {
+            return Err("Add and enable aspects in Settings → Review first".to_owned());
         }
         self.validate_sub_agent_depth(&caller).await?;
         self.agent_review_handle(&caller, None)
             .await?
-            .request_review(caller, scope)
+            .request_review(caller, scope, mode)
             .await
     }
 
     async fn spawn_ai_reviewers(
         &self,
         request: &ReviewAiSpawnRequest,
-    ) -> Result<Vec<protocol::ReviewReviewerRun>, String> {
-        tracing::info!(review_id = %request.review_id, snapshot_id = %request.snapshot_id, "launching review snapshot");
+    ) -> Result<(protocol::ReviewMode, Vec<protocol::ReviewReviewerRun>), String> {
         let settings = self.read_settings().await?;
         if !settings.review.enabled {
             return Err("Reviews are disabled in Settings → Review".to_owned());
         }
-        let configured = !settings.review.agents.is_empty();
-        let mut configs = settings
+        let mode = request.mode.unwrap_or(settings.review.default_mode);
+        let configured = !settings.review.aspects.is_empty();
+        let aspects = settings
             .review
-            .agents
+            .aspects
             .into_iter()
-            .filter(|(_, r)| r.enabled)
+            .filter(|(_, a)| a.enabled)
+            .map(|(id, a)| protocol::ReviewAspectSnapshot {
+                id,
+                name: a.name,
+                description: a.description,
+                instructions: a.instructions,
+            })
             .collect::<Vec<_>>();
-        if configs.is_empty() {
-            if request.requested_by.is_some() || configured {
-                return Err("Add and enable review agents in Settings → Review first".to_owned());
-            }
-            configs.push((
-                String::new(),
-                settings_model::ReviewAgentConfig {
-                    name: "AI Review".to_owned(),
-                    description: String::new(),
-                    enabled: true,
-                    instructions: request.instructions.clone().unwrap_or_default(),
-                    backend_kind: self
-                        .resolve_ai_reviewer_backend_kind(request.backend_kind)
-                        .await?,
-                    session_settings: Default::default(),
-                },
-            ));
+        if aspects.is_empty()
+            && (configured || request.requested_by.is_some() || mode == protocol::ReviewMode::Deep)
+        {
+            return Err("Add and enable review aspects in Settings → Review first".to_owned());
         }
-        let legacy = !configured && request.requested_by.is_none();
-        let results = futures_util::future::join_all(configs.into_iter().map(
-            |(config_id, config)| async move {
-                let result = self.spawn_ai_reviewer_member(request, &config).await;
+        let mut assignments = Vec::new();
+        match mode {
+            protocol::ReviewMode::Light => {
+                let config = if configured {
+                    settings.review.light
+                } else {
+                    settings_model::ReviewExecutionConfig {
+                        backend_kind: self
+                            .resolve_ai_reviewer_backend_kind(request.backend_kind)
+                            .await?,
+                        session_settings: Default::default(),
+                    }
+                };
+                assignments.push(("AI Review".to_owned(), aspects, config));
+            }
+            protocol::ReviewMode::Deep => {
+                for aspect in aspects {
+                    for (backend_kind, session_settings, label) in [
+                        (BackendKind::Claude, &settings.review.claude, "Claude"),
+                        (BackendKind::Codex, &settings.review.codex, "Codex"),
+                    ] {
+                        assignments.push((
+                            format!("{} · {label}", aspect.name),
+                            vec![aspect.clone()],
+                            settings_model::ReviewExecutionConfig {
+                                backend_kind,
+                                session_settings: session_settings.clone(),
+                            },
+                        ));
+                    }
+                }
+            }
+        }
+        tracing::info!(review_id = %request.review_id, snapshot_id = %request.snapshot_id, ?mode, assignment_count = assignments.len(), "launching aspect review snapshot");
+        let results = futures_util::future::join_all(assignments.into_iter().map(
+            |(name, aspects, config)| async move {
+                let mut instructions = aspects
+                    .iter()
+                    .map(|a| format!("## {}\n{}", a.name, a.instructions))
+                    .collect::<Vec<_>>()
+                    .join("\n\n");
+                if let Some(extra) = &request.instructions {
+                    instructions.push_str("\n\nAdditional instructions:\n");
+                    instructions.push_str(extra);
+                }
+                let result = self
+                    .spawn_ai_reviewer_member(request, &name, &instructions, &config)
+                    .await;
                 protocol::ReviewReviewerRun {
-                    config_id,
-                    name: config.name,
+                    aspects,
+                    name,
                     backend_kind: config.backend_kind,
                     status: if result.is_ok() {
                         protocol::ReviewAiReviewerStatus::Running
@@ -13432,16 +13470,21 @@ impl HostHandle {
             },
         ))
         .await;
-        if legacy && let Some(error) = results.first().and_then(|r| r.error.clone()) {
+        if !configured
+            && request.requested_by.is_none()
+            && let Some(error) = results.first().and_then(|r| r.error.clone())
+        {
             return Err(error);
         }
-        Ok(results)
+        Ok((mode, results))
     }
 
     async fn spawn_ai_reviewer_member(
         &self,
         request: &ReviewAiSpawnRequest,
-        config: &settings_model::ReviewAgentConfig,
+        name: &str,
+        instructions: &str,
+        config: &settings_model::ReviewExecutionConfig,
     ) -> Result<AgentId, String> {
         let requested_backend_kind = Some(config.backend_kind);
         let backend_kind = match self
@@ -13521,7 +13564,7 @@ impl HostHandle {
         let context_directory = prepare_reviewer_context(
             &request.review,
             &request.scope,
-            &config.instructions,
+            instructions,
             &context_parent,
         )
         .await?;
@@ -13560,10 +13603,10 @@ impl HostHandle {
         let prompt = build_reviewer_user_prompt();
         let prompt_len = prompt.len();
         let payload = SpawnAgentPayload {
-            name: Some(if config.name == "AI Review" {
-                config.name.clone()
+            name: Some(if name == "AI Review" {
+                name.to_owned()
             } else {
-                format!("Review: {}", config.name)
+                format!("Review: {name}")
             }),
             custom_agent_id: None,
             parent_agent_id: request.requested_by.clone(),

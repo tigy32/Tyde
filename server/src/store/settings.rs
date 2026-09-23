@@ -80,6 +80,7 @@ impl HostSettingsStore {
         // that reason. It must also precede `read_from_disk`, which strips
         // unrecognized backend kinds and would drop "kiro" rather than rename
         // it.
+        Self::migrate_review_aspects(&path)?;
         Self::migrate_legacy_kiro_settings(&path)?;
         Self::migrate_legacy_gemini_settings(&path)?;
         Self::migrate_launch_profiles_to_map(&path)?;
@@ -191,6 +192,39 @@ impl HostSettingsStore {
         let settings = validate_settings(settings)?;
         Self::save(&self.path, &settings)?;
         Ok(settings)
+    }
+
+    fn migrate_review_aspects(path: &Path) -> Result<(), String> {
+        let contents = match std::fs::read_to_string(path) {
+            Ok(contents) => contents,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(format!("Cannot read review settings: {error}")),
+        };
+        let mut value: Value = serde_json::from_str(&contents).map_err(|e| e.to_string())?;
+        let Some(review) = value
+            .pointer_mut("/settings/review")
+            .and_then(Value::as_object_mut)
+        else {
+            return Ok(());
+        };
+        let Some(Value::Object(agents)) = review.remove("agents") else {
+            return Ok(());
+        };
+        if !review.contains_key("aspects") {
+            let aspects = agents
+                .into_iter()
+                .map(|(id, mut aspect)| {
+                    if let Some(fields) = aspect.as_object_mut() {
+                        fields.remove("backend_kind");
+                        fields.remove("session_settings");
+                    }
+                    (id, aspect)
+                })
+                .collect();
+            review.insert("aspects".to_owned(), Value::Object(aspects));
+        }
+        tracing::info!("converted review agent definitions to backend-independent aspects");
+        Self::save_raw(path, &value)
     }
 
     fn migrate_legacy_gemini_settings(path: &Path) -> Result<(), String> {
@@ -673,12 +707,12 @@ fn empty_settings() -> HostSettings {
 }
 
 fn validate_settings(settings: HostSettings) -> Result<HostSettings, String> {
-    for (id, reviewer) in &settings.review.agents {
+    for (id, reviewer) in &settings.review.aspects {
         if id.trim().is_empty()
             || reviewer.name.trim().is_empty()
             || reviewer.instructions.trim().is_empty()
         {
-            return Err("Review agents require an id, name, and review instructions".to_owned());
+            return Err("Review aspects require an id, name, and review instructions".to_owned());
         }
     }
 

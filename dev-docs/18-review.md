@@ -404,8 +404,32 @@ files, Git status, diffs, review comments, or review navigation.
 
 ### AI review
 
-`StartAiReview` spawns one agent named `AI Review` for the requested `ReviewAiScope`.
-The spawn request uses:
+`StartAiReview` and `tyde_request_review` accept optional `mode: light | deep`.
+Omitting it uses `/review/default_mode` (initially light). Host-scoped
+`/review/aspects` stores backend-independent names, descriptions, instructions,
+and enabled flags. `/review/light` selects the light backend and session
+settings; `/review/claude` and `/review/codex` hold deep session settings.
+
+Light launches one `AI Review` agent with all enabled aspects. Deep launches
+one independent Claude and one independent Codex reviewer per enabled aspect,
+concurrently. The UI reports the resulting agent count; there is no concurrency
+cap. A missing backend remains a failed member, never silently reduced coverage.
+All members receive the same frozen diff snapshot. Each round records its mode,
+and each member records the exact aspect definitions it received. Prior records
+without this metadata remain readable and are displayed as Legacy.
+
+Agent-requested members are children of the requester. Await waits for the whole
+round, and findings are read through tools, never injected into conversations.
+Manual reviews retain the accept-and-submit flow. Duplicate findings retain
+their independent reviewer identities.
+
+On startup, the settings store rewrites old `review.agents` definitions into
+`review.aspects`, retaining text and enabled flags but dropping per-aspect model
+and backend choices. The old configuration MCP names are replaced by
+`tyde_config_{list,upsert,delete}_review_aspect(s)`; clients must update together.
+Unconfigured manual light reviews retain the existing default-backend fallback.
+
+Each spawn request uses:
 
 - `project_id = Some(review.project_id)`
 - `workspace_roots = project.roots`

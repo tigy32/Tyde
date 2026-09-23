@@ -111,6 +111,18 @@ impl From<BackendKindInput> for BackendKind {
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "setting", rename_all = "snake_case", deny_unknown_fields)]
 enum SettingInput {
+    ReviewDefaultMode {
+        mode: protocol::ReviewMode,
+    },
+    ReviewLightExecution {
+        config: settings_model::ReviewExecutionConfig,
+    },
+    ReviewClaudeExecution {
+        session_settings: protocol::SessionSettingsValues,
+    },
+    ReviewCodexExecution {
+        session_settings: protocol::SessionSettingsValues,
+    },
     ReviewsEnabled {
         enabled: bool,
     },
@@ -153,6 +165,18 @@ impl SettingInput {
     fn into_op(self, current: &settings_model::HostSettings) -> Result<SettingOp, String> {
         let doc = serde_json::to_value(current).map_err(|error| error.to_string())?;
         let (path, value) = match self {
+            Self::ReviewDefaultMode { mode } => {
+                ("/review/default_mode".to_owned(), Some(json!(mode)))
+            }
+            Self::ReviewLightExecution { config } => {
+                ("/review/light".to_owned(), Some(json!(config)))
+            }
+            Self::ReviewClaudeExecution { session_settings } => {
+                ("/review/claude".to_owned(), Some(json!(session_settings)))
+            }
+            Self::ReviewCodexExecution { session_settings } => {
+                ("/review/codex".to_owned(), Some(json!(session_settings)))
+            }
             Self::ReviewsEnabled { enabled } => {
                 ("/review/enabled".to_owned(), Some(json!(enabled)))
             }
@@ -215,16 +239,16 @@ impl SettingInput {
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
-struct ReviewAgentToolInput {
-    /// Omit to add a reviewer; use an existing id to edit it.
-    reviewer_id: Option<String>,
-    reviewer: settings_model::ReviewAgentConfig,
+struct ReviewAspectToolInput {
+    /// Omit to add an aspect; use an existing id to edit it.
+    aspect_id: Option<String>,
+    aspect: settings_model::ReviewAspectConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
-struct ReviewAgentIdToolInput {
-    reviewer_id: String,
+struct ReviewAspectIdToolInput {
+    aspect_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
@@ -398,16 +422,16 @@ where
 #[tool_router]
 impl TydeConfigMcpServer {
     #[tool(
-        description = "List configured review agents, the review enabled setting, and backend model/effort schemas. These are the same reviewers shown in Settings → Review."
+        description = "List configured review aspects, the review enabled setting, and backend model/effort schemas. These are the same aspects shown in Settings → Review."
     )]
-    async fn tyde_config_list_review_agents(
+    async fn tyde_config_list_review_aspects(
         &self,
         Parameters(_input): Parameters<EmptyToolInput>,
     ) -> Result<CallToolResult, McpError> {
         match self.host.read_settings().await {
             Ok(settings) => match self.host.review_session_schemas().await {
                 Ok(schemas) => ok_json(
-                    json!({ "enabled": settings.review.enabled, "agents": settings.review.agents, "session_schemas": schemas }),
+                    json!({ "enabled": settings.review.enabled, "aspects": settings.review.aspects, "default_mode": settings.review.default_mode, "light": settings.review.light, "claude": settings.review.claude, "codex": settings.review.codex, "session_schemas": schemas }),
                 ),
                 Err(err) => Ok(err_text(err)),
             },
@@ -416,18 +440,18 @@ impl TydeConfigMcpServer {
     }
 
     #[tool(
-        description = "Add or edit a focused review agent. Omit reviewer_id to add; supply an existing id to replace its definition. Configure name, description, instructions, backend_kind, session_settings (model/effort), and enabled. Changes appear immediately in Settings → Review. Does not run a review."
+        description = "Add or edit a focused review aspect. Omit aspect_id to add; supply an existing id to replace its definition. Configure name, description, instructions, and enabled. Backend/model/effort belong to shared review execution settings, not aspects. Changes appear immediately in Settings → Review. Does not run a review."
     )]
-    async fn tyde_config_upsert_review_agent(
+    async fn tyde_config_upsert_review_aspect(
         &self,
-        Parameters(input): Parameters<ReviewAgentToolInput>,
+        Parameters(input): Parameters<ReviewAspectToolInput>,
     ) -> Result<CallToolResult, McpError> {
         let result: Result<Value, String> = async {
             let current = self.host.read_settings().await?;
             let id = input
-                .reviewer_id
+                .aspect_id
                 .unwrap_or_else(|| Uuid::new_v4().to_string());
-            let existing = current.review.agents.get(&id);
+            let existing = current.review.aspects.get(&id);
             let expected = match existing {
                 Some(value) => SettingExpectation::Value {
                     value: json!(value),
@@ -436,14 +460,14 @@ impl TydeConfigMcpServer {
             };
             let op = SettingOp::Replace {
                 path: format!(
-                    "/review/agents/{}",
+                    "/review/aspects/{}",
                     settings_model::escape_pointer_token(&id)
                 ),
-                value: json!(input.reviewer),
+                value: json!(input.aspect),
                 expected,
             };
             self.write_review_setting(op).await?;
-            Ok(json!({ "reviewer_id": id, "reviewer": input.reviewer }))
+            Ok(json!({ "aspect_id": id, "aspect": input.aspect }))
         }
         .await;
         match result {
@@ -453,23 +477,23 @@ impl TydeConfigMcpServer {
     }
 
     #[tool(
-        description = "Delete a configured review agent by id. This affects future reviews, not running or historical rounds."
+        description = "Delete a configured review aspect by id. This affects future reviews, not running or historical rounds."
     )]
-    async fn tyde_config_delete_review_agent(
+    async fn tyde_config_delete_review_aspect(
         &self,
-        Parameters(input): Parameters<ReviewAgentIdToolInput>,
+        Parameters(input): Parameters<ReviewAspectIdToolInput>,
     ) -> Result<CallToolResult, McpError> {
         let result = async {
             let current = self.host.read_settings().await?;
             let existing = current
                 .review
-                .agents
-                .get(&input.reviewer_id)
-                .ok_or_else(|| "Unknown reviewer id".to_owned())?;
+                .aspects
+                .get(&input.aspect_id)
+                .ok_or_else(|| "Unknown aspect id".to_owned())?;
             self.write_review_setting(SettingOp::Remove {
                 path: format!(
-                    "/review/agents/{}",
-                    settings_model::escape_pointer_token(&input.reviewer_id)
+                    "/review/aspects/{}",
+                    settings_model::escape_pointer_token(&input.aspect_id)
                 ),
                 expected: SettingExpectation::Value {
                     value: json!(existing),
@@ -479,7 +503,7 @@ impl TydeConfigMcpServer {
         }
         .await;
         match result {
-            Ok(()) => ok_json(json!({"deleted": input.reviewer_id})),
+            Ok(()) => ok_json(json!({"deleted": input.aspect_id})),
             Err(err) => Ok(err_text(err)),
         }
     }

@@ -79,10 +79,12 @@ impl ReviewHandle {
         &self,
         caller: AgentId,
         scope: protocol::ReviewAiScope,
+        mode: Option<protocol::ReviewMode>,
     ) -> Result<Review, String> {
         let (reply, response) = oneshot::channel();
         self.tx
             .send(ReviewCommand::AgentRequest {
+                mode,
                 caller,
                 scope,
                 reply,

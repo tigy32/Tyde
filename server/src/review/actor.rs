@@ -53,7 +53,15 @@ pub(crate) struct ReviewDeliveryRequest {
     pub reply: oneshot::Sender<ReviewDeliveryOutcome>,
 }
 
+pub(crate) struct ReviewLaunchOptions {
+    pub mode: Option<protocol::ReviewMode>,
+    pub backend_kind: Option<protocol::BackendKind>,
+    pub cost_hint: Option<protocol::SpawnCostHint>,
+    pub instructions: Option<String>,
+}
+
 pub(crate) struct ReviewAiSpawnRequest {
+    pub mode: Option<protocol::ReviewMode>,
     pub review_id: ReviewId,
     /// Only the selected scope is materialized for the reviewer to read.
     pub review: Review,
@@ -64,13 +72,15 @@ pub(crate) struct ReviewAiSpawnRequest {
     pub instructions: Option<String>,
     pub review_handle: crate::review::ReviewHandle,
     pub requested_by: Option<AgentId>,
-    pub reply: oneshot::Sender<Result<Vec<protocol::ReviewReviewerRun>, String>>,
+    pub reply:
+        oneshot::Sender<Result<(protocol::ReviewMode, Vec<protocol::ReviewReviewerRun>), String>>,
 }
 
 pub(crate) type AiSuggestionResult = Result<ReviewSuggestionId, ReviewErrorPayload>;
 
 pub(crate) enum ReviewCommand {
     AgentRequest {
+        mode: Option<protocol::ReviewMode>,
         caller: AgentId,
         scope: protocol::ReviewAiScope,
         reply: oneshot::Sender<Result<Review, String>>,
@@ -192,15 +202,19 @@ impl ReviewActor {
         while let Some(command) = rx.recv().await {
             match command {
                 ReviewCommand::AgentRequest {
+                    mode,
                     caller,
                     scope,
                     reply,
                 } => {
                     let rounds = self.review.ai_reviewer.rounds.len();
                     self.start_ai_review(
-                        None,
-                        None,
-                        None,
+                        ReviewLaunchOptions {
+                            mode,
+                            backend_kind: None,
+                            cost_hint: None,
+                            instructions: None,
+                        },
                         scope,
                         StreamPath(format!("/review-request/{}", caller.0)),
                         Some(caller),
@@ -366,13 +380,24 @@ impl ReviewActor {
                 self.reject_suggestion(suggestion_id, conn).await;
             }
             ReviewActionPayload::StartAiReview {
+                mode,
                 backend_kind,
                 cost_hint,
                 instructions,
                 scope,
             } => {
-                self.start_ai_review(backend_kind, cost_hint, instructions, scope, conn, None)
-                    .await;
+                self.start_ai_review(
+                    ReviewLaunchOptions {
+                        mode,
+                        backend_kind,
+                        cost_hint,
+                        instructions,
+                    },
+                    scope,
+                    conn,
+                    None,
+                )
+                .await;
             }
             ReviewActionPayload::Submit { target } => {
                 self.submit(target, conn).await;
@@ -775,13 +800,17 @@ impl ReviewActor {
 
     async fn start_ai_review(
         &mut self,
-        backend_kind: Option<protocol::BackendKind>,
-        cost_hint: Option<protocol::SpawnCostHint>,
-        instructions: Option<String>,
+        options: ReviewLaunchOptions,
         scope: protocol::ReviewAiScope,
         conn: ConnectionId,
         requested_by: Option<AgentId>,
     ) {
+        let ReviewLaunchOptions {
+            mode,
+            backend_kind,
+            cost_hint,
+            instructions,
+        } = options;
         let context = ReviewErrorContext::StartAiReview;
         // A legacy committed-range record can only ever read its own range.
         let scope = match &self.review.selection {
@@ -899,6 +928,7 @@ impl ReviewActor {
             Sha256::digest(serde_json::to_vec(&review_for_prompt.diffs).expect("diffs serialize"))
         );
         let request = ReviewAiSpawnRequest {
+            mode,
             snapshot_id: snapshot_id.clone(),
             review_id: self.review.id.clone(),
             review: review_for_prompt,
@@ -934,7 +964,7 @@ impl ReviewActor {
         }
 
         match response.await {
-            Ok(Ok(reviewers)) => {
+            Ok(Ok((mode, reviewers))) => {
                 let agent_id = reviewers.iter().find_map(|r| r.agent_id.clone());
                 tracing::info!(
                     review_id = %self.review.id,
@@ -945,6 +975,7 @@ impl ReviewActor {
                 let previous = self.review.clone();
                 let mut rounds = self.review.ai_reviewer.rounds.clone();
                 rounds.push(protocol::ReviewRound {
+                    mode: Some(mode),
                     snapshot_id,
                     id: Uuid::new_v4().to_string(),
                     scope: scope.clone(),

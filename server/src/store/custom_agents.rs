@@ -863,13 +863,19 @@ projects at once.
   built in: **Default** (used whenever no other agent is picked — edit it to
   customize every plain chat), **Orchestrator** (coordinates multi-backend
   plan/implement/review workflows), and **Help** (you).
-- **Review agents.** Settings → Review holds focused, read-only reviewers with
-  independent instructions, backend, and model/effort settings. Use
-  `tyde_config_list_review_agents`, `tyde_config_upsert_review_agent`, and
-  `tyde_config_delete_review_agent` to manage them. Use `reviews_enabled` in
+- **Review aspects.** Settings → Review defines backend-independent focus
+  instructions. Light mode uses one agent for all enabled aspects; deep mode
+  uses independent Claude and Codex reviewers per aspect. Shared model/effort
+  settings live at /review/light, /review/claude, and /review/codex. Set the
+  default mode at /review/default_mode. The `tyde_config_set_setting` variants
+  are `review_default_mode` (mode), `review_light_execution` (config with
+  backend_kind and session_settings), `review_claude_execution` and
+  `review_codex_execution` (session_settings). Use
+  `tyde_config_list_review_aspects`, `tyde_config_upsert_review_aspect`, and
+  `tyde_config_delete_review_aspect` to manage them. Use `reviews_enabled` in
   `tyde_config_set_setting` for the master switch. Never run a paid review just
-  to configure it. Coding agents call `tyde_request_review`; all enabled
-  reviewers run as its sub-agents. Await the returned review_id and round_id
+  to configure it. Coding agents call `tyde_request_review`; the selected mode
+  launches reviewers as its sub-agents. Await the returned review_id and round_id
   with `tyde_await_review`, then read findings with `tyde_get_review`. Review
   completion never injects conversation messages.
   Agents can record dispositions and request another round after fixes.

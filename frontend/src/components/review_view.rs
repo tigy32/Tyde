@@ -479,6 +479,7 @@ pub(crate) fn ReviewSidebar(
         let ai_reason = ai_reason.clone();
         move || !ai_reason().is_empty()
     };
+    let review_mode = RwSignal::new(None::<protocol::ReviewMode>);
     let live_for_run_ai = live_for_ai;
     let on_run_ai = move |_| {
         let rid = review_for_ai.clone();
@@ -547,6 +548,7 @@ pub(crate) fn ReviewSidebar(
         let target_rid = rid.clone();
         spawn_local(async move {
             let payload = ReviewActionPayload::StartAiReview {
+                mode: review_mode.get_untracked(),
                 backend_kind: backend_override,
                 cost_hint: cost,
                 instructions: inst,
@@ -797,11 +799,17 @@ pub(crate) fn ReviewSidebar(
         <div class="review-sidebar">
             <crate::notices::InlineNotices scopes=vec![crate::notices::NoticeScope::Review(host_id.clone(), review_id.clone())] />
             <div class="review-sidebar-section">
+                <ReviewModePicker selection=review_mode />
+                <p class="review-round-note">{move || configuration.get().map(|s| {
+                    let count = s.aspects.values().filter(|a| a.enabled).count();
+                    let mode = review_mode.get().unwrap_or(s.default_mode);
+                    format!("{} review · {} aspects · {} agents", mode.label(), count, if mode == protocol::ReviewMode::Deep { count * 2 } else { 1 })
+                })}</p>
                 <div class="review-ai-row">
                     <button
                         class="review-btn primary review-run-ai-btn"
                         data-test="review-run-ai"
-                        disabled=move || ai_disabled() || configuration.get().is_some_and(|s| !s.enabled || (!s.agents.is_empty() && !s.agents.values().any(|a| a.enabled)))
+                        disabled=move || ai_disabled() || configuration.get().is_some_and(|s| !s.enabled || (!s.aspects.is_empty() && !s.aspects.values().any(|a| a.enabled)))
                         title=ai_reason
                         on:click=move |ev| {
                             // Opening the disclosure on Run is a UX nicety —
@@ -811,7 +819,7 @@ pub(crate) fn ReviewSidebar(
                             on_run_ai(ev);
                         }
                     >
-                        {move || if configuration.get().is_some_and(|s| !s.agents.is_empty()) { "Run review" } else { "Run AI reviewer" }}
+                        {move || if configuration.get().is_some_and(|s| !s.aspects.is_empty()) { "Run review" } else { "Run AI reviewer" }}
                     </button>
                     <div
                         class=move || format!("review-ai-status status-{}", ai_status_kind())
@@ -828,11 +836,11 @@ pub(crate) fn ReviewSidebar(
                 <Show when=move || live_for_ai.get().is_some_and(|r| r.ai_reviewer.status == ReviewAiReviewerStatus::Running)>
                     <button class="review-btn" on:click=on_stop.clone()>"Stop review"</button>
                 </Show>
-                <Show when=move || configuration.get().is_some_and(|s| !s.agents.is_empty())>
-                    <p class="review-round-note">"Reviewers are configured in Settings → Review."</p>
+                <Show when=move || configuration.get().is_some_and(|s| !s.aspects.is_empty())>
+                    <p class="review-round-note">"Aspects and execution settings are configured in Settings → Review."</p>
                 </Show>
                 <details
-                    style:display=move || if configuration.get().is_some_and(|s| !s.agents.is_empty()) { "none" } else { "" }
+                    style:display=move || if configuration.get().is_some_and(|s| !s.aspects.is_empty()) { "none" } else { "" }
                     class="review-ai-disclosure"
                     prop:open=ai_open_attr
                     on:toggle=move |ev: leptos::ev::Event| {
@@ -849,6 +857,7 @@ pub(crate) fn ReviewSidebar(
                     <div class="review-ai-disclosure-body">
                         <select
                             class="review-backend-select"
+                            aria-label="Review backend"
                             on:change=move |ev| {
                                 let val = event_target_value(&ev);
                                 backend_pick.set(parse_backend_kind(&val));
@@ -2473,12 +2482,25 @@ fn ReviewRounds(review: Review) -> impl IntoView {
                 let count = round.reviewers.len();
                 let findings = review.suggestions.clone();
                 let dispositions = round.dispositions;
+                let mut groups: Vec<(Vec<protocol::ReviewAspectSnapshot>, Vec<protocol::ReviewReviewerRun>)> = Vec::new();
+                for reviewer in round.reviewers {
+                    if let Some((_, members)) = groups.iter_mut().find(|(aspects, _)| !aspects.is_empty() && *aspects == reviewer.aspects) {
+                        members.push(reviewer);
+                    } else {
+                        groups.push((reviewer.aspects.clone(), vec![reviewer]));
+                    }
+                }
                 view! {
                     <details open=index + 1 == total>
-                        <summary>{format!("Round {} · {} of {} reviewers completed", index + 1, completed, count)}</summary>
+                        <summary>{format!("Round {} · {} · {} of {} reviewers completed", index + 1, round.mode.map_or("Legacy", protocol::ReviewMode::label), completed, count)}</summary>
                         <p class="review-round-note">{if round.requested_by.is_some() { "The requesting agent awaits this round and reads findings through tools." } else { "Manual review · select suggestions to submit." }}</p>
                         {round.delivery_error.map(|error| view! { <p role="alert">{error}</p> })}
-                        {round.reviewers.into_iter().map(|reviewer| {
+                        {groups.into_iter().map(|(aspects, members)| {
+                            let findings = findings.clone();
+                            let dispositions = dispositions.clone();
+                            view! { <section aria-label="Review aspect results">
+                                {aspects.into_iter().map(|aspect| view! { <details><summary>{aspect.name}</summary><p>{aspect.description}</p><pre>{aspect.instructions}</pre></details> }).collect_view()}
+                                {members.into_iter().map(|reviewer| {
                             let reviewer_findings = findings.iter().filter(|s| reviewer.agent_id.as_ref() == Some(&s.reviewer_agent_id)).cloned().collect::<Vec<_>>();
                             let dispositions = dispositions.clone();
                             view! {
@@ -2497,6 +2519,8 @@ fn ReviewRounds(review: Review) -> impl IntoView {
                                     }).collect_view()}
                                 </section>
                             }
+                                }).collect_view()}
+                            </section> }
                         }).collect_view()}
                     </details>
                 }
@@ -4138,6 +4162,31 @@ mod wasm_tests {
             "default AI review must omit backend_kind (server resolves the \
              default); sent: {sent}"
         );
+        assert!(
+            sent.contains("\"mode\":null"),
+            "No depth override delegates to host settings"
+        );
+        let state = holder.borrow().clone().unwrap();
+        state
+            .review_action_pending
+            .update(|pending| pending.clear());
+        let picker: web_sys::HtmlSelectElement = container
+            .query_selector("[aria-label='Review depth']")
+            .unwrap()
+            .unwrap()
+            .dyn_into()
+            .unwrap();
+        picker.set_value("deep");
+        picker
+            .dispatch_event(&web_sys::Event::new("change").unwrap())
+            .unwrap();
+        next_tick().await;
+        run_btn.click();
+        next_tick().await;
+        assert!(
+            sent_lines_joined().contains("\"mode\":\"deep\""),
+            "The selected depth must reach the review launch request"
+        );
     }
 
     /// An explicit picker selection overrides the default: the chosen backend
@@ -4157,8 +4206,9 @@ mod wasm_tests {
         next_tick().await;
         next_tick().await;
 
+        // Depth and backend share styling, but only the backend picker offers Codex.
         let select = container
-            .query_selector(".review-backend-select")
+            .query_selector("[aria-label='Review backend']")
             .unwrap()
             .expect("backend select rendered");
         let select: web_sys::HtmlSelectElement = select.dyn_into().unwrap();
@@ -4437,5 +4487,18 @@ mod wasm_tests {
             text.contains("let x = 1;"),
             "the committed snippet renders from the revision-pinned diff; got: {text}"
         );
+    }
+}
+
+#[component]
+pub(crate) fn ReviewModePicker(selection: RwSignal<Option<protocol::ReviewMode>>) -> impl IntoView {
+    view! {
+        <select class="review-backend-select" aria-label="Review depth"
+            prop:value=move || match selection.get() { None => "", Some(protocol::ReviewMode::Light) => "light", Some(protocol::ReviewMode::Deep) => "deep" }
+            on:change=move |ev| selection.set(match event_target_value(&ev).as_str() { "light" => Some(protocol::ReviewMode::Light), "deep" => Some(protocol::ReviewMode::Deep), _ => None })>
+            <option value="">"Default review depth"</option>
+            <option value="light">"Light · one agent, all aspects"</option>
+            <option value="deep">"Deep · Claude + Codex per aspect"</option>
+        </select>
     }
 }

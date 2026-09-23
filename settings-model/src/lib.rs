@@ -38,29 +38,54 @@ pub struct HostLaunchProfileConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-pub struct ReviewAgentConfig {
+pub struct ReviewAspectConfig {
     pub name: String,
     #[serde(default)]
     pub description: String,
     pub instructions: String,
-    pub backend_kind: BackendKind,
-    #[serde(default)]
-    pub session_settings: SessionSettingsValues,
     pub enabled: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ReviewExecutionConfig {
+    pub backend_kind: BackendKind,
+    #[serde(default)]
+    pub session_settings: SessionSettingsValues,
+}
+
+impl Default for ReviewExecutionConfig {
+    fn default() -> Self {
+        Self {
+            backend_kind: BackendKind::Codex,
+            session_settings: Default::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ReviewSettings {
+    #[serde(default)]
+    pub default_mode: protocol::ReviewMode,
+    #[serde(default)]
+    pub light: ReviewExecutionConfig,
+    #[serde(default)]
+    pub claude: SessionSettingsValues,
+    #[serde(default)]
+    pub codex: SessionSettingsValues,
     pub enabled: bool,
     #[serde(default)]
-    pub agents: BTreeMap<String, ReviewAgentConfig>,
+    pub aspects: BTreeMap<String, ReviewAspectConfig>,
 }
 
 impl Default for ReviewSettings {
     fn default() -> Self {
         Self {
             enabled: true,
-            agents: BTreeMap::new(),
+            aspects: BTreeMap::new(),
+            default_mode: protocol::ReviewMode::Light,
+            light: ReviewExecutionConfig::default(),
+            claude: Default::default(),
+            codex: Default::default(),
         }
     }
 }

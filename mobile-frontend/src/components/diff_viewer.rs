@@ -1143,6 +1143,7 @@ fn ReviewControls(project: ActiveProjectRef, ctx: Option<ReviewCtx>) -> impl Int
     // backend picker, so always send `None` ⇒ server uses its
     // `default_backend` (else first enabled). Gate on there being some
     // runnable backend so we don't fire a request the host can't satisfy.
+    let review_mode = RwSignal::new(None::<protocol::ReviewMode>);
     let ctx_ai = ctx.clone();
     let on_ai = Callback::new(move |_: ()| {
         let ctx = ctx_ai.clone();
@@ -1156,6 +1157,7 @@ fn ReviewControls(project: ActiveProjectRef, ctx: Option<ReviewCtx>) -> impl Int
                 &ctx.host,
                 ctx.review_id.clone(),
                 protocol::ReviewActionPayload::StartAiReview {
+                    mode: review_mode.get_untracked(),
                     backend_kind: None,
                     cost_hint: None,
                     instructions: None,
@@ -1213,6 +1215,13 @@ fn ReviewControls(project: ActiveProjectRef, ctx: Option<ReviewCtx>) -> impl Int
                     }
                 }}
             </div>
+            <label>"Review depth"
+                <select aria-label="Review depth" on:change=move |ev| review_mode.set(match event_target_value(&ev).as_str() {
+                    "light" => Some(protocol::ReviewMode::Light), "deep" => Some(protocol::ReviewMode::Deep), _ => None,
+                })>
+                    <option value="">"Default"</option><option value="light">"Light · one agent"</option><option value="deep">"Deep · Claude + Codex per aspect"</option>
+                </select>
+            </label>
             <div class="project-diff-review-actions">
                 {move || {
                     let label = if ai_running.get() { "AI reviewing…" } else { "AI review" };
@@ -2373,6 +2382,24 @@ mod wasm_tests {
             !sent.contains("\"backend_kind\""),
             "mobile AI review must omit backend_kind (server resolves the \
              default); sent: {sent}"
+        );
+        assert!(sent.contains("\"mode\":null"));
+        let picker: web_sys::HtmlSelectElement = container
+            .query_selector("[aria-label='Review depth']")
+            .unwrap()
+            .unwrap()
+            .dyn_into()
+            .unwrap();
+        picker.set_value("deep");
+        picker
+            .dispatch_event(&web_sys::Event::new("change").unwrap())
+            .unwrap();
+        next_tick().await;
+        ai_btn.dyn_ref::<HtmlElement>().unwrap().click();
+        next_tick().await;
+        assert!(
+            sent_lines_joined().contains("\"mode\":\"deep\""),
+            "Mobile must send the selected review depth"
         );
     }
 

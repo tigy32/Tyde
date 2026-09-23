@@ -755,6 +755,8 @@ async fn authorize_direct_children(
 #[serde(deny_unknown_fields)]
 struct RequestReviewToolInput {
     #[serde(default)]
+    mode: Option<protocol::ReviewMode>,
+    #[serde(default)]
     scope: protocol::ReviewAiScope,
 }
 
@@ -803,7 +805,7 @@ fn review_tool_result(review: protocol::Review) -> Result<CallToolResult, McpErr
 #[tool_router]
 impl TydeAgentControlMcpServer {
     #[tool(
-        description = "Request all enabled reviewers from Settings → Review against a frozen snapshot of your project's changes. Returns review_id and round_id after launch. Call tyde_await_review on the await server for that round, then tyde_get_review for findings. No feedback is injected into your conversation. Fix actionable findings, record dispositions, then request another review after changes until nothing actionable remains. Never treat a failed review as clean. Working tree is default; committed_range requires root and exact base_oid/tip_oid. Cannot override the user's reviewers."
+        description = "Review all enabled aspects from Settings → Review. Light uses one agent for all aspects; deep uses independent Claude and Codex agents per aspect. Omit mode to use the user-configured default. Request a review against a frozen snapshot of your project's changes. Returns review_id and round_id after launch. Call tyde_await_review on the await server for that round, then tyde_get_review for findings. No feedback is injected into your conversation. Fix actionable findings, record dispositions, then request another review after changes until nothing actionable remains. Never treat a failed review as clean. Working tree is default; committed_range requires root and exact base_oid/tip_oid. Cannot override the user's aspects or model settings."
     )]
     async fn tyde_request_review(
         &self,
@@ -814,7 +816,11 @@ impl TydeAgentControlMcpServer {
             Ok(caller) => caller,
             Err(error) => return Ok(err_text(error)),
         };
-        match self.host.request_agent_review(caller, input.scope).await {
+        match self
+            .host
+            .request_agent_review(caller, input.scope, input.mode)
+            .await
+        {
             Ok(review) => review_tool_result(review),
             Err(error) => Ok(err_text(error)),
         }
