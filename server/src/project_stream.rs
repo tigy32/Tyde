@@ -33,6 +33,7 @@ use crate::stream::Stream;
 
 const PROJECT_REFRESH_DEBOUNCE: Duration = Duration::from_millis(250);
 const PROJECT_GIT_REFRESH_SPACING: Duration = Duration::from_secs(1);
+const PROJECT_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 const GIT_STATUS_POLL_INTERVAL: Duration = Duration::from_secs(5);
 const RECENT_HISTORY_LIMIT: usize = 100;
 pub(crate) const BINARY_PREVIEW_LIMIT_BYTES: u64 = 8 * 1024 * 1024;
@@ -405,6 +406,34 @@ pub(crate) async fn spawn_project_subscription(
     let (watch_tx, watch_rx) = mpsc::unbounded_channel();
     let watched_roots = project.root_paths();
     let snapshot = background_project_read(&project, "initialize", initialize_snapshot).await?;
+    let (command_tx, command_rx) = mpsc::unbounded_channel();
+    let handle = ProjectStreamHandle { tx: command_tx };
+
+    let task = tokio::spawn(async move {
+        run_project_subscription(
+            project_store,
+            project_id,
+            project,
+            snapshot,
+            None,
+            watched_roots,
+            watch_tx,
+            watch_rx,
+            force_watch_limit,
+            command_rx,
+            review_registry,
+        )
+        .await;
+    });
+
+    Ok(ProjectStreamSubscription { task, handle })
+}
+
+fn start_project_watcher(
+    project: &Project,
+    watch_tx: mpsc::UnboundedSender<notify::Result<Event>>,
+    force_watch_limit: bool,
+) -> mpsc::UnboundedReceiver<Result<ProjectWatcher, ProjectWatcherFailure>> {
     let (watcher_ready_tx, watcher_ready_rx) = mpsc::unbounded_channel();
     {
         let project = project.clone();
@@ -423,27 +452,7 @@ pub(crate) async fn spawn_project_subscription(
             }));
         }
     }
-    let (command_tx, command_rx) = mpsc::unbounded_channel();
-    let handle = ProjectStreamHandle { tx: command_tx };
-
-    let task = tokio::spawn(async move {
-        run_project_subscription(
-            project_store,
-            project_id,
-            project,
-            snapshot,
-            None,
-            watched_roots,
-            watch_tx,
-            watch_rx,
-            watcher_ready_rx,
-            command_rx,
-            review_registry,
-        )
-        .await;
-    });
-
-    Ok(ProjectStreamSubscription { task, handle })
+    watcher_ready_rx
 }
 
 async fn load_subscription_project(
@@ -520,7 +529,7 @@ async fn run_project_subscription(
     mut watched_roots: Vec<ProjectRootPath>,
     watch_tx: mpsc::UnboundedSender<notify::Result<Event>>,
     mut watch_rx: mpsc::UnboundedReceiver<notify::Result<Event>>,
-    mut watcher_ready_rx: mpsc::UnboundedReceiver<Result<ProjectWatcher, ProjectWatcherFailure>>,
+    force_watch_limit: bool,
     mut command_rx: mpsc::UnboundedReceiver<ProjectStreamCommand>,
     review_registry: ReviewRegistryHandle,
 ) {
@@ -543,8 +552,12 @@ async fn run_project_subscription(
     // on every event.
     let mut watcher_roots = WatcherRootPaths::new(project.root_paths());
     let mut pending_update = PendingProjectUpdate::default();
-    let mut watcher_initializing = watcher.is_none();
+    let mut watcher_ready_rx = start_project_watcher(&project, watch_tx.clone(), force_watch_limit);
+    let mut watcher_initializing = true;
+    let mut watcher_retry = Instant::now();
     let mut watcher_warning = None::<String>;
+    let mut file_warning = None::<String>;
+    let mut git_warning = None::<String>;
     let mut debounce_active = false;
     let mut next_git_refresh = Instant::now();
     let mut pending_git = PendingGitRefresh::default();
@@ -580,14 +593,22 @@ async fn run_project_subscription(
                         if result.is_err() {
                             subscribers.remove(&host_path);
                             snapshot.diff_context_modes.retain(|(subscriber, _), _| subscriber != &host_path);
-                        } else if let Some(message) = watcher_warning.as_ref() {
-                            emit_project_command_error(
-                                &stream,
-                                FrameKind::ProjectFileList,
-                                "project_watch",
-                                message.clone(),
-                                false,
-                            ).await;
+                        } else {
+                            for (operation, warning) in [
+                                ("project_watch", &watcher_warning),
+                                ("project_watch", &file_warning),
+                                ("project_git_status", &git_warning),
+                            ] {
+                                if let Some(message) = warning {
+                                    emit_project_command_error(
+                                        &stream,
+                                        FrameKind::ProjectFileList,
+                                        operation,
+                                        message.clone(),
+                                        false,
+                                    ).await;
+                                }
+                            }
                         }
                         let _ = reply.send(result);
                     }
@@ -612,7 +633,12 @@ async fn run_project_subscription(
                                 pending_git.request(true, true);
                                 pending_git.replies.push(reply);
                             }
-                            Err(error) => { let _ = reply.send(Err(error)); }
+                            Err(error) => {
+                                pending_update.merge(PendingProjectUpdate { files: true, git: true });
+                                debounce_active = true;
+                                debounce_sleep.as_mut().reset(Instant::now() + PROJECT_RETRY_INTERVAL);
+                                let _ = reply.send(Err(error));
+                            }
                         }
                     }
                     ProjectStreamCommand::RememberDiffContext { host_path, key, context_mode, reply } => {
@@ -711,64 +737,53 @@ async fn run_project_subscription(
                     }
                 }
             }
+            _ = sleep_until(watcher_retry), if watcher.is_none() && !watcher_initializing => {
+                tracing::debug!(%project_id, "retrying project filesystem watcher initialization");
+                watcher_ready_rx = start_project_watcher(&project, watch_tx.clone(), force_watch_limit);
+                watcher_initializing = true;
+            }
             maybe_watcher = watcher_ready_rx.recv(), if watcher_initializing => {
                 watcher_initializing = false;
+                watcher_retry = Instant::now() + PROJECT_RETRY_INTERVAL;
                 match maybe_watcher {
                     Some(Ok(mut ready_watcher)) => {
+                        let mut observe_error = None;
                         for path in &observed_files {
                             if let Err(error) = ready_watcher.observe(path).await {
-                                let _ = watch_tx.send(Err(error));
+                                observe_error = Some(error.to_string());
+                                break;
                             }
                         }
-                        watcher = Some(ready_watcher);
-                        if let Err(error) = refresh_project_files(
-                            &project_store,
-                            &project_id,
-                            &mut project,
-                            &mut snapshot,
-                            watcher.as_mut(),
-                            &mut watched_roots,
-                            watch_tx.clone(),
-                            &mut subscribers,
-                            true,
-                        ).await {
-                            tracing::warn!(project_id = %project_id, error = %error, "stopping project subscription after watcher initialization refresh failure");
-                            emit_fatal_project_stream_error(&mut subscribers, "project_watch", error).await;
-                            return;
+                        if let Some(error) = observe_error {
+                            warn_project_retry(&project_id, &mut subscribers, "project_watch", error, &mut watcher_warning).await;
+                            continue;
                         }
-                        pending_git.request(true, true);
+                        watcher = Some(ready_watcher);
+                        if watcher_warning.take().is_some() {
+                            tracing::info!(%project_id, observed_files = observed_files.len(), "project filesystem watching recovered");
+                            // Changes during the watch gap have no OS events to replay.
+                            for path in &observed_files {
+                                let version = bump_file_version(&mut file_versions, path);
+                                pending_file_version_changes.insert(path.clone(), version);
+                            }
+                        }
+                        pending_update.merge(PendingProjectUpdate { files: true, git: true });
+                        debounce_active = true;
+                        debounce_sleep.as_mut().reset(Instant::now() + PROJECT_REFRESH_DEBOUNCE);
                     }
-                    Some(Err(error)) if error.limit_reached => {
-                        let message = project_watch_limit_guidance(&error.message);
-                        tracing::warn!(project_id = %project_id, error = %message, "continuing project subscription without filesystem watching");
-                        emit_project_stream_warning(&mut subscribers, "project_watch", message.clone()).await;
-                        watcher_warning = Some(message);
-                    }
-                    Some(Err(error)) => {
-                        tracing::warn!(project_id = %project_id, error = %error.message, "stopping project subscription after watcher initialization failure");
-                        emit_fatal_project_stream_error(&mut subscribers, "project_watch", error.message).await;
-                        return;
-                    }
-                    None => {
-                        tracing::warn!(project_id = %project_id, "stopping project subscription after watcher initialization channel closed");
-                        emit_fatal_project_stream_error(
-                            &mut subscribers,
-                            "project_watch",
-                            "project filesystem watcher failed to initialize".to_owned(),
-                        ).await;
-                        return;
+                    result => {
+                        let message = match result {
+                            Some(Err(error)) if error.limit_reached => project_watch_limit_guidance(&error.message),
+                            Some(Err(error)) => error.message,
+                            None => "project filesystem watcher failed to initialize".to_owned(),
+                            Some(Ok(_)) => unreachable!(),
+                        };
+                        warn_project_retry(&project_id, &mut subscribers, "project_watch", message, &mut watcher_warning).await;
                     }
                 }
             }
             maybe_event = watch_rx.recv(), if watcher.is_some() => {
-                let Some(event_result) = maybe_event else {
-                    emit_fatal_project_stream_error(
-                        &mut subscribers,
-                        "project_watch",
-                        "project filesystem watcher stopped unexpectedly".to_owned(),
-                    ).await;
-                    return;
-                };
+                let event_result = maybe_event.unwrap_or_else(|| Err(notify::Error::generic("project filesystem watcher stopped unexpectedly")));
 
                 match event_result {
                     Ok(event) => {
@@ -806,18 +821,16 @@ async fn run_project_subscription(
                             }
                         }
                     }
-                    Err(error) if matches!(error.kind, notify::ErrorKind::MaxFilesWatch) => {
-                        let message = project_watch_limit_guidance(&format!("project filesystem watcher failed: {error}"));
-                        tracing::warn!(project_id = %project_id, error = %message, "continuing project subscription without filesystem watching");
-                        watcher = None;
-                        emit_project_stream_warning(&mut subscribers, "project_watch", message.clone()).await;
-                        watcher_warning = Some(message);
-                    }
                     Err(error) => {
                         let message = format!("project filesystem watcher failed: {error}");
-                        tracing::warn!(project_id = %project_id, error = %message, "stopping project subscription");
-                        emit_fatal_project_stream_error(&mut subscribers, "project_watch", message).await;
-                        return;
+                        let message = if matches!(error.kind, notify::ErrorKind::MaxFilesWatch) {
+                            project_watch_limit_guidance(&message)
+                        } else {
+                            message
+                        };
+                        watcher = None;
+                        watcher_retry = Instant::now() + PROJECT_RETRY_INTERVAL;
+                        warn_project_retry(&project_id, &mut subscribers, "project_watch", message, &mut watcher_warning).await;
                     }
                 }
             }
@@ -837,9 +850,19 @@ async fn run_project_subscription(
                         &mut subscribers,
                         full,
                     ).await {
-                        tracing::warn!(project_id = %project_id, error = %error, "stopping project subscription after debounced refresh failure");
-                        emit_fatal_project_stream_error(&mut subscribers, "project_watch", error).await;
-                        return;
+                        if project.root_paths().iter().any(|root| matches!(Path::new(&root.0).try_exists(), Ok(false))) {
+                            tracing::warn!(%project_id, %error, "stopping project subscription after project root disappeared");
+                            emit_fatal_project_stream_error(&mut subscribers, "project_watch", error).await;
+                            return;
+                        }
+                        warn_project_retry(&project_id, &mut subscribers, "project_watch", error, &mut file_warning).await;
+                        pending_update.merge(refresh);
+                        debounce_active = true;
+                        debounce_sleep.as_mut().reset(Instant::now() + PROJECT_RETRY_INTERVAL);
+                        continue;
+                }
+                if file_warning.take().is_some() {
+                    tracing::info!(%project_id, "project file refresh recovered");
                 }
                 if refresh.git || full {
                     pending_git.request(full, refresh.files || full);
@@ -874,7 +897,7 @@ async fn run_project_subscription(
                 }
             }
             _ = git_poll.tick(), if !debounce_active && git_tasks.is_empty() && !pending_git.requested => {
-                pending_git.request(false, false);
+                pending_git.request(git_warning.is_some(), git_warning.is_some());
             }
             _ = sleep_until(if pending_git.full {
                 Instant::now()
@@ -896,8 +919,10 @@ async fn run_project_subscription(
                     for reply in std::mem::take(&mut pending_git.replies) {
                         let _ = reply.send(Err(error.clone()));
                     }
-                    emit_fatal_project_stream_error(&mut subscribers, "project_git_status", error).await;
-                    return;
+                    pending_git = PendingGitRefresh::default();
+                    git_poll.reset();
+                    warn_project_retry(&project_id, &mut subscribers, "project_git_status", error, &mut git_warning).await;
+                    continue;
                 }
                 let request = std::mem::take(&mut pending_git);
                 tracing::debug!(%project_id, full = request.full, refresh_diffs = request.refresh_diffs,
@@ -920,9 +945,8 @@ async fn run_project_subscription(
                     Ok(completed) => completed,
                     Err(error) => {
                         let message = format!("project Git refresh task failed: {error}");
-                        tracing::warn!(%project_id, %message, "stopping project subscription");
-                        emit_fatal_project_stream_error(&mut subscribers, "project_git_status", message).await;
-                        return;
+                        warn_project_retry(&project_id, &mut subscribers, "project_git_status", message, &mut git_warning).await;
+                        continue;
                     }
                 };
                 if completed.project.root_paths() != project.root_paths() {
@@ -947,11 +971,14 @@ async fn run_project_subscription(
                     let _ = reply.send(result.clone());
                 }
                 if let Err(error) = result {
-                    tracing::warn!(%project_id, %error, "project Git refresh failed");
-                    if !explicit_refresh {
-                        emit_fatal_project_stream_error(&mut subscribers, "project_git_status", error).await;
-                        return;
+                    if explicit_refresh {
+                        tracing::warn!(%project_id, %error, "explicit project Git refresh failed");
+                        git_warning = Some(error);
+                    } else {
+                        warn_project_retry(&project_id, &mut subscribers, "project_git_status", error, &mut git_warning).await;
                     }
+                } else if git_warning.take().is_some() {
+                    tracing::info!(%project_id, "project Git refresh recovered");
                 }
             }
         }
@@ -1775,6 +1802,25 @@ async fn send_payload<T: serde::Serialize>(
         .map_err(|_| "project stream closed".to_owned())
 }
 
+async fn warn_project_retry(
+    project_id: &ProjectId,
+    subscribers: &mut HashMap<StreamPath, ProjectSubscriber>,
+    operation: &str,
+    error: String,
+    warning: &mut Option<String>,
+) {
+    let message = format!(
+        "{error} The project remains available; automatic recovery will retry in a few seconds."
+    );
+    if warning.as_ref() != Some(&message) {
+        tracing::warn!(%project_id, operation, %error, retry_ms = PROJECT_RETRY_INTERVAL.as_millis(), "project background operation failed; retaining subscription");
+    }
+    if warning.is_none() {
+        emit_project_stream_warning(subscribers, operation, message.clone()).await;
+    }
+    *warning = Some(message);
+}
+
 async fn emit_fatal_project_stream_error(
     subscribers: &mut HashMap<StreamPath, ProjectSubscriber>,
     operation: &str,
@@ -1799,7 +1845,7 @@ async fn emit_fatal_project_stream_error(
 
 fn project_watch_limit_guidance(error: &str) -> String {
     format!(
-        "{error} Live project file updates are disabled, but the project remains available. For best results, configure each project root as the root of its Git repository instead of a broader parent directory. On Linux, you can also increase fs.inotify.max_user_watches. Reopen the project after correcting the root or system limit."
+        "{error} Live project file updates are disabled, but the project remains available. For best results, configure each project root as the root of its Git repository instead of a broader parent directory. On Linux, you can also increase fs.inotify.max_user_watches. Watching will resume automatically after correcting the root or system limit."
     )
 }
 

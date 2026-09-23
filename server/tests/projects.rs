@@ -1910,6 +1910,254 @@ async fn watch_limit_warns_without_stopping_project_or_polling_files() {
     );
 }
 
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn project_recovers_after_real_file_descriptor_exhaustion() {
+    fixture::init_tracing();
+    let mut fixture = Fixture::new().await;
+    let repo = init_git_repo("descriptor-recovery", &[("file.rs", "// before\n")]);
+    let project = create_project(
+        &mut fixture.client,
+        "Descriptor Recovery",
+        vec![repo.path().to_string_lossy().into_owned()],
+    )
+    .await;
+    expect_project_bootstrap(&mut fixture.client, "descriptor bootstrap").await;
+    fs::write(repo.path().join("watch-ready"), "ready").unwrap();
+    expect_project_file_list_matching(&mut fixture.client, "watcher initialized", |listing| {
+        listing.roots[0]
+            .entries
+            .iter()
+            .any(|entry| entry.relative_path == "watch-ready")
+    })
+    .await;
+    let held = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let exhaust = held.clone();
+    let hook = fixture.on_project_scan(
+        repo.path().to_path_buf(),
+        server::ScanPoint::ReadDirectory,
+        move || {
+            *exhaust.lock().unwrap() = Some(fixture::ExhaustedFileDescriptors::exhaust());
+        },
+    );
+    fs::write(
+        repo.path().join("during-exhaustion"),
+        "must appear after recovery",
+    )
+    .unwrap();
+    let error =
+        expect_project_command_error(&mut fixture.client, "file-descriptor exhaustion").await;
+    let exhausted = held
+        .lock()
+        .unwrap()
+        .take()
+        .expect("scan exhausted real descriptors");
+    drop(exhausted);
+    drop(hook);
+    eprintln!(
+        "descriptor recovery: operation={} fatal={}",
+        error.operation, error.fatal
+    );
+    assert!(
+        !error.fatal,
+        "EMFILE must not terminate the project subscription"
+    );
+    assert!(error.message.contains("Too many open files"));
+    assert!(error.message.contains("automatic recovery"));
+    // No new filesystem event or client command may be needed to retry the lost scan.
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let event = fixture.client.next_event().await.unwrap().unwrap();
+            match event.kind {
+                FrameKind::CommandError => {
+                    let error: CommandErrorPayload = event.parse_payload().unwrap();
+                    assert!(!error.fatal);
+                }
+                FrameKind::ProjectBootstrap => {
+                    panic!("resource recovery must preserve the subscription")
+                }
+                FrameKind::ProjectFileList => {
+                    let listing: ProjectFileListPayload = event.parse_payload().unwrap();
+                    if listing.roots[0]
+                        .entries
+                        .iter()
+                        .any(|entry| entry.relative_path == "during-exhaustion")
+                    {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("failed scan retries after descriptors become available");
+    fixture
+        .client
+        .project_read_file(
+            &project.id,
+            ProjectReadFilePayload {
+                path: ProjectPath {
+                    root: ProjectRootPath(project_root(&project, 0)),
+                    relative_path: "file.rs".to_owned(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+    let contents = expect_project_file_contents(&mut fixture.client, "file after EMFILE").await;
+    assert_eq!(contents.contents.as_deref(), Some("// before\n"));
+}
+
+#[tokio::test]
+async fn project_recovers_from_filesystem_and_git_failures_without_reconnecting() {
+    fixture::init_tracing();
+    for force_project_watch_limit in [false, true] {
+        let mut fixture = Fixture::new_with_runtime_config(server::HostRuntimeConfig {
+            force_project_watch_limit,
+            ..Default::default()
+        })
+        .await;
+        let repo = init_git_repo("project-recovery", &[("file.rs", "// before\n")]);
+        let project = create_project(
+            &mut fixture.client,
+            "Project Recovery",
+            vec![repo.path().to_string_lossy().into_owned()],
+        )
+        .await;
+        expect_project_bootstrap(&mut fixture.client, "recovery bootstrap").await;
+        if force_project_watch_limit {
+            expect_command_error(&mut fixture.client, "watch limit warning").await;
+        }
+        let path = ProjectPath {
+            root: ProjectRootPath(project_root(&project, 0)),
+            relative_path: "file.rs".to_owned(),
+        };
+        fixture
+            .client
+            .project_read_file(&project.id, ProjectReadFilePayload { path: path.clone() })
+            .await
+            .unwrap();
+        let before = expect_project_file_contents(&mut fixture.client, "initial file").await;
+        if !force_project_watch_limit {
+            fs::write(repo.path().join("watch-ready"), "ready").unwrap();
+            expect_project_file_list_matching(
+                &mut fixture.client,
+                "watcher initialized",
+                |listing| {
+                    listing.roots[0]
+                        .entries
+                        .iter()
+                        .any(|entry| entry.relative_path == "watch-ready")
+                },
+            )
+            .await;
+        }
+        let index = repo.path().join(".git/index");
+        let saved_index = fs::read(&index).unwrap();
+        fs::write(&index, "temporarily unreadable Git index").unwrap();
+        let error =
+            expect_project_command_error(&mut fixture.client, "background I/O failure").await;
+        eprintln!(
+            "project recovery: operation={} fatal={} watching={}",
+            error.operation, error.fatal, !force_project_watch_limit
+        );
+        assert!(
+            !error.fatal,
+            "a failed background operation must not kill the project subscription"
+        );
+        assert!(matches!(
+            error.operation.as_str(),
+            "project_watch" | "project_git_status"
+        ));
+
+        fixture
+            .client
+            .project_read_file(&project.id, ProjectReadFilePayload { path: path.clone() })
+            .await
+            .unwrap();
+        let during = next_frame_matching_on(
+            &mut fixture.client,
+            "file during background failure",
+            |event| {
+                if event.kind == FrameKind::CommandError {
+                    let error: CommandErrorPayload = event.parse_payload().unwrap();
+                    assert!(!error.fatal);
+                    assert_ne!(
+                        error.operation, "project_read_file",
+                        "background failure must not break file reads"
+                    );
+                }
+                event.kind == FrameKind::ProjectFileContents
+            },
+        )
+        .await;
+        let during: ProjectFileContentsPayload = during.parse_payload().unwrap();
+        assert_eq!(during.contents, before.contents);
+        assert_eq!(during.version, before.version);
+
+        fs::write(repo.path().join("file.rs"), "// recovered\n").unwrap();
+        fs::write(&index, saved_index).unwrap();
+        let mut got_git = false;
+        let mut got_change = force_project_watch_limit;
+        tokio::time::timeout(Duration::from_secs(20), async {
+            while !got_git || !got_change {
+                let event = fixture.client.next_event().await.unwrap().unwrap();
+                match event.kind {
+                    FrameKind::CommandError => {
+                        let error: CommandErrorPayload = event.parse_payload().unwrap();
+                        assert!(
+                            !error.fatal,
+                            "recovery must retain the existing subscription"
+                        );
+                    }
+                    FrameKind::ProjectBootstrap => {
+                        panic!("recovery must not replace the subscription or reset file versions")
+                    }
+                    FrameKind::ProjectGitStatus => {
+                        let status: ProjectGitStatusPayload = event.parse_payload().unwrap();
+                        got_git |= status.roots.iter().any(|root| !root.clean);
+                    }
+                    FrameKind::ProjectEvent => {
+                        if let protocol::ProjectEventPayload::FilesChanged { files } =
+                            event.parse_payload().unwrap()
+                        {
+                            got_change |= files.iter().any(|change| {
+                                change.path == path && change.version > before.version
+                            });
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("Git and watched file updates must resume without a client request");
+        fixture
+            .client
+            .project_read_file(&project.id, ProjectReadFilePayload { path: path.clone() })
+            .await
+            .unwrap();
+        let after = expect_project_file_contents(&mut fixture.client, "recovered file").await;
+        assert_eq!(after.contents.as_deref(), Some("// recovered\n"));
+        if !force_project_watch_limit {
+            assert!(after.version > before.version);
+            fs::write(repo.path().join("after-recovery.rs"), "// watching again\n").unwrap();
+            expect_project_file_list_matching(
+                &mut fixture.client,
+                "watcher after recovery",
+                |listing| {
+                    listing.roots[0]
+                        .entries
+                        .iter()
+                        .any(|entry| entry.relative_path == "after-recovery.rs")
+                },
+            )
+            .await;
+        }
+    }
+}
+
 #[tokio::test]
 async fn project_read_file_accepts_absolute_path_with_line_suffix() {
     let mut fixture = Fixture::new().await;

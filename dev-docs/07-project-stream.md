@@ -518,8 +518,8 @@ Examples:
 - `git diff` process exits non-zero -> `git_failed`, `fatal: false`
 - project deleted while a live subscription is active -> `not_found`,
   `fatal: true`, context `watch`
-- internal watcher task failure that leaves the subscription unusable ->
-  `internal`, `fatal: true`
+- filesystem watcher initialization/event failure or background refresh failure ->
+  `internal`, `fatal: false`, with automatic retry
 
 ---
 
@@ -615,7 +615,26 @@ These must emit `project_error`, not panic the whole server:
 Default classification:
 
 - user-intent-specific failures -> `fatal: false`
-- stream-wide subscription failures -> `fatal: true`
+- background watcher, file scan, or Git refresh failures -> `fatal: false`
+- unusable project/subscription state -> `fatal: true`
+
+Background I/O failures (including file-descriptor exhaustion) retain the
+subscription, last successful snapshots, file versions, and listeners. Current
+wire errors use `CommandError` with `project_watch` or `project_git_status` as
+the operation. A warning is emitted once per failed operation/recovery episode,
+not on every retry; new subscribers receive the outstanding warnings too.
+
+Failed watchers are recreated with a five-second retry delay, including watch
+limit failures. Failed scans retain their pending updates and retry after five
+seconds without requiring another filesystem event. Git refresh retries on its
+normal five-second poll. File reads remain independently available whenever the
+OS permits them. A definitively missing project root remains a fatal failure.
+
+After watching recovers, the server rescans and invalidates previously observed
+files so clients and code-intelligence listeners re-read edits made during the
+watch gap. Recovery does not reset file versions or require a new subscription.
+A degraded watcher does not periodically poll the whole file tree; it retries
+watcher initialization and catches up once watching becomes available.
 
 ### 9.2 Fatal project-stream failures
 
@@ -623,7 +642,6 @@ The server emits `project_error { fatal: true }` and closes the stream
 logically when:
 
 - the project disappears while the subscription is active
-- the live watch loop cannot continue safely
 - server-side state for that subscription is no longer usable
 
 After a fatal `project_error`, the client must treat the project stream as

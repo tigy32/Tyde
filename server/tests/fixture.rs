@@ -1535,3 +1535,57 @@ async fn connect_raw_client(host: server::HostHandle) -> client::Connection {
         .await
         .expect("client handshake failed")
 }
+
+// nextest isolates each test in its own process, including this OS resource limit.
+#[cfg(target_os = "linux")]
+#[allow(dead_code)]
+pub struct ExhaustedFileDescriptors {
+    original: libc::rlimit,
+    files: Vec<std::fs::File>,
+}
+
+#[cfg(target_os = "linux")]
+impl ExhaustedFileDescriptors {
+    // The shared fixture is also compiled by binaries without resource-pressure tests.
+    #[allow(dead_code)]
+    pub fn exhaust() -> Self {
+        let mut original = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut original) },
+            0
+        );
+        let mut exhausted = Self {
+            original,
+            files: Vec::new(),
+        };
+        let limited = libc::rlimit {
+            rlim_cur: original.rlim_cur.min(512),
+            ..original
+        };
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limited) }, 0);
+        loop {
+            match std::fs::File::open("/dev/null") {
+                Ok(file) => exhausted.files.push(file),
+                Err(error) => {
+                    assert_eq!(error.raw_os_error(), Some(libc::EMFILE));
+                    break;
+                }
+            }
+        }
+        exhausted
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for ExhaustedFileDescriptors {
+    fn drop(&mut self) {
+        self.files.clear();
+        assert_eq!(
+            unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &self.original) },
+            0
+        );
+    }
+}
