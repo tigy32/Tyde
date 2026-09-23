@@ -48,6 +48,32 @@ const ACP_CAPACITY_TIMEOUT: Duration = Duration::from_secs(20);
 const ACP_CAPACITY_REFRESH_INTERVAL: Duration = Duration::from_secs(120);
 const GROK_COMPACTION_TIMEOUT: Duration = Duration::from_secs(300);
 
+fn diagnostic_notification_method(method: &str) -> &'static str {
+    match method {
+        "session/update" => "session/update",
+        "session/notification" => "session/notification",
+        "_kiro.dev/commands/available" => "_kiro.dev/commands/available",
+        _ => "other",
+    }
+}
+
+fn diagnostic_update_kind(update_kind: &str) -> &'static str {
+    match update_kind {
+        "available_commands_update" => "available_commands_update",
+        "agent_message_chunk" => "agent_message_chunk",
+        "user_message_chunk" => "user_message_chunk",
+        "agent_thought_chunk" => "agent_thought_chunk",
+        "tool_call" => "tool_call",
+        "tool_call_update" => "tool_call_update",
+        "turn_end" => "turn_end",
+        "error" => "error",
+        "current_mode_update" => "current_mode_update",
+        "config_option_update" => "config_option_update",
+        "plan" => "plan",
+        _ => "other",
+    }
+}
+
 fn kiro_prompt_error_is_retryable(error: &str) -> bool {
     let error = error.to_ascii_lowercase();
     [
@@ -547,6 +573,13 @@ impl KiroSession {
         .await;
 
         let (session_id, session_started) = session_result?;
+        tracing::info!(
+            target: "tyde_acp_resume",
+            phase = "startup",
+            backend = ?adapter.backend_kind(),
+            identity_present = !session_id.is_empty(),
+            "ACP session/new established current identity"
+        );
 
         let backend_kind = adapter.backend_kind();
         let initial_model = extract_current_model(&session_started);
@@ -1689,6 +1722,14 @@ impl KiroInner {
             state.replay_assistant_reasoning.clear();
             state.replay_assistant_message_emitted_since_user = false;
             state.replay_error = None;
+            tracing::info!(
+                target: "tyde_acp_resume",
+                phase = "load",
+                backend = ?self.adapter.backend_kind(),
+                requested_identity_present = !session_id.is_empty(),
+                requested_matches_current = session_id == state.session_id,
+                "ACP resume recorded requested identity; current identity unchanged"
+            );
             (
                 state.workspace_root.clone(),
                 state.startup_mcp_servers.clone(),
@@ -1735,6 +1776,11 @@ impl KiroInner {
             }
         };
 
+        tracing::info!(
+            target: "tyde_acp_resume",
+            phase = "load",
+            "ACP session/load response received; awaiting inbound replay barrier"
+        );
         if let Err(err) = self.bridge.sync_inbound().await {
             let mut state = self.state.lock().await;
             state.replaying_history = false;
@@ -1780,6 +1826,12 @@ impl KiroInner {
         {
             let mut state = self.state.lock().await;
             if let Some(error) = state.replay_error.take() {
+                tracing::info!(
+                    target: "tyde_acp_resume",
+                    phase = "replay",
+                    decision = "fail_resume",
+                    "ACP replay barrier reached with retained rejection"
+                );
                 state.replaying_history = false;
                 state.replay_session_id = None;
                 state.replay_assistant_identity = None;
@@ -2313,13 +2365,45 @@ impl KiroInner {
                 .and_then(Value::as_str);
             let foreign = {
                 let state = self.state.lock().await;
-                actual
+                let obsolete_kiro_commands = self.adapter.backend_kind()
+                    == protocol::BackendKind::Kiro
+                    && method == "_kiro.dev/commands/available"
+                    && state.replaying_history
+                    && actual == Some(state.session_id.as_str())
+                    && state
+                        .replay_session_id
+                        .as_deref()
+                        .is_some_and(|requested| requested != state.session_id);
+                let foreign = actual
                     .filter(|actual| {
                         *actual != state.session_id
                             && !(state.replaying_history
                                 && state.replay_session_id.as_deref() == Some(*actual))
                     })
-                    .map(str::to_owned)
+                    .map(str::to_owned);
+                tracing::info!(
+                    target: "tyde_acp_resume",
+                    method = diagnostic_notification_method(method),
+                    replaying_history = state.replaying_history,
+                    identity_present = actual.is_some(),
+                    requested_identity_present = state.replay_session_id.is_some(),
+                    matches_current = actual == Some(state.session_id.as_str()),
+                    matches_requested = actual.is_some() && actual == state.replay_session_id.as_deref(),
+                    decision = if obsolete_kiro_commands {
+                        "drop_obsolete_kiro_commands"
+                    } else if foreign.is_some() {
+                        "foreign_route"
+                    } else {
+                        "local_route"
+                    },
+                    "ACP notification identity routing before normalization"
+                );
+                // session/new metadata must not replace the requested session's
+                // command state: Kiro normalization mutates its subcommand table.
+                if obsolete_kiro_commands {
+                    return;
+                }
+                foreign
             };
             if let Some(session_id) = foreign {
                 let child = self
@@ -2355,8 +2439,16 @@ impl KiroInner {
     async fn handle_local_notification(&self, method: &str, params: &Value) {
         match method {
             "session/update" => {
-                tracing::debug!(?params, "ACP session/update notification");
-                if !self.accept_replay_notification_session(params).await {
+                let update = params.get("update").unwrap_or(params);
+                let update_kind = update
+                    .get("sessionUpdate")
+                    .or_else(|| update.get("session_update"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if !self
+                    .accept_replay_notification_session(method, update_kind, params)
+                    .await
+                {
                     return;
                 }
                 self.handle_standard_update(params).await;
@@ -2367,7 +2459,10 @@ impl KiroInner {
                 let Some(normalized) = self.adapter.normalize_notification(other, params) else {
                     return;
                 };
-                if !self.accept_replay_notification_session(params).await {
+                if !self
+                    .accept_replay_notification_session(method, normalized.session_update, params)
+                    .await
+                {
                     return;
                 }
                 let mut normalized_params = normalized.params;
@@ -2544,10 +2639,22 @@ impl KiroInner {
         }
     }
 
-    async fn accept_replay_notification_session(&self, params: &Value) -> bool {
+    async fn accept_replay_notification_session(
+        &self,
+        method: &str,
+        update_kind: &str,
+        params: &Value,
+    ) -> bool {
         let error = {
             let state = self.state.lock().await;
             if !state.replaying_history {
+                tracing::info!(
+                    target: "tyde_acp_resume",
+                    method = diagnostic_notification_method(method),
+                    update_kind = diagnostic_update_kind(update_kind),
+                    decision = "accept_non_replay",
+                    "ACP recognized notification identity validation"
+                );
                 return true;
             }
             let expected = state.replay_session_id.as_deref();
@@ -2555,7 +2662,7 @@ impl KiroInner {
                 .get("sessionId")
                 .or_else(|| params.get("session_id"))
                 .and_then(Value::as_str);
-            match (expected, actual) {
+            let error = match (expected, actual) {
                 (Some(expected), Some(actual)) if expected == actual => None,
                 (Some(_), Some(actual))
                     if matches!(
@@ -2565,9 +2672,13 @@ impl KiroInner {
                 {
                     None
                 }
-                (Some(expected), Some(actual)) => Some(format!(
-                    "{} session replay expected {expected} but received {actual}",
-                    self.adapter.display_name()
+                (Some(_), Some(actual)) => Some(format!(
+                    "{} session replay identity mismatch: method={}, update_kind={}, \
+                     matches_current={}, matches_requested=false",
+                    self.adapter.display_name(),
+                    diagnostic_notification_method(method),
+                    diagnostic_update_kind(update_kind),
+                    actual == state.session_id,
                 )),
                 (Some(_), None) => {
                     Some("ACP session replay event omitted its session identity".to_string())
@@ -2575,7 +2686,22 @@ impl KiroInner {
                 (None, _) => {
                     Some("ACP session replay received an event outside session/load".to_string())
                 }
-            }
+            };
+            tracing::info!(
+                target: "tyde_acp_resume",
+                phase = "replay",
+                method = diagnostic_notification_method(method),
+                update_kind = diagnostic_update_kind(update_kind),
+                identity_present = actual.is_some(),
+                requested_identity_present = expected.is_some(),
+                matches_current = actual == Some(state.session_id.as_str()),
+                matches_requested = actual.is_some() && actual == expected,
+                decision = if error.is_some() { "reject" } else { "accept" },
+                first_rejection = error.is_some() && state.replay_error.is_none(),
+                prior_rejection = state.replay_error.is_some(),
+                "ACP recognized notification identity validation"
+            );
+            error
         };
 
         if let Some(error) = error {
@@ -2783,6 +2909,11 @@ impl KiroInner {
             }
             state.slash_commands = Some(catalog.clone());
         }
+        tracing::info!(
+            target: "tyde_acp_resume",
+            command_count = catalog.commands.len(),
+            "ACP command catalog published"
+        );
         self.emitter.slash_commands(catalog);
     }
 

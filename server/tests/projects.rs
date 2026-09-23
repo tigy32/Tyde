@@ -5392,12 +5392,25 @@ async fn move_agent_preserves_conversation_and_persists_all_project_roots() {
                 .parse_payload::<protocol::types::AgentMoveResultPayload>()
                 .unwrap();
                 assert_eq!(broadcast.result.unwrap().project_id, Some(project_id));
-                let (_, persisted) = fixture.connect_fresh_host_with_bootstrap().await;
+                eprintln!(
+                    "PROJECT MOVE PERSISTENCE connecting observer expected_root_count={}",
+                    roots.len()
+                );
+                // A fresh host restores open agents and becomes another writer.
+                // Keep one owner while moving; bootstrap reads persisted SQLite
+                // rows, and the real host restart below checks recovery afterward.
+                let (_, persisted) = fixture.connect_with_bootstrap().await;
                 let saved = persisted
                     .sessions
                     .iter()
                     .find(|session| Some(&session.id) == start.session_id.as_ref())
                     .expect("moved session persisted");
+                eprintln!(
+                    "PROJECT MOVE PERSISTENCE bootstrap root_count={} matches_expected={} project_matches_expected={}",
+                    saved.workspace_roots.len(),
+                    saved.workspace_roots == roots,
+                    saved.project_id == moved.project_id
+                );
                 assert_eq!(saved.workspace_roots, roots);
                 assert_eq!(saved.project_id, moved.project_id);
                 fixture
@@ -5409,12 +5422,18 @@ async fn move_agent_preserves_conversation_and_persists_all_project_roots() {
             }
         }
     }
-    let (_, bootstrap) = fixture.connect_fresh_host_with_bootstrap().await;
+    let bootstrap = fixture.restart_host().await;
     let session = bootstrap
         .sessions
         .iter()
         .find(|session| Some(&session.id) == start.session_id.as_ref())
         .expect("saved session after host restart");
+    eprintln!(
+        "PROJECT MOVE PERSISTENCE final bootstrap root_count={} matches_source={} project_matches_source={}",
+        session.workspace_roots.len(),
+        session.workspace_roots == project_roots(&source),
+        session.project_id == Some(source.id.clone())
+    );
     assert_eq!(session.project_id, Some(source.id.clone()));
     assert_eq!(session.workspace_roots, project_roots(&source));
 }

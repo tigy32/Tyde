@@ -1658,7 +1658,21 @@ mod wasm_tests {
                     &format!("width:{width}px;height:{height}px;border:0"),
                 )
                 .unwrap();
-            sleep(Duration::from_millis(100)).await;
+            // A timer fired with viewport=130 but the old shell height=516.
+            // The shell applies resize geometry in its owner's animation frame,
+            // not on a wall-clock deadline; let that render cycle complete.
+            for _ in 0..2 {
+                let rendered = js_sys::Promise::new(&mut |resolve, _reject| {
+                    frame
+                        .content_window()
+                        .unwrap()
+                        .request_animation_frame(&resolve)
+                        .unwrap();
+                });
+                wasm_bindgen_futures::JsFuture::from(rendered)
+                    .await
+                    .unwrap();
+            }
             let current = container
                 .query_selector("[data-mobile-test='chat-input']")
                 .unwrap()

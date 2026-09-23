@@ -342,6 +342,14 @@ impl SessionStore {
             if launch_profile_id.is_some() {
                 entry.launch_profile_id = launch_profile_id.clone();
             }
+            tracing::info!(
+                target: "tyde_session_roots",
+                existing_root_count = entry.workspace_roots.len(),
+                incoming_root_count = session.workspace_roots.len(),
+                roots_changed = entry.workspace_roots != session.workspace_roots,
+                project_changed = entry.project_id != project_id,
+                "Session startup upsert workspace roots"
+            );
             entry.workspace_roots = session.workspace_roots.clone();
             entry.project_id = project_id.clone();
             entry.custom_agent_id = custom_agent_id.clone();
@@ -468,6 +476,14 @@ impl SessionStore {
         roots: Vec<String>,
     ) -> Result<(), String> {
         self.update(session_id, |record| {
+            tracing::info!(
+                target: "tyde_session_roots",
+                existing_root_count = record.workspace_roots.len(),
+                incoming_root_count = roots.len(),
+                roots_changed = record.workspace_roots != roots,
+                project_changed = record.project_id != project_id,
+                "Session move persists workspace roots"
+            );
             record.project_id = project_id;
             record.workspace_roots = roots;
             record.updated_at_ms = now_ms();

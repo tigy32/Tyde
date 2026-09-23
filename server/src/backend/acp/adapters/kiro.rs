@@ -105,6 +105,14 @@ impl KiroAdapter {
                 }))
             })
             .collect::<Vec<_>>();
+        tracing::info!(
+            target: "tyde_acp_resume",
+            method = "_kiro.dev/commands/available",
+            update_kind = "available_commands_update",
+            advertised_command_count = commands.len(),
+            normalized_command_count = available.len(),
+            "Kiro command normalization replacing subcommand table before identity validation"
+        );
         *self
             .subcommands
             .lock()

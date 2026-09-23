@@ -97,6 +97,103 @@ boundary. Its idle publication cannot clear an active registry turn or its
 stream. Binding preparation and the conformance harness likewise consume
 only through the marker, leaving subsequent live events unread.
 
+## Kiro resume startup command identity
+
+On 2026-09-23, the unchanged
+`real_conversation_on_resumed_session::kiro` failed before the fix in 6.93
+seconds (7.01 seconds wall, exit 101). Sanitized notification tracing confirmed
+that the first rejection was `_kiro.dev/commands/available`, normalized as
+`available_commands_update`, carrying the temporary `session/new` identity
+rather than the requested `session/load` identity. The router admitted the
+current startup identity during replay, and Kiro normalization replaced its
+subcommand table before the strict replay validator recorded the mismatch.
+Requested-session history and a separate requested-session command advertisement
+arrived afterward, but the retained first rejection failed resume at the barrier.
+
+The router now discards only Kiro's command advertisement when replay is active,
+the notification explicitly identifies the current startup session, and a
+present, different requested replay identity exists. This happens before child
+routing and side-effectful normalization; neither the subcommand table nor the
+catalog sees that obsolete advertisement. Requested-session advertisements,
+missing-identity failures, standard updates, history-bearing vendor updates,
+and the existing Grok/OpenCode identity exceptions are unchanged. The
+`53db493f` inbound gate remains held through replay flush and the in-band
+`ResumeReplayComplete` boundary. No frontend behavior is inferred or changed.
+
+The same unchanged case passed once with the fix in 11.17 seconds (11.21
+seconds wall, exit 0), including requested history, a follow-up reading an
+out-of-band rewritten file through a real tool, and the existing duplicate
+history checks. Tracing observed the startup advertisement discarded before
+normalization and the requested-session advertisement accepted, publishing 19
+commands. Both runs used Kiro's default/auto model selection. Only Kiro was
+rerun for this fix; the common case and its assertions remain unchanged for all
+seven eligible providers. This is targeted regression evidence, not renewed
+certification of other backends or every Kiro feature.
+
+Content-free diagnostics are retained under the `tyde_acp_resume` tracing target;
+they report known methods/update kinds, phases, identity comparisons, routing,
+first rejection, and command counts, never session identities or payloads.
+Local red and green evidence is retained under
+`target/kiro-resume-diagnostics/` (`sanitized.log` and
+`green/sanitized.log`, with separate invocation and timing files).
+
+Scoped desktop QA also passed on Kiro CLI 2.21.2 with the rendered model
+`auto`, using an initially empty disposable store and disposable workspace.
+After native close confirmation, clicking the saved History conversation
+replayed the original user/assistant history once and settled at Idle before
+any prompt. The resumed slash menu contained the same 19 commands. One
+follow-up recalled pre-resume context and returned the exact bytes of a file
+rewritten outside the conversation, with one successful rendered read-tool
+card and a Thinking-to-Idle transition. The read-tool renderer displays file
+metadata, not file contents; the exact bytes were verified in the assistant
+reply. There remained one saved conversation and no agent error cards.
+
+Four bounded cold-build/startup readiness attempts timed out before the fifth
+instance became ready; no QA prompts were sent during those attempts. The
+scoped run used rendered UI controls, including the real native close dialog
+confirmed through AT-SPI. Screenshots and second-client automation were
+unavailable, so this does not claim those checks or broad backend certification.
+The instance was stopped, its disposable stores removed, and its process gone.
+Content-free UI evidence is in `target/kiro-resume-diagnostics/ui/`.
+
+### Project-move validation collateral
+
+The first diagnostic build also failed the existing server sim
+`move_agent_preserves_conversation_and_persists_all_project_roots`: after the
+return move, final bootstrap retained the destination's two roots instead of
+the source's one root, while the immediately preceding source-project assertion
+passed. Intermediate move acknowledgements and persisted-root assertions had
+passed. An instrumented check passed without a production persistence change;
+that pass alone does not resolve the race.
+
+The test created fresh hosts against the same live store after each move,
+without stopping the original host. `connect_fresh_host_with_bootstrap` starts
+restoration of open agents; restored actor startup calls
+`persist_agent_session` and `upsert_backend_session`, which write the captured
+roots. These are additional asynchronous writers, not read-only persistence
+observers. Returning bootstrap does not wait for their restoration to finish,
+and dropping the client does not stop the host's agents. The test was racing
+those stale startup writes against subsequent moves, not simulating a restart.
+
+The scenario now connects another client to the one owning host for intermediate
+bootstrap observations (session summaries read persisted SQLite rows), then uses
+`restart_host` to shut down the owning agents before the final fresh host.
+All existing busy/missing-project, acknowledgement, observer, session identity,
+workspace-root, project, follow-up, and final persistence assertions are retained
+unchanged. Only invalid overlapping-host setup is corrected; production
+persistence behavior is untouched. Sanitized root-count/comparison diagnostics
+remain in the sim and under the `tyde_session_roots` tracing target.
+
+The committed check also exposed a separate wasm fixture timing error in
+`one_chat_mount_preserves_transcript_and_composer_draft`: at the 852x130
+resize, diagnostics showed viewport/document height 130 but shell height 516
+and send-button bottom 500, the preceding frame's geometry. The test waited
+100 milliseconds even though `attachShell` applies geometry in the iframe's
+`requestAnimationFrame`. It now awaits that window's render cycles instead of
+a timer. All existing reachability, bounds, DOM identity, draft, selection,
+and focus assertions and diagnostic output remain unchanged; no production
+mobile behavior changed.
+
 ## Generated-image response ownership
 
 `real_generated_image_preserves_tool_ownership` runs on backends declaring
