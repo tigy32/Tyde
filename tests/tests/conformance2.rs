@@ -134,6 +134,9 @@ macro_rules! conformance2_scenario {
                 } else if stringify!($scenario) == "real_generated_image_preserves_tool_ownership" {
                     // Luna missed the race; Astra reproduced the captured empty-reasoning interleaving.
                     Profile::new(&["gpt-6-astra"], &[("model", "gpt-6-astra"), ("reasoning_effort", "low")])
+                } else if matches!(stringify!($scenario), "real_async_user_question" | "real_user_question") {
+                    // Luna exposes only the blocking tool; Astra exposes async questions.
+                    Profile::new(&["gpt-6-astra"], &[("model", "gpt-6-astra"), ("reasoning_effort", "low")])
                 } else { Profile::codex() }
             );
             provider!(
@@ -2904,6 +2907,102 @@ async fn real_user_question<B: Backend>(host: &mut Harness<B>) {
 
     assert_clean_close(host, &agent).await;
 }
+
+async fn real_async_user_question<B: Backend>(host: &mut Harness<B>) {
+    let prompt = "Use request_user_input_async to ask one question titled Which label? with \
+        options ALPHA and BETA. Do not use the blocking request_user_input tool. Do not \
+        select an answer or run other tools. End your turn after asking, then wait for my \
+        actual answer. After I answer, repeat my chosen label.";
+    let agent = spawn_agent(host, &launch_prompt()).await;
+    let launched = collect_turn(host, &agent, &launch_prompt()).await;
+    assert_ready_handshake(&launched);
+
+    let asked = ask_question(host, &agent, prompt).await;
+    assert_question_shape(&asked);
+    assert_question_waits_for_an_answer(&asked);
+    let choice = asked
+        .first_option()
+        .expect("question offers options")
+        .to_owned();
+    let answered = answer_question(host, &agent, &asked, &choice).await;
+    assert_question_answer_reached_the_model(&asked, &answered, &choice);
+    assert_async_answer_has_no_user_echo(&answered);
+
+    let continuing = ask_question(
+        host,
+        &agent,
+        &format!(
+            "{prompt} For this question only, after posting it run the foreground command \
+         `sleep 45` using your command tool. Do not detach it. This is independent work \
+         that must run while the question remains unanswered. After the command finishes, \
+         acknowledge the answer I send while it runs."
+        ),
+    )
+    .await;
+    assert_question_waits_for_an_answer(&continuing);
+    let running_commands = continuing.events().iter().filter_map(|event| match event {
+        ChatEvent::ToolRequest(request)
+            if matches!(request.tool_type, ToolRequestType::RunCommand { .. }) => Some(request),
+        _ => None,
+    }).filter(|request| !continuing.events().iter().any(|event| matches!(event,
+        ChatEvent::ToolExecutionCompleted(completion) if completion.tool_call_id == request.tool_call_id
+    ))).count();
+    assert_eq!(
+        running_commands, 1,
+        "async questions must allow independent work to continue"
+    );
+    let answered = answer_question(host, &agent, &continuing, "BETA").await;
+    assert_question_answer_reached_the_model(&continuing, &answered, "BETA");
+    assert_async_answer_has_no_user_echo(&answered);
+
+    let free_text = ask_question(host, &agent, prompt).await;
+    assert_question_waits_for_an_answer(&free_text);
+    let answered = answer_question(host, &agent, &free_text, "GAMMA").await;
+    assert_question_answer_reached_the_model(&free_text, &answered, "GAMMA");
+    assert_async_answer_has_no_user_echo(&answered);
+
+    let abandoned = ask_question(host, &agent, prompt).await;
+    assert_question_waits_for_an_answer(&abandoned);
+    let cancelled = cancel_turn(host, &agent).await;
+    assert_no_error_message("async question cancellation", &cancelled);
+    assert_eq!(
+        cancelled
+            .iter()
+            .filter(|event| matches!(event,
+                ChatEvent::ToolExecutionCompleted(completion)
+                    if completion.tool_call_id == abandoned.tool_call_id()
+                    && matches!(completion.outcome, ToolExecutionOutcome::Cancelled { .. })
+            ))
+            .count(),
+        1,
+        "cancelling must retire the unanswered question exactly once"
+    );
+    let recovered = ask_expecting_delivery(host, &agent, &launch_prompt()).await;
+    assert_ready_handshake(&recovered);
+    assert_universal_contract(&[launched, recovered]);
+    assert_clean_close(host, &agent).await;
+}
+
+fn assert_async_answer_has_no_user_echo(turn: &Turn) {
+    let echoes = turn
+        .events()
+        .iter()
+        .filter(|event| {
+            matches!(event,
+                ChatEvent::MessageAdded(message) if matches!(message.sender, MessageSender::User)
+            )
+        })
+        .count();
+    assert_eq!(
+        echoes, 0,
+        "the actor already persists the typed answer; a backend echo duplicates it"
+    );
+}
+
+conformance2_scenario!(
+    real_async_user_question,
+    [BackendCapability::AsyncUserQuestionRequests]
+);
 
 fn write_prompt(workspace: &Path, payload: &str) -> String {
     format!(

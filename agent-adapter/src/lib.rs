@@ -142,6 +142,7 @@ exhaustive_capabilities! {
     RetryTelemetry,
     OrchestrationEvents,
     UserQuestionRequests,
+    AsyncUserQuestionRequests,
     PlanApprovalRequests,
     WorkspaceInstructions,
     Customization,

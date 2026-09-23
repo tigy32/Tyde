@@ -443,8 +443,11 @@ pub fn ToolCardView(
         }
     };
 
+    let is_ask_user_question = matches!(tool_type, ToolRequestType::AskUserQuestion { .. });
     let status_label = move || {
-        if !has_result || (background_running.get() && !result_failed) {
+        if !has_result && is_ask_user_question {
+            "Awaiting answer".to_owned()
+        } else if !has_result || (background_running.get() && !result_failed) {
             "Running\u{2026}".to_owned()
         } else if result_cancelled {
             "Cancelled".to_owned()
@@ -501,7 +504,6 @@ pub fn ToolCardView(
             .map(|completion| completion_outcome_summary(&tool_type, &completion.outcome))
     };
 
-    let is_ask_user_question = matches!(tool_type, ToolRequestType::AskUserQuestion { .. });
     let is_exit_plan_mode = matches!(tool_type, ToolRequestType::ExitPlanMode { .. });
     let body_tool_type = tool_type.clone();
     let body_outcome = result.as_ref().map(|r| r.outcome.clone());
@@ -1858,6 +1860,11 @@ mod live_card_wasm_tests {
             assert!(
                 text(&container).contains("Which language?"),
                 "and its question renders in {mode:?}"
+            );
+            assert_eq!(
+                tool_header_status(&container),
+                "Awaiting answer",
+                "an unanswered question waits on the user, not a running tool"
             );
         }
     }

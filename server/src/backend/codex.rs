@@ -146,6 +146,80 @@ impl CodexCommandHandle {
         self.inner.execute(command).await
     }
 
+    async fn send_user_input(
+        &self,
+        mut payload: protocol::SendMessagePayload,
+    ) -> Result<(), String> {
+        let tool_call_id = match payload.tool_response.as_ref() {
+            Some(protocol::SendMessageToolResponse::AskUserQuestion {
+                tool_call_id,
+                answer,
+            }) if tool_call_id.starts_with("async-user-input-") => {
+                if answer.trim().is_empty()
+                    || !self
+                        .inner
+                        .state
+                        .lock()
+                        .await
+                        .pending_async_questions
+                        .contains(tool_call_id)
+                {
+                    return Err(
+                        "Codex async question response is empty or no longer pending".to_owned(),
+                    );
+                }
+                payload.message = answer.clone();
+                Some(tool_call_id.clone())
+            }
+            _ => None,
+        };
+        let Some(tool_call_id) = tool_call_id else {
+            return self
+                .execute(SessionCommand::SendMessage {
+                    message: payload.message,
+                    images: protocol_images_to_attachments(payload.images),
+                })
+                .await;
+        };
+        // The actor persists typed answers; only plain messages echo from the backend.
+        payload.tool_response = None;
+        self.inner.emitter.typing_status_changed(true);
+        match self.inner.steer_user_message(payload).await {
+            SteerOutcome::Accepted => {}
+            SteerOutcome::NoActiveTurn(payload) => {
+                let images = protocol_images_to_attachments(payload.images);
+                self.inner
+                    .start_user_message_turn(&payload.message, images.as_deref())
+                    .await?;
+            }
+            SteerOutcome::Unsupported(_) => {
+                return Err("Codex cannot deliver the answer to its running turn".to_owned());
+            }
+            SteerOutcome::Closed => {
+                return Err("Codex closed before accepting the question response".to_owned());
+            }
+        }
+        let remaining = {
+            let mut state = self.inner.state.lock().await;
+            state.pending_async_questions.remove(&tool_call_id);
+            state.pending_async_questions.len()
+        };
+        tracing::info!(
+            remaining_questions = remaining,
+            "Codex accepted an async question answer"
+        );
+        self.inner
+            .emit_tool_execution_completed(
+                &tool_call_id,
+                "request_user_input_async",
+                true,
+                json!({"kind": "Other", "result": {"answered": true}}),
+                None,
+            )
+            .await;
+        Ok(())
+    }
+
     async fn cancel_background_task(&self, tool_call_id: &str) -> CancelBackgroundTaskOutcome {
         self.inner.cancel_background_task(tool_call_id).await
     }
@@ -3415,6 +3489,7 @@ impl CodexResponseSplitter {
         &mut self,
         turn_id: Option<&str>,
         item: &Value,
+        project_async_questions: bool,
     ) -> Option<(Option<CodexProviderResponseIdentity>, ChatMessageId)> {
         if !is_raw_codex_provider_output_item(item) {
             return None;
@@ -3469,7 +3544,10 @@ impl CodexResponseSplitter {
                 if let Some(call_id) = request.provider_call_id {
                     self.typed_owned_call_ids.insert(call_id);
                 }
-            } else if codex_raw_call_is_rendered_elsewhere(&request.tool_name, &request.arguments) {
+            } else if codex_raw_call_is_rendered_elsewhere(&request.tool_name, &request.arguments)
+                // The accepted result only posts the question; the typed message owns its card.
+                || (project_async_questions && request.tool_name == "request_user_input_async")
+            {
                 if let Some(call_id) = request.provider_call_id.clone() {
                     self.suppressed_raw_tool_requests.insert(
                         call_id,
@@ -3633,8 +3711,15 @@ impl CodexResponseSplitter {
             response.turn_id = turn_id.to_owned();
         }
         let content_offset = u32::try_from(response.text.chars().count()).unwrap_or(u32::MAX);
-        let provider_item_id = response.pending_typed_tool_item_id.clone();
-        let provider_call_id = response.pending_typed_tool_call_id.clone();
+        // Async questions belong to a message, not a concurrently executing tool item.
+        let (provider_item_id, provider_call_id) = if tool_name == "request_user_input_async" {
+            (None, None)
+        } else {
+            (
+                response.pending_typed_tool_item_id.clone(),
+                response.pending_typed_tool_call_id.clone(),
+            )
+        };
         response.raw_tool_requests.retain(|raw| {
             let raw_item_id = raw.provider_item_id.as_deref().unwrap_or_default();
             let typed_matches_raw_item = provider_item_id.as_ref().is_some_and(|typed_item_id| {
@@ -4500,6 +4585,7 @@ struct CodexState {
     file_change_call_ids: HashMap<String, Vec<String>>,
     pending_raw_modify_calls: HashMap<(String, String), PendingRawCodexModify>,
     pending_request: Option<PendingRequest>,
+    pending_async_questions: HashSet<String>,
     subagent_emitter: Option<Arc<dyn SubAgentEmitter>>,
     capacity_refresh_in_flight: bool,
     pending_subagent_spawns: HashMap<String, CodexSubAgentSpawnInfo>,
@@ -4634,6 +4720,7 @@ fn initial_codex_state(
         file_change_call_ids: HashMap::new(),
         pending_raw_modify_calls: HashMap::new(),
         pending_request: None,
+        pending_async_questions: HashSet::new(),
         subagent_emitter,
         capacity_refresh_in_flight: false,
         pending_subagent_spawns: HashMap::new(),
@@ -7734,6 +7821,7 @@ impl CodexInner {
             state.tool_container_images.clear();
             state.close_active_stream_when_tools_idle = false;
             state.pending_request = None;
+            state.pending_async_questions.clear();
             state.file_change_call_ids.clear();
             state.pending_message_metadata = None;
             let root_thread_id = state.thread_id.clone();
@@ -7976,6 +8064,16 @@ impl CodexInner {
         {
             return SteerOutcome::Unsupported(payload);
         }
+        let message = payload.message.clone();
+        let images = protocol_images_to_attachments(payload.images.clone());
+        let outcome = self.steer_user_message(payload).await;
+        if matches!(outcome, SteerOutcome::Accepted) {
+            self.emit_user_message_added(&message, images.as_deref());
+        }
+        outcome
+    }
+
+    async fn steer_user_message(&self, payload: protocol::SendMessagePayload) -> SteerOutcome {
         let (thread_id, turn_id) = {
             let state = self.state.lock().await;
             let turn_id = match state.active_turn_id.clone() {
@@ -8009,10 +8107,7 @@ impl CodexInner {
             )
             .await;
         match steered {
-            Ok(_) => {
-                self.emit_user_message_added(&payload.message, images.as_deref());
-                SteerOutcome::Accepted
-            }
+            Ok(_) => SteerOutcome::Accepted,
             Err(error) if error.code.is_none() => {
                 tracing::warn!(%error, turn_id, "Codex went away during turn/steer");
                 SteerOutcome::Closed
@@ -8026,6 +8121,77 @@ impl CodexInner {
                 SteerOutcome::NoActiveTurn(payload)
             }
         }
+    }
+
+    async fn start_user_message_turn(
+        &self,
+        message: &str,
+        images: Option<&[ImageAttachment]>,
+    ) -> Result<(), String> {
+        let (
+            thread_id,
+            model_override,
+            effort_override,
+            approval_policy_override,
+            access_mode,
+            execution_mode,
+            turn_network_access,
+        ) = {
+            let mut state = self.state.lock().await;
+            // This send supersedes any cancel that raced an earlier
+            // turn start; the next turn/started belongs to it.
+            state.interrupt_next_root_turn = false;
+            state.awaiting_root_turn_start = true;
+            let (model_override, effort_override) = match state.execution_mode {
+                BackendExecutionMode::Agent => (
+                    state.model_override.clone(),
+                    state.reasoning_effort_override.clone(),
+                ),
+                BackendExecutionMode::InferenceOnly => (None, None),
+            };
+            (
+                state.thread_id.clone(),
+                model_override,
+                effort_override,
+                state.approval_policy.clone(),
+                state.access_mode,
+                state.execution_mode,
+                state.turn_network_access,
+            )
+        };
+
+        let input_items = codex_user_input_items(message, images).await?;
+
+        let mut params = json!({
+            "threadId": thread_id,
+            "input": input_items
+        });
+
+        if let Some(model) = model_override {
+            params["model"] = Value::String(model);
+        }
+        if let Some(effort) = effort_override {
+            params["effort"] = Value::String(effort);
+        }
+        params["summary"] = Value::String(CODEX_REASONING_SUMMARY_LEVEL.to_string());
+        let approval_policy = approval_policy_override
+            .unwrap_or_else(|| codex_approval_policy(execution_mode).to_string());
+        params["approvalPolicy"] = Value::String(approval_policy);
+        params["sandboxPolicy"] =
+            codex_sandbox_policy(access_mode, turn_network_access, execution_mode);
+
+        if let Some(roots) = &self.state.lock().await.workspace_roots_override {
+            params["cwd"] = json!(roots[0]);
+            params["runtimeWorkspaceRoots"] = json!(roots);
+        }
+        let turn_start = self.rpc.request("turn/start", params).await;
+        eprintln!("TYDE CODEX TURN START RESPONSE result={turn_start:?}");
+        if let Err(err) = turn_start {
+            self.state.lock().await.awaiting_root_turn_start = false;
+            self.emitter.typing_status_changed(false);
+            return Err(err);
+        }
+        Ok(())
     }
 
     async fn execute(&self, command: SessionCommand) -> Result<(), String> {
@@ -8043,72 +8209,16 @@ impl CodexInner {
                     return self.run_slash_command(&command.name, &message).await;
                 }
 
-                let (
-                    thread_id,
-                    model_override,
-                    effort_override,
-                    approval_policy_override,
-                    access_mode,
-                    execution_mode,
-                    turn_network_access,
-                ) = {
-                    let mut state = self.state.lock().await;
-                    // This send supersedes any cancel that raced an earlier
-                    // turn start; the next turn/started belongs to it.
-                    state.interrupt_next_root_turn = false;
-                    state.awaiting_root_turn_start = true;
-                    let (model_override, effort_override) = match state.execution_mode {
-                        BackendExecutionMode::Agent => (
-                            state.model_override.clone(),
-                            state.reasoning_effort_override.clone(),
-                        ),
-                        BackendExecutionMode::InferenceOnly => (None, None),
-                    };
-                    (
-                        state.thread_id.clone(),
-                        model_override,
-                        effort_override,
-                        state.approval_policy.clone(),
-                        state.access_mode,
-                        state.execution_mode,
-                        state.turn_network_access,
-                    )
-                };
-
-                let input_items = codex_user_input_items(&message, images.as_deref()).await?;
-
-                let mut params = json!({
-                    "threadId": thread_id,
-                    "input": input_items
-                });
-
-                if let Some(model) = model_override {
-                    params["model"] = Value::String(model);
-                }
-                if let Some(effort) = effort_override {
-                    params["effort"] = Value::String(effort);
-                }
-                params["summary"] = Value::String(CODEX_REASONING_SUMMARY_LEVEL.to_string());
-                let approval_policy = approval_policy_override
-                    .unwrap_or_else(|| codex_approval_policy(execution_mode).to_string());
-                params["approvalPolicy"] = Value::String(approval_policy);
-                params["sandboxPolicy"] =
-                    codex_sandbox_policy(access_mode, turn_network_access, execution_mode);
-
-                if let Some(roots) = &self.state.lock().await.workspace_roots_override {
-                    params["cwd"] = json!(roots[0]);
-                    params["runtimeWorkspaceRoots"] = json!(roots);
-                }
-                let turn_start = self.rpc.request("turn/start", params).await;
-                eprintln!("TYDE CODEX TURN START RESPONSE result={turn_start:?}");
-                if let Err(err) = turn_start {
-                    self.state.lock().await.awaiting_root_turn_start = false;
-                    self.emitter.typing_status_changed(false);
-                    return Err(err);
-                }
-                Ok(())
+                self.start_user_message_turn(&message, images.as_deref())
+                    .await
             }
             SessionCommand::CancelConversation => {
+                let cancelling_async_questions = {
+                    let mut state = self.state.lock().await;
+                    let pending = !state.pending_async_questions.is_empty();
+                    state.pending_async_questions.clear();
+                    pending
+                };
                 let compaction_start_pending = {
                     let state = self.state.lock().await;
                     state.active_turn_id.is_none()
@@ -8182,7 +8292,7 @@ impl CodexInner {
                 );
                 // An answer can finish before its provider turn releases the
                 // reservation that blocks queued messages.
-                if foreground_ended_with_background_work {
+                if foreground_ended_with_background_work && !cancelling_async_questions {
                     self.emitter.interrupt_acknowledged(
                         "Codex foreground turn already ended; background work continues.",
                     );
@@ -8396,6 +8506,7 @@ impl CodexInner {
             state.pending_background_wakes.clear();
             state.background_wake_request_in_flight = false;
             state.pending_request = None;
+            state.pending_async_questions.clear();
         }
 
         self.emitter.conversation_cleared();
@@ -9123,6 +9234,14 @@ impl CodexInner {
         }
         self.project_response_notification(&thread_id, &emitter, &model, event, params)
             .await?;
+        if root
+            && matches!(
+                event,
+                CodexResponseEvent::Completed(CodexProviderItemKind::AgentMessage)
+            )
+        {
+            self.emit_async_user_questions(params).await;
+        }
         Ok(CodexResponseDispatch::ProviderResponse)
     }
 
@@ -9761,11 +9880,14 @@ impl CodexInner {
         let turn_id = extract_turn_id(params);
         {
             let mut state = self.state.lock().await;
+            let project_async_questions = thread_id == state.thread_id;
             state
                 .response_projections
                 .get_mut(&thread_id)
                 .and_then(CodexResponseProjection::responses_mut)
-                .and_then(|splitter| splitter.observe_raw_item(turn_id.as_deref(), item));
+                .and_then(|splitter| {
+                    splitter.observe_raw_item(turn_id.as_deref(), item, project_async_questions)
+                });
         }
     }
 
@@ -14478,6 +14600,87 @@ impl CodexInner {
         }
     }
 
+    async fn emit_async_user_questions(&self, params: &Value) {
+        let Some(questions) = params
+            .pointer("/item/questions")
+            .filter(|value| !value.is_null())
+        else {
+            return;
+        };
+        #[derive(serde::Deserialize)]
+        struct Question {
+            title: String,
+            options: Option<Vec<String>>,
+        }
+        let Ok(parsed) = serde_json::from_value::<Vec<Question>>(questions.clone()) else {
+            self.emitter
+                .backend_error("Codex sent malformed async questions");
+            return;
+        };
+        if parsed.is_empty() {
+            return;
+        }
+        if parsed
+            .iter()
+            .any(|question| question.title.trim().is_empty())
+        {
+            self.emitter
+                .backend_error("Codex sent an async question without a title");
+            return;
+        }
+        let Some(item_id) = params
+            .pointer("/item/id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+        else {
+            self.emitter
+                .backend_error("Codex async questions have no message identity");
+            return;
+        };
+        let tool_call_id = format!("async-user-input-{item_id}");
+        if self.emitter.has_known_tool_request(&tool_call_id) {
+            return;
+        }
+        let normalized = parsed
+            .into_iter()
+            .map(|question| protocol::AskUserQuestion {
+                id: None,
+                question: question.title,
+                header: None,
+                options: question
+                    .options
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|label| protocol::AskUserQuestionOption {
+                        label,
+                        description: None,
+                    })
+                    .collect(),
+                multi_select: false,
+            })
+            .collect::<Vec<_>>();
+        tracing::info!(
+            question_count = normalized.len(),
+            "Codex projecting pending async user questions"
+        );
+        self.state
+            .lock()
+            .await
+            .pending_async_questions
+            .insert(tool_call_id.clone());
+        self.track_tool_requests(std::iter::once(tool_call_id.clone()))
+            .await;
+        self.emit_tool_request(
+            &tool_call_id,
+            "request_user_input_async",
+            CodexToolRequest::typed(
+                json!({"questions": questions}),
+                json!({"kind": "AskUserQuestion", "questions": normalized}),
+            ),
+        )
+        .await;
+    }
+
     async fn handle_item_completed(self: &Arc<Self>, params: &Value) {
         let Some(item) = params.get("item") else {
             return;
@@ -14488,6 +14691,14 @@ impl CodexInner {
         // Clears the splitter's per-item bookkeeping; the card itself is
         // completed by the typed handler below, which owns it.
         let _ = self.finish_strict_typed_tool(params).await;
+
+        if let Some(questions) = item.get("questions").and_then(Value::as_array) {
+            tracing::info!(
+                question_count = questions.len(),
+                item_type,
+                "Codex completed item carries async user questions"
+            );
+        }
 
         match item_type {
             "agentMessage" => {
@@ -14615,6 +14826,7 @@ impl CodexInner {
                     },
                 )
                 .await;
+                self.emit_async_user_questions(params).await;
             }
             "subAgentActivity" | "sub_agent_activity" => {
                 self.register_codex_subagent_activity_if_needed(item).await;
@@ -15846,6 +16058,7 @@ impl CodexInner {
             state.pending_request = None;
             state.file_change_call_ids.clear();
             if turn_status == "interrupted" {
+                state.pending_async_questions.clear();
                 let interrupted_tool_call_ids = state
                     .pending_tool_call_ids
                     .iter()
@@ -19980,11 +20193,7 @@ impl CodexBackend {
                                     "TYDE CODEX FOLLOWUP DEQUEUE mode=spawn message={:?}",
                                     payload.message.chars().take(96).collect::<String>()
                                 );
-                                let images = protocol_images_to_attachments(payload.images);
-                                let result = handle.execute(SessionCommand::SendMessage {
-                                    message: payload.message,
-                                    images,
-                                }).await;
+                                let result = handle.send_user_input(payload).await;
                                 eprintln!(
                                     "TYDE CODEX FOLLOWUP RPC mode=spawn result={result:?}"
                                 );
@@ -21102,6 +21311,8 @@ impl Backend for CodexBackend {
             tyde_agent_adapter::BackendCapability::NativeGoals,
             tyde_agent_adapter::BackendCapability::AgentInitiatedTurns,
             tyde_agent_adapter::BackendCapability::MidTurnSteering,
+            tyde_agent_adapter::BackendCapability::AsyncUserQuestionRequests,
+            tyde_agent_adapter::BackendCapability::UserQuestionRequests,
             tyde_agent_adapter::BackendCapability::ReasoningDeltas,
             tyde_agent_adapter::BackendCapability::TaskUpdates,
             tyde_agent_adapter::BackendCapability::TaskListReplacement,
@@ -21297,13 +21508,7 @@ impl Backend for CodexBackend {
                                     "TYDE CODEX FOLLOWUP DEQUEUE mode=resume message={:?}",
                                     payload.message.chars().take(96).collect::<String>()
                                 );
-                                let images = protocol_images_to_attachments(payload.images);
-                                let result = handle
-                                    .execute(SessionCommand::SendMessage {
-                                        message: payload.message,
-                                        images,
-                                    })
-                                    .await;
+                                let result = handle.send_user_input(payload).await;
                                 eprintln!(
                                     "TYDE CODEX FOLLOWUP RPC mode=resume result={result:?}"
                                 );
@@ -21570,13 +21775,7 @@ impl Backend for CodexBackend {
                                     "TYDE CODEX FOLLOWUP DEQUEUE mode=fork message={:?}",
                                     payload.message.chars().take(96).collect::<String>()
                                 );
-                                let images = protocol_images_to_attachments(payload.images);
-                                let result = handle
-                                    .execute(SessionCommand::SendMessage {
-                                        message: payload.message,
-                                        images,
-                                    })
-                                    .await;
+                                let result = handle.send_user_input(payload).await;
                                 eprintln!(
                                     "TYDE CODEX FOLLOWUP RPC mode=fork result={result:?}"
                                 );

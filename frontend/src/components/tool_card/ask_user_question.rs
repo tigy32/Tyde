@@ -53,7 +53,7 @@ pub(crate) fn render(
     agent_ref: Signal<Option<ActiveAgentRef>>,
     tool_call_id: &str,
     req: &ToolRequestType,
-    _result: Option<&ToolExecutionResult>,
+    result: Option<&ToolExecutionResult>,
     _mode: ToolOutputMode,
 ) -> AnyView {
     let ToolRequestType::AskUserQuestion { questions } = req else {
@@ -65,6 +65,7 @@ pub(crate) fn render(
             agent_ref=agent_ref
             tool_call_id=tool_call_id.to_owned()
             questions=questions.clone()
+            answered=result.is_some()
         />
     }
     .into_any()
@@ -94,6 +95,7 @@ fn AskUserQuestionCard(
     agent_ref: Signal<Option<ActiveAgentRef>>,
     tool_call_id: String,
     questions: Vec<AskUserQuestion>,
+    answered: bool,
 ) -> impl IntoView {
     let state = expect_context::<AppState>();
 
@@ -107,7 +109,7 @@ fn AskUserQuestionCard(
             })
             .collect(),
     );
-    let submitted = RwSignal::new(false);
+    let submitted = RwSignal::new(answered);
     let sending = RwSignal::new(false);
     let send_error = RwSignal::new(None::<String>);
     let fatal_state = state.clone();
@@ -209,7 +211,7 @@ fn AskUserQuestionCard(
                 </button>
                 <Show when=move || submitted.get()>
                     <span class="ask-question-sent-note" role="status">
-                        "Sent — the agent will continue on the next turn."
+                        "Answer sent to the agent."
                     </span>
                 </Show>
                 <Show when=move || send_error.get().is_some()>
@@ -757,7 +759,10 @@ mod wasm_tests {
     }
 
     #[wasm_bindgen_test]
-    async fn completed_tool_card_stays_open_for_answering() {
+    async fn completed_question_stays_readable_without_resubmission() {
+        // The live Codex UI remounted this card after accepting the answer and
+        // re-enabled its buttons, although the actor rejects that id as stale.
+        // Preserve the open question text without reopening the interaction.
         let entry = ToolRequestEntry {
             tool_name: "AskUserQuestion".to_owned(),
             request: ToolRequest {
@@ -785,6 +790,8 @@ mod wasm_tests {
             .unwrap();
         assert!(details.open(), "completed question card should stay open");
         assert!(text(&container).contains("Which language?"));
+        assert!(text(&container).contains("Answer sent"));
+        assert_answer_controls_disabled(&container);
     }
 
     #[wasm_bindgen_test]
