@@ -34,12 +34,29 @@ impl ProjectWatcher {
     ) -> notify::Result<Self> {
         let (tx, rx) = sync::channel();
         let callback = tx.clone();
+        #[cfg(feature = "test-support")]
+        for root in project.root_paths() {
+            crate::project_stream::scan_test_support::run(
+                Path::new(&root.0),
+                crate::project_stream::scan_test_support::ScanPoint::WatcherInitialize,
+            );
+        }
         let watcher = RecommendedWatcher::new(
             move |event| {
                 let _ = callback.send(Command::Event(event));
             },
             Config::default().with_follow_symlinks(false),
-        )?;
+        );
+        #[cfg(feature = "test-support")]
+        for root in project.root_paths() {
+            crate::project_stream::scan_test_support::run(
+                Path::new(&root.0),
+                crate::project_stream::scan_test_support::ScanPoint::WatcherInitialized,
+            );
+        }
+        #[cfg(target_os = "linux")]
+        let watcher = watcher.map_err(watcher_creation_error);
+        let watcher = watcher?;
         let roots = project
             .root_paths()
             .into_iter()
@@ -109,6 +126,18 @@ impl ProjectWatcher {
         self.observed.insert(path.clone());
         Ok(())
     }
+}
+
+#[cfg(target_os = "linux")]
+fn watcher_creation_error(error: notify::Error) -> notify::Error {
+    // Linux uses EMFILE for both inotify-instance and process-descriptor exhaustion.
+    if matches!(&error.kind, notify::ErrorKind::Io(io) if io.raw_os_error() == Some(rustix::io::Errno::MFILE.raw_os_error()))
+    {
+        return notify::Error::generic(&format!(
+            "{error}. Linux watcher creation may have reached either the per-user inotify instance limit (fs.inotify.max_user_instances), shared with IDEs and other processes, or this server's open-file limit (RLIMIT_NOFILE). Check `sysctl fs.inotify.max_user_instances` on the server. If the instance limit is exhausted, ask an administrator to increase it; raising the open-file limit alone will not help."
+        )).set_paths(error.paths);
+    }
+    error
 }
 
 #[derive(Default)]

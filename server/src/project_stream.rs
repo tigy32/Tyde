@@ -3377,6 +3377,8 @@ pub mod scan_test_support {
     pub enum ScanPoint {
         Metadata,
         ReadDirectory,
+        WatcherInitialize,
+        WatcherInitialized,
     }
 
     type ScanKey = (PathBuf, ScanPoint);
@@ -3407,7 +3409,7 @@ pub mod scan_test_support {
         }
     }
 
-    pub(super) fn run(path: &Path, point: ScanPoint) {
+    pub(crate) fn run(path: &Path, point: ScanPoint) {
         let action = HOOKS
             .get_or_init(Mutex::default)
             .lock()

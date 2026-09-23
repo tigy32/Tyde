@@ -2428,17 +2428,24 @@ async fn lightweight_review_subscribe_skips_full_root_diff_refresh() {
         )
         .await
         .expect("lightweight review subscribe");
-    // Moving the root produced a project_git_status error on /project/<id>,
-    // not a review error. The stored lightweight review must remain available.
+    // Renaming the root can race watcher initialization or Git refresh. The
+    // observed watcher-initialization error is a nonfatal recovery warning,
+    // not the fatal Git error this test previously assumed. Both belong to the
+    // project stream; neither may prevent loading the stored lightweight review.
     let redacted =
         next_frame_matching_on(&mut lightweight, "lightweight review bootstrap", |env| {
             if env.kind == FrameKind::CommandError {
                 let error: CommandErrorPayload = env.parse_payload().expect("project root error");
                 assert_eq!(error.stream.0, format!("/project/{}", project.id.0));
-                assert_eq!(error.operation, "project_git_status");
+                assert_eq!(env.stream, error.stream);
+                assert!(matches!(
+                    error.operation.as_str(),
+                    "project_watch" | "project_git_status"
+                ));
                 assert_eq!(error.request_kind, FrameKind::ProjectFileList);
+                assert_eq!(error.code, protocol::CommandErrorCode::Internal);
                 assert!(error.message.contains(repo.to_str().unwrap()));
-                assert!(error.fatal);
+                assert_eq!(error.fatal, !error.message.contains("automatic recovery"));
             }
             env.kind == FrameKind::ReviewBootstrap
         })

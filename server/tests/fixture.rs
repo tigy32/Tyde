@@ -630,9 +630,20 @@ impl Turn {
 pub async fn next_frame_matching_on(
     client: &mut client::Connection,
     context: &str,
+    matches: impl FnMut(&Envelope) -> bool,
+) -> Envelope {
+    next_frame_matching_on_with_timeout(client, context, EVENT_TIMEOUT, matches).await
+}
+
+// Each integration binary compiles the fixture, but only timed recovery flows use this.
+#[allow(dead_code)]
+pub async fn next_frame_matching_on_with_timeout(
+    client: &mut client::Connection,
+    context: &str,
+    timeout: Duration,
     mut matches: impl FnMut(&Envelope) -> bool,
 ) -> Envelope {
-    let deadline = tokio::time::Instant::now() + EVENT_TIMEOUT;
+    let deadline = tokio::time::Instant::now() + timeout;
     let mut skipped: Vec<String> = Vec::new();
     loop {
         let env = match tokio::time::timeout_at(deadline, client.next_event()).await {

@@ -1860,6 +1860,7 @@ async fn watch_limit_warns_without_stopping_project_or_polling_files() {
             .contains("configure each project root as the root of its Git repository")
     );
     assert!(error.message.contains("fs.inotify.max_user_watches"));
+    assert!(!error.message.contains("fs.inotify.max_user_instances"));
 
     fs::write(
         repo.path().join("src/main.rs"),
@@ -1916,6 +1917,33 @@ async fn project_recovers_after_real_file_descriptor_exhaustion() {
     fixture::init_tracing();
     let mut fixture = Fixture::new().await;
     let repo = init_git_repo("descriptor-recovery", &[("file.rs", "// before\n")]);
+    let initialization_fds = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let exhaust = initialization_fds.clone();
+    let before_init = fixture.on_project_scan(
+        repo.path().to_path_buf(),
+        server::ScanPoint::WatcherInitialize,
+        move || {
+            *exhaust.lock().unwrap() = Some(fixture::ExhaustedFileDescriptors::exhaust());
+        },
+    );
+    let release = initialization_fds.clone();
+    let (initialized_tx, initialized_rx) = tokio::sync::oneshot::channel();
+    let after_init = fixture.on_project_scan(
+        repo.path().to_path_buf(),
+        server::ScanPoint::WatcherInitialized,
+        move || {
+            drop(
+                release
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .expect("watcher creation exhausted descriptors"),
+            );
+            initialized_tx
+                .send(())
+                .expect("watcher initialization observer");
+        },
+    );
     let project = create_project(
         &mut fixture.client,
         "Descriptor Recovery",
@@ -1923,13 +1951,63 @@ async fn project_recovers_after_real_file_descriptor_exhaustion() {
     )
     .await;
     expect_project_bootstrap(&mut fixture.client, "descriptor bootstrap").await;
+    initialized_rx
+        .await
+        .expect("real watcher creation attempted");
+    drop(before_init);
+    drop(after_init);
+    let event = next_frame_matching_on(
+        &mut fixture.client,
+        "watcher creation exhaustion guidance",
+        |event| {
+            event.kind == FrameKind::CommandError
+                && event
+                    .parse_payload::<CommandErrorPayload>()
+                    .is_ok_and(|error| error.operation == "project_watch")
+        },
+    )
+    .await;
+    let error: CommandErrorPayload = event.parse_payload().unwrap();
+    eprintln!(
+        "watcher creation exhaustion: operation={} fatal={}",
+        error.operation, error.fatal
+    );
+    assert!(!error.fatal);
+    assert!(error.message.contains("Too many open files"));
+    assert!(error.message.contains("fs.inotify.max_user_instances"));
+    assert!(error.message.contains("shared"));
+    assert!(error.message.contains("RLIMIT_NOFILE"));
+    assert!(
+        error
+            .message
+            .contains("sysctl fs.inotify.max_user_instances")
+    );
+    assert!(error.message.contains("administrator"));
+    assert!(!error.message.contains("fs.inotify.max_user_watches"));
+    assert!(error.message.contains("automatic recovery"));
     fs::write(repo.path().join("watch-ready"), "ready").unwrap();
-    expect_project_file_list_matching(&mut fixture.client, "watcher initialized", |listing| {
-        listing.roots[0]
-            .entries
-            .iter()
-            .any(|entry| entry.relative_path == "watch-ready")
-    })
+    // Watcher retry starts at five seconds; the ordinary five-second event wait
+    // would expire before initialization and its subsequent refresh can complete.
+    fixture::next_frame_matching_on_with_timeout(
+        &mut fixture.client,
+        "watcher initialized after exhaustion",
+        Duration::from_secs(10),
+        |event| {
+            if event.kind == FrameKind::CommandError {
+                assert!(!event.parse_payload::<CommandErrorPayload>().unwrap().fatal);
+            }
+            assert_ne!(event.kind, FrameKind::ProjectBootstrap);
+            event.kind == FrameKind::ProjectFileList
+                && event
+                    .parse_payload::<ProjectFileListPayload>()
+                    .is_ok_and(|listing| {
+                        listing.roots[0]
+                            .entries
+                            .iter()
+                            .any(|entry| entry.relative_path == "watch-ready")
+                    })
+        },
+    )
     .await;
     let held = std::sync::Arc::new(std::sync::Mutex::new(None));
     let exhaust = held.clone();
@@ -1964,6 +2042,7 @@ async fn project_recovers_after_real_file_descriptor_exhaustion() {
     );
     assert!(error.message.contains("Too many open files"));
     assert!(error.message.contains("automatic recovery"));
+    assert!(!error.message.contains("fs.inotify.max_user_instances"));
     // No new filesystem event or client command may be needed to retry the lost scan.
     tokio::time::timeout(Duration::from_secs(20), async {
         loop {
@@ -2056,8 +2135,16 @@ async fn project_recovers_from_filesystem_and_git_failures_without_reconnecting(
         let index = repo.path().join(".git/index");
         let saved_index = fs::read(&index).unwrap();
         fs::write(&index, "temporarily unreadable Git index").unwrap();
-        let error =
-            expect_project_command_error(&mut fixture.client, "background I/O failure").await;
+        // With watching disabled, Git discovers the failure on its five-second
+        // poll, so the generic five-second wait races the poll plus Git execution.
+        let error = fixture::next_frame_matching_on_with_timeout(
+            &mut fixture.client,
+            "background I/O failure",
+            Duration::from_secs(10),
+            |event| event.kind == FrameKind::CommandError,
+        )
+        .await;
+        let error: CommandErrorPayload = error.parse_payload().unwrap();
         eprintln!(
             "project recovery: operation={} fatal={} watching={}",
             error.operation, error.fatal, !force_project_watch_limit
@@ -2070,6 +2157,7 @@ async fn project_recovers_from_filesystem_and_git_failures_without_reconnecting(
             error.operation.as_str(),
             "project_watch" | "project_git_status"
         ));
+        assert!(!error.message.contains("fs.inotify.max_user_instances"));
 
         fixture
             .client

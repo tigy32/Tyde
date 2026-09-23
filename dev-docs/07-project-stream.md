@@ -624,6 +624,15 @@ wire errors use `CommandError` with `project_watch` or `project_git_status` as
 the operation. A warning is emitted once per failed operation/recovery episode,
 not on every retry; new subscribers receive the outstanding warnings too.
 
+On Linux, `EMFILE` during native watcher creation names both possible causes:
+`fs.inotify.max_user_instances` (shared across the user's processes) and the
+server's `RLIMIT_NOFILE`. The warning gives the read-only sysctl check and
+administrator guidance without claiming the errno proves which limit was hit.
+Raising the open-file limit alone cannot fix an inotify-instance shortage.
+Ordinary directory-scan failures do not get this inotify advice, and exhausted
+watch registrations retain the separate `fs.inotify.max_user_watches` guidance.
+Tyde does not change host-wide sysctls automatically.
+
 Failed watchers are recreated with a five-second retry delay, including watch
 limit failures. Failed scans retain their pending updates and retry after five
 seconds without requiring another filesystem event. Git refresh retries on its
