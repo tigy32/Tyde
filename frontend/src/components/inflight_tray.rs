@@ -49,7 +49,7 @@ use crate::components::tool_card::{
 };
 use crate::components::workflow_view::run_status_label;
 use crate::send::send_frame;
-use crate::state::{ActiveAgentRef, AppState, TabContent, ToolCallId};
+use crate::state::{ActiveAgentRef, AppState, TabContent, ToolCallId, ToolRequestEntry};
 
 const STORAGE_INFLIGHT_TRAY_EXPANDED: &str = "tyde-inflight-tray-expanded";
 
@@ -622,27 +622,42 @@ pub fn InflightTray(agent_ref: Signal<Option<ActiveAgentRef>>) -> impl IntoView 
         }
     });
 
-    // What the model is blocked on right now: the newest streaming tool
-    // request whose result has not arrived. `ToolExecutionCompleted`
-    // patches these entries in place (see dispatch), so `result: None`
-    // means genuinely pending — this never guesses.
+    // A response can end while its await is still running (Codex exec yields).
+    // Follow pending requests into history until ToolExecutionCompleted.
     let waiting = Signal::derive({
         let state = state.clone();
         move || -> Option<String> {
             let parent = agent_ref.get()?;
-            let requests = state
+            let pending_tool = |entry: &ToolRequestEntry| {
+                entry
+                    .result
+                    .is_none()
+                    .then(|| entry.request.tool_type.clone())
+            };
+            let pending = state
                 .streaming_text
-                .with(|map| map.get(&parent.agent_id).map(|s| s.tool_requests.clone()))?;
-            let pending = requests.with(|requests| {
-                requests.iter().rev().find_map(|request| {
-                    request.entry.with(|entry| {
-                        entry
-                            .result
-                            .is_none()
-                            .then(|| entry.request.tool_type.clone())
+                .with(|map| map.get(&parent.agent_id).map(|s| s.tool_requests.clone()))
+                .and_then(|requests| {
+                    requests.with(|requests| {
+                        requests
+                            .iter()
+                            .rev()
+                            .find_map(|request| request.entry.with(pending_tool))
                     })
                 })
-            })?;
+                .or_else(|| {
+                    state.chat_rows.with(|rows| {
+                        rows.get(&parent.agent_id)?
+                            .iter()
+                            .rev()
+                            .filter_map(|row| row.message_entry())
+                            .find_map(|entry| {
+                                entry.with(|entry| {
+                                    entry.tool_requests.iter().rev().find_map(pending_tool)
+                                })
+                            })
+                    })
+                })?;
             match &pending {
                 ToolRequestType::TydeAwaitAgents { agent_ids } => {
                     let names = agent_ids
@@ -2835,6 +2850,86 @@ mod wasm_tests {
 
     fn apply_live(state: &AppState, event: ChatEvent) {
         apply_chat_event(state, "host-1", &parent_ref().agent_id, event);
+    }
+
+    #[wasm_bindgen_test]
+    async fn pending_await_stays_visible_after_response_ends() {
+        let (container, state) = mount_tray(|state| {
+            state
+                .agents
+                .update(|agents| agents.push(child_agent("agent-a", "Awaited Worker")));
+            set_turn_active(state, "agent-a");
+        });
+        let start = ChatEvent::StreamStart(protocol::StreamStartData {
+            agent: "codex".to_owned(),
+            model: None,
+        });
+        let request = ToolRequest {
+            tool_call_id: "await-held".to_owned(),
+            tool_name: "tyde_await_agents".to_owned(),
+            tool_type: ToolRequestType::TydeAwaitAgents {
+                agent_ids: vec![AgentId("agent-a".to_owned())],
+            },
+        };
+        apply_live(&state, start.clone());
+        apply_live(&state, ChatEvent::ToolRequest(request.clone()));
+        next_tick().await;
+        assert!(text(&container).contains("waiting on Awaited Worker"));
+
+        // The real Codex exec yield ended its response 31 seconds into a
+        // three-minute await; only the response ended, not the tool.
+        apply_live(
+            &state,
+            ChatEvent::StreamEnd(protocol::StreamEndData {
+                message: protocol::ChatMessage {
+                    message_id: None,
+                    timestamp: 1,
+                    sender: protocol::MessageSender::Assistant {
+                        agent: "codex".to_owned(),
+                    },
+                    content: "Waiting for the QA child.".to_owned(),
+                    reasoning: None,
+                    tool_calls: vec![protocol::ToolUseData {
+                        tool_call_id: request.tool_call_id.clone(),
+                        name: request.tool_name.clone(),
+                        arguments: json!({"agent_ids": ["agent-a"]}),
+                        content_offset: None,
+                    }],
+                    model_info: None,
+                    token_usage: None,
+                    context_breakdown: None,
+                    images: None,
+                },
+            }),
+        );
+        next_tick().await;
+        assert!(
+            text(&container).contains("waiting on Awaited Worker"),
+            "ending the response must not hide the still-running await"
+        );
+        apply_live(&state, start);
+        next_tick().await;
+        assert!(
+            text(&container).contains("waiting on Awaited Worker"),
+            "the next response must not displace the outstanding wait"
+        );
+
+        apply_live(
+            &state,
+            ChatEvent::ToolExecutionCompleted(succeeded_completion(
+                &request.tool_call_id,
+                ToolExecutionResult::TydeAwaitAgents {
+                    ready: vec![protocol::TydeAgentWaitStatus {
+                        agent_id: AgentId("agent-a".to_owned()),
+                        status: protocol::AgentControlStatus::Idle,
+                    }],
+                    still_thinking: vec![],
+                },
+            )),
+        );
+        next_tick().await;
+        assert!(!text(&container).contains("waiting on"));
+        assert!(text(&container).contains("1 running"));
     }
 
     fn apply_replay(state: &AppState, event: ChatEvent) {
