@@ -62,7 +62,7 @@ MCP bridge and the conformance executable, but does not run paid scenarios.
 Set `CONFORMANCE_BIN` to the resulting executable under
 `target/debug/deps/conformance2-<hash>` (not its `.d` dependency file).
 
-After authorizing the real calls under `AGENTS.md`, run a narrow case:
+Following the scoped testing policy in `AGENTS.md`, run a narrow case:
 
 ```sh
 TYDE_RUN_REAL_AI_TESTS=1 TYDE_REAL_BACKENDS=codex \

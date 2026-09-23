@@ -4,9 +4,10 @@ Use this workflow to certify a real agent backend through the rendered Tyde
 desktop application. This is an end-to-end product audit, not a smoke test and
 not a substitute for deterministic backend tests or `./dev.sh check`.
 
-Real backend turns can spend money. Obtain explicit approval before starting
-them. Certification favors feature coverage, but it must obtain that coverage
-with the cheapest suitable models, bounded prompts, and bounded commands.
+Real backend turns can spend money. Necessary testing has standing
+authorization under `AGENTS.md`; no per-run permission is required.
+Certification favors feature coverage, but it must obtain that coverage with
+the cheapest suitable models, bounded prompts, and bounded commands.
 
 ## Certification contract
 
