@@ -14713,7 +14713,10 @@ impl CodexInner {
             "request_user_input_async",
             CodexToolRequest::typed(
                 json!({"questions": questions}),
-                json!({"kind": "AskUserQuestion", "questions": normalized}),
+                json!(protocol::ToolRequestType::AskUserQuestion {
+                    questions: normalized,
+                    mode: protocol::UserQuestionMode::NonBlocking,
+                }),
             ),
         )
         .await;
@@ -15951,6 +15954,11 @@ impl CodexInner {
             .into_iter()
             .collect::<HashSet<_>>();
 
+        tracing::debug!(
+            foreground_work = open_foreground_tool_ids.len(),
+            "Codex terminal turn foreground work remaining"
+        );
+
         let (
             open_item_without_completion,
             open_item_published,
@@ -16108,9 +16116,8 @@ impl CodexInner {
                 state.pending_tool_call_ids.clear();
                 state.close_active_stream_when_tools_idle = false;
             } else {
-                // The emitter's execution mode is the explicit protocol
-                // ownership signal. Background requests may outlive an idle
-                // turn; foreground requests keep the presentation active.
+                // Only machine work delays terminal idle. Human-response
+                // cards remain pending and answerable after the turn ends.
                 state.pending_tool_call_ids = open_foreground_tool_ids;
                 state.close_active_stream_when_tools_idle = !state.pending_tool_call_ids.is_empty();
             }

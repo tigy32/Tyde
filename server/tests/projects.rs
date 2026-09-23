@@ -5272,6 +5272,130 @@ async fn sha256_root_history_uses_repository_empty_tree() {
     assert_eq!(diff.files[0].relative_path, "root.txt");
 }
 
+async fn restart_moved_agent(
+    fixture: &mut Fixture,
+    session_id: &protocol::SessionId,
+    project_id: &ProjectId,
+    roots: &[String],
+) -> (fixture::TestAgent, protocol::AgentStartPayload) {
+    // The old flow launched three inspection hosts over the original live
+    // stores. The failure logged three backend launches for one explicit
+    // spawn: those hosts auto-restored the same session. Startup persistence
+    // could then replace the later move's roots with an older resume snapshot.
+    // Retire the previous owner before exercising actual auto-restoration.
+    let bootstrap = fixture.restart_host().await;
+    let saved = bootstrap
+        .sessions
+        .iter()
+        .find(|session| &session.id == session_id)
+        .expect("moved session persisted across restart");
+    assert_eq!(saved.workspace_roots, roots);
+    assert_eq!(saved.project_id.as_ref(), Some(project_id));
+    let mut descriptors = bootstrap.agents;
+    let env = next_frame_matching_on(&mut fixture.client, "moved agent auto-restoration", |env| {
+        if env.kind == FrameKind::NewAgent {
+            descriptors.push(env.parse_payload::<protocol::NewAgentPayload>().expect("restored descriptor"));
+        }
+        env.kind == FrameKind::AgentBootstrap && env.parse_payload::<protocol::AgentBootstrapPayload>()
+            .is_ok_and(|payload| payload.events.iter().any(|event| matches!(event,
+                protocol::AgentBootstrapEvent::AgentStart(start) if start.session_id.as_ref() == Some(session_id))))
+    }).await;
+    let replay: protocol::AgentBootstrapPayload =
+        env.parse_payload().expect("restored agent bootstrap");
+    assert!(
+        !replay.turn_active,
+        "auto-restored moved agent must be idle"
+    );
+    let start = replay
+        .events
+        .iter()
+        .find_map(|event| match event {
+            protocol::AgentBootstrapEvent::AgentStart(start) => Some(start.clone()),
+            _ => None,
+        })
+        .expect("restored start");
+    assert!(
+        start.session_id.as_ref() == Some(session_id),
+        "restart must preserve the conversation identity"
+    );
+    assert_eq!(start.workspace_roots, roots);
+    assert_eq!(start.project_id.as_ref(), Some(project_id));
+    let replay_messages = replay
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            protocol::AgentBootstrapEvent::ChatEvent(protocol::ChatEvent::MessageAdded(
+                message,
+            )) => Some(message.content.as_str()),
+            protocol::AgentBootstrapEvent::ChatEvent(protocol::ChatEvent::StreamEnd(end)) => {
+                Some(end.message.content.as_str())
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    eprintln!(
+        "Move auto-restoration replay: event_count={} message_count={} original_reply_count={}",
+        replay.events.len(),
+        replay_messages.len(),
+        replay_messages
+            .iter()
+            .filter(|content| **content == "Before moving")
+            .count()
+    );
+    // The authoritative journal replays the actual scripted reply, not the
+    // native mock history's regenerated response to the original prompt.
+    assert_eq!(
+        replay_messages
+            .iter()
+            .filter(|content| **content == "Before moving")
+            .count(),
+        1,
+        "restart must replay the original conversation exactly once"
+    );
+    let matching = descriptors
+        .iter()
+        .filter(|agent| agent.agent_id == start.agent_id)
+        .count();
+    assert_eq!(
+        matching, 1,
+        "auto-restoration must publish one descriptor for the owner"
+    );
+    let descriptor = descriptors
+        .into_iter()
+        .find(|agent| agent.agent_id == start.agent_id)
+        .expect("restored agent descriptor");
+    assert_eq!(descriptor.workspace_roots, roots);
+    assert_eq!(descriptor.project_id.as_ref(), Some(project_id));
+    let (_, settled) = fixture.connect_with_bootstrap().await;
+    let saved = settled
+        .sessions
+        .iter()
+        .find(|session| &session.id == session_id)
+        .expect("saved session after auto-restoration");
+    assert_eq!(saved.workspace_roots, roots);
+    assert_eq!(saved.project_id.as_ref(), Some(project_id));
+    assert_eq!(
+        settled
+            .agents
+            .iter()
+            .filter(|agent| agent.session_id.as_ref() == Some(session_id))
+            .count(),
+        1,
+        "restart must leave exactly one owner of the moved conversation"
+    );
+    eprintln!(
+        "Move restart persisted and auto-restored one owner; root_count={}",
+        roots.len()
+    );
+    (
+        fixture::TestAgent {
+            stream: descriptor.instance_stream.clone(),
+            new_agent: descriptor,
+        },
+        start,
+    )
+}
+
 #[tokio::test]
 async fn move_agent_preserves_conversation_and_persists_all_project_roots() {
     let mut fixture = Fixture::new().await;
@@ -5300,16 +5424,10 @@ async fn move_agent_preserves_conversation_and_persists_all_project_roots() {
             server::backend::mock::MockScript::one(server::backend::mock::MockTurn::gated_text(
                 "Before moving",
                 &gate,
-            ))
-            .then(server::backend::mock::MockTurn::text(
-                "Continued after moving",
-            ))
-            .then(server::backend::mock::MockTurn::text(
-                "Continued after returning",
             )),
         )
         .await;
-    let (agent, start) = fixture
+    let (mut agent, mut start) = fixture
         .spawn_with(protocol::SpawnAgentPayload {
             name: Some("Moving agent".to_owned()),
             custom_agent_id: None,
@@ -5328,6 +5446,7 @@ async fn move_agent_preserves_conversation_and_persists_all_project_roots() {
         })
         .await;
     drop(reservation);
+    let session_id = start.session_id.clone().expect("moving session identity");
     gate.wait_until_entered().await;
     fixture
         .client
@@ -5391,7 +5510,10 @@ async fn move_agent_preserves_conversation_and_persists_all_project_roots() {
                 .await
                 .parse_payload::<protocol::types::AgentMoveResultPayload>()
                 .unwrap();
-                assert_eq!(broadcast.result.unwrap().project_id, Some(project_id));
+                assert_eq!(
+                    broadcast.result.unwrap().project_id,
+                    Some(project_id.clone())
+                );
                 eprintln!(
                     "PROJECT MOVE PERSISTENCE connecting observer expected_root_count={}",
                     roots.len()
@@ -5413,16 +5535,46 @@ async fn move_agent_preserves_conversation_and_persists_all_project_roots() {
                 );
                 assert_eq!(saved.workspace_roots, roots);
                 assert_eq!(saved.project_id, moved.project_id);
+                let continued = format!("Continued after {request_id}");
+                fixture
+                    .mock(&agent)
+                    .await
+                    .enqueue(server::backend::mock::MockTurn::text(continued.clone()))
+                    .await;
                 fixture
                     .client
                     .send_message(&agent.stream, "Continue the same chat".to_owned())
                     .await
                     .unwrap();
-                fixture.finish_turn(&agent).await;
+                let turn = fixture.finish_turn(&agent).await;
+                assert!(
+                    turn.chat_events().iter().any(|event| matches!(event,
+                    protocol::ChatEvent::StreamEnd(end) if end.message.content == continued)),
+                    "the live conversation must continue after moving"
+                );
+                let prior_agent_id = start.agent_id.clone();
+                (agent, start) =
+                    restart_moved_agent(&mut fixture, &session_id, &project_id, &roots).await;
+                assert!(
+                    start.agent_id != prior_agent_id,
+                    "restart must reconstruct a new agent owner"
+                );
+                observer = fixture.connect().await;
             }
         }
     }
-    let bootstrap = fixture.restart_host().await;
+    let (restored, restored_start) = restart_moved_agent(
+        &mut fixture,
+        &session_id,
+        &source.id,
+        &project_roots(&source),
+    )
+    .await;
+    assert!(
+        restored_start.session_id == start.session_id,
+        "final restart must preserve the session"
+    );
+    let (_, bootstrap) = fixture.connect_with_bootstrap().await;
     let session = bootstrap
         .sessions
         .iter()
@@ -5436,4 +5588,13 @@ async fn move_agent_preserves_conversation_and_persists_all_project_roots() {
     );
     assert_eq!(session.project_id, Some(source.id.clone()));
     assert_eq!(session.workspace_roots, project_roots(&source));
+    fixture
+        .client
+        .send_message(&restored.stream, "Continue after final restart".to_owned())
+        .await
+        .expect("send to auto-restored conversation");
+    let turn = fixture.finish_turn(&restored).await;
+    assert!(turn.chat_events().iter().any(|event| matches!(event,
+        protocol::ChatEvent::StreamEnd(end) if end.message.content.contains("Continue after final restart"))),
+        "the persisted conversation must remain usable after final restart");
 }

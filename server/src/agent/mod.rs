@@ -2982,6 +2982,7 @@ pub(crate) fn spawn_agent_actor(
                                     status.is_thinking = false;
                                     status.turn_completed = true;
                                     status.pending_user_response = None;
+                                    status.blocked_on_user_response = false;
                                     status.activity_counter =
                                         status.activity_counter.saturating_add(1);
                                 })
@@ -4128,7 +4129,7 @@ pub(crate) fn spawn_agent_actor(
                         && !matches!(lifecycle, ActorLifecycle::Closing)
                         && supervisor_status.is_active()
                         // Waiting on a person is not stalling.
-                        && !supervisor_status.is_user_response_pending()
+                        && !supervisor_status.blocked_on_user_response
                         && active_compaction.is_none()
                         && !compaction_blocked
                         // Detached background work is real progress that the
@@ -5053,11 +5054,24 @@ pub(crate) fn spawn_agent_actor(
                         ChatEvent::TypingStatusChanged(typing) => {
                             let typing = *typing;
                             backend_typing = typing;
+                            if !typing && !pending_tool_response_ids.is_empty() {
+                                tracing::info!(
+                                    pending_responses = pending_tool_response_ids.len(),
+                                    in_turn,
+                                    idle_transition_armed,
+                                    "Backend idle received with pending user responses"
+                                );
+                            }
+                            let blocked_on_user = pending_tool_response_ids.iter().any(|id| {
+                                open_tool_requests.get(id).is_some_and(|request| {
+                                    user_response_blocks_turn(&request.tool_type)
+                                })
+                            });
                             let mut completed_by_idle = false;
                             if typing {
                                 in_turn = true;
                                 idle_transition_armed = true;
-                            } else if !pending_tool_response_ids.is_empty() {
+                            } else if blocked_on_user {
                                 idle_transition_armed = false;
                             } else if in_turn && idle_transition_armed {
                                 real_idle_transition = true;
@@ -5072,7 +5086,7 @@ pub(crate) fn spawn_agent_actor(
                             }
                             let visibly_busy = backend_turn_visibly_busy(
                                 typing,
-                                pending_tool_response_ids.len(),
+                                blocked_on_user,
                             );
                             status_handle.update(|s| {
                                 s.is_thinking = visibly_busy;
@@ -5102,6 +5116,7 @@ pub(crate) fn spawn_agent_actor(
                             }
                             status_handle.update(|s| {
                                 s.pending_user_response = None;
+                                s.blocked_on_user_response = false;
                                 s.is_thinking = false;
                                 s.turn_completed = true;
                                 s.activity_counter = s.activity_counter.saturating_add(1);
@@ -5128,12 +5143,23 @@ pub(crate) fn spawn_agent_actor(
                             };
                             if pending_response_kind.is_some() {
                                 pending_tool_response_ids.insert(request.tool_call_id.clone());
-                                in_turn = true;
-                                idle_transition_armed = false;
+                                if user_response_blocks_turn(&request.tool_type) {
+                                    in_turn = true;
+                                    idle_transition_armed = false;
+                                }
                             }
                             status_handle.update(|s| {
                                 if let Some(pending_response_kind) = pending_response_kind {
                                     s.pending_user_response = Some(pending_response_kind);
+                                    s.blocked_on_user_response = pending_tool_response_ids.iter().any(|id| {
+                                        open_tool_requests.get(id).is_some_and(|request| {
+                                            user_response_blocks_turn(&request.tool_type)
+                                        })
+                                    });
+                                    if user_response_blocks_turn(&request.tool_type) {
+                                        s.is_thinking = true;
+                                        s.turn_completed = false;
+                                    }
                                 }
                                 s.activity_counter = s.activity_counter.saturating_add(1);
                             }).await;
@@ -5151,16 +5177,23 @@ pub(crate) fn spawn_agent_actor(
                             }
                             completed_tool_call_ids.insert(completion.tool_call_id.clone());
                             open_tool_call_ids.remove(&completion.tool_call_id);
-                            open_tool_requests.remove(&completion.tool_call_id);
+                            let completed_response_blocks_turn = open_tool_requests
+                                .remove(&completion.tool_call_id)
+                                .is_some_and(|request| user_response_blocks_turn(&request.tool_type));
                             active_agent_await_ids.remove(&completion.tool_call_id);
                             let completed_pending_response =
                                 pending_tool_response_ids.remove(&completion.tool_call_id);
-                            if completed_pending_response && pending_tool_response_ids.is_empty() && in_turn {
+                            let blocked_on_user = pending_tool_response_ids.iter().any(|id| {
+                                open_tool_requests.get(id).is_some_and(|request| {
+                                    user_response_blocks_turn(&request.tool_type)
+                                })
+                            });
+                            if completed_pending_response && !blocked_on_user && in_turn {
                                 idle_transition_armed = true;
                             }
                             let interrupted_tool_ends_turn = !completed_pending_response
                                 && in_turn
-                                && pending_tool_response_ids.is_empty()
+                                && !blocked_on_user
                                 && interrupted_tool_completion(completion);
                             if interrupted_tool_ends_turn {
                                 tracing::warn!(
@@ -5179,10 +5212,13 @@ pub(crate) fn spawn_agent_actor(
                                 backend_typing = false;
                             }
                             status_handle.update(|s| {
+                                s.blocked_on_user_response = blocked_on_user;
                                 if completed_pending_response && pending_tool_response_ids.is_empty() {
                                     s.pending_user_response = None;
+                                }
+                                if completed_pending_response && in_turn {
                                     s.turn_completed = false;
-                                    s.is_thinking = true;
+                                    s.is_thinking = backend_typing || completed_response_blocks_turn;
                                 }
                                 if interrupted_tool_ends_turn {
                                     s.turn_completed = true;
@@ -5781,7 +5817,14 @@ pub(crate) fn spawn_agent_actor(
                                             tool_call_id,
                                             ..
                                         }) if pending_tool_response_ids.contains(tool_call_id) => {
-                                            Some(pending_tool_response_ids.len() == 1)
+                                            Some((
+                                                pending_tool_response_ids.len() == 1,
+                                                pending_tool_response_ids.iter().any(|id| {
+                                                    id != tool_call_id && open_tool_requests.get(id).is_some_and(|request| {
+                                                        user_response_blocks_turn(&request.tool_type)
+                                                    })
+                                                }),
+                                            ))
                                         }
                                         _ => None,
                                     };
@@ -5847,7 +5890,7 @@ pub(crate) fn spawn_agent_actor(
                                             let _ = reply.send(Ok(()));
                                         }
                                     } else {
-                                        if !is_tool_response {
+                                        if !in_turn {
                                             in_turn = true;
                                             idle_transition_armed = false;
                                         }
@@ -6056,12 +6099,13 @@ pub(crate) fn spawn_agent_actor(
                                                 event_log.len(),
                                             );
                                         }
-                                        if let Some(clear_pending_response) = clear_pending_response {
+                                        if let Some((clear_pending_response, blocked_on_user_response)) = clear_pending_response {
                                             status_handle
                                                 .update(|s| {
                                                     if clear_pending_response {
                                                         s.pending_user_response = None;
                                                     }
+                                                    s.blocked_on_user_response = blocked_on_user_response;
                                                     s.turn_completed = false;
                                                     s.is_thinking = true;
                                                     s.activity_counter =
@@ -8424,6 +8468,7 @@ pub(crate) fn spawn_relay_agent_actor(
                             s.is_thinking = false;
                             s.turn_completed = true;
                             s.pending_user_response = None;
+                            s.blocked_on_user_response = false;
                             s.activity_counter = s.activity_counter.saturating_add(1);
                         }).await;
                         // The subagent's backend event stream is done, but the
@@ -8500,6 +8545,7 @@ pub(crate) fn spawn_relay_agent_actor(
                             pending_tool_response_ids.clear();
                             status_handle.update(|s| {
                                 s.pending_user_response = None;
+                                s.blocked_on_user_response = false;
                                 s.is_thinking = false;
                                 s.turn_completed = true;
                                 s.activity_counter = s.activity_counter.saturating_add(1);
@@ -8525,6 +8571,7 @@ pub(crate) fn spawn_relay_agent_actor(
                                 if waiting_for_plan_approval {
                                     s.pending_user_response =
                                         Some(registry::PendingUserResponseKind::PlanApproval);
+                                    s.blocked_on_user_response = true;
                                 }
                                 s.activity_counter = s.activity_counter.saturating_add(1);
                             }).await;
@@ -8538,6 +8585,7 @@ pub(crate) fn spawn_relay_agent_actor(
                             status_handle.update(|s| {
                                 if completed_pending_response && pending_tool_response_ids.is_empty() {
                                     s.pending_user_response = None;
+                                    s.blocked_on_user_response = false;
                                     s.turn_completed = false;
                                     s.is_thinking = true;
                                 }
@@ -8842,6 +8890,7 @@ pub(crate) fn spawn_relay_agent_actor(
                                     status.is_thinking = false;
                                     status.turn_completed = true;
                                     status.pending_user_response = None;
+                                    status.blocked_on_user_response = false;
                                     status.last_error = Some(
                                         "backend-native child transport closed".to_owned(),
                                     );
@@ -9130,6 +9179,7 @@ async fn finish_actor_close(
             s.is_thinking = false;
             s.turn_completed = true;
             s.pending_user_response = None;
+            s.blocked_on_user_response = false;
             s.activity_counter = s.activity_counter.saturating_add(1);
         })
         .await;
@@ -9314,6 +9364,7 @@ async fn enter_terminal_failure(
             s.is_thinking = false;
             s.turn_completed = true;
             s.pending_user_response = None;
+            s.blocked_on_user_response = false;
             s.last_error = Some(payload.message.clone());
             s.activity_counter = s.activity_counter.saturating_add(1);
         })
@@ -11153,8 +11204,18 @@ async fn mark_agent_turn_active(status_handle: &registry::AgentStatusHandle) {
         .await;
 }
 
-fn backend_turn_visibly_busy(backend_typing: bool, pending_tool_responses: usize) -> bool {
-    backend_typing || pending_tool_responses > 0
+fn backend_turn_visibly_busy(backend_typing: bool, blocked_on_user: bool) -> bool {
+    backend_typing || blocked_on_user
+}
+
+fn user_response_blocks_turn(request: &protocol::ToolRequestType) -> bool {
+    matches!(
+        request,
+        protocol::ToolRequestType::AskUserQuestion {
+            mode: protocol::UserQuestionMode::Blocking,
+            ..
+        } | protocol::ToolRequestType::ExitPlanMode { .. }
+    )
 }
 
 fn record_agent_started(status: &mut registry::AgentStatus, is_resume: bool) {

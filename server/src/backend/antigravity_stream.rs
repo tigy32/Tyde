@@ -451,6 +451,7 @@ pub fn tool_request_type(tool_name: &str, args: &Value, enriched: bool) -> ToolR
         // renders as an opaque blob carrying neither the question nor its
         // options, because the stream gives it no name and no arguments.
         "ask_question" => ToolRequestType::AskUserQuestion {
+            mode: protocol::UserQuestionMode::Blocking,
             questions: args
                 .get("questions")
                 .and_then(Value::as_array)

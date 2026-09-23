@@ -91,6 +91,77 @@ async fn exit_plan_mode_tool_response_resumes_and_drains_queue() {
         approval_turn.saw_queue_drained() || drain_turn.saw_queue_drained(),
         "queue never reported empty after ExitPlanMode approval"
     );
+
+    let gate = MockGateHandle::new();
+    let question = fixture
+        .spawn_scripted(
+            "blocking-question",
+            MockScript::one(MockTurn::blocking_question_request(
+                "blocking-question",
+                &gate,
+            ))
+            .then(MockTurn::text("answer accepted"))
+            .then(MockTurn::text("queued question follow-up")),
+        )
+        .await;
+    gate.wait_until_entered().await;
+    gate.release_one();
+    let request = fixture
+        .expect_paused_tool_request(&question, "AskUserQuestion")
+        .await;
+    assert!(matches!(
+        request.tool_type,
+        protocol::ToolRequestType::AskUserQuestion {
+            mode: protocol::UserQuestionMode::Blocking,
+            ..
+        }
+    ));
+    fixture
+        .client
+        .send_message(&question.stream, "queued question follow-up".to_owned())
+        .await
+        .expect("send during blocking question");
+    fixture.expect_queued_messages(&question, 1).await;
+    let (mobile, bootstrap) = fixture::connect_mobile_client_with_bootstrap(
+        fixture.host_for_test(),
+        "blocking-question-phone",
+    )
+    .await;
+    let descriptor = bootstrap
+        .agents
+        .iter()
+        .find(|agent| agent.agent_id == question.new_agent.agent_id)
+        .expect("blocking question descriptor");
+    assert!(
+        descriptor.turn_active,
+        "blocking question must retain its active turn despite typing(false)"
+    );
+    drop(mobile);
+    fixture
+        .client
+        .send_message_payload(
+            &question.stream,
+            SendMessagePayload {
+                message: "BLUE".to_owned(),
+                images: None,
+                origin: None,
+                tool_response: Some(SendMessageToolResponse::AskUserQuestion {
+                    tool_call_id: request.tool_call_id.clone(),
+                    answer: "BLUE".to_owned(),
+                }),
+            },
+        )
+        .await
+        .expect("answer blocking question");
+    let answered = fixture.finish_turn(&question).await;
+    assert_eq!(answered.chat_events().iter().filter(|event| matches!(event,
+        ChatEvent::ToolExecutionCompleted(completion) if completion.tool_call_id == request.tool_call_id
+            && matches!(completion.outcome, protocol::ToolExecutionOutcome::Succeeded { .. }))).count(), 1);
+    let drained = fixture.finish_turn(&question).await;
+    assert!(drained.chat_events().iter().any(|event| matches!(event,
+        ChatEvent::StreamEnd(end) if end.message.content == "queued question follow-up")));
+    assert!(answered.saw_queue_drained() || drained.saw_queue_drained());
+    fixture.mock(&question).await.assert_clean().await;
 }
 
 #[tokio::test(start_paused = true)]

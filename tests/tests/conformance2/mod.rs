@@ -1167,7 +1167,7 @@ pub async fn ask_question<B: Backend>(
             .expect("backend did not ask a question");
         let asked = match &event {
             ChatEvent::ToolRequest(request) => match &request.tool_type {
-                protocol::ToolRequestType::AskUserQuestion { questions } => questions
+                protocol::ToolRequestType::AskUserQuestion { questions, .. } => questions
                     .first()
                     .map(|question| (request.clone(), question.clone())),
                 _ => None,
@@ -1187,6 +1187,64 @@ pub async fn ask_question<B: Backend>(
         question,
         events,
     }
+}
+
+pub async fn wait_for_unanswered_question_idle<B: Backend>(
+    host: &mut Harness<B>,
+    question: &mut Question,
+) {
+    assert!(
+        matches!(
+            question.request.tool_type,
+            protocol::ToolRequestType::AskUserQuestion {
+                mode: protocol::UserQuestionMode::NonBlocking,
+                ..
+            }
+        ),
+        "async request must explicitly preserve nonblocking semantics"
+    );
+    let request_index = question
+        .events
+        .iter()
+        .position(|event| {
+            matches!(event,
+                ChatEvent::ToolRequest(request) if request.tool_call_id == question.tool_call_id()
+            )
+        })
+        .expect("question request event");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(240);
+    while !question.events[request_index + 1..]
+        .iter()
+        .any(|event| matches!(event, ChatEvent::TypingStatusChanged(false)))
+    {
+        let event = host
+            .next_chat(deadline)
+            .await
+            .expect("unanswered nonblocking question prevented terminal typing(false)");
+        question.events.push(event);
+    }
+    let active = question
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            ChatEvent::TypingStatusChanged(active) => Some(*active),
+            _ => None,
+        })
+        .next_back()
+        .expect("backend turn activity signal");
+    assert!(!active, "unanswered question turn must be inactive");
+    assert!(
+        question
+            .events
+            .iter()
+            .any(|event| matches!(event, ChatEvent::TypingStatusChanged(true))),
+        "question turn must have started before becoming idle"
+    );
+    assert_eq!(
+        question.completions().count(),
+        0,
+        "idle must retain the unanswered question as pending"
+    );
 }
 
 pub async fn answer_question<B: Backend>(

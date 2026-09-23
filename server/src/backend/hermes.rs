@@ -5775,7 +5775,10 @@ impl HermesEventMapper {
         Ok(vec![ChatEvent::ToolRequest(ToolRequest {
             tool_call_id,
             tool_name: "clarify".to_string(),
-            tool_type: ToolRequestType::AskUserQuestion { questions },
+            tool_type: ToolRequestType::AskUserQuestion {
+                questions,
+                mode: protocol::UserQuestionMode::Blocking,
+            },
         })])
     }
 
@@ -6632,9 +6635,12 @@ fn hermes_delegation_goals(arguments: &Value) -> Vec<String> {
 fn hermes_native_tool_request_type(tool_name: &str, arguments: &Value) -> Option<ToolRequestType> {
     let normalized = normalized_hermes_tool_name(tool_name);
     if normalized == "clarify" {
-        return hermes_clarify_questions(arguments)
-            .ok()
-            .map(|questions| ToolRequestType::AskUserQuestion { questions });
+        return hermes_clarify_questions(arguments).ok().map(|questions| {
+            ToolRequestType::AskUserQuestion {
+                questions,
+                mode: protocol::UserQuestionMode::Blocking,
+            }
+        });
     }
     if normalized == "terminal" {
         let command = arguments.get("command")?.as_str()?.to_owned();

@@ -2946,7 +2946,8 @@ async fn real_async_user_question<B: Backend>(host: &mut Harness<B>) {
     let launched = collect_turn(host, &agent, &launch_prompt()).await;
     assert_ready_handshake(&launched);
 
-    let asked = ask_question(host, &agent, prompt).await;
+    let mut asked = ask_question(host, &agent, prompt).await;
+    wait_for_unanswered_question_idle(host, &mut asked).await;
     assert_question_shape(&asked);
     assert_question_waits_for_an_answer(&asked);
     let choice = asked
@@ -2984,13 +2985,15 @@ async fn real_async_user_question<B: Backend>(host: &mut Harness<B>) {
     assert_question_answer_reached_the_model(&continuing, &answered, "BETA");
     assert_async_answer_has_no_user_echo(&answered);
 
-    let free_text = ask_question(host, &agent, prompt).await;
+    let mut free_text = ask_question(host, &agent, prompt).await;
+    wait_for_unanswered_question_idle(host, &mut free_text).await;
     assert_question_waits_for_an_answer(&free_text);
     let answered = answer_question(host, &agent, &free_text, "GAMMA").await;
     assert_question_answer_reached_the_model(&free_text, &answered, "GAMMA");
     assert_async_answer_has_no_user_echo(&answered);
 
-    let abandoned = ask_question(host, &agent, prompt).await;
+    let mut abandoned = ask_question(host, &agent, prompt).await;
+    wait_for_unanswered_question_idle(host, &mut abandoned).await;
     assert_question_waits_for_an_answer(&abandoned);
     let cancelled = cancel_turn(host, &agent).await;
     assert_no_error_message("async question cancellation", &cancelled);

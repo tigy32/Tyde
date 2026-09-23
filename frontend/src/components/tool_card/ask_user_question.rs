@@ -56,7 +56,7 @@ pub(crate) fn render(
     result: Option<&ToolExecutionResult>,
     _mode: ToolOutputMode,
 ) -> AnyView {
-    let ToolRequestType::AskUserQuestion { questions } = req else {
+    let ToolRequestType::AskUserQuestion { questions, .. } = req else {
         unreachable!("ask_user_question::render dispatched on non-AskUserQuestion request");
     };
 
@@ -419,6 +419,7 @@ mod wasm_tests {
 
     fn single_select_req() -> ToolRequestType {
         ToolRequestType::AskUserQuestion {
+            mode: protocol::UserQuestionMode::Blocking,
             questions: vec![AskUserQuestion {
                 id: None,
                 question: "Which language?".to_owned(),
@@ -431,6 +432,7 @@ mod wasm_tests {
 
     fn multi_select_req() -> ToolRequestType {
         ToolRequestType::AskUserQuestion {
+            mode: protocol::UserQuestionMode::Blocking,
             questions: vec![AskUserQuestion {
                 id: None,
                 question: "Which frameworks?".to_owned(),

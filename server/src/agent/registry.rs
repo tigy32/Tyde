@@ -63,6 +63,8 @@ pub(crate) struct AgentStatus {
     pub goal: Option<protocol::NativeGoal>,
     pub goal_capabilities: Option<protocol::GoalCapabilities>,
     pub pending_user_response: Option<PendingUserResponseKind>,
+    /// Derived by the actor from unanswered canonical requests, not card presence.
+    pub blocked_on_user_response: bool,
     pub last_error: Option<String>,
     pub activity_counter: u64,
     /// This agent's transcript was replayed from a saved session and no live
@@ -99,7 +101,7 @@ impl AgentStatus {
     pub fn status(&self) -> AgentControlStatus {
         if self.terminated && self.last_error.is_some() {
             AgentControlStatus::Failed
-        } else if self.is_user_response_pending() {
+        } else if self.blocked_on_user_response {
             AgentControlStatus::Idle
         } else if self.is_active() {
             AgentControlStatus::Thinking

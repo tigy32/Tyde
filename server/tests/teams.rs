@@ -1206,6 +1206,192 @@ async fn team_describe_includes_default_agent_member() {
         described["binding"]["current_agent_id"],
         json!(new_agent.agent_id)
     );
+    let manager_agent_id = new_agent.agent_id;
+    fixture
+        .client
+        .team_member_create(TeamMemberCreatePayload {
+            team_id: team.id.clone(),
+            member: member_spec_with_profile(
+                "async-report",
+                None,
+                BackendKind::Codex,
+                Some(SpawnCostHint::Low),
+                vec![project.id],
+            ),
+            session_id: None,
+        })
+        .await
+        .expect("create async report");
+    let report = expect_team_member_notify(&mut fixture.client, "async report member").await;
+    expect_team_member_binding_notify(&mut fixture.client, "unbound async report").await;
+    let question_gate = server::backend::mock::MockGateHandle::new();
+    let follow_up_gate = server::backend::mock::MockGateHandle::new();
+    let reservation = fixture
+        .reserve_next_mock_launch(
+            "async-report",
+            server::backend::mock::MockScript::one(
+                server::backend::mock::MockTurn::async_question_request(
+                    "team-async-question",
+                    &question_gate,
+                ),
+            )
+            .then(server::backend::mock::MockTurn::gated_text(
+                "team follow-up",
+                &follow_up_gate,
+            ))
+            .then(server::backend::mock::MockTurn::text(
+                "team answer continuation",
+            )),
+        )
+        .await;
+    fixture
+        .client
+        .team_member_activate(TeamMemberActivatePayload {
+            member_id: report.id.clone(),
+            prompt: Some("Ask asynchronously".to_owned()),
+            images: None,
+        })
+        .await
+        .expect("activate async report");
+    let new_agent: NewAgentPayload = expect_kind(
+        &mut fixture.client,
+        FrameKind::NewAgent,
+        "async report agent",
+    )
+    .await
+    .parse_payload()
+    .expect("report agent");
+    let binding = expect_bound_team_member(
+        &mut fixture.client,
+        &report.id,
+        &new_agent.agent_id,
+        "bound async report",
+    )
+    .await;
+    question_gate.wait_until_entered().await;
+    drop(reservation);
+    assert_eq!(
+        binding.status,
+        AgentControlStatus::Thinking,
+        "team binding must report continuing work despite a pending async card"
+    );
+    let agent = fixture::TestAgent {
+        stream: new_agent.instance_stream.clone(),
+        new_agent: new_agent.clone(),
+    };
+    let (mut observer, host_bootstrap) = fixture::connect_mobile_client_with_bootstrap(
+        fixture.host_for_test(),
+        "team-question-observer",
+    )
+    .await;
+    assert!(
+        host_bootstrap
+            .team_member_bindings
+            .iter()
+            .any(|binding| binding.member_id == report.id
+                && binding.status == AgentControlStatus::Thinking)
+    );
+    let observer_stream = host_bootstrap
+        .agents
+        .iter()
+        .find(|entry| entry.agent_id == agent.new_agent.agent_id)
+        .expect("team agent in observer bootstrap")
+        .instance_stream
+        .clone();
+    fixture::send_load_agent_on(&mut observer, &observer_stream).await;
+    let bootstrap: AgentBootstrapPayload =
+        fixture::next_frame_matching_on(&mut observer, "team pending card bootstrap", |env| {
+            env.kind == FrameKind::AgentBootstrap && env.stream == observer_stream
+        })
+        .await
+        .parse_payload()
+        .expect("team bootstrap");
+    let request = bootstrap
+        .events
+        .iter()
+        .find_map(|event| match event {
+            AgentBootstrapEvent::ChatEvent(protocol::ChatEvent::ToolRequest(request))
+                if request.tool_call_id == "team-async-question" =>
+            {
+                Some(request.clone())
+            }
+            _ => None,
+        })
+        .expect("pending team question must remain in bootstrap");
+    question_gate.release_one();
+    fixture
+        .next_chat_event_matching(&agent, "team terminal idle", |event| {
+            matches!(event, protocol::ChatEvent::TypingStatusChanged(false))
+        })
+        .await;
+    let idle = expect_bound_team_member(
+        &mut observer,
+        &report.id,
+        &new_agent.agent_id,
+        "team binding idle with unanswered nonblocking question",
+    )
+    .await;
+    eprintln!(
+        "Async team terminal binding: idle={}, pending_card=true",
+        idle.status == AgentControlStatus::Idle
+    );
+    assert_eq!(
+        idle.status,
+        AgentControlStatus::Idle,
+        "ended async-question team binding must be Idle while the card remains answerable"
+    );
+
+    let outcome = call_agent_control_tool_json(
+        &fixture,
+        &manager_agent_id,
+        "tyde_team_message_member",
+        json!({"member_id": report.id, "message": "team follow-up"}),
+    )
+    .await;
+    assert_eq!(
+        outcome["queued"], false,
+        "team follow-up must not report queued behind a nonblocking card"
+    );
+    follow_up_gate.wait_until_entered().await;
+    let active = expect_bound_team_member(
+        &mut observer,
+        &report.id,
+        &new_agent.agent_id,
+        "team binding active on independent follow-up",
+    )
+    .await;
+    assert_eq!(active.status, AgentControlStatus::Thinking);
+    follow_up_gate.release_one();
+    fixture.finish_turn(&agent).await;
+    let idle = expect_bound_team_member(
+        &mut observer,
+        &report.id,
+        &new_agent.agent_id,
+        "team binding idle after independent follow-up",
+    )
+    .await;
+    assert_eq!(idle.status, AgentControlStatus::Idle);
+    fixture
+        .client
+        .send_message_payload(
+            &agent.stream,
+            protocol::SendMessagePayload {
+                message: "GREEN".to_owned(),
+                images: None,
+                origin: None,
+                tool_response: Some(protocol::SendMessageToolResponse::AskUserQuestion {
+                    tool_call_id: request.tool_call_id.clone(),
+                    answer: "GREEN".to_owned(),
+                }),
+            },
+        )
+        .await
+        .expect("answer pending team card");
+    let answered = fixture.finish_turn(&agent).await;
+    assert_eq!(answered.chat_events().iter().filter(|event| matches!(event,
+        protocol::ChatEvent::ToolExecutionCompleted(completion) if completion.tool_call_id == request.tool_call_id
+    )).count(), 1, "team card must remain answerable exactly once");
+    fixture.mock(&agent).await.assert_clean().await;
 }
 
 #[tokio::test(start_paused = true)]

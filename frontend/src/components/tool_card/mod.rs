@@ -1150,7 +1150,7 @@ fn tool_icon_and_detail(name: &str, tool_type: &ToolRequestType) -> (&'static st
         }
         ToolRequestType::SearchTypes { type_name, .. } => ("\u{1f50d}", Some(type_name.clone())),
         ToolRequestType::GetTypeDocs { type_path, .. } => ("\u{1f4d6}", Some(type_path.clone())),
-        ToolRequestType::AskUserQuestion { questions } => {
+        ToolRequestType::AskUserQuestion { questions, .. } => {
             let detail = match questions.len() {
                 0 => None,
                 1 => questions[0].header.clone(),
@@ -1831,6 +1831,7 @@ mod live_card_wasm_tests {
                 tool_call_id: "toolu_ask".to_owned(),
                 tool_name: "ask_user_question".to_owned(),
                 tool_type: ToolRequestType::AskUserQuestion {
+                    mode: protocol::UserQuestionMode::Blocking,
                     questions: vec![protocol::AskUserQuestion {
                         id: None,
                         question: "Which language?".to_owned(),
@@ -2875,6 +2876,7 @@ mod live_card_wasm_tests {
                 tool_call_id: "unicode-question-error".to_owned(),
                 tool_name: "AskUserQuestion".to_owned(),
                 tool_type: ToolRequestType::AskUserQuestion {
+                    mode: protocol::UserQuestionMode::Blocking,
                     questions: Vec::new(),
                 },
             },

@@ -7393,7 +7393,7 @@ impl HostHandle {
         let queued = self
             .agent_status_snapshot(&agent_id)
             .await
-            .map(|status| status.is_active() || status.is_user_response_pending())
+            .map(|status| status.is_active() || status.blocked_on_user_response)
             .unwrap_or(false);
         let events = registry
             .record_member_activity(plan.member.id.clone(), AgentControlStatus::Thinking)
@@ -7472,7 +7472,7 @@ impl HostHandle {
                 if let Some(status) = self.agent_status_snapshot(&agent_id).await {
                     let events = if status.terminated {
                         registry.clear_binding_by_agent(agent_id.clone()).await?
-                    } else if status.is_user_response_pending() {
+                    } else if status.blocked_on_user_response {
                         registry
                             .record_agent_activity(agent_id.clone(), AgentControlStatus::Thinking)
                             .await?
@@ -15352,7 +15352,7 @@ impl HostHandle {
         if let Some(status) = self.agent_status_snapshot(&agent_id).await {
             let update = if status.terminated {
                 registry.clear_binding_by_agent(agent_id.clone()).await
-            } else if status.is_user_response_pending() {
+            } else if status.blocked_on_user_response {
                 registry
                     .record_agent_activity(agent_id.clone(), AgentControlStatus::Thinking)
                     .await
@@ -15471,7 +15471,7 @@ fn spawn_host_team_status_task(host: HostHandle) {
                 let registry = { host.state.lock().await.team_registry.clone() };
                 let result = if status.terminated {
                     registry.clear_binding_by_agent(agent_id.clone()).await
-                } else if status.is_user_response_pending() {
+                } else if status.blocked_on_user_response {
                     registry
                         .record_agent_activity(agent_id.clone(), AgentControlStatus::Thinking)
                         .await

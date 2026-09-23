@@ -8148,6 +8148,16 @@ pub struct ToolRequest {
     pub tool_type: ToolRequestType,
 }
 
+/// Whether answering a question is required to finish the provider's turn.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum UserQuestionMode {
+    /// Older serialized requests paused the provider until answered.
+    #[default]
+    Blocking,
+    /// The provider may finish its turn while the question remains answerable.
+    NonBlocking,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind")]
 pub enum ToolRequestType {
@@ -8175,6 +8185,8 @@ pub enum ToolRequestType {
     },
     AskUserQuestion {
         questions: Vec<AskUserQuestion>,
+        #[serde(default)]
+        mode: UserQuestionMode,
     },
     ExitPlanMode {
         #[serde(default, skip_serializing_if = "Option::is_none")]

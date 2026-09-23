@@ -5513,6 +5513,28 @@ async fn agent_control_interrupt_redirects_without_losing_queued_messages() {
             )
             .await;
         }
+        // The failed run read before the final queued reply: observing its
+        // user bubble only proves admission, not completion of that turn.
+        fixture::next_chat_event_matching_on(
+            &mut fixture.client,
+            stream,
+            "final preserved queued reply",
+            |event| {
+                matches!(event, ChatEvent::StreamEnd(end)
+                    if end.message.content == "explicit queued reply")
+            },
+        )
+        .await;
+        fixture::next_chat_event_matching_on(
+            &mut fixture.client,
+            stream,
+            "final preserved queued turn idle",
+            |event| matches!(event, ChatEvent::TypingStatusChanged(false)),
+        )
+        .await;
+        eprintln!(
+            "Interrupt queue read boundary: native_steering={native_steering}, queued_inputs=2, final_reply_observed=true, terminal_idle_observed=true"
+        );
         let read = mcp_tool_call_as(
             &caller,
             false,

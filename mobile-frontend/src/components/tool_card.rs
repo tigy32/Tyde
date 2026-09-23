@@ -75,7 +75,7 @@ pub fn ToolCardView(owner_agent_ref: AgentRef, entry: ToolRequestEntry) -> impl 
         .and_then(completion_normalization_failure);
     let normalization_failed = normalization_failure.is_some();
 
-    if let ToolRequestType::AskUserQuestion { questions } = &entry.request.tool_type
+    if let ToolRequestType::AskUserQuestion { questions, .. } = &entry.request.tool_type
         && entry.result.as_ref().is_none_or(completion_succeeded)
     {
         let questions = questions.clone();
@@ -1829,6 +1829,7 @@ mod wasm_tests {
                 tool_call_id: "toolu_ask".to_owned(),
                 tool_name: "AskUserQuestion".to_owned(),
                 tool_type: ToolRequestType::AskUserQuestion {
+                    mode: protocol::UserQuestionMode::Blocking,
                     questions: vec![AskUserQuestion {
                         id: None,
                         question: "Which language?".to_owned(),

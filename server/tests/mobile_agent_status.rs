@@ -88,6 +88,45 @@ async fn settle_turn(fixture: &mut Fixture, agent: &TestAgent) {
         .await;
 }
 
+async fn call_control_tool(
+    url: &str,
+    authorization: &str,
+    name: &str,
+    arguments: serde_json::Value,
+) -> serde_json::Value {
+    let response = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .expect("agent-control HTTP client")
+        .post(url)
+        .header("Authorization", authorization)
+        .header("Accept", "application/json, text/event-stream")
+        .json(&serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": { "name": name, "arguments": arguments }
+        }))
+        .send()
+        .await
+        .expect("agent-control HTTP request")
+        .error_for_status()
+        .expect("agent-control HTTP status")
+        .text()
+        .await
+        .expect("agent-control HTTP response");
+    let payload = response
+        .lines()
+        .find_map(|line| line.strip_prefix("data: "))
+        .expect("agent-control SSE data");
+    let response: serde_json::Value = serde_json::from_str(payload).expect("agent-control JSON");
+    assert_eq!(response["result"]["isError"].as_bool(), Some(false));
+    serde_json::from_str(
+        response["result"]["content"][0]["text"]
+            .as_str()
+            .expect("tool content"),
+    )
+    .expect("tool JSON")
+}
+
 #[tokio::test]
 async fn lazy_client_learns_agent_liveness_from_the_host_stream() {
     let mut fixture = Fixture::new().await;
@@ -335,4 +374,352 @@ async fn lazy_client_learns_agent_liveness_from_the_host_stream() {
         .await,
         "unattached idle must return to idle after its second follow-up"
     );
+
+    let question_gate = MockGateHandle::new();
+    let question_follow_up = MockGateHandle::new();
+    let answer_continuation = MockGateHandle::new();
+    let reservation = fixture
+        .reserve_next_mock_launch(
+            "async-question",
+            MockScript::one(MockTurn::async_question_request(
+                "liveness-question",
+                &question_gate,
+            ))
+            .then(MockTurn::gated_text(
+                "independent follow-up",
+                &question_follow_up,
+            ))
+            .then(MockTurn::gated_text(
+                "answer continuation",
+                &answer_continuation,
+            ))
+            .then(MockTurn::text("queued after late answer")),
+        )
+        .await;
+    let (question_agent, _) = fixture
+        .spawn_with(SpawnAgentPayload {
+            name: Some("async-question".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: Some(busy.new_agent.agent_id.clone()),
+            project_id: None,
+            params: SpawnAgentParams::New {
+                workspace_roots: vec!["/tmp/test".to_owned()],
+                prompt: "scripted launch".to_owned(),
+                images: None,
+                backend_kind: BackendKind::Claude,
+                launch_profile_id: None,
+                cost_hint: None,
+                access_mode: Default::default(),
+                session_settings: None,
+            },
+        })
+        .await;
+    drop(reservation);
+    question_gate.wait_until_entered().await;
+    let (mut question_mobile, bootstrap) =
+        fixture::connect_mobile_client_with_bootstrap(fixture.host_for_test(), "question-phone")
+            .await;
+    assert!(
+        descriptor(&bootstrap.agents, &question_agent).turn_active,
+        "pending nonblocking question must not hide continuing work"
+    );
+    question_gate.release_one();
+    let request = fixture
+        .expect_paused_tool_request(&question_agent, "AskUserQuestion")
+        .await;
+    assert!(matches!(
+        request.tool_type,
+        protocol::ToolRequestType::AskUserQuestion {
+            mode: protocol::UserQuestionMode::NonBlocking,
+            ..
+        }
+    ));
+    let (mut late_mobile, bootstrap) = fixture::connect_mobile_client_with_bootstrap(
+        fixture.host_for_test(),
+        "late-question-phone",
+    )
+    .await;
+    assert!(
+        !descriptor(&bootstrap.agents, &question_agent).turn_active,
+        "ended nonblocking-question turn must be idle in HostBootstrap while its answer remains pending"
+    );
+    assert!(
+        !next_turn_state_on(
+            &mut question_mobile,
+            &question_agent.new_agent.agent_id,
+            &[],
+            "unanswered question turn ended"
+        )
+        .await
+    );
+    let late_stream = descriptor(&bootstrap.agents, &question_agent)
+        .instance_stream
+        .clone();
+    send_load_agent_on(&mut late_mobile, &late_stream).await;
+    let bootstrap: AgentBootstrapPayload =
+        next_frame_matching_on(&mut late_mobile, "idle question bootstrap", |env| {
+            env.kind == FrameKind::AgentBootstrap && env.stream == late_stream
+        })
+        .await
+        .parse_payload()
+        .expect("parse question bootstrap");
+    assert!(
+        !bootstrap.turn_active,
+        "pending card must not keep AgentBootstrap active"
+    );
+    assert!(bootstrap.events.iter().any(|event| matches!(event,
+        protocol::AgentBootstrapEvent::ChatEvent(ChatEvent::ToolRequest(pending))
+            if pending.tool_call_id == request.tool_call_id)));
+    assert!(!bootstrap.events.iter().any(|event| matches!(event,
+        protocol::AgentBootstrapEvent::ChatEvent(ChatEvent::ToolExecutionCompleted(completion))
+            if completion.tool_call_id == request.tool_call_id)));
+    let caller = fixture.agent_control_caller(&busy.new_agent.agent_id).await;
+    let agents = call_control_tool(
+        &caller.url,
+        &caller.authorization,
+        "tyde_list_agents",
+        serde_json::json!({}),
+    )
+    .await;
+    let listed = agents
+        .as_array()
+        .expect("agent list")
+        .iter()
+        .find(|entry| {
+            entry["agent_id"].as_str() == Some(question_agent.new_agent.agent_id.0.as_str())
+        })
+        .expect("question agent listed");
+    assert_eq!(listed["status"].as_str(), Some("idle"));
+
+    fixture
+        .client
+        .send_message(&question_agent.stream, "independent follow-up".to_owned())
+        .await
+        .expect("send follow-up without answering");
+    question_follow_up.wait_until_entered().await;
+    assert!(
+        next_turn_state_on(
+            &mut question_mobile,
+            &question_agent.new_agent.agent_id,
+            &[],
+            "independent follow-up active"
+        )
+        .await
+    );
+    let agents = call_control_tool(
+        &caller.url,
+        &caller.authorization,
+        "tyde_list_agents",
+        serde_json::json!({}),
+    )
+    .await;
+    let listed = agents
+        .as_array()
+        .expect("agent list")
+        .iter()
+        .find(|entry| {
+            entry["agent_id"].as_str() == Some(question_agent.new_agent.agent_id.0.as_str())
+        })
+        .expect("question agent listed during follow-up");
+    eprintln!(
+        "Async follow-up control status: thinking={}, pending_card=true",
+        listed["status"] == "thinking"
+    );
+    let awaiting = call_control_tool(
+        &caller.await_url,
+        &caller.authorization,
+        "tyde_await_agents",
+        serde_json::json!({
+            "agent_ids": [question_agent.new_agent.agent_id]
+        }),
+    );
+    tokio::pin!(awaiting);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), &mut awaiting)
+            .await
+            .is_err(),
+        "agent-control await must not report ready during gated work with an unanswered async card"
+    );
+    assert_eq!(
+        listed["status"].as_str(),
+        Some("thinking"),
+        "agent-control must report Thinking during independent work with an unanswered async card"
+    );
+    question_follow_up.release_one();
+    let ready = tokio::time::timeout(std::time::Duration::from_secs(5), awaiting)
+        .await
+        .expect("await completes after terminal idle");
+    assert_eq!(ready["ready"].as_array().map(Vec::len), Some(1));
+    assert_eq!(ready["ready"][0]["status"], "idle");
+    assert_eq!(ready["still_thinking"].as_array().map(Vec::len), Some(0));
+
+    let follow_up = fixture.finish_turn(&question_agent).await;
+    assert!(follow_up.chat_events().iter().any(|event| matches!(event,
+        ChatEvent::StreamEnd(end) if end.message.content == "independent follow-up")));
+    assert!(!follow_up.chat_events().iter().any(|event| matches!(event,
+        ChatEvent::ToolExecutionCompleted(completion) if completion.tool_call_id == request.tool_call_id)));
+    assert!(
+        !next_turn_state_on(
+            &mut question_mobile,
+            &question_agent.new_agent.agent_id,
+            &[],
+            "independent follow-up idle"
+        )
+        .await
+    );
+
+    let answer_payload = protocol::SendMessagePayload {
+        message: "GREEN".to_owned(),
+        images: None,
+        origin: None,
+        tool_response: Some(protocol::SendMessageToolResponse::AskUserQuestion {
+            tool_call_id: request.tool_call_id.clone(),
+            answer: "GREEN".to_owned(),
+        }),
+    };
+    fixture
+        .client
+        .send_message_payload(&question_agent.stream, answer_payload.clone())
+        .await
+        .expect("answer idle question");
+    fixture
+        .client
+        .send_message(
+            &question_agent.stream,
+            "queued after late answer".to_owned(),
+        )
+        .await
+        .expect("send immediately after late answer");
+    answer_continuation.wait_until_entered().await;
+    assert!(
+        next_turn_state_on(
+            &mut question_mobile,
+            &question_agent.new_agent.agent_id,
+            &[],
+            "late answer active"
+        )
+        .await
+    );
+    // Gate entry proves the answer started, not that the following client
+    // message arrived. Releasing before its queue acknowledgement lets that
+    // message legitimately arrive after idle instead of racing active work.
+    let mut answered = fixture::Turn { frames: Vec::new() };
+    next_frame_matching_on(&mut fixture.client, "late-answer follow-up queued", |env| {
+        if env.stream != question_agent.stream {
+            return false;
+        }
+        let queued = env.kind == FrameKind::QueuedMessages
+            && env
+                .parse_payload::<protocol::QueuedMessagesPayload>()
+                .is_ok_and(|payload| payload.messages.len() == 1);
+        answered.frames.push(env.clone());
+        queued
+    })
+    .await;
+    eprintln!(
+        "Async answer gate held through queue acknowledgement; observed_frames={}, busy_markers={}, idle_markers={}",
+        answered.frames.len(),
+        answered
+            .chat_events()
+            .iter()
+            .filter(|event| matches!(event, ChatEvent::TypingStatusChanged(true)))
+            .count(),
+        answered
+            .chat_events()
+            .iter()
+            .filter(|event| matches!(event, ChatEvent::TypingStatusChanged(false)))
+            .count()
+    );
+    answer_continuation.release_one();
+    // The queue acknowledgement already consumed this turn's busy markers.
+    // Starting finish_turn here can consume the following turn before returning.
+    next_frame_matching_on(
+        &mut fixture.client,
+        "late-answer continuation idle",
+        |env| {
+            if env.stream != question_agent.stream {
+                return false;
+            }
+            let idle = env.kind == FrameKind::ChatEvent
+                && matches!(
+                    env.parse_payload::<ChatEvent>(),
+                    Ok(ChatEvent::TypingStatusChanged(false))
+                );
+            answered.frames.push(env.clone());
+            idle
+        },
+    )
+    .await;
+    let events = answered.chat_events();
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, ChatEvent::TypingStatusChanged(true)))
+    );
+    assert_eq!(events.iter().filter(|event| matches!(event,
+        ChatEvent::ToolExecutionCompleted(completion) if completion.tool_call_id == request.tool_call_id
+            && matches!(completion.outcome, protocol::ToolExecutionOutcome::Succeeded { .. }))).count(), 1,
+        "late answer must complete its card exactly once");
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event,
+        ChatEvent::MessageAdded(message) if matches!(message.sender, protocol::MessageSender::User)
+            && message.content == "GREEN"))
+            .count(),
+        1,
+        "answer must be persisted exactly once"
+    );
+    assert!(
+        answered
+            .queued_message_snapshots()
+            .iter()
+            .any(|snapshot| snapshot.messages.len() == 1),
+        "message racing the late answer must queue behind its continuation"
+    );
+    let queued = fixture.finish_turn(&question_agent).await;
+    assert!(queued.chat_events().iter().any(|event| matches!(event,
+        ChatEvent::StreamEnd(end) if end.message.content == "queued after late answer")));
+    assert!(!queued.chat_events().iter().any(|event| matches!(event,
+        ChatEvent::ToolExecutionCompleted(completion) if completion.tool_call_id == request.tool_call_id)));
+    fixture
+        .client
+        .send_message_payload(&question_agent.stream, answer_payload)
+        .await
+        .expect("send duplicate answer");
+    fixture.next_chat_event_matching(&question_agent, "duplicate answer rejected", |event|
+        matches!(event, ChatEvent::MessageAdded(message) if matches!(message.sender, protocol::MessageSender::Error))
+    ).await;
+    let (mut final_mobile, bootstrap) = fixture::connect_mobile_client_with_bootstrap(
+        fixture.host_for_test(),
+        "answered-question-phone",
+    )
+    .await;
+    assert!(
+        !descriptor(&bootstrap.agents, &question_agent).turn_active,
+        "duplicate answer must not resurrect an ended turn"
+    );
+    let final_stream = descriptor(&bootstrap.agents, &question_agent)
+        .instance_stream
+        .clone();
+    send_load_agent_on(&mut final_mobile, &final_stream).await;
+    let bootstrap: AgentBootstrapPayload =
+        next_frame_matching_on(&mut final_mobile, "answered question bootstrap", |env| {
+            env.kind == FrameKind::AgentBootstrap && env.stream == final_stream
+        })
+        .await
+        .parse_payload()
+        .expect("parse answered bootstrap");
+    assert!(!bootstrap.turn_active);
+    assert_eq!(
+        bootstrap
+            .events
+            .iter()
+            .filter(|event| matches!(event,
+        protocol::AgentBootstrapEvent::ChatEvent(ChatEvent::ToolExecutionCompleted(completion))
+            if completion.tool_call_id == request.tool_call_id))
+            .count(),
+        1
+    );
+    fixture.mock(&question_agent).await.assert_clean().await;
 }

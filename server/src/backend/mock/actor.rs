@@ -1,6 +1,6 @@
 //! The mock command loop and scripted-turn executor.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 
 use protocol::{AgentInput, SendMessagePayload, SessionId};
@@ -56,6 +56,7 @@ pub(super) fn start_mock_command_loop(
         user_bubbles,
         slash_commands,
         phase: TurnPhase::Idle,
+        pending_async_questions: HashSet::new(),
         goal_status: None,
         violations: Vec::new(),
         requests: Vec::new(),
@@ -113,6 +114,7 @@ struct MockActor {
     user_bubbles: bool,
     slash_commands: Option<Vec<protocol::SlashCommand>>,
     phase: TurnPhase,
+    pending_async_questions: HashSet<String>,
     goal_status: Option<protocol::GoalStatus>,
     violations: Vec<MockViolation>,
     requests: Vec<MockRequest>,
@@ -335,6 +337,40 @@ impl MockActor {
         tool_response: protocol::SendMessageToolResponse,
         control: &mut ControlPlane,
     ) -> bool {
+        if let protocol::SendMessageToolResponse::AskUserQuestion {
+            tool_call_id,
+            answer,
+        } = &tool_response
+        {
+            if !self.pending_async_questions.remove(tool_call_id) {
+                match &self.phase {
+                    TurnPhase::ToolPending(pending) if pending.tool_call_id == *tool_call_id => {
+                        self.phase = TurnPhase::Idle;
+                    }
+                    _ => return self.record_violation(MockViolation::UnmatchedToolResponse),
+                }
+            }
+            if !self.events_tx.send_event(emit::typing(true))
+                || !self.events_tx.send_event(emit::tool_completed(
+                    protocol::ToolExecutionCompletedData {
+                        tool_call_id: tool_call_id.clone(),
+                        outcome: protocol::ToolExecutionOutcome::Succeeded {
+                            result: protocol::ToolExecutionResult::Other {
+                                result: serde_json::json!({"answered": true}),
+                            },
+                        },
+                    },
+                ))
+            {
+                return false;
+            }
+            let Some(turn) = self.script.pop_front() else {
+                return self.record_violation(MockViolation::ScriptExhausted {
+                    message: "question continuation".to_owned(),
+                });
+            };
+            return self.run_turn(turn, answer, control).await;
+        }
         let protocol::SendMessageToolResponse::ExitPlanMode {
             tool_call_id,
             decision,
@@ -425,6 +461,19 @@ impl MockActor {
     async fn run_step(&mut self, step: MockStep, control: &mut ControlPlane) -> bool {
         match step {
             MockStep::Emit(event) => {
+                if let crate::backend::BackendEvent::Chat(protocol::ChatEvent::ToolRequest(request)) =
+                    &*event
+                    && matches!(
+                        request.tool_type,
+                        protocol::ToolRequestType::AskUserQuestion {
+                            mode: protocol::UserQuestionMode::NonBlocking,
+                            ..
+                        }
+                    )
+                {
+                    self.pending_async_questions
+                        .insert(request.tool_call_id.clone());
+                }
                 if let crate::backend::BackendEvent::Chat(protocol::ChatEvent::GoalChanged(goal)) =
                     &*event
                 {

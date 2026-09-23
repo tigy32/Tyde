@@ -398,6 +398,50 @@ impl MockTurn {
         Self::held(steps, true)
     }
 
+    pub fn async_question_request(tool_call_id: &str, gate: &MockGateHandle) -> Self {
+        Self::done(vec![
+            MockStep::emit(emit::typing(true)),
+            MockStep::emit(emit::tool_request(protocol::ToolRequest {
+                tool_call_id: tool_call_id.to_owned(),
+                tool_name: "request_user_input_async".to_owned(),
+                tool_type: protocol::ToolRequestType::AskUserQuestion {
+                    mode: protocol::UserQuestionMode::NonBlocking,
+                    questions: vec![protocol::AskUserQuestion {
+                        id: None,
+                        question: "Choose a color".to_owned(),
+                        header: None,
+                        options: Vec::new(),
+                        multi_select: false,
+                    }],
+                },
+            })),
+            MockStep::Gate(gate.gate()),
+            MockStep::emit(emit::typing(false)),
+        ])
+    }
+
+    pub fn blocking_question_request(tool_call_id: &str, gate: &MockGateHandle) -> Self {
+        let mut turn = Self::async_question_request(tool_call_id, gate);
+        if let MockTurnBody::Steps(steps) = &mut turn.body {
+            for step in steps {
+                if let MockStep::Emit(event) = step
+                    && let BackendEvent::Chat(protocol::ChatEvent::ToolRequest(request)) =
+                        &mut **event
+                    && let protocol::ToolRequestType::AskUserQuestion { mode, .. } =
+                        &mut request.tool_type
+                {
+                    *mode = protocol::UserQuestionMode::Blocking;
+                }
+            }
+        }
+        turn.finish = MockTurnFinish::AwaitToolResponse(MockPendingTool {
+            tool_call_id: tool_call_id.to_owned(),
+            gate_before_completion: None,
+            gate_after_completion: None,
+        });
+        turn
+    }
+
     pub fn exit_plan_request(tool_call_id: impl Into<String>, plan: impl Into<String>) -> Self {
         let tool_call_id = tool_call_id.into();
         let steps = emit::exit_plan_mode_request_frames(

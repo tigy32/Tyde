@@ -2264,7 +2264,7 @@ async fn await_result_from_snapshot(
             agent_id: agent_id.0.clone(),
             status: status.status(),
         };
-        if status.is_user_response_pending() || !status.is_active() {
+        if status.blocked_on_user_response || !status.is_active() {
             ready.push(entry);
         } else {
             still_thinking.push(entry);

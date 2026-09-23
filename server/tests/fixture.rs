@@ -446,7 +446,11 @@ impl Fixture {
 
     #[allow(dead_code)]
     pub async fn restart_host(&mut self) -> HostBootstrapPayload {
+        let prior_agent_count = self.host.agent_ids().await.len();
         self.host.shutdown_agents_for_conformance().await;
+        eprintln!(
+            "Fixture restart retired old-host agents before replacement; prior_agent_count={prior_agent_count}"
+        );
         let host = server::spawn_host_with_mock_backend_and_runtime_config(
             self.session_store_path(),
             self.project_store_path(),
@@ -1071,6 +1075,14 @@ pub async fn expect_paused_tool_request_on(
                 request = Some(r);
             }
             ChatEvent::TypingStatusChanged(false) => paused = true,
+            ChatEvent::ToolExecutionCompleted(completion) => {
+                assert!(
+                    request
+                        .as_ref()
+                        .is_none_or(|request| { request.tool_call_id != completion.tool_call_id }),
+                    "user-response card completed before an answer was submitted"
+                );
+            }
             _ => {}
         }
     }
