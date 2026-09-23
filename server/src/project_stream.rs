@@ -492,7 +492,10 @@ fn create_project_watcher(
     tracing::debug!(project_id = %project.id, "registering project filesystem watches");
     ProjectWatcher::new(shared_watcher, project, watch_tx).map_err(|error| {
         ProjectWatcherFailure::from_notify(
-            "failed to create project filesystem watcher".to_owned(),
+            format!(
+                "failed to create project filesystem watcher for roots {:?}",
+                project.root_paths()
+            ),
             error,
         )
     })
