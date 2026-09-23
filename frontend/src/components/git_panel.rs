@@ -292,12 +292,10 @@ fn CommittedAiReviewButton(selection: HistoricalSelection) -> impl IntoView {
     });
     let backend_state = state.clone();
     let backend_host = selection.host_id.clone();
-    let has_backend = Memo::new(move |_| {
-        backend_state.host_settings_by_host.with(|map| {
-            map.get(&backend_host).is_some_and(|settings| {
-                settings.default_backend.is_some() || !settings.enabled_backends.is_empty()
-            })
-        })
+    let settings_ready = Memo::new(move |_| {
+        backend_state
+            .host_settings_by_host
+            .with(|map| map.contains_key(&backend_host))
     });
     let running_state = state.clone();
     let running = Memo::new(move |_| {
@@ -325,8 +323,8 @@ fn CommittedAiReviewButton(selection: HistoricalSelection) -> impl IntoView {
     let reason = move || -> &'static str {
         if target.get().is_none() {
             "No review is open for this project"
-        } else if !has_backend.get() {
-            "No AI backend available"
+        } else if !settings_ready.get() {
+            "Waiting for review settings"
         } else if pending.get() {
             "AI reviewer starting\u{2026}"
         } else if running.get() {
@@ -3643,6 +3641,9 @@ mod wasm_tests {
                 started_at_ms: 1,
                 requested_by: Some(AgentId("requester".to_owned())),
                 reviewers: vec![protocol::ReviewReviewerRun {
+                    reviewer_id: None,
+                    target: None,
+                    session_settings: Default::default(),
                     aspects: vec![protocol::ReviewAspectSnapshot {
                         id: "tests".to_owned(),
                         name: "Test quality".to_owned(),
@@ -3752,9 +3753,10 @@ mod wasm_tests {
                 && group.contains("Test coverage · Codex")
         );
         assert!(group.contains("Frozen original test instructions"));
+        // Historical wire mode `deep` now renders Heavy; retain the exact completion count.
         assert!(
             main.inner_text()
-                .contains("Deep · 2 of 2 reviewers completed")
+                .contains("Heavy · 2 of 2 reviewers completed")
         );
         click(
             &query(&main, "[data-test=review-actions-toggle]").expect("Review actions disclosure"),

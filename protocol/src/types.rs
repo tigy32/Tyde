@@ -6554,8 +6554,8 @@ pub enum ReviewMode {
 impl ReviewMode {
     pub const fn label(self) -> &'static str {
         match self {
-            Self::Light => "Light",
-            Self::Deep => "Deep",
+            Self::Light => "Lite",
+            Self::Deep => "Heavy",
         }
     }
 }
@@ -6568,8 +6568,30 @@ pub struct ReviewAspectSnapshot {
     pub instructions: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(transparent)]
+pub struct ReviewReviewerId(pub String);
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ReviewReviewerTarget {
+    #[default]
+    Default,
+    Explicit {
+        backend_kind: BackendKind,
+        #[serde(default)]
+        session_settings: SessionSettingsValues,
+    },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReviewReviewerRun {
+    #[serde(default)]
+    pub reviewer_id: Option<ReviewReviewerId>,
+    #[serde(default)]
+    pub target: Option<ReviewReviewerTarget>,
+    #[serde(default)]
+    pub session_settings: SessionSettingsValues,
     #[serde(default)]
     pub aspects: Vec<ReviewAspectSnapshot>,
     pub name: String,

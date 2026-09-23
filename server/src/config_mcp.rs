@@ -114,14 +114,9 @@ enum SettingInput {
     ReviewDefaultMode {
         mode: protocol::ReviewMode,
     },
-    ReviewLightExecution {
-        config: settings_model::ReviewExecutionConfig,
-    },
-    ReviewClaudeExecution {
-        session_settings: protocol::SessionSettingsValues,
-    },
-    ReviewCodexExecution {
-        session_settings: protocol::SessionSettingsValues,
+    ReviewReviewers {
+        mode: protocol::ReviewMode,
+        reviewers: Vec<settings_model::ReviewReviewerConfig>,
     },
     ReviewsEnabled {
         enabled: bool,
@@ -168,14 +163,12 @@ impl SettingInput {
             Self::ReviewDefaultMode { mode } => {
                 ("/review/default_mode".to_owned(), Some(json!(mode)))
             }
-            Self::ReviewLightExecution { config } => {
-                ("/review/light".to_owned(), Some(json!(config)))
-            }
-            Self::ReviewClaudeExecution { session_settings } => {
-                ("/review/claude".to_owned(), Some(json!(session_settings)))
-            }
-            Self::ReviewCodexExecution { session_settings } => {
-                ("/review/codex".to_owned(), Some(json!(session_settings)))
+            Self::ReviewReviewers { mode, reviewers } => {
+                let path = match mode {
+                    protocol::ReviewMode::Light => "/review/lite",
+                    protocol::ReviewMode::Deep => "/review/heavy",
+                };
+                (path.to_owned(), Some(json!(reviewers)))
             }
             Self::ReviewsEnabled { enabled } => {
                 ("/review/enabled".to_owned(), Some(json!(enabled)))
@@ -422,7 +415,7 @@ where
 #[tool_router]
 impl TydeConfigMcpServer {
     #[tool(
-        description = "List configured review aspects, the review enabled setting, and backend model/effort schemas. These are the same aspects shown in Settings → Review."
+        description = "List shared review aspects, independent Lite/Heavy reviewer lists, the default mode, the review enabled setting, and backend model/effort schemas. These are the same aspects shown in Settings → Review."
     )]
     async fn tyde_config_list_review_aspects(
         &self,
@@ -431,7 +424,7 @@ impl TydeConfigMcpServer {
         match self.host.read_settings().await {
             Ok(settings) => match self.host.review_session_schemas().await {
                 Ok(schemas) => ok_json(
-                    json!({ "enabled": settings.review.enabled, "aspects": settings.review.aspects, "default_mode": settings.review.default_mode, "light": settings.review.light, "claude": settings.review.claude, "codex": settings.review.codex, "session_schemas": schemas }),
+                    json!({ "enabled": settings.review.enabled, "aspects": settings.review.aspects, "default_mode": settings.review.default_mode, "lite": settings.review.lite, "heavy": settings.review.heavy, "session_schemas": schemas }),
                 ),
                 Err(err) => Ok(err_text(err)),
             },

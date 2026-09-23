@@ -13407,42 +13407,53 @@ impl HostHandle {
         {
             return Err("Add and enable review aspects in Settings → Review first".to_owned());
         }
+        if request.backend_kind.is_some() {
+            return Err("Per-run review backend overrides are no longer supported; configure reviewers in Settings → Review".to_owned());
+        }
+        let reviewers = match mode {
+            protocol::ReviewMode::Light => settings.review.lite,
+            protocol::ReviewMode::Deep => settings.review.heavy,
+        };
         let mut assignments = Vec::new();
-        match mode {
-            protocol::ReviewMode::Light => {
-                let config = if configured {
-                    settings.review.light
-                } else {
-                    settings_model::ReviewExecutionConfig {
-                        backend_kind: self
-                            .resolve_ai_reviewer_backend_kind(request.backend_kind)
-                            .await?,
-                        session_settings: Default::default(),
-                    }
-                };
-                assignments.push(("AI Review".to_owned(), aspects, config));
-            }
-            protocol::ReviewMode::Deep => {
-                for aspect in aspects {
-                    for (backend_kind, session_settings, label) in [
-                        (BackendKind::Claude, &settings.review.claude, "Claude"),
-                        (BackendKind::Codex, &settings.review.codex, "Codex"),
-                    ] {
+        for reviewer in reviewers {
+            let config = match &reviewer.target {
+                protocol::ReviewReviewerTarget::Default => settings_model::ReviewExecutionConfig {
+                    backend_kind: settings
+                        .default_backend
+                        .or_else(|| settings.enabled_backends.first().copied())
+                        .ok_or_else(|| {
+                            "Review requires a host default backend or enabled backend".to_owned()
+                        })?,
+                    session_settings: Default::default(),
+                },
+                protocol::ReviewReviewerTarget::Explicit {
+                    backend_kind,
+                    session_settings,
+                } => settings_model::ReviewExecutionConfig {
+                    backend_kind: *backend_kind,
+                    session_settings: session_settings.clone(),
+                },
+            };
+            match mode {
+                protocol::ReviewMode::Light => {
+                    assignments.push((reviewer.name.clone(), aspects.clone(), reviewer, config))
+                }
+                protocol::ReviewMode::Deep => {
+                    for aspect in &aspects {
                         assignments.push((
-                            format!("{} · {label}", aspect.name),
+                            format!("{} · {}", aspect.name, reviewer.name),
                             vec![aspect.clone()],
-                            settings_model::ReviewExecutionConfig {
-                                backend_kind,
-                                session_settings: session_settings.clone(),
-                            },
+                            reviewer.clone(),
+                            config.clone(),
                         ));
                     }
                 }
             }
         }
         tracing::info!(review_id = %request.review_id, snapshot_id = %request.snapshot_id, ?mode, assignment_count = assignments.len(), "launching aspect review snapshot");
+        let enabled_backends = &settings.enabled_backends;
         let results = futures_util::future::join_all(assignments.into_iter().map(
-            |(name, aspects, config)| async move {
+            |(name, aspects, reviewer, config)| async move {
                 let mut instructions = aspects
                     .iter()
                     .map(|a| format!("## {}\n{}", a.name, a.instructions))
@@ -13452,10 +13463,19 @@ impl HostHandle {
                     instructions.push_str("\n\nAdditional instructions:\n");
                     instructions.push_str(extra);
                 }
-                let result = self
-                    .spawn_ai_reviewer_member(request, &name, &instructions, &config)
-                    .await;
+                let result = if enabled_backends.contains(&config.backend_kind) {
+                    self.spawn_ai_reviewer_member(request, &name, &instructions, &config)
+                        .await
+                } else {
+                    Err(format!(
+                        "Review backend {:?} is not enabled",
+                        config.backend_kind
+                    ))
+                };
                 protocol::ReviewReviewerRun {
+                    reviewer_id: Some(reviewer.id),
+                    target: Some(reviewer.target),
+                    session_settings: config.session_settings,
                     aspects,
                     name,
                     backend_kind: config.backend_kind,
@@ -13471,6 +13491,7 @@ impl HostHandle {
         ))
         .await;
         if !configured
+            && results.len() == 1
             && request.requested_by.is_none()
             && let Some(error) = results.first().and_then(|r| r.error.clone())
         {

@@ -81,6 +81,7 @@ impl HostSettingsStore {
         // unrecognized backend kinds and would drop "kiro" rather than rename
         // it.
         Self::migrate_review_aspects(&path)?;
+        Self::migrate_reviewers(&path)?;
         Self::migrate_legacy_kiro_settings(&path)?;
         Self::migrate_legacy_gemini_settings(&path)?;
         Self::migrate_launch_profiles_to_map(&path)?;
@@ -225,6 +226,74 @@ impl HostSettingsStore {
         }
         tracing::info!("converted review agent definitions to backend-independent aspects");
         Self::save_raw(path, &value)
+    }
+
+    fn migrate_reviewers(path: &Path) -> Result<(), String> {
+        let contents = match std::fs::read_to_string(path) {
+            Ok(contents) => contents,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(format!("Cannot read review settings: {error}")),
+        };
+        let mut value: Value = serde_json::from_str(&contents).map_err(|e| e.to_string())?;
+        let Some(review) = value
+            .pointer_mut("/settings/review")
+            .and_then(Value::as_object_mut)
+        else {
+            return Ok(());
+        };
+        let before = review.clone();
+        let light = review.remove("light");
+        let claude = review.remove("claude");
+        let codex = review.remove("codex");
+        let default =
+            serde_json::to_value(settings_model::default_reviewers()).map_err(|e| e.to_string())?;
+        if !review.contains_key("lite") {
+            let lite = match light {
+                Some(config)
+                    if config.get("backend_kind") != Some(&serde_json::json!("codex"))
+                        || config
+                            .get("session_settings")
+                            .is_some_and(|v| v != &serde_json::json!({})) =>
+                {
+                    let mut target = config
+                        .as_object()
+                        .cloned()
+                        .ok_or("Invalid legacy Lite configuration")?;
+                    target.insert("kind".to_owned(), serde_json::json!("explicit"));
+                    serde_json::json!([{ "id": "legacy-light", "name": "AI Review", "target": target }])
+                }
+                _ => default.clone(),
+            };
+            review.insert("lite".to_owned(), lite);
+        } else if light.is_some() {
+            return Err(
+                "Review settings contain both legacy light and lite configurations".to_owned(),
+            );
+        }
+        if !review.contains_key("heavy") {
+            let customized = [&claude, &codex]
+                .into_iter()
+                .flatten()
+                .any(|v| v != &serde_json::json!({}));
+            let heavy = if customized {
+                serde_json::json!([
+                    { "id": "legacy-claude", "name": "Claude", "target": { "kind": "explicit", "backend_kind": "claude", "session_settings": claude.unwrap_or_else(|| serde_json::json!({})) } },
+                    { "id": "legacy-codex", "name": "Codex", "target": { "kind": "explicit", "backend_kind": "codex", "session_settings": codex.unwrap_or_else(|| serde_json::json!({})) } }
+                ])
+            } else {
+                default
+            };
+            review.insert("heavy".to_owned(), heavy);
+        } else if claude.is_some() || codex.is_some() {
+            return Err(
+                "Review settings contain both legacy provider and heavy configurations".to_owned(),
+            );
+        }
+        if *review != before {
+            tracing::info!("converted review execution settings to independent reviewer lists");
+            Self::save_raw(path, &value)?;
+        }
+        Ok(())
     }
 
     fn migrate_legacy_gemini_settings(path: &Path) -> Result<(), String> {
@@ -707,6 +776,23 @@ fn empty_settings() -> HostSettings {
 }
 
 fn validate_settings(settings: HostSettings) -> Result<HostSettings, String> {
+    for (mode, reviewers) in [
+        ("Lite", &settings.review.lite),
+        ("Heavy", &settings.review.heavy),
+    ] {
+        if reviewers.is_empty() {
+            return Err(format!("{mode} requires at least one reviewer"));
+        }
+        let mut ids = std::collections::HashSet::new();
+        for reviewer in reviewers {
+            if reviewer.id.0.trim().is_empty() || reviewer.name.trim().is_empty() {
+                return Err(format!("{mode} reviewers require an id and name"));
+            }
+            if !ids.insert(&reviewer.id) {
+                return Err(format!("{mode} reviewer ids must be unique"));
+            }
+        }
+    }
     for (id, reviewer) in &settings.review.aspects {
         if id.trim().is_empty()
             || reviewer.name.trim().is_empty()

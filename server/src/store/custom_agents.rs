@@ -864,13 +864,15 @@ projects at once.
   customize every plain chat), **Orchestrator** (coordinates multi-backend
   plan/implement/review workflows), and **Help** (you).
 - **Review aspects.** Settings → Review defines backend-independent focus
-  instructions. Light mode uses one agent for all enabled aspects; deep mode
-  uses independent Claude and Codex reviewers per aspect. Shared model/effort
-  settings live at /review/light, /review/claude, and /review/codex. Set the
-  default mode at /review/default_mode. The `tyde_config_set_setting` variants
-  are `review_default_mode` (mode), `review_light_execution` (config with
-  backend_kind and session_settings), `review_claude_execution` and
-  `review_codex_execution` (session_settings). Use
+  instructions. Lite mode runs each configured reviewer on all enabled aspects;
+  Heavy runs each reviewer separately per enabled aspect. Independent reviewer
+  lists live at /review/lite and /review/heavy; both initially contain one
+  reviewer inheriting the default backend and its settings at launch. Set the
+  default mode at /review/default_mode (wire values light or deep). The
+  `tyde_config_set_setting` variants are `review_default_mode` (mode) and
+  `review_reviewers` (mode, reviewers). Each reviewer has a stable id, name,
+  and target: {kind: "default"} or {kind: "explicit", backend_kind,
+  session_settings}. Multiple entries may use the same backend. Use
   `tyde_config_list_review_aspects`, `tyde_config_upsert_review_aspect`, and
   `tyde_config_delete_review_aspect` to manage them. Use `reviews_enabled` in
   `tyde_config_set_setting` for the master switch. Never run a paid review just

@@ -3678,7 +3678,7 @@ async fn rehydrate_status_variants_and_subscribe_terminal_reviews() {
             ReviewAiReviewerStatus::Idle,
         ),
     ];
-    let records = reviews
+    let mut records = reviews
         .iter()
         .map(|review| {
             (
@@ -3687,6 +3687,12 @@ async fn rehydrate_status_variants_and_subscribe_terminal_reviews() {
             )
         })
         .collect::<serde_json::Map<_, _>>();
+    records.get_mut(SUBMITTED_ID).unwrap()["ai_reviewer"]["rounds"] = json!([{
+        "mode": "deep", "id": "legacy-round", "snapshot_id": "legacy-snapshot",
+        "scope": {"kind": "working_tree"}, "started_at_ms": 1, "requested_by": null,
+        "reviewers": [{"name": "Legacy reviewer", "backend_kind": "claude", "agent_id": null,
+            "status": "completed", "error": null}]
+    }]);
     fs::write(
         &reviews_path,
         serde_json::to_vec_pretty(&json!({ "records": records })).expect("reviews store JSON"),
@@ -3697,6 +3703,14 @@ async fn rehydrate_status_variants_and_subscribe_terminal_reviews() {
     for review in reviews {
         let snapshot = subscribe_review(&mut client, &review.id).await;
         assert!(!snapshot.diffs.is_empty());
+        if review.id.0 == SUBMITTED_ID {
+            let legacy = &snapshot.ai_reviewer.rounds[0];
+            assert_eq!(legacy.mode, Some(protocol::ReviewMode::Deep));
+            assert_eq!(legacy.reviewers[0].name, "Legacy reviewer");
+            assert!(legacy.reviewers[0].reviewer_id.is_none());
+            assert!(legacy.reviewers[0].target.is_none());
+        }
+
         match review.id.0.as_str() {
             DRAFT_ID => {
                 assert_eq!(snapshot.status, ReviewStatus::Draft);
@@ -4202,8 +4216,15 @@ async fn review_mcp_call(
         }),
     )
     .await
-    .expect("bounded MCP call")
-    .expect("MCP response");
+    .expect("bounded MCP call");
+    let result = match result {
+        Ok(result) => result,
+        Err(rmcp::ServiceError::McpError(error)) => {
+            service.cancel().await.expect("close rejected MCP call");
+            return (true, json!(error.message));
+        }
+        Err(error) => panic!("MCP transport failed: {error}"),
+    };
     let text = result
         .content
         .iter()
@@ -4225,12 +4246,61 @@ async fn configured_reviews_are_awaited_without_injecting_parent_messages() {
             "disabled-legacy": { "name": "Disabled aspect", "description": "Preserved", "instructions": "Do not review this disabled focus", "backend_kind": "claude", "session_settings": {}, "enabled": false }
         }}
     }}).to_string()).await;
+    let review_settings = serde_json::to_value(&fixture.bootstrap.settings.review).unwrap();
+    assert_eq!(
+        review_settings["lite"][0]["target"]["kind"], "default",
+        "Migrated Lite must inherit the host default at launch"
+    );
+    assert_eq!(
+        review_settings["heavy"].as_array().map(Vec::len),
+        Some(1),
+        "Untouched Heavy must not retain the old provider pairing"
+    );
     let migrated = &fixture.bootstrap.settings.review.aspects;
     assert_eq!(
         migrated["disabled-legacy"].instructions,
         "Do not review this disabled focus"
     );
     assert!(!migrated["disabled-legacy"].enabled);
+
+    for customized in [false, true] {
+        let mut legacy = Fixture::new_with_settings_file(&json!({"settings": {
+            "enabled_backends": ["claude"], "default_backend": "claude",
+            "review": {"enabled": true, "default_mode": "deep", "aspects": {},
+                "light": {"backend_kind": if customized {"claude"} else {"codex"}, "session_settings": if customized {json!({"model": {"string": "sonnet"}})} else {json!({})}},
+                "claude": if customized {json!({"effort": {"string": "high"}})} else {json!({})}, "codex": {}}
+        }}).to_string()).await;
+        let before = serde_json::to_value(&legacy.bootstrap.settings.review).unwrap();
+        assert_eq!(
+            before["default_mode"], "deep",
+            "Migration preserves the selected mode, not the old execution pairing"
+        );
+        assert_eq!(
+            before["heavy"].as_array().unwrap().len(),
+            if customized { 2 } else { 1 }
+        );
+        assert_eq!(
+            before["lite"][0]["target"]["kind"],
+            if customized { "explicit" } else { "default" }
+        );
+        if customized {
+            assert_eq!(
+                before["lite"][0]["target"]["session_settings"]["model"]["string"],
+                "sonnet"
+            );
+            assert_eq!(
+                before["heavy"][0]["target"]["session_settings"]["effort"]["string"],
+                "high"
+            );
+            assert_eq!(before["lite"][0]["target"]["backend_kind"], "claude");
+        }
+        let after = legacy.restart_host().await;
+        assert_eq!(
+            serde_json::to_value(after.settings.review).unwrap(),
+            before,
+            "Settings migration must be idempotent across real host restarts"
+        );
+    }
 
     let mut client = fixture.connect().await;
     set_default_backend(&mut client, BackendKind::Claude).await;
@@ -4253,8 +4323,33 @@ async fn configured_reviews_are_awaited_without_injecting_parent_messages() {
         .expect("select deep reviews");
     expect_host_settings(&mut client, "default review depth").await;
     let config_url = fixture.config_mcp_http_url().await;
+    let (failed, _) = review_mcp_call(&config_url, None, "tyde_config_set_setting", json!({"setting": {"setting": "review_light_execution", "config": {"backend_kind": "claude", "session_settings": {}}}})).await;
+    assert!(
+        failed,
+        "Obsolete settings writes must fail visibly, not be dropped"
+    );
+    let heavy_reviewers = json!([
+        {"id": "heavy-claude", "name": "Claude", "target": {"kind": "explicit", "backend_kind": "claude", "session_settings": {}}},
+        {"id": "heavy-codex", "name": "Codex", "target": {"kind": "explicit", "backend_kind": "codex", "session_settings": {}}}
+    ]);
+    for invalid in [
+        json!([]),
+        json!([
+            {"id": "duplicate", "name": "One", "target": {"kind": "default"}},
+            {"id": "duplicate", "name": "Two", "target": {"kind": "default"}}
+        ]),
+        json!([{"id": "", "name": "Missing ID", "target": {"kind": "default"}}]),
+    ] {
+        let (failed, _) = review_mcp_call(&config_url, None, "tyde_config_set_setting", json!({"setting": {"setting": "review_reviewers", "mode": "deep", "reviewers": invalid}})).await;
+        assert!(
+            failed,
+            "Invalid reviewer lists must fail without altering settings"
+        );
+    }
+    let (failed, _) = review_mcp_call(&config_url, None, "tyde_config_set_setting", json!({"setting": {"setting": "review_reviewers", "mode": "deep", "reviewers": heavy_reviewers}})).await;
+    assert!(!failed, "Help must configure Heavy independently");
     let mut definitions = Vec::new();
-    for name in ["Tests", "Comments"] {
+    for name in ["Tests", "Comments", "Scope"] {
         let reviewer = json!({ "name": name, "description": "Focused review", "instructions": format!("Review {name} only"), "enabled": true });
         let (failed, created) = review_mcp_call(
             &config_url,
@@ -4284,7 +4379,7 @@ async fn configured_reviews_are_awaited_without_injecting_parent_messages() {
     )
     .await;
     assert!(!failed);
-    assert_eq!(listed["aspects"].as_object().unwrap().len(), 3);
+    assert_eq!(listed["aspects"].as_object().unwrap().len(), 4);
     let settings = expect_host_settings(&mut client, "review configuration fanout").await;
     assert!(
         !settings.settings.review.aspects.is_empty(),
@@ -4332,6 +4427,14 @@ async fn configured_reviews_are_awaited_without_injecting_parent_messages() {
                     &second_gate,
                 )),
             ),
+            (
+                "Review: Scope · Claude".to_owned(),
+                MockScript::one(MockTurn::gated_text("Scope review", &second_gate)),
+            ),
+            (
+                "Review: Scope · Codex".to_owned(),
+                MockScript::one(MockTurn::gated_text("Scope review", &second_gate)),
+            ),
         ])
         .await;
     let (failed, started) = review_mcp_call(
@@ -4345,8 +4448,8 @@ async fn configured_reviews_are_awaited_without_injecting_parent_messages() {
     assert_eq!(started["status"], "running");
     assert_eq!(
         started["rounds"][0]["reviewers"].as_array().unwrap().len(),
-        4,
-        "Deep review must launch both backends for every enabled aspect"
+        6,
+        "Heavy must launch each configured reviewer for all three enabled aspects"
     );
     let mut observed = Vec::new();
     next_frame_matching_on(
@@ -4379,7 +4482,7 @@ async fn configured_reviews_are_awaited_without_injecting_parent_messages() {
                     observed.push(agent.name);
                 }
             }
-            observed.len() == 4
+            observed.len() == 6
         },
     )
     .await;
@@ -4389,7 +4492,7 @@ async fn configured_reviews_are_awaited_without_injecting_parent_messages() {
         .iter()
         .filter(|agent| agent.name.starts_with("Review: "))
         .collect::<Vec<_>>();
-    assert_eq!(reviewers.len(), 4);
+    assert_eq!(reviewers.len(), 6);
     for reviewer in reviewers {
         assert_eq!(reviewer.parent_agent_id.as_ref(), Some(&requester.agent_id));
     }
@@ -4409,7 +4512,7 @@ async fn configured_reviews_are_awaited_without_injecting_parent_messages() {
         .filter(|session| session.parent_id.as_ref() == Some(&requester_session))
         .count();
     assert_eq!(
-        children, 4,
+        children, 6,
         "Both reviewers must retain parent session lineage"
     );
     let (failed, children) = review_mcp_call(
@@ -4420,9 +4523,9 @@ async fn configured_reviews_are_awaited_without_injecting_parent_messages() {
     )
     .await;
     assert!(!failed);
-    assert_eq!(children.as_array().map(Vec::len), Some(4));
+    assert_eq!(children.as_array().map(Vec::len), Some(6));
     let round = &started["rounds"][0];
-    assert_eq!(round["reviewers"].as_array().unwrap().len(), 4);
+    assert_eq!(round["reviewers"].as_array().unwrap().len(), 6);
     assert_eq!(round["mode"], "deep");
     for reviewer in round["reviewers"].as_array().unwrap() {
         assert_eq!(reviewer["aspects"].as_array().unwrap().len(), 1);
@@ -4471,6 +4574,8 @@ async fn configured_reviews_are_awaited_without_injecting_parent_messages() {
     next_frame_matching_on(&mut client, "one reviewer complete while the other still runs", |env| {
         env.kind == FrameKind::ReviewEvent && matches!(env.parse_payload::<ReviewEventPayload>(), Ok(ReviewEventPayload::AiReviewerChanged { state }) if state.status == ReviewAiReviewerStatus::Running && state.rounds.last().is_some_and(|r| r.reviewers.iter().filter(|a| a.status == ReviewAiReviewerStatus::Completed).count() == 1))
     }).await;
+    second_gate.release_one();
+    second_gate.release_one();
     second_gate.release_one();
     second_gate.release_one();
     second_gate.release_one();
@@ -4538,7 +4643,7 @@ async fn configured_reviews_are_awaited_without_injecting_parent_messages() {
     );
     assert_eq!(
         feedback["rounds"][0]["reviewers"].as_array().map(Vec::len),
-        Some(4)
+        Some(6)
     );
     let mut observer = fixture.connect().await;
     let completed = subscribe_review(&mut observer, &review.id).await;
@@ -4584,6 +4689,14 @@ async fn configured_reviews_are_awaited_without_injecting_parent_messages() {
             ),
             (
                 "Review: Comments · Codex".to_owned(),
+                MockScript::one(MockTurn::gated_text("No issues", &next_comments_gate)),
+            ),
+            (
+                "Review: Scope · Claude".to_owned(),
+                MockScript::one(MockTurn::gated_text("No issues", &next_comments_gate)),
+            ),
+            (
+                "Review: Scope · Codex".to_owned(),
                 MockScript::one(MockTurn::gated_text("No issues", &next_comments_gate)),
             ),
         ])
@@ -4638,6 +4751,8 @@ async fn configured_reviews_are_awaited_without_injecting_parent_messages() {
     next_comments_gate.release_one();
     next_comments_gate.release_one();
     next_comments_gate.release_one();
+    next_comments_gate.release_one();
+    next_comments_gate.release_one();
     let (failed, awaited) = wait.await;
     assert!(!failed);
     assert_eq!(awaited["status"], "completed");
@@ -4679,7 +4794,7 @@ async fn configured_reviews_are_awaited_without_injecting_parent_messages() {
             .iter()
             .filter(|r| r["status"] == "failed" && r["backend_kind"] == "codex")
             .count(),
-        2,
+        3,
         "Each missing Codex review must remain visible"
     );
     let (failed, awaited) = review_mcp_call(
@@ -4789,6 +4904,14 @@ async fn configured_reviews_are_awaited_without_injecting_parent_messages() {
                 "Review: Comments · Codex".to_owned(),
                 MockScript::one(MockTurn::held_text("Waiting for cancellation")),
             ),
+            (
+                "Review: Scope · Claude".to_owned(),
+                MockScript::one(MockTurn::held_text("Waiting for cancellation")),
+            ),
+            (
+                "Review: Scope · Codex".to_owned(),
+                MockScript::one(MockTurn::held_text("Waiting for cancellation")),
+            ),
         ])
         .await;
     let (failed, fourth) = review_mcp_call(
@@ -4857,15 +4980,28 @@ async fn configured_reviews_are_awaited_without_injecting_parent_messages() {
     }
     drop(stop_reservation);
 
-    let (failed, _) = review_mcp_call(&config_url, None, "tyde_config_set_setting", json!({"setting": {"setting": "review_light_execution", "config": {"backend_kind": "claude", "session_settings": {"model": {"string": "sonnet"}, "effort": {"string": "high"}}}}})).await;
-    assert!(!failed, "Help must configure shared execution settings");
+    let lite_reviewers = json!([
+        {"id": "lite-sonnet", "name": "AI Review", "target": {"kind": "explicit", "backend_kind": "claude", "session_settings": {"model": {"string": "sonnet"}, "effort": {"string": "high"}}}},
+        {"id": "lite-opus", "name": "Second reviewer", "target": {"kind": "explicit", "backend_kind": "claude", "session_settings": {"model": {"string": "opus"}}}}
+    ]);
+    let (failed, _) = review_mcp_call(&config_url, None, "tyde_config_set_setting", json!({"setting": {"setting": "review_reviewers", "mode": "light", "reviewers": lite_reviewers}})).await;
+    assert!(
+        !failed,
+        "Help must configure independent Lite execution settings"
+    );
     expect_host_settings(&mut client, "shared light execution").await;
     let light_gate = MockGateHandle::new();
     let light_reservation = fixture
-        .reserve_next_mock_launch(
-            "AI Review",
-            MockScript::one(MockTurn::gated_echo(&light_gate)),
-        )
+        .reserve_mock_launches(vec![
+            (
+                "AI Review".to_owned(),
+                MockScript::one(MockTurn::gated_echo(&light_gate)),
+            ),
+            (
+                "Review: Second reviewer".to_owned(),
+                MockScript::one(MockTurn::gated_echo(&light_gate)),
+            ),
+        ])
         .await;
     let (failed, light) = review_mcp_call(
         &caller.url,
@@ -4877,14 +5013,30 @@ async fn configured_reviews_are_awaited_without_injecting_parent_messages() {
     assert!(!failed, "Light override must work with a deep default");
     let light_round = light["rounds"].as_array().unwrap().last().unwrap();
     assert_eq!(light_round["mode"], "light");
-    assert_eq!(light_round["reviewers"].as_array().unwrap().len(), 1);
+    assert_eq!(light_round["reviewers"].as_array().unwrap().len(), 2);
     let assigned = light_round["reviewers"][0]["aspects"].as_array().unwrap();
     assert_eq!(
         assigned.len(),
-        2,
-        "One light reviewer receives both enabled aspects"
+        3,
+        "Each Lite reviewer receives all enabled aspects"
     );
     assert!(assigned.iter().all(|a| a["id"] != "disabled-legacy"));
+    for (index, model) in ["sonnet", "opus"].into_iter().enumerate() {
+        assert_eq!(
+            light_round["reviewers"][index]["aspects"]
+                .as_array()
+                .unwrap(),
+            assigned
+        );
+        assert_eq!(
+            light_round["reviewers"][index]["session_settings"]["model"]["string"],
+            model
+        );
+    }
+    assert_ne!(
+        light_round["reviewers"][0]["reviewer_id"],
+        light_round["reviewers"][1]["reviewer_id"]
+    );
     let (mut light_client, light_bootstrap) = fixture.connect_with_bootstrap().await;
     let light_agent = light_bootstrap
         .agents
@@ -4892,6 +5044,25 @@ async fn configured_reviews_are_awaited_without_injecting_parent_messages() {
         .find(|a| a.name == "AI Review")
         .unwrap();
     assert_eq!(light_agent.backend_kind, BackendKind::Claude);
+    let second_agent = light_bootstrap
+        .agents
+        .iter()
+        .find(|a| a.name == "Review: Second reviewer")
+        .unwrap();
+    assert_eq!(second_agent.backend_kind, BackendKind::Claude);
+    let mut second_client = fixture.connect().await;
+    let second_boot = next_frame_matching_on(&mut second_client, "second Lite model", |env| {
+        env.stream
+            .0
+            .starts_with(&format!("/agent/{}/", second_agent.agent_id))
+            && env.kind == FrameKind::AgentBootstrap
+    })
+    .await
+    .parse_payload::<protocol::AgentBootstrapPayload>()
+    .unwrap();
+    assert!(second_boot.events.iter().any(|event| matches!(event, AgentBootstrapEvent::SessionSettings(settings) if settings.values.0.get("model") == Some(&protocol::SessionSettingValue::String("opus".to_owned())))), "The second same-backend reviewer must actually launch with its own model");
+    drop(second_client);
+
     let boot_frame = next_frame_matching_on(
         &mut light_client,
         "light execution settings after launch",
@@ -4937,6 +5108,9 @@ async fn configured_reviews_are_awaited_without_injecting_parent_messages() {
         fs::read_to_string(manifest_path).unwrap() == manifest,
         "Editing an aspect cannot change a running review snapshot"
     );
+    let (failed, _) = review_mcp_call(&config_url, None, "tyde_config_set_setting", json!({"setting": {"setting": "review_reviewers", "mode": "light", "reviewers": [{"id": "inherited", "name": "AI Review", "target": {"kind": "default"}}]}})).await;
+    assert!(!failed);
+    light_gate.release_one();
     light_gate.release_one();
     let (failed, light_done) = review_mcp_call(
         &caller.await_url,
@@ -4968,7 +5142,140 @@ async fn configured_reviews_are_awaited_without_injecting_parent_messages() {
         retained["rounds"][0]["reviewers"].as_array().unwrap() == &historical,
         "Earlier rounds must retain the original aspect definitions"
     );
+    assert_eq!(
+        retained["rounds"].as_array().unwrap().last().unwrap()["reviewers"][0]["session_settings"]
+            ["model"]["string"],
+        "sonnet"
+    );
+    assert_eq!(
+        retained["rounds"].as_array().unwrap().last().unwrap()["reviewers"][1]["reviewer_id"],
+        "lite-opus"
+    );
     drop(light_reservation);
+    let inherited_gate = MockGateHandle::new();
+    let inherited_reservation = fixture
+        .reserve_next_mock_launch(
+            "AI Review",
+            MockScript::one(MockTurn::gated_echo(&inherited_gate)),
+        )
+        .await;
+    let (failed, inherited) = review_mcp_call(
+        &caller.url,
+        Some(&caller.authorization),
+        "tyde_request_review",
+        json!({"mode": "light"}),
+    )
+    .await;
+    assert!(!failed);
+    let inherited_round = inherited["rounds"].as_array().unwrap().last().unwrap();
+    assert_eq!(inherited_round["reviewers"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        inherited_round["reviewers"][0]["backend_kind"], "claude",
+        "Default reviewers inherit the non-Codex host default at launch"
+    );
+    assert_eq!(inherited_round["reviewers"][0]["target"]["kind"], "default");
+    assert_eq!(
+        inherited_round["reviewers"][0]["session_settings"],
+        json!({}),
+        "Default reviewers do not pin prior model settings"
+    );
+    let mut inherited_client = fixture.connect().await;
+    let inherited_id = inherited_round["reviewers"][0]["agent_id"]
+        .as_str()
+        .unwrap();
+    let inherited_boot =
+        next_frame_matching_on(&mut inherited_client, "inherited Lite settings", |env| {
+            env.stream.0.starts_with(&format!("/agent/{inherited_id}/"))
+                && env.kind == FrameKind::AgentBootstrap
+        })
+        .await
+        .parse_payload::<protocol::AgentBootstrapPayload>()
+        .unwrap();
+    assert!(inherited_boot.events.iter().any(|event| matches!(event, AgentBootstrapEvent::SessionSettings(settings) if settings.values.0.is_empty())), "Default launch must inherit backend settings without the previous explicit model or effort");
+    drop(inherited_client);
+    inherited_gate.release_one();
+    let (failed, done) = review_mcp_call(
+        &caller.await_url,
+        Some(&caller.authorization),
+        "tyde_await_review",
+        json!({"review_id": review.id, "round_id": inherited_round["id"]}),
+    )
+    .await;
+    assert!(!failed);
+    assert_eq!(done["status"], "completed");
+    drop(inherited_reservation);
+    let same_backend_heavy = json!([
+        {"id": "heavy-sonnet", "name": "Heavy sonnet", "target": {"kind": "explicit", "backend_kind": "claude", "session_settings": {"model": {"string": "sonnet"}}}},
+        {"id": "heavy-opus", "name": "Heavy opus", "target": {"kind": "explicit", "backend_kind": "claude", "session_settings": {"model": {"string": "opus"}}}}
+    ]);
+    let (failed, _) = review_mcp_call(&config_url, None, "tyde_config_set_setting", json!({"setting": {"setting": "review_reviewers", "mode": "deep", "reviewers": same_backend_heavy}})).await;
+    assert!(!failed);
+    let heavy_gate = MockGateHandle::new();
+    let mut launches = Vec::new();
+    for aspect in ["Tests", "Comments", "Scope"] {
+        for name in ["Heavy sonnet", "Heavy opus"] {
+            launches.push((
+                format!("Review: {aspect} · {name}"),
+                MockScript::one(MockTurn::gated_echo(&heavy_gate)),
+            ));
+        }
+    }
+    let same_backend_reservation = fixture.reserve_mock_launches(launches).await;
+    let (failed, same_backend) = review_mcp_call(
+        &caller.url,
+        Some(&caller.authorization),
+        "tyde_request_review",
+        json!({}),
+    )
+    .await;
+    assert!(!failed);
+    let same_backend_round = same_backend["rounds"].as_array().unwrap().last().unwrap();
+    assert_eq!(same_backend_round["mode"], "deep");
+    let members = same_backend_round["reviewers"].as_array().unwrap();
+    assert_eq!(
+        members.len(),
+        6,
+        "Heavy must not hardcode a provider pairing"
+    );
+    for member in members {
+        assert_eq!(member["backend_kind"], "claude");
+        assert_eq!(member["aspects"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            member["session_settings"]["model"]["string"],
+            if member["reviewer_id"] == "heavy-sonnet" {
+                "sonnet"
+            } else {
+                "opus"
+            }
+        );
+        heavy_gate.release_one();
+    }
+    let (failed, done) = review_mcp_call(
+        &caller.await_url,
+        Some(&caller.authorization),
+        "tyde_await_review",
+        json!({"review_id": review.id, "round_id": same_backend_round["id"]}),
+    )
+    .await;
+    assert!(!failed);
+    assert_eq!(done["status"], "completed");
+    drop(same_backend_reservation);
+    let (failed, configured) = review_mcp_call(
+        &config_url,
+        None,
+        "tyde_config_list_review_aspects",
+        json!({}),
+    )
+    .await;
+    assert!(!failed);
+    assert_eq!(
+        configured["lite"][0]["target"]["kind"], "default",
+        "Heavy edits must leave Lite unchanged"
+    );
+    let (failed, _) = review_mcp_call(&config_url, None, "tyde_config_set_setting", json!({"setting": {"setting": "review_reviewers", "mode": "deep", "reviewers": heavy_reviewers}})).await;
+    assert!(!failed);
+    drop(client);
+    let mut client = fixture.connect().await;
 
     let max_depth = settings.settings.tyde_agent_control_max_depth;
     client
@@ -5024,7 +5331,17 @@ async fn configured_reviews_are_awaited_without_injecting_parent_messages() {
         json!({}),
     )
     .await;
-    assert_eq!(remaining["aspects"].as_object().unwrap().len(), 2);
+    assert_eq!(remaining["aspects"].as_object().unwrap().len(), 3);
+    assert!(
+        remaining["aspects"]
+            .get(definitions[1]["aspect_id"].as_str().unwrap())
+            .is_none()
+    );
+    assert!(
+        remaining["aspects"]
+            .get(definitions[2]["aspect_id"].as_str().unwrap())
+            .is_some()
+    );
 
     let (failed, _) = review_mcp_call(
         &config_url,
@@ -5073,6 +5390,13 @@ async fn configured_reviews_are_awaited_without_injecting_parent_messages() {
         |env| env.stream == requester_stream && env.kind == FrameKind::AgentBootstrap,
     )
     .await;
+    drop(observer);
+    let mut observer = fixture.connect().await;
+    let before_parent_close = subscribe_review(&mut observer, &review.id).await;
+    assert_eq!(
+        before_parent_close.ai_reviewer.status,
+        ReviewAiReviewerStatus::Running
+    );
     closing_client
         .close_agent(&requester_stream)
         .await

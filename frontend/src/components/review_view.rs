@@ -236,28 +236,14 @@ pub(crate) fn ReviewSidebar(
         move || !submit_reason().is_empty()
     };
 
-    // ── Run AI reviewer form
-    //
-    // `backend_pick` is an *explicit override*. The AI reviewer otherwise
-    // runs against the effective default backend so the user never has to
-    // pick: explicit override → `host_settings.default_backend` → first
-    // enabled backend. Only when the host has no enabled backends at all is
-    // there nothing to run.
-    let backend_pick: RwSignal<Option<BackendKind>> = RwSignal::new(None);
     let cost_pick: RwSignal<Option<protocol::SpawnCostHint>> = RwSignal::new(None);
     let instructions: RwSignal<String> = RwSignal::new(String::new());
-
-    let eff_backend_state = state.clone();
-    let eff_backend_host = host_id.clone();
-    let effective_backend: Memo<Option<BackendKind>> = Memo::new(move |_| {
-        backend_pick.get().or_else(|| {
-            eff_backend_state.host_settings_by_host.with(|map| {
-                map.get(&eff_backend_host).and_then(|s| {
-                    s.default_backend
-                        .or_else(|| s.enabled_backends.first().copied())
-                })
-            })
-        })
+    let settings_state = state.clone();
+    let settings_host = host_id.clone();
+    let settings_ready = Memo::new(move |_| {
+        settings_state
+            .host_settings_by_host
+            .with(|m| m.contains_key(&settings_host))
     });
 
     let host_for_submit = host_id.clone();
@@ -459,8 +445,8 @@ pub(crate) fn ReviewSidebar(
             if !can_run_ai.map(|m| m.get()).unwrap_or(true) {
                 return "No reviewable changes";
             }
-            if effective_backend.get().is_none() {
-                return "No AI backend available";
+            if !settings_ready.get() {
+                return "Waiting for review settings";
             }
             if action_pending().start_ai {
                 return "AI reviewer starting\u{2026}";
@@ -489,15 +475,6 @@ pub(crate) fn ReviewSidebar(
             log::info!("review.start_ai.skipped review={rid} reason=no_reviewable_changes");
             return;
         }
-        // Gate on there being *some* runnable backend (else nothing to do),
-        // but resolve the default server-side: send the explicit picker
-        // override when chosen, else `None` so the host applies its
-        // `default_backend` (or first enabled).
-        if effective_backend.get_untracked().is_none() {
-            log::info!("review.start_ai.skipped review={rid} reason=no_backend");
-            return;
-        }
-        let backend_override = backend_pick.get_untracked();
         let host = host_for_ai.clone();
         let cost = cost_pick.get_untracked();
         let inst = {
@@ -531,11 +508,10 @@ pub(crate) fn ReviewSidebar(
             }
         });
         log::info!(
-            "review.start_ai.click review={} claimed={} gate_before_start_ai={} backend_override={:?} cost={:?} instructions_len={} ai_status={} {}",
+            "review.start_ai.click review={} claimed={} gate_before_start_ai={} cost={:?} instructions_len={} ai_status={} {}",
             rid,
             claimed,
             gate_before.start_ai,
-            backend_override,
             cost,
             inst_len,
             ai_status,
@@ -549,7 +525,7 @@ pub(crate) fn ReviewSidebar(
         spawn_local(async move {
             let payload = ReviewActionPayload::StartAiReview {
                 mode: review_mode.get_untracked(),
-                backend_kind: backend_override,
+                backend_kind: None,
                 cost_hint: cost,
                 instructions: inst,
                 scope: protocol::ReviewAiScope::WorkingTree,
@@ -576,21 +552,6 @@ pub(crate) fn ReviewSidebar(
         });
     };
 
-    // Backends list — read from host settings if available.
-    let backends_state = state.clone();
-    let host_for_backends = host_id.clone();
-    let backends = move || -> Vec<BackendKind> {
-        backends_state
-            .host_settings_by_host
-            .with(|map| {
-                map.get(&host_for_backends)
-                    .map(|s| s.enabled_backends.clone())
-            })
-            .unwrap_or_default()
-    };
-
-    // Independent backend reader for the submit-target picker (the AI
-    // form already consumed the `backends` closure, which isn't `Copy`).
     let target_backends_state = state.clone();
     let host_for_target_backends = host_id.clone();
     let target_backends = move || -> Vec<BackendKind> {
@@ -800,16 +761,11 @@ pub(crate) fn ReviewSidebar(
             <crate::notices::InlineNotices scopes=vec![crate::notices::NoticeScope::Review(host_id.clone(), review_id.clone())] />
             <div class="review-sidebar-section">
                 <ReviewModePicker selection=review_mode />
-                <p class="review-round-note">{move || configuration.get().map(|s| {
-                    let count = s.aspects.values().filter(|a| a.enabled).count();
-                    let mode = review_mode.get().unwrap_or(s.default_mode);
-                    format!("{} review · {} aspects · {} agents", mode.label(), count, if mode == protocol::ReviewMode::Deep { count * 2 } else { 1 })
-                })}</p>
                 <div class="review-ai-row">
                     <button
                         class="review-btn primary review-run-ai-btn"
                         data-test="review-run-ai"
-                        disabled=move || ai_disabled() || configuration.get().is_some_and(|s| !s.enabled || (!s.aspects.is_empty() && !s.aspects.values().any(|a| a.enabled)))
+                        disabled=move || ai_disabled() || configuration.get().is_some_and(|s| !s.enabled)
                         title=ai_reason
                         on:click=move |ev| {
                             // Opening the disclosure on Run is a UX nicety —
@@ -840,7 +796,6 @@ pub(crate) fn ReviewSidebar(
                     <p class="review-round-note">"Aspects and execution settings are configured in Settings → Review."</p>
                 </Show>
                 <details
-                    style:display=move || if configuration.get().is_some_and(|s| !s.aspects.is_empty()) { "none" } else { "" }
                     class="review-ai-disclosure"
                     prop:open=ai_open_attr
                     on:toggle=move |ev: leptos::ev::Event| {
@@ -852,32 +807,9 @@ pub(crate) fn ReviewSidebar(
                 >
                     <summary class="review-ai-disclosure-summary">
                         <span class="fe-chevron">{ai_chevron}</span>
-                        "Configure AI reviewer"
+                        "Additional review instructions"
                     </summary>
                     <div class="review-ai-disclosure-body">
-                        <select
-                            class="review-backend-select"
-                            aria-label="Review backend"
-                            on:change=move |ev| {
-                                let val = event_target_value(&ev);
-                                backend_pick.set(parse_backend_kind(&val));
-                            }
-                        >
-                            <option value="" selected=move || backend_pick.get().is_none()>
-                                {move || match effective_backend.get() {
-                                    Some(kind) if backend_pick.get().is_none() => {
-                                        format!("Default ({})", backend_kind_label(kind))
-                                    }
-                                    _ => "Use default backend".to_owned(),
-                                }}
-                            </option>
-                            {move || backends().into_iter().map(|kind| {
-                                let label = backend_kind_label(kind);
-                                view! {
-                                    <option value={label}>{label}</option>
-                                }
-                            }).collect::<Vec<_>>()}
-                        </select>
                         <select
                             class="review-cost-select"
                             on:change=move |ev| {
@@ -3188,11 +3120,8 @@ mod wasm_tests {
         assert!(txt.contains("1 AI"), "expected '1 AI' in: {txt}");
     }
 
-    /// AI review uses the host's default backend automatically — the user no
-    /// longer has to choose one first. Run AI is disabled only when the host
-    /// has *no* enabled backend (nothing to run); once a default backend
-    /// exists it enables without any explicit picker choice. We assert via
-    /// the `disabled` attribute, which is user-perceived.
+    /// Wait for settings, then let the server resolve reviewer readiness.
+    /// The UI cannot gate explicit reviewer lists on the host default backend.
     #[wasm_bindgen_test]
     async fn run_ai_uses_default_backend_without_explicit_pick() {
         ensure_styles_loaded();
@@ -3203,12 +3132,12 @@ mod wasm_tests {
         next_tick().await;
         next_tick().await;
 
-        // No enabled backends yet ⇒ nothing to run, button disabled.
+        // Settings have not arrived yet: the action waits for the server snapshot.
         let run_btn =
             find_button_by_text(&container, "Run AI reviewer").expect("run AI button rendered");
         assert!(
             run_btn.has_attribute("disabled"),
-            "Run AI must be disabled when the host has no enabled backend"
+            "Run AI must wait for the host settings snapshot"
         );
 
         // Seed host settings with a default backend. No explicit picker choice.
@@ -4189,15 +4118,15 @@ mod wasm_tests {
         );
     }
 
-    /// An explicit picker selection overrides the default: the chosen backend
-    /// is sent as `Some(kind)` even when it differs from the host default.
+    // Per-run provider overrides now contradict the configured reviewer lists.
+    // Keep the host-default-versus-explicit-choice regression by checking that
+    // this surface cannot replace the server's mode configuration at launch.
     #[wasm_bindgen_test]
-    async fn run_ai_sends_some_backend_when_explicitly_picked() {
+    async fn run_ai_preserves_configured_reviewers_without_backend_override() {
         ensure_styles_loaded();
         record_bridge();
         let container = make_container();
         let holder = mount_sidebar(container.clone(), make_review());
-        // Host default is Antigravity; the user explicitly picks Codex.
         seed_host_settings(
             &holder.borrow().clone().unwrap(),
             Some(BackendKind::Antigravity),
@@ -4205,28 +4134,28 @@ mod wasm_tests {
         );
         next_tick().await;
         next_tick().await;
-
-        // Depth and backend share styling, but only the backend picker offers Codex.
-        let select = container
-            .query_selector("[aria-label='Review backend']")
-            .unwrap()
-            .expect("backend select rendered");
-        let select: web_sys::HtmlSelectElement = select.dyn_into().unwrap();
-        select.set_value("Codex");
-        let ev = web_sys::Event::new("change").unwrap();
-        select.dispatch_event(&ev).unwrap();
-        next_tick().await;
-
-        let run_btn =
-            find_button_by_text(&container, "Run AI reviewer").expect("run AI button rendered");
-        run_btn.click();
-        next_tick().await;
-
-        let sent = sent_lines_joined();
         assert!(
-            sent.contains("\"backend_kind\":\"codex\""),
-            "an explicit pick must send the chosen backend as Some(kind); \
-             sent: {sent}"
+            container
+                .query_selector("[aria-label='Review backend']")
+                .unwrap()
+                .is_none(),
+            "Backend choices belong to the independent mode lists, not this launch form"
+        );
+        let mode = container
+            .query_selector("[aria-label='Review depth']")
+            .unwrap()
+            .unwrap();
+        let labels = mode.text_content().unwrap();
+        assert!(labels.contains("Lite") && labels.contains("Heavy"));
+        find_button_by_text(&container, "Run AI reviewer")
+            .unwrap()
+            .click();
+        next_tick().await;
+        let sent = sent_lines_joined();
+        assert!(sent.contains("start_ai_review"));
+        assert!(
+            !sent.contains("\"backend_kind\""),
+            "Review launch must preserve the server-owned reviewer lists"
         );
     }
 
@@ -4497,8 +4426,8 @@ pub(crate) fn ReviewModePicker(selection: RwSignal<Option<protocol::ReviewMode>>
             prop:value=move || match selection.get() { None => "", Some(protocol::ReviewMode::Light) => "light", Some(protocol::ReviewMode::Deep) => "deep" }
             on:change=move |ev| selection.set(match event_target_value(&ev).as_str() { "light" => Some(protocol::ReviewMode::Light), "deep" => Some(protocol::ReviewMode::Deep), _ => None })>
             <option value="">"Default review depth"</option>
-            <option value="light">"Light · one agent, all aspects"</option>
-            <option value="deep">"Deep · Claude + Codex per aspect"</option>
+            <option value="light">"Lite · each reviewer covers all aspects"</option>
+            <option value="deep">"Heavy · each reviewer per aspect"</option>
         </select>
     }
 }

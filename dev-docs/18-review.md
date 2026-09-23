@@ -256,9 +256,10 @@ success.
 `ClearComments` explicitly resets comments/suggestions/AI state without
 delivering anything. `Cancel` remains deserializable for backcompat but new
 server/UI paths should not depend on it for lifecycle.
-`StartAiReview.backend_kind = None` asks the host to use
-`HostSettings.default_backend`, or the first enabled backend if no default is
-configured; `Some(kind)` remains an explicit override.
+`StartAiReview.backend_kind = None` uses the selected mode's configured
+reviewer list. Each reviewer either inherits the host default backend and its
+settings at launch or uses its explicit backend and settings. `Some(kind)` is
+rejected visibly; configure reviewers in Settings → Review instead.
 
 ### Anchor status
 
@@ -405,29 +406,45 @@ files, Git status, diffs, review comments, or review navigation.
 ### AI review
 
 `StartAiReview` and `tyde_request_review` accept optional `mode: light | deep`.
-Omitting it uses `/review/default_mode` (initially light). Host-scoped
-`/review/aspects` stores backend-independent names, descriptions, instructions,
-and enabled flags. `/review/light` selects the light backend and session
-settings; `/review/claude` and `/review/codex` hold deep session settings.
+The stable wire values display as **Lite** and **Heavy**, including history.
+Omitting mode uses `/review/default_mode` (initially Lite). Shared
+`/review/aspects` contains names, descriptions, instructions and enabled flags.
+Independent `/review/lite` and `/review/heavy` lists each initially contain one
+reviewer inheriting the host default backend and its current settings at launch.
+Each entry has a stable `id`, a `name`, and a typed `target`: `kind: default`,
+or `kind: explicit` with `backend_kind` and `session_settings`. Lists must be
+nonempty and IDs unique within each mode. Multiple entries can use the same
+backend with different models/settings. Help uses `review_reviewers` with
+`mode` and `reviewers` to replace a list.
 
-Light launches one `AI Review` agent with all enabled aspects. Deep launches
-one independent Claude and one independent Codex reviewer per enabled aspect,
-concurrently. The UI reports the resulting agent count; there is no concurrency
-cap. A missing backend remains a failed member, never silently reduced coverage.
-All members receive the same frozen diff snapshot. Each round records its mode,
-and each member records the exact aspect definitions it received. Prior records
-without this metadata remain readable and are displayed as Legacy.
+Lite launches one agent per reviewer, each receiving all enabled aspects.
+Heavy launches one agent per reviewer per enabled aspect: three aspects and
+two reviewers launch six agents. The server alone computes assignments; the
+UI does not predict counts or provider readiness. Heavy and agent-requested
+reviews require enabled aspects. Unconfigured manual Lite reviews still work.
+Per-run backend overrides are rejected visibly; edit the mode's reviewers
+instead. Additional instructions and cost hints remain available.
 
-Agent-requested members are children of the requester. Await waits for the whole
-round, and findings are read through tools, never injected into conversations.
-Manual reviews retain the accept-and-submit flow. Duplicate findings retain
-their independent reviewer identities.
+All members receive the same frozen diff snapshot. Each round records its mode;
+each member records its reviewer ID, selected target, resolved backend, session
+setting overrides and exact aspect definitions. Omitted settings continue to use
+backend defaults through the normal spawn path. Missing explicit backends fail
+visibly, never silently change provider or reduce required coverage. Historical
+records missing the new fields remain readable. Agent-requested members remain
+children of the requester. Await waits for the whole round, and findings are
+read through tools, never injected into conversations. Manual reviews retain
+the accept-and-submit flow and independent finding attribution.
 
-On startup, the settings store rewrites old `review.agents` definitions into
-`review.aspects`, retaining text and enabled flags but dropping per-aspect model
-and backend choices. The old configuration MCP names are replaced by
-`tyde_config_{list,upsert,delete}_review_aspect(s)`; clients must update together.
-Unconfigured manual light reviews retain the existing default-backend fallback.
+Before any typed settings read, startup migrates `review.agents` into aspects,
+then migrates legacy execution settings. Untouched Light (Codex, empty settings)
+and untouched Heavy (both empty) become singleton inherit-default lists, even
+when the old default mode was Heavy. Nondefault Light targets/settings remain
+explicit; customized Heavy retains its old Claude and Codex pair as ordinary
+entries. Explicitly selecting the old defaults is indistinguishable from never
+changing them and deliberately becomes inheritance. Aspect IDs, text, enabled
+flags and the selected default mode are retained. Migration is idempotent;
+obsolete setting writes fail rather than silently disappearing. Mixed legacy
+and new execution keys are rejected as ambiguous.
 
 Each spawn request uses:
 
@@ -502,8 +519,9 @@ target or retry.
   Older JSON with that extra field is ignored.
 - `ReviewSubscribePayload.include_diffs` defaults to `true`, so legacy
   subscribe payloads keep receiving full diffs.
-- `ReviewActionPayload::StartAiReview.backend_kind` is optional. Missing values
-  use the host default backend, then the first enabled backend.
+- `ReviewActionPayload::StartAiReview.backend_kind` remains optional for wire
+  compatibility. Missing values use the selected mode's configured reviewers;
+  explicit per-run backend overrides are rejected.
 - `ReviewActionPayload::Submit` requires an explicit `target`.
 - Active reviews normalize to `ReviewDiffSelection::Workspace { scope:
   Unstaged }`.

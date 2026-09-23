@@ -2364,7 +2364,7 @@ fn ReviewSettingsTab() -> impl IntoView {
             .map(|s| s.review)
     });
     let editor = RwSignal::new(None::<(String, settings_model::ReviewAspectConfig)>);
-    let execution_editor = RwSignal::new(None::<(String, settings_model::ReviewExecutionConfig)>);
+    let execution_editor = RwSignal::new(None::<(String, settings_model::ReviewReviewerConfig)>);
     let deleting = RwSignal::new(None::<(String, String)>);
     let state_for_host = state.clone();
     Effect::new(move |_| {
@@ -2396,25 +2396,65 @@ fn ReviewSettingsTab() -> impl IntoView {
                 <select class="settings-select" aria-label="Default review depth"
                     prop:value=move || if settings.get().is_some_and(|s| s.default_mode == protocol::ReviewMode::Deep) { "deep" } else { "light" }
                     on:change=move |ev| send_host_replace(&mode_state, "/review/default_mode", event_target_value(&ev))>
-                    <option value="light">"Light · one agent, all aspects"</option>
-                    <option value="deep">"Deep · Claude + Codex per aspect"</option>
+                    <option value="light">"Lite · each reviewer covers all aspects"</option>
+                    <option value="deep">"Heavy · each reviewer per aspect"</option>
                 </select>
             </label>
-            <p class="settings-description">"Deep reviews launch two independent agents per enabled aspect. Both backends must be available; failures never count as a clean review. Findings remain attributed to each reviewer."</p>
-            <div class="review-settings-list-heading">
-                { [ ("light", "Configure light review"), ("claude", "Configure deep Claude"), ("codex", "Configure deep Codex") ].into_iter().map(|(key, label)| view! {
-                    <button class="settings-btn" disabled=move || settings.get().is_none() on:click=move |_| {
-                        if let Some(s) = settings.get_untracked() {
-                            let config = match key {
-                                "claude" => settings_model::ReviewExecutionConfig { backend_kind: BackendKind::Claude, session_settings: s.claude },
-                                "codex" => settings_model::ReviewExecutionConfig { backend_kind: BackendKind::Codex, session_settings: s.codex },
-                                _ => s.light,
-                            };
-                            execution_editor.set(Some((key.to_owned(), config)));
-                        }
-                    }>{label}</button>
-                }).collect_view() }
-            </div>
+            <p class="settings-description">"Lite gives every reviewer all enabled aspects. Heavy launches each reviewer separately for every enabled aspect. Both modes inherit your default backend and its settings unless you configure explicit reviewers. Failures never count as a clean review."</p>
+            {[("lite", "Lite"), ("heavy", "Heavy")].into_iter().map(|(key, label)| {
+                let add_state = state.clone();
+                let rows_state = state.clone();
+                view! {
+                    <section>
+                        <div class="review-settings-list-heading">
+                            <h3>{format!("{label} reviewers")}</h3>
+                            <button class="settings-btn" disabled=move || settings.get().is_none() on:click=move |_| {
+                                let path = format!("/review/{key}");
+                                send_host_change(&add_state, move |doc| {
+                                    let original = doc.pointer(&path).cloned().ok_or("Reviewer list is unavailable")?;
+                                    let mut reviewers: Vec<settings_model::ReviewReviewerConfig> = serde_json::from_value(original.clone()).map_err(|e| e.to_string())?;
+                                    reviewers.push(settings_model::ReviewReviewerConfig {
+                                        id: protocol::ReviewReviewerId(generate_id()), name: format!("Reviewer {}", reviewers.len() + 1), target: protocol::ReviewReviewerTarget::Default,
+                                    });
+                                    Ok(vec![SettingOp::Replace { path, value: serde_json::to_value(reviewers).map_err(|e| e.to_string())?, expected: SettingExpectation::Value { value: original } }])
+                                });
+                            }>{format!("+ Add {label} reviewer")}</button>
+                        </div>
+                        {move || {
+                            let row_state = rows_state.clone();
+                            settings.get().map(|s| {
+                                let reviewers = if key == "lite" { s.lite } else { s.heavy };
+                                let singleton = reviewers.len() == 1;
+                                reviewers.into_iter().enumerate().map(|(index, reviewer)| {
+                                    let edit = reviewer.clone();
+                                    let id = reviewer.id.clone();
+                                    let remove_state = row_state.clone();
+                                    let target = match &reviewer.target {
+                                        protocol::ReviewReviewerTarget::Default => "Default backend and settings (inherited at launch)".to_owned(),
+                                        protocol::ReviewReviewerTarget::Explicit { backend_kind, .. } => backend_label(*backend_kind).to_owned(),
+                                    };
+                                    view! {
+                                        <div class="review-settings-row">
+                                            <div class="review-settings-row-copy"><strong>{reviewer.name}</strong><span>{target}</span></div>
+                                            <button class="settings-btn" on:click=move |_| execution_editor.set(Some((format!("/review/{key}/{index}"), edit.clone())))>{format!("Configure {label} reviewer")}</button>
+                                            <button class="settings-btn" disabled=singleton on:click=move |_| {
+                                                let path = format!("/review/{key}");
+                                                let id = id.clone();
+                                                send_host_change(&remove_state, move |doc| {
+                                                    let original = doc.pointer(&path).cloned().ok_or("Reviewer list is unavailable")?;
+                                                    let mut reviewers: Vec<settings_model::ReviewReviewerConfig> = serde_json::from_value(original.clone()).map_err(|e| e.to_string())?;
+                                                    reviewers.retain(|r| r.id != id);
+                                                    Ok(vec![SettingOp::Replace { path, value: serde_json::to_value(reviewers).map_err(|e| e.to_string())?, expected: SettingExpectation::Value { value: original } }])
+                                                });
+                                            }>{format!("Remove {label} reviewer")}</button>
+                                        </div>
+                                    }
+                                }).collect_view()
+                            })
+                        }}
+                    </section>
+                }
+            }).collect_view()}
             <div class="review-settings-list-heading">
                 <h3>"Review aspects"</h3>
                 <span class="review-settings-count">{move || format!("{} enabled", settings.get().map_or(0, |s| s.aspects.values().filter(|a| a.enabled).count()))}</span>
@@ -2457,7 +2497,7 @@ fn ReviewSettingsTab() -> impl IntoView {
                     </div>
                 </Show>
             </div>
-            <p class="review-settings-note">"Agent-requested reviews return feedback automatically."</p>
+            <p class="review-settings-note">"Agent-requested reviews are awaited and read through review tools."</p>
             {move || editor.get().map(|(id, reviewer)| view! { <ReviewAspectEditor id reviewer on_close=Callback::new(move |()| editor.set(None)) /> })}
             {move || execution_editor.get().map(|execution| view! {
                 <ReviewAspectEditor id=String::new() reviewer=settings_model::ReviewAspectConfig {
@@ -2482,7 +2522,7 @@ fn ReviewSettingsTab() -> impl IntoView {
 fn ReviewAspectEditor(
     id: String,
     reviewer: settings_model::ReviewAspectConfig,
-    #[prop(optional)] execution: Option<(String, settings_model::ReviewExecutionConfig)>,
+    #[prop(optional)] execution: Option<(String, settings_model::ReviewReviewerConfig)>,
     on_close: Callback<()>,
 ) -> impl IntoView {
     let state = expect_context::<AppState>();
@@ -2491,14 +2531,29 @@ fn ReviewAspectEditor(
         .as_ref()
         .map(|(key, _)| key.clone())
         .unwrap_or_default();
-    let light_execution = execution_key == "light";
-    let execution_config = execution.map(|(_, config)| config).unwrap_or_default();
+    let execution_id = execution.as_ref().map(|(_, config)| config.id.clone());
+    let target = execution
+        .as_ref()
+        .map(|(_, config)| config.target.clone())
+        .unwrap_or_default();
     let is_new = reviewer.name.is_empty();
-    let name = RwSignal::new(reviewer.name);
+    let name = RwSignal::new(
+        execution
+            .as_ref()
+            .map(|(_, c)| c.name.clone())
+            .unwrap_or(reviewer.name),
+    );
     let description = RwSignal::new(reviewer.description);
     let instructions = RwSignal::new(reviewer.instructions);
-    let backend = RwSignal::new(execution_config.backend_kind);
-    let values = RwSignal::new(execution_config.session_settings);
+    let (kind, settings) = match target {
+        protocol::ReviewReviewerTarget::Default => (None, SessionSettingsValues::default()),
+        protocol::ReviewReviewerTarget::Explicit {
+            backend_kind,
+            session_settings,
+        } => (Some(backend_kind), session_settings),
+    };
+    let backend = RwSignal::new(kind);
+    let values = RwSignal::new(settings);
     let enabled = reviewer.enabled;
     let name_ref = NodeRef::<leptos::html::Input>::new();
     let modal_ref = NodeRef::<leptos::html::Div>::new();
@@ -2535,7 +2590,7 @@ fn ReviewAspectEditor(
     let state_for_schema = StoredValue::new(state.clone());
     let state_for_options = StoredValue::new(state.clone());
     let path = if is_execution {
-        format!("/review/{execution_key}")
+        execution_key
     } else {
         format!(
             "/review/aspects/{}",
@@ -2559,15 +2614,18 @@ fn ReviewAspectEditor(
             instructions: instructions.get_untracked().trim().to_owned(),
             enabled,
         };
-        let config = if is_execution {
-            if light_execution {
-                serde_json::to_value(settings_model::ReviewExecutionConfig {
-                    backend_kind: backend.get_untracked(),
-                    session_settings: values.get_untracked(),
-                })
-            } else {
-                serde_json::to_value(values.get_untracked())
-            }
+        let config = if let Some(id) = &execution_id {
+            serde_json::to_value(settings_model::ReviewReviewerConfig {
+                id: id.clone(),
+                name: name.get_untracked().trim().to_owned(),
+                target: match backend.get_untracked() {
+                    None => protocol::ReviewReviewerTarget::Default,
+                    Some(backend_kind) => protocol::ReviewReviewerTarget::Explicit {
+                        backend_kind,
+                        session_settings: values.get_untracked(),
+                    },
+                },
+            })
         } else {
             serde_json::to_value(config)
         };
@@ -2640,37 +2698,39 @@ fn ReviewAspectEditor(
             <div class="review-agent-modal" node_ref=modal_ref role="dialog" aria-modal="true" aria-labelledby=labelled_by
                 on:click=move |ev| ev.stop_propagation() on:keydown=keydown>
                 <header><h3 id=title_id>{if is_execution { "Review execution settings" } else if is_new { "Add aspect" } else { "Edit aspect" }}</h3><button class="settings-btn" aria-label="Close review editor" on:click=move |_| on_close.run(())>"×"</button></header>
-                <Show when=move || !is_execution>
                 <label class="settings-form-label"><span>"Name"</span><input class="settings-text-input" node_ref=name_ref prop:value=move || name.get() on:input=move |ev| name.set(event_target_value(&ev)) /></label>
+                <Show when=move || !is_execution>
                 <label class="settings-form-label"><span>"Description"</span><input class="settings-text-input" prop:value=move || description.get() on:input=move |ev| description.set(event_target_value(&ev)) /></label>
                 </Show>
                 <Show when=move || is_execution>
-                <Show when=move || light_execution>
                 <label class="settings-form-label"><span>"Backend"</span>
-                    <select class="settings-select" prop:value=move || backend_value(backend.get()) on:change=move |ev| {
-                        if let Some(kind) = parse_backend_kind(&event_target_value(&ev)) { backend.set(kind); values.set(SessionSettingsValues::default()); }
+                    <select class="settings-select" prop:value=move || backend.get().map(backend_value).unwrap_or("default") on:change=move |ev| {
+                        backend.set(parse_backend_kind(&event_target_value(&ev))); values.set(SessionSettingsValues::default());
                     }>
+                        <option value="default">"Default backend and settings"</option>
                         {move || {
                             let mut backends = state_for_options.get_value().selected_host_settings().map(|s| s.enabled_backends).unwrap_or_default();
-                            if !backends.contains(&backend.get()) { backends.push(backend.get()); }
+                            if let Some(kind) = backend.get() && !backends.contains(&kind) { backends.push(kind); }
                             backends.into_iter().map(|kind| view! { <option value=backend_value(kind)>{backend_label(kind)}</option> }).collect_view()
                         }}
                     </select>
                 </label>
-                </Show>
+                <Show when=move || backend.get().is_none()><p class="settings-description">"Inherit the host default backend and its current default settings when the review starts."</p></Show>
+                <Show when=move || backend.get().is_some()>
                 {move || {
-                    let schema = state_for_schema.get_value().selected_host_id.get().and_then(|host| state_for_schema.get_value().session_schemas.get().get(&host).and_then(|schemas| schemas.get(&backend.get())).cloned());
+                    let schema = state_for_schema.get_value().selected_host_id.get().and_then(|host| state_for_schema.get_value().session_schemas.get().get(&host).and_then(|schemas| backend.get().and_then(|kind| schemas.get(&kind))).cloned());
                     match schema {
                         Some(SessionSchemaEntry::Ready { schema }) => view! { <SessionSettingsControls schema values=Signal::derive(move || values.get()) on_change=Callback::new(move |v| values.set(v)) /> }.into_any(),
                         _ => view! { <p class="settings-description">"Model options are unavailable until this backend is ready. Existing selections are preserved."</p> }.into_any(),
                     }
                 }}
                 </Show>
+                </Show>
                 <Show when=move || !is_execution>
                 <label class="settings-form-label"><span>"Review instructions"</span><textarea class="settings-text-input" rows="6" prop:value=move || instructions.get() on:input=move |ev| instructions.set(event_target_value(&ev)) /></label>
                 <p class="review-settings-note">"Only report concrete issues. No findings is a valid result."</p>
                 </Show>
-                <footer><button class="settings-btn" on:click=move |_| on_close.run(())>"Cancel"</button><button class="settings-btn settings-btn-primary" disabled=move || !is_execution && (name.get().trim().is_empty() || instructions.get().trim().is_empty()) on:click=save>{if is_execution { "Save execution settings" } else { "Save aspect" }}</button></footer>
+                <footer><button class="settings-btn" on:click=move |_| on_close.run(())>"Cancel"</button><button class="settings-btn settings-btn-primary" disabled=move || name.get().trim().is_empty() || (!is_execution && instructions.get().trim().is_empty()) on:click=save>{if is_execution { "Save execution settings" } else { "Save aspect" }}</button></footer>
             </div>
         </div>
     }
@@ -16978,7 +17038,11 @@ mod wasm_tests {
         install_launch_profile_host(&state, Vec::new());
         let host = state.selected_host_id.get_untracked().unwrap();
         state.host_settings_by_host.update(|hosts| {
-            hosts.get_mut(&host).unwrap().review.light.backend_kind = BackendKind::Hermes
+            hosts.get_mut(&host).unwrap().review.lite[0].target =
+                protocol::ReviewReviewerTarget::Explicit {
+                    backend_kind: BackendKind::Hermes,
+                    session_settings: Default::default(),
+                }
         });
         state.session_schemas.update(|hosts| {
             let SessionSchemaEntry::Ready { schema } = hosts
@@ -17016,7 +17080,11 @@ mod wasm_tests {
             view! { <ReviewSettingsTab /> }
         });
         next_tick().await;
-        let add = find_button_by_text(&container, "Configure light review").unwrap();
+        assert!(
+            container.text_content().unwrap().contains("Lite reviewers"),
+            "Review settings must expose independent Lite and Heavy reviewer lists"
+        );
+        let add = find_button_by_text(&container, "Configure Lite reviewer").unwrap();
         add.click();
         next_tick().await;
         let dialog = container
@@ -17092,13 +17160,13 @@ mod wasm_tests {
         }
         let writes = recorded_settings_write_ops(&calls);
         let saved = writes.last().unwrap();
-        assert_eq!(saved["path"], "/review/light");
+        assert_eq!(saved["path"], "/review/lite/0");
         assert_eq!(
-            saved["value"]["session_settings"]["model"]["string"],
+            saved["value"]["target"]["session_settings"]["model"]["string"],
             "opus"
         );
         assert_eq!(
-            saved["value"]["session_settings"]["effort"]["string"],
+            saved["value"]["target"]["session_settings"]["effort"]["string"],
             "high"
         );
         add.click();
@@ -17159,6 +17227,106 @@ mod wasm_tests {
                 .unwrap()
                 .contains("Maximum review rounds")
         );
+        let initial = state.host_settings_by_host.get_untracked()[&host]
+            .review
+            .clone();
+        assert!(container.text_content().unwrap().contains("Lite reviewers"));
+        assert!(
+            container
+                .text_content()
+                .unwrap()
+                .contains("Heavy reviewers")
+        );
+        assert!(
+            container
+                .text_content()
+                .unwrap()
+                .contains("Default backend and settings (inherited at launch)")
+        );
+        let remove: web_sys::HtmlButtonElement =
+            find_button_by_text(&container, "Remove Lite reviewer")
+                .unwrap()
+                .dyn_into()
+                .unwrap();
+        assert!(remove.disabled(), "Every mode must retain a reviewer");
+        find_button_by_text(&container, "+ Add Lite reviewer")
+            .unwrap()
+            .click();
+        next_tick().await;
+        let writes = recorded_settings_write_ops(&calls);
+        let added = writes.last().unwrap();
+        assert_eq!(added["path"], "/review/lite");
+        let reviewers: Vec<settings_model::ReviewReviewerConfig> =
+            serde_json::from_value(added["value"].clone()).unwrap();
+        assert_eq!(reviewers.len(), 2);
+        assert_ne!(reviewers[0].id, reviewers[1].id);
+        state
+            .host_settings_by_host
+            .update(|hosts| hosts.get_mut(&host).unwrap().review.lite = reviewers.clone());
+        next_tick().await;
+        assert!(
+            container.text_content().unwrap().contains("Reviewer 2"),
+            "The server's added reviewer must appear immediately"
+        );
+        assert_eq!(
+            state.host_settings_by_host.get_untracked()[&host]
+                .review
+                .heavy,
+            initial.heavy
+        );
+        find_button_by_text(&container, "Remove Lite reviewer")
+            .unwrap()
+            .click();
+        next_tick().await;
+        let writes = recorded_settings_write_ops(&calls);
+        let removed = writes.last().unwrap();
+        assert_eq!(removed["path"], "/review/lite");
+        let remaining: Vec<settings_model::ReviewReviewerConfig> =
+            serde_json::from_value(removed["value"].clone()).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(
+            remaining[0].id, reviewers[1].id,
+            "Removing one reviewer must retain the other's stable identity"
+        );
+        state
+            .host_settings_by_host
+            .update(|hosts| hosts.get_mut(&host).unwrap().review.lite = remaining);
+        next_tick().await;
+        find_button_by_text(&container, "Configure Heavy reviewer")
+            .unwrap()
+            .click();
+        next_tick().await;
+        let dialog = container
+            .query_selector("[role='dialog']")
+            .unwrap()
+            .unwrap();
+        assert!(
+            dialog
+                .text_content()
+                .unwrap()
+                .contains("Inherit the host default backend")
+        );
+        find_button_by_text(&container, "Save execution settings")
+            .unwrap()
+            .click();
+        next_tick().await;
+        let writes = recorded_settings_write_ops(&calls);
+        assert_eq!(writes.last().unwrap()["path"], "/review/heavy/0");
+        assert_eq!(writes.last().unwrap()["value"]["target"]["kind"], "default");
+        let mode: HtmlSelectElement = container
+            .query_selector("[aria-label='Default review depth']")
+            .unwrap()
+            .unwrap()
+            .dyn_into()
+            .unwrap();
+        assert!(mode.text_content().unwrap().contains("Lite"));
+        assert!(mode.text_content().unwrap().contains("Heavy"));
+        mode.set_value("deep");
+        dispatch_event_from_js(mode.unchecked_ref(), "change", None);
+        next_tick().await;
+        let writes = recorded_settings_write_ops(&calls);
+        assert_eq!(writes.last().unwrap()["path"], "/review/default_mode");
+        assert_eq!(writes.last().unwrap()["value"], "deep");
         let assert_button_surface = |button: &web_sys::HtmlElement| {
             let rect = button.get_bounding_client_rect();
             let computed = web_sys::window()

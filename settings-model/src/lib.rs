@@ -53,25 +53,31 @@ pub struct ReviewExecutionConfig {
     pub session_settings: SessionSettingsValues,
 }
 
-impl Default for ReviewExecutionConfig {
-    fn default() -> Self {
-        Self {
-            backend_kind: BackendKind::Codex,
-            session_settings: Default::default(),
-        }
-    }
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewReviewerConfig {
+    pub id: protocol::ReviewReviewerId,
+    pub name: String,
+    pub target: protocol::ReviewReviewerTarget,
+}
+
+pub fn default_reviewers() -> Vec<ReviewReviewerConfig> {
+    vec![ReviewReviewerConfig {
+        id: protocol::ReviewReviewerId("default".to_owned()),
+        name: "AI Review".to_owned(),
+        target: protocol::ReviewReviewerTarget::Default,
+    }]
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ReviewSettings {
     #[serde(default)]
     pub default_mode: protocol::ReviewMode,
-    #[serde(default)]
-    pub light: ReviewExecutionConfig,
-    #[serde(default)]
-    pub claude: SessionSettingsValues,
-    #[serde(default)]
-    pub codex: SessionSettingsValues,
+    #[serde(default = "default_reviewers")]
+    pub lite: Vec<ReviewReviewerConfig>,
+    #[serde(default = "default_reviewers")]
+    pub heavy: Vec<ReviewReviewerConfig>,
     pub enabled: bool,
     #[serde(default)]
     pub aspects: BTreeMap<String, ReviewAspectConfig>,
@@ -83,9 +89,8 @@ impl Default for ReviewSettings {
             enabled: true,
             aspects: BTreeMap::new(),
             default_mode: protocol::ReviewMode::Light,
-            light: ReviewExecutionConfig::default(),
-            claude: Default::default(),
-            codex: Default::default(),
+            lite: default_reviewers(),
+            heavy: default_reviewers(),
         }
     }
 }

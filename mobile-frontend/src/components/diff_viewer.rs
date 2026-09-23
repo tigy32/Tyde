@@ -1110,16 +1110,12 @@ fn ReviewControls(project: ActiveProjectRef, ctx: Option<ReviewCtx>) -> impl Int
             .unwrap_or((0, 0))
     });
 
-    // Whether the host has any backend the AI reviewer could run on (default
-    // or first enabled). When false the AI review button is disabled, matching
-    // desktop — there's nothing to run.
-    let backend_ctx = ctx.clone();
-    let ai_backend_available = Memo::new(move |_| {
-        backend_ctx.state.host_settings_by_host.with(|m| {
-            m.get(&backend_ctx.host)
-                .map(|s| s.default_backend.is_some() || !s.enabled_backends.is_empty())
-                .unwrap_or(false)
-        })
+    let settings_ctx = ctx.clone();
+    let review_settings_ready = Memo::new(move |_| {
+        settings_ctx
+            .state
+            .host_settings_by_host
+            .with(|m| m.contains_key(&settings_ctx.host))
     });
 
     // Whether the AI reviewer is currently running.
@@ -1139,19 +1135,11 @@ fn ReviewControls(project: ActiveProjectRef, ctx: Option<ReviewCtx>) -> impl Int
     // Submit target picker open state.
     let picker_open = RwSignal::new(false);
 
-    // AI review: the host resolves the backend. Mobile has no reviewer
-    // backend picker, so always send `None` ⇒ server uses its
-    // `default_backend` (else first enabled). Gate on there being some
-    // runnable backend so we don't fire a request the host can't satisfy.
     let review_mode = RwSignal::new(None::<protocol::ReviewMode>);
     let ctx_ai = ctx.clone();
     let on_ai = Callback::new(move |_: ()| {
         let ctx = ctx_ai.clone();
         spawn_local(async move {
-            if ctx.effective_backend().is_none() {
-                log::error!("start ai review skipped: host has no enabled backend");
-                return;
-            }
             if let Err(e) = crate::actions::send_review_action(
                 &ctx.state,
                 &ctx.host,
@@ -1219,7 +1207,7 @@ fn ReviewControls(project: ActiveProjectRef, ctx: Option<ReviewCtx>) -> impl Int
                 <select aria-label="Review depth" on:change=move |ev| review_mode.set(match event_target_value(&ev).as_str() {
                     "light" => Some(protocol::ReviewMode::Light), "deep" => Some(protocol::ReviewMode::Deep), _ => None,
                 })>
-                    <option value="">"Default"</option><option value="light">"Light · one agent"</option><option value="deep">"Deep · Claude + Codex per aspect"</option>
+                    <option value="">"Default"</option><option value="light">"Lite · all aspects per reviewer"</option><option value="deep">"Heavy · each reviewer per aspect"</option>
                 </select>
             </label>
             <div class="project-diff-review-actions">
@@ -1230,7 +1218,7 @@ fn ReviewControls(project: ActiveProjectRef, ctx: Option<ReviewCtx>) -> impl Int
                             label=label
                             variant=ButtonVariant::Ghost
                             size=ButtonSize::Compact
-                            disabled=ai_running.get() || !ai_backend_available.get()
+                            disabled=ai_running.get() || !review_settings_ready.get()
                             data_mobile_test="diff-review-ai"
                             on_click=on_ai
                         />
@@ -2390,6 +2378,8 @@ mod wasm_tests {
             .unwrap()
             .dyn_into()
             .unwrap();
+        assert!(picker.text_content().unwrap().contains("Lite"));
+        assert!(picker.text_content().unwrap().contains("Heavy"));
         picker.set_value("deep");
         picker
             .dispatch_event(&web_sys::Event::new("change").unwrap())
