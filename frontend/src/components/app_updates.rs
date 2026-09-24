@@ -163,6 +163,8 @@ pub fn UpdatesSettings() -> impl IntoView {
     view! {
         <h2 class="settings-panel-title">"Updates"</h2>
 
+        <crate::components::settings_panel::AgentRestorationSettings />
+
         <p class="settings-description settings-panel-intro">
             "Tyde updates itself in place from its signed release repository. It only tells you when a newer version exists — nothing downloads or installs until you approve it."
         </p>

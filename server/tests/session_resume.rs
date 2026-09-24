@@ -2057,6 +2057,158 @@ async fn restart_restores_open_agents_and_preserves_settings() {
         })
         .expect("restored bootstrap includes session settings");
     assert_eq!(restored_settings, &settings);
+    let mut host = fixture.host_for_test();
+    for enabled in [false, true] {
+        let write_id = protocol::SettingsWriteId(format!("resume-previous-{enabled}"));
+        fixture
+            .client
+            .settings_write(protocol::SettingsWritePayload {
+                write_id: write_id.clone(),
+                ops: vec![protocol::SettingOp::Replace {
+                    path: "/resume_previous_agents".to_owned(),
+                    value: serde_json::json!(enabled),
+                    expected: protocol::SettingExpectation::Value {
+                        value: serde_json::json!(!enabled),
+                    },
+                }],
+            })
+            .await
+            .expect("change automatic restoration preference");
+        let result = fixture::next_frame_matching_on(
+            &mut fixture.client,
+            "restoration preference saved",
+            |env| {
+                env.kind == FrameKind::SettingsWriteResult
+                    && env
+                        .parse_payload::<protocol::SettingsWriteResultPayload>()
+                        .is_ok_and(|result| result.write_id == write_id)
+            },
+        )
+        .await
+        .parse_payload::<protocol::SettingsWriteResultPayload>()
+        .expect("parse setting result");
+        assert!(
+            result.applied && result.field_errors.is_empty(),
+            "restoration preference write must succeed"
+        );
+
+        host.shutdown_agents_for_conformance().await;
+        let finished = server::new_spawn_operation_test_gate();
+        host = server::spawn_host_with_mock_backend_and_runtime_config(
+            fixture.store_dir().join("sessions.json"),
+            fixture.store_dir().join("projects.json"),
+            fixture.store_dir().join("settings.json"),
+            server::HostRuntimeConfig {
+                restoration_complete_test_gate: Some(finished.shared()),
+                skip_real_backend_probe: true,
+                ..Default::default()
+            },
+        )
+        .expect("restart with persisted restoration preference");
+        finished.wait_until_entered().await;
+        let (client, bootstrap) = fixture::connect_host(host.clone()).await;
+        finished.release_one();
+        fixture.client = client;
+        assert_eq!(bootstrap.settings.resume_previous_agents, enabled);
+        assert_eq!(
+            bootstrap.agents.len(),
+            if enabled { 2 } else { 0 },
+            "only enabled startup may restore the open hierarchy"
+        );
+        if enabled {
+            let parent = bootstrap
+                .agents
+                .iter()
+                .find(|agent| agent.session_id.as_ref() == Some(&survivor_session))
+                .expect("restored parent after re-enabling");
+            let child = bootstrap
+                .agents
+                .iter()
+                .find(|agent| agent.session_id.as_ref() == Some(&survivor_child_session))
+                .expect("restored child after re-enabling");
+            assert!(
+                child.parent_agent_id.as_ref() == Some(&parent.agent_id),
+                "re-enabled restoration preserves ownership"
+            );
+            continue;
+        }
+        fixture
+            .client
+            .list_sessions(ListSessionsPayload {
+                scope: None,
+                cursor: None,
+                limit: None,
+            })
+            .await
+            .expect("list saved sessions while automatic resume is off");
+        let sessions = fixture::next_frame_matching_on(
+            &mut fixture.client,
+            "saved history with restoration disabled",
+            |env| env.kind == FrameKind::SessionList,
+        )
+        .await
+        .parse_payload::<SessionListPayload>()
+        .expect("parse saved sessions");
+        assert!(
+            sessions
+                .sessions
+                .iter()
+                .any(|session| session.id == survivor_session),
+            "disabled restoration retains parent history"
+        );
+        assert!(
+            sessions
+                .sessions
+                .iter()
+                .any(|session| session.id == survivor_child_session),
+            "disabled restoration retains child history"
+        );
+        fixture
+            .client
+            .spawn_agent(SpawnAgentPayload {
+                name: None,
+                custom_agent_id: None,
+                parent_agent_id: None,
+                project_id: None,
+                params: SpawnAgentParams::Resume {
+                    session_id: survivor_child_session.clone(),
+                    prompt: None,
+                },
+            })
+            .await
+            .expect("manually resume a child while automatic restoration is disabled");
+        let child =
+            fixture::next_frame_matching_on(&mut fixture.client, "manual child resume", |env| {
+                env.kind == FrameKind::NewAgent
+                    && env.parse_payload::<NewAgentPayload>().is_ok_and(|agent| {
+                        agent.session_id.as_ref() == Some(&survivor_child_session)
+                    })
+            })
+            .await
+            .parse_payload::<NewAgentPayload>()
+            .expect("parse manual child");
+        expect_agent_start_on_stream(
+            &mut fixture.client,
+            &child.instance_stream,
+            "manual child start",
+        )
+        .await;
+        let (_, manual) = fixture::connect_host(host.clone()).await;
+        assert_eq!(
+            manual.agents.len(),
+            2,
+            "manual child resume restores its owning parent only"
+        );
+        let parent = manual
+            .agents
+            .iter()
+            .find(|agent| agent.session_id.as_ref() == Some(&survivor_session))
+            .expect("manually restored owner");
+        assert!(
+            child.parent_agent_id.as_ref() == Some(&parent.agent_id),
+            "manual resume retains ownership with automatic restoration off"
+        );
+    }
 }
 
 #[tokio::test]

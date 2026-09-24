@@ -15191,6 +15191,18 @@ fn spawn_open_agent_restoration_task(host: HostHandle) {
         if let Err(error) = host.restore_open_agents().await {
             tracing::error!(error = %error, "failed to restore open agents after host restart");
         }
+        #[cfg(feature = "test-support")]
+        {
+            let gate = host
+                .state
+                .lock()
+                .await
+                .restoration_complete_test_gate
+                .clone();
+            if let Some(gate) = gate {
+                wait_for_spawn_operation_test_gate_inner(&gate).await;
+            }
+        }
     };
 
     if let Ok(handle) = tokio::runtime::Handle::try_current() {
@@ -15228,6 +15240,17 @@ fn spawn_open_agent_restoration_task(host: HostHandle) {
 
 impl HostHandle {
     async fn restore_open_agents(&self) -> Result<(), String> {
+        let settings_store = Arc::clone(&self.state.lock().await.settings_store);
+        let resume_previous_agents = settings_store
+            .lock()
+            .await
+            .get()
+            .map_err(|error| format!("failed to read agent restoration preference: {error}"))?
+            .resume_previous_agents;
+        if !resume_previous_agents {
+            tracing::info!("automatic agent restoration is disabled for this host");
+            return Ok(());
+        }
         let (session_store, team_registry, backend_storage) = {
             let state = self.state.lock().await;
             (
@@ -15421,18 +15444,6 @@ impl HostHandle {
                         "failed to reconstruct open agent"
                     );
                 }
-            }
-        }
-        #[cfg(feature = "test-support")]
-        {
-            let gate = self
-                .state
-                .lock()
-                .await
-                .restoration_complete_test_gate
-                .clone();
-            if let Some(gate) = gate {
-                wait_for_spawn_operation_test_gate_inner(&gate).await;
             }
         }
         Ok(())

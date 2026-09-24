@@ -97,6 +97,8 @@ impl Default for ReviewSettings {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct HostSettings {
+    #[serde(default = "default_resume_previous_agents")]
+    pub resume_previous_agents: bool,
     #[serde(default)]
     pub review: ReviewSettings,
     #[serde(default)]
@@ -182,6 +184,7 @@ pub struct HostSettings {
 impl Default for HostSettings {
     fn default() -> Self {
         Self {
+            resume_previous_agents: default_resume_previous_agents(),
             review: ReviewSettings::default(),
             enabled_backends: Vec::new(),
             default_backend: None,
@@ -485,6 +488,10 @@ pub struct BackendTierConfig {
     pub high: SessionSettingsValues,
 }
 
+pub fn default_resume_previous_agents() -> bool {
+    true
+}
+
 fn default_agent_control_mcp_enabled() -> bool {
     true
 }
@@ -549,6 +556,7 @@ fn decorate_host_settings_schema(schema: &mut Value) {
         "x-tyde-sections".to_owned(),
         serde_json::json!([
             {"id": "general", "title": "General", "order": 10},
+            {"id": "updates", "title": "Agent restoration", "order": 15},
             {"id": "subagents", "title": "Subagents", "order": 20},
             {"id": "supervisor", "title": "Supervisor", "order": 30},
             {"id": "usage_limits", "title": "Usage limits", "order": 35},
@@ -558,6 +566,7 @@ fn decorate_host_settings_schema(schema: &mut Value) {
     );
 
     for (field, section, order, widget) in [
+        ("resume_previous_agents", "updates", 10, "toggle"),
         ("tyde_debug_mcp_enabled", "general", 10, "toggle"),
         ("tyde_agent_control_mcp_enabled", "subagents", 10, "toggle"),
         ("tyde_agent_control_max_depth", "subagents", 20, "slider"),
@@ -572,6 +581,11 @@ fn decorate_host_settings_schema(schema: &mut Value) {
     }
 
     for (field, title, description) in [
+        (
+            "resume_previous_agents",
+            "Resume previous agents",
+            "Automatically reopen this host's previously open agents after an update or restart. Turning this off leaves running agents alone and keeps saved sessions in History for manual resume. Changes take effect on the next host restart.",
+        ),
         (
             "tyde_debug_mcp_enabled",
             "Tyde Debug MCP",

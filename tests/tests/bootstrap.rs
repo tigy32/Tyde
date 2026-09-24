@@ -221,6 +221,7 @@ fn write_host_settings_with_launch_profiles(
     launch_profiles: Vec<HostLaunchProfileConfig>,
 ) {
     let settings = settings_model::HostSettings {
+        resume_previous_agents: settings_model::default_resume_previous_agents(),
         review: Default::default(),
         enabled_backends: backends.to_vec(),
         default_backend,

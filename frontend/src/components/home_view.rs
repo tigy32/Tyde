@@ -342,6 +342,7 @@ mod wasm_tests {
             map.insert(
                 host_id.to_owned(),
                 settings_model::HostSettings {
+                    resume_previous_agents: settings_model::default_resume_previous_agents(),
                     review: Default::default(),
                     enabled_backends: vec![BackendKind::Claude],
                     default_backend: Some(BackendKind::Claude),

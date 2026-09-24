@@ -123,6 +123,7 @@ fn write_unusable_hermes_cli(home: &Path) -> PathBuf {
 
 fn expected_empty_settings() -> HostSettings {
     HostSettings {
+        resume_previous_agents: settings_model::default_resume_previous_agents(),
         review: Default::default(),
         enabled_backends: Vec::new(),
         default_backend: None,
@@ -369,6 +370,7 @@ fn persisted_backend_lists_are_canonicalized_but_not_defaulted() {
     assert_eq!(
         store.get().expect("read canonicalized settings"),
         HostSettings {
+            resume_previous_agents: settings_model::default_resume_previous_agents(),
             review: Default::default(),
             enabled_backends: vec![
                 BackendKind::Kiro,

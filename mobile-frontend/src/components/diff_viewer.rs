@@ -2173,6 +2173,7 @@ mod wasm_tests {
 
     fn host_settings(default: Option<BackendKind>, enabled: Vec<BackendKind>) -> HostSettings {
         HostSettings {
+            resume_previous_agents: settings_model::default_resume_previous_agents(),
             review: Default::default(),
             enabled_backends: enabled,
             default_backend: default,

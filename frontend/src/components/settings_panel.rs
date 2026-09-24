@@ -453,9 +453,8 @@ impl SettingsTab {
         }
     }
 
-    /// Which host's settings this tab edits, if any. Every tab except the
-    /// device-local ones reads `selected_host_settings()`, so the scope bar has
-    /// to say so.
+    /// The page's primary scope. Updates names its host-scoped restoration
+    /// control separately from device-local updater preferences.
     fn scope(self) -> SettingsScope {
         match self {
             Self::Updates | Self::Hosts | Self::Appearance | Self::Display => SettingsScope::Device,
@@ -486,6 +485,9 @@ impl SettingsTab {
                 "Update channel",
                 "Check for updates",
                 "Automatic updates",
+                "Resume previous agents",
+                "Agent restoration",
+                "Restart",
             ],
             Self::Hosts => &[
                 "Hosts",
@@ -1067,14 +1069,29 @@ fn SettingsScopeBar(active_page: RwSignal<SettingsPage>) -> impl IntoView {
     // Type-erased branches: the wasm test module runs every frontend test in
     // one browser instance, and each distinct nested view type it monomorphizes
     // costs module size against that ceiling.
-    let body = move || match active_page.get().scope() {
+    let body = move || {
+        match active_page.get().scope() {
         SettingsScope::Host => view! { <SettingsHostScope /> }.into_any(),
+        SettingsScope::Device if active_page.get() == SettingsPage::Tab(SettingsTab::Updates) => view! {
+            <span class="settings-scope-text">"Update preferences apply to this device. Agent restoration applies to the host selected below."</span>
+        }.into_any(),
         SettingsScope::Device => view! {
             <span class="settings-scope-text">"These settings apply to this device only."</span>
         }
         .into_any(),
+    }
     };
     view! { <div class="settings-scope-bar">{body}</div> }
+}
+
+#[component]
+pub(crate) fn AgentRestorationSettings() -> impl IntoView {
+    let state = expect_context::<AppState>();
+    view! {
+        <h3 class="settings-section-title">"Agent restoration"</h3>
+        <div class="settings-scope-bar"><SettingsHostScope /></div>
+        {move || host_schema_section(&state, "updates")}
+    }
 }
 
 /// The host half of the scope bar: which host is being edited, whether it can
@@ -9548,6 +9565,7 @@ mod wasm_tests {
             m.insert(
                 host_id,
                 settings_model::HostSettings {
+                    resume_previous_agents: settings_model::default_resume_previous_agents(),
                     review: Default::default(),
                     enabled_backends: vec![protocol::BackendKind::Claude],
                     default_backend: Some(protocol::BackendKind::Claude),
@@ -11052,6 +11070,7 @@ mod wasm_tests {
             m.insert(
                 host_id,
                 settings_model::HostSettings {
+                    resume_previous_agents: settings_model::default_resume_previous_agents(),
                     review: Default::default(),
                     enabled_backends: vec![protocol::BackendKind::Claude],
                     default_backend: Some(protocol::BackendKind::Claude),
@@ -11154,6 +11173,77 @@ mod wasm_tests {
             frame.get("value").and_then(Value::as_bool),
             Some(true),
             "the committed frame must carry enabled=true: {frame:?}"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    async fn updates_tab_controls_server_owned_agent_restoration() {
+        let calls = install_settings_send_stub();
+        let container = make_container();
+        let state = AppState::new();
+        install_general_host_settings(&state, true, false, None);
+        state.settings_open.set(true);
+        let mounted_state = state.clone();
+        let _handle = mount_to(container.clone(), move || {
+            provide_context(mounted_state.clone());
+            view! { <SettingsPanel /> }
+        });
+        next_tick().await;
+        click_tab(&container, "Updates");
+        next_tick().await;
+        let text = container.text_content().expect("settings text");
+        assert!(text.contains("Agent restoration applies to the host selected below"));
+        assert!(text.contains("Editing settings on"));
+        let toggle = toggle_for_label(&container, "Resume previous agents");
+        assert!(
+            toggle.checked(),
+            "existing installations retain automatic restoration"
+        );
+        toggle.set_checked(false);
+        dispatch_change(&toggle);
+        for _ in 0..4 {
+            next_tick().await;
+        }
+        assert!(
+            recorded_settings_write_ops(&calls)
+                .iter()
+                .any(|op| replacement_value(op, "/resume_previous_agents")
+                    .and_then(Value::as_bool)
+                    == Some(false)),
+            "disabling restoration must write the host preference"
+        );
+        state.host_settings_by_host.update(|hosts| {
+            hosts
+                .get_mut("host-general")
+                .expect("fixture host")
+                .resume_previous_agents = false;
+        });
+        next_tick().await;
+        assert!(
+            !toggle_for_label(&container, "Resume previous agents").checked(),
+            "toggle reflects server-published settings"
+        );
+        click_tab(&container, "Appearance");
+        next_tick().await;
+        click_tab(&container, "Updates");
+        next_tick().await;
+        let toggle = toggle_for_label(&container, "Resume previous agents");
+        assert!(
+            !toggle.checked(),
+            "reopening Updates retains the server preference"
+        );
+        toggle.set_checked(true);
+        dispatch_change(&toggle);
+        for _ in 0..4 {
+            next_tick().await;
+        }
+        assert!(
+            recorded_settings_write_ops(&calls)
+                .iter()
+                .any(|op| replacement_value(op, "/resume_previous_agents")
+                    .and_then(Value::as_bool)
+                    == Some(true)),
+            "re-enabling restoration must write the host preference"
         );
     }
 
@@ -11868,6 +11958,7 @@ mod wasm_tests {
         enabled_backends: Vec<BackendKind>,
     ) -> settings_model::HostSettings {
         settings_model::HostSettings {
+            resume_previous_agents: settings_model::default_resume_previous_agents(),
             review: Default::default(),
             enabled_backends,
             default_backend: Some(BackendKind::Hermes),
@@ -14026,6 +14117,7 @@ mod wasm_tests {
             m.insert(
                 host_id.clone(),
                 settings_model::HostSettings {
+                    resume_previous_agents: settings_model::default_resume_previous_agents(),
                     review: Default::default(),
                     enabled_backends: vec![BackendKind::Hermes],
                     default_backend: Some(BackendKind::Hermes),

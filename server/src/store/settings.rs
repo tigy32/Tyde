@@ -749,6 +749,7 @@ fn is_known_backend_kind(value: &serde_json::Value) -> bool {
 
 fn empty_settings() -> HostSettings {
     HostSettings {
+        resume_previous_agents: settings_model::default_resume_previous_agents(),
         review: settings_model::ReviewSettings::default(),
         enabled_backends: Vec::new(),
         default_backend: None,
@@ -926,6 +927,7 @@ fn validate_settings(settings: HostSettings) -> Result<HostSettings, String> {
     };
 
     Ok(HostSettings {
+        resume_previous_agents: settings.resume_previous_agents,
         enabled_backends,
         default_backend: settings.default_backend,
         enable_mobile_connections: settings.enable_mobile_connections,
