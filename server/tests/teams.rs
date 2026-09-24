@@ -13,9 +13,9 @@ use protocol::{
     TeamId, TeamMember, TeamMemberActivatePayload, TeamMemberBindingNotifyPayload,
     TeamMemberBindingPayload, TeamMemberCreatePayload, TeamMemberCreateSpec,
     TeamMemberDeletePayload, TeamMemberId, TeamMemberNotifyPayload, TeamMemberPresetProfile,
-    TeamMemberRole, TeamMemberState, TeamNotifyPayload, TeamPersonalityPresetId,
-    TeamPersonalityTrait, TeamRenamePayload, TeamRolePresetId, TeamSetManagerPayload,
-    TeamTemplateId, ToolPolicy, write_envelope,
+    TeamMemberRole, TeamMemberState, TeamMemberUpdatePayload, TeamNotifyPayload,
+    TeamPersonalityPresetId, TeamPersonalityTrait, TeamRenamePayload, TeamRolePresetId,
+    TeamSetManagerPayload, TeamTemplateId, ToolPolicy, write_envelope,
 };
 use rmcp::ServiceExt;
 use rmcp::model::{CallToolRequestParams, RawContent};
@@ -1685,6 +1685,141 @@ async fn team_delete_hard_removes_team_and_members() {
         error.message.contains("missing team"),
         "unexpected error: {}",
         error.message
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn disabling_member_backend_keeps_teams_editable_and_host_startable() {
+    let mut fixture = Fixture::new().await;
+    let (custom_agent, project, codex_team, _, _) =
+        create_team_with_report(&mut fixture, "disabled-backend").await;
+    fixture
+        .client
+        .team_member_create(TeamMemberCreatePayload {
+            team_id: codex_team.id.clone(),
+            member: member_spec_with_profile(
+                "codex report",
+                Some(custom_agent.id.clone()),
+                BackendKind::Codex,
+                None,
+                vec![project.id.clone()],
+            ),
+            session_id: None,
+        })
+        .await
+        .expect("team_member_create codex report failed");
+    let codex_member =
+        expect_team_member_notify(&mut fixture.client, "TeamMemberNotify codex report").await;
+    expect_team_member_binding_notify(&mut fixture.client, "codex report binding").await;
+    let (other_team, _) = create_team(
+        &mut fixture.client,
+        "unrelated team",
+        custom_agent.id.clone(),
+        Some(project.id.clone()),
+    )
+    .await;
+
+    let write_id = fixture
+        .client
+        .replace_setting(
+            "/enabled_backends",
+            vec![BackendKind::Claude],
+            vec![BackendKind::Claude, BackendKind::Codex],
+        )
+        .await
+        .expect("disable codex write failed");
+    expect_settings_write_applied(&mut fixture.client, &write_id, "disable codex").await;
+
+    fixture
+        .client
+        .team_rename(TeamRenamePayload {
+            id: other_team.id.clone(),
+            name: "renamed unrelated team".to_owned(),
+        })
+        .await
+        .expect("team_rename write failed");
+    let renamed = expect_team_notify(&mut fixture.client, "unrelated team rename").await;
+    assert_eq!(renamed.name, "renamed unrelated team");
+
+    fixture
+        .client
+        .team_member_update(TeamMemberUpdatePayload {
+            id: codex_member.id.clone(),
+            name: codex_member.name.clone(),
+            description: "edited while codex is disabled".to_owned(),
+            profile: codex_member.profile.clone(),
+            project_ids: codex_member.project_ids.clone(),
+        })
+        .await
+        .expect("team_member_update write failed");
+    let updated = expect_team_member_notify(&mut fixture.client, "codex member update").await;
+    assert_eq!(updated.description, "edited while codex is disabled");
+    assert_eq!(updated.backend_kind, BackendKind::Codex);
+
+    fixture
+        .client
+        .team_member_create(TeamMemberCreatePayload {
+            team_id: other_team.id.clone(),
+            member: member_spec_with_profile(
+                "new codex report",
+                Some(custom_agent.id.clone()),
+                BackendKind::Codex,
+                None,
+                vec![project.id.clone()],
+            ),
+            session_id: None,
+        })
+        .await
+        .expect("team_member_create write failed");
+    let error = expect_command_error(&mut fixture.client, "new member on disabled backend").await;
+    assert_eq!(error.operation, "team_member_create");
+    assert!(
+        error.message.contains("disabled backend"),
+        "unexpected error: {}",
+        error.message
+    );
+
+    let bootstrap = fixture.restart_host().await;
+    let restored = bootstrap
+        .team_members
+        .iter()
+        .find(|member| member.id == codex_member.id)
+        .expect("codex member survives restart");
+    assert_eq!(restored.backend_kind, BackendKind::Codex);
+    assert_eq!(restored.description, "edited while codex is disabled");
+    assert!(
+        bootstrap
+            .teams
+            .iter()
+            .any(|team| team.id == other_team.id && team.name == "renamed unrelated team")
+    );
+
+    // A directory at the store path makes the atomic rename fail, so the
+    // write fails after the in-memory mutation has been applied.
+    let store_path = fixture.store_dir().join("agent_teams.json");
+    std::fs::remove_file(&store_path).expect("remove teams store");
+    std::fs::create_dir_all(store_path.join("blocker")).expect("block teams store path");
+    fixture
+        .client
+        .team_rename(TeamRenamePayload {
+            id: other_team.id.clone(),
+            name: "never persisted".to_owned(),
+        })
+        .await
+        .expect("team_rename write failed");
+    let error = expect_command_error(&mut fixture.client, "unpersisted rename").await;
+    assert_eq!(error.operation, "team_rename");
+    std::fs::remove_dir_all(&store_path).expect("unblock teams store path");
+
+    let (_replay, bootstrap) = fixture.connect_with_bootstrap().await;
+    let replayed = bootstrap
+        .teams
+        .iter()
+        .find(|team| team.id == other_team.id)
+        .expect("unrelated team replays");
+    assert_eq!(
+        replayed.name, "renamed unrelated team",
+        "a failed store write must not change the replayed team"
     );
 }
 

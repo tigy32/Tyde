@@ -124,6 +124,7 @@ impl AgentTeamsStore {
         payload: TeamCreatePayload,
         refs: &AgentTeamValidationRefs,
     ) -> Result<(Team, TeamMember), String> {
+        let mut next = self.file.clone();
         validate_team_name(&payload.name)?;
         validate_member_create_fields(&payload.manager)?;
         validate_custom_agent_ref(payload.manager.custom_agent_id.as_ref(), refs)?;
@@ -158,9 +159,9 @@ impl AgentTeamsStore {
             updated_at_ms: now,
         };
 
-        insert_unique_team(&mut self.file.teams, team.clone())?;
-        insert_unique_member(&mut self.file.members, manager.clone())?;
-        self.validate_and_save(refs)?;
+        insert_unique_team(&mut next.teams, team.clone())?;
+        insert_unique_member(&mut next.members, manager.clone())?;
+        self.commit(next, refs)?;
         Ok((team, manager))
     }
 
@@ -169,6 +170,7 @@ impl AgentTeamsStore {
         payload: TeamCreateFromDraftPayload,
         refs: &AgentTeamValidationRefs,
     ) -> Result<(Team, Vec<TeamMember>), String> {
+        let mut next = self.file.clone();
         validate_team_name(&payload.name)?;
         validate_member_create_fields(&payload.manager)?;
         validate_custom_agent_ref(payload.manager.custom_agent_id.as_ref(), refs)?;
@@ -230,11 +232,11 @@ impl AgentTeamsStore {
             });
         }
 
-        insert_unique_team(&mut self.file.teams, team.clone())?;
+        insert_unique_team(&mut next.teams, team.clone())?;
         for member in &members {
-            insert_unique_member(&mut self.file.members, member.clone())?;
+            insert_unique_member(&mut next.members, member.clone())?;
         }
-        self.validate_and_save(refs)?;
+        self.commit(next, refs)?;
         Ok((team, members))
     }
 
@@ -243,17 +245,17 @@ impl AgentTeamsStore {
         payload: TeamRenamePayload,
         refs: &AgentTeamValidationRefs,
     ) -> Result<Team, String> {
+        let mut next = self.file.clone();
         self.assert_team_active(&payload.id)?;
         validate_team_name(&payload.name)?;
-        let team = self
-            .file
+        let team = next
             .teams
             .get_mut(&payload.id)
             .ok_or_else(|| format!("cannot rename missing team {}", payload.id))?;
         team.name = payload.name;
         team.updated_at_ms = now_ms()?;
         let updated = team.clone();
-        self.validate_and_save(refs)?;
+        self.commit(next, refs)?;
         Ok(updated)
     }
 
@@ -262,13 +264,12 @@ impl AgentTeamsStore {
         id: &TeamId,
         refs: &AgentTeamValidationRefs,
     ) -> Result<(Team, Vec<TeamMember>), String> {
-        let team = self
-            .file
+        let mut next = self.file.clone();
+        let team = next
             .teams
             .remove(id)
             .ok_or_else(|| format!("cannot delete missing team {id}"))?;
-        let mut members = self
-            .file
+        let mut members = next
             .members
             .values()
             .filter(|member| member.team_id == *id)
@@ -281,9 +282,9 @@ impl AgentTeamsStore {
                 .then(left.id.0.cmp(&right.id.0))
         });
         for member in &members {
-            self.file.members.remove(&member.id);
+            next.members.remove(&member.id);
         }
-        self.validate_and_save(refs)?;
+        self.commit(next, refs)?;
         Ok((team, members))
     }
 
@@ -292,13 +293,12 @@ impl AgentTeamsStore {
         payload: TeamSetManagerPayload,
         refs: &AgentTeamValidationRefs,
     ) -> Result<(Team, TeamMember, TeamMember), String> {
+        let mut next = self.file.clone();
         self.assert_team_active(&payload.team_id)?;
-        let team = self
-            .file
-            .teams
-            .get(&payload.team_id)
-            .cloned()
-            .ok_or_else(|| format!("cannot set manager for missing team {}", payload.team_id))?;
+        let team =
+            next.teams.get(&payload.team_id).cloned().ok_or_else(|| {
+                format!("cannot set manager for missing team {}", payload.team_id)
+            })?;
         if team.manager_member_id == payload.new_manager_member_id {
             return Err(format!(
                 "member {} is already the manager for team {}",
@@ -306,8 +306,7 @@ impl AgentTeamsStore {
             ));
         }
         let old_manager_id = team.manager_member_id.clone();
-        let new_manager = self
-            .file
+        let new_manager = next
             .members
             .get(&payload.new_manager_member_id)
             .cloned()
@@ -333,7 +332,7 @@ impl AgentTeamsStore {
         }
 
         let now = now_ms()?;
-        let old_manager = self.file.members.get_mut(&old_manager_id).ok_or_else(|| {
+        let old_manager = next.members.get_mut(&old_manager_id).ok_or_else(|| {
             format!(
                 "team {} has missing manager {}",
                 payload.team_id, old_manager_id
@@ -343,8 +342,7 @@ impl AgentTeamsStore {
         old_manager.updated_at_ms = now;
         let old_manager = old_manager.clone();
 
-        let new_manager = self
-            .file
+        let new_manager = next
             .members
             .get_mut(&payload.new_manager_member_id)
             .ok_or_else(|| {
@@ -357,15 +355,15 @@ impl AgentTeamsStore {
         new_manager.updated_at_ms = now;
         let new_manager = new_manager.clone();
 
-        let team =
-            self.file.teams.get_mut(&payload.team_id).ok_or_else(|| {
-                format!("cannot set manager for missing team {}", payload.team_id)
-            })?;
+        let team = next
+            .teams
+            .get_mut(&payload.team_id)
+            .ok_or_else(|| format!("cannot set manager for missing team {}", payload.team_id))?;
         team.manager_member_id = payload.new_manager_member_id;
         team.updated_at_ms = now;
         let team = team.clone();
 
-        self.validate_and_save(refs)?;
+        self.commit(next, refs)?;
         Ok((team, old_manager, new_manager))
     }
 
@@ -374,6 +372,7 @@ impl AgentTeamsStore {
         payload: TeamMemberCreatePayload,
         refs: &AgentTeamValidationRefs,
     ) -> Result<TeamMember, String> {
+        let mut next = self.file.clone();
         self.assert_team_active(&payload.team_id)?;
         if payload.session_id.is_some() {
             return Err("team_member_create session_id must be absent".to_string());
@@ -401,8 +400,8 @@ impl AgentTeamsStore {
             created_at_ms: now,
             updated_at_ms: now,
         };
-        insert_unique_member(&mut self.file.members, member.clone())?;
-        self.validate_and_save(refs)?;
+        insert_unique_member(&mut next.members, member.clone())?;
+        self.commit(next, refs)?;
         Ok(member)
     }
 
@@ -411,8 +410,8 @@ impl AgentTeamsStore {
         payload: TeamMemberUpdatePayload,
         refs: &AgentTeamValidationRefs,
     ) -> Result<TeamMember, String> {
-        let member = self
-            .file
+        let mut next = self.file.clone();
+        let member = next
             .members
             .get(&payload.id)
             .cloned()
@@ -424,8 +423,7 @@ impl AgentTeamsStore {
         validate_project_ids(&payload.project_ids)?;
         validate_project_refs(&payload.project_ids, refs)?;
 
-        let member = self
-            .file
+        let member = next
             .members
             .get_mut(&payload.id)
             .ok_or_else(|| format!("cannot update missing team member {}", payload.id))?;
@@ -435,7 +433,7 @@ impl AgentTeamsStore {
         member.project_ids = payload.project_ids;
         member.updated_at_ms = now_ms()?;
         let updated = member.clone();
-        self.validate_and_save(refs)?;
+        self.commit(next, refs)?;
         Ok(updated)
     }
 
@@ -445,9 +443,10 @@ impl AgentTeamsStore {
         deleted_session_ids: &HashSet<SessionId>,
         refs: &AgentTeamValidationRefs,
     ) -> Result<Vec<TeamMember>, String> {
+        let mut next = self.file.clone();
         let now = now_ms()?;
         let mut updated = Vec::new();
-        for member in self.file.members.values_mut() {
+        for member in next.members.values_mut() {
             let original_len = member.project_ids.len();
             member
                 .project_ids
@@ -465,7 +464,7 @@ impl AgentTeamsStore {
             }
         }
         if !updated.is_empty() {
-            self.validate_and_save(refs)?;
+            self.commit(next, refs)?;
             updated.sort_by(|left, right| {
                 left.created_at_ms
                     .cmp(&right.created_at_ms)
@@ -480,14 +479,14 @@ impl AgentTeamsStore {
         payload: TeamMemberDeletePayload,
         refs: &AgentTeamValidationRefs,
     ) -> Result<TeamMember, String> {
-        let member = self
-            .file
+        let mut next = self.file.clone();
+        let member = next
             .members
             .get(&payload.id)
             .cloned()
             .ok_or_else(|| format!("cannot delete missing team member {}", payload.id))?;
         self.assert_team_active(&member.team_id)?;
-        let team = self.file.teams.get(&member.team_id).ok_or_else(|| {
+        let team = next.teams.get(&member.team_id).ok_or_else(|| {
             format!(
                 "member {} references missing team {}",
                 member.id, member.team_id
@@ -496,8 +495,7 @@ impl AgentTeamsStore {
         if team.manager_member_id == member.id {
             return Err(format!("cannot delete active manager {}", member.id));
         }
-        let member_count = self
-            .file
+        let member_count = next
             .members
             .values()
             .filter(|candidate| candidate.team_id == member.team_id)
@@ -509,12 +507,11 @@ impl AgentTeamsStore {
             ));
         }
 
-        let deleted = self
-            .file
+        let deleted = next
             .members
             .remove(&payload.id)
             .ok_or_else(|| format!("cannot delete missing team member {}", payload.id))?;
-        self.validate_and_save(refs)?;
+        self.commit(next, refs)?;
         Ok(deleted)
     }
 
@@ -524,7 +521,8 @@ impl AgentTeamsStore {
         session_id: SessionId,
         refs: &AgentTeamValidationRefs,
     ) -> Result<TeamMember, String> {
-        if let Some(existing_owner) = self.file.members.values().find(|member| {
+        let mut next = self.file.clone();
+        if let Some(existing_owner) = next.members.values().find(|member| {
             member.id != *member_id && member.session_id.as_ref() == Some(&session_id)
         }) {
             return Err(format!(
@@ -533,8 +531,7 @@ impl AgentTeamsStore {
             ));
         }
 
-        let member = self
-            .file
+        let member = next
             .members
             .get_mut(member_id)
             .ok_or_else(|| format!("cannot set session for missing team member {member_id}"))?;
@@ -544,7 +541,7 @@ impl AgentTeamsStore {
         member.session_id = Some(session_id);
         member.updated_at_ms = now_ms()?;
         let updated = member.clone();
-        self.validate_and_save(refs)?;
+        self.commit(next, refs)?;
         Ok(updated)
     }
 
@@ -555,7 +552,8 @@ impl AgentTeamsStore {
         new_session_id: SessionId,
         refs: &AgentTeamValidationRefs,
     ) -> Result<TeamMember, String> {
-        if let Some(existing_owner) = self.file.members.values().find(|member| {
+        let mut next = self.file.clone();
+        if let Some(existing_owner) = next.members.values().find(|member| {
             member.id != *member_id && member.session_id.as_ref() == Some(&new_session_id)
         }) {
             return Err(format!(
@@ -564,10 +562,10 @@ impl AgentTeamsStore {
             ));
         }
 
-        let member =
-            self.file.members.get_mut(member_id).ok_or_else(|| {
-                format!("cannot replace session for missing team member {member_id}")
-            })?;
+        let member = next
+            .members
+            .get_mut(member_id)
+            .ok_or_else(|| format!("cannot replace session for missing team member {member_id}"))?;
         if member.session_id.as_ref() != Some(old_session_id) {
             return Err(format!(
                 "team member {member_id} session_id {:?} does not match expected {old_session_id}",
@@ -577,7 +575,7 @@ impl AgentTeamsStore {
         member.session_id = Some(new_session_id);
         member.updated_at_ms = now_ms()?;
         let updated = member.clone();
-        self.validate_and_save(refs)?;
+        self.commit(next, refs)?;
         Ok(updated)
     }
 
@@ -586,17 +584,18 @@ impl AgentTeamsStore {
         member_id: &TeamMemberId,
         refs: &AgentTeamValidationRefs,
     ) -> Result<Option<TeamMember>, String> {
-        let member =
-            self.file.members.get_mut(member_id).ok_or_else(|| {
-                format!("cannot clear session for missing team member {member_id}")
-            })?;
+        let mut next = self.file.clone();
+        let member = next
+            .members
+            .get_mut(member_id)
+            .ok_or_else(|| format!("cannot clear session for missing team member {member_id}"))?;
         if member.session_id.is_none() {
             return Ok(None);
         }
         member.session_id = None;
         member.updated_at_ms = now_ms()?;
         let updated = member.clone();
-        self.validate_and_save(refs)?;
+        self.commit(next, refs)?;
         Ok(Some(updated))
     }
 
@@ -608,9 +607,15 @@ impl AgentTeamsStore {
         Ok(())
     }
 
-    fn validate_and_save(&self, refs: &AgentTeamValidationRefs) -> Result<(), String> {
-        validate_store_file(&self.file, refs)?;
-        Self::save(&self.path, &self.file)
+    fn commit(
+        &mut self,
+        next: AgentTeamsStoreFile,
+        refs: &AgentTeamValidationRefs,
+    ) -> Result<(), String> {
+        validate_store_file(&next, refs)?;
+        Self::save(&self.path, &next)?;
+        self.file = next;
+        Ok(())
     }
 
     fn read_from_disk(
@@ -710,7 +715,9 @@ pub fn validate_store_file(
             ));
         }
         validate_custom_agent_ref(member.custom_agent_id.as_ref(), refs)?;
-        validate_backend_kind(member.backend_kind, refs)?;
+        // Enablement is a live setting, not referential integrity: a stored
+        // member keeps its backend while that backend is disabled, and only
+        // members being created are held to the enabled set.
         validate_member_profile(member.profile.as_ref(), refs)?;
         validate_project_refs(&member.project_ids, refs)?;
         if let Some(session_id) = member.session_id.as_ref()
