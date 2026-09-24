@@ -305,6 +305,15 @@ impl Fixture {
         .await
     }
 
+    #[allow(dead_code)]
+    pub async fn new_with_runtime_config_and_settings_file(
+        runtime_config: server::HostRuntimeConfig,
+        settings: &str,
+    ) -> Self {
+        Self::new_with_store_files_inner(runtime_config, true, None, true, None, Some(settings))
+            .await
+    }
+
     async fn new_with_store_files_inner(
         mut runtime_config: server::HostRuntimeConfig,
         skip_real_backend_probe: bool,

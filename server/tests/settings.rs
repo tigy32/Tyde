@@ -1712,6 +1712,149 @@ async fn settings_write_enabled_backends_refreshes_schemas_and_config_snapshots(
     assert!(result.applied, "{:?}", result.field_errors);
 }
 
+fn codex_schema_offers(entries: &[protocol::SessionSchemaEntry], model: &str) -> bool {
+    entries.iter().any(|entry| match entry {
+        protocol::SessionSchemaEntry::Ready { schema } => {
+            schema.backend_kind == BackendKind::Codex
+                && schema.fields.iter().any(|field| {
+                    field.key == "model"
+                        && matches!(
+                            &field.field_type,
+                            protocol::SessionSettingFieldType::Select { options, .. }
+                                if options.iter().any(|option| option.value == model)
+                        )
+                })
+        }
+        _ => false,
+    })
+}
+
+async fn wait_for_codex_catalog(fixture: &mut Fixture, model: &str) {
+    if codex_schema_offers(&fixture.bootstrap.session_schemas, model) {
+        return;
+    }
+    next_frame_matching_on(&mut fixture.client, "Codex catalog", |env| {
+        env.kind == FrameKind::SessionSchemas
+            && codex_schema_offers(
+                &env.parse_payload::<SessionSchemasPayload>()
+                    .expect("parse SessionSchemas")
+                    .schemas,
+                model,
+            )
+    })
+    .await;
+}
+
+/// The user-visible flow: a tier was saved, then the backend's model catalog
+/// changed under it (a CLI upgrade, a provider switch). Every tier edit writes
+/// both tiers, so revalidating the untouched stale tier rejected every edit —
+/// including the ones that would repair it. Only the tier an edit changes is
+/// validated; a changed tier is still held to the current catalog.
+#[tokio::test]
+async fn tier_edit_is_not_blocked_by_a_stale_untouched_tier() {
+    let mut fixture = Fixture::new_with_runtime_config_and_settings_file(
+        server::HostRuntimeConfig {
+            mock_backend_discovery: [(
+                BackendKind::Codex,
+                server::backend::mock::MockDiscovery::new(vec![Ok(mock_model_discovery(
+                    "gpt-new",
+                    &["low", "high"],
+                ))]),
+            )]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        },
+        r#"{
+  "settings": {
+    "enabled_backends": ["codex"],
+    "default_backend": "codex",
+    "complexity_tiers_enabled": true,
+    "backend_tier_configs": {
+      "codex": {
+        "low": { "model": { "string": "gpt-old" }, "reasoning_effort": { "string": "low" } },
+        "high": { "model": { "string": "gpt-old" }, "reasoning_effort": { "string": "max" } }
+      }
+    }
+  }
+}"#,
+    )
+    .await;
+    wait_for_codex_catalog(&mut fixture, "gpt-new").await;
+    let tier = |model: &str, effort: &str| {
+        serde_json::json!({
+            "model": { "string": model },
+            "reasoning_effort": { "string": effort }
+        })
+    };
+    let stale_high = tier("gpt-old", "max");
+    let fresh_low = tier("gpt-new", "high");
+
+    send_settings_write(
+        &mut fixture.client,
+        "w-tier-low-only",
+        vec![replace_op(
+            "/backend_tier_configs/codex",
+            serde_json::json!({ "low": fresh_low, "high": stale_high }),
+            serde_json::json!({ "low": tier("gpt-old", "low"), "high": stale_high }),
+        )],
+    )
+    .await;
+    let result =
+        expect_settings_write_result(&mut fixture.client, "w-tier-low-only", "Low-only edit").await;
+    assert!(
+        result.applied,
+        "a Low edit must not be rejected for the untouched High tier: {:?}",
+        result.field_errors
+    );
+
+    send_settings_write(
+        &mut fixture.client,
+        "w-tier-high-stale",
+        vec![replace_op(
+            "/backend_tier_configs/codex",
+            serde_json::json!({ "low": fresh_low, "high": tier("gpt-old", "low") }),
+            serde_json::json!({ "low": fresh_low, "high": stale_high }),
+        )],
+    )
+    .await;
+    let result = expect_settings_write_result(
+        &mut fixture.client,
+        "w-tier-high-stale",
+        "High edit to a dropped model",
+    )
+    .await;
+    assert!(!result.applied, "a changed tier is still validated");
+    let messages = result
+        .field_errors
+        .iter()
+        .map(|error| error.message.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        messages,
+        vec!["invalid High tier: invalid session setting 'model' value 'gpt-old'"],
+        "only the changed High tier is rejected, naming the dropped model"
+    );
+
+    send_settings_write(
+        &mut fixture.client,
+        "w-tier-high-repair",
+        vec![replace_op(
+            "/backend_tier_configs/codex",
+            serde_json::json!({ "low": fresh_low, "high": tier("gpt-new", "high") }),
+            serde_json::json!({ "low": fresh_low, "high": stale_high }),
+        )],
+    )
+    .await;
+    let result = expect_settings_write_result(
+        &mut fixture.client,
+        "w-tier-high-repair",
+        "High repaired to the current catalog",
+    )
+    .await;
+    assert!(result.applied, "{:?}", result.field_errors);
+}
+
 #[tokio::test(start_paused = true)]
 async fn sequential_settings_writes_preserve_prior_fields() {
     let mut fixture = Fixture::new().await;

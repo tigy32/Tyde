@@ -36,7 +36,7 @@ use crate::send::{
     mobile_device_revoke, mobile_pairing_cancel, mobile_pairing_start, skill_refresh,
     steering_delete, steering_upsert,
 };
-use protocol::clear_invalid_dependent_select_values;
+use protocol::{clear_invalid_dependent_select_values, options_including_current};
 
 const RESERVED_MCP_NAMES: &[&str] = &["tyde-debug", "tyde-agent-control", "tyde-review-feedback"];
 
@@ -3745,14 +3745,17 @@ fn tier_row(
                 Some(SessionSettingValue::String(value)) => value.clone(),
                 _ => String::new(),
             };
-            let option_views = field
-                .select_options(values)
-                .unwrap_or_default()
-                .iter()
-                .map(|option| {
-                    view! { <option value=option.value.clone()>{option.label.clone()}</option> }
-                })
-                .collect::<Vec<_>>();
+            let option_views = options_including_current(
+                field.select_options(values).unwrap_or_default(),
+                &current,
+            )
+            .into_iter()
+            .map(|entry| {
+                view! {
+                    <option value=entry.value disabled=entry.unavailable>{entry.label}</option>
+                }
+            })
+            .collect::<Vec<_>>();
             let state = state.clone();
             let key = field.key.clone();
             let fields = fields.to_vec();
@@ -12594,6 +12597,176 @@ mod wasm_tests {
             .find(|op| replacement_value(op, "/tyde_agent_control_max_depth").is_some())
             .expect("the depth input must commit its settings path");
         assert_eq!(depth_frame.get("value").and_then(Value::as_u64), Some(4));
+    }
+
+    /// A tier value the model catalog has since dropped must stay visible as
+    /// unavailable (not a blank control), and editing the other tier must
+    /// still commit — carrying the stale tier unchanged for the server to
+    /// leave alone rather than silently rewriting it.
+    #[wasm_bindgen_test]
+    async fn stale_tier_value_renders_unavailable_and_other_tier_stays_editable() {
+        fn string_values(pairs: &[(&str, &str)]) -> SessionSettingsValues {
+            let mut values = SessionSettingsValues::default();
+            for (key, value) in pairs {
+                values.0.insert(
+                    (*key).to_owned(),
+                    SessionSettingValue::String((*value).to_owned()),
+                );
+            }
+            values
+        }
+        fn option(value: &str) -> SelectOption {
+            SelectOption {
+                value: value.to_owned(),
+                label: value.to_owned(),
+            }
+        }
+        fn selected_text(select: &HtmlSelectElement) -> (String, bool) {
+            let option: HtmlOptionElement = select
+                .item(select.selected_index() as u32)
+                .expect("a select with a saved value must show a selected option")
+                .dyn_into()
+                .unwrap();
+            (option.text(), option.disabled())
+        }
+
+        let calls = install_settings_send_stub();
+        let container = make_container();
+        let _handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            install_general_host_settings(&state, true, false, None);
+            state.host_settings_by_host.update(|hosts| {
+                let settings = hosts.get_mut("host-general").expect("general fixture");
+                settings.enabled_backends = vec![BackendKind::Codex];
+                settings.default_backend = Some(BackendKind::Codex);
+                settings.complexity_tiers_enabled = true;
+                settings.backend_tier_configs.insert(
+                    BackendKind::Codex,
+                    settings_model::BackendTierConfig {
+                        low: string_values(&[("model", "us.openai.gpt-6-astra")]),
+                        high: string_values(&[
+                            ("model", "openai.gpt-6-astra"),
+                            ("reasoning_effort", "max"),
+                        ]),
+                    },
+                );
+            });
+            let efforts = ["low", "high", "max"].map(option).to_vec();
+            state.session_schemas.update(|hosts| {
+                hosts.entry("host-general".to_owned()).or_default().insert(
+                    BackendKind::Codex,
+                    SessionSchemaEntry::Ready {
+                        schema: SessionSettingsSchema {
+                            model_resolutions: Default::default(),
+                            backend_kind: BackendKind::Codex,
+                            fields: vec![
+                                SessionSettingField {
+                                    key: "model".to_owned(),
+                                    label: "Model".to_owned(),
+                                    description: None,
+                                    use_slider: false,
+                                    select_options_by_setting: None,
+                                    field_type: SessionSettingFieldType::Select {
+                                        options: vec![option("us.openai.gpt-6-astra")],
+                                        default: None,
+                                        nullable: true,
+                                    },
+                                },
+                                SessionSettingField {
+                                    key: "reasoning_effort".to_owned(),
+                                    label: "Reasoning Effort".to_owned(),
+                                    description: None,
+                                    use_slider: true,
+                                    select_options_by_setting: Some(
+                                        protocol::SelectOptionsBySetting {
+                                            setting_key: "model".to_owned(),
+                                            values: vec![protocol::SelectOptionsForValue {
+                                                setting_value: "us.openai.gpt-6-astra".to_owned(),
+                                                options: efforts.clone(),
+                                            }],
+                                        },
+                                    ),
+                                    field_type: SessionSettingFieldType::Select {
+                                        options: efforts,
+                                        default: None,
+                                        nullable: true,
+                                    },
+                                },
+                            ],
+                        },
+                    },
+                );
+            });
+            state.settings_open.set(true);
+            provide_context(state);
+            view! { <SettingsPanel /> }
+        });
+        next_tick().await;
+        click_tab(&container, "Subagents");
+        next_tick().await;
+
+        let selects = container.query_selector_all("select").unwrap();
+        let tier_selects: Vec<HtmlSelectElement> = (0..selects.length())
+            .filter_map(|i| selects.item(i)?.dyn_into::<HtmlSelectElement>().ok())
+            .filter(|select| {
+                (0..select.length()).any(|i| {
+                    select
+                        .item(i)
+                        .and_then(|el| el.text_content())
+                        .is_some_and(|text| text == "Backend default")
+                })
+            })
+            .collect();
+        assert_eq!(
+            tier_selects.len(),
+            4,
+            "Codex Low and High each render Model and Reasoning Effort selects"
+        );
+        let (low_model, low_effort, high_model, high_effort) = (
+            &tier_selects[0],
+            &tier_selects[1],
+            &tier_selects[2],
+            &tier_selects[3],
+        );
+        assert_eq!(
+            selected_text(low_model),
+            ("us.openai.gpt-6-astra".to_owned(), false)
+        );
+        assert_eq!(
+            selected_text(high_model),
+            ("openai.gpt-6-astra (unavailable)".to_owned(), true),
+            "a saved model the catalog no longer offers must be shown, disabled, not blank"
+        );
+        assert_eq!(
+            selected_text(high_effort),
+            ("max (unavailable)".to_owned(), true),
+            "an effort the saved model no longer offers must be shown, disabled, not blank"
+        );
+
+        low_effort.set_value("max");
+        dispatch_event_from_js(&low_effort.clone().unchecked_into(), "change", None);
+        for _ in 0..4 {
+            next_tick().await;
+        }
+        let ops = recorded_settings_write_ops(&calls);
+        let written = ops
+            .iter()
+            .find_map(|op| replacement_value(op, "/backend_tier_configs/codex"))
+            .expect("editing the Low tier must commit the Codex tier config");
+        assert_eq!(
+            written,
+            &serde_json::json!({
+                "low": {
+                    "model": { "string": "us.openai.gpt-6-astra" },
+                    "reasoning_effort": { "string": "max" }
+                },
+                "high": {
+                    "model": { "string": "openai.gpt-6-astra" },
+                    "reasoning_effort": { "string": "max" }
+                }
+            }),
+            "the Low edit must commit with the untouched High tier carried verbatim"
+        );
     }
 
     #[wasm_bindgen_test]

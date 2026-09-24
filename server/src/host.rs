@@ -8443,9 +8443,18 @@ impl HostHandle {
             if !backend_tiers_touched {
                 continue;
             }
-            if current.backend_tier_configs.get(backend) == Some(config)
-                || (config.low.0.is_empty() && config.high.0.is_empty())
-            {
+            let prior = current.backend_tier_configs.get(backend);
+            // A tier left untouched keeps whatever it held, even if the model
+            // catalog has since dropped it; revalidating it would reject every
+            // edit to the other tier and leave no way to repair either one.
+            let changed_tiers = [
+                ("Low", &config.low, prior.map(|prior| &prior.low)),
+                ("High", &config.high, prior.map(|prior| &prior.high)),
+            ]
+            .into_iter()
+            .filter(|(_, values, prior)| !values.0.is_empty() && *prior != Some(*values))
+            .collect::<Vec<_>>();
+            if changed_tiers.is_empty() {
                 continue;
             }
             let pointer = format!("/backend_tier_configs/{}", backend_wire_slug(*backend));
@@ -8458,21 +8467,15 @@ impl HostHandle {
                 );
                 continue;
             };
-            if let Err(error) = validate_session_settings_values(&schema, &config.low) {
-                push_error(
-                    &mut field_errors,
-                    &pointer,
-                    SettingsErrorCode::Invalid,
-                    format!("invalid Low tier: {error}"),
-                );
-            }
-            if let Err(error) = validate_session_settings_values(&schema, &config.high) {
-                push_error(
-                    &mut field_errors,
-                    &pointer,
-                    SettingsErrorCode::Invalid,
-                    format!("invalid High tier: {error}"),
-                );
+            for (tier, values, _) in changed_tiers {
+                if let Err(error) = validate_session_settings_values(&schema, values) {
+                    push_error(
+                        &mut field_errors,
+                        &pointer,
+                        SettingsErrorCode::Invalid,
+                        format!("invalid {tier} tier: {error}"),
+                    );
+                }
             }
         }
         for (backend, values) in &candidate.backend_config {
