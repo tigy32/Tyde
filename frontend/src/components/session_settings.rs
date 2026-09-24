@@ -5,7 +5,7 @@ use protocol::{
     BackendKind, ControlOption, SessionSchemaEntry, SessionSettingFieldType, SessionSettingValue,
     SessionSettingsSchema, SessionSettingsValues, TaskTokenUsageAmount, TaskTokenUsagePayload,
     TaskTokenUsageScope, TaskTokenUsageStatus, TaskTokenUsageUnavailableReason,
-    clear_invalid_dependent_select_values, options_including_current,
+    UNAVAILABLE_OPTION_SUFFIX, clear_invalid_dependent_select_values, options_including_current,
 };
 
 use crate::components::agents_panel::backend_label;
@@ -18,9 +18,33 @@ pub fn SessionSettingsControls(
     schema: SessionSettingsSchema,
     values: Signal<SessionSettingsValues>,
     on_change: Callback<SessionSettingsValues>,
+    /// Stored presets (launch profiles, reviewers) can hold keys the backend's
+    /// schema has since dropped. The server rejects the whole preset for them,
+    /// and no field row would ever show them, so every save would resend the
+    /// key with no way to repair it. Opted in by editors whose saves replace
+    /// the stored values wholesale, where dropping a key really removes it.
+    #[prop(optional)]
+    remove_unsupported_keys: bool,
 ) -> impl IntoView {
     let fields = schema.fields.clone();
     let all_fields = schema.fields;
+    let known_keys = all_fields
+        .iter()
+        .map(|field| field.key.clone())
+        .collect::<Vec<_>>();
+    let unsupported = Memo::new(move |_| {
+        if !remove_unsupported_keys {
+            return Vec::new();
+        }
+        let mut stale = values
+            .get()
+            .0
+            .into_iter()
+            .filter(|(key, _)| !known_keys.contains(key))
+            .collect::<Vec<_>>();
+        stale.sort_by(|a, b| a.0.cmp(&b.0));
+        stale
+    });
 
     view! {
         <div class="session-settings">
@@ -384,6 +408,37 @@ pub fn SessionSettingsControls(
                                 }.into_any()
                             }
                         }}
+                    </div>
+                }
+            }).collect_view()}
+            {move || unsupported.get().into_iter().map(|(key, value)| {
+                let shown = match value {
+                    SessionSettingValue::String(value) => value,
+                    SessionSettingValue::Bool(value) => value.to_string(),
+                    SessionSettingValue::Integer(value) => value.to_string(),
+                    SessionSettingValue::Null => "unset".to_owned(),
+                };
+                let remove_label = format!("Remove unavailable setting {key}");
+                view! {
+                    <div
+                        class="session-setting-row"
+                        title="This backend no longer offers this setting"
+                    >
+                        <span class="session-setting-label">{key.clone()}</span>
+                        <span class="session-setting-value-label">
+                            {format!("{shown}{UNAVAILABLE_OPTION_SUFFIX}")}
+                        </span>
+                        <button
+                            class="settings-btn"
+                            aria-label=remove_label
+                            on:click=move |_| {
+                                let mut current = values.get_untracked();
+                                current.0.remove(&key);
+                                on_change.run(current);
+                            }
+                        >
+                            "Remove"
+                        </button>
                     </div>
                 }
             }).collect_view()}

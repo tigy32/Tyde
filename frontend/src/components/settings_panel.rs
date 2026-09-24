@@ -2737,7 +2737,7 @@ fn ReviewAspectEditor(
                 {move || {
                     let schema = state_for_schema.get_value().selected_host_id.get().and_then(|host| state_for_schema.get_value().session_schemas.get().get(&host).and_then(|schemas| backend.get().and_then(|kind| schemas.get(&kind))).cloned());
                     match schema {
-                        Some(SessionSchemaEntry::Ready { schema }) => view! { <SessionSettingsControls schema values=Signal::derive(move || values.get()) on_change=Callback::new(move |v| values.set(v)) /> }.into_any(),
+                        Some(SessionSchemaEntry::Ready { schema }) => view! { <SessionSettingsControls schema values=Signal::derive(move || values.get()) on_change=Callback::new(move |v| values.set(v)) remove_unsupported_keys=true /> }.into_any(),
                         _ => view! { <p class="settings-description">"Model options are unavailable until this backend is ready. Existing selections are preserved."</p> }.into_any(),
                     }
                 }}
@@ -3433,11 +3433,14 @@ fn LaunchProfileEditor(
                 <div class="settings-form-label">
                     <span>"Session settings"</span>
                     {move || match schema_for_backend() {
-                        Some(schema) if !schema.fields.is_empty() => view! {
+                        Some(schema)
+                            if !schema.fields.is_empty()
+                                || !session_settings_sig.get().0.is_empty() => view! {
                             <SessionSettingsControls
                                 schema=schema
                                 values=settings_values
                                 on_change=settings_on_change
+                                remove_unsupported_keys=true
                             />
                         }.into_any(),
                         Some(_) => view! {
@@ -14466,16 +14469,22 @@ mod wasm_tests {
 
     /// Editing a profile's typed session setting (Hermes model) persists a
     /// `LaunchProfiles` frame whose `session_settings` carries the typed value.
+    /// A stored key the Hermes schema no longer has makes the server mark the
+    /// whole profile unavailable, so the editor must show it and let the user
+    /// remove it; left invisible, every save resent it and the profile could
+    /// never be repaired.
     #[wasm_bindgen_test]
     async fn launch_profiles_edit_persists_typed_session_settings() {
         let calls = install_settings_send_stub();
         let container = make_container();
         let _handle = mount_to(container.clone(), move || {
             let state = AppState::new();
-            install_launch_profile_host(
-                &state,
-                vec![launch_profile_config("hermes:claude", "Hermes · Claude")],
+            let mut profile = launch_profile_config("hermes:claude", "Hermes · Claude");
+            profile.session_settings.0.insert(
+                "toolset".to_owned(),
+                SessionSettingValue::String("legacy".to_owned()),
             );
+            install_launch_profile_host(&state, vec![profile]);
             provide_context(state);
             view! { <LaunchProfilesSection /> }
         });
@@ -14485,6 +14494,34 @@ mod wasm_tests {
             .expect("Edit button")
             .click();
         next_tick().await;
+
+        let form_text = container
+            .query_selector(".settings-form")
+            .unwrap()
+            .expect("editor form")
+            .text_content()
+            .unwrap_or_default();
+        assert!(
+            form_text.contains("toolset") && form_text.contains("legacy (unavailable)"),
+            "a stored setting the schema dropped must be shown as unavailable: {form_text:?}"
+        );
+        container
+            .query_selector("button[aria-label='Remove unavailable setting toolset']")
+            .unwrap()
+            .expect("the unavailable setting must offer a way to remove it")
+            .unchecked_into::<HtmlElement>()
+            .click();
+        next_tick().await;
+        let form_text = container
+            .query_selector(".settings-form")
+            .unwrap()
+            .expect("editor form")
+            .text_content()
+            .unwrap_or_default();
+        assert!(
+            !form_text.contains("legacy (unavailable)"),
+            "the removed setting must leave the editor: {form_text:?}"
+        );
 
         let select: web_sys::HtmlSelectElement = container
             .query_selector(".settings-form .session-setting-select")
@@ -14518,6 +14555,12 @@ mod wasm_tests {
             model,
             Some("opus"),
             "typed session settings must be persisted on the profile: {op:?}"
+        );
+        assert_eq!(
+            op.get("value")
+                .and_then(|value| value.get("session_settings")),
+            Some(&serde_json::json!({ "model": { "string": "opus" } })),
+            "the removed unavailable setting must not be saved back"
         );
     }
 
@@ -17296,6 +17339,83 @@ mod wasm_tests {
             "the module tab is still marked selected after the snapshot"
         );
     }
+    /// A reviewer saved with a setting its backend's schema has since dropped
+    /// fails at every review start. The execution editor must show that
+    /// setting and let the user remove it, while untouched valid settings
+    /// are saved as they were.
+    #[wasm_bindgen_test]
+    async fn review_execution_editor_removes_setting_the_schema_dropped() {
+        let calls = install_settings_send_stub();
+        let container = make_container();
+        let state = AppState::new();
+        install_launch_profile_host(&state, Vec::new());
+        let host = state.selected_host_id.get_untracked().unwrap();
+        state.host_settings_by_host.update(|hosts| {
+            let mut session_settings = SessionSettingsValues::default();
+            session_settings.0.insert(
+                "model".to_owned(),
+                SessionSettingValue::String("opus".to_owned()),
+            );
+            session_settings.0.insert(
+                "toolset".to_owned(),
+                SessionSettingValue::String("legacy".to_owned()),
+            );
+            hosts.get_mut(&host).unwrap().review.heavy[0].target =
+                protocol::ReviewReviewerTarget::Explicit {
+                    backend_kind: BackendKind::Hermes,
+                    session_settings,
+                }
+        });
+        let handle = mount_to(container.clone(), move || {
+            provide_context(state.clone());
+            view! { <ReviewSettingsTab /> }
+        });
+        next_tick().await;
+        find_button_by_text(&container, "Configure Heavy reviewer")
+            .unwrap()
+            .click();
+        next_tick().await;
+        let dialog = container
+            .query_selector("[role='dialog']")
+            .unwrap()
+            .unwrap();
+        let text = dialog.text_content().unwrap_or_default();
+        assert!(
+            text.contains("toolset") && text.contains("legacy (unavailable)"),
+            "a saved setting the schema dropped must be shown as unavailable: {text:?}"
+        );
+        dialog
+            .query_selector("button[aria-label='Remove unavailable setting toolset']")
+            .unwrap()
+            .expect("the unavailable setting must offer a way to remove it")
+            .unchecked_into::<HtmlElement>()
+            .click();
+        next_tick().await;
+        assert!(
+            !dialog
+                .text_content()
+                .unwrap_or_default()
+                .contains("legacy (unavailable)"),
+            "the removed setting must leave the editor"
+        );
+        find_button_by_text(&container, "Save execution settings")
+            .unwrap()
+            .click();
+        for _ in 0..3 {
+            next_tick().await;
+        }
+        let writes = recorded_settings_write_ops(&calls);
+        let saved = writes.last().unwrap();
+        assert_eq!(saved["path"], "/review/heavy/0");
+        assert_eq!(
+            saved["value"]["target"]["session_settings"],
+            serde_json::json!({ "model": { "string": "opus" } }),
+            "the removed setting must not be saved back and the valid one must be kept"
+        );
+        drop(handle);
+        container.remove();
+    }
+
     #[wasm_bindgen_test]
     async fn review_effort_drag_keeps_editor_and_unsaved_values() {
         let calls = install_settings_send_stub();
