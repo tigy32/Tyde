@@ -1,7 +1,7 @@
 //! Built-in `tyde-config` MCP server.
 //!
 //! Exposes host configuration — settings, custom agents, skills, MCP servers,
-//! backend setup status — as MCP tools. Attached only to spawns of the
+//! backend setup status, and host-wide agent lifecycle — as MCP tools. Attached only to spawns of the
 //! builtin Help agent so a user can ask it to inspect and change Tyde
 //! configuration directly. All mutations go through the same `HostHandle`
 //! methods the protocol handlers use, so connected clients see changes
@@ -40,6 +40,10 @@ use serde_json::{Value, json};
 use settings_model::HostExecutablePath;
 use uuid::Uuid;
 
+use crate::agent_control_mcp::{
+    BackendAccessModeInput, CostHintInput, SpawnRequestInput, do_list_agents,
+    do_list_launch_options, do_send_message, do_spawn_agent, parse_agent_id,
+};
 use crate::backend::setup;
 use crate::host::HostHandle;
 
@@ -250,6 +254,37 @@ struct EmptyToolInput {}
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
+struct SpawnAgentToolInput {
+    /// Select an existing project from tyde_config_list_projects, or supply absolute workspace_roots.
+    project_id: Option<String>,
+    #[serde(default)]
+    workspace_roots: Vec<String>,
+    prompt: String,
+    name: Option<String>,
+    backend_kind: Option<crate::agent_control_mcp::BackendKindInput>,
+    launch_profile_id: Option<String>,
+    cost_hint: Option<CostHintInput>,
+    access_mode: Option<BackendAccessModeInput>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct AgentIdToolInput {
+    agent_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct SendAgentMessageToolInput {
+    agent_id: String,
+    message: String,
+    /// Queue by default; true redirects active work using the normal steering path.
+    #[serde(default)]
+    interrupt: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct SettingsWriteToolInput {
     setting: SettingInput,
 }
@@ -414,6 +449,107 @@ where
 
 #[tool_router]
 impl TydeConfigMcpServer {
+    #[tool(
+        description = "List all projects and workbenches on this Tyde host. Use their exact project IDs when creating top-level agents."
+    )]
+    async fn tyde_config_list_projects(
+        &self,
+        Parameters(_input): Parameters<EmptyToolInput>,
+    ) -> Result<CallToolResult, McpError> {
+        match self.host.list_projects().await {
+            Ok(projects) => ok_json(projects),
+            Err(error) => Ok(err_text(error)),
+        }
+    }
+
+    #[tool(
+        description = "List enabled backends, launch profiles, ordered advisory preferences, defaults, and known backend limits. Read before creating an agent."
+    )]
+    async fn tyde_config_list_launch_options(
+        &self,
+        Parameters(_input): Parameters<EmptyToolInput>,
+    ) -> Result<CallToolResult, McpError> {
+        match do_list_launch_options(&self.host).await {
+            Ok(options) => ok_json(options),
+            Err(error) => Ok(err_text(error)),
+        }
+    }
+
+    #[tool(
+        description = "List all open agents across all projects on this Tyde host, including top-level agents and children, with server-owned status and parent/project IDs. Not limited to Help's children. Excludes closed session history."
+    )]
+    async fn tyde_config_list_agents(
+        &self,
+        Parameters(_input): Parameters<EmptyToolInput>,
+    ) -> Result<CallToolResult, McpError> {
+        match do_list_agents(&self.host, None).await {
+            Ok(agents) => ok_json(agents),
+            Err(error) => Ok(err_text(error)),
+        }
+    }
+
+    #[tool(
+        description = "Create an independent top-level agent, not a child of Help, on this Tyde host. Supply a project ID from tyde_config_list_projects or absolute workspace roots. Read tyde_config_list_launch_options first and follow the user's launch preference unless explicitly directed otherwise. Returns agent_id after launch; does not wait for completion."
+    )]
+    async fn tyde_config_spawn_agent(
+        &self,
+        Parameters(input): Parameters<SpawnAgentToolInput>,
+    ) -> Result<CallToolResult, McpError> {
+        let request = SpawnRequestInput {
+            workspace_roots: input.workspace_roots,
+            prompt: input.prompt,
+            name: input.name,
+            project_id: input.project_id,
+            parent_agent_id: None,
+            backend_kind: input.backend_kind,
+            launch_profile_id: input.launch_profile_id,
+            cost_hint: input.cost_hint,
+            access_mode: input.access_mode,
+        };
+        match do_spawn_agent(&self.host, request, None).await {
+            Ok(agent) => ok_json(agent),
+            Err(error) => Ok(err_text(error)),
+        }
+    }
+
+    #[tool(
+        description = "Send a message to any open agent on this Tyde host by exact agent_id. Queues by default; interrupt=true redirects active work through native steering or interrupt-and-send. Idle agents start immediately. Not limited to Help's children."
+    )]
+    async fn tyde_config_send_agent_message(
+        &self,
+        Parameters(input): Parameters<SendAgentMessageToolInput>,
+    ) -> Result<CallToolResult, McpError> {
+        let agent_id = match parse_agent_id(&input.agent_id) {
+            Ok(id) => id,
+            Err(error) => return Ok(err_text(error)),
+        };
+        if input.message.trim().is_empty() {
+            return Ok(err_text("message must not be empty"));
+        }
+        match do_send_message(&self.host, &agent_id, input.message, input.interrupt).await {
+            Ok(()) => ok_json(json!({"agent_id": agent_id, "accepted": true})),
+            Err(error) => Ok(err_text(error)),
+        }
+    }
+
+    #[tool(
+        description = "Close any open agent on this Tyde host by exact agent_id, stopping its active work and closing its descendants through the normal lifecycle. Does not delete saved session history. Confirm the target with the user before closing; never close Help itself while it is handling the request."
+    )]
+    async fn tyde_config_close_agent(
+        &self,
+        Parameters(input): Parameters<AgentIdToolInput>,
+    ) -> Result<CallToolResult, McpError> {
+        let agent_id = match parse_agent_id(&input.agent_id) {
+            Ok(id) => id,
+            Err(error) => return Ok(err_text(error)),
+        };
+        if self.host.close_agent(&agent_id).await {
+            ok_json(json!({"agent_id": agent_id, "closed": true}))
+        } else {
+            Ok(err_text("agent is not open or is already closing"))
+        }
+    }
+
     #[tool(
         description = "List shared review aspects, independent Lite/Heavy reviewer lists, the default mode, the review enabled setting, and backend model/effort schemas. These are the same aspects shown in Settings → Review."
     )]
@@ -812,7 +948,7 @@ impl ServerHandler for TydeConfigMcpServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo {
             instructions: Some(
-                "Tools for inspecting and configuring this Tyde host: read/change settings, manage custom agents, install/update/delete skills and MCP servers, and check backend setup status. Read current state before changing it, and tell the user exactly what changed."
+                "Tools for inspecting and configuring this Tyde host: read/change settings, manage custom agents, install/update/delete skills and MCP servers, check backend setup status, and create/list/message/close live agents across all projects on this host. Global agent tools are distinct from custom-agent templates; ordinary agent-control remains child-scoped. Read current state before changing it, and tell the user exactly what changed."
                     .into(),
             ),
             capabilities: ServerCapabilities::builder().enable_tools().build(),

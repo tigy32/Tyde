@@ -9685,3 +9685,277 @@ async fn viewed_images_reach_remote_clients_and_survive_file_deletion() {
             )
     )), "reconnecting must not depend on the temporary server file still existing");
 }
+
+async fn config_agent_tool(url: &str, name: &str, arguments: Value) -> Value {
+    post_json(
+        url,
+        &json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": name, "arguments": arguments}
+        }),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn help_controls_top_level_agents_across_projects() {
+    let mut fixture = Fixture::new().await;
+    let url = fixture.config_mcp_http_url().await;
+    // Fresh hosts enable no backends; configure one before asserting discovery.
+    let configured = config_agent_tool(
+        &url,
+        "tyde_config_set_setting",
+        json!({
+            "setting": {"setting": "enabled_backends", "enabled_backends": ["claude"]}
+        }),
+    )
+    .await;
+    assert!(!mcp_result_is_error(&configured));
+    let options = config_agent_tool(&url, "tyde_config_list_launch_options", json!({})).await;
+    assert!(
+        options.get("error").is_none(),
+        "Help must expose launch discovery"
+    );
+    let options = mcp_success_json(&options);
+    assert!(
+        options["enabled_backends"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("claude"))
+    );
+
+    let existing = spawn_agent_control_parent(&mut fixture, "existing top level").await;
+    let ordinary = fixture.agent_control_caller(&existing.agent_id).await;
+    let project_root = tempfile::tempdir().unwrap();
+    let project = create_project(
+        &mut fixture.client,
+        "Other project",
+        vec![project_root.path().to_string_lossy().into_owned()],
+    )
+    .await;
+    let projects = config_agent_tool(&url, "tyde_config_list_projects", json!({})).await;
+    let projects = mcp_success_json(&projects);
+    assert!(
+        projects
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p["id"] == project.id.0)
+    );
+
+    let redirect_gate = MockGateHandle::new();
+    let reservation = fixture
+        .reserve_next_mock_launch(
+            "Help-created top level",
+            MockScript::one(MockTurn::held_text("initial held reply"))
+                .then(MockTurn::gated_text("redirect reply", &redirect_gate))
+                .then(MockTurn::text("queued reply"))
+                .then(MockTurn::text("idle reply"))
+                .with_user_bubbles(),
+        )
+        .await;
+    let spawned = config_agent_tool(
+        &url,
+        "tyde_config_spawn_agent",
+        json!({
+            "project_id": project.id.0, "prompt": "Begin", "name": "Help-created top level",
+            "backend_kind": "claude"
+        }),
+    )
+    .await;
+    let spawned = mcp_success_json(&spawned);
+    let agent_id = protocol::AgentId(spawned["agent_id"].as_str().unwrap().to_owned());
+    drop(reservation);
+    let new =
+        expect_replayed_new_agent(&mut fixture.client, &agent_id, "Help-created NewAgent").await;
+    assert!(
+        new.parent_agent_id.is_none(),
+        "Help must create independent roots"
+    );
+    let start = expect_agent_start_on_stream(
+        &mut fixture.client,
+        &new.instance_stream,
+        "Help-created start",
+    )
+    .await;
+    assert_eq!(start.project_id, Some(project.id.clone()));
+    assert!(start.parent_agent_id.is_none());
+    assert_eq!(start.workspace_roots, project_roots(&project));
+    fixture::next_chat_event_matching_on(&mut fixture.client, &new.instance_stream, "held initial output", |event| {
+        matches!(event, ChatEvent::StreamDelta(delta) if delta.text.contains("initial held reply"))
+    }).await;
+
+    let listed = config_agent_tool(&url, "tyde_config_list_agents", json!({})).await;
+    let listed = mcp_success_json(&listed);
+    let agents = listed.as_array().unwrap();
+    assert!(agents.iter().any(|a| a["agent_id"] == existing.agent_id.0));
+    assert!(agents.iter().any(|a| a["agent_id"] == agent_id.0
+        && a["status"] == "thinking"
+        && a["project_id"] == project.id.0
+        && a["parent_agent_id"].is_null()));
+    assert!(
+        mcp_list_agents(&ordinary)
+            .await
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    let denied = mcp_tool_call_as(
+        &ordinary,
+        false,
+        "tyde_send_agent_message",
+        json!({"agent_id": agent_id.0, "message": "Not authorized"}),
+    )
+    .await;
+    assert!(
+        mcp_result_is_error(&denied),
+        "Ordinary agent-control must remain child-scoped"
+    );
+    let injected_parent = config_agent_tool(&url, "tyde_config_spawn_agent", json!({
+        "project_id": project.id.0, "prompt": "Invalid", "backend_kind": "claude", "parent_agent_id": existing.agent_id.0
+    })).await;
+    assert!(
+        injected_parent.get("error").is_some() || mcp_result_is_error(&injected_parent),
+        "Global creation must reject parent injection"
+    );
+
+    let queued = config_agent_tool(
+        &url,
+        "tyde_config_send_agent_message",
+        json!({"agent_id": agent_id.0, "message": "Queue this"}),
+    )
+    .await;
+    assert!(!mcp_result_is_error(&queued));
+    fixture::next_frame_matching_on(&mut fixture.client, "Help message queued", |env| {
+        env.stream == new.instance_stream
+            && env.kind == FrameKind::QueuedMessages
+            && env
+                .parse_payload::<protocol::QueuedMessagesPayload>()
+                .is_ok_and(|p| p.messages.len() == 1 && p.messages[0].message == "Queue this")
+    })
+    .await;
+    let redirected = config_agent_tool(
+        &url,
+        "tyde_config_send_agent_message",
+        json!({"agent_id": agent_id.0, "message": "Redirect now", "interrupt": true}),
+    )
+    .await;
+    assert!(!mcp_result_is_error(&redirected));
+    redirect_gate.wait_until_entered().await;
+    fixture::next_chat_event_matching_on(&mut fixture.client, &new.instance_stream, "Help redirect", |event| {
+        matches!(event, ChatEvent::MessageAdded(message) if matches!(message.sender, MessageSender::User) && message.content == "Redirect now")
+    }).await;
+    redirect_gate.release_one();
+    fixture::next_chat_event_matching_on(
+        &mut fixture.client,
+        &new.instance_stream,
+        "queued reply preserved",
+        |event| matches!(event, ChatEvent::StreamEnd(end) if end.message.content == "queued reply"),
+    )
+    .await;
+    fixture::next_chat_event_matching_on(
+        &mut fixture.client,
+        &new.instance_stream,
+        "queued turn idle",
+        |event| matches!(event, ChatEvent::TypingStatusChanged(false)),
+    )
+    .await;
+    let idle = config_agent_tool(
+        &url,
+        "tyde_config_send_agent_message",
+        json!({"agent_id": agent_id.0, "message": "Continue while idle"}),
+    )
+    .await;
+    assert!(!mcp_result_is_error(&idle));
+    fixture::next_chat_event_matching_on(
+        &mut fixture.client,
+        &new.instance_stream,
+        "idle agent restarted",
+        |event| matches!(event, ChatEvent::StreamEnd(end) if end.message.content == "idle reply"),
+    )
+    .await;
+    fixture::next_chat_event_matching_on(
+        &mut fixture.client,
+        &new.instance_stream,
+        "idle follow-up complete",
+        |event| matches!(event, ChatEvent::TypingStatusChanged(false)),
+    )
+    .await;
+
+    let parent_caller = fixture.agent_control_caller(&agent_id).await;
+    let child = mcp_spawn_agent_as(
+        &parent_caller,
+        json!({"prompt": "Child task", "name": "Descendant", "backend_kind": "claude"}),
+    )
+    .await;
+    let (mut observer, bootstrap) = fixture.connect_with_bootstrap().await;
+    assert!(
+        bootstrap
+            .agents
+            .iter()
+            .any(|a| a.agent_id == agent_id && a.parent_agent_id.is_none())
+    );
+    assert!(
+        bootstrap
+            .agents
+            .iter()
+            .any(|a| a.agent_id == child && a.parent_agent_id.as_ref() == Some(&agent_id))
+    );
+    let closed = config_agent_tool(
+        &url,
+        "tyde_config_close_agent",
+        json!({"agent_id": agent_id.0}),
+    )
+    .await;
+    assert!(!mcp_result_is_error(&closed));
+    let mut closed_ids = std::collections::HashSet::new();
+    while closed_ids.len() < 2 {
+        let event = expect_kind(
+            &mut observer,
+            FrameKind::AgentClosed,
+            "global close fan-out",
+        )
+        .await;
+        closed_ids.insert(
+            event
+                .parse_payload::<AgentClosedPayload>()
+                .unwrap()
+                .agent_id,
+        );
+    }
+    assert!(closed_ids.contains(&agent_id) && closed_ids.contains(&child));
+    let listed = config_agent_tool(&url, "tyde_config_list_agents", json!({})).await;
+    let listed = mcp_success_json(&listed);
+    assert!(
+        listed
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|a| a["agent_id"] == existing.agent_id.0)
+    );
+    assert!(
+        !listed
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|a| a["agent_id"] == agent_id.0 || a["agent_id"] == child.0)
+    );
+    for (name, args) in [
+        (
+            "tyde_config_send_agent_message",
+            json!({"agent_id": agent_id.0, "message": "After close"}),
+        ),
+        ("tyde_config_close_agent", json!({"agent_id": agent_id.0})),
+        ("tyde_config_close_agent", json!({"agent_id": "invalid"})),
+        (
+            "tyde_config_send_agent_message",
+            json!({"agent_id": existing.agent_id.0, "message": "  "}),
+        ),
+    ] {
+        let failed = config_agent_tool(&url, name, args).await;
+        assert!(
+            mcp_result_is_error(&failed),
+            "Invalid target/input must fail visibly"
+        );
+    }
+}

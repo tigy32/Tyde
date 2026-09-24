@@ -406,8 +406,37 @@ async fn builtin_team_custom_agents_seed_and_preserve_user_edits() {
         "the built-in override must be notified verbatim"
     );
 
+    let mut previous_help = help.clone();
+    previous_help.instructions = Some(
+        help.instructions
+            .as_deref()
+            .expect("Help instructions")
+            .split_once("\n\n## Global agent control")
+            .expect("Help must document its global controls")
+            .0
+            .to_owned(),
+    );
+    fixture
+        .client
+        .custom_agent_upsert(CustomAgentUpsertPayload {
+            custom_agent: previous_help,
+        })
+        .await
+        .expect("install previously shipped Help");
+    fixture.next_frame_matching("previous Help upsert", |env| {
+        env.kind == FrameKind::CustomAgentNotify
+            && env.parse_payload::<CustomAgentNotifyPayload>().is_ok_and(|p| {
+                matches!(p, CustomAgentNotifyPayload::Upsert { custom_agent } if custom_agent.id == help.id)
+            })
+    }).await;
+
     let (_fresh, bootstrap) = fixture.connect_fresh_host_with_bootstrap().await;
     let replayed = collect_builtin_team_custom_agents_from_bootstrap(&bootstrap);
+    assert_eq!(
+        replayed.get(&help.id),
+        Some(help),
+        "Unedited Help must gain global-control instructions on restart"
+    );
     assert_eq!(
         replayed.get(&orchestrator_id),
         Some(&edited),

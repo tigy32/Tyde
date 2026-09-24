@@ -925,6 +925,25 @@ When you don't know an answer, say so rather than guessing — and suggest
 where in the UI the answer would be visible.
 "#;
 
+fn help_instructions() -> String {
+    format!(
+        "{}\n\n## Global agent control\n\n\
+         Your tyde-config tools can control live agents across every project on this host.\n\
+         These are running chats, not the custom-agent templates. Use\n\
+         `tyde_config_list_agents` to identify exact agent and project IDs and current\n\
+         server-owned status. Use `tyde_config_list_projects` and\n\
+         `tyde_config_list_launch_options` before `tyde_config_spawn_agent`.\n\
+         Created agents are independent top-level agents, not your children.\n\
+         `tyde_config_send_agent_message` queues by default; set interrupt=true only\n\
+         when the user wants to redirect active work. `tyde_config_close_agent` stops\n\
+         the target and closes its descendants, but preserves saved session history.\n\
+         Confirm the intended target before closing. Do not close yourself.\n\
+         Ordinary tyde-agent-control tools remain restricted to direct children.\n\
+         Global means this host, not every connected remote host.",
+        HELP_INSTRUCTIONS.trim()
+    )
+}
+
 // ── Superseded builtin definitions ──────────────────────────────────────
 //
 // Exact copies of previously shipped builtin agents. A stored record that
@@ -1567,7 +1586,7 @@ pub fn builtin_custom_agents() -> Vec<CustomAgent> {
             name: "Help".to_owned(),
             description: "Answers questions about Tyde and can configure settings for you."
                 .to_owned(),
-            instructions: Some(HELP_INSTRUCTIONS.trim().to_owned()),
+            instructions: Some(help_instructions()),
             skill_ids: Vec::new(),
             mcp_server_ids: Vec::new(),
             tool_policy: ToolPolicy::Unrestricted,
@@ -1600,6 +1619,15 @@ pub fn is_superseded_builtin(record: &CustomAgent) -> bool {
 /// builtin records from user-edited ones.
 fn superseded_builtin_custom_agents() -> Vec<CustomAgent> {
     let mut published = legacy_builtin_team_custom_agents();
+    published.push(CustomAgent {
+        id: CustomAgentId(HELP_CUSTOM_AGENT_ID.to_owned()),
+        name: "Help".to_owned(),
+        description: "Answers questions about Tyde and can configure settings for you.".to_owned(),
+        instructions: Some(HELP_INSTRUCTIONS.trim().to_owned()),
+        skill_ids: Vec::new(),
+        mcp_server_ids: Vec::new(),
+        tool_policy: ToolPolicy::Unrestricted,
+    });
     published.extend([
         CustomAgent {
             id: CustomAgentId(TEAM_LEAD_CUSTOM_AGENT_ID.to_owned()),

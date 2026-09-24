@@ -299,7 +299,7 @@ struct TydeAgentControlMcpServer {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
-enum BackendKindInput {
+pub(crate) enum BackendKindInput {
     Kiro,
     Claude,
     Codex,
@@ -325,7 +325,7 @@ impl From<BackendKindInput> for BackendKind {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
-enum BackendAccessModeInput {
+pub(crate) enum BackendAccessModeInput {
     Unrestricted,
     ReadOnly,
 }
@@ -341,7 +341,7 @@ impl From<BackendAccessModeInput> for BackendAccessMode {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
-enum CostHintInput {
+pub(crate) enum CostHintInput {
     Low,
     Med,
     High,
@@ -505,7 +505,7 @@ enum ProjectKindOutput {
 }
 
 #[derive(Debug, Serialize)]
-struct SpawnAgentResult {
+pub(crate) struct SpawnAgentResult {
     agent_id: String,
     name: String,
     status: AgentControlStatus,
@@ -524,7 +524,7 @@ struct AwaitAgentsResult {
 }
 
 #[derive(Debug, Serialize)]
-struct ListLaunchOptionsResult {
+pub(crate) struct ListLaunchOptionsResult {
     enabled_backends: Vec<BackendKind>,
     default_backend: Option<BackendKind>,
     complexity_tiers_enabled: bool,
@@ -583,7 +583,7 @@ impl AwaitProgressReporter {
 }
 
 #[derive(Debug, Serialize)]
-struct AgentOverview {
+pub(crate) struct AgentOverview {
     agent_id: String,
     name: String,
     backend_kind: BackendKind,
@@ -1258,7 +1258,7 @@ impl TydeAgentControlMcpServer {
                 Ok(agent_id) => agent_id,
                 Err(err) => return Ok(err_text(err)),
             };
-        match do_list_agents(&self.host, &request_agent_id).await {
+        match do_list_agents(&self.host, Some(&request_agent_id)).await {
             Ok(result) => ok_json(result),
             Err(err) => Ok(err_text(err)),
         }
@@ -1495,7 +1495,7 @@ pub fn start_server(
     })
 }
 
-async fn do_spawn_agent(
+pub(crate) async fn do_spawn_agent(
     host: &HostHandle,
     mut input: SpawnRequestInput,
     request_agent_id: Option<AgentId>,
@@ -1803,7 +1803,9 @@ async fn do_remove_workbench(
     .map_err(|error| error.to_string())
 }
 
-async fn do_list_launch_options(host: &HostHandle) -> Result<ListLaunchOptionsResult, String> {
+pub(crate) async fn do_list_launch_options(
+    host: &HostHandle,
+) -> Result<ListLaunchOptionsResult, String> {
     let settings = host.read_settings().await?;
     let catalog = host.read_launch_profile_catalog().await?;
     let backend_limits = host
@@ -1854,7 +1856,7 @@ async fn do_list_launch_options(host: &HostHandle) -> Result<ListLaunchOptionsRe
     })
 }
 
-async fn do_send_message(
+pub(crate) async fn do_send_message(
     host: &HostHandle,
     agent_id: &AgentId,
     message: String,
@@ -2031,18 +2033,22 @@ async fn do_workflow_save(
     host.workflow_save_from_agent(input).await
 }
 
-async fn do_list_agents(
+pub(crate) async fn do_list_agents(
     host: &HostHandle,
-    caller_agent_id: &AgentId,
+    caller_agent_id: Option<&AgentId>,
 ) -> Result<Vec<AgentOverview>, String> {
-    if host.agent_handle(caller_agent_id).await.is_none() {
+    if let Some(caller_agent_id) = caller_agent_id
+        && host.agent_handle(caller_agent_id).await.is_none()
+    {
         return Err(format!("unknown caller agent_id {}", caller_agent_id.0));
     }
     let agents = host
         .list_agents()
         .await
         .into_iter()
-        .filter(|start| start.parent_agent_id.as_ref() == Some(caller_agent_id))
+        .filter(|start| {
+            caller_agent_id.is_none_or(|caller| start.parent_agent_id.as_ref() == Some(caller))
+        })
         .collect::<Vec<_>>();
     let mut overviews = Vec::with_capacity(agents.len());
     for start in agents {
@@ -2346,16 +2352,16 @@ async fn do_read_agent_debug(
 }
 
 #[derive(Debug)]
-struct SpawnRequestInput {
-    workspace_roots: Vec<String>,
-    prompt: String,
-    launch_profile_id: Option<String>,
-    backend_kind: Option<BackendKindInput>,
-    parent_agent_id: Option<String>,
-    project_id: Option<String>,
-    name: Option<String>,
-    cost_hint: Option<CostHintInput>,
-    access_mode: Option<BackendAccessModeInput>,
+pub(crate) struct SpawnRequestInput {
+    pub(crate) workspace_roots: Vec<String>,
+    pub(crate) prompt: String,
+    pub(crate) launch_profile_id: Option<String>,
+    pub(crate) backend_kind: Option<BackendKindInput>,
+    pub(crate) parent_agent_id: Option<String>,
+    pub(crate) project_id: Option<String>,
+    pub(crate) name: Option<String>,
+    pub(crate) cost_hint: Option<CostHintInput>,
+    pub(crate) access_mode: Option<BackendAccessModeInput>,
 }
 
 impl From<SpawnAgentToolInput> for SpawnRequestInput {
@@ -2388,7 +2394,7 @@ impl From<SpawnAgentToolInput> for SpawnRequestInput {
     }
 }
 
-fn parse_agent_id(input: &str) -> Result<AgentId, String> {
+pub(crate) fn parse_agent_id(input: &str) -> Result<AgentId, String> {
     Uuid::parse_str(input).map_err(|err| format!("invalid agent_id '{input}': {err}"))?;
     Ok(AgentId(input.to_string()))
 }
