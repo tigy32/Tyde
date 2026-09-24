@@ -5351,12 +5351,18 @@ async fn configured_reviews_are_awaited_without_injecting_parent_messages() {
     )
     .await;
     assert!(!failed);
-    let close_reservation = fixture
-        .reserve_next_mock_launch(
-            "Review: Tests · Claude",
-            MockScript::one(MockTurn::held_text("Waiting for parent close")),
-        )
-        .await;
+    // Review aspects launch concurrently; a one-name reservation rejected
+    // Scope whenever it reached the host before Tests.
+    let mut closing_launches = Vec::new();
+    for aspect in ["Tests", "Scope"] {
+        for backend in ["Claude", "Codex"] {
+            closing_launches.push((
+                format!("Review: {aspect} · {backend}"),
+                MockScript::one(MockTurn::held_text("Waiting for parent close")),
+            ));
+        }
+    }
+    let close_reservation = fixture.reserve_mock_launches(closing_launches).await;
     let (failed, last) = review_mcp_call(
         &caller.url,
         Some(&caller.authorization),
@@ -5366,6 +5372,26 @@ async fn configured_reviews_are_awaited_without_injecting_parent_messages() {
     .await;
     assert!(!failed);
     assert_eq!(last["status"], "running");
+    let closing_reviewers = last["rounds"].as_array().unwrap().last().unwrap()["reviewers"]
+        .as_array()
+        .unwrap();
+    eprintln!(
+        "Parent-close round: reviewer_count={} running_count={} failed_count={}",
+        closing_reviewers.len(),
+        closing_reviewers
+            .iter()
+            .filter(|r| r["status"] == "running")
+            .count(),
+        closing_reviewers
+            .iter()
+            .filter(|r| r["status"] == "failed")
+            .count()
+    );
+    assert_eq!(closing_reviewers.len(), 4);
+    assert!(
+        closing_reviewers.iter().all(|r| r["status"] == "running"),
+        "every configured reviewer must start before parent-close coverage"
+    );
     let (mut closing_client, before_close) = fixture.connect_with_bootstrap().await;
     let expected_closed = before_close
         .agents

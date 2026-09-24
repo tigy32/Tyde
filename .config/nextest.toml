@@ -38,6 +38,11 @@ success-output = "final"
 filter = 'binary_id(server::agents) & test(agent_control_http_await_stays_active_after_exit_plan_mode_approval)'
 success-output = "final"
 
+# Retain safe frame-order evidence for the review parent-close flow.
+[[profile.default.overrides]]
+filter = 'binary_id(server::review) & test(configured_reviews_are_awaited_without_injecting_parent_messages)'
+success-output = "final"
+
 [profile.default]
 # The native suite is a fast local gate, not a background job. Crossing five
 # minutes is a test failure that must be fixed rather than normalized.
