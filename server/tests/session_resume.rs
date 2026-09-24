@@ -1631,6 +1631,20 @@ async fn restart_restores_a_backend_continued_turn_as_running() {
             .expect("source session");
         if !authoritative {
             let journal = transcript_journal_path(&fixture, &session_id);
+            eprintln!(
+                "RESUME FIXTURE before persistence barrier: marker_present={} journal_present={}",
+                journal.with_extension("authoritative").is_file(),
+                journal.is_file(),
+            );
+            // The actor publishes idle before awaiting its authoritative-marker
+            // write. A mailbox round trip finishes that event's persistence
+            // before this fixture deliberately removes the saved transcript.
+            fixture.mock(&source).await;
+            eprintln!(
+                "RESUME FIXTURE after persistence barrier: marker_present={} journal_present={}",
+                journal.with_extension("authoritative").is_file(),
+                journal.is_file(),
+            );
             std::fs::remove_file(journal.with_extension("authoritative"))
                 .expect("remove authoritative marker to exercise provider history");
             std::fs::remove_file(journal).expect("remove authoritative transcript");
