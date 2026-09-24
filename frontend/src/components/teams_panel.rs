@@ -2,12 +2,12 @@ use leptos::prelude::*;
 use wasm_bindgen_futures::spawn_local;
 
 use protocol::{
-    AgentControlStatus, BackendKind, CustomAgent, CustomAgentId, ProjectId, SpawnCostHint, Team,
-    TeamDraft, TeamDraftId, TeamDraftMember, TeamDraftMemberEdit, TeamDraftMemberId,
-    TeamDraftShuffleScope, TeamId, TeamMember, TeamMemberBindingPayload, TeamMemberCreateSpec,
-    TeamMemberId, TeamMemberPresetProfile, TeamMemberRole, TeamMemberState,
+    AgentControlStatus, BackendKind, CustomAgent, CustomAgentId, ProjectId, SelectOption,
+    SpawnCostHint, Team, TeamDraft, TeamDraftId, TeamDraftMember, TeamDraftMemberEdit,
+    TeamDraftMemberId, TeamDraftShuffleScope, TeamId, TeamMember, TeamMemberBindingPayload,
+    TeamMemberCreateSpec, TeamMemberId, TeamMemberPresetProfile, TeamMemberRole, TeamMemberState,
     TeamMemberUpdatePayload, TeamPersonalityPresetId, TeamPersonalityTrait, TeamRolePresetId,
-    TeamTemplateId,
+    TeamTemplateId, options_including_current,
 };
 
 use crate::send::{
@@ -1537,6 +1537,11 @@ fn DraftMemberRow(
             .unwrap_or_default()
     });
 
+    let current_agent: Memo<Option<CustomAgentId>> =
+        Memo::new(move |_| member.get().and_then(|member| member.custom_agent_id));
+    let current_backend: Memo<Option<BackendKind>> =
+        Memo::new(move |_| member.get().and_then(|member| member.backend_kind));
+
     let send_replace: Callback<TeamDraftMember> = {
         let state = state.clone();
         let host_id = host_id.clone();
@@ -1786,17 +1791,8 @@ fn DraftMemberRow(
                             }
                         }
                     >
-                        <option value="" prop:selected=move || member.get().and_then(|member| member.custom_agent_id).is_none()>"Default agent"</option>
-                        {move || available_agents.get().into_iter().map(|agent| {
-                            let id = agent.id.clone();
-                            let value = agent.id.0.clone();
-                            view! {
-                                <option
-                                    value=value
-                                    prop:selected=move || member.get().and_then(|member| member.custom_agent_id) == Some(id.clone())
-                                >{agent.name}</option>
-                            }
-                        }).collect_view()}
+                        <option value="" prop:selected=move || current_agent.get().is_none()>"Default agent"</option>
+                        {move || custom_agent_options(available_agents.get(), current_agent.get())}
                     </select>
                 </label>
                 <label class="settings-form-label">
@@ -1811,17 +1807,8 @@ fn DraftMemberRow(
                             }
                         }
                     >
-                        <option value="" prop:selected=move || member.get().and_then(|member| member.backend_kind).is_none()>"— select backend —"</option>
-                        {move || available_backends.get().into_iter().map(|backend| {
-                            let value = backend_kind_value(backend);
-                            let label = backend_kind_label(backend);
-                            view! {
-                                <option
-                                    value=value
-                                    prop:selected=move || member.get().and_then(|member| member.backend_kind) == Some(backend)
-                                >{label}</option>
-                            }
-                        }).collect_view()}
+                        <option value="" prop:selected=move || current_backend.get().is_none()>"— select backend —"</option>
+                        {move || backend_options(available_backends.get(), current_backend.get())}
                     </select>
                 </label>
                 {move || {
@@ -2136,19 +2123,7 @@ fn MemberFormFields(form: MemberFormState) -> impl IntoView {
                 >
                     "Default agent"
                 </option>
-                {move || available_agents.get().into_iter().map(|agent| {
-                    let id_str = agent.id.0.clone();
-                    let id_val = agent.id.clone();
-                    let label = agent.name.clone();
-                    view! {
-                        <option
-                            value=id_str
-                            prop:selected=move || custom_agent_sig.get().as_ref() == Some(&id_val)
-                        >
-                            {label}
-                        </option>
-                    }
-                }).collect_view()}
+                {move || custom_agent_options(available_agents.get(), custom_agent_sig.get())}
             </select>
             {move || is_editing.then(|| view! {
                 <span class="settings-form-hint">"The agent profile is fixed once a member exists."</span>
@@ -2169,18 +2144,7 @@ fn MemberFormFields(form: MemberFormState) -> impl IntoView {
                 >
                     "— select backend —"
                 </option>
-                {move || available_backends.get().into_iter().map(|backend| {
-                    let value = backend_kind_value(backend);
-                    let label = backend_kind_label(backend);
-                    view! {
-                        <option
-                            value=value
-                            prop:selected=move || backend_sig.get() == Some(backend)
-                        >
-                            {label}
-                        </option>
-                    }
-                }).collect_view()}
+                {move || backend_options(available_backends.get(), backend_sig.get())}
             </select>
             {move || available_backends.get().is_empty().then(|| view! {
                 <span class="settings-form-hint">"No enabled backends on this host."</span>
@@ -2322,8 +2286,55 @@ fn parse_backend_kind(value: &str) -> Option<BackendKind> {
         "codex" => Some(BackendKind::Codex),
         "antigravity" => Some(BackendKind::Antigravity),
         "hermes" => Some(BackendKind::Hermes),
+        "grok" => Some(BackendKind::Grok),
+        "opencode" => Some(BackendKind::Opencode),
         _ => None,
     }
+}
+
+fn custom_agent_options(agents: Vec<CustomAgent>, current: Option<CustomAgentId>) -> impl IntoView {
+    let options = agents
+        .into_iter()
+        .map(|agent| SelectOption {
+            value: agent.id.0,
+            label: agent.name,
+        })
+        .collect::<Vec<_>>();
+    select_options_view(options, current.map(|id| id.0).unwrap_or_default())
+}
+
+fn backend_options(backends: Vec<BackendKind>, current: Option<BackendKind>) -> impl IntoView {
+    let options = backends
+        .into_iter()
+        .map(|backend| SelectOption {
+            value: backend_kind_value(backend).to_owned(),
+            label: backend_kind_label(backend).to_owned(),
+        })
+        .collect::<Vec<_>>();
+    select_options_view(
+        options,
+        current
+            .map(backend_kind_value)
+            .unwrap_or_default()
+            .to_owned(),
+    )
+}
+
+/// Options for a member select whose stored value may no longer be offered:
+/// the stored value stays selected as a disabled "(unavailable)" entry
+/// rather than the select falling back to its empty option.
+fn select_options_view(options: Vec<SelectOption>, current: String) -> impl IntoView {
+    options_including_current(&options, &current)
+        .into_iter()
+        .map(|entry| {
+            let selected = entry.value == current;
+            view! {
+                <option value=entry.value disabled=entry.unavailable prop:selected=selected>
+                    {entry.label}
+                </option>
+            }
+        })
+        .collect_view()
 }
 
 fn agent_control_status_label(status: AgentControlStatus) -> &'static str {
@@ -3959,6 +3970,40 @@ mod wasm_tests {
         panic!("select label {label_text:?} not found");
     }
 
+    /// The visible text and disabled state of the option a labelled
+    /// `<select>` currently shows.
+    fn selected_option_by_label(container: &HtmlElement, label_text: &str) -> (String, bool) {
+        let labels = container
+            .query_selector_all("label.settings-form-label")
+            .unwrap();
+        for i in 0..labels.length() {
+            let label = labels.item(i).unwrap().dyn_into::<HtmlElement>().unwrap();
+            let Some(text) = label
+                .query_selector("span")
+                .unwrap()
+                .and_then(|span| span.text_content())
+            else {
+                continue;
+            };
+            if text.trim() != label_text {
+                continue;
+            }
+            let select: web_sys::HtmlSelectElement = label
+                .query_selector("select")
+                .unwrap()
+                .unwrap_or_else(|| panic!("label {label_text:?} has no select"))
+                .dyn_into()
+                .unwrap();
+            let option: web_sys::HtmlOptionElement = select
+                .item(select.selected_index() as u32)
+                .unwrap_or_else(|| panic!("select {label_text:?} shows no option"))
+                .dyn_into()
+                .unwrap();
+            return (option.text(), option.disabled());
+        }
+        panic!("select label {label_text:?} not found");
+    }
+
     fn check_project_checkbox(container: &HtmlElement, project_id: &str) {
         let selector = format!("input[type='checkbox'][id='{project_id}']");
         let el: web_sys::HtmlInputElement = container
@@ -4997,6 +5042,148 @@ mod wasm_tests {
                 .unwrap()
                 .is_none(),
             "shuffle button should be hidden when editing an existing member"
+        );
+    }
+
+    /// A draft member whose stored backend was disabled and whose custom
+    /// agent was deleted must show those stored values as unavailable rather
+    /// than a default option, carry them untouched through unrelated edits,
+    /// and stay repairable by picking any enabled backend.
+    #[wasm_bindgen_test]
+    async fn team_draft_member_stale_backend_and_agent_stay_visible_and_repairable() {
+        let calls = install_send_stub();
+        let container = make_container();
+        let host_id = "host-draft-stale";
+        let state = install_state(host_id, vec![], vec![]);
+        state.host_settings_by_host.update(|settings_by_host| {
+            settings_by_host
+                .get_mut(host_id)
+                .expect("test host settings")
+                .enabled_backends = vec![BackendKind::Claude, BackendKind::Grok];
+        });
+        install_host_stream(&state, host_id);
+        install_catalog(&state, host_id);
+        install_custom_agents(
+            &state,
+            host_id,
+            vec![make_custom_agent("ca-1", "Custom teammate")],
+        );
+        let mut member = make_draft_member("draft-manager", TeamMemberRole::Manager, "Lead", "");
+        member.backend_kind = Some(BackendKind::Opencode);
+        member.custom_agent_id = Some(CustomAgentId("ca-deleted".to_owned()));
+        install_draft(&state, host_id, make_draft("Stale Team", vec![member]));
+
+        let state_for_mount = state.clone();
+        let _handle = mount_to(container.clone(), move || {
+            provide_context(state_for_mount.clone());
+            view! { <TeamsPanel /> }
+        });
+        next_tick().await;
+        click_button_with_text(&container, "+ New team");
+        next_tick().await;
+
+        assert_eq!(
+            selected_option_by_label(&container, "Backend"),
+            ("opencode (unavailable)".to_owned(), true),
+            "a stored backend that is no longer enabled must be shown, disabled"
+        );
+        assert_eq!(
+            selected_option_by_label(&container, "Custom agent"),
+            ("ca-deleted (unavailable)".to_owned(), true),
+            "a stored custom agent that no longer exists must be shown, disabled"
+        );
+
+        let description = find_draft_member_text_input(&container, "draft-manager", "Description");
+        description.set_value("Keeps shipping");
+        description
+            .dispatch_event(&web_sys::Event::new("input").unwrap())
+            .unwrap();
+        next_tick().await;
+        let replaced_members = |frames: &[(String, serde_json::Value)]| {
+            frames
+                .iter()
+                .filter(|(kind, payload)| {
+                    kind == &FrameKind::TeamDraftUpdate.to_string()
+                        && payload.get("kind").and_then(|v| v.as_str()) == Some("replace_member")
+                })
+                .filter_map(|(_, payload)| payload.get("member").cloned())
+                .collect::<Vec<_>>()
+        };
+        let description_edit = replaced_members(&recorded_frames(&calls))
+            .into_iter()
+            .find(|member| {
+                member.get("description").and_then(|v| v.as_str()) == Some("Keeps shipping")
+            })
+            .expect("the description edit must replace the member");
+        assert_eq!(
+            description_edit
+                .get("backend_kind")
+                .and_then(|v| v.as_str()),
+            Some("opencode"),
+            "an unrelated edit must carry the stored backend unchanged"
+        );
+        assert_eq!(
+            description_edit
+                .get("custom_agent_id")
+                .and_then(|v| v.as_str()),
+            Some("ca-deleted"),
+            "an unrelated edit must carry the stored custom agent unchanged"
+        );
+
+        set_select_by_label(&container, "Backend", "grok");
+        next_tick().await;
+        assert!(
+            replaced_members(&recorded_frames(&calls))
+                .iter()
+                .any(|member| member.get("backend_kind").and_then(|v| v.as_str()) == Some("grok")),
+            "picking an enabled backend must repair the stale one"
+        );
+    }
+
+    /// The existing-member dialog shows the member's stored backend and
+    /// custom agent even when they are no longer offered, instead of
+    /// claiming the member has none.
+    #[wasm_bindgen_test]
+    async fn edit_member_dialog_shows_stale_backend_and_agent_as_unavailable() {
+        let _calls = install_send_stub();
+        let container = make_container();
+        let host_id = "host-edit-stale";
+        let mut manager = make_member("m-1", "t-1", "Manager", TeamMemberRole::Manager);
+        manager.backend_kind = BackendKind::Hermes;
+        let state = install_state(
+            host_id,
+            vec![make_team("t-1", "Alpha", "m-1")],
+            vec![
+                manager,
+                make_member("m-2", "t-1", "Report One", TeamMemberRole::Report),
+            ],
+        );
+        install_host_stream(&state, host_id);
+        install_project(&state, host_id, "p-1", "Test Project");
+        install_catalog(&state, host_id);
+
+        let state_for_mount = state.clone();
+        let _handle = mount_to(container.clone(), move || {
+            provide_context(state_for_mount.clone());
+            view! { <TeamsPanel /> }
+        });
+        next_tick().await;
+        let edit_btn: HtmlElement = container
+            .query_selector("button[aria-label='Edit member']")
+            .unwrap()
+            .expect("edit member icon button should be present")
+            .dyn_into()
+            .unwrap();
+        edit_btn.click();
+        next_tick().await;
+
+        assert_eq!(
+            selected_option_by_label(&container, "Backend"),
+            ("hermes (unavailable)".to_owned(), true),
+        );
+        assert_eq!(
+            selected_option_by_label(&container, "Custom agent"),
+            ("ca-1 (unavailable)".to_owned(), true),
         );
     }
 
