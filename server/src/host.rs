@@ -2349,6 +2349,12 @@ impl HostHandle {
 
 #[cfg(any(test, feature = "test-support"))]
 impl HostHandle {
+    pub async fn hold_session_schema_refresh_for_test(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        Arc::clone(&self.session_schema_refresh_lock)
+            .lock_owned()
+            .await
+    }
+
     pub async fn set_session_schema_ready_for_test(&self, backend_kind: BackendKind) {
         let schema = session_settings_schema_for_backend(backend_kind);
         let _refresh_guard = self.session_schema_refresh_lock.lock().await;
@@ -4427,14 +4433,14 @@ impl HostHandle {
 
     async fn spawn_agent_with_origin_config_and_team(
         &self,
-        payload: SpawnAgentPayload,
+        mut payload: SpawnAgentPayload,
         context: SpawnAgentContext,
     ) -> AppResult<AgentId> {
         let SpawnAgentContext {
-            origin,
+            mut origin,
             resolved_spawn_config_override,
             team_context,
-            workflow,
+            mut workflow,
             operation_terminal_claim,
             admitted_session,
         } = context;
@@ -4468,6 +4474,18 @@ impl HostHandle {
             }
             (_, admitted) => admitted,
         };
+        if let SpawnAgentParams::Resume { session_id, .. } = &payload.params {
+            let store = Arc::clone(&self.state.lock().await.session_store);
+            if let Some(record) = store.get(session_id).await {
+                if payload.parent_agent_id.is_none() && record.parent_id.is_some() {
+                    payload.parent_agent_id = Some(self.resume_parent_owner(&record).await?);
+                }
+                if let Some(restore) = record.restore_state {
+                    origin = restore.origin;
+                    workflow = restore.workflow;
+                }
+            }
+        }
         let (
             session_store,
             project_store,
@@ -4531,9 +4549,9 @@ impl HostHandle {
                 tracing::warn!(
                     parent_agent_id = ?payload.parent_agent_id,
                     error = %err.message,
-                    "spawn could not resolve the parent session; child records no lineage"
+                    "refusing child spawn without durable parent lineage"
                 );
-                None
+                return Err(AppError::conflict("spawn_agent", err.message));
             }
             None => None,
         };
@@ -4834,6 +4852,12 @@ impl HostHandle {
                             mock_launch: None,
                         })
                         .await);
+                }
+                if record.parent_id.is_some() && record.parent_id != parent_session_id {
+                    return Err(AppError::conflict(
+                        "spawn_agent",
+                        "resume parent must match the saved owning session",
+                    ));
                 }
                 if let Some(requested_custom_agent_id) = payload.custom_agent_id.as_ref() {
                     assert_eq!(
@@ -8891,12 +8915,18 @@ impl HostHandle {
         if !backend_has_dynamic_session_schema(backend_kind) {
             return Ok(Some(session_settings_schema_for_backend(backend_kind)));
         }
-        let _refresh_guard = self.session_schema_refresh_lock.lock().await;
         let mut resolution = {
             let state = self.state.lock().await;
             session_schema_resolution_for_backend(&state, backend_kind, profile_id)
         };
         if matches!(&resolution, SessionSchemaResolution::Pending) {
+            let wait_started = Instant::now();
+            let _refresh_guard = self.session_schema_refresh_lock.lock().await;
+            tracing::info!(
+                ?backend_kind,
+                wait_ms = wait_started.elapsed().as_millis(),
+                "spawn waited for pending session schema discovery"
+            );
             self.refresh_session_schemas_with_fanout_unlocked(false, false, Some(backend_kind))
                 .await;
             resolution = {
@@ -9911,6 +9941,105 @@ impl HostHandle {
                     })
             })
             .collect()
+    }
+
+    fn resume_parent_owner<'a>(
+        &'a self,
+        child: &'a SessionRecord,
+    ) -> futures_util::future::BoxFuture<'a, AppResult<AgentId>> {
+        async move {
+            let (store, storage, teams) = {
+                let state = self.state.lock().await;
+                (
+                    Arc::clone(&state.session_store),
+                    state.backend_storage.clone(),
+                    state.team_registry.clone(),
+                )
+            };
+            let mut ancestors = Vec::new();
+            let mut visited = HashSet::from([child.id.clone()]);
+            let mut next = child.parent_id.clone();
+            while let Some(session_id) = next {
+                if !visited.insert(session_id.clone()) {
+                    return Err(AppError::conflict(
+                        "spawn_agent",
+                        "saved parent lineage contains a cycle",
+                    ));
+                }
+                let record = store.get(&session_id).await.ok_or_else(|| {
+                    AppError::not_found("spawn_agent", "saved parent session is missing")
+                })?;
+                next = record.parent_id.clone();
+                ancestors.push(record);
+            }
+            let team_snapshot = teams
+                .snapshot()
+                .await
+                .map_err(|error| AppError::internal("spawn_agent", anyhow!(error)))?;
+            let mut parent_agent_id = None;
+            for ancestor in ancestors.into_iter().rev() {
+                let admission = self.session_resume_admission(&ancestor.id).await;
+                let admitted = admission.lock_owned().await;
+                if let Some(owner) = self.live_agent_for_session(&ancestor.id).await {
+                    parent_agent_id = Some(owner);
+                    continue;
+                }
+                let record = store.get(&ancestor.id).await.ok_or_else(|| {
+                    AppError::not_found("spawn_agent", "saved parent session was removed")
+                })?;
+                let restore = record.restore_state.as_ref().ok_or_else(|| {
+                    AppError::conflict(
+                        "spawn_agent",
+                        "owning parent is closed; resume the parent first",
+                    )
+                })?;
+                if !session_record_is_resumable(&record, &storage) {
+                    return Err(AppError::conflict(
+                        "spawn_agent",
+                        "owning parent session cannot be resumed",
+                    ));
+                }
+                let team_context = team_snapshot.members.iter().find_map(|member| {
+                    (member.session_id.as_ref() == Some(&record.id)).then(|| TeamSpawnContext {
+                        team_id: member.team_id.clone(),
+                        team_member_id: member.id.clone(),
+                    })
+                });
+                tracing::info!(
+                    ancestor_count = visited.len().saturating_sub(1),
+                    "resuming saved parent before admitting its child"
+                );
+                let owner = self
+                    .spawn_agent_with_origin_config_and_team(
+                        SpawnAgentPayload {
+                            name: None,
+                            custom_agent_id: record.custom_agent_id.clone(),
+                            parent_agent_id,
+                            project_id: record.project_id.clone(),
+                            params: SpawnAgentParams::Resume {
+                                session_id: record.id.clone(),
+                                prompt: None,
+                            },
+                        },
+                        SpawnAgentContext {
+                            origin: restore.origin,
+                            workflow: restore.workflow.clone(),
+                            team_context: team_context.clone(),
+                            admitted_session: Some(admitted),
+                            ..Default::default()
+                        },
+                    )
+                    .await?;
+                if let Some(team_context) = team_context {
+                    self.bind_restored_team_member(team_context, owner.clone(), record.id)
+                        .await;
+                }
+                parent_agent_id = Some(owner);
+            }
+            parent_agent_id
+                .ok_or_else(|| AppError::conflict("spawn_agent", "saved parent lineage is empty"))
+        }
+        .boxed()
     }
 
     /// The agent that currently owns `session_id`, including one whose binding
@@ -15190,10 +15319,11 @@ impl HostHandle {
                             .iter()
                             .map(|record| (record.id.clone(), record.parent_id.clone()))
                             .collect::<Vec<_>>(),
-                        "open agent restoration could not order the remaining sessions \
-                         parent-first; restoring them as root agents"
+                        "open agent restoration could not resolve the remaining parent ownership"
                     );
-                    0
+                    return Err(
+                        "cannot restore children whose owning parents were not restored".to_owned(),
+                    );
                 }
             };
             let record = records.remove(index);
@@ -15246,7 +15376,7 @@ impl HostHandle {
                         tracing::warn!(
                             session_id = %record.id,
                             parent_session_id = %parent_session_id,
-                            "restoring an open agent as a root because its parent was not restored"
+                            "saved parent is outside the restoration snapshot; resolving ownership before resume"
                         );
                     }
                     parent_agent_id

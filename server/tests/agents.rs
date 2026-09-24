@@ -4517,6 +4517,121 @@ async fn agent_control_http_binds_parent_to_authenticated_caller() {
     assert_eq!(child_start.project_id, None);
 
     parent_gate.release_one();
+    let parent_session = parent_start.session_id.expect("parent session exists");
+    let child_session = child_start.session_id.expect("child session exists");
+    assert_eq!(child_start.origin, AgentOrigin::AgentControl);
+
+    fixture
+        .client
+        .list_sessions(ListSessionsPayload::default())
+        .await
+        .expect("request durable lineage before restart");
+    let sessions = fixture::next_frame_matching_on(
+        &mut fixture.client,
+        "persisted MCP child lineage",
+        |env| {
+            env.kind == FrameKind::SessionList
+                && env.parse_payload::<SessionListPayload>().is_ok_and(|list| {
+                    list.sessions
+                        .iter()
+                        .any(|session| session.id == child_session)
+                })
+        },
+    )
+    .await
+    .parse_payload::<SessionListPayload>()
+    .expect("parse persisted session lineage");
+    let saved_child = sessions
+        .sessions
+        .iter()
+        .find(|session| session.id == child_session)
+        .expect("saved MCP child");
+    assert!(
+        saved_child.parent_id.as_ref() == Some(&parent_session),
+        "MCP spawning must persist the same parent shown by the live protocol"
+    );
+    fixture
+        .host_for_test()
+        .shutdown_agents_for_conformance()
+        .await;
+
+    // A client may resume the child before the restart pass reaches its parent.
+    // Reusing that live child must not leave it permanently advertised as a root.
+    let restoration_gate = server::new_spawn_operation_test_gate();
+    let restoration_finished = server::new_spawn_operation_test_gate();
+    let host = server::spawn_host_with_mock_backend_and_runtime_config(
+        fixture.store_dir().join("sessions.json"),
+        fixture.store_dir().join("projects.json"),
+        fixture.store_dir().join("settings.json"),
+        server::HostRuntimeConfig {
+            skip_real_backend_probe: true,
+            restoration_snapshot_test_gate: Some(restoration_gate.shared()),
+            restoration_complete_test_gate: Some(restoration_finished.shared()),
+            ..Default::default()
+        },
+    )
+    .expect("restart host with restoration held");
+    restoration_gate.wait_until_entered().await;
+    host.set_session_schema_ready_for_test(BackendKind::Claude)
+        .await;
+    let discovery_guard = host.hold_session_schema_refresh_for_test().await;
+    let (mut resumed_client, initial_bootstrap) = fixture::connect_host(host.clone()).await;
+    assert!(initial_bootstrap.agents.is_empty());
+    resumed_client
+        .spawn_agent(SpawnAgentPayload {
+            name: None,
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::Resume {
+                session_id: child_session.clone(),
+                prompt: None,
+            },
+        })
+        .await
+        .expect("resume MCP child before automatic parent restoration");
+    let early_child =
+        fixture::next_frame_matching_on(&mut resumed_client, "early child resume", |env| {
+            env.kind == FrameKind::NewAgent
+                && env
+                    .parse_payload::<NewAgentPayload>()
+                    .is_ok_and(|agent| agent.session_id.as_ref() == Some(&child_session))
+        })
+        .await
+        .parse_payload::<NewAgentPayload>()
+        .expect("parse early child resume");
+    fixture::next_frame_matching_on(&mut resumed_client, "early child bootstrap", |env| {
+        env.kind == FrameKind::AgentBootstrap && env.stream == early_child.instance_stream
+    })
+    .await;
+    drop(discovery_guard);
+    restoration_gate.release_one();
+    restoration_finished.wait_until_entered().await;
+
+    let (observer, restored) = fixture::connect_host(host.clone()).await;
+    restoration_finished.release_one();
+    host.shutdown_agents_for_conformance().await;
+    drop(observer);
+    let parents = restored
+        .agents
+        .iter()
+        .filter(|agent| agent.session_id.as_ref() == Some(&parent_session))
+        .collect::<Vec<_>>();
+    let children = restored
+        .agents
+        .iter()
+        .filter(|agent| agent.session_id.as_ref() == Some(&child_session))
+        .collect::<Vec<_>>();
+    assert_eq!(parents.len(), 1, "restore exactly one parent card");
+    assert_eq!(
+        children.len(),
+        1,
+        "reuse the early child without duplicating it"
+    );
+    assert!(
+        children[0].parent_agent_id.as_ref() == Some(&parents[0].agent_id),
+        "restart must advertise the MCP child under its restored parent, not as a root card"
+    );
 }
 
 #[tokio::test]

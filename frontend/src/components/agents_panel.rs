@@ -330,7 +330,13 @@ pub(crate) fn status_class(derived: &DerivedAgentState) -> &'static str {
 #[derive(Clone, Debug, PartialEq)]
 struct AgentTreeGroup {
     parent: AgentInfo,
-    children: Vec<AgentInfo>,
+    children: Vec<AgentTreeGroup>,
+}
+
+impl AgentTreeGroup {
+    fn member_count(&self) -> usize {
+        1 + self.children.iter().map(Self::member_count).sum::<usize>()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -406,42 +412,51 @@ fn project_label(
 }
 
 fn build_parent_child_groups(agents: Vec<AgentInfo>) -> Vec<AgentTreeGroup> {
-    let visible_ids: HashSet<AgentId> = agents.iter().map(|a| a.agent_id.clone()).collect();
-    let mut children_by_parent: HashMap<AgentId, Vec<AgentInfo>> = HashMap::new();
-    let mut top_level: Vec<AgentInfo> = Vec::new();
-    let mut orphans: Vec<AgentInfo> = Vec::new();
+    fn take_tree(
+        parent: AgentInfo,
+        children_by_parent: &mut HashMap<SidebarAgentRef, Vec<AgentInfo>>,
+    ) -> AgentTreeGroup {
+        let children = children_by_parent
+            .remove(&agent_ref(&parent))
+            .unwrap_or_default()
+            .into_iter()
+            .map(|child| take_tree(child, children_by_parent))
+            .collect();
+        AgentTreeGroup { parent, children }
+    }
 
+    let visible_ids: HashSet<SidebarAgentRef> = agents.iter().map(agent_ref).collect();
+    let mut children_by_parent: HashMap<SidebarAgentRef, Vec<AgentInfo>> = HashMap::new();
+    let mut roots = Vec::new();
     for agent in agents {
-        match &agent.parent_agent_id {
-            Some(parent_id) if visible_ids.contains(parent_id) => {
-                children_by_parent
-                    .entry(parent_id.clone())
-                    .or_default()
-                    .push(agent);
+        let parent = agent
+            .parent_agent_id
+            .as_ref()
+            .map(|parent_id| SidebarAgentRef {
+                host_id: agent.host_id.clone(),
+                agent_id: parent_id.clone(),
+            });
+        match parent {
+            Some(parent) if visible_ids.contains(&parent) => {
+                children_by_parent.entry(parent).or_default().push(agent);
             }
-            Some(_) => orphans.push(agent),
-            None => top_level.push(agent),
+            _ => roots.push(agent),
         }
     }
-
-    let mut groups = Vec::with_capacity(top_level.len() + orphans.len());
-    for parent in top_level {
-        let children = children_by_parent
-            .remove(&parent.agent_id)
-            .unwrap_or_default();
-        groups.push(AgentTreeGroup { parent, children });
-    }
-    for orphan in orphans {
-        groups.push(AgentTreeGroup {
-            parent: orphan,
-            children: Vec::new(),
-        });
+    let groups = roots
+        .into_iter()
+        .map(|parent| take_tree(parent, &mut children_by_parent))
+        .collect();
+    if !children_by_parent.is_empty() {
+        log::error!(
+            "server agent ownership contains a cycle; sidebar cannot render the affected tree"
+        );
     }
     groups
 }
 
 fn build_sidebar_sections(
-    agents: Vec<AgentInfo>,
+    groups: Vec<AgentTreeGroup>,
     configured_hosts: Vec<crate::bridge::ConfiguredHost>,
     mut projects: Vec<ProjectInfo>,
 ) -> Vec<AgentHostSection> {
@@ -465,12 +480,12 @@ fn build_sidebar_sections(
         })
         .collect();
 
-    let mut leaf_agents: HashMap<(String, Option<ProjectId>), Vec<AgentInfo>> = HashMap::new();
+    let mut leaf_agents: HashMap<(String, Option<ProjectId>), Vec<AgentTreeGroup>> = HashMap::new();
     let mut first_seen_hosts: Vec<String> = Vec::new();
     let mut first_seen_projects: HashMap<String, Vec<Option<ProjectId>>> = HashMap::new();
-    for agent in agents {
-        let host_id = agent.host_id.clone();
-        let project_id = agent.project_id.clone();
+    for group in groups {
+        let host_id = group.parent.host_id.clone();
+        let project_id = group.parent.project_id.clone();
         if !known_host_order.contains(&host_id) && !first_seen_hosts.contains(&host_id) {
             first_seen_hosts.push(host_id.clone());
         }
@@ -481,7 +496,7 @@ fn build_sidebar_sections(
         leaf_agents
             .entry((host_id, project_id))
             .or_default()
-            .push(agent);
+            .push(group);
     }
 
     let mut host_order: Vec<String> = known_host_order
@@ -528,7 +543,7 @@ fn build_sidebar_sections(
                             .map(|id| format!("{}:{}", host_id, id.0))
                             .unwrap_or_else(|| format!("{host_id}:no-project")),
                         label,
-                        groups: build_parent_child_groups(agents),
+                        groups: agents,
                     })
                 })
                 .collect();
@@ -581,17 +596,17 @@ fn build_sidebar_projection(
         .map(|assignment| (assignment.target, assignment.group_id))
         .collect::<HashMap<_, _>>();
 
-    let mut grouped_agents = HashMap::<AgentGroupId, Vec<AgentInfo>>::new();
+    let mut grouped_agents = HashMap::<AgentGroupId, Vec<AgentTreeGroup>>::new();
     let mut ungrouped_agents = Vec::new();
-    for agent in agents {
-        let target = agent_annotation_target(&agent);
+    for tree in build_parent_child_groups(agents) {
+        let target = agent_annotation_target(&tree.parent);
         if let Some(group_id) = assignments.get(&target) {
             grouped_agents
                 .entry(group_id.clone())
                 .or_default()
-                .push(agent);
+                .push(tree);
         } else {
-            ungrouped_agents.push(agent);
+            ungrouped_agents.push(tree);
         }
     }
 
@@ -599,8 +614,7 @@ fn build_sidebar_projection(
         .groups
         .into_iter()
         .filter_map(|group| {
-            let agents = grouped_agents.remove(&group.id)?;
-            let groups = build_parent_child_groups(agents);
+            let groups = grouped_agents.remove(&group.id)?;
             (!groups.is_empty()).then_some(AgentCustomGroupSection { group, groups })
         })
         .collect();
@@ -1154,7 +1168,7 @@ pub fn AgentsPanel() -> impl IntoView {
                                             let group_id = custom_group.group.id.clone();
                                             let group_id_attr = group_id.0.clone();
                                             let folder_key = format!("group:{}", group_id.0);
-                                            let member_count = custom_group.groups.iter().map(|group| 1 + group.children.len()).sum();
+                                            let member_count = custom_group.groups.iter().map(|group| group.member_count()).sum();
                                             let group_name = custom_group.group.name.clone();
                                             let section_group_id = group_id.clone();
                                             let header_group_id = group_id.clone();
@@ -1411,7 +1425,7 @@ pub fn AgentsPanel() -> impl IntoView {
                                             <div class="agent-sidebar-host-header">{format!("Host: {}", host.label)}</div>
                                             {host.projects.into_iter().map(|project| {
                                                 let folder_key = format!("project:{}", project.key);
-                                                let member_count = project.groups.iter().map(|group| 1 + group.children.len()).sum();
+                                                let member_count = project.groups.iter().map(|group| group.member_count()).sum();
                                                 view! {
                                                     <section class="agent-sidebar-project-section" data-project-key=project.key>
                                                         <div class="agent-sidebar-project-header">
@@ -1438,7 +1452,7 @@ fn render_agent_tree_group(
     state: AppState,
     group: AgentTreeGroup,
     interactions: AgentsPanelInteractions,
-) -> impl IntoView {
+) -> AnyView {
     let parent = group.parent;
     let children = group.children;
     let parent_id = parent.agent_id.clone();
@@ -1460,12 +1474,7 @@ fn render_agent_tree_group(
                         }
                     }
                 >
-                    {agent_card(
-                        state.clone(),
-                        child,
-                        0,
-                        interactions.clone(),
-                    )}
+                    {render_agent_tree_group(state.clone(), child, interactions.clone())}
                 </div>
             }
         })
@@ -1476,6 +1485,7 @@ fn render_agent_tree_group(
             {children_view}
         </div>
     }
+    .into_any()
 }
 
 /// Switch the active project (and host) to the project the clicked agent
@@ -3651,6 +3661,96 @@ mod wasm_tests {
                 && group_text.contains("Child Alpha Agent")
                 && group_text.contains('1'),
             "parent group should show parent, child, and visible child count; got {group_text:?}"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    async fn sidebar_keeps_children_nested_across_project_and_group_boundaries() {
+        let mut failures = Vec::new();
+        for scope in ["another project", "no project", "parent custom group"] {
+            let container = make_container();
+            let state = make_app_state("local");
+            seed_sidebar_group_fixture(&state);
+            state.agents.update(|agents| {
+                let child = agents
+                    .iter_mut()
+                    .find(|agent| agent.agent_id.0 == "child-alpha")
+                    .expect("fixture child");
+                child.origin = AgentOrigin::AgentControl;
+                child.project_id = match scope {
+                    "another project" => Some(ProjectId("beta".to_owned())),
+                    "no project" => None,
+                    _ => child.project_id.clone(),
+                };
+            });
+            if scope == "parent custom group" {
+                apply_group_snapshot(
+                    &state,
+                    assigned_group("owners", "Owners", &["parent-alpha"]),
+                );
+            }
+
+            CenterWorkspaceWidth::forget_measurement();
+            let mounted_state = state.clone();
+            let handle = mount_to(container.clone(), move || {
+                provide_context(mounted_state.clone());
+                view! {
+                    <style>{include_str!("../../styles.css")}</style>
+                    <AgentsPanel />
+                }
+            });
+            for _ in 0..4 {
+                next_tick().await;
+            }
+
+            let parent = agent_card_el(&container, "parent-alpha");
+            let names = container.query_selector_all(".agent-card-name").unwrap();
+            let child_names = (0..names.length())
+                .filter_map(|index| names.item(index))
+                .filter(|name| name.text_content().as_deref() == Some("Child Alpha Agent"))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                child_names.len(),
+                1,
+                "{scope}: render the child exactly once"
+            );
+            let child = child_names[0]
+                .clone()
+                .dyn_into::<web_sys::Element>()
+                .unwrap()
+                .closest(".agent-card")
+                .unwrap()
+                .expect("child card");
+            let parent_box = parent.get_bounding_client_rect();
+            let child_box = child.get_bounding_client_rect();
+            let toggle = parent
+                .query_selector("button[title='Toggle sub-agents']")
+                .unwrap();
+            if child_box.left() <= parent_box.left() || toggle.is_none() {
+                failures.push(format!(
+                    "{scope}: child indentation={}px, parent has child toggle={}",
+                    child_box.left() - parent_box.left(),
+                    toggle.is_some()
+                ));
+            }
+            if let Some(toggle) = toggle {
+                toggle.dyn_into::<HtmlElement>().unwrap().click();
+                for _ in 0..4 {
+                    next_tick().await;
+                }
+                assert_eq!(
+                    child.get_bounding_client_rect().height(),
+                    0.0,
+                    "{scope}: collapsing the parent must hide its child"
+                );
+                assert!(parent.get_bounding_client_rect().height() > 0.0);
+            }
+            drop(handle);
+            container.remove();
+        }
+        assert!(
+            failures.is_empty(),
+            "Owned children must not become root cards at sidebar boundaries: {failures:?}"
         );
     }
 
