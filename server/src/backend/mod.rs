@@ -69,7 +69,8 @@ pub const AGENT_CONTROL_SPAWN_STEERING: &str = concat!(
     "`tyde_send_agent_message` queues by default; use `interrupt: true` to interrupt and ",
     "redirect active work. Call `tyde_await_agents` with all pending child IDs: like select, ",
     "it returns when any is ready. Read ready children with `tyde_read_agent`, act on their ",
-    "output, then await remaining work. Don't poll or expect injected results."
+    "output, then await remaining work. Don't poll or expect injected results.\n",
+    "Close your agents when you no longer need them."
 );
 
 /// Tyde's own steering for a session holding `startup_mcp_servers`.

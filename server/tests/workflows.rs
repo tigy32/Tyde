@@ -507,7 +507,8 @@ async fn trigger_workflow_spawns_workflow_origin_coordinator() {
     assert!(
         response.contains(&format!(
             "[builtin_steering: {}]",
-            server::backend::AGENT_CONTROL_SPAWN_STEERING
+            // The mock's startup summary renders newlines as literal \n.
+            server::backend::AGENT_CONTROL_SPAWN_STEERING.replace('\n', "\\n")
         )),
         "coordinator holds agent control without the steering for it: {response}"
     );

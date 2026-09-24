@@ -4950,6 +4950,7 @@ async fn agent_control_http_credentials_scope_every_child_tool() {
 
     for (tool, await_surface, arguments) in [
         ("tyde_read_agent", false, json!({ "agent_id": child_b.0 })),
+        ("tyde_close_agent", false, json!({ "agent_id": child_b.0 })),
         (
             "tyde_read_agent_debug",
             false,
@@ -5035,6 +5036,163 @@ async fn agent_control_http_credentials_scope_every_child_tool() {
     .await;
     assert!(mcp_result_is_error(&forged));
     assert!(mcp_result_text(&forged).contains("invalid agent-control bearer"));
+
+    let child_caller = fixture.agent_control_caller(&child_a).await;
+    let reservation = fixture
+        .reserve_next_mock_launch(
+            "credential-grandchild",
+            MockScript::one(MockTurn::held_text("grandchild still active")),
+        )
+        .await;
+    let grandchild = mcp_spawn_agent_as(
+        &child_caller,
+        json!({
+            "workspace_roots": ["/tmp/credential-grandchild"],
+            "prompt": "Hold until closed", "backend_kind": "claude",
+            "name": "credential-grandchild"
+        }),
+    )
+    .await;
+    drop(reservation);
+    for (caller, target) in [
+        (&caller_a, &parent_a.agent_id),
+        (&caller_a, &parent_b.agent_id),
+        (&caller_a, &grandchild),
+        (&child_caller, &parent_a.agent_id),
+        (&caller_b, &child_a),
+    ] {
+        let denied = mcp_tool_call_as(
+            caller,
+            false,
+            "tyde_close_agent",
+            json!({"agent_id": target.0}),
+        )
+        .await;
+        assert!(
+            mcp_result_is_error(&denied),
+            "Close must reject self, ancestors, indirect descendants, and unrelated agents"
+        );
+        assert!(mcp_result_text(&denied).contains("not a direct child"));
+    }
+    let anonymous = post_json(
+        &base_url,
+        &json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": "tyde_close_agent", "arguments": {"agent_id": child_a.0}}
+        }),
+    )
+    .await;
+    assert!(mcp_result_is_error(&anonymous));
+    assert!(mcp_result_text(&anonymous).contains("bearer credential"));
+    let wrong_surface = mcp_tool_call_as(
+        &caller_a,
+        true,
+        "tyde_close_agent",
+        json!({"agent_id": child_a.0}),
+    )
+    .await;
+    assert!(mcp_result_is_error(&wrong_surface));
+    assert!(mcp_result_text(&wrong_surface).contains("not available"));
+    let invalid = mcp_tool_call_as(
+        &caller_a,
+        false,
+        "tyde_close_agent",
+        json!({"agent_id": "invalid"}),
+    )
+    .await;
+    assert!(mcp_result_is_error(&invalid));
+    assert!(mcp_result_text(&invalid).contains("invalid agent_id"));
+
+    let (mut observer, bootstrap) = fixture.connect_with_bootstrap().await;
+    for target in [
+        &parent_a.agent_id,
+        &parent_b.agent_id,
+        &child_a,
+        &child_b,
+        &grandchild,
+    ] {
+        assert!(
+            bootstrap.agents.iter().any(|a| &a.agent_id == target),
+            "Denied closes must leave every agent open"
+        );
+    }
+    let closed = mcp_tool_call_as(
+        &caller_a,
+        false,
+        "tyde_close_agent",
+        json!({"agent_id": child_a.0}),
+    )
+    .await;
+    let closed = mcp_success_json(&closed);
+    assert_eq!(closed["agent_id"], child_a.0);
+    assert_eq!(closed["closed"], true);
+    for expected in [&grandchild, &child_a] {
+        let event = expect_kind(
+            &mut observer,
+            FrameKind::AgentClosed,
+            "MCP subtree close fan-out",
+        )
+        .await;
+        assert_eq!(
+            &event
+                .parse_payload::<AgentClosedPayload>()
+                .unwrap()
+                .agent_id,
+            expected,
+            "Descendants must close before their parent"
+        );
+    }
+    assert!(
+        mcp_list_agents(&caller_a)
+            .await
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    let siblings = mcp_list_agents(&caller_b).await;
+    assert!(
+        siblings
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|a| a["agent_id"] == child_b.0)
+    );
+    let repeated = mcp_tool_call_as(
+        &caller_a,
+        false,
+        "tyde_close_agent",
+        json!({"agent_id": child_a.0}),
+    )
+    .await;
+    assert!(
+        mcp_result_is_error(&repeated),
+        "Closing a missing child must fail visibly"
+    );
+    let revoked = mcp_tool_call_as(&child_caller, false, "tyde_list_agents", json!({})).await;
+    assert!(
+        mcp_result_is_error(&revoked),
+        "Closed agents must lose their caller authority"
+    );
+    let (_late_client, after_close) = fixture.connect_with_bootstrap().await;
+    assert!(
+        !after_close
+            .agents
+            .iter()
+            .any(|a| a.agent_id == child_a || a.agent_id == grandchild)
+    );
+    assert!(
+        after_close
+            .agents
+            .iter()
+            .any(|a| a.agent_id == parent_a.agent_id)
+    );
+    assert!(
+        after_close
+            .agents
+            .iter()
+            .any(|a| a.agent_id == parent_b.agent_id)
+    );
+    assert!(after_close.agents.iter().any(|a| a.agent_id == child_b));
 }
 
 #[tokio::test]
@@ -5081,6 +5239,10 @@ async fn agent_control_await_endpoint_isolated_and_remains_pending() {
             .expect("tools/list result");
         assert!(tools.iter().any(|tool| tool["name"] == expected));
         assert!(!tools.iter().any(|tool| tool["name"] == absent));
+        assert_eq!(
+            tools.iter().any(|tool| tool["name"] == "tyde_close_agent"),
+            url == &caller.url
+        );
     }
 
     let pending = mcp_tool_call_as(
@@ -7655,7 +7817,8 @@ async fn detached_spawn_bootstraps_before_follow_up_is_admitted() {
         format!(
             "[startup_mcp_servers: tyde-agent-control(http), tyde-agent-await(http)] \
              [builtin_steering: {}] mock backend response to: {prompt}",
-            server::backend::AGENT_CONTROL_SPAWN_STEERING
+            // The mock's startup summary renders newlines as literal \n.
+            server::backend::AGENT_CONTROL_SPAWN_STEERING.replace('\n', "\\n")
         )
     };
     let expected = [

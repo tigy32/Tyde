@@ -402,7 +402,7 @@ struct AwaitAgentsToolInput {
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
-struct ReadAgentToolInput {
+struct AgentIdToolInput {
     agent_id: String,
 }
 
@@ -1066,7 +1066,7 @@ impl TydeAgentControlMcpServer {
     )]
     async fn tyde_read_agent(
         &self,
-        Parameters(input): Parameters<ReadAgentToolInput>,
+        Parameters(input): Parameters<AgentIdToolInput>,
         Extension(parts): Extension<axum::http::request::Parts>,
     ) -> Result<CallToolResult, McpError> {
         let caller = match require_authenticated_caller(self, &parts, "tyde_read_agent").await {
@@ -1121,6 +1121,34 @@ impl TydeAgentControlMcpServer {
         {
             Ok(result) => ok_json(result),
             Err(err) => Ok(err_text(err)),
+        }
+    }
+
+    #[tool(
+        description = "Close a direct child of the authenticated caller when it is no longer needed. Stops active work and closes its descendants, while preserving saved session history. Read needed results first: closed agents can no longer be read or messaged. Cannot close yourself, ancestors, or unrelated agents."
+    )]
+    async fn tyde_close_agent(
+        &self,
+        Parameters(input): Parameters<AgentIdToolInput>,
+        Extension(parts): Extension<axum::http::request::Parts>,
+    ) -> Result<CallToolResult, McpError> {
+        let caller = match require_authenticated_caller(self, &parts, "tyde_close_agent").await {
+            Ok(caller) => caller,
+            Err(error) => return Ok(err_text(error)),
+        };
+        let agent_id = match parse_agent_id(&input.agent_id) {
+            Ok(id) => id,
+            Err(error) => return Ok(err_text(error)),
+        };
+        if let Err(error) =
+            authorize_direct_children(&self.host, &caller, std::slice::from_ref(&agent_id)).await
+        {
+            return Ok(err_text(error));
+        }
+        if self.host.close_agent(&agent_id).await {
+            ok_json(json!({ "agent_id": agent_id, "closed": true }))
+        } else {
+            Ok(err_text("agent is not open or is already closing"))
         }
     }
 
@@ -1269,7 +1297,7 @@ impl ServerHandler for TydeAgentControlMcpServer {
     fn get_info(&self) -> ServerInfo {
         let instructions = match self.surface {
             AgentControlMcpSurface::Control => {
-                "Tools for orchestrating direct child Tyde agents. Spawn agents, send follow-ups, read the latest visible output, inspect incremental debug events, and list direct children. Long-running waits are exposed by the separate tyde-agent-await MCP server. Use tyde_request_review for the user-configured focused reviewers; call tyde_await_review with the returned review_id and round_id, then tyde_get_review to read findings. Review results never arrive as injected messages. Record addressed or dismissed findings with tyde_review_disposition and request another round after fixes. Review configuration is managed by the user or Help agent, not by coding agents."
+                "Tools for orchestrating direct child Tyde agents. Spawn agents, send follow-ups, read the latest visible output, inspect incremental debug events, and list or close direct children. Long-running waits are exposed by the separate tyde-agent-await MCP server. Use tyde_request_review for the user-configured focused reviewers; call tyde_await_review with the returned review_id and round_id, then tyde_get_review to read findings. Review results never arrive as injected messages. Record addressed or dismissed findings with tyde_review_disposition and request another round after fixes. Review configuration is managed by the user or Help agent, not by coding agents."
             }
             AgentControlMcpSurface::Await => {
                 "Long-running tools for awaiting direct child agents and requested review rounds. tyde_await_review waits for all reviewers in the specified round; use tyde_get_review on the control server to read findings."

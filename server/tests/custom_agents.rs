@@ -1559,6 +1559,7 @@ async fn agent_control_spawn_steering_follows_the_agent_control_mcp() {
         "`tyde_await_agents` with all pending child IDs: like select, it returns when any is ready",
         "Read ready children with `tyde_read_agent`",
         "then await remaining work. Don't poll or expect injected results.",
+        "Close your agents when you no longer need them.",
     ] {
         assert!(
             text.contains(instruction),
@@ -1572,7 +1573,8 @@ async fn agent_control_spawn_steering_follows_the_agent_control_mcp() {
     assert!(
         text.contains(&format!(
             "[builtin_steering: {}]",
-            server::backend::AGENT_CONTROL_SPAWN_STEERING
+            // The mock's startup summary renders newlines as literal \n.
+            server::backend::AGENT_CONTROL_SPAWN_STEERING.replace('\n', "\\n")
         )),
         "spawn config lost the agent-control steering: {text}"
     );
