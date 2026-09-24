@@ -203,6 +203,10 @@ pub struct SetSessionSettingsPayload {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionSettingsPayload {
     pub values: SessionSettingsValues,
+    /// The schema this agent validates edits against, resolved at start.
+    /// The host catalog can drift after that, so a running agent's controls
+    /// render this schema, never the host's `session_schemas` entry.
+    pub schema: Option<SessionSettingsSchema>,
 }
 ```
 
@@ -617,7 +621,8 @@ Handle new frame kinds in `dispatch_envelope()`:
 - `FrameKind::SessionSchemas` → parse `SessionSchemasPayload`, update
   `session_schemas` signal (keyed by `backend_kind`).
 - `FrameKind::SessionSettings` → parse `SessionSettingsPayload`, update
-  `agent_session_settings` signal (keyed by agent ID from stream path).
+  `agent_session_settings` and `agent_session_schemas` signals (keyed by
+  agent ID from stream path).
 
 ### 7.3 Chat Input Area
 

@@ -13,7 +13,7 @@ use serde_json::Value;
 /// `protocol::TydeReleaseVersion`.
 pub use host_config::{LOCAL_HOST_ID, TydeReleaseVersion};
 
-pub const PROTOCOL_VERSION: u32 = 63;
+pub const PROTOCOL_VERSION: u32 = 64;
 
 // Exported verbatim to TydeMobileService by tools/export-mobile-rtc.py.
 pub mod mobile_rtc {
@@ -4286,6 +4286,9 @@ pub struct SetSessionSettingsPayload {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionSettingsPayload {
     pub values: SessionSettingsValues,
+    /// The schema this agent validates settings edits against, resolved when
+    /// it started. `None` when the agent has no schema and rejects edits.
+    pub schema: Option<SessionSettingsSchema>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

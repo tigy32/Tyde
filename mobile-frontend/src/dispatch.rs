@@ -517,7 +517,10 @@ pub fn dispatch_envelope(state: &AppState, host: &LocalHostId, envelope: Envelop
                 envelope.parse_payload::<SessionSettingsPayload>(),
             ) {
                 state.agent_session_settings.update(|map| {
-                    map.insert(agent_ref, payload.values);
+                    map.insert(agent_ref.clone(), payload.values);
+                });
+                state.agent_session_schemas.update(|map| {
+                    map.insert(agent_ref, payload.schema);
                 });
             }
         }
@@ -1347,6 +1350,9 @@ fn drop_agent_state(state: &AppState, agent_ref: &AgentRef) {
         m.remove(agent_ref);
     });
     state.agent_session_settings.update(|m| {
+        m.remove(agent_ref);
+    });
+    state.agent_session_schemas.update(|m| {
         m.remove(agent_ref);
     });
     state.context_compaction_operations.update(|m| {
@@ -3030,6 +3036,9 @@ fn apply_agent_bootstrap(
     state.agent_session_settings.update(|m| {
         m.remove(&agent_ref);
     });
+    state.agent_session_schemas.update(|m| {
+        m.remove(&agent_ref);
+    });
     state.context_compaction_operations.update(|m| {
         m.remove(&agent_ref);
     });
@@ -3049,6 +3058,9 @@ fn apply_agent_bootstrap(
             AgentBootstrapEvent::SessionSettings(inner) => {
                 state.agent_session_settings.update(|map| {
                     map.insert(agent_ref.clone(), inner.values);
+                });
+                state.agent_session_schemas.update(|map| {
+                    map.insert(agent_ref.clone(), inner.schema);
                 });
             }
             AgentBootstrapEvent::QueuedMessages(inner) => {

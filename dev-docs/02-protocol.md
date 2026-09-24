@@ -428,6 +428,12 @@ arbitrary request payload or secrets are echoed into error context. Cause codes
 and fatality remain independent of UI presentation; there is still no wire-level
 "show a banner" flag.
 
+Protocol 64 adds `schema` to the agent-stream `SessionSettings` snapshot: the
+session settings schema the agent resolved when it started and validates every
+edit against, or `null` when it has none. A running agent's settings controls
+render this schema rather than the host's current catalog, which can drift
+after the agent starts. Drafts still render the host catalog.
+
 The project-warning DOM regression fails on the old global-banner path. The
 extended flow checks local action errors, deduplication, project isolation,
 file-read correlation, and recovery. Terminal and native-settings DOM flows

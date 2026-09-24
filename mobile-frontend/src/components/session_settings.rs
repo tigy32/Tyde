@@ -77,9 +77,19 @@ pub fn SessionSettingsSheet() -> impl IntoView {
     // `None` while the host's schema snapshot has not arrived at all — which is
     // a different thing from a snapshot that arrived without this backend, and
     // must not be reported as "unavailable" during a reconnect.
+    //
+    // A running agent validates edits against the schema it started with,
+    // which the host catalog may have drifted from, so it renders only the
+    // schema its own stream emitted.
     let schema_state = state.clone();
     let schema_entry = Memo::new(move |_| -> Option<Option<SessionSchemaEntry>> {
-        let (host, backend_kind, _) = binding.get()?;
+        let (host, backend_kind, target) = binding.get()?;
+        if let SettingsTarget::Agent(active) = target {
+            let schema = schema_state
+                .agent_session_schemas
+                .with(|map| map.get(&active.as_agent_ref()).cloned())?;
+            return Some(schema.map(|schema| SessionSchemaEntry::Ready { schema }));
+        }
         schema_state.session_schemas_by_host.with(|by_host| {
             by_host
                 .get(&host)
@@ -631,6 +641,9 @@ mod wasm_tests {
             agent_id,
         };
         state.active_agent.set(Some(active.clone()));
+        state.agent_session_schemas.update(|map| {
+            map.insert(active.as_agent_ref(), Some(schema()));
+        });
         active
     }
 
@@ -650,6 +663,72 @@ mod wasm_tests {
             .unwrap_or_else(|| panic!("the {key} control must render"))
             .dyn_into()
             .unwrap()
+    }
+
+    /// **A running agent's sheet renders the schema that agent validates
+    /// against, not the host's current catalog.**
+    ///
+    /// The host catalog moved on after the agent started: the `deep` profile
+    /// dropped `sonnet`, which the agent is still using and still accepts.
+    /// Rendering the host catalog showed the agent's live model as
+    /// unavailable and offered models the agent would reject.
+    #[wasm_bindgen_test]
+    async fn a_running_agent_renders_the_schema_its_stream_emitted() {
+        let container = make_container();
+        let state = AppState::new();
+        seed_host(&state);
+        let active = seed_agent(&state);
+        crate::dispatch::reset_inbound_seq_for_host(&host_id());
+        let mut agent_schema = schema();
+        agent_schema.fields[1]
+            .select_options_by_setting
+            .as_mut()
+            .unwrap()
+            .values[1]
+            .options = vec![select_option("sonnet", "Sonnet")];
+        let envelope = protocol::Envelope::from_payload(
+            StreamPath("/agent/settings/inst".to_owned()),
+            protocol::FrameKind::SessionSettings,
+            0,
+            &protocol::SessionSettingsPayload {
+                values: SessionSettingsValues(
+                    [
+                        (
+                            "profile".to_owned(),
+                            SessionSettingValue::String("deep".to_owned()),
+                        ),
+                        (
+                            "model".to_owned(),
+                            SessionSettingValue::String("sonnet".to_owned()),
+                        ),
+                    ]
+                    .into_iter()
+                    .collect(),
+                ),
+                schema: Some(agent_schema),
+            },
+        )
+        .unwrap();
+        crate::dispatch::dispatch_envelope(&state, &active.local_host_id, envelope);
+        mount_sheet(&container, state.clone());
+        state.session_settings_open.set(true);
+        next_tick().await;
+
+        let model = control(&container, "model");
+        assert_eq!(model.value(), "sonnet", "the agent's own model must show");
+        let options = model.query_selector_all("option").unwrap();
+        let offered: Vec<(String, bool)> = (0..options.length())
+            .filter_map(|index| options.item(index))
+            .map(|node| {
+                let option: web_sys::HtmlOptionElement = node.dyn_into().unwrap();
+                (option.text(), option.disabled())
+            })
+            .collect();
+        assert_eq!(
+            offered,
+            vec![("Auto".to_owned(), false), ("Sonnet".to_owned(), false)],
+            "the model list must be the one the agent accepts"
+        );
     }
 
     /// **A live agent's settings can be changed from the sheet, and the change

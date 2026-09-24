@@ -2121,3 +2121,168 @@ async fn delegation_preference_normalizes_only_invalid_and_duplicate_ids() {
         "the normalized order must persist across a real host restart"
     );
 }
+
+fn codex_schema_model(schema: &protocol::SessionSettingsSchema) -> Vec<String> {
+    schema
+        .fields
+        .iter()
+        .filter(|field| field.key == "model")
+        .flat_map(|field| match &field.field_type {
+            protocol::SessionSettingFieldType::Select { options, .. } => options
+                .iter()
+                .map(|option| option.value.clone())
+                .collect::<Vec<_>>(),
+            _ => Vec::new(),
+        })
+        .collect()
+}
+
+async fn expect_agent_session_settings(
+    client: &mut client::Connection,
+    stream: &protocol::StreamPath,
+    context: &str,
+) -> protocol::SessionSettingsPayload {
+    fixture::next_logical_frame_matching_on(client, context, |env| {
+        &env.stream == stream && env.kind == FrameKind::SessionSettings
+    })
+    .await
+    .parse_payload()
+    .unwrap_or_else(|err| panic!("parse SessionSettings for {context}: {err}"))
+}
+
+/// A running agent validates session-setting edits against the schema it
+/// started with, not the host's current catalog. The agent's settings carry
+/// that schema, so a client renders what this agent accepts: after the
+/// catalog drops `gpt-old` and gains `gpt-new`, an unrelated edit keeps the
+/// agent's `gpt-old`, and `gpt-new` is rejected — exactly as the emitted
+/// schema says.
+#[tokio::test]
+async fn running_agent_settings_carry_the_schema_the_agent_validates() {
+    let mut fixture = Fixture::new_with_runtime_config_and_settings_file(
+        server::HostRuntimeConfig {
+            mock_backend_discovery: [(
+                BackendKind::Codex,
+                server::backend::mock::MockDiscovery::new(vec![
+                    Ok(mock_model_discovery("gpt-old", &["low", "high"])),
+                    Ok(mock_model_discovery("gpt-new", &["low", "high"])),
+                ]),
+            )]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        },
+        r#"{
+  "settings": {
+    "enabled_backends": ["codex"],
+    "default_backend": "codex"
+  }
+}"#,
+    )
+    .await;
+    wait_for_codex_catalog(&mut fixture, "gpt-old").await;
+    let values = |model: &str, effort: &str| {
+        protocol::SessionSettingsValues(
+            [
+                (
+                    "model".to_owned(),
+                    SessionSettingValue::String(model.to_owned()),
+                ),
+                (
+                    "reasoning_effort".to_owned(),
+                    SessionSettingValue::String(effort.to_owned()),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        )
+    };
+    let (agent, _) = fixture
+        .spawn_with(protocol::SpawnAgentPayload {
+            name: Some("Catalog drift".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: protocol::SpawnAgentParams::New {
+                workspace_roots: vec!["/tmp".to_owned()],
+                prompt: "hello".to_owned(),
+                images: None,
+                backend_kind: BackendKind::Codex,
+                launch_profile_id: None,
+                cost_hint: None,
+                access_mode: protocol::BackendAccessMode::Unrestricted,
+                session_settings: Some(values("gpt-old", "low")),
+            },
+        })
+        .await;
+    let started =
+        expect_agent_session_settings(&mut fixture.client, &agent.stream, "started settings").await;
+    assert_eq!(started.values, values("gpt-old", "low"));
+    let agent_schema = started
+        .schema
+        .expect("a running agent's settings carry its session schema");
+    assert_eq!(codex_schema_model(&agent_schema), vec!["gpt-old"]);
+
+    send_settings_write(
+        &mut fixture.client,
+        "w-enable-claude",
+        vec![replace_op(
+            "/enabled_backends",
+            serde_json::json!(["codex", "claude"]),
+            serde_json::json!(["codex"]),
+        )],
+    )
+    .await;
+    let result =
+        expect_settings_write_result(&mut fixture.client, "w-enable-claude", "refresh catalog")
+            .await;
+    assert!(result.applied, "{:?}", result.field_errors);
+    wait_for_codex_catalog(&mut fixture, "gpt-new").await;
+
+    fixture
+        .client
+        .set_session_settings(
+            &agent.stream,
+            protocol::SetSessionSettingsPayload {
+                values: values("gpt-old", "high"),
+            },
+        )
+        .await
+        .expect("send unrelated edit");
+    let edited =
+        expect_agent_session_settings(&mut fixture.client, &agent.stream, "unrelated edit").await;
+    assert_eq!(
+        edited.values,
+        values("gpt-old", "high"),
+        "an unrelated edit keeps the agent's model even though the host catalog dropped it"
+    );
+    assert_eq!(
+        edited.schema.as_ref(),
+        Some(&agent_schema),
+        "the agent's schema does not follow the host catalog"
+    );
+
+    fixture
+        .client
+        .set_session_settings(
+            &agent.stream,
+            protocol::SetSessionSettingsPayload {
+                values: values("gpt-new", "high"),
+            },
+        )
+        .await
+        .expect("send catalog-only model");
+    let error = next_frame_matching_on(&mut fixture.client, "rejected model", |env| {
+        env.stream == agent.stream && env.kind == FrameKind::AgentError
+    })
+    .await
+    .parse_payload::<protocol::AgentErrorPayload>()
+    .expect("parse AgentError");
+    assert!(
+        error.message.contains("invalid session setting 'model'"),
+        "a model outside the agent's emitted schema is rejected: {error:?}"
+    );
+    let reverted =
+        expect_agent_session_settings(&mut fixture.client, &agent.stream, "rejected echo").await;
+    assert_eq!(reverted.values, values("gpt-old", "high"));
+    assert_eq!(reverted.schema.as_ref(), Some(&agent_schema));
+}

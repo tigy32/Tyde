@@ -500,11 +500,24 @@ pub fn SessionSettingsBar(
     // snapshot hasn't arrived yet — either way we render nothing. Only after
     // the snapshot arrives and still lacks the backend do we surface the
     // missing-schema banner, preventing a flash during host connect.
+    //
+    // A running agent validates edits against the schema it started with,
+    // which the host catalog may have drifted from, so it renders only the
+    // schema its own stream emitted.
     let schema_status = {
         let state = state.clone();
         Memo::new(
             move |_| -> Option<(BackendKind, Option<SessionSchemaEntry>)> {
                 let (host_id, backend_kind) = current_binding.get()?;
+                if let Some(agent_ref) = agent_ref.get() {
+                    let schema = state
+                        .agent_session_schemas
+                        .with(|map| map.get(&agent_ref.agent_id).cloned())?;
+                    return Some((
+                        backend_kind,
+                        schema.map(|schema| SessionSchemaEntry::Ready { schema }),
+                    ));
+                }
                 let loaded = state
                     .schemas_loaded_for_host
                     .get()
@@ -984,8 +997,8 @@ mod wasm_tests {
     use protocol::{
         AgentActivitySummaryPayload, AgentActivitySummaryState, AgentId, AgentOrigin, Envelope,
         FrameKind, LaunchProfile, LaunchProfileId, LaunchProfileKind, SelectOption,
-        SelectOptionsBySetting, SelectOptionsForValue, SessionSettingField, StreamPath,
-        TaskTokenUsageAggregate, TaskTokenUsageEntry,
+        SelectOptionsBySetting, SelectOptionsForValue, SessionSettingField,
+        SetSessionSettingsPayload, StreamPath, TaskTokenUsageAggregate, TaskTokenUsageEntry,
     };
     use wasm_bindgen::JsCast;
     use wasm_bindgen_test::*;
@@ -1735,17 +1748,21 @@ mod wasm_tests {
         } else {
             Vec::new()
         };
+        let schema = SessionSettingsSchema {
+            model_resolutions: Default::default(),
+            backend_kind,
+            fields,
+        };
         state.session_schemas.update(|map| {
             map.entry(host_id.to_owned()).or_default().insert(
                 backend_kind,
                 SessionSchemaEntry::Ready {
-                    schema: SessionSettingsSchema {
-                        model_resolutions: Default::default(),
-                        backend_kind,
-                        fields,
-                    },
+                    schema: schema.clone(),
                 },
             );
+        });
+        state.agent_session_schemas.update(|map| {
+            map.insert(AgentId(agent_id.to_owned()), Some(schema));
         });
         state.schemas_loaded_for_host.update(|map| {
             map.insert(host_id.to_owned(), true);
@@ -1852,6 +1869,247 @@ mod wasm_tests {
             active_text.contains("Session Settings (Kiro)"),
             "active Kiro agent must retain the backend identity, got: {active_text}"
         );
+    }
+
+    fn select_field(
+        key: &str,
+        options: &[&str],
+        nullable: bool,
+        by_setting: Option<(&str, &[(&str, &[&str])])>,
+    ) -> SessionSettingField {
+        let to_options = |values: &[&str]| {
+            values
+                .iter()
+                .map(|value| SelectOption {
+                    value: (*value).to_owned(),
+                    label: (*value).to_owned(),
+                })
+                .collect::<Vec<_>>()
+        };
+        SessionSettingField {
+            key: key.to_owned(),
+            label: key.to_owned(),
+            description: None,
+            field_type: SessionSettingFieldType::Select {
+                options: to_options(options),
+                default: (!nullable).then(|| options[0].to_owned()),
+                nullable,
+            },
+            use_slider: false,
+            select_options_by_setting: by_setting.map(|(setting_key, values)| {
+                SelectOptionsBySetting {
+                    setting_key: setting_key.to_owned(),
+                    values: values
+                        .iter()
+                        .map(|(setting_value, options)| SelectOptionsForValue {
+                            setting_value: (*setting_value).to_owned(),
+                            options: to_options(options),
+                        })
+                        .collect(),
+                }
+            }),
+        }
+    }
+
+    /// A multi-profile Hermes schema whose `work` profile offers `work_models`.
+    fn hermes_profile_schema(work_models: &[&str]) -> SessionSettingsSchema {
+        SessionSettingsSchema {
+            model_resolutions: Default::default(),
+            backend_kind: BackendKind::Hermes,
+            fields: vec![
+                select_field("profile", &["default", "work"], false, None),
+                select_field(
+                    "model",
+                    &["default-model"],
+                    true,
+                    Some((
+                        "profile",
+                        &[("default", &["default-model"]), ("work", work_models)],
+                    )),
+                ),
+                select_field("reasoning_effort", &["low", "high"], true, None),
+            ],
+        }
+    }
+
+    fn setting_row_select(container: &HtmlElement, label: &str) -> web_sys::HtmlSelectElement {
+        let rows = container
+            .query_selector_all(".session-setting-row")
+            .unwrap();
+        (0..rows.length())
+            .filter_map(|index| rows.item(index)?.dyn_into::<HtmlElement>().ok())
+            .find(|row| {
+                row.query_selector(".session-setting-label")
+                    .ok()
+                    .flatten()
+                    .and_then(|label| label.text_content())
+                    .as_deref()
+                    == Some(label)
+            })
+            .and_then(|row| row.query_selector("select").ok().flatten())
+            .unwrap_or_else(|| panic!("a {label} select should render"))
+            .dyn_into()
+            .unwrap()
+    }
+
+    fn option_labels(select: &web_sys::HtmlSelectElement) -> Vec<(String, bool)> {
+        let options = select.query_selector_all("option").unwrap();
+        (0..options.length())
+            .filter_map(|index| options.item(index))
+            .map(|option| {
+                let option: web_sys::HtmlOptionElement = option.dyn_into().unwrap();
+                (option.text(), option.disabled())
+            })
+            .collect()
+    }
+
+    /// A running agent validates edits against the schema it started with, not
+    /// the host's current catalog. Here the host catalog moved on after the
+    /// agent started: the `work` profile dropped `old-model` and gained
+    /// `new-model`. Rendering the host catalog made an unrelated edit silently
+    /// reset the agent's model to Auto, and offered `new-model`, which the
+    /// agent then rejected. The bar must render the agent's own schema.
+    #[wasm_bindgen_test]
+    async fn running_agent_settings_use_the_agent_schema_not_the_host_catalog() {
+        install_send_stub();
+        let container = make_container();
+        let host_id = "h-agent-schema";
+        let state = make_state_for_backend(host_id, "root", false, BackendKind::Hermes);
+        state.session_schemas.update(|map| {
+            map.entry(host_id.to_owned()).or_default().insert(
+                BackendKind::Hermes,
+                SessionSchemaEntry::Ready {
+                    schema: hermes_profile_schema(&["new-model"]),
+                },
+            );
+        });
+        let mut values = SessionSettingsValues::default();
+        for (key, value) in [
+            ("profile", "work"),
+            ("model", "old-model"),
+            ("reasoning_effort", "low"),
+        ] {
+            values.0.insert(
+                key.to_owned(),
+                SessionSettingValue::String(value.to_owned()),
+            );
+        }
+        dispatch_agent_session_settings(
+            &state,
+            "root",
+            serde_json::json!({
+                "values": values,
+                "schema": hermes_profile_schema(&["old-model"]),
+            }),
+        );
+        let _handle = mount_bar(&container, state);
+        for _ in 0..4 {
+            next_tick().await;
+        }
+        query(&container, ".session-settings-toggle")
+            .expect("the agent's settings header should render")
+            .click();
+        for _ in 0..4 {
+            next_tick().await;
+        }
+
+        let effort = setting_row_select(&container, "reasoning_effort");
+        effort.set_value("high");
+        effort
+            .dispatch_event(&web_sys::Event::new("change").unwrap())
+            .unwrap();
+        for _ in 0..4 {
+            next_tick().await;
+        }
+        let frames = captured_frames("set_session_settings");
+        assert_eq!(frames.len(), 1, "one edit is sent, got {frames:?}");
+        let sent: SetSessionSettingsPayload =
+            serde_json::from_str(&frames[0]).expect("parse sent SetSessionSettings");
+        assert_eq!(
+            sent.values.0.get("model"),
+            Some(&SessionSettingValue::String("old-model".to_owned())),
+            "an unrelated edit must not rewrite the agent's model"
+        );
+        assert_eq!(
+            sent.values.0.get("reasoning_effort"),
+            Some(&SessionSettingValue::String("high".to_owned())),
+        );
+
+        let model = setting_row_select(&container, "model");
+        assert_eq!(
+            model.value(),
+            "old-model",
+            "the model select must show the agent's model"
+        );
+        let model_options = option_labels(&model);
+        assert!(
+            model_options.contains(&("old-model".to_owned(), false)),
+            "the agent's schema offers old-model, so it is an ordinary choice, got {model_options:?}"
+        );
+        assert!(
+            !model_options.iter().any(|(label, _)| label == "new-model"),
+            "a model the agent's schema does not offer must not be offered, got {model_options:?}"
+        );
+    }
+
+    fn dispatch_agent_session_settings(
+        state: &AppState,
+        agent_id: &str,
+        payload: serde_json::Value,
+    ) {
+        let envelope = Envelope::from_payload(
+            StreamPath(format!("/agent/{agent_id}/inst")),
+            FrameKind::SessionSettings,
+            0,
+            &payload,
+        )
+        .expect("envelope serialize");
+        let host_id = state.selected_host_id.get_untracked().expect("host");
+        crate::dispatch::dispatch_envelope(state, &host_id, envelope);
+    }
+
+    fn install_send_stub() {
+        js_sys::eval(
+            r#"
+            (function() {
+                window.__test_send_calls = [];
+                window.__TAURI__ = window.__TAURI__ || {};
+                window.__TAURI__.core = window.__TAURI__.core || {};
+                window.__TAURI__.core.invoke = function(cmd, args) {
+                    window.__test_send_calls.push([cmd, JSON.stringify(args || {})]);
+                    return Promise.resolve();
+                };
+                window.__TAURI__.event = window.__TAURI__.event || {};
+                window.__TAURI__.event.listen = function() { return Promise.resolve(null); };
+            })();
+            "#,
+        )
+        .expect("install send stub");
+    }
+
+    fn captured_frames(kind: &str) -> Vec<String> {
+        let script = format!(
+            r#"
+            (function() {{
+                const out = [];
+                for (const [cmd, args] of (window.__test_send_calls || [])) {{
+                    if (cmd !== "send_host_line") continue;
+                    const env = JSON.parse(JSON.parse(args).line);
+                    if (env.kind === "{kind}") out.push(JSON.stringify(env.payload));
+                }}
+                return out.join("\n");
+            }})()
+            "#
+        );
+        let joined = js_sys::eval(&script)
+            .expect("probe send calls")
+            .as_string()
+            .unwrap_or_default();
+        if joined.is_empty() {
+            Vec::new()
+        } else {
+            joined.lines().map(|line| line.to_owned()).collect()
+        }
     }
 
     fn known_amount(input: u64, output: u64) -> TaskTokenUsageAmount {

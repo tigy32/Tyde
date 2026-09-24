@@ -3371,6 +3371,7 @@ pub(crate) fn spawn_agent_actor(
             FrameKind::SessionSettings,
             &SessionSettingsPayload {
                 values: current_session_settings.clone(),
+                schema: session_schema.clone(),
             },
         )
         .await;
@@ -6629,6 +6630,7 @@ pub(crate) fn spawn_agent_actor(
                                             FrameKind::SessionSettings,
                                             &SessionSettingsPayload {
                                                 values: current_session_settings.clone(),
+                                                schema: Some(session_schema.clone()),
                                             },
                                         )
                                         .await;
@@ -6660,6 +6662,7 @@ pub(crate) fn spawn_agent_actor(
                                             FrameKind::SessionSettings,
                                             &SessionSettingsPayload {
                                                 values: current_session_settings.clone(),
+                                                schema: Some(session_schema.clone()),
                                             },
                                         )
                                         .await;
@@ -6694,6 +6697,7 @@ pub(crate) fn spawn_agent_actor(
                                             FrameKind::SessionSettings,
                                             &SessionSettingsPayload {
                                                 values: current_session_settings.clone(),
+                                                schema: Some(session_schema.clone()),
                                             },
                                         )
                                         .await;
@@ -6722,6 +6726,7 @@ pub(crate) fn spawn_agent_actor(
                                         FrameKind::SessionSettings,
                                         &SessionSettingsPayload {
                                             values: current_session_settings.clone(),
+                                            schema: Some(session_schema.clone()),
                                         },
                                     )
                                     .await;

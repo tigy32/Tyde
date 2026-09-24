@@ -22,11 +22,11 @@ use protocol::{
     ProjectId, ProjectPath, ProjectRootGitStatus, ProjectRootListing, ProjectRootPath,
     ProjectSearchFileResult, QueuedMessageEntry, RequestedCompactionAvailability, Review,
     ReviewCommentId, ReviewId, ReviewSuggestionId, ReviewSummary, SessionId, SessionSchemaEntry,
-    SessionSettingsValues, SessionSummary, Skill, SkillId, SmartViewId, Steering, SteeringId,
-    StreamPath, TaskList, TaskTokenUsagePayload, Team, TeamDraft, TeamDraftId, TeamId, TeamMember,
-    TeamMemberBindingPayload, TeamMemberId, TeamMemberShuffleSuggestion,
-    TeamMemberShuffleSuggestionNotifyPayload, TeamPresetCatalog, TerminalId,
-    ToolExecutionCompletedData, ToolProgressData, ToolRequest, WorkflowCatalogLocation,
+    SessionSettingsSchema, SessionSettingsValues, SessionSummary, Skill, SkillId, SmartViewId,
+    Steering, SteeringId, StreamPath, TaskList, TaskTokenUsagePayload, Team, TeamDraft,
+    TeamDraftId, TeamId, TeamMember, TeamMemberBindingPayload, TeamMemberId,
+    TeamMemberShuffleSuggestion, TeamMemberShuffleSuggestionNotifyPayload, TeamPresetCatalog,
+    TerminalId, ToolExecutionCompletedData, ToolProgressData, ToolRequest, WorkflowCatalogLocation,
     WorkflowDiagnostic, WorkflowId, WorkflowInputSpec, WorkflowRunId, WorkflowRunSnapshot,
     WorkflowSummary,
 };
@@ -3861,6 +3861,9 @@ pub struct AppState {
     /// terminal becomes active even if another terminal was already selected.
     pub pending_terminal_focus: RwSignal<Option<String>>,
     pub agent_session_settings: RwSignal<HashMap<AgentId, SessionSettingsValues>>,
+    /// Schema each running agent validates settings edits against, as last
+    /// emitted on its stream. `None` means the agent has no schema.
+    pub agent_session_schemas: RwSignal<HashMap<AgentId, Option<SessionSettingsSchema>>>,
     /// User-visible settings submitted for a draft whose `NewAgent` echo has
     /// not arrived yet. The host stream publishes agent identity before the
     /// agent stream publishes authoritative effective settings; retaining the
@@ -4280,6 +4283,7 @@ impl AppState {
             native_settings_save_state: RwSignal::new(HashMap::new()),
             pending_terminal_focus: RwSignal::new(None),
             agent_session_settings: RwSignal::new(HashMap::new()),
+            agent_session_schemas: RwSignal::new(HashMap::new()),
             pending_agent_session_settings: RwSignal::new(HashMap::new()),
             next_pending_agent_session_settings_id: RwSignal::new(0),
             font_size: RwSignal::new(13),
@@ -4849,6 +4853,9 @@ impl AppState {
             map.remove(agent_id);
         });
         self.agent_session_settings.update(|map| {
+            map.remove(agent_id);
+        });
+        self.agent_session_schemas.update(|map| {
             map.remove(agent_id);
         });
         let host_for_cz = host_id.to_owned();
@@ -6744,6 +6751,9 @@ impl AppState {
                 map.retain(|id, _| !drop_set.contains(id));
             });
             self.agent_session_settings.update(|map| {
+                map.retain(|id, _| !drop_set.contains(id));
+            });
+            self.agent_session_schemas.update(|map| {
                 map.retain(|id, _| !drop_set.contains(id));
             });
         }

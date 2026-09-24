@@ -1149,6 +1149,9 @@ fn apply_disconnect(state: &AppState, host: &LocalHostId, _reason: Option<String
     state.agent_session_settings.update(|m| {
         m.retain(|k, _| k.local_host_id != *host);
     });
+    state.agent_session_schemas.update(|m| {
+        m.retain(|k, _| k.local_host_id != *host);
+    });
     // A completed legacy replacement is retained while the old agent is removed
     // inside one connection so its redirect remains actionable. A disconnect is
     // the authoritative boundary: legacy replacement state is not bootstrapped,

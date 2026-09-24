@@ -1053,7 +1053,10 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
             match envelope.parse_payload::<SessionSettingsPayload>() {
                 Ok(payload) => {
                     state.agent_session_settings.update(|map| {
-                        map.insert(agent_id, payload.values);
+                        map.insert(agent_id.clone(), payload.values);
+                    });
+                    state.agent_session_schemas.update(|map| {
+                        map.insert(agent_id, payload.schema);
                     });
                 }
                 Err(error) => report_dispatch_error(
@@ -4790,6 +4793,9 @@ fn apply_agent_closed(state: &AppState, host_id: &str, agent_id: AgentId) {
     state.agent_session_settings.update(|map| {
         map.remove(&agent_id);
     });
+    state.agent_session_schemas.update(|map| {
+        map.remove(&agent_id);
+    });
 
     // active_agent is a Memo over center_zone — closing the chat tabs below
     // drives it to None for this agent.
@@ -6930,6 +6936,9 @@ fn apply_agent_bootstrap(
     state.agent_session_settings.update(|map| {
         map.remove(&agent_id);
     });
+    state.agent_session_schemas.update(|map| {
+        map.remove(&agent_id);
+    });
 
     for event in payload.events {
         match event {
@@ -6942,6 +6951,9 @@ fn apply_agent_bootstrap(
             AgentBootstrapEvent::SessionSettings(inner) => {
                 state.agent_session_settings.update(|map| {
                     map.insert(agent_id.clone(), inner.values);
+                });
+                state.agent_session_schemas.update(|map| {
+                    map.insert(agent_id.clone(), inner.schema);
                 });
             }
             AgentBootstrapEvent::QueuedMessages(inner) => {

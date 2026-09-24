@@ -18,10 +18,10 @@ use protocol::{
     ProjectGitDiffFile, ProjectId, ProjectPath, ProjectRootGitStatus, ProjectRootPath,
     QueuedMessageEntry, Review, ReviewErrorPayload, ReviewId, ReviewSummary, SessionId,
     SessionListCursor, SessionListPageInfo, SessionListPageStatus, SessionSchemaEntry,
-    SessionSettingsValues, SessionSummary, Skill, SkillId, Steering, SteeringId, StreamPath,
-    TaskList, Team, TeamCompactNotifyPayload, TeamDraft, TeamDraftId, TeamMember,
-    TeamMemberBindingPayload, TeamMemberId, TeamMemberShuffleSuggestion, TeamPresetCatalog,
-    ToolExecutionCompletedData, ToolRequest, TydeReleaseVersion,
+    SessionSettingsSchema, SessionSettingsValues, SessionSummary, Skill, SkillId, Steering,
+    SteeringId, StreamPath, TaskList, Team, TeamCompactNotifyPayload, TeamDraft, TeamDraftId,
+    TeamMember, TeamMemberBindingPayload, TeamMemberId, TeamMemberShuffleSuggestion,
+    TeamPresetCatalog, ToolExecutionCompletedData, ToolRequest, TydeReleaseVersion,
 };
 use settings_model::HostSettings;
 
@@ -1008,6 +1008,9 @@ pub struct AppState {
     pub agent_activity_stats: RwSignal<HashMap<AgentRef, protocol::AgentActivityStats>>,
     pub transient_events: RwSignal<HashMap<AgentRef, Vec<TransientEvent>>>,
     pub agent_session_settings: RwSignal<HashMap<AgentRef, SessionSettingsValues>>,
+    /// Schema each running agent validates settings edits against, as last
+    /// emitted on its stream. `None` means the agent has no schema.
+    pub agent_session_schemas: RwSignal<HashMap<AgentRef, Option<SessionSettingsSchema>>>,
     /// Whether the session-settings sheet is up. Model and reasoning effort are
     /// changed rarely and cost real money when changed by accident, so mobile
     /// keeps them off the chat surface and behind the header's overflow menu
@@ -1126,6 +1129,7 @@ impl AppState {
             agent_activity_stats: RwSignal::new(HashMap::new()),
             transient_events: RwSignal::new(HashMap::new()),
             agent_session_settings: RwSignal::new(HashMap::new()),
+            agent_session_schemas: RwSignal::new(HashMap::new()),
             session_settings_open: RwSignal::new(false),
             agent_compactions: RwSignal::new(HashMap::new()),
             context_compaction_operations: RwSignal::new(HashMap::new()),
@@ -1856,6 +1860,9 @@ impl AppState {
             m.retain(|k, _| k.local_host_id != *host);
         });
         self.agent_session_settings.update(|m| {
+            m.retain(|k, _| k.local_host_id != *host);
+        });
+        self.agent_session_schemas.update(|m| {
             m.retain(|k, _| k.local_host_id != *host);
         });
         self.agent_compactions.update(|m| {

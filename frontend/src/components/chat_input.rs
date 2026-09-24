@@ -2878,26 +2878,28 @@ mod wasm_tests {
         let container = make_styled_container();
         let state = AppState::new();
         configure(&state, false, true, "");
+        let schema = protocol::SessionSettingsSchema {
+            model_resolutions: Default::default(),
+            backend_kind: BackendKind::Claude,
+            fields: vec![protocol::SessionSettingField {
+                key: "verbose".to_owned(),
+                label: "Verbose".to_owned(),
+                description: None,
+                field_type: protocol::SessionSettingFieldType::Toggle { default: false },
+                use_slider: false,
+                select_options_by_setting: None,
+            }],
+        };
         state.session_schemas.update(|schemas| {
             schemas.entry(HOST.to_owned()).or_default().insert(
                 BackendKind::Claude,
                 protocol::SessionSchemaEntry::Ready {
-                    schema: protocol::SessionSettingsSchema {
-                        model_resolutions: Default::default(),
-                        backend_kind: BackendKind::Claude,
-                        fields: vec![protocol::SessionSettingField {
-                            key: "verbose".to_owned(),
-                            label: "Verbose".to_owned(),
-                            description: None,
-                            field_type: protocol::SessionSettingFieldType::Toggle {
-                                default: false,
-                            },
-                            use_slider: false,
-                            select_options_by_setting: None,
-                        }],
-                    },
+                    schema: schema.clone(),
                 },
             );
+        });
+        state.agent_session_schemas.update(|schemas| {
+            schemas.insert(AgentId(AGENT.to_owned()), Some(schema));
         });
         let mount_state = state.clone();
         let _h = mount_to(container.clone(), move || {
