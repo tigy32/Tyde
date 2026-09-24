@@ -1538,20 +1538,11 @@ pub fn ChatInput(
             on:drop=on_drop
         >
             <Show when=is_thinking>
-                    <svg
-                        class="chat-thinking-ring"
-                        data-testid="chat-thinking-ring"
-                        aria-hidden="true"
-                    >
-                        <rect
-                            class="chat-thinking-ring-tail"
-                            {..leptos::attr::custom::custom_attribute("pathLength", "100")}
-                        />
-                        <rect
-                            class="chat-thinking-ring-head"
-                            {..leptos::attr::custom::custom_attribute("pathLength", "100")}
-                        />
-                    </svg>
+                <div
+                    class="chat-thinking-ring"
+                    data-testid="chat-thinking-ring"
+                    aria-hidden="true"
+                ></div>
             </Show>
             <InflightTray agent_ref=agent_ref />
             <div class="chat-input-content">
@@ -2935,44 +2926,58 @@ mod wasm_tests {
         let composer = query(&container, ".chat-input-area").expect("composer");
         let window = web_sys::window().unwrap();
         let ring = query(&container, "[data-testid='chat-thinking-ring']")
-            .expect("desktop uses the original mobile orbit");
+            .expect("a running turn shows the desktop status border");
         let style = window.get_computed_style(&ring).unwrap().unwrap();
         assert_eq!(style.get_property_value("pointer-events").unwrap(), "none");
-        let strokes = ring.query_selector_all("rect").unwrap();
-        assert_eq!(strokes.length(), 2, "one bright head and its dim tail");
-        for index in 0..strokes.length() {
-            let stroke: web_sys::Element = strokes.item(index).unwrap().dyn_into().unwrap();
-            let style = window.get_computed_style(&stroke).unwrap().unwrap();
-            let prop = |name: &str| style.get_property_value(name).unwrap();
-            assert_eq!(prop("fill"), "none", "leave the composer center clear");
-            assert_eq!(prop("stroke-width"), "1.5px", "retain the mobile hairline");
-            assert_eq!(stroke.get_attribute("pathLength").as_deref(), Some("100"));
-            assert_eq!(prop("animation-duration"), "2.4s");
-            assert_eq!(prop("animation-timing-function"), "linear");
-            assert_eq!(prop("animation-iteration-count"), "infinite");
-            if index == 0 {
-                assert_eq!(prop("stroke"), "rgb(74, 158, 255)");
-                assert_eq!(prop("stroke-dasharray"), "22px, 78px");
-                assert_eq!(prop("opacity"), "0.55");
-            } else {
-                assert_eq!(prop("stroke"), "rgb(108, 180, 255)");
-                assert_eq!(prop("stroke-dasharray"), "0px, 14px, 8px, 78px");
-                assert_eq!(prop("stroke-linecap"), "butt", "no extra dot at the tail");
-            }
-        }
+        let prop = |name: &str| style.get_property_value(name).unwrap();
+        // Sidequest fades through transparent edges and a bright middle;
+        // the previous two constant-color SVG strokes had a visible seam.
+        assert_eq!(
+            prop("background-image"),
+            "linear-gradient(90deg, rgba(0, 0, 0, 0) 0%, rgb(74, 158, 255) 40%, rgb(74, 158, 255) 60%, rgba(0, 0, 0, 0) 100%)",
+            "the border must have Sidequest's continuous transparency gradient"
+        );
+        assert_eq!(prop("background-size"), "200% 100%");
+        assert_eq!(
+            prop("filter"),
+            "none",
+            "a crisp shimmer, not blurred dashes"
+        );
+        assert_eq!(prop("animation-duration"), "1.6s");
+        assert_eq!(prop("animation-timing-function"), "ease-in-out");
+        assert_eq!(prop("animation-iteration-count"), "infinite");
+        let seek = js_sys::Function::new_with_args(
+            "element, time",
+            "const animation = element.getAnimations()[0]; animation.pause(); animation.currentTime = time;",
+        );
+        seek.call2(&wasm_bindgen::JsValue::NULL, &ring, &0.into())
+            .unwrap();
+        assert_eq!(prop("background-position"), "100% 0px");
+        seek.call2(&wasm_bindgen::JsValue::NULL, &ring, &800.into())
+            .unwrap();
+        assert_eq!(
+            prop("background-position"),
+            "0% 0px",
+            "the gradient sweeps across the border"
+        );
 
         let assert_outline_bounds = || {
             let outline = composer.get_bounding_client_rect();
             let ring_box = ring.get_bounding_client_rect();
+            assert!(
+                (ring_box.height() - 1.0).abs() < 0.01,
+                "top-only shimmer must be one pixel tall, not a box: {}px",
+                ring_box.height()
+            );
+
             for (actual, expected) in [
                 (ring_box.top(), outline.top()),
-                (ring_box.bottom(), outline.bottom()),
                 (ring_box.left(), outline.left()),
                 (ring_box.right(), outline.right()),
             ] {
                 assert!(
                     (actual - expected).abs() < 0.5,
-                    "the orbit hugs the whole composer"
+                    "the shimmer spans the composer's top edge"
                 );
             }
 
@@ -3061,7 +3066,7 @@ mod wasm_tests {
         next_tick().await;
         assert!(
             query(&container, "[data-testid='chat-thinking-ring']").is_none(),
-            "idle composers have no orbit"
+            "idle composers have no shimmer"
         );
         assert_eq!(primary(&container).text_content().unwrap().trim(), "Send");
     }
