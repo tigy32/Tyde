@@ -3210,22 +3210,40 @@ fn LaunchProfileEditor(
 
     let error_sig: RwSignal<Option<String>> = RwSignal::new(None);
 
-    // Typed session-settings controls for the selected backend, sourced from the
-    // host's session schema. Falls back to a note when the schema is not
-    // available (backend not installed / no configurable settings).
+    // Typed session-settings controls, from the schema the server validates
+    // this profile against. A saved profile has its own server-emitted schema
+    // (ACP profiles discover their own catalog from their agent command); a
+    // new profile, or one being moved to another backend, is not known to the
+    // server yet, so it uses the host's schema for the selected backend. Falls
+    // back to a note when the schema is not available.
     let state_for_schema = state.clone();
+    let saved_profile = (!is_new).then(|| {
+        (
+            LaunchProfileId(id_sig.get_untracked()),
+            backend_kind_sig.get_untracked(),
+        )
+    });
     let schema_for_backend = move || -> Option<SessionSettingsSchema> {
         let host_id = state_for_schema.selected_host_id.get()?;
         let kind = backend_kind_sig.get();
-        match state_for_schema
-            .session_schemas
-            .get()
-            .get(&host_id)?
-            .get(&kind)?
-        {
-            SessionSchemaEntry::Ready { schema } => Some(schema.clone()),
-            _ => None,
-        }
+        let entry = match &saved_profile {
+            Some((profile_id, saved_kind)) if *saved_kind == kind => state_for_schema
+                .launch_profile_catalog
+                .get()
+                .get(&host_id)?
+                .custom_profile_schemas
+                .iter()
+                .find(|entry| &entry.launch_profile_id == profile_id)?
+                .schema
+                .clone(),
+            _ => state_for_schema
+                .session_schemas
+                .get()
+                .get(&host_id)?
+                .get(&kind)?
+                .clone(),
+        };
+        entry.ready_schema().cloned()
     };
 
     let settings_values: Signal<SessionSettingsValues> =
@@ -12823,6 +12841,7 @@ mod wasm_tests {
                             },
                         ],
                         default_profile_id: None,
+                        custom_profile_schemas: Vec::new(),
                     },
                 );
             });
@@ -14275,10 +14294,15 @@ mod wasm_tests {
     }
 
     /// Install a connected host whose Hermes session schema exposes a `model`
-    /// select, plus any explicit launch profiles, and select it. Enough for the
-    /// Launch Profiles editor to render and persist typed settings.
+    /// select, plus any explicit launch profiles, and select it. Like the
+    /// server, the launch catalog carries each profile's own schema. Enough for
+    /// the Launch Profiles editor to render and persist typed settings.
     fn install_launch_profile_host(state: &AppState, profiles: Vec<HostLaunchProfileConfig>) {
         let host_id = "host-lp".to_owned();
+        let profile_ids = profiles
+            .iter()
+            .map(|profile| profile.id.clone())
+            .collect::<Vec<_>>();
         state.selected_host_id.set(Some(host_id.clone()));
         state.host_streams.update(|m| {
             m.insert(
@@ -14327,38 +14351,53 @@ mod wasm_tests {
         state.schemas_loaded_for_host.update(|m| {
             m.insert(host_id.clone(), true);
         });
-        state.session_schemas.update(|m| {
-            let host = m.entry(host_id).or_default();
-            host.insert(
-                BackendKind::Hermes,
-                SessionSchemaEntry::Ready {
-                    schema: SessionSettingsSchema {
-                        model_resolutions: Default::default(),
-                        backend_kind: BackendKind::Hermes,
-                        fields: vec![protocol::SessionSettingField {
-                            key: "model".to_owned(),
-                            label: "Model".to_owned(),
-                            description: None,
-                            field_type: SessionSettingFieldType::Select {
-                                options: vec![
-                                    SelectOption {
-                                        value: "sonnet".to_owned(),
-                                        label: "Sonnet".to_owned(),
-                                    },
-                                    SelectOption {
-                                        value: "opus".to_owned(),
-                                        label: "Opus".to_owned(),
-                                    },
-                                ],
-                                default: Some("sonnet".to_owned()),
-                                nullable: false,
+        let hermes_schema = SessionSchemaEntry::Ready {
+            schema: SessionSettingsSchema {
+                model_resolutions: Default::default(),
+                backend_kind: BackendKind::Hermes,
+                fields: vec![protocol::SessionSettingField {
+                    key: "model".to_owned(),
+                    label: "Model".to_owned(),
+                    description: None,
+                    field_type: SessionSettingFieldType::Select {
+                        options: vec![
+                            SelectOption {
+                                value: "sonnet".to_owned(),
+                                label: "Sonnet".to_owned(),
                             },
-                            use_slider: false,
-                            select_options_by_setting: None,
-                        }],
+                            SelectOption {
+                                value: "opus".to_owned(),
+                                label: "Opus".to_owned(),
+                            },
+                        ],
+                        default: Some("sonnet".to_owned()),
+                        nullable: false,
                     },
+                    use_slider: false,
+                    select_options_by_setting: None,
+                }],
+            },
+        };
+        state.launch_profile_catalog.update(|m| {
+            m.insert(
+                host_id.clone(),
+                protocol::LaunchProfileCatalog {
+                    entries: Vec::new(),
+                    default_profile_id: None,
+                    custom_profile_schemas: profile_ids
+                        .into_iter()
+                        .map(|launch_profile_id| protocol::LaunchProfileSessionSchema {
+                            launch_profile_id,
+                            schema: hermes_schema.clone(),
+                        })
+                        .collect(),
                 },
             );
+        });
+        state.session_schemas.update(|m| {
+            m.entry(host_id)
+                .or_default()
+                .insert(BackendKind::Hermes, hermes_schema);
         });
     }
 
@@ -14561,6 +14600,142 @@ mod wasm_tests {
                 .and_then(|value| value.get("session_settings")),
             Some(&serde_json::json!({ "model": { "string": "opus" } })),
             "the removed unavailable setting must not be saved back"
+        );
+    }
+
+    /// A custom ACP profile is validated against the catalog its own agent
+    /// command reports, which the server emits per profile. Its editor must
+    /// offer exactly those options: the host-level Kiro schema describes the
+    /// default agent, so rendering it would mark the profile's real model
+    /// unavailable and offer models the profile's agent rejects.
+    #[wasm_bindgen_test]
+    async fn launch_profiles_acp_editor_uses_the_profile_schema() {
+        fn model_schema(models: &[&str]) -> SessionSchemaEntry {
+            SessionSchemaEntry::Ready {
+                schema: SessionSettingsSchema {
+                    model_resolutions: Default::default(),
+                    backend_kind: BackendKind::Kiro,
+                    fields: vec![protocol::SessionSettingField {
+                        key: "model".to_owned(),
+                        label: "Model".to_owned(),
+                        description: None,
+                        field_type: SessionSettingFieldType::Select {
+                            options: models
+                                .iter()
+                                .map(|model| SelectOption {
+                                    value: (*model).to_owned(),
+                                    label: (*model).to_owned(),
+                                })
+                                .collect(),
+                            default: None,
+                            nullable: true,
+                        },
+                        use_slider: false,
+                        select_options_by_setting: None,
+                    }],
+                },
+            }
+        }
+
+        let calls = install_settings_send_stub();
+        let container = make_container();
+        let _handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            let mut profile = launch_profile_config("kiro:custom", "Custom ACP");
+            profile.backend_kind = BackendKind::Kiro;
+            profile.session_settings.0.insert(
+                "model".to_owned(),
+                SessionSettingValue::String("custom-a".to_owned()),
+            );
+            profile.acp = Some(AcpAgentSpec {
+                command: "custom-acp-agent".to_owned(),
+                args: Vec::new(),
+                cwd: None,
+                env: Default::default(),
+                adapter: AcpAdapterId::Stock,
+            });
+            install_launch_profile_host(&state, vec![profile]);
+            state.host_settings_by_host.update(|hosts| {
+                hosts
+                    .get_mut("host-lp")
+                    .expect("launch profile host")
+                    .enabled_backends
+                    .push(BackendKind::Kiro);
+            });
+            state.session_schemas.update(|hosts| {
+                hosts
+                    .get_mut("host-lp")
+                    .expect("launch profile host")
+                    .insert(BackendKind::Kiro, model_schema(&["kiro-default-model"]));
+            });
+            state.launch_profile_catalog.update(|catalogs| {
+                catalogs.insert(
+                    "host-lp".to_owned(),
+                    protocol::LaunchProfileCatalog {
+                        entries: Vec::new(),
+                        default_profile_id: None,
+                        custom_profile_schemas: vec![protocol::LaunchProfileSessionSchema {
+                            launch_profile_id: LaunchProfileId("kiro:custom".to_owned()),
+                            schema: model_schema(&["custom-a", "custom-b"]),
+                        }],
+                    },
+                );
+            });
+            provide_context(state);
+            view! { <LaunchProfilesSection /> }
+        });
+        next_tick().await;
+
+        find_button_by_text(&container, "Edit")
+            .expect("Edit button")
+            .click();
+        next_tick().await;
+
+        let select: HtmlSelectElement = container
+            .query_selector(".settings-form .session-setting-select")
+            .unwrap()
+            .expect("the model select must render from the profile's schema")
+            .dyn_into()
+            .unwrap();
+        let options = (0..select.length())
+            .filter_map(|i| select.item(i)?.text_content())
+            .collect::<Vec<_>>();
+        assert!(
+            options.iter().any(|text| text == "custom-b"),
+            "the editor must offer the profile agent's models: {options:?}"
+        );
+        assert!(
+            !options
+                .iter()
+                .any(|text| text.contains("kiro-default-model")),
+            "the editor must not offer the default Kiro agent's models: {options:?}"
+        );
+        let selected: HtmlOptionElement = select
+            .item(select.selected_index() as u32)
+            .expect("the saved model must be selected")
+            .dyn_into()
+            .unwrap();
+        assert_eq!(
+            (selected.text(), selected.disabled()),
+            ("custom-a".to_owned(), false),
+            "the profile's valid saved model must not read as unavailable"
+        );
+
+        select.set_value("custom-b");
+        dispatch_event_from_js(&select.clone().unchecked_into(), "change", None);
+        next_tick().await;
+        find_button_by_text(&container, "Save")
+            .expect("Save button")
+            .click();
+        for _ in 0..3 {
+            next_tick().await;
+        }
+        let op = last_launch_profile_op(&calls).expect("a launch-profile op must be emitted");
+        assert_eq!(
+            op.pointer("/value/session_settings/model/string")
+                .and_then(Value::as_str),
+            Some("custom-b"),
+            "the model picked from the profile's schema must be saved: {op:?}"
         );
     }
 

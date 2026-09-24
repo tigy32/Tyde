@@ -2031,6 +2031,194 @@ async fn hermes_save_is_not_blocked_by_a_stale_untouched_profile_value() {
     assert!(stale_yaml.contains("threshold_pct: 50"), "{stale_yaml}");
 }
 
+fn kiro_model_discovery(models: &[&str]) -> server::backend::BackendDiscovery {
+    let mut discovery = mock_model_discovery(models[0], &[]);
+    discovery.schema.backend_kind = BackendKind::Kiro;
+    discovery.schema.fields = vec![protocol::SessionSettingField {
+        key: "model".to_owned(),
+        label: "model".to_owned(),
+        description: None,
+        use_slider: false,
+        select_options_by_setting: None,
+        field_type: protocol::SessionSettingFieldType::Select {
+            options: models
+                .iter()
+                .map(|model| protocol::SelectOption {
+                    value: (*model).to_owned(),
+                    label: (*model).to_owned(),
+                })
+                .collect(),
+            default: None,
+            nullable: true,
+        },
+    }];
+    discovery
+}
+
+fn offered_models(entry: &protocol::SessionSchemaEntry) -> Vec<String> {
+    let Some(schema) = entry.ready_schema() else {
+        return Vec::new();
+    };
+    schema
+        .fields
+        .iter()
+        .filter(|field| field.key == "model")
+        .flat_map(|field| match &field.field_type {
+            protocol::SessionSettingFieldType::Select { options, .. } => options
+                .iter()
+                .map(|option| option.value.clone())
+                .collect::<Vec<_>>(),
+            _ => Vec::new(),
+        })
+        .collect()
+}
+
+fn custom_profile_models(
+    catalog: &protocol::LaunchProfileCatalog,
+    profile_id: &str,
+) -> Option<Vec<String>> {
+    catalog
+        .custom_profile_schemas
+        .iter()
+        .find(|entry| entry.launch_profile_id.0 == profile_id)
+        .map(|entry| offered_models(&entry.schema))
+}
+
+fn profile_is_ready(catalog: &protocol::LaunchProfileCatalog, profile_id: &str) -> bool {
+    catalog.entries.iter().any(|entry| {
+        entry.id().0 == profile_id && matches!(entry, protocol::LaunchProfileEntry::Ready { .. })
+    })
+}
+
+async fn wait_for_launch_profile_catalog(
+    fixture: &mut Fixture,
+    context: &str,
+    ready: impl Fn(&protocol::LaunchProfileCatalog) -> bool,
+) -> protocol::LaunchProfileCatalog {
+    if ready(&fixture.bootstrap.launch_profile_catalog) {
+        return fixture.bootstrap.launch_profile_catalog.clone();
+    }
+    let mut catalog = None;
+    next_frame_matching_on(&mut fixture.client, context, |env| {
+        if env.kind != FrameKind::LaunchProfileCatalogNotify {
+            return false;
+        }
+        let payload: protocol::LaunchProfileCatalogPayload = env
+            .parse_payload()
+            .expect("parse LaunchProfileCatalogNotify");
+        if !ready(&payload.catalog) {
+            return false;
+        }
+        catalog = Some(payload.catalog);
+        true
+    })
+    .await;
+    catalog.expect("matched catalog")
+}
+
+/// A custom ACP profile discovers its model catalog from its own agent
+/// command, and the server validates the profile against that catalog, not the
+/// default Kiro one. The launch profile editor can only offer the options the
+/// profile is held to if the server emits that per-profile schema; otherwise
+/// the profile's real model reads as unavailable and the editor offers models
+/// the profile's agent rejects.
+#[tokio::test]
+async fn custom_acp_profile_schema_is_emitted_for_its_editor() {
+    let mut fixture = Fixture::new_with_runtime_config_and_settings_file(
+        server::HostRuntimeConfig {
+            mock_backend_discovery: [(
+                BackendKind::Kiro,
+                server::backend::mock::MockDiscovery::new(vec![
+                    Ok(kiro_model_discovery(&["kiro-default-model"])),
+                    Ok(kiro_model_discovery(&["custom-a", "custom-b"])),
+                ]),
+            )]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        },
+        r#"{
+  "settings": {
+    "enabled_backends": ["kiro"],
+    "default_backend": "kiro",
+    "launch_profiles": {
+      "kiro:custom": {
+        "id": "kiro:custom",
+        "label": "Custom ACP",
+        "backend_kind": "kiro",
+        "session_settings": { "model": { "string": "custom-a" } },
+        "acp": { "command": "custom-acp-agent" }
+      }
+    }
+  }
+}"#,
+    )
+    .await;
+
+    let catalog = wait_for_launch_profile_catalog(
+        &mut fixture,
+        "custom ACP profile ready with its own schema",
+        |catalog| {
+            profile_is_ready(catalog, "kiro:custom")
+                && custom_profile_models(catalog, "kiro:custom").is_some()
+        },
+    )
+    .await;
+    assert_eq!(
+        custom_profile_models(&catalog, "kiro:custom"),
+        Some(vec!["custom-a".to_owned(), "custom-b".to_owned()]),
+        "the profile's editor schema must be the catalog its own agent reported, \
+         not the default Kiro catalog"
+    );
+
+    let profile = |model: &str| {
+        serde_json::json!({
+            "id": "kiro:custom",
+            "label": "Custom ACP",
+            "backend_kind": "kiro",
+            "session_settings": { "model": { "string": model } },
+            "acp": { "command": "custom-acp-agent", "args": [], "adapter": "stock" }
+        })
+    };
+    send_settings_write(
+        &mut fixture.client,
+        "w-custom-acp-model",
+        vec![replace_op(
+            "/launch_profiles/kiro:custom",
+            profile("custom-b"),
+            profile("custom-a"),
+        )],
+    )
+    .await;
+    let result = expect_settings_write_result(
+        &mut fixture.client,
+        "w-custom-acp-model",
+        "custom ACP profile model edit",
+    )
+    .await;
+    assert!(result.applied, "{:?}", result.field_errors);
+    let catalog = wait_for_launch_profile_catalog(
+        &mut fixture,
+        "custom ACP profile edited to another model its agent offers",
+        |catalog| {
+            catalog.entries.iter().any(|entry| match entry {
+                protocol::LaunchProfileEntry::Ready { profile } => {
+                    profile.id.0 == "kiro:custom"
+                        && profile.session_settings.0.get("model")
+                            == Some(&SessionSettingValue::String("custom-b".to_owned()))
+                }
+                _ => false,
+            })
+        },
+    )
+    .await;
+    assert_eq!(
+        custom_profile_models(&catalog, "kiro:custom"),
+        Some(vec!["custom-a".to_owned(), "custom-b".to_owned()]),
+        "a model picked from the emitted profile schema keeps the profile ready"
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn sequential_settings_writes_preserve_prior_fields() {
     let mut fixture = Fixture::new().await;

@@ -35,10 +35,11 @@ use protocol::{
     HostBootstrapPayload, HostBrowseInitial, HostBrowseListPayload, HostBrowseStartPayload,
     HostFilterId, HostSettingsPayload, ImageData, LOCAL_HOST_ID, LaunchProfile,
     LaunchProfileCatalog, LaunchProfileCatalogPayload, LaunchProfileEntry, LaunchProfileId,
-    LaunchProfileKind, ListSessionsPayload, MAX_SESSION_LIST_PAGE_LIMIT, McpServerDeletePayload,
-    McpServerNotifyPayload, McpServerUpsertPayload, MessageSender, MobileDeviceRenamePayload,
-    MobileDeviceRevokePayload, MobilePairingCancelPayload, NewAgentPayload, Project,
-    ProjectAddRootPayload, ProjectCreatePayload, ProjectDeletePayload, ProjectDeleteRootPayload,
+    LaunchProfileKind, LaunchProfileSessionSchema, ListSessionsPayload,
+    MAX_SESSION_LIST_PAGE_LIMIT, McpServerDeletePayload, McpServerNotifyPayload,
+    McpServerUpsertPayload, MessageSender, MobileDeviceRenamePayload, MobileDeviceRevokePayload,
+    MobilePairingCancelPayload, NewAgentPayload, Project, ProjectAddRootPayload,
+    ProjectCreatePayload, ProjectDeletePayload, ProjectDeleteRootPayload,
     ProjectDiscardFilePayload, ProjectGitCommitPayload, ProjectGitCommitResultPayload, ProjectId,
     ProjectListDirPayload, ProjectNotifyPayload, ProjectOpenPathPayload, ProjectPath,
     ProjectReadDiffPayload, ProjectReadFilePayload, ProjectRenamePayload, ProjectReorderPayload,
@@ -20324,15 +20325,25 @@ fn launch_profile_catalog_for_settings(
         }
     }
 
+    let mut custom_profile_schemas = Vec::new();
     for config in settings.launch_profiles.values() {
         if settings.enabled_backends.contains(&config.backend_kind) {
             entries.push(launch_profile_entry_for_config(state, config));
+            custom_profile_schemas.push(LaunchProfileSessionSchema {
+                launch_profile_id: config.id.clone(),
+                schema: session_schema_entry_for_backend(
+                    state,
+                    config.backend_kind,
+                    Some(&config.id),
+                ),
+            });
         }
     }
 
     LaunchProfileCatalog {
         entries,
         default_profile_id: settings.default_backend.map(default_launch_profile_id),
+        custom_profile_schemas,
     }
 }
 

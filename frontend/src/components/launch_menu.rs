@@ -426,6 +426,7 @@ mod wasm_tests {
                 LaunchProfileCatalog {
                     entries,
                     default_profile_id: None,
+                    custom_profile_schemas: Vec::new(),
                 },
             );
         });

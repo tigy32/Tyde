@@ -644,6 +644,17 @@ pub struct LaunchProfileCatalog {
     pub entries: Vec<LaunchProfileEntry>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_profile_id: Option<LaunchProfileId>,
+    /// The schema each custom profile's session settings are validated
+    /// against. ACP profiles discover their own catalog from their agent
+    /// command, so the host-level backend schema does not describe them.
+    #[serde(default)]
+    pub custom_profile_schemas: Vec<LaunchProfileSessionSchema>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LaunchProfileSessionSchema {
+    pub launch_profile_id: LaunchProfileId,
+    pub schema: SessionSchemaEntry,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
