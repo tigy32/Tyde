@@ -1917,11 +1917,16 @@ pub(crate) async fn persist_native_settings(
         ));
     }
 
-    // Validate every profile section before any credential or config
+    // Validate every profile section's edits before any credential or config
     // mutation: a bad document must be rejected whole, not half-applied and
-    // rediscovered later as a broken snapshot.
+    // rediscovered later as a broken snapshot. Values unchanged from the base
+    // are not revalidated; the base itself is checked against disk below.
     for profile_settings in &doc.profiles {
-        hermes_config::validate_profile_config(&profile_settings.config).map_err(|error| {
+        hermes_config::validate_profile_config(
+            &profile_settings.config,
+            profile_settings.base_config.as_ref(),
+        )
+        .map_err(|error| {
             format!(
                 "invalid Hermes settings for profile '{}': {error}",
                 profile_settings.name

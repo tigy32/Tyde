@@ -723,17 +723,26 @@ fn json_to_yaml(value: &serde_json::Value) -> Yaml {
 
 /// Semantic validation applied before a save is written anywhere: an invalid
 /// document must be rejected up front, never persisted and rediscovered as a
-/// broken snapshot later.
-pub(crate) fn validate_profile_config(config: &HermesProfileConfig) -> Result<(), String> {
-    for (index, fallback) in config.fallback_providers.iter().enumerate() {
-        if fallback.provider.trim().is_empty() || fallback.model.trim().is_empty() {
-            return Err(format!(
-                "fallback provider #{} needs both a provider and a model",
-                index + 1
-            ));
+/// broken snapshot later. Only values the save changes from `base` are
+/// checked: every save carries every profile's config, so a value already on
+/// disk that Tyde would refuse (hand-edited, or written by the Hermes CLI)
+/// must not block unrelated edits, including the one that repairs it.
+pub(crate) fn validate_profile_config(
+    config: &HermesProfileConfig,
+    base: Option<&HermesProfileConfig>,
+) -> Result<(), String> {
+    if base.is_none_or(|base| base.fallback_providers != config.fallback_providers) {
+        for (index, fallback) in config.fallback_providers.iter().enumerate() {
+            if fallback.provider.trim().is_empty() || fallback.model.trim().is_empty() {
+                return Err(format!(
+                    "fallback provider #{} needs both a provider and a model",
+                    index + 1
+                ));
+            }
         }
     }
     if let Some(threshold) = config.tool_search.threshold_pct
+        && base.is_none_or(|base| base.tool_search.threshold_pct != Some(threshold))
         && !(0.0..=100.0).contains(&threshold)
     {
         return Err(format!(

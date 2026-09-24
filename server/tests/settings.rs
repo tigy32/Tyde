@@ -1855,6 +1855,182 @@ async fn tier_edit_is_not_blocked_by_a_stale_untouched_tier() {
     assert!(result.applied, "{:?}", result.field_errors);
 }
 
+async fn save_hermes_doc(
+    fixture: &mut Fixture,
+    doc: &protocol::hermes_config::HermesNativeSettingsDoc,
+    context: &str,
+) -> SettingsWriteResultPayload {
+    let write_id = fixture
+        .client
+        .backend_native_settings_write(BackendKind::Hermes, doc)
+        .await
+        .unwrap_or_else(|err| panic!("send Hermes native settings write for {context}: {err:?}"));
+    expect_settings_write_result(&mut fixture.client, &write_id.0, context).await
+}
+
+/// The user-visible flow: one Hermes profile's `config.yaml` carries a value
+/// Tyde's editor refuses (`threshold_pct: 150`, hand-edited or written by the
+/// Hermes CLI, which clamps it). Every Hermes save carries every profile's
+/// config, so revalidating that untouched stale value rejected every save —
+/// edits to other profiles, other fields of the same profile, and profile
+/// create/delete. Only the fields a save changes are validated; a changed
+/// threshold is still held to 0..100, and repairing it saves.
+#[tokio::test]
+async fn hermes_save_is_not_blocked_by_a_stale_untouched_profile_value() {
+    let _env_guard = env_lock().lock().await;
+    let temp_home = tempfile::tempdir().expect("create temp HOME");
+    let hermes_home = temp_home.path().join(".hermes");
+    let stale_profile_home = hermes_home.join("profiles").join("stale");
+    fs::create_dir_all(&stale_profile_home).expect("create stale Hermes profile");
+    fs::write(hermes_home.join("config.yaml"), "model: default-model\n")
+        .expect("write default Hermes config");
+    fs::write(
+        stale_profile_home.join("config.yaml"),
+        "model: stale-model\ntools:\n  tool_search:\n    threshold_pct: 150\n",
+    )
+    .expect("write stale Hermes profile config");
+    let _home = EnvVarGuard::set("HOME", temp_home.path().to_string_lossy().to_string());
+    let _hermes_home = EnvVarGuard::set("HERMES_HOME", hermes_home.to_string_lossy().to_string());
+    let _hermes_python =
+        EnvVarGuard::set("HERMES_PYTHON", "/definitely/not/hermes-python".to_string());
+
+    let mut fixture = Fixture::new_with_runtime_config_and_real_backend_probe_for_enabled_backends(
+        server::HostRuntimeConfig::default(),
+        vec![BackendKind::Hermes],
+    )
+    .await;
+    let mut snapshot = None;
+    next_frame_matching_on(
+        &mut fixture.client,
+        "Hermes native settings snapshot with the stale profile",
+        |env| {
+            if env.kind != FrameKind::BackendConfigSnapshots {
+                return false;
+            }
+            let payload: BackendConfigSnapshotsPayload =
+                env.parse_payload().expect("parse BackendConfigSnapshots");
+            snapshot = payload
+                .native_settings
+                .into_iter()
+                .find(|snapshot| snapshot.backend_kind == BackendKind::Hermes)
+                .and_then(|snapshot| snapshot.settings)
+                .map(|settings| {
+                    serde_json::from_value::<protocol::hermes_config::HermesNativeSettingsDoc>(
+                        settings,
+                    )
+                    .expect("parse Hermes native settings doc")
+                })
+                .filter(|doc| doc.profiles.iter().any(|profile| profile.name == "stale"));
+            snapshot.is_some()
+        },
+    )
+    .await;
+    let mut doc = snapshot.expect("Hermes snapshot");
+    let stale = doc
+        .profiles
+        .iter()
+        .find(|profile| profile.name == "stale")
+        .expect("stale profile in snapshot");
+    assert_eq!(
+        stale.config.tool_search.threshold_pct,
+        Some(150.0),
+        "the stale value loads and is shown to the user"
+    );
+    let profile_index = |doc: &protocol::hermes_config::HermesNativeSettingsDoc, name: &str| {
+        doc.profiles
+            .iter()
+            .position(|profile| profile.name == name)
+            .unwrap_or_else(|| panic!("profile {name} in Hermes doc"))
+    };
+    let default_index = profile_index(&doc, "default");
+    let stale_index = profile_index(&doc, "stale");
+    let rebase = |doc: &mut protocol::hermes_config::HermesNativeSettingsDoc| {
+        for profile in &mut doc.profiles {
+            profile.base_config = Some(profile.config.clone());
+        }
+        doc.profile_actions.clear();
+    };
+    rebase(&mut doc);
+
+    // Editing another profile.
+    doc.profiles[default_index].config.model.model = Some("edited-default".to_owned());
+    let result = save_hermes_doc(&mut fixture, &doc, "edit the default profile").await;
+    assert!(
+        result.applied,
+        "an edit to another profile must not be rejected for the untouched stale threshold: {:?}",
+        result.field_errors
+    );
+    assert!(
+        fs::read_to_string(hermes_home.join("config.yaml"))
+            .expect("read default Hermes config")
+            .contains("edited-default")
+    );
+    rebase(&mut doc);
+
+    // Creating a profile.
+    doc.profile_actions = vec![
+        protocol::hermes_config::HermesProfileAction::CreateProfile {
+            name: "fresh".to_owned(),
+            copy_config_from: None,
+        },
+    ];
+    let result = save_hermes_doc(&mut fixture, &doc, "create a profile").await;
+    assert!(
+        result.applied,
+        "creating a profile must not be rejected for the untouched stale threshold: {:?}",
+        result.field_errors
+    );
+    assert!(hermes_home.join("profiles").join("fresh").is_dir());
+    rebase(&mut doc);
+
+    // Editing a different field of the stale profile itself.
+    doc.profiles[stale_index].config.model.model = Some("edited-stale".to_owned());
+    let result = save_hermes_doc(
+        &mut fixture,
+        &doc,
+        "edit another field of the stale profile",
+    )
+    .await;
+    assert!(
+        result.applied,
+        "an edit to another field must not be rejected for the untouched stale threshold: {:?}",
+        result.field_errors
+    );
+    let stale_yaml =
+        fs::read_to_string(stale_profile_home.join("config.yaml")).expect("read stale config");
+    assert!(stale_yaml.contains("edited-stale"), "{stale_yaml}");
+    assert!(
+        stale_yaml.contains("threshold_pct: 150"),
+        "the untouched stale value is preserved, not rewritten: {stale_yaml}"
+    );
+    rebase(&mut doc);
+
+    // A changed threshold is still validated.
+    doc.profiles[stale_index].config.tool_search.threshold_pct = Some(250.0);
+    let result = save_hermes_doc(&mut fixture, &doc, "edit the threshold out of range").await;
+    assert!(!result.applied, "a changed threshold is still validated");
+    let messages = result
+        .field_errors
+        .iter()
+        .map(|error| error.message.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        messages,
+        vec![
+            "invalid Hermes settings for profile 'stale': tool search threshold must be \
+             between 0 and 100, got 250"
+        ]
+    );
+
+    // Repairing the stale value saves.
+    doc.profiles[stale_index].config.tool_search.threshold_pct = Some(50.0);
+    let result = save_hermes_doc(&mut fixture, &doc, "repair the stale threshold").await;
+    assert!(result.applied, "{:?}", result.field_errors);
+    let stale_yaml =
+        fs::read_to_string(stale_profile_home.join("config.yaml")).expect("read stale config");
+    assert!(stale_yaml.contains("threshold_pct: 50"), "{stale_yaml}");
+}
+
 #[tokio::test(start_paused = true)]
 async fn sequential_settings_writes_preserve_prior_fields() {
     let mut fixture = Fixture::new().await;
