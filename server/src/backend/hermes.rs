@@ -10,9 +10,9 @@ use protocol::{
     AgentInput, BackendConfigSnapshotStatus, BackendKind, BackendNativeSettingsSnapshot,
     BackendSetupDiagnosticCode, ChatEvent, ChatMessage, CompactionMethod, CompactionMetrics,
     CompactionStage, CompactionTrigger, ContextBreakdown, CurrentContextUsage, ImageData,
-    MessageSender, MessageTokenUsage, ModelInfo, ModelRequestId, ModelRequestTokenUsage,
-    ModelTurnId, OperationCancelledData, ReasoningData, RetryAttemptData, SelectOption,
-    SendMessageToolResponse, SessionId, SessionSettingField, SessionSettingFieldType,
+    MessageMetadataUpdateData, MessageSender, MessageTokenUsage, ModelInfo, ModelRequestId,
+    ModelRequestTokenUsage, ModelTurnId, OperationCancelledData, ReasoningData, RetryAttemptData,
+    SelectOption, SendMessageToolResponse, SessionId, SessionSettingField, SessionSettingFieldType,
     SessionSettingValue, SessionSettingsSchema, SessionSettingsValues, StreamEndData,
     StreamStartData, StreamTextDeltaData, TokenUsage, TokenUsageScope, TokenUsageUnavailableReason,
     ToolExecutionCompletedData, ToolExecutionMode, ToolExecutionOutcome, ToolExecutionResult,
@@ -902,6 +902,14 @@ struct HermesEventMapper {
     /// turn can have been seen reasoning while this stays empty.
     current_reasoning: String,
     typing_active: bool,
+    /// The provider iteration's response was ended early because it asked a
+    /// blocking question. Hermes keeps that iteration running while it waits,
+    /// but a response left open across the wait is live transcript state that
+    /// a reattach discards once the turn stops reporting activity, and the
+    /// question inside it would vanish with it. `current_message_id` stays set:
+    /// the turn is still running, and the iteration's late usage is attached
+    /// to the ended message by id.
+    user_response_closed_stream: bool,
     model: Option<String>,
     provider: Option<String>,
     pending_tools: HashMap<String, String>,
@@ -2918,7 +2926,7 @@ impl HermesSessionActor {
         {
             return SteerOutcome::Unsupported(payload);
         }
-        if !self.mapper.typing_active {
+        if !self.mapper.typing_active && !self.mapper.user_response_closed_stream {
             return SteerOutcome::NoActiveTurn(payload);
         }
         let steered = self
@@ -3170,6 +3178,8 @@ impl HermesSessionActor {
                     }
                 }
                 self.mapper.pending_clarify = None;
+                self.mapper.typing_active = true;
+                self.emit(ChatEvent::TypingStatusChanged(true));
             }
             SendMessageToolResponse::ExitPlanMode {
                 tool_call_id,
@@ -5406,6 +5416,10 @@ impl HermesEventMapper {
 
         let message_id = Uuid::new_v4().to_string();
         self.current_message_id = Some(message_id.clone());
+        if !self.typing_active {
+            events.push(ChatEvent::TypingStatusChanged(true));
+            self.typing_active = true;
+        }
         events.push(ChatEvent::StreamStart(StreamStartData {
             agent: HERMES_AGENT_NAME.to_string(),
             model: self.model.clone(),
@@ -5448,8 +5462,10 @@ impl HermesEventMapper {
         if text.is_empty() {
             return Ok(Vec::new());
         }
+        let mut events = self.reopen_stream_after_user_response();
         self.current_text.push_str(&text);
-        Ok(vec![ChatEvent::StreamDelta(StreamTextDeltaData { text })])
+        events.push(ChatEvent::StreamDelta(StreamTextDeltaData { text }));
+        Ok(events)
     }
 
     fn map_message_interim(&mut self, payload: Option<Value>) -> Result<Vec<ChatEvent>, String> {
@@ -5468,8 +5484,10 @@ impl HermesEventMapper {
         {
             return Ok(Vec::new());
         }
+        let mut events = self.reopen_stream_after_user_response();
         self.current_text.push_str(&text);
-        Ok(vec![ChatEvent::StreamDelta(StreamTextDeltaData { text })])
+        events.push(ChatEvent::StreamDelta(StreamTextDeltaData { text }));
+        Ok(events)
     }
 
     fn map_reasoning_delta(
@@ -5493,6 +5511,12 @@ impl HermesEventMapper {
         if text.is_empty() {
             return Ok(Vec::new());
         }
+        // Hermes keeps animating its spinner through a question wait; only
+        // real reasoning starts the response that follows the answer.
+        if self.user_response_closed_stream && event_type != "reasoning.delta" {
+            return Ok(Vec::new());
+        }
+        let mut events = self.reopen_stream_after_user_response();
         self.current_reasoning_seen = true;
         // `thinking.delta` is not reasoning. Hermes builds it from
         // `random.choice(KawaiiSpinner.get_thinking_faces())`
@@ -5502,12 +5526,13 @@ impl HermesEventMapper {
         // reasoning panel and no reasoning at all. Only `reasoning.delta`
         // carries content, from the provider's own reasoning stream.
         if event_type != "reasoning.delta" {
-            return Ok(Vec::new());
+            return Ok(events);
         }
         self.current_reasoning.push_str(&text);
-        Ok(vec![ChatEvent::StreamReasoningDelta(StreamTextDeltaData {
+        events.push(ChatEvent::StreamReasoningDelta(StreamTextDeltaData {
             text,
-        })])
+        }));
+        Ok(events)
     }
 
     fn map_reasoning_available(
@@ -5685,10 +5710,14 @@ impl HermesEventMapper {
         let payload = required_payload(payload, "tool.start")?;
         let provider_tool_id =
             required_string_any(&payload, &["tool_id", "tool_call_id"], "tool.start")?;
+        if self.current_message_id.is_none() {
+            return Err("Hermes tool started without a provider response".to_owned());
+        }
+        let mut events = self.reopen_stream_after_user_response();
         let response_id = self
             .current_message_id
             .as_ref()
-            .ok_or_else(|| "Hermes tool started without a provider response".to_owned())?;
+            .expect("provider response checked above");
         let tool_call_id = format!("hermes:{response_id}:{provider_tool_id}");
         self.tool_call_ids
             .insert(provider_tool_id.clone(), tool_call_id.clone());
@@ -5738,15 +5767,16 @@ impl HermesEventMapper {
             });
         }
         if normalized_hermes_tool_name(&tool_name) == "clarify" {
-            return Ok(Vec::new());
+            return Ok(events);
         }
         // Agent-control progress is emitted once for every backend in
         // `EventStream::project_tyde_agent_control`.
-        Ok(vec![ChatEvent::ToolRequest(ToolRequest {
+        events.push(ChatEvent::ToolRequest(ToolRequest {
             tool_call_id: tool_call_id.clone(),
             tool_name: tool_name.clone(),
             tool_type,
-        })])
+        }));
+        Ok(events)
     }
 
     fn map_clarify_request(&mut self, payload: Option<Value>) -> Result<Vec<ChatEvent>, String> {
@@ -5777,27 +5807,32 @@ impl HermesEventMapper {
             request_id,
             questions: questions.clone(),
         });
-        Ok(vec![ChatEvent::ToolRequest(ToolRequest {
+        Ok(self.await_user_response(ToolRequest {
             tool_call_id,
             tool_name: "clarify".to_string(),
             tool_type: ToolRequestType::AskUserQuestion {
                 questions,
                 mode: protocol::UserQuestionMode::Blocking,
             },
-        })])
+        }))
     }
 
     fn map_clarify_expire(&mut self, payload: Option<Value>) -> Result<Vec<ChatEvent>, String> {
         let payload = required_payload(payload, "clarify.expire")?;
         let request_id = required_string(&payload, &["request_id"], "clarify.expire")?;
+        let mut events = Vec::new();
         if self
             .pending_clarify
             .as_ref()
             .is_some_and(|pending| pending.request_id == request_id)
         {
             self.pending_clarify = None;
+            if !self.typing_active {
+                events.push(ChatEvent::TypingStatusChanged(true));
+                self.typing_active = true;
+            }
         }
-        Ok(Vec::new())
+        Ok(events)
     }
 
     fn map_tool_progress(&mut self, payload: Option<Value>) -> Result<Vec<ChatEvent>, String> {
@@ -6242,14 +6277,80 @@ impl HermesEventMapper {
         self.pending_approval_request_id = optional_string(&payload, &["request_id"]);
         self.pending_tools
             .insert(tool_call_id.clone(), "approval.request".to_string());
-        Ok(vec![ChatEvent::ToolRequest(ToolRequest {
+        Ok(self.await_user_response(ToolRequest {
             tool_call_id,
             tool_name: "approval.request".to_string(),
             tool_type: ToolRequestType::ExitPlanMode {
                 plan: Some(question),
                 plan_path: None,
             },
-        })])
+        }))
+    }
+
+    /// Ends the open response before a blocking request so the wait holds no
+    /// live stream, and reports the backend idle for the wait's duration.
+    fn await_user_response(&mut self, request: ToolRequest) -> Vec<ChatEvent> {
+        let mut events = Vec::new();
+        if let Some(message_id) = self.current_message_id.clone()
+            && !self.user_response_closed_stream
+        {
+            let content = std::mem::take(&mut self.current_text);
+            let tool_calls = self.tool_uses_for_message(&content, &content);
+            let reasoning = Some(std::mem::take(&mut self.current_reasoning))
+                .filter(|text| !text.trim().is_empty())
+                .map(|text| ReasoningData {
+                    text,
+                    tokens: None,
+                    signature: None,
+                    blob: None,
+                });
+            self.current_reasoning_seen = false;
+            self.turn_tools.clear();
+            self.next_turn_tool_order = 0;
+            self.user_response_closed_stream = true;
+            events.push(ChatEvent::StreamEnd(StreamEndData {
+                message: ChatMessage {
+                    message_id: Some(protocol::ChatMessageId(message_id)),
+                    timestamp: unix_now_ms(),
+                    sender: MessageSender::Assistant {
+                        agent: HERMES_AGENT_NAME.to_string(),
+                    },
+                    content,
+                    reasoning,
+                    tool_calls,
+                    model_info: self.model.clone().map(|model| ModelInfo { model }),
+                    token_usage: None,
+                    context_breakdown: None,
+                    images: None,
+                },
+            }));
+        }
+        events.push(ChatEvent::ToolRequest(request));
+        if self.typing_active {
+            events.push(ChatEvent::TypingStatusChanged(false));
+            self.typing_active = false;
+        }
+        events
+    }
+
+    /// Starts the response that continues a provider iteration after its
+    /// blocking request was answered.
+    fn reopen_stream_after_user_response(&mut self) -> Vec<ChatEvent> {
+        if !self.user_response_closed_stream {
+            return Vec::new();
+        }
+        self.user_response_closed_stream = false;
+        self.current_message_id = Some(Uuid::new_v4().to_string());
+        let mut events = Vec::new();
+        if !self.typing_active {
+            events.push(ChatEvent::TypingStatusChanged(true));
+            self.typing_active = true;
+        }
+        events.push(ChatEvent::StreamStart(StreamStartData {
+            agent: HERMES_AGENT_NAME.to_string(),
+            model: self.model.clone(),
+        }));
+        events
     }
 
     fn map_error(&mut self, payload: Option<Value>) -> Result<Vec<ChatEvent>, String> {
@@ -6361,6 +6462,27 @@ impl HermesEventMapper {
         cumulative_usage: Option<TokenUsage>,
         context_breakdown: Option<ContextBreakdown>,
     ) -> Vec<ChatEvent> {
+        if self.user_response_closed_stream {
+            // The iteration's response already ended at its blocking request
+            // and nothing followed the answer, so only its usage is left.
+            self.user_response_closed_stream = false;
+            let message_id = self
+                .current_message_id
+                .take()
+                .expect("a closed response keeps its message id");
+            self.current_text.clear();
+            self.current_reasoning.clear();
+            self.current_reasoning_seen = false;
+            let token_usage = self.message_token_usage(request_usage, cumulative_usage);
+            return vec![ChatEvent::MessageMetadataUpdated(
+                MessageMetadataUpdateData {
+                    message_id: protocol::ChatMessageId(message_id),
+                    model_info: self.model.clone().map(|model| ModelInfo { model }),
+                    token_usage,
+                    context_breakdown,
+                },
+            )];
+        }
         let content = reconcile_hermes_stream_text(&self.current_text, final_text.as_deref());
         let tool_calls = self.tool_uses_for_message(&self.current_text, &content);
         let message_id = self.current_message_id.take().map(protocol::ChatMessageId);
@@ -6379,12 +6501,37 @@ impl HermesEventMapper {
         self.current_text.clear();
         self.current_reasoning.clear();
         self.current_reasoning_seen = false;
+        let token_usage = self.message_token_usage(request_usage, cumulative_usage);
+
+        vec![ChatEvent::StreamEnd(StreamEndData {
+            message: ChatMessage {
+                message_id,
+                timestamp: unix_now_ms(),
+                sender: MessageSender::Assistant {
+                    agent: HERMES_AGENT_NAME.to_string(),
+                },
+                content,
+                reasoning,
+                tool_calls,
+                model_info: self.model.clone().map(|model| ModelInfo { model }),
+                token_usage,
+                context_breakdown,
+                images: None,
+            },
+        })]
+    }
+
+    fn message_token_usage(
+        &mut self,
+        request_usage: Option<TokenUsage>,
+        cumulative_usage: Option<TokenUsage>,
+    ) -> Option<MessageTokenUsage> {
         // Hermes reports session-cumulative counters and Tyde samples them at
         // every provider-request boundary, so the delta between samples is one
         // request -- never the turn. Filing it under `turn` understated a
         // four-request turn as a quarter of its cost and left `request`
         // `Unavailable`, which is the slot the chat row actually renders.
-        let token_usage = match (request_usage, cumulative_usage) {
+        match (request_usage, cumulative_usage) {
             (Some(request), cumulative) => {
                 let turn = add_token_usage(self.turn_usage_so_far.as_ref(), &request);
                 self.turn_usage_so_far = Some(turn.clone());
@@ -6408,24 +6555,7 @@ impl HermesEventMapper {
             (None, _) => Some(MessageTokenUsage::unavailable(
                 TokenUsageUnavailableReason::BackendDidNotReport,
             )),
-        };
-
-        vec![ChatEvent::StreamEnd(StreamEndData {
-            message: ChatMessage {
-                message_id,
-                timestamp: unix_now_ms(),
-                sender: MessageSender::Assistant {
-                    agent: HERMES_AGENT_NAME.to_string(),
-                },
-                content,
-                reasoning,
-                tool_calls,
-                model_info: self.model.clone().map(|model| ModelInfo { model }),
-                token_usage,
-                context_breakdown,
-                images: None,
-            },
-        })]
+        }
     }
 
     fn cancel_events(&mut self, message: &str) -> Vec<ChatEvent> {
@@ -6449,6 +6579,7 @@ impl HermesEventMapper {
         }));
         events.push(ChatEvent::TypingStatusChanged(false));
         self.typing_active = false;
+        self.user_response_closed_stream = false;
         self.current_message_id = None;
         self.current_text.clear();
         self.current_reasoning_seen = false;
@@ -6510,6 +6641,7 @@ impl HermesEventMapper {
             self.last_turn_generation = Some(generation);
         }
         self.current_message_id = None;
+        self.user_response_closed_stream = false;
         self.current_text.clear();
         self.current_reasoning.clear();
         self.current_reasoning_seen = false;

@@ -2915,6 +2915,7 @@ async fn real_user_question<B: Backend>(host: &mut Harness<B>) {
     let asked = ask_question(host, &agent, &question_prompt()).await;
     assert_question_shape(&asked);
     assert_question_waits_for_an_answer(&asked);
+    assert_blocking_question_leaves_no_open_response(&asked);
 
     // Answering with a label the provider actually offered, so this
     // tests the tool rather than the prompt.
@@ -3635,6 +3636,30 @@ fn assert_question_waits_for_an_answer(question: &Question) {
          the user was asked to act on was terminalized behind their back.",
         question.label(),
         question.question().question
+    );
+}
+
+/// A reattach rebuilds the transcript from durable events plus live state
+/// that only a visibly active turn keeps, and a turn waiting on a blocking
+/// question is not visibly active. A question left inside a still-open
+/// response is therefore dropped with that response on reload, and the
+/// agent waits on a card nobody can see.
+fn assert_blocking_question_leaves_no_open_response(question: &Question) {
+    let mut open_responses = 0usize;
+    for event in question.events() {
+        match event {
+            ChatEvent::StreamStart(_) => open_responses += 1,
+            ChatEvent::StreamEnd(_) => open_responses = open_responses.saturating_sub(1),
+            _ => {}
+        }
+    }
+    assert_eq!(
+        open_responses,
+        0,
+        "{}: the blocking question {:?} is waiting inside a response that never ended, so a \
+         reattach during the wait discards the question with the live response.",
+        question.label(),
+        question.tool_call_id()
     );
 }
 
