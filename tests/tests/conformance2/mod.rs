@@ -2508,3 +2508,98 @@ pub async fn approve_plan<B: Backend>(
     );
     collect_turn(host, agent, "Approved. Implement the plan now.").await
 }
+
+/// Run process-kill scenarios alone so every direct child belongs to this case.
+pub async fn isolated_process_case<B: Backend>(host: &Harness<B>) -> bool {
+    if std::env::var("TYDE_PROCESS_CASE").ok().as_deref() == Some(&host.test_name) {
+        return true;
+    }
+    let directory = tempfile::Builder::new()
+        .prefix("tyde-process-case-")
+        .tempdir()
+        .expect("create private process evidence")
+        .keep();
+    let log = std::fs::File::create(directory.join("run.log")).expect("create evidence log");
+    let status = tokio::process::Command::new(std::env::current_exe().expect("test executable"))
+        .args(["--exact", &host.test_name, "--ignored", "--nocapture"])
+        .env("TYDE_PROCESS_CASE", &host.test_name)
+        .stdout(log.try_clone().expect("clone evidence log"))
+        .stderr(log)
+        .status()
+        .await
+        .expect("run isolated process case");
+    eprintln!("Process case evidence: {}", directory.display());
+    assert!(
+        status.success(),
+        "isolated process case failed; see private evidence log"
+    );
+    false
+}
+
+pub async fn backend_process_group(probe: &Path) -> i32 {
+    let pid: i32 = std::fs::read_to_string(probe)
+        .expect("read running tool pid")
+        .trim()
+        .parse()
+        .expect("parse running tool pid");
+    let output = tokio::process::Command::new("ps")
+        .args(["-eo", "pid=,ppid=,pgid="])
+        .output()
+        .await
+        .expect("inspect owned process ancestry");
+    assert!(output.status.success(), "process ancestry unavailable");
+    let rows: Vec<Vec<i32>> = String::from_utf8(output.stdout)
+        .expect("process table encoding")
+        .lines()
+        .map(|line| {
+            line.split_whitespace()
+                .map(|field| field.parse().expect("numeric process field"))
+                .collect()
+        })
+        .collect();
+    let owner = i32::try_from(std::process::id()).expect("test pid range");
+    let mut current = pid;
+    loop {
+        let row = rows
+            .iter()
+            .find(|row| row[0] == current)
+            .expect("tool must descend from the test process");
+        if row[1] == owner {
+            assert_eq!(row[0], row[2], "backend must own its process group");
+            return row[2];
+        }
+        assert!(row[1] > 1, "tool escaped the test process ancestry");
+        current = row[1];
+    }
+}
+
+pub async fn kill_backend_group(group: i32) {
+    let status = tokio::process::Command::new("kill")
+        .args(["-KILL", "--", &format!("-{group}")])
+        .status()
+        .await
+        .expect("kill owned backend group");
+    assert!(status.success(), "owned backend group could not be killed");
+}
+
+pub async fn wait_for_process_probe<B: Backend>(host: &mut Harness<B>, probe: &Path) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
+    while !probe.exists() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "tool never established the process probe"
+        );
+        if let Some(event) = host
+            .next_chat(std::cmp::min(
+                deadline,
+                tokio::time::Instant::now() + Duration::from_millis(100),
+            ))
+            .await
+        {
+            assert!(
+                !matches!(event, ChatEvent::TypingStatusChanged(false)),
+                "turn ended before the process probe"
+            );
+        }
+    }
+}

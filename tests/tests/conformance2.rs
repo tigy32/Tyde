@@ -148,7 +148,7 @@ macro_rules! conformance2_scenario {
                 server::backend::antigravity::AntigravityBackend,
                 if matches!(
                     stringify!($scenario),
-                    "real_async_user_question" | "real_user_question"
+                    "real_async_user_question" | "real_user_question" | "real_immediate_message_after_uncooperative_stop"
                 ) {
                     Profile::new(&["gemini-3.8-flash-low"], &[("model", "gemini-3.8-flash-low")])
                 } else {
@@ -6221,6 +6221,66 @@ async fn real_session_speed<B: Backend>(host: &mut Harness<B>) {
     assert_final_text_contains(&reset, "TYDE_SPEED_READY");
     turns.push(reset);
     assert_universal_contract_with_models(&turns, &expected_models);
+    assert_clean_close(host, &resumed).await;
+}
+
+conformance2_scenario!(
+    real_immediate_message_after_uncooperative_stop,
+    [BackendCapability::ResumeSession]
+);
+
+async fn real_immediate_message_after_uncooperative_stop<B: Backend>(host: &mut Harness<B>) {
+    if !isolated_process_case(host).await {
+        return;
+    }
+    let agent = spawn_agent(host, &launch_prompt()).await;
+    let launched = collect_turn(host, &agent, &launch_prompt()).await;
+    assert_ready_handshake(&launched);
+    assert_universal_contract(&[launched]);
+    let probe = host.workspace().join("restart-probe.pid");
+    let prompt = format!(
+        "Run this command in the foreground and wait for it, not in the background: \
+         python3 -c \"import os,time; open('{}','w').write(str(os.getpid())); time.sleep(120)\". \
+         When it finishes reply OLD_TURN_DONE. Do not run this command again after a restart.",
+        probe.display()
+    );
+    send_prompt(host, &agent, &prompt).await;
+    wait_for_process_probe(host, &probe).await;
+    let group = backend_process_group(&probe).await;
+    kill_backend_group(group).await;
+    host.shutdown().await;
+    let resumed = resume_agent(host, &agent.session_id).await;
+    let reply = ask(host, &resumed, "The host restarted. Abandon the previous command. Do not use any tools. Reply with exactly RESTART_REPLY, and nothing else.").await;
+    assert_eq!(
+        reply
+            .events()
+            .iter()
+            .filter(|event| matches!(event, ChatEvent::StreamStart(_)))
+            .count(),
+        1,
+        "resume produced multiple responses"
+    );
+    assert_eq!(
+        reply
+            .events()
+            .iter()
+            .filter(|event| matches!(event, ChatEvent::StreamEnd(_)))
+            .count(),
+        1,
+        "resume lost or duplicated the response"
+    );
+    assert!(
+        reply.final_text().trim() == "RESTART_REPLY",
+        "resume did not answer the new message coherently"
+    );
+    assert_universal_contract(&[reply]);
+    let late = drain_events_for(host, Duration::from_secs(2)).await;
+    assert!(
+        !late
+            .iter()
+            .any(|event| matches!(event, ChatEvent::StreamStart(_) | ChatEvent::StreamEnd(_))),
+        "resume produced a delayed duplicate response"
+    );
     assert_clean_close(host, &resumed).await;
 }
 

@@ -1798,30 +1798,6 @@ impl KiroInner {
         // through the flush and marker keeps inbound chunks on one side of the
         // replay/live transition, including handlers that await the state lock.
         let _inbound_guard = self.inbound_gate.lock().await;
-        if self.adapter.backend_kind() == protocol::BackendKind::Grok {
-            let unresolved = {
-                let mut state = self.state.lock().await;
-                let unresolved = state
-                    .active_tool_contexts
-                    .keys()
-                    .cloned()
-                    .collect::<Vec<_>>();
-                for tool_call_id in &unresolved {
-                    state.completed_tool_call_ids.insert(tool_call_id.clone());
-                }
-                state.active_tool_contexts.clear();
-                state.tool_call_aliases.clear();
-                unresolved
-            };
-            for tool_call_id in unresolved {
-                self.emitter.tool_completed(
-                    &tool_call_id,
-                    ToolExecutionOutcome::Cancelled {
-                        message: "Grok does not replay historical tool results".to_owned(),
-                    },
-                );
-            }
-        }
 
         {
             let mut state = self.state.lock().await;
@@ -1841,26 +1817,32 @@ impl KiroInner {
                 self.emitter.typing_status_changed(false);
                 return Err(error);
             }
-            if !state.active_tool_contexts.is_empty() {
-                let pending = state
-                    .active_tool_contexts
-                    .keys()
-                    .cloned()
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                state.replaying_history = false;
-                state.replay_session_id = None;
-                state.replay_assistant_identity = None;
-                state.replay_assistant_text.clear();
-                state.replay_assistant_reasoning.clear();
-                state.replay_assistant_message_emitted_since_user = false;
-                state.active_tool_contexts.clear();
-                state.tool_call_aliases.clear();
-                self.emitter.typing_status_changed(false);
-                return Err(format!(
-                    "ACP session replay ended with unresolved tool calls: {pending}"
-                ));
+            // session/load has finished replay, not started a live turn. A killed
+            // provider can leave historical requests without terminal results.
+            // Retire those cards without inventing successful tool outcomes.
+            let unresolved = state
+                .active_tool_contexts
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>();
+            if !unresolved.is_empty() {
+                tracing::warn!(
+                    target: "tyde_acp_resume",
+                    unresolved_tools = unresolved.len(),
+                    "retiring historical tools without results at the replay boundary"
+                );
             }
+            for tool_call_id in unresolved {
+                state.completed_tool_call_ids.insert(tool_call_id.clone());
+                self.emitter.tool_completed(
+                    &tool_call_id,
+                    ToolExecutionOutcome::Cancelled {
+                        message: "No terminal result was reported in this session history. Inspect side effects before repeating this operation.".to_owned(),
+                    },
+                );
+            }
+            state.active_tool_contexts.clear();
+            state.tool_call_aliases.clear();
             state.session_id = session_id;
             apply_acp_config_options(&mut state, &response, self.adapter.backend_kind());
             if let Some(model) = extract_current_model(&response) {

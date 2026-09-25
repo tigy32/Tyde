@@ -2937,6 +2937,7 @@ impl ClaudeInner {
                     TurnStartError::Failed("Claude CLI process is not running".to_string())
                 })?
         };
+        tracing::info!(turn_id, "writing Claude foreground prompt");
         let (resume_bootstrap_generation, resume_bootstrap_rx, written) = {
             // Keep the bootstrap state locked through the stdin write so the
             // resume terminal cannot race past waiter registration.
@@ -6284,14 +6285,11 @@ async fn read_claude_stdout_persistent(
                 .get("subtype")
                 .and_then(|field| field.as_str())
                 .unwrap_or(""),
-            session_id = value
-                .get("session_id")
-                .and_then(|field| field.as_str())
-                .unwrap_or(""),
-            result = value
+            has_session_id = value.get("session_id").is_some(),
+            has_result_text = value
                 .get("result")
                 .and_then(|field| field.as_str())
-                .unwrap_or(""),
+                .is_some_and(|text| !text.is_empty()),
             "received Claude CLI frame"
         );
         if let Some(update) = claude_init_frame_slash_commands(&value) {

@@ -117,8 +117,10 @@ The adapter audit establishes the current production ordering:
   even when that notification arrives on the transport before the resume RPC
   reply. Its existing self-start handling emits the live typing edge.
 - Claude loads history and emits the marker before process initialization.
-  Its hidden post-resume bootstrap remains quarantined through its terminal
-  result and never becomes visible activity.
+  On CLI 2.1.281, the mid-tool hard-stop regression observes no standalone
+  bootstrap result before the next prompt. Its first `system/init` follows
+  that prompt, and its terminal result belongs to the live response. Do not
+  wait for an assumed bootstrap result before writing this prompt.
 - ACP holds its inbound gate through replay flush, idle normalization, marker
   emission, and the switch to live handling. Kiro, Grok, and OpenCode share it.
 - Hermes emits replay and the marker before buffered gateway events.
@@ -523,3 +525,41 @@ selecting `codex_responses`. Set `HERMES_HOME` to that disposable home and
 configuration without printing them. The local Responses run reproduced the
 HTTP 400 after the settlement fix and before the serializer fix. Both
 transports exercise the real model, not a stub or canned gateway.
+
+## Immediate follow-up after uncooperative termination
+
+`real_immediate_message_after_uncooperative_stop` runs the same setup and
+oracle for every `ResumeSession` backend. An isolated test process starts a
+real agent, waits until a foreground tool writes its PID, verifies the tool's
+ancestry back to the test process, and SIGKILLs the owned backend process
+group. It resumes the saved session and immediately sends a tool-free reply
+request. Exactly one non-empty StreamStart/StreamEnd pair, the requested
+reply, the universal contract, and no delayed duplicate are required. No
+provider output is fabricated and no process is selected by name or path.
+
+Baseline at `302039e7` (2026-09-25), with only the new test and content-free
+Claude diagnostics: Claude passed twice (11.87s and 9.92s); Codex 11.65s,
+Kiro 8.93s, Grok 12.52s, Hermes 20.80s, and Antigravity 20.17s passed.
+OpenCode failed in 8.58s: ACP `session/load` replay ended with the real
+interrupted tool still unresolved, and Tyde rejected the entire resume.
+
+The Claude trace establishes that resume initialization finished before the
+follow-up was written; the subsequent init and result were the live reply,
+not a separately identified bootstrap generation. The reported Claude reply
+loss was **not reproduced**. Its quarantine behavior is deliberately unchanged;
+a terminal-result wait without positive bootstrap identification would hang
+the observed quiescent path. The new diagnostics report frame kinds and
+presence only, not session identifiers or response content.
+
+ACP now retires unfinished historical tool cards at the authoritative replay
+boundary using Cancelled and an explicit unknown-outcome notice. It never
+claims a side effect did not happen or invents a successful result. Retained
+replay errors still reject startup; live tool handling is unchanged. This
+replaces the Grok-only historical-result exception with the same boundary
+handling for Kiro, Grok, and OpenCode. The unchanged real scenario then passed
+all seven backends (111.95s combined): Claude Haiku 12.10s, Codex
+GPT-5.6-Luna 21.56s, Hermes DeepSeek-V4-Flash-0731 24.16s, Grok-4.6 low
+13.26s, Kiro auto 10.63s, OpenCode big-pickle 12.43s, and Antigravity
+Gemini-3.8-Flash high 17.58s. The case now pins Antigravity's cheaper
+Gemini-3.8-Flash low profile rather than its installed default. This is
+targeted resume coverage, not full backend certification.
