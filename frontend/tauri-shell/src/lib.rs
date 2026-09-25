@@ -444,7 +444,7 @@ fn with_recovery_policies<T>(
 
 fn shutdown_managed_host(app: &AppHandle) {
     let host = app.state::<ShellState>().host.clone();
-    tauri::async_runtime::block_on(host.shutdown_spawn_operations());
+    tauri::async_runtime::block_on(host.shutdown_for_restart());
 }
 
 #[derive(Default)]
@@ -595,7 +595,7 @@ fn show_web_content_recovery_notice(
     }
     dialog.show_with_result(move |result| {
         match recovery_dialog_action(failure, result) {
-            RecoveryDialogAction::Restart => app.request_restart(),
+            RecoveryDialogAction::Restart => { shutdown_managed_host(&app); app.request_restart(); },
             RecoveryDialogAction::KeepWaiting => tracing::info!(
                 "webview.recovery event=recovery_prompt_dismissed label={label} generation={generation} failure={failure:?} action=keep_waiting"
             ),

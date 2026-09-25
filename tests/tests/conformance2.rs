@@ -148,7 +148,7 @@ macro_rules! conformance2_scenario {
                 server::backend::antigravity::AntigravityBackend,
                 if matches!(
                     stringify!($scenario),
-                    "real_async_user_question" | "real_user_question" | "real_immediate_message_after_uncooperative_stop"
+                    "real_async_user_question" | "real_user_question" | "real_immediate_message_after_uncooperative_stop" | "real_interrupt_shutdown_kills_process_group"
                 ) {
                     Profile::new(&["gemini-3.8-flash-low"], &[("model", "gemini-3.8-flash-low")])
                 } else {
@@ -3361,6 +3361,7 @@ fn describe_event(event: &ChatEvent) -> String {
         ChatEvent::GoalCompleted(_) => "GoalCompleted".to_owned(),
         ChatEvent::SlashCommandsChanged(_) => "SlashCommandsChanged".to_owned(),
         ChatEvent::TaskUpdate(_) => "TaskUpdate".to_owned(),
+        ChatEvent::RestartRecovery { .. } => "RestartRecovery".to_owned(),
         ChatEvent::OperationCancelled(_) => "OperationCancelled".to_owned(),
         ChatEvent::RetryAttempt(_) => "RetryAttempt".to_owned(),
         ChatEvent::Orchestration(_) => "Orchestration".to_owned(),
@@ -7801,3 +7802,55 @@ conformance2_scenario!(
     real_plan_pending_across_restart,
     [BackendCapability::PlanApprovalRequests]
 );
+
+conformance2_scenario!(real_interrupt_shutdown_kills_process_group, []);
+
+async fn real_interrupt_shutdown_kills_process_group<B: Backend>(host: &mut Harness<B>) {
+    if !isolated_process_case(host).await {
+        return;
+    }
+    let agent = spawn_agent(host, &launch_prompt()).await;
+    let launched = collect_turn(host, &agent, &launch_prompt()).await;
+    assert_ready_handshake(&launched);
+    assert_universal_contract(&[launched]);
+    let probe = host.workspace().join("shutdown-probe.pid");
+    let prompt = format!(
+        "Run this command in the foreground and wait, not in the background: python3 -c \"import os,time; open('{}','w').write(str(os.getpid())); time.sleep(120)\". Do not run it again if interrupted.",
+        probe.display()
+    );
+    send_prompt(host, &agent, &prompt).await;
+    wait_for_process_probe(host, &probe).await;
+    let group = backend_process_group(&probe).await;
+    // A real, uncooperative member of the exact owned group. Joining from
+    // outside the CLI avoids depending on providers' tool sandbox policies.
+    let mut sentinel = tokio::process::Command::new("python3")
+        .args([
+            "-c",
+            "import os,sys; os.setpgid(0,int(sys.argv[1])); os.execvp('sleep',['sleep','120'])",
+            &group.to_string(),
+        ])
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn group sentinel");
+    let sentinel_pid = sentinel.id().expect("sentinel pid");
+    wait_for_group_member(sentinel_pid, group).await;
+    let stopped = tokio::time::timeout(Duration::from_secs(25), async {
+        interrupt_backend(host).await;
+        host.shutdown().await;
+    })
+    .await;
+    let survivors = running_group_members(group).await;
+    if !survivors.is_empty() {
+        kill_backend_group(group).await;
+    }
+    let _ = sentinel.wait().await;
+    assert!(
+        stopped.is_ok(),
+        "interrupt plus shutdown exceeded the host budget"
+    );
+    assert!(
+        survivors.is_empty(),
+        "backend process group retained {} running processes",
+        survivors.len()
+    );
+}

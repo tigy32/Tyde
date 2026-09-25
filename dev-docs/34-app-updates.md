@@ -27,10 +27,41 @@ system administrator authentication. Development binaries cannot replace
 themselves. Mobile applications and the web loader retain their existing
 platform-specific update delivery.
 
-A restart stops the embedded local host and local running agents. The prompt
-states this before consent. Saved conversations and settings are retained;
-remote servers are not stopped. Restoring the full open-agent working set is
-tracked separately in [#68](https://github.com/tigy32/Tyde/issues/68).
+Before installing, quitting, or restarting, the embedded host runs the same
+idempotent shutdown used by standalone SIGTERM/SIGINT and managed-host stop.
+Admissions and restoration stop first. Parked agent waits expire with a typed
+host-stopped error; every registered actor (including children and team members)
+persists its interruption before interrupting and shutting down its backend.
+This is not Close: queued messages and restore intent survive. Concurrent callers
+share one shutdown, with a host-wide 25-second budget. At the deadline, owned
+process scopes synchronously kill their groups; runtime Drop/reaper scheduling
+is not relied on to deliver that signal. No process is selected by name.
+
+The embedded host cannot serve again after this shutdown. If the installer fails
+or is rejected (for example, cancelled administrator authentication) after the
+host stopped, the update status reports the error and a native dialog shows it;
+dismissing the dialog relaunches the unchanged app, whose normal startup
+reconstructs the host and continues interrupted turns. Further installs are
+refused until that relaunch, so one process never runs two hosts. A download
+failure happens before shutdown and leaves the host running.
+
+The consent prompt explains that interrupted turns continue when **Resume previous
+agents** is enabled, and that approvals/questions still require a user response.
+Remote hosts are not stopped by a local app update. Managed remote stop validates
+the recorded PID's command line, sends SIGTERM, allows 35 seconds, then uses
+SIGKILL if needed. SSH allows 45 seconds for this operation.
+
+Turn recovery is durable session state: `InFlight` is written at the active-turn
+funnel and cleared only at genuine foreground idle; restart changes it to
+`InterruptedByRestart`. A crash leaves `InFlight`, reported as `UnexpectedStop`
+on resume. Typed recovery notices render in both desktop and mobile history.
+Old stores default to no marker.
+
+On Linux, backend children request `PR_SET_PDEATHSIG(SIGKILL)` and reject a
+parent-exit race before exec. This is best effort: it covers the direct backend
+child, not descendants that detach or escape its process group. macOS has no
+parent-death signal equivalent here; an uncatchable host SIGKILL can leave backend
+processes running. Graceful shutdown kills owned groups on both platforms.
 
 ## Publishing
 

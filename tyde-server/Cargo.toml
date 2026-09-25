@@ -17,5 +17,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 rlimit = "0.10"
 
 [dev-dependencies]
+client = { path = "../client" }
 host-config = { path = "../host-config" }
 tempfile = "3"

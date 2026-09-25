@@ -197,7 +197,7 @@ fn run_host_stdio() -> Result<(), String> {
 
     runtime.block_on(async {
         let host = spawn_host()?;
-        let result = async {
+        let connection = async {
             let transport = StdioTransport::new();
             let connection = server::accept(&server::ServerConfig::current(), transport)
                 .await
@@ -206,9 +206,14 @@ fn run_host_stdio() -> Result<(), String> {
             server::run_connection(connection, host.clone())
                 .await
                 .map_err(|err| format!("host stdio connection failed: {err:?}"))
-        }
-        .await;
-        host.shutdown_spawn_operations().await;
+        };
+        let shutdown = server::host_shutdown_signal().map_err(|error| error.to_string())?;
+        let result = tokio::select! {
+            _ = shutdown.cancelled() => Ok(()),
+            result = connection => result,
+        };
+        host.shutdown_for_restart().await;
+        tracing::info!("stdio host graceful shutdown completed; leaving runtime");
         result
     })
 }
@@ -252,14 +257,19 @@ fn run_host_uds(managed: bool) -> Result<(), String> {
             if managed {
                 record_managed_host_process()?;
             }
-            server::serve_uds(listener, server::ServerConfig::current(), host)
-                .await
-                .map_err(|err| {
-                    format!(
-                        "host UDS listener failed at {}: {err}",
-                        socket_path.display()
-                    )
-                })
+            server::serve_uds(
+                listener,
+                server::ServerConfig::current(),
+                host,
+                server::host_shutdown_signal().map_err(|error| error.to_string())?,
+            )
+            .await
+            .map_err(|err| {
+                format!(
+                    "host UDS listener failed at {}: {err}",
+                    socket_path.display()
+                )
+            })
         })
     }
 }

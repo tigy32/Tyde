@@ -10,9 +10,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::backend::subprocess::{AsyncCommandGroup, AsyncGroupChild};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
-use command_group::{AsyncCommandGroup, AsyncGroupChild};
 use indexmap::IndexMap;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -2273,7 +2273,7 @@ impl CodexSession {
         emit_codex_raw_events_warning_if_needed(inner.emitter.as_ref(), strict_response_splitting);
 
         let forward_inner = Arc::clone(&inner);
-        tokio::spawn(async move {
+        crate::backend::subprocess::spawn(async move {
             let mut rx = inbound_rx;
             let mut nested_batches = HashMap::<String, CodexNestedGenericBatch>::new();
             while let Some(inbound) = rx.recv().await {
@@ -5017,7 +5017,7 @@ impl CodexInner {
         if self.state.lock().await.pending_compaction.is_some() {
             let inner = Arc::clone(self);
             let operation_id = request.operation_id.clone();
-            tokio::spawn(async move {
+            crate::backend::subprocess::spawn(async move {
                 tokio::time::sleep(Duration::from_secs(300)).await;
                 let matches = inner
                     .state
@@ -6071,7 +6071,7 @@ impl CodexInner {
     /// keep the session — and its app-server child — alive after teardown.
     fn spawn_background_terminal_poll(self: &Arc<Self>) {
         let weak = Arc::downgrade(self);
-        tokio::spawn(async move {
+        crate::backend::subprocess::spawn(async move {
             {
                 let Some(inner) = weak.upgrade() else {
                     return;
@@ -6447,7 +6447,7 @@ impl CodexInner {
 
     fn spawn_pending_background_wake(self: &Arc<Self>) {
         let inner = Arc::clone(self);
-        tokio::spawn(async move {
+        crate::backend::subprocess::spawn(async move {
             let Some((thread_id, wakes, model, effort, approval_policy, sandbox_policy)) = ({
                 let mut state = inner.state.lock().await;
                 if state.pending_background_wakes.is_empty()
@@ -6609,7 +6609,7 @@ impl CodexInner {
 
     fn spawn_capacity_refresh(self: &Arc<Self>, emitter: Arc<dyn SubAgentEmitter>) {
         let inner = Arc::clone(self);
-        tokio::spawn(async move {
+        crate::backend::subprocess::spawn(async move {
             {
                 let mut state = inner.state.lock().await;
                 if state.capacity_refresh_in_flight {
@@ -10389,7 +10389,7 @@ impl CodexInner {
             && params.get("status").and_then(Value::as_str) == Some("ready")
         {
             let inner = Arc::clone(self);
-            tokio::spawn(async move {
+            crate::backend::subprocess::spawn(async move {
                 match inner
                     .rpc
                     .request(
@@ -19501,20 +19501,12 @@ impl CodexRpc {
                 .map_err(|e| format!("Failed to spawn Codex app-server: {e}"))?
         };
 
-        let stdin = child
-            .inner()
-            .stdin
-            .take()
-            .ok_or("Failed to capture Codex stdin")?;
+        let stdin = child.take_stdin().ok_or("Failed to capture Codex stdin")?;
         let stdout = child
-            .inner()
-            .stdout
-            .take()
+            .take_stdout()
             .ok_or("Failed to capture Codex stdout")?;
         let stderr = child
-            .inner()
-            .stderr
-            .take()
+            .take_stderr()
             .ok_or("Failed to capture Codex stderr")?;
 
         let child_ref = Arc::new(Mutex::new(Some(child)));
@@ -19524,7 +19516,7 @@ impl CodexRpc {
         let stdout_pending = Arc::clone(&pending);
         let stdout_inbound = inbound_tx.clone();
         let stdout_child = Arc::clone(&child_ref);
-        let stdout_task = tokio::spawn(async move {
+        let stdout_task = crate::backend::subprocess::spawn(async move {
             let mut lines = BufReader::new(stdout).lines();
             while let Ok(Some(line)) = lines.next_line().await {
                 let parsed = match serde_json::from_str::<Value>(&line) {
@@ -19586,14 +19578,14 @@ impl CodexRpc {
         });
 
         let stderr_inbound = inbound_tx.clone();
-        let stderr_task = tokio::spawn(async move {
+        let stderr_task = crate::backend::subprocess::spawn(async move {
             let mut lines = BufReader::new(stderr).lines();
             while let Ok(Some(line)) = lines.next_line().await {
                 let _ = stderr_inbound.send(CodexInbound::Stderr(line));
             }
         });
         let rollout_trace_task = rollout_trace_root.as_ref().map(|root| {
-            tokio::spawn(forward_codex_rollout_trace(
+            crate::backend::subprocess::spawn(forward_codex_rollout_trace(
                 root.path().to_path_buf(),
                 inbound_tx,
             ))
@@ -19663,7 +19655,7 @@ impl CodexRpc {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let stdin = Arc::clone(&self.stdin);
         let pending = Arc::clone(&self.pending);
-        tokio::spawn(async move {
+        crate::backend::subprocess::spawn(async move {
             let payload = json!({
                 "jsonrpc": "2.0",
                 "id": id,
@@ -19797,16 +19789,17 @@ impl CodexRpc {
 async fn shut_down_codex_child(child: &mut AsyncGroupChild) -> Result<(), String> {
     eprintln!(
         "TYDE CODEX PROCESS SHUTDOWN waiting_for_eof_exit pid={:?}",
-        child.inner().id()
+        child.id()
     );
-    // No deadline. This ends when the process ends, which is the same liveness
-    // signal the stdout reader watches. A clock could only pre-empt the flush
-    // this wait exists to allow — and if some future codex stopped exiting on
-    // EOF, hanging is the honest report of that, where a deadline would hide it.
-    let _ = child.inner().wait().await;
+    if tokio::time::timeout(Duration::from_secs(5), child.wait())
+        .await
+        .is_err()
+    {
+        tracing::warn!("Codex EOF shutdown exceeded its grace; killing owned group");
+    }
     eprintln!(
         "TYDE CODEX PROCESS SHUTDOWN eof_exit_observed pid={:?}",
-        child.inner().id()
+        child.id()
     );
 
     let kill_error = child
@@ -19966,7 +19959,7 @@ impl CodexBackend {
         let compaction_handle = Arc::new(std::sync::Mutex::new(None::<CodexCommandHandle>));
         let task_compaction_handle = Arc::clone(&compaction_handle);
 
-        tokio::spawn(async move {
+        crate::backend::subprocess::spawn(async move {
             let combined_instructions = (!inference_only)
                 .then(|| render_combined_spawn_instructions(&config.resolved_spawn_config))
                 .flatten();
@@ -20162,7 +20155,7 @@ impl CodexBackend {
             let mut initial_turn_pending = !pending_initial_input_cancelled;
             if initial_turn_pending {
                 let initial_turn_handle = handle.clone();
-                tokio::spawn(async move {
+                crate::backend::subprocess::spawn(async move {
                     let result = initial_turn_handle
                         .execute(SessionCommand::SendMessage {
                             message: initial_input.message,
@@ -20908,7 +20901,7 @@ fn spawn_codex_subagent_event_bridge(
     event_tx: mpsc::UnboundedSender<ChatEvent>,
     model_usage_tx: mpsc::UnboundedSender<ModelRequestTokenUsage>,
 ) {
-    tokio::spawn(async move {
+    crate::backend::subprocess::spawn(async move {
         let mut normalization_failures = HashMap::new();
         while let Some(raw) = raw_rx.recv().await {
             if let Some(usage) = model_request_token_usage_from_raw(&raw) {
@@ -21058,6 +21051,7 @@ fn codex_transcript_provider_event_id(event: &ChatEvent) -> Option<String> {
         | ChatEvent::GoalCompleted(_)
         | ChatEvent::SlashCommandsChanged(_)
         | ChatEvent::TaskUpdate(_)
+        | ChatEvent::RestartRecovery { .. }
         | ChatEvent::OperationCancelled(_)
         | ChatEvent::RetryAttempt(_)
         | ChatEvent::Orchestration(_)
@@ -21377,7 +21371,7 @@ impl Backend for CodexBackend {
             Arc::new(std::sync::Mutex::new(Some(SessionId(session_id.clone()))));
         let transcript_session_id = Arc::clone(&backend_session_id);
 
-        tokio::spawn(async move {
+        crate::backend::subprocess::spawn(async move {
             let combined_instructions =
                 render_combined_spawn_instructions(&config.resolved_spawn_config);
             let (session, mut raw_events) = match CodexSession::spawn_with_mode(
@@ -21566,7 +21560,7 @@ impl Backend for CodexBackend {
         let (startup_cancel_tx, mut startup_cancel_rx) = oneshot::channel();
         let mut startup_cancel_guard = CodexStartupCancelGuard(Some(startup_cancel_tx));
 
-        tokio::spawn(async move {
+        crate::backend::subprocess::spawn(async move {
             let mut ready_tx = Some(ready_tx);
             let combined_instructions =
                 render_combined_spawn_instructions(&config.resolved_spawn_config);

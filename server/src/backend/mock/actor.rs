@@ -67,7 +67,7 @@ pub(super) fn start_mock_command_loop(
         rx: control_rx,
         open: true,
     };
-    tokio::spawn(actor.run(control));
+    crate::backend::subprocess::spawn(actor.run(control));
 }
 
 enum TurnPhase {

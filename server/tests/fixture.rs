@@ -534,6 +534,7 @@ impl Fixture {
     /// agents are never closed, so nothing they left open is terminalized.
     #[allow(dead_code)]
     pub async fn relaunch_host_after_kill(&mut self) -> HostBootstrapPayload {
+        self.host.hard_stop_for_conformance().await;
         let host = server::spawn_host_with_mock_backend_and_runtime_config(
             self.session_store_path(),
             self.project_store_path(),
@@ -551,7 +552,7 @@ impl Fixture {
     #[allow(dead_code)]
     pub async fn restart_host(&mut self) -> HostBootstrapPayload {
         let prior_agent_count = self.host.agent_ids().await.len();
-        self.host.shutdown_agents_for_conformance().await;
+        self.host.shutdown_for_restart().await;
         eprintln!(
             "Fixture restart retired old-host agents before replacement; prior_agent_count={prior_agent_count}"
         );
@@ -582,6 +583,11 @@ impl Fixture {
     #[allow(dead_code)]
     pub async fn install_agent_name_test_gate(&self) -> server::InstalledAgentNameGate {
         self.host.install_agent_name_test_gate().await
+    }
+
+    #[allow(dead_code)]
+    pub fn install_restart_stop_test_gate(&self) -> server::InstalledSpawnOperationTestGate {
+        self.host.install_restart_stop_test_gate()
     }
 
     #[allow(dead_code)]
@@ -653,7 +659,7 @@ impl Fixture {
         self.host.workflow_mcp_url().await
     }
 
-    fn session_store_path(&self) -> PathBuf {
+    pub fn session_store_path(&self) -> PathBuf {
         self.session_store_dir.path().join("sessions.json")
     }
 

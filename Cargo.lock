@@ -9293,6 +9293,7 @@ dependencies = [
 name = "tyde-server"
 version = "0.9.4-beta.11"
 dependencies = [
+ "client",
  "host-config",
  "rlimit",
  "server",

@@ -3,7 +3,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use command_group::{AsyncCommandGroup, AsyncGroupChild};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -156,21 +155,9 @@ impl SubprocessBridge {
                 .map_err(|e| format!("Failed to spawn subprocess: {e:?}"))?
         };
 
-        let stdin = child
-            .inner()
-            .stdin
-            .take()
-            .ok_or("Failed to capture stdin")?;
-        let stdout = child
-            .inner()
-            .stdout
-            .take()
-            .ok_or("Failed to capture stdout")?;
-        let stderr = child
-            .inner()
-            .stderr
-            .take()
-            .ok_or("Failed to capture stderr")?;
+        let stdin = child.take_stdin().ok_or("Failed to capture stdin")?;
+        let stdout = child.take_stdout().ok_or("Failed to capture stdout")?;
+        let stderr = child.take_stderr().ok_or("Failed to capture stderr")?;
 
         let (event_tx, event_rx) = mpsc::unbounded_channel();
 
@@ -279,5 +266,209 @@ impl Drop for SubprocessBridge {
         self.stdout_task.abort();
         self.stderr_task.abort();
         reap_group_child_slot(&self.child);
+    }
+}
+
+// Only runtime process handles live here. Killing never needs an actor/backend
+// state lock, including when a backend is stuck shutting down.
+tokio::task_local! {
+    static PROCESS_OWNER: ProcessOwner;
+}
+
+type SharedProcess = Arc<std::sync::Mutex<OwnedProcess>>;
+
+#[derive(Clone, Default)]
+pub(crate) struct ProcessOwner {
+    state: Arc<std::sync::Mutex<ProcessOwnerState>>,
+}
+
+#[derive(Default)]
+struct ProcessOwnerState {
+    stopped: bool,
+    children: Vec<std::sync::Weak<std::sync::Mutex<OwnedProcess>>>,
+}
+
+struct OwnedProcess {
+    child: Option<command_group::AsyncGroupChild>,
+    group_signalled: bool,
+}
+
+impl OwnedProcess {
+    fn kill(&mut self) -> std::io::Result<()> {
+        if self.group_signalled {
+            return Ok(());
+        }
+        if let Some(child) = self.child.as_mut() {
+            match child.start_kill() {
+                Ok(()) => {}
+                #[cfg(unix)]
+                Err(error) if error.raw_os_error() == Some(libc::ESRCH) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        self.group_signalled = true;
+        Ok(())
+    }
+}
+
+impl ProcessOwner {
+    pub(crate) async fn scope<F: std::future::Future>(&self, future: F) -> F::Output {
+        PROCESS_OWNER.scope(self.clone(), future).await
+    }
+
+    pub(crate) fn kill_all(&self) {
+        let mut state = self.state.lock().expect("process owner mutex poisoned");
+        state.stopped = true;
+        for child in state.children.drain(..).filter_map(|child| child.upgrade()) {
+            if let Err(error) = child.lock().expect("process signal mutex poisoned").kill() {
+                tracing::error!(%error, "failed to kill owned backend process group");
+            }
+        }
+    }
+}
+
+pub(crate) fn spawn<F>(future: F) -> tokio::task::JoinHandle<F::Output>
+where
+    F: std::future::Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    let owner = PROCESS_OWNER.try_with(Clone::clone).ok();
+    tokio::spawn(async move {
+        match owner {
+            Some(owner) => owner.scope(future).await,
+            None => future.await,
+        }
+    })
+}
+
+pub(crate) struct AsyncGroupChild {
+    process: SharedProcess,
+}
+
+impl AsyncGroupChild {
+    fn with_child<T>(&self, action: impl FnOnce(&mut command_group::AsyncGroupChild) -> T) -> T {
+        let mut process = self.process.lock().expect("process signal mutex poisoned");
+        action(process.child.as_mut().expect("owned child already taken"))
+    }
+
+    pub(crate) fn take_stdin(&mut self) -> Option<tokio::process::ChildStdin> {
+        self.with_child(|child| child.inner().stdin.take())
+    }
+    pub(crate) fn take_stdout(&mut self) -> Option<tokio::process::ChildStdout> {
+        self.with_child(|child| child.inner().stdout.take())
+    }
+    pub(crate) fn take_stderr(&mut self) -> Option<tokio::process::ChildStderr> {
+        self.with_child(|child| child.inner().stderr.take())
+    }
+    pub(crate) fn id(&self) -> Option<u32> {
+        self.with_child(|child| child.id())
+    }
+    pub(crate) fn start_kill(&mut self) -> std::io::Result<()> {
+        self.process
+            .lock()
+            .expect("process signal mutex poisoned")
+            .kill()
+    }
+    pub(crate) fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        let mut process = self.process.lock().expect("process signal mutex poisoned");
+        let status = process
+            .child
+            .as_mut()
+            .expect("owned child already taken")
+            .inner()
+            .try_wait()?;
+        if status.is_some() {
+            // A leader can exit while descendants still hold pipes. Kill its
+            // group before releasing the ownership guard, on Unix and Windows.
+            process.kill()?;
+        }
+        Ok(status)
+    }
+    pub(crate) async fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        // Do not hold the process guard across an await: the host-wide deadline
+        // must be able to signal even while another task is waiting for exit.
+        loop {
+            if let Some(status) = self.try_wait()? {
+                return Ok(status);
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+    pub(crate) async fn kill(&mut self) -> std::io::Result<()> {
+        self.start_kill()?;
+        self.wait().await.map(|_| ())
+    }
+}
+
+#[cfg(unix)]
+impl command_group::UnixChildExt for AsyncGroupChild {
+    fn signal(&self, signal: command_group::Signal) -> std::io::Result<()> {
+        self.with_child(|child| child.signal(signal))
+    }
+}
+
+impl Drop for AsyncGroupChild {
+    fn drop(&mut self) {
+        let mut process = self.process.lock().expect("process signal mutex poisoned");
+        if let Err(error) = process.kill() {
+            tracing::error!(%error, "backend group drop kill failed");
+        }
+        if let Some(mut child) = process.child.take()
+            && let Ok(runtime) = tokio::runtime::Handle::try_current()
+        {
+            runtime.spawn(async move {
+                if let Err(error) = child.wait().await {
+                    tracing::warn!(%error, "backend group reaping failed");
+                }
+            });
+        }
+    }
+}
+
+pub(crate) trait AsyncCommandGroup {
+    fn group_spawn(&mut self) -> std::io::Result<AsyncGroupChild>;
+}
+
+impl AsyncCommandGroup for tokio::process::Command {
+    /// PR_SET_PDEATHSIG fires when the spawning *thread* exits, not the
+    /// process. Never call this from `spawn_blocking` or another short-lived
+    /// thread: the child would be killed when that thread is retired.
+    fn group_spawn(&mut self) -> std::io::Result<AsyncGroupChild> {
+        #[cfg(target_os = "linux")]
+        unsafe {
+            let parent = libc::getpid();
+            self.pre_exec(move || {
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::getppid() != parent {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Interrupted,
+                        "backend parent exited before exec",
+                    ));
+                }
+                Ok(())
+            });
+        }
+        let child = command_group::AsyncCommandGroup::group(self)
+            .kill_on_drop(true)
+            .spawn()?;
+        let process = Arc::new(std::sync::Mutex::new(OwnedProcess {
+            child: Some(child),
+            group_signalled: false,
+        }));
+        if let Ok(owner) = PROCESS_OWNER.try_with(Clone::clone) {
+            let mut state = owner.state.lock().expect("process owner mutex poisoned");
+            if state.stopped {
+                process
+                    .lock()
+                    .expect("process signal mutex poisoned")
+                    .kill()?;
+            } else {
+                state.children.retain(|child| child.strong_count() != 0);
+                state.children.push(Arc::downgrade(&process));
+            }
+        }
+        Ok(AsyncGroupChild { process })
     }
 }

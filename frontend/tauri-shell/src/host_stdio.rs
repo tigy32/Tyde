@@ -26,7 +26,7 @@ pub fn run() -> Result<(), String> {
             },
         )?;
 
-        let result = async {
+        let connection = async {
             let transport = StdioTransport::new();
             let connection = server::accept(&server::ServerConfig::current(), transport)
                 .await
@@ -35,9 +35,13 @@ pub fn run() -> Result<(), String> {
             server::run_connection(connection, host.clone())
                 .await
                 .map_err(|err| format!("host stdio connection failed: {err:?}"))
-        }
-        .await;
-        host.shutdown_spawn_operations().await;
+        };
+        let shutdown = server::host_shutdown_signal().map_err(|error| error.to_string())?;
+        let result = tokio::select! {
+            _ = shutdown.cancelled() => Ok(()),
+            result = connection => result,
+        };
+        host.shutdown_for_restart().await;
         result
     })
 }

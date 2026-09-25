@@ -243,8 +243,8 @@ fn managed_host_lifecycle_tracks_the_process_that_owns_the_socket() {
         home.launch_log()
     );
 
-    // Stopping leaves the dead server's socket file behind (SIGTERM skips
-    // cleanup). That is not a running host.
+    // SIGTERM runs production cleanup; disconnecting the earlier probes did
+    // not shut down this shared host.
     home.stop();
     wait_until("stopped server to exit", || {
         home.managed_server_pids().is_empty()
@@ -308,4 +308,84 @@ fn managed_host_lifecycle_tracks_the_process_that_owns_the_socket() {
     );
     let owner = home.sole_managed_server();
     home.assert_managed_by(owner, "after launching over a stale socket");
+}
+
+#[test]
+fn managed_stop_refuses_a_reused_foreign_pid() {
+    let home = ManagedHome::install();
+    let mut foreign = home
+        .command("sleep")
+        .arg("120")
+        .spawn()
+        .expect("spawn foreign process");
+    let run = home.path().join(".tyde/run");
+    std::fs::create_dir_all(&run).expect("create run directory");
+    let pid_file = run.join("tyde-host.pid");
+    std::fs::write(&pid_file, foreign.id().to_string()).expect("record stale pid binding");
+    let result = home.sh(&managed_host::stop_script());
+    let survived = foreign
+        .try_wait()
+        .expect("inspect foreign process")
+        .is_none();
+    let _ = foreign.kill();
+    foreign.wait().expect("reap owned probe");
+    assert!(
+        !result.status.success(),
+        "stop must reject a pid belonging to another command"
+    );
+    assert!(survived, "stop signalled an unrelated process");
+    assert!(
+        pid_file.exists(),
+        "failed identity check must not remove ownership evidence"
+    );
+    std::fs::remove_file(pid_file).expect("remove probe pid file");
+}
+
+#[tokio::test]
+async fn stdio_signals_exit_cleanly_with_the_client_still_connected() {
+    for signal in ["-TERM", "-INT"] {
+        let home = ManagedHome::install();
+        let log_path = home.path().join("stdio.log");
+        let log = std::fs::File::create(&log_path).expect("stdio diagnostics");
+        let mut child = tokio::process::Command::new(home.managed_bin())
+            .args(["host", "--stdio"])
+            .env("HOME", home.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(log)
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn stdio host");
+        let io = tokio::io::join(
+            child.stdout.take().expect("host stdout"),
+            child.stdin.take().expect("host stdin"),
+        );
+        let connection = tokio::time::timeout(
+            Duration::from_secs(15),
+            client::connect(&client::ClientConfig::current(), io),
+        )
+        .await
+        .expect("stdio handshake deadline")
+        .expect("real stdio handshake");
+        let sent = tokio::process::Command::new("kill")
+            .args([signal, &child.id().expect("owned host pid").to_string()])
+            .status()
+            .await
+            .expect("signal owned stdio host");
+        assert!(sent.success());
+        let exited = tokio::time::timeout(Duration::from_secs(28), child.wait()).await;
+        let graceful_finished = std::fs::read_to_string(&log_path)
+            .expect("read stdio diagnostics")
+            .contains("stdio host graceful shutdown completed; leaving runtime");
+        assert!(
+            exited.is_ok(),
+            "signal shutdown waited for stdin EOF; graceful shutdown completed={graceful_finished}"
+        );
+        let exited = exited.expect("checked timeout").expect("reap stdio host");
+        drop(connection);
+        assert!(
+            exited.success(),
+            "signal must finish production shutdown, not terminate the host abruptly"
+        );
+    }
 }

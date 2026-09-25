@@ -2166,6 +2166,14 @@ fn summarize_chat_event(event: &ChatEvent) -> String {
                 tasks.tasks.len()
             )
         }
+        ChatEvent::RestartRecovery { phase } => format!(
+            "event=restart_recovery phase={}",
+            match phase {
+                crate::RestartRecoveryPhase::Interrupted { .. } => "interrupted",
+                crate::RestartRecoveryPhase::Continuing => "continuing",
+                crate::RestartRecoveryPhase::ContinuationFailed { .. } => "failed",
+            }
+        ),
         ChatEvent::OperationCancelled(data) => {
             format!("event=operation_cancelled message={:?}", data.message)
         }

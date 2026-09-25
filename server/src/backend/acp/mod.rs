@@ -19,7 +19,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use command_group::{AsyncCommandGroup, AsyncGroupChild};
+use crate::backend::subprocess::{AsyncCommandGroup, AsyncGroupChild};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::ChildStdin;
@@ -433,8 +433,8 @@ impl AcpBridge {
             .group_spawn()
             .map_err(|err| format!("Failed to spawn terminal command '{command}': {err}"))?;
 
-        let stdout = child.inner().stdout.take();
-        let stderr = child.inner().stderr.take();
+        let stdout = child.take_stdout();
+        let stderr = child.take_stderr();
 
         let terminal = Arc::new(Mutex::new(AcpTerminal {
             child: Some(child),
@@ -446,10 +446,10 @@ impl AcpBridge {
         }));
 
         if let Some(reader) = stdout {
-            tokio::spawn(read_terminal_output(reader, Arc::clone(&terminal)));
+            crate::backend::subprocess::spawn(read_terminal_output(reader, Arc::clone(&terminal)));
         }
         if let Some(reader) = stderr {
-            tokio::spawn(read_terminal_output(reader, Arc::clone(&terminal)));
+            crate::backend::subprocess::spawn(read_terminal_output(reader, Arc::clone(&terminal)));
         }
 
         let terminal_id = format!(
@@ -1215,21 +1215,9 @@ impl AcpRpc {
                 .map_err(|err| format!("Failed to spawn {}: {err}", spec.display_name))?
         };
 
-        let stdin = child
-            .inner()
-            .stdin
-            .take()
-            .ok_or("Failed to capture ACP stdin")?;
-        let stdout = child
-            .inner()
-            .stdout
-            .take()
-            .ok_or("Failed to capture ACP stdout")?;
-        let stderr = child
-            .inner()
-            .stderr
-            .take()
-            .ok_or("Failed to capture ACP stderr")?;
+        let stdin = child.take_stdin().ok_or("Failed to capture ACP stdin")?;
+        let stdout = child.take_stdout().ok_or("Failed to capture ACP stdout")?;
+        let stderr = child.take_stderr().ok_or("Failed to capture ACP stderr")?;
 
         let child_ref = Arc::new(Mutex::new(Some(child)));
         let pending: PendingRpcMap = Arc::new(Mutex::new(HashMap::new()));
@@ -1239,7 +1227,7 @@ impl AcpRpc {
         let stdout_pending = Arc::clone(&pending);
         let stdout_inbound = inbound_tx.clone();
         let stdout_child = Arc::clone(&child_ref);
-        let stdout_task = tokio::spawn(async move {
+        let stdout_task = crate::backend::subprocess::spawn(async move {
             let mut lines = BufReader::new(stdout).lines();
             while let Ok(Some(line)) = lines.next_line().await {
                 let parsed = match serde_json::from_str::<Value>(&line) {
@@ -1333,7 +1321,7 @@ impl AcpRpc {
         });
 
         let stderr_inbound = inbound_tx.clone();
-        let stderr_task = tokio::spawn(async move {
+        let stderr_task = crate::backend::subprocess::spawn(async move {
             let mut lines = BufReader::new(stderr).lines();
             while let Ok(Some(line)) = lines.next_line().await {
                 let _ = stderr_inbound.send(AcpInbound::Stderr(line));

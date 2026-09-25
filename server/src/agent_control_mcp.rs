@@ -643,6 +643,44 @@ enum TeamToolErrorCode {
     Conflict,
 }
 
+#[derive(Debug, Serialize)]
+struct AwaitToolError {
+    code: AwaitToolErrorCode,
+    message: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum AwaitToolErrorCode {
+    HostStopping,
+}
+
+#[derive(Debug)]
+enum AwaitToolFailure {
+    HostStopping,
+    Message(String),
+}
+
+impl From<String> for AwaitToolFailure {
+    fn from(message: String) -> Self {
+        Self::Message(message)
+    }
+}
+
+impl AwaitToolFailure {
+    fn into_tool_result(self, tool_name: &str) -> Result<CallToolResult, McpError> {
+        match self {
+            Self::HostStopping => err_json(AwaitToolError {
+                code: AwaitToolErrorCode::HostStopping,
+                message: format!(
+                    "{tool_name} did not complete: the Tyde host is stopping to restart. Call {tool_name} again after the host restarts."
+                ),
+            }),
+            Self::Message(message) => Ok(err_text(message)),
+        }
+    }
+}
+
 #[derive(Serialize)]
 struct HealthResponse {
     status: &'static str,
@@ -910,14 +948,14 @@ impl TydeAgentControlMcpServer {
         };
         let result = tokio::select! {
             biased;
-            _ = self.await_expiration.cancelled() => Err("review await expired because the host stopped".to_owned()),
-            _ = host_cancellation.cancelled() => Err("review await request cancelled".to_owned()),
-            _ = context.ct.cancelled() => Err("review await request cancelled".to_owned()),
-            result = wait => result,
+            _ = self.await_expiration.cancelled() => Err(AwaitToolFailure::HostStopping),
+            _ = host_cancellation.cancelled() => Err(AwaitToolFailure::Message("review await request cancelled".to_owned())),
+            _ = context.ct.cancelled() => Err(AwaitToolFailure::Message("review await request cancelled".to_owned())),
+            result = wait => result.map_err(AwaitToolFailure::from),
         };
         match result {
             Ok(result) => ok_json(result),
-            Err(error) => Ok(err_text(error)),
+            Err(failure) => failure.into_tool_result("tyde_await_review"),
         }
     }
 
@@ -1082,7 +1120,7 @@ impl TydeAgentControlMcpServer {
         .await
         {
             Ok(result) => ok_json(result),
-            Err(err) => Ok(err_text(err)),
+            Err(failure) => failure.into_tool_result("tyde_await_agents"),
         }
     }
 
@@ -2190,7 +2228,7 @@ async fn do_await_agents(
     context: RequestContext<RoleServer>,
     host_cancellation: CancellationToken,
     host_expiration: CancellationToken,
-) -> Result<AwaitAgentsResult, String> {
+) -> Result<AwaitAgentsResult, AwaitToolFailure> {
     let cancellation_token = context.ct.clone();
     let progress_reporter = AwaitProgressReporter::from_context(&context);
     do_await_agents_with_progress(
@@ -2211,14 +2249,19 @@ async fn do_await_agents_with_progress(
     host_cancellation: Option<CancellationToken>,
     host_expiration: Option<CancellationToken>,
     progress_reporter: Option<AwaitProgressReporter>,
-) -> Result<AwaitAgentsResult, String> {
+) -> Result<AwaitAgentsResult, AwaitToolFailure> {
     if agent_ids.is_empty() {
-        return Err("agent_ids must contain at least one agent_id".to_string());
+        return Err(AwaitToolFailure::Message(
+            "agent_ids must contain at least one agent_id".to_owned(),
+        ));
     }
 
     for agent_id in &agent_ids {
         if host.agent_status_snapshot(agent_id).await.is_none() {
-            return Err(format!("unknown agent_id {}", agent_id.0));
+            return Err(AwaitToolFailure::Message(format!(
+                "unknown agent_id {}",
+                agent_id.0
+            )));
         }
     }
 
@@ -2238,7 +2281,7 @@ async fn do_await_agents_with_progress(
             .as_ref()
             .is_some_and(CancellationToken::is_cancelled)
         {
-            return Err("agent await expired because the host stopped".to_owned());
+            return Err(AwaitToolFailure::HostStopping);
         }
         let result = await_result_from_snapshot(host, &agent_ids).await?;
         if !result.ready.is_empty() || result.still_thinking.is_empty() {
@@ -2263,11 +2306,13 @@ async fn do_await_agents_with_progress(
                     std::future::pending::<()>().await;
                 }
             } => {
-                return Err("agent await expired because the host stopped".to_owned());
+                return Err(AwaitToolFailure::HostStopping);
             }
             changed = status_rx.changed() => {
                 if changed.is_err() {
-                    return Err("agent status notification channel closed".to_string());
+                    return Err(AwaitToolFailure::Message(
+                        "agent status notification channel closed".to_owned(),
+                    ));
                 }
             }
             _ = progress_tick.tick(), if progress_reporter.is_some() => {
@@ -2289,7 +2334,7 @@ async fn do_await_agents_with_progress(
                     std::future::pending::<()>().await;
                 }
             } => {
-                return Err("agent await request cancelled".to_owned());
+                return Err(AwaitToolFailure::Message("agent await request cancelled".to_owned()));
             }
             _ = async {
                 if let Some(cancellation_token) = cancellation_token.as_ref() {
@@ -2298,7 +2343,7 @@ async fn do_await_agents_with_progress(
                     std::future::pending::<()>().await;
                 }
             } => {
-                return Err("agent await request cancelled".to_owned());
+                return Err(AwaitToolFailure::Message("agent await request cancelled".to_owned()));
             }
         }
     }

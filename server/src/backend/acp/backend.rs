@@ -657,7 +657,7 @@ impl KiroSession {
         });
 
         let forward_inner = Arc::clone(&inner);
-        tokio::spawn(async move {
+        crate::backend::subprocess::spawn(async move {
             let mut rx = inbound_rx;
             while let Some(msg) = rx.recv().await {
                 forward_inner.handle_inbound(msg).await;
@@ -1118,7 +1118,7 @@ impl KiroInner {
             emitter
         };
         let inner = Arc::clone(self);
-        tokio::spawn(async move {
+        crate::backend::subprocess::spawn(async move {
             let capacity = inner.read_capacity().await;
             inner.capacity_state.lock().await.in_flight = false;
             emitter.on_backend_capacity(inner.adapter.backend_kind(), capacity);
@@ -1962,7 +1962,7 @@ impl KiroInner {
 
         let inner = Arc::clone(self);
         let operation_id = request.operation_id.clone();
-        tokio::spawn(async move {
+        crate::backend::subprocess::spawn(async move {
             let _prompt_guard = prompt_guard;
             inner.run_grok_compact(request, terminal_tx).await;
         });
@@ -6832,7 +6832,7 @@ impl Backend for KiroBackend {
         let (ready_tx, ready_rx) = oneshot::channel::<Result<KiroCommandHandle, String>>();
         let initial_emitter = config.subagent_emitter.clone();
 
-        let startup_task = tokio::spawn(async move {
+        let startup_task = crate::backend::subprocess::spawn(async move {
             let mut ready_tx: Option<oneshot::Sender<Result<KiroCommandHandle, String>>> =
                 Some(ready_tx);
             let combined_instructions =
@@ -6887,7 +6887,7 @@ impl Backend for KiroBackend {
             }
 
             let events_tx_forward = events_tx_task.clone();
-            let forward_task = tokio::spawn(async move {
+            let forward_task = crate::backend::subprocess::spawn(async move {
                 while let Some(raw) = raw_events.recv().await {
                     if let Some(event) = map_kiro_value_to_backend_event(&raw)
                         && events_tx_forward.send(event).is_err()
@@ -6900,7 +6900,7 @@ impl Backend for KiroBackend {
             let (command_error_tx, mut command_error_rx) = mpsc::unbounded_channel::<String>();
             let initial_handle = handle.clone();
             let initial_command_error_tx = command_error_tx.clone();
-            tokio::spawn(async move {
+            crate::backend::subprocess::spawn(async move {
                 if let Err(err) = initial_handle
                     .execute(SessionCommand::SendMessage {
                         message: initial_message,
@@ -6928,7 +6928,7 @@ impl Backend for KiroBackend {
                             AgentInput::SendMessage(payload) => {
                                 let handle = handle.clone();
                                 let command_error_tx = command_error_tx.clone();
-                                tokio::spawn(async move {
+                                crate::backend::subprocess::spawn(async move {
                                     let result = handle.handle_follow_up(payload).await;
                                     handle
                                         .inner
@@ -7010,7 +7010,7 @@ impl Backend for KiroBackend {
         let (ready_tx, ready_rx) = oneshot::channel::<Result<KiroCommandHandle, String>>();
         let initial_emitter = config.subagent_emitter.clone();
 
-        let startup_task = tokio::spawn(async move {
+        let startup_task = crate::backend::subprocess::spawn(async move {
             let mut ready_tx: Option<oneshot::Sender<Result<KiroCommandHandle, String>>> =
                 Some(ready_tx);
             let combined_instructions =
@@ -7080,7 +7080,7 @@ impl Backend for KiroBackend {
             }
 
             let events_tx_forward = events_tx_task.clone();
-            let forward_task = tokio::spawn(async move {
+            let forward_task = crate::backend::subprocess::spawn(async move {
                 while let Some(raw) = raw_events.recv().await {
                     if let Some(event) = map_kiro_value_to_backend_event(&raw)
                         && events_tx_forward.send(event).is_err()
@@ -7106,7 +7106,7 @@ impl Backend for KiroBackend {
                             AgentInput::SendMessage(payload) => {
                                 let handle = handle.clone();
                                 let command_error_tx = command_error_tx.clone();
-                                tokio::spawn(async move {
+                                crate::backend::subprocess::spawn(async move {
                                     let result = handle.handle_follow_up(payload).await;
                                     handle
                                         .inner

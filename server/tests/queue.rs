@@ -2,10 +2,11 @@ mod fixture;
 
 use fixture::{Fixture, TestAgent};
 use protocol::{
-    AgentActivity, AgentActivityChangedPayload, AgentErrorPayload, CancelQueuedMessagePayload,
-    ChatEvent, EditQueuedMessagePayload, FrameKind, ImageData, MessageOrigin, QueuedMessageId,
-    QueuedMessagesPayload, SendMessagePayload, SendMessageToolResponse,
-    SendQueuedMessageNowPayload, StreamPath,
+    AgentActivity, AgentActivityChangedPayload, AgentErrorPayload, BackendKind,
+    CancelQueuedMessagePayload, ChatEvent, EditQueuedMessagePayload, FrameKind, ImageData,
+    MessageOrigin, QueuedMessageId, QueuedMessagesPayload, SendMessagePayload,
+    SendMessageToolResponse, SendQueuedMessageNowPayload, SpawnAgentParams, SpawnAgentPayload,
+    StreamPath,
 };
 use server::backend::mock::{MockGateHandle, MockRequest, MockScript, MockTurn};
 
@@ -1144,4 +1145,205 @@ async fn queue_cleared_on_agent_termination() {
         .await;
     let err: AgentErrorPayload = env.parse_payload().expect("parse AgentErrorPayload");
     assert!(err.fatal, "termination must produce a fatal AgentError");
+}
+
+async fn spawn_restart_agent(
+    fixture: &mut Fixture,
+    name: &str,
+    parent_agent_id: Option<protocol::AgentId>,
+    script: Option<MockScript>,
+) -> (fixture::TestAgent, protocol::SessionId) {
+    let reservation = match script {
+        Some(script) => Some(fixture.reserve_next_mock_launch(name, script).await),
+        None => None,
+    };
+    let (agent, start) = fixture
+        .spawn_with(SpawnAgentPayload {
+            name: Some(name.to_owned()),
+            custom_agent_id: None,
+            parent_agent_id,
+            project_id: None,
+            params: SpawnAgentParams::New {
+                workspace_roots: vec![format!("/tmp/{}", name.replace(' ', "-"))],
+                prompt: format!("{name} prompt"),
+                images: None,
+                backend_kind: BackendKind::Claude,
+                launch_profile_id: None,
+                cost_hint: None,
+                access_mode: Default::default(),
+                session_settings: None,
+            },
+        })
+        .await;
+    drop(reservation);
+    (agent, start.session_id.expect("spawned agent session id"))
+}
+
+#[tokio::test]
+async fn restart_stop_preserves_durable_turn_and_queue() {
+    let mut fixture = Fixture::new().await;
+    let shutdown_gate = server::backend::mock::MockGateHandle::new();
+    let (agent, durable_session) = spawn_restart_agent(
+        &mut fixture,
+        "restart durable",
+        None,
+        Some(
+            MockScript::one(MockTurn::held_text("held response"))
+                .with_shutdown_gate(&shutdown_gate),
+        ),
+    )
+    .await;
+    fixture
+        .client
+        .send_message(&agent.stream, "queued first".to_owned())
+        .await
+        .expect("queue first");
+    fixture.expect_queued_messages(&agent, 1).await;
+    fixture
+        .client
+        .send_message(&agent.stream, "queued second".to_owned())
+        .await
+        .expect("queue second");
+    fixture.expect_queued_messages(&agent, 2).await;
+
+    // An orchestrator parked in tyde_await_agents on a live child. The restart
+    // shutdown expires that await, so the orchestrator's turn can end while
+    // the shutdown is still under way; nothing it has queued may start then.
+    let (parent, parent_session) =
+        spawn_restart_agent(&mut fixture, "restart orchestrator", None, None).await;
+    fixture.finish_turn(&parent).await;
+    let (child, child_session) = spawn_restart_agent(
+        &mut fixture,
+        "restart worker",
+        Some(parent.new_agent.agent_id.clone()),
+        Some(MockScript::one(MockTurn::held_text("child unfinished"))),
+    )
+    .await;
+    fixture
+        .next_chat_event_matching(&child, "child held turn streamed", |event| {
+            matches!(event, ChatEvent::StreamEnd(_))
+        })
+        .await;
+    fixture
+        .mock(&parent)
+        .await
+        .enqueue(MockTurn::agent_control_await(vec![
+            child.new_agent.agent_id.clone(),
+        ]))
+        .await;
+    fixture
+        .client
+        .send_message(&parent.stream, "await the worker".to_owned())
+        .await
+        .expect("send parent await prompt");
+    fixture
+        .next_chat_event_matching(&parent, "parent parked in await", |event| {
+            matches!(event, ChatEvent::ToolRequest(request) if fixture::tool_request_name(request) == "tyde_await_agents")
+        })
+        .await;
+    fixture
+        .client
+        .send_message(&parent.stream, "parent queued".to_owned())
+        .await
+        .expect("queue on parent");
+    fixture.expect_queued_messages(&parent, 1).await;
+
+    let store = server::store::session::SessionStore::load(fixture.session_store_path())
+        .expect("read durable store");
+    let before = store.list().expect("list durable records");
+    assert_eq!(before.len(), 3);
+    let record_for = |records: &[server::store::session::SessionRecord],
+                      session: &protocol::SessionId|
+     -> serde_json::Value {
+        let record = records
+            .iter()
+            .find(|record| &record.id == session)
+            .unwrap_or_else(|| panic!("no durable record for the spawned session"));
+        serde_json::to_value(record).expect("inspect durable record")
+    };
+    for session in [&durable_session, &parent_session, &child_session] {
+        assert_eq!(
+            record_for(&before, session)["turn_recovery"],
+            serde_json::json!("InFlight"),
+            "held live turns must be durably marked before restart"
+        );
+    }
+
+    let stop_gate = fixture.host_for_test().install_restart_stop_test_gate();
+    let host = fixture.host_for_test();
+    let first_host = host.clone();
+    let first = tokio::spawn(async move {
+        first_host.shutdown_for_restart().await;
+    });
+    stop_gate.wait_until_entered().await;
+    // Every agent is prepared for the restart and the orchestrator's await has
+    // been expired, but no agent has received its stop command yet.
+    fixture
+        .next_chat_event_matching(
+            &parent,
+            "orchestrator turn ends once the restart expires its await",
+            |event| matches!(event, ChatEvent::TypingStatusChanged(false)),
+        )
+        .await;
+    stop_gate.release_one();
+    shutdown_gate.wait_until_entered().await;
+    first.abort();
+    assert!(
+        first
+            .await
+            .expect_err("first waiter cancelled")
+            .is_cancelled()
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(27), async {
+        tokio::join!(host.shutdown_for_restart(), host.shutdown_for_restart());
+    })
+    .await
+    .expect("all callers must share the bounded shutdown despite a stuck backend");
+    let after = store.list().expect("list stopped records");
+    let queued_messages = |record: &serde_json::Value| -> Vec<(String, String)> {
+        record["queued_messages"]
+            .as_array()
+            .expect("queued messages array")
+            .iter()
+            .map(|entry| {
+                (
+                    entry["id"].as_str().expect("queued id").to_owned(),
+                    entry["message"].as_str().expect("queued text").to_owned(),
+                )
+            })
+            .collect()
+    };
+    let durable_after = record_for(&after, &durable_session);
+    assert_eq!(
+        queued_messages(&durable_after),
+        queued_messages(&record_for(&before, &durable_session)),
+        "a held turn's queue survives the restart stop unchanged"
+    );
+    assert_eq!(queued_messages(&durable_after).len(), 2);
+    assert_eq!(
+        durable_after["turn_recovery"],
+        serde_json::json!("InterruptedByRestart")
+    );
+    assert!(
+        !durable_after["restore_state"].is_null(),
+        "restart must preserve restore intent"
+    );
+    let parent_after = record_for(&after, &parent_session);
+    assert_eq!(
+        queued_messages(&parent_after)
+            .iter()
+            .map(|(_, message)| message.as_str())
+            .collect::<Vec<_>>(),
+        vec!["parent queued"],
+        "a turn that ends because the restart expired its await must not start queued work"
+    );
+    assert_eq!(
+        parent_after["turn_recovery"],
+        serde_json::json!("InterruptedByRestart"),
+        "an await cut short by the restart is an interruption, not a completed turn"
+    );
+    assert_eq!(
+        record_for(&after, &child_session)["turn_recovery"],
+        serde_json::json!("InterruptedByRestart")
+    );
 }

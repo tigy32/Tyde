@@ -2603,3 +2603,45 @@ pub async fn wait_for_process_probe<B: Backend>(host: &mut Harness<B>, probe: &P
         }
     }
 }
+
+pub async fn running_group_members(group: i32) -> Vec<u32> {
+    let output = tokio::process::Command::new("ps")
+        .args(["-eo", "pid=,pgid=,stat="])
+        .output()
+        .await
+        .expect("read group table");
+    assert!(output.status.success(), "cannot inspect process groups");
+    String::from_utf8(output.stdout)
+        .expect("process table encoding")
+        .lines()
+        .filter_map(|line| {
+            let fields = line.split_whitespace().collect::<Vec<_>>();
+            (fields[1].parse::<i32>().expect("pgid") == group && !fields[2].starts_with('Z'))
+                .then(|| fields[0].parse().expect("pid"))
+        })
+        .collect()
+}
+
+pub async fn wait_for_group_member(pid: u32, group: i32) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if running_group_members(group).await.contains(&pid) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("sentinel did not join backend group");
+}
+
+pub async fn interrupt_backend<B: Backend>(host: &Harness<B>) {
+    assert!(
+        host.backend
+            .as_ref()
+            .expect("live backend")
+            .interrupt()
+            .await,
+        "backend rejected interrupt"
+    );
+}

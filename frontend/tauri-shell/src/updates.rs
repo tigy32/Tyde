@@ -1,6 +1,9 @@
 use std::{
     path::PathBuf,
-    sync::Mutex,
+    sync::{
+        Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -10,6 +13,7 @@ use host_config::updates::{
 use semver::Version;
 use serde::Deserialize;
 use tauri::{AppHandle, Emitter, Manager};
+use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
 use tauri_plugin_updater::{Update, UpdaterExt};
 
 const CHECK_INTERVAL: u64 = 6 * 60 * 60;
@@ -27,6 +31,7 @@ struct Inner {
 struct Updates {
     inner: Mutex<Inner>,
     operation: tokio::sync::Mutex<()>,
+    host_stopped: AtomicBool,
     preferences_path: PathBuf,
 }
 
@@ -321,6 +326,9 @@ async fn install(app: AppHandle, version: String) -> Result<AppUpdateStatus, Str
         .operation
         .try_lock()
         .map_err(|_| "An update operation is in progress")?;
+    if updates.host_stopped.load(Ordering::Acquire) {
+        return Err("Tyde is restarting to bring local agents back.".into());
+    }
     let update = {
         let inner = updates
             .inner
@@ -362,6 +370,11 @@ async fn install(app: AppHandle, version: String) -> Result<AppUpdateStatus, Str
             inner.status.downloaded = bytes.len() as u64;
             inner.status.phase = UpdatePhase::Installing;
         });
+        updates.host_stopped.store(true, Ordering::Release);
+        app.state::<crate::ShellState>()
+            .host
+            .shutdown_for_restart()
+            .await;
         tauri::async_runtime::spawn_blocking(move || update.install(bytes))
             .await
             .map_err(|error| error.to_string())?
@@ -372,12 +385,35 @@ async fn install(app: AppHandle, version: String) -> Result<AppUpdateStatus, Str
     .await;
     if let Err(error) = result {
         tracing::error!(%error, "app update installation failed");
-        return Ok(updates.change(&app, |inner| {
+        let host_stopped = updates.host_stopped.load(Ordering::Acquire);
+        let error = if host_stopped {
+            format!("{error}. Tyde will restart the current version to bring local agents back.")
+        } else {
+            error
+        };
+        let status = updates.change(&app, |inner| {
             inner.status.phase = UpdatePhase::Error;
-            inner.status.error = Some(error);
-        }));
+            inner.status.error = Some(error.clone());
+        });
+        if host_stopped {
+            restart_after_failed_install(&app, error);
+        }
+        return Ok(status);
     }
     Ok(updates.snapshot())
+}
+
+// The embedded host cannot serve again after its restart shutdown, so a
+// failed install relaunches the unchanged app, whose normal startup
+// reconstructs the host and continues the interrupted turns.
+fn restart_after_failed_install(app: &AppHandle, message: String) {
+    let restart = app.clone();
+    app.dialog()
+        .message(message)
+        .title("Tyde update failed")
+        .kind(MessageDialogKind::Error)
+        .buttons(MessageDialogButtons::OkCustom("Restart Tyde".to_owned()))
+        .show(move |_| restart.request_restart());
 }
 
 pub fn init(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
@@ -428,6 +464,7 @@ pub fn init(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
             seen_servers: Default::default(),
         }),
         operation: tokio::sync::Mutex::new(()),
+        host_stopped: AtomicBool::new(false),
         preferences_path,
     });
     app.plugin(tauri_plugin_updater::Builder::new().build())?;

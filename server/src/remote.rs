@@ -1,6 +1,6 @@
 use std::process::Output;
 
-use command_group::{AsyncCommandGroup, AsyncGroupChild};
+use crate::backend::subprocess::{AsyncCommandGroup, AsyncGroupChild};
 
 pub fn parse_remote_workspace_roots(
     workspace_roots: &[String],
@@ -59,7 +59,7 @@ pub async fn run_ssh_raw(host: &str, command: &str) -> Result<Output, String> {
         .map_err(|err| format!("ssh command failed: {err}"))
 }
 
-pub async fn spawn_remote_process(
+pub(crate) async fn spawn_remote_process(
     host: &str,
     program: &str,
     args: &[String],
@@ -68,7 +68,7 @@ pub async fn spawn_remote_process(
     spawn_remote_process_with_env(host, program, args, cwd, &[]).await
 }
 
-pub async fn spawn_remote_process_with_env(
+pub(crate) async fn spawn_remote_process_with_env(
     host: &str,
     program: &str,
     args: &[String],

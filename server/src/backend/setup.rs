@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
-use command_group::AsyncCommandGroup;
+use crate::backend::subprocess::AsyncCommandGroup;
 use protocol::{
     AcpAdapterId, BackendKind, BackendSetupAction, BackendSetupCommand, BackendSetupDiagnostic,
     BackendSetupDiagnosticCode, BackendSetupInfo, BackendSetupPayload, BackendSetupStatus,
@@ -646,7 +646,7 @@ fn version_command_failure(
 }
 
 async fn wait_for_version_command_group(
-    child: &mut command_group::AsyncGroupChild,
+    child: &mut crate::backend::subprocess::AsyncGroupChild,
     started: Instant,
     command: &str,
 ) -> std::io::Result<std::process::ExitStatus> {
@@ -692,10 +692,10 @@ async fn run_version_command_with_child_path(
         .group_spawn()
         .map_err(|error| VersionCommandFailure::Start(format!("failed to spawn: {error}")))?;
     trace_version_probe_stage(started, &command_name, "group_spawn_completed");
-    let mut stdout_pipe = child.inner().stdout.take().ok_or_else(|| {
+    let mut stdout_pipe = child.take_stdout().ok_or_else(|| {
         VersionCommandFailure::Start("failed to capture standard output".to_owned())
     })?;
-    let mut stderr_pipe = child.inner().stderr.take().ok_or_else(|| {
+    let mut stderr_pipe = child.take_stderr().ok_or_else(|| {
         VersionCommandFailure::Start("failed to capture standard error".to_owned())
     })?;
 
@@ -740,7 +740,7 @@ async fn run_version_command_with_child_path(
             }
             trace_version_probe_stage(started, &command_name, "background_reap_spawning");
             let reap_command = command_name.clone();
-            tokio::spawn(async move {
+            crate::backend::subprocess::spawn(async move {
                 trace_version_probe_stage(started, &reap_command, "background_reap_started");
                 if let Err(error) = child.wait().await {
                     tracing::warn!(%error, "failed to reap timed-out version command group");

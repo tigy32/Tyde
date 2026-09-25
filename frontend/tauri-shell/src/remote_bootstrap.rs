@@ -540,9 +540,13 @@ ln -sfn "$version" "$HOME/.tyde/bin/current"
 }
 
 async fn stop_managed_server(ssh_destination: &str) -> Result<(), String> {
-    ssh_capture(ssh_destination, &managed_host::stop_script())
-        .await
-        .map(|_| ())
+    tokio::time::timeout(
+        std::time::Duration::from_secs(45),
+        ssh_capture(ssh_destination, &managed_host::stop_script()),
+    )
+    .await
+    .map_err(|_| "managed host shutdown exceeded 45 seconds".to_owned())?
+    .map(|_| ())
 }
 
 async fn launch_server(ssh_destination: &str, version: &TydeReleaseVersion) -> Result<(), String> {

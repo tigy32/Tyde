@@ -6,8 +6,8 @@ use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::backend::subprocess::{AsyncCommandGroup, AsyncGroupChild};
 use chrono::DateTime;
-use command_group::{AsyncCommandGroup, AsyncGroupChild};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::fs as tokio_fs;
@@ -1060,7 +1060,7 @@ impl Drop for ClaudeResumeStartupGuard {
         let Some(session) = self.session.take() else {
             return;
         };
-        tokio::spawn(async move {
+        crate::backend::subprocess::spawn(async move {
             session.shutdown().await;
         });
     }
@@ -2056,7 +2056,7 @@ impl ClaudeInner {
         self.emit_typing_status(true);
         self.emit_stream_start(&message_id, model_hint.clone());
 
-        tokio::spawn(async move {
+        crate::backend::subprocess::spawn(async move {
             match self
                 .write_turn_to_persistent_process(turn_id, &message, &images)
                 .await
@@ -2287,7 +2287,7 @@ impl ClaudeInner {
             }
         }
         let timeout_inner = Arc::clone(&self);
-        tokio::spawn(async move {
+        crate::backend::subprocess::spawn(async move {
             tokio::select! {
                 _ = tokio::time::sleep(CLAUDE_COMPACTION_TIMEOUT) => {
                     let _ = timeout_inner
@@ -2552,7 +2552,7 @@ impl ClaudeInner {
         self.emit_stream_start(&message_id, model_hint.clone());
 
         let this = Arc::clone(self);
-        tokio::spawn(async move {
+        crate::backend::subprocess::spawn(async move {
             let outcome = outcome_rx.await.unwrap_or_else(|_| TurnOutcome::Failed {
                 summary: ClaudeStdoutSummary::default(),
                 error: "Claude turn ended before returning a result".to_string(),
@@ -2970,7 +2970,7 @@ impl ClaudeInner {
             (resume_bootstrap_generation, resume_bootstrap_rx)
         {
             let inner = Arc::clone(self);
-            tokio::spawn(async move {
+            crate::backend::subprocess::spawn(async move {
                 match tokio::time::timeout(CLAUDE_INITIALIZE_TIMEOUT, receiver).await {
                     Ok(Ok(Ok(()))) => {}
                     Ok(Ok(Err(error))) => {
@@ -3609,7 +3609,7 @@ impl ClaudeInner {
         deadline: tokio::time::Instant,
     ) {
         let this = Arc::clone(self);
-        tokio::spawn(async move {
+        crate::backend::subprocess::spawn(async move {
             loop {
                 tokio::time::sleep(CLAUDE_MCP_RECHECK_INTERVAL).await;
                 // A restart replaces every server this watcher was asked about,
@@ -3896,7 +3896,7 @@ impl ClaudeInner {
             return;
         }
         let this = Arc::clone(self);
-        tokio::spawn(async move {
+        crate::backend::subprocess::spawn(async move {
             let result = this.send_control_request("get_usage").await;
             let capacity = match result {
                 Ok(response) => map_claude_control_usage(&response),
@@ -3991,33 +3991,30 @@ impl ClaudeInner {
         };
 
         let stdin = child
-            .inner()
-            .stdin
-            .take()
+            .take_stdin()
             .ok_or_else(|| "Failed to capture Claude stdin".to_string())?;
         let stdout = child
-            .inner()
-            .stdout
-            .take()
+            .take_stdout()
             .ok_or_else(|| "Failed to capture Claude stdout".to_string())?;
         let stderr = child
-            .inner()
-            .stderr
-            .take()
+            .take_stderr()
             .ok_or_else(|| "Failed to capture Claude stderr".to_string())?;
 
         let stdin = Arc::new(Mutex::new(stdin));
         let child = Arc::new(Mutex::new(Some(child)));
         let control_waiters = Arc::new(Mutex::new(HashMap::new()));
         self.activate_background_task_owner();
-        let stdout_task = tokio::spawn(read_claude_stdout_persistent(
+        let stdout_task = crate::backend::subprocess::spawn(read_claude_stdout_persistent(
             stdout,
             Arc::clone(self),
             Arc::clone(&control_waiters),
             Arc::clone(&stdin),
             process_generation,
         ));
-        let stderr_task = tokio::spawn(read_claude_stderr_persistent(stderr, Arc::clone(self)));
+        let stderr_task = crate::backend::subprocess::spawn(read_claude_stderr_persistent(
+            stderr,
+            Arc::clone(self),
+        ));
 
         Ok(ClaudeProcessRuntime {
             generation: process_generation,
@@ -4350,7 +4347,7 @@ impl ClaudeInner {
             turn_id: state.active_turn.as_ref().map(|active| active.id),
         };
         let inner = Arc::clone(self);
-        let handle = tokio::spawn(async move {
+        let handle = crate::backend::subprocess::spawn(async move {
             tokio::time::sleep(CLAUDE_SKILL_VERIFICATION_TIMEOUT).await;
             // `abort_watchdog: false` — this task owns the handle it would be
             // aborting, and cancelling itself would drop the settle.
@@ -4558,7 +4555,7 @@ impl ClaudeInner {
         self.drain_background_tasks();
         if let Some(runtime) = runtime {
             runtime.abort_readers();
-            tokio::spawn(runtime.kill());
+            crate::backend::subprocess::spawn(runtime.kill());
         }
     }
 
@@ -13768,7 +13765,7 @@ impl ClaudeBackend {
             Arc::new(StdMutex::new(None));
         let command_handle_task = Arc::clone(&command_handle);
 
-        tokio::spawn(async move {
+        crate::backend::subprocess::spawn(async move {
             // The probe must run where the session will run, so resolve the
             // workspace the same way `spawn_with_mode` does.
             let probe_workspace_root = match pick_workspace_root(&workspace_roots) {
@@ -13889,7 +13886,7 @@ impl ClaudeBackend {
             let ready_tx_forward = Arc::clone(&ready_tx);
             let session_id_forward = Arc::clone(&session_id_task);
             let events_tx_forward = events_tx.clone();
-            let forward_task = tokio::spawn(async move {
+            let forward_task = crate::backend::subprocess::spawn(async move {
                 while let Some(raw) = raw_events.recv().await {
                     if !forward_claude_backend_event(
                         raw,
@@ -14147,7 +14144,7 @@ fn spawn_claude_subagent_event_bridge(
     model_usage_tx: mpsc::UnboundedSender<protocol::ModelRequestTokenUsage>,
     total_usage_tx: mpsc::UnboundedSender<u64>,
 ) {
-    tokio::spawn(async move {
+    crate::backend::subprocess::spawn(async move {
         while let Some(raw) = raw_rx.recv().await {
             if raw.get("kind").and_then(Value::as_str) == Some("ModelRequestTokenUsage")
                 && let Some(data) = raw.get("data")
@@ -14645,10 +14642,10 @@ async fn claude_capacity_probe_exchange(
     let unreachable = protocol::BackendCapacityState::Unavailable {
         reason: CapacityUnavailableReason::SourceUnreachable,
     };
-    let Some(mut stdin) = child.inner().stdin.take() else {
+    let Some(mut stdin) = child.take_stdin() else {
         return unreachable;
     };
-    let Some(stdout) = child.inner().stdout.take() else {
+    let Some(stdout) = child.take_stdout() else {
         return unreachable;
     };
 
@@ -14945,7 +14942,7 @@ impl Backend for ClaudeBackend {
 
         startup_guard.disarm();
 
-        tokio::spawn(async move {
+        crate::backend::subprocess::spawn(async move {
             loop {
                 tokio::select! {
                     biased;

@@ -7936,9 +7936,43 @@ pub enum OrchestrationWorkflowPhase {
 ///      tool. Calls already moved to `Background` continue independently.
 ///   3. Emit exactly one `OperationCancelled`.
 ///   4. Emit `TypingStatusChanged(false)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RestartInterruptionCause {
+    HostRestart,
+    UnexpectedStop,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind")]
+pub enum RestartRecoveryPhase {
+    Interrupted { cause: RestartInterruptionCause },
+    Continuing,
+    ContinuationFailed { message: String },
+}
+
+impl RestartRecoveryPhase {
+    pub fn notice_text(&self) -> String {
+        match self {
+            Self::Interrupted {
+                cause: RestartInterruptionCause::HostRestart,
+            } => "This turn was interrupted because the host restarted.".to_owned(),
+            Self::Interrupted {
+                cause: RestartInterruptionCause::UnexpectedStop,
+            } => "This turn was interrupted because the host stopped unexpectedly.".to_owned(),
+            Self::Continuing => "Continuing the interrupted turn after restart.".to_owned(),
+            Self::ContinuationFailed { message } => {
+                format!("Could not continue the interrupted turn: {message}")
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "data")]
 pub enum ChatEvent {
+    RestartRecovery {
+        phase: RestartRecoveryPhase,
+    },
     GoalCapabilities(GoalCapabilities),
     GoalChanged(Option<NativeGoal>),
     GoalCompleted(NativeGoal),

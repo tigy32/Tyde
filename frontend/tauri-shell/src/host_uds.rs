@@ -54,14 +54,19 @@ pub fn run() -> Result<(), String> {
             })
             .await?;
 
-            server::serve_uds(listener, server::ServerConfig::current(), host)
-                .await
-                .map_err(|err| {
-                    format!(
-                        "host UDS listener failed at {}: {err}",
-                        socket_path.display()
-                    )
-                })
+            server::serve_uds(
+                listener,
+                server::ServerConfig::current(),
+                host,
+                server::host_shutdown_signal().map_err(|error| error.to_string())?,
+            )
+            .await
+            .map_err(|err| {
+                format!(
+                    "host UDS listener failed at {}: {err}",
+                    socket_path.display()
+                )
+            })
         })
     }
 }

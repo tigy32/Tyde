@@ -171,18 +171,24 @@ pub async fn listen_uds(
         let listener = match bind_uds(path).await {
             Ok(listener) => listener,
             Err(err) => {
-                host.shutdown_spawn_operations().await;
+                host.shutdown_for_restart().await;
                 return Err(err);
             }
         };
-        serve_uds(listener, config, host).await
+        serve_uds(
+            listener,
+            config,
+            host,
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await
     }
 
     #[cfg(not(unix))]
     {
         let _ = path;
         let _ = config;
-        host.shutdown_spawn_operations().await;
+        host.shutdown_for_restart().await;
         Err(io::Error::new(
             ErrorKind::Unsupported,
             "Unix domain sockets are not supported on this platform",
@@ -215,11 +221,16 @@ pub async fn serve_uds(
     listener: BoundUdsListener,
     config: ServerConfig,
     host: HostHandle,
+    shutdown: tokio_util::sync::CancellationToken,
 ) -> io::Result<()> {
     let recovery = crate::recovery::Registry::default();
     let result = async {
         loop {
-            let (stream, _) = listener.listener.accept().await?;
+            let (stream, _) = tokio::select! {
+                biased;
+                _ = shutdown.cancelled() => break Ok(()),
+                accepted = listener.listener.accept() => accepted?,
+            };
             let host = host.clone();
             let recovery = recovery.clone();
 
@@ -257,7 +268,7 @@ pub async fn serve_uds(
         }
     }
     .await;
-    host.shutdown_spawn_operations().await;
+    host.shutdown_for_restart().await;
     result
 }
 
@@ -325,4 +336,28 @@ impl Drop for UdsPathCleanup {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.path);
     }
+}
+
+/// Install once per standalone host runner, not per client connection.
+pub fn host_shutdown_signal() -> io::Result<tokio_util::sync::CancellationToken> {
+    let token = tokio_util::sync::CancellationToken::new();
+    let cancelled = token.clone();
+    #[cfg(unix)]
+    {
+        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        let mut interrupt =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+        tokio::spawn(async move {
+            tokio::select! { _ = term.recv() => {}, _ = interrupt.recv() => {} }
+            cancelled.cancel();
+        });
+    }
+    #[cfg(not(unix))]
+    tokio::spawn(async move {
+        if let Err(error) = tokio::signal::ctrl_c().await {
+            tracing::error!(%error, "host shutdown signal listener failed");
+        }
+        cancelled.cancel();
+    });
+    Ok(token)
 }

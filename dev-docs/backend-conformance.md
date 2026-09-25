@@ -563,3 +563,28 @@ GPT-5.6-Luna 21.56s, Hermes DeepSeek-V4-Flash-0731 24.16s, Grok-4.6 low
 Gemini-3.8-Flash high 17.58s. The case now pins Antigravity's cheaper
 Gemini-3.8-Flash low profile rather than its installed default. This is
 targeted resume coverage, not full backend certification.
+
+## Restart process containment
+
+`real_interrupt_shutdown_kills_process_group` uses identical setup and oracle
+for all seven backends: hold a real foreground tool, locate its owned backend
+process group through PID ancestry, join a separate sleep probe to that group,
+then interrupt and shut down. The whole operation must finish within 25s and
+leave no running group members. Zombies are not running processes. No provider
+output is fabricated; the probe tests ownership, not model behavior.
+
+The guard passed all seven on the unmodified shutdown implementation (58.90s).
+That establishes the existing explicit-shutdown contract, not a reproduction
+of host exit forgetting to call shutdown. With restart containment changes,
+six passed in the first run; Codex failed before initial readiness with HTTP
+401, not at the containment oracle, and bounded retries confirmed the
+credential failure. Once those credentials recovered, the Codex guard passed
+(8.31s), so all seven pass with the change.
+
+Protocol sims separately reproduced the missing durable InFlight marker and
+unsafe managed-process termination. Real stdio subprocesses reproduced abrupt
+SIGTERM/SIGINT exit. Those tests now pass, along with shared, cancellation-safe
+25s shutdown, preserved restore intent and ordered queued messages. Both DOM
+suites render all typed recovery phases, including a notice-only conversation.
+Linux backend leaders use parent-death SIGKILL as best-effort containment;
+descendants which escape the group and macOS abrupt host death remain gaps.

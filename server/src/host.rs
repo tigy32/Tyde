@@ -858,6 +858,7 @@ fn installed_backend_version(
 }
 
 pub struct HostHandle {
+    restart: Arc<RestartShutdown>,
     state: Arc<Mutex<HostState>>,
     workflow_save_lock: Arc<Mutex<()>>,
     backend_setup_refresh_lock: Arc<Mutex<()>>,
@@ -873,6 +874,34 @@ pub struct HostHandle {
     settings_apply_lock: Arc<Mutex<()>>,
     spawn_operations: SpawnOperationHandle,
     spawn_operation_owner: Option<Arc<SpawnOperationOwner>>,
+}
+
+struct RestartShutdown {
+    // Runtime handles stay outside HostState so a stuck host operation cannot
+    // prevent the shutdown deadline from killing its owned processes.
+    agents: StdMutex<Vec<AgentHandle>>,
+    control: std::sync::OnceLock<AgentControlMcpHandle>,
+    started: std::sync::atomic::AtomicBool,
+    stopped: CancellationToken,
+    complete: tokio::sync::watch::Sender<bool>,
+    /// Holds a restart shutdown after every agent is prepared and parked await
+    /// requests are expired, before any agent receives its stop command.
+    #[cfg(feature = "test-support")]
+    stop_test_gate: StdMutex<Option<Arc<SpawnOperationTestGateInner>>>,
+}
+
+impl Default for RestartShutdown {
+    fn default() -> Self {
+        Self {
+            agents: StdMutex::new(Vec::new()),
+            control: std::sync::OnceLock::new(),
+            started: std::sync::atomic::AtomicBool::new(false),
+            stopped: CancellationToken::new(),
+            complete: tokio::sync::watch::channel(false).0,
+            #[cfg(feature = "test-support")]
+            stop_test_gate: StdMutex::new(None),
+        }
+    }
 }
 
 const SPAWN_OPERATION_QUEUE_CAPACITY: usize = 32;
@@ -1044,6 +1073,7 @@ impl SpawnOperationTerminalClaim {
 }
 
 pub(crate) struct WeakHostHandle {
+    restart: Weak<RestartShutdown>,
     state: Weak<Mutex<HostState>>,
     workflow_save_lock: Weak<Mutex<()>>,
     backend_setup_refresh_lock: Weak<Mutex<()>>,
@@ -1055,6 +1085,7 @@ pub(crate) struct WeakHostHandle {
 impl WeakHostHandle {
     pub(crate) fn downgrade(host: &HostHandle) -> Self {
         Self {
+            restart: Arc::downgrade(&host.restart),
             state: Arc::downgrade(&host.state),
             workflow_save_lock: Arc::downgrade(&host.workflow_save_lock),
             backend_setup_refresh_lock: Arc::downgrade(&host.backend_setup_refresh_lock),
@@ -1066,6 +1097,7 @@ impl WeakHostHandle {
 
     pub(crate) fn upgrade(&self) -> Option<HostHandle> {
         Some(HostHandle {
+            restart: self.restart.upgrade()?,
             state: self.state.upgrade()?,
             workflow_save_lock: self.workflow_save_lock.upgrade()?,
             backend_setup_refresh_lock: self.backend_setup_refresh_lock.upgrade()?,
@@ -1080,6 +1112,7 @@ impl WeakHostHandle {
 impl Clone for HostHandle {
     fn clone(&self) -> Self {
         Self {
+            restart: Arc::clone(&self.restart),
             state: Arc::clone(&self.state),
             workflow_save_lock: Arc::clone(&self.workflow_save_lock),
             backend_setup_refresh_lock: Arc::clone(&self.backend_setup_refresh_lock),
@@ -1981,45 +2014,24 @@ impl HostHandle {
     }
 
     pub async fn shutdown_agents_for_conformance(&self) {
-        let (agent_control_mcp, handles, session_store) = {
-            let state = self.state.lock().await;
-            (
-                state.agent_control_mcp.clone(),
-                state
-                    .registry
-                    .agent_ids()
-                    .into_iter()
-                    .filter_map(|agent_id| state.registry.agent_handle(&agent_id))
-                    .collect::<Vec<_>>(),
-                Arc::clone(&state.session_store),
-            )
-        };
-        let durable_queues = session_store
-            .list()
-            .await
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|record| !record.queued_messages.is_empty())
-            .map(|record| (record.id, record.queued_messages))
-            .collect::<Vec<_>>();
-        agent_control_mcp.expire_await_requests();
-        for handle in handles {
-            handle.close().await;
+        self.shutdown_for_restart().await;
+    }
+
+    #[cfg(feature = "test-support")]
+    pub async fn hard_stop_for_conformance(&self) {
+        self.restart.stopped.cancel();
+        if let Some(owner) = self.spawn_operations.owner.upgrade() {
+            owner.begin_shutdown();
         }
-        for (session_id, queued_messages) in durable_queues {
-            if let Err(error) = session_store
-                .update(&session_id, move |record| {
-                    record.queued_messages = queued_messages
-                })
-                .await
-            {
-                eprintln!(
-                    "TYDE CONFORMANCE RESTART QUEUE RESTORE session={} error={}",
-                    session_id.0, error
-                );
-            }
+        for handle in self
+            .restart
+            .agents
+            .lock()
+            .expect("restart handles mutex poisoned")
+            .iter()
+        {
+            handle.kill_for_restart();
         }
-        self.shutdown_spawn_operations().await;
     }
 
     pub async fn force_agent_backend_shutdown_for_conformance(&self, agent_id: &AgentId) -> bool {
@@ -2219,6 +2231,16 @@ impl HostHandle {
         });
         self.state.lock().await.agent_name_test_gate = Some(Arc::clone(&inner));
         InstalledAgentNameGate { inner }
+    }
+
+    pub fn install_restart_stop_test_gate(&self) -> InstalledSpawnOperationTestGate {
+        let gate = new_spawn_operation_test_gate();
+        *self
+            .restart
+            .stop_test_gate
+            .lock()
+            .expect("restart stop test gate mutex poisoned") = Some(Arc::clone(&gate.inner));
+        gate
     }
 
     pub fn install_spawn_operation_completion_test_gate(&self) -> InstalledSpawnOperationTestGate {
@@ -3375,6 +3397,94 @@ impl HostHandle {
             })
     }
 
+    fn register_restart_handle(&self, handle: &AgentHandle) {
+        let mut agents = self
+            .restart
+            .agents
+            .lock()
+            .expect("restart handles mutex poisoned");
+        agents.retain(|agent| !agent.actor_finished());
+        if self.restart.stopped.is_cancelled() {
+            handle.kill_for_restart();
+        } else {
+            agents.push(handle.clone());
+        }
+    }
+
+    pub async fn shutdown_for_restart(&self) {
+        let mut complete = self.restart.complete.subscribe();
+        if !self
+            .restart
+            .started
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            self.restart.stopped.cancel();
+            if let Some(owner) = self.spawn_operations.owner.upgrade() {
+                owner.begin_shutdown();
+            }
+            let host = self.clone();
+            tokio::spawn(async move {
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(25);
+                let handles = host
+                    .restart
+                    .agents
+                    .lock()
+                    .expect("restart handles mutex poisoned")
+                    .clone();
+                let control = host
+                    .restart
+                    .control
+                    .get()
+                    .expect("host MCP initialized before serving");
+                let graceful = async {
+                    futures_util::future::join_all(
+                        handles.iter().map(|handle| handle.prepare_restart()),
+                    )
+                    .await;
+                    control.expire_await_requests();
+                    #[cfg(feature = "test-support")]
+                    {
+                        let gate = host
+                            .restart
+                            .stop_test_gate
+                            .lock()
+                            .expect("restart stop test gate mutex poisoned")
+                            .clone();
+                        if let Some(gate) = gate {
+                            wait_for_spawn_operation_test_gate_inner(&gate).await;
+                        }
+                    }
+                    futures_util::future::join_all(
+                        handles.iter().map(|handle| handle.stop_for_restart()),
+                    )
+                    .await;
+                    host.shutdown_spawn_operations().await;
+                };
+                if tokio::time::timeout_at(deadline, graceful).await.is_err() {
+                    tracing::warn!(
+                        agents = handles.len(),
+                        "host restart shutdown exhausted its shared budget"
+                    );
+                }
+                control.expire_await_requests();
+                for handle in &handles {
+                    handle.kill_for_restart();
+                }
+                tracing::info!(
+                    agents = handles.len(),
+                    "host restart shutdown completed; owned process scopes sealed"
+                );
+                host.restart.complete.send_replace(true);
+            });
+        }
+        while !*complete.borrow_and_update() {
+            if complete.changed().await.is_err() {
+                tracing::error!("host restart completion channel closed");
+                return;
+            }
+        }
+    }
+
     pub async fn shutdown_spawn_operations(&self) {
         if let Some(owner) = self.spawn_operations.owner.upgrade() {
             owner.shutdown().await;
@@ -4404,6 +4514,12 @@ impl HostHandle {
         mut payload: SpawnAgentPayload,
         context: SpawnAgentContext,
     ) -> AppResult<AgentId> {
+        if self.restart.stopped.is_cancelled() {
+            return Err(AppError::internal(
+                "spawn_agent",
+                anyhow!("host is stopping for restart"),
+            ));
+        }
         let SpawnAgentContext {
             mut origin,
             resolved_spawn_config_override,
@@ -4725,7 +4841,7 @@ impl HostHandle {
                         name,
                         persistence: InitialAgentAliasPersistence::User,
                     });
-                    return Ok(self
+                    return self
                         .spawn_resolved_agent(ResolvedSpawnRequest {
                             name: resolved_name,
                             origin,
@@ -4767,7 +4883,7 @@ impl HostHandle {
                             use_mock_backend,
                             mock_launch: None,
                         })
-                        .await);
+                        .await;
                 };
                 if !session_record_is_resumable(&record, &backend_storage) {
                     let resolved_name = payload
@@ -4780,7 +4896,7 @@ impl HostHandle {
                         name,
                         persistence: InitialAgentAliasPersistence::User,
                     });
-                    return Ok(self
+                    return self
                         .spawn_resolved_agent(ResolvedSpawnRequest {
                             name: resolved_name,
                             origin,
@@ -4819,7 +4935,7 @@ impl HostHandle {
                             use_mock_backend,
                             mock_launch: None,
                         })
-                        .await);
+                        .await;
                 }
                 if record.parent_id.is_some() && record.parent_id != parent_session_id {
                     return Err(AppError::conflict(
@@ -5067,7 +5183,7 @@ impl HostHandle {
                     });
                     let mut resolved_spawn_config = ResolvedSpawnConfig::failed_startup();
                     resolved_spawn_config.access_mode = access_mode.unwrap_or_default();
-                    return Ok(self
+                    return self
                         .spawn_resolved_agent(ResolvedSpawnRequest {
                             name: resolved_name,
                             origin: AgentOrigin::User,
@@ -5104,7 +5220,7 @@ impl HostHandle {
                             use_mock_backend,
                             mock_launch: None,
                         })
-                        .await);
+                        .await;
                 };
                 tracing::warn!(
                     from_session_id = %from_session_id,
@@ -5434,6 +5550,12 @@ impl HostHandle {
             let usage_limits_rx = state.usage_limits_tx.subscribe();
             let supervisor_use_mock_backend = state.use_mock_backend;
             let supervisor_compaction_tx = state.supervisor_compaction_tx.clone();
+            if self.restart.stopped.is_cancelled() {
+                return Err(AppError::internal(
+                    "spawn_agent",
+                    anyhow!("host is stopping for restart"),
+                ));
+            }
             let spawned = state.registry.spawn(
                 request,
                 &agent_control_mcp,
@@ -5457,6 +5579,7 @@ impl HostHandle {
                     .spawn_publication_claims
                     .insert(spawned.start.agent_id.clone(), terminal_claim.clone());
             }
+            self.register_restart_handle(&spawned.handle);
             (
                 spawned.start,
                 spawned.handle,
@@ -5840,7 +5963,7 @@ impl HostHandle {
         request
     }
 
-    async fn spawn_resolved_agent(&self, request: ResolvedSpawnRequest) -> AgentId {
+    async fn spawn_resolved_agent(&self, request: ResolvedSpawnRequest) -> AppResult<AgentId> {
         let request = self.apply_complexity_tier_settings(request).await;
         let request = self.resolve_backend_launch(request).await;
         tracing::info!(
@@ -5881,6 +6004,12 @@ impl HostHandle {
             let usage_limits_rx = state.usage_limits_tx.subscribe();
             let supervisor_use_mock_backend = state.use_mock_backend;
             let supervisor_compaction_tx = state.supervisor_compaction_tx.clone();
+            if self.restart.stopped.is_cancelled() {
+                return Err(AppError::internal(
+                    "spawn_agent",
+                    anyhow!("host is stopping for restart"),
+                ));
+            }
             let spawned = state.registry.spawn(
                 request,
                 &agent_control_mcp,
@@ -5899,6 +6028,7 @@ impl HostHandle {
                     backend_storage,
                 },
             );
+            self.register_restart_handle(&spawned.handle);
             (
                 spawned.start,
                 spawned.handle,
@@ -5920,7 +6050,7 @@ impl HostHandle {
 
         let fanout_started = visibility.begin_fanout();
         if !fanout_started {
-            return agent_id;
+            return Ok(agent_id);
         }
         let mut host_streams = {
             let mut state = self.state.lock().await;
@@ -6020,7 +6150,7 @@ impl HostHandle {
             &agent_id,
         );
         if cleanup_requested {
-            return agent_id;
+            return Ok(agent_id);
         }
 
         if let Some(project_id) = start.project_id.clone()
@@ -6041,7 +6171,7 @@ impl HostHandle {
             name = %start.name,
             "host spawn_agent completed"
         );
-        agent_id
+        Ok(agent_id)
     }
 
     pub(crate) async fn create_project(&self, payload: ProjectCreatePayload) -> AppResult<()> {
@@ -11125,7 +11255,7 @@ impl HostHandle {
             use_mock_backend,
             mock_launch: None,
         };
-        let coordinator_agent_id = self.spawn_resolved_agent(request).await;
+        let coordinator_agent_id = self.spawn_resolved_agent(request).await?;
         self.workflow_note_agent(&run_id, coordinator_agent_id.clone(), true)
             .await
             .map_err(|error| {
@@ -11832,6 +11962,9 @@ impl HostHandle {
             let mut state = self.state.lock().await;
             let session_summary_count_tx = state.session_summary_count_tx.clone();
             let transcript_store = state.transcript_store.clone();
+            if self.restart.stopped.is_cancelled() {
+                return Err("host is stopping for restart".to_owned());
+            }
             let spawned = state.registry.spawn_relay(
                 relay_request,
                 RelayEventReceivers {
@@ -11845,6 +11978,7 @@ impl HostHandle {
                     session_summary_count_tx,
                 },
             );
+            self.register_restart_handle(&spawned.handle);
             state
                 .agent_sessions
                 .insert(spawned.start.agent_id.clone(), session_id.clone());
@@ -13355,7 +13489,10 @@ impl HostHandle {
             use_mock_backend,
             mock_launch: None,
         };
-        let agent_id = self.spawn_resolved_agent(request).await;
+        let agent_id = self
+            .spawn_resolved_agent(request)
+            .await
+            .map_err(|error| error.message)?;
         tracing::info!(
             review_id = %review_id,
             project_id = %project_id,
@@ -14848,6 +14985,7 @@ fn spawn_host_inner(
         owner: Arc::downgrade(&spawn_operations),
     };
     let host = HostHandle {
+        restart: Arc::new(RestartShutdown::default()),
         state: Arc::new(Mutex::new(HostState {
             registry: AgentRegistry::new(),
             supervisor_compaction_tx,
@@ -14959,6 +15097,7 @@ fn spawn_host_inner(
 
     let spawn_operation_worker = spawn_host_spawn_operation_task(
         WeakHostHandle {
+            restart: Arc::downgrade(&host.restart),
             state: Arc::downgrade(&host.state),
             workflow_save_lock: Arc::downgrade(&host.workflow_save_lock),
             backend_setup_refresh_lock: Arc::downgrade(&host.backend_setup_refresh_lock),
@@ -14994,6 +15133,7 @@ fn spawn_host_inner(
     };
     spawn_agent_turn_state_fanout_task(
         WeakHostHandle {
+            restart: Arc::downgrade(&host.restart),
             state: Arc::downgrade(&host.state),
             workflow_save_lock: Arc::downgrade(&host.workflow_save_lock),
             backend_setup_refresh_lock: Arc::downgrade(&host.backend_setup_refresh_lock),
@@ -15043,7 +15183,10 @@ fn spawn_host_inner(
     host.state
         .try_lock()
         .expect("newly created host state must be unlocked")
-        .agent_control_mcp = agent_control_mcp;
+        .agent_control_mcp = agent_control_mcp.clone();
+    if host.restart.control.set(agent_control_mcp).is_err() {
+        return Err("restart MCP handle already initialized".to_owned());
+    }
 
     let config_mcp = match crate::config_mcp::start_server(None, host.clone()) {
         Ok(handle) => handle,
@@ -15279,6 +15422,9 @@ impl HostHandle {
         let mut restored_agent_ids = HashMap::<SessionId, AgentId>::new();
 
         while !records.is_empty() {
+            if self.restart.stopped.is_cancelled() {
+                return Ok(());
+            }
             // Parents first, so a child's ephemeral parent agent id can be
             // rebuilt from its durable parent session id.
             let index = match records.iter().position(|record| {

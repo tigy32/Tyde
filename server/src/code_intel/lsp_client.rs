@@ -28,7 +28,7 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
-use command_group::{AsyncCommandGroup, AsyncGroupChild};
+use crate::backend::subprocess::{AsyncCommandGroup, AsyncGroupChild};
 use serde_json::{Value, json};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{Mutex, mpsc, oneshot};
@@ -340,21 +340,9 @@ impl LspClient {
             .group_spawn()
             .map_err(|e| format!("failed to spawn language server {binary:?}: {e}"))?;
 
-        let stdin = child
-            .inner()
-            .stdin
-            .take()
-            .ok_or("failed to capture stdin")?;
-        let stdout = child
-            .inner()
-            .stdout
-            .take()
-            .ok_or("failed to capture stdout")?;
-        let stderr = child
-            .inner()
-            .stderr
-            .take()
-            .ok_or("failed to capture stderr")?;
+        let stdin = child.take_stdin().ok_or("failed to capture stdin")?;
+        let stdout = child.take_stdout().ok_or("failed to capture stdout")?;
+        let stderr = child.take_stderr().ok_or("failed to capture stderr")?;
 
         let stderr_capture = Arc::new(Mutex::new(StderrCapture::default()));
         let stderr_capture_for_task = stderr_capture.clone();
@@ -684,7 +672,7 @@ async fn collect_exit_status(process: &LspProcessDiagnostics) -> Option<String> 
         let status = {
             let mut guard = process.child.lock().await;
             match guard.as_mut() {
-                Some(child) => child.inner().try_wait(),
+                Some(child) => child.try_wait(),
                 None => return None,
             }
         };

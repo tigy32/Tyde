@@ -1447,6 +1447,9 @@ fn context_compaction_marker_view(event: &ContextCompactionTimelineEvent) -> imp
 fn ChatNoticeView(notice: ArcRwSignal<ChatNotice>) -> impl IntoView {
     view! {
         {move || match notice.get() {
+            ChatNotice::RestartRecovery(phase) => view! {
+                <div class="chat-card chat-card-system"><div class="chat-card-body"><p>{phase.notice_text()}</p></div></div>
+            }.into_any(),
             ChatNotice::GoalCompleted(goal) => view! {
                 <div class="chat-card chat-card-system" data-test="goal-completed">
                     <div class="chat-card-header"><span class="chat-card-sender">"Goal completed"</span></div>
@@ -1912,6 +1915,50 @@ mod wasm_tests {
             .unwrap();
         document.body().unwrap().append_child(&container).unwrap();
         container.dyn_into::<HtmlElement>().unwrap()
+    }
+
+    #[wasm_bindgen_test]
+    async fn restart_notices_render_each_server_phase() {
+        use protocol::{RestartInterruptionCause as Cause, RestartRecoveryPhase as Phase};
+        let container = make_container();
+        let notice = ArcRwSignal::new(ChatNotice::RestartRecovery(Phase::Interrupted {
+            cause: Cause::HostRestart,
+        }));
+        let for_view = notice.clone();
+        let handle = mount_to(
+            container.clone(),
+            move || view! { <ChatNoticeView notice=for_view /> },
+        );
+        for (phase, expected) in [
+            (
+                Phase::Interrupted {
+                    cause: Cause::HostRestart,
+                },
+                "This turn was interrupted because the host restarted.",
+            ),
+            (
+                Phase::Interrupted {
+                    cause: Cause::UnexpectedStop,
+                },
+                "This turn was interrupted because the host stopped unexpectedly.",
+            ),
+            (
+                Phase::Continuing,
+                "Continuing the interrupted turn after restart.",
+            ),
+            (
+                Phase::ContinuationFailed {
+                    message: "Backend unavailable".to_owned(),
+                },
+                "Could not continue the interrupted turn: Backend unavailable",
+            ),
+        ] {
+            notice.set(ChatNotice::RestartRecovery(phase));
+            next_tick().await;
+            assert_eq!(container.text_content().unwrap().trim(), expected);
+        }
+        drop(handle);
+        container.remove();
     }
 
     fn message_rows(container: &HtmlElement) -> Vec<Element> {

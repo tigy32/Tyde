@@ -130,8 +130,16 @@ impl AgentStatus {
     }
 }
 
+struct RecoveryBinding {
+    store: Arc<crate::store::session::SessionStoreHandle>,
+    id: SessionId,
+}
+
 #[derive(Clone)]
 pub(crate) struct AgentStatusHandle {
+    recovery_binding: Arc<Mutex<Option<RecoveryBinding>>>,
+    restarting: Arc<std::sync::atomic::AtomicBool>,
+    restart_requested: tokio_util::sync::CancellationToken,
     agent_id: AgentId,
     status: Arc<Mutex<AgentStatus>>,
     status_change_tx: watch::Sender<u64>,
@@ -147,12 +155,77 @@ impl AgentStatusHandle {
         transition_tx: broadcast::Sender<AgentStatusTransition>,
     ) -> Self {
         Self {
+            recovery_binding: Arc::new(Mutex::new(None)),
+            restarting: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            restart_requested: tokio_util::sync::CancellationToken::new(),
             agent_id,
             status: Arc::new(Mutex::new(AgentStatus::default())),
             status_change_tx,
             status_change_counter,
             transition_tx,
         }
+    }
+
+    pub async fn bind_recovery(
+        &self,
+        store: Arc<crate::store::session::SessionStoreHandle>,
+        id: SessionId,
+    ) {
+        *self.recovery_binding.lock().await = Some(RecoveryBinding { store, id });
+    }
+
+    pub async fn persist_recovery(&self, marker: Option<crate::store::session::TurnRecovery>) {
+        let binding = self.recovery_binding.lock().await;
+        if let Some(RecoveryBinding { store, id }) = binding.as_ref() {
+            let restarting = self.restarting.load(Ordering::Acquire);
+            if restarting
+                && marker != Some(crate::store::session::TurnRecovery::InterruptedByRestart)
+            {
+                return;
+            }
+            if let Err(error) = store
+                .update(id, move |record| record.turn_recovery = marker)
+                .await
+            {
+                tracing::error!(%error, "cannot persist turn recovery state");
+                self.update(|status| {
+                    status.last_error = Some(format!("Cannot persist turn recovery state: {error}"))
+                })
+                .await;
+            }
+        }
+    }
+
+    pub async fn prepare_restart(&self) {
+        self.restarting.store(true, Ordering::Release);
+        let binding = self.recovery_binding.lock().await;
+        if let Some(RecoveryBinding { store, id }) = binding.as_ref()
+            && let Err(error) = store
+                .update(id, |record| {
+                    if record.turn_recovery.is_some() {
+                        record.turn_recovery =
+                            Some(crate::store::session::TurnRecovery::InterruptedByRestart);
+                    }
+                })
+                .await
+        {
+            tracing::error!(%error, "cannot persist restart interruption");
+            self.update(|status| {
+                status.last_error = Some(format!("Cannot persist restart interruption: {error}"))
+            })
+            .await;
+        }
+        self.restart_requested.cancel();
+    }
+
+    pub async fn wait_for_restart(&self) {
+        self.restart_requested.cancelled().await;
+    }
+
+    /// A restart stop has begun for this agent, so no new backend work may
+    /// start even if its current turn ends before the stop command arrives.
+    pub fn restarting(&self) -> bool {
+        self.restarting.load(Ordering::Acquire)
     }
 
     pub async fn update<F>(&self, update: F)

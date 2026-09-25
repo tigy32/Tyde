@@ -320,7 +320,7 @@ impl MockBackend {
         let controlled_resume_replay = resume_replay.clone();
         let replay_tx = events_tx.clone();
         let replay_session_id = session_id.clone();
-        tokio::spawn(async move {
+        crate::backend::subprocess::spawn(async move {
             if let Some((replay, _)) = &resume_continuation {
                 replay.wait().await;
             }
@@ -713,7 +713,7 @@ impl Backend for MockBackend {
         let active_compaction = Arc::clone(&self.active_compaction);
         let session_id = self.session_id.clone();
         let observation_gates = self.compaction_observation_gates.clone();
-        tokio::spawn(async move {
+        crate::backend::subprocess::spawn(async move {
             tokio::task::yield_now().await;
             let _ = events_tx.send_compaction(BackendCompactionEvent::Progress(
                 BackendCompactionProgress {

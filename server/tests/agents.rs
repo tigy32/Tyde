@@ -5337,6 +5337,84 @@ async fn agent_control_await_endpoint_isolated_and_remains_pending() {
 }
 
 #[tokio::test]
+async fn agent_control_await_cut_short_by_host_restart_reports_typed_host_stopping() {
+    let mut fixture = Fixture::new().await;
+    let parent = spawn_agent_control_parent(&mut fixture, "restart-await-parent").await;
+    let caller = fixture.agent_control_caller(&parent.agent_id).await;
+    let reservation = fixture
+        .reserve_next_mock_launch(
+            "restart-await-child",
+            MockScript::one(MockTurn::held_text("restart await holding")),
+        )
+        .await;
+    let held_child = mcp_spawn_agent_as(
+        &caller,
+        json!({
+            "workspace_roots": ["/tmp/restart-await-child"],
+            "prompt": "restart await",
+            "backend_kind": "claude",
+            "name": "restart-await-child"
+        }),
+    )
+    .await;
+    drop(reservation);
+    expect_replayed_new_agent(
+        &mut fixture.client,
+        &held_child,
+        "restart await child NewAgent",
+    )
+    .await;
+
+    let pending = mcp_tool_call_as(
+        &caller,
+        true,
+        "tyde_await_agents",
+        json!({ "agent_ids": [held_child.0] }),
+    );
+    tokio::pin!(pending);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), &mut pending)
+            .await
+            .is_err(),
+        "await must stay parked while the child is still thinking"
+    );
+
+    let stop_gate = fixture.install_restart_stop_test_gate();
+    let host = fixture.host_for_test();
+    let shutdown = tokio::spawn(async move {
+        host.shutdown_for_restart().await;
+    });
+    stop_gate.wait_until_entered().await;
+    let response = tokio::time::timeout(Duration::from_secs(5), &mut pending)
+        .await
+        .expect("the restart must end the parked await before agents are stopped");
+    assert!(
+        mcp_result_is_error(&response),
+        "an await the host cut short did not complete: {response}"
+    );
+    let payload: Value = serde_json::from_str(mcp_result_text(&response))
+        .unwrap_or_else(|_| panic!("host-stopped await must return a typed payload: {response}"));
+    assert_eq!(
+        payload["code"],
+        json!("host_stopping"),
+        "the orchestrator must be able to tell a restart apart from a failed await: {payload}"
+    );
+    let message = payload["message"]
+        .as_str()
+        .unwrap_or_else(|| panic!("host-stopped await must explain itself: {payload}"));
+    assert!(
+        message.contains("restart") && message.contains("tyde_await_agents"),
+        "the orchestrator must be told to re-issue its await after the restart: {message}"
+    );
+
+    stop_gate.release_one();
+    tokio::time::timeout(Duration::from_secs(27), shutdown)
+        .await
+        .expect("restart shutdown must finish within its bounded budget")
+        .expect("restart shutdown task");
+}
+
+#[tokio::test]
 async fn agent_control_http_await_emits_progress_notifications() {
     let mut fixture = Fixture::new().await;
     let parent = spawn_agent_control_parent(&mut fixture, "await-progress-parent").await;

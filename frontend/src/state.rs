@@ -3100,6 +3100,7 @@ pub struct TerminalInfo {
 /// honest projection is a row at the point they occurred.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ChatNotice {
+    RestartRecovery(protocol::RestartRecoveryPhase),
     GoalCompleted(protocol::NativeGoal),
     OperationCancelled {
         message: String,

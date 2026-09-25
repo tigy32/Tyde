@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::sync::LazyLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use command_group::{AsyncCommandGroup, AsyncGroupChild};
+use crate::backend::subprocess::{AsyncCommandGroup, AsyncGroupChild};
 use protocol::{
     AgentInput, BackendAccessMode, BackendKind, CapacityBucket, CapacityBucketId, CapacityCoverage,
     CapacityMeasure, CapacityReport, CapacityReset, CapacityScope, CapacitySource,
@@ -294,23 +294,17 @@ impl AgyProcess {
             .group_spawn()
             .map_err(|err| format!("Failed to start Antigravity CLI: {err:?}"))?;
         let stdin = child
-            .inner()
-            .stdin
-            .take()
+            .take_stdin()
             .ok_or_else(|| "Failed to capture Antigravity stdin".to_string())?;
         let stdout = child
-            .inner()
-            .stdout
-            .take()
+            .take_stdout()
             .ok_or_else(|| "Failed to capture Antigravity stdout".to_string())?;
         let stderr = child
-            .inner()
-            .stderr
-            .take()
+            .take_stderr()
             .ok_or_else(|| "Failed to capture Antigravity stderr".to_string())?;
 
         let (frames_tx, mut frames_rx) = mpsc::unbounded_channel();
-        tokio::spawn(async move {
+        crate::backend::subprocess::spawn(async move {
             let mut lines = BufReader::new(stdout).lines();
             loop {
                 match lines.next_line().await {
@@ -334,7 +328,7 @@ impl AgyProcess {
         });
 
         let stderr_emitter = Arc::clone(&emitter);
-        tokio::spawn(async move {
+        crate::backend::subprocess::spawn(async move {
             let mut lines = BufReader::new(stderr).lines();
             while let Ok(Some(line)) = lines.next_line().await {
                 if !line.trim().is_empty() {
@@ -1527,7 +1521,7 @@ impl Supervisor {
             return;
         };
         self.capacity_read_at = Some(std::time::Instant::now());
-        tokio::spawn(async move {
+        crate::backend::subprocess::spawn(async move {
             let state = match read_antigravity_capacity().await {
                 Ok(report) => protocol::BackendCapacityState::Known { report },
                 Err(reason) => protocol::BackendCapacityState::Unavailable { reason },
@@ -2884,8 +2878,9 @@ impl AntigravityBackend {
             None
         };
         // Overlaps with the process start, which itself blocks on `init`.
-        let slash_commands_probe =
-            tokio::spawn(read_antigravity_slash_commands(launch.model.clone()));
+        let slash_commands_probe = crate::backend::subprocess::spawn(
+            read_antigravity_slash_commands(launch.model.clone()),
+        );
         let process = match AgyProcess::start(
             &launch,
             resume.as_ref().map(|id| id.0.as_str()),
@@ -2962,7 +2957,7 @@ impl AntigravityBackend {
             slash_commands,
             relaunch_before_next_turn: false,
         };
-        tokio::spawn(async move {
+        crate::backend::subprocess::spawn(async move {
             supervisor
                 .run(
                     process,
@@ -2988,7 +2983,7 @@ impl AntigravityBackend {
                 .send(BackendEvent::ResumeReplayComplete(Ok(())))
                 .map_err(|_| "Antigravity replay receiver closed")?;
         }
-        tokio::spawn(async move {
+        crate::backend::subprocess::spawn(async move {
             let mut event_rx = event_rx;
             while let Some(raw) = event_rx.recv().await {
                 let Some(event) = map_emitter_event(&raw) else {

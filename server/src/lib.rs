@@ -38,7 +38,7 @@ pub use backend::{acp, antigravity, claude, codex, kiro, subprocess};
 
 #[cfg(unix)]
 pub use acceptor::{BoundUdsListener, bind_uds, serve_uds};
-pub use acceptor::{HandshakeError, accept, listen_uds};
+pub use acceptor::{HandshakeError, accept, host_shutdown_signal, listen_uds};
 #[cfg(feature = "test-support")]
 pub use agent::take_duplicate_tool_completion_count;
 #[cfg(feature = "test-support")]

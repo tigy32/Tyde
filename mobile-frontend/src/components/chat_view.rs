@@ -21,14 +21,23 @@ const SESSION_HISTORY_PAGE_LIMIT: u32 = 50;
 enum MobileTimelineRow {
     Message(ChatMessageEntry),
     ContextCompaction(protocol::ContextCompactionTimelineEvent),
+    RestartRecovery(protocol::RestartRecoveryPhase),
 }
 
 fn merge_timeline_rows(
     messages: Vec<ChatMessageEntry>,
     markers: Vec<PositionedCompactionMarker>,
+    notices: Vec<crate::state::PositionedRestartNotice>,
 ) -> Vec<MobileTimelineRow> {
     let mut rows = Vec::with_capacity(messages.len().saturating_add(markers.len()));
     for message_index in 0..=messages.len() {
+        rows.extend(
+            notices
+                .iter()
+                .filter(|notice| notice.message_index == message_index)
+                .map(|notice| MobileTimelineRow::RestartRecovery(notice.phase.clone())),
+        );
+
         rows.extend(
             markers
                 .iter()
@@ -912,7 +921,8 @@ pub fn ChatView() -> impl IntoView {
                         m.get(&key).cloned().unwrap_or_default()
                     });
                     let prior_history = s_body.session_history.with(|m| m.get(&key).cloned());
-                    let shown = merge_timeline_rows(messages.clone(), markers.clone());
+                    let notices = s_body.restart_notices.with(|m| m.get(&key).cloned().unwrap_or_default());
+                    let shown = merge_timeline_rows(messages.clone(), markers.clone(), notices);
                     let load_state = s_body.clone();
                     let load_key = key.clone();
                     let load_stream = s_body.agents.with(|agents| {
@@ -990,8 +1000,7 @@ pub fn ChatView() -> impl IntoView {
                     let goal_state = s_body.clone();
                     let transient = s_body.transient_events.with(|m| m.get(&key).cloned().unwrap_or_default());
 
-                    let no_content = messages.is_empty()
-                        && markers.is_empty()
+                    let no_content = shown.is_empty()
                         && prior_history.is_none()
                         && streaming.is_none()
                         && task_list.is_none()
@@ -1154,7 +1163,8 @@ pub fn ChatView() -> impl IntoView {
                                             <ChatMessageView owner_agent_ref=owner_agent_ref entry=entry />
                                         }.into_any()
                                     }
-                                    MobileTimelineRow::ContextCompaction(event) => view! {
+                                    MobileTimelineRow::RestartRecovery(phase) => view! { <div class="chat-card chat-card-system">{phase.notice_text()}</div> }.into_any(),
+                                        MobileTimelineRow::ContextCompaction(event) => view! {
                                         <ContextCompactionMarkerView event=event />
                                     }.into_any(),
                                 }
@@ -3389,6 +3399,71 @@ mod wasm_tests {
                 .is_some(),
             "retry transient selector must render"
         );
+    }
+
+    #[wasm_bindgen_test]
+    async fn restart_notices_render_all_phases_in_mobile_timeline() {
+        use protocol::{RestartInterruptionCause as Cause, RestartRecoveryPhase as Phase};
+        let container = make_container();
+        let handle = mount_to(container.clone(), move || {
+            let host = LocalHostId("restart-host".to_owned());
+            let state = AppState::new();
+            seed_connected_agent(&state, &host);
+            state.restart_notices.update(|map| {
+                map.insert(
+                    AgentRef {
+                        local_host_id: host,
+                        agent_id: AgentId("agent-1".to_owned()),
+                    },
+                    [
+                        Phase::Interrupted {
+                            cause: Cause::HostRestart,
+                        },
+                        Phase::Interrupted {
+                            cause: Cause::UnexpectedStop,
+                        },
+                        Phase::Continuing,
+                        Phase::ContinuationFailed {
+                            message: "Backend unavailable".to_owned(),
+                        },
+                    ]
+                    .into_iter()
+                    .map(|phase| crate::state::PositionedRestartNotice {
+                        message_index: 0,
+                        phase,
+                    })
+                    .collect(),
+                );
+            });
+            provide_context(state);
+            view! { <ChatView /> }
+        });
+        next_tick().await;
+        let text = container.text_content().unwrap();
+        web_sys::console::log_1(
+            &format!(
+                "restart timeline has notices={}, empty_state={}",
+                container
+                    .query_selector_all(".chat-card-system")
+                    .unwrap()
+                    .length(),
+                text.contains("Conversation is empty")
+            )
+            .into(),
+        );
+        for expected in [
+            "This turn was interrupted because the host restarted.",
+            "This turn was interrupted because the host stopped unexpectedly.",
+            "Continuing the interrupted turn after restart.",
+            "Could not continue the interrupted turn: Backend unavailable",
+        ] {
+            assert!(
+                text.contains(expected),
+                "mobile timeline omitted a restart notice"
+            );
+        }
+        drop(handle);
+        container.remove();
     }
 
     /// The default edge-swipe (start near the right edge, travel left past the

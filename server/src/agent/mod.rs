@@ -366,6 +366,9 @@ enum AgentCommand {
     Close {
         reply: oneshot::Sender<()>,
     },
+    StopForRestart {
+        reply: oneshot::Sender<()>,
+    },
     #[cfg(feature = "test-support")]
     ForceBackendShutdownForConformance {
         reply: oneshot::Sender<bool>,
@@ -535,7 +538,7 @@ fn arm_context_compaction_retry(
     flight.retry_attempt = flight.retry_attempt.saturating_add(1);
     let operation_id = flight.operation_id.clone();
     let tx = actor_tx.clone();
-    tokio::spawn(async move {
+    crate::backend::subprocess::spawn(async move {
         tokio::time::sleep(delay).await;
         let _ = tx.send(AgentCommand::RetryContextCompaction { operation_id });
     });
@@ -626,6 +629,9 @@ struct ReplayActiveStream {
 
 #[derive(Clone)]
 pub(crate) struct AgentHandle {
+    processes: crate::backend::subprocess::ProcessOwner,
+    actor_abort: tokio::task::AbortHandle,
+    actor_status: registry::AgentStatusHandle,
     tx: mpsc::UnboundedSender<AgentCommand>,
     accepting_input: Arc<AtomicBool>,
     closing: Arc<AtomicBool>,
@@ -832,6 +838,7 @@ impl AgentActivityStatsTracker {
             | ChatEvent::GoalCompleted(_)
             | ChatEvent::SlashCommandsChanged(_)
             | ChatEvent::TaskUpdate(_)
+            | ChatEvent::RestartRecovery { .. }
             | ChatEvent::OperationCancelled(_)
             | ChatEvent::RetryAttempt(_)
             | ChatEvent::Orchestration(_) => {}
@@ -1642,6 +1649,29 @@ impl AgentHandle {
         reply_rx
             .await
             .unwrap_or(crate::backend::CancelBackgroundTaskOutcome::NotTracked)
+    }
+
+    pub async fn prepare_restart(&self) {
+        self.accepting_input.store(false, Ordering::SeqCst);
+        self.closing.store(true, Ordering::SeqCst);
+        self.actor_status.prepare_restart().await;
+    }
+
+    pub async fn stop_for_restart(&self) {
+        self.prepare_restart().await;
+        let (reply, done) = oneshot::channel();
+        if self.tx.send(AgentCommand::StopForRestart { reply }).is_ok() {
+            let _ = done.await;
+        }
+    }
+
+    pub fn actor_finished(&self) -> bool {
+        self.actor_abort.is_finished()
+    }
+
+    pub fn kill_for_restart(&self) {
+        self.processes.kill_all();
+        self.actor_abort.abort();
     }
 
     pub async fn close(&self) -> bool {
@@ -2727,7 +2757,11 @@ pub(crate) fn spawn_agent_actor(
     let (start_tx, start_rx) = watch::channel(start.clone());
     let actor_tx = tx.clone();
 
-    tokio::spawn(async move {
+    let processes = crate::backend::subprocess::ProcessOwner::default();
+    let actor_processes = processes.clone();
+    let actor_status = status_handle.clone();
+    let actor_task = crate::backend::subprocess::spawn(async move {
+        actor_processes.scope(async move {
         let ResolvedSpawnRequest {
             parent_session_id,
             backend_kind,
@@ -2806,6 +2840,10 @@ pub(crate) fn spawn_agent_actor(
                 resolved_spawn_config,
             },
         );
+        let resume_recovery = match resume_session_id.as_ref() {
+            Some(session_id) => session_store.get(session_id).await.and_then(|record| record.turn_recovery),
+            None => None,
+        };
         let persisted_queue = if let Some(session_id) = resume_session_id.as_ref() {
             session_store
                 .get(session_id)
@@ -2815,6 +2853,9 @@ pub(crate) fn spawn_agent_actor(
         } else {
             Vec::new()
         };
+        if let Some(session_id) = resume_session_id.as_ref() {
+            status_handle.bind_recovery(Arc::clone(&session_store), session_id.clone()).await;
+        }
         let mut queue = persisted_queue
             .into_iter()
             .enumerate()
@@ -2945,12 +2986,18 @@ pub(crate) fn spawn_agent_actor(
             crate::backend::startup_drop_cancels_workers(backend_kind);
         let mut pending_startup_attaches: Vec<(Stream, oneshot::Sender<bool>)> = Vec::new();
         let startup_result = loop {
-            match next_agent_startup_event(
-                startup_future.as_mut(),
-                &mut rx,
-                startup_cancellation_supported,
-            )
-            .await
+            let startup_event = tokio::select! {
+                biased;
+                _ = status_handle.wait_for_restart() => {
+                    tracing::info!("stopping backend startup for host restart");
+                    let _ = startup_tx.send(Err("host stopped during startup".to_owned()));
+                    return;
+                }
+                event = next_agent_startup_event(
+                    startup_future.as_mut(), &mut rx, startup_cancellation_supported,
+                ) => event,
+            };
+            match startup_event
             {
                 AgentStartupEvent::Completed(result) => break result,
                 AgentStartupEvent::Command(command) => {
@@ -2970,6 +3017,13 @@ pub(crate) fn spawn_agent_actor(
                             );
                             let _ = reply.send(InterruptOutcome::Interrupted);
                             break Err(AgentStartupFailure::internal("agent startup interrupted"));
+                        }
+                        AgentCommand::StopForRestart { reply } => {
+                            accepting_input_task.store(false, Ordering::SeqCst);
+                            status_handle.prepare_restart().await;
+                            let _ = startup_tx.send(Err("host stopped during startup".to_owned()));
+                            let _ = reply.send(());
+                            return;
                         }
                         AgentCommand::Close { reply } => {
                             tracing::debug!(
@@ -3249,6 +3303,7 @@ pub(crate) fn spawn_agent_actor(
             VecDeque::new();
         let mut compaction_blocked = false;
         current_session_id = Some(actor_session_id.clone());
+        status_handle.bind_recovery(Arc::clone(&session_store), actor_session_id.clone()).await;
         replay_state.journal = Some(transcript_store.open_session(&actor_session_id));
         replay_state.journal_agent_id = Some(current_start.agent_id.clone());
         current_start.session_id = Some(actor_session_id.clone());
@@ -3415,6 +3470,9 @@ pub(crate) fn spawn_agent_actor(
             .await;
         }
 
+        if starts_with_initial_turn {
+            mark_agent_turn_active(&status_handle).await;
+        }
         let mut initial_follow_up = initial_follow_up.filter(|input| {
             !input.message.trim().is_empty()
                 || input
@@ -4005,7 +4063,7 @@ pub(crate) fn spawn_agent_actor(
                                     .begin_verdict(supervisor_settings.settings, attempts_started);
                                 let verdict_tx = supervisor_verdict_tx.clone();
                                 let launched_at = supervisor_status.activity_counter;
-                                tokio::spawn(async move {
+                                crate::backend::subprocess::spawn(async move {
                                     let result = match tokio::time::timeout(
                                         supervisor::SUPERVISION_GENERATION_TIMEOUT,
                                         supervisor::generate_supervision_verdict(request),
@@ -4494,6 +4552,12 @@ pub(crate) fn spawn_agent_actor(
                             resume_replay_gate_pending = false;
                             match result {
                                 Ok(()) => {
+                                    if let Some(recovery) = resume_recovery {
+                                        append_chat_event(
+                                            &canonical_stream, &mut event_log, &mut subscribers, &mut replay_state,
+                                            &ChatEvent::RestartRecovery { phase: protocol::RestartRecoveryPhase::Interrupted { cause: recovery.cause() } },
+                                        ).await;
+                                    }
                                     for tool_call_id in unanswered_replayed_user_interactions(&event_log) {
                                         tracing::info!(
                                             tool_call_id,
@@ -5176,6 +5240,7 @@ pub(crate) fn spawn_agent_actor(
                             } else if blocked_on_user {
                                 idle_transition_armed = false;
                             } else if in_turn && idle_transition_armed {
+                                status_handle.persist_recovery(None).await;
                                 real_idle_transition = true;
                                 completed_by_idle = true;
                                 in_turn = false;
@@ -5532,6 +5597,7 @@ pub(crate) fn spawn_agent_actor(
                     if real_idle_transition
                         && !resume_replay_gate_pending
                         && !usage_paused
+                        && !status_handle.restarting()
                         && matches!(lifecycle, ActorLifecycle::Running)
                         && !compaction_blocked
                         && !queue.is_empty()
@@ -7058,7 +7124,7 @@ pub(crate) fn spawn_agent_actor(
                             .await;
                             let deadline_operation_id = operation_id.clone();
                             let deadline_tx = actor_tx.clone();
-                            tokio::spawn(async move {
+                            crate::backend::subprocess::spawn(async move {
                                 tokio::time::sleep(barrier_timeout).await;
                                 let _ = deadline_tx.send(
                                     AgentCommand::ContextCompactionBarrierExpired {
@@ -8186,6 +8252,16 @@ pub(crate) fn spawn_agent_actor(
                             .await;
                             return;
                         }
+                        AgentCommand::StopForRestart { reply } => {
+                            accepting_input_task.store(false, Ordering::SeqCst);
+                            status_handle.prepare_restart().await;
+                            if let Some(backend) = backend.take() {
+                                backend.interrupt().await;
+                                backend.shutdown().await;
+                            }
+                            finish_actor_close(&accepting_input_task, &status_handle, reply).await;
+                            return;
+                        }
                         AgentCommand::Close { reply } => {
                             accepting_input_task.store(false, Ordering::SeqCst);
                             if matches!(lifecycle, ActorLifecycle::Closing) {
@@ -8359,10 +8435,14 @@ pub(crate) fn spawn_agent_actor(
                 }
             }
         }
+    }).await;
     });
 
     (
         AgentHandle {
+            processes,
+            actor_abort: actor_task.abort_handle(),
+            actor_status,
             tx,
             accepting_input,
             closing,
@@ -8435,7 +8515,12 @@ pub(crate) fn spawn_relay_agent_actor(
     let closing = Arc::new(AtomicBool::new(false));
     let (start_tx, start_rx) = watch::channel(start.clone());
 
-    tokio::spawn(async move {
+    let processes = crate::backend::subprocess::ProcessOwner::default();
+    let actor_processes = processes.clone();
+    let actor_status = status_handle.clone();
+    let actor_task = crate::backend::subprocess::spawn(async move {
+        actor_processes.scope(async move {
+        status_handle.bind_recovery(Arc::clone(&session_store), session_id.clone()).await;
         let canonical_stream = format!("/agent/{}", agent_id);
         let mut event_log: Vec<Envelope> = Vec::new();
         let mut latest_output = AgentControlLatestOutput::default();
@@ -8679,6 +8764,11 @@ pub(crate) fn spawn_relay_agent_actor(
                         }
                         ChatEvent::TypingStatusChanged(typing) => {
                             let typing = *typing;
+                            if typing && !in_turn {
+                                mark_agent_turn_active(&status_handle).await;
+                            } else if !typing && in_turn && pending_tool_response_ids.is_empty() {
+                                status_handle.persist_recovery(None).await;
+                            }
                             in_turn = typing;
                             status_handle.update(|s| {
                                 s.is_thinking = typing;
@@ -8979,6 +9069,11 @@ pub(crate) fn spawn_relay_agent_actor(
                                 &activity_stats,
                             ));
                         }
+                        AgentCommand::StopForRestart { reply } => {
+                            status_handle.prepare_restart().await;
+                            finish_actor_close(&accepting_input_task, &status_handle, reply).await;
+                            return;
+                        }
                         AgentCommand::Close { reply } => {
                             accepting_input_task.store(false, Ordering::SeqCst);
                             if matches!(lifecycle, ActorLifecycle::Closing) {
@@ -9104,9 +9199,13 @@ pub(crate) fn spawn_relay_agent_actor(
                 }
             }
         }
+    }).await;
     });
 
     AgentHandle {
+        processes,
+        actor_abort: actor_task.abort_handle(),
+        actor_status,
         tx,
         accepting_input,
         closing,
@@ -9879,7 +9978,7 @@ async fn park_terminal_agent(
                 );
                 let _ = reply.send(attached);
             }
-            AgentCommand::Close { reply } => {
+            AgentCommand::Close { reply } | AgentCommand::StopForRestart { reply } => {
                 let _ = reply.send(());
                 break;
             }
@@ -10069,7 +10168,7 @@ async fn park_relay_terminal_agent(
                 );
                 let _ = reply.send(attached);
             }
-            AgentCommand::Close { reply } => {
+            AgentCommand::Close { reply } | AgentCommand::StopForRestart { reply } => {
                 finish_actor_close(accepting_input, status_handle, reply).await;
                 break;
             }
@@ -11423,10 +11522,15 @@ fn remember_slash_commands(latest: &mut Option<protocol::SlashCommandCatalog>, e
 
 async fn mark_agent_turn_active(status_handle: &registry::AgentStatusHandle) {
     status_handle
+        .update(|status| status.last_error = None)
+        .await;
+    status_handle
+        .persist_recovery(Some(crate::store::session::TurnRecovery::InFlight))
+        .await;
+    status_handle
         .update(|status| {
             status.is_thinking = true;
             status.turn_completed = false;
-            status.last_error = None;
             status.activity_counter = status.activity_counter.saturating_add(1);
             // A live turn is the thing a restored transcript was missing, and
             // it is where the supervisor's stall clock starts.
@@ -11723,7 +11827,8 @@ fn record_chat_event_for_replay(
         // Session state, not transcript: the actor holds the latest set for
         // bootstrap, and a logged copy would resurface in history pages.
         ChatEvent::SlashCommandsChanged(_) => {}
-        ChatEvent::MessageAdded(_)
+        ChatEvent::RestartRecovery { .. }
+        | ChatEvent::MessageAdded(_)
         | ChatEvent::GoalCapabilities(_)
         | ChatEvent::GoalChanged(_)
         | ChatEvent::GoalCompleted(_)
@@ -12144,6 +12249,7 @@ fn render_activity_chat_event(event: &ChatEvent) -> Option<String> {
                 ))
             }
         }
+        ChatEvent::RestartRecovery { phase } => Some(phase.notice_text()),
         ChatEvent::OperationCancelled(cancelled) => Some(format!(
             "Operation cancelled: {}",
             cap_activity_text(&cancelled.message, 500)
@@ -12429,7 +12535,7 @@ async fn release_context_compaction_barrier(
     review_registry: &ReviewRegistryHandle,
     usage_paused: bool,
 ) -> QueuedMessageDispatchOutcome {
-    if *in_turn || usage_paused {
+    if *in_turn || usage_paused || status_handle.restarting() {
         return QueuedMessageDispatchOutcome::Empty;
     }
     dispatch_queued_message(QueuedMessageDispatchContext {
@@ -12623,7 +12729,7 @@ async fn begin_inline_context_fallback(
     };
     let operation_id = active.operation_id.clone();
     let tx = context.actor_tx.clone();
-    active.fallback_task = Some(tokio::spawn(async move {
+    active.fallback_task = Some(crate::backend::subprocess::spawn(async move {
         let result = prepare_context_fallback(request).await;
         let _ = tx.send(AgentCommand::ContextCompactionFallbackPrepared {
             operation_id,
@@ -12806,7 +12912,7 @@ async fn try_dispatch_context_compaction(
             }
             let operation_id = accepted.operation_id;
             let tx = context.actor_tx.clone();
-            tokio::spawn(async move {
+            crate::backend::subprocess::spawn(async move {
                 let result = accepted.terminal.await.map_err(|_| {
                     "accepted backend compaction ended without a terminal result".to_owned()
                 });

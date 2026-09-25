@@ -249,7 +249,7 @@ pub fn UpdatePrompt() -> impl IntoView {
             <aside class="app-update-prompt" aria-label="App update">
                 <h2>"Update Tyde?"</h2>
                 <p role="status">{move || status.with(|value| value.as_ref().map(status_text))}</p>
-                <p>"Tyde will download the update, install it, and restart. Local running agents will stop; saved conversations remain in History. Remote servers keep running."</p>
+                <p>"Tyde will download the update, install it, and restart. Local agents will stop cleanly. Interrupted turns continue after restart when Resume previous agents is enabled; queued messages are preserved. Approvals and questions still need your response. Remote servers keep running."</p>
                 <details><summary>"Release notes"</summary><pre>{move || status.with(|value| value.as_ref().and_then(|value| value.notes.clone()).unwrap_or_else(|| "No release notes provided.".into()))}</pre></details>
                 <p role="alert">{move || error.get().or_else(|| status.with(|value| value.as_ref().and_then(|value| value.error.clone())))}</p>
                 <div class="app-update-actions">
@@ -438,12 +438,21 @@ mod wasm_tests {
                 .unwrap()
                 .contains("Tyde 1.1.0 is available")
         );
-        assert!(
-            container
-                .text_content()
-                .unwrap()
-                .contains("Local running agents will stop")
-        );
+        // Consent now promises clean interruption and conditional recovery,
+        // not just termination. Protect every user-visible part of that promise.
+        let consent = container.text_content().unwrap();
+        for statement in [
+            "Local agents will stop cleanly",
+            "Interrupted turns continue after restart when Resume previous agents is enabled",
+            "queued messages are preserved",
+            "Approvals and questions still need your response",
+            "Remote servers keep running",
+        ] {
+            assert!(
+                consent.contains(statement),
+                "update consent omitted a recovery guarantee"
+            );
+        }
         js_sys::eval("for (const callback of window.__tydeUpdateTest.listeners) callback({payload: {...window.__tydeUpdateTest.status, revision: 0, phase: 'idle', prompt: false}})").unwrap();
         tick().await;
         assert!(

@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::{fs, io};
 
-use command_group::{AsyncCommandGroup, AsyncGroupChild};
+use crate::backend::subprocess::{AsyncCommandGroup, AsyncGroupChild};
 use protocol::{
     AgentInput, BackendConfigSnapshotStatus, BackendKind, BackendNativeSettingsSnapshot,
     BackendSetupDiagnosticCode, ChatEvent, ChatMessage, CompactionMethod, CompactionMetrics,
@@ -1370,7 +1370,11 @@ impl Backend for HermesBackend {
             synthetic_subagent_ids: HashMap::new(),
             recent_stderr: VecDeque::new(),
         };
-        tokio::spawn(actor.run(Some(initial_input), None, startup_gateway_events));
+        crate::backend::subprocess::spawn(actor.run(
+            Some(initial_input),
+            None,
+            startup_gateway_events,
+        ));
 
         Ok((
             Self {
@@ -1506,7 +1510,7 @@ impl Backend for HermesBackend {
             synthetic_subagent_ids: HashMap::new(),
             recent_stderr: VecDeque::new(),
         };
-        tokio::spawn(actor.run(None, Some(replay_events), Vec::new()));
+        crate::backend::subprocess::spawn(actor.run(None, Some(replay_events), Vec::new()));
 
         Ok((
             Self {
@@ -2582,7 +2586,7 @@ impl HermesSessionActor {
         let active_compaction = Arc::clone(&self.active_compaction);
         let events_tx = self.events_tx.clone();
         let terminal_operation_id = operation_id.clone();
-        tokio::spawn(async move {
+        crate::backend::subprocess::spawn(async move {
             let response = response.await.unwrap_or_else(|_| {
                 Err(HermesRpcError {
                     code: None,
@@ -4089,19 +4093,13 @@ impl HermesGatewayHandle {
 
         let mut child = spawn_gateway_child(&target).await?;
         let stdin = child
-            .inner()
-            .stdin
-            .take()
+            .take_stdin()
             .ok_or_else(|| "Failed to capture Hermes gateway stdin".to_string())?;
         let stdout = child
-            .inner()
-            .stdout
-            .take()
+            .take_stdout()
             .ok_or_else(|| "Failed to capture Hermes gateway stdout".to_string())?;
         let stderr = child
-            .inner()
-            .stderr
-            .take()
+            .take_stderr()
             .ok_or_else(|| "Failed to capture Hermes gateway stderr".to_string())?;
 
         let (command_tx, command_rx) = mpsc::unbounded_channel();
@@ -4113,7 +4111,7 @@ impl HermesGatewayHandle {
         spawn_stdout_reader(stdout, inbound_tx.clone());
         spawn_stderr_reader(stderr, inbound_tx.clone());
         spawn_child_waiter(child, inbound_tx, force_shutdown_rx);
-        tokio::spawn(run_gateway_actor(
+        crate::backend::subprocess::spawn(run_gateway_actor(
             stdin,
             command_rx,
             inbound_rx,
@@ -4494,7 +4492,7 @@ async fn run_gateway_actor(
                             // close the process pipe; dropping it delivers EOF.
                             drop(stdin.take());
                             let force_shutdown_tx = force_shutdown_tx.clone();
-                            tokio::spawn(async move {
+                            crate::backend::subprocess::spawn(async move {
                                 tokio::time::sleep(HERMES_SHUTDOWN_GRACE).await;
                                 let _ = force_shutdown_tx.send(());
                             });
@@ -4665,7 +4663,7 @@ fn spawn_stdout_reader(
     stdout: ChildStdout,
     inbound_tx: mpsc::UnboundedSender<HermesGatewayInbound>,
 ) {
-    tokio::spawn(async move {
+    crate::backend::subprocess::spawn(async move {
         let mut lines = BufReader::new(stdout).lines();
         loop {
             match lines.next_line().await {
@@ -4693,7 +4691,7 @@ fn spawn_stderr_reader(
     stderr: ChildStderr,
     inbound_tx: mpsc::UnboundedSender<HermesGatewayInbound>,
 ) {
-    tokio::spawn(async move {
+    crate::backend::subprocess::spawn(async move {
         let mut lines = BufReader::new(stderr).lines();
         loop {
             match lines.next_line().await {
@@ -4724,7 +4722,7 @@ fn spawn_child_waiter(
     inbound_tx: mpsc::UnboundedSender<HermesGatewayInbound>,
     mut force_shutdown_rx: mpsc::UnboundedReceiver<()>,
 ) {
-    tokio::spawn(async move {
+    crate::backend::subprocess::spawn(async move {
         enum WaitOutcome {
             Exited(std::io::Result<std::process::ExitStatus>),
             ForceShutdown,
@@ -8591,13 +8589,13 @@ async fn run_hermes_version_command(
             ));
         }
     };
-    let mut stdout_pipe = child.inner().stdout.take().ok_or_else(|| {
+    let mut stdout_pipe = child.take_stdout().ok_or_else(|| {
         HermesProbeFailure::new(
             BackendSetupDiagnosticCode::CommandFailed,
             format!("Failed to capture Hermes {command} --version stdout"),
         )
     })?;
-    let mut stderr_pipe = child.inner().stderr.take().ok_or_else(|| {
+    let mut stderr_pipe = child.take_stderr().ok_or_else(|| {
         HermesProbeFailure::new(
             BackendSetupDiagnosticCode::CommandFailed,
             format!("Failed to capture Hermes {command} --version stderr"),
@@ -8773,13 +8771,13 @@ pub(crate) async fn probe_hermes_python_gateway_import(
             format!("Failed to run Hermes gateway import probe with {command}: {err}"),
         )
     })?;
-    let mut stdout_pipe = child.inner().stdout.take().ok_or_else(|| {
+    let mut stdout_pipe = child.take_stdout().ok_or_else(|| {
         HermesProbeFailure::new(
             BackendSetupDiagnosticCode::CommandFailed,
             format!("Failed to capture Hermes gateway import probe stdout from {command}"),
         )
     })?;
-    let mut stderr_pipe = child.inner().stderr.take().ok_or_else(|| {
+    let mut stderr_pipe = child.take_stderr().ok_or_else(|| {
         HermesProbeFailure::new(
             BackendSetupDiagnosticCode::CommandFailed,
             format!("Failed to capture Hermes gateway import probe stderr from {command}"),

@@ -171,22 +171,44 @@ exit 1
 const STOP_BODY: &str = r#"if [ ! -f "$pid_file" ]; then
   exit 0
 fi
-pid="$(cat "$pid_file" 2>/dev/null || true)"
-if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-  kill "$pid"
+pid="$(cat "$pid_file")"
+case "$pid" in ''|*[!0-9]*) echo "invalid managed host pid" >&2; exit 1;; esac
+matches_managed_host() {
+  args="$(ps -o args= -p "$pid" 2>/dev/null || true)"
+  case "$args" in
+    "$HOME"/.tyde/bin/*/tyde-server\ host\ --uds|"$HOME"/.tyde/bin/*/tyde-server\ host\ --uds\ --managed) return 0;;
+    *) return 1;;
+  esac
+}
+process_running() {
+  kill -0 "$pid" 2>/dev/null || return 1
+  case "$(ps -o stat= -p "$pid" 2>/dev/null || true)" in
+    ''|Z*) return 1;;
+    *) return 0;;
+  esac
+}
+if process_running; then
+  if ! matches_managed_host; then
+    echo "refusing to signal a pid that is not the managed Tyde host" >&2
+    exit 1
+  fi
+  kill -TERM "$pid"
   i=0
-  while [ "$i" -lt 50 ]; do
-    if ! kill -0 "$pid" 2>/dev/null; then
-      rm -f "$pid_file" "$version_file"
-      exit 0
-    fi
+  while process_running && [ "$i" -lt 350 ]; do
     i=$((i + 1))
     sleep 0.1
   done
-  echo "managed Tyde host process $pid did not stop" >&2
-  exit 1
+  if process_running; then
+    if ! matches_managed_host; then
+      echo "managed host pid changed identity during shutdown" >&2
+      exit 1
+    fi
+    kill -KILL "$pid"
+  fi
 fi
-rm -f "$pid_file" "$version_file"
+if [ "$(cat "$pid_file" 2>/dev/null || true)" = "$pid" ]; then
+  rm -f "$pid_file" "$version_file" "$socket"
+fi
 "#;
 
 pub fn shell_quote(value: &str) -> String {

@@ -102,8 +102,25 @@ pub(crate) struct CommitCompactedBinding {
     pub message: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TurnRecovery {
+    InFlight,
+    InterruptedByRestart,
+}
+
+impl TurnRecovery {
+    pub fn cause(self) -> protocol::RestartInterruptionCause {
+        match self {
+            Self::InFlight => protocol::RestartInterruptionCause::UnexpectedStop,
+            Self::InterruptedByRestart => protocol::RestartInterruptionCause::HostRestart,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionRecord {
+    #[serde(default)]
+    pub turn_recovery: Option<TurnRecovery>,
     pub id: SessionId,
     pub backend_kind: BackendKind,
     #[serde(default)]
@@ -304,6 +321,7 @@ impl SessionStore {
             let entry = records
                 .entry(session.id.0.clone())
                 .or_insert_with(|| SessionRecord {
+                    turn_recovery: None,
                     id: session.id.clone(),
                     backend_kind: session.backend_kind,
                     launch_profile_id: launch_profile_id.clone(),

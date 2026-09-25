@@ -658,6 +658,12 @@ pub struct ChatMessageEntry {
 }
 
 #[derive(Clone, Debug)]
+pub struct PositionedRestartNotice {
+    pub message_index: usize,
+    pub phase: protocol::RestartRecoveryPhase,
+}
+
+#[derive(Clone, Debug)]
 pub struct PositionedCompactionMarker {
     pub message_index: usize,
     pub event: ContextCompactionTimelineEvent,
@@ -947,6 +953,7 @@ pub struct AppState {
     /// patched in place. Cleared anywhere `chat_messages` is cleared
     /// (host runtime reset, agent close, agent bootstrap snapshot).
     pub chat_message_index: RwSignal<HashMap<AgentRef, HashMap<ChatMessageId, usize>>>,
+    pub restart_notices: RwSignal<HashMap<AgentRef, Vec<PositionedRestartNotice>>>,
     pub compaction_markers: RwSignal<HashMap<AgentRef, Vec<PositionedCompactionMarker>>>,
     pub compaction_marker_ids: RwSignal<HashMap<AgentRef, HashSet<CompactionObservationId>>>,
     /// Server-owned prior-history availability for each agent. The server
@@ -1118,6 +1125,7 @@ impl AppState {
             agent_load_errors: RwSignal::new(HashMap::new()),
             chat_messages: RwSignal::new(HashMap::new()),
             chat_message_index: RwSignal::new(HashMap::new()),
+            restart_notices: RwSignal::new(HashMap::new()),
             compaction_markers: RwSignal::new(HashMap::new()),
             compaction_marker_ids: RwSignal::new(HashMap::new()),
             session_history: RwSignal::new(HashMap::new()),
@@ -1817,6 +1825,9 @@ impl AppState {
             m.retain(|k, _| k.local_host_id != *host);
         });
         self.chat_message_index.update(|m| {
+            m.retain(|k, _| k.local_host_id != *host);
+        });
+        self.restart_notices.update(|m| {
             m.retain(|k, _| k.local_host_id != *host);
         });
         self.compaction_markers.update(|m| {
