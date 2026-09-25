@@ -8360,6 +8360,20 @@ async fn terminal_startup_failure_bootstraps_before_immediate_rejection() {
         1,
         "terminal Bootstrap must contain the fatal startup error exactly once"
     );
+    // Clients render an agent's settings from its SessionSettings snapshot;
+    // without one a failed agent's settings read as loading forever.
+    assert_eq!(
+        bootstrap
+            .events
+            .iter()
+            .filter(|event| matches!(
+                event,
+                AgentBootstrapEvent::SessionSettings(settings) if settings.schema.is_none()
+            ))
+            .count(),
+        1,
+        "terminal Bootstrap must say the failed agent has no editable settings schema"
+    );
     assert!(
         bootstrap.events.iter().all(|event| !matches!(
             event,
@@ -8440,6 +8454,18 @@ async fn terminal_startup_failure_bootstraps_before_immediate_rejection() {
             .count(),
         1,
         "late replay proves the live rejection came from the actor log, not the router"
+    );
+    assert_eq!(
+        late_bootstrap
+            .events
+            .iter()
+            .filter(|event| matches!(
+                event,
+                AgentBootstrapEvent::SessionSettings(settings) if settings.schema.is_none()
+            ))
+            .count(),
+        1,
+        "late replay must carry the failed agent's settings snapshot"
     );
 
     fixture

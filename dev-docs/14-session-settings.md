@@ -210,6 +210,11 @@ pub struct SessionSettingsPayload {
 }
 ```
 
+Every agent stream emits this snapshot, including an agent whose backend
+failed to start and a backend-native relay child. Neither accepts edits, so
+both carry `schema: None` and clients render them as unavailable rather than
+waiting for a snapshot that would never come.
+
 ### 3.4 FrameKind Additions
 
 ```rust

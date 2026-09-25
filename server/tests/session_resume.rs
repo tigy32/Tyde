@@ -4174,6 +4174,17 @@ async fn restart_does_not_resurrect_backend_native_children() {
     let child_session = child_start.session_id.expect("native child session id");
     assert_eq!(child_start.origin, protocol::AgentOrigin::BackendNative);
     assert_ne!(child_session, parent_session);
+    // A relay child accepts no settings edits. Clients render its settings
+    // from this snapshot, so without it they would read as loading forever.
+    let child_settings = fixture::next_logical_frame_matching_on(
+        &mut fixture.client,
+        "native child SessionSettings",
+        |env| env.kind == FrameKind::SessionSettings && env.stream == child.instance_stream,
+    )
+    .await
+    .parse_payload::<protocol::SessionSettingsPayload>()
+    .expect("parse native child SessionSettings");
+    assert!(child_settings.schema.is_none());
 
     let bootstrap = fixture.restart_host().await;
     let (mut restored, _) = collect_restart_replay(

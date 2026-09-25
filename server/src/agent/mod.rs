@@ -3145,6 +3145,20 @@ pub(crate) fn spawn_agent_actor(
                     activity_stats.snapshot(),
                 )
                 .await;
+                // A failed agent accepts no settings edits, so it has no
+                // schema to offer; clients still need its snapshot to render
+                // that instead of waiting for one.
+                append_event(
+                    &canonical_stream,
+                    &mut event_log,
+                    &mut subscribers,
+                    FrameKind::SessionSettings,
+                    &SessionSettingsPayload {
+                        values: current_session_settings.clone(),
+                        schema: None,
+                    },
+                )
+                .await;
                 enter_terminal_failure(
                     TerminalFailureContext {
                         accepting_input: &accepting_input_task,
@@ -8358,6 +8372,18 @@ pub(crate) fn spawn_relay_agent_actor(
             &mut subscribers,
             &current_start.agent_id,
             activity_stats.snapshot(),
+        )
+        .await;
+        // A relay accepts no input, so it has no settings schema to edit.
+        append_event(
+            &canonical_stream,
+            &mut event_log,
+            &mut subscribers,
+            FrameKind::SessionSettings,
+            &SessionSettingsPayload {
+                values: SessionSettingsValues::default(),
+                schema: None,
+            },
         )
         .await;
 
