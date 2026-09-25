@@ -439,3 +439,47 @@ without concealing the failed response or changing terminal teardown.
 Codex's existing `real_background_task_outlives_its_turn` and
 `real_background_task_cancel` also passed against the fixed adapter, covering
 normal late completion and explicit cancellation beside the retry path.
+
+## Plan approval presentation (2026-09-25)
+
+Plan completions now carry `ToolExecutionResult::ExitPlanMode` with an enum
+verdict and optional feedback, plan, and plan path. The desktop card projects
+that server result: awaiting approval while pending, then approved or rejected
+with feedback retained. Successful rejection is not a failed tool invocation.
+The server omits transcript messages for tool responses with no text or images;
+nonempty responses and ordinary messages keep their existing path.
+
+The server-protocol regression failed on the former empty user message, with
+483 other native tests passing. Both browser regressions failed against the
+old presentation (`Running…` instead of `Awaiting approval`, and `Done` instead
+of `Approved`), with 807 other desktop wasm tests passing. The fixed committed
+workbench passed `./dev.sh check`. Scoped `real_plan_approval` passed on Claude
+Haiku 4.5 (20.19 s) and Grok 4.6/low (63.30 s); no other paid conformance scenarios ran.
+
+An isolated dev instance verified pending, rejected-with-feedback, and approved
+cards on Claude Haiku 4.5 and Grok 4.5/low. Both retained the server decision,
+used distinct approval/rejection colors, removed finished controls, and added
+no user bubble for either decision. Grok 4.5 was the lowest-price available
+catalog option (lower cached-input pricing than 4.6/4.7). The desktop ran on
+Linux x86_64/WebKit at 1280×784. Screenshots and second-client automation are
+not supported by this debug driver. The instance and its agents were stopped.
+
+The reported Grok feedback loss without a plan file is upstream, not a Tyde
+transport defect. It also reproduced in a top-level Grok 4.5 agent: the finished
+card retained exact feedback, but the model asked generically for direction
+instead of echoing it. Tyde sends the documented `cancelled` outcome and
+`feedback`. Grok's `PlanApprovalOutcome::Cancelled` branch only uses feedback
+when `plan_content.is_some()`; otherwise it supplies generic planning text to
+the model. This branch is not specific to Tyde children or teams. No provider
+workaround or second implementation commit was added.
+
+Sources: [Grok response schema](https://github.com/xai-org/grok-build/blob/main/crates/codegen/xai-grok-tools/src/implementations/grok_build/exit_plan_mode/types.rs),
+[Grok cancellation branch](https://github.com/xai-org/grok-build/blob/main/crates/codegen/xai-grok-shell/src/session/acp_session_impl/tool_calls.rs#L2054-L2061),
+and [model pricing](https://docs.x.ai/developers/pricing).
+
+Post-rebase validation also exposed a startup race in the existing
+`agent_control_http_await_returns_while_exit_plan_mode_is_pending` sim. Its
+failing trace contained a replayed pending request but no live typing edge;
+bootstrap correctly does not replay transient typing events. As in the adjacent
+plan-approval sim, startup is now gated and the plan requested only after the
+client subscribes. All pause/await/continuation assertions remain unchanged.

@@ -90,6 +90,7 @@ fn result_kind(result: &ToolExecutionResult) -> &'static str {
         ToolExecutionResult::WebSearch => "WebSearch",
         ToolExecutionResult::ViewImage { .. } => "ViewImage",
         ToolExecutionResult::Sleep => "Sleep",
+        ToolExecutionResult::ExitPlanMode { .. } => "ExitPlanMode",
         ToolExecutionResult::Other { .. } => "Other",
     }
 }

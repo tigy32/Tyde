@@ -317,6 +317,7 @@ fn result_kind(result: &ToolExecutionResult) -> &'static str {
         R::ViewImage { .. } => "view_image",
         R::Sleep => "sleep",
         R::Other { .. } => "other",
+        R::ExitPlanMode { .. } => "exit_plan_mode",
     }
 }
 

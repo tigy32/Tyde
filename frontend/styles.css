@@ -3507,7 +3507,8 @@ kbd {
     color: var(--success);
 }
 
-.tool-status-text.failure {
+.tool-status-text.failure,
+.tool-status-text.rejected {
     color: var(--error);
 }
 
@@ -3610,7 +3611,7 @@ kbd {
 }
 
 .exit-plan-sent-note {
-    color: var(--success);
+    color: var(--text-secondary);
 }
 
 .exit-plan-error-note {

@@ -6167,25 +6167,35 @@ pub(crate) fn spawn_agent_actor(
                                                     ..
                                                 } => tool_call_id.clone(),
                                             };
-                                            append_chat_event(
-                                                &canonical_stream,
-                                                &mut event_log,
-                                                &mut subscribers,
-                                                &mut replay_state,
-                                                &ChatEvent::MessageAdded(ChatMessage {
-                                                    message_id: None,
-                                                    timestamp: now_ms(),
-                                                    sender: MessageSender::User,
-                                                    content: admitted_message,
-                                                    reasoning: None,
-                                                    tool_calls: Vec::new(),
-                                                    model_info: None,
-                                                    token_usage: None,
-                                                    context_breakdown: None,
-                                                    images: admitted_images,
-                                                }),
-                                            )
-                                            .await;
+                                            let has_message_content = !admitted_message.trim().is_empty()
+                                                || admitted_images.as_ref().is_some_and(|images| !images.is_empty());
+                                            tracing::debug!(
+                                                has_message_content,
+                                                message_len,
+                                                images_count,
+                                                "committing tool response transcript content"
+                                            );
+                                            if has_message_content {
+                                                append_chat_event(
+                                                    &canonical_stream,
+                                                    &mut event_log,
+                                                    &mut subscribers,
+                                                    &mut replay_state,
+                                                    &ChatEvent::MessageAdded(ChatMessage {
+                                                        message_id: None,
+                                                        timestamp: now_ms(),
+                                                        sender: MessageSender::User,
+                                                        content: admitted_message,
+                                                        reasoning: None,
+                                                        tool_calls: Vec::new(),
+                                                        model_info: None,
+                                                        token_usage: None,
+                                                        context_breakdown: None,
+                                                        images: admitted_images,
+                                                    }),
+                                                )
+                                                .await;
+                                            }
                                             mark_transcript_authoritative(
                                                 &transcript_store,
                                                 current_session_id.as_ref().expect(

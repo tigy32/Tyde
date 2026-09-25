@@ -4094,10 +4094,12 @@ async fn agent_control_http_await_returns_while_exit_plan_mode_is_pending() {
     let parent = spawn_agent_control_parent(&mut fixture, "plan-await-parent").await;
     let caller = fixture.agent_control_caller(&parent.agent_id).await;
 
+    let startup_gate = MockGateHandle::new();
     let reservation = fixture
         .reserve_next_mock_launch(
             "await-exit-plan-mode",
-            MockScript::one(MockTurn::exit_plan_request("epm-await", "# mock plan"))
+            MockScript::one(MockTurn::text_after_gate("plan agent ready", &startup_gate))
+                .then(MockTurn::exit_plan_request("epm-await", "# mock plan"))
                 .then(MockTurn::text("mock ExitPlanMode approved"))
                 .then(MockTurn::text("follow-up response after plan approval")),
         )
@@ -4111,7 +4113,7 @@ async fn agent_control_http_await_returns_while_exit_plan_mode_is_pending() {
             project_id: None,
             params: SpawnAgentParams::New {
                 workspace_roots: vec!["/tmp/await-exit-plan-mode".to_owned()],
-                prompt: "request plan approval".to_owned(),
+                prompt: "initialize plan agent".to_owned(),
                 images: None,
                 backend_kind: BackendKind::Claude,
                 launch_profile_id: None,
@@ -4135,6 +4137,26 @@ async fn agent_control_http_await_returns_while_exit_plan_mode_is_pending() {
     .await;
     assert_eq!(start.agent_id, new_agent.agent_id);
     drop(reservation);
+
+    // Bootstrap replays pending requests but not their transient typing edge.
+    // Subscribe before requesting the plan so this live-pause assertion is valid.
+    startup_gate.wait_until_entered().await;
+    eprintln!("EXIT PLAN AWAIT FIXTURE subscribed before requesting approval");
+    startup_gate.release_one();
+    expect_turn_on_stream(
+        &mut fixture.client,
+        &new_agent.instance_stream,
+        "plan agent ready",
+    )
+    .await;
+    fixture
+        .client
+        .send_message(
+            &new_agent.instance_stream,
+            "request plan approval".to_owned(),
+        )
+        .await
+        .expect("request plan approval after subscription");
 
     let request =
         wait_for_exit_plan_mode_pause_on_stream(&mut fixture.client, &new_agent.instance_stream)

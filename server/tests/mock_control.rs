@@ -415,67 +415,90 @@ async fn explicit_prompts_survive_resume_replay() {
 
 #[tokio::test]
 async fn explicit_tool_response_consumes_next_scripted_turn() {
-    let mut fixture = Fixture::new().await;
-    let agent = fixture
-        .spawn_scripted(
-            "planner",
-            MockScript::one(MockTurn::text("launch response"))
-                .then(MockTurn::exit_plan_request(
-                    "epm-scripted",
-                    "# Scripted plan",
-                ))
-                .then(MockTurn::text("post-approval response")),
-        )
-        .await;
-    fixture.finish_turn(&agent).await;
-
-    fixture
-        .client
-        .send_message(&agent.stream, "make a plan".to_owned())
-        .await
-        .expect("send plan request message");
-    let request = fixture
-        .expect_paused_tool_request(&agent, "ExitPlanMode")
-        .await;
-    assert_eq!(request.tool_call_id, "epm-scripted");
-
-    fixture.approve_exit_plan_mode(&agent, &request).await;
-    fixture
-        .next_chat_event_matching(&agent, "ExitPlanMode completion", |event| {
-            matches!(
-                event,
-                ChatEvent::ToolExecutionCompleted(done)
-                    if done.tool_call_id == "epm-scripted"
-                        && fixture::tool_completion_succeeded(done)
+    for decision in [ExitPlanModeDecision::Approve, ExitPlanModeDecision::Reject] {
+        let feedback = (decision == ExitPlanModeDecision::Reject)
+            .then(|| "Keep the verification step".to_owned());
+        let mut fixture = Fixture::new().await;
+        let agent = fixture
+            .spawn_scripted(
+                "planner",
+                MockScript::one(MockTurn::text("launch response"))
+                    .then(MockTurn::exit_plan_request(
+                        "epm-scripted",
+                        "# Scripted plan",
+                    ))
+                    .then(MockTurn::text("post-approval response")),
             )
-        })
-        .await;
-    let turn = fixture.finish_turn(&agent).await;
-    turn.assert_stream_end_contains("post-approval response");
-    for event in turn.chat_events() {
-        if let ChatEvent::StreamEnd(end) = event {
-            assert!(
-                !end.message.content.contains("mock ExitPlanMode approved"),
-                "explicit continuation must not run the default echo follow-up: {:?}",
-                end.message.content
-            );
-        }
-    }
+            .await;
+        fixture.finish_turn(&agent).await;
 
-    let mock = fixture.mock(&agent).await;
-    let requests = mock.requests().await;
-    assert!(
-        requests.iter().any(|request| matches!(
-            request,
-            MockRequest::ToolResponse(SendMessageToolResponse::ExitPlanMode {
-                tool_call_id,
-                decision,
-                ..
-            }) if tool_call_id == "epm-scripted" && *decision == ExitPlanModeDecision::Approve
-        )),
-        "the approval must be captured as a typed tool response: {requests:?}"
-    );
-    mock.assert_clean().await;
+        fixture
+            .client
+            .send_message(&agent.stream, "make a plan".to_owned())
+            .await
+            .expect("send plan request message");
+        let request = fixture
+            .expect_paused_tool_request(&agent, "ExitPlanMode")
+            .await;
+        assert_eq!(request.tool_call_id, "epm-scripted");
+
+        fixture
+            .client
+            .send_message_payload(
+                &agent.stream,
+                protocol::SendMessagePayload {
+                    message: String::new(),
+                    images: None,
+                    tool_response: Some(SendMessageToolResponse::ExitPlanMode {
+                        tool_call_id: request.tool_call_id.clone(),
+                        decision,
+                        feedback: feedback.clone(),
+                    }),
+                    origin: None,
+                },
+            )
+            .await
+            .expect("send plan decision");
+        let turn = fixture.finish_turn(&agent).await;
+        assert!(turn.chat_events().iter().any(|event| matches!(
+            event,
+            ChatEvent::ToolExecutionCompleted(done)
+                if done.tool_call_id == "epm-scripted" && matches!(&done.outcome, protocol::ToolExecutionOutcome::Succeeded {
+                    result: protocol::ToolExecutionResult::ExitPlanMode { decision: actual, feedback: actual_feedback, .. }
+                } if *actual == decision && *actual_feedback == feedback)
+        )));
+        assert!(
+            turn.chat_events().iter().all(|event| !matches!(
+                event,
+                ChatEvent::MessageAdded(message) if matches!(message.sender, MessageSender::User)
+            )),
+            "a plan decision must not append an empty user message"
+        );
+        turn.assert_stream_end_contains("post-approval response");
+        for event in turn.chat_events() {
+            if let ChatEvent::StreamEnd(end) = event {
+                assert!(
+                    !end.message.content.contains("mock ExitPlanMode approved"),
+                    "explicit continuation must not run the default echo follow-up"
+                );
+            }
+        }
+
+        let mock = fixture.mock(&agent).await;
+        let requests = mock.requests().await;
+        assert!(
+            requests.iter().any(|request| matches!(
+                request,
+                MockRequest::ToolResponse(SendMessageToolResponse::ExitPlanMode {
+                    tool_call_id,
+                    decision: actual,
+                    ..
+                }) if tool_call_id == "epm-scripted" && *actual == decision
+            )),
+            "the decision must be captured as a typed tool response"
+        );
+        mock.assert_clean().await;
+    }
 }
 
 #[tokio::test]

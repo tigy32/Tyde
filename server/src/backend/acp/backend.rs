@@ -4441,6 +4441,13 @@ impl KiroInner {
             ));
         }
 
+        tracing::debug!(
+            ?decision,
+            feedback_present = feedback
+                .as_ref()
+                .is_some_and(|text| !text.trim().is_empty()),
+            "sending Grok plan approval response"
+        );
         self.bridge
             .respond(
                 pending.rpc_id,
@@ -4454,25 +4461,20 @@ impl KiroInner {
             .active_tool_contexts
             .get(&pending.tool_call_id)
             .map(|context| context.tool_type.clone());
-        let mut result = serde_json::Map::new();
-        result.insert(
-            "decision".to_owned(),
-            json!(match decision {
-                ExitPlanModeDecision::Approve => "approved",
-                ExitPlanModeDecision::Reject => "rejected",
-            }),
-        );
-        if let Some(feedback) = feedback.filter(|text| !text.trim().is_empty()) {
-            result.insert("feedback".to_owned(), json!(feedback));
-        }
-        if let Some(tool_type) = plan_info {
-            if let Some(plan) = tool_type.get("plan").and_then(Value::as_str) {
-                result.insert("plan".to_owned(), json!(plan));
-            }
-            if let Some(plan_path) = tool_type.get("plan_path").and_then(Value::as_str) {
-                result.insert("plan_path".to_owned(), json!(plan_path));
-            }
-        }
+        let result = ToolExecutionResult::ExitPlanMode {
+            decision,
+            feedback: feedback.filter(|text| !text.trim().is_empty()),
+            plan: plan_info
+                .as_ref()
+                .and_then(|info| info.get("plan"))
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            plan_path: plan_info
+                .as_ref()
+                .and_then(|info| info.get("plan_path"))
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+        };
         {
             let mut state = self.state.lock().await;
             state
@@ -4482,7 +4484,7 @@ impl KiroInner {
         }
         self.emitter.tool_completed(
             &pending.tool_call_id,
-            kiro_tool_execution_outcome(json!({ "kind": "Other", "result": result }), true, None),
+            ToolExecutionOutcome::Succeeded { result },
         );
         self.emitter.typing_status_changed(true);
         Ok(())

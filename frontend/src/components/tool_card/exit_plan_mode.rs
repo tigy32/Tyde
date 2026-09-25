@@ -52,10 +52,17 @@ pub(crate) fn render(
             tool_call_id=tool_call_id.to_owned()
             plan=plan.clone()
             plan_path=plan_path.clone()
-            completed=result.is_some()
+            result=result.cloned()
         />
     }
     .into_any()
+}
+
+pub(super) fn decision_label(decision: ExitPlanModeDecision) -> &'static str {
+    match decision {
+        ExitPlanModeDecision::Approve => "Approved",
+        ExitPlanModeDecision::Reject => "Rejected",
+    }
 }
 
 fn target_is_fatal_tracked(state: &AppState, agent_ref: Signal<Option<ActiveAgentRef>>) -> bool {
@@ -77,9 +84,28 @@ fn ExitPlanModeCard(
     tool_call_id: String,
     plan: Option<String>,
     plan_path: Option<String>,
-    completed: bool,
+    result: Option<ToolExecutionResult>,
 ) -> impl IntoView {
     let state = expect_context::<AppState>();
+    let completed = result.is_some();
+    let completion = result.map(|result| match result {
+        ToolExecutionResult::ExitPlanMode {
+            decision, feedback, ..
+        } => view! {
+            <div class="exit-plan-decision" role="status">{decision_label(decision)}</div>
+            {feedback.map(|feedback| view! {
+                <div class="exit-plan-completion-feedback">
+                    <strong>"Feedback"</strong>
+                    <div class="exit-plan-text">{feedback}</div>
+                </div>
+            })}
+        }
+        .into_any(),
+        _ => view! {
+            <div role="alert">"Plan decision unavailable: unexpected completion result."</div>
+        }
+        .into_any(),
+    });
 
     let decision_sent = RwSignal::new(None::<ExitPlanModeDecision>);
     let sending = RwSignal::new(false);
@@ -216,6 +242,7 @@ fn ExitPlanModeCard(
                 .map(|plan| view! {
                     <div class="exit-plan-text">{plan}</div>
                 })}
+            {completion}
             {controls}
         </div>
     }
@@ -323,8 +350,11 @@ mod wasm_tests {
             result: Some(if success {
                 succeeded_completion(
                     "toolu_plan",
-                    ToolExecutionResult::Other {
-                        result: serde_json::json!({ "decision": "approve" }),
+                    ToolExecutionResult::ExitPlanMode {
+                        decision: ExitPlanModeDecision::Approve,
+                        feedback: None,
+                        plan: None,
+                        plan_path: None,
                     },
                 )
             } else {
@@ -554,6 +584,96 @@ mod wasm_tests {
                 tool_type: exit_plan_req(),
             },
             result: None,
+        }
+    }
+
+    #[wasm_bindgen_test]
+    async fn pending_header_awaits_approval() {
+        let container = mount_with_state(configure_active_agent, move || {
+            view! {<ToolCardView agent_ref=test_agent_ref() entry=pending_entry() />}.into_any()
+        });
+        next_tick().await;
+        assert_eq!(
+            container
+                .query_selector(".tool-status-text")
+                .unwrap()
+                .unwrap()
+                .text_content()
+                .as_deref(),
+            Some("Awaiting approval")
+        );
+        assert!(approve_button(&container).is_some());
+        assert!(reject_button(&container).is_some());
+    }
+
+    #[wasm_bindgen_test]
+    async fn plan_decisions_render_server_state_and_feedback() {
+        let document = web_sys::window().unwrap().document().unwrap();
+        let style = document.create_element("style").unwrap();
+        style.set_text_content(Some(include_str!("../../../styles.css")));
+        document.head().unwrap().append_child(&style).unwrap();
+        let entry = ArcRwSignal::new(pending_entry());
+        let container = {
+            let entry = entry.clone();
+            mount_with_state(configure_active_agent, move || {
+                view! {{move || view! {<ToolCardView agent_ref=test_agent_ref() entry=entry.get() />}}}.into_any()
+            })
+        };
+        next_tick().await;
+        let status = || {
+            container
+                .query_selector(".tool-status-text")
+                .unwrap()
+                .unwrap()
+        };
+        let mut approved_color = None;
+        for decision in [ExitPlanModeDecision::Approve, ExitPlanModeDecision::Reject] {
+            let mut completed = pending_entry();
+            completed.result = Some(succeeded_completion(
+                "toolu_plan",
+                ToolExecutionResult::ExitPlanMode {
+                    decision,
+                    feedback: (decision == ExitPlanModeDecision::Reject)
+                        .then(|| "Use the safer approach.\nKeep the tests.".to_owned()),
+                    plan: None,
+                    plan_path: None,
+                },
+            ));
+            entry.set(completed);
+            next_tick().await;
+            let label = match decision {
+                ExitPlanModeDecision::Approve => "Approved",
+                ExitPlanModeDecision::Reject => "Rejected",
+            };
+            assert_eq!(status().text_content().as_deref(), Some(label));
+            assert!(approve_button(&container).is_none());
+            assert!(reject_button(&container).is_none());
+            let body = container
+                .query_selector(".exit-plan-card")
+                .unwrap()
+                .unwrap();
+            let text = body.text_content().unwrap();
+            assert!(text.contains(label));
+            assert!(text.contains("Step 1: do the thing"));
+            assert!(text.contains("docs/plan.md"));
+            let color = web_sys::window()
+                .unwrap()
+                .get_computed_style(&status())
+                .unwrap()
+                .unwrap()
+                .get_property_value("color")
+                .unwrap();
+            match decision {
+                ExitPlanModeDecision::Approve => approved_color = Some(color),
+                ExitPlanModeDecision::Reject => {
+                    assert!(text.contains("Use the safer approach.\nKeep the tests."));
+                    assert_ne!(
+                        approved_color.as_ref(),
+                        Some(&color),
+                        "rejection must not look like approval"
+                    );
+                }
+            }
         }
     }
 

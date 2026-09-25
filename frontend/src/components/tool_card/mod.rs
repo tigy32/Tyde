@@ -431,11 +431,23 @@ pub fn ToolCardView(
         .is_some_and(|result| matches!(&result.outcome, ToolExecutionOutcome::Cancelled { .. }));
     let result_failed = has_result && !result_success;
 
+    let is_exit_plan_mode = matches!(tool_type, ToolRequestType::ExitPlanMode { .. });
+    let plan_decision = match result.as_ref().map(|completion| &completion.outcome) {
+        Some(ToolExecutionOutcome::Succeeded {
+            result: ToolExecutionResult::ExitPlanMode { decision, .. },
+        }) => Some(*decision),
+        _ => None,
+    };
+
     let status_class = move || {
         if !has_result || (background_running.get() && !result_failed) {
             "tool-status-text pending"
         } else if result_cancelled {
             "tool-status-text cancelled"
+        } else if plan_decision == Some(protocol::ExitPlanModeDecision::Reject) {
+            "tool-status-text rejected"
+        } else if result_success && is_exit_plan_mode && plan_decision.is_none() {
+            "tool-status-text failure"
         } else if result_success {
             "tool-status-text success"
         } else {
@@ -447,10 +459,17 @@ pub fn ToolCardView(
     let status_label = move || {
         if !has_result && is_ask_user_question {
             "Awaiting answer".to_owned()
+        } else if !has_result && is_exit_plan_mode {
+            "Awaiting approval".to_owned()
         } else if !has_result || (background_running.get() && !result_failed) {
             "Running\u{2026}".to_owned()
         } else if result_cancelled {
             "Cancelled".to_owned()
+        } else if result_success && is_exit_plan_mode {
+            match plan_decision {
+                Some(decision) => exit_plan_mode::decision_label(decision).to_owned(),
+                None => "Decision unavailable".to_owned(),
+            }
         } else if result_success {
             "Done".to_owned()
         } else {
@@ -504,7 +523,6 @@ pub fn ToolCardView(
             .map(|completion| completion_outcome_summary(&tool_type, &completion.outcome))
     };
 
-    let is_exit_plan_mode = matches!(tool_type, ToolRequestType::ExitPlanMode { .. });
     let body_tool_type = tool_type.clone();
     let body_outcome = result.as_ref().map(|r| r.outcome.clone());
     let body_tool_type_slot = StoredValue::new_local(body_tool_type);
@@ -1308,6 +1326,7 @@ pub(crate) fn completion_header_summary(
         ToolExecutionResult::WebSearch => "search complete".to_owned(),
         ToolExecutionResult::ViewImage { .. } => "image viewed".to_owned(),
         ToolExecutionResult::Sleep => "wait complete".to_owned(),
+        ToolExecutionResult::ExitPlanMode { .. } => String::new(),
         ToolExecutionResult::Other { .. } => String::new(),
     }
 }

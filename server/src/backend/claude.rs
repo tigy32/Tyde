@@ -3209,28 +3209,17 @@ impl ClaudeInner {
         };
 
         let plan = exit_plan_mode_plan_info_from_arguments(&pending.input);
-        let mut result = serde_json::Map::new();
-        result.insert(
-            "decision".to_owned(),
-            json!(match decision {
-                ExitPlanModeDecision::Approve => "approved",
-                ExitPlanModeDecision::Reject => "rejected",
-            }),
-        );
-        for (key, value) in [
-            ("feedback", feedback),
-            ("plan", plan.plan),
-            ("plan_path", plan.plan_path),
-        ] {
-            if let Some(value) = value {
-                result.insert(key.to_owned(), json!(value));
-            }
-        }
         self.emit_tool_execution_completed(
             &pending.tool_call_id,
             &pending.tool_name,
             true,
-            json!({"kind": "Other", "result": result}),
+            serde_json::to_value(ToolExecutionResult::ExitPlanMode {
+                decision,
+                feedback,
+                plan: plan.plan,
+                plan_path: plan.plan_path,
+            })
+            .expect("serialize plan decision"),
             None,
         );
         self.emit_typing_status(true);

@@ -371,7 +371,6 @@ pub(super) fn exit_plan_mode_completion(
     feedback: Option<String>,
 ) -> (BackendEvent, String) {
     let approved = decision == protocol::ExitPlanModeDecision::Approve;
-    let decision_label = if approved { "approved" } else { "rejected" };
     let message = if approved {
         "mock ExitPlanMode approved".to_owned()
     } else {
@@ -384,11 +383,11 @@ pub(super) fn exit_plan_mode_completion(
     let completion = tool_completed(ToolExecutionCompletedData {
         tool_call_id: tool_call_id.to_owned(),
         outcome: ToolExecutionOutcome::Succeeded {
-            result: ToolExecutionResult::Other {
-                result: serde_json::json!({
-                    "decision": decision_label,
-                    "feedback": feedback,
-                }),
+            result: ToolExecutionResult::ExitPlanMode {
+                decision,
+                feedback,
+                plan: None,
+                plan_path: None,
             },
         },
     });

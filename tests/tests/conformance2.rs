@@ -7459,9 +7459,16 @@ async fn real_plan_approval<B: Backend>(host: &mut Harness<B>) {
         "one approval must complete its card once"
     );
     assert!(
-        matches!(&completions[0].outcome, ToolExecutionOutcome::Succeeded { result: ToolExecutionResult::Other { result } } if result.get("decision").and_then(Value::as_str) == Some("approved")),
-        "approval completion lost the decision: {:?}",
-        completions[0]
+        matches!(
+            &completions[0].outcome,
+            ToolExecutionOutcome::Succeeded {
+                result: ToolExecutionResult::ExitPlanMode {
+                    decision: protocol::ExitPlanModeDecision::Approve,
+                    ..
+                }
+            }
+        ),
+        "approval completion lost the typed decision"
     );
     assert_eq!(
         std::fs::read_to_string(&proof)
