@@ -1917,12 +1917,18 @@ async fn project_recovers_after_real_file_descriptor_exhaustion() {
     fixture::init_tracing();
     let mut fixture = Fixture::new().await;
     let repo = init_git_repo("descriptor-recovery", &[("file.rs", "// before\n")]);
+    // Process-wide exhaustion otherwise races the review-store creation needed
+    // for bootstrap, testing setup failure rather than watcher recovery.
+    let (begin_failure_tx, begin_failure_rx) = std::sync::mpsc::sync_channel(1);
     let initialization_fds = std::sync::Arc::new(std::sync::Mutex::new(None));
     let exhaust = initialization_fds.clone();
     let before_init = fixture.on_project_scan(
         repo.path().to_path_buf(),
         server::ScanPoint::WatcherInitialize,
         move || {
+            begin_failure_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("bootstrap completes before watcher fault injection");
             *exhaust.lock().unwrap() = Some(fixture::ExhaustedFileDescriptors::exhaust());
         },
     );
@@ -1951,6 +1957,9 @@ async fn project_recovers_after_real_file_descriptor_exhaustion() {
     )
     .await;
     expect_project_bootstrap(&mut fixture.client, "descriptor bootstrap").await;
+    begin_failure_tx
+        .send(())
+        .expect("release watcher fault injection");
     initialized_rx
         .await
         .expect("real watcher creation attempted");

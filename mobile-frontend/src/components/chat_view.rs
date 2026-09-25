@@ -1593,6 +1593,11 @@ mod wasm_tests {
     async fn mobile_activity_drawer_opens_agents_and_tracks_background_work() {
         crate::components::test_styles::ensure_styles_loaded();
         let container = make_container();
+        // Normal flow put the capsule at y=1369 in a 437px viewport, leaving
+        // Chrome's reveal transition at time zero. Exercise a visible drawer.
+        container.style().set_property("position", "fixed").unwrap();
+        container.style().set_property("bottom", "0").unwrap();
+        container.style().set_property("left", "0").unwrap();
         container.style().set_property("width", "390px").unwrap();
         container.style().set_property("height", "700px").unwrap();
         let state = mount_active_chat(container.clone());
@@ -1641,6 +1646,19 @@ mod wasm_tests {
         };
         let capsule = element("chat-input-capsule");
         let before = capsule.get_bounding_client_rect();
+        let viewport_height = web_sys::window()
+            .unwrap()
+            .inner_height()
+            .unwrap()
+            .as_f64()
+            .unwrap();
+        assert!(
+            before.top() >= 0.0 && before.bottom() <= viewport_height,
+            "the animated drawer fixture must be visible: capsule_top={} capsule_bottom={} viewport_height={}",
+            before.top(),
+            before.bottom(),
+            viewport_height
+        );
         let tab = toggle.get_bounding_client_rect();
         assert!(
             (tab.bottom() - before.top()).abs() < 1.0,

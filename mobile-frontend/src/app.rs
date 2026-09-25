@@ -1633,6 +1633,31 @@ mod wasm_tests {
             .query_selector("[data-mobile-test='chat-bottom-dock']")
             .unwrap()
             .unwrap();
+        let shell = container.query_selector(".mobile-app").unwrap().unwrap();
+        let assert_bottom_gap = |element: &web_sys::Element, expected: f64| {
+            let gap = shell.get_bounding_client_rect().bottom()
+                - element.get_bounding_client_rect().bottom();
+            assert!(
+                (gap - expected).abs() <= 1.0,
+                "bottom chrome must keep the intended edge distance: expected={expected}, actual={gap}"
+            );
+        };
+        // CSS safe-area inputs reproduce the measured iPhone spacing without
+        // pretending an iframe supplies a physical keyboard or status bar.
+        let safe_area = frame_document.create_element("style").unwrap();
+        safe_area.set_text_content(Some(".mobile-app { --tws-safe-bottom: 34px; }"));
+        frame_document
+            .body()
+            .unwrap()
+            .append_child(&safe_area)
+            .unwrap();
+        sleep(Duration::from_millis(100)).await;
+        assert_bottom_gap(&dock, 26.0);
+        safe_area.set_text_content(Some(".mobile-app { --tws-safe-bottom: 0px; }"));
+        sleep(Duration::from_millis(100)).await;
+        assert_bottom_gap(&dock, 8.0);
+        scroller.set_scroll_top(scroller.scroll_height());
+        sleep(Duration::from_millis(100)).await;
         let clearance =
             dock.get_bounding_client_rect().top() - transcript.get_bounding_client_rect().bottom();
         wasm_bindgen_test::console_log!("Transcript end clearance={clearance}");
@@ -1723,6 +1748,7 @@ mod wasm_tests {
                 reachable(),
                 "composer hit target is reachable at {width}x{height}"
             );
+            assert_bottom_gap(&dock, if height < 181 { 2.0 } else { 8.0 });
             assert!(send.get_bounding_client_rect().bottom() <= f64::from(height));
             assert!(
                 frame_document
@@ -1733,6 +1759,7 @@ mod wasm_tests {
         }
         input.blur().unwrap();
         state.viewing_chat.set(false);
+        safe_area.set_text_content(Some(".mobile-app { --tws-safe-bottom: 34px; }"));
         for tab in [
             MobileTab::Home,
             MobileTab::Agents,
@@ -1746,7 +1773,8 @@ mod wasm_tests {
                 .unwrap()
                 .unwrap();
             let bounds = nav.get_bounding_client_rect();
-            assert!(bounds.height() >= 44.0 && bounds.bottom() <= 852.0);
+            assert!(bounds.height() >= 44.0);
+            assert_bottom_gap(&nav, 26.0);
             assert!(
                 frame_document
                     .element_from_point(
@@ -1756,6 +1784,7 @@ mod wasm_tests {
                     .is_some_and(|hit| nav.contains(Some(&hit)))
             );
         }
+        safe_area.set_text_content(Some(".mobile-app { --tws-safe-bottom: 0px; }"));
         frame
             .set_attribute("style", "width:852px;height:130px;border:0")
             .unwrap();
@@ -1777,6 +1806,7 @@ mod wasm_tests {
             nav.get_bounding_client_rect().height() >= 44.0,
             "tabs return after expansion"
         );
+        assert_bottom_gap(&nav, 8.0);
         drop(mount);
         assert!(
             !frame_document

@@ -579,8 +579,18 @@ async fn removed_backend_fork_fails_without_touching_source_session() {
         .expect("insert source session");
     let before = load_sessions(dir.path());
 
-    let host = server::spawn_host_with_store_paths(session_path, project_path, settings_path)
-        .expect("spawn real-backend host");
+    // Retired-backend rejection must not wait for unrelated CLI/network model
+    // discovery before HostBootstrap. Keep the real provider factory below.
+    let host = server::spawn_host_with_store_paths_and_runtime_config(
+        session_path,
+        project_path,
+        settings_path,
+        server::HostRuntimeConfig {
+            skip_real_backend_probe: true,
+            ..Default::default()
+        },
+    )
+    .expect("spawn real-backend host without discovery");
     let (mut client, _bootstrap) = fixture::connect_host(host.clone()).await;
 
     client

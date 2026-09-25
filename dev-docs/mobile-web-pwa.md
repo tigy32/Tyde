@@ -164,3 +164,86 @@ iOS 26.5 PWA contacts retain focus until intentional dismissal, but keyboard
 bounds were not exposed to accessibility, so that farm run is not a full geometry
 pass. Tyde's canonical workbench and clean-main gates remain required; a source
 pin update is not a deployed Tyde release or exact-device acceptance.
+
+### Bottom-inset regression: physical evidence
+
+The beta.5 migration inherited the library's `max(10px, safe-bottom)` bottom
+margin instead of Tyde's `max(8px, safe-bottom - 8px)`. Tyde now supplies its
+original spacing through `--tws-bottom-gap`; the shared shell still owns all
+viewport measurement, keyboard detection, compact layout and clearance. The
+44px controls, default status bar and loader version-pinning policy are unchanged.
+The inline app-surface DOM flow pins composer and tab proximity at both 0px and
+34px safe-bottom inputs, instead of accepting any bottom above the viewport edge.
+It failed against the old styles with `expected=26, actual=34`.
+
+A bounded AWS Device Farm comparison on iPhone 12 / iOS 26.6 verified real
+Home Screen launch. Tab measurements executed CDN-downloaded, SRI-verified
+beta.4/beta.10 release WASM with an isolated offline synthetic host. Composer
+measurements used exact-tag `ui-fixtures` builds with the same app CSS. Release
+and fixture tab geometry agreed. Private HTTPS documents preserved loader CSS
+and each version's metadata, but did not exercise production-origin pairing,
+CSP, service workers or loader selection. No production account was used.
+
+Both versions reported a 797px client/visual viewport on an 844px screen.
+The fresh beta.4 legacy-translucent icon put that document at native y=0, with
+47px safe-top and a 26px capsule inset: its physical bottom gap was 73px.
+A fresh beta.10 standard-status icon put the document at native y=47, with
+zero safe-top and a 34px inset: its physical gap was 34px. Native textarea
+rectangles independently confirmed the coordinate origins.
+
+Loading beta.10 in the same installed beta.4 icon, without reinstalling,
+retained native y=0 and 47px safe-top despite the new document's `default`
+status-bar metadata. Its capsule bottom moved up 8px (physical gap 81px), and
+its top moved up 16px because the capsule also grew from 48px to 56px tall.
+Restoring the inset repairs that 8px regression; it does **not** claim to remove
+iOS's separate retained 47px installation strip. Expanding the shell to
+`screen.height` would violate its 797px paintable cap, so no such recovery is
+added. Keep `status-bar-style=default`; fresh-install evidence supports it.
+
+Served beta.9 and beta.10 app CSS, shell CSS and shell JS were byte-identical.
+The manifest protocol version changed from 63 to 64 at beta.10. The loader
+retains the saved bundle until incompatible-protocol repair; a pre-shell bundle
+can therefore survive through beta.9 and switch at beta.10. The exact prior
+bundle stored on the user's phone was not observed.
+
+The first two allocations completed all 11 observations each. The third retained
+seven observations, including the legacy-icon upgrade, but failed its subsequent
+native icon-relaunch lookup; that relaunch is not a pass. iOS 26.6 did not expose
+native keyboard accessibility bounds, so screenshots and actual keyboard-driven
+viewport contraction are not a native-AX keyboard-suite pass. Exact-owner
+hardware/OS, cold relaunch and existing-origin service-worker upgrades remain
+separate acceptance gaps. Full measurements, hashes and original screenshots
+are retained on the dev server under
+`/home/tyggs/Tyde/mobile-bottom-evidence/`.
+
+The fourth allocation passed all 14 observations, including an unchanged-to-fixed
+CSS switch within the legacy icon. Closed and dismissed composer/tab gaps were
+26px; the real keyboard-open gap stayed 10px. Shell height remained 797px closed
+and 468px with the keyboard open; the client cap stayed 797px. Capsule/input
+heights stayed 56px/44px. The physical legacy-icon gap returned from 81px to
+73px, not to 26px: the retained 47px status-bar strip is explicitly unresolved.
+All temporary cloud resources were deleted after four allocations (42.81
+reported device-minutes; trial balance 809.08 to 799.52).
+
+The repository gate also exposed an unrelated descriptor-exhaustion test race:
+`WatcherInitialize` exhausted the process descriptors while initial review-store
+creation still needed a temporary file, so no `ProjectBootstrap` arrived. The
+existing real-server flow now gates that injection on the received bootstrap;
+it still creates real descriptor exhaustion at watcher initialization and keeps
+every original error/recovery assertion. No production server behavior or test
+timeout was changed.
+
+A subsequent native run reached all 484 cases but timed out before the
+retired-backend fork test's initial `HostBootstrap`. Unlike the shared fixture,
+that case spawned a host with live CLI/model discovery enabled; host registration
+awaits that unrelated discovery before bootstrap. It now uses the fixture's
+existing discovery-disable flag while retaining the real provider factory and
+all unsupported-fork/source-session assertions. This is server protocol coverage,
+not provider-discovery conformance. Production code and timeouts are unchanged.
+
+The drawer DOM flow also stalled with its reveal animation at time zero. A
+visibility assertion reproduced the fixture error: the capsule was at
+1369.53–1425.53px in a 437px viewport, below the shared test document's visible
+area. The flow now anchors its fixture to the viewport bottom, keeps that new
+visibility assertion, and retains every existing transition/geometry check and
+timeout. No production animation or layout behavior was changed for this case.

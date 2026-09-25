@@ -157,6 +157,8 @@ input, textarea, select {
     overflow: hidden;
     --tws-ink: var(--text-primary);
     --tws-focus: var(--accent-primary);
+    /* Preserve Tyde's floating-capsule inset, not the shell's full safe area. */
+    --tws-bottom-gap: max(var(--space-2), calc(var(--tws-safe-bottom) - var(--space-2)));
     background: var(--bg-base);
     /* The shell states its own colour rather than inheriting one from the page
        it was mounted into: the theme lives on this element, so anything the
