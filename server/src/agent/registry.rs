@@ -94,6 +94,12 @@ impl AgentStatus {
         !self.terminated && (!self.started || self.is_thinking || !self.turn_completed)
     }
 
+    /// Liveness published to clients, which render it as thinking. A turn
+    /// blocked on the user's answer stays open but has stopped typing.
+    pub fn is_visibly_active(&self) -> bool {
+        self.is_active() && !self.blocked_on_user_response
+    }
+
     pub fn is_user_response_pending(&self) -> bool {
         self.pending_user_response.is_some()
     }

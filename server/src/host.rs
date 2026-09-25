@@ -10384,7 +10384,7 @@ impl HostHandle {
         let Some(status) = state.registry.agent_status_handle(agent_id) else {
             return;
         };
-        let turn_active = status.snapshot().await.is_active();
+        let turn_active = status.snapshot().await.is_visibly_active();
         fan_out_agent_turn_state(&mut state, agent_id, turn_active);
         fan_out_agent_background_work(&mut state, agent_id).await;
         if let Some(parent) = state.registry.parent_agent_id(agent_id) {
@@ -10407,7 +10407,7 @@ impl HostHandle {
             let Some(status) = state.registry.agent_status_handle(&agent_id) else {
                 continue;
             };
-            let turn_active = status.snapshot().await.is_active();
+            let turn_active = status.snapshot().await.is_visibly_active();
             fan_out_agent_turn_state(&mut state, &agent_id, turn_active);
             fan_out_agent_background_work(&mut state, &agent_id).await;
         }
@@ -19153,7 +19153,7 @@ async fn agent_turn_active(state: &HostState, agent_id: &AgentId) -> bool {
         .registry
         .agent_status_handle(agent_id)
         .unwrap_or_else(|| panic!("registry missing status for listed agent {}", agent_id));
-    status.snapshot().await.is_active()
+    status.snapshot().await.is_visibly_active()
 }
 
 async fn fan_out_agent_background_work(state: &mut HostState, agent_id: &AgentId) {

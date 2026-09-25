@@ -122,7 +122,11 @@ async fn exit_plan_mode_tool_response_resumes_and_drains_queue() {
         .await
         .expect("send during blocking question");
     fixture.expect_queued_messages(&question, 1).await;
-    let (mobile, bootstrap) = fixture::connect_mobile_client_with_bootstrap(
+    // The turn stays open (the follow-up above queued behind the answer), but
+    // the backend has stopped typing. Clients render turn_active as thinking,
+    // so a reconnecting client must see the same idle state the live stream
+    // already reported, or it hides that the user owes an answer.
+    let (mut mobile, bootstrap) = fixture::connect_mobile_client_with_bootstrap(
         fixture.host_for_test(),
         "blocking-question-phone",
     )
@@ -133,9 +137,25 @@ async fn exit_plan_mode_tool_response_resumes_and_drains_queue() {
         .find(|agent| agent.agent_id == question.new_agent.agent_id)
         .expect("blocking question descriptor");
     assert!(
-        descriptor.turn_active,
-        "blocking question must retain its active turn despite typing(false)"
+        !descriptor.turn_active,
+        "HostBootstrap must not report a turn awaiting the user's answer as thinking"
     );
+    let question_stream = descriptor.instance_stream.clone();
+    fixture::send_load_agent_on(&mut mobile, &question_stream).await;
+    let agent_bootstrap: protocol::AgentBootstrapPayload =
+        fixture::next_frame_matching_on(&mut mobile, "blocking question bootstrap", |env| {
+            env.kind == FrameKind::AgentBootstrap && env.stream == question_stream
+        })
+        .await
+        .parse_payload()
+        .expect("parse blocking question AgentBootstrap");
+    assert!(
+        !agent_bootstrap.turn_active,
+        "AgentBootstrap must not report a turn awaiting the user's answer as thinking"
+    );
+    assert!(agent_bootstrap.events.iter().any(|event| matches!(event,
+        protocol::AgentBootstrapEvent::ChatEvent(ChatEvent::ToolRequest(pending))
+            if pending.tool_call_id == request.tool_call_id)));
     drop(mobile);
     fixture
         .client

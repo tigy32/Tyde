@@ -8204,7 +8204,7 @@ pub(crate) fn spawn_agent_actor(
                                 &event_log,
                                 Some(&replay_state),
                                 latest_output.output(),
-                                status_handle.snapshot().await.is_active(),
+                                status_handle.snapshot().await.is_visibly_active(),
                                 latest_slash_commands.as_ref(),
                                 &mut subscribers,
                                 stream,
@@ -8951,7 +8951,7 @@ pub(crate) fn spawn_relay_agent_actor(
                                 &event_log,
                                 Some(&replay_state),
                                 latest_output.output(),
-                                status_handle.snapshot().await.is_active(),
+                                status_handle.snapshot().await.is_visibly_active(),
                                 latest_slash_commands.as_ref(),
                                 &mut subscribers,
                                 stream,
@@ -9875,7 +9875,7 @@ async fn park_relay_terminal_agent(
                     event_log,
                     None,
                     latest_output.output(),
-                    status_handle.snapshot().await.is_active(),
+                    status_handle.snapshot().await.is_visibly_active(),
                     None,
                     subscribers,
                     stream,
@@ -11012,7 +11012,7 @@ async fn flush_pending_agent_attaches(
 ) {
     let output = current_latest_output(latest_output, event_log)
         .expect("typed agent replay log must project latest output");
-    let turn_active = status_handle.snapshot().await.is_active();
+    let turn_active = status_handle.snapshot().await.is_visibly_active();
     for (stream, reply) in std::mem::take(pending_attaches) {
         let attached = attach_subscriber_with_latest_output(
             event_log,
