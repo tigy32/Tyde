@@ -4360,10 +4360,15 @@ impl KiroInner {
                 .await;
         }
 
-        let (canonical_id, emit_request) = {
+        let (canonical_id, emit_request, interjected) = {
             let mut state = self.state.lock().await;
             let canonical_id = resolve_tool_call_id_alias(&state, Some(&raw_tool_call_id), None)
                 .unwrap_or_else(|| raw_tool_call_id.clone());
+            // After session/load Grok re-asks an approval its previous process
+            // left unanswered, outside any response and with no tool call
+            // announcing it.
+            let interjected = !state.active_tool_contexts.contains_key(&canonical_id)
+                && state.active_response.is_none();
             let context = state
                 .active_tool_contexts
                 .entry(canonical_id.clone())
@@ -4383,11 +4388,22 @@ impl KiroInner {
                 rpc_id,
                 tool_call_id: canonical_id.clone(),
             });
-            (canonical_id, emit_request)
+            (canonical_id, emit_request, interjected)
         };
 
         self.flush_pending_grok_response_end().await;
-        if emit_request {
+        if interjected {
+            tracing::info!(
+                tool_call_id = canonical_id,
+                "Grok asked for plan approval without declaring the tool call"
+            );
+            self.emitter.typing_status_changed(true);
+            self.emitter.interjected_plan_approval_request(
+                &canonical_id,
+                "exit_plan_mode",
+                kiro_tool_request_type(tool_type),
+            );
+        } else if emit_request {
             self.emitter
                 .tool_request(&canonical_id, kiro_tool_request_type(tool_type));
         }

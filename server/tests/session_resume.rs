@@ -4711,3 +4711,181 @@ async fn session_import_failure_rolls_back_and_retries_without_data_loss() {
         "retry must retain the original session"
     );
 }
+
+fn restart_expiry_of(
+    events: &[AgentBootstrapEvent],
+    tool_call_id: &str,
+) -> Vec<protocol::ToolExecutionOutcome> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            AgentBootstrapEvent::ChatEvent(ChatEvent::ToolExecutionCompleted(completion))
+                if completion.tool_call_id == tool_call_id =>
+            {
+                Some(completion.outcome.clone())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// A question or plan approval left pending when the app was killed replays
+/// on relaunch, but the relaunched backend holds nothing that could accept an
+/// answer. The server must close the card with a typed terminal outcome,
+/// persist it, and keep refusing answers to it — never leave it answerable.
+#[tokio::test]
+async fn relaunch_after_kill_expires_unanswered_questions_and_plans() {
+    for plan in [false, true] {
+        let mut fixture = Fixture::new().await;
+        let gate = server::backend::mock::MockGateHandle::new();
+        let (tool_call_id, tool_name, script) = if plan {
+            (
+                "orphaned-plan",
+                "ExitPlanMode",
+                MockScript::one(MockTurn::text("launch response"))
+                    .then(MockTurn::exit_plan_request("orphaned-plan", "# Plan")),
+            )
+        } else {
+            (
+                "orphaned-question",
+                "AskUserQuestion",
+                MockScript::one(MockTurn::text("launch response")).then(
+                    MockTurn::blocking_question_request("orphaned-question", &gate),
+                ),
+            )
+        };
+        let agent = fixture.spawn_scripted("orphaned interaction", script).await;
+        // The kill must come after a completed turn: that is what makes the
+        // server's transcript, not the backend, the replayed history.
+        fixture.finish_turn(&agent).await;
+        fixture
+            .client
+            .send_message(&agent.stream, "ask me".to_owned())
+            .await
+            .expect("send the turn that asks");
+        if !plan {
+            gate.wait_until_entered().await;
+            gate.release_one();
+        }
+        let request = fixture.expect_paused_tool_request(&agent, tool_name).await;
+        assert_eq!(request.tool_call_id, tool_call_id);
+        // A mailbox round trip finishes persisting the request before the kill.
+        fixture.mock(&agent).await;
+        let session_id = fixture
+            .agent_session_ids()
+            .await
+            .into_iter()
+            .next()
+            .expect("orphaned interaction session");
+
+        let mut restored_stream = None;
+        for relaunch in 1..=2 {
+            let relaunched = fixture.relaunch_host_after_kill().await;
+            let (agents, bootstraps) = collect_restart_replay(
+                &mut fixture,
+                &relaunched,
+                std::slice::from_ref(&session_id),
+            )
+            .await;
+            let restored = agents.get(&session_id).expect("restored agent");
+            let bootstrap = &bootstraps[&restored.instance_stream];
+            assert!(
+                bootstrap.events.iter().any(|event| matches!(
+                    event,
+                    AgentBootstrapEvent::ChatEvent(ChatEvent::ToolRequest(replayed))
+                        if replayed.tool_call_id == tool_call_id
+                )),
+                "{tool_name} relaunch {relaunch}: the card must still replay"
+            );
+            let mut outcomes = restart_expiry_of(&bootstrap.events, tool_call_id);
+            if outcomes.is_empty() {
+                let event = fixture::next_frame_matching_on(
+                    &mut fixture.client,
+                    "expiry of the orphaned interaction",
+                    |env| {
+                        env.stream == restored.instance_stream
+                            && env.kind == FrameKind::ChatEvent
+                            && matches!(
+                                env.parse_payload::<ChatEvent>(),
+                                Ok(ChatEvent::ToolExecutionCompleted(completion))
+                                    if completion.tool_call_id == tool_call_id
+                            )
+                    },
+                )
+                .await
+                .parse_payload::<ChatEvent>()
+                .expect("parse expiry");
+                let ChatEvent::ToolExecutionCompleted(completion) = event else {
+                    unreachable!("matched a completion");
+                };
+                outcomes.push(completion.outcome);
+            }
+            assert_eq!(
+                outcomes.len(),
+                1,
+                "{tool_name} relaunch {relaunch}: exactly one terminal outcome, got {outcomes:?}"
+            );
+            assert!(
+                matches!(
+                    &outcomes[0],
+                    protocol::ToolExecutionOutcome::Cancelled { message }
+                        if message.contains("can no longer be answered")
+                ),
+                "{tool_name} relaunch {relaunch}: the card must expire, got {:?}",
+                outcomes[0]
+            );
+            restored_stream = Some(restored.instance_stream.clone());
+        }
+
+        let tool_response = if plan {
+            protocol::SendMessageToolResponse::ExitPlanMode {
+                tool_call_id: tool_call_id.to_owned(),
+                decision: protocol::ExitPlanModeDecision::Approve,
+                feedback: None,
+            }
+        } else {
+            protocol::SendMessageToolResponse::AskUserQuestion {
+                tool_call_id: tool_call_id.to_owned(),
+                answer: "Rust".to_owned(),
+            }
+        };
+        let restored_stream = restored_stream.expect("relaunched agent stream");
+        fixture
+            .client
+            .send_message_payload(
+                &restored_stream,
+                protocol::SendMessagePayload {
+                    message: "Rust".to_owned(),
+                    images: None,
+                    origin: None,
+                    tool_response: Some(tool_response),
+                },
+            )
+            .await
+            .expect("send answer to the expired interaction");
+        let refused = fixture::next_frame_matching_on(
+            &mut fixture.client,
+            "refusal of an answer to the expired interaction",
+            |env| {
+                env.stream == restored_stream
+                    && env.kind == FrameKind::ChatEvent
+                    && matches!(
+                        env.parse_payload::<ChatEvent>(),
+                        Ok(ChatEvent::MessageAdded(_) | ChatEvent::ToolExecutionCompleted(_))
+                    )
+            },
+        )
+        .await
+        .parse_payload::<ChatEvent>()
+        .expect("parse refusal");
+        assert!(
+            matches!(
+                &refused,
+                ChatEvent::MessageAdded(message)
+                    if matches!(message.sender, protocol::MessageSender::Error)
+                        && message.content.contains("No matching pending tool request")
+            ),
+            "{tool_name}: an answer to an expired card must be refused, got {refused:?}"
+        );
+    }
+}

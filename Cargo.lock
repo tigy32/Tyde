@@ -8694,6 +8694,7 @@ dependencies = [
  "tokio",
  "tokio-rustls 0.26.4",
  "tokio-tungstenite",
+ "tracing",
  "tracing-subscriber",
  "turn",
  "tyde-agent-adapter",

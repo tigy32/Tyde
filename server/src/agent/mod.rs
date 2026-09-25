@@ -4491,6 +4491,29 @@ pub(crate) fn spawn_agent_actor(
                             resume_replay_gate_pending = false;
                             match result {
                                 Ok(()) => {
+                                    for tool_call_id in unanswered_replayed_user_interactions(&event_log) {
+                                        tracing::info!(
+                                            tool_call_id,
+                                            "expiring a user interaction left unanswered before the resume"
+                                        );
+                                        append_chat_event(
+                                            &canonical_stream,
+                                            &mut event_log,
+                                            &mut subscribers,
+                                            &mut replay_state,
+                                            &ChatEvent::ToolExecutionCompleted(
+                                                protocol::ToolExecutionCompletedData {
+                                                    tool_call_id: tool_call_id.clone(),
+                                                    outcome: protocol::ToolExecutionOutcome::Cancelled {
+                                                        message: EXPIRED_USER_INTERACTION_MESSAGE
+                                                            .to_owned(),
+                                                    },
+                                                },
+                                            ),
+                                        )
+                                        .await;
+                                        completed_tool_call_ids.insert(tool_call_id);
+                                    }
                                     let session_id = current_session_id
                                         .as_ref()
                                         .expect("live agent must have session_id");
@@ -9342,6 +9365,36 @@ fn compaction_input_rejected_payload(agent_id: &AgentId) -> AgentErrorPayload {
         message: "agent compaction is in progress".to_owned(),
         fatal: false,
     }
+}
+
+const EXPIRED_USER_INTERACTION_MESSAGE: &str =
+    "Expired: the agent restarted before this was answered, so it can no longer be answered.";
+
+/// Replayed history only ever redraws a question or plan approval; nothing
+/// before the resume boundary registers one as awaiting a response, so every
+/// such request still open at the boundary can never be answered.
+fn unanswered_replayed_user_interactions(event_log: &[Envelope]) -> Vec<String> {
+    let mut open = Vec::new();
+    for envelope in event_log
+        .iter()
+        .filter(|envelope| envelope.kind == FrameKind::ChatEvent)
+    {
+        match envelope.parse_payload::<ChatEvent>() {
+            Ok(ChatEvent::ToolRequest(request))
+                if matches!(
+                    request.tool_type,
+                    ToolRequestType::AskUserQuestion { .. } | ToolRequestType::ExitPlanMode { .. }
+                ) && !open.contains(&request.tool_call_id) =>
+            {
+                open.push(request.tool_call_id);
+            }
+            Ok(ChatEvent::ToolExecutionCompleted(completion)) => {
+                open.retain(|id| id != &completion.tool_call_id);
+            }
+            _ => {}
+        }
+    }
+    open
 }
 
 fn stale_tool_response_rejected_event() -> ChatEvent {

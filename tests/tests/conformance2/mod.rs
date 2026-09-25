@@ -419,6 +419,41 @@ pub struct Agent {
     pub replayed_history: Vec<ChatEvent>,
 }
 
+const TURN_EMITTER_TARGET: &str = "server::backend::turn_emitter";
+
+thread_local! {
+    static PROTOCOL_VIOLATIONS: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Each scenario runs on its own thread with a current-thread runtime, so the
+/// violations its backend tasks record land in that thread's list. Only the
+/// violation code is kept; details can carry session identifiers.
+struct ProtocolViolationCapture;
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for ProtocolViolationCapture {
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        struct ViolationCode(Option<String>);
+        impl tracing::field::Visit for ViolationCode {
+            fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                if field.name() == "violation" {
+                    self.0 = Some(value.to_owned());
+                }
+            }
+            fn record_debug(&mut self, _: &tracing::field::Field, _: &dyn std::fmt::Debug) {}
+        }
+        let mut code = ViolationCode(None);
+        event.record(&mut code);
+        if let Some(code) = code.0 {
+            PROTOCOL_VIOLATIONS.with(|violations| violations.borrow_mut().push(code));
+        }
+    }
+}
+
 pub struct Harness<B: Backend> {
     backend: Option<B>,
     events: Option<EventStream>,
@@ -436,10 +471,24 @@ pub struct Harness<B: Backend> {
 
 impl<B: Backend> Harness<B> {
     pub fn new(profile: Profile, test_name: &str) -> Self {
-        let _ = tracing_subscriber::fmt()
-            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-            .with_test_writer()
-            .try_init();
+        {
+            use tracing_subscriber::Layer;
+            use tracing_subscriber::layer::SubscriberExt;
+            use tracing_subscriber::util::SubscriberInitExt;
+            let _ = tracing_subscriber::registry()
+                .with(
+                    tracing_subscriber::fmt::layer()
+                        .with_test_writer()
+                        .with_filter(tracing_subscriber::EnvFilter::from_default_env()),
+                )
+                .with(
+                    ProtocolViolationCapture.with_filter(
+                        tracing_subscriber::filter::Targets::new()
+                            .with_target(TURN_EMITTER_TARGET, tracing::Level::ERROR),
+                    ),
+                )
+                .try_init();
+        }
         let workspace = tempfile::Builder::new()
             .prefix("tyde-conformance2-")
             .tempdir_in("/tmp")
@@ -481,6 +530,13 @@ impl<B: Backend> Harness<B> {
         let (service, task) = control::ControlService::start(self.config.clone()).await;
         service.configure(&service.root_id, &mut self.config);
         self.control = Some((service, task));
+    }
+
+    /// Chat protocol violations the backend's turn emitter recorded so far in
+    /// this scenario. Stable builds only log these, so they are otherwise
+    /// invisible to the events a scenario collects.
+    pub fn protocol_violations(&self) -> Vec<String> {
+        PROTOCOL_VIOLATIONS.with(|violations| violations.borrow().clone())
     }
 
     pub async fn finish(&mut self) {
@@ -877,7 +933,7 @@ impl Interrupted {
 }
 
 impl<B: Backend> Harness<B> {
-    fn turn(&self, prompt: &str) -> Turn {
+    pub fn turn(&self, prompt: &str) -> Turn {
         Turn {
             backend: self.backend(),
             capabilities: B::capabilities(),

@@ -7591,3 +7591,97 @@ sys.exit(status)
     }
     program
 }
+
+/// A plan approval left pending when the host dies must not strand the user.
+/// After resume a backend may re-ask for approval as a live request — which
+/// must then be declared and answerable — or not re-ask at all, in which case
+/// the conversation must still carry on. Either way the approved plan must be
+/// implemented exactly once. Grok re-asks outside any response with no tool
+/// call announcing it; that request was dropped as undeclared, leaving Grok
+/// blocked on an approval no client could see.
+async fn real_plan_pending_across_restart<B: Backend>(host: &mut Harness<B>) {
+    let agent = spawn_agent(host, &launch_prompt()).await;
+    let launched = collect_turn(host, &agent, &launch_prompt()).await;
+    assert_ready_handshake(&launched);
+    let proof = host.workspace().join("approved-plan.txt");
+    let payload = unique_payload();
+    let prompt = format!(
+        "Enter native plan mode using EnterPlanMode. Make a one-step plan to write exactly {payload} to {}. Request my approval through the native ExitPlanMode tool. Do not write that file until I approve. Once approved, implement the plan and reply with exactly TYDE_PLAN_IMPLEMENTED.",
+        proof.display()
+    );
+    request_plan_approval(host, &agent, &prompt).await;
+    host.shutdown().await;
+    assert!(
+        !proof.exists(),
+        "backend implemented the plan before approval"
+    );
+
+    resume_agent(host, &agent.session_id).await;
+    let mut resumed_turn = host.turn("Plan approval after restart");
+    resumed_turn
+        .events
+        .extend(drain_events_for(host, Duration::from_secs(30)).await);
+    for _ in 0..3 {
+        let open_plan = resumed_turn
+            .tool_requests()
+            .filter(|live| {
+                matches!(live.tool_type, ToolRequestType::ExitPlanMode { .. })
+                    && !resumed_turn
+                        .tool_completions()
+                        .any(|completion| completion.tool_call_id == live.tool_call_id)
+            })
+            .map(|live| live.tool_call_id.clone())
+            .collect::<Vec<_>>();
+        assert!(
+            open_plan.len() <= 1,
+            "{}: several approvals open at once: {open_plan:?}",
+            resumed_turn.label()
+        );
+        let next = match open_plan.first() {
+            Some(tool_call_id) => approve_plan(host, &agent, tool_call_id).await,
+            None if proof.exists() => break,
+            None => ask(host, &agent, "Approved. Implement the plan now.").await,
+        };
+        resumed_turn.events.extend(next.events);
+        resumed_turn.model_requests.extend(next.model_requests);
+        if proof.exists() {
+            break;
+        }
+    }
+    let approvals = resumed_turn
+        .tool_completions()
+        .filter(|completion| {
+            resumed_turn.tool_requests().any(|live| {
+                live.tool_call_id == completion.tool_call_id
+                    && matches!(live.tool_type, ToolRequestType::ExitPlanMode { .. })
+            })
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        approvals.iter().all(|completion| matches!(
+            &completion.outcome,
+            ToolExecutionOutcome::Succeeded { result: ToolExecutionResult::Other { result } }
+                if result.get("decision").and_then(Value::as_str) == Some("approved")
+        )),
+        "a live approval after restart did not accept the decision: {approvals:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&proof)
+            .expect("the plan approved after restart must be implemented")
+            .trim(),
+        payload
+    );
+    assert_final_text_contains(&resumed_turn, "TYDE_PLAN_IMPLEMENTED");
+    let violations = host.protocol_violations();
+    assert!(
+        violations.is_empty(),
+        "{:?} dropped events that violated the chat protocol: {violations:?}",
+        host.backend()
+    );
+    assert_universal_contract(&[launched, resumed_turn]);
+    assert_clean_close(host, &agent).await;
+}
+conformance2_scenario!(
+    real_plan_pending_across_restart,
+    [BackendCapability::PlanApprovalRequests]
+);

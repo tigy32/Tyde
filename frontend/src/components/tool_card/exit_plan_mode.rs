@@ -185,10 +185,10 @@ fn ExitPlanModeCard(
                     <span class="exit-plan-sent-note" role="status">
                         {move || match decision_sent.get() {
                             Some(ExitPlanModeDecision::Approve) => {
-                                "Approved — the agent will continue."
+                                "Approval sent — waiting for the agent to accept it."
                             }
                             Some(ExitPlanModeDecision::Reject) => {
-                                "Rejected — the agent will revise."
+                                "Rejection sent — waiting for the agent to accept it."
                             }
                             None => "",
                         }}
@@ -863,6 +863,39 @@ mod wasm_tests {
             approve_button(&container).unwrap().disabled(),
             "controls disabled after a decision is sent"
         );
+        // The server refuses decisions for approvals it no longer tracks, so
+        // a sent decision must not read as one the agent accepted.
+        let shown = container.text_content().unwrap_or_default();
+        assert!(
+            shown.contains("Approval sent — waiting for the agent to accept it."),
+            "card: {shown}"
+        );
+        assert!(!shown.contains("will continue"), "card: {shown}");
+    }
+
+    #[wasm_bindgen_test]
+    async fn expired_plan_renders_as_no_longer_answerable() {
+        let entry = ToolRequestEntry {
+            tool_name: "ExitPlanMode".to_owned(),
+            request: ToolRequest {
+                tool_call_id: "toolu_plan".to_owned(),
+                tool_name: "ExitPlanMode".to_owned(),
+                tool_type: exit_plan_req(),
+            },
+            result: Some(cancelled_completion(
+                "toolu_plan",
+                "Expired: the agent restarted before this was answered, so it can no longer be answered.",
+            )),
+        };
+        let container = mount_with_state(configure_active_agent, move || {
+            view! { <ToolCardView agent_ref=test_agent_ref() entry=entry /> }.into_any()
+        });
+        next_tick().await;
+
+        let shown = container.text_content().unwrap_or_default();
+        assert!(shown.contains("can no longer be answered"), "card: {shown}");
+        assert!(approve_button(&container).is_none(), "card: {shown}");
+        assert!(reject_button(&container).is_none(), "card: {shown}");
     }
 
     #[wasm_bindgen_test]

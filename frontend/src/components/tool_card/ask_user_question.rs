@@ -109,7 +109,7 @@ fn AskUserQuestionCard(
             })
             .collect(),
     );
-    let submitted = RwSignal::new(answered);
+    let delivered = RwSignal::new(false);
     let sending = RwSignal::new(false);
     let send_error = RwSignal::new(None::<String>);
     let fatal_state = state.clone();
@@ -124,17 +124,15 @@ fn AskUserQuestionCard(
         }
     };
 
+    // Only the server's completion of this request marks it answered. A sent
+    // frame is not an accepted answer: the server can still refuse it.
+    let locked = Signal::derive(move || answered || delivered.get() || sending.get());
+
     let question_views = questions
         .iter()
         .enumerate()
         .map(|(idx, question)| {
-            render_question(
-                question.clone(),
-                states[idx],
-                submitted,
-                sending,
-                target_is_fatal,
-            )
+            render_question(question.clone(), states[idx], locked, target_is_fatal)
         })
         .collect::<Vec<_>>();
 
@@ -143,10 +141,7 @@ fn AskUserQuestionCard(
         let states = states.clone();
         let tool_call_id = tool_call_id.clone();
         move |_| {
-            if submitted.get_untracked()
-                || sending.get_untracked()
-                || target_is_fatal.get_untracked()
-            {
+            if locked.get_untracked() || target_is_fatal.get_untracked() {
                 return;
             }
             send_error.set(None);
@@ -178,7 +173,7 @@ fn AskUserQuestionCard(
                 stream,
                 tool_call_id.clone(),
                 message,
-                submitted,
+                delivered,
                 sending,
                 send_error,
             );
@@ -187,7 +182,7 @@ fn AskUserQuestionCard(
 
     let submit_disabled = {
         let all_answered = all_answered.clone();
-        move || submitted.get() || sending.get() || target_is_fatal.get() || !all_answered()
+        move || locked.get() || target_is_fatal.get() || !all_answered()
     };
 
     view! {
@@ -200,8 +195,10 @@ fn AskUserQuestionCard(
                     on:click=on_submit
                 >
                     {move || {
-                        if submitted.get() {
+                        if answered {
                             "Answer sent"
+                        } else if delivered.get() {
+                            "Awaiting the agent..."
                         } else if sending.get() {
                             "Sending..."
                         } else {
@@ -209,9 +206,14 @@ fn AskUserQuestionCard(
                         }
                     }}
                 </button>
-                <Show when=move || submitted.get()>
+                {answered.then(|| view! {
                     <span class="ask-question-sent-note" role="status">
                         "Answer sent to the agent."
+                    </span>
+                })}
+                <Show when=move || !answered && delivered.get()>
+                    <span class="ask-question-pending-note" role="status">
+                        "Waiting for the agent to accept this answer."
                     </span>
                 </Show>
                 <Show when=move || send_error.get().is_some()>
@@ -227,8 +229,7 @@ fn AskUserQuestionCard(
 fn render_question(
     question: AskUserQuestion,
     qstate: QuestionState,
-    submitted: RwSignal<bool>,
-    sending: RwSignal<bool>,
+    locked: Signal<bool>,
     target_is_fatal: Memo<bool>,
 ) -> AnyView {
     let multi_select = question.multi_select;
@@ -248,10 +249,7 @@ fn render_question(
             let selected = qstate.selected;
             let is_selected = move || selected.get().contains(&idx);
             let on_click = move |_| {
-                if submitted.get_untracked()
-                    || sending.get_untracked()
-                    || target_is_fatal.get_untracked()
-                {
+                if locked.get_untracked() || target_is_fatal.get_untracked() {
                     return;
                 }
                 selected.update(|current| {
@@ -280,9 +278,7 @@ fn render_question(
                 <button
                     class="ask-question-option"
                     class:selected=is_selected
-                    prop:disabled=move || {
-                        submitted.get() || sending.get() || target_is_fatal.get()
-                    }
+                    prop:disabled=move || locked.get() || target_is_fatal.get()
                     aria-pressed=move || if is_selected() { "true" } else { "false" }
                     on:click=on_click
                 >
@@ -297,7 +293,7 @@ fn render_question(
 
     let custom = qstate.custom;
     let on_custom_input = move |ev: leptos::ev::Event| {
-        if submitted.get_untracked() || sending.get_untracked() || target_is_fatal.get_untracked() {
+        if locked.get_untracked() || target_is_fatal.get_untracked() {
             return;
         }
         custom.set(event_target_value(&ev));
@@ -316,9 +312,7 @@ fn render_question(
                 class="ask-question-custom"
                 r#type="text"
                 placeholder="Or type your own answer"
-                prop:disabled=move || {
-                    submitted.get() || sending.get() || target_is_fatal.get()
-                }
+                prop:disabled=move || locked.get() || target_is_fatal.get()
                 on:input=on_custom_input
             />
         </div>
@@ -354,7 +348,7 @@ fn send_answer(
     stream: StreamPath,
     tool_call_id: String,
     message: String,
-    submitted: RwSignal<bool>,
+    delivered: RwSignal<bool>,
     sending: RwSignal<bool>,
     send_error: RwSignal<Option<String>>,
 ) {
@@ -370,7 +364,7 @@ fn send_answer(
         };
         match send_frame(&host_id, stream, FrameKind::SendMessage, &payload).await {
             Ok(()) => {
-                submitted.set(true);
+                delivered.set(true);
                 send_error.set(None);
             }
             Err(error) => {
@@ -1003,6 +997,39 @@ mod wasm_tests {
     }
 
     #[wasm_bindgen_test]
+    async fn expired_question_renders_as_no_longer_answerable() {
+        let entry = ToolRequestEntry {
+            tool_name: "AskUserQuestion".to_owned(),
+            request: ToolRequest {
+                tool_call_id: "toolu_ask".to_owned(),
+                tool_name: "AskUserQuestion".to_owned(),
+                tool_type: single_select_req(),
+            },
+            result: Some(cancelled_completion(
+                "toolu_ask",
+                "Expired: the agent restarted before this was answered, so it can no longer be answered.",
+            )),
+        };
+        let container = mount_with_state(move || {
+            view! { <ToolCardView agent_ref=test_agent_ref() entry=entry /> }.into_any()
+        });
+        next_tick().await;
+
+        assert!(text(&container).contains("can no longer be answered"));
+        assert!(!text(&container).contains("Answer sent"));
+        assert!(
+            container
+                .query_selector_all(
+                    ".tool-card-body button:not([disabled]), .tool-card-body input:not([disabled])"
+                )
+                .unwrap()
+                .length()
+                == 0,
+            "an expired question must offer no answer controls"
+        );
+    }
+
+    #[wasm_bindgen_test]
     async fn submit_waits_for_successful_send_before_showing_sent() {
         let calls = install_deferred_send_stub();
         let req = single_select_req();
@@ -1041,11 +1068,18 @@ mod wasm_tests {
         resolve_deferred_send();
         next_tick().await;
 
+        // The frame reaching the host is not the server accepting the answer:
+        // it refuses answers to requests it no longer tracks. Only the
+        // request's completion (see
+        // `completed_question_stays_readable_without_resubmission`) may
+        // report the answer as sent.
         assert!(
-            has_sent_note(&container),
-            "sent note appears after send resolves"
+            !has_sent_note(&container),
+            "a delivered answer is not reported sent before the server completes the request"
         );
-        assert!(text(&container).contains("Answer sent"));
+        assert!(!text(&container).contains("Answer sent"));
+        assert!(text(&container).contains("Waiting for the agent to accept this answer."));
+        assert!(submit_button(&container).disabled());
         assert_answer_controls_disabled(&container);
     }
 

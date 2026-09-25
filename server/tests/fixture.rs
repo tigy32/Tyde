@@ -530,6 +530,24 @@ impl Fixture {
         connect_client_with_bootstrap(host).await
     }
 
+    /// Replaces the host the way a killed app is relaunched: the old host's
+    /// agents are never closed, so nothing they left open is terminalized.
+    #[allow(dead_code)]
+    pub async fn relaunch_host_after_kill(&mut self) -> HostBootstrapPayload {
+        let host = server::spawn_host_with_mock_backend_and_runtime_config(
+            self.session_store_path(),
+            self.project_store_path(),
+            self.settings_store_path(),
+            self.fresh_host_runtime_config(),
+        )
+        .expect("initialize relaunched host with existing stores");
+        let (client, bootstrap) = connect_client_with_bootstrap(host.clone()).await;
+        self.host = host;
+        self.client = client;
+        self.bootstrap = bootstrap.clone();
+        bootstrap
+    }
+
     #[allow(dead_code)]
     pub async fn restart_host(&mut self) -> HostBootstrapPayload {
         let prior_agent_count = self.host.agent_ids().await.len();

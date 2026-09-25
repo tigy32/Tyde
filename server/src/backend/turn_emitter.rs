@@ -195,6 +195,19 @@ impl TurnEmitter {
         self.lock().tool_request(tool_call_id, tool_type)
     }
 
+    /// A plan approval the host asks for on its own, with no assistant response
+    /// declaring it — Grok re-asks one its previous process left unanswered as
+    /// soon as `session/load` finishes.
+    pub fn interjected_plan_approval_request(
+        &self,
+        tool_call_id: &str,
+        tool_name: &str,
+        tool_type: ToolRequestType,
+    ) -> bool {
+        self.lock()
+            .interjected_plan_approval_request(tool_call_id, tool_name, tool_type)
+    }
+
     pub fn tool_completed(&self, tool_call_id: &str, outcome: ToolExecutionOutcome) {
         self.lock().tool_completed(tool_call_id, outcome);
     }
@@ -1066,6 +1079,49 @@ impl TurnEmitterState {
         self.send_chat(ChatEvent::ToolRequest(ToolRequest {
             tool_call_id: tool_call_id.to_owned(),
             tool_name,
+            tool_type,
+        }));
+        true
+    }
+
+    fn interjected_plan_approval_request(
+        &mut self,
+        tool_call_id: &str,
+        tool_name: &str,
+        tool_type: ToolRequestType,
+    ) -> bool {
+        if !matches!(tool_type, ToolRequestType::ExitPlanMode { .. }) {
+            self.violation(
+                "interjected_non_plan_request",
+                format!("only a plan approval may be requested without a declaration; '{tool_call_id}' was not one"),
+            );
+            return false;
+        }
+        if tool_call_id.trim().is_empty() {
+            self.violation("empty_tool_call_id", "tool request carried an empty id");
+            return false;
+        }
+        if self.declared_tools.contains_key(tool_call_id)
+            || self.open_tool_requests.contains_key(tool_call_id)
+            || self.completed_tool_requests.contains_key(tool_call_id)
+            || self.retired_tool_call_ids.contains_key(tool_call_id)
+        {
+            self.violation(
+                "reused_tool_call_id",
+                format!("interjected plan approval reused tool call id '{tool_call_id}'"),
+            );
+            return false;
+        }
+        self.open_tool_requests.insert(
+            tool_call_id.to_owned(),
+            EmittedToolRequest {
+                tool_type: tool_type.clone(),
+                execution_mode: ToolExecutionMode::Foreground,
+            },
+        );
+        self.send_chat(ChatEvent::ToolRequest(ToolRequest {
+            tool_call_id: tool_call_id.to_owned(),
+            tool_name: tool_name.to_owned(),
             tool_type,
         }));
         true
