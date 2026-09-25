@@ -4231,7 +4231,7 @@ async fn agent_control_http_await_stays_active_after_exit_plan_mode_approval() {
     let reservation = fixture
         .reserve_next_mock_launch(
             "await-exit-plan-mode-resume",
-            MockScript::one(MockTurn::gated_text("plan agent ready", &startup_gate))
+            MockScript::one(MockTurn::text_after_gate("plan agent ready", &startup_gate))
                 .then(MockTurn::exit_plan_request_stream_end_first(
                     "mock-exit-plan-tool",
                     "# Plan\n\nApprove the mock plan.",
@@ -4281,9 +4281,10 @@ async fn agent_control_http_await_stays_active_after_exit_plan_mode_approval() {
     assert_eq!(start.agent_id, new_agent.agent_id);
     drop(reservation);
 
-    // A paused startup turn can be replayed without its historical typing(false).
-    // Attach before the plan request so the live pause assertion is deterministic.
+    // gated_text blocks after StreamEnd, allowing bootstrap to replay the turn
+    // before this live-order assertion. Hold before all text events instead.
     startup_gate.wait_until_entered().await;
+    eprintln!("EXIT PLAN FIXTURE attached before releasing startup text events");
     startup_gate.release_one();
     expect_turn_on_stream(
         &mut fixture.client,

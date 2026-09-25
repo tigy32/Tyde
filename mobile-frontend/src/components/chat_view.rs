@@ -1505,10 +1505,9 @@ mod wasm_tests {
         wasm_bindgen_futures::JsFuture::from(promise).await.unwrap();
     }
 
-    /// Four identical geometry samples can precede the first animation frame:
-    /// Chrome reported a running reveal at time=0 with the list bottom 147px
-    /// below the composer. Require the reveal transition to finish as well;
-    /// the original flush-edge and bounded-height assertions remain unchanged.
+    /// Timer samples repeatedly observed a reveal at time=0, even in view.
+    /// Sample actual animation frames as well as requiring the transition to
+    /// finish; the flush-edge and bounded-height assertions remain unchanged.
     async fn wait_for_drawer_motion(container: &HtmlElement) {
         const SAMPLE_MS: i32 = 16;
         const STILL_SAMPLES: u32 = 4;
@@ -1519,10 +1518,31 @@ mod wasm_tests {
         next_tick().await;
         next_tick().await;
 
+        let viewport_height = web_sys::window()
+            .unwrap()
+            .inner_height()
+            .unwrap()
+            .as_f64()
+            .unwrap();
+        let container_bounds = container.get_bounding_client_rect();
+        console_log!(
+            "DRAWER VIEWPORT height={} container_top={} container_bottom={}",
+            viewport_height,
+            container_bounds.top(),
+            container_bounds.bottom()
+        );
+
         let mut previous = f64::NAN;
         let mut still = 0;
         for _ in 0..MAX_SAMPLES {
             sleep_ms(SAMPLE_MS).await;
+            let frame = js_sys::Promise::new(&mut |resolve, _reject| {
+                web_sys::window()
+                    .unwrap()
+                    .request_animation_frame(&resolve)
+                    .unwrap();
+            });
+            wasm_bindgen_futures::JsFuture::from(frame).await.unwrap();
             let Some(drawer) = container
                 .query_selector("[data-mobile-test='activity-drawer']")
                 .unwrap()
