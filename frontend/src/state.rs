@@ -3811,6 +3811,9 @@ pub struct AppState {
     pub backend_setup_by_host: RwSignal<HashMap<String, Vec<BackendSetupInfo>>>,
     pub agent_message_queue: RwSignal<HashMap<AgentId, Vec<QueuedMessageEntry>>>,
     pub agent_turn_active: RwSignal<HashMap<AgentId, bool>>,
+    /// Agents the server reports as `AgentActivity::AwaitingUser`: an open
+    /// question or plan approval that only the user can answer.
+    pub agent_awaiting_user: RwSignal<HashSet<AgentId>>,
     /// Server-owned launch profile catalog keyed by host id. Seeded by
     /// `HostBootstrap` and replaced wholesale by `LaunchProfileCatalogNotify`.
     /// The new-chat menus render these entries directly instead of deriving
@@ -4276,6 +4279,7 @@ impl AppState {
             backend_setup_by_host: RwSignal::new(HashMap::new()),
             agent_message_queue: RwSignal::new(HashMap::new()),
             agent_turn_active: RwSignal::new(HashMap::new()),
+            agent_awaiting_user: RwSignal::new(HashSet::new()),
             launch_profile_catalog: RwSignal::new(HashMap::new()),
             session_schemas: RwSignal::new(HashMap::new()),
             schemas_loaded_for_host: RwSignal::new(HashMap::new()),
@@ -4831,6 +4835,9 @@ impl AppState {
         });
         self.agent_turn_active.update(|map| {
             map.remove(agent_id);
+        });
+        self.agent_awaiting_user.update(|set| {
+            set.remove(agent_id);
         });
         self.interrupt_pending.update(|set| {
             set.remove(agent_id);
@@ -6753,6 +6760,9 @@ impl AppState {
             });
             self.agent_turn_active.update(|map| {
                 map.retain(|id, _| !drop_set.contains(id));
+            });
+            self.agent_awaiting_user.update(|set| {
+                set.retain(|id| !drop_set.contains(id));
             });
             self.agent_session_settings.update(|map| {
                 map.retain(|id, _| !drop_set.contains(id));

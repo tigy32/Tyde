@@ -395,7 +395,7 @@ struct SpawnAgentToolInput {
 #[serde(deny_unknown_fields)]
 struct AwaitAgentsToolInput {
     /// One or more non-empty direct child agent IDs. Pass every child whose
-    /// transition to idle or failed should wake this wait.
+    /// transition to idle, awaiting_user, or failed should wake this wait.
     #[schemars(length(min = 1), inner(length(min = 1)))]
     agent_ids: Vec<String>,
 }
@@ -1048,7 +1048,7 @@ impl TydeAgentControlMcpServer {
     }
 
     #[tool(
-        description = "Wait without a Tyde tool timer until any supplied direct child, or team manager report, becomes idle or failed. agent_ids is required and must contain at least one non-empty agent ID. Requires the calling agent's bearer credential and returns statuses only."
+        description = "Wait without a Tyde tool timer until any supplied direct child, or team manager report, becomes idle, awaiting_user (waiting on the user's answer; not finished), or failed. agent_ids is required and must contain at least one non-empty agent ID. Requires the calling agent's bearer credential and returns statuses only."
     )]
     async fn tyde_await_agents(
         &self,
@@ -1087,7 +1087,7 @@ impl TydeAgentControlMcpServer {
     }
 
     #[tool(
-        description = "Read only a direct child's, or team manager report's, server-owned latest assistant-visible message, error, or empty record. Never scans backward."
+        description = "Read only a direct child's, or team manager report's, server-owned latest assistant-visible message, error, or empty record, with its current status. An awaiting_user agent is waiting on the user, not finished. Never scans backward."
     )]
     async fn tyde_read_agent(
         &self,
@@ -2323,7 +2323,10 @@ async fn await_result_from_snapshot(
             agent_id: agent_id.0.clone(),
             status: status.status(),
         };
-        if status.blocked_on_user_response || !status.is_active() {
+        // A turn waiting on the user is ready: the caller must not block on
+        // an answer only the user can give, and the typed status tells it the
+        // agent has not finished.
+        if status.activity() != protocol::AgentActivity::Thinking {
             ready.push(entry);
         } else {
             still_thinking.push(entry);
@@ -2348,9 +2351,15 @@ async fn do_read_agent(
         .read_latest_output()
         .await
         .ok_or_else(|| format!("agent {} is not available", agent_id.0))??;
+    let status = host
+        .agent_status_snapshot(agent_id)
+        .await
+        .ok_or_else(|| format!("missing status for agent_id {}", agent_id.0))?
+        .status();
 
     Ok(AgentControlReadResult {
         agent_id: agent_id.clone(),
+        status,
         output: latest,
     })
 }

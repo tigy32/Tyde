@@ -9,8 +9,9 @@ mod fixture;
 
 use fixture::{Fixture, TestAgent, next_frame_matching_on, send_load_agent_on};
 use protocol::{
-    AgentBootstrapPayload, AgentId, AgentTurnStateNotifyPayload, BackendKind, ChatEvent, Envelope,
-    FrameKind, NewAgentPayload, SpawnAgentParams, SpawnAgentPayload, StreamPath,
+    AgentActivity, AgentBootstrapPayload, AgentId, AgentTurnStateNotifyPayload, BackendKind,
+    ChatEvent, Envelope, FrameKind, NewAgentPayload, SpawnAgentParams, SpawnAgentPayload,
+    StreamPath,
 };
 use server::backend::mock::{MockGateHandle, MockScript, MockTurn};
 
@@ -28,14 +29,14 @@ fn descriptor<'a>(bootstrap: &'a [NewAgentPayload], agent: &TestAgent) -> &'a Ne
         })
 }
 
-fn turn_state_for(env: &Envelope, agent_id: &AgentId) -> Option<bool> {
+fn turn_state_for(env: &Envelope, agent_id: &AgentId) -> Option<AgentActivity> {
     if env.kind != FrameKind::AgentTurnStateNotify {
         return None;
     }
     let payload: AgentTurnStateNotifyPayload = env
         .parse_payload()
         .expect("parse AgentTurnStateNotifyPayload");
-    (payload.agent_id == *agent_id).then_some(payload.turn_active)
+    (payload.agent_id == *agent_id).then_some(payload.activity)
 }
 
 /// The next host-stream liveness update for `agent_id`. A lazy client that
@@ -47,8 +48,8 @@ async fn next_turn_state_on(
     agent_id: &AgentId,
     attached: &[StreamPath],
     context: &str,
-) -> bool {
-    let mut turn_active = None;
+) -> AgentActivity {
+    let mut activity = None;
     next_frame_matching_on(client, context, |env| {
         assert!(
             !env.stream.0.starts_with("/agent/") || attached.contains(&env.stream),
@@ -69,11 +70,11 @@ async fn next_turn_state_on(
             );
         }
         turn_state_for(env, agent_id)
-            .inspect(|state| turn_active = Some(*state))
+            .inspect(|state| activity = Some(*state))
             .is_some()
     })
     .await;
-    turn_active.expect("matched AgentTurnStateNotify")
+    activity.expect("matched AgentTurnStateNotify")
 }
 
 /// Drain the desktop client until `agent`'s current turn ends. The desktop
@@ -165,12 +166,14 @@ async fn lazy_client_learns_agent_liveness_from_the_host_stream() {
         fixture::connect_mobile_client_with_bootstrap(fixture.host_for_test(), DEVICE_ID).await;
     let busy_descriptor = descriptor(&bootstrap.agents, &busy);
     let idle_descriptor = descriptor(&bootstrap.agents, &idle);
-    assert!(
-        busy_descriptor.turn_active,
+    assert_eq!(
+        busy_descriptor.activity,
+        AgentActivity::Thinking,
         "an agent mid-turn must be listed as running on connect"
     );
-    assert!(
-        !idle_descriptor.turn_active,
+    assert_eq!(
+        idle_descriptor.activity,
+        AgentActivity::Idle,
         "an agent between turns must be listed as idle on connect"
     );
     let mobile_busy_stream = busy_descriptor.instance_stream.clone();
@@ -179,14 +182,15 @@ async fn lazy_client_learns_agent_liveness_from_the_host_stream() {
     // attaching the agent.
     busy_launch.release_one();
     settle_turn(&mut fixture, &busy).await;
-    assert!(
-        !next_turn_state_on(
+    assert_eq!(
+        next_turn_state_on(
             &mut mobile,
             &busy.new_agent.agent_id,
             &[],
             "busy going idle"
         )
         .await,
+        AgentActivity::Idle,
         "busy must be announced idle after its turn ends"
     );
 
@@ -197,7 +201,7 @@ async fn lazy_client_learns_agent_liveness_from_the_host_stream() {
         .await
         .expect("send follow-up to idle");
     idle_follow_up.wait_until_entered().await;
-    assert!(
+    assert_eq!(
         next_turn_state_on(
             &mut mobile,
             &idle.new_agent.agent_id,
@@ -205,18 +209,20 @@ async fn lazy_client_learns_agent_liveness_from_the_host_stream() {
             "idle going busy"
         )
         .await,
+        AgentActivity::Thinking,
         "idle must be announced running once its follow-up turn starts"
     );
     idle_follow_up.release_one();
     settle_turn(&mut fixture, &idle).await;
-    assert!(
-        !next_turn_state_on(
+    assert_eq!(
+        next_turn_state_on(
             &mut mobile,
             &idle.new_agent.agent_id,
             &[],
             "idle going idle"
         )
         .await,
+        AgentActivity::Idle,
         "idle must be announced idle again after its follow-up turn ends"
     );
 
@@ -265,8 +271,9 @@ async fn lazy_client_learns_agent_liveness_from_the_host_stream() {
         .await
         .parse_payload()
         .expect("parse late NewAgentPayload");
-    assert!(
-        late_new_agent.turn_active,
+    assert_eq!(
+        late_new_agent.activity,
+        AgentActivity::Thinking,
         "an agent spawned by the phone must be described as running"
     );
     let late_stream = late_new_agent.instance_stream.clone();
@@ -278,8 +285,9 @@ async fn lazy_client_learns_agent_liveness_from_the_host_stream() {
         .await
         .parse_payload()
         .expect("parse late AgentBootstrapPayload");
-    assert!(
-        late_bootstrap.turn_active,
+    assert_eq!(
+        late_bootstrap.activity,
+        AgentActivity::Thinking,
         "the phone-opened agent stream must bootstrap as running"
     );
     late_launch.release_one();
@@ -305,8 +313,9 @@ async fn lazy_client_learns_agent_liveness_from_the_host_stream() {
     let busy_bootstrap: AgentBootstrapPayload = bootstrap_env
         .parse_payload()
         .expect("parse busy AgentBootstrapPayload");
-    assert!(
-        !busy_bootstrap.turn_active,
+    assert_eq!(
+        busy_bootstrap.activity,
+        AgentActivity::Idle,
         "AgentBootstrap must report busy idle between turns"
     );
     let attached = [mobile_busy_stream.clone()];
@@ -353,7 +362,7 @@ async fn lazy_client_learns_agent_liveness_from_the_host_stream() {
     // With only two scripted turns this request emitted ScriptExhausted and
     // closed the backend; observing its transient running flag was a race.
     idle_second_follow_up.wait_until_entered().await;
-    assert!(
+    assert_eq!(
         next_turn_state_on(
             &mut mobile,
             &idle.new_agent.agent_id,
@@ -361,17 +370,19 @@ async fn lazy_client_learns_agent_liveness_from_the_host_stream() {
             "idle busy again"
         )
         .await,
+        AgentActivity::Thinking,
         "unattached idle must still be announced running on the host stream"
     );
     idle_second_follow_up.release_one();
-    assert!(
-        !next_turn_state_on(
+    assert_eq!(
+        next_turn_state_on(
             &mut mobile,
             &idle.new_agent.agent_id,
             &attached,
             "idle second follow-up finished"
         )
         .await,
+        AgentActivity::Idle,
         "unattached idle must return to idle after its second follow-up"
     );
 
@@ -419,8 +430,9 @@ async fn lazy_client_learns_agent_liveness_from_the_host_stream() {
     let (mut question_mobile, bootstrap) =
         fixture::connect_mobile_client_with_bootstrap(fixture.host_for_test(), "question-phone")
             .await;
-    assert!(
-        descriptor(&bootstrap.agents, &question_agent).turn_active,
+    assert_eq!(
+        descriptor(&bootstrap.agents, &question_agent).activity,
+        AgentActivity::Thinking,
         "pending nonblocking question must not hide continuing work"
     );
     question_gate.release_one();
@@ -439,18 +451,20 @@ async fn lazy_client_learns_agent_liveness_from_the_host_stream() {
         "late-question-phone",
     )
     .await;
-    assert!(
-        !descriptor(&bootstrap.agents, &question_agent).turn_active,
-        "ended nonblocking-question turn must be idle in HostBootstrap while its answer remains pending"
+    assert_eq!(
+        descriptor(&bootstrap.agents, &question_agent).activity,
+        AgentActivity::AwaitingUser,
+        "ended nonblocking-question turn must await the user in HostBootstrap while its answer remains pending"
     );
-    assert!(
-        !next_turn_state_on(
+    assert_eq!(
+        next_turn_state_on(
             &mut question_mobile,
             &question_agent.new_agent.agent_id,
             &[],
             "unanswered question turn ended"
         )
-        .await
+        .await,
+        AgentActivity::AwaitingUser
     );
     let late_stream = descriptor(&bootstrap.agents, &question_agent)
         .instance_stream
@@ -463,9 +477,10 @@ async fn lazy_client_learns_agent_liveness_from_the_host_stream() {
         .await
         .parse_payload()
         .expect("parse question bootstrap");
-    assert!(
-        !bootstrap.turn_active,
-        "pending card must not keep AgentBootstrap active"
+    assert_eq!(
+        bootstrap.activity,
+        AgentActivity::AwaitingUser,
+        "pending card must report AgentBootstrap as awaiting the user, not active"
     );
     assert!(bootstrap.events.iter().any(|event| matches!(event,
         protocol::AgentBootstrapEvent::ChatEvent(ChatEvent::ToolRequest(pending))
@@ -489,7 +504,19 @@ async fn lazy_client_learns_agent_liveness_from_the_host_stream() {
             entry["agent_id"].as_str() == Some(question_agent.new_agent.agent_id.0.as_str())
         })
         .expect("question agent listed");
-    assert_eq!(listed["status"].as_str(), Some("idle"));
+    assert_eq!(listed["status"].as_str(), Some("awaiting_user"));
+    let read = call_control_tool(
+        &caller.url,
+        &caller.authorization,
+        "tyde_read_agent",
+        serde_json::json!({"agent_id": question_agent.new_agent.agent_id}),
+    )
+    .await;
+    assert_eq!(
+        read["status"].as_str(),
+        Some("awaiting_user"),
+        "a parent reading a child parked on the user must be told so, not handed bare output"
+    );
 
     fixture
         .client
@@ -497,14 +524,15 @@ async fn lazy_client_learns_agent_liveness_from_the_host_stream() {
         .await
         .expect("send follow-up without answering");
     question_follow_up.wait_until_entered().await;
-    assert!(
+    assert_eq!(
         next_turn_state_on(
             &mut question_mobile,
             &question_agent.new_agent.agent_id,
             &[],
             "independent follow-up active"
         )
-        .await
+        .await,
+        AgentActivity::Thinking
     );
     let agents = call_control_tool(
         &caller.url,
@@ -550,7 +578,10 @@ async fn lazy_client_learns_agent_liveness_from_the_host_stream() {
         .await
         .expect("await completes after terminal idle");
     assert_eq!(ready["ready"].as_array().map(Vec::len), Some(1));
-    assert_eq!(ready["ready"][0]["status"], "idle");
+    assert_eq!(
+        ready["ready"][0]["status"], "awaiting_user",
+        "await returns once work stops, and says the card still needs the user"
+    );
     assert_eq!(ready["still_thinking"].as_array().map(Vec::len), Some(0));
 
     let follow_up = fixture.finish_turn(&question_agent).await;
@@ -558,14 +589,15 @@ async fn lazy_client_learns_agent_liveness_from_the_host_stream() {
         ChatEvent::StreamEnd(end) if end.message.content == "independent follow-up")));
     assert!(!follow_up.chat_events().iter().any(|event| matches!(event,
         ChatEvent::ToolExecutionCompleted(completion) if completion.tool_call_id == request.tool_call_id)));
-    assert!(
-        !next_turn_state_on(
+    assert_eq!(
+        next_turn_state_on(
             &mut question_mobile,
             &question_agent.new_agent.agent_id,
             &[],
             "independent follow-up idle"
         )
-        .await
+        .await,
+        AgentActivity::AwaitingUser
     );
 
     let answer_payload = protocol::SendMessagePayload {
@@ -591,14 +623,15 @@ async fn lazy_client_learns_agent_liveness_from_the_host_stream() {
         .await
         .expect("send immediately after late answer");
     answer_continuation.wait_until_entered().await;
-    assert!(
+    assert_eq!(
         next_turn_state_on(
             &mut question_mobile,
             &question_agent.new_agent.agent_id,
             &[],
             "late answer active"
         )
-        .await
+        .await,
+        AgentActivity::Thinking
     );
     // Gate entry proves the answer started, not that the following client
     // message arrived. Releasing before its queue acknowledgement lets that
@@ -695,8 +728,9 @@ async fn lazy_client_learns_agent_liveness_from_the_host_stream() {
         "answered-question-phone",
     )
     .await;
-    assert!(
-        !descriptor(&bootstrap.agents, &question_agent).turn_active,
+    assert_eq!(
+        descriptor(&bootstrap.agents, &question_agent).activity,
+        AgentActivity::Idle,
         "duplicate answer must not resurrect an ended turn"
     );
     let final_stream = descriptor(&bootstrap.agents, &question_agent)
@@ -710,7 +744,7 @@ async fn lazy_client_learns_agent_liveness_from_the_host_stream() {
         .await
         .parse_payload()
         .expect("parse answered bootstrap");
-    assert!(!bootstrap.turn_active);
+    assert_eq!(bootstrap.activity, AgentActivity::Idle);
     assert_eq!(
         bootstrap
             .events

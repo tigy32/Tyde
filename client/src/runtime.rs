@@ -3,20 +3,20 @@ use std::sync::{Arc, Mutex};
 
 use protocol::types::{AgentClosedPayload, CloseAgentPayload};
 use protocol::{
-    AgentActivityStatsPayload, AgentActivitySummaryPayload, AgentBootstrapPayload,
-    AgentErrorPayload, AgentRenamedPayload, AgentStartPayload, AgentTurnStateNotifyPayload,
-    AgentsViewPreferencesNotifyPayload, BackendCapacityPayload, BackendConfigSchemasPayload,
-    BackendConfigSnapshotsPayload, BackendSetupPayload, CancelWorkflowPayload, ChatEvent,
-    CodeIntelDiagnosticsPayload, CodeIntelErrorPayload, CodeIntelFileModelPayload,
-    CodeIntelHoverResultPayload, CodeIntelNavigateResultPayload, CodeIntelOverviewPayload,
-    CodeIntelReferencesCompletePayload, CodeIntelReferencesResultsPayload, CodeIntelStatusPayload,
-    CommandErrorPayload, ContextCompactionCapabilityPayload, ContextCompactionNotifyPayload,
-    CustomAgentNotifyPayload, Envelope, FetchSessionHistoryPayload, FrameError, FrameKind,
-    FrameReader, HostBootstrapPayload, HostSettingsPayload, InterruptPayload,
-    LaunchProfileCatalogPayload, ListSessionsPayload, McpServerNotifyPayload,
-    MobileAccessStatePayload, MobilePairingOfferPayload, NewAgentPayload, NewTerminalPayload,
-    ProjectAccessedPayload, ProjectAddRootPayload, ProjectBootstrapPayload, ProjectCreatePayload,
-    ProjectDeletePayload, ProjectDeleteRootPayload, ProjectEventPayload,
+    AgentActivityChangedPayload, AgentActivityStatsPayload, AgentActivitySummaryPayload,
+    AgentBootstrapPayload, AgentErrorPayload, AgentRenamedPayload, AgentStartPayload,
+    AgentTurnStateNotifyPayload, AgentsViewPreferencesNotifyPayload, BackendCapacityPayload,
+    BackendConfigSchemasPayload, BackendConfigSnapshotsPayload, BackendSetupPayload,
+    CancelWorkflowPayload, ChatEvent, CodeIntelDiagnosticsPayload, CodeIntelErrorPayload,
+    CodeIntelFileModelPayload, CodeIntelHoverResultPayload, CodeIntelNavigateResultPayload,
+    CodeIntelOverviewPayload, CodeIntelReferencesCompletePayload,
+    CodeIntelReferencesResultsPayload, CodeIntelStatusPayload, CommandErrorPayload,
+    ContextCompactionCapabilityPayload, ContextCompactionNotifyPayload, CustomAgentNotifyPayload,
+    Envelope, FetchSessionHistoryPayload, FrameError, FrameKind, FrameReader, HostBootstrapPayload,
+    HostSettingsPayload, InterruptPayload, LaunchProfileCatalogPayload, ListSessionsPayload,
+    McpServerNotifyPayload, MobileAccessStatePayload, MobilePairingOfferPayload, NewAgentPayload,
+    NewTerminalPayload, ProjectAccessedPayload, ProjectAddRootPayload, ProjectBootstrapPayload,
+    ProjectCreatePayload, ProjectDeletePayload, ProjectDeleteRootPayload, ProjectEventPayload,
     ProjectFileContentsPayload, ProjectFileListPayload, ProjectGitDiffPayload,
     ProjectGitStatusPayload, ProjectId, ProjectNotifyPayload, ProjectReadDiffPayload,
     ProjectReadFilePayload, ProjectRenamePayload, ProjectReorderPayload, ProjectStageFilePayload,
@@ -176,6 +176,7 @@ pub enum AgentEvent {
     Renamed(AgentRenamedPayload),
     Error(AgentErrorPayload),
     ActivityStats(AgentActivityStatsPayload),
+    ActivityChanged(AgentActivityChangedPayload),
     ContextCompactionNotify(ContextCompactionNotifyPayload),
     ContextCompactionCapability(ContextCompactionCapabilityPayload),
     Chat(Box<ChatEvent>),
@@ -1386,6 +1387,7 @@ fn agent_event_session_id(event: &AgentEvent) -> Option<protocol::SessionId> {
         AgentEvent::Renamed(_)
         | AgentEvent::Error(_)
         | AgentEvent::ActivityStats(_)
+        | AgentEvent::ActivityChanged(_)
         | AgentEvent::Chat(_)
         | AgentEvent::SessionHistory(_)
         | AgentEvent::SessionSettings(_)
@@ -1493,6 +1495,13 @@ async fn handle_agent_envelope(envelope: Envelope, shared: &Arc<Shared>) {
                 payload.agent_id, envelope.stream
             );
             AgentEvent::ActivityStats(payload)
+        }
+        FrameKind::AgentActivityChanged => {
+            let payload: AgentActivityChangedPayload = match envelope.parse_payload() {
+                Ok(payload) => payload,
+                Err(_) => return,
+            };
+            AgentEvent::ActivityChanged(payload)
         }
         FrameKind::ContextCompactionNotify => {
             let payload: ContextCompactionNotifyPayload = match envelope.parse_payload() {

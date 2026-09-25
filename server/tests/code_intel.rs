@@ -230,6 +230,7 @@ async fn wait_for_code_intel_unavailable(
             | FrameKind::AgentError
             | FrameKind::AgentActivitySummary
             | FrameKind::AgentActivityStats
+            | FrameKind::AgentActivityChanged
             | FrameKind::TaskTokenUsage
             | FrameKind::ChatEvent
             | FrameKind::TeamPresetCatalogNotify
@@ -299,6 +300,7 @@ async fn wait_for_code_intel_unavailable_with_overview(
             | FrameKind::AgentError
             | FrameKind::AgentActivitySummary
             | FrameKind::AgentActivityStats
+            | FrameKind::AgentActivityChanged
             | FrameKind::TaskTokenUsage
             | FrameKind::ChatEvent
             | FrameKind::TeamPresetCatalogNotify
@@ -375,6 +377,7 @@ async fn wait_for_code_intel_warm_unavailable_overview(
             | FrameKind::AgentError
             | FrameKind::AgentActivitySummary
             | FrameKind::AgentActivityStats
+            | FrameKind::AgentActivityChanged
             | FrameKind::TaskTokenUsage
             | FrameKind::ChatEvent
             | FrameKind::TeamPresetCatalogNotify

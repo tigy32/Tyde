@@ -890,6 +890,9 @@ fn MemberRow(
                     {move || is_active_member.get().then(|| view! {
                         <span class="team-member-active-badge">"Active"</span>
                     })}
+                    {move || (binding_status() == Some(AgentControlStatus::AwaitingUser)).then(|| view! {
+                        <span class="team-member-awaiting-badge">"Needs your answer"</span>
+                    })}
                     <span class="team-member-role-badge">
                         {move || match member.get().map(|m| m.role) {
                             Some(TeamMemberRole::Manager) => "Manager",
@@ -2371,6 +2374,7 @@ fn select_options_view(options: Vec<SelectOption>, current: String) -> impl Into
 fn agent_control_status_label(status: AgentControlStatus) -> &'static str {
     match status {
         AgentControlStatus::Thinking => "thinking",
+        AgentControlStatus::AwaitingUser => "needs your answer",
         AgentControlStatus::Idle => "idle",
         AgentControlStatus::Failed => "failed",
     }
@@ -2379,6 +2383,7 @@ fn agent_control_status_label(status: AgentControlStatus) -> &'static str {
 fn agent_control_status_dot_class(status: AgentControlStatus) -> &'static str {
     match status {
         AgentControlStatus::Thinking => "running",
+        AgentControlStatus::AwaitingUser => "awaiting",
         AgentControlStatus::Idle => "completed",
         AgentControlStatus::Failed => "error",
     }
@@ -2956,7 +2961,7 @@ mod wasm_tests {
             .unwrap();
         let row_text = row_after.text_content().unwrap_or_default();
         let row_text_lc = row_text.to_lowercase();
-        for word in ["thinking", "idle", "failed"] {
+        for word in ["thinking", "idle", "failed", "needs your answer"] {
             assert!(
                 !row_text_lc.contains(word),
                 "row visible text should not contain literal status word {word:?} \
@@ -2969,6 +2974,51 @@ mod wasm_tests {
         assert!(
             row_text.contains("last active recorded"),
             "expected last-active text after binding update: {row_text:?}"
+        );
+
+        // A member waiting on the user is the one state that asks something
+        // of whoever reads the panel, so it is labelled and spelled out
+        // rather than reported as thinking.
+        state.team_member_bindings.update(|m| {
+            let entry = m.entry(host_id.to_owned()).or_default();
+            entry.insert(
+                manager_id.clone(),
+                TeamMemberBindingPayload {
+                    member_id: manager_id.clone(),
+                    current_agent_id: None,
+                    status: AgentControlStatus::AwaitingUser,
+                    last_active_at_ms: Some(123),
+                },
+            );
+        });
+        next_tick().await;
+        let dot: HtmlElement = container
+            .query_selector(".team-member-status-dot")
+            .unwrap()
+            .expect("status indicator should remain while awaiting the user")
+            .dyn_into()
+            .unwrap();
+        assert_eq!(
+            dot.get_attribute("aria-label").as_deref(),
+            Some("needs your answer")
+        );
+        assert_eq!(
+            dot.get_attribute("title").as_deref(),
+            Some("needs your answer")
+        );
+        let row_text = container
+            .query_selector(".team-member-row")
+            .unwrap()
+            .expect("member row")
+            .text_content()
+            .unwrap_or_default();
+        assert!(
+            row_text.contains("Needs your answer"),
+            "a member awaiting the user must say so in the row: {row_text:?}"
+        );
+        assert!(
+            !row_text.to_lowercase().contains("thinking"),
+            "a member awaiting the user is not thinking: {row_text:?}"
         );
     }
 

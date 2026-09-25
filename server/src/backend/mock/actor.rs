@@ -420,14 +420,21 @@ impl MockActor {
 
     fn handle_interrupt(&mut self) -> bool {
         self.requests.push(MockRequest::Interrupt);
-        if !matches!(
-            self.phase,
-            TurnPhase::Held {
-                interruptible: true
-            }
-        ) {
+        // Like the real backends, an interrupt ends the wait on an open
+        // question without answering it; the agent actor owns retiring it.
+        let awaiting_user = matches!(self.phase, TurnPhase::ToolPending(_))
+            || (matches!(self.phase, TurnPhase::Idle) && !self.pending_async_questions.is_empty());
+        if !awaiting_user
+            && !matches!(
+                self.phase,
+                TurnPhase::Held {
+                    interruptible: true
+                }
+            )
+        {
             return true;
         }
+        self.pending_async_questions.clear();
         emit::cancel_live_native_children(&self.active_subagents);
         let _ = self.events_tx.send_event(emit::cancelled(
             "mock backend interrupted held turn".to_owned(),

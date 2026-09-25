@@ -13,7 +13,7 @@ use serde_json::Value;
 /// `protocol::TydeReleaseVersion`.
 pub use host_config::{LOCAL_HOST_ID, TydeReleaseVersion};
 
-pub const PROTOCOL_VERSION: u32 = 65;
+pub const PROTOCOL_VERSION: u32 = 66;
 
 // Exported verbatim to TydeMobileService by tools/export-mobile-rtc.py.
 pub mod mobile_rtc {
@@ -752,8 +752,33 @@ pub enum AgentOrigin {
 #[serde(rename_all = "snake_case")]
 pub enum AgentControlStatus {
     Thinking,
+    /// The turn is waiting on the user: a blocking question or plan approval,
+    /// or an unanswered async question left open after the turn ended. The
+    /// agent has not finished; its output so far may be empty.
+    AwaitingUser,
     Idle,
     Failed,
+}
+
+/// Server-derived activity of an agent's foreground turn, published wherever
+/// liveness is published. The server owns the derivation from its pending
+/// user-interaction state; clients render it and never infer it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentActivity {
+    #[default]
+    Idle,
+    Thinking,
+    /// Waiting on the user's answer to a question or plan approval. Never
+    /// thinking: the backend has stopped typing.
+    AwaitingUser,
+}
+
+/// Instance-stream activity edge, emitted by the agent actor whenever
+/// [`AgentActivity`] changes. `AgentBootstrap` carries the current value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentActivityChangedPayload {
+    pub activity: AgentActivity,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -875,6 +900,7 @@ pub fn agent_control_output_from_chat_event(event: &ChatEvent) -> Option<AgentCo
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentControlReadResult {
     pub agent_id: AgentId,
+    pub status: AgentControlStatus,
     pub output: AgentControlOutput,
 }
 
@@ -1090,6 +1116,7 @@ pub enum FrameKind {
     NewAgent,
     AgentActivitySummary,
     AgentActivityStats,
+    AgentActivityChanged,
     AgentTurnStateNotify,
     AgentBackgroundWorkNotify,
     TaskTokenUsage,
@@ -1291,6 +1318,7 @@ impl fmt::Display for FrameKind {
             Self::NewAgent => f.write_str("new_agent"),
             Self::AgentActivitySummary => f.write_str("agent_activity_summary"),
             Self::AgentActivityStats => f.write_str("agent_activity_stats"),
+            Self::AgentActivityChanged => f.write_str("agent_activity_changed"),
             Self::AgentBackgroundWorkNotify => f.write_str("agent_background_work_notify"),
             Self::AgentTurnStateNotify => f.write_str("agent_turn_state_notify"),
             Self::TaskTokenUsage => f.write_str("task_token_usage"),
@@ -2200,8 +2228,8 @@ pub struct AgentsViewPreferencesNotifyPayload {
 pub struct AgentBootstrapPayload {
     pub events: Vec<AgentBootstrapEvent>,
     pub latest_output: AgentControlOutput,
-    /// Authoritative liveness after replaying `events`.
-    pub turn_active: bool,
+    /// Authoritative activity after replaying `events`.
+    pub activity: AgentActivity,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -4409,11 +4437,12 @@ pub struct AgentBackgroundWorkNotifyPayload {
     pub has_background_work: bool,
 }
 
-/// Host-stream liveness for unopened agents; attached streams supply their own.
+/// Host-stream activity for unopened agents; attached streams receive
+/// `AgentActivityChanged` instead.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentTurnStateNotifyPayload {
     pub agent_id: AgentId,
-    pub turn_active: bool,
+    pub activity: AgentActivity,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -4686,11 +4715,11 @@ pub struct NewAgentPayload {
     pub instance_stream: StreamPath,
     #[serde(default)]
     pub activity_summary: AgentActivitySummaryState,
-    /// Liveness when this descriptor was built, with the same meaning as
-    /// `AgentBootstrapPayload::turn_active`. A client that has not attached
+    /// Activity when this descriptor was built, with the same meaning as
+    /// `AgentBootstrapPayload::activity`. A client that has not attached
     /// the agent's instance stream has no other way to learn it.
     #[serde(default)]
-    pub turn_active: bool,
+    pub activity: AgentActivity,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

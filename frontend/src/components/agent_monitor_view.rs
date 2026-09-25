@@ -184,8 +184,10 @@ pub(crate) fn status_to_filter(status: DerivedAgentState) -> AgentStatusFilter {
         // persisted in user preferences and is deliberately left unchanged.
         // Waiting on background work is idle from the agent's side: no turn
         // is running, and the filter vocabulary is persisted, so it stays.
+        // Waiting on the user is likewise no work in flight.
         DerivedAgentState::Idle
         | DerivedAgentState::Cancelled
+        | DerivedAgentState::AwaitingUser
         | DerivedAgentState::BackgroundWork => AgentStatusFilter::Idle,
         DerivedAgentState::Terminated => AgentStatusFilter::Terminated,
     }
@@ -307,7 +309,8 @@ fn monitor_status_rank(status: DerivedAgentState) -> u8 {
         | DerivedAgentState::Thinking
         | DerivedAgentState::Cancelling
         | DerivedAgentState::CompactionQueued
-        | DerivedAgentState::Compacting => 0,
+        | DerivedAgentState::Compacting
+        | DerivedAgentState::AwaitingUser => 0,
         DerivedAgentState::Idle
         | DerivedAgentState::Cancelled
         | DerivedAgentState::BackgroundWork => 1,

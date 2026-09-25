@@ -51,6 +51,7 @@ async fn expect_next_event(client: &mut client::Connection, context: &str) -> En
                     | FrameKind::BackendCapacity
                     | FrameKind::BackendConfigSchemas
                     | FrameKind::BackendConfigSnapshots
+                    | FrameKind::AgentActivityChanged
                     | FrameKind::SessionList
                     | FrameKind::TaskTokenUsage
                     | FrameKind::WorkflowNotify
@@ -160,6 +161,7 @@ async fn expect_no_event(client: &mut client::Connection, duration: Duration, co
                 | FrameKind::HostSettings
                 | FrameKind::WorkflowNotify
                 | FrameKind::AgentActivityStats
+                | FrameKind::AgentActivityChanged
                 | FrameKind::TaskTokenUsage
                 | FrameKind::ContextCompactionNotify
                 | FrameKind::ContextCompactionCapability
@@ -659,7 +661,7 @@ async fn await_dev_driver_agent_ready(
     awaited
 }
 
-fn assert_await_result_ready(body: &Value, agent_id: &protocol::AgentId) {
+fn assert_await_result_ready(body: &Value, agent_id: &protocol::AgentId, expected_status: &str) {
     let ready = body
         .get("ready")
         .and_then(Value::as_array)
@@ -681,7 +683,10 @@ fn assert_await_result_ready(body: &Value, agent_id: &protocol::AgentId) {
         ready[0].get("agent_id").and_then(Value::as_str),
         Some(agent_id.0.as_str())
     );
-    assert_eq!(ready[0].get("status").and_then(Value::as_str), Some("idle"));
+    assert_eq!(
+        ready[0].get("status").and_then(Value::as_str),
+        Some(expected_status)
+    );
 }
 
 async fn wait_for_agent_control_status(
@@ -3982,7 +3987,7 @@ async fn agent_control_http_limits_spawn_selection_to_profile_backend_and_tier()
     )
     .await;
     let awaited = mcp_await_agent(&caller, &agent_id).await;
-    assert_await_result_ready(&awaited, &agent_id);
+    assert_await_result_ready(&awaited, &agent_id, "idle");
 }
 
 /// An explicitly configured Hermes launch profile becomes Ready after the
@@ -4168,7 +4173,7 @@ async fn agent_control_http_await_returns_while_exit_plan_mode_is_pending() {
     )
     .await
     .expect("tyde_await_agents must return while plan approval is pending");
-    assert_await_result_ready(&pending_await, &new_agent.agent_id);
+    assert_await_result_ready(&pending_await, &new_agent.agent_id, "awaiting_user");
 
     fixture
         .client
@@ -4194,7 +4199,7 @@ async fn agent_control_http_await_returns_while_exit_plan_mode_is_pending() {
     )
     .await
     .expect("tyde_await_agents must return after plan approval resumes the turn");
-    assert_await_result_ready(&resumed_await, &new_agent.agent_id);
+    assert_await_result_ready(&resumed_await, &new_agent.agent_id, "idle");
 
     let mut saw_completion = false;
     let mut saw_approval = false;
@@ -4333,7 +4338,7 @@ async fn agent_control_http_await_stays_active_after_exit_plan_mode_approval() {
     )
     .await
     .expect("tyde_await_agents must return while stream-end-first plan approval is pending");
-    assert_await_result_ready(&pending_await, &new_agent.agent_id);
+    assert_await_result_ready(&pending_await, &new_agent.agent_id, "awaiting_user");
 
     fixture
         .client
@@ -4431,7 +4436,7 @@ async fn agent_control_http_await_stays_active_after_exit_plan_mode_approval() {
     )
     .await
     .expect("tyde_await_agents must return after stream-end-first resumed turn finishes");
-    assert_await_result_ready(&finished_await, &new_agent.agent_id);
+    assert_await_result_ready(&finished_await, &new_agent.agent_id, "idle");
 }
 
 #[tokio::test]
@@ -4814,7 +4819,7 @@ async fn agent_control_http_latest_empty_error_reconnect_and_debug_are_typed() {
     )
     .await;
     let empty_ready = mcp_await_agent(&caller, &empty_child).await;
-    assert_await_result_ready(&empty_ready, &empty_child);
+    assert_await_result_ready(&empty_ready, &empty_child, "idle");
     fixture
         .mock_by_id(&empty_child)
         .await
@@ -4832,7 +4837,7 @@ async fn agent_control_http_latest_empty_error_reconnect_and_debug_are_typed() {
     .await;
     assert!(!mcp_result_is_error(&send_empty));
     let empty_ready = mcp_await_agent(&caller, &empty_child).await;
-    assert_await_result_ready(&empty_ready, &empty_child);
+    assert_await_result_ready(&empty_ready, &empty_child, "idle");
 
     let empty_read = mcp_tool_call_as(
         &caller,
@@ -4877,7 +4882,7 @@ async fn agent_control_http_latest_empty_error_reconnect_and_debug_are_typed() {
     )
     .await;
     let initially_ready = mcp_await_agent(&caller, &failed_child).await;
-    assert_await_result_ready(&initially_ready, &failed_child);
+    assert_await_result_ready(&initially_ready, &failed_child, "idle");
     let close_gate = MockGateHandle::new();
     fixture
         .mock_by_id(&failed_child)
@@ -5835,7 +5840,7 @@ async fn agent_control_interrupt_redirects_without_losing_queued_messages() {
             redirect_gate.release_one();
         }
         let ready = await_redirect.await;
-        assert_await_result_ready(&ready, &child);
+        assert_await_result_ready(&ready, &child, "idle");
         for expected in ["default queued", "explicit queued"] {
             fixture::next_chat_event_matching_on(
                 &mut fixture.client,
@@ -5903,7 +5908,7 @@ async fn agent_control_interrupt_redirects_without_losing_queued_messages() {
             "acknowledgment must publish the newly active turn before await"
         );
         idle_gate.release_one();
-        assert_await_result_ready(&await_idle.await, &child);
+        assert_await_result_ready(&await_idle.await, &child, "idle");
         let read = mcp_tool_call_as(
             &caller,
             false,

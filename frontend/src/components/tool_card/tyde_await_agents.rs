@@ -90,9 +90,16 @@ fn AwaitVerdict(
         .collect();
 
     let counts = {
-        let mut parts = Vec::with_capacity(2);
-        if !ready.is_empty() {
-            parts.push(format!("{} ready", ready.len()));
+        let awaiting = ready
+            .iter()
+            .filter(|agent| agent.status == AgentControlStatus::AwaitingUser)
+            .count();
+        let mut parts = Vec::with_capacity(3);
+        if ready.len() > awaiting {
+            parts.push(format!("{} ready", ready.len() - awaiting));
+        }
+        if awaiting > 0 {
+            parts.push(format!("{awaiting} awaiting the user"));
         }
         if !still_thinking.is_empty() {
             parts.push(format!("{} still thinking", still_thinking.len()));
@@ -313,6 +320,34 @@ mod wasm_tests {
             !body.contains("still thinking"),
             "an empty group contributes nothing: {body}"
         );
+    }
+
+    /// An agent the wait returned because it is parked on the user's answer
+    /// has not finished; counting it as "ready" would tell the reader its
+    /// work is done.
+    #[wasm_bindgen_test]
+    async fn awaiting_user_is_not_counted_as_ready() {
+        let result = ToolExecutionResult::TydeAwaitAgents {
+            ready: vec![
+                wait_status("agent-a", AgentControlStatus::Idle),
+                wait_status("agent-b", AgentControlStatus::AwaitingUser),
+            ],
+            still_thinking: Vec::new(),
+        };
+        let container = mount_await(Some(result), ToolOutputMode::Summary, |state| {
+            state.agents.update(|agents| {
+                agents.push(child_agent("agent-a", "Finished Worker"));
+                agents.push(child_agent("agent-b", "Asking Worker"));
+            });
+        });
+        next_tick().await;
+
+        let body = text(&container);
+        assert!(
+            body.contains("1 ready") && body.contains("1 awaiting the user"),
+            "an agent awaiting the user is reported separately from ready ones: {body}"
+        );
+        assert!(!body.contains("2 ready"), "{body}");
     }
 
     /// While the wait is pending there is no verdict yet — the live progress rows

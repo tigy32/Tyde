@@ -6,12 +6,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use protocol::{
-    AgentActivityStats, AgentActivityStatsPayload, AgentActivitySummary, AgentBootstrapEvent,
-    AgentBootstrapPayload, AgentControlLatestOutput, AgentControlOutput, AgentErrorCode,
-    AgentErrorPayload, AgentId, AgentInput, AgentOrigin, AgentRenamedPayload, AgentStartPayload,
-    BackendKind, ChatEvent, ChatMessage, ChatMessageId, CompactionMethod, CompactionMetrics,
-    CompactionMutation, CompactionObservationId, CompactionOperationId, CompactionStage,
-    CompactionTrigger, ContextBreakdown, ContextCompactionCapabilityPayload,
+    AgentActivity, AgentActivityStats, AgentActivityStatsPayload, AgentActivitySummary,
+    AgentBootstrapEvent, AgentBootstrapPayload, AgentControlLatestOutput, AgentControlOutput,
+    AgentErrorCode, AgentErrorPayload, AgentId, AgentInput, AgentOrigin, AgentRenamedPayload,
+    AgentStartPayload, BackendKind, ChatEvent, ChatMessage, ChatMessageId, CompactionMethod,
+    CompactionMetrics, CompactionMutation, CompactionObservationId, CompactionOperationId,
+    CompactionStage, CompactionTrigger, ContextBreakdown, ContextCompactionCapabilityPayload,
     ContextCompactionNotifyPayload, ContextCompactionStatus, ContextCompactionTimelineEvent,
     ContextCompactionTimelineStatus, Envelope, FrameKind, MessageMetadataUpdateData, MessageOrigin,
     MessageSender, MessageTokenUsage, ModelRequestId, ModelRequestTokenUsage, QueuedMessageEntry,
@@ -3481,10 +3481,13 @@ pub(crate) fn spawn_agent_actor(
             u64,
             Result<supervisor::SupervisionVerdict, supervisor::SupervisionFailure>,
         )>();
+        let mut published_activity = status_handle.snapshot().await.activity();
         loop {
             latest_output
                 .observe_event_log(&event_log)
                 .expect("typed agent replay log must project latest output");
+            publish_activity_change(&status_handle, &mut published_activity, &mut subscribers)
+                .await;
             // The loop turns whenever a backend event or command lands, which
             // is exactly when this agent's status can have changed, so the
             // supervisor sees every transition without polling anything.
@@ -5196,7 +5199,19 @@ pub(crate) fn spawn_agent_actor(
                             }).await;
                         }
                         ChatEvent::OperationCancelled(_) => {
-                            pending_tool_response_ids.clear();
+                            retire_cancelled_user_interactions(
+                                CancelledUserInteractions {
+                                    pending_tool_response_ids: &mut pending_tool_response_ids,
+                                    open_tool_call_ids: &mut open_tool_call_ids,
+                                    open_tool_requests: &mut open_tool_requests,
+                                    completed_tool_call_ids: &mut completed_tool_call_ids,
+                                },
+                                &canonical_stream,
+                                &mut event_log,
+                                &mut subscribers,
+                                &mut replay_state,
+                            )
+                            .await;
                             active_agent_await_ids.clear();
                             // Re-arm, rather than ending the turn here. Arming
                             // otherwise happens only on typing-true or on
@@ -8090,6 +8105,30 @@ pub(crate) fn spawn_agent_actor(
                                 )
                                 .await;
                             }
+                            // Between turns nothing but an unanswered async
+                            // question keeps the agent waiting, and a backend
+                            // with no turn to abort may report nothing, so the
+                            // actor retires those cards itself.
+                            if interrupted && !in_turn && !pending_tool_response_ids.is_empty() {
+                                retire_cancelled_user_interactions(
+                                    CancelledUserInteractions {
+                                        pending_tool_response_ids: &mut pending_tool_response_ids,
+                                        open_tool_call_ids: &mut open_tool_call_ids,
+                                        open_tool_requests: &mut open_tool_requests,
+                                        completed_tool_call_ids: &mut completed_tool_call_ids,
+                                    },
+                                    &canonical_stream,
+                                    &mut event_log,
+                                    &mut subscribers,
+                                    &mut replay_state,
+                                )
+                                .await;
+                                status_handle.update(|s| {
+                                    s.pending_user_response = None;
+                                    s.blocked_on_user_response = false;
+                                    s.activity_counter = s.activity_counter.saturating_add(1);
+                                }).await;
+                            }
                             let outcome = if interrupted {
                                 InterruptOutcome::Interrupted
                             } else {
@@ -8299,7 +8338,7 @@ pub(crate) fn spawn_agent_actor(
                                 &event_log,
                                 Some(&replay_state),
                                 latest_output.output(),
-                                status_handle.snapshot().await.is_visibly_active(),
+                                status_handle.snapshot().await.activity(),
                                 latest_slash_commands.as_ref(),
                                 &mut subscribers,
                                 stream,
@@ -8482,10 +8521,13 @@ pub(crate) fn spawn_relay_agent_actor(
         )
         .await;
 
+        let mut published_activity = status_handle.snapshot().await.activity();
         loop {
             latest_output
                 .observe_event_log(&event_log)
                 .expect("typed relay replay log must project latest output");
+            publish_activity_change(&status_handle, &mut published_activity, &mut subscribers)
+                .await;
             tokio::select! {
                 maybe_usage = model_usage.recv(), if model_usage_open => {
                     let Some(usage) = maybe_usage else {
@@ -9046,7 +9088,7 @@ pub(crate) fn spawn_relay_agent_actor(
                                 &event_log,
                                 Some(&replay_state),
                                 latest_output.output(),
-                                status_handle.snapshot().await.is_visibly_active(),
+                                status_handle.snapshot().await.activity(),
                                 latest_slash_commands.as_ref(),
                                 &mut subscribers,
                                 stream,
@@ -9405,6 +9447,49 @@ fn unanswered_replayed_user_interactions(event_log: &[Envelope]) -> Vec<String> 
         }
     }
     open
+}
+
+const CANCELLED_USER_INTERACTION_MESSAGE: &str =
+    "Cancelled: the turn was cancelled before this was answered.";
+
+struct CancelledUserInteractions<'a> {
+    pending_tool_response_ids: &'a mut HashSet<String>,
+    open_tool_call_ids: &'a mut HashSet<String>,
+    open_tool_requests: &'a mut HashMap<String, protocol::ToolRequest>,
+    completed_tool_call_ids: &'a mut HashSet<String>,
+}
+
+/// A cancel ends the wait on every question or plan approval still open, so
+/// it retires those cards rather than leaving them answerable.
+async fn retire_cancelled_user_interactions(
+    tools: CancelledUserInteractions<'_>,
+    canonical_stream: &str,
+    event_log: &mut Vec<Envelope>,
+    subscribers: &mut Vec<Stream>,
+    replay_state: &mut AgentReplayState,
+) {
+    for tool_call_id in std::mem::take(tools.pending_tool_response_ids) {
+        if !tools.open_tool_call_ids.remove(&tool_call_id)
+            || tools.completed_tool_call_ids.contains(&tool_call_id)
+        {
+            continue;
+        }
+        tools.open_tool_requests.remove(&tool_call_id);
+        append_chat_event(
+            canonical_stream,
+            event_log,
+            subscribers,
+            replay_state,
+            &ChatEvent::ToolExecutionCompleted(protocol::ToolExecutionCompletedData {
+                tool_call_id: tool_call_id.clone(),
+                outcome: protocol::ToolExecutionOutcome::Cancelled {
+                    message: CANCELLED_USER_INTERACTION_MESSAGE.to_owned(),
+                },
+            }),
+        )
+        .await;
+        tools.completed_tool_call_ids.insert(tool_call_id);
+    }
 }
 
 fn stale_tool_response_rejected_event() -> ChatEvent {
@@ -9810,7 +9895,7 @@ async fn park_terminal_agent(
                     event_log,
                     None,
                     latest_output.output(),
-                    false,
+                    AgentActivity::Idle,
                     None,
                     subscribers,
                     stream,
@@ -10000,7 +10085,7 @@ async fn park_relay_terminal_agent(
                     event_log,
                     None,
                     latest_output.output(),
-                    status_handle.snapshot().await.is_visibly_active(),
+                    status_handle.snapshot().await.activity(),
                     None,
                     subscribers,
                     stream,
@@ -11137,13 +11222,13 @@ async fn flush_pending_agent_attaches(
 ) {
     let output = current_latest_output(latest_output, event_log)
         .expect("typed agent replay log must project latest output");
-    let turn_active = status_handle.snapshot().await.is_visibly_active();
+    let activity = status_handle.snapshot().await.activity();
     for (stream, reply) in std::mem::take(pending_attaches) {
         let attached = attach_subscriber_with_latest_output(
             event_log,
             replay_state,
             &output,
-            turn_active,
+            activity,
             slash_commands,
             subscribers,
             stream,
@@ -12958,6 +13043,28 @@ async fn broadcast_live_event<T: serde::Serialize>(
     broadcast_event(subscribers, &event);
 }
 
+/// Every loop turn follows the backend event or command that may have changed
+/// this agent's status, so checking at the top of the loop publishes each
+/// activity edge after the events that caused it, in stream order. Attached
+/// subscribers learn the starting value from `AgentBootstrap`.
+async fn publish_activity_change(
+    status_handle: &registry::AgentStatusHandle,
+    published: &mut AgentActivity,
+    subscribers: &mut Vec<Stream>,
+) {
+    let activity = status_handle.snapshot().await.activity();
+    if *published == activity {
+        return;
+    }
+    *published = activity;
+    broadcast_live_event(
+        subscribers,
+        FrameKind::AgentActivityChanged,
+        &protocol::AgentActivityChangedPayload { activity },
+    )
+    .await;
+}
+
 fn broadcast_event(subscribers: &mut Vec<Stream>, event: &Envelope) {
     let mut idx = 0;
     while idx < subscribers.len() {
@@ -12976,7 +13083,7 @@ fn attach_subscriber_with_latest_output(
     event_log: &[Envelope],
     replay_state: Option<&AgentReplayState>,
     latest_output: &AgentControlOutput,
-    turn_active: bool,
+    activity: AgentActivity,
     slash_commands: Option<&protocol::SlashCommandCatalog>,
     subscribers: &mut Vec<Stream>,
     stream: Stream,
@@ -13042,7 +13149,7 @@ fn attach_subscriber_with_latest_output(
     let payload = serde_json::to_value(AgentBootstrapPayload {
         events,
         latest_output: latest_output.clone(),
-        turn_active,
+        activity,
     })
     .expect("failed to serialize AgentBootstrap payload");
     if stream

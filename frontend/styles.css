@@ -2120,6 +2120,15 @@ kbd {
 }
 
 .team-card-active-badge,
+.team-member-awaiting-badge {
+    font-size: 0.7rem;
+    padding: 1px 6px;
+    border-radius: 3px;
+    border: 1px solid var(--warning);
+    color: var(--warning);
+    flex-shrink: 0;
+}
+
 .team-member-active-badge {
     font-size: 0.7rem;
     text-transform: uppercase;
@@ -2221,6 +2230,10 @@ kbd {
 .team-member-status-dot.running {
     background: var(--accent-primary);
     animation: pulse 1.5s infinite;
+}
+
+.team-member-status-dot.awaiting {
+    background: var(--warning);
 }
 
 .team-member-status-dot.completed {
@@ -6807,6 +6820,13 @@ math merror {
    will be woken by it, so this must not read as "done, needs you". */
 .agent-card-status.background {
     color: var(--warning);
+}
+
+/* The agent is waiting on a question or plan approval only the user can
+   answer: not working, not done. */
+.agent-card-status.awaiting {
+    color: var(--warning);
+    font-weight: 600;
 }
 
 /* Spelled-out status, shown for outcomes whose glyph alone is ambiguous. */
@@ -14058,6 +14078,10 @@ pre.tool-error-pre {
 
 .tool-live-agent-status.running {
     color: var(--accent-primary);
+}
+
+.tool-live-agent-status.awaiting {
+    color: var(--warning);
 }
 
 .tool-live-agent-status.idle {

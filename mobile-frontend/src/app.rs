@@ -1143,6 +1143,9 @@ fn apply_disconnect(state: &AppState, host: &LocalHostId, _reason: Option<String
     state.agent_turn_active.update(|m| {
         m.retain(|k, _| k.local_host_id != *host);
     });
+    state.agent_awaiting_user.update(|m| {
+        m.retain(|k| k.local_host_id != *host);
+    });
     state.transient_events.update(|m| {
         m.retain(|k, _| k.local_host_id != *host);
     });

@@ -5311,8 +5311,9 @@ async fn restart_moved_agent(
     }).await;
     let replay: protocol::AgentBootstrapPayload =
         env.parse_payload().expect("restored agent bootstrap");
-    assert!(
-        !replay.turn_active,
+    assert_eq!(
+        replay.activity,
+        protocol::AgentActivity::Idle,
         "auto-restored moved agent must be idle"
     );
     let start = replay

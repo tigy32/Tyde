@@ -1616,6 +1616,15 @@ impl Connection {
                         envelope.stream
                     );
                 }
+                FrameKind::AgentActivityChanged => {
+                    let _: protocol::AgentActivityChangedPayload =
+                        envelope.parse_payload().map_err(FrameError::Json)?;
+                    assert!(
+                        self.outgoing_seq.contains_key(&envelope.stream),
+                        "AgentActivityChanged on stream {} before NewAgent",
+                        envelope.stream
+                    );
+                }
                 FrameKind::ContextCompactionNotify => {
                     let payload: ContextCompactionNotifyPayload =
                         envelope.parse_payload().map_err(FrameError::Json)?;

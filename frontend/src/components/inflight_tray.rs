@@ -249,6 +249,7 @@ enum ChildAgentStatus {
     Starting,
     Running,
     Compacting,
+    AwaitingUser,
     Idle,
     Failed(String),
 }
@@ -259,6 +260,7 @@ impl ChildAgentStatus {
             Self::Starting => "Starting".to_owned(),
             Self::Running => "Running".to_owned(),
             Self::Compacting => "Compacting context".to_owned(),
+            Self::AwaitingUser => "Needs your answer".to_owned(),
             Self::Idle => "Idle".to_owned(),
             Self::Failed(message) if message.trim().is_empty() => "Failed".to_owned(),
             Self::Failed(message) => format!("Failed: {}", truncate_inline(message, 72)),
@@ -268,6 +270,7 @@ impl ChildAgentStatus {
     fn class(&self) -> &'static str {
         match self {
             Self::Starting | Self::Running | Self::Compacting => "tool-live-agent-status running",
+            Self::AwaitingUser => "tool-live-agent-status awaiting",
             Self::Idle => "tool-live-agent-status idle",
             Self::Failed(_) => "tool-live-agent-status failed",
         }
@@ -288,27 +291,7 @@ fn backend_label(kind: BackendKind) -> &'static str {
 }
 
 fn derive_child_status(state: &AppState, agent: &crate::state::AgentInfo) -> ChildAgentStatus {
-    let derived = state.compaction_in_progress.with(|compaction| {
-        state.context_compactions.with(|context_compaction| {
-            state.agent_turn_active.with(|turn_active| {
-                state.streaming_text.with(|streaming| {
-                    state.last_turn_cancelled.with(|cancelled| {
-                        state.interrupt_pending.with(|interrupt_pending| {
-                            derive_agent_state(
-                                agent,
-                                streaming,
-                                turn_active,
-                                compaction,
-                                context_compaction,
-                                cancelled,
-                                interrupt_pending,
-                            )
-                        })
-                    })
-                })
-            })
-        })
-    });
+    let derived = derive_agent_state(state, agent);
     match derived {
         DerivedAgentState::Initializing => ChildAgentStatus::Starting,
         // A compacting child is running, but "Running" alone hides *why* it
@@ -318,6 +301,7 @@ fn derive_child_status(state: &AppState, agent: &crate::state::AgentInfo) -> Chi
             ChildAgentStatus::Compacting
         }
         DerivedAgentState::Thinking | DerivedAgentState::Cancelling => ChildAgentStatus::Running,
+        DerivedAgentState::AwaitingUser => ChildAgentStatus::AwaitingUser,
         // The tray tracks whether work is in flight, not how the last turn
         // ended; a cancelled child is idle for its purposes. A child's own
         // background work is the child's tray to show, not the parent's.
@@ -396,7 +380,10 @@ fn compute_snapshot(state: &AppState, parent: &ActiveAgentRef) -> TraySnapshot {
                     snapshot.counts.running += 1;
                     snapshot.children.push(agent.agent_id.clone());
                 }
-                ChildAgentStatus::Idle | ChildAgentStatus::Failed(_) => {}
+                // Nothing is in flight while the child waits on the user.
+                ChildAgentStatus::AwaitingUser
+                | ChildAgentStatus::Idle
+                | ChildAgentStatus::Failed(_) => {}
             }
         }
     });

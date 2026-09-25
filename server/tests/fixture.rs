@@ -988,13 +988,13 @@ pub fn agent_bootstrap_frames(env: &Envelope) -> VecDeque<Envelope> {
     assert_eq!(env.kind, FrameKind::AgentBootstrap);
     let payload: AgentBootstrapPayload = env.parse_payload().expect("parse AgentBootstrapPayload");
     if payload.events.iter().any(|event| matches!(event, AgentBootstrapEvent::AgentStart(start) if start.name.starts_with("BTW:"))) {
-        eprintln!("SIDE QUESTION BOOTSTRAP turn_active={} events={:?}", payload.turn_active, payload.events);
+        eprintln!("SIDE QUESTION BOOTSTRAP activity={:?} events={:?}", payload.activity, payload.events);
     }
     if payload.events.iter().any(|event| matches!(event, AgentBootstrapEvent::AgentStart(start) if start.name == "fork-scripted")) {
-        eprintln!("TYDE FORK FIXTURE BOOTSTRAP turn_active={} events={:?}", payload.turn_active, payload.events);
+        eprintln!("TYDE FORK FIXTURE BOOTSTRAP activity={:?} events={:?}", payload.activity, payload.events);
     }
     if payload.events.iter().any(|event| matches!(event, AgentBootstrapEvent::AgentStart(start) if start.name == "await-exit-plan-mode-resume")) {
-        eprintln!("EXIT PLAN BOOTSTRAP turn_active={} events={:?}", payload.turn_active, payload.events);
+        eprintln!("EXIT PLAN BOOTSTRAP activity={:?} events={:?}", payload.activity, payload.events);
     }
     payload
         .events

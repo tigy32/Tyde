@@ -1952,7 +1952,7 @@ mod wasm_tests {
                 events: vec![protocol::AgentBootstrapEvent::ChatEvent(protocol::ChatEvent::ToolProgress(protocol::ToolProgressData {
                     tool_call_id: "background-check".to_owned(), execution_mode: protocol::ToolExecutionMode::Background, cancellable: false,
                     update: protocol::ToolProgressUpdate::Other { payload: serde_json::json!({"description": "Restored running command"}) },
-                }))], latest_output: Default::default(), turn_active: false,
+                }))], latest_output: Default::default(), activity: protocol::AgentActivity::Idle,
             },
         ).unwrap());
         settle_autoscroll().await;

@@ -441,6 +441,22 @@ fn active_agent_is_running_tracked(state: &AppState) -> bool {
     })
 }
 
+/// True when the server reports the active agent as parked on the user's
+/// answer. Not a running turn, but still cancellable: cancelling withdraws the
+/// pending request.
+fn active_agent_is_awaiting_user_tracked(state: &AppState) -> bool {
+    let Some(active) = state.active_agent.get() else {
+        return false;
+    };
+    if active_agent_is_terminated_tracked(state) {
+        return false;
+    }
+    let agent_ref = active.as_agent_ref();
+    state
+        .agent_awaiting_user
+        .with(|awaiting| awaiting.contains(&agent_ref))
+}
+
 /// True when the active agent has reported a backend session id, which is
 /// required to fork via "Fork + send".
 fn active_agent_has_session_id_tracked(state: &AppState) -> bool {
@@ -1489,6 +1505,12 @@ pub fn ChatInput() -> impl IntoView {
     let s_input = state.clone();
     let running_state = state.clone();
     let is_running = Memo::new(move |_| active_agent_is_running_tracked(&running_state));
+    let awaiting_state = state.clone();
+    let is_awaiting_user =
+        Memo::new(move |_| active_agent_is_awaiting_user_tracked(&awaiting_state));
+    // Cancel is offered with an empty draft for a running turn and for a
+    // pending question or plan approval alike.
+    let can_cancel = Memo::new(move |_| is_running.get() || is_awaiting_user.get());
     let terminated_state = state.clone();
     // The composer target died. Same-actor Send/Steer/Interrupt are off, but the
     // draft, the photo controls, and Fork + send all stay live: the draft is the
@@ -1791,6 +1813,11 @@ pub fn ChatInput() -> impl IntoView {
             >
                 {move || composer.announcement.get()}
             </div>
+            <Show when=move || is_awaiting_user.get()>
+                <div class="chat-input-queued-title" role="status" data-mobile-test="chat-awaiting-user">
+                    <span>"Needs your answer — respond above, or Cancel to withdraw the request."</span>
+                </div>
+            </Show>
             <Show when=move || usage_pause.get().is_some() && !is_terminated.get()>
                 <div class="chat-input-queued-title" role="status">
                     <span>{move || usage_pause.get().map(|pause| pause.status_message())}</span>
@@ -1975,7 +2002,7 @@ pub fn ChatInput() -> impl IntoView {
                         class="send-button"
                         aria-label={move || {
                             if is_terminated.get() { TERMINATED_COMPOSER_LABEL }
-                            else if is_running.get() && !has_input.get() { "Cancel current turn" }
+                            else if can_cancel.get() && !has_input.get() { "Cancel current turn" }
                             else if is_steer.get() { "Queue message" }
                             else { "Send message" }
                         }}
@@ -1990,7 +2017,7 @@ pub fn ChatInput() -> impl IntoView {
                                 if is_terminated.get_untracked() {
                                     return;
                                 }
-                                if is_running.get_untracked() && !has_input.get_untracked() {
+                                if can_cancel.get_untracked() && !has_input.get_untracked() {
                                     do_interrupt();
                                 } else {
                                     do_send();
@@ -2004,7 +2031,7 @@ pub fn ChatInput() -> impl IntoView {
                             if is_terminated.get() { true }
                             // Cancel (thinking+empty): always enabled — stopping a
                             // turn must never be blocked by an unsettled send.
-                            else if is_running.get() && !has_input.get() { false }
+                            else if can_cancel.get() && !has_input.get() { false }
                             // The composer keeps its draft across the in-flight
                             // window, so having input no longer implies this is
                             // a fresh send. Say so explicitly.
@@ -2013,7 +2040,7 @@ pub fn ChatInput() -> impl IntoView {
                     >
                         {move || {
                             if is_terminated.get() { "Terminated" }
-                            else if is_running.get() && !has_input.get() { "Cancel" }
+                            else if can_cancel.get() && !has_input.get() { "Cancel" }
                             else if is_steer.get() { "Queue" }
                             else { "Send" }
                         }}
@@ -2040,7 +2067,8 @@ pub fn ChatInput() -> impl IntoView {
                         let on_cancel = interrupt_for_menu.clone();
                         let show_steer = is_steer.get();
                         let show_btw = can_btw.get();
-                        let show_cancel = is_steer.get();
+                        let show_cancel =
+                            is_steer.get() || (is_awaiting_user.get() && has_input.get());
                         view! {
                             <div
                                 class="chat-send-menu-backdrop"
@@ -4134,6 +4162,104 @@ mod wasm_tests {
             "",
             "the visible composer must be empty after Steer"
         );
+    }
+
+    /// A question or plan approval the server reports as awaiting the user is
+    /// not a running turn, but it must stay cancellable: an async question
+    /// left open after its turn ended otherwise has no way to be withdrawn.
+    #[wasm_bindgen_test]
+    async fn awaiting_user_offers_cancel_and_says_it_needs_an_answer() {
+        let _guard = crate::bridge::test_capture_sends();
+        let host = LocalHostId("host-1".to_owned());
+        let agent_id = AgentId("agent-1".to_owned());
+        let state = AppState::new();
+        state.active_local_host_id.set(Some(host.clone()));
+        state.agents.set(vec![AgentInfo {
+            local_host_id: host.clone(),
+            agent_id: agent_id.clone(),
+            name: "Agent".to_owned(),
+            origin: AgentOrigin::User,
+            backend_kind: BackendKind::Codex,
+            workspace_roots: Vec::new(),
+            project_id: None,
+            parent_agent_id: None,
+            session_id: None,
+            custom_agent_id: None,
+            created_at_ms: 0,
+            instance_stream: StreamPath("/agent/agent-1/inst".to_owned()),
+            started: true,
+            fatal_error: None,
+        }]);
+        state.active_agent.set(Some(crate::state::ActiveAgentRef {
+            local_host_id: host.clone(),
+            agent_id: agent_id.clone(),
+        }));
+        let container = make_container();
+        let mount_state = state.clone();
+        let _h = mount_to(container.clone(), move || {
+            provide_context(mount_state);
+            view! { <ChatInput /> }
+        });
+        next_tick().await;
+
+        assert_eq!(
+            primary(&container)
+                .text_content()
+                .unwrap_or_default()
+                .trim(),
+            "Send",
+            "control: an idle agent offers Send, not Cancel"
+        );
+        assert!(
+            container
+                .query_selector("[data-mobile-test='chat-awaiting-user']")
+                .unwrap()
+                .is_none(),
+            "control: an idle agent has no awaiting notice"
+        );
+
+        state.agent_awaiting_user.update(|awaiting| {
+            awaiting.insert(AgentRef {
+                local_host_id: host.clone(),
+                agent_id: agent_id.clone(),
+            });
+        });
+        next_tick().await;
+
+        let notice = container
+            .query_selector("[data-mobile-test='chat-awaiting-user']")
+            .unwrap()
+            .expect("awaiting the user must be announced in the composer");
+        assert!(
+            notice
+                .text_content()
+                .unwrap_or_default()
+                .contains("Needs your answer"),
+            "the notice must say the agent needs an answer"
+        );
+        assert!(
+            container
+                .query_selector("[data-mobile-test='chat-thinking-ring']")
+                .unwrap()
+                .is_none(),
+            "an agent awaiting the user is not thinking"
+        );
+        let p = primary(&container);
+        assert_eq!(p.text_content().unwrap_or_default().trim(), "Cancel");
+        assert!(
+            !p.has_attribute("disabled"),
+            "Cancel must be enabled while the agent awaits the user"
+        );
+        p.unchecked_ref::<web_sys::HtmlElement>().click();
+        next_tick().await;
+        next_tick().await;
+        let frames: Vec<serde_json::Value> = crate::bridge::test_sent_lines()
+            .iter()
+            .map(|line| serde_json::from_str(line).expect("sent frame json"))
+            .collect();
+        assert_eq!(frames.len(), 1, "Cancel must emit exactly one frame");
+        assert_eq!(frames[0]["kind"], "interrupt");
+        assert_eq!(frames[0]["stream"], "/agent/agent-1/inst");
     }
 
     // ── State matrix row 3: Idle + input + session ───────────────────────────

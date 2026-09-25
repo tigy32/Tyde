@@ -8,14 +8,14 @@ use crate::types::{
     TeamContextCompactionNotifyPayload, TerminalBootstrapPayload,
 };
 use crate::{
-    AgentActivityStatsPayload, AgentActivitySummaryPayload, AgentClosedPayload, AgentOrigin,
-    AgentStartPayload, AgentTurnStateNotifyPayload, AgentsViewPreferencesNotifyPayload,
-    BackendCapacityPayload, BackendCapacityRefreshPayload, BackendConfigSchemasPayload,
-    BackendConfigSnapshotsPayload, BackendKind, BackendNativeSettingsWritePayload,
-    BackendSettingsRefreshPayload, BackendSetupPayload, CancelWorkflowPayload, ChatEvent,
-    ClientErrorPayload, CodeIntelDiagnosticsPayload, CodeIntelErrorPayload,
-    CodeIntelFileModelPayload, CodeIntelHoverResultPayload, CodeIntelNavigateResultPayload,
-    CodeIntelOverviewPayload, CodeIntelReferencesCompletePayload,
+    AgentActivityChangedPayload, AgentActivityStatsPayload, AgentActivitySummaryPayload,
+    AgentClosedPayload, AgentOrigin, AgentStartPayload, AgentTurnStateNotifyPayload,
+    AgentsViewPreferencesNotifyPayload, BackendCapacityPayload, BackendCapacityRefreshPayload,
+    BackendConfigSchemasPayload, BackendConfigSnapshotsPayload, BackendKind,
+    BackendNativeSettingsWritePayload, BackendSettingsRefreshPayload, BackendSetupPayload,
+    CancelWorkflowPayload, ChatEvent, ClientErrorPayload, CodeIntelDiagnosticsPayload,
+    CodeIntelErrorPayload, CodeIntelFileModelPayload, CodeIntelHoverResultPayload,
+    CodeIntelNavigateResultPayload, CodeIntelOverviewPayload, CodeIntelReferencesCompletePayload,
     CodeIntelReferencesResultsPayload, CodeIntelStatusPayload, CommandErrorPayload,
     ContextCompactionCapabilityPayload, ContextCompactionNotifyPayload, CustomAgentDeletePayload,
     CustomAgentNotifyPayload, CustomAgentUpsertPayload, DeleteSessionPayload, Envelope,
@@ -594,6 +594,14 @@ impl ProtocolValidator {
                 None,
                 format!(
                     "AgentActivityStats is an agent-stream-only frame, received on host stream {}",
+                    envelope.stream
+                ),
+            )),
+            FrameKind::AgentActivityChanged => Err(self.violation(
+                envelope,
+                None,
+                format!(
+                    "AgentActivityChanged is an agent-stream-only frame, received on host stream {}",
                     envelope.stream
                 ),
             )),
@@ -1268,6 +1276,27 @@ impl ProtocolValidator {
                         ),
                     ));
                 }
+            }
+            FrameKind::AgentActivityChanged => {
+                if !state.saw_agent_start {
+                    return Err(build_violation(
+                        &recent_frames,
+                        envelope,
+                        Some(state.backend_kind),
+                        format!(
+                            "AgentActivityChanged arrived before AgentStart on {}",
+                            envelope.stream
+                        ),
+                    ));
+                }
+                let _: AgentActivityChangedPayload = envelope.parse_payload().map_err(|error| {
+                    build_violation(
+                        &recent_frames,
+                        envelope,
+                        Some(state.backend_kind),
+                        format!("failed to parse AgentActivityChanged payload: {error}"),
+                    )
+                })?;
             }
             FrameKind::AgentError => {}
             FrameKind::SessionSettings => {}

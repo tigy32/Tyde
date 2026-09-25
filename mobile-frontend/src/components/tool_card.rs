@@ -596,6 +596,7 @@ fn agent_display_name(state: &AppState, owner: &AgentRef, agent_id: &AgentId) ->
 enum LiveAgentStatus {
     Starting,
     Running,
+    AwaitingUser,
     Idle,
     Failed,
     Unknown,
@@ -606,6 +607,7 @@ impl LiveAgentStatus {
         match self {
             Self::Starting => "Starting",
             Self::Running => "Running",
+            Self::AwaitingUser => "Needs your answer",
             Self::Idle => "Idle",
             Self::Failed => "Failed",
             Self::Unknown => "Unknown",
@@ -638,7 +640,12 @@ fn live_agent_status(state: &AppState, owner: &AgentRef, agent_id: &AgentId) -> 
             let streaming = state
                 .streaming_text
                 .with(|map| map.contains_key(&agent_ref));
-            if typing || streaming {
+            let awaiting = state
+                .agent_awaiting_user
+                .with(|set| set.contains(&agent_ref));
+            if awaiting {
+                LiveAgentStatus::AwaitingUser
+            } else if typing || streaming {
                 LiveAgentStatus::Running
             } else {
                 LiveAgentStatus::Idle
@@ -650,6 +657,7 @@ fn live_agent_status(state: &AppState, owner: &AgentRef, agent_id: &AgentId) -> 
 fn wait_status_label(status: AgentControlStatus) -> &'static str {
     match status {
         AgentControlStatus::Thinking => "Thinking",
+        AgentControlStatus::AwaitingUser => "Needs your answer",
         AgentControlStatus::Idle => "Idle",
         AgentControlStatus::Failed => "Failed",
     }

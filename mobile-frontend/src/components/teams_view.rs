@@ -170,6 +170,9 @@ fn TeamMemberRow(
     let backend = format!("{:?}", member.backend_kind);
     let (tone, status_label) = match binding.as_ref().map(|b| b.status) {
         Some(protocol::AgentControlStatus::Thinking) => (StatusTone::Active, "Thinking"),
+        Some(protocol::AgentControlStatus::AwaitingUser) => {
+            (StatusTone::Pending, "Needs your answer")
+        }
         Some(protocol::AgentControlStatus::Idle) => (StatusTone::Online, "Idle"),
         Some(protocol::AgentControlStatus::Failed) => (StatusTone::Error, "Failed"),
         None => (StatusTone::Muted, "No session"),

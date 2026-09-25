@@ -424,12 +424,18 @@ fn agent_row(
         .agent_turn_active
         .with(|m| m.get(&agent_ref).copied().unwrap_or(false));
 
+    let awaiting_user = is_active
+        && state
+            .agent_awaiting_user
+            .with(|agents| agents.contains(&agent_ref));
     let background_work = is_active
         && state
             .agents_with_background_work
             .with(|agents| agents.contains(&agent_ref));
     let tone = if has_error {
         StatusTone::Error
+    } else if awaiting_user {
+        StatusTone::Pending
     } else if turn_active {
         StatusTone::Active
     } else if background_work {
@@ -441,6 +447,8 @@ fn agent_row(
     };
     let status_label = if has_error {
         "Error"
+    } else if awaiting_user {
+        "Needs your answer"
     } else if turn_active {
         "Thinking"
     } else if background_work {
@@ -457,6 +465,8 @@ fn agent_row(
     // "which agents can I kick forward" pops on a scan.
     let status_pill_tone = if has_error {
         PillTone::Error
+    } else if awaiting_user {
+        PillTone::Warning
     } else if turn_active {
         PillTone::Accent
     } else if background_work {
@@ -469,6 +479,8 @@ fn agent_row(
 
     let test_selector: &'static str = if has_error {
         "agent-row-error"
+    } else if awaiting_user {
+        "agent-row-awaiting-user"
     } else if turn_active {
         "agent-row-active"
     } else if background_work {
@@ -884,6 +896,42 @@ mod wasm_tests {
             status_text(),
             "Idle",
             "a live turn-end edge must settle the visible row back to idle"
+        );
+
+        // The server's activity is the only source of "awaiting the user"; it
+        // must read differently from both a running turn and a finished one.
+        let activity_update = |activity, seq| {
+            crate::dispatch::dispatch_envelope(
+                &state,
+                &host,
+                protocol::Envelope::from_payload(
+                    StreamPath("/host/mobile-background".to_owned()),
+                    protocol::FrameKind::AgentTurnStateNotify,
+                    seq,
+                    &protocol::AgentTurnStateNotifyPayload {
+                        agent_id: agent_ref.agent_id.clone(),
+                        activity,
+                    },
+                )
+                .unwrap(),
+            );
+        };
+        activity_update(protocol::AgentActivity::Thinking, 2);
+        next_tick().await;
+        assert_eq!(status_text(), "Thinking");
+        activity_update(protocol::AgentActivity::AwaitingUser, 3);
+        next_tick().await;
+        assert_eq!(
+            status_text(),
+            "Needs your answer",
+            "an agent parked on the user's answer is neither thinking nor idle"
+        );
+        activity_update(protocol::AgentActivity::Idle, 4);
+        next_tick().await;
+        assert_eq!(
+            status_text(),
+            "Idle",
+            "answering or cancelling settles the row back to idle"
         );
     }
 

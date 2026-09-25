@@ -7,11 +7,12 @@ use std::time::Duration;
 use client::ClientConfig;
 use protocol::{
     AGENT_CONTROL_DEFAULT_READ_LIMIT, AGENT_CONTROL_DEFAULT_READ_MAX_BYTES,
-    AGENT_CONTROL_MAX_READ_LIMIT, AGENT_CONTROL_MAX_READ_MAX_BYTES, AgentBootstrapEvent,
-    AgentBootstrapPayload, AgentControlLatestOutput, AgentControlReadDebugResult,
-    AgentControlReadResult, AgentControlStatus, AgentErrorPayload, AgentId, AgentRenamedPayload,
-    AgentStartPayload, BackendAccessMode, BackendCapacityPayload, BackendCapacitySnapshot,
-    BackendCapacityState, BackendConfigSchemasPayload, BackendKind, CapacityReport, ChatEvent,
+    AGENT_CONTROL_MAX_READ_LIMIT, AGENT_CONTROL_MAX_READ_MAX_BYTES, AgentActivity,
+    AgentActivityChangedPayload, AgentBootstrapEvent, AgentBootstrapPayload,
+    AgentControlLatestOutput, AgentControlReadDebugResult, AgentControlReadResult,
+    AgentControlStatus, AgentErrorPayload, AgentId, AgentRenamedPayload, AgentStartPayload,
+    BackendAccessMode, BackendCapacityPayload, BackendCapacitySnapshot, BackendCapacityState,
+    BackendConfigSchemasPayload, BackendKind, CapacityReport, ChatEvent,
     ContextCompactionCapabilityPayload, ContextCompactionNotifyPayload, Envelope, FrameKind,
     LaunchProfileCatalog, LaunchProfileCatalogPayload, LaunchProfileEntry, LaunchProfileId,
     MessageSender, NewAgentPayload, ProjectId, SendMessagePayload, SessionId, SessionSchemaEntry,
@@ -51,6 +52,8 @@ struct AgentState {
     is_thinking: bool,
     /// True after at least one turn has completed since the last send/spawn.
     turn_completed: bool,
+    /// The server's published activity for the agent.
+    activity: AgentActivity,
     /// Set when a fatal AgentError arrives.
     terminated: bool,
     last_error: Option<String>,
@@ -70,6 +73,8 @@ impl AgentState {
     fn status(&self) -> AgentControlStatus {
         if self.terminated && self.last_error.is_some() {
             AgentControlStatus::Failed
+        } else if !self.terminated && self.activity == AgentActivity::AwaitingUser {
+            AgentControlStatus::AwaitingUser
         } else if self.is_active() {
             AgentControlStatus::Thinking
         } else {
@@ -380,6 +385,7 @@ impl AgentControlHandle {
             .ok_or_else(|| format!("unknown agent_id {}", agent_id.0))?;
         Ok(AgentControlReadResult {
             agent_id,
+            status: agent.status(),
             output: agent.latest_output.output().clone(),
         })
     }
@@ -718,6 +724,7 @@ async fn run_runtime(
                                     .get_mut(&agent_id)
                                     .expect("agent must still exist after send_message");
                                 agent.turn_completed = false;
+                                agent.activity = AgentActivity::Thinking;
                                 agent.activity_counter =
                                     agent.activity_counter.saturating_add(1);
                                 publish_snapshot(&mut state.snapshot, &snapshot_tx);
@@ -851,7 +858,7 @@ fn fail_runtime(
 }
 
 fn apply_new_agent_payload(snapshot: &mut SnapshotState, payload: NewAgentPayload) {
-    let activity = snapshot
+    let activity_counter = snapshot
         .agents
         .get(&payload.agent_id)
         .map(|agent| agent.activity_counter.saturating_add(1))
@@ -870,9 +877,10 @@ fn apply_new_agent_payload(snapshot: &mut SnapshotState, payload: NewAgentPayloa
             instance_stream: payload.instance_stream,
             is_thinking: false,
             turn_completed: false,
+            activity: payload.activity,
             terminated: false,
             last_error: None,
-            activity_counter: activity,
+            activity_counter,
             event_log: Vec::new(),
             latest_output: AgentControlLatestOutput::default(),
         },
@@ -1002,17 +1010,24 @@ fn apply_envelope(snapshot: &mut SnapshotState, envelope: &protocol::Envelope) {
                 apply_agent_bootstrap_event(snapshot, &envelope.stream, event);
             }
             let agent_id = parse_agent_id_from_stream(&envelope.stream);
-            snapshot
-                .agents
-                .get_mut(&agent_id)
-                .unwrap_or_else(|| {
-                    panic!(
-                        "agent bootstrap arrived for unknown agent stream {}",
-                        envelope.stream.0
-                    )
-                })
-                .latest_output
-                .replace_from_bootstrap(latest_output);
+            let agent = snapshot.agents.get_mut(&agent_id).unwrap_or_else(|| {
+                panic!(
+                    "agent bootstrap arrived for unknown agent stream {}",
+                    envelope.stream.0
+                )
+            });
+            agent.latest_output.replace_from_bootstrap(latest_output);
+            agent.activity = payload.activity;
+        }
+        FrameKind::AgentActivityChanged => {
+            let payload: AgentActivityChangedPayload = envelope
+                .parse_payload()
+                .expect("validated AgentActivityChanged payload should parse");
+            let agent_id = parse_agent_id_from_stream(&envelope.stream);
+            if let Some(agent) = snapshot.agents.get_mut(&agent_id) {
+                agent.activity = payload.activity;
+                agent.activity_counter = agent.activity_counter.saturating_add(1);
+            }
         }
         FrameKind::AgentStart => {
             let payload: AgentStartPayload = envelope

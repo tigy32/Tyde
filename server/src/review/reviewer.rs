@@ -126,14 +126,14 @@ impl ReviewerToolBridge {
                                 _ => {}
                             }
                         }
-                        tracing::info!(reviewer_agent_id = %reviewer_agent_id, event_count = bootstrap.events.len(), turn_active = bootstrap.turn_active, has_response, failure = ?failure, "reviewer bridge replayed bootstrap");
+                        tracing::info!(reviewer_agent_id = %reviewer_agent_id, event_count = bootstrap.events.len(), activity = ?bootstrap.activity, has_response, failure = ?failure, "reviewer bridge replayed bootstrap");
                         if let Some(error) = failure {
                             let _ = review_handle
                                 .ai_reviewer_exited(reviewer_agent_id.clone(), Err(error))
                                 .await;
                             return;
                         }
-                        if !bootstrap.turn_active && has_response {
+                        if bootstrap.activity != protocol::AgentActivity::Thinking && has_response {
                             let _ = review_handle
                                 .ai_reviewer_exited(reviewer_agent_id.clone(), Ok(()))
                                 .await;

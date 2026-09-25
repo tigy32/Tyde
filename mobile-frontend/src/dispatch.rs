@@ -8,23 +8,24 @@ use leptos::prelude::{GetUntracked, Set, Update, WithUntracked};
 use protocol::MobileAccessErrorCode;
 use protocol::types::{AgentCompactNotifyPayload, AgentCompactStatus};
 use protocol::{
-    AgentActivityStatsPayload, AgentActivitySummaryPayload, AgentBootstrapEvent,
-    AgentBootstrapPayload, AgentClosedPayload, AgentErrorPayload, AgentId, AgentOrigin,
-    AgentRenamedPayload, AgentStartPayload, AgentTurnStateNotifyPayload, BackendCapacityPayload,
-    BackendConfigSchemasPayload, BackendSetupPayload, BrowseBootstrapListing,
-    BrowseBootstrapPayload, ChatEvent, ClientErrorCode, CodeIntelOverviewPayload,
-    CommandErrorPayload, ContextCompactionCapabilityPayload, ContextCompactionNotifyPayload,
-    CustomAgentNotifyPayload, Envelope, FrameKind, HeartbeatPayload, HostBrowseEntriesPayload,
-    HostBrowseErrorPayload, HostBrowseOpenedPayload, LaunchProfileCatalogPayload,
-    ListSessionsPayload, McpServerNotifyPayload, NewAgentPayload, ProjectBootstrapPayload,
-    ProjectEventPayload, ProjectFileContentsPayload, ProjectGitDiffPayload,
-    ProjectGitStatusPayload, ProjectId, ProjectNotifyPayload, QueuedMessagesPayload, RejectCode,
-    RejectPayload, ReviewBootstrapPayload, ReviewEventPayload, ReviewId, SeqMismatch,
-    SessionHistoryPayload, SessionListPayload, SessionSchemasPayload, SessionSettingsPayload,
-    SkillNotifyPayload, SteeringNotifyPayload, StreamPath, TaskTokenUsagePayload,
-    TeamCompactNotifyPayload, TeamCompactStatus, TeamContextCompactionNotifyPayload,
-    TeamDraftNotifyPayload, TeamMemberBindingNotifyPayload, TeamMemberNotifyPayload,
-    TeamMemberShuffleSuggestionNotifyPayload, TeamNotifyPayload, TeamPresetCatalogNotifyPayload,
+    AgentActivity, AgentActivityChangedPayload, AgentActivityStatsPayload,
+    AgentActivitySummaryPayload, AgentBootstrapEvent, AgentBootstrapPayload, AgentClosedPayload,
+    AgentErrorPayload, AgentId, AgentOrigin, AgentRenamedPayload, AgentStartPayload,
+    AgentTurnStateNotifyPayload, BackendCapacityPayload, BackendConfigSchemasPayload,
+    BackendSetupPayload, BrowseBootstrapListing, BrowseBootstrapPayload, ChatEvent,
+    ClientErrorCode, CodeIntelOverviewPayload, CommandErrorPayload,
+    ContextCompactionCapabilityPayload, ContextCompactionNotifyPayload, CustomAgentNotifyPayload,
+    Envelope, FrameKind, HeartbeatPayload, HostBrowseEntriesPayload, HostBrowseErrorPayload,
+    HostBrowseOpenedPayload, LaunchProfileCatalogPayload, ListSessionsPayload,
+    McpServerNotifyPayload, NewAgentPayload, ProjectBootstrapPayload, ProjectEventPayload,
+    ProjectFileContentsPayload, ProjectGitDiffPayload, ProjectGitStatusPayload, ProjectId,
+    ProjectNotifyPayload, QueuedMessagesPayload, RejectCode, RejectPayload, ReviewBootstrapPayload,
+    ReviewEventPayload, ReviewId, SeqMismatch, SessionHistoryPayload, SessionListPayload,
+    SessionSchemasPayload, SessionSettingsPayload, SkillNotifyPayload, SteeringNotifyPayload,
+    StreamPath, TaskTokenUsagePayload, TeamCompactNotifyPayload, TeamCompactStatus,
+    TeamContextCompactionNotifyPayload, TeamDraftNotifyPayload, TeamMemberBindingNotifyPayload,
+    TeamMemberNotifyPayload, TeamMemberShuffleSuggestionNotifyPayload, TeamNotifyPayload,
+    TeamPresetCatalogNotifyPayload,
 };
 
 use crate::bridge;
@@ -420,13 +421,13 @@ pub fn dispatch_envelope(state: &AppState, host: &LocalHostId, envelope: Envelop
                         agent_id: payload.agent_id,
                     };
                     log::info!(
-                        "dispatch agent_turn_state_notify host={} agent_id={} turn_active={}",
+                        "dispatch agent_turn_state_notify host={} agent_id={} activity={:?}",
                         host,
                         agent_ref.agent_id,
-                        payload.turn_active
+                        payload.activity
                     );
                     if !agent_is_fatal(state, &agent_ref) {
-                        set_agent_turn_active(state, agent_ref, payload.turn_active);
+                        set_agent_activity(state, agent_ref, payload.activity);
                     }
                 }
                 Err(error) => log::error!(
@@ -541,14 +542,14 @@ pub fn dispatch_envelope(state: &AppState, host: &LocalHostId, envelope: Envelop
                 let instance_stream = payload.instance_stream.clone();
                 let origin = payload.origin;
                 let started = payload.session_id.is_some();
-                let turn_active = payload.turn_active;
+                let activity = payload.activity;
                 log::info!(
-                    "mobile_apply_new_agent host={} agent_id={} instance_stream={} origin={:?} turn_active={}",
+                    "mobile_apply_new_agent host={} agent_id={} instance_stream={} origin={:?} activity={:?}",
                     host,
                     agent_id,
                     instance_stream,
                     origin,
-                    turn_active
+                    activity
                 );
                 let info = AgentInfo {
                     local_host_id: host.clone(),
@@ -570,13 +571,13 @@ pub fn dispatch_envelope(state: &AppState, host: &LocalHostId, envelope: Envelop
                     agents.retain(|a| !(a.local_host_id == *host && a.agent_id == agent_id));
                     agents.push(info);
                 });
-                set_agent_turn_active(
+                set_agent_activity(
                     state,
                     AgentRef {
                         local_host_id: host.clone(),
                         agent_id: agent_id.clone(),
                     },
-                    turn_active,
+                    activity,
                 );
 
                 // User-origin agents auto-open into the chat view — the user
@@ -1072,6 +1073,28 @@ pub fn dispatch_envelope(state: &AppState, host: &LocalHostId, envelope: Envelop
                 apply_agent_compact_notify(state, host, payload);
             }
         }
+        FrameKind::AgentActivityChanged => {
+            match envelope.parse_payload::<AgentActivityChangedPayload>() {
+                Ok(payload) => match resolve_agent_ref(state, host, &envelope.stream) {
+                    Some(agent_ref) if !agent_is_fatal(state, &agent_ref) => {
+                        set_agent_activity(state, agent_ref, payload.activity);
+                    }
+                    Some(_) => {}
+                    None => log::warn!(
+                        "AgentActivityChanged for unknown stream host={} stream={}",
+                        host,
+                        envelope.stream
+                    ),
+                },
+                Err(error) => log::error!(
+                    "failed to parse AgentActivityChanged host={} stream={} seq={}: {}",
+                    host,
+                    envelope.stream,
+                    envelope.seq,
+                    error
+                ),
+            }
+        }
         FrameKind::AgentActivityStats => {
             match envelope.parse_payload::<AgentActivityStatsPayload>() {
                 Ok(payload) => {
@@ -1229,6 +1252,9 @@ fn settle_fatal_agent_ui(state: &AppState, agent_ref: &AgentRef) {
     state.agent_turn_active.update(|m| {
         m.remove(agent_ref);
     });
+    state.agent_awaiting_user.update(|m| {
+        m.remove(agent_ref);
+    });
     // Cancelled/Retry cards claim live activity ("Retrying in 800ms…") that a
     // dead agent can never follow through on. Terminated supersedes them.
     state.transient_events.update(|m| {
@@ -1330,6 +1356,9 @@ fn drop_agent_state(state: &AppState, agent_ref: &AgentRef) {
         m.remove(agent_ref);
     });
     state.agent_turn_active.update(|m| {
+        m.remove(agent_ref);
+    });
+    state.agent_awaiting_user.update(|m| {
         m.remove(agent_ref);
     });
     state.agent_activity_stats.update(|m| {
@@ -2865,7 +2894,7 @@ fn apply_host_bootstrap(
     state.agents.update(|agents| {
         agents.retain(|a| a.local_host_id != *host || snapshot_ids.contains(&a.agent_id));
         for payload in payload.agents {
-            let turn_active = payload.turn_active;
+            let activity = payload.activity;
             let mut info = agent_info_from_payload(host, payload);
             if let Some(existing) = agents
                 .iter_mut()
@@ -2880,24 +2909,36 @@ fn apply_host_bootstrap(
                 if info.session_id.is_none() {
                     info.session_id = existing.session_id.clone();
                 }
-                turn_states.push((info.agent_ref(), turn_active && info.fatal_error.is_none()));
+                let activity = if info.fatal_error.is_some() {
+                    AgentActivity::Idle
+                } else {
+                    activity
+                };
+                turn_states.push((info.agent_ref(), activity));
                 *existing = info;
             } else {
-                turn_states.push((info.agent_ref(), turn_active));
+                turn_states.push((info.agent_ref(), activity));
                 agents.push(info);
             }
         }
     });
     // The snapshot is the only liveness a lazy client has for agents it never
     // opens; a fatal row keeps its settled state regardless.
-    for (agent_ref, turn_active) in turn_states {
-        set_agent_turn_active(state, agent_ref, turn_active);
+    for (agent_ref, activity) in turn_states {
+        set_agent_activity(state, agent_ref, activity);
     }
 }
 
-fn set_agent_turn_active(state: &AppState, agent_ref: AgentRef, turn_active: bool) {
+fn set_agent_activity(state: &AppState, agent_ref: AgentRef, activity: AgentActivity) {
+    state.agent_awaiting_user.update(|set| {
+        if activity == AgentActivity::AwaitingUser {
+            set.insert(agent_ref.clone());
+        } else {
+            set.remove(&agent_ref);
+        }
+    });
     state.agent_turn_active.update(|map| {
-        if turn_active {
+        if activity == AgentActivity::Thinking {
             map.insert(agent_ref, true);
         } else {
             map.remove(&agent_ref);
@@ -3014,6 +3055,9 @@ fn apply_agent_bootstrap(
         m.remove(&agent_ref);
     });
     state.agent_turn_active.update(|m| {
+        m.remove(&agent_ref);
+    });
+    state.agent_awaiting_user.update(|m| {
         m.remove(&agent_ref);
     });
     state.agent_activity_stats.update(|m| {
@@ -3146,7 +3190,7 @@ fn apply_agent_bootstrap(
         }
     }
     // Fatal is terminal authority, and it wins over the snapshot's own
-    // `turn_active`. Two reasons this settles *after* the whole replay rather
+    // `activity`. Two reasons this settles *after* the whole replay rather
     // than trusting a loop-local flag:
     //
     // 1. replayed events that follow the fatal record (a trailing StreamStart,
@@ -3160,14 +3204,8 @@ fn apply_agent_bootstrap(
         settle_fatal_agent_ui(state, &agent_ref);
         return;
     }
-    state.agent_turn_active.update(|map| {
-        if payload.turn_active {
-            map.insert(agent_ref.clone(), true);
-        } else {
-            map.remove(&agent_ref);
-        }
-    });
-    if !payload.turn_active {
+    set_agent_activity(state, agent_ref.clone(), payload.activity);
+    if payload.activity != AgentActivity::Thinking {
         state.streaming_text.update(|map| {
             map.remove(&agent_ref);
         });
@@ -3330,7 +3368,7 @@ mod wasm_tests {
         let bootstrap = protocol::AgentBootstrapPayload {
             events: Vec::new(),
             latest_output: Default::default(),
-            turn_active: false,
+            activity: protocol::AgentActivity::Idle,
         };
         let env = Envelope::from_payload(stream.clone(), FrameKind::AgentBootstrap, 0, &bootstrap)
             .expect("synthetic AgentBootstrap");
@@ -3737,7 +3775,7 @@ mod wasm_tests {
                     created_at_ms: 1,
                     instance_stream: StreamPath("/agent/old-agent/inst".to_owned()),
                     activity_summary: Default::default(),
-                    turn_active: false,
+                    activity: protocol::AgentActivity::Idle,
                 },
             ),
         );
@@ -3796,7 +3834,7 @@ mod wasm_tests {
                     created_at_ms: 2,
                     instance_stream: StreamPath("/agent/new-agent/inst".to_owned()),
                     activity_summary: Default::default(),
-                    turn_active: false,
+                    activity: protocol::AgentActivity::Idle,
                 },
             ),
         );
@@ -4021,7 +4059,7 @@ mod wasm_tests {
             created_at_ms: 1,
             instance_stream: StreamPath("/agent/a-1/inst".to_owned()),
             activity_summary: Default::default(),
-            turn_active: true,
+            activity: protocol::AgentActivity::Thinking,
         };
         let bootstrap = settings_model::HostBootstrapPayload {
             agents_with_background_work: Vec::new(),
@@ -4156,7 +4194,7 @@ mod wasm_tests {
             state
                 .agent_turn_active
                 .with_untracked(|map| map.get(&agent_ref).copied().unwrap_or(false)),
-            "HostBootstrap turn_active=true must mark the agent's turn active"
+            "HostBootstrap activity=Thinking must mark the agent's turn active"
         );
 
         // Later changes for an unattached agent arrive on the host stream.
@@ -4169,7 +4207,7 @@ mod wasm_tests {
                 2,
                 &protocol::AgentTurnStateNotifyPayload {
                     agent_id: agent_payload.agent_id.clone(),
-                    turn_active: false,
+                    activity: protocol::AgentActivity::Idle,
                 },
             ),
         );
@@ -4177,7 +4215,7 @@ mod wasm_tests {
             !state
                 .agent_turn_active
                 .with_untracked(|map| map.contains_key(&agent_ref)),
-            "AgentTurnStateNotify turn_active=false must settle the agent idle"
+            "AgentTurnStateNotify activity=Idle must settle the agent idle"
         );
         dispatch_envelope(
             &state,
@@ -4188,7 +4226,7 @@ mod wasm_tests {
                 3,
                 &protocol::AgentTurnStateNotifyPayload {
                     agent_id: agent_payload.agent_id.clone(),
-                    turn_active: true,
+                    activity: protocol::AgentActivity::Thinking,
                 },
             ),
         );
@@ -4196,7 +4234,7 @@ mod wasm_tests {
             state
                 .agent_turn_active
                 .with_untracked(|map| map.get(&agent_ref).copied().unwrap_or(false)),
-            "AgentTurnStateNotify turn_active=true must mark the agent running again"
+            "AgentTurnStateNotify activity=Thinking must mark the agent running again"
         );
     }
 
@@ -4233,7 +4271,7 @@ mod wasm_tests {
                     created_at_ms: 1,
                     instance_stream: instance_stream.clone(),
                     activity_summary: Default::default(),
-                    turn_active: false,
+                    activity: protocol::AgentActivity::Idle,
                 },
             ),
         );
@@ -4272,7 +4310,7 @@ mod wasm_tests {
                 protocol::AgentBootstrapEvent::ChatEvent(chat_event),
             ],
             latest_output: Default::default(),
-            turn_active: false,
+            activity: protocol::AgentActivity::Idle,
         };
         dispatch_envelope(
             &state,
@@ -4348,7 +4386,7 @@ mod wasm_tests {
                     created_at_ms: 1,
                     instance_stream: instance_stream.clone(),
                     activity_summary: Default::default(),
-                    turn_active: false,
+                    activity: protocol::AgentActivity::Idle,
                 },
             ),
         );
@@ -5101,7 +5139,7 @@ mod wasm_tests {
                 },
             )],
             latest_output: Default::default(),
-            turn_active: false,
+            activity: protocol::AgentActivity::Idle,
         };
         dispatch_envelope(
             &state,

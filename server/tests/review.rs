@@ -4612,8 +4612,9 @@ async fn configured_reviews_are_awaited_without_injecting_parent_messages() {
     .await
     .parse_payload::<protocol::AgentBootstrapPayload>()
     .expect("requester bootstrap");
-    assert!(
-        parent_snapshot.turn_active,
+    assert_eq!(
+        parent_snapshot.activity,
+        protocol::AgentActivity::Thinking,
         "Review completion must not interrupt the requester's own work"
     );
     for event in parent_snapshot.events {

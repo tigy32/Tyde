@@ -16,16 +16,16 @@ use protocol::types::{
     TeamCompactNotifyPayload, TeamCompactPayload, TeamCompactStatus,
 };
 use protocol::{
-    AgentActivitySummary, AgentActivitySummaryPayload, AgentActivitySummaryStaleReason,
-    AgentActivitySummaryState, AgentAnnotationTarget, AgentControlStatus, AgentGroupsUpdate,
-    AgentId, AgentInput, AgentOrderKey, AgentOrigin, AgentPinsUpdate, AgentStartPayload,
-    AgentSystemTagAssignment, AgentSystemTagDescriptor, AgentSystemTagId, AgentTagsSnapshot,
-    AgentTagsUpdate, AgentTurnStateNotifyPayload, AgentWorkflowMetadata,
-    AgentsViewPreferencesNotifyPayload, AgentsViewPreferencesSnapshot, AgentsViewPreferencesUpdate,
-    BackendCapacityPayload, BackendCapacitySnapshot, BackendCapacityState, BackendConfigSnapshot,
-    BackendConfigSnapshotsPayload, BackendKind, BackendNativeSettingsSnapshot,
-    BackendSettingsRefreshPayload, BackendSetupPayload, BrowseBootstrapListing,
-    BrowseBootstrapPayload, CancelWorkflowPayload, ChatEvent, ChatMessage,
+    AgentActivity, AgentActivitySummary, AgentActivitySummaryPayload,
+    AgentActivitySummaryStaleReason, AgentActivitySummaryState, AgentAnnotationTarget,
+    AgentControlStatus, AgentGroupsUpdate, AgentId, AgentInput, AgentOrderKey, AgentOrigin,
+    AgentPinsUpdate, AgentStartPayload, AgentSystemTagAssignment, AgentSystemTagDescriptor,
+    AgentSystemTagId, AgentTagsSnapshot, AgentTagsUpdate, AgentTurnStateNotifyPayload,
+    AgentWorkflowMetadata, AgentsViewPreferencesNotifyPayload, AgentsViewPreferencesSnapshot,
+    AgentsViewPreferencesUpdate, BackendCapacityPayload, BackendCapacitySnapshot,
+    BackendCapacityState, BackendConfigSnapshot, BackendConfigSnapshotsPayload, BackendKind,
+    BackendNativeSettingsSnapshot, BackendSettingsRefreshPayload, BackendSetupPayload,
+    BrowseBootstrapListing, BrowseBootstrapPayload, CancelWorkflowPayload, ChatEvent, ChatMessage,
     CodeIntelCancelReferencesPayload, CodeIntelFindReferencesPayload, CodeIntelHoverPayload,
     CodeIntelNavigatePayload, CodeIntelSetVisibleRangePayload, CodeIntelSubscribeFilePayload,
     CodeIntelUnsubscribeFilePayload, CompactionAvailabilityReason, CompactionMethod,
@@ -253,7 +253,7 @@ struct PendingNewAgentFanout {
     instance_stream: StreamPath,
     attach_eagerly: bool,
     activity_summary: AgentActivitySummaryState,
-    turn_active: bool,
+    activity: AgentActivity,
 }
 
 struct NewAgentFanoutBatchGuard {
@@ -2930,7 +2930,7 @@ impl HostHandle {
             });
             let start = agent_handle.snapshot();
             let activity_summary = current_agent_activity_summary_state(&state, &start.agent_id);
-            let turn_active = agent_turn_active(&state, &start.agent_id).await;
+            let activity = agent_activity(&state, &start.agent_id).await;
             let Some(subscriber) = state.host_streams.get_mut(&host_path) else {
                 panic!(
                     "host stream {} disappeared during registration bootstrap build",
@@ -2955,7 +2955,7 @@ impl HostHandle {
                 created_at_ms: start.created_at_ms,
                 instance_stream: instance_stream.clone(),
                 activity_summary,
-                turn_active,
+                activity,
             };
             subscriber
                 .known_agent_streams
@@ -3103,7 +3103,7 @@ impl HostHandle {
                 pending.instance_stream,
                 pending.attach_eagerly,
                 pending.activity_summary,
-                pending.turn_active,
+                pending.activity,
             ) {
                 Ok(Some(attachment)) => {
                     agent_visibility
@@ -5492,7 +5492,7 @@ impl HostHandle {
             if let Some(parent) = &start.parent_agent_id {
                 fan_out_agent_background_work(&mut state, parent).await;
             }
-            let turn_active = agent_turn_active(&state, &start.agent_id).await;
+            let activity = agent_activity(&state, &start.agent_id).await;
             let host_streams = state
                 .host_streams
                 .iter_mut()
@@ -5502,23 +5502,17 @@ impl HostHandle {
                         &start,
                         &agent_handle,
                         activity_summary.clone(),
-                        turn_active,
+                        activity,
                     )
                     .map(
-                        |(
-                            stream,
-                            attach_eagerly,
-                            instance_stream,
-                            activity_summary,
-                            turn_active,
-                        )| {
+                        |(stream, attach_eagerly, instance_stream, activity_summary, activity)| {
                             (
                                 path.clone(),
                                 stream,
                                 attach_eagerly,
                                 instance_stream,
                                 activity_summary,
-                                turn_active,
+                                activity,
                             )
                         },
                     )
@@ -5550,7 +5544,7 @@ impl HostHandle {
         let mut dead_paths = Vec::new();
         let mut deferred_attachments = Vec::new();
         let mut publication_claimed = false;
-        for (path, stream, attach_eagerly, instance_stream, activity_summary, turn_active) in
+        for (path, stream, attach_eagerly, instance_stream, activity_summary, activity) in
             host_streams
         {
             if !visibility.may_emit_new_agent() {
@@ -5572,7 +5566,7 @@ impl HostHandle {
                 instance_stream,
                 attach_eagerly,
                 activity_summary,
-                turn_active,
+                activity,
             ) {
                 Ok(attachment) => {
                     let continue_fanout = visibility.record_new_agent_delivery(path.clone());
@@ -5935,7 +5929,7 @@ impl HostHandle {
             if let Some(parent) = &start.parent_agent_id {
                 fan_out_agent_background_work(&mut state, parent).await;
             }
-            let turn_active = agent_turn_active(&state, &start.agent_id).await;
+            let activity = agent_activity(&state, &start.agent_id).await;
             let host_streams = state
                 .host_streams
                 .iter_mut()
@@ -5945,23 +5939,17 @@ impl HostHandle {
                         &start,
                         &agent_handle,
                         activity_summary.clone(),
-                        turn_active,
+                        activity,
                     )
                     .map(
-                        |(
-                            stream,
-                            attach_eagerly,
-                            instance_stream,
-                            activity_summary,
-                            turn_active,
-                        )| {
+                        |(stream, attach_eagerly, instance_stream, activity_summary, activity)| {
                             (
                                 path.clone(),
                                 stream,
                                 attach_eagerly,
                                 instance_stream,
                                 activity_summary,
-                                turn_active,
+                                activity,
                             )
                         },
                     )
@@ -5982,7 +5970,7 @@ impl HostHandle {
 
         let mut dead_paths = Vec::new();
         let mut deferred_attachments = Vec::new();
-        for (path, stream, attach_eagerly, instance_stream, activity_summary, turn_active) in
+        for (path, stream, attach_eagerly, instance_stream, activity_summary, activity) in
             host_streams
         {
             if !visibility.may_emit_new_agent() {
@@ -5995,7 +5983,7 @@ impl HostHandle {
                 instance_stream,
                 attach_eagerly,
                 activity_summary,
-                turn_active,
+                activity,
             ) {
                 Ok(attachment) => {
                     let continue_fanout = visibility.record_new_agent_delivery(path.clone());
@@ -7462,10 +7450,6 @@ impl HostHandle {
                 if let Some(status) = self.agent_status_snapshot(&agent_id).await {
                     let events = if status.terminated {
                         registry.clear_binding_by_agent(agent_id.clone()).await?
-                    } else if status.blocked_on_user_response {
-                        registry
-                            .record_agent_activity(agent_id.clone(), AgentControlStatus::Thinking)
-                            .await?
                     } else {
                         registry
                             .record_agent_activity(agent_id.clone(), status.status())
@@ -10395,8 +10379,8 @@ impl HostHandle {
         let Some(status) = state.registry.agent_status_handle(agent_id) else {
             return;
         };
-        let turn_active = status.snapshot().await.is_visibly_active();
-        fan_out_agent_turn_state(&mut state, agent_id, turn_active);
+        let activity = status.snapshot().await.activity();
+        fan_out_agent_turn_state(&mut state, agent_id, activity);
         fan_out_agent_background_work(&mut state, agent_id).await;
         if let Some(parent) = state.registry.parent_agent_id(agent_id) {
             fan_out_agent_background_work(&mut state, &parent).await;
@@ -10418,8 +10402,8 @@ impl HostHandle {
             let Some(status) = state.registry.agent_status_handle(&agent_id) else {
                 continue;
             };
-            let turn_active = status.snapshot().await.is_visibly_active();
-            fan_out_agent_turn_state(&mut state, &agent_id, turn_active);
+            let activity = status.snapshot().await.activity();
+            fan_out_agent_turn_state(&mut state, &agent_id, activity);
             fan_out_agent_background_work(&mut state, &agent_id).await;
         }
     }
@@ -11878,7 +11862,7 @@ impl HostHandle {
             if let Some(parent) = &start.parent_agent_id {
                 fan_out_agent_background_work(&mut state, parent).await;
             }
-            let turn_active = agent_turn_active(&state, &start.agent_id).await;
+            let activity = agent_activity(&state, &start.agent_id).await;
             state
                 .host_streams
                 .iter_mut()
@@ -11888,23 +11872,17 @@ impl HostHandle {
                         &start,
                         &agent_handle,
                         activity_summary.clone(),
-                        turn_active,
+                        activity,
                     )
                     .map(
-                        |(
-                            stream,
-                            attach_eagerly,
-                            instance_stream,
-                            activity_summary,
-                            turn_active,
-                        )| {
+                        |(stream, attach_eagerly, instance_stream, activity_summary, activity)| {
                             (
                                 path.clone(),
                                 stream,
                                 attach_eagerly,
                                 instance_stream,
                                 activity_summary,
-                                turn_active,
+                                activity,
                             )
                         },
                     )
@@ -11989,7 +11967,7 @@ impl HostHandle {
         }
         let mut dead_paths = Vec::new();
         let mut deferred_attachments = Vec::new();
-        for (path, stream, attach_eagerly, instance_stream, activity_summary, turn_active) in
+        for (path, stream, attach_eagerly, instance_stream, activity_summary, activity) in
             host_streams
         {
             match emit_new_agent_for_stream(
@@ -11999,7 +11977,7 @@ impl HostHandle {
                 instance_stream,
                 attach_eagerly,
                 activity_summary,
-                turn_active,
+                activity,
             ) {
                 Ok(attachment) => {
                     agent_visibility.record_new_agent(start.agent_id.clone(), path.clone());
@@ -15452,10 +15430,6 @@ impl HostHandle {
         if let Some(status) = self.agent_status_snapshot(&agent_id).await {
             let update = if status.terminated {
                 registry.clear_binding_by_agent(agent_id.clone()).await
-            } else if status.blocked_on_user_response {
-                registry
-                    .record_agent_activity(agent_id.clone(), AgentControlStatus::Thinking)
-                    .await
             } else {
                 registry
                     .record_agent_activity(agent_id.clone(), status.status())
@@ -15571,10 +15545,6 @@ fn spawn_host_team_status_task(host: HostHandle) {
                 let registry = { host.state.lock().await.team_registry.clone() };
                 let result = if status.terminated {
                     registry.clear_binding_by_agent(agent_id.clone()).await
-                } else if status.blocked_on_user_response {
-                    registry
-                        .record_agent_activity(agent_id.clone(), AgentControlStatus::Thinking)
-                        .await
                 } else {
                     registry
                         .record_agent_activity(agent_id.clone(), status.status())
@@ -17561,8 +17531,14 @@ fn prepare_new_agent_fanout_for_subscriber(
     start: &AgentStartPayload,
     agent_handle: &AgentHandle,
     activity_summary: AgentActivitySummaryState,
-    turn_active: bool,
-) -> Option<(Stream, bool, StreamPath, AgentActivitySummaryState, bool)> {
+    activity: AgentActivity,
+) -> Option<(
+    Stream,
+    bool,
+    StreamPath,
+    AgentActivitySummaryState,
+    AgentActivity,
+)> {
     let instance_stream = new_instance_stream(&start.agent_id);
     subscriber
         .known_agent_streams
@@ -17584,7 +17560,7 @@ fn prepare_new_agent_fanout_for_subscriber(
             attach_eagerly,
             instance_stream,
             activity_summary,
-            turn_active,
+            activity,
         ))
     } else {
         subscriber
@@ -17595,7 +17571,7 @@ fn prepare_new_agent_fanout_for_subscriber(
                 instance_stream,
                 attach_eagerly,
                 activity_summary,
-                turn_active,
+                activity,
             });
         None
     }
@@ -17650,7 +17626,7 @@ fn emit_new_agent_for_stream(
     instance_stream: StreamPath,
     attach_eagerly: bool,
     activity_summary: AgentActivitySummaryState,
-    turn_active: bool,
+    activity: AgentActivity,
 ) -> Result<Option<DeferredAgentAttachment>, StreamClosed> {
     let new_agent = NewAgentPayload {
         agent_id: start.agent_id.clone(),
@@ -17669,7 +17645,7 @@ fn emit_new_agent_for_stream(
         created_at_ms: start.created_at_ms,
         instance_stream: instance_stream.clone(),
         activity_summary,
-        turn_active,
+        activity,
     };
 
     let payload = serde_json::to_value(&new_agent)
@@ -19159,12 +19135,12 @@ fn activity_summary_from_state(state: &AgentActivitySummaryState) -> Option<Agen
     }
 }
 
-async fn agent_turn_active(state: &HostState, agent_id: &AgentId) -> bool {
+async fn agent_activity(state: &HostState, agent_id: &AgentId) -> AgentActivity {
     let status = state
         .registry
         .agent_status_handle(agent_id)
         .unwrap_or_else(|| panic!("registry missing status for listed agent {}", agent_id));
-    status.snapshot().await.is_visibly_active()
+    status.snapshot().await.activity()
 }
 
 async fn fan_out_agent_background_work(state: &mut HostState, agent_id: &AgentId) {
@@ -19196,10 +19172,10 @@ async fn fan_out_agent_background_work(state: &mut HostState, agent_id: &AgentId
     });
 }
 
-fn fan_out_agent_turn_state(state: &mut HostState, agent_id: &AgentId, turn_active: bool) {
+fn fan_out_agent_turn_state(state: &mut HostState, agent_id: &AgentId, activity: AgentActivity) {
     let payload = serde_json::to_value(AgentTurnStateNotifyPayload {
         agent_id: agent_id.clone(),
-        turn_active,
+        activity,
     })
     .expect("failed to serialize AgentTurnStateNotify payload for host stream fanout");
     let stream_prefix = format!("/agent/{}/", agent_id);
@@ -19208,8 +19184,8 @@ fn fan_out_agent_turn_state(state: &mut HostState, agent_id: &AgentId, turn_acti
     for (path, subscriber) in state.host_streams.iter_mut() {
         // Only a subscriber that knows the agent but has not attached its
         // instance stream needs this. Once attached, `AgentBootstrap` and the
-        // agent's own events carry liveness, and a second source would race
-        // them across streams.
+        // agent's own `AgentActivityChanged` frames carry activity, and a
+        // second source would race them across streams.
         let attached = match subscriber
             .known_agent_streams
             .iter()

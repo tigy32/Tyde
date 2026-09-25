@@ -249,7 +249,7 @@ pub fn prime_agent_stream_for_tests(
         &BootstrapPayload {
             events: vec![BootstrapEvent::AgentStart(agent_payload.clone())],
             latest_output: Default::default(),
-            turn_active: false,
+            activity: protocol::AgentActivity::Idle,
         },
     )
     .expect("synthetic AgentBootstrap");
@@ -383,7 +383,7 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                         })
                     });
                     if !fatal {
-                        set_agent_turn_active(state, &payload.agent_id, payload.turn_active);
+                        set_agent_activity(state, &payload.agent_id, payload.activity);
                     }
                 }
                 Err(error) => report_dispatch_error(
@@ -1092,6 +1092,33 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                 ),
             }
         }
+        FrameKind::AgentActivityChanged => {
+            let Some(agent_id) = resolve_agent_id(state, host_id, &envelope.stream) else {
+                log::warn!(
+                    "agent_activity_changed on unknown stream {}",
+                    envelope.stream
+                );
+                return;
+            };
+            match envelope.parse_payload::<protocol::AgentActivityChangedPayload>() {
+                Ok(payload) => {
+                    log::info!(
+                        "dispatch agent_activity_changed host={} agent_id={} activity={:?}",
+                        host_id,
+                        agent_id,
+                        payload.activity
+                    );
+                    set_agent_activity(state, &agent_id, payload.activity);
+                }
+                Err(error) => report_dispatch_error(
+                    state,
+                    host_id,
+                    &envelope.stream,
+                    envelope.kind,
+                    format!("failed to parse agent_activity_changed payload: {error}"),
+                ),
+            }
+        }
         FrameKind::QueuedMessages => {
             let Some(agent_id) = resolve_agent_id(state, host_id, &envelope.stream) else {
                 log::warn!("queued_messages on unknown stream {}", envelope.stream);
@@ -1129,7 +1156,7 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                     payload.instance_stream
                 );
                 let agent_id = payload.agent_id.clone();
-                let turn_active = payload.turn_active;
+                let activity = payload.activity;
                 let started = payload.session_id.is_some();
                 let origin = payload.origin;
                 let team_member_id = payload.team_member_id.clone();
@@ -1171,7 +1198,7 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                         .retain(|agent| !(agent.host_id == host_id && agent.agent_id == agent_id));
                     agents.push(info);
                 });
-                set_agent_turn_active(state, &agent_id, turn_active);
+                set_agent_activity(state, &agent_id, activity);
 
                 // If a compaction `Completed` notify arrived before this
                 // `NewAgent` echo, the dispatch handler for the notify
@@ -4808,6 +4835,9 @@ fn apply_agent_closed(state: &AppState, host_id: &str, agent_id: AgentId) {
     state.agent_turn_active.update(|map| {
         map.remove(&agent_id);
     });
+    state.agent_awaiting_user.update(|set| {
+        set.remove(&agent_id);
+    });
     state.interrupt_pending.update(|set| {
         set.remove(&agent_id);
     });
@@ -4869,6 +4899,9 @@ fn settle_fatal_agent_ui(state: &AppState, agent_id: &AgentId) {
     });
     state.agent_turn_active.update(|map| {
         map.remove(agent_id);
+    });
+    state.agent_awaiting_user.update(|set| {
+        set.remove(agent_id);
     });
     state.interrupt_pending.update(|pending| {
         pending.remove(agent_id);
@@ -6654,7 +6687,7 @@ fn apply_host_bootstrap(state: &AppState, host_id: &str, payload: HostBootstrapP
     state.agents.update(|agents| {
         agents.retain(|agent| agent.host_id != host_id || snapshot_ids.contains(&agent.agent_id));
         for payload in payload.agents {
-            let turn_active = payload.turn_active;
+            let activity = payload.activity;
             let mut info = agent_info_from_payload(host_id, payload);
             if let Some(existing) = agents
                 .iter_mut()
@@ -6667,19 +6700,21 @@ fn apply_host_bootstrap(state: &AppState, host_id: &str, payload: HostBootstrapP
                 if info.session_id.is_none() {
                     info.session_id = existing.session_id.clone();
                 }
-                turn_states.push((
-                    info.agent_id.clone(),
-                    turn_active && info.fatal_error.is_none(),
-                ));
+                let activity = if info.fatal_error.is_none() {
+                    activity
+                } else {
+                    protocol::AgentActivity::Idle
+                };
+                turn_states.push((info.agent_id.clone(), activity));
                 *existing = info;
             } else {
-                turn_states.push((info.agent_id.clone(), turn_active));
+                turn_states.push((info.agent_id.clone(), activity));
                 agents.push(info);
             }
         }
     });
-    for (agent_id, turn_active) in turn_states {
-        set_agent_turn_active(state, &agent_id, turn_active);
+    for (agent_id, activity) in turn_states {
+        set_agent_activity(state, &agent_id, activity);
     }
     // Only now can the persisted selection be resolved: it names an agent, a
     // backend and a launch profile, and all three become knowable at this line.
@@ -6897,12 +6932,19 @@ fn restore_draft_selection_after_host_bootstrap(state: &AppState, host_id: &str)
     state.persist_selection_snapshot();
 }
 
-fn set_agent_turn_active(state: &AppState, agent_id: &AgentId, turn_active: bool) {
+fn set_agent_activity(state: &AppState, agent_id: &AgentId, activity: protocol::AgentActivity) {
     state.agent_turn_active.update(|map| {
-        if turn_active {
+        if activity == protocol::AgentActivity::Thinking {
             map.insert(agent_id.clone(), true);
         } else {
             map.remove(agent_id);
+        }
+    });
+    state.agent_awaiting_user.update(|set| {
+        if activity == protocol::AgentActivity::AwaitingUser {
+            set.insert(agent_id.clone());
+        } else {
+            set.remove(agent_id);
         }
     });
 }
@@ -6982,6 +7024,9 @@ fn apply_agent_bootstrap(
     });
     state.agent_turn_active.update(|map| {
         map.remove(&agent_id);
+    });
+    state.agent_awaiting_user.update(|set| {
+        set.remove(&agent_id);
     });
     state.interrupt_pending.update(|set| {
         set.remove(&agent_id);
@@ -7085,8 +7130,8 @@ fn apply_agent_bootstrap(
     if fatal {
         settle_fatal_agent_ui(state, &agent_id);
     } else {
-        set_agent_turn_active(state, &agent_id, payload.turn_active);
-        if !payload.turn_active {
+        set_agent_activity(state, &agent_id, payload.activity);
+        if payload.activity != protocol::AgentActivity::Thinking {
             state.streaming_text.update(|map| {
                 map.remove(&agent_id);
             });
@@ -7398,7 +7443,7 @@ pub(crate) mod restore_fixtures {
             created_at_ms: 0,
             instance_stream: StreamPath(format!("/agent/{agent}/inst")),
             activity_summary: Default::default(),
-            turn_active: false,
+            activity: protocol::AgentActivity::Idle,
         }
     }
 

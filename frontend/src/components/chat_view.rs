@@ -3324,7 +3324,7 @@ mod wasm_tests {
                 AgentBootstrapEvent::ChatEvent(ChatEvent::TypingStatusChanged(false)),
             ],
             latest_output: Default::default(),
-            turn_active: false,
+            activity: protocol::AgentActivity::Idle,
         }
     }
 
@@ -3343,7 +3343,7 @@ mod wasm_tests {
         AgentBootstrapPayload {
             events,
             latest_output: Default::default(),
-            turn_active: false,
+            activity: protocol::AgentActivity::Idle,
         }
     }
 

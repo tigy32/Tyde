@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use protocol::{
-    AgentControlStatus, AgentErrorCode, AgentId, AgentOrigin, AgentStartPayload,
+    AgentActivity, AgentControlStatus, AgentErrorCode, AgentId, AgentOrigin, AgentStartPayload,
     AgentWorkflowMetadata, BackendAccessMode, BackendKind, CustomAgentId, ProjectId,
     SendMessagePayload, SessionId, SessionSettingsSchema, SessionSettingsValues, SpawnCostHint,
     TeamId, TeamMemberId,
@@ -36,8 +36,9 @@ pub(crate) struct AgentRegistry {
 }
 
 /// An agent crossing from one `AgentControlStatus` to another, or its
-/// liveness (`AgentStatus::is_active`) flipping while the status holds — a
-/// pending user question reports `Idle` for as long as the turn stays open.
+/// liveness (`AgentStatus::is_active`) flipping while the status holds — an
+/// unanswered async question reports `Thinking` while work continues and
+/// `AwaitingUser` once the turn ends.
 /// The registry owns the status, so it computes the edge where the status is
 /// mutated; consumers that need edges rather than levels subscribe here
 /// instead of mirroring every agent's last known status.
@@ -94,10 +95,23 @@ impl AgentStatus {
         !self.terminated && (!self.started || self.is_thinking || !self.turn_completed)
     }
 
-    /// Liveness published to clients, which render it as thinking. A turn
-    /// blocked on the user's answer stays open but has stopped typing.
-    pub fn is_visibly_active(&self) -> bool {
-        self.is_active() && !self.blocked_on_user_response
+    /// Activity published to clients. A turn blocked on the user's answer
+    /// stays open but has stopped typing, so it is never `Thinking`. An
+    /// unanswered async question does not hold the turn: while work continues
+    /// the agent is `Thinking`, and once the turn ends the user's answer is
+    /// what the agent is waiting for.
+    pub fn activity(&self) -> AgentActivity {
+        if self.terminated {
+            AgentActivity::Idle
+        } else if self.blocked_on_user_response {
+            AgentActivity::AwaitingUser
+        } else if self.is_active() {
+            AgentActivity::Thinking
+        } else if self.pending_user_response.is_some() {
+            AgentActivity::AwaitingUser
+        } else {
+            AgentActivity::Idle
+        }
     }
 
     pub fn is_user_response_pending(&self) -> bool {
@@ -106,13 +120,12 @@ impl AgentStatus {
 
     pub fn status(&self) -> AgentControlStatus {
         if self.terminated && self.last_error.is_some() {
-            AgentControlStatus::Failed
-        } else if self.blocked_on_user_response {
-            AgentControlStatus::Idle
-        } else if self.is_active() {
-            AgentControlStatus::Thinking
-        } else {
-            AgentControlStatus::Idle
+            return AgentControlStatus::Failed;
+        }
+        match self.activity() {
+            AgentActivity::Idle => AgentControlStatus::Idle,
+            AgentActivity::Thinking => AgentControlStatus::Thinking,
+            AgentActivity::AwaitingUser => AgentControlStatus::AwaitingUser,
         }
     }
 }

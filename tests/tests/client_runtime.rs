@@ -866,7 +866,8 @@ async fn split_endpoints_allow_event_loops_and_commands_to_run_independently() {
                 | AgentEvent::SessionHistory(_)
                 | AgentEvent::ContextCompactionNotify(_)
                 | AgentEvent::ContextCompactionCapability(_)
-                | AgentEvent::ActivityStats(_) => {}
+                | AgentEvent::ActivityStats(_)
+                | AgentEvent::ActivityChanged(_) => {}
                 AgentEvent::Error(err) => panic!("unexpected agent error: {}", err.message),
             }
         }

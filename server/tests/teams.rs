@@ -1409,13 +1409,15 @@ async fn team_describe_includes_default_agent_member() {
     )
     .await;
     eprintln!(
-        "Async team terminal binding: idle={}, pending_card=true",
-        idle.status == AgentControlStatus::Idle
+        "Async team terminal binding: awaiting_user={}, pending_card=true",
+        idle.status == AgentControlStatus::AwaitingUser
     );
+    // Not Thinking (work has stopped) and not Idle (the member still owes
+    // the user an answer): the panel must say the member needs an answer.
     assert_eq!(
         idle.status,
-        AgentControlStatus::Idle,
-        "ended async-question team binding must be Idle while the card remains answerable"
+        AgentControlStatus::AwaitingUser,
+        "ended async-question team binding must await the user while the card remains answerable"
     );
 
     let outcome = call_agent_control_tool_json(
@@ -1447,7 +1449,11 @@ async fn team_describe_includes_default_agent_member() {
         "team binding idle after independent follow-up",
     )
     .await;
-    assert_eq!(idle.status, AgentControlStatus::Idle);
+    assert_eq!(
+        idle.status,
+        AgentControlStatus::AwaitingUser,
+        "the unanswered card still awaits the user after independent work ends"
+    );
     fixture
         .client
         .send_message_payload(

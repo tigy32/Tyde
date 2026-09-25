@@ -31,6 +31,7 @@ async fn expect_next_event(client: &mut client::Connection, context: &str) -> En
                     | FrameKind::WorkflowNotify
                     | FrameKind::AgentsViewPreferencesNotify
                     | FrameKind::AgentActivityStats
+                    | FrameKind::AgentActivityChanged
                     | FrameKind::SessionSummaryCountUpdated
                     | FrameKind::ProjectBootstrap
                     | FrameKind::ProjectGitStatus
@@ -186,6 +187,7 @@ async fn expect_session_list(
         FrameKind::WorkflowNotify,
         FrameKind::AgentsViewPreferencesNotify,
         FrameKind::AgentActivityStats,
+        FrameKind::AgentActivityChanged,
         FrameKind::TaskTokenUsage,
         FrameKind::ProjectBootstrap,
         FrameKind::ProjectGitStatus,

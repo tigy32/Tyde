@@ -223,12 +223,24 @@ Clients compose the primitives explicitly: spawn, await status, then read output
 
 ### Status Model
 
-Tool-visible agent status is the protocol `AgentControlStatus` enum with exactly three values:
+Tool-visible agent status is the protocol `AgentControlStatus` enum with exactly four values:
 
 - `thinking`: the agent has not completed the current turn, or has not emitted
   its initial completion yet
+- `awaiting_user`: the agent is waiting on the user's answer — a blocking
+  question or plan approval, or an async question left unanswered after the
+  turn ended. It has not finished and its latest output may be empty; only the
+  user can move it on.
 - `idle`: the agent is available for more input
 - `failed`: the agent reached a terminal failure
+
+The server derives `awaiting_user` from its own pending user-interaction state
+(`AgentStatus::activity`), the same value it publishes to clients as
+`AgentActivity::AwaitingUser`. It is never `thinking`: a turn blocked on an
+answer has stopped typing. An async question does not hold the turn, so while
+the agent keeps working it is `thinking`; once that turn ends with the card
+unanswered the agent is `awaiting_user`, because the user's answer is what it
+is waiting for.
 
 Statuses are metadata only. They must not carry final messages, summaries, or
 error text.
@@ -328,10 +340,16 @@ Input:
 
 Output:
 
-- `ready`: watched agents whose status is `idle` or `failed`
+- `ready`: watched agents whose status is `idle`, `awaiting_user`, or `failed`.
+  An `awaiting_user` agent is returned so the caller never blocks on an answer
+  only the user can give; it has not finished.
 - `still_thinking`: watched agents that are still `thinking`
 
 It returns status only. Call `tyde_read_agent` to inspect output.
+
+`tyde_read_agent` returns the agent's current `status` beside its latest
+output, so an empty output from an `awaiting_user` agent is not mistaken for a
+finished one.
 
 #### `tyde_send_agent_message`
 

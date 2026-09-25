@@ -33,6 +33,7 @@ async fn expect_next_event(client: &mut client::Connection, context: &str) -> En
                     | FrameKind::WorkflowNotify
                     | FrameKind::AgentsViewPreferencesNotify
                     | FrameKind::AgentActivityStats
+                    | FrameKind::AgentActivityChanged
                     | FrameKind::ContextCompactionNotify
                     | FrameKind::ContextCompactionCapability
             )
@@ -65,6 +66,7 @@ async fn expect_raw_event_on_stream(
                 | FrameKind::BackendCapacity
                 | FrameKind::TeamPresetCatalogNotify
                 | FrameKind::TaskTokenUsage
+                | FrameKind::AgentActivityChanged
                 | FrameKind::WorkflowNotify
                 | FrameKind::AgentsViewPreferencesNotify
                 | FrameKind::ContextCompactionNotify
@@ -352,6 +354,7 @@ async fn wait_for_session_list(
                 | FrameKind::AgentError
                 | FrameKind::SessionSummaryCountUpdated
                 | FrameKind::TaskTokenUsage
+                | FrameKind::AgentActivityChanged
                 | FrameKind::ChatEvent
         ) {
             return false;
@@ -1675,7 +1678,11 @@ async fn restart_restores_a_backend_continued_turn_as_running() {
             .parse_payload::<NewAgentPayload>()
             .expect("parse restored NewAgent"),
         };
-        assert!(!restored.turn_active, "replay alone is not a live turn");
+        assert_eq!(
+            restored.activity,
+            protocol::AgentActivity::Idle,
+            "replay alone is not a live turn"
+        );
         replay.release_one();
         finish.wait_until_entered().await;
         let (agents, bootstraps) =
@@ -1691,8 +1698,9 @@ async fn restart_restores_a_backend_continued_turn_as_running() {
             "post-replay reasoning must not be swallowed into history"
         );
 
-        assert!(
-            bootstrap.turn_active,
+        assert_eq!(
+            bootstrap.activity,
+            protocol::AgentActivity::Thinking,
             "eager bootstrap must include the live start received before the replay boundary"
         );
         assert!(
@@ -1733,8 +1741,9 @@ async fn restart_restores_a_backend_continued_turn_as_running() {
             .await
             .parse_payload::<protocol::AgentTurnStateNotifyPayload>()
             .expect("parse running state");
-        assert!(
-            state.turn_active,
+        assert_eq!(
+            state.activity,
+            protocol::AgentActivity::Thinking,
             "continued turn must announce running to mobile"
         );
 
@@ -1748,8 +1757,9 @@ async fn restart_restores_a_backend_continued_turn_as_running() {
             .iter()
             .find(|agent| agent.agent_id == restored.agent_id)
             .expect("late mobile descriptor");
-        assert!(
-            late.turn_active,
+        assert_eq!(
+            late.activity,
+            protocol::AgentActivity::Thinking,
             "HostBootstrap/NewAgent descriptor must report running"
         );
         fixture::send_load_agent_on(&mut late_mobile, &late.instance_stream).await;
@@ -1761,8 +1771,9 @@ async fn restart_restores_a_backend_continued_turn_as_running() {
         .await
         .parse_payload::<AgentBootstrapPayload>()
         .expect("parse lazy bootstrap");
-        assert!(
-            late_bootstrap.turn_active,
+        assert_eq!(
+            late_bootstrap.activity,
+            protocol::AgentActivity::Thinking,
             "AgentBootstrap must preserve the active turn"
         );
         assert!(
@@ -1816,7 +1827,7 @@ async fn restart_restores_a_backend_continued_turn_as_running() {
             .await
             .parse_payload::<protocol::AgentTurnStateNotifyPayload>()
             .expect("parse idle state");
-        assert!(!state.turn_active);
+        assert_eq!(state.activity, protocol::AgentActivity::Idle);
         let settled = tokio::time::timeout(Duration::from_secs(5), awaiting)
             .await
             .expect("agent-control await completes after the turn")
@@ -1900,7 +1911,8 @@ async fn resume_completed_turn_and_followup_settle_before_attach() {
             );
         }
         assert_eq!(
-            bootstrap.turn_active, follow_up,
+            bootstrap.activity == protocol::AgentActivity::Thinking,
+            follow_up,
             "first bootstrap must reflect accepted or busy follow-up dispatch"
         );
         if ongoing {
@@ -2866,8 +2878,9 @@ async fn resume_replay_deadline_rejects_ready_history_and_late_boundary() {
             messages[0], "completed history",
             "saved history must survive timeout"
         );
-        assert!(
-            !bootstrap.turn_active,
+        assert_eq!(
+            bootstrap.activity,
+            protocol::AgentActivity::Idle,
             "timed-out replay must not be running"
         );
         tokio::time::resume();
@@ -3149,7 +3162,7 @@ async fn agent_bootstrap_keeps_active_stream_while_recent_history_loads() {
 #[tokio::test]
 async fn session_listing_covers_empty_parent_child_and_resume_without_prompt() {
     let mut fixture = Fixture::new().await;
-    // A completed bootstrap reports turn_active=false instead of replaying a
+    // A completed bootstrap reports activity=Idle instead of replaying a
     // live idle event. Hold these turns until subscription so expect_turn
     // always checks live streaming, even when the mock finishes immediately.
     let parent_gate = server::backend::mock::MockGateHandle::new();

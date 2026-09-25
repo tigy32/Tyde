@@ -966,9 +966,19 @@ pub fn ChatInput(
                         .with(|map| map.get(&agent_ref.agent_id).copied().unwrap_or(false))
                 })
                 .unwrap_or(false);
+        // An agent waiting on the user is not thinking, but the wait is still
+        // something the user can cancel.
+        let awaiting_user = agent_ref
+            .get()
+            .map(|agent_ref| {
+                ui_state
+                    .agent_awaiting_user
+                    .with(|set| set.contains(&agent_ref.agent_id))
+            })
+            .unwrap_or(false);
 
         let send_enabled = is_connected && has_input && target_ready;
-        let interrupt_enabled = is_connected && is_thinking && target_ready;
+        let interrupt_enabled = is_connected && (is_thinking || awaiting_user) && target_ready;
         // (send_enabled, interrupt_enabled, is_steer). `is_steer` (running with
         // input) gates the secondary Cancel + send, Steer, and Cancel items in the dropdown.
         (
@@ -1065,6 +1075,16 @@ pub fn ChatInput(
             })
             .unwrap_or(false)
     };
+
+    let awaiting_state = state.clone();
+    let is_awaiting_user = Memo::new(move |_| {
+        !is_terminated.get()
+            && agent_ref.get().is_some_and(|agent_ref| {
+                awaiting_state
+                    .agent_awaiting_user
+                    .with(|set| set.contains(&agent_ref.agent_id))
+            })
+    });
 
     let submit_on_enter_state = state.clone();
     let submit_on_enter_composer = composer.clone();
@@ -1547,6 +1567,11 @@ pub fn ChatInput(
             <InflightTray agent_ref=agent_ref />
             <div class="chat-input-content">
             <crate::notices::ActionError error=action_error />
+            <Show when=move || is_awaiting_user.get()>
+                <div class="chat-backend-notice" role="status" data-testid="chat-awaiting-user">
+                    <span>"Needs your answer \u{2014} respond above, or Cancel to withdraw the request."</span>
+                </div>
+            </Show>
             <Show when=move || usage_pause.get().is_some() && !is_terminated.get()>
                 <div class="chat-backend-notice" role="status">
                     <span>{move || usage_pause.get().map(|pause| pause.status_message())}</span>
@@ -2242,6 +2267,72 @@ mod wasm_tests {
             primary_btn.has_attribute("disabled"),
             "Cancel must be disabled while its interrupt is unanswered"
         );
+    }
+
+    /// An agent waiting on the user is not thinking, but the wait is the
+    /// user's to cancel. Before the server published this state, Cancel was
+    /// gated on the turn being active only, so a question left open after
+    /// the turn ended could never be withdrawn.
+    #[wasm_bindgen_test]
+    async fn awaiting_user_offers_cancel_and_says_it_needs_an_answer() {
+        let container = make_container();
+        let state = AppState::new();
+        configure(&state, false, false, "");
+        let calls = stub_send_recording();
+        let state_for_mount = state.clone();
+        let _h = mount_to(container.clone(), move || {
+            provide_context(state_for_mount.clone());
+            view! { <ChatInput /> }
+        });
+        next_tick().await;
+
+        assert!(
+            primary(&container).has_attribute("disabled"),
+            "precondition: an idle agent with an empty composer offers nothing"
+        );
+        assert!(
+            query(&container, "[data-testid='chat-awaiting-user']").is_none(),
+            "precondition: an idle agent is not waiting on the user"
+        );
+
+        state.agent_awaiting_user.update(|set| {
+            set.insert(AgentId(AGENT.to_owned()));
+        });
+        next_tick().await;
+
+        let notice = query(&container, "[data-testid='chat-awaiting-user']")
+            .expect("an agent waiting on the user must say so in the composer");
+        assert!(
+            notice
+                .text_content()
+                .unwrap_or_default()
+                .contains("Needs your answer"),
+            "got: {:?}",
+            notice.text_content()
+        );
+        assert!(
+            query(&container, "[data-testid='chat-thinking-ring']").is_none(),
+            "waiting on the user is not thinking"
+        );
+        let primary_btn: HtmlElement = primary(&container).dyn_into().unwrap();
+        assert_eq!(
+            primary_btn.text_content().unwrap_or_default().trim(),
+            "Cancel",
+            "waiting on the user must offer Cancel"
+        );
+        assert!(
+            !primary_btn.has_attribute("disabled"),
+            "Cancel must be usable while the agent waits on the user"
+        );
+        primary_btn.click();
+        next_tick().await;
+        next_tick().await;
+        assert_eq!(
+            interrupt_frames(&calls),
+            1,
+            "Cancel while awaiting the user must send one Interrupt frame"
+        );
+        stub_send_host_line();
     }
 
     /// R-03: a transport failure means nothing is in flight. Leaving the slot

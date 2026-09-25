@@ -997,6 +997,9 @@ pub struct AppState {
     pub slash_commands: RwSignal<HashMap<AgentRef, protocol::SlashCommandCatalog>>,
     pub agent_message_queue: RwSignal<HashMap<AgentRef, Vec<QueuedMessageEntry>>>,
     pub agent_turn_active: RwSignal<HashMap<AgentRef, bool>>,
+    /// Agents the server reports as `AgentActivity::AwaitingUser`: parked on
+    /// the user's answer, not thinking. Fed only by server activity frames.
+    pub agent_awaiting_user: RwSignal<HashSet<AgentRef>>,
     pub agents_with_background_work: RwSignal<HashSet<AgentRef>>,
     pub tool_progress: RwSignal<HashMap<AgentRef, HashMap<String, protocol::ToolProgressData>>>,
     // Completion can precede its request or be followed by replayed progress.
@@ -1123,6 +1126,7 @@ impl AppState {
             slash_commands: RwSignal::new(HashMap::new()),
             agent_message_queue: RwSignal::new(HashMap::new()),
             agent_turn_active: RwSignal::new(HashMap::new()),
+            agent_awaiting_user: RwSignal::new(HashSet::new()),
             agents_with_background_work: RwSignal::new(HashSet::new()),
             tool_progress: RwSignal::new(HashMap::new()),
             completed_tool_calls: RwSignal::new(HashMap::new()),
@@ -1843,6 +1847,9 @@ impl AppState {
         });
         self.agent_turn_active.update(|m| {
             m.retain(|k, _| k.local_host_id != *host);
+        });
+        self.agent_awaiting_user.update(|m| {
+            m.retain(|k| k.local_host_id != *host);
         });
         self.tool_progress.update(|map| {
             map.retain(|agent, _| agent.local_host_id != *host);

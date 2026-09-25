@@ -25,6 +25,7 @@ pub fn agent_passes_filters(
     active_project: Option<&ActiveProjectRef>,
     streaming: &HashMap<AgentId, StreamingState>,
     turn_active: &HashMap<AgentId, bool>,
+    awaiting_user: &HashSet<AgentId>,
     lowercase_query: &str,
 ) -> bool {
     if filters.hide_sub_agents && agent.parent_agent_id.is_some() {
@@ -33,7 +34,8 @@ pub fn agent_passes_filters(
     if filters.hide_inactive {
         let is_active = !agent.started
             || streaming.contains_key(&agent.agent_id)
-            || turn_active.get(&agent.agent_id).copied().unwrap_or(false);
+            || turn_active.get(&agent.agent_id).copied().unwrap_or(false)
+            || awaiting_user.contains(&agent.agent_id);
         if !is_active {
             return false;
         }
@@ -172,6 +174,9 @@ pub(crate) enum DerivedAgentState {
     /// the backend takes to tear its turn down, and during that window the user
     /// needs to see that their cancel was heard.
     Cancelling,
+    /// The server reports the agent waiting on a question or plan approval
+    /// that only the user can answer: neither working nor finished.
+    AwaitingUser,
     Idle,
     /// The turn is over but the agent still has work running: a backgrounded
     /// command, a child agent, a workflow. It will be woken when that work
@@ -192,15 +197,57 @@ pub(crate) enum DerivedAgentState {
     Terminated,
 }
 
-pub(crate) fn derive_agent_state(
-    agent: &AgentInfo,
-    streaming: &HashMap<AgentId, StreamingState>,
-    turn_active: &HashMap<AgentId, bool>,
-    compaction: &HashMap<AgentId, CompactionOldInfo>,
-    context_compaction: &HashMap<AgentId, ContextCompactionUiState>,
-    last_turn_cancelled: &HashSet<AgentId>,
-    interrupt_pending: &HashSet<AgentId>,
-) -> DerivedAgentState {
+/// The per-agent liveness maps [`derive_agent_state`] reads, borrowed from
+/// [`AppState`] signals for the duration of one derivation.
+struct AgentLiveness<'a> {
+    streaming: &'a HashMap<AgentId, StreamingState>,
+    turn_active: &'a HashMap<AgentId, bool>,
+    awaiting_user: &'a HashSet<AgentId>,
+    compaction: &'a HashMap<AgentId, CompactionOldInfo>,
+    context_compaction: &'a HashMap<AgentId, ContextCompactionUiState>,
+    last_turn_cancelled: &'a HashSet<AgentId>,
+    interrupt_pending: &'a HashSet<AgentId>,
+}
+
+pub(crate) fn derive_agent_state(state: &AppState, agent: &AgentInfo) -> DerivedAgentState {
+    state.compaction_in_progress.with(|compaction| {
+        state.context_compactions.with(|context_compaction| {
+            state.agent_turn_active.with(|turn_active| {
+                state.streaming_text.with(|streaming| {
+                    state.last_turn_cancelled.with(|last_turn_cancelled| {
+                        state.interrupt_pending.with(|interrupt_pending| {
+                            state.agent_awaiting_user.with(|awaiting_user| {
+                                derive_from_liveness(
+                                    agent,
+                                    &AgentLiveness {
+                                        streaming,
+                                        turn_active,
+                                        awaiting_user,
+                                        compaction,
+                                        context_compaction,
+                                        last_turn_cancelled,
+                                        interrupt_pending,
+                                    },
+                                )
+                            })
+                        })
+                    })
+                })
+            })
+        })
+    })
+}
+
+fn derive_from_liveness(agent: &AgentInfo, liveness: &AgentLiveness<'_>) -> DerivedAgentState {
+    let AgentLiveness {
+        streaming,
+        turn_active,
+        awaiting_user,
+        compaction,
+        context_compaction,
+        last_turn_cancelled,
+        interrupt_pending,
+    } = liveness;
     if agent.fatal_error.is_some() {
         return DerivedAgentState::Terminated;
     }
@@ -222,6 +269,12 @@ pub(crate) fn derive_agent_state(
         if operation.is_in_flight() {
             return DerivedAgentState::Compacting;
         }
+    }
+    if awaiting_user.contains(&agent.agent_id) {
+        if interrupt_pending.contains(&agent.agent_id) {
+            return DerivedAgentState::Cancelling;
+        }
+        return DerivedAgentState::AwaitingUser;
     }
     let typing = turn_active.get(&agent.agent_id).copied().unwrap_or(false);
     let streaming_open = streaming.contains_key(&agent.agent_id);
@@ -250,27 +303,7 @@ pub(crate) fn derive_agent_state_with_background(
     state: &AppState,
     agent: &AgentInfo,
 ) -> DerivedAgentState {
-    let derived = state.compaction_in_progress.with(|compaction| {
-        state.context_compactions.with(|context_compaction| {
-            state.agent_turn_active.with(|turn_active| {
-                state.streaming_text.with(|streaming| {
-                    state.last_turn_cancelled.with(|cancelled| {
-                        state.interrupt_pending.with(|interrupt_pending| {
-                            derive_agent_state(
-                                agent,
-                                streaming,
-                                turn_active,
-                                compaction,
-                                context_compaction,
-                                cancelled,
-                                interrupt_pending,
-                            )
-                        })
-                    })
-                })
-            })
-        })
-    });
+    let derived = derive_agent_state(state, agent);
     if derived != DerivedAgentState::Idle {
         return derived;
     }
@@ -290,6 +323,7 @@ pub(crate) fn status_label(derived: &DerivedAgentState) -> &'static str {
         DerivedAgentState::Initializing => "Initializing",
         DerivedAgentState::Thinking => "Thinking",
         DerivedAgentState::Cancelling => "Cancelling",
+        DerivedAgentState::AwaitingUser => "Needs your answer",
         DerivedAgentState::CompactionQueued => "Compaction queued",
         DerivedAgentState::Compacting => "Compacting context",
         DerivedAgentState::Idle => "Idle",
@@ -304,12 +338,13 @@ pub(crate) fn status_icon(derived: &DerivedAgentState) -> &'static str {
         DerivedAgentState::Initializing => "\u{25F7}", // ◷ clock (CSS animates)
         DerivedAgentState::Thinking => "\u{25F7}",     // ◷ clock (CSS animates)
         DerivedAgentState::Cancelling => "\u{25F7}",   // ◷ clock (CSS animates)
+        DerivedAgentState::AwaitingUser => "?",
         DerivedAgentState::CompactionQueued => "\u{27F2}", // ⟲ counter-clockwise gapped circle
-        DerivedAgentState::Compacting => "\u{27F2}",   // ⟲ counter-clockwise gapped circle
-        DerivedAgentState::Idle => "\u{2713}",         // ✓
-        DerivedAgentState::BackgroundWork => "\u{29D7}", // ⧗ hourglass
-        DerivedAgentState::Cancelled => "\u{2298}",    // ⊘ circled division slash
-        DerivedAgentState::Terminated => "\u{2022}",   // •
+        DerivedAgentState::Compacting => "\u{27F2}",       // ⟲ counter-clockwise gapped circle
+        DerivedAgentState::Idle => "\u{2713}",             // ✓
+        DerivedAgentState::BackgroundWork => "\u{29D7}",   // ⧗ hourglass
+        DerivedAgentState::Cancelled => "\u{2298}",        // ⊘ circled division slash
+        DerivedAgentState::Terminated => "\u{2022}",       // •
     }
 }
 
@@ -318,6 +353,7 @@ pub(crate) fn status_class(derived: &DerivedAgentState) -> &'static str {
         DerivedAgentState::Initializing => "agent-card-status running",
         DerivedAgentState::Thinking => "agent-card-status running",
         DerivedAgentState::Cancelling => "agent-card-status running",
+        DerivedAgentState::AwaitingUser => "agent-card-status awaiting",
         DerivedAgentState::CompactionQueued => "agent-card-status running",
         DerivedAgentState::Compacting => "agent-card-status running",
         DerivedAgentState::Idle => "agent-card-status completed",
@@ -1039,21 +1075,24 @@ pub fn AgentsPanel() -> impl IntoView {
         // dominant per-keystroke cost in the audit.
         filter_state.streaming_text.with(|streaming_map| {
             filter_state.agent_turn_active.with(|turn_active_map| {
-                filter_state.agents.with(|agents| {
-                    agents
-                        .iter()
-                        .filter(|a| {
-                            agent_passes_filters(
-                                a,
-                                &filters,
-                                active_project.as_ref(),
-                                streaming_map,
-                                turn_active_map,
-                                &query,
-                            )
-                        })
-                        .cloned()
-                        .collect::<Vec<_>>()
+                filter_state.agent_awaiting_user.with(|awaiting_user| {
+                    filter_state.agents.with(|agents| {
+                        agents
+                            .iter()
+                            .filter(|a| {
+                                agent_passes_filters(
+                                    a,
+                                    &filters,
+                                    active_project.as_ref(),
+                                    streaming_map,
+                                    turn_active_map,
+                                    awaiting_user,
+                                    &query,
+                                )
+                            })
+                            .cloned()
+                            .collect::<Vec<_>>()
+                    })
                 })
             })
         })
@@ -1799,6 +1838,7 @@ fn agent_card(
                 derived.get(),
                 DerivedAgentState::Cancelled
                     | DerivedAgentState::Cancelling
+                    | DerivedAgentState::AwaitingUser
                     | DerivedAgentState::CompactionQueued
                     | DerivedAgentState::Compacting
             )
@@ -4428,6 +4468,64 @@ mod wasm_tests {
         );
     }
 
+    /// An attached agent learns it is waiting on the user from the server's
+    /// live `AgentActivityChanged` frame on its own stream. Before that
+    /// state existed, an agent blocked on a question rendered "✓ Idle",
+    /// identical to one that had finished.
+    #[wasm_bindgen_test]
+    async fn live_activity_frames_render_awaiting_user_distinctly() {
+        let container = make_container();
+        let state = make_app_state("h-await");
+        reset_inbound_seqs(&state, "h-await");
+        register_agent_via_new_agent(&state, "h-await", "a-await", "Agent", 0, 0);
+        let handle = mount_panel(&container, state.clone());
+        for _ in 0..4 {
+            next_tick().await;
+        }
+        let status = agent_card_el(&container, "a-await")
+            .query_selector(".agent-card-status")
+            .unwrap()
+            .expect("agent row status");
+        for (seq, activity, label) in [
+            (0, protocol::AgentActivity::Thinking, "Thinking"),
+            (
+                1,
+                protocol::AgentActivity::AwaitingUser,
+                "Needs your answer",
+            ),
+            (2, protocol::AgentActivity::Thinking, "Thinking"),
+            (
+                3,
+                protocol::AgentActivity::AwaitingUser,
+                "Needs your answer",
+            ),
+            (4, protocol::AgentActivity::Idle, "Idle"),
+        ] {
+            dispatch_frame(
+                &state,
+                "h-await",
+                agent_stream("a-await"),
+                FrameKind::AgentActivityChanged,
+                seq,
+                &protocol::AgentActivityChangedPayload { activity },
+            );
+            next_tick().await;
+            assert_eq!(status.get_attribute("title").as_deref(), Some(label));
+            let text = status.text_content().unwrap_or_default();
+            assert!(
+                text.contains(label),
+                "status must read {label}, got {text:?}"
+            );
+            assert_eq!(
+                text.contains('\u{2713}'),
+                activity == protocol::AgentActivity::Idle,
+                "only an idle agent shows the completed check, got {text:?}"
+            );
+        }
+        drop(handle);
+        container.remove();
+    }
+
     #[wasm_bindgen_test]
     async fn restored_turn_status_uses_host_frames_without_loading_chat() {
         use crate::dispatch::restore_fixtures::{restore_agent_payload, restore_bootstrap};
@@ -4440,7 +4538,7 @@ mod wasm_tests {
             let mut agent = restore_agent_payload("a-restored", None);
             agent.backend_kind = BackendKind::Codex;
             agent.session_id = Some(protocol::SessionId("restored-session".to_owned()));
-            agent.turn_active = true;
+            agent.activity = protocol::AgentActivity::Thinking;
             if host_bootstrap {
                 dispatch_frame(
                     &state,
@@ -4481,10 +4579,17 @@ mod wasm_tests {
                 .expect("restored row status");
             assert_eq!(status.get_attribute("title").as_deref(), Some("Thinking"));
             assert!(status.text_content().unwrap().contains("Thinking"));
-            for (seq, active, label) in [
-                (1, false, "Idle"),
-                (2, true, "Thinking"),
-                (3, false, "Idle"),
+            // A member waiting on the user is neither thinking nor done, and
+            // must not render the completed check.
+            for (seq, activity, label) in [
+                (1, protocol::AgentActivity::Idle, "Idle"),
+                (2, protocol::AgentActivity::Thinking, "Thinking"),
+                (
+                    3,
+                    protocol::AgentActivity::AwaitingUser,
+                    "Needs your answer",
+                ),
+                (4, protocol::AgentActivity::Idle, "Idle"),
             ] {
                 dispatch_frame(
                     &state,
@@ -4494,12 +4599,17 @@ mod wasm_tests {
                     seq,
                     &protocol::AgentTurnStateNotifyPayload {
                         agent_id: AgentId("a-restored".to_owned()),
-                        turn_active: active,
+                        activity,
                     },
                 );
                 next_tick().await;
                 assert_eq!(status.get_attribute("title").as_deref(), Some(label));
                 assert!(status.text_content().unwrap().contains(label));
+                assert_eq!(
+                    status.text_content().unwrap().contains('\u{2713}'),
+                    activity == protocol::AgentActivity::Idle,
+                    "only an idle agent shows the completed check ({label})"
+                );
             }
             drop(handle);
             container.remove();
@@ -5195,7 +5305,7 @@ mod wasm_tests {
                 created_at_ms,
                 instance_stream: agent_stream(agent_id),
                 activity_summary: Default::default(),
-                turn_active: false,
+                activity: protocol::AgentActivity::Idle,
             },
         );
         // Prime the agent's instance stream so subsequent

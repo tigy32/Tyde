@@ -1,12 +1,110 @@
 mod fixture;
 
-use fixture::Fixture;
+use fixture::{Fixture, TestAgent};
 use protocol::{
-    AgentErrorPayload, CancelQueuedMessagePayload, ChatEvent, EditQueuedMessagePayload, FrameKind,
-    ImageData, MessageOrigin, QueuedMessageId, QueuedMessagesPayload, SendMessagePayload,
-    SendMessageToolResponse, SendQueuedMessageNowPayload, StreamPath,
+    AgentActivity, AgentActivityChangedPayload, AgentErrorPayload, CancelQueuedMessagePayload,
+    ChatEvent, EditQueuedMessagePayload, FrameKind, ImageData, MessageOrigin, QueuedMessageId,
+    QueuedMessagesPayload, SendMessagePayload, SendMessageToolResponse,
+    SendQueuedMessageNowPayload, StreamPath,
 };
 use server::backend::mock::{MockGateHandle, MockRequest, MockScript, MockTurn};
+
+fn activity_edge(env: &protocol::Envelope, agent: &TestAgent) -> Option<AgentActivity> {
+    (env.stream == agent.stream && env.kind == FrameKind::AgentActivityChanged).then(|| {
+        env.parse_payload::<AgentActivityChangedPayload>()
+            .expect("parse AgentActivityChanged")
+            .activity
+    })
+}
+
+/// Wait until `agent` has asked the user a question and stopped typing, and
+/// the server has published that it is awaiting the user's answer.
+async fn expect_live_question_awaiting_user(
+    fixture: &mut Fixture,
+    agent: &TestAgent,
+) -> protocol::ToolRequest {
+    let mut request = None;
+    let mut paused = false;
+    let mut activity = None;
+    while !(request.is_some() && paused && activity == Some(AgentActivity::AwaitingUser)) {
+        let env = fixture
+            .next_frame_matching("question awaiting the user", |env| {
+                env.stream == agent.stream
+            })
+            .await;
+        if let Some(edge) = activity_edge(&env, agent) {
+            activity = Some(edge);
+            continue;
+        }
+        if env.kind != FrameKind::ChatEvent {
+            continue;
+        }
+        match env.parse_payload::<ChatEvent>().expect("parse ChatEvent") {
+            ChatEvent::ToolRequest(pending) => request = Some(pending),
+            ChatEvent::TypingStatusChanged(false) => paused = true,
+            ChatEvent::ToolExecutionCompleted(completion) => assert!(
+                request
+                    .as_ref()
+                    .is_none_or(|pending| pending.tool_call_id != completion.tool_call_id),
+                "question completed before it was answered or cancelled"
+            ),
+            _ => {}
+        }
+    }
+    request.expect("question request")
+}
+
+/// Cancel `agent` while it awaits the user and assert the pending card is
+/// retired as cancelled before the server settles the agent back to idle.
+async fn cancel_question_awaiting_user(
+    fixture: &mut Fixture,
+    agent: &TestAgent,
+    request: &protocol::ToolRequest,
+) {
+    fixture
+        .client
+        .interrupt(&agent.stream)
+        .await
+        .expect("cancel while awaiting the user");
+    let mut cancelled = 0;
+    loop {
+        let env = fixture
+            .next_frame_matching("cancelled question settles idle", |env| {
+                env.stream == agent.stream
+            })
+            .await;
+        if let Some(edge) = activity_edge(&env, agent) {
+            assert_ne!(
+                edge,
+                AgentActivity::Thinking,
+                "cancelling a pending question must not start work"
+            );
+            if edge == AgentActivity::Idle {
+                break;
+            }
+            continue;
+        }
+        if env.kind == FrameKind::ChatEvent
+            && let Ok(ChatEvent::ToolExecutionCompleted(completion)) =
+                env.parse_payload::<ChatEvent>()
+            && completion.tool_call_id == request.tool_call_id
+        {
+            assert!(
+                matches!(
+                    completion.outcome,
+                    protocol::ToolExecutionOutcome::Cancelled { .. }
+                ),
+                "a cancelled question must be retired as cancelled, got {:?}",
+                completion.outcome
+            );
+            cancelled += 1;
+        }
+    }
+    assert_eq!(
+        cancelled, 1,
+        "cancel must retire the pending card exactly once before idle"
+    );
+}
 
 async fn assert_queue_not_emptied_before_next_typing_true(
     client: &mut client::Connection,
@@ -93,6 +191,8 @@ async fn exit_plan_mode_tool_response_resumes_and_drains_queue() {
     );
 
     let gate = MockGateHandle::new();
+    let cancel_blocking_gate = MockGateHandle::new();
+    let cancel_async_gate = MockGateHandle::new();
     let question = fixture
         .spawn_scripted(
             "blocking-question",
@@ -101,14 +201,20 @@ async fn exit_plan_mode_tool_response_resumes_and_drains_queue() {
                 &gate,
             ))
             .then(MockTurn::text("answer accepted"))
-            .then(MockTurn::text("queued question follow-up")),
+            .then(MockTurn::text("queued question follow-up"))
+            .then(MockTurn::blocking_question_request(
+                "cancelled-blocking-question",
+                &cancel_blocking_gate,
+            ))
+            .then(MockTurn::async_question_request(
+                "cancelled-async-question",
+                &cancel_async_gate,
+            )),
         )
         .await;
     gate.wait_until_entered().await;
     gate.release_one();
-    let request = fixture
-        .expect_paused_tool_request(&question, "AskUserQuestion")
-        .await;
+    let request = expect_live_question_awaiting_user(&mut fixture, &question).await;
     assert!(matches!(
         request.tool_type,
         protocol::ToolRequestType::AskUserQuestion {
@@ -123,9 +229,9 @@ async fn exit_plan_mode_tool_response_resumes_and_drains_queue() {
         .expect("send during blocking question");
     fixture.expect_queued_messages(&question, 1).await;
     // The turn stays open (the follow-up above queued behind the answer), but
-    // the backend has stopped typing. Clients render turn_active as thinking,
-    // so a reconnecting client must see the same idle state the live stream
-    // already reported, or it hides that the user owes an answer.
+    // the backend has stopped typing. A reconnecting client must see the same
+    // awaiting-user state the live stream already reported: not thinking, and
+    // not idle either, or it hides that the user owes an answer.
     let (mut mobile, bootstrap) = fixture::connect_mobile_client_with_bootstrap(
         fixture.host_for_test(),
         "blocking-question-phone",
@@ -136,9 +242,10 @@ async fn exit_plan_mode_tool_response_resumes_and_drains_queue() {
         .iter()
         .find(|agent| agent.agent_id == question.new_agent.agent_id)
         .expect("blocking question descriptor");
-    assert!(
-        !descriptor.turn_active,
-        "HostBootstrap must not report a turn awaiting the user's answer as thinking"
+    assert_eq!(
+        descriptor.activity,
+        protocol::AgentActivity::AwaitingUser,
+        "HostBootstrap must report a turn awaiting the user's answer as awaiting the user"
     );
     let question_stream = descriptor.instance_stream.clone();
     fixture::send_load_agent_on(&mut mobile, &question_stream).await;
@@ -149,9 +256,10 @@ async fn exit_plan_mode_tool_response_resumes_and_drains_queue() {
         .await
         .parse_payload()
         .expect("parse blocking question AgentBootstrap");
-    assert!(
-        !agent_bootstrap.turn_active,
-        "AgentBootstrap must not report a turn awaiting the user's answer as thinking"
+    assert_eq!(
+        agent_bootstrap.activity,
+        protocol::AgentActivity::AwaitingUser,
+        "AgentBootstrap must report a turn awaiting the user's answer as awaiting the user"
     );
     assert!(agent_bootstrap.events.iter().any(|event| matches!(event,
         protocol::AgentBootstrapEvent::ChatEvent(ChatEvent::ToolRequest(pending))
@@ -181,6 +289,77 @@ async fn exit_plan_mode_tool_response_resumes_and_drains_queue() {
     assert!(drained.chat_events().iter().any(|event| matches!(event,
         ChatEvent::StreamEnd(end) if end.message.content == "queued question follow-up")));
     assert!(answered.saw_queue_drained() || drained.saw_queue_drained());
+
+    // Cancel withdraws a blocking question: the card is retired as cancelled
+    // and the agent settles idle rather than waiting forever.
+    fixture
+        .client
+        .send_message(&question.stream, "ask again".to_owned())
+        .await
+        .expect("send prompt that asks a blocking question");
+    cancel_blocking_gate.wait_until_entered().await;
+    cancel_blocking_gate.release_one();
+    let blocking = expect_live_question_awaiting_user(&mut fixture, &question).await;
+    cancel_question_awaiting_user(&mut fixture, &question, &blocking).await;
+
+    // An async question left open after its turn ended has no running turn to
+    // cancel, yet Cancel must still withdraw it.
+    fixture
+        .client
+        .send_message(&question.stream, "ask asynchronously".to_owned())
+        .await
+        .expect("send prompt that asks an async question");
+    cancel_async_gate.wait_until_entered().await;
+    cancel_async_gate.release_one();
+    let async_question = expect_live_question_awaiting_user(&mut fixture, &question).await;
+    assert!(matches!(
+        async_question.tool_type,
+        protocol::ToolRequestType::AskUserQuestion {
+            mode: protocol::UserQuestionMode::NonBlocking,
+            ..
+        }
+    ));
+    cancel_question_awaiting_user(&mut fixture, &question, &async_question).await;
+
+    let (mut late, bootstrap) = fixture::connect_mobile_client_with_bootstrap(
+        fixture.host_for_test(),
+        "cancelled-question-phone",
+    )
+    .await;
+    let descriptor = bootstrap
+        .agents
+        .iter()
+        .find(|agent| agent.agent_id == question.new_agent.agent_id)
+        .expect("cancelled question descriptor");
+    assert_eq!(
+        descriptor.activity,
+        protocol::AgentActivity::Idle,
+        "a withdrawn question no longer awaits the user"
+    );
+    let question_stream = descriptor.instance_stream.clone();
+    fixture::send_load_agent_on(&mut late, &question_stream).await;
+    let late_bootstrap: protocol::AgentBootstrapPayload =
+        fixture::next_frame_matching_on(&mut late, "cancelled question bootstrap", |env| {
+            env.kind == FrameKind::AgentBootstrap && env.stream == question_stream
+        })
+        .await
+        .parse_payload()
+        .expect("parse cancelled question AgentBootstrap");
+    assert_eq!(late_bootstrap.activity, protocol::AgentActivity::Idle);
+    for cancelled in [&blocking, &async_question] {
+        assert_eq!(
+            late_bootstrap
+                .events
+                .iter()
+                .filter(|event| matches!(event,
+                    protocol::AgentBootstrapEvent::ChatEvent(ChatEvent::ToolExecutionCompleted(completion))
+                        if completion.tool_call_id == cancelled.tool_call_id
+                            && matches!(completion.outcome, protocol::ToolExecutionOutcome::Cancelled { .. })))
+                .count(),
+            1,
+            "history must record each withdrawn question as cancelled exactly once"
+        );
+    }
     fixture.mock(&question).await.assert_clean().await;
 }
 

@@ -674,14 +674,14 @@ async fn reserved_script_governs_forked_session() {
             .iter()
             .find(|agent| agent.agent_id == forked.new_agent.agent_id)
             .expect("completed fork remains visible to a later client");
-        assert!(!descriptor.turn_active);
+        assert_eq!(descriptor.activity, protocol::AgentActivity::Idle);
         let envelope =
             fixture::next_frame_matching_on(&mut late_client, "completed fork bootstrap", |env| {
                 env.kind == FrameKind::AgentBootstrap && env.stream == descriptor.instance_stream
             })
             .await;
         let bootstrap: AgentBootstrapPayload = envelope.parse_payload().expect("fork bootstrap");
-        assert!(!bootstrap.turn_active);
+        assert_eq!(bootstrap.activity, protocol::AgentActivity::Idle);
         assert!(
             bootstrap.events.iter().all(|event| !matches!(
                 event,

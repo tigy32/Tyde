@@ -2121,20 +2121,22 @@ impl MobileAccessActor {
                     reason
                 } else {
                     if transition.from != AgentControlStatus::Thinking
-                        || transition.to != AgentControlStatus::Idle
                         || transition.has_queued_messages
                     {
                         continue;
                     }
-                    match transition.pending_user_response {
-                        Some(PendingUserResponseKind::UserQuestion) => {
-                            MobilePushReason::QuestionPending
-                        }
-                        Some(PendingUserResponseKind::PlanApproval) => {
-                            MobilePushReason::PlanApproval
-                        }
-                        None if transition.goal.is_some() => continue,
-                        None => MobilePushReason::TurnComplete,
+                    match (transition.to, transition.pending_user_response) {
+                        (
+                            AgentControlStatus::AwaitingUser,
+                            Some(PendingUserResponseKind::UserQuestion),
+                        ) => MobilePushReason::QuestionPending,
+                        (
+                            AgentControlStatus::AwaitingUser,
+                            Some(PendingUserResponseKind::PlanApproval),
+                        ) => MobilePushReason::PlanApproval,
+                        (AgentControlStatus::Idle, None) if transition.goal.is_some() => continue,
+                        (AgentControlStatus::Idle, None) => MobilePushReason::TurnComplete,
+                        _ => continue,
                     }
                 };
                 let Some(start) = host.agent_start_snapshot(&transition.agent_id).await else {
