@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -971,6 +971,11 @@ struct Supervisor {
     /// Question cards waiting on a human. They survive the turn that asked, and
     /// are cleared either by an answer or by a cancel.
     pending_questions: Vec<String>,
+    /// Answers the user gave while a turn was still running, in the order they
+    /// were given. `agy` runs one turn at a time and holds a mid-turn stdin
+    /// message until the running turn's `result`, so each answer becomes the
+    /// next turn only once the current one has finished.
+    deferred_answers: VecDeque<String>,
     /// When the account's quota was last read, so a busy session does not spawn
     /// a probe per turn.
     capacity_read_at: Option<std::time::Instant>,
@@ -1029,17 +1034,33 @@ impl Supervisor {
                     if !self.interrupt(&mut process).await {
                         break;
                     }
+                    if !self.start_deferred_answer(&mut process).await {
+                        break;
+                    }
                 }
 
                 frame = process.frames_rx.recv() => {
                     match frame {
-                        Some(Ok(frame)) => self.handle_frame(frame).await,
+                        Some(Ok(frame)) => {
+                            self.handle_frame(frame).await;
+                            if !self.start_deferred_answer(&mut process).await {
+                                break;
+                            }
+                        }
                         // A line we cannot read is the provider telling us
                         // something we do not understand. Surfacing it beats
                         // dropping it and reporting a turn that quietly lost
                         // half its events.
                         Some(Err(err)) => emitter.backend_error(&err),
                         None => {
+                            if !self.deferred_answers.is_empty() {
+                                emitter.backend_error(&format!(
+                                    "Antigravity CLI exited before {} answered question(s) \
+                                     could be delivered",
+                                    self.deferred_answers.len()
+                                ));
+                                self.deferred_answers.clear();
+                            }
                             if self.inner.state.lock().await.turn_active {
                                 emitter.backend_error(
                                     "Antigravity CLI exited while a turn was still running",
@@ -1172,10 +1193,14 @@ impl Supervisor {
     async fn handle_input(&mut self, process: &mut AgyProcess, input: AgentInput) -> bool {
         match input {
             AgentInput::SendMessage(payload) => {
-                if let Some(response) = payload.tool_response.clone()
-                    && !self.answer_question(response).await
-                {
-                    return true;
+                if let Some(response) = payload.tool_response.clone() {
+                    if !self.answer_question(response).await {
+                        return true;
+                    }
+                    if self.mapper.is_some() {
+                        self.deferred_answers.push_back(payload.message);
+                        return true;
+                    }
                 }
                 if payload.tool_response.is_none()
                     && let Some(catalog) = self.slash_commands.as_ref()
@@ -1224,18 +1249,28 @@ impl Supervisor {
             );
             return false;
         };
-        let Some(position) = self
-            .pending_questions
-            .iter()
-            .position(|pending| *pending == tool_call_id)
-        else {
+        // A question asked earlier in the running turn is still held by that
+        // turn's mapper; it moves here only when the turn finishes.
+        let held = [
+            Some(&mut self.pending_questions),
+            self.mapper
+                .as_mut()
+                .map(|mapper| &mut mapper.pending_questions),
+        ]
+        .into_iter()
+        .flatten()
+        .find_map(|pending| {
+            let position = pending.iter().position(|id| *id == tool_call_id)?;
+            pending.remove(position);
+            Some(())
+        });
+        if held.is_none() {
             self.inner.emitter.backend_error(&format!(
                 "Antigravity received an answer for question {tool_call_id}, which is not waiting \
                  on one"
             ));
             return false;
-        };
-        self.pending_questions.remove(position);
+        }
         self.inner.emitter.tool_completed(
             &tool_call_id,
             ToolExecutionOutcome::Succeeded {
@@ -1456,9 +1491,24 @@ impl Supervisor {
             self.pending_questions
                 .extend(mapper.take_pending_questions());
         }
-        self.inner.emitter.typing_status_changed(false);
-        self.inner.state.lock().await.turn_active = false;
+        // A deferred answer starts its turn as soon as this one is over, so
+        // the session never reports an idle it is about to leave.
+        if self.deferred_answers.is_empty() {
+            self.inner.emitter.typing_status_changed(false);
+            self.inner.state.lock().await.turn_active = false;
+        }
         self.refresh_capacity().await;
+    }
+
+    /// Starts the oldest answer that arrived mid-turn once no turn is running.
+    async fn start_deferred_answer(&mut self, process: &mut AgyProcess) -> bool {
+        if self.mapper.is_some() {
+            return true;
+        }
+        let Some(answer) = self.deferred_answers.pop_front() else {
+            return true;
+        };
+        self.start_turn(process, &answer, None).await
     }
 
     /// Re-reads the account's remaining quota, at most once per interval.
@@ -2521,6 +2571,7 @@ impl Backend for AntigravityBackend {
             Cap::WorkspaceInstructions,
             Cap::Customization,
             Cap::UserQuestionRequests,
+            Cap::AsyncUserQuestionRequests,
             Cap::TurnUsageReported,
             Cap::ModelRequestUsageReported,
             Cap::Subagents,
@@ -2901,6 +2952,7 @@ impl AntigravityBackend {
             cumulative: AgyUsage::default(),
             turn_counter: 0,
             pending_questions: Vec::new(),
+            deferred_answers: VecDeque::new(),
             capacity_read_at: None,
             shutdown_complete: shutdown_complete_tx,
             native_pending: BTreeMap::new(),

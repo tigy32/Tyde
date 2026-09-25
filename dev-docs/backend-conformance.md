@@ -48,6 +48,23 @@ Server-only guarantees remain in `server/tests/session_resume.rs`: history pagin
 
 Normal validation is `./dev.sh check`; it builds the test binary and MCP bridge without running paid cases. Real cases are ignored and additionally require `TYDE_RUN_REAL_AI_TESTS=1`; `TYDE_REAL_BACKENDS` selects providers. Follow the authorization rules in `AGENTS.md` before running them.
 
+## Antigravity questions are nonblocking
+
+Headless `agy` (checked on 1.2.11) cannot hold `ask_question` for a human:
+print mode answers every question itself with "User Skipped" and keeps
+going, its stream-json stdin accepts only `user` events, and the terminal is
+used only for login. Antigravity therefore declares
+`AsyncUserQuestionRequests` and reports its questions as `NonBlocking`. The
+card stays answerable after the turn goes idle. The answer is relayed as the
+next turn; an answer given mid-turn is queued until the running turn's
+`result`, with no idle state emitted between the two turns.
+
+`real_async_user_question` and `real_user_question` pin Antigravity to
+`gemini-3.8-flash-low`. Both passed on Antigravity on 2026-09-25. Before the
+fix, `real_async_user_question` failed on the `Blocking` mapping. With only
+the `NonBlocking` mapping in place, it failed because an answer given
+mid-turn produced no turn.
+
 ## Resumed native-goal running state
 
 `real_resumed_native_goal_reports_running` requires `NativeGoals` and

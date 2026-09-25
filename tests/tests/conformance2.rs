@@ -146,7 +146,14 @@ macro_rules! conformance2_scenario {
             provider!(
                 antigravity,
                 server::backend::antigravity::AntigravityBackend,
-                Profile::new(&[], &[])
+                if matches!(
+                    stringify!($scenario),
+                    "real_async_user_question" | "real_user_question"
+                ) {
+                    Profile::new(&["gemini-3.8-flash-low"], &[("model", "gemini-3.8-flash-low")])
+                } else {
+                    Profile::new(&[], &[])
+                }
             );
             provider!(
                 kiro,
@@ -2938,10 +2945,21 @@ async fn real_user_question<B: Backend>(host: &mut Harness<B>) {
 }
 
 async fn real_async_user_question<B: Backend>(host: &mut Harness<B>) {
-    let prompt = "Use request_user_input_async to ask one question titled Which label? with \
-        options ALPHA and BETA. Do not use the blocking request_user_input tool. Do not \
-        select an answer or run other tools. End your turn after asking, then wait for my \
-        actual answer. After I answer, repeat my chosen label.";
+    let prompt = match host.backend() {
+        BackendKind::Antigravity => {
+            "Use ask_question exactly once to ask one question titled Which label? with \
+             options ALPHA and BETA. Its result will say the question was skipped; that is \
+             expected, because my answer arrives as my next message. Do not ask again, do not \
+             select an answer, and do not run other tools. End your turn after asking. After \
+             I answer, repeat my chosen label."
+        }
+        _ => {
+            "Use request_user_input_async to ask one question titled Which label? with \
+             options ALPHA and BETA. Do not use the blocking request_user_input tool. Do not \
+             select an answer or run other tools. End your turn after asking, then wait for \
+             my actual answer. After I answer, repeat my chosen label."
+        }
+    };
     let agent = spawn_agent(host, &launch_prompt()).await;
     let launched = collect_turn(host, &agent, &launch_prompt()).await;
     assert_ready_handshake(&launched);

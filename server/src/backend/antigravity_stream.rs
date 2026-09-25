@@ -443,15 +443,17 @@ pub fn tool_request_type(tool_name: &str, args: &Value, enriched: bool) -> ToolR
                 after: arg_str(args, "ReplacementContent").unwrap_or_default(),
             }
         }
-        // Headless `agy` answers this itself — "A1: User Skipped" — and ends
-        // the turn without ever showing anyone the question. Tyde's contract
-        // wants exactly that turn boundary: the card stays open past idle and
-        // the user answers it afterwards, which arrives as a tool response and
-        // is relayed to `agy` as the next turn. Without this mapping the step
-        // renders as an opaque blob carrying neither the question nor its
-        // options, because the stream gives it no name and no arguments.
+        // Headless `agy` answers this itself — "A1: User Skipped" — and keeps
+        // going: print mode has no way to hold a question for a human (its
+        // stdin takes only `user` events, and the controlling terminal is used
+        // for login alone). The question therefore never pauses the provider,
+        // which is exactly the nonblocking contract: the card stays open past
+        // idle and the user's answer is relayed to `agy` as a later turn.
+        // Without this mapping the step renders as an opaque blob carrying
+        // neither the question nor its options, because the stream gives it no
+        // name and no arguments.
         "ask_question" => ToolRequestType::AskUserQuestion {
-            mode: protocol::UserQuestionMode::Blocking,
+            mode: protocol::UserQuestionMode::NonBlocking,
             questions: args
                 .get("questions")
                 .and_then(Value::as_array)
