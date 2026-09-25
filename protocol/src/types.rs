@@ -1017,6 +1017,7 @@ pub enum FrameKind {
     TeamCreate,
     TeamRename,
     TeamDelete,
+    TeamsStoreReset,
     TeamSetManager,
     TeamMemberCreate,
     TeamMemberUpdate,
@@ -1110,6 +1111,7 @@ pub enum FrameKind {
     SkillNotify,
     McpServerNotify,
     TeamNotify,
+    TeamsStoreStatusNotify,
     TeamMemberNotify,
     TeamMemberBindingNotify,
     TeamCompactNotify,
@@ -1221,6 +1223,7 @@ impl fmt::Display for FrameKind {
             Self::TeamCreate => f.write_str("team_create"),
             Self::TeamRename => f.write_str("team_rename"),
             Self::TeamDelete => f.write_str("team_delete"),
+            Self::TeamsStoreReset => f.write_str("teams_store_reset"),
             Self::TeamSetManager => f.write_str("team_set_manager"),
             Self::TeamMemberCreate => f.write_str("team_member_create"),
             Self::TeamMemberUpdate => f.write_str("team_member_update"),
@@ -1309,6 +1312,7 @@ impl fmt::Display for FrameKind {
             Self::SkillNotify => f.write_str("skill_notify"),
             Self::McpServerNotify => f.write_str("mcp_server_notify"),
             Self::TeamNotify => f.write_str("team_notify"),
+            Self::TeamsStoreStatusNotify => f.write_str("teams_store_status_notify"),
             Self::TeamMemberNotify => f.write_str("team_member_notify"),
             Self::TeamMemberBindingNotify => f.write_str("team_member_binding_notify"),
             Self::TeamCompactNotify => f.write_str("team_compact_notify"),
@@ -1720,6 +1724,8 @@ pub struct HostBootstrapPayload<S = Value> {
     pub teams: Vec<Team>,
     pub team_members: Vec<TeamMember>,
     pub team_member_bindings: Vec<TeamMemberBindingPayload>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub teams_store_load_error: Option<TeamsStoreLoadError>,
     pub agents: Vec<NewAgentPayload>,
     #[serde(default)]
     pub task_token_usages: Vec<TaskTokenUsagePayload>,
@@ -5155,6 +5161,33 @@ pub enum TeamNotifyPayload {
     Upsert { team: Team },
     Delete { team: Team },
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TeamsStoreLoadErrorKind {
+    Io,
+    Corrupt,
+    UnsupportedVersion,
+    Invalid,
+}
+
+/// Why the host could not load its teams store. While set, the store holds
+/// no teams and rejects every write so the unreadable file is never
+/// overwritten; `TeamsStoreReset` moves the file aside to repair it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TeamsStoreLoadError {
+    pub kind: TeamsStoreLoadErrorKind,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TeamsStoreStatusNotifyPayload {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub load_error: Option<TeamsStoreLoadError>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TeamsStoreResetPayload {}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]

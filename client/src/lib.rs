@@ -719,6 +719,14 @@ impl Connection {
             .await
     }
 
+    pub async fn teams_store_reset(
+        &mut self,
+        payload: protocol::TeamsStoreResetPayload,
+    ) -> Result<(), FrameError> {
+        self.send_host_payload(FrameKind::TeamsStoreReset, &payload)
+            .await
+    }
+
     pub async fn team_set_manager(
         &mut self,
         payload: TeamSetManagerPayload,
@@ -1411,6 +1419,10 @@ impl Connection {
                 }
                 FrameKind::TeamNotify => {
                     let _: TeamNotifyPayload =
+                        envelope.parse_payload().map_err(FrameError::Json)?;
+                }
+                FrameKind::TeamsStoreStatusNotify => {
+                    let _: protocol::TeamsStoreStatusNotifyPayload =
                         envelope.parse_payload().map_err(FrameError::Json)?;
                 }
                 FrameKind::TeamMemberNotify => {

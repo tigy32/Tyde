@@ -15,7 +15,8 @@ use protocol::{
     TeamMemberDeletePayload, TeamMemberId, TeamMemberNotifyPayload, TeamMemberPresetProfile,
     TeamMemberRole, TeamMemberState, TeamMemberUpdatePayload, TeamNotifyPayload,
     TeamPersonalityPresetId, TeamPersonalityTrait, TeamRenamePayload, TeamRolePresetId,
-    TeamSetManagerPayload, TeamTemplateId, ToolPolicy, write_envelope,
+    TeamSetManagerPayload, TeamTemplateId, TeamsStoreLoadErrorKind, TeamsStoreResetPayload,
+    TeamsStoreStatusNotifyPayload, ToolPolicy, write_envelope,
 };
 use rmcp::ServiceExt;
 use rmcp::model::{CallToolRequestParams, RawContent};
@@ -1820,6 +1821,207 @@ async fn disabling_member_backend_keeps_teams_editable_and_host_startable() {
     assert_eq!(
         replayed.name, "renamed unrelated team",
         "a failed store write must not change the replayed team"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn stale_team_member_references_keep_host_startable_and_teams_editable() {
+    let mut fixture = Fixture::new().await;
+    let (_, project, team, _, report) = create_team_with_report(&mut fixture, "stale-refs").await;
+
+    // A custom agent, project, or preset can disappear outside the teams
+    // store (a hand-edited sibling store, or an upgrade retiring a preset).
+    let store_path = fixture.store_dir().join("agent_teams.json");
+    let mut stored: Value =
+        serde_json::from_str(&std::fs::read_to_string(&store_path).expect("read teams store"))
+            .expect("parse teams store");
+    let stored_member = &mut stored["members"][report.id.0.as_str()];
+    stored_member["custom_agent_id"] = json!("deleted-agent");
+    stored_member["profile"] = json!({ "role_preset_id": "retired-role" });
+    stored_member["project_ids"] = json!([project.id.0.clone(), "deleted-project"]);
+    std::fs::write(
+        &store_path,
+        serde_json::to_string_pretty(&stored).expect("serialize teams store"),
+    )
+    .expect("write teams store");
+
+    let bootstrap = fixture.restart_host().await;
+    let restored = bootstrap
+        .team_members
+        .iter()
+        .find(|member| member.id == report.id)
+        .expect("member with stale references survives restart")
+        .clone();
+    assert_eq!(
+        restored.custom_agent_id,
+        Some(CustomAgentId("deleted-agent".to_owned()))
+    );
+    assert_eq!(
+        restored
+            .profile
+            .as_ref()
+            .and_then(|profile| profile.role_preset_id.clone()),
+        Some(TeamRolePresetId("retired-role".to_owned()))
+    );
+
+    fixture
+        .client
+        .team_rename(TeamRenamePayload {
+            id: team.id.clone(),
+            name: "renamed stale team".to_owned(),
+        })
+        .await
+        .expect("team_rename write failed");
+    let renamed = expect_team_notify(&mut fixture.client, "stale team rename").await;
+    assert_eq!(renamed.name, "renamed stale team");
+
+    fixture
+        .client
+        .team_member_update(TeamMemberUpdatePayload {
+            id: restored.id.clone(),
+            name: restored.name.clone(),
+            description: "edited around stale references".to_owned(),
+            profile: restored.profile.clone(),
+            project_ids: restored.project_ids.clone(),
+        })
+        .await
+        .expect("team_member_update write failed");
+    let updated = expect_team_member_notify(&mut fixture.client, "stale member update").await;
+    assert_eq!(updated.description, "edited around stale references");
+    assert_eq!(updated.profile, restored.profile);
+    assert_eq!(updated.project_ids, restored.project_ids);
+
+    fixture
+        .client
+        .team_member_update(TeamMemberUpdatePayload {
+            id: restored.id.clone(),
+            name: restored.name.clone(),
+            description: "edited around stale references".to_owned(),
+            profile: Some(TeamMemberPresetProfile {
+                role_preset_id: Some(TeamRolePresetId("another-missing-role".to_owned())),
+                personality_preset_id: None,
+                personality_traits: Vec::new(),
+            }),
+            project_ids: restored.project_ids.clone(),
+        })
+        .await
+        .expect("team_member_update write failed");
+    let error = expect_command_error(&mut fixture.client, "edited missing preset").await;
+    assert_eq!(error.operation, "team_member_update");
+    assert!(
+        error.message.contains("missing role preset"),
+        "unexpected error: {}",
+        error.message
+    );
+
+    fixture
+        .client
+        .team_member_update(TeamMemberUpdatePayload {
+            id: restored.id.clone(),
+            name: restored.name.clone(),
+            description: "stale project removed".to_owned(),
+            profile: None,
+            project_ids: vec![project.id.clone()],
+        })
+        .await
+        .expect("team_member_update write failed");
+    let repaired = expect_team_member_notify(&mut fixture.client, "stale refs repaired").await;
+    assert_eq!(repaired.profile, None);
+    assert_eq!(repaired.project_ids, vec![project.id.clone()]);
+
+    let bootstrap = fixture.restart_host().await;
+    assert!(
+        bootstrap
+            .team_members
+            .iter()
+            .any(|member| member.id == report.id && member.description == "stale project removed")
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn unreadable_teams_store_keeps_host_startable() {
+    let mut fixture = Fixture::new().await;
+    let (custom_agent, project, team, _, _) =
+        create_team_with_report(&mut fixture, "unreadable").await;
+    let store_path = fixture.store_dir().join("agent_teams.json");
+    let corrupt = std::fs::read_to_string(&store_path).expect("read teams store")[..40].to_owned();
+    std::fs::write(&store_path, &corrupt).expect("truncate teams store");
+
+    let bootstrap = fixture.restart_host().await;
+    assert!(
+        bootstrap
+            .teams
+            .iter()
+            .all(|candidate| candidate.id != team.id)
+    );
+    let load_error = bootstrap
+        .teams_store_load_error
+        .expect("bootstrap must report the unreadable teams store");
+    assert_eq!(load_error.kind, TeamsStoreLoadErrorKind::Corrupt);
+
+    fixture
+        .client
+        .team_create(TeamCreatePayload {
+            name: "blocked".to_owned(),
+            manager: member_spec("manager", Some(custom_agent.id), vec![project.id]),
+        })
+        .await
+        .expect("team_create write failed");
+    let error = expect_command_error(&mut fixture.client, "team_create while unreadable").await;
+    assert_eq!(error.operation, "team_create");
+    assert_eq!(error.code, CommandErrorCode::Conflict);
+    assert!(
+        error.message.contains("reset"),
+        "unexpected error: {}",
+        error.message
+    );
+    assert_eq!(
+        std::fs::read_to_string(&store_path).expect("read teams store"),
+        corrupt,
+        "an unreadable teams store must never be overwritten"
+    );
+
+    let bootstrap = fixture.restart_host().await;
+    assert!(bootstrap.teams_store_load_error.is_some());
+
+    fixture
+        .client
+        .teams_store_reset(TeamsStoreResetPayload {})
+        .await
+        .expect("teams_store_reset write failed");
+    let status: TeamsStoreStatusNotifyPayload = expect_kind(
+        &mut fixture.client,
+        FrameKind::TeamsStoreStatusNotify,
+        "TeamsStoreStatusNotify after reset",
+    )
+    .await
+    .parse_payload()
+    .expect("parse TeamsStoreStatusNotifyPayload");
+    assert_eq!(status.load_error, None);
+    let backups = std::fs::read_dir(fixture.store_dir())
+        .expect("read store dir")
+        .map(|entry| entry.expect("store dir entry").path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("agent_teams.json.unreadable-"))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(backups.len(), 1, "reset must keep exactly one backup");
+    assert_eq!(
+        std::fs::read_to_string(&backups[0]).expect("read backup"),
+        corrupt,
+        "the backup must hold the original unreadable contents"
+    );
+
+    let (_, _, recreated, _, _) = create_team_with_report(&mut fixture, "after-reset").await;
+    let bootstrap = fixture.restart_host().await;
+    assert_eq!(bootstrap.teams_store_load_error, None);
+    assert!(
+        bootstrap
+            .teams
+            .iter()
+            .any(|candidate| candidate.id == recreated.id)
     );
 }
 

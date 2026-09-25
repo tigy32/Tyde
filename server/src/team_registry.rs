@@ -13,6 +13,7 @@ use protocol::{
     TeamNotifyPayload, TeamPersonalityPreset, TeamPersonalityPresetId, TeamPersonalityTrait,
     TeamPersonalityTraitPreset, TeamPresetCatalog, TeamRenamePayload, TeamRolePreset,
     TeamRolePresetId, TeamSetManagerPayload, TeamTemplate, TeamTemplateId, TeamTemplateMember,
+    TeamsStoreLoadError, TeamsStoreStatusNotifyPayload,
 };
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
@@ -35,6 +36,7 @@ pub(crate) struct TeamRegistrySnapshot {
     pub teams: Vec<Team>,
     pub members: Vec<TeamMember>,
     pub bindings: Vec<TeamMemberBindingPayload>,
+    pub load_error: Option<TeamsStoreLoadError>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -44,6 +46,7 @@ pub(crate) struct TeamRegistryEvents {
     pub binding_notifies: Vec<TeamMemberBindingNotifyPayload>,
     pub draft_notifies: Vec<TeamDraftNotifyPayload>,
     pub shuffle_suggestion_notifies: Vec<TeamMemberShuffleSuggestionNotifyPayload>,
+    pub store_status_notifies: Vec<TeamsStoreStatusNotifyPayload>,
 }
 
 #[derive(Debug, Clone)]
@@ -89,7 +92,6 @@ enum TeamRegistryCommand {
         member_id: TeamMemberId,
         agent_id: AgentId,
         session_id: Option<SessionId>,
-        refs: AgentTeamValidationRefs,
         reply: oneshot::Sender<Result<TeamRegistryEvents, String>>,
     },
     RotateMemberAgent {
@@ -98,7 +100,6 @@ enum TeamRegistryCommand {
         new_agent_id: AgentId,
         old_session_id: SessionId,
         new_session_id: SessionId,
-        refs: AgentTeamValidationRefs,
         reply: oneshot::Sender<Result<TeamRegistryEvents, String>>,
     },
     RecordBindingFailure {
@@ -107,7 +108,6 @@ enum TeamRegistryCommand {
     },
     RecordResumeFailure {
         member_id: TeamMemberId,
-        refs: AgentTeamValidationRefs,
         reply: oneshot::Sender<Result<TeamRegistryEvents, String>>,
     },
     RecordMemberActivity {
@@ -131,17 +131,14 @@ enum TeamRegistryCommand {
     },
     RenameTeam {
         payload: TeamRenamePayload,
-        refs: AgentTeamValidationRefs,
         reply: oneshot::Sender<Result<TeamRegistryEvents, String>>,
     },
     DeleteTeam {
         payload: TeamDeletePayload,
-        refs: AgentTeamValidationRefs,
         reply: oneshot::Sender<Result<TeamRegistryEvents, String>>,
     },
     SetManager {
         payload: TeamSetManagerPayload,
-        refs: AgentTeamValidationRefs,
         reply: oneshot::Sender<Result<TeamRegistryEvents, String>>,
     },
     CreateMember {
@@ -156,13 +153,11 @@ enum TeamRegistryCommand {
     },
     DeleteMember {
         payload: TeamMemberDeletePayload,
-        refs: AgentTeamValidationRefs,
         reply: oneshot::Sender<Result<TeamRegistryEvents, String>>,
     },
     RemoveProjectRefs {
         project_id: ProjectId,
         deleted_session_ids: HashSet<SessionId>,
-        refs: AgentTeamValidationRefs,
         reply: oneshot::Sender<Result<TeamRegistryEvents, String>>,
     },
     CreateDraft {
@@ -192,6 +187,9 @@ enum TeamRegistryCommand {
     },
     DiscardDraft {
         payload: TeamDraftDiscardPayload,
+        reply: oneshot::Sender<Result<TeamRegistryEvents, String>>,
+    },
+    ResetStore {
         reply: oneshot::Sender<Result<TeamRegistryEvents, String>>,
     },
 }
@@ -298,13 +296,11 @@ impl TeamRegistryHandle {
         member_id: TeamMemberId,
         agent_id: AgentId,
         session_id: Option<SessionId>,
-        refs: AgentTeamValidationRefs,
     ) -> Result<TeamRegistryEvents, String> {
         self.mutate(|reply| TeamRegistryCommand::BindMemberAgent {
             member_id,
             agent_id,
             session_id,
-            refs,
             reply,
         })
         .await
@@ -317,7 +313,6 @@ impl TeamRegistryHandle {
         new_agent_id: AgentId,
         old_session_id: SessionId,
         new_session_id: SessionId,
-        refs: AgentTeamValidationRefs,
     ) -> Result<TeamRegistryEvents, String> {
         self.mutate(|reply| TeamRegistryCommand::RotateMemberAgent {
             member_id,
@@ -325,7 +320,6 @@ impl TeamRegistryHandle {
             new_agent_id,
             old_session_id,
             new_session_id,
-            refs,
             reply,
         })
         .await
@@ -342,14 +336,9 @@ impl TeamRegistryHandle {
     pub(crate) async fn record_resume_failure(
         &self,
         member_id: TeamMemberId,
-        refs: AgentTeamValidationRefs,
     ) -> Result<TeamRegistryEvents, String> {
-        self.mutate(|reply| TeamRegistryCommand::RecordResumeFailure {
-            member_id,
-            refs,
-            reply,
-        })
-        .await
+        self.mutate(|reply| TeamRegistryCommand::RecordResumeFailure { member_id, reply })
+            .await
     }
 
     pub(crate) async fn record_member_activity(
@@ -402,40 +391,25 @@ impl TeamRegistryHandle {
     pub(crate) async fn rename_team(
         &self,
         payload: TeamRenamePayload,
-        refs: AgentTeamValidationRefs,
     ) -> Result<TeamRegistryEvents, String> {
-        self.mutate(|reply| TeamRegistryCommand::RenameTeam {
-            payload,
-            refs,
-            reply,
-        })
-        .await
+        self.mutate(|reply| TeamRegistryCommand::RenameTeam { payload, reply })
+            .await
     }
 
     pub(crate) async fn delete_team(
         &self,
         payload: TeamDeletePayload,
-        refs: AgentTeamValidationRefs,
     ) -> Result<TeamRegistryEvents, String> {
-        self.mutate(|reply| TeamRegistryCommand::DeleteTeam {
-            payload,
-            refs,
-            reply,
-        })
-        .await
+        self.mutate(|reply| TeamRegistryCommand::DeleteTeam { payload, reply })
+            .await
     }
 
     pub(crate) async fn set_manager(
         &self,
         payload: TeamSetManagerPayload,
-        refs: AgentTeamValidationRefs,
     ) -> Result<TeamRegistryEvents, String> {
-        self.mutate(|reply| TeamRegistryCommand::SetManager {
-            payload,
-            refs,
-            reply,
-        })
-        .await
+        self.mutate(|reply| TeamRegistryCommand::SetManager { payload, reply })
+            .await
     }
 
     pub(crate) async fn create_member(
@@ -467,26 +441,19 @@ impl TeamRegistryHandle {
     pub(crate) async fn delete_member(
         &self,
         payload: TeamMemberDeletePayload,
-        refs: AgentTeamValidationRefs,
     ) -> Result<TeamRegistryEvents, String> {
-        self.mutate(|reply| TeamRegistryCommand::DeleteMember {
-            payload,
-            refs,
-            reply,
-        })
-        .await
+        self.mutate(|reply| TeamRegistryCommand::DeleteMember { payload, reply })
+            .await
     }
 
     pub(crate) async fn remove_project_refs(
         &self,
         project_id: ProjectId,
         deleted_session_ids: HashSet<SessionId>,
-        refs: AgentTeamValidationRefs,
     ) -> Result<TeamRegistryEvents, String> {
         self.mutate(|reply| TeamRegistryCommand::RemoveProjectRefs {
             project_id,
             deleted_session_ids,
-            refs,
             reply,
         })
         .await
@@ -553,6 +520,11 @@ impl TeamRegistryHandle {
             .await
     }
 
+    pub(crate) async fn reset_store(&self) -> Result<TeamRegistryEvents, String> {
+        self.mutate(|reply| TeamRegistryCommand::ResetStore { reply })
+            .await
+    }
+
     async fn mutate<F>(&self, build: F) -> Result<TeamRegistryEvents, String>
     where
         F: FnOnce(oneshot::Sender<Result<TeamRegistryEvents, String>>) -> TeamRegistryCommand,
@@ -598,10 +570,9 @@ impl TeamRegistryActor {
                     member_id,
                     agent_id,
                     session_id,
-                    refs,
                     reply,
                 } => {
-                    let result = self.bind_member_agent(member_id, agent_id, session_id, &refs);
+                    let result = self.bind_member_agent(member_id, agent_id, session_id);
                     let _ = reply.send(result);
                 }
                 TeamRegistryCommand::RotateMemberAgent {
@@ -610,7 +581,6 @@ impl TeamRegistryActor {
                     new_agent_id,
                     old_session_id,
                     new_session_id,
-                    refs,
                     reply,
                 } => {
                     let result = self.rotate_member_agent(
@@ -619,20 +589,15 @@ impl TeamRegistryActor {
                         new_agent_id,
                         old_session_id,
                         new_session_id,
-                        &refs,
                     );
                     let _ = reply.send(result);
                 }
                 TeamRegistryCommand::RecordBindingFailure { member_id, reply } => {
-                    let result = self.record_binding_failure(&member_id, None);
+                    let result = self.record_binding_failure(&member_id, false);
                     let _ = reply.send(result);
                 }
-                TeamRegistryCommand::RecordResumeFailure {
-                    member_id,
-                    refs,
-                    reply,
-                } => {
-                    let result = self.record_binding_failure(&member_id, Some(&refs));
+                TeamRegistryCommand::RecordResumeFailure { member_id, reply } => {
+                    let result = self.record_binding_failure(&member_id, true);
                     let _ = reply.send(result);
                 }
                 TeamRegistryCommand::RecordMemberActivity {
@@ -663,28 +628,16 @@ impl TeamRegistryActor {
                     let result = self.create_team(payload, &refs);
                     let _ = reply.send(result);
                 }
-                TeamRegistryCommand::RenameTeam {
-                    payload,
-                    refs,
-                    reply,
-                } => {
-                    let result = self.rename_team(payload, &refs);
+                TeamRegistryCommand::RenameTeam { payload, reply } => {
+                    let result = self.rename_team(payload);
                     let _ = reply.send(result);
                 }
-                TeamRegistryCommand::DeleteTeam {
-                    payload,
-                    refs,
-                    reply,
-                } => {
-                    let result = self.delete_team(payload, &refs);
+                TeamRegistryCommand::DeleteTeam { payload, reply } => {
+                    let result = self.delete_team(payload);
                     let _ = reply.send(result);
                 }
-                TeamRegistryCommand::SetManager {
-                    payload,
-                    refs,
-                    reply,
-                } => {
-                    let result = self.set_manager(payload, &refs);
+                TeamRegistryCommand::SetManager { payload, reply } => {
+                    let result = self.set_manager(payload);
                     let _ = reply.send(result);
                 }
                 TeamRegistryCommand::CreateMember {
@@ -703,21 +656,16 @@ impl TeamRegistryActor {
                     let result = self.update_member(payload, &refs);
                     let _ = reply.send(result);
                 }
-                TeamRegistryCommand::DeleteMember {
-                    payload,
-                    refs,
-                    reply,
-                } => {
-                    let result = self.delete_member(payload, &refs);
+                TeamRegistryCommand::DeleteMember { payload, reply } => {
+                    let result = self.delete_member(payload);
                     let _ = reply.send(result);
                 }
                 TeamRegistryCommand::RemoveProjectRefs {
                     project_id,
                     deleted_session_ids,
-                    refs,
                     reply,
                 } => {
-                    let result = self.remove_project_refs(&project_id, &deleted_session_ids, &refs);
+                    let result = self.remove_project_refs(&project_id, &deleted_session_ids);
                     let _ = reply.send(result);
                 }
                 TeamRegistryCommand::CreateDraft { payload, reply } => {
@@ -752,6 +700,10 @@ impl TeamRegistryActor {
                     let result = self.discard_draft(payload);
                     let _ = reply.send(result);
                 }
+                TeamRegistryCommand::ResetStore { reply } => {
+                    let result = self.reset_store();
+                    let _ = reply.send(result);
+                }
             }
         }
     }
@@ -763,7 +715,18 @@ impl TeamRegistryActor {
             teams: self.store.teams(),
             members: self.store.members(),
             bindings: self.bindings.clone(),
+            load_error: self.store.load_error(),
         }
+    }
+
+    fn reset_store(&mut self) -> Result<TeamRegistryEvents, String> {
+        self.store.reset_after_load_error()?;
+        Ok(TeamRegistryEvents {
+            store_status_notifies: vec![TeamsStoreStatusNotifyPayload {
+                load_error: self.store.load_error(),
+            }],
+            ..TeamRegistryEvents::default()
+        })
     }
 
     fn describe_for_agent(&self, agent_id: &AgentId) -> Result<TeamDescribeData, String> {
@@ -929,7 +892,6 @@ impl TeamRegistryActor {
         member_id: TeamMemberId,
         agent_id: AgentId,
         session_id: Option<SessionId>,
-        refs: &AgentTeamValidationRefs,
     ) -> Result<TeamRegistryEvents, String> {
         self.pending_activations.remove(&member_id);
         let mut events = TeamRegistryEvents::default();
@@ -945,9 +907,7 @@ impl TeamRegistryActor {
                 }
                 Some(_) => {}
                 None => {
-                    let member = self
-                        .store
-                        .set_member_session_id(&member_id, session_id, refs)?;
+                    let member = self.store.set_member_session_id(&member_id, session_id)?;
                     events
                         .member_notifies
                         .push(TeamMemberNotifyPayload::Upsert { member });
@@ -970,7 +930,6 @@ impl TeamRegistryActor {
         new_agent_id: AgentId,
         old_session_id: SessionId,
         new_session_id: SessionId,
-        refs: &AgentTeamValidationRefs,
     ) -> Result<TeamRegistryEvents, String> {
         self.pending_activations.remove(&member_id);
         let binding = self
@@ -984,12 +943,9 @@ impl TeamRegistryActor {
             ));
         }
 
-        let member = self.store.replace_member_session_id(
-            &member_id,
-            &old_session_id,
-            new_session_id,
-            refs,
-        )?;
+        let member =
+            self.store
+                .replace_member_session_id(&member_id, &old_session_id, new_session_id)?;
         let binding =
             self.upsert_binding(member_id, Some(new_agent_id), AgentControlStatus::Thinking)?;
         Ok(TeamRegistryEvents {
@@ -1002,13 +958,11 @@ impl TeamRegistryActor {
     fn record_binding_failure(
         &mut self,
         member_id: &TeamMemberId,
-        clear_session_refs: Option<&AgentTeamValidationRefs>,
+        clear_session: bool,
     ) -> Result<TeamRegistryEvents, String> {
         self.pending_activations.remove(member_id);
         let mut events = TeamRegistryEvents::default();
-        if let Some(refs) = clear_session_refs
-            && let Some(member) = self.store.clear_member_session_id(member_id, refs)?
-        {
+        if clear_session && let Some(member) = self.store.clear_member_session_id(member_id)? {
             events
                 .member_notifies
                 .push(TeamMemberNotifyPayload::Upsert { member });
@@ -1089,24 +1043,16 @@ impl TeamRegistryActor {
         })
     }
 
-    fn rename_team(
-        &mut self,
-        payload: TeamRenamePayload,
-        refs: &AgentTeamValidationRefs,
-    ) -> Result<TeamRegistryEvents, String> {
-        let team = self.store.rename_team(payload, refs)?;
+    fn rename_team(&mut self, payload: TeamRenamePayload) -> Result<TeamRegistryEvents, String> {
+        let team = self.store.rename_team(payload)?;
         Ok(TeamRegistryEvents {
             team_notifies: vec![TeamNotifyPayload::Upsert { team }],
             ..TeamRegistryEvents::default()
         })
     }
 
-    fn delete_team(
-        &mut self,
-        payload: TeamDeletePayload,
-        refs: &AgentTeamValidationRefs,
-    ) -> Result<TeamRegistryEvents, String> {
-        let (team, members) = self.store.delete_team(&payload.id, refs)?;
+    fn delete_team(&mut self, payload: TeamDeletePayload) -> Result<TeamRegistryEvents, String> {
+        let (team, members) = self.store.delete_team(&payload.id)?;
         let mut member_notifies = Vec::new();
         let mut binding_notifies = Vec::new();
         for member in members {
@@ -1127,9 +1073,8 @@ impl TeamRegistryActor {
     fn set_manager(
         &mut self,
         payload: TeamSetManagerPayload,
-        refs: &AgentTeamValidationRefs,
     ) -> Result<TeamRegistryEvents, String> {
-        let (team, old_manager, new_manager) = self.store.set_manager(payload, refs)?;
+        let (team, old_manager, new_manager) = self.store.set_manager(payload)?;
         Ok(TeamRegistryEvents {
             team_notifies: vec![TeamNotifyPayload::Upsert { team }],
             member_notifies: vec![
@@ -1173,7 +1118,6 @@ impl TeamRegistryActor {
     fn delete_member(
         &mut self,
         payload: TeamMemberDeletePayload,
-        refs: &AgentTeamValidationRefs,
     ) -> Result<TeamRegistryEvents, String> {
         if self
             .bindings
@@ -1185,7 +1129,7 @@ impl TeamRegistryActor {
                 payload.id
             ));
         }
-        let member = self.store.delete_member(payload, refs)?;
+        let member = self.store.delete_member(payload)?;
         self.pending_activations.remove(&member.id);
         let binding_notifies = self
             .remove_binding_payload(&member.id)
@@ -1202,11 +1146,10 @@ impl TeamRegistryActor {
         &mut self,
         project_id: &ProjectId,
         deleted_session_ids: &HashSet<SessionId>,
-        refs: &AgentTeamValidationRefs,
     ) -> Result<TeamRegistryEvents, String> {
-        let members =
-            self.store
-                .remove_project_from_members(project_id, deleted_session_ids, refs)?;
+        let members = self
+            .store
+            .remove_project_from_members(project_id, deleted_session_ids)?;
         for member in &members {
             if member.project_ids.is_empty() {
                 self.pending_activations.remove(&member.id);
@@ -1407,6 +1350,7 @@ impl TeamRegistryActor {
                     binding_notifies,
                     draft_notifies: vec![TeamDraftNotifyPayload::Delete { draft_id: draft.id }],
                     shuffle_suggestion_notifies: Vec::new(),
+                    store_status_notifies: Vec::new(),
                 })
             }
             Err(err) => {

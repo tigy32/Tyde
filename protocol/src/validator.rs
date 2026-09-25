@@ -43,10 +43,10 @@ use crate::{
     TeamMemberBindingNotifyPayload, TeamMemberCreatePayload, TeamMemberDeletePayload,
     TeamMemberNotifyPayload, TeamMemberShufflePayload, TeamMemberShuffleSuggestionNotifyPayload,
     TeamMemberUpdatePayload, TeamNotifyPayload, TeamPresetCatalogNotifyPayload, TeamRenamePayload,
-    TeamSetManagerPayload, TerminalCreatePayload, TerminalErrorPayload, TerminalExitPayload,
-    TerminalOutputPayload, TriggerWorkflowPayload, WelcomePayload, WorkbenchCreatePayload,
-    WorkbenchRemovePayload, WorkflowNotifyPayload, WorkflowRefreshPayload,
-    WorkflowRunNotifyPayload, parse_json_pointer,
+    TeamSetManagerPayload, TeamsStoreResetPayload, TeamsStoreStatusNotifyPayload,
+    TerminalCreatePayload, TerminalErrorPayload, TerminalExitPayload, TerminalOutputPayload,
+    TriggerWorkflowPayload, WelcomePayload, WorkbenchCreatePayload, WorkbenchRemovePayload,
+    WorkflowNotifyPayload, WorkflowRefreshPayload, WorkflowRunNotifyPayload, parse_json_pointer,
 };
 
 const DEFAULT_HISTORY_LIMIT: usize = 64;
@@ -688,6 +688,13 @@ impl ProtocolValidator {
             FrameKind::TeamNotify => {
                 parse_host_payload::<TeamNotifyPayload>(self, envelope, "TeamNotify")
             }
+            FrameKind::TeamsStoreStatusNotify => {
+                parse_host_payload::<TeamsStoreStatusNotifyPayload>(
+                    self,
+                    envelope,
+                    "TeamsStoreStatusNotify",
+                )
+            }
             FrameKind::TeamMemberNotify => {
                 parse_host_payload::<TeamMemberNotifyPayload>(self, envelope, "TeamMemberNotify")
             }
@@ -905,6 +912,9 @@ impl ProtocolValidator {
             }
             FrameKind::TeamDelete => {
                 parse_host_payload::<TeamDeletePayload>(self, envelope, "TeamDelete")
+            }
+            FrameKind::TeamsStoreReset => {
+                parse_host_payload::<TeamsStoreResetPayload>(self, envelope, "TeamsStoreReset")
             }
             FrameKind::TeamSetManager => {
                 parse_host_payload::<TeamSetManagerPayload>(self, envelope, "TeamSetManager")

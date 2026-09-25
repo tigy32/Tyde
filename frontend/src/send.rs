@@ -721,6 +721,16 @@ pub async fn team_delete(host_id: &str, host_stream: StreamPath, id: TeamId) -> 
     .await
 }
 
+pub async fn teams_store_reset(host_id: &str, host_stream: StreamPath) -> Result<(), String> {
+    send_frame(
+        host_id,
+        host_stream,
+        FrameKind::TeamsStoreReset,
+        &protocol::TeamsStoreResetPayload {},
+    )
+    .await
+}
+
 pub async fn team_set_manager(
     host_id: &str,
     host_stream: StreamPath,

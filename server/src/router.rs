@@ -372,6 +372,11 @@ pub(crate) async fn route_client_envelope(
                 ensure_non_empty("team_delete", "id", payload.id.0.as_str())?;
                 host.delete_team(payload).await?;
             }
+            FrameKind::TeamsStoreReset => {
+                let _: protocol::TeamsStoreResetPayload =
+                    parse_payload(&envelope, "teams_store_reset")?;
+                host.reset_teams_store().await?;
+            }
             FrameKind::TeamSetManager => {
                 let payload: TeamSetManagerPayload = parse_payload(&envelope, "team_set_manager")?;
                 ensure_non_empty("team_set_manager", "team_id", payload.team_id.0.as_str())?;

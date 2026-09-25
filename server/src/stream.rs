@@ -689,6 +689,7 @@ pub(crate) fn classify(kind: FrameKind) -> OutputLane {
         | FrameKind::SkillNotify
         | FrameKind::McpServerNotify
         | FrameKind::TeamNotify
+        | FrameKind::TeamsStoreStatusNotify
         | FrameKind::TeamMemberNotify
         | FrameKind::TeamMemberBindingNotify
         | FrameKind::TeamCompactNotify
@@ -781,6 +782,7 @@ pub(crate) fn classify(kind: FrameKind) -> OutputLane {
         | FrameKind::TeamCreate
         | FrameKind::TeamRename
         | FrameKind::TeamDelete
+        | FrameKind::TeamsStoreReset
         | FrameKind::TeamSetManager
         | FrameKind::TeamMemberCreate
         | FrameKind::TeamMemberUpdate

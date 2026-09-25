@@ -2718,21 +2718,28 @@ impl HostHandle {
         // set) when the stored copy is an unedited published version and no
         // team member references it. User-edited copies and agents in use by
         // teams are preserved. Idempotent, so re-running per registration is
-        // harmless.
-        {
-            let referenced: std::collections::HashSet<String> =
-                match state.team_registry.snapshot().await {
-                    Ok(snapshot) => snapshot
+        // harmless. An unreadable teams store may reference any of them, so
+        // pare-back waits until it loads.
+        let referenced: Option<std::collections::HashSet<String>> =
+            match state.team_registry.snapshot().await {
+                Ok(snapshot) if snapshot.load_error.is_some() => {
+                    tracing::warn!("skipping builtin agent pare-back: teams store is unreadable");
+                    None
+                }
+                Ok(snapshot) => Some(
+                    snapshot
                         .members
                         .iter()
                         .filter_map(|member| member.custom_agent_id.as_ref())
                         .map(|id| id.0.clone())
                         .collect(),
-                    Err(err) => {
-                        tracing::warn!(%err, "skipping builtin agent pare-back: no team snapshot");
-                        std::collections::HashSet::new()
-                    }
-                };
+                ),
+                Err(err) => {
+                    tracing::warn!(%err, "skipping builtin agent pare-back: no team snapshot");
+                    None
+                }
+            };
+        if let Some(referenced) = referenced {
             let custom_agents = state.custom_agent_store.lock().await;
             for id in crate::store::custom_agents::deprecated_builtin_custom_agent_ids() {
                 if referenced.contains(id) {
@@ -3017,6 +3024,7 @@ impl HostHandle {
             teams: team_snapshot.teams,
             team_members: team_snapshot.members,
             team_member_bindings: team_snapshot.bindings,
+            teams_store_load_error: team_snapshot.load_error,
             agents,
             task_token_usages,
             workflow_summaries,
@@ -4263,30 +4271,6 @@ impl HostHandle {
         };
 
         if let Some(context) = team_context.as_ref() {
-            let refs_result = {
-                let state = self.state.lock().await;
-                agent_team_validation_refs(&state, "agent_compact").await
-            };
-            let refs = match refs_result {
-                Ok(refs) => refs,
-                Err(error) => {
-                    self.close_agent(&new_agent_id).await;
-                    let _ = agent_handle.release_compaction().await;
-                    send_agent_compact_notify(
-                        &stream,
-                        AgentCompactNotifyPayload {
-                            status: AgentCompactStatus::Failed,
-                            old_agent_id: agent_id,
-                            old_session_id: Some(old_session_id),
-                            new_agent_id: Some(new_agent_id),
-                            new_session_id: Some(new_session_id),
-                            summary_preview: Some(summary_preview),
-                            message: Some(format!("team validation failed: {error}")),
-                        },
-                    );
-                    return;
-                }
-            };
             match team_registry
                 .rotate_member_agent(
                     context.team_member_id.clone(),
@@ -4294,7 +4278,6 @@ impl HostHandle {
                     new_agent_id.clone(),
                     old_session_id.clone(),
                     new_session_id.clone(),
-                    refs,
                 )
                 .await
             {
@@ -4327,41 +4310,25 @@ impl HostHandle {
             .await
         {
             if let Some(context) = team_context.as_ref() {
-                let rollback_refs_result = {
-                    let state = self.state.lock().await;
-                    agent_team_validation_refs(&state, "agent_compact_rollback").await
-                };
-                match rollback_refs_result {
-                    Ok(rollback_refs) => {
-                        match team_registry
-                            .rotate_member_agent(
-                                context.team_member_id.clone(),
-                                new_agent_id.clone(),
-                                agent_id.clone(),
-                                new_session_id.clone(),
-                                old_session_id.clone(),
-                                rollback_refs,
-                            )
-                            .await
-                        {
-                            Ok(events) => {
-                                let mut state = self.state.lock().await;
-                                fan_out_team_registry_events(&mut state, events).await;
-                            }
-                            Err(rollback_error) => {
-                                tracing::error!(
-                                    member_id = %context.team_member_id,
-                                    error = %rollback_error,
-                                    "failed to roll back team binding after session compaction metadata failure"
-                                );
-                            }
-                        }
+                match team_registry
+                    .rotate_member_agent(
+                        context.team_member_id.clone(),
+                        new_agent_id.clone(),
+                        agent_id.clone(),
+                        new_session_id.clone(),
+                        old_session_id.clone(),
+                    )
+                    .await
+                {
+                    Ok(events) => {
+                        let mut state = self.state.lock().await;
+                        fan_out_team_registry_events(&mut state, events).await;
                     }
                     Err(rollback_error) => {
                         tracing::error!(
                             member_id = %context.team_member_id,
                             error = %rollback_error,
-                            "failed to validate team binding rollback after session compaction metadata failure"
+                            "failed to roll back team binding after session compaction metadata failure"
                         );
                     }
                 }
@@ -6377,10 +6344,9 @@ impl HostHandle {
             .detach_project(&payload.id)
             .await
             .map_err(|error| AppError::internal(OPERATION, anyhow!(error)))?;
-        let team_refs = agent_team_validation_refs(&state, OPERATION).await?;
         let team_events = state
             .team_registry
-            .remove_project_refs(payload.id.clone(), HashSet::new(), team_refs)
+            .remove_project_refs(payload.id.clone(), HashSet::new())
             .await
             .map_err(|error| team_registry_error(OPERATION, error))?;
         let project = {
@@ -6735,12 +6701,11 @@ impl HostHandle {
             .await
             .delete_for_project(&payload.id)
             .map_err(|error| AppError::internal(OPERATION, anyhow!(error)))?;
-        let team_refs = agent_team_validation_refs(&state, OPERATION).await?;
         let deleted_sessions = !deleted_session_ids.is_empty();
         let deleted_session_ids = deleted_session_ids.into_iter().collect();
         let team_events = state
             .team_registry
-            .remove_project_refs(payload.id.clone(), deleted_session_ids, team_refs)
+            .remove_project_refs(payload.id.clone(), deleted_session_ids)
             .await
             .map_err(|error| team_registry_error(OPERATION, error))?;
         state
@@ -7479,19 +7444,8 @@ impl HostHandle {
             .map_err(|error| error.to_string())?;
         match self.wait_for_agent_session_id_result(&agent_id).await {
             Ok(session_id) => {
-                let refs = {
-                    let state = self.state.lock().await;
-                    agent_team_validation_refs(&state, "team_member_bind")
-                        .await
-                        .map_err(|err| err.to_string())?
-                };
                 let events = registry
-                    .bind_member_agent(
-                        plan.member.id.clone(),
-                        agent_id.clone(),
-                        Some(session_id),
-                        refs,
-                    )
+                    .bind_member_agent(plan.member.id.clone(), agent_id.clone(), Some(session_id))
                     .await?;
                 self.fan_out_team_registry_events(events).await;
                 if let Some(status) = self.agent_status_snapshot(&agent_id).await {
@@ -7534,13 +7488,7 @@ impl HostHandle {
         registry: &TeamRegistryHandle,
         member_id: TeamMemberId,
     ) -> Result<(), String> {
-        let refs = {
-            let state = self.state.lock().await;
-            agent_team_validation_refs(&state, "team_member_resume_failure")
-                .await
-                .map_err(|err| err.to_string())?
-        };
-        let events = registry.record_resume_failure(member_id, refs).await?;
+        let events = registry.record_resume_failure(member_id).await?;
         self.fan_out_team_registry_events(events).await;
         Ok(())
     }
@@ -7655,33 +7603,33 @@ impl HostHandle {
 
     pub(crate) async fn rename_team(&self, payload: TeamRenamePayload) -> AppResult<()> {
         const OPERATION: &str = "team_rename";
-        let events = self
-            .serialized_team_registry_mutation(OPERATION, |registry, refs| async move {
-                registry.rename_team(payload, refs).await
-            })
-            .await?;
+        let registry = { self.state.lock().await.team_registry.clone() };
+        let events = registry
+            .rename_team(payload)
+            .await
+            .map_err(|error| team_registry_error(OPERATION, error))?;
         self.fan_out_team_registry_events(events).await;
         Ok(())
     }
 
     pub(crate) async fn delete_team(&self, payload: TeamDeletePayload) -> AppResult<()> {
         const OPERATION: &str = "team_delete";
-        let events = self
-            .serialized_team_registry_mutation(OPERATION, |registry, refs| async move {
-                registry.delete_team(payload, refs).await
-            })
-            .await?;
+        let registry = { self.state.lock().await.team_registry.clone() };
+        let events = registry
+            .delete_team(payload)
+            .await
+            .map_err(|error| team_registry_error(OPERATION, error))?;
         self.fan_out_team_registry_events(events).await;
         Ok(())
     }
 
     pub(crate) async fn set_team_manager(&self, payload: TeamSetManagerPayload) -> AppResult<()> {
         const OPERATION: &str = "team_set_manager";
-        let events = self
-            .serialized_team_registry_mutation(OPERATION, |registry, refs| async move {
-                registry.set_manager(payload, refs).await
-            })
-            .await?;
+        let registry = { self.state.lock().await.team_registry.clone() };
+        let events = registry
+            .set_manager(payload)
+            .await
+            .map_err(|error| team_registry_error(OPERATION, error))?;
         self.fan_out_team_registry_events(events).await;
         Ok(())
     }
@@ -7719,11 +7667,22 @@ impl HostHandle {
         payload: TeamMemberDeletePayload,
     ) -> AppResult<()> {
         const OPERATION: &str = "team_member_delete";
-        let events = self
-            .serialized_team_registry_mutation(OPERATION, |registry, refs| async move {
-                registry.delete_member(payload, refs).await
-            })
-            .await?;
+        let registry = { self.state.lock().await.team_registry.clone() };
+        let events = registry
+            .delete_member(payload)
+            .await
+            .map_err(|error| team_registry_error(OPERATION, error))?;
+        self.fan_out_team_registry_events(events).await;
+        Ok(())
+    }
+
+    pub(crate) async fn reset_teams_store(&self) -> AppResult<()> {
+        const OPERATION: &str = "teams_store_reset";
+        let registry = { self.state.lock().await.team_registry.clone() };
+        let events = registry
+            .reset_store()
+            .await
+            .map_err(|error| team_registry_error(OPERATION, error))?;
         self.fan_out_team_registry_events(events).await;
         Ok(())
     }
@@ -14820,7 +14779,7 @@ fn spawn_host_inner(
         legacy_backend_kind: host_settings.default_backend,
         purged_gemini_session_ids,
     };
-    let team_store = AgentTeamsStore::load(paths.agent_team, &team_refs)?;
+    let team_store = AgentTeamsStore::load(paths.agent_team, &team_refs);
     let project_store = Arc::new(Mutex::new(project_store));
     let mcp_server_store = McpServerStore::load(paths.mcp_server)?;
     let steering_store = SteeringStore::load(paths.steering)?;
@@ -15459,27 +15418,12 @@ impl HostHandle {
         agent_id: AgentId,
         session_id: SessionId,
     ) {
-        let (registry, refs) = {
-            let state = self.state.lock().await;
-            let refs = match agent_team_validation_refs(&state, "restore_open_agents").await {
-                Ok(refs) => refs,
-                Err(error) => {
-                    tracing::error!(
-                        team_member_id = %team_context.team_member_id,
-                        error = %error,
-                        "failed to validate restored team member"
-                    );
-                    return;
-                }
-            };
-            (state.team_registry.clone(), refs)
-        };
+        let registry = { self.state.lock().await.team_registry.clone() };
         match registry
             .bind_member_agent(
                 team_context.team_member_id.clone(),
                 agent_id.clone(),
                 Some(session_id),
-                refs,
             )
             .await
         {
@@ -18689,6 +18633,33 @@ async fn fan_out_team_registry_events(state: &mut HostState, events: TeamRegistr
     for payload in events.shuffle_suggestion_notifies {
         fan_out_team_member_shuffle_suggestion(state, payload).await;
     }
+    for payload in events.store_status_notifies {
+        fan_out_teams_store_status_notify(state, payload).await;
+    }
+}
+
+async fn fan_out_teams_store_status_notify(
+    state: &mut HostState,
+    payload: protocol::TeamsStoreStatusNotifyPayload,
+) {
+    let paths: Vec<StreamPath> = state.host_streams.keys().cloned().collect();
+    let mut dead_paths = Vec::new();
+
+    for path in paths {
+        let Some(subscriber) = state.host_streams.get_mut(&path) else {
+            continue;
+        };
+        if emit_teams_store_status_notify_for_subscriber(&payload, subscriber)
+            .await
+            .is_err()
+        {
+            dead_paths.push(path);
+        }
+    }
+
+    for path in dead_paths {
+        state.host_streams.remove(&path);
+    }
 }
 
 async fn fan_out_team_member_shuffle_suggestion(
@@ -19870,6 +19841,15 @@ async fn emit_team_notify_for_subscriber(
     let payload = serde_json::to_value(payload)
         .expect("failed to serialize TeamNotify payload for host stream fanout");
     emit_or_queue_host_frame(subscriber, FrameKind::TeamNotify, payload)
+}
+
+async fn emit_teams_store_status_notify_for_subscriber(
+    payload: &protocol::TeamsStoreStatusNotifyPayload,
+    subscriber: &mut HostSubscriber,
+) -> Result<(), StreamClosed> {
+    let payload = serde_json::to_value(payload)
+        .expect("failed to serialize TeamsStoreStatusNotify payload for host stream fanout");
+    emit_or_queue_host_frame(subscriber, FrameKind::TeamsStoreStatusNotify, payload)
 }
 
 async fn emit_team_member_notify_for_subscriber(

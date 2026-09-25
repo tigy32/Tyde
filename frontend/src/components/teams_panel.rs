@@ -15,6 +15,7 @@ use crate::send::{
     team_draft_create, team_draft_discard, team_draft_remove_member, team_draft_replace_member,
     team_draft_set_member_profile, team_draft_set_name, team_draft_shuffle, team_member_create,
     team_member_delete, team_member_shuffle, team_member_update, team_set_manager,
+    teams_store_reset,
 };
 use crate::state::{ActiveAgentRef, AppState, TabContent};
 
@@ -189,6 +190,16 @@ pub fn TeamsPanel() -> impl IntoView {
         teams.into_iter().map(|t| (host_id.clone(), t)).collect()
     });
 
+    let load_error_state = state.clone();
+    let teams_load_error: Memo<Option<(String, String)>> = Memo::new(move |_| {
+        let host_id = load_error_state.selected_host_id.get()?;
+        load_error_state.teams_store_load_errors.with(|errors| {
+            errors
+                .get(&host_id)
+                .map(|load_error| (host_id.clone(), load_error.message.clone()))
+        })
+    });
+
     let state_new = state.clone();
     let on_new_team = move |_| {
         if state_new.selected_host_id.get_untracked().is_none() {
@@ -197,17 +208,37 @@ pub fn TeamsPanel() -> impl IntoView {
         new_team_open.set(true);
     };
 
+    let state_reset = state.clone();
     view! {
         <div class="panel teams-panel">
             <div class="panel-filters">
                 <button
                     class="filter-toggle"
-                    disabled=move || state.selected_host_id.get().is_none()
+                    disabled=move || {
+                        state.selected_host_id.get().is_none() || teams_load_error.get().is_some()
+                    }
                     on:click=on_new_team
                 >
                     "+ New team"
                 </button>
             </div>
+            {move || teams_load_error.get().map(|(host_id, message)| {
+                let state_reset = state_reset.clone();
+                view! {
+                    <div class="workflow-error-banner" role="alert">
+                        <span class="workflow-error-banner-message">
+                            {format!("Teams could not be loaded: {message}")}
+                        </span>
+                        <button
+                            type="button"
+                            class="filter-toggle"
+                            on:click=move |_| reset_unreadable_teams_store(&state_reset, host_id.clone())
+                        >
+                            "Set file aside and start fresh"
+                        </button>
+                    </div>
+                }
+            })}
             <div class="panel-content">
                 <div class="team-card-list">
                     <For
@@ -264,7 +295,7 @@ pub fn TeamsPanel() -> impl IntoView {
                         }
                     </For>
                 </div>
-                {move || teams_for_host.get().is_empty().then(|| view! {
+                {move || (teams_for_host.get().is_empty() && teams_load_error.get().is_none()).then(|| view! {
                     <div class="panel-empty">"No teams on this host."</div>
                 })}
             </div>
@@ -2526,6 +2557,27 @@ fn delete_team(state: &AppState, host_id: String, team_id: TeamId) {
     });
 }
 
+fn reset_unreadable_teams_store(state: &AppState, host_id: String) {
+    let state = state.clone();
+    spawn_local(async move {
+        let Some(stream) = state.host_stream_untracked(&host_id) else {
+            return;
+        };
+        if !crate::bridge::confirm_dialog(
+            "Start fresh teams",
+            "The unreadable teams file will be renamed and kept beside the original, \
+             and this host will start with no teams.",
+        )
+        .await
+        {
+            return;
+        }
+        if let Err(error) = teams_store_reset(&host_id, stream).await {
+            log::error!("teams_store_reset failed: {error}");
+        }
+    });
+}
+
 fn promote_member(state: &AppState, host_id: String, team_id: TeamId, member_id: TeamMemberId) {
     let state = state.clone();
     spawn_local(async move {
@@ -4076,6 +4128,136 @@ mod wasm_tests {
                 .unwrap();
         }
         panic!("text input label {label_text:?} not found for member {member_id}");
+    }
+
+    fn dispatch_teams_store_status(
+        state: &AppState,
+        host_id: &str,
+        seq: u64,
+        load_error: Option<protocol::TeamsStoreLoadError>,
+    ) {
+        let envelope = protocol::Envelope::from_payload(
+            StreamPath(format!("/host/{host_id}")),
+            FrameKind::TeamsStoreStatusNotify,
+            seq,
+            &protocol::TeamsStoreStatusNotifyPayload { load_error },
+        )
+        .expect("envelope serialize");
+        crate::dispatch::dispatch_envelope(state, host_id, envelope);
+    }
+
+    #[wasm_bindgen_test]
+    async fn unreadable_teams_store_shows_error_and_resets_through_server() {
+        let calls = install_send_stub();
+        let _ = js_sys::eval(
+            r#"
+            window.__TAURI__.core.invoke = function(cmd, args) {
+                window.__test_send_calls.push([cmd, JSON.stringify(args || {})]);
+                if (cmd === 'plugin:dialog|message') {
+                    return Promise.resolve('Ok');
+                }
+                return Promise.resolve();
+            };
+            "#,
+        );
+        let host_id = "host-unreadable-teams";
+        let state = install_state(host_id, vec![], vec![]);
+        install_host_stream(&state, host_id);
+        state.connection_statuses.update(|map| {
+            map.insert(host_id.to_owned(), ConnectionStatus::Connected);
+        });
+        crate::dispatch::prime_host_for_tests(&state, host_id);
+        dispatch_teams_store_status(
+            &state,
+            host_id,
+            0,
+            Some(protocol::TeamsStoreLoadError {
+                kind: protocol::TeamsStoreLoadErrorKind::Corrupt,
+                message: "agent_teams.json is not valid JSON".to_owned(),
+            }),
+        );
+
+        let container = make_container();
+        let state_for_mount = state.clone();
+        let _handle = mount_to(container.clone(), move || {
+            provide_context(state_for_mount.clone());
+            view! { <TeamsPanel /> }
+        });
+        next_tick().await;
+
+        let alert = container
+            .query_selector("[role='alert']")
+            .unwrap()
+            .expect("an unreadable teams store must be announced");
+        let alert_text = alert.text_content().unwrap_or_default();
+        assert!(
+            alert_text.contains("agent_teams.json is not valid JSON"),
+            "the server's load error must be shown: {alert_text:?}"
+        );
+        let text = visible_text(&container);
+        assert!(
+            !text.contains("No teams on this host."),
+            "an unreadable store must not read as an empty one: {text:?}"
+        );
+        let new_team = || -> web_sys::HtmlButtonElement {
+            let buttons = container.query_selector_all("button").unwrap();
+            (0..buttons.length())
+                .filter_map(|index| buttons.item(index))
+                .filter_map(|node| node.dyn_into::<web_sys::HtmlButtonElement>().ok())
+                .find(|button| {
+                    button.text_content().as_deref().map(str::trim) == Some("+ New team")
+                })
+                .expect("new team button")
+        };
+        assert!(
+            new_team().disabled(),
+            "creating a team would be rejected while the store is unreadable"
+        );
+
+        click_button_with_text(&container, "Set file aside and start fresh");
+        for _ in 0..8 {
+            next_tick().await;
+        }
+        let dialog_shown = calls.iter().any(|entry| {
+            entry
+                .dyn_into::<js_sys::Array>()
+                .ok()
+                .and_then(|call| call.get(0).as_string())
+                .as_deref()
+                == Some("plugin:dialog|message")
+        });
+        assert!(dialog_shown, "the reset must be confirmed first");
+        let resets = recorded_frames(&calls)
+            .into_iter()
+            .filter(|(kind, _)| kind == &FrameKind::TeamsStoreReset.to_string())
+            .count();
+        assert_eq!(resets, 1, "the reset is a single server command");
+        assert!(
+            container
+                .query_selector("[role='alert']")
+                .unwrap()
+                .is_some(),
+            "the error stays until the server reports the store is readable"
+        );
+
+        dispatch_teams_store_status(&state, host_id, 1, None);
+        next_tick().await;
+        assert!(
+            container
+                .query_selector("[role='alert']")
+                .unwrap()
+                .is_none(),
+            "the server's cleared status must remove the error"
+        );
+        let text = visible_text(&container);
+        assert!(
+            text.contains("No teams on this host."),
+            "a reset store is empty: {text:?}"
+        );
+        assert!(
+            !new_team().disabled(),
+            "teams can be created after the reset"
+        );
     }
 
     #[wasm_bindgen_test]

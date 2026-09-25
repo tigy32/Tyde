@@ -8,7 +8,7 @@ use protocol::{
     TeamCreatePayload, TeamId, TeamMember, TeamMemberCreatePayload, TeamMemberDeletePayload,
     TeamMemberId, TeamMemberPresetProfile, TeamMemberRole, TeamMemberState,
     TeamMemberUpdatePayload, TeamPersonalityPresetId, TeamRenamePayload, TeamRolePresetId,
-    TeamSetManagerPayload,
+    TeamSetManagerPayload, TeamsStoreLoadError, TeamsStoreLoadErrorKind,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -48,13 +48,74 @@ impl Default for AgentTeamsStoreFile {
 pub struct AgentTeamsStore {
     path: PathBuf,
     file: AgentTeamsStoreFile,
+    load_error: Option<TeamsStoreLoadError>,
 }
 
 impl AgentTeamsStore {
-    pub fn load(path: PathBuf, refs: &AgentTeamValidationRefs) -> Result<Self, String> {
-        let file = Self::read_from_disk(&path, refs)?;
-        validate_store_file(&file, refs)?;
-        Ok(Self { path, file })
+    pub fn load(path: PathBuf, refs: &AgentTeamValidationRefs) -> Self {
+        match Self::read_from_disk(&path, refs) {
+            Ok(file) => Self {
+                path,
+                file,
+                load_error: None,
+            },
+            Err(load_error) => {
+                tracing::error!(
+                    store_path = %path.display(),
+                    kind = ?load_error.kind,
+                    error = %load_error.message,
+                    "agent teams store failed to load; teams are unavailable until it is reset"
+                );
+                Self {
+                    path,
+                    file: AgentTeamsStoreFile::default(),
+                    load_error: Some(load_error),
+                }
+            }
+        }
+    }
+
+    pub fn load_error(&self) -> Option<TeamsStoreLoadError> {
+        self.load_error.clone()
+    }
+
+    /// Moves an unloadable store file aside, keeping its contents, and starts
+    /// an empty store in its place.
+    pub fn reset_after_load_error(&mut self) -> Result<(), String> {
+        if self.load_error.is_none() {
+            return Err("conflict: agent teams store loaded successfully; nothing to reset".into());
+        }
+        let file_name = self
+            .path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| {
+                format!(
+                    "Agent teams store path has no file name: {}",
+                    self.path.display()
+                )
+            })?;
+        let backup_path = self
+            .path
+            .with_file_name(format!("{file_name}.unreadable-{}", now_ms()?));
+        match std::fs::rename(&self.path, &backup_path) {
+            Ok(()) => tracing::warn!(
+                store_path = %self.path.display(),
+                backup_path = %backup_path.display(),
+                "moved unloadable agent teams store aside"
+            ),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(format!(
+                    "Failed to move unloadable agent teams store {} to {}: {err}",
+                    self.path.display(),
+                    backup_path.display()
+                ));
+            }
+        }
+        self.file = AgentTeamsStoreFile::default();
+        self.load_error = None;
+        Ok(())
     }
 
     pub fn default_path() -> Result<PathBuf, String> {
@@ -161,7 +222,7 @@ impl AgentTeamsStore {
 
         insert_unique_team(&mut next.teams, team.clone())?;
         insert_unique_member(&mut next.members, manager.clone())?;
-        self.commit(next, refs)?;
+        self.commit(next)?;
         Ok((team, manager))
     }
 
@@ -236,15 +297,11 @@ impl AgentTeamsStore {
         for member in &members {
             insert_unique_member(&mut next.members, member.clone())?;
         }
-        self.commit(next, refs)?;
+        self.commit(next)?;
         Ok((team, members))
     }
 
-    pub fn rename_team(
-        &mut self,
-        payload: TeamRenamePayload,
-        refs: &AgentTeamValidationRefs,
-    ) -> Result<Team, String> {
+    pub fn rename_team(&mut self, payload: TeamRenamePayload) -> Result<Team, String> {
         let mut next = self.file.clone();
         self.assert_team_active(&payload.id)?;
         validate_team_name(&payload.name)?;
@@ -255,15 +312,11 @@ impl AgentTeamsStore {
         team.name = payload.name;
         team.updated_at_ms = now_ms()?;
         let updated = team.clone();
-        self.commit(next, refs)?;
+        self.commit(next)?;
         Ok(updated)
     }
 
-    pub fn delete_team(
-        &mut self,
-        id: &TeamId,
-        refs: &AgentTeamValidationRefs,
-    ) -> Result<(Team, Vec<TeamMember>), String> {
+    pub fn delete_team(&mut self, id: &TeamId) -> Result<(Team, Vec<TeamMember>), String> {
         let mut next = self.file.clone();
         let team = next
             .teams
@@ -284,14 +337,13 @@ impl AgentTeamsStore {
         for member in &members {
             next.members.remove(&member.id);
         }
-        self.commit(next, refs)?;
+        self.commit(next)?;
         Ok((team, members))
     }
 
     pub fn set_manager(
         &mut self,
         payload: TeamSetManagerPayload,
-        refs: &AgentTeamValidationRefs,
     ) -> Result<(Team, TeamMember, TeamMember), String> {
         let mut next = self.file.clone();
         self.assert_team_active(&payload.team_id)?;
@@ -363,7 +415,7 @@ impl AgentTeamsStore {
         team.updated_at_ms = now;
         let team = team.clone();
 
-        self.commit(next, refs)?;
+        self.commit(next)?;
         Ok((team, old_manager, new_manager))
     }
 
@@ -401,7 +453,7 @@ impl AgentTeamsStore {
             updated_at_ms: now,
         };
         insert_unique_member(&mut next.members, member.clone())?;
-        self.commit(next, refs)?;
+        self.commit(next)?;
         Ok(member)
     }
 
@@ -419,9 +471,19 @@ impl AgentTeamsStore {
         self.assert_team_active(&member.team_id)?;
         validate_member_name(&payload.name)?;
         validate_member_description(&payload.description)?;
-        validate_member_profile(payload.profile.as_ref(), refs)?;
+        if payload.profile == member.profile {
+            validate_profile_ids(payload.profile.as_ref())?;
+        } else {
+            validate_member_profile(payload.profile.as_ref(), refs)?;
+        }
         validate_project_ids(&payload.project_ids)?;
-        validate_project_refs(&payload.project_ids, refs)?;
+        let added_project_ids = payload
+            .project_ids
+            .iter()
+            .filter(|project_id| !member.project_ids.contains(project_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        validate_project_refs(&added_project_ids, refs)?;
 
         let member = next
             .members
@@ -433,7 +495,7 @@ impl AgentTeamsStore {
         member.project_ids = payload.project_ids;
         member.updated_at_ms = now_ms()?;
         let updated = member.clone();
-        self.commit(next, refs)?;
+        self.commit(next)?;
         Ok(updated)
     }
 
@@ -441,7 +503,6 @@ impl AgentTeamsStore {
         &mut self,
         project_id: &ProjectId,
         deleted_session_ids: &HashSet<SessionId>,
-        refs: &AgentTeamValidationRefs,
     ) -> Result<Vec<TeamMember>, String> {
         let mut next = self.file.clone();
         let now = now_ms()?;
@@ -464,7 +525,7 @@ impl AgentTeamsStore {
             }
         }
         if !updated.is_empty() {
-            self.commit(next, refs)?;
+            self.commit(next)?;
             updated.sort_by(|left, right| {
                 left.created_at_ms
                     .cmp(&right.created_at_ms)
@@ -477,7 +538,6 @@ impl AgentTeamsStore {
     pub fn delete_member(
         &mut self,
         payload: TeamMemberDeletePayload,
-        refs: &AgentTeamValidationRefs,
     ) -> Result<TeamMember, String> {
         let mut next = self.file.clone();
         let member = next
@@ -511,7 +571,7 @@ impl AgentTeamsStore {
             .members
             .remove(&payload.id)
             .ok_or_else(|| format!("cannot delete missing team member {}", payload.id))?;
-        self.commit(next, refs)?;
+        self.commit(next)?;
         Ok(deleted)
     }
 
@@ -519,7 +579,6 @@ impl AgentTeamsStore {
         &mut self,
         member_id: &TeamMemberId,
         session_id: SessionId,
-        refs: &AgentTeamValidationRefs,
     ) -> Result<TeamMember, String> {
         let mut next = self.file.clone();
         if let Some(existing_owner) = next.members.values().find(|member| {
@@ -541,7 +600,7 @@ impl AgentTeamsStore {
         member.session_id = Some(session_id);
         member.updated_at_ms = now_ms()?;
         let updated = member.clone();
-        self.commit(next, refs)?;
+        self.commit(next)?;
         Ok(updated)
     }
 
@@ -550,7 +609,6 @@ impl AgentTeamsStore {
         member_id: &TeamMemberId,
         old_session_id: &SessionId,
         new_session_id: SessionId,
-        refs: &AgentTeamValidationRefs,
     ) -> Result<TeamMember, String> {
         let mut next = self.file.clone();
         if let Some(existing_owner) = next.members.values().find(|member| {
@@ -575,14 +633,13 @@ impl AgentTeamsStore {
         member.session_id = Some(new_session_id);
         member.updated_at_ms = now_ms()?;
         let updated = member.clone();
-        self.commit(next, refs)?;
+        self.commit(next)?;
         Ok(updated)
     }
 
     pub fn clear_member_session_id(
         &mut self,
         member_id: &TeamMemberId,
-        refs: &AgentTeamValidationRefs,
     ) -> Result<Option<TeamMember>, String> {
         let mut next = self.file.clone();
         let member = next
@@ -595,7 +652,7 @@ impl AgentTeamsStore {
         member.session_id = None;
         member.updated_at_ms = now_ms()?;
         let updated = member.clone();
-        self.commit(next, refs)?;
+        self.commit(next)?;
         Ok(Some(updated))
     }
 
@@ -607,12 +664,14 @@ impl AgentTeamsStore {
         Ok(())
     }
 
-    fn commit(
-        &mut self,
-        next: AgentTeamsStoreFile,
-        refs: &AgentTeamValidationRefs,
-    ) -> Result<(), String> {
-        validate_store_file(&next, refs)?;
+    fn commit(&mut self, next: AgentTeamsStoreFile) -> Result<(), String> {
+        if let Some(load_error) = self.load_error.as_ref() {
+            return Err(format!(
+                "conflict: teams are unavailable until the unreadable agent teams store is reset: {}",
+                load_error.message
+            ));
+        }
+        validate_store_file(&next)?;
         Self::save(&self.path, &next)?;
         self.file = next;
         Ok(())
@@ -621,22 +680,28 @@ impl AgentTeamsStore {
     fn read_from_disk(
         path: &Path,
         refs: &AgentTeamValidationRefs,
-    ) -> Result<AgentTeamsStoreFile, String> {
+    ) -> Result<AgentTeamsStoreFile, TeamsStoreLoadError> {
         match std::fs::read_to_string(path) {
             Ok(contents) => {
                 let (file, changed) = migrate_store_file(path, &contents, refs)?;
-                validate_store_file(&file, refs)?;
+                validate_store_file(&file).map_err(|error| {
+                    load_error(
+                        TeamsStoreLoadErrorKind::Invalid,
+                        format!("Invalid agent teams store {}: {error}", path.display()),
+                    )
+                })?;
                 if changed {
-                    Self::save(path, &file)?;
+                    Self::save(path, &file)
+                        .map_err(|error| load_error(TeamsStoreLoadErrorKind::Io, error))?;
                 }
                 Ok(file)
             }
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
                 Ok(AgentTeamsStoreFile::default())
             }
-            Err(err) => Err(format!(
-                "Failed to read agent teams store {}: {err}",
-                path.display()
+            Err(err) => Err(load_error(
+                TeamsStoreLoadErrorKind::Io,
+                format!("Failed to read agent teams store {}: {err}", path.display()),
             )),
         }
     }
@@ -678,10 +743,10 @@ impl AgentTeamsStore {
     }
 }
 
-pub fn validate_store_file(
-    file: &AgentTeamsStoreFile,
-    refs: &AgentTeamValidationRefs,
-) -> Result<(), String> {
+/// Checks the store's own structure. References to records owned elsewhere
+/// (custom agents, projects, presets, enabled backends) can go stale without
+/// any teams write, so they are checked only when a write sets them.
+pub fn validate_store_file(file: &AgentTeamsStoreFile) -> Result<(), String> {
     if file.version != STORE_VERSION {
         return Err(format!(
             "agent teams store version must be {STORE_VERSION}, got {}",
@@ -714,12 +779,6 @@ pub fn validate_store_file(
                 member.id, member.team_id
             ));
         }
-        validate_custom_agent_ref(member.custom_agent_id.as_ref(), refs)?;
-        // Enablement is a live setting, not referential integrity: a stored
-        // member keeps its backend while that backend is disabled, and only
-        // members being created are held to the enabled set.
-        validate_member_profile(member.profile.as_ref(), refs)?;
-        validate_project_refs(&member.project_ids, refs)?;
         if let Some(session_id) = member.session_id.as_ref()
             && !session_ids.insert(session_id.clone())
         {
@@ -771,43 +830,48 @@ pub fn validate_store_file(
     Ok(())
 }
 
+fn load_error(kind: TeamsStoreLoadErrorKind, message: String) -> TeamsStoreLoadError {
+    TeamsStoreLoadError { kind, message }
+}
+
 fn migrate_store_file(
     path: &Path,
     contents: &str,
     refs: &AgentTeamValidationRefs,
-) -> Result<(AgentTeamsStoreFile, bool), String> {
-    let mut changed = false;
-    let mut value = serde_json::from_str::<Value>(contents).map_err(|err| {
-        format!(
-            "Failed to parse agent teams store {}: {err}",
-            path.display()
+) -> Result<(AgentTeamsStoreFile, bool), TeamsStoreLoadError> {
+    let corrupt = |err: String| {
+        load_error(
+            TeamsStoreLoadErrorKind::Corrupt,
+            format!(
+                "Failed to parse agent teams store {}: {err}",
+                path.display()
+            ),
         )
-    })?;
+    };
+    let invalid = |message: String| load_error(TeamsStoreLoadErrorKind::Invalid, message);
+    let mut changed = false;
+    let mut value =
+        serde_json::from_str::<Value>(contents).map_err(|err| corrupt(err.to_string()))?;
     let version = value
         .get("version")
         .and_then(Value::as_u64)
-        .ok_or_else(|| {
-            format!(
-                "Failed to parse agent teams store {}: missing version",
-                path.display()
-            )
-        })?;
+        .ok_or_else(|| corrupt("missing version".to_string()))?;
     match version {
         1 => {
-            migrate_v1_to_v2(path, &mut value)?;
-            migrate_v2_to_v3(path, &mut value)?;
-            migrate_v3_to_v4(path, &mut value, refs)?;
+            migrate_v1_to_v2(path, &mut value).map_err(invalid)?;
+            migrate_v2_to_v3(path, &mut value).map_err(invalid)?;
+            migrate_v3_to_v4(path, &mut value, refs).map_err(invalid)?;
             migrate_v4_to_v5(&mut value);
             changed = true;
         }
         2 => {
-            migrate_v2_to_v3(path, &mut value)?;
-            migrate_v3_to_v4(path, &mut value, refs)?;
+            migrate_v2_to_v3(path, &mut value).map_err(invalid)?;
+            migrate_v3_to_v4(path, &mut value, refs).map_err(invalid)?;
             migrate_v4_to_v5(&mut value);
             changed = true;
         }
         3 => {
-            migrate_v3_to_v4(path, &mut value, refs)?;
+            migrate_v3_to_v4(path, &mut value, refs).map_err(invalid)?;
             migrate_v4_to_v5(&mut value);
             changed = true;
         }
@@ -817,12 +881,16 @@ fn migrate_store_file(
         }
         version if version == u64::from(STORE_VERSION) => {}
         other => {
-            return Err(format!(
-                "agent teams store version must be {STORE_VERSION}, got {other}"
+            return Err(load_error(
+                TeamsStoreLoadErrorKind::UnsupportedVersion,
+                format!(
+                    "Agent teams store {} has version {other}; this Tyde supports version {STORE_VERSION}",
+                    path.display()
+                ),
             ));
         }
     }
-    if migrate_legacy_gemini_members(path, &mut value, refs)? {
+    if migrate_legacy_gemini_members(path, &mut value, refs).map_err(invalid)? {
         changed = true;
     }
     // Unlike the Gemini rename this needs no session purge: the backend only
@@ -830,12 +898,8 @@ fn migrate_store_file(
     if crate::store::legacy_backend_kind::rewrite_legacy_acp_backend_kinds(&mut value) {
         changed = true;
     }
-    let file = serde_json::from_value::<AgentTeamsStoreFile>(value).map_err(|err| {
-        format!(
-            "Failed to parse agent teams store {}: {err}",
-            path.display()
-        )
-    })?;
+    let file = serde_json::from_value::<AgentTeamsStoreFile>(value)
+        .map_err(|err| corrupt(err.to_string()))?;
     Ok((file, changed))
 }
 

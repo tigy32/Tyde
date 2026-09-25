@@ -203,6 +203,7 @@ pub fn prime_host_for_tests(state: &AppState, host_id: &str) {
         teams: Vec::new(),
         team_members: Vec::new(),
         team_member_bindings: Vec::new(),
+        teams_store_load_error: None,
         agents: Vec::new(),
         task_token_usages: Vec::new(),
         workflow_summaries: Vec::new(),
@@ -2830,6 +2831,18 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                     &envelope.stream,
                     envelope.kind,
                     format!("failed to parse review_event payload: {error}"),
+                ),
+            }
+        }
+        FrameKind::TeamsStoreStatusNotify => {
+            match envelope.parse_payload::<protocol::TeamsStoreStatusNotifyPayload>() {
+                Ok(payload) => set_teams_store_load_error(state, host_id, payload.load_error),
+                Err(error) => report_dispatch_error(
+                    state,
+                    host_id,
+                    &envelope.stream,
+                    envelope.kind,
+                    format!("failed to parse teams_store_status_notify payload: {error}"),
                 ),
             }
         }
@@ -6384,6 +6397,23 @@ fn apply_mobile_access_state(state: &AppState, host_id: &str, payload: MobileAcc
     });
 }
 
+fn set_teams_store_load_error(
+    state: &AppState,
+    host_id: &str,
+    load_error: Option<protocol::TeamsStoreLoadError>,
+) {
+    state
+        .teams_store_load_errors
+        .update(|map| match load_error {
+            Some(load_error) => {
+                map.insert(host_id.to_owned(), load_error);
+            }
+            None => {
+                map.remove(host_id);
+            }
+        });
+}
+
 fn apply_host_bootstrap(state: &AppState, host_id: &str, payload: HostBootstrapPayload) {
     log::info!(
         "dispatch host_bootstrap host={} sessions={} projects={} agents={} teams={} team_members={}",
@@ -6562,6 +6592,7 @@ fn apply_host_bootstrap(state: &AppState, host_id: &str, payload: HostBootstrapP
             host_map.insert(team.id.clone(), team);
         }
     });
+    set_teams_store_load_error(state, host_id, payload.teams_store_load_error);
     state.team_members.update(|map| {
         let host_map = map.entry(host_id.to_string()).or_default();
         host_map.clear();
@@ -7263,6 +7294,7 @@ pub(crate) mod restore_fixtures {
                 teams: Vec::new(),
                 team_members: Vec::new(),
                 team_member_bindings: Vec::new(),
+                teams_store_load_error: None,
                 agents: Vec::new(),
                 task_token_usages: Vec::new(),
                 workflow_summaries: Vec::new(),

@@ -246,17 +246,11 @@ rename) before emitting protocol events. No `Arc<Mutex<...>>`.
 
 ### Validation
 
-The registry validates on load and on every mutation. No silent
-repair; loud failure on invariant violation:
+The registry validates the store's own structure on load and on every
+mutation. No silent repair; loud failure on invariant violation:
 
 - Every member references an existing team.
-- Every `Some(custom_agent_id)` references an existing
-  `CustomAgent`; `None` means the default agent profile.
-- Every member has one or more `project_ids`, each referencing an
-  existing `Project`.
-- Every member's `backend_kind` is enabled on the host.
-- Every present preset id in `profile` resolves against the server-owned
-  preset catalog.
+- Every member has one or more `project_ids`.
 - Each team has exactly one active manager (`role == Manager &&
   state == Active`).
 - A `TeamMemberId` belongs to exactly one team.
@@ -264,9 +258,21 @@ repair; loud failure on invariant violation:
 - A team's `manager_member_id` resolves to a member of that team
   with `role == Manager`.
 
-If the file fails to load (invalid JSON, invariant violation,
-unknown enum variant), startup fails loudly. No "best-effort drop
-the bad rows" recovery.
+References to records owned elsewhere are checked only when a write sets
+them: a `Some(custom_agent_id)` must name an existing `CustomAgent`
+(`None` means the default agent profile), each `project_id` an existing
+`Project`, `backend_kind` an enabled backend, and each `profile` preset id
+the server-owned catalog. Those records can disappear without any teams
+write, so a stale reference the user did not touch never fails load or
+blocks an unrelated edit; the UI renders it as unavailable for repair.
+
+If the file fails to load (unreadable, invalid JSON, unsupported version,
+structural invariant violation), the host still starts. The store holds
+no teams, rejects every write so the file is never overwritten, and
+reports a typed `TeamsStoreLoadError` in the host bootstrap. No
+"best-effort drop the bad rows" recovery: the user repairs it by editing
+the file and restarting, or with `TeamsStoreReset`, which renames the file
+to `agent_teams.json.unreadable-<ms>` and starts an empty store.
 
 ### Runtime live-agent binding
 
@@ -595,6 +601,7 @@ TeamDraftShuffle         // server chooses new role/personality content
 TeamDraftApplyTemplate   // replaces draft members from a server template
 TeamDraftCommit          // atomic team + manager + reports create
 TeamDraftDiscard         // drops the server-owned draft
+TeamsStoreReset          // moves an unloadable store file aside
 ```
 
 No `TeamMember*Message`, no `TeamCard*` anything.
@@ -608,6 +615,7 @@ TeamMemberBindingNotify // payload defined above
 TeamPresetCatalogNotify // server-owned role/personality/template catalog
 TeamDraftNotify         // Upsert { draft } | Delete { draft_id }
 TeamMemberShuffleSuggestionNotify // ephemeral Add-report shuffle suggestion
+TeamsStoreStatusNotify  // { load_error } after TeamsStoreReset
 ```
 
 `TeamMemberShuffleSuggestionNotify` is fire-and-forget: the server emits
