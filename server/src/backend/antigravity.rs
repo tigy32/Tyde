@@ -982,6 +982,9 @@ struct Supervisor {
     /// The CLI-answered commands advertised for this session. An invoking
     /// message runs as its own `--print` invocation, never as a turn.
     slash_commands: Option<protocol::SlashCommandCatalog>,
+    /// A model change arrived while a turn was running. The process serving
+    /// that turn keeps it; the next turn starts on a relaunched process.
+    relaunch_before_next_turn: bool,
 }
 
 struct InitialTurn {
@@ -1124,6 +1127,7 @@ impl Supervisor {
         {
             Ok(restarted) => {
                 *process = restarted;
+                self.relaunch_before_next_turn = false;
                 true
             }
             Err(err) => {
@@ -1249,6 +1253,12 @@ impl Supervisor {
         message: &str,
         echoed_user_message: Option<&str>,
     ) -> bool {
+        if self.relaunch_before_next_turn
+            && let Err(err) = self.relaunch(process).await
+        {
+            self.inner.emitter.backend_error(&err);
+            return false;
+        }
         self.turn_counter += 1;
         let model = {
             let mut state = self.inner.state.lock().await;
@@ -1537,6 +1547,7 @@ impl Supervisor {
             }
         }
         self.launch = launch;
+        self.relaunch_before_next_turn = false;
         tracing::info!(session_id = %self.session_id, ?roots, "Antigravity resumed in the new workspace roots");
         Ok(())
     }
@@ -1549,14 +1560,24 @@ impl Supervisor {
         values: SessionSettingsValues,
     ) -> Result<(), String> {
         let model = selected_model(&values, Some(Path::new(&self.launch.primary_root))).await?;
-        {
+        let turn_active = {
             let mut state = self.inner.state.lock().await;
             if state.model == model {
                 return Ok(());
             }
             state.model = model.clone();
-        }
+            state.turn_active
+        };
         self.launch.model = model;
+        if turn_active {
+            self.relaunch_before_next_turn = true;
+            return Ok(());
+        }
+        self.relaunch(process).await
+    }
+
+    async fn relaunch(&mut self, process: &mut AgyProcess) -> Result<(), String> {
+        self.relaunch_before_next_turn = false;
         let conversation_id = process.conversation_id.clone();
         let replacement = AgyProcess::start(
             &self.launch,
@@ -2887,6 +2908,7 @@ impl AntigravityBackend {
             native_children: tokio::task::JoinSet::new(),
             session_id: session_id.0.clone(),
             slash_commands,
+            relaunch_before_next_turn: false,
         };
         tokio::spawn(async move {
             supervisor

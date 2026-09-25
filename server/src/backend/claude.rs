@@ -558,7 +558,7 @@ impl ClaudeSession {
                 resume_empty_result_generation: None,
                 pending_compaction: None,
                 closing: false,
-                restart_process_after_turn: false,
+                stale_process_generation: None,
                 subagent_emitter: None,
                 capacity_access: ClaudeCapacityAccess::Unknown,
                 capacity_refresh_in_flight: false,
@@ -783,7 +783,10 @@ struct ClaudeState {
     /// Set by `shutdown`. Blocks new turns (including CLI-initiated ones) and
     /// process respawn after the backend has been told to close.
     closing: bool,
-    restart_process_after_turn: bool,
+    /// The newest process generation started before the last change to a
+    /// setting fixed at CLI launch. A process at or below it must not take a
+    /// new turn; whichever path first finds it idle retires it.
+    stale_process_generation: Option<u64>,
     subagent_emitter: Option<Arc<dyn SubAgentEmitter>>,
     capacity_access: ClaudeCapacityAccess,
     capacity_refresh_in_flight: bool,
@@ -843,7 +846,7 @@ impl Default for ClaudeState {
             resume_empty_result_generation: None,
             pending_compaction: None,
             closing: false,
-            restart_process_after_turn: false,
+            stale_process_generation: None,
             subagent_emitter: None,
             capacity_access: ClaudeCapacityAccess::Unknown,
             capacity_refresh_in_flight: false,
@@ -955,6 +958,7 @@ enum ClaudeSkillReadiness {
 }
 
 struct ClaudeProcessRuntime {
+    generation: u64,
     stdin: Arc<Mutex<ChildStdin>>,
     child: Arc<Mutex<Option<AsyncGroupChild>>>,
     control_waiters: ClaudeControlWaiters,
@@ -1971,16 +1975,13 @@ impl ClaudeInner {
                     }
 
                     if changed_process_setting {
-                        state.restart_process_after_turn = state.active_turn.is_some();
+                        state.stale_process_generation = Some(state.process_generation);
                     }
                 }
                 if changed_process_setting {
-                    let should_shutdown_now = {
-                        let state = this.state.lock().await;
-                        state.active_turn.is_none()
-                    };
-                    if should_shutdown_now {
-                        this.shutdown_process().await;
+                    let idle = this.state.lock().await.active_turn.is_none();
+                    if idle {
+                        this.retire_stale_process().await;
                     }
                 }
                 this.emit_settings().await;
@@ -2134,7 +2135,9 @@ impl ClaudeInner {
             // late steer down with it.
             if active.pending_ask_user_question.is_some()
                 || active.pending_exit_plan_mode.is_some()
-                || state.restart_process_after_turn
+                || state
+                    .stale_process_generation
+                    .is_some_and(|stale| stale >= state.process_generation)
                 || super::invokes_slash_command(state.slash_commands.as_ref(), &payload.message)
             {
                 return SteerOutcome::Unsupported(payload);
@@ -2230,7 +2233,7 @@ impl ClaudeInner {
             (turn_id, terminal_rx, timeout_cancel_rx)
         };
 
-        if let Err(error) = self.ensure_process_ready().await {
+        if let Err(error) = self.ensure_current_process_ready().await {
             self.abandon_undispatched_compaction(turn_id).await;
             return BackendCompactionStart::NotDispatched {
                 reason: BackendCompactionNotDispatchedReason::CapabilityUnknown(
@@ -2401,9 +2404,7 @@ impl ClaudeInner {
                 let quiesced_waiters = self.clear_active_turn(turn_id).await;
                 self.emit_operation_cancelled("Claude turn cancelled.");
                 notify_turn_quiesced(quiesced_waiters);
-                if self.take_restart_process_after_turn().await {
-                    self.shutdown_process().await;
-                }
+                self.retire_stale_process().await;
                 return;
             }
             TurnOutcome::Failed { summary, error } => {
@@ -2429,9 +2430,7 @@ impl ClaudeInner {
 
         let quiesced_waiters = self.clear_active_turn_and_emit_idle(turn_id).await;
         notify_turn_quiesced(quiesced_waiters);
-        if self.take_restart_process_after_turn().await {
-            self.shutdown_process().await;
-        }
+        self.retire_stale_process().await;
     }
 
     fn arm_cli_wake(&self) {
@@ -2893,9 +2892,7 @@ impl ClaudeInner {
             let _ = terminal_tx.send(result.clone());
         }
         notify_turn_quiesced(waiters);
-        if self.take_restart_process_after_turn().await {
-            self.shutdown_process().await;
-        }
+        self.retire_stale_process().await;
         Some(result)
     }
 
@@ -2914,7 +2911,7 @@ impl ClaudeInner {
         prompt: &str,
         images: &[ImageAttachment],
     ) -> Result<(), TurnStartError> {
-        self.ensure_process_ready()
+        self.ensure_current_process_ready()
             .await
             .map_err(TurnStartError::Failed)?;
 
@@ -4033,6 +4030,7 @@ impl ClaudeInner {
         let stderr_task = tokio::spawn(read_claude_stderr_persistent(stderr, Arc::clone(self)));
 
         Ok(ClaudeProcessRuntime {
+            generation: process_generation,
             stdin,
             child,
             control_waiters,
@@ -4482,11 +4480,46 @@ impl ClaudeInner {
         }
     }
 
-    async fn take_restart_process_after_turn(&self) -> bool {
-        let mut state = self.state.lock().await;
-        let restart = state.restart_process_after_turn;
-        state.restart_process_after_turn = false;
-        restart
+    /// Retire the CLI process if it predates a launch-setting change.
+    ///
+    /// Called only where no turn is running on the process: after a turn
+    /// clears, on an idle settings change, and when a newly admitted turn is
+    /// about to pick its process. A turn can be admitted the moment the prior
+    /// one clears, so the process is taken out of its slot before it is killed
+    /// and its readers are aborted first: its exit handling would otherwise
+    /// treat the newly admitted turn, and any replacement runtime, as its own.
+    async fn retire_stale_process(&self) {
+        let Some(stale) = self.state.lock().await.stale_process_generation else {
+            return;
+        };
+        let runtime = {
+            let mut slot = self.runtime.lock().await;
+            if !slot
+                .as_ref()
+                .is_some_and(|runtime| runtime.generation <= stale)
+            {
+                return;
+            }
+            slot.take()
+        };
+        let Some(runtime) = runtime else {
+            return;
+        };
+        runtime.abort_readers();
+        self.fail_resume_bootstrap(
+            runtime.generation,
+            "Claude process restarted for new session settings before its resume bootstrap reached a terminal result",
+        )
+        .await;
+        self.drain_background_tasks();
+        runtime.kill().await;
+    }
+
+    /// Ready the process a newly admitted turn will write to, replacing one
+    /// launched with settings that have since changed.
+    async fn ensure_current_process_ready(self: &Arc<Self>) -> Result<(), String> {
+        self.retire_stale_process().await;
+        self.ensure_process_ready().await
     }
 
     async fn shutdown_process(&self) {

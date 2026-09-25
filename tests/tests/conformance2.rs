@@ -5972,6 +5972,7 @@ async fn real_session_settings<B: Backend>(host: &mut Harness<B>) {
     let agent = spawn_agent(host, &launch_prompt()).await;
     let launched = collect_turn(host, &agent, &launch_prompt()).await;
     assert_ready_handshake(&launched);
+    let launch_settings = read_session_settings(host).await;
 
     let mut current = SessionSettingsValues::default();
     // Profiles select a provider before launch; model and mode are live settings.
@@ -5988,7 +5989,7 @@ async fn real_session_settings<B: Backend>(host: &mut Harness<B>) {
         !fields.is_empty(),
         "backend offered no model or mode with two values"
     );
-    for field in fields {
+    for &field in &fields {
         let options = field
             .select_options(&current)
             .expect("selectable field")
@@ -6008,9 +6009,59 @@ async fn real_session_settings<B: Backend>(host: &mut Harness<B>) {
         }
     }
 
+    for &field in &fields {
+        let value = launch_settings
+            .0
+            .get(&field.key)
+            .cloned()
+            .unwrap_or(protocol::SessionSettingValue::Null);
+        current = set_session_setting_value(host, &agent, &field.key, value).await;
+    }
+
+    // A setting changed while a turn runs applies from the next turn, and the
+    // message sent the moment the running turn ends is answered. Claude used to
+    // kill the relaunched CLI after that message reached it ("Claude process
+    // exited before returning a result"); Antigravity abandoned the running
+    // turn, which never went idle.
+    let field = fields[0];
+    let option = field
+        .select_options(&current)
+        .expect("selectable field")
+        .iter()
+        .map(|option| option.value.clone())
+        .find(|option| {
+            launch_settings.0.get(&field.key)
+                != Some(&protocol::SessionSettingValue::String(option.clone()))
+        })
+        .expect("a second value for the setting");
+    let proof = host.workspace().join(SETTINGS_PROOF_FILE);
+    let (changed_mid_turn, applied) = set_session_setting_mid_turn(
+        host,
+        &agent,
+        &slow_command_prompt(&proof),
+        &field.key,
+        &option,
+    )
+    .await;
+    assert_eq!(
+        applied.0.get(&field.key),
+        Some(&protocol::SessionSettingValue::String(option)),
+        "{:?}: session setting {:?} changed mid-turn was not applied",
+        host.backend(),
+        field.key
+    );
+    assert_final_text_contains(&changed_mid_turn, RAN_MARKER);
+    let follow_up = ask(host, &agent, launch_prompt()).await;
+    assert_ready_handshake(&follow_up);
+
     assert_universal_contract(&[launched]);
+    // Some providers switch models inside the running turn, and the follow-up
+    // runs on the value selected mid-turn rather than the fixture pin.
+    assert_universal_contract_with_models(&[changed_mid_turn, follow_up], &[]);
     assert_clean_close(host, &agent).await;
 }
+
+const SETTINGS_PROOF_FILE: &str = "settings_proof.txt";
 
 conformance2_scenario!(
     real_session_speed,

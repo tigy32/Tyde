@@ -601,21 +601,26 @@ pub async fn ask<B: Backend>(
 }
 
 pub async fn collect_turn<B: Backend>(host: &mut Harness<B>, _agent: &Agent, prompt: &str) -> Turn {
-    let mut turn = Turn {
-        backend: host.backend(),
-        capabilities: B::capabilities(),
-        expected_models: host.profile.expected_models.clone(),
-        prompt: prompt.to_owned(),
-        events: Vec::new(),
-        model_requests: Vec::new(),
-        context_usage_event_positions: Vec::new(),
-    };
+    let mut turn = host.turn(prompt);
+    collect_turn_until(host, &mut turn, |event| {
+        matches!(event, ChatEvent::TypingStatusChanged(false))
+    })
+    .await;
+    turn
+}
+
+/// Records the running turn's events into `turn` through the first chat event
+/// `stop` accepts. The turn must not go idle before then.
+async fn collect_turn_until<B: Backend>(
+    host: &mut Harness<B>,
+    turn: &mut Turn,
+    mut stop: impl FnMut(&ChatEvent) -> bool,
+) {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(240);
     let stream = host
         .events
         .as_mut()
         .expect("backend event stream must be open");
-    let mut saw_stream_end = false;
     loop {
         let event = tokio::time::timeout_at(deadline, stream.recv_backend())
             .await
@@ -624,16 +629,25 @@ pub async fn collect_turn<B: Backend>(host: &mut Harness<B>, _agent: &Agent, pro
         eprintln!("{} {event:?}", turn.label());
         match event {
             BackendEvent::Chat(event) => {
-                saw_stream_end |= matches!(event, ChatEvent::StreamEnd(_));
                 let idle = matches!(event, ChatEvent::TypingStatusChanged(false));
+                let stopped = stop(&event);
                 turn.events.push(event);
                 if idle {
                     assert!(
-                        saw_stream_end,
+                        stopped,
+                        "{}: turn went idle before the event it was waiting for",
+                        turn.label()
+                    );
+                    assert!(
+                        turn.events
+                            .iter()
+                            .any(|event| matches!(event, ChatEvent::StreamEnd(_))),
                         "{}: backend went idle without an assistant response",
                         turn.label()
                     );
-                    return turn;
+                }
+                if stopped {
+                    return;
                 }
             }
             BackendEvent::ModelRequestTokenUsage(usage) => {
@@ -653,6 +667,33 @@ pub async fn collect_turn<B: Backend>(host: &mut Harness<B>, _agent: &Agent, pro
             }
         }
     }
+}
+
+/// Runs `prompt` and, while its shell command is running, applies a live
+/// session setting. Returns the whole turn through its idle.
+pub async fn set_session_setting_mid_turn<B: Backend>(
+    host: &mut Harness<B>,
+    agent: &Agent,
+    prompt: &str,
+    key: &str,
+    value: &str,
+) -> (Turn, SessionSettingsValues) {
+    send_prompt(host, agent, prompt).await;
+    let mut turn = host.turn(prompt);
+    collect_turn_until(host, &mut turn, |event| {
+        matches!(
+            event,
+            ChatEvent::ToolRequest(request)
+                if matches!(request.tool_type, ToolRequestType::RunCommand { .. })
+        )
+    })
+    .await;
+    let applied = set_session_setting(host, agent, key, value).await;
+    collect_turn_until(host, &mut turn, |event| {
+        matches!(event, ChatEvent::TypingStatusChanged(false))
+    })
+    .await;
+    (turn, applied)
 }
 
 pub async fn collect_rejected_turn<B: Backend>(host: &mut Harness<B>) -> Vec<ChatEvent> {
@@ -1830,6 +1871,15 @@ pub async fn spawn_agent_with_settings<B: Backend>(
 ) -> Agent {
     host.config.session_settings = settings;
     spawn_agent(host, prompt).await
+}
+
+pub async fn read_session_settings<B: Backend>(host: &Harness<B>) -> SessionSettingsValues {
+    host.backend
+        .as_ref()
+        .expect("live backend")
+        .read_session_settings()
+        .await
+        .expect("read backend session settings")
 }
 
 pub async fn set_session_setting<B: Backend>(
