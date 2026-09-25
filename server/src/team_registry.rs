@@ -78,6 +78,11 @@ enum TeamRegistryCommand {
         agent_id: AgentId,
         reply: oneshot::Sender<Result<TeamDescribeData, String>>,
     },
+    ManagerObservesReportAgent {
+        caller_agent_id: AgentId,
+        target_agent_id: AgentId,
+        reply: oneshot::Sender<Result<bool, String>>,
+    },
     PlanMessageMember {
         caller_agent_id: AgentId,
         target_member_id: TeamMemberId,
@@ -247,6 +252,24 @@ impl TeamRegistryHandle {
             .map_err(|_| "team registry actor stopped".to_string())?;
         rx.await
             .map_err(|_| "team registry actor dropped describe reply".to_string())?
+    }
+
+    pub(crate) async fn manager_observes_report_agent(
+        &self,
+        caller_agent_id: AgentId,
+        target_agent_id: AgentId,
+    ) -> Result<bool, String> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(TeamRegistryCommand::ManagerObservesReportAgent {
+                caller_agent_id,
+                target_agent_id,
+                reply,
+            })
+            .await
+            .map_err(|_| "team registry actor stopped".to_string())?;
+        rx.await
+            .map_err(|_| "team registry actor dropped observe reply".to_string())?
     }
 
     pub(crate) async fn plan_message_member(
@@ -550,6 +573,15 @@ impl TeamRegistryActor {
                     let result = self.describe_for_agent(&agent_id);
                     let _ = reply.send(result);
                 }
+                TeamRegistryCommand::ManagerObservesReportAgent {
+                    caller_agent_id,
+                    target_agent_id,
+                    reply,
+                } => {
+                    let result =
+                        self.manager_observes_report_agent(&caller_agent_id, &target_agent_id);
+                    let _ = reply.send(result);
+                }
                 TeamRegistryCommand::PlanMessageMember {
                     caller_agent_id,
                     target_member_id,
@@ -755,6 +787,32 @@ impl TeamRegistryActor {
             members,
             bindings,
         })
+    }
+
+    fn manager_observes_report_agent(
+        &self,
+        caller_agent_id: &AgentId,
+        target_agent_id: &AgentId,
+    ) -> Result<bool, String> {
+        let Some(caller) = self.member_for_agent(caller_agent_id)? else {
+            return Ok(false);
+        };
+        let team = self.store.get_team(&caller.team_id).ok_or_else(|| {
+            format!(
+                "caller member {} references missing team {}",
+                caller.id, caller.team_id
+            )
+        })?;
+        if caller.role != TeamMemberRole::Manager
+            || caller.state != TeamMemberState::Active
+            || team.manager_member_id != caller.id
+        {
+            return Ok(false);
+        }
+        let Some(target) = self.member_for_agent(target_agent_id)? else {
+            return Ok(false);
+        };
+        Ok(target.team_id == team.id && target.role == TeamMemberRole::Report)
     }
 
     fn plan_message_member(

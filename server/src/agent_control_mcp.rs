@@ -751,6 +751,31 @@ async fn authorize_direct_children(
     Ok(())
 }
 
+async fn authorize_observed_agents(
+    host: &HostHandle,
+    caller: &AgentId,
+    targets: &[AgentId],
+) -> Result<(), String> {
+    let agents = host.list_agents().await;
+    for target in targets {
+        let direct_child = agents.iter().any(|agent| {
+            agent.agent_id == *target && agent.parent_agent_id.as_ref() == Some(caller)
+        });
+        if direct_child
+            || host
+                .team_manager_observes_report_agent(caller.clone(), target.clone())
+                .await?
+        {
+            continue;
+        }
+        return Err(format!(
+            "authorization: agent_id {} is not a direct child of caller {} or a report on a team it manages",
+            target.0, caller.0
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct RequestReviewToolInput {
@@ -1023,7 +1048,7 @@ impl TydeAgentControlMcpServer {
     }
 
     #[tool(
-        description = "Wait without a Tyde tool timer until any supplied direct child becomes idle or failed. agent_ids is required and must contain at least one non-empty direct child ID. Requires the calling agent's bearer credential and returns statuses only."
+        description = "Wait without a Tyde tool timer until any supplied direct child, or team manager report, becomes idle or failed. agent_ids is required and must contain at least one non-empty agent ID. Requires the calling agent's bearer credential and returns statuses only."
     )]
     async fn tyde_await_agents(
         &self,
@@ -1040,7 +1065,7 @@ impl TydeAgentControlMcpServer {
             Ok(ids) => ids,
             Err(err) => return Ok(err_text(err)),
         };
-        if let Err(error) = authorize_direct_children(&self.host, &caller, &agent_ids).await {
+        if let Err(error) = authorize_observed_agents(&self.host, &caller, &agent_ids).await {
             return Ok(err_text(error));
         }
         let (_cancellation_guard, host_cancellation) = AgentAwaitCancellationGuard::register(
@@ -1062,7 +1087,7 @@ impl TydeAgentControlMcpServer {
     }
 
     #[tool(
-        description = "Read only a direct child's server-owned latest assistant-visible message, error, or empty record. Never scans backward."
+        description = "Read only a direct child's, or team manager report's, server-owned latest assistant-visible message, error, or empty record. Never scans backward."
     )]
     async fn tyde_read_agent(
         &self,
@@ -1078,7 +1103,7 @@ impl TydeAgentControlMcpServer {
             Err(err) => return Ok(err_text(err)),
         };
         if let Err(error) =
-            authorize_direct_children(&self.host, &caller, std::slice::from_ref(&agent_id)).await
+            authorize_observed_agents(&self.host, &caller, std::slice::from_ref(&agent_id)).await
         {
             return Ok(err_text(error));
         }
@@ -1089,7 +1114,7 @@ impl TydeAgentControlMcpServer {
     }
 
     #[tool(
-        description = "Debug-only detailed incremental output events for a direct child. Results are capped by limit and max_bytes."
+        description = "Debug-only detailed incremental output events for a direct child or team manager report. Results are capped by limit and max_bytes."
     )]
     async fn tyde_read_agent_debug(
         &self,
@@ -1106,7 +1131,7 @@ impl TydeAgentControlMcpServer {
             Err(err) => return Ok(err_text(err)),
         };
         if let Err(error) =
-            authorize_direct_children(&self.host, &caller, std::slice::from_ref(&agent_id)).await
+            authorize_observed_agents(&self.host, &caller, std::slice::from_ref(&agent_id)).await
         {
             return Ok(err_text(error));
         }

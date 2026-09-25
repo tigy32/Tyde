@@ -356,8 +356,13 @@ Native subagent-count limits do not apply to Tyde children. Native subagents are
 also permitted for same-backend work; cross-backend delegation uses Tyde MCP
 unless the user explicitly requests a shell CLI.
 
-Await, read, debug-read, send, and list centrally authorize targets against the
-server-owned direct-child relation. Knowing another agent id is insufficient.
+Await, read, debug-read, send, close, and list centrally authorize targets
+against the server-owned direct-child relation. Knowing another agent id is
+insufficient. Team members are spawned without a parent, so await, read, and
+debug-read also admit one server-owned team relation: the caller is its team's
+active manager and the target is the live agent bound to a report on that team
+(`19-agent-teams.md` §8). Managers message reports only through
+`tyde_team_message_member`; send, close, and list stay direct-child only.
 
 #### `tyde_read_agent`
 

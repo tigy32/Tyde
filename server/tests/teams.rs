@@ -276,6 +276,82 @@ async fn call_agent_control_tool_json(
     value
 }
 
+async fn activate_team_member(
+    client: &mut client::Connection,
+    member: &TeamMember,
+    context: &str,
+) -> AgentId {
+    client
+        .team_member_activate(TeamMemberActivatePayload {
+            member_id: member.id.clone(),
+            prompt: Some("Lead the team".to_owned()),
+            images: None,
+        })
+        .await
+        .expect("team_member_activate failed");
+    let new_agent: NewAgentPayload = expect_kind(client, FrameKind::NewAgent, context)
+        .await
+        .parse_payload()
+        .expect("parse NewAgentPayload");
+    expect_bound_team_member(client, &member.id, &new_agent.agent_id, context).await;
+    new_agent.agent_id
+}
+
+async fn call_agent_control_tool(
+    fixture: &Fixture,
+    agent_id: &AgentId,
+    await_surface: bool,
+    name: &str,
+    arguments: Value,
+) -> rmcp::model::CallToolResult {
+    let caller = fixture.agent_control_caller(agent_id).await;
+    let bearer = caller
+        .authorization
+        .strip_prefix("Bearer ")
+        .expect("fixture caller authorization must be bearer")
+        .to_owned();
+    let url = if await_surface {
+        caller.await_url
+    } else {
+        caller.url
+    };
+    let transport = StreamableHttpClientTransport::from_config(
+        StreamableHttpClientTransportConfig::with_uri(url).auth_header(bearer),
+    );
+    let service = ().serve(transport).await.expect("connect to agent MCP");
+    let result = service
+        .call_tool(CallToolRequestParams {
+            meta: None,
+            name: name.to_string().into(),
+            arguments: arguments.as_object().cloned(),
+            task: None,
+        })
+        .await
+        .expect("call agent-control tool");
+    service.cancel().await.expect("cancel MCP client");
+    result
+}
+
+fn tool_result_text(result: &rmcp::model::CallToolResult) -> &str {
+    let content = result
+        .content
+        .first()
+        .expect("tool result should include content");
+    let RawContent::Text(text) = &content.raw else {
+        panic!("expected text tool result, got {:?}", content.raw);
+    };
+    &text.text
+}
+
+fn tool_result_json(result: &rmcp::model::CallToolResult) -> Value {
+    assert_eq!(
+        result.is_error,
+        Some(false),
+        "agent-control tool returned error: {result:?}"
+    );
+    serde_json::from_str(tool_result_text(result)).expect("tool result text must be JSON")
+}
+
 fn sample_custom_agent(id: &str) -> CustomAgent {
     CustomAgent {
         id: CustomAgentId(id.to_owned()),
@@ -2481,4 +2557,126 @@ async fn custom_agent_delete_rejected_for_builtin_role_preset_default() {
         "error should explain the role preset link: {}",
         err.message
     );
+}
+
+#[tokio::test]
+async fn manager_awaits_and_reads_report_answer() {
+    let mut fixture = Fixture::new().await;
+    let (_, _, _, manager, report) = create_team_with_report(&mut fixture, "observe").await;
+    let (_, _, _, other_manager, _) = create_team_with_report(&mut fixture, "other-observe").await;
+
+    let manager_agent_id =
+        activate_team_member(&mut fixture.client, &manager, "observe manager agent").await;
+    let other_manager_agent_id =
+        activate_team_member(&mut fixture.client, &other_manager, "other manager agent").await;
+
+    let reservation = fixture
+        .reserve_next_mock_launch(
+            "report",
+            server::backend::mock::MockScript::one(server::backend::mock::MockTurn::text(
+                "report verdict: GREEN",
+            )),
+        )
+        .await;
+    let delegated = call_agent_control_tool_json(
+        &fixture,
+        &manager_agent_id,
+        "tyde_team_message_member",
+        json!({"member_id": report.id, "message": "Review the change"}),
+    )
+    .await;
+    drop(reservation);
+    let report_agent_id = delegated["agent_id"]
+        .as_str()
+        .expect("team_message_member returns the report agent_id")
+        .to_owned();
+
+    let awaited = tool_result_json(
+        &call_agent_control_tool(
+            &fixture,
+            &manager_agent_id,
+            true,
+            "tyde_await_agents",
+            json!({"agent_ids": [report_agent_id]}),
+        )
+        .await,
+    );
+    assert_eq!(awaited["ready"][0]["agent_id"], json!(report_agent_id));
+    assert_eq!(awaited["ready"][0]["status"], "idle");
+
+    let read = tool_result_json(
+        &call_agent_control_tool(
+            &fixture,
+            &manager_agent_id,
+            false,
+            "tyde_read_agent",
+            json!({"agent_id": report_agent_id}),
+        )
+        .await,
+    );
+    assert_eq!(read["output"]["text"], "report verdict: GREEN");
+
+    let debug = tool_result_json(
+        &call_agent_control_tool(
+            &fixture,
+            &manager_agent_id,
+            false,
+            "tyde_read_agent_debug",
+            json!({"agent_id": report_agent_id, "after_seq": 0}),
+        )
+        .await,
+    );
+    assert_eq!(debug["agent_id"], json!(report_agent_id));
+
+    let denied = [
+        (
+            &other_manager_agent_id,
+            true,
+            "tyde_await_agents",
+            json!({"agent_ids": [report_agent_id]}),
+        ),
+        (
+            &other_manager_agent_id,
+            false,
+            "tyde_read_agent",
+            json!({"agent_id": report_agent_id}),
+        ),
+        (
+            &other_manager_agent_id,
+            false,
+            "tyde_read_agent_debug",
+            json!({"agent_id": report_agent_id}),
+        ),
+        (
+            &AgentId(report_agent_id.clone()),
+            false,
+            "tyde_read_agent",
+            json!({"agent_id": manager_agent_id.0}),
+        ),
+        (
+            &manager_agent_id,
+            false,
+            "tyde_send_agent_message",
+            json!({"agent_id": report_agent_id, "message": "bypass"}),
+        ),
+        (
+            &manager_agent_id,
+            false,
+            "tyde_close_agent",
+            json!({"agent_id": report_agent_id}),
+        ),
+    ];
+    for (caller, await_surface, tool, arguments) in denied {
+        let result =
+            call_agent_control_tool(&fixture, caller, await_surface, tool, arguments).await;
+        assert_eq!(
+            result.is_error,
+            Some(true),
+            "{tool} must stay denied: {result:?}"
+        );
+        assert!(
+            tool_result_text(&result).contains("authorization:"),
+            "{tool} must fail authorization: {result:?}"
+        );
+    }
 }

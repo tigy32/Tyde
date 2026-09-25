@@ -7148,6 +7148,17 @@ impl HostHandle {
         registry.describe_for_agent(agent_id).await
     }
 
+    pub(crate) async fn team_manager_observes_report_agent(
+        &self,
+        caller_agent_id: AgentId,
+        target_agent_id: AgentId,
+    ) -> Result<bool, String> {
+        let registry = { self.state.lock().await.team_registry.clone() };
+        registry
+            .manager_observes_report_agent(caller_agent_id, target_agent_id)
+            .await
+    }
+
     pub(crate) async fn list_custom_agents(&self) -> Result<Vec<CustomAgent>, String> {
         let store = { Arc::clone(&self.state.lock().await.custom_agent_store) };
         let agents = store.lock().await.list()?;
