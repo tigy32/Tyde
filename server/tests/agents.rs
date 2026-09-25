@@ -7404,29 +7404,34 @@ async fn user_rename_wins_race_with_generated_name() {
         .await
         .expect("generated-name race barrier");
     let mut user_renames = 0;
-    loop {
-        let env = fixture
-            .client
-            .next_event()
-            .await
-            .expect("read generated-name race barrier")
-            .expect("connection remained open");
-        if env.kind == FrameKind::AgentRenamed {
-            let renamed: AgentRenamedPayload = env.parse_payload().expect("parse race rename");
-            assert_eq!(renamed.name, "User Wins");
-            user_renames += 1;
-        }
-        if env.kind == FrameKind::SessionList {
-            let list: SessionListPayload = env.parse_payload().expect("parse race SessionList");
-            if list.sessions[0].user_alias.as_deref() == Some("User Wins") {
-                assert_eq!(
-                    list.sessions[0].alias.as_deref(),
-                    Some("Rename Race Mock-async-generated-name")
-                );
-                break;
+    let mut saw_user_alias = false;
+    fixture::next_frame_matching_on(
+        &mut fixture.client,
+        "user rename notification and persisted alias",
+        |env| {
+            if env.kind == FrameKind::AgentRenamed {
+                let renamed: AgentRenamedPayload = env.parse_payload().expect("parse race rename");
+                assert_eq!(renamed.name, "User Wins");
+                user_renames += 1;
             }
-        }
-    }
+            if env.kind == FrameKind::SessionList {
+                let list: SessionListPayload = env.parse_payload().expect("parse race SessionList");
+                if list.sessions[0].user_alias.as_deref() == Some("User Wins") {
+                    assert_eq!(
+                        list.sessions[0].alias.as_deref(),
+                        Some("Rename Race Mock-async-generated-name")
+                    );
+                    // Alias persistence can fan out SessionList before the agent
+                    // emits AgentRenamed. A store snapshot is not a wire barrier
+                    // for the independently delivered rename notification.
+                    eprintln!("RENAME RACE alias snapshot received; rename_count={user_renames}");
+                    saw_user_alias = true;
+                }
+            }
+            saw_user_alias && user_renames > 0
+        },
+    )
+    .await;
     assert_eq!(user_renames, 1, "pre-Bootstrap user rename must apply once");
 }
 

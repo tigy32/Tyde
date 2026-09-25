@@ -503,8 +503,12 @@ pub enum BackendEvent {
     Chat(ChatEvent),
     ModelRequestTokenUsage(ModelRequestTokenUsage),
     Compaction(BackendCompactionEvent),
-    /// Exactly one per resume, after all history and before any live event.
-    /// Failure terminates startup instead of admitting a partial replay.
+    /// Exactly one per resume, after all historical replay. History never emits
+    /// TypingStatusChanged(true). Prefer emitting this before live events; if a
+    /// provider starts earlier, its typing(true) begins an ordered live suffix
+    /// with no further history. The actor defers that suffix until this marker
+    /// and reduces it before settling resume. Failure terminates startup
+    /// instead of admitting a partial replay.
     ResumeReplayComplete(Result<(), String>),
 }
 
@@ -934,16 +938,6 @@ impl EventStream {
             self.buffered.push_back(follow_up);
         }
         Ok(event)
-    }
-
-    pub(crate) fn restore_backend_events(
-        &mut self,
-        events: impl IntoIterator<Item = BackendEvent>,
-    ) {
-        let restored = events.into_iter().collect::<Vec<_>>();
-        for event in restored.into_iter().rev() {
-            self.buffered.push_front(event);
-        }
     }
 
     pub(crate) fn transcript_metadata(&self, event: &ChatEvent) -> BackendTranscriptEventMetadata {
@@ -1400,8 +1394,12 @@ pub trait Backend: Send + Sync + 'static {
 
     /// Resume an existing backend session.
     /// The returned stream must emit exactly one ResumeReplayComplete after
-    /// history and before live work, including provider-initiated turns.
-    /// Startup failures after returning the stream use its Err form.
+    /// history. Historical replay must never emit TypingStatusChanged(true).
+    /// A provider-initiated turn may begin before the marker: preserve its
+    /// typing(true) and subsequent live events in order, without interleaving
+    /// more history. The actor reduces that deferred live suffix after the
+    /// marker, before settling resume. Prefer ordering live work after the
+    /// marker in the adapter. Startup failures use the marker's Err form.
     fn resume(
         workspace_roots: Vec<String>,
         config: BackendSpawnConfig,

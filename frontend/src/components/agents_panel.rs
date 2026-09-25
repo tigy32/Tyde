@@ -4429,6 +4429,84 @@ mod wasm_tests {
     }
 
     #[wasm_bindgen_test]
+    async fn restored_turn_status_uses_host_frames_without_loading_chat() {
+        use crate::dispatch::restore_fixtures::{restore_agent_payload, restore_bootstrap};
+
+        for host_bootstrap in [true, false] {
+            let container = make_container();
+            let state = make_app_state("h");
+            // Each connection starts at zero; the validator outlives AppState.
+            crate::dispatch::prime_host_for_tests(&state, "h");
+            let mut agent = restore_agent_payload("a-restored", None);
+            agent.backend_kind = BackendKind::Codex;
+            agent.session_id = Some(protocol::SessionId("restored-session".to_owned()));
+            agent.turn_active = true;
+            if host_bootstrap {
+                dispatch_frame(
+                    &state,
+                    "h",
+                    StreamPath("/host/h".to_owned()),
+                    FrameKind::HostBootstrap,
+                    0,
+                    &restore_bootstrap(
+                        vec![BackendKind::Codex],
+                        Default::default(),
+                        vec![],
+                        vec![agent],
+                    ),
+                );
+            } else {
+                dispatch_frame(
+                    &state,
+                    "h",
+                    StreamPath("/host/h".to_owned()),
+                    FrameKind::NewAgent,
+                    0,
+                    &agent,
+                );
+            }
+            let handle = mount_panel(&container, state.clone());
+            for _ in 0..4 {
+                next_tick().await;
+            }
+            wasm_bindgen_test::console_log!(
+                "Restored status: host_bootstrap={}, agents={}, connection={:?}",
+                host_bootstrap,
+                state.agents.get_untracked().len(),
+                state.connection_statuses.get_untracked().get("h"),
+            );
+            let status = agent_card_el(&container, "a-restored")
+                .query_selector(".agent-card-status")
+                .unwrap()
+                .expect("restored row status");
+            assert_eq!(status.get_attribute("title").as_deref(), Some("Thinking"));
+            assert!(status.text_content().unwrap().contains("Thinking"));
+            for (seq, active, label) in [
+                (1, false, "Idle"),
+                (2, true, "Thinking"),
+                (3, false, "Idle"),
+            ] {
+                dispatch_frame(
+                    &state,
+                    "h",
+                    StreamPath("/host/h".to_owned()),
+                    FrameKind::AgentTurnStateNotify,
+                    seq,
+                    &protocol::AgentTurnStateNotifyPayload {
+                        agent_id: AgentId("a-restored".to_owned()),
+                        turn_active: active,
+                    },
+                );
+                next_tick().await;
+                assert_eq!(status.get_attribute("title").as_deref(), Some(label));
+                assert!(status.text_content().unwrap().contains(label));
+            }
+            drop(handle);
+            container.remove();
+        }
+    }
+
+    #[wasm_bindgen_test]
     async fn status_exposes_text_and_hides_decorative_glyph() {
         let container = make_container();
         let state = make_app_state("h");

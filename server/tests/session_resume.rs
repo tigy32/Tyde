@@ -1691,15 +1691,16 @@ async fn restart_restores_a_backend_continued_turn_as_running() {
             "post-replay reasoning must not be swallowed into history"
         );
 
-        let event = expect_chat_event_on_stream(
-            &mut fixture.client,
-            &eager.instance_stream,
-            "continued turn typing before stream",
-        )
-        .await;
         assert!(
-            matches!(event, ChatEvent::TypingStatusChanged(true)),
-            "resumed live turn must publish typing(true) before its stream"
+            bootstrap.turn_active,
+            "eager bootstrap must include the live start received before the replay boundary"
+        );
+        assert!(
+            bootstrap.events.iter().any(|event| matches!(
+                event,
+                AgentBootstrapEvent::ChatEvent(ChatEvent::TypingStatusChanged(true))
+            )),
+            "pre-boundary live typing must reach the reducer before bootstrap"
         );
         let event = expect_chat_event_on_stream(
             &mut fixture.client,
@@ -1823,6 +1824,156 @@ async fn restart_restores_a_backend_continued_turn_as_running() {
         assert_eq!(settled.ready.len(), 1);
         assert_eq!(settled.ready[0].status, protocol::AgentControlStatus::Idle);
         assert!(settled.still_thinking.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn resume_completed_turn_and_followup_settle_before_attach() {
+    for (follow_up, ongoing, start_before_boundary) in [
+        (false, false, true),
+        (true, false, true),
+        (true, true, true),
+        (true, true, false),
+    ] {
+        let mut fixture = Fixture::new().await;
+        let replay = server::backend::mock::MockResumeReplay::default();
+        let source = fixture
+            .spawn_scripted(
+                "completed before boundary source",
+                MockScript::one(MockTurn::text("saved history"))
+                    .with_controlled_resume_replay(&replay),
+            )
+            .await;
+        fixture.finish_turn(&source).await;
+        let session_id = fixture.agent_session_ids().await.remove(0);
+        let finish = server::backend::mock::MockGateHandle::new();
+        let reservation = fixture
+            .reserve_next_mock_launch(
+                "completed before boundary",
+                MockScript::one(MockTurn::text_after_gate("follow-up response", &finish)),
+            )
+            .await;
+        fixture
+            .client
+            .spawn_agent(SpawnAgentPayload {
+                name: Some("completed before boundary".to_owned()),
+                custom_agent_id: None,
+                parent_agent_id: None,
+                project_id: None,
+                params: SpawnAgentParams::Resume {
+                    session_id,
+                    prompt: follow_up.then(|| "resume follow-up".to_owned()),
+                },
+            })
+            .await
+            .expect("resume with controlled boundary");
+        let agent = expect_next_event(&mut fixture.client, "resumed NewAgent")
+            .await
+            .parse_payload::<NewAgentPayload>()
+            .expect("resumed descriptor");
+        replay.wait_until_started().await;
+        if !start_before_boundary {
+            replay.complete();
+        }
+        if ongoing {
+            replay.start_live_turn("provider resumed response");
+        } else {
+            replay.live_turn("provider resumed response");
+        }
+        if start_before_boundary {
+            replay.complete();
+        }
+        let bootstrap = expect_raw_event_on_stream(
+            &mut fixture.client,
+            &agent.instance_stream,
+            FrameKind::AgentBootstrap,
+            "completed pre-boundary turn bootstrap",
+        )
+        .await
+        .parse_payload::<AgentBootstrapPayload>()
+        .expect("resumed bootstrap");
+        if !ongoing {
+            assert!(
+                bootstrap_message_contents(&bootstrap)
+                    .contains(&"provider resumed response".to_owned()),
+                "a live turn completed before the boundary must not be dropped as provider history"
+            );
+        }
+        assert_eq!(
+            bootstrap.turn_active, follow_up,
+            "first bootstrap must reflect accepted or busy follow-up dispatch"
+        );
+        if ongoing {
+            assert!(
+                bootstrap.events.iter().any(|event| matches!(
+                    event,
+                    AgentBootstrapEvent::QueuedMessages(payload) if payload.messages.len() == 1
+                )),
+                "the Busy initial follow-up must remain queued"
+            );
+            if !start_before_boundary {
+                for expected in ["typing", "start", "delta"] {
+                    let event = expect_chat_event_on_stream(
+                        &mut fixture.client,
+                        &agent.instance_stream,
+                        "post-boundary provider start",
+                    )
+                    .await;
+                    assert!(matches!(
+                        (expected, event),
+                        ("typing", ChatEvent::TypingStatusChanged(true))
+                            | ("start", ChatEvent::StreamStart(_))
+                            | ("delta", ChatEvent::StreamDelta(_))
+                    ));
+                }
+            }
+            replay.finish_live_turn("provider resumed response");
+            let event = expect_chat_event_on_stream(
+                &mut fixture.client,
+                &agent.instance_stream,
+                "provider end after Busy",
+            )
+            .await;
+            assert!(matches!(event, ChatEvent::StreamEnd(_)));
+            let event = expect_chat_event_on_stream(
+                &mut fixture.client,
+                &agent.instance_stream,
+                "armed provider completion after Busy",
+            )
+            .await;
+            assert!(matches!(event, ChatEvent::TypingStatusChanged(false)));
+            let queue = fixture::next_frame_matching_on(
+                &mut fixture.client,
+                "armed completion dispatches the queued follow-up",
+                |env| env.stream == agent.instance_stream && env.kind == FrameKind::QueuedMessages,
+            )
+            .await
+            .parse_payload::<protocol::QueuedMessagesPayload>()
+            .expect("queued follow-up state");
+            assert!(queue.messages.is_empty(), "follow-up must leave the queue");
+        }
+        if follow_up {
+            finish.wait_until_entered().await;
+            finish.release_one();
+            expect_turn_on_stream(
+                &mut fixture.client,
+                &agent.instance_stream,
+                "follow-up response",
+            )
+            .await;
+        }
+        let control = fixture.connect_agent_control().await;
+        let settled = tokio::time::timeout(
+            Duration::from_secs(5),
+            control.await_agents(Some(vec![agent.agent_id.clone()])),
+        )
+        .await
+        .expect("completed resume and follow-up settle")
+        .expect("agent-control await succeeds");
+        assert_eq!(settled.ready.len(), 1);
+        assert_eq!(settled.ready[0].status, protocol::AgentControlStatus::Idle);
+        assert!(settled.still_thinking.is_empty());
+        drop(reservation);
     }
 }
 

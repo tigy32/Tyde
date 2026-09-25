@@ -372,6 +372,29 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                 format!("failed to parse host_bootstrap payload: {error}"),
             ),
         },
+        FrameKind::AgentTurnStateNotify => {
+            match envelope.parse_payload::<protocol::AgentTurnStateNotifyPayload>() {
+                Ok(payload) => {
+                    let fatal = state.agents.with_untracked(|agents| {
+                        agents.iter().any(|agent| {
+                            agent.host_id == host_id
+                                && agent.agent_id == payload.agent_id
+                                && agent.fatal_error.is_some()
+                        })
+                    });
+                    if !fatal {
+                        set_agent_turn_active(state, &payload.agent_id, payload.turn_active);
+                    }
+                }
+                Err(error) => report_dispatch_error(
+                    state,
+                    host_id,
+                    &envelope.stream,
+                    envelope.kind,
+                    format!("failed to parse agent_turn_state_notify payload: {error}"),
+                ),
+            }
+        }
         FrameKind::AgentBootstrap => match envelope.parse_payload::<AgentBootstrapPayload>() {
             Ok(payload) => apply_agent_bootstrap(state, host_id, &envelope.stream, payload),
             Err(error) => report_dispatch_error(
@@ -1106,6 +1129,8 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                     payload.instance_stream
                 );
                 let agent_id = payload.agent_id.clone();
+                let turn_active = payload.turn_active;
+                let started = payload.session_id.is_some();
                 let origin = payload.origin;
                 let team_member_id = payload.team_member_id.clone();
                 // Snapshot the fingerprint inputs before moving payload
@@ -1130,7 +1155,7 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                     workflow: payload.workflow,
                     created_at_ms: payload.created_at_ms,
                     instance_stream: payload.instance_stream,
-                    started: false,
+                    started,
                     fatal_error: None,
                     activity_summary: payload.activity_summary,
                 };
@@ -1146,6 +1171,7 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                         .retain(|agent| !(agent.host_id == host_id && agent.agent_id == agent_id));
                     agents.push(info);
                 });
+                set_agent_turn_active(state, &agent_id, turn_active);
 
                 // If a compaction `Completed` notify arrived before this
                 // `NewAgent` echo, the dispatch handler for the notify
@@ -6624,32 +6650,37 @@ fn apply_host_bootstrap(state: &AppState, host_id: &str, payload: HostBootstrapP
     for dropped in &dropped_ids {
         state.forget_session_history(dropped);
     }
+    let mut turn_states = Vec::with_capacity(payload.agents.len());
     state.agents.update(|agents| {
         agents.retain(|agent| agent.host_id != host_id || snapshot_ids.contains(&agent.agent_id));
         for payload in payload.agents {
+            let turn_active = payload.turn_active;
             let mut info = agent_info_from_payload(host_id, payload);
             if let Some(existing) = agents
                 .iter_mut()
                 .find(|a| a.host_id == host_id && a.agent_id == info.agent_id)
             {
-                // `agent_info_from_payload` zeroes runtime-only fields
-                // (`started`, `fatal_error`) because `NewAgentPayload`
-                // doesn't carry them. It may also omit `session_id`
-                // before backend startup completes. Preserve whatever the live event
-                // stream had set on the existing entry so a bootstrap
-                // re-application doesn't reset an already-started agent
-                // to `started: false`.
-                info.started = existing.started;
+                // Startup descriptors can omit the session until it is assigned.
+                // Retain the more complete live startup/error state on reattach.
+                info.started = info.started || existing.started;
                 info.fatal_error = existing.fatal_error.clone();
                 if info.session_id.is_none() {
                     info.session_id = existing.session_id.clone();
                 }
+                turn_states.push((
+                    info.agent_id.clone(),
+                    turn_active && info.fatal_error.is_none(),
+                ));
                 *existing = info;
             } else {
+                turn_states.push((info.agent_id.clone(), turn_active));
                 agents.push(info);
             }
         }
     });
+    for (agent_id, turn_active) in turn_states {
+        set_agent_turn_active(state, &agent_id, turn_active);
+    }
     // Only now can the persisted selection be resolved: it names an agent, a
     // backend and a launch profile, and all three become knowable at this line.
     // The project restore above runs earlier because it only needs
@@ -6866,7 +6897,18 @@ fn restore_draft_selection_after_host_bootstrap(state: &AppState, host_id: &str)
     state.persist_selection_snapshot();
 }
 
+fn set_agent_turn_active(state: &AppState, agent_id: &AgentId, turn_active: bool) {
+    state.agent_turn_active.update(|map| {
+        if turn_active {
+            map.insert(agent_id.clone(), true);
+        } else {
+            map.remove(agent_id);
+        }
+    });
+}
+
 fn agent_info_from_payload(host_id: &str, payload: NewAgentPayload) -> AgentInfo {
+    let started = payload.session_id.is_some();
     AgentInfo {
         host_id: host_id.to_string(),
         agent_id: payload.agent_id,
@@ -6882,7 +6924,7 @@ fn agent_info_from_payload(host_id: &str, payload: NewAgentPayload) -> AgentInfo
         workflow: payload.workflow,
         created_at_ms: payload.created_at_ms,
         instance_stream: payload.instance_stream,
-        started: false,
+        started,
         fatal_error: None,
         activity_summary: payload.activity_summary,
     }
@@ -7043,13 +7085,7 @@ fn apply_agent_bootstrap(
     if fatal {
         settle_fatal_agent_ui(state, &agent_id);
     } else {
-        state.agent_turn_active.update(|map| {
-            if payload.turn_active {
-                map.insert(agent_id.clone(), true);
-            } else {
-                map.remove(&agent_id);
-            }
-        });
+        set_agent_turn_active(state, &agent_id, payload.turn_active);
         if !payload.turn_active {
             state.streaming_text.update(|map| {
                 map.remove(&agent_id);

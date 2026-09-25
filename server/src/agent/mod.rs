@@ -162,6 +162,8 @@ struct InitialFollowUpContext<'a> {
     canonical_stream: &'a str,
     event_log: &'a mut Vec<Envelope>,
     latest_output: &'a mut AgentControlLatestOutput,
+    latest_slash_commands: Option<&'a protocol::SlashCommandCatalog>,
+    pending_attaches: &'a mut Vec<(Stream, oneshot::Sender<bool>)>,
     replay_state: &'a mut AgentReplayState,
     subscribers: &'a mut Vec<Stream>,
     queue: &'a mut VecDeque<SequencedQueuedMessage>,
@@ -3253,7 +3255,9 @@ pub(crate) fn spawn_agent_actor(
         let _ = start_tx.send(current_start.clone());
         let mut resume_replay_gate_pending = is_resume;
         let resume_replay_deadline = tokio::time::Instant::now() + RESUME_REPLAY_BARRIER_TIMEOUT;
-        let mut deferred_authoritative_resume_events = Vec::new();
+        let mut deferred_resume_events = VecDeque::new();
+        let mut resume_replay_boundary: Option<Result<(), String>> = None;
+        let mut resume_live_turn_seen = false;
         let mut pending_resume_attaches: Vec<(Stream, oneshot::Sender<bool>)> = Vec::new();
         if is_resume {
             pending_resume_attaches.append(&mut pending_startup_attaches);
@@ -3450,6 +3454,8 @@ pub(crate) fn spawn_agent_actor(
                     canonical_stream: &canonical_stream,
                     event_log: &mut event_log,
                     latest_output: &mut latest_output,
+                    latest_slash_commands: latest_slash_commands.as_ref(),
+                    pending_attaches: &mut pending_startup_attaches,
                     replay_state: &mut replay_state,
                     subscribers: &mut subscribers,
                     queue: &mut queue,
@@ -4200,14 +4206,23 @@ pub(crate) fn spawn_agent_actor(
                     }
                 }
                 maybe_event = async {
-                    if resume_replay_gate_pending {
+                    if let Some(result) = &resume_replay_boundary {
+                        Some(match deferred_resume_events.pop_front() {
+                            Some(event) => event,
+                            None => BackendEvent::ResumeReplayComplete(result.clone()),
+                        })
+                    } else if resume_replay_gate_pending {
                         match tokio::time::timeout_at(
                             resume_replay_deadline,
                             events.recv_backend(),
                         ).await {
                             Ok(event) if tokio::time::Instant::now() < resume_replay_deadline => event,
                             _ => {
-                                tracing::warn!("resume replay deadline expired before boundary");
+                                tracing::warn!(
+                                    deferred_events = deferred_resume_events.len(),
+                                    resume_live_turn_seen,
+                                    "resume replay deadline expired before boundary"
+                                );
                                 Some(BackendEvent::ResumeReplayComplete(Err(format!(
                                     "timed out after {}s waiting for resume replay to complete",
                                     RESUME_REPLAY_BARRIER_TIMEOUT.as_secs(),
@@ -4435,16 +4450,6 @@ pub(crate) fn spawn_agent_actor(
                             } else {
                                 Err("unexpected resume replay boundary".to_owned())
                             };
-                            tracing::info!(
-                                succeeded = result.is_ok(),
-                                authoritative_history = resume_uses_authoritative_transcript,
-                                backend_typing,
-                                in_turn,
-                                "resume replay boundary reached in backend stream order"
-                            );
-                            events.restore_backend_events(
-                                deferred_authoritative_resume_events.drain(..),
-                            );
                             if result.is_ok()
                                 && let Some(task_list) = persisted_resume_task_list.take()
                                 && !replay_log_latest_task_snapshot_is(&event_log, &task_list)
@@ -4463,6 +4468,26 @@ pub(crate) fn spawn_agent_actor(
                                 )
                                 .await;
                             }
+                            if resume_replay_boundary.is_none()
+                                && result.is_ok()
+                                && !deferred_resume_events.is_empty()
+                            {
+                                tracing::info!(
+                                    deferred_events = deferred_resume_events.len(),
+                                    resume_live_turn_seen,
+                                    "reducing deferred live resume events before settling replay"
+                                );
+                                resume_replay_boundary = Some(result);
+                                continue;
+                            }
+                            resume_replay_boundary = None;
+                            tracing::info!(
+                                succeeded = result.is_ok(),
+                                authoritative_history = resume_uses_authoritative_transcript,
+                                backend_typing,
+                                in_turn,
+                                "resume replay boundary reached in backend stream order"
+                            );
                             resume_replay_gate_pending = false;
                             match result {
                                 Ok(()) => {
@@ -4520,19 +4545,10 @@ pub(crate) fn spawn_agent_actor(
                                         )
                                         .await;
                                     }
-                                    flush_pending_agent_attaches(
-                                        &event_log,
-                                        Some(&replay_state),
-                                        &mut latest_output,
-                                        latest_slash_commands.as_ref(),
-                                        &mut subscribers,
-                                        &mut pending_resume_attaches,
-                                        &status_handle,
-                                    )
-                                    .await;
                                     if initial_follow_up.is_none()
                                         && acknowledged_gated_deliveries == 0
                                         && !queue.is_empty()
+                                        && !in_turn
                                         && !usage_paused
                                         && !compaction_blocked
                                         && context_compaction.as_ref().is_none_or(|flight| {
@@ -4623,6 +4639,16 @@ pub(crate) fn spawn_agent_actor(
                                                 &payload,
                                             )
                                             .await;
+                                            flush_pending_agent_attaches(
+                                                &event_log,
+                                                None,
+                                                &mut latest_output,
+                                                latest_slash_commands.as_ref(),
+                                                &mut subscribers,
+                                                &mut pending_resume_attaches,
+                                                &status_handle,
+                                            )
+                                            .await;
                                             park_terminal_agent(
                                                 &session_store,
                                                 &transcript_store,
@@ -4658,6 +4684,8 @@ pub(crate) fn spawn_agent_actor(
                                                 canonical_stream: &canonical_stream,
                                                 event_log: &mut event_log,
                                                 latest_output: &mut latest_output,
+                                                latest_slash_commands: latest_slash_commands.as_ref(),
+                                                pending_attaches: &mut pending_resume_attaches,
                                                 replay_state: &mut replay_state,
                                                 subscribers: &mut subscribers,
                                                 queue: &mut queue,
@@ -4671,8 +4699,25 @@ pub(crate) fn spawn_agent_actor(
                                     {
                                         return;
                                     }
+                                    flush_pending_agent_attaches(
+                                        &event_log,
+                                        Some(&replay_state),
+                                        &mut latest_output,
+                                        latest_slash_commands.as_ref(),
+                                        &mut subscribers,
+                                        &mut pending_resume_attaches,
+                                        &status_handle,
+                                    )
+                                    .await;
                                 }
                                 Err(err) => {
+                                    tracing::warn!(
+                                        deferred_events = deferred_resume_events.len(),
+                                        deferred_live_events = deferred_resume_events.iter().skip_while(|event| {
+                                            !matches!(event, BackendEvent::Chat(ChatEvent::TypingStatusChanged(true)))
+                                        }).count(),
+                                        "resume replay failed before deferred live events could be reduced"
+                                    );
                                     accepting_input_task.store(false, Ordering::SeqCst);
                                     let payload = AgentErrorPayload {
                                         agent_id: current_start.agent_id.clone(),
@@ -4753,6 +4798,21 @@ pub(crate) fn spawn_agent_actor(
                             continue;
                         }
                         event if resume_replay_gate_pending
+                            && resume_replay_boundary.is_none()
+                            && (resume_live_turn_seen || matches!(
+                                event,
+                                BackendEvent::Chat(ChatEvent::TypingStatusChanged(true))
+                            )) =>
+                        {
+                            // Typing(true) is a live turn edge, never history.
+                            // Keep its ordered suffix, including a possible end,
+                            // out of replay and reduce it before attaching clients.
+                            resume_live_turn_seen = true;
+                            deferred_resume_events.push_back(event);
+                            continue;
+                        }
+                        event if resume_replay_gate_pending
+                            && resume_replay_boundary.is_none()
                             && restore_native_goal_snapshot(&event, &status_handle).await =>
                         {
                             if let BackendEvent::Chat(event) = event {
@@ -4761,16 +4821,14 @@ pub(crate) fn spawn_agent_actor(
                             }
                             continue;
                         }
-                        event if resume_replay_gate_pending && resume_uses_authoritative_transcript => {
-                            // The backend owns this barrier and closes it before it
-                            // accepts live conversation work. Chat events on its
-                            // pre-barrier side are provider replay even when their
-                            // normalized shape differs from the authoritative
-                            // journal. Compaction observations on this side are
-                            // replay too: restoring them as live events duplicates
-                            // the authoritative timeline with provider-local ids.
+                        event if resume_replay_gate_pending
+                            && resume_replay_boundary.is_none()
+                            && resume_uses_authoritative_transcript => {
+                            // No live turn has started: provider history and
+                            // compaction observations must not duplicate the
+                            // authoritative journal with provider-local ids.
                             if matches!(event, BackendEvent::ModelRequestTokenUsage(_)) {
-                                deferred_authoritative_resume_events.push(event);
+                                deferred_resume_events.push_back(event);
                             }
                             continue;
                         }
@@ -4938,7 +4996,7 @@ pub(crate) fn spawn_agent_actor(
                             continue;
                         }
                     };
-                    if resume_replay_gate_pending {
+                    if resume_replay_gate_pending && resume_replay_boundary.is_none() {
                         if !resume_uses_authoritative_transcript {
                             ingest_gated_replay_event(
                                 &mut event,
@@ -5084,6 +5142,9 @@ pub(crate) fn spawn_agent_actor(
                             });
                             let mut completed_by_idle = false;
                             if typing {
+                                if !in_turn {
+                                    mark_agent_turn_active(&status_handle).await;
+                                }
                                 in_turn = true;
                                 idle_transition_armed = true;
                             } else if blocked_on_user {
@@ -5431,6 +5492,7 @@ pub(crate) fn spawn_agent_actor(
                     }
 
                     if real_idle_transition
+                        && !resume_replay_gate_pending
                         && !usage_paused
                         && matches!(lifecycle, ActorLifecycle::Running)
                         && !compaction_blocked
@@ -11035,8 +11097,10 @@ async fn send_initial_follow_up_or_park(
         agent_id = %context.current_start.agent_id,
         "dispatching initial resumed-session follow-up"
     );
+    if !*context.in_turn {
+        *context.idle_transition_armed = false;
+    }
     *context.in_turn = true;
-    *context.idle_transition_armed = false;
     match context
         .backend
         .as_ref()
@@ -11045,6 +11109,7 @@ async fn send_initial_follow_up_or_park(
         .await
     {
         SendOutcome::Accepted => {
+            *context.idle_transition_armed = false;
             tracing::info!(
                 agent_id = %context.current_start.agent_id,
                 "initial resumed-session follow-up accepted by backend"
@@ -11053,6 +11118,7 @@ async fn send_initial_follow_up_or_park(
             return true;
         }
         SendOutcome::Busy(input) => {
+            mark_agent_turn_active(context.status_handle).await;
             if let AgentInput::SendMessage(payload) = input {
                 tracing::info!(
                     agent_id = %context.current_start.agent_id,
@@ -11103,6 +11169,16 @@ async fn send_initial_follow_up_or_park(
             compaction: None,
         },
         &payload,
+    )
+    .await;
+    flush_pending_agent_attaches(
+        context.event_log,
+        None,
+        context.latest_output,
+        context.latest_slash_commands,
+        context.subscribers,
+        context.pending_attaches,
+        context.status_handle,
     )
     .await;
     park_terminal_agent(

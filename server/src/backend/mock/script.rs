@@ -128,6 +128,7 @@ impl MockScript {
 /// paused clock, without scheduling the server between those two operations.
 #[derive(Debug, Clone, Default)]
 pub struct MockResumeReplay {
+    live_turn_active: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ready: std::sync::Arc<tokio::sync::Notify>,
     sender:
         std::sync::Arc<std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<BackendEvent>>>>,
@@ -153,6 +154,46 @@ impl MockResumeReplay {
                     "replayed history".to_owned(),
                 )))
                 .expect("mock replay stream closed");
+        }
+    }
+
+    pub(super) fn is_turn_active(&self) -> bool {
+        self.live_turn_active
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub fn live_turn(&self, text: &str) {
+        self.start_live_turn(text);
+        self.finish_live_turn(text);
+    }
+
+    pub fn start_live_turn(&self, text: &str) {
+        let sender = self.sender.lock().expect("mock replay sender mutex");
+        let sender = sender.as_ref().expect("mock resume has not started");
+        self.live_turn_active
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        for event in [
+            emit::typing(true),
+            emit::stream_start("mock", Some(MOCK_MODEL.to_owned())),
+            emit::stream_delta(text.to_owned()),
+        ] {
+            sender.send(event).expect("mock replay stream closed");
+        }
+    }
+
+    pub fn finish_live_turn(&self, text: &str) {
+        let sender = self.sender.lock().expect("mock replay sender mutex");
+        let sender = sender.as_ref().expect("mock resume has not started");
+        self.live_turn_active
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        for event in [
+            emit::stream_end(emit::mock_assistant_message(
+                Some(ChatMessageId(Uuid::new_v4().to_string())),
+                text.to_owned(),
+            )),
+            emit::typing(false),
+        ] {
+            sender.send(event).expect("mock replay stream closed");
         }
     }
 

@@ -6215,6 +6215,22 @@ async fn real_conversation_on_resumed_session<B: Backend>(host: &mut Harness<B>)
              never reached the client as a card",
         follow_up.label()
     );
+    let mut running = false;
+    for event in follow_up.events() {
+        match event {
+            ChatEvent::TypingStatusChanged(active) => running = *active,
+            ChatEvent::StreamStart(_)
+            | ChatEvent::StreamDelta(_)
+            | ChatEvent::StreamReasoningDelta(_)
+            | ChatEvent::StreamEnd(_)
+            | ChatEvent::ToolRequest(_) => assert!(
+                running,
+                "resumed live response or tool arrived while published typing was idle"
+            ),
+            _ => {}
+        }
+    }
+    assert!(!running, "resumed follow-up must finish idle");
     assert_universal_contract(&[follow_up]);
 
     assert_replay_has_no_duplicates(

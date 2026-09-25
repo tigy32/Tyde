@@ -107,6 +107,7 @@ pub struct MockBackend {
     #[cfg_attr(not(feature = "test-support"), allow(dead_code))]
     control: MockControl,
     scripted_busy_self_turn: bool,
+    controlled_resume_replay: Option<MockResumeReplay>,
     mid_turn_steering: bool,
     shutdown_gate: Option<gate::MockGate>,
     compaction_observation_gates: Option<(gate::MockGate, gate::MockGate)>,
@@ -216,6 +217,7 @@ impl MockBackend {
                 compaction_capability,
                 control,
                 scripted_busy_self_turn,
+                controlled_resume_replay: None,
                 mid_turn_steering,
                 shutdown_gate: shutdown_gate.clone(),
                 compaction_observation_gates: compaction_observation_gates.clone(),
@@ -305,6 +307,7 @@ impl MockBackend {
                     compaction_capability,
                     control,
                     scripted_busy_self_turn,
+                    controlled_resume_replay: resume_replay.clone(),
                     mid_turn_steering,
                     shutdown_gate: shutdown_gate.clone(),
                     compaction_observation_gates: compaction_observation_gates.clone(),
@@ -314,6 +317,7 @@ impl MockBackend {
             ));
         }
 
+        let controlled_resume_replay = resume_replay.clone();
         let replay_tx = events_tx.clone();
         let replay_session_id = session_id.clone();
         tokio::spawn(async move {
@@ -327,6 +331,10 @@ impl MockBackend {
                     &replay_prompts,
                     session_user_bubbles,
                 );
+                if resume_continuation.is_some() {
+                    replay_tx.send_event(emit::typing(true));
+                    tracing::info!("mock resume queued live typing before replay boundary");
+                }
                 replay_tx.send_event(BackendEvent::ResumeReplayComplete(Ok(())));
             }
             start_mock_command_loop(
@@ -345,16 +353,14 @@ impl MockBackend {
             );
 
             if let Some((_, finish)) = resume_continuation {
-                // Queue the first live events without yielding after replay,
-                // just as a provider can continue work while resume returns.
-                replay_tx.send_event(emit::typing(true));
+                // The provider turn has already started before replay settled.
                 replay_tx.send_event(emit::stream_start("mock", Some(MOCK_MODEL.to_owned())));
                 replay_tx.send_event(BackendEvent::Chat(
                     protocol::ChatEvent::StreamReasoningDelta(protocol::StreamTextDeltaData {
                         text: "continued reasoning".to_owned(),
                     }),
                 ));
-                tracing::info!("mock resume queued live typing and reasoning after replay");
+                tracing::info!("mock resume queued reasoning after replay");
                 finish.wait().await;
                 replay_tx.send_event(emit::stream_end(emit::mock_assistant_message(
                     Some(ChatMessageId(Uuid::new_v4().to_string())),
@@ -374,6 +380,7 @@ impl MockBackend {
                 compaction_capability,
                 control,
                 scripted_busy_self_turn,
+                controlled_resume_replay,
                 mid_turn_steering,
                 shutdown_gate: shutdown_gate.clone(),
                 compaction_observation_gates: compaction_observation_gates.clone(),
@@ -481,6 +488,7 @@ impl MockBackend {
                 compaction_capability,
                 control,
                 scripted_busy_self_turn,
+                controlled_resume_replay: None,
                 mid_turn_steering,
                 shutdown_gate: shutdown_gate.clone(),
                 compaction_observation_gates: compaction_observation_gates.clone(),
@@ -817,6 +825,15 @@ impl Backend for MockBackend {
             .expect("mock active compaction mutex poisoned")
             .is_some()
         {
+            return SendOutcome::Busy(input);
+        }
+        if matches!(input, AgentInput::SendMessage(_))
+            && self
+                .controlled_resume_replay
+                .as_ref()
+                .is_some_and(MockResumeReplay::is_turn_active)
+        {
+            tracing::info!("mock resume rejected follow-up while provider turn is active");
             return SendOutcome::Busy(input);
         }
         if matches!(input, AgentInput::SendMessage(_))

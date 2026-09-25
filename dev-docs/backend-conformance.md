@@ -80,22 +80,59 @@ unchanged outside that resume boundary.
 
 ## Ordered resume replay boundary
 
-Every successful `Backend::resume` stream now contains exactly one internal
-`BackendEvent::ResumeReplayComplete(Ok(()))`, after history and before live
-events. Codex places it before releasing its inbound guard; ACP holds its
-inbound gate through replay flush, marker emission, and the switch to live
-handling. Claude emits it after explicit history loading, before starting the
-CLI; process readiness does not wait for live turns to finish. Hermes,
-Antigravity, and the mock emit it before forwarding or accepting live work.
-Grok and OpenCode share the ACP producer. Asynchronous resume startup errors
-use the marker's `Err` form. No client protocol or frontend inference is
-involved.
+Every successful `Backend::resume` stream contains exactly one internal
+`BackendEvent::ResumeReplayComplete(Ok(()))` after historical replay. History
+never emits `TypingStatusChanged(true)`. Adapters should place the marker
+before live events. If a provider starts earlier, its explicit typing edge
+begins an ordered live suffix; no more history may follow that edge. The
+actor defers the suffix, including any completion, until the marker, then
+reduces it before resume normalization. It never infers activity from text,
+tools, or history. Persisted task restoration precedes live reduction.
 
-The actor settles replay inline, preserves its 30-second deadline and fatal
-close handling, and never drains a temporarily empty queue to infer the
-boundary. Its idle publication cannot clear an active registry turn or its
-stream. Binding preparation and the conformance harness likewise consume
-only through the marker, leaving subsequent live events unread.
+The marker's `Err` form, a missing marker at the 30-second deadline, or a
+closed stream fails startup rather than admitting partial replay. Failure
+warnings include deferred event counts. Binding preparation and conformance
+collection consume through the marker, leaving subsequent live events unread.
+
+The adapter audit establishes the current production ordering:
+
+- Codex's inbound gate orders its provider `turn/started` after the marker,
+  even when that notification arrives on the transport before the resume RPC
+  reply. Its existing self-start handling emits the live typing edge.
+- Claude loads history and emits the marker before process initialization.
+  Its hidden post-resume bootstrap remains quarantined through its terminal
+  result and never becomes visible activity.
+- ACP holds its inbound gate through replay flush, idle normalization, marker
+  emission, and the switch to live handling. Kiro, Grok, and OpenCode share it.
+- Hermes emits replay and the marker before buffered gateway events.
+  Antigravity emits them before starting its live event-forwarding task.
+
+## Restored live turn state and desktop projection
+
+The user-visible fix is desktop `turn_active` parity plus the post-dispatch
+attach flush, not a new Codex adapter fix. The actor's pre-boundary live-event
+handling is hardening. No provider adapter is changed.
+
+Desktop applies the server's typed state from `HostBootstrap`, `NewAgent`,
+`AgentBootstrap`, and `AgentTurnStateNotify`, without loading chat to discover
+activity. An assigned session establishes completed startup, matching mobile.
+Fatal rows cannot be revived by a turn notification.
+
+Parked attaches are flushed after queued and initial follow-up dispatch so
+that the first bootstrap carries the resulting authoritative registry state.
+A Busy initial follow-up marks the provider turn active, remains queued, and
+does not disarm the ongoing turn's completion. Its end dispatches the queued
+follow-up; the final completion settles idle. Dispatch failures flush terminal
+state to parked clients.
+
+Server simulations cover completed and ongoing pre-boundary turns, Busy
+follow-ups on both sides of the marker, eager/lazy bootstraps, unattached
+notifications, and final idle. The real-DOM sidebar flow exercises typed host
+frames without an `AgentBootstrap`. Real conformance checks resumed streaming
+and tool events occur while typing is active, with idle at completion; the
+controlled Codex native-goal case covers provider-initiated turns.
+
+Shutdown, orphaned CLIs, and in-flight turn persistence remain unchanged.
 
 ## Kiro resume startup command identity
 
