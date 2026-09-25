@@ -5672,9 +5672,9 @@ async fn codex_global_settings<B: Backend>(host: &mut Harness<B>) {
     for key in changes.as_object().unwrap().keys() {
         reset["values"][key] = Value::Null;
     }
-    let (result, cleared) = save_native_settings(host, reset).await;
+    let (result, cleared_snapshot) = save_native_settings(host, reset).await;
     assert!(result.is_ok(), "reset rejected: {:?}", result);
-    let cleared = cleared.settings.expect("cleared settings");
+    let cleared = cleared_snapshot.settings.clone().expect("cleared settings");
     for key in changes.as_object().unwrap().keys() {
         assert!(
             cleared["values"].get(key).is_none(),
@@ -5688,6 +5688,29 @@ async fn codex_global_settings<B: Backend>(host: &mut Harness<B>) {
                 "unedited setting must survive: {key}"
             );
         }
+    }
+
+    // With no user override, Codex's per-model verbosity and reasoning summary
+    // defaults come only from its raw model catalog, so the page must show them.
+    assert!(
+        cleared_snapshot.advisories.is_empty(),
+        "reading Codex's model catalog must succeed, got {:?}",
+        cleared_snapshot.advisories
+    );
+    for key in ["model_verbosity", "model_reasoning_summary"] {
+        let schema = cleared_snapshot
+            .groups
+            .iter()
+            .find_map(|group| group.schema["properties"].get(key))
+            .unwrap_or_else(|| panic!("{key} is not on the settings page"));
+        let default = &schema["x-tyde-default"];
+        assert!(
+            default.is_string()
+                && schema["enum"]
+                    .as_array()
+                    .is_some_and(|options| options.contains(default)),
+            "{key} must show the selected model's catalog default, got {default:?}"
+        );
     }
 
     // A model the catalog does not describe — a custom provider model, or

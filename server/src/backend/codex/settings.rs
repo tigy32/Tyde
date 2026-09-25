@@ -1,7 +1,7 @@
 use super::*;
 use protocol::{
-    BackendConfigSnapshotStatus, BackendKind, BackendNativeSettingsGroup,
-    BackendNativeSettingsGroupKind, BackendNativeSettingsSnapshot,
+    BackendConfigSnapshotStatus, BackendKind, BackendNativeSettingsAdvisory,
+    BackendNativeSettingsGroup, BackendNativeSettingsGroupKind, BackendNativeSettingsSnapshot,
 };
 use serde::{Deserialize, Serialize};
 
@@ -215,32 +215,43 @@ fn config_value<'a>(config: &'a Value, key: &str) -> Option<&'a Value> {
 ///
 /// `model/list` reports a curated view that omits the per-model default
 /// verbosity and reasoning summary, so those come from `codex debug models`
-/// instead. Best effort by design: a missing binary, a failed run, or an
-/// unrecognized shape yields no entries, and the affected fields then report no
-/// default rather than a guessed one.
-async fn raw_model_catalog() -> serde_json::Map<String, Value> {
-    let Ok(mut command) = codex_command() else {
-        return serde_json::Map::new();
-    };
+/// instead, which prints Codex's `{"models":[...]}` catalog response. A failed
+/// read is returned so the page can report it; the affected fields then show
+/// no default rather than a guessed one.
+async fn raw_model_catalog() -> Result<serde_json::Map<String, Value>, String> {
+    #[derive(Deserialize)]
+    struct Catalog {
+        models: Vec<Value>,
+    }
+    let mut command = codex_command()?;
     command.arg("debug").arg("models");
     if let Some(path) = process_env::resolved_child_process_path() {
         command.env("PATH", path);
     }
-    let Ok(Ok(output)) = tokio::time::timeout(CODEX_CAPACITY_PROBE_TIMEOUT, command.output()).await
-    else {
-        return serde_json::Map::new();
-    };
+    let output = tokio::time::timeout(CODEX_CAPACITY_PROBE_TIMEOUT, command.output())
+        .await
+        .map_err(|_| "`codex debug models` timed out".to_owned())?
+        .map_err(|error| format!("`codex debug models` could not run: {error}"))?;
     if !output.status.success() {
-        return serde_json::Map::new();
+        return Err(format!(
+            "`codex debug models` failed ({}): {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
     }
-    let Ok(entries) = serde_json::from_slice::<Vec<Value>>(&output.stdout) else {
-        return serde_json::Map::new();
-    };
-    entries
+    let catalog: Catalog = serde_json::from_slice(&output.stdout).map_err(|error| {
+        format!("`codex debug models` printed an unrecognized catalog: {error}")
+    })?;
+    catalog
+        .models
         .into_iter()
-        .filter_map(|entry| {
-            let slug = entry.get("slug").and_then(Value::as_str)?.to_owned();
-            Some((slug, entry))
+        .map(|entry| {
+            let slug = entry
+                .get("slug")
+                .and_then(Value::as_str)
+                .ok_or("`codex debug models` listed a model without a slug")?
+                .to_owned();
+            Ok((slug, entry))
         })
         .collect()
 }
@@ -478,7 +489,21 @@ pub(crate) async fn native_settings_snapshot() -> BackendNativeSettingsSnapshot 
         let catalog = raw_model_catalog().await;
         let result = tokio::time::timeout(CODEX_CAPACITY_PROBE_TIMEOUT, async {
             let (response, models) = read_config(&rpc).await?;
-            snapshot(&response, &models, &catalog)
+            match catalog {
+                Ok(catalog) => snapshot(&response, &models, &catalog),
+                Err(error) => {
+                    tracing::warn!(%error, "Codex model catalog read failed");
+                    let mut degraded = snapshot(&response, &models, &serde_json::Map::new())?;
+                    degraded
+                        .advisories
+                        .push(BackendNativeSettingsAdvisory::BackendReported {
+                            message: format!(
+                                "Codex's per-model response defaults are unavailable: {error}"
+                            ),
+                        });
+                    Ok(degraded)
+                }
+            }
         })
         .await
         .map_err(|_| "Codex settings read timed out".to_owned())
