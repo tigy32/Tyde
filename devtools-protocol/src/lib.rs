@@ -20,6 +20,9 @@ pub struct DevInstanceMutablePath {
 
 pub const WORKFLOW_RUN_STORE_PATH_ENV: &str = "TYDE_WORKFLOW_RUN_STORE_PATH";
 pub const CONFIGURED_HOST_STORE_PATH_ENV: &str = "TYDE_CONFIGURED_HOST_STORE_PATH";
+pub const CLAUDE_CONFIG_DIR_ENV: &str = "CLAUDE_CONFIG_DIR";
+#[cfg(feature = "launcher")]
+pub const CLAUDE_SECURESTORAGE_CONFIG_DIR_ENV: &str = "CLAUDE_SECURESTORAGE_CONFIG_DIR";
 #[cfg(feature = "launcher")]
 pub const DEV_INSTANCE_HOME_ENV: &str = "HOME";
 #[cfg(feature = "launcher")]
@@ -178,7 +181,26 @@ pub const DEV_INSTANCE_MUTABLE_PATHS: &[DevInstanceMutablePath] = &[
         env: "TYDE_TRACING_DIR_PATH",
         relative_path: "tracing",
     },
+    // Plans, transcripts, and CLI state. The `.claude` leaf keeps plan paths
+    // in the `.claude/plans/` shape the Claude backend recognizes.
+    DevInstanceMutablePath {
+        env: CLAUDE_CONFIG_DIR_ENV,
+        relative_path: "claude-home/.claude",
+    },
 ];
+
+/// The parent's Claude CLI credential store, for a dev instance whose
+/// `CLAUDE_CONFIG_DIR` is isolated. The CLI keeps credentials (the
+/// `.credentials.json` file, or the macOS Keychain entry named after this
+/// directory) in `CLAUDE_SECURESTORAGE_CONFIG_DIR` when it is set; an empty
+/// value selects the default `~/.claude` store. OAuth refresh rotates the
+/// stored tokens, so the instance must share the parent's store, not a copy.
+#[cfg(feature = "launcher")]
+pub fn parent_claude_credential_store_dir() -> std::ffi::OsString {
+    std::env::var_os(CLAUDE_SECURESTORAGE_CONFIG_DIR_ENV)
+        .or_else(|| std::env::var_os(CLAUDE_CONFIG_DIR_ENV))
+        .unwrap_or_default()
+}
 
 pub fn dev_instance_mutable_paths(
     store_dir: &Path,

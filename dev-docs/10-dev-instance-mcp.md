@@ -452,6 +452,15 @@ This tool:
 5. starts background event capture
 6. returns only when the instance is actually usable
 
+Every instance runs the Claude CLI with `CLAUDE_CONFIG_DIR` set to
+`<storeDir>/claude-home/.claude`, so plans, transcripts, history, and other CLI
+state never reach the user's Claude home. Credentials are the one shared
+store: without `hermes`, `CLAUDE_SECURESTORAGE_CONFIG_DIR` names the parent's
+credential store (its own value, else its `CLAUDE_CONFIG_DIR`, else empty for
+the default `~/.claude` file or Keychain entry). OAuth refresh rotates tokens,
+so a copied credential would log the user out. With `hermes`, the variable is
+removed and the instance has no Claude credentials.
+
 The restart rule is important:
 
 - launched dev instances should disable automatic reload/watch behavior

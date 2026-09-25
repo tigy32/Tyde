@@ -9,13 +9,14 @@ use axum::{Json, Router, response::IntoResponse, routing::get};
 use client::ClientConfig;
 use command_group::{AsyncCommandGroup, AsyncGroupChild};
 use devtools_protocol::{
-    BoundedDebugOutput, DEV_INSTANCE_DENY_PROXY_URL, DEV_INSTANCE_HERMES_EXECUTABLE_ENV,
-    DEV_INSTANCE_HERMES_HOME_ENV, DEV_INSTANCE_HERMES_PYTHON_ENV, DEV_INSTANCE_HOME_ENV,
-    DEV_INSTANCE_PROVIDER_ENV_EXACT_KEYS, DebugOutputSlice,
-    DevInstanceHermesEnvironmentAttestation, DevInstanceStartupCleanup,
+    BoundedDebugOutput, CLAUDE_SECURESTORAGE_CONFIG_DIR_ENV, DEV_INSTANCE_DENY_PROXY_URL,
+    DEV_INSTANCE_HERMES_EXECUTABLE_ENV, DEV_INSTANCE_HERMES_HOME_ENV,
+    DEV_INSTANCE_HERMES_PYTHON_ENV, DEV_INSTANCE_HOME_ENV, DEV_INSTANCE_PROVIDER_ENV_EXACT_KEYS,
+    DebugOutputSlice, DevInstanceHermesEnvironmentAttestation, DevInstanceStartupCleanup,
     DisposableHermesEnvironment, PreparedDisposableHermesEnvironment, UiDebugRequest,
     UiDebugResponse, dev_instance_mutable_paths, is_provider_environment_key,
-    prepare_disposable_hermes_environment, resolve_parent_hermes_runtime,
+    parent_claude_credential_store_dir, prepare_disposable_hermes_environment,
+    resolve_parent_hermes_runtime,
 };
 use protocol::{Project, ProjectId, ProjectRootPath, ProjectSource};
 use rmcp::{
@@ -548,8 +549,13 @@ fn configure_dev_instance_environment(
         }
     }
     if hermes.is_none() {
+        command.env(
+            CLAUDE_SECURESTORAGE_CONFIG_DIR_ENV,
+            parent_claude_credential_store_dir(),
+        );
         return Ok(());
     }
+    command.env_remove(CLAUDE_SECURESTORAGE_CONFIG_DIR_ENV);
     for env in DEV_INSTANCE_PROVIDER_ENV_EXACT_KEYS {
         command.env_remove(env);
     }
