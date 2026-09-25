@@ -483,3 +483,43 @@ failing trace contained a replayed pending request but no live typing edge;
 bootstrap correctly does not replay transient typing events. As in the adjacent
 plan-approval sim, startup is now gated and the plan requested only after the
 client subscribes. All pause/await/continuation assertions remain unchanged.
+
+## Hermes clarify lifecycle
+
+`real_user_question` requires live typing-off while the unanswered question
+remains pending, exactly one cancelled completion when that question is
+abandoned, and an ordinary follow-up immediately after cancellation (without
+an artificial settlement delay). The same scenario and assertions apply to
+every backend declaring `UserQuestionRequests`.
+
+The unfixed Hermes `qwen-local` run failed the live typing assertion with
+`Some(true)` instead of `Some(false)`. Hermes now emits typing-off at the
+blocking `clarify.request` and typing-on after accepting the answer. The
+concurrent reload fix in `302039e7` also closes the provider response before
+the blocking request, retaining the native turn and attaching late usage to
+the closed message. That implementation superseded the initial typing-only
+fix here; it is retained rather than duplicated.
+
+Cancellation exposed two native boundaries. `session.interrupt` acknowledges
+before the clarify worker has settled history, so an immediate follow-up can
+be treated as a redirect into the cancelled turn. The bridge now waits for
+that worker only when interrupting a pending clarify. Ordinary interrupts
+keep their existing behavior. Once settled, Hermes's synthesized assistant
+interruption notice lacks a native Responses message sidecar. Its serializer
+emitted that notice as an untyped assistant input item, which the local
+llama.cpp Responses endpoint rejected with HTTP 400, `Cannot determine type
+of 'item'`. Content-free instrumentation showed no untyped assistant items in
+requests 1–6, then one in the failing post-cancellation request 7. The bridge
+uses Hermes's own typed message serializer for these assistant notices,
+retaining their text and all preceding conversation and tool results. Native
+typed response items, reasoning items, and Chat Completions are untouched.
+
+Select the host's existing Hermes profile with
+`TYDE_HERMES_TEST_PROFILE=qwen-local`. That profile currently uses Chat
+Completions, so Responses coverage additionally uses a disposable Hermes home
+with a named custom provider pointing at the same local model and explicitly
+selecting `codex_responses`. Set `HERMES_HOME` to that disposable home and
+`TYDE_HERMES_TEST_PROFILE=default`; copy credentials directly into its private
+configuration without printing them. The local Responses run reproduced the
+HTTP 400 after the settlement fix and before the serializer fix. Both
+transports exercise the real model, not a stub or canned gateway.

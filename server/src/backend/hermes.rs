@@ -156,6 +156,59 @@ def _tyde_get_usage(agent):
         usage["reasoning_tokens"] = int(getattr(agent, "session_reasoning_tokens", 0) or 0)
     return usage
 
+from agent import codex_responses_adapter as _tyde_responses
+_tyde_original_responses_input = _tyde_responses._chat_messages_to_responses_input
+
+def _tyde_responses_input(*args, **kwargs):
+    items = _tyde_original_responses_input(*args, **kwargs)
+    typed_notices = 0
+    for index, item in enumerate(items):
+        if item.get("role") == "assistant" and "type" not in item:
+            # Interrupted-turn notices have no native Responses message sidecar.
+            content = item["content"]
+            if isinstance(content, str):
+                content = [{"type": "output_text", "text": content}]
+            items[index] = _tyde_responses._message_item(content, status="completed")
+            typed_notices += 1
+    if typed_notices:
+        print(
+            f"TYDE HERMES RESPONSES typed_assistant_notices={typed_notices}",
+            file=sys.stderr, flush=True,
+        )
+    return items
+
+_tyde_responses._chat_messages_to_responses_input = _tyde_responses_input
+
+def _tyde_history_shape(history):
+    return [
+        {
+            "role": entry.get("role") if entry.get("role") in ("system", "user", "assistant", "tool") else "other",
+            "item_type": entry.get("type") if entry.get("type") in ("message", "reasoning", "function_call", "function_call_output") else "untyped",
+            "content_type": type(entry.get("content")).__name__,
+            "content_empty": not bool(entry.get("content")),
+            "tool_calls": len(entry.get("tool_calls") or []),
+            "tool_result": bool(entry.get("tool_call_id")),
+        }
+        for entry in history if isinstance(entry, dict)
+    ]
+
+import httpx as _tyde_httpx
+import json as _tyde_json
+_tyde_original_http_send = _tyde_httpx.Client.send
+
+def _tyde_http_send(client, request, *args, **kwargs):
+    if request.url.path.endswith(("/chat/completions", "/responses")):
+        body = _tyde_json.loads(request.content)
+        messages = body.get("messages", body.get("input", []))
+        print(
+            f"TYDE HERMES REQUEST SHAPE responses={request.url.path.endswith('/responses')} "
+            f"history={_tyde_history_shape(messages) if isinstance(messages, list) else 'text'}",
+            file=sys.stderr, flush=True,
+        )
+    return _tyde_original_http_send(client, request, *args, **kwargs)
+
+_tyde_httpx.Client.send = _tyde_http_send
+
 def _tyde_make_agent(*args, **kwargs):
     agent = _tyde_original_make_agent(*args, **kwargs)
     tyde_prompt = os.environ.get("TYDE_HERMES_SYSTEM_PROMPT", "").strip()
@@ -189,7 +242,14 @@ def _tyde_make_agent(*args, **kwargs):
             f"history_roles={[entry.get('role') for entry in history if isinstance(entry, dict)]}",
             file=sys.stderr, flush=True,
         )
-        return original_run_conversation(*run_args, **run_kwargs)
+        result = original_run_conversation(*run_args, **run_kwargs)
+        if isinstance(result, dict):
+            print(
+                f"TYDE HERMES RESULT SHAPE interrupted={bool(result.get('interrupted'))} "
+                f"history={_tyde_history_shape(result.get('messages') or [])}",
+                file=sys.stderr, flush=True,
+            )
+        return result
     agent.run_conversation = _tyde_run_conversation
     original_buffer_status = getattr(agent, "_buffer_status", None)
     original_buffer_vprint = getattr(agent, "_buffer_vprint", None)
@@ -321,6 +381,34 @@ def _tyde_on_tool_start(session_id, tool_call_id, name, args):
     if isinstance(args, dict):
         _tyde_tool_start_args[(session_id, str(tool_call_id))] = args
     _tyde_original_tool_start(session_id, tool_call_id, name, args)
+
+_tyde_original_interrupt = _tyde_gateway_server._methods["session.interrupt"]
+
+def _tyde_interrupt(rid, params):
+    sid = params.get("session_id")
+    with _tyde_gateway_server._prompt_lock:
+        pending_clarify = any(
+            owner == sid and _tyde_gateway_server._pending_prompt_payloads[request_id][0] == "clarify.request"
+            for request_id, (owner, event) in _tyde_gateway_server._pending.items()
+        )
+    session = _tyde_gateway_server._sessions.get(sid)
+    worker = session.get("_run_thread") if session is not None else None
+    response = _tyde_original_interrupt(rid, params)
+    if pending_clarify and "error" not in response:
+        print(
+            f"TYDE HERMES CLARIFY INTERRUPT worker_present={worker is not None}",
+            file=sys.stderr, flush=True,
+        )
+        if worker is None:
+            return _tyde_gateway_server._err(rid, 5000, "Hermes clarify interrupt has no turn worker")
+        # Native interrupt only requests cancellation; the worker still owns history.
+        worker.join(timeout=60)
+        if worker.is_alive():
+            return _tyde_gateway_server._err(rid, 5000, "Hermes clarify interrupt did not settle within 60 seconds")
+        print("TYDE HERMES CLARIFY INTERRUPT settled", file=sys.stderr, flush=True)
+    return response
+
+_tyde_gateway_server._methods["session.interrupt"] = _tyde_interrupt
 
 _tyde_original_session_row_summary = _tyde_gateway_server._session_row_summary
 
@@ -5807,6 +5895,11 @@ impl HermesEventMapper {
             request_id,
             questions: questions.clone(),
         });
+        tracing::debug!(
+            typing_active = self.typing_active,
+            stream_open = self.current_message_id.is_some(),
+            "Hermes waiting for a blocking clarify answer"
+        );
         Ok(self.await_user_response(ToolRequest {
             tool_call_id,
             tool_name: "clarify".to_string(),

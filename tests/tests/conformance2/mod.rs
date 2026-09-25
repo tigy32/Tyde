@@ -401,6 +401,9 @@ impl Profile {
     }
 
     pub fn hermes() -> Self {
+        if let Ok(profile) = std::env::var("TYDE_HERMES_TEST_PROFILE") {
+            return Self::new(&[], &[("profile", &profile)]);
+        }
         let provider =
             std::env::var("TYDE_HERMES_TEST_PROVIDER").unwrap_or_else(|_| "openrouter".to_owned());
         let model = std::env::var("TYDE_HERMES_TEST_MODEL")
@@ -1070,6 +1073,29 @@ pub async fn cancel_turn<B: Backend>(host: &mut Harness<B>, _agent: &Agent) -> V
         "backend refused to interrupt the active turn"
     );
     drain_events_for(host, Duration::from_secs(10)).await
+}
+
+pub async fn cancel_question<B: Backend>(host: &mut Harness<B>) -> Vec<ChatEvent> {
+    assert!(
+        host.backend
+            .as_ref()
+            .expect("backend must be running")
+            .interrupt()
+            .await,
+        "backend refused to interrupt the pending question"
+    );
+    let deadline = tokio::time::Instant::now() + INTERRUPT_DEADLINE;
+    let mut events = Vec::new();
+    let mut cancelled = false;
+    while let Some(event) = host.next_chat(deadline).await {
+        cancelled |= matches!(event, ChatEvent::OperationCancelled(_));
+        let idle = matches!(event, ChatEvent::TypingStatusChanged(false));
+        events.push(event);
+        if cancelled && idle {
+            return events;
+        }
+    }
+    panic!("pending question cancellation did not settle");
 }
 
 pub async fn interrupt_turn<B: Backend>(

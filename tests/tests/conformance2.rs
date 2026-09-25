@@ -2915,6 +2915,18 @@ async fn real_user_question<B: Backend>(host: &mut Harness<B>) {
     let asked = ask_question(host, &agent, &question_prompt()).await;
     assert_question_shape(&asked);
     assert_question_waits_for_an_answer(&asked);
+    assert_eq!(
+        asked
+            .events()
+            .iter()
+            .filter_map(|event| match event {
+                ChatEvent::TypingStatusChanged(active) => Some(*active),
+                _ => None,
+            })
+            .next_back(),
+        Some(false),
+        "awaiting a user answer must stop live typing before the answer arrives"
+    );
     assert_blocking_question_leaves_no_open_response(&asked);
 
     // Answering with a label the provider actually offered, so this
@@ -2931,8 +2943,20 @@ async fn real_user_question<B: Backend>(host: &mut Harness<B>) {
     // one path where a card and a turn can be terminalized out of step.
     let abandoned = ask_question(host, &agent, &question_prompt()).await;
     assert_question_shape(&abandoned);
-    let cancelled = cancel_turn(host, &agent).await;
+    let cancelled = cancel_question(host).await;
     assert_no_error_message(&format!("{:?} question cancel", host.backend()), &cancelled);
+    assert_eq!(
+        cancelled
+            .iter()
+            .filter(|event| matches!(event,
+                ChatEvent::ToolExecutionCompleted(completion)
+                    if completion.tool_call_id == abandoned.tool_call_id()
+                    && matches!(completion.outcome, ToolExecutionOutcome::Cancelled { .. })
+            ))
+            .count(),
+        1,
+        "cancelling must retire the unanswered question exactly once"
+    );
 
     // The assertion the wedge costs: a cancelled question must leave an
     // agent that still works. A latched turn queues every later message
