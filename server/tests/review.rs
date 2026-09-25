@@ -5429,6 +5429,7 @@ async fn configured_reviews_are_awaited_without_injecting_parent_messages() {
         .await
         .expect("close review requester");
     let mut closed = std::collections::HashSet::new();
+    let mut closed_order = Vec::new();
     next_frame_matching_on(
         &mut closing_client,
         "requester closes its reviewers",
@@ -5436,6 +5437,7 @@ async fn configured_reviews_are_awaited_without_injecting_parent_messages() {
             if env.kind == FrameKind::AgentClosed {
                 let payload: protocol::AgentClosedPayload =
                     env.parse_payload().expect("closed agent");
+                closed_order.push(payload.agent_id.clone());
                 closed.insert(payload.agent_id);
             }
             expected_closed.is_subset(&closed)
@@ -5454,6 +5456,7 @@ async fn configured_reviews_are_awaited_without_injecting_parent_messages() {
         .expect("backlogged host bootstrap");
     let mut backlogged_bootstraps = std::collections::HashSet::new();
     let mut backlogged_closed = std::collections::HashSet::new();
+    let mut backlogged_closed_order = Vec::new();
     next_frame_matching_on(&mut backlogged, "backlogged reviewer closure", |env| {
         if env.kind == FrameKind::AgentBootstrap {
             backlogged_bootstraps.insert(env.stream.clone());
@@ -5470,11 +5473,16 @@ async fn configured_reviews_are_awaited_without_injecting_parent_messages() {
                     "AgentClosed must follow the advertised agent bootstrap even with backpressure"
                 );
             }
+            backlogged_closed_order.push(payload.agent_id.clone());
             backlogged_closed.insert(payload.agent_id);
         }
         expected_closed.is_subset(&backlogged_closed)
     })
     .await;
+    assert_eq!(
+        backlogged_closed_order, closed_order,
+        "Observers must receive closures in the same server-emitted order"
+    );
     eprintln!(
         "Backlogged reviewer lifecycle: bootstraps={}, closures={}",
         backlogged_bootstraps.len(),

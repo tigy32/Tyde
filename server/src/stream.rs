@@ -166,9 +166,36 @@ impl OutputQueue {
         }
     }
     fn pop_lane(queues: &mut Queues, lane: OutputLane) -> Option<QueuedOutput> {
-        let position = Self::queue(queues, lane)
-            .iter()
-            .position(|candidate| Self::eligible(queues, candidate));
+        let mut earlier_closure = false;
+        let position = Self::queue(queues, lane).iter().position(|candidate| {
+            if candidate.frame.envelope.kind == FrameKind::AgentClosed {
+                // Preserve host post-order without copying bootstrap tokens:
+                // only the first queued closure may become eligible, while
+                // non-closure frames can still drain its prerequisites.
+                if earlier_closure {
+                    return false;
+                }
+                earlier_closure = true;
+            }
+            Self::eligible(queues, candidate)
+        });
+        if let Some(position) = position {
+            let queue = Self::queue(queues, lane);
+            if queue[position].frame.envelope.kind == FrameKind::AgentClosed {
+                let blocked_closures = queue
+                    .iter()
+                    .take(position)
+                    .filter(|item| item.frame.envelope.kind == FrameKind::AgentClosed)
+                    .count();
+                if blocked_closures != 0 {
+                    tracing::warn!(
+                        blocked_closures,
+                        ?lane,
+                        "agent closure overtook earlier blocked closures"
+                    );
+                }
+            }
+        }
         let item = position.and_then(|position| Self::queue_mut(queues, lane).remove(position));
         if let Some(item) = &item {
             if item.frame.envelope.kind == FrameKind::AgentClosed {

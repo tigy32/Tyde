@@ -5116,6 +5116,7 @@ async fn agent_control_http_credentials_scope_every_child_tool() {
             "Denied closes must leave every agent open"
         );
     }
+    let (mut backlogged, release_output) = fixture.connect_with_paused_output().await;
     let closed = mcp_tool_call_as(
         &caller_a,
         false,
@@ -5140,6 +5141,40 @@ async fn agent_control_http_credentials_scope_every_child_tool() {
                 .agent_id,
             expected,
             "Descendants must close before their parent"
+        );
+    }
+    release_output.send(()).expect("release subtree observer");
+    let backlogged_host = fixture::next_frame_matching_on(
+        &mut backlogged,
+        "backlogged subtree registration",
+        |env| env.kind == FrameKind::HostBootstrap,
+    )
+    .await
+    .parse_payload::<HostBootstrapPayload>()
+    .expect("backlogged host bootstrap");
+    let mut bootstrapped = std::collections::HashSet::new();
+    for expected in [&grandchild, &child_a] {
+        let event =
+            fixture::next_frame_matching_on(&mut backlogged, "backlogged subtree close", |env| {
+                if env.kind == FrameKind::AgentBootstrap {
+                    bootstrapped.insert(env.stream.clone());
+                }
+                env.kind == FrameKind::AgentClosed
+            })
+            .await;
+        let closed = event.parse_payload::<AgentClosedPayload>().unwrap();
+        assert_eq!(
+            &closed.agent_id, expected,
+            "Backpressure must preserve descendant-before-parent closure order"
+        );
+        let advertised = backlogged_host
+            .agents
+            .iter()
+            .find(|agent| &agent.agent_id == expected)
+            .expect("subtree advertised before close");
+        assert!(
+            bootstrapped.contains(&advertised.instance_stream),
+            "Closure must follow the advertised agent bootstrap"
         );
     }
     assert!(
