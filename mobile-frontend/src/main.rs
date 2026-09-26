@@ -1,6 +1,7 @@
 pub mod actions;
 mod app;
 mod bridge;
+mod bundle;
 mod components;
 mod dispatch;
 #[cfg(all(feature = "ui-fixtures", debug_assertions))]

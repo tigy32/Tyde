@@ -2,6 +2,7 @@
 //! dialogs. The browser talks directly to hosts over WebRTC-over-WebSocket,
 //! persists pairing data in IndexedDB, and delivers events in process.
 
+pub(crate) mod loader;
 pub(crate) mod web;
 
 use serde::{Deserialize, Serialize};
@@ -192,11 +193,9 @@ pub fn take_pending_pairing_uri() -> Option<String> {
     web::take_pending_pairing_uri()
 }
 
-/// Asks the PWA loader to reboot into the host's exact published
-/// bundle (identified by `release_version`) after an incompatible-protocol
-/// reject, so an already-paired host self-heals without a re-scan. Synchronous:
-/// it dispatches the DOM `tyde:repair-version` CustomEvent the loader listens
-/// for.
+/// Historical event encoder retained for the loader compatibility test.
+/// Current clients use the selected-host prepare/commit bridge instead.
+#[cfg(all(test, target_arch = "wasm32"))]
 pub fn request_loader_repair_version(release_version: &str) {
     web::request_loader_repair_version(release_version);
 }

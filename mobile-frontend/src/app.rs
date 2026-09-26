@@ -41,9 +41,9 @@ pub fn App() -> impl IntoView {
     crate::components::settings_view::restore_appearance(&state);
     provide_context(state.clone());
 
+    crate::bundle::restore_selection(&state);
     install_event_listeners(state.clone());
     install_page_visibility_recovery(state.clone());
-    spawn_initial_paired_hosts_load(state.clone());
     install_app_mode_effect(state.clone());
     spawn_boot_pairing_handoff(state.clone());
     spawn_heartbeat_loop(state.clone());
@@ -64,6 +64,7 @@ pub fn FixtureApp() -> impl IntoView {
 #[component]
 fn AppSurface() -> impl IntoView {
     let state = use_context::<AppState>().unwrap();
+    crate::bundle::install(state.clone());
     mirror_theme_to_document(state.clone());
     let root = NodeRef::<leptos::html::Div>::new();
     crate::shell::install(root);
@@ -392,6 +393,7 @@ fn install_app_mode_effect(state: AppState) {
 /// fresh scan. Invalid stashed QRs are rejected rather than trusted as loader
 /// decisions.
 fn spawn_boot_pairing_handoff(state: AppState) {
+    state.boot_handoff_complete.set(false);
     let pending_qr_uri = bridge::take_pending_pairing_uri();
     spawn_local(async move {
         let callback_auth = bridge::complete_boot_managed_auth_callback().await;
@@ -416,6 +418,7 @@ fn spawn_boot_pairing_handoff(state: AppState) {
                 }
             }
         }
+        state.boot_handoff_complete.set(true);
     });
 }
 
@@ -462,23 +465,6 @@ fn apply_boot_auth_without_pending(state: &AppState, auth: MobileServiceAuthStat
             log::warn!("Tyggs OAuth callback did not produce a terminal auth state");
         }
     }
-}
-
-fn spawn_initial_paired_hosts_load(state: AppState) {
-    spawn_local(async move {
-        match bridge::list_paired_hosts().await {
-            Ok(hosts) => apply_paired_hosts_list(&state, hosts),
-            Err(error) => {
-                log::error!("list_paired_hosts failed: {error}");
-                // Phase C HIGH 4: surface to the user, not just console.
-                report_shell_error(
-                    &state,
-                    MobileAccessErrorCode::Internal,
-                    format!("Failed to load paired hosts: {error}"),
-                );
-            }
-        }
-    });
 }
 
 fn report_shell_error(state: &AppState, code: MobileAccessErrorCode, message: String) {
@@ -576,6 +562,19 @@ fn install_event_listeners(state: AppState) {
             })
             .await,
         );
+
+        // Resolve selection before transport status replay can start any handshake.
+        match bridge::list_paired_hosts().await {
+            Ok(hosts) => apply_paired_hosts_list(&state, hosts),
+            Err(error) => {
+                report_shell_error(
+                    &state,
+                    MobileAccessErrorCode::Internal,
+                    format!("Failed to load paired hosts: {error}"),
+                );
+                return;
+            }
+        }
 
         let known_connection_instance_ids = state
             .active_connection_instance_ids
@@ -826,6 +825,17 @@ pub fn apply_paired_hosts_list(state: &AppState, hosts: Vec<PairedHostSummary>) 
     {
         state.active_local_host_id.set(None);
     }
+    if state.active_local_host_id.get_untracked().is_none()
+        && state.paired_hosts.get_untracked().len() == 1
+    {
+        state.active_local_host_id.set(
+            state
+                .paired_hosts
+                .get_untracked()
+                .first()
+                .map(|host| host.local_host_id.clone()),
+        );
+    }
 }
 
 fn apply_connection_status(
@@ -888,10 +898,6 @@ fn apply_connection_status(
                     };
                     m.insert(host.clone(), status);
                 });
-                // Same live connection: just ensure a host is selected.
-                if state.active_local_host_id.get_untracked().is_none() {
-                    state.active_local_host_id.set(Some(host.clone()));
-                }
                 drain_pending_host_lines(state.clone());
                 return;
             }
@@ -900,6 +906,9 @@ fn apply_connection_status(
                 m.insert(host.clone(), ConnectionStatus::Bootstrapping);
             });
             state.bootstrapped_host_streams.update(|m| {
+                m.remove(&host);
+            });
+            state.host_releases.update(|m| {
                 m.remove(&host);
             });
             // New or changed connection: allocate a fresh host stream and
@@ -967,9 +976,6 @@ fn apply_connection_status(
                     log::warn!("failed to send initial heartbeat to {host_for_hello}: {error}");
                 }
             });
-            if state.active_local_host_id.get_untracked().is_none() {
-                state.active_local_host_id.set(Some(host));
-            }
             drain_pending_host_lines(state.clone());
         }
         PairedHostConnectionStatus::Disconnected { reason } => {
@@ -994,6 +1000,9 @@ fn apply_connection_status(
             apply_disconnect(state, &host, Some(message));
         }
         PairedHostConnectionStatus::Connecting => {
+            state.host_releases.update(|m| {
+                m.remove(&host);
+            });
             state.connection_statuses.update(|m| {
                 m.insert(host.clone(), ConnectionStatus::Connecting);
             });
@@ -1023,6 +1032,16 @@ fn apply_host_error(state: &AppState, host: LocalHostId, message: String) {
 }
 
 fn apply_disconnect(state: &AppState, host: &LocalHostId, _reason: Option<String>) {
+    // A terminal rejection remains the sticky handshake verdict, even when
+    // that rejected socket closes. A Welcome is authority only while live.
+    state.host_releases.update(|m| {
+        if matches!(
+            m.get(host),
+            Some(crate::bundle::HostRelease::Welcome { .. })
+        ) {
+            m.remove(host);
+        }
+    });
     crate::voice::transport_lost(state, host);
     state.active_connection_instance_ids.update(|m| {
         m.remove(host);
@@ -1216,6 +1235,385 @@ mod wasm_tests {
         let container = document.create_element("div").unwrap();
         document.body().unwrap().append_child(&container).unwrap();
         container.dyn_into::<HtmlElement>().unwrap()
+    }
+
+    #[wasm_bindgen::prelude::wasm_bindgen(module = "/src/bridge/loader-test.js")]
+    extern "C" {
+        #[wasm_bindgen(js_name = install)]
+        fn install_loader_boundary();
+        #[wasm_bindgen(js_name = finish)]
+        fn finish_loader_prepare(index: u32, reason: &str);
+        #[wasm_bindgen(js_name = preparations)]
+        fn loader_preparations() -> u32;
+        #[wasm_bindgen(js_name = reloads)]
+        fn loader_reloads() -> u32;
+        #[wasm_bindgen(js_name = ownsTarget)]
+        fn loader_owns_target(host: &str, version: &str) -> bool;
+        #[wasm_bindgen(js_name = noTarget)]
+        fn loader_no_target() -> bool;
+        #[wasm_bindgen(js_name = restore)]
+        fn restore_loader_boundary();
+    }
+
+    #[wasm_bindgen_test]
+    async fn compatible_welcome_defers_exact_release_switch_without_losing_draft() {
+        install_loader_boundary();
+        let _sends = bridge::test_clean_sends();
+        let state = AppState::new();
+        let host = LocalHostId("bundle-selected".into());
+        let stream = make_host_stream();
+        state.app_mode.set(AppMode::Workspace);
+        state.active_local_host_id.set(Some(host.clone()));
+        state.host_streams.update(|m| {
+            m.insert(host.clone(), stream.clone());
+        });
+        state.chat_input.set("unsent draft".into());
+        let container = make_container();
+        let mounted_state = state.clone();
+        let handle = mount_to(container.clone(), move || {
+            provide_context(mounted_state);
+            view! { <AppSurface /> }
+        });
+        dispatch_envelope(
+            &state,
+            &host,
+            protocol::Envelope::from_payload(
+                stream,
+                FrameKind::Welcome,
+                0,
+                &protocol::WelcomePayload {
+                    protocol_version: protocol::PROTOCOL_VERSION,
+                    tyde_version: protocol::TYDE_VERSION,
+                    release_version: Some(
+                        protocol::TydeReleaseVersion::parse("0.9.4-beta.12").unwrap(),
+                    ),
+                },
+            )
+            .unwrap(),
+        );
+        next_tick().await;
+        assert!(
+            container
+                .text_content()
+                .unwrap_or_default()
+                .contains("Finish or save"),
+            "a compatible Welcome must visibly defer exact-host switching while a draft exists"
+        );
+        assert!(
+            state.chat_input.get_untracked() == "unsent draft",
+            "draft is retained"
+        );
+        assert_eq!(loader_preparations(), 0);
+
+        let background = LocalHostId("bundle-background".into());
+        let background_stream = make_host_stream();
+        state.host_streams.update(|m| {
+            m.insert(background.clone(), background_stream.clone());
+        });
+        dispatch_envelope(
+            &state,
+            &background,
+            protocol::Envelope::from_payload(
+                background_stream,
+                FrameKind::Reject,
+                0,
+                &protocol::RejectPayload {
+                    code: protocol::RejectCode::IncompatibleProtocol,
+                    message: "test mismatch".into(),
+                    server_protocol_version: protocol::PROTOCOL_VERSION + 1,
+                    server_tyde_version: protocol::TYDE_VERSION,
+                    release_version: Some(
+                        protocol::TydeReleaseVersion::parse("0.9.4-beta.13").unwrap(),
+                    ),
+                },
+            )
+            .unwrap(),
+        );
+        next_tick().await;
+        assert_eq!(
+            loader_preparations(),
+            0,
+            "background rejection must never switch"
+        );
+        state.active_local_host_id.set(Some(background.clone()));
+        next_tick().await;
+        assert!(
+            container
+                .text_content()
+                .unwrap_or_default()
+                .contains("Finish or save")
+        );
+        assert!(
+            loader_owns_target(&background.0, "0.9.4-beta.13"),
+            "deferred selected host must own the next cold boot"
+        );
+        assert_eq!(loader_preparations(), 0);
+        state.active_local_host_id.set(None);
+        next_tick().await;
+        assert!(
+            loader_no_target(),
+            "picker must not retain a deselected target"
+        );
+        state.active_local_host_id.set(Some(host.clone()));
+        next_tick().await;
+        assert!(loader_owns_target(&host.0, "0.9.4-beta.12"));
+        state.viewing_chat.set(true);
+        state.chat_input.set(String::new());
+        next_tick().await;
+        assert_eq!(
+            loader_preparations(),
+            0,
+            "mounted composer may own attachments or queued edits"
+        );
+        state.viewing_chat.set(false);
+        state.session_settings_open.set(true);
+        next_tick().await;
+        assert_eq!(loader_preparations(), 0, "settings editor must defer");
+        state.session_settings_open.set(false);
+        state.voice_ui.set(crate::voice::MobileVoiceState::Failed(
+            "voice recovery".into(),
+        ));
+        next_tick().await;
+        assert_eq!(loader_preparations(), 0, "voice recovery must defer");
+        state.hold_submission(crate::state::PendingSubmission {
+            local_submission_id: bridge::LocalSubmissionId(9999),
+            origin: state.mint_submission_origin(),
+            local_host_id: host.clone(),
+            connection_instance_id: 17,
+            target: crate::state::SubmissionTarget::NewChat,
+            text: "pending fixture".into(),
+            images: Vec::new(),
+            tool_response: None,
+            state: crate::state::PendingSubmissionState::QueuedLocally,
+        });
+        state.voice_ui.set(crate::voice::MobileVoiceState::Idle);
+        next_tick().await;
+        assert_eq!(loader_preparations(), 0, "pending submissions must defer");
+        state.apply_submission_outcome(
+            bridge::LocalSubmissionId(9999),
+            17,
+            bridge::SubmissionTransportOutcome::TransportAcknowledged,
+        );
+        state.boot_handoff_complete.set(false);
+        next_tick().await;
+        assert_eq!(
+            loader_preparations(),
+            0,
+            "boot auth must finish before switching"
+        );
+        state.boot_handoff_complete.set(true);
+        next_tick().await;
+        assert_eq!(loader_preparations(), 1);
+        assert!(
+            container
+                .text_content()
+                .unwrap()
+                .contains("Preparing exact host release")
+        );
+        state.active_local_host_id.set(Some(background.clone()));
+        next_tick().await;
+        assert_eq!(
+            loader_preparations(),
+            2,
+            "selection must choose the background rejection now"
+        );
+        finish_loader_prepare(0, "");
+        next_tick().await;
+        assert_eq!(loader_reloads(), 0, "superseded preparation cannot reload");
+        finish_loader_prepare(1, "unpublished");
+        next_tick().await;
+        assert!(
+            container
+                .text_content()
+                .unwrap()
+                .contains("has not been published")
+        );
+        assert_eq!(loader_reloads(), 0);
+        state.active_local_host_id.set(Some(host.clone()));
+        next_tick().await;
+        assert_eq!(loader_preparations(), 3, "deliberate A > B > A is allowed");
+        // A new draft can race the promise completion before effects flush.
+        state.chat_input.set("new unsent draft".into());
+        finish_loader_prepare(2, "");
+        next_tick().await;
+        assert_eq!(loader_reloads(), 0);
+        assert!(
+            state.chat_input.get_untracked() == "new unsent draft",
+            "new draft is retained"
+        );
+        state.chat_input.set(String::new());
+        next_tick().await;
+        assert_eq!(loader_preparations(), 4);
+        apply_disconnect(&state, &host, None);
+        finish_loader_prepare(3, "");
+        next_tick().await;
+        assert_eq!(loader_reloads(), 0, "disconnected Welcome loses authority");
+        assert!(
+            !container
+                .text_content()
+                .unwrap()
+                .contains("Preparing exact host release")
+        );
+
+        let stream = make_host_stream();
+        state.host_streams.update(|m| {
+            m.insert(host.clone(), stream.clone());
+        });
+        dispatch_envelope(
+            &state,
+            &host,
+            protocol::Envelope::from_payload(
+                stream.clone(),
+                FrameKind::Welcome,
+                0,
+                &protocol::WelcomePayload {
+                    protocol_version: protocol::PROTOCOL_VERSION,
+                    tyde_version: protocol::TYDE_VERSION,
+                    release_version: Some(
+                        protocol::TydeReleaseVersion::parse("0.9.4-beta.11").unwrap(),
+                    ),
+                },
+            )
+            .unwrap(),
+        );
+        next_tick().await;
+        assert_eq!(
+            loader_preparations(),
+            4,
+            "same exact executing release does not reload"
+        );
+        reset_inbound_seq_for_host(&host);
+        dispatch_envelope(
+            &state,
+            &host,
+            protocol::Envelope::from_payload(
+                stream,
+                FrameKind::Welcome,
+                0,
+                &protocol::WelcomePayload {
+                    protocol_version: protocol::PROTOCOL_VERSION,
+                    tyde_version: protocol::TYDE_VERSION,
+                    release_version: None,
+                },
+            )
+            .unwrap(),
+        );
+        next_tick().await;
+        assert!(
+            container
+                .text_content()
+                .unwrap()
+                .contains("did not advertise a release")
+        );
+        assert_eq!(loader_preparations(), 4);
+        state.active_local_host_id.set(Some(background));
+        next_tick().await;
+        assert_eq!(loader_preparations(), 5);
+        finish_loader_prepare(4, "");
+        next_tick().await;
+        assert_eq!(
+            loader_reloads(),
+            1,
+            "safe selected-host switch commits once"
+        );
+        js_sys::Reflect::set(
+            &web_sys::window().unwrap(),
+            &"__tydeLoader".into(),
+            &wasm_bindgen::JsValue::NULL,
+        )
+        .unwrap();
+        state.active_tab.set(MobileTab::Settings);
+        next_tick().await;
+        assert!(
+            container
+                .text_content()
+                .unwrap()
+                .contains("no compatible release loader")
+        );
+        assert_eq!(loader_reloads(), 1, "missing bridge never reloads");
+        drop(handle);
+        restore_loader_boundary();
+        container.remove();
+    }
+
+    #[wasm_bindgen_test]
+    async fn bundle_selection_survives_replay_and_multiple_hosts_require_a_choice() {
+        install_loader_boundary();
+        let _sends = bridge::test_clean_sends();
+        let state = AppState::new();
+        state.app_mode.set(AppMode::Workspace);
+        let a = fixture_host("bundle-choice-a", "First host");
+        let b = fixture_host("bundle-choice-b", "Second host");
+        let c = fixture_host("bundle-choice-c", "Third host");
+        crate::bridge::loader::save_selection(Some(&b.local_host_id)).unwrap();
+        crate::bundle::restore_selection(&state);
+        apply_paired_hosts_list(&state, vec![a.clone(), b.clone(), c.clone()]);
+        let container = make_container();
+        let mounted = state.clone();
+        let handle = mount_to(container.clone(), move || {
+            provide_context(mounted);
+            view! { <AppSurface /> }
+        });
+        apply_connection_status(
+            &state,
+            a.local_host_id.clone(),
+            PairedHostConnectionStatus::Connected,
+            Some(101),
+        );
+        next_tick().await;
+        assert!(container.text_content().unwrap().contains("Second host"));
+        assert_eq!(
+            state.active_local_host_id.get_untracked(),
+            Some(b.local_host_id.clone())
+        );
+        let stream = make_host_stream();
+        state.host_streams.update(|streams| {
+            streams.insert(b.local_host_id.clone(), stream.clone());
+        });
+        dispatch_envelope(
+            &state,
+            &b.local_host_id,
+            protocol::Envelope::from_payload(
+                stream,
+                FrameKind::Welcome,
+                0,
+                &protocol::WelcomePayload {
+                    protocol_version: protocol::PROTOCOL_VERSION,
+                    tyde_version: protocol::TYDE_VERSION,
+                    release_version: Some(
+                        protocol::TydeReleaseVersion::parse("0.9.4-beta.11").unwrap(),
+                    ),
+                },
+            )
+            .unwrap(),
+        );
+        next_tick().await;
+        assert!(loader_owns_target(&b.local_host_id.0, "0.9.4-beta.11"));
+        apply_paired_hosts_list(&state, vec![a.clone(), c]);
+        next_tick().await;
+        assert!(
+            loader_no_target(),
+            "forgetting the owner must retire its cold-boot target"
+        );
+        apply_connection_status(
+            &state,
+            b.local_host_id.clone(),
+            PairedHostConnectionStatus::Connected,
+            Some(102),
+        );
+        next_tick().await;
+        assert!(container.text_content().unwrap().contains("Pick a Host"));
+        assert!(state.active_local_host_id.get_untracked().is_none());
+        apply_paired_hosts_list(&state, vec![a.clone()]);
+        next_tick().await;
+        assert!(container.text_content().unwrap().contains("First host"));
+        assert_eq!(
+            state.active_local_host_id.get_untracked(),
+            Some(a.local_host_id)
+        );
+        drop(handle);
+        container.remove();
+        restore_loader_boundary();
     }
 
     async fn next_tick() {

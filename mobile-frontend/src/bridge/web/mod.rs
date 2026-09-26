@@ -469,18 +469,9 @@ fn request_loader_repair(qr_uri: &str) {
 #[cfg(not(target_arch = "wasm32"))]
 fn request_loader_repair(_qr_uri: &str) {}
 
-/// Dispatch the PWA loader's `tyde:repair-version` event carrying the host's
-/// validated release version so the loader forgets the stale remembered bundle
-/// and reboots into the version-matched one (see `web/loader/loader.js`
-/// `onRepairVersion`). Unlike [`request_loader_repair`], this carries no
-/// pairing URI — the reconnect path already has the paired host stored in
-/// IndexedDB, so the rebooted bundle restores it and reconnects without a
-/// re-scan. Best-effort: any failure (no window, CustomEvent unavailable)
-/// leaves the sticky `UpdateRequired` error as the visible surface.
-///
-/// wasm-only for the same reason as [`request_loader_repair`]: `web_sys::window`
-/// is a wasm-bindgen import, and the native build (unit tests) gets a no-op.
-#[cfg(target_arch = "wasm32")]
+/// Historical bundles still emit this event; retain its browser compatibility
+/// fixture without exposing an unconditional reload path to current dispatch.
+#[cfg(all(test, target_arch = "wasm32"))]
 pub fn request_loader_repair_version(release_version: &str) {
     let Some(window) = web_sys::window() else {
         return;
@@ -492,9 +483,6 @@ pub fn request_loader_repair_version(release_version: &str) {
         let _ = window.dispatch_event(&event);
     }
 }
-
-#[cfg(not(target_arch = "wasm32"))]
-pub fn request_loader_repair_version(_release_version: &str) {}
 
 fn normalize_host_label(host_label: String) -> Result<String, String> {
     let trimmed = host_label.trim().to_owned();
@@ -725,7 +713,7 @@ mod wasm_tests {
             .add_event_listener_with_callback("tyde:repair-version", cb.as_ref().unchecked_ref())
             .expect("add listener");
 
-        request_loader_repair_version("0.8.19-beta.15");
+        crate::bridge::request_loader_repair_version("0.8.19-beta.15");
 
         window
             .remove_event_listener_with_callback("tyde:repair-version", cb.as_ref().unchecked_ref())

@@ -409,6 +409,10 @@ manifest.versions[version] = {
   entry: entryUrl,
   integrity: entryIntegrity,
   protocolVersion,
+  ...(existsSync(join(opts.dist, "index.html")) &&
+    /<meta\s+name="tyde-follow-selected-host"\s+content="1"\s*\/?>/.test(
+      readFileSync(join(opts.dist, "index.html"), "utf8"),
+    ) ? { followsSelectedHost: 1 } : {}),
   artifacts,
 };
 enforceMinSupportedFloor(manifest);

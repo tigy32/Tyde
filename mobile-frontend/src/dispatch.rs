@@ -219,6 +219,34 @@ pub fn dispatch_envelope(state: &AppState, host: &LocalHostId, envelope: Envelop
     }
     match envelope.kind {
         FrameKind::Welcome => {
+            let payload = match envelope.parse_payload::<protocol::WelcomePayload>() {
+                Ok(payload) if payload.protocol_version == protocol::PROTOCOL_VERSION => payload,
+                _ => {
+                    report_protocol_error(
+                        state,
+                        host,
+                        bridge::ConnectionInvalidation::ProtocolViolation {
+                            message: "Invalid Welcome handshake payload".into(),
+                        },
+                    );
+                    return;
+                }
+            };
+            if state.host_stream_untracked(host).as_ref() == Some(&envelope.stream) {
+                log::info!(
+                    "mobile_bundle_sync received live Welcome release_present={}",
+                    payload.release_version.is_some()
+                );
+                state.host_releases.update(|m| {
+                    m.insert(
+                        host.clone(),
+                        crate::bundle::HostRelease::Welcome {
+                            stream: envelope.stream.clone(),
+                            payload,
+                        },
+                    );
+                });
+            }
             state.command_errors_by_host.update(|map| {
                 map.remove(host);
             });
@@ -339,7 +367,7 @@ pub fn dispatch_envelope(state: &AppState, host: &LocalHostId, envelope: Envelop
         }
         FrameKind::Reject => {
             if let Ok(payload) = envelope.parse_payload::<RejectPayload>() {
-                apply_reject(state, host, payload);
+                apply_reject(state, host, &envelope.stream, payload);
                 clear_session_history_loading_for_host(state, host);
             }
         }
@@ -1168,6 +1196,9 @@ fn report_protocol_error(
     host: &LocalHostId,
     invalidation: bridge::ConnectionInvalidation,
 ) {
+    state.host_releases.update(|m| {
+        m.remove(host);
+    });
     let message = invalidation.to_string();
     state.connection_statuses.update(|map| {
         map.insert(host.clone(), ConnectionStatus::Error(message.clone()));
@@ -2524,18 +2555,9 @@ fn rebuild_chat_message_index(state: &AppState, agent_ref: &AgentRef) {
     });
 }
 
-// A `Reject` frame is the host's answer to our `Hello`: the app-level Tyde
-// handshake failed before any `Welcome`/`HostBootstrap` could arrive. An
-// `IncompatibleProtocol` reject is terminal for this build against this host,
-// so it becomes a sticky [`ConnectionStatus::UpdateRequired`] (which transport
-// reconnect statuses cannot overwrite — see `app::apply_connection_status`)
-// rather than a transient error the reconnect loop would immediately paper
-// over with `Connecting`/`Connected`. On the web/PWA we additionally ask the
-// loader to self-heal by rebooting into the host's exact published bundle,
-// keyed on the reject's `release_version`, so an already-paired host recovers
-// without a re-scan. Native shells have no loader to reboot, so the sticky
-// error is the surface until the app itself is updated.
-fn apply_reject(state: &AppState, host: &LocalHostId, payload: RejectPayload) {
+// Rejection stays sticky and tears down protocol runtime. Only the selected
+// host coordinator may prepare a release switch; a background host cannot reload.
+fn apply_reject(state: &AppState, host: &LocalHostId, stream: &StreamPath, payload: RejectPayload) {
     log::error!(
         "connection rejected on {host}: {} (code={:?}, host protocol {}, app protocol {})",
         payload.message,
@@ -2555,8 +2577,17 @@ fn apply_reject(state: &AppState, host: &LocalHostId, payload: RejectPayload) {
                     },
                 );
             });
-            if let Some(release_version) = payload.release_version.as_ref() {
-                crate::bridge::request_loader_repair_version(release_version.as_str());
+            log::info!(
+                "mobile_bundle_sync received incompatible release_present={}",
+                payload.release_version.is_some()
+            );
+            if state.host_stream_untracked(host).as_ref() == Some(stream) {
+                state.host_releases.update(|m| {
+                    m.insert(
+                        host.clone(),
+                        crate::bundle::HostRelease::Rejected(payload.clone()),
+                    );
+                });
             }
             // The Connected transport event that preceded this reject already
             // allocated a host stream, seq state, and a connection-instance id

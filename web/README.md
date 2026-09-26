@@ -43,17 +43,15 @@ that compiles into the *versioned* bundles).
 | `sw.js` | Service worker: network-first shell, **network-only manifest**, cache-first immutable bundles (cache populated only by the page after SRI-verify). |
 | `loader.css` | Loader styling (external so the shell needs no inline `<style>`). |
 | `icons/` | `icon.svg` + a README on the PNG sizes still needed for iOS. |
-| `test/` | `node --test` unit tests + fixtures (real host URIs + synthetic abuse cases). |
+| `test/` | Parser/policy fixtures plus the real-browser loader/storage/worker flow, run through `./dev.sh check`. |
 
-## Run / test locally (no build step)
+## Run / test locally (no loader build step)
 
-The loader has **no build step** — it is plain ES modules served as files.
-
-```sh
-cd web/loader
-node --test          # unit tests, no deps
-npm run serve        # python3 -m http.server 8088, then open http://127.0.0.1:8088/
-```
+The loader is plain ES modules served as files. Run repository validation from
+the repository root with `./dev.sh check`; it provisions the exact Chrome and
+chromedriver used by the loader's real-browser lifecycle flow as well as the
+Rust/wasm suites. The browser flow owns its temporary HTTP server, browser
+session and artifact directory and cleans them up on completion or failure.
 
 ## Security model (as implemented)
 
@@ -139,31 +137,39 @@ forged/stale stash is rejected by the app's parse and cleared on read.
   SRI-fail wedge. Once verified, the immutable bundle serves from cache for fast
   relaunch.
 
-## Returning users & repair flow
+## Returning users & exact selected-host release
 
-- On a successful pairing the validated version is stored in `localStorage`
-  (`tyde.loader.version`). On next launch the loader boots it directly — **no
-  QR** — *after* re-checking it against a freshly fetched manifest.
-- If that version is gone from the manifest (or now blocked / below
-  `minSupported`), the stored version is forgotten and the loader falls through
-  to the newest bootable manifest entry. If no supported entry can boot, it then
-  shows the pair/re-pair flow.
-- The beta16 self-heal floor uses this same policy path: a remembered beta15
-  bundle is below `minSupported`, so a fresh loader launch skips it and boots the
-  latest supported beta16+ bundle. An already-running beta15 bundle still needs a
-  reload/close-open boundary before the loader can apply that manifest policy;
-  installed iOS PWA users may need to force-quit/swipe away the PWA rather than
-  only backgrounding and foregrounding it.
-- A protocol mismatch during the normal host handshake is still rejected by the
-  host and surfaced by the app as a connection error. Do **not** assume a
-  historical bundle can repair itself from that handshake alone.
-- Current bundles can use the loader repair path only when the app explicitly
-  dispatches a loader event: `tyde:repair-needed` after in-app QR validation
-  detects that the host needs a newer release, or `tyde:repair-version` after an
-  already-paired reconnect gets an incompatible-protocol reject with a host
-  release version. The loader listens for those app-owned signals, forgets the
-  stored version, and reloads through the manifest-controlled release-version
-  path.
+Current mobile clients consume the exact release from every valid Welcome, not
+only an incompatible-protocol Reject. Only the selected host can initiate a
+switch. The loader exposes its executing target through
+window.__tydeLoader.bootVersion(); version() is only the remembered
+preference and is not executing identity.
+
+The browser bridge separates prepareHostSwitch (fresh manifest, exact
+protocol, all-artifact SRI, no UI teardown) from commitHostSwitch (persisted
+selection/target, bounded retries, reload). The app checks selection, connection
+authority and draft/activity safety again before commit. Cancellation aborts
+superseded work. Typed failures remain visible in the app. A known exact target
+is retained on failure and never falls back to latest. Cold offline launch
+continues to fail closed on the network-only manifest.
+
+An unpaired first launch boots the newest allowed entry. Existing installations
+have a one-time tyde.loader.follow-host.v1 migration: when a capable release
+is published, an otherwise remembered old pin boots the newest capable entry.
+followsSelectedHost: 1 is stamped from the release artifact's own
+tyde-follow-selected-host HTML marker, not from the version number or the
+deploy checkout. Historical backfills remain unmarked. The migration is marked
+complete only after successful boot; explicit QR/repair and selected-host
+targets take precedence. Pairing/key IndexedDB stores are never cleared.
+
+The root shell is network-first, so its next navigation can migrate an existing
+installation after publication. Service-worker activation does not hot-swap
+already-running WASM. Historical immutable clients cannot gain the new
+coordinator when deliberately selected; their old repair behavior remains a
+limitation, not a reason to repeat migration or raise the support floor.
+Legacy tyde:repair-needed / tyde:repair-version listeners remain for those
+clients. See [the mobile contract](../dev-docs/mobile-web-pwa.md#exact-selected-host-release-synchronization)
+for safety, retry, publication, historical-client and device-acceptance details.
 
 ## Phase 6 — deploy (`web/deploy/`)
 

@@ -58,9 +58,15 @@ pub fn ConnectionBanner() -> impl IntoView {
     let state = use_context::<AppState>().unwrap();
     let status_state = state.clone();
     let command_error_state = state.clone();
+    let bundle_state = state.clone();
 
     view! {
         <div class="connection-banner" data-mobile-test="connection-banner">
+            {move || bundle_state.bundle_status.get().message().map(|message| view! {
+                <div class="connection-banner-inner error" role="status" data-mobile-test="bundle-sync">
+                    <span class="status-text">{message}</span>
+                </div>
+            })}
             {move || {
                 let status = status_state.active_host_connection_status();
                 match status {

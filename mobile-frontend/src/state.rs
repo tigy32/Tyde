@@ -849,6 +849,9 @@ pub enum MobileTab {
 
 #[derive(Clone)]
 pub struct AppState {
+    pub host_releases: RwSignal<HashMap<LocalHostId, crate::bundle::HostRelease>>,
+    pub bundle_status: RwSignal<crate::bundle::BundleStatus>,
+    pub boot_handoff_complete: RwSignal<bool>,
     // Top-level routing
     pub app_mode: RwSignal<AppMode>,
     pub active_local_host_id: RwSignal<Option<LocalHostId>>,
@@ -1065,6 +1068,9 @@ impl Default for AppState {
 impl AppState {
     pub fn new() -> Self {
         Self {
+            host_releases: RwSignal::new(HashMap::new()),
+            bundle_status: RwSignal::new(crate::bundle::BundleStatus::Idle),
+            boot_handoff_complete: RwSignal::new(true),
             app_mode: RwSignal::new(AppMode::Onboarding),
             active_local_host_id: RwSignal::new(None),
 
@@ -1723,6 +1729,9 @@ impl AppState {
     /// forgotten (the user removed the pairing) or fully disconnects in a way
     /// that should clear cached snapshots.
     pub fn clear_host_runtime(&self, host: &LocalHostId) {
+        self.host_releases.update(|m| {
+            m.remove(host);
+        });
         self.active_connection_instance_ids.update(|m| {
             m.remove(host);
         });

@@ -71,6 +71,163 @@ const WEB_HOSTS_STORE = "paired_hosts";
 const WEB_PSK_STORE = "psk";
 const WEB_HOSTS_KEY = "all";
 
+// Browser-operation results only. Host/release authority remains in the app's
+// typed handshake dispatcher; no host discovery or selection happens here.
+export const SELECTED_HOST_KEY = "tyde.selected-host.v1";
+export const HOST_TARGET_KEY = "tyde.loader.host-target.v1";
+export const FOLLOW_MIGRATION_KEY = "tyde.loader.follow-host.v1";
+const SWITCH_ATTEMPTS_KEY = "tyde.loader.switch-attempts.v1";
+let executingTarget = null;
+let preparation = null;
+let preparationSerial = 0;
+
+function unavailable(reason) { return { status: "unavailable", reason }; }
+
+export function cancelHostSwitch() {
+  if (preparation) preparation.controller.abort();
+  preparation = null;
+}
+
+export async function prepareHostSwitch(version, protocolVersion, host) {
+  cancelHostSwitch();
+  const operation = {
+    ticket: ++preparationSerial, controller: new AbortController(),
+    version, protocolVersion, host, ready: false,
+  };
+  preparation = operation;
+  const timeout = setTimeout(() => operation.controller.abort(), 30000);
+  try {
+    const response = await fetch(MANIFEST_URL, {
+      cache: "no-store", signal: operation.controller.signal,
+    });
+    if (!response.ok) return unavailable("manifest");
+    const target = resolveBootTarget(version, await response.json());
+    if (!target.ok) {
+      return unavailable(target.reason === "not-in-manifest" ? "unpublished" : "policy");
+    }
+    if (!checkProtocolCompatibility(protocolVersion, target).ok) return unavailable("protocol");
+    if (!selectBootUrls(target).ok) return unavailable("integrity");
+    const verified = await verifyArtifacts(target.artifacts, {
+      cache: await openBundleCache(),
+      fetchImpl: (url, options) => fetch(url, { ...options, signal: operation.controller.signal }),
+    });
+    if (preparation !== operation) return unavailable("cancelled");
+    if (operation.controller.signal.aborted) return unavailable("manifest");
+    if (!verified.ok) return unavailable("integrity");
+    operation.ready = true;
+    console.info("tyde_bundle_switch prepared exact target");
+    return { status: "ready", ticket: operation.ticket };
+  } catch {
+    return unavailable(preparation !== operation ? "cancelled" : "manifest");
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+export function commitHostSwitch(ticket, host, reload = () => window.location.reload()) {
+  const op = preparation;
+  if (!op || !op.ready || op.ticket !== ticket || op.host !== host) return unavailable("cancelled");
+  try {
+    const previous = JSON.parse(sessionStorage.getItem(SWITCH_ATTEMPTS_KEY) || "null");
+    const attempts = previous && previous.host === host && previous.version === op.version
+      && previous.protocolVersion === op.protocolVersion ? previous.attempts + 1 : 1;
+    if (!Number.isSafeInteger(attempts) || attempts > MAX_REPAIR_ATTEMPTS) return unavailable("reload_loop");
+    const handoff = JSON.stringify({ host, version: op.version, protocolVersion: op.protocolVersion });
+    // One durable record contains selection + exact target. Startup never
+    // substitutes latest if this committed target becomes unavailable.
+    localStorage.setItem(SELECTED_HOST_KEY, host);
+    localStorage.setItem(HOST_TARGET_KEY, handoff);
+    localStorage.setItem(STORAGE_KEY, op.version);
+    sessionStorage.setItem(SWITCH_ATTEMPTS_KEY, JSON.stringify({
+      host, version: op.version, protocolVersion: op.protocolVersion, attempts,
+    }));
+    if (localStorage.getItem(HOST_TARGET_KEY) !== handoff) return unavailable("storage");
+  } catch {
+    return unavailable("storage");
+  }
+  cancelHostSwitch();
+  console.info("tyde_bundle_switch committed exact target");
+  reload();
+  return { status: "reloading" };
+}
+
+// Selection changes retire only the previous owner's authority, not a failed
+// exact target still owned by the selected host. A picker has no host target.
+export function selectHost(host) {
+  try {
+    const target = JSON.parse(localStorage.getItem(HOST_TARGET_KEY) || "null");
+    if (host === null) localStorage.removeItem(SELECTED_HOST_KEY);
+    else localStorage.setItem(SELECTED_HOST_KEY, host);
+    if (target && target.host !== host) {
+      localStorage.removeItem(STORAGE_KEY);
+      localStorage.removeItem(HOST_TARGET_KEY);
+      console.info("tyde_bundle_switch retired deselected target");
+    }
+    return { status: "matching" };
+  } catch { return unavailable("storage"); }
+}
+
+// This records server authority without preparing, unmounting or reloading.
+// Even deferred/unpublished targets must govern the next cold navigation.
+export function recordHostRelease(version, protocolVersion, host) {
+  try {
+    if (localStorage.getItem(SELECTED_HOST_KEY) !== host) return unavailable("cancelled");
+    const handoff = JSON.stringify({ host, version, protocolVersion });
+    localStorage.setItem(HOST_TARGET_KEY, handoff);
+    if (localStorage.getItem(HOST_TARGET_KEY) !== handoff) return unavailable("storage");
+    return { status: "matching" };
+  } catch { return unavailable("storage"); }
+}
+
+export function confirmHostRelease(version, protocolVersion, host) {
+  if (!executingTarget || executingTarget.version !== version || executingTarget.protocolVersion !== protocolVersion) {
+    return unavailable("protocol");
+  }
+  try {
+    if (localStorage.getItem(SELECTED_HOST_KEY) !== host) return unavailable("storage");
+    localStorage.setItem(HOST_TARGET_KEY, JSON.stringify({ host, version, protocolVersion }));
+    localStorage.setItem(STORAGE_KEY, version);
+    sessionStorage.removeItem(SWITCH_ATTEMPTS_KEY);
+    return { status: "matching" };
+  } catch { return unavailable("storage"); }
+}
+
+// Capability comes from the release's built artifact, not a version threshold
+// or whichever checkout happens to run a historical release backfill.
+export function resolveFollowHostBootstrap(manifest, remembered, pairedHosts, pairedHostIds = null) {
+  let handoff = JSON.parse(localStorage.getItem(HOST_TARGET_KEY) || "null");
+  const selected = localStorage.getItem(SELECTED_HOST_KEY);
+  const forgotten = selected !== null && pairedHostIds !== null && !pairedHostIds.includes(selected);
+  if (forgotten) localStorage.removeItem(SELECTED_HOST_KEY);
+  if (pairedHosts === false || (handoff?.host && (handoff.host !== selected || forgotten))) {
+    localStorage.removeItem(HOST_TARGET_KEY);
+    localStorage.removeItem(STORAGE_KEY);
+    remembered = null;
+    handoff = null;
+    console.info("tyde_bundle_switch retired unowned startup target");
+  }
+  // Legacy QR/rejection repairs have no selected-host owner. Until a capable
+  // boot succeeds they must not prevent the one-time capability migration.
+  if (!handoff?.host && pairedHosts !== false && localStorage.getItem(FOLLOW_MIGRATION_KEY) !== "1") {
+    const capable = {
+      ...manifest,
+      versions: Object.fromEntries(Object.entries(manifest.versions || {}).filter(
+        ([, entry]) => entry?.followsSelectedHost === 1,
+      )),
+    };
+    const target = resolveLatestBootTarget(capable);
+    if (target.ok) return { ...target, followHostMigration: true };
+  }
+  if (handoff) {
+    const resolved = resolveBootTarget(handoff.version, manifest);
+    if (!resolved.ok) return { ...resolved, exactTarget: true };
+    const protocol = checkProtocolCompatibility(handoff.protocolVersion, resolved);
+    if (!protocol.ok) return { ...protocol, exactTarget: true };
+    return { ...resolved, exactTarget: true, handoff };
+  }
+  return resolveStartupTarget(manifest, remembered, pairedHosts);
+}
+
 const ui = {};
 
 function $(id) {
@@ -186,7 +343,7 @@ async function deleteCachedArtifacts(target) {
 // real hashed `…_bg.wasm` (the entry's built-in default path is the unhashed,
 // nonexistent name). Both URLs are the artifacts integrity.js already verified
 // and cached, so the import reads exactly those verified bytes.
-async function bootTarget(target) {
+async function bootTarget(target, followsSelectedHost = false) {
   show("booting");
   if (ui.bootingVersion) ui.bootingVersion.textContent = target.version;
 
@@ -244,7 +401,24 @@ async function bootTarget(target) {
       throw new Error("entry module exposes no init()");
     }
     // Explicit hashed wasm path; `'wasm-unsafe-eval'` permits the compilation.
+    executingTarget = target;
+    // Preserve an owned startup record byte-for-byte. Legacy repair/QR paths
+    // have no owner; write before init so the capable app can replace it with
+    // its selected host's announcement, even during initialization.
+    if (target.followHostMigration) localStorage.removeItem(HOST_TARGET_KEY);
+    if (target.exactTarget && !target.handoff) {
+      localStorage.setItem(HOST_TARGET_KEY, JSON.stringify({
+        version: target.version, protocolVersion: target.protocolVersion,
+      }));
+    }
     await initFn({ module_or_path: urls.wasmUrl });
+    if (target.followHostMigration || target.exactTarget) {
+      localStorage.setItem(STORAGE_KEY, target.version);
+    }
+    if (followsSelectedHost) {
+      localStorage.setItem(FOLLOW_MIGRATION_KEY, "1");
+      console.info("tyde_bundle_switch capable bootstrap completed");
+    }
   } catch (err) {
     // Defense in depth: if the boot fails (bad import, wasm instantiate error, a
     // poisoned cache entry slipping past), purge the cached artifacts so a
@@ -466,6 +640,21 @@ export async function hasStoredPairedHosts(factory = indexedDbFactory()) {
   } finally {
     if (db && typeof db.close === "function") db.close();
   }
+}
+
+// WebPairedHostRecord uses camelCase (bridge/web/store.rs). Unknown/corrupt
+// storage must not invalidate a known target; only a readable list can do so.
+async function storedPairedHostIds() {
+  let db;
+  try {
+    db = await openWebStoreDb(indexedDbFactory());
+    const raw = await idbGet(db, WEB_HOSTS_STORE, WEB_HOSTS_KEY);
+    if (raw === undefined || raw === null) return [];
+    const records = JSON.parse(raw);
+    if (!Array.isArray(records) || !records.every(record => typeof record?.localHostId === "string")) return null;
+    return records.map(record => record.localHostId);
+  } catch { return null; }
+  finally { if (db) db.close(); }
 }
 
 export function resolveStartupTarget(manifest, remembered, pairedHosts) {
@@ -819,7 +1008,7 @@ export async function handlePairingUri(uri, manifest) {
   // pairing can complete, then remember the version for future no-QR launches.
   stashPairingUri(inner.trim());
   rememberVersion(resolved.version);
-  await bootTarget(resolved);
+  await bootTarget({ ...resolved, exactTarget: true }, manifest.versions?.[resolved.version]?.followsSelectedHost === 1);
 }
 
 // --- QR scanning -----------------------------------------------------------
@@ -1082,7 +1271,12 @@ async function init() {
 
   // Debug/escape hatch for support: clear a wedged stored version from the
   // console without DevTools storage spelunking.
-  window.__tydeLoader = { forgetVersion, version: () => readVersion() };
+  window.__tydeLoader = {
+    forgetVersion, version: () => readVersion(),
+    bootVersion: () => executingTarget?.version ?? null,
+    prepareHostSwitch, cancelHostSwitch, commitHostSwitch, confirmHostRelease,
+    selectHost, recordHostRelease,
+  };
 
   registerServiceWorker();
 
@@ -1181,7 +1375,7 @@ async function init() {
       return;
     }
     rememberVersion(resolved.version);
-    await bootTarget(resolved);
+    await bootTarget({ ...resolved, exactTarget: true }, manifest.versions?.[resolved.version]?.followsSelectedHost === 1);
     return;
   }
   // Clean (non-repair) entry: reset the loop guard so a later genuine drift can
@@ -1202,10 +1396,20 @@ async function init() {
   // remembered-version behavior for already-paired users.
   const remembered = readVersion();
   const pairedHosts = await hasStoredPairedHosts();
-  const startup = resolveStartupTarget(manifest, remembered, pairedHosts);
+  let startup;
+  try {
+    startup = resolveFollowHostBootstrap(manifest, remembered, pairedHosts, await storedPairedHostIds());
+  } catch {
+    setError("The browser could not read the exact-release handoff.", "Storage unavailable or invalid");
+    return;
+  }
+  if (!startup.ok && startup.exactTarget) {
+    setError(reasonToMessage(startup.reason), "The selected host target was retained.");
+    return;
+  }
   if (startup.ok) {
     if (remembered && startup.source !== "remembered") forgetVersion();
-    await bootTarget(startup);
+    await bootTarget(startup, manifest.versions?.[startup.version]?.followsSelectedHost === 1);
     return;
   }
   if (remembered) forgetVersion();

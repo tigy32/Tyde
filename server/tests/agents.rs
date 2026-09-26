@@ -4193,14 +4193,6 @@ async fn agent_control_http_await_returns_while_exit_plan_mode_is_pending() {
         .await
         .expect("send ExitPlanMode approval");
 
-    let resumed_await = tokio::time::timeout(
-        Duration::from_secs(5),
-        mcp_await_agent(&caller, &new_agent.agent_id),
-    )
-    .await
-    .expect("tyde_await_agents must return after plan approval resumes the turn");
-    assert_await_result_ready(&resumed_await, &new_agent.agent_id, "idle");
-
     let mut saw_completion = false;
     let mut saw_approval = false;
     let mut saw_final_idle = false;
@@ -4232,6 +4224,18 @@ async fn agent_control_http_await_returns_while_exit_plan_mode_is_pending() {
             break;
         }
     }
+
+    // The protocol write and HTTP await are independent connections: a sent
+    // approval can still be pending when HTTP observes it. Gate the idle
+    // assertion on the approval's actual completion, not write admission.
+    eprintln!("EXIT PLAN AWAIT approval completion observed before idle query");
+    let resumed_await = tokio::time::timeout(
+        Duration::from_secs(5),
+        mcp_await_agent(&caller, &new_agent.agent_id),
+    )
+    .await
+    .expect("tyde_await_agents must return after plan approval resumes the turn");
+    assert_await_result_ready(&resumed_await, &new_agent.agent_id, "idle");
 
     fixture
         .client

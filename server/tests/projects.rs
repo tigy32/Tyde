@@ -2121,12 +2121,6 @@ async fn project_recovers_from_filesystem_and_git_failures_without_reconnecting(
             root: ProjectRootPath(project_root(&project, 0)),
             relative_path: "file.rs".to_owned(),
         };
-        fixture
-            .client
-            .project_read_file(&project.id, ProjectReadFilePayload { path: path.clone() })
-            .await
-            .unwrap();
-        let before = expect_project_file_contents(&mut fixture.client, "initial file").await;
         if !force_project_watch_limit {
             fs::write(repo.path().join("watch-ready"), "ready").unwrap();
             expect_project_file_list_matching(
@@ -2141,6 +2135,14 @@ async fn project_recovers_from_filesystem_and_git_failures_without_reconnecting(
             )
             .await;
         }
+        // Initial watcher discovery can advance file versions. Establish the
+        // unchanged-read baseline after that discovery, not before it.
+        fixture
+            .client
+            .project_read_file(&project.id, ProjectReadFilePayload { path: path.clone() })
+            .await
+            .unwrap();
+        let before = expect_project_file_contents(&mut fixture.client, "initial file").await;
         let healthy_repo = init_git_repo("healthy-during-recovery", &[("healthy.rs", "before\n")]);
         let healthy = if !force_project_watch_limit {
             Some(

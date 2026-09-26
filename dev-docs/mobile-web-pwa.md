@@ -247,3 +247,134 @@ visibility assertion reproduced the fixture error: the capsule was at
 area. The flow now anchors its fixture to the viewport bottom, keeps that new
 visibility assertion, and retains every existing transition/geometry check and
 timeout. No production animation or layout behavior was changed for this case.
+
+## Exact selected-host release synchronization
+
+The mobile dispatcher consumes the typed WelcomePayload.release_version on
+the current host stream, even when protocol numbers are compatible.
+RejectPayload.release_version enters the same selected-host coordinator.
+There is no protocol bump: the existing optional, prerelease-capable field is
+the authority; TYDE_VERSION and the mobile crate's package version are not
+bundle identities. The loader exposes the target actually executing.
+
+Selection is restored before frontend-attach replay. Only a single paired host
+may be automatically selected; multiple hosts without a valid saved selection
+show the picker. A background Welcome/rejection never changes that choice.
+Live Welcome authority is invalidated on disconnect, replacement, reconnect,
+or protocol failure. A terminal incompatible rejection retains the existing
+sticky verdict after its rejected socket closes, without reviving its stream
+or connection runtime; selecting that host can repair the incompatibility.
+
+For a differing release, the loader fetches fresh manifest policy, checks exact
+release/protocol metadata, and verifies all executable SRI before asking for a
+reload. Preparation leaves the running UI mounted. Selection, stream authority,
+operation generation and safety are checked again immediately before committing.
+Superseded fetches are aborted. Browser failures have typed operation outcomes
+and a persistent banner; they are not invented host business state. Missing
+release metadata, unpublished builds, policy denial, protocol drift, SRI,
+storage and bridge failures never select latest as a substitute.
+
+Automatic commit is deliberately conservative: only workspace Home, with no
+mounted chat/editor, open project/settings sheet, text draft, draft settings,
+pending/recovery submission, voice activity/recovery, shell error or boot
+pairing/auth handoff. Empty global text alone is insufficient: the composer
+owns attachments and queue edits locally. No DOM scraping, forced blur or
+unmount makes a switch safe. The banner asks the user to finish/save their work
+and return Home; this change neither changes draft ownership nor touches the
+composer, keyboard, shared shell or send path.
+
+The selected identity and exact handoff must be persisted successfully before
+reload. A confirmed matching Welcome also records the exact target, so later
+revocation cannot silently replace it with latest. Cold starts still fetch the
+network-only manifest and fail closed offline. A running disconnected client
+does not reload from an old Welcome; existing disconnect/recovery behavior
+remains unchanged. First launch without host truth bootstraps from the manifest.
+Repeated switches to the same host/target/protocol are session-bounded; a
+confirmed match resets the guard, and deliberate A > B > A selection is not
+subject to a lifetime reload quota.
+
+### One-time bootstrap for existing installations
+
+The independently updated, unversioned root loader can acquire this behavior
+without clearing pairings or requiring a protocol incompatibility. Its
+tyde.loader.follow-host.v1 migration ignores an old remembered pin once and
+boots the latest **capable** allowed manifest entry. The release generator
+stamps followsSelectedHost: 1 only when that release's built HTML declares
+tyde-follow-selected-host capability. Running new tooling against historical
+artifacts does not mark them capable. No support floor is raised, and no
+published historical executable is changed.
+
+Publication ordering matters: the capable immutable artifacts and their
+manifest entry must exist before migration activates. Updating only the root
+loader leaves existing pins alone. After a successful capable boot the marker
+is durable. An exact legacy QR/rejection repair before capability publication
+retains its target but does not complete migration: on a later cold navigation
+it remains eligible for the first capable bootstrap. A selected-host-owned
+target takes precedence; intentionally switching to an allowed older host
+after migration does not trigger
+the migration again on the next cold navigation. Exact-target failures retain
+the target rather than booting latest. Completion is written only after a
+successful boot whose fresh manifest entry declares the capability, never by
+preparation, commit, confirmation, or an incapable exact repair.
+
+The coordinator records a selected host's typed release before waiting for a
+safe reload. Thus a cold navigation during an A-to-B deferral targets B, not A;
+recording authority itself never discards the running draft or mounts a bundle.
+Selection changes retire the previous owner's target and remembered pin. Cold
+startup also checks ownership against the persisted selection and readable
+IndexedDB host identities, so forgetting A with B/C remaining can bootstrap
+the picker even if A is now revoked. Unknown storage cannot prove a host was
+forgotten. A still-selected known target remains fail-closed under the fresh
+manifest, including while switching is deferred. Exact boot preserves the
+owner rather than rewriting an anonymous target.
+
+The worker's network-first shell path picks up new loader code on navigation.
+Worker activation/foreground resume alone does **not** replace an already
+executing immutable WASM app. An installation still running old code therefore
+needs its next real navigation/cold launch (iOS may retain a resumed document
+until the PWA is closed). No storage clearing, re-pairing, protocol bump or
+reinstall is part of this migration.
+
+There is an unavoidable historical-client limit: selecting an immutable release
+from before this coordinator executes that historical client's behavior.
+It cannot learn selected-host switching retroactively, and its old rejection
+repair can still act without selection awareness. The root loader preserves
+that explicit older choice instead of repeatedly forcing a newer client.
+Likewise, release identity is what the host advertises; a locally modified
+binary advertising an existing published release is indistinguishable from
+that release under the current handshake. Missing or genuinely unpublished
+release identities are surfaced, not guessed.
+
+### Evidence and remaining device acceptance
+
+The canonical check mounts the real mobile surface and drives dispatch,
+selection, deferred/unavailable banners, draft retention, delayed browser
+preparation and reload commitment. Its loader suite also drives real headless
+Chrome through HTTP, IndexedDB, CacheStorage and service-worker lifecycle:
+an existing stored pin, independent root update before capability publication,
+pre-publication legacy repair, one-time migration, retained pairing/key stores,
+exact older-target switching, deferred A-to-B authority and forgotten-owner
+invalidation with two remaining pairings,
+repeat navigation, revocation, offline policy, SRI/protocol failures, storage
+failure and bounded retries. It invokes the real release-manifest generator on
+immutable artifact fixtures and checks that historical fixtures remain unmarked.
+
+The loader fixture executes small SRI-verified JS modules and a hashed WASM
+artifact, not a released Tyde WASM application or real phone pairing. The
+mounted Rust suite covers the app half separately. These are not an iPhone
+standalone acceptance claim. The existing Device Farm package replaces the
+loader/CSP and its supervisor detaches the runner; it cannot certify this
+storage/worker path unchanged. No device allocation, paid backend call,
+production publication, release or tag is needed for these local checks.
+
+The canonical gate also exposed two pre-existing server-sim ordering races.
+The watcher flow observed unchanged contents at version 1 after its baseline
+read returned version 0: the baseline preceded watcher initialization. It now
+reads after the already-required watcher-ready listing, retaining the original
+contents/version equality assertions. The plan-approval flow observed
+awaiting_user when its independent HTTP query beat the protocol approval write.
+It now observes the already-required completion, approved response and final
+idle events before making the original HTTP idle assertion. The adjacent gated
+scenario still checks that await stays active during approval execution. These
+are fixture-ordering corrections, not server/provider behavior changes or
+weakened assertions; the new ordering diagnostic remains privacy-safe.
