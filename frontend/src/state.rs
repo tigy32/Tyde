@@ -3909,6 +3909,10 @@ pub struct AppState {
     /// Hosts whose teams store could not be loaded. Set from bootstrap and
     /// cleared by `TeamsStoreStatusNotify` once the store is reset.
     pub teams_store_load_errors: RwSignal<HashMap<String, protocol::TeamsStoreLoadError>>,
+    /// Agent subtrees each host's restoration pass could not bring back, as
+    /// last reported by `HostBootstrap` or `AgentRestorationStatus`.
+    pub agent_restoration_failures:
+        RwSignal<HashMap<String, Vec<protocol::AgentRestorationFailure>>>,
     /// Host-scoped team member records. Members are looked up by id when
     /// rendering rosters and detail views; teams are joined via member.team_id.
     pub team_members: RwSignal<HashMap<String, HashMap<TeamMemberId, TeamMember>>>,
@@ -4313,6 +4317,7 @@ impl AppState {
             workflow_command_errors: RwSignal::new(HashMap::new()),
             teams: RwSignal::new(HashMap::new()),
             teams_store_load_errors: RwSignal::new(HashMap::new()),
+            agent_restoration_failures: RwSignal::new(HashMap::new()),
             team_members: RwSignal::new(HashMap::new()),
             team_member_bindings: RwSignal::new(HashMap::new()),
             team_preset_catalogs: RwSignal::new(HashMap::new()),
@@ -6974,6 +6979,9 @@ impl AppState {
             map.remove(host_id);
         });
         self.teams_store_load_errors.update(|map| {
+            map.remove(host_id);
+        });
+        self.agent_restoration_failures.update(|map| {
             map.remove(host_id);
         });
         self.team_members.update(|map| {

@@ -23,7 +23,10 @@ use crate::backend::{
 };
 use crate::sub_agent::{SubAgentEmitter, SubAgentHandle};
 
-use super::script::{MockAgentControlAwait, MockChildLifecycle, MockNativeChild};
+use super::script::{
+    AbandonedResponse, MockAgentControlAwait, MockChildLifecycle, MockNativeChild,
+    RunningCommandShape,
+};
 use super::{MOCK_MODEL, now_ms};
 
 #[derive(Clone)]
@@ -462,6 +465,97 @@ pub(super) fn background_task_finished_frames(tool_call_id: &str) -> Vec<Backend
             },
         },
     })]
+}
+
+/// A command the model handed off to run that the backend never reports
+/// finishing, in each order a provider can report it relative to the response
+/// that issued it.
+pub(super) fn running_command_frames(
+    tool_call_id: &str,
+    shape: RunningCommandShape,
+) -> Vec<BackendEvent> {
+    const TEXT: &str = "mock running a long command";
+    let request = tool_request(ToolRequest {
+        tool_call_id: tool_call_id.to_owned(),
+        tool_name: "run_command".to_owned(),
+        tool_type: ToolRequestType::RunCommand {
+            command: "mock long-running command".to_owned(),
+            working_directory: "/tmp/test".to_owned(),
+        },
+    });
+    let end = stream_end(mock_assistant_message(
+        Some(ChatMessageId(Uuid::new_v4().to_string())),
+        TEXT.to_owned(),
+    ));
+    let mut frames = vec![
+        typing(true),
+        stream_start("mock", Some(MOCK_MODEL.to_owned())),
+        stream_delta(TEXT.to_owned()),
+    ];
+    match shape {
+        RunningCommandShape::RequestAfterResponse => frames.extend([end, request]),
+        RunningCommandShape::RequestInsideEndedResponse => frames.extend([request, end]),
+        RunningCommandShape::RequestInsideOpenResponse => frames.push(request),
+    }
+    frames
+}
+
+/// Commands a response issued before the backend dropped that response
+/// without ending it: one still running, one the backend reports finishing.
+/// `Interrupted` ends the turn with a Claude interrupted-tool completion, and
+/// `Replaced` opens the next response before reporting the finish.
+pub(super) fn abandoned_response_command_frames(
+    running_id: &str,
+    finished_id: &str,
+    abandon: AbandonedResponse,
+) -> Vec<BackendEvent> {
+    let command = |tool_call_id: &str| {
+        tool_request(ToolRequest {
+            tool_call_id: tool_call_id.to_owned(),
+            tool_name: "run_command".to_owned(),
+            tool_type: ToolRequestType::RunCommand {
+                command: "mock abandoned command".to_owned(),
+                working_directory: "/tmp/test".to_owned(),
+            },
+        })
+    };
+    let mut frames = vec![
+        typing(true),
+        stream_start("mock", Some(MOCK_MODEL.to_owned())),
+        stream_delta("mock abandoned response".to_owned()),
+        command(running_id),
+        command(finished_id),
+    ];
+    match abandon {
+        AbandonedResponse::Interrupted => frames.push(tool_completed(ToolExecutionCompletedData {
+            tool_call_id: finished_id.to_owned(),
+            outcome: ToolExecutionOutcome::Failed {
+                message: "Tool execution was interrupted".to_owned(),
+                details: Some("Claude history did not contain a tool_result before the conversation advanced; treating the tool as interrupted.".to_owned()),
+                normalization_failure: None,
+            },
+        })),
+        AbandonedResponse::Replaced => frames.extend([
+            stream_start("mock", Some(MOCK_MODEL.to_owned())),
+            tool_completed(ToolExecutionCompletedData {
+                tool_call_id: finished_id.to_owned(),
+                outcome: ToolExecutionOutcome::Succeeded {
+                    result: ToolExecutionResult::RunCommand {
+                        exit_code: 0,
+                        stdout: "mock abandoned command finished".to_owned(),
+                        stderr: String::new(),
+                    },
+                },
+            }),
+            stream_delta("mock replacement response".to_owned()),
+            stream_end(mock_assistant_message(
+                Some(ChatMessageId(Uuid::new_v4().to_string())),
+                "mock replacement response".to_owned(),
+            )),
+            typing(false),
+        ]),
+    }
+    frames
 }
 
 pub(super) fn tool_failure_without_idle_frames(tool_call_id: &str) -> Vec<BackendEvent> {

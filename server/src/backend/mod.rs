@@ -264,6 +264,7 @@ pub(crate) fn tyde_owned_no_root_cwd(backend: &str) -> Result<String, String> {
 #[derive(Debug, Clone)]
 pub enum SessionCommand {
     SendMessage {
+        origin: Option<protocol::MessageOrigin>,
         message: String,
         images: Option<Vec<ImageAttachment>>,
     },

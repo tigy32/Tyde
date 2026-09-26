@@ -718,6 +718,7 @@ pub(crate) fn classify(kind: FrameKind) -> OutputLane {
         | FrameKind::McpServerNotify
         | FrameKind::TeamNotify
         | FrameKind::TeamsStoreStatusNotify
+        | FrameKind::AgentRestorationStatus
         | FrameKind::TeamMemberNotify
         | FrameKind::TeamMemberBindingNotify
         | FrameKind::TeamCompactNotify

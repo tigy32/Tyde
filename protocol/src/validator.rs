@@ -703,6 +703,13 @@ impl ProtocolValidator {
                     "TeamsStoreStatusNotify",
                 )
             }
+            FrameKind::AgentRestorationStatus => {
+                parse_host_payload::<crate::types::AgentRestorationStatusPayload>(
+                    self,
+                    envelope,
+                    "AgentRestorationStatus",
+                )
+            }
             FrameKind::TeamMemberNotify => {
                 parse_host_payload::<TeamMemberNotifyPayload>(self, envelope, "TeamMemberNotify")
             }

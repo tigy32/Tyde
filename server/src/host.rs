@@ -395,6 +395,14 @@ pub struct HostRuntimeConfig {
     /// can assert on what the pass did without waiting a fixed time for it.
     #[cfg(feature = "test-support")]
     pub restoration_complete_test_gate: Option<Arc<SpawnOperationTestGateInner>>,
+    /// Overrides how long a restored agent may take to start once activated
+    /// before its startup fails and releases its parent.
+    #[cfg(feature = "test-support")]
+    pub restored_agent_startup_timeout: Option<Duration>,
+    /// Sessions whose restored spawn fails before an actor registers, as a
+    /// conflicting registration or a parent lineage error would.
+    #[cfg(feature = "test-support")]
+    pub rejected_restoration_sessions: HashSet<SessionId>,
 }
 
 impl Default for HostRuntimeConfig {
@@ -426,6 +434,10 @@ impl Default for HostRuntimeConfig {
             restoration_snapshot_test_gate: None,
             #[cfg(feature = "test-support")]
             restoration_complete_test_gate: None,
+            #[cfg(feature = "test-support")]
+            restored_agent_startup_timeout: None,
+            #[cfg(feature = "test-support")]
+            rejected_restoration_sessions: HashSet::new(),
         }
     }
 }
@@ -456,6 +468,7 @@ const ACTIVITY_SUMMARY_DEBOUNCE: Duration = Duration::from_secs(5);
 const ACTIVITY_SUMMARY_MAX_FREQUENCY: Duration = Duration::from_secs(60);
 const ACTIVITY_SUMMARY_FAILURE_BACKOFF: Duration = Duration::from_secs(30);
 const ACTIVITY_SUMMARY_GENERATION_TIMEOUT: Duration = Duration::from_secs(30);
+const RESTORED_AGENT_STARTUP_TIMEOUT: Duration = Duration::from_secs(60);
 const AGENT_NAME_GENERATION_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long a subtree teardown waits on one agent before moving on.
 ///
@@ -797,10 +810,14 @@ pub(crate) struct HostState {
     restoration_snapshot_test_gate: Option<Arc<SpawnOperationTestGateInner>>,
     #[cfg(feature = "test-support")]
     restoration_complete_test_gate: Option<Arc<SpawnOperationTestGateInner>>,
+    restored_agent_startup_timeout: Duration,
+    #[cfg(feature = "test-support")]
+    rejected_restoration_sessions: HashSet<SessionId>,
     #[cfg(feature = "test-support")]
     resume_admission_test_gate: Option<Arc<SpawnOperationTestGateInner>>,
     #[cfg(feature = "test-support")]
     restore_marker_withdraw_test_gate: Option<Arc<SpawnOperationTestGateInner>>,
+    agent_restoration_failures: Vec<protocol::AgentRestorationFailure>,
     host_streams: HashMap<StreamPath, HostSubscriber>,
     project_streams: HashMap<ProjectId, ProjectStreamSubscription>,
     project_watcher: crate::project_watch::SharedProjectWatcher,
@@ -2303,6 +2320,10 @@ impl HostHandle {
         gate
     }
 
+    pub fn install_non_cancellable_agent_startup(&self, agent_name: &str) {
+        crate::agent::install_non_cancellable_startup_test_agent(agent_name.to_owned());
+    }
+
     pub fn install_agent_startup_completion_test_gate(
         &self,
         agent_name: &str,
@@ -2340,6 +2361,18 @@ impl HostHandle {
     ) -> InstalledSpawnOperationTestGate {
         let gate = new_spawn_operation_test_gate();
         crate::agent::install_resume_queue_dispatch_test_gate(
+            agent_name.to_owned(),
+            Arc::clone(&gate.inner),
+        );
+        gate
+    }
+
+    pub fn install_restart_continuation_dispatch_test_gate(
+        &self,
+        agent_name: &str,
+    ) -> InstalledSpawnOperationTestGate {
+        let gate = new_spawn_operation_test_gate();
+        crate::agent::install_restart_continuation_dispatch_test_gate(
             agent_name.to_owned(),
             Arc::clone(&gate.inner),
         );
@@ -3009,6 +3042,7 @@ impl HostHandle {
             }
         }
         let settings_store_for_projection = Arc::clone(&state.settings_store);
+        let agent_restoration_failures = state.agent_restoration_failures.clone();
         drop(state);
         let task_token_usages = task_token_usage_rollups_from_handles(
             usage_handles,
@@ -3047,6 +3081,7 @@ impl HostHandle {
             team_members: team_snapshot.members,
             team_member_bindings: team_snapshot.bindings,
             teams_store_load_error: team_snapshot.load_error,
+            agent_restoration_failures,
             agents,
             task_token_usages,
             workflow_summaries,
@@ -4527,6 +4562,7 @@ impl HostHandle {
             mut workflow,
             operation_terminal_claim,
             admitted_session,
+            restoration,
         } = context;
         tracing::info!(
             parent_agent_id = ?payload.parent_agent_id,
@@ -4795,6 +4831,7 @@ impl HostHandle {
                     }
                 };
                 ResolvedSpawnRequest {
+                    restoration: restoration.clone(),
                     name: resolved_name,
                     origin,
                     custom_agent_id: effective_custom_agent_id,
@@ -4843,6 +4880,7 @@ impl HostHandle {
                     });
                     return self
                         .spawn_resolved_agent(ResolvedSpawnRequest {
+                            restoration: restoration.clone(),
                             name: resolved_name,
                             origin,
                             custom_agent_id: payload.custom_agent_id.clone(),
@@ -4898,6 +4936,7 @@ impl HostHandle {
                     });
                     return self
                         .spawn_resolved_agent(ResolvedSpawnRequest {
+                            restoration: restoration.clone(),
                             name: resolved_name,
                             origin,
                             custom_agent_id: record.custom_agent_id.clone(),
@@ -5123,6 +5162,7 @@ impl HostHandle {
                     .join("; ");
                 let combined_startup_warning = (!warnings.is_empty()).then_some(warnings);
                 ResolvedSpawnRequest {
+                    restoration: restoration.clone(),
                     name: resolved_name,
                     origin,
                     custom_agent_id: effective_custom_agent_id,
@@ -5185,6 +5225,7 @@ impl HostHandle {
                     resolved_spawn_config.access_mode = access_mode.unwrap_or_default();
                     return self
                         .spawn_resolved_agent(ResolvedSpawnRequest {
+                            restoration: restoration.clone(),
                             name: resolved_name,
                             origin: AgentOrigin::User,
                             custom_agent_id: payload.custom_agent_id,
@@ -5445,6 +5486,7 @@ impl HostHandle {
                     }
                 };
                 ResolvedSpawnRequest {
+                    restoration: restoration.clone(),
                     name: resolved_name,
                     origin: AgentOrigin::User,
                     custom_agent_id: effective_custom_agent_id,
@@ -5554,6 +5596,29 @@ impl HostHandle {
                 return Err(AppError::internal(
                     "spawn_agent",
                     anyhow!("host is stopping for restart"),
+                ));
+            }
+            #[cfg(feature = "test-support")]
+            if request.restoration.is_some()
+                && request
+                    .resume_session_id
+                    .as_ref()
+                    .is_some_and(|id| state.rejected_restoration_sessions.contains(id))
+            {
+                return Err(AppError::conflict(
+                    "spawn_agent",
+                    "test rejected this restored spawn",
+                ));
+            }
+            if let Some(id) = request
+                .restoration
+                .as_ref()
+                .and_then(|admission| admission.agent_id.as_ref())
+                && state.registry.agent_handle(id).is_some()
+            {
+                return Err(AppError::conflict(
+                    "spawn_agent",
+                    "restored agent identity is already registered",
                 ));
             }
             let spawned = state.registry.spawn(
@@ -5729,7 +5794,14 @@ impl HostHandle {
             self.schedule_generated_agent_name(agent_handle.clone(), request);
         }
         for attachment in deferred_attachments {
-            self.attach_deferred_agent_stream(attachment).await;
+            if restoration.is_some() {
+                let host = self.clone();
+                tokio::spawn(async move {
+                    host.attach_deferred_agent_stream(attachment).await;
+                });
+            } else {
+                self.attach_deferred_agent_stream(attachment).await;
+            }
         }
         if let Some(terminal_claim) = operation_terminal_claim.as_ref() {
             terminal_claim
@@ -5964,6 +6036,7 @@ impl HostHandle {
     }
 
     async fn spawn_resolved_agent(&self, request: ResolvedSpawnRequest) -> AppResult<AgentId> {
+        let restoring = request.restoration.is_some();
         let request = self.apply_complexity_tier_settings(request).await;
         let request = self.resolve_backend_launch(request).await;
         tracing::info!(
@@ -6008,6 +6081,17 @@ impl HostHandle {
                 return Err(AppError::internal(
                     "spawn_agent",
                     anyhow!("host is stopping for restart"),
+                ));
+            }
+            if let Some(id) = request
+                .restoration
+                .as_ref()
+                .and_then(|admission| admission.agent_id.as_ref())
+                && state.registry.agent_handle(id).is_some()
+            {
+                return Err(AppError::conflict(
+                    "spawn_agent",
+                    "restored agent identity is already registered",
                 ));
             }
             let spawned = state.registry.spawn(
@@ -6129,7 +6213,14 @@ impl HostHandle {
         }
         dead_paths.extend(fanout_guard.release().await);
         for attachment in deferred_attachments {
-            self.attach_deferred_agent_stream(attachment).await;
+            if restoring {
+                let host = self.clone();
+                tokio::spawn(async move {
+                    host.attach_deferred_agent_stream(attachment).await;
+                });
+            } else {
+                self.attach_deferred_agent_stream(attachment).await;
+            }
         }
         if !dead_paths.is_empty() {
             let mut state = self.state.lock().await;
@@ -11220,6 +11311,7 @@ impl HostHandle {
             resolved_spawn_config.unwrap_or_else(|_| ResolvedSpawnConfig::failed_startup());
         resolved_spawn_config.access_mode = definition.summary.coordinator.access_mode;
         let request = ResolvedSpawnRequest {
+            restoration: None,
             name: format!("Workflow: {}", definition.summary.name),
             origin: AgentOrigin::Workflow,
             custom_agent_id: None,
@@ -11602,6 +11694,12 @@ impl HostHandle {
                 startup = &mut startup_rx => Some(startup),
                 publication = publish_rx.recv() => match publication {
                     Some(()) => None,
+                    None if host.restart.stopped.is_cancelled() => {
+                        // The restart aborted the spawn; its stop owns the
+                        // agent and records a turn the provider already took.
+                        inflight_resume.take();
+                        return;
+                    }
                     None => {
                         inflight_resume.take();
                         host.cleanup_unpublished_agent_session(agent_id.clone(), None, &visibility)
@@ -13459,6 +13557,7 @@ impl HostHandle {
             .filter(|name| !name.trim().is_empty())
             .unwrap_or_else(|| "Review Feedback".to_owned());
         let request = ResolvedSpawnRequest {
+            restoration: None,
             name: name.clone(),
             origin: protocol::AgentOrigin::AgentControl,
             custom_agent_id,
@@ -15067,10 +15166,25 @@ fn spawn_host_inner(
             restoration_snapshot_test_gate: runtime_config.restoration_snapshot_test_gate.clone(),
             #[cfg(feature = "test-support")]
             restoration_complete_test_gate: runtime_config.restoration_complete_test_gate.clone(),
+            restored_agent_startup_timeout: {
+                #[cfg(feature = "test-support")]
+                {
+                    runtime_config
+                        .restored_agent_startup_timeout
+                        .unwrap_or(RESTORED_AGENT_STARTUP_TIMEOUT)
+                }
+                #[cfg(not(feature = "test-support"))]
+                {
+                    RESTORED_AGENT_STARTUP_TIMEOUT
+                }
+            },
+            #[cfg(feature = "test-support")]
+            rejected_restoration_sessions: runtime_config.rejected_restoration_sessions.clone(),
             #[cfg(feature = "test-support")]
             resume_admission_test_gate: None,
             #[cfg(feature = "test-support")]
             restore_marker_withdraw_test_gate: None,
+            agent_restoration_failures: Vec::new(),
             host_streams: HashMap::new(),
             project_streams: HashMap::new(),
             project_watcher: crate::project_watch::SharedProjectWatcher::default(),
@@ -15266,6 +15380,7 @@ struct SpawnAgentContext {
     /// wants restoring at all; the guard rides along so this spawn does not
     /// deadlock trying to take it a second time.
     admitted_session: Option<tokio::sync::OwnedMutexGuard<()>>,
+    restoration: Option<Arc<crate::agent::registry::RestorationAdmission>>,
 }
 
 impl Default for SpawnAgentContext {
@@ -15277,8 +15392,72 @@ impl Default for SpawnAgentContext {
             workflow: None,
             operation_terminal_claim: None,
             admitted_session: None,
+            restoration: None,
         }
     }
+}
+
+fn restored_session_ref(record: &SessionRecord) -> protocol::RestoredAgentRef {
+    protocol::RestoredAgentRef::Session {
+        session_id: record.id.clone(),
+        agent_id: record
+            .restore_state
+            .as_ref()
+            .and_then(|restore_state| restore_state.agent_id.clone()),
+        name: record.user_alias.clone().or_else(|| record.alias.clone()),
+    }
+}
+
+fn failed_session_is(failed: &protocol::RestoredAgentRef, session: Option<&SessionId>) -> bool {
+    match failed {
+        protocol::RestoredAgentRef::Session { session_id, .. } => Some(session_id) == session,
+        protocol::RestoredAgentRef::StartupReservation { .. } => false,
+    }
+}
+
+fn failed_agent_is(failed: &protocol::RestoredAgentRef, agent: &AgentId) -> bool {
+    match failed {
+        protocol::RestoredAgentRef::Session { agent_id, .. } => agent_id.as_ref() == Some(agent),
+        protocol::RestoredAgentRef::StartupReservation { agent_id, .. } => agent_id == agent,
+    }
+}
+
+/// An agent not restored because its parent was not joins the failure whose
+/// subtree holds that parent, or reports its own when the parent failed
+/// nowhere this pass could see.
+fn record_restoration_skip(
+    failures: &mut Vec<protocol::AgentRestorationFailure>,
+    is_parent: impl Fn(&protocol::RestoredAgentRef) -> bool,
+    agent: protocol::RestoredAgentRef,
+) {
+    let subtree = failures
+        .iter_mut()
+        .find(|failure| is_parent(&failure.agent) || failure.skipped.iter().any(&is_parent));
+    match subtree {
+        Some(failure) => failure.skipped.push(agent),
+        None => failures.push(protocol::AgentRestorationFailure {
+            agent,
+            reason: protocol::AgentRestorationFailureReason::ParentNotRestored,
+            retry: protocol::AgentRestorationRetry::NextLaunch,
+            skipped: Vec::new(),
+        }),
+    }
+}
+
+fn fan_out_agent_restoration_status(
+    state: &mut HostState,
+    payload: &protocol::AgentRestorationStatusPayload,
+) {
+    let payload = serde_json::to_value(payload)
+        .expect("failed to serialize AgentRestorationStatus payload for host stream fanout");
+    state.host_streams.retain(|_, subscriber| {
+        emit_or_queue_host_frame(
+            subscriber,
+            FrameKind::AgentRestorationStatus,
+            payload.clone(),
+        )
+        .is_ok()
+    });
 }
 
 fn spawn_open_agent_restoration_task(host: HostHandle) {
@@ -15346,12 +15525,13 @@ impl HostHandle {
             tracing::info!("automatic agent restoration is disabled for this host");
             return Ok(());
         }
-        let (session_store, team_registry, backend_storage) = {
+        let (session_store, team_registry, backend_storage, restored_agent_startup_timeout) = {
             let state = self.state.lock().await;
             (
                 Arc::clone(&state.session_store),
                 state.team_registry.clone(),
                 state.backend_storage.clone(),
+                state.restored_agent_startup_timeout,
             )
         };
         let mut records = session_store
@@ -15421,20 +15601,31 @@ impl HostHandle {
             .collect::<HashSet<_>>();
         let mut restored_agent_ids = HashMap::<SessionId, AgentId>::new();
 
+        let mut admissions =
+            Vec::<(SessionId, Arc<crate::agent::registry::RestorationAdmission>)>::new();
+        let mut admission_by_session =
+            HashMap::<SessionId, Arc<crate::agent::registry::RestorationAdmission>>::new();
+        let mut children_by_session =
+            HashMap::<SessionId, Vec<Arc<crate::agent::registry::RestorationAdmission>>>::new();
+        let mut failures = Vec::<protocol::AgentRestorationFailure>::new();
         while !records.is_empty() {
             if self.restart.stopped.is_cancelled() {
                 return Ok(());
             }
-            // Parents first, so a child's ephemeral parent agent id can be
-            // rebuilt from its durable parent session id.
+            // Register parents first for ownership. Continuations are released
+            // afterwards, each parent only once its children continue, so no
+            // parent can find a child idle and replace it.
             let index = match records.iter().position(|record| {
-                record.parent_id.as_ref().is_none_or(|parent_id| {
-                    !restore_session_ids.contains(parent_id)
-                        || restored_agent_ids.contains_key(parent_id)
-                })
+                record
+                    .parent_id
+                    .as_ref()
+                    .is_none_or(|parent_id| !records.iter().any(|pending| &pending.id == parent_id))
             }) {
                 Some(index) => index,
                 None => {
+                    // Only a saved parent cycle leaves every record waiting on
+                    // another. Those sessions are not restored, but the agents
+                    // already reconstructed must still be released below.
                     tracing::error!(
                         unresolved_session_ids = ?records
                             .iter()
@@ -15442,9 +15633,15 @@ impl HostHandle {
                             .collect::<Vec<_>>(),
                         "open agent restoration could not resolve the remaining parent ownership"
                     );
-                    return Err(
-                        "cannot restore children whose owning parents were not restored".to_owned(),
-                    );
+                    for record in &records {
+                        let agent = restored_session_ref(record);
+                        record_restoration_skip(
+                            &mut failures,
+                            |failed| failed_session_is(failed, record.parent_id.as_ref()),
+                            agent,
+                        );
+                    }
+                    break;
                 }
             };
             let record = records.remove(index);
@@ -15490,21 +15687,45 @@ impl HostHandle {
                 continue;
             }
 
+            // A parent this pass did not restore is either closed or failed to
+            // reconstruct. Resuming it here would give it a new identity
+            // outside the child-first admission order, so its subtree keeps
+            // its restoration intent for the next launch instead.
             let parent_agent_id = match record.parent_id.as_ref() {
                 Some(parent_session_id) => {
-                    let parent_agent_id = restored_agent_ids.get(parent_session_id).cloned();
+                    let parent_agent_id = match restored_agent_ids.get(parent_session_id) {
+                        Some(agent_id) => Some(agent_id.clone()),
+                        None => self.live_agent_for_session(parent_session_id).await,
+                    };
                     if parent_agent_id.is_none() {
-                        tracing::warn!(
+                        tracing::error!(
                             session_id = %record.id,
                             parent_session_id = %parent_session_id,
-                            "saved parent is outside the restoration snapshot; resolving ownership before resume"
+                            parent_in_snapshot = restore_session_ids.contains(parent_session_id),
+                            "not restoring an open agent whose saved parent was not restored"
                         );
+                        record_restoration_skip(
+                            &mut failures,
+                            |failed| failed_session_is(failed, Some(parent_session_id)),
+                            restored_session_ref(&record),
+                        );
+                        continue;
                     }
                     parent_agent_id
                 }
                 None => None,
             };
             let team_context = team_contexts.get(&record.id).cloned();
+            // Only a restored parent waits on this agent's startup; any other
+            // agent may start as late as its backend needs.
+            let parent_waits = record
+                .parent_id
+                .as_ref()
+                .is_some_and(|parent| admission_by_session.contains_key(parent));
+            let restoration = crate::agent::registry::RestorationAdmission::new(
+                restore_state.agent_id.clone(),
+                parent_waits.then_some(restored_agent_startup_timeout),
+            );
             let restored = self
                 .spawn_agent_with_origin_config_and_team(
                     SpawnAgentPayload {
@@ -15522,6 +15743,7 @@ impl HostHandle {
                         team_context: team_context.clone(),
                         workflow: restore_state.workflow,
                         admitted_session: Some(admitted),
+                        restoration: Some(restoration.clone()),
                         ..Default::default()
                     },
                 )
@@ -15529,6 +15751,17 @@ impl HostHandle {
 
             match restored {
                 Ok(agent_id) => {
+                    if let Some(parent_session_id) = record.parent_id.as_ref()
+                        && let Some(parent) = admission_by_session.get(parent_session_id)
+                    {
+                        parent.record_restored_child(agent_id.clone());
+                        children_by_session
+                            .entry(parent_session_id.clone())
+                            .or_default()
+                            .push(restoration.clone());
+                    }
+                    admission_by_session.insert(record.id.clone(), restoration.clone());
+                    admissions.push((record.id.clone(), restoration));
                     restored_agent_ids.insert(record.id.clone(), agent_id.clone());
                     if let Some(team_context) = team_context {
                         self.bind_restored_team_member(team_context, agent_id, record.id)
@@ -15536,11 +15769,130 @@ impl HostHandle {
                     }
                 }
                 Err(error) => {
+                    restoration.abandon();
                     tracing::error!(
                         session_id = %record.id,
                         error = %error,
                         "failed to reconstruct open agent"
                     );
+                    failures.push(protocol::AgentRestorationFailure {
+                        agent: restored_session_ref(&record),
+                        reason: protocol::AgentRestorationFailureReason::ReconstructFailed {
+                            message: error.to_string(),
+                        },
+                        retry: protocol::AgentRestorationRetry::NextLaunch,
+                        skipped: Vec::new(),
+                    });
+                }
+            }
+        }
+        self.restore_startup_reservations(&session_store, &mut failures)
+            .await?;
+        if !failures.is_empty() {
+            let mut state = self.state.lock().await;
+            state.agent_restoration_failures = failures.clone();
+            fan_out_agent_restoration_status(
+                &mut state,
+                &protocol::AgentRestorationStatusPayload { failures },
+            );
+        }
+        // Each restored agent activates on its own once its restored children
+        // settle, so subtrees recover child-first and independently: a held
+        // subtree never delays an unrelated one.
+        for (session_id, admission) in admissions {
+            let children = children_by_session.remove(&session_id).unwrap_or_default();
+            let stopped = self.restart.stopped.clone();
+            tokio::spawn(async move {
+                for child in children {
+                    tokio::select! {
+                        _ = stopped.cancelled() => return,
+                        _ = child.wait_until_settled() => {}
+                    }
+                }
+                admission.activate();
+            });
+        }
+        Ok(())
+    }
+
+    /// A new or forked agent the previous host stopped before its provider
+    /// session existed is reconstructed from its startup reservation: the
+    /// same agent, first prompt, and held messages.
+    async fn restore_startup_reservations(
+        &self,
+        session_store: &Arc<SessionStoreHandle>,
+        failures: &mut Vec<protocol::AgentRestorationFailure>,
+    ) -> Result<(), String> {
+        let reservations = session_store
+            .startup_reservations()
+            .await
+            .map_err(|error| format!("failed to load agent startup reservations: {error}"))?;
+        for reservation in reservations {
+            if self.restart.stopped.is_cancelled() {
+                return Ok(());
+            }
+            let agent_id = reservation.agent_id.clone();
+            if !reservation.restorable {
+                if let Err(error) = session_store.remove_startup_reservation(&agent_id).await {
+                    tracing::error!(%agent_id, %error, "failed to drop an unrestorable startup reservation");
+                }
+                continue;
+            }
+            if self.agent_status_snapshot(&agent_id).await.is_some() {
+                continue;
+            }
+            let spawn = reservation.spawn;
+            let agent = protocol::RestoredAgentRef::StartupReservation {
+                agent_id: agent_id.clone(),
+                name: spawn.name.clone(),
+            };
+            if let Some(parent_agent_id) = spawn.parent_agent_id.as_ref()
+                && self.agent_status_snapshot(parent_agent_id).await.is_none()
+            {
+                tracing::error!(
+                    %agent_id,
+                    %parent_agent_id,
+                    "not restoring a reserved agent whose parent was not restored"
+                );
+                record_restoration_skip(
+                    failures,
+                    |failed| failed_agent_is(failed, parent_agent_id),
+                    agent,
+                );
+                continue;
+            }
+            let restoration =
+                crate::agent::registry::RestorationAdmission::new(Some(agent_id.clone()), None);
+            let restored = self
+                .spawn_agent_with_origin_config_and_team(
+                    spawn,
+                    SpawnAgentContext {
+                        origin: reservation.origin,
+                        workflow: reservation.workflow,
+                        restoration: Some(restoration.clone()),
+                        ..Default::default()
+                    },
+                )
+                .await;
+            match restored {
+                Ok(_) => restoration.activate(),
+                Err(error) => {
+                    restoration.abandon();
+                    tracing::error!(%agent_id, %error, "failed to reconstruct a reserved agent");
+                    failures.push(protocol::AgentRestorationFailure {
+                        agent,
+                        reason: protocol::AgentRestorationFailureReason::ReconstructFailed {
+                            message: error.to_string(),
+                        },
+                        retry: protocol::AgentRestorationRetry::Abandoned,
+                        skipped: Vec::new(),
+                    });
+                    if !self.restart.stopped.is_cancelled()
+                        && let Err(error) =
+                            session_store.remove_startup_reservation(&agent_id).await
+                    {
+                        tracing::error!(%agent_id, %error, "failed to drop a startup reservation");
+                    }
                 }
             }
         }

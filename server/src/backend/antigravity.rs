@@ -1204,7 +1204,8 @@ impl Supervisor {
                 }
                 // A tool response is not a chat message, so it produces no user
                 // bubble — the card the user acted on is the record of it.
-                let echo = payload.tool_response.is_none();
+                let echo = payload.tool_response.is_none()
+                    && payload.origin != Some(protocol::MessageOrigin::HostRestart);
                 let echoed = echo.then_some(payload.message.as_str());
                 self.start_turn(process, &payload.message, echoed).await
             }

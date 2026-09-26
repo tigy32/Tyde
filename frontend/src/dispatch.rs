@@ -204,6 +204,7 @@ pub fn prime_host_for_tests(state: &AppState, host_id: &str) {
         team_members: Vec::new(),
         team_member_bindings: Vec::new(),
         teams_store_load_error: None,
+        agent_restoration_failures: Vec::new(),
         agents: Vec::new(),
         task_token_usages: Vec::new(),
         workflow_summaries: Vec::new(),
@@ -2884,6 +2885,18 @@ pub fn dispatch_envelope(state: &AppState, host_id: &str, envelope: Envelope) {
                     &envelope.stream,
                     envelope.kind,
                     format!("failed to parse review_event payload: {error}"),
+                ),
+            }
+        }
+        FrameKind::AgentRestorationStatus => {
+            match envelope.parse_payload::<protocol::AgentRestorationStatusPayload>() {
+                Ok(payload) => set_agent_restoration_failures(state, host_id, payload.failures),
+                Err(error) => report_dispatch_error(
+                    state,
+                    host_id,
+                    &envelope.stream,
+                    envelope.kind,
+                    format!("failed to parse agent_restoration_status payload: {error}"),
                 ),
             }
         }
@@ -6481,6 +6494,20 @@ fn set_teams_store_load_error(
         });
 }
 
+fn set_agent_restoration_failures(
+    state: &AppState,
+    host_id: &str,
+    failures: Vec<protocol::AgentRestorationFailure>,
+) {
+    state.agent_restoration_failures.update(|map| {
+        if failures.is_empty() {
+            map.remove(host_id);
+        } else {
+            map.insert(host_id.to_owned(), failures);
+        }
+    });
+}
+
 fn apply_host_bootstrap(state: &AppState, host_id: &str, payload: HostBootstrapPayload) {
     log::info!(
         "dispatch host_bootstrap host={} sessions={} projects={} agents={} teams={} team_members={}",
@@ -6660,6 +6687,7 @@ fn apply_host_bootstrap(state: &AppState, host_id: &str, payload: HostBootstrapP
         }
     });
     set_teams_store_load_error(state, host_id, payload.teams_store_load_error);
+    set_agent_restoration_failures(state, host_id, payload.agent_restoration_failures);
     state.team_members.update(|map| {
         let host_map = map.entry(host_id.to_string()).or_default();
         host_map.clear();
@@ -7384,6 +7412,7 @@ pub(crate) mod restore_fixtures {
                 team_members: Vec::new(),
                 team_member_bindings: Vec::new(),
                 teams_store_load_error: None,
+                agent_restoration_failures: Vec::new(),
                 agents: Vec::new(),
                 task_token_usages: Vec::new(),
                 workflow_summaries: Vec::new(),

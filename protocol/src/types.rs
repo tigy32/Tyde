@@ -13,7 +13,7 @@ use serde_json::Value;
 /// `protocol::TydeReleaseVersion`.
 pub use host_config::{LOCAL_HOST_ID, TydeReleaseVersion};
 
-pub const PROTOCOL_VERSION: u32 = 66;
+pub const PROTOCOL_VERSION: u32 = 67;
 
 // Exported verbatim to TydeMobileService by tools/export-mobile-rtc.py.
 pub mod mobile_rtc {
@@ -1139,6 +1139,7 @@ pub enum FrameKind {
     McpServerNotify,
     TeamNotify,
     TeamsStoreStatusNotify,
+    AgentRestorationStatus,
     TeamMemberNotify,
     TeamMemberBindingNotify,
     TeamCompactNotify,
@@ -1341,6 +1342,7 @@ impl fmt::Display for FrameKind {
             Self::McpServerNotify => f.write_str("mcp_server_notify"),
             Self::TeamNotify => f.write_str("team_notify"),
             Self::TeamsStoreStatusNotify => f.write_str("teams_store_status_notify"),
+            Self::AgentRestorationStatus => f.write_str("agent_restoration_status"),
             Self::TeamMemberNotify => f.write_str("team_member_notify"),
             Self::TeamMemberBindingNotify => f.write_str("team_member_binding_notify"),
             Self::TeamCompactNotify => f.write_str("team_compact_notify"),
@@ -1754,6 +1756,8 @@ pub struct HostBootstrapPayload<S = Value> {
     pub team_member_bindings: Vec<TeamMemberBindingPayload>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub teams_store_load_error: Option<TeamsStoreLoadError>,
+    #[serde(default)]
+    pub agent_restoration_failures: Vec<AgentRestorationFailure>,
     pub agents: Vec<NewAgentPayload>,
     #[serde(default)]
     pub task_token_usages: Vec<TaskTokenUsagePayload>,
@@ -3495,6 +3499,8 @@ pub enum MessageOrigin {
     /// Sent by the hidden agent supervisor to kick a stalled agent back to
     /// work after it went idle without finishing its task.
     Supervisor,
+    /// Server-owned continuation after host restart; never accepted from clients.
+    HostRestart,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -5217,6 +5223,61 @@ pub struct TeamsStoreStatusNotifyPayload {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TeamsStoreResetPayload {}
+
+/// An open agent the host tried to reconstruct after a restart.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RestoredAgentRef {
+    /// An agent with a saved provider session.
+    Session {
+        session_id: SessionId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_id: Option<AgentId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+    },
+    /// An agent the previous host stopped before its provider session existed.
+    StartupReservation {
+        agent_id: AgentId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AgentRestorationFailureReason {
+    ReconstructFailed { message: String },
+    ParentNotRestored,
+}
+
+/// What happens to a failed restoration's intent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentRestorationRetry {
+    /// The failed agent and its skipped subtree keep their restoration intent
+    /// and are retried, under the same identities, on the next launch.
+    NextLaunch,
+    /// The failed agent's restoration intent was dropped; it is not retried.
+    Abandoned,
+}
+
+/// One agent subtree this launch's restoration pass could not bring back.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentRestorationFailure {
+    pub agent: RestoredAgentRef,
+    pub reason: AgentRestorationFailureReason,
+    pub retry: AgentRestorationRetry,
+    /// Descendants not restored because this agent was not.
+    #[serde(default)]
+    pub skipped: Vec<RestoredAgentRef>,
+}
+
+/// The host's current restoration failures. Replaces any earlier status.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentRestorationStatusPayload {
+    pub failures: Vec<AgentRestorationFailure>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]

@@ -1425,6 +1425,10 @@ impl Connection {
                     let _: protocol::TeamsStoreStatusNotifyPayload =
                         envelope.parse_payload().map_err(FrameError::Json)?;
                 }
+                FrameKind::AgentRestorationStatus => {
+                    let _: protocol::AgentRestorationStatusPayload =
+                        envelope.parse_payload().map_err(FrameError::Json)?;
+                }
                 FrameKind::TeamMemberNotify => {
                     let _: TeamMemberNotifyPayload =
                         envelope.parse_payload().map_err(FrameError::Json)?;

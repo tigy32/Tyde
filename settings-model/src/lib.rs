@@ -584,7 +584,7 @@ fn decorate_host_settings_schema(schema: &mut Value) {
         (
             "resume_previous_agents",
             "Resume previous agents",
-            "Automatically reopen this host's previously open agents after an update or restart. Turning this off leaves running agents alone and keeps saved sessions in History for manual resume. Changes take effect on the next host restart.",
+            "Automatically reopen this host's previously open agents after an update or restart. Agents that were mid-turn continue where they stopped, with their queued messages preserved; approvals and questions still wait for you. Turning this off keeps saved sessions in History for manual resume, which never continues on its own. Changes take effect on the next host restart.",
         ),
         (
             "tyde_debug_mcp_enabled",

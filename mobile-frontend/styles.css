@@ -1159,6 +1159,26 @@ input, textarea, select {
     color: var(--accent-error);
 }
 
+.agent-restoration-notice {
+    margin-bottom: var(--space-3);
+    padding: var(--space-3);
+    background: var(--accent-error-bg);
+    border: 1px solid var(--accent-error);
+    border-radius: var(--radius-md);
+    font-size: var(--text-sm);
+    color: var(--accent-error);
+}
+
+.agent-restoration-notice-title {
+    margin: 0;
+    font-weight: 600;
+}
+
+.agent-restoration-notice-list {
+    margin: var(--space-2) 0 0;
+    padding-left: var(--space-4);
+}
+
 /* ── Chat View ──────────────────────────────────────────────────────── */
 
 .chat-view {

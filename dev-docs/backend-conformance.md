@@ -588,3 +588,22 @@ SIGTERM/SIGINT exit. Those tests now pass, along with shared, cancellation-safe
 suites render all typed recovery phases, including a notice-only conversation.
 Linux backend leaders use parent-death SIGKILL as best-effort containment;
 descendants which escape the group and macOS abrupt host death remain gaps.
+
+## Restart continuation origin
+
+`real_restart_continuation_is_not_a_user_message` resumes a cleanly closed
+session through every backend that declares resume and delivers a prompt with
+the server-reserved host-restart origin through the production `Backend`
+trait. The oracle is identical everywhere: the turn must show no user message,
+must end exactly one response, and that response must be the requested marker,
+so the continuation reached the model as a prompt without being echoed as
+user text. Before the origin was threaded through the providers, every backend
+echoed it as a user bubble. It passed all seven backends (14.63s combined); a
+Codex-only rerun with captured output confirmed the scenario executed there
+(10.18s).
+
+The scenario covers the provider boundary only. Restoration ordering, queue
+placement, adoption of a backend's own resumed turn, and the manual-resume
+path are sims in `server/tests/session_resume.rs`. Providers that replay
+history from their own transcripts may still show the continuation as a user
+message on a later resume; that replay is not covered here.

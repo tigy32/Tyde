@@ -15,6 +15,10 @@ pub(crate) enum TranscriptVisibility {
     TimelineMarker,
     InternalCompactionSeed,
     ProviderMetadata,
+    /// A tool request, or its completion, issued inside a response that has
+    /// not ended. Replay materializes the response only at its end, so this
+    /// record is what keeps the call durable if the host dies first.
+    OpenStreamToolEvent,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]

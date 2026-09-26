@@ -2968,10 +2968,12 @@ impl HermesSessionActor {
         // Scope the stderr tail to this turn so a later failure never reports
         // stale output from an earlier one.
         self.recent_stderr.clear();
-        self.emit(ChatEvent::MessageAdded(user_message(
-            &payload.message,
-            (!images.is_empty()).then_some(images),
-        )));
+        if payload.origin != Some(protocol::MessageOrigin::HostRestart) {
+            self.emit(ChatEvent::MessageAdded(user_message(
+                &payload.message,
+                (!images.is_empty()).then_some(images),
+            )));
+        }
         self.mapper.typing_active = true;
         self.emit(ChatEvent::TypingStatusChanged(true));
         self.submit_prompt(&payload.message, &attached_paths).await;

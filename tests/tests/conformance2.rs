@@ -7854,3 +7854,64 @@ async fn real_interrupt_shutdown_kills_process_group<B: Backend>(host: &mut Harn
         survivors.len()
     );
 }
+
+conformance2_scenario!(
+    real_restart_continuation_is_not_a_user_message,
+    [BackendCapability::ResumeSession]
+);
+
+async fn real_restart_continuation_is_not_a_user_message<B: Backend>(host: &mut Harness<B>) {
+    use server::backend::SendOutcome;
+
+    let agent = spawn_agent(host, &launch_prompt()).await;
+    let launched = collect_turn(host, &agent, &launch_prompt()).await;
+    assert_ready_handshake(&launched);
+    assert_universal_contract(&[launched]);
+    assert_clean_close(host, &agent).await;
+
+    let session = stored_session(host).await;
+    let resumed = resume_agent(host, &session.id).await;
+    let prompt = "Tyde restarted while you were working. Do not use any tools. \
+                  Reply with exactly RESTART_CONTINUED, and nothing else.";
+    let continuation = protocol::SendMessagePayload {
+        message: prompt.to_owned(),
+        images: None,
+        origin: Some(protocol::MessageOrigin::HostRestart),
+        tool_response: None,
+    };
+    assert!(
+        matches!(
+            try_deliver_message(host, &resumed, continuation, false).await,
+            SendOutcome::Accepted
+        ),
+        "backend did not accept the host restart continuation"
+    );
+    let continued = collect_turn(host, &resumed, prompt).await;
+    let echoed = continued
+        .user_messages()
+        .map(|message| message.content.clone())
+        .collect::<Vec<_>>();
+    assert!(
+        echoed.is_empty(),
+        "{}: a server-owned restart continuation was shown as user text: {echoed:?}",
+        continued.label()
+    );
+    assert_eq!(
+        continued
+            .events()
+            .iter()
+            .filter(|event| matches!(event, ChatEvent::StreamEnd(_)))
+            .count(),
+        1,
+        "{}: the continuation lost or duplicated its response",
+        continued.label()
+    );
+    assert_eq!(
+        continued.final_text().trim(),
+        "RESTART_CONTINUED",
+        "{}: the continuation did not reach the model as a prompt",
+        continued.label()
+    );
+    assert_universal_contract(&[continued]);
+    assert_clean_close(host, &resumed).await;
+}

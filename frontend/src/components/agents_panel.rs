@@ -1003,6 +1003,74 @@ fn folder_members(
     }
 }
 
+fn restored_agent_label(agent: &protocol::RestoredAgentRef) -> String {
+    match agent {
+        protocol::RestoredAgentRef::Session {
+            session_id, name, ..
+        } => name
+            .clone()
+            .unwrap_or_else(|| format!("session {}", session_id.0)),
+        protocol::RestoredAgentRef::StartupReservation { agent_id, name } => {
+            name.clone().unwrap_or_else(|| format!("agent {agent_id}"))
+        }
+    }
+}
+
+fn restoration_failure_text(failure: &protocol::AgentRestorationFailure) -> String {
+    let reason = match &failure.reason {
+        protocol::AgentRestorationFailureReason::ReconstructFailed { message } => message.clone(),
+        protocol::AgentRestorationFailureReason::ParentNotRestored => {
+            "its parent agent was not restored".to_owned()
+        }
+    };
+    let mut text = format!("{}: {reason}.", restored_agent_label(&failure.agent));
+    if !failure.skipped.is_empty() {
+        let skipped = failure
+            .skipped
+            .iter()
+            .map(restored_agent_label)
+            .collect::<Vec<_>>()
+            .join(", ");
+        text.push_str(&format!(" Also not restored: {skipped}."));
+    }
+    text.push_str(match failure.retry {
+        protocol::AgentRestorationRetry::NextLaunch => " Restore will be retried on next launch.",
+        protocol::AgentRestorationRetry::Abandoned => " It will not be restored.",
+    });
+    text
+}
+
+#[component]
+fn AgentRestorationNotice() -> impl IntoView {
+    let state = expect_context::<AppState>();
+    move || {
+        let mut hosts = state
+            .agent_restoration_failures
+            .get()
+            .into_iter()
+            .collect::<Vec<_>>();
+        hosts.sort_by(|a, b| a.0.cmp(&b.0));
+        hosts
+            .into_iter()
+            .map(|(_, failures)| {
+                view! {
+                    <div class="workflow-error-banner" role="alert">
+                        <span class="workflow-error-banner-message">
+                            "Some open agents could not be restored."
+                        </span>
+                        <ul>
+                            {failures
+                                .iter()
+                                .map(|failure| view! { <li>{restoration_failure_text(failure)}</li> })
+                                .collect_view()}
+                        </ul>
+                    </div>
+                }
+            })
+            .collect_view()
+    }
+}
+
 #[component]
 pub fn AgentsPanel() -> impl IntoView {
     let state = expect_context::<AppState>();
@@ -1184,6 +1252,7 @@ pub fn AgentsPanel() -> impl IntoView {
                     "Show other projects"
                 </button>
             </div>
+            <AgentRestorationNotice />
             <div class="panel-content">
                 {move || {
                     let projection = projection.get();
@@ -6619,6 +6688,92 @@ mod wasm_tests {
                 .unwrap()
                 .is_none(),
             "and the side-open class is gone entirely"
+        );
+    }
+
+    /// A restoration pass that could not bring an agent back is announced,
+    /// naming the failed agent, its skipped children and the deferred retry,
+    /// whether the host reports it in its bootstrap or as a live status, and
+    /// the notice disappears when the host reports no failures.
+    #[wasm_bindgen_test]
+    async fn restoration_failures_name_the_skipped_subtree_until_cleared() {
+        use crate::dispatch::restore_fixtures::restore_bootstrap;
+
+        let failure = protocol::AgentRestorationFailure {
+            agent: protocol::RestoredAgentRef::Session {
+                session_id: protocol::SessionId("parent-session".to_owned()),
+                agent_id: Some(AgentId("parent-agent".to_owned())),
+                name: Some("failing parent".to_owned()),
+            },
+            reason: protocol::AgentRestorationFailureReason::ReconstructFailed {
+                message: "backend refused the resume".to_owned(),
+            },
+            retry: protocol::AgentRestorationRetry::NextLaunch,
+            skipped: vec![protocol::RestoredAgentRef::Session {
+                session_id: protocol::SessionId("child-session".to_owned()),
+                agent_id: None,
+                name: None,
+            }],
+        };
+        let container = make_container();
+        let state = make_app_state("h");
+        crate::dispatch::prime_host_for_tests(&state, "h");
+        let mut bootstrap = restore_bootstrap(vec![], Default::default(), vec![], vec![]);
+        bootstrap.agent_restoration_failures = vec![failure.clone()];
+        dispatch_frame(
+            &state,
+            "h",
+            StreamPath("/host/h".to_owned()),
+            FrameKind::HostBootstrap,
+            0,
+            &bootstrap,
+        );
+        let _handle = mount_panel(&container, state.clone());
+        for _ in 0..4 {
+            next_tick().await;
+        }
+        let expected = "Some open agents could not be restored.\
+             failing parent: backend refused the resume. \
+             Also not restored: session child-session. \
+             Restore will be retried on next launch.";
+        let notice_text = || {
+            container
+                .query_selector("[role='alert']")
+                .unwrap()
+                .map(|alert| alert.text_content().unwrap_or_default())
+        };
+        assert_eq!(
+            notice_text().as_deref(),
+            Some(expected),
+            "the bootstrap's restoration failure is announced"
+        );
+
+        dispatch_frame(
+            &state,
+            "h",
+            StreamPath("/host/h".to_owned()),
+            FrameKind::AgentRestorationStatus,
+            1,
+            &protocol::AgentRestorationStatusPayload { failures: vec![] },
+        );
+        next_tick().await;
+        assert_eq!(notice_text(), None, "a cleared status removes the notice");
+
+        dispatch_frame(
+            &state,
+            "h",
+            StreamPath("/host/h".to_owned()),
+            FrameKind::AgentRestorationStatus,
+            2,
+            &protocol::AgentRestorationStatusPayload {
+                failures: vec![failure],
+            },
+        );
+        next_tick().await;
+        assert_eq!(
+            notice_text().as_deref(),
+            Some(expected),
+            "a live restoration status is announced"
         );
     }
 }

@@ -756,6 +756,7 @@ async fn split_endpoints_allow_event_loops_and_commands_to_run_independently() {
                 | HostEvent::MobilePairingOffer(_)
                 | HostEvent::TeamNotify(_)
                 | HostEvent::TeamsStoreStatusNotify(_)
+                | HostEvent::AgentRestorationStatus(_)
                 | HostEvent::TeamMemberNotify(_)
                 | HostEvent::TeamMemberBindingNotify(_)
                 | HostEvent::TeamPresetCatalogNotify(_)

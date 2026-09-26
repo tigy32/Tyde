@@ -332,6 +332,7 @@ impl KiroCommandHandle {
             return self.inner.answer_pending_tool_response(payload).await;
         }
         self.execute(SessionCommand::SendMessage {
+            origin: payload.origin,
             message: payload.message,
             images: crate::backend::protocol_images_to_attachments(payload.images),
         })
@@ -1214,7 +1215,11 @@ impl KiroInner {
             SessionCommand::CancelBackgroundTask { tool_call_id } => Err(format!(
                 "this backend cannot cancel background command {tool_call_id}"
             )),
-            SessionCommand::SendMessage { message, images } => {
+            SessionCommand::SendMessage {
+                message,
+                images,
+                origin,
+            } => {
                 // ACP notifications carry a session id, not a prompt id. Drain
                 // the preceding prompt before admitting another into that stream.
                 let prompt_guard = self.prompt_lock.lock().await;
@@ -1240,7 +1245,9 @@ impl KiroInner {
                         state.opencode_pending_response_usage = None;
                     }
                 }
-                self.emit_user_message_added(&message, images.as_deref());
+                if origin != Some(protocol::MessageOrigin::HostRestart) {
+                    self.emit_user_message_added(&message, images.as_deref());
+                }
                 self.emitter.typing_status_changed(true);
 
                 let (session_id, model, mode, steering, command_plan) = {
@@ -6903,6 +6910,7 @@ impl Backend for KiroBackend {
             crate::backend::subprocess::spawn(async move {
                 if let Err(err) = initial_handle
                     .execute(SessionCommand::SendMessage {
+                        origin: None,
                         message: initial_message,
                         images: initial_images,
                     })

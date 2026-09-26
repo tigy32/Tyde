@@ -57,6 +57,28 @@ funnel and cleared only at genuine foreground idle; restart changes it to
 on resume. Typed recovery notices render in both desktop and mobile history.
 Old stores default to no marker.
 
+Continuation is server-owned and runs only when **Resume previous agents** is
+enabled. Restoration registers every record under its persisted agent id, so
+orchestrators keep the child ids they already hold; a record whose recovery
+marker is set gets a server-composed continuation dispatched as a real live turn
+with `MessageOrigin::HostRestart`. The connection layer rejects that origin from
+clients, backends emit no user bubble for it, and it runs before the agent's
+previously queued messages, whose order is unchanged. A backend that resumes its
+own live turn is adopted instead of being sent a second prompt. Either path
+publishes `RestartRecovery(Continuing)`; a startup failure publishes
+`ContinuationFailed` and clears the marker. Idle records get no continuation.
+A usage-limit hold delays the continuation until the hold lifts.
+
+Continuations are released in post-order: a parent's is held until each of its
+restored children has been admitted, so an orchestrator never sees a child idle
+and spawns a replacement. Its continuation names the restored child ids and says
+to reuse them through `tyde_list_agents`/`tyde_await_agents`. Every
+continuation says to inspect results before repeating side effects and that it
+is not a user answer or approval. Manual resume from History reports
+`Interrupted` once, clears the marker, and never continues on its own. Once an
+agent is prepared for restart it starts no queued work, even if its current turn
+ends before its stop command arrives.
+
 On Linux, backend children request `PR_SET_PDEATHSIG(SIGKILL)` and reject a
 parent-exit race before exec. This is best effort: it covers the direct backend
 child, not descendants that detach or escape its process group. macOS has no

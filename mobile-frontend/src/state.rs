@@ -878,6 +878,10 @@ pub struct AppState {
     pub heartbeat_round_trip_ms_by_host: RwSignal<HashMap<LocalHostId, u64>>,
     pub host_settings_by_host: RwSignal<HashMap<LocalHostId, HostSettings>>,
     pub command_errors_by_host: RwSignal<HashMap<LocalHostId, String>>,
+    /// Agent subtrees each host's restoration pass could not bring back, as
+    /// last reported by `HostBootstrap` or `AgentRestorationStatus`.
+    pub agent_restoration_failures_by_host:
+        RwSignal<HashMap<LocalHostId, Vec<protocol::AgentRestorationFailure>>>,
     pub voice_capabilities_by_host:
         RwSignal<HashMap<LocalHostId, protocol::VoiceCapabilitiesPayload>>,
     pub voice_ui: RwSignal<crate::voice::MobileVoiceState>,
@@ -1090,6 +1094,7 @@ impl AppState {
             heartbeat_round_trip_ms_by_host: RwSignal::new(HashMap::new()),
             host_settings_by_host: RwSignal::new(HashMap::new()),
             command_errors_by_host: RwSignal::new(HashMap::new()),
+            agent_restoration_failures_by_host: RwSignal::new(HashMap::new()),
             voice_capabilities_by_host: RwSignal::new(HashMap::new()),
             voice_ui: RwSignal::new(crate::voice::MobileVoiceState::Idle),
             voice_generation: RwSignal::new(0),
@@ -1759,6 +1764,9 @@ impl AppState {
             m.remove(host);
         });
         self.command_errors_by_host.update(|m| {
+            m.remove(host);
+        });
+        self.agent_restoration_failures_by_host.update(|m| {
             m.remove(host);
         });
         self.backend_setup_by_host.update(|m| {

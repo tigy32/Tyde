@@ -88,9 +88,30 @@ pub(crate) struct FinishCompactionOperation {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct SessionRestoreState {
+    #[serde(default)]
+    pub agent_id: Option<protocol::AgentId>,
     pub origin: AgentOrigin,
     #[serde(default)]
     pub workflow: Option<AgentWorkflowMetadata>,
+}
+
+/// A new or forked agent whose provider session does not exist yet. It is
+/// durable before the agent's first prompt is admitted and carries that
+/// prompt, so a host that dies during startup re-issues it on the same agent
+/// at the next launch. Startup replaces it with the session record in one
+/// transaction.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct StartupReservation {
+    pub agent_id: protocol::AgentId,
+    pub spawn: protocol::SpawnAgentPayload,
+    pub origin: AgentOrigin,
+    #[serde(default)]
+    pub workflow: Option<AgentWorkflowMetadata>,
+    pub restorable: bool,
+    #[serde(default)]
+    pub turn_recovery: Option<TurnRecovery>,
+    #[serde(default)]
+    pub queued_messages: Vec<protocol::QueuedMessageEntry>,
 }
 
 pub(crate) struct CommitCompactedBinding {
@@ -243,6 +264,11 @@ impl SessionStore {
             1 => {}
             _ => return Err("session database schema is newer than this server".to_owned()),
         }
+        transaction
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS startup_reservations (id TEXT PRIMARY KEY NOT NULL, record TEXT NOT NULL);",
+            )
+            .map_err(sql_error)?;
         let purged = {
             let mut statement = transaction
                 .prepare("SELECT id FROM archived_sessions")
@@ -924,6 +950,117 @@ impl SessionStore {
         Ok(summaries)
     }
 
+    /// Records `reservation`, keeping the messages already queued on an
+    /// earlier reservation of the same agent, and returns them.
+    pub(crate) fn reserve_startup(
+        &self,
+        mut reservation: StartupReservation,
+    ) -> Result<Vec<protocol::QueuedMessageEntry>, String> {
+        self.reservation_transaction(|transaction| {
+            if let Some(existing) = read_reservation(transaction, &reservation.agent_id)? {
+                reservation.queued_messages = existing.queued_messages;
+            }
+            write_reservation(transaction, &reservation)?;
+            Ok((reservation.queued_messages, true))
+        })
+    }
+
+    pub(crate) fn update_startup_reservation(
+        &self,
+        agent_id: &protocol::AgentId,
+        update: impl FnOnce(&mut StartupReservation),
+    ) -> Result<(), String> {
+        self.reservation_transaction(|transaction| {
+            let mut reservation = read_reservation(transaction, agent_id)?
+                .ok_or("the agent's startup reservation is missing")?;
+            update(&mut reservation);
+            write_reservation(transaction, &reservation)?;
+            Ok(((), true))
+        })
+    }
+
+    pub(crate) fn remove_startup_reservation(
+        &self,
+        agent_id: &protocol::AgentId,
+    ) -> Result<(), String> {
+        self.reservation_transaction(|transaction| {
+            let removed = transaction
+                .execute(
+                    "DELETE FROM startup_reservations WHERE id=?1",
+                    [&agent_id.0],
+                )
+                .map_err(sql_error)?;
+            Ok(((), removed > 0))
+        })
+    }
+
+    pub(crate) fn startup_reservations(&self) -> Result<Vec<StartupReservation>, String> {
+        let connection = self.reader()?;
+        let mut statement = connection
+            .prepare("SELECT record FROM startup_reservations")
+            .map_err(sql_error)?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(sql_error)?;
+        rows.map(|row| {
+            serde_json::from_str(&row.map_err(sql_error)?)
+                .map_err(|error| format!("decode startup reservation: {error}"))
+        })
+        .collect()
+    }
+
+    /// Replaces the agent's startup reservation with its now-existing session:
+    /// the reservation's recovery marker, queue and restoration intent move to
+    /// the session in the same transaction that removes the reservation, so a
+    /// restart finds exactly one of them.
+    pub(crate) fn promote_startup_reservation(
+        &self,
+        agent_id: &protocol::AgentId,
+        session_id: &SessionId,
+        restore_state: Option<SessionRestoreState>,
+    ) -> Result<(), String> {
+        self.reservation_transaction(|transaction| {
+            let reservation = read_reservation(transaction, agent_id)?
+                .ok_or("the agent's startup reservation is missing")?;
+            let original = read_raw_records(transaction, &[session_id])?;
+            let mut records = decode_records(&original)?;
+            let record = records
+                .get_mut(&session_id.0)
+                .ok_or("the agent's session record is missing")?;
+            record.turn_recovery = reservation.turn_recovery;
+            record.queued_messages = reservation.queued_messages;
+            if restore_state.is_some() {
+                record.restore_state = restore_state;
+            }
+            write_records(transaction, &original, records)?;
+            transaction
+                .execute(
+                    "DELETE FROM startup_reservations WHERE id=?1",
+                    [&agent_id.0],
+                )
+                .map_err(sql_error)?;
+            Ok(((), true))
+        })
+    }
+
+    fn reservation_transaction<T>(
+        &self,
+        body: impl FnOnce(&rusqlite::Transaction<'_>) -> Result<(T, bool), String>,
+    ) -> Result<T, String> {
+        let mut connection = self.writer.lock().map_err(|_| "session writer poisoned")?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql_error)?;
+        let (result, wrote) = body(&transaction)?;
+        #[cfg(feature = "test-support")]
+        if wrote {
+            commit_hooks::run(&self.path)?;
+        }
+        transaction.commit().map_err(sql_error)?;
+        tracing::debug!(wrote, "committed startup reservation transaction");
+        Ok(result)
+    }
+
     fn reader(&self) -> Result<Connection, String> {
         let connection = Connection::open_with_flags(&self.path, OpenFlags::SQLITE_OPEN_READ_ONLY)
             .map_err(sql_error)?;
@@ -955,33 +1092,14 @@ impl SessionStore {
         let original = read_raw_records(&transaction, ids)?;
         let mut records = decode_records(&original)?;
         let (result, changed) = body(&mut records)?;
-        let mut writes = 0;
-        if changed {
-            for id in original.keys().filter(|id| !records.contains_key(*id)) {
-                transaction
-                    .execute("DELETE FROM sessions WHERE id=?1", [id])
-                    .map_err(sql_error)?;
-                transaction
-                    .execute("DELETE FROM session_tasks WHERE id=?1", [id])
-                    .map_err(sql_error)?;
-                writes += 1;
-            }
-            for (id, record) in records {
-                let mut value = original
-                    .get(&id)
-                    .cloned()
-                    .unwrap_or_else(|| serde_json::json!({}));
-                merge_record(&mut value, &record)?;
-                if original.get(&id) == Some(&value) {
-                    continue;
-                }
-                transaction.execute("INSERT INTO sessions (id, record) VALUES (?1, ?2) ON CONFLICT(id) DO UPDATE SET record=excluded.record", params![id, value.to_string()]).map_err(sql_error)?;
-                writes += 1;
-            }
-        }
+        let writes = if changed {
+            write_records(&transaction, &original, records)?
+        } else {
+            0
+        };
         #[cfg(feature = "test-support")]
         if writes > 0 {
-            commit_hooks::run(&self.path);
+            commit_hooks::run(&self.path)?;
         }
         transaction.commit().map_err(sql_error)?;
         tracing::debug!(
@@ -1182,6 +1300,51 @@ impl SessionStoreHandle {
             .await
     }
 
+    pub(crate) async fn reserve_startup(
+        &self,
+        reservation: StartupReservation,
+    ) -> Result<Vec<protocol::QueuedMessageEntry>, String> {
+        self.call(move |store| store.reserve_startup(reservation))
+            .await
+    }
+
+    pub(crate) async fn update_startup_reservation(
+        &self,
+        agent_id: &protocol::AgentId,
+        update: impl FnOnce(&mut StartupReservation) + Send + 'static,
+    ) -> Result<(), String> {
+        let agent_id = agent_id.clone();
+        self.call(move |store| store.update_startup_reservation(&agent_id, update))
+            .await
+    }
+
+    pub(crate) async fn remove_startup_reservation(
+        &self,
+        agent_id: &protocol::AgentId,
+    ) -> Result<(), String> {
+        let agent_id = agent_id.clone();
+        self.call(move |store| store.remove_startup_reservation(&agent_id))
+            .await
+    }
+
+    pub(crate) async fn startup_reservations(&self) -> Result<Vec<StartupReservation>, String> {
+        self.read(|store| store.startup_reservations()).await
+    }
+
+    pub(crate) async fn promote_startup_reservation(
+        &self,
+        agent_id: &protocol::AgentId,
+        session_id: &SessionId,
+        restore_state: Option<SessionRestoreState>,
+    ) -> Result<(), String> {
+        let agent_id = agent_id.clone();
+        let session_id = session_id.clone();
+        self.call(move |store| {
+            store.promote_startup_reservation(&agent_id, &session_id, restore_state)
+        })
+        .await
+    }
+
     pub(crate) async fn clear_restore_states(
         &self,
         session_ids: &HashSet<SessionId>,
@@ -1344,6 +1507,70 @@ fn read_records(
     decode_records(&read_raw_records(connection, ids)?)
 }
 
+fn write_records(
+    transaction: &rusqlite::Transaction<'_>,
+    original: &HashMap<String, Value>,
+    records: HashMap<String, SessionRecord>,
+) -> Result<usize, String> {
+    let mut writes = 0;
+    for id in original.keys().filter(|id| !records.contains_key(*id)) {
+        transaction
+            .execute("DELETE FROM sessions WHERE id=?1", [id])
+            .map_err(sql_error)?;
+        transaction
+            .execute("DELETE FROM session_tasks WHERE id=?1", [id])
+            .map_err(sql_error)?;
+        writes += 1;
+    }
+    for (id, record) in records {
+        let mut value = original
+            .get(&id)
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({}));
+        merge_record(&mut value, &record)?;
+        if original.get(&id) == Some(&value) {
+            continue;
+        }
+        transaction.execute("INSERT INTO sessions (id, record) VALUES (?1, ?2) ON CONFLICT(id) DO UPDATE SET record=excluded.record", params![id, value.to_string()]).map_err(sql_error)?;
+        writes += 1;
+    }
+    Ok(writes)
+}
+
+fn read_reservation(
+    connection: &Connection,
+    agent_id: &protocol::AgentId,
+) -> Result<Option<StartupReservation>, String> {
+    connection
+        .query_row(
+            "SELECT record FROM startup_reservations WHERE id=?1",
+            [&agent_id.0],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(sql_error)?
+        .map(|json| {
+            serde_json::from_str(&json)
+                .map_err(|error| format!("decode startup reservation: {error}"))
+        })
+        .transpose()
+}
+
+fn write_reservation(
+    connection: &Connection,
+    reservation: &StartupReservation,
+) -> Result<(), String> {
+    let json = serde_json::to_string(reservation)
+        .map_err(|error| format!("encode startup reservation: {error}"))?;
+    connection
+        .execute(
+            "INSERT INTO startup_reservations (id, record) VALUES (?1, ?2) ON CONFLICT(id) DO UPDATE SET record=excluded.record",
+            params![reservation.agent_id.0, json],
+        )
+        .map_err(sql_error)?;
+    Ok(())
+}
+
 fn merge_record(value: &mut Value, record: &SessionRecord) -> Result<(), String> {
     let encoded =
         serde_json::to_value(record).map_err(|error| format!("encode session: {error}"))?;
@@ -1504,7 +1731,7 @@ pub mod commit_hooks {
     use std::path::{Path, PathBuf};
     use std::sync::{Mutex, OnceLock};
 
-    type Hook = Box<dyn FnOnce() + Send>;
+    type Hook = Box<dyn FnOnce() -> Result<(), String> + Send>;
     static HOOKS: OnceLock<Mutex<HashMap<PathBuf, Hook>>> = OnceLock::new();
 
     pub struct InstalledHook(PathBuf);
@@ -1531,14 +1758,12 @@ pub mod commit_hooks {
         }
     }
 
-    pub(super) fn run(path: &Path) {
+    pub(super) fn run(path: &Path) -> Result<(), String> {
         let hook = HOOKS
             .get_or_init(Mutex::default)
             .lock()
             .unwrap()
             .remove(path);
-        if let Some(hook) = hook {
-            hook();
-        }
+        hook.map_or(Ok(()), |hook| hook())
     }
 }

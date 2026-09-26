@@ -294,7 +294,11 @@ impl MockActor {
             return self.record_violation(MockViolation::InputWhileToolPending);
         }
         let compact = payload.message.trim() == "/compact";
-        if self.user_bubbles && !compact && !self.emit_user_bubble(&payload.message) {
+        if self.user_bubbles
+            && payload.origin != Some(protocol::MessageOrigin::HostRestart)
+            && !compact
+            && !self.emit_user_bubble(&payload.message)
+        {
             return false;
         }
         let prompt_index = record_prompt(&self.session_id, &payload.message);
@@ -534,7 +538,7 @@ impl MockActor {
             tokio::pin!(wait);
             loop {
                 tokio::select! {
-                    () = &mut wait => break,
+                    _ = &mut wait => break,
                     command = control.recv() => self.handle_control(command),
                 }
             }

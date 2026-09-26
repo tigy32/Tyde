@@ -19,6 +19,22 @@ pub enum MockCompactionFailure {
     QuotaExceededOnce,
 }
 
+/// Where a running command's request lands relative to the response that
+/// issued it.
+#[derive(Debug, Clone, Copy)]
+pub enum RunningCommandShape {
+    RequestAfterResponse,
+    RequestInsideEndedResponse,
+    RequestInsideOpenResponse,
+}
+
+/// How the backend abandons a response that issued commands.
+#[derive(Debug, Clone, Copy)]
+pub enum AbandonedResponse {
+    Interrupted,
+    Replaced,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct MockScript {
     pub(super) compaction_availability: Option<crate::backend::BackendCompactionAvailability>,
@@ -31,6 +47,8 @@ pub struct MockScript {
     pub(super) resume_replay: Option<MockResumeReplay>,
     pub(super) mid_turn_steering: bool,
     pub(super) shutdown_gate: Option<MockGate>,
+    /// Parks every follow-up message before the provider accepts it.
+    pub(super) send_gate: Option<MockGate>,
     pub(super) compaction_observation_gates: Option<(MockGate, MockGate)>,
     /// Advertised as the session's slash-command set before the launch turn.
     pub(super) slash_commands: Option<Vec<SlashCommand>>,
@@ -122,6 +140,11 @@ impl MockScript {
         self.shutdown_gate = Some(gate.gate());
         self
     }
+
+    pub fn with_send_gate(mut self, gate: &MockGateHandle) -> Self {
+        self.send_gate = Some(gate.gate());
+        self
+    }
 }
 
 /// Synchronous replay production lets a sim queue history before advancing its
@@ -132,9 +155,22 @@ pub struct MockResumeReplay {
     ready: std::sync::Arc<tokio::sync::Notify>,
     sender:
         std::sync::Arc<std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<BackendEvent>>>>,
+    send_gate: std::sync::Arc<std::sync::Mutex<Option<MockGate>>>,
 }
 
 impl MockResumeReplay {
+    /// Parks every message sent to the resumed session on `gate`.
+    pub fn gate_sends(&self, gate: &MockGateHandle) {
+        *self.send_gate.lock().expect("mock replay send gate mutex") = Some(gate.gate());
+    }
+
+    pub(super) fn send_gate(&self) -> Option<MockGate> {
+        self.send_gate
+            .lock()
+            .expect("mock replay send gate mutex")
+            .clone()
+    }
+
     pub(super) fn bind(&self, sender: tokio::sync::mpsc::UnboundedSender<BackendEvent>) {
         *self.sender.lock().expect("mock replay sender mutex") = Some(sender);
         self.ready.notify_one();
@@ -419,6 +455,32 @@ impl MockTurn {
 
     pub fn held_text(text: impl Into<String>) -> Self {
         Self::held(held_steps(text.into()), true)
+    }
+
+    /// A turn parked inside a command the backend never reports finishing.
+    pub fn held_running_command(tool_call_id: &str, shape: RunningCommandShape) -> Self {
+        Self::held(
+            emit::running_command_frames(tool_call_id, shape)
+                .into_iter()
+                .map(MockStep::emit)
+                .collect(),
+            true,
+        )
+    }
+
+    /// A turn whose response issues two commands and is then abandoned
+    /// without ending; only `finished_id` is ever reported finishing.
+    pub fn abandoned_response_commands(
+        running_id: &str,
+        finished_id: &str,
+        abandon: AbandonedResponse,
+    ) -> Self {
+        Self::done(
+            emit::abandoned_response_command_frames(running_id, finished_id, abandon)
+                .into_iter()
+                .map(MockStep::emit)
+                .collect(),
+        )
     }
 
     pub fn held_text_uninterruptible(text: impl Into<String>) -> Self {

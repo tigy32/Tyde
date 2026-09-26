@@ -95,6 +95,17 @@ pub fn reset_inbound_seq_for_host(host: &LocalHostId) {
 /// dispatch their first envelope at seq `0` without a seq-mismatch error.
 #[cfg(all(test, target_arch = "wasm32"))]
 pub fn prime_host_for_tests(state: &AppState, host: &LocalHostId) {
+    prime_host_with_bootstrap_for_tests(state, host, |_| {});
+}
+
+/// Test helper: like [`prime_host_for_tests`], but lets the test shape the
+/// delivered `HostBootstrap` payload before it is dispatched.
+#[cfg(all(test, target_arch = "wasm32"))]
+pub fn prime_host_with_bootstrap_for_tests(
+    state: &AppState,
+    host: &LocalHostId,
+    customize: impl FnOnce(&mut HostBootstrapPayload),
+) {
     use protocol::{
         BackendSetupPayload as BootstrapBackendSetup, HostBootstrapPayload as BootstrapHostPayload,
         MobileAccessStatePayload as BootstrapMobileAccess,
@@ -112,7 +123,7 @@ pub fn prime_host_for_tests(state: &AppState, host: &LocalHostId) {
         tyde_version: TYDE_VERSION,
         release_version: None,
     };
-    let bootstrap = BootstrapHostPayload {
+    let mut bootstrap = BootstrapHostPayload {
         agents_with_background_work: Vec::new(),
         settings: BootstrapHostSettings {
             resume_previous_agents: settings_model::default_resume_previous_agents(),
@@ -175,6 +186,7 @@ pub fn prime_host_for_tests(state: &AppState, host: &LocalHostId) {
         team_members: Vec::new(),
         team_member_bindings: Vec::new(),
         teams_store_load_error: None,
+        agent_restoration_failures: Vec::new(),
         agents: Vec::new(),
         task_token_usages: Vec::new(),
         workflow_summaries: Vec::new(),
@@ -183,6 +195,7 @@ pub fn prime_host_for_tests(state: &AppState, host: &LocalHostId) {
         workflow_locations: Vec::new(),
         agents_view_preferences: None,
     };
+    customize(&mut bootstrap);
 
     let welcome_env = Envelope::from_payload(host_stream.clone(), FrameKind::Welcome, 0, &welcome)
         .expect("synthetic Welcome");
@@ -1161,6 +1174,23 @@ pub fn dispatch_envelope(state: &AppState, host: &LocalHostId, envelope: Envelop
                     envelope.seq,
                     error
                 );
+            }
+        }
+        FrameKind::AgentRestorationStatus => {
+            match envelope.parse_payload::<protocol::AgentRestorationStatusPayload>() {
+                Ok(payload) => set_agent_restoration_failures(state, host, payload.failures),
+                Err(error) => {
+                    let message = format!(
+                        "failed to parse AgentRestorationStatus host={} stream={} seq={}: {}",
+                        host, envelope.stream, envelope.seq, error
+                    );
+                    log::error!("{message}");
+                    report_protocol_error(
+                        state,
+                        host,
+                        bridge::ConnectionInvalidation::ProtocolViolation { message },
+                    );
+                }
             }
         }
         _ => {
@@ -2760,6 +2790,20 @@ pub fn load_next_session_page(state: &AppState, host: &LocalHostId) {
     });
 }
 
+fn set_agent_restoration_failures(
+    state: &AppState,
+    host: &LocalHostId,
+    failures: Vec<protocol::AgentRestorationFailure>,
+) {
+    state.agent_restoration_failures_by_host.update(|map| {
+        if failures.is_empty() {
+            map.remove(host);
+        } else {
+            map.insert(host.clone(), failures);
+        }
+    });
+}
+
 fn apply_host_bootstrap(
     state: &AppState,
     host: &LocalHostId,
@@ -2825,6 +2869,7 @@ fn apply_host_bootstrap(
     state.backend_setup_by_host.update(|map| {
         map.insert(host.clone(), payload.backend_setup.backends);
     });
+    set_agent_restoration_failures(state, host, payload.agent_restoration_failures);
     state.session_schemas_by_host.update(|map| {
         let mut schemas = HashMap::new();
         for schema in payload.session_schemas {
@@ -4201,6 +4246,7 @@ mod wasm_tests {
             team_members: Vec::new(),
             team_member_bindings: Vec::new(),
             teams_store_load_error: None,
+            agent_restoration_failures: Vec::new(),
             agents: vec![agent_payload.clone()],
             task_token_usages: Vec::new(),
             workflow_summaries: Vec::new(),

@@ -5568,8 +5568,8 @@ async fn move_agent_preserves_conversation_and_persists_all_project_roots() {
                 (agent, start) =
                     restart_moved_agent(&mut fixture, &session_id, &project_id, &roots).await;
                 assert!(
-                    start.agent_id != prior_agent_id,
-                    "restart must reconstruct a new agent owner"
+                    start.agent_id == prior_agent_id,
+                    "restart must reconstruct the owner under its persisted agent id"
                 );
                 observer = fixture.connect().await;
             }

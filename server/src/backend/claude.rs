@@ -153,6 +153,7 @@ impl ClaudeCommandHandle {
             payload.message,
             protocol_images_to_attachments(payload.images),
             payload.tool_response,
+            payload.origin,
         )
         .await?
         {
@@ -180,6 +181,7 @@ impl ClaudeCommandHandle {
             payload.message,
             protocol_images_to_attachments(payload.images),
             payload.tool_response,
+            payload.origin,
         )
         .await
     }
@@ -1867,8 +1869,12 @@ impl ClaudeInner {
                     CancelBackgroundTaskOutcome::Failed(error) => Err(error),
                 }
             }
-            SessionCommand::SendMessage { message, images } => {
-                match Self::send_message(this.clone(), message, images, None).await? {
+            SessionCommand::SendMessage {
+                message,
+                images,
+                origin,
+            } => {
+                match Self::send_message(this.clone(), message, images, None, origin).await? {
                     ClaudeSendAdmission::Handled => Ok(()),
                     // See `send_message_payload`: this command path cannot
                     // hand the message back for requeueing.
@@ -1995,6 +2001,7 @@ impl ClaudeInner {
         message: String,
         images: Option<Vec<ImageAttachment>>,
         tool_response: Option<SendMessageToolResponse>,
+        origin: Option<protocol::MessageOrigin>,
     ) -> Result<ClaudeSendAdmission, String> {
         if let Some(tool_response) = tool_response {
             if this
@@ -2007,7 +2014,7 @@ impl ClaudeInner {
             return Ok(ClaudeSendAdmission::Handled);
         }
 
-        Ok(this.start_turn(message, images).await)
+        Ok(this.start_turn(message, images, origin).await)
     }
 
     /// Start a user turn, or report that the backend is busy with a turn it
@@ -2017,6 +2024,7 @@ impl ClaudeInner {
         self: Arc<Self>,
         message: String,
         images: Option<Vec<ImageAttachment>>,
+        origin: Option<protocol::MessageOrigin>,
     ) -> ClaudeSendAdmission {
         let images = images.unwrap_or_default();
         let (turn_id, model_hint, ephemeral, outcome_rx) = {
@@ -2051,7 +2059,12 @@ impl ClaudeInner {
         // The user bubble is emitted only once the turn is admitted, so a
         // busy hand-back (which redispatches later) can never duplicate it and
         // the chat never shows a message that was not delivered.
-        self.emit_user_message_added(&message, (!images.is_empty()).then_some(images.as_slice()));
+        if origin != Some(protocol::MessageOrigin::HostRestart) {
+            self.emit_user_message_added(
+                &message,
+                (!images.is_empty()).then_some(images.as_slice()),
+            );
+        }
         let message_id = format!("claude-msg-{turn_id}");
         self.emit_typing_status(true);
         self.emit_stream_start(&message_id, model_hint.clone());

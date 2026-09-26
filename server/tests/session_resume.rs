@@ -9,7 +9,7 @@ use protocol::{
     SessionListPayload, SessionSettingValue, SessionSettingsValues, SpawnAgentParams,
     SpawnAgentPayload, StreamPath,
 };
-use server::backend::mock::{MockScript, MockTurn};
+use server::backend::mock::{AbandonedResponse, MockScript, MockTurn, RunningCommandShape};
 use server::store::session::SessionStore;
 use std::path::Path;
 use std::time::Duration;
@@ -2189,11 +2189,19 @@ async fn restart_restores_open_agents_and_preserves_settings() {
     let restored_child = restored_by_session
         .remove(&survivor_child_session)
         .expect("restored child");
-    assert_ne!(restored.agent_id, survivor.agent_id);
-    assert_ne!(restored_child.agent_id, survivor_child.agent_id);
+    // Restoration keeps each agent's persisted id, so an orchestrator that
+    // held a child id before the restart still addresses the same child.
+    assert_eq!(
+        restored.agent_id, survivor.agent_id,
+        "restart must restore the parent under its persisted agent id"
+    );
+    assert_eq!(
+        restored_child.agent_id, survivor_child.agent_id,
+        "restart must restore the child under its persisted agent id"
+    );
     assert_eq!(restored_child.name, "child survives restart");
-    // The durable parent session id is the only lineage that survives a
-    // restart; the restored child must hang off the parent's *new* agent id.
+    // The durable parent session id rebuilds the lineage; the restored child
+    // must hang off the restored parent's agent id.
     assert_eq!(
         restored_child.parent_agent_id.as_ref(),
         Some(&restored.agent_id),
@@ -4358,7 +4366,10 @@ async fn restart_does_not_resurrect_backend_native_children() {
     )
     .await;
     let restored_parent = restored.remove(&parent_session).expect("restored parent");
-    assert_ne!(restored_parent.agent_id, parent.agent_id);
+    assert_eq!(
+        restored_parent.agent_id, parent.agent_id,
+        "restart must restore the parent under its persisted agent id"
+    );
 
     // Restoration is one sequential pass, so the child would be reconstructed
     // moments after the parent. Give the pass room to do it and require that
@@ -4742,13 +4753,14 @@ fn restart_expiry_of(
         .collect()
 }
 
-/// A question or plan approval left pending when the app was killed replays
-/// on relaunch, but the relaunched backend holds nothing that could accept an
-/// answer. The server must close the card with a typed terminal outcome,
-/// persist it, and keep refusing answers to it — never leave it answerable.
+/// A question or plan approval left pending when the app was killed, or when
+/// it restarted gracefully, replays on relaunch, but the relaunched backend
+/// holds nothing that could accept an answer. The server must close the card
+/// with a typed expiry, persist it, and keep refusing answers to it — never
+/// leave it answerable, nor report it as a tool whose outcome is unknown.
 #[tokio::test]
 async fn relaunch_after_kill_expires_unanswered_questions_and_plans() {
-    for plan in [false, true] {
+    for (plan, graceful) in [(false, false), (true, false), (false, true), (true, true)] {
         let mut fixture = Fixture::new().await;
         let gate = server::backend::mock::MockGateHandle::new();
         let (tool_call_id, tool_name, script) = if plan {
@@ -4793,7 +4805,11 @@ async fn relaunch_after_kill_expires_unanswered_questions_and_plans() {
 
         let mut restored_stream = None;
         for relaunch in 1..=2 {
-            let relaunched = fixture.relaunch_host_after_kill().await;
+            let relaunched = if graceful {
+                fixture.restart_host().await
+            } else {
+                fixture.relaunch_host_after_kill().await
+            };
             let (agents, bootstraps) = collect_restart_replay(
                 &mut fixture,
                 &relaunched,
@@ -4808,7 +4824,7 @@ async fn relaunch_after_kill_expires_unanswered_questions_and_plans() {
                     AgentBootstrapEvent::ChatEvent(ChatEvent::ToolRequest(replayed))
                         if replayed.tool_call_id == tool_call_id
                 )),
-                "{tool_name} relaunch {relaunch}: the card must still replay"
+                "{tool_name} graceful={graceful} relaunch {relaunch}: the card must still replay"
             );
             let mut outcomes = restart_expiry_of(&bootstrap.events, tool_call_id);
             if outcomes.is_empty() {
@@ -4836,7 +4852,7 @@ async fn relaunch_after_kill_expires_unanswered_questions_and_plans() {
             assert_eq!(
                 outcomes.len(),
                 1,
-                "{tool_name} relaunch {relaunch}: exactly one terminal outcome, got {outcomes:?}"
+                "{tool_name} graceful={graceful} relaunch {relaunch}: exactly one terminal outcome, got {outcomes:?}"
             );
             assert!(
                 matches!(
@@ -4844,7 +4860,7 @@ async fn relaunch_after_kill_expires_unanswered_questions_and_plans() {
                     protocol::ToolExecutionOutcome::Cancelled { message }
                         if message.contains("can no longer be answered")
                 ),
-                "{tool_name} relaunch {relaunch}: the card must expire, got {:?}",
+                "{tool_name} graceful={graceful} relaunch {relaunch}: the card must expire, got {:?}",
                 outcomes[0]
             );
             restored_stream = Some(restored.instance_stream.clone());
@@ -4901,4 +4917,3418 @@ async fn relaunch_after_kill_expires_unanswered_questions_and_plans() {
             "{tool_name}: an answer to an expired card must be refused, got {refused:?}"
         );
     }
+}
+
+/// Spawn a scripted agent and return the session the server persisted for it.
+async fn spawn_restart_agent(
+    fixture: &mut Fixture,
+    name: &str,
+    prompt: &str,
+    parent_agent_id: Option<protocol::AgentId>,
+    script: MockScript,
+) -> (fixture::TestAgent, SessionId) {
+    let reservation = fixture.reserve_next_mock_launch(name, script).await;
+    let (agent, start) = fixture
+        .spawn_with(SpawnAgentPayload {
+            name: Some(name.to_owned()),
+            custom_agent_id: None,
+            parent_agent_id,
+            project_id: None,
+            params: SpawnAgentParams::New {
+                workspace_roots: vec![format!("/tmp/{}", name.replace(' ', "-"))],
+                prompt: prompt.to_owned(),
+                images: None,
+                backend_kind: BackendKind::Claude,
+                launch_profile_id: None,
+                cost_hint: None,
+                access_mode: Default::default(),
+                session_settings: None,
+            },
+        })
+        .await;
+    drop(reservation);
+    (agent, start.session_id.expect("spawned agent session id"))
+}
+
+/// Restored `NewAgent` descriptors and `AgentBootstrap` payloads observed so
+/// far after a restart. Restoration interleaves both frame kinds across
+/// agents, so a wait for one agent's descriptor must retain another agent's
+/// bootstrap rather than discarding it.
+#[derive(Default)]
+struct RestoredReplay {
+    agents: std::collections::HashMap<SessionId, NewAgentPayload>,
+    bootstraps: std::collections::HashMap<StreamPath, AgentBootstrapPayload>,
+}
+
+impl RestoredReplay {
+    fn seed(bootstrap: &settings_model::HostBootstrapPayload) -> Self {
+        let mut replay = Self::default();
+        for agent in &bootstrap.agents {
+            if let Some(session_id) = agent.session_id.as_ref() {
+                replay.agents.insert(session_id.clone(), agent.clone());
+            }
+        }
+        replay
+    }
+
+    async fn wait_until(
+        &mut self,
+        fixture: &mut Fixture,
+        context: &str,
+        mut done: impl FnMut(&Self) -> bool,
+    ) {
+        while !done(self) {
+            let env = fixture::next_frame_matching_on(&mut fixture.client, context, |env| {
+                matches!(env.kind, FrameKind::NewAgent | FrameKind::AgentBootstrap)
+            })
+            .await;
+            match env.kind {
+                FrameKind::NewAgent => {
+                    let agent: NewAgentPayload =
+                        env.parse_payload().expect("parse restored NewAgent");
+                    if let Some(session_id) = agent.session_id.as_ref() {
+                        self.agents.insert(session_id.clone(), agent);
+                    }
+                }
+                FrameKind::AgentBootstrap => {
+                    let payload: AgentBootstrapPayload =
+                        env.parse_payload().expect("parse restored AgentBootstrap");
+                    self.bootstraps.insert(env.stream.clone(), payload);
+                }
+                kind => unreachable!("unexpected restart replay frame {kind:?}"),
+            }
+        }
+    }
+
+    async fn agents(
+        &mut self,
+        fixture: &mut Fixture,
+        sessions: &[SessionId],
+    ) -> Vec<NewAgentPayload> {
+        self.wait_until(fixture, "restored NewAgent", |replay| {
+            sessions
+                .iter()
+                .all(|session| replay.agents.contains_key(session))
+        })
+        .await;
+        sessions
+            .iter()
+            .map(|session| self.agents[session].clone())
+            .collect()
+    }
+
+    async fn bootstrap(
+        &mut self,
+        fixture: &mut Fixture,
+        stream: &StreamPath,
+    ) -> AgentBootstrapPayload {
+        self.wait_until(fixture, "restored AgentBootstrap", |replay| {
+            replay.bootstraps.contains_key(stream)
+        })
+        .await;
+        self.bootstraps[stream].clone()
+    }
+}
+
+fn recovery_phases(events: &[AgentBootstrapEvent]) -> Vec<protocol::RestartRecoveryPhase> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            AgentBootstrapEvent::ChatEvent(ChatEvent::RestartRecovery { phase }) => {
+                Some(phase.clone())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// Every message the mock backend was asked to run, in arrival order.
+async fn mock_inputs(
+    fixture: &Fixture,
+    agent_id: &protocol::AgentId,
+) -> Vec<protocol::SendMessagePayload> {
+    fixture
+        .mock_by_id(agent_id)
+        .await
+        .requests()
+        .await
+        .into_iter()
+        .filter_map(|request| match request {
+            server::backend::mock::MockRequest::Input(input) => Some(input),
+            _ => None,
+        })
+        .collect()
+}
+
+fn stored_turn_recovery(fixture: &Fixture, session_id: &SessionId) -> serde_json::Value {
+    let store = SessionStore::load(fixture.session_store_path()).expect("load session store");
+    let record = store.get(session_id).expect("stored session record");
+    serde_json::to_value(&record).expect("inspect stored record")["turn_recovery"].clone()
+}
+
+/// One thing a client saw on a restored agent's stream, in arrival order,
+/// whether it came inside the agent's bootstrap or as a live frame.
+#[derive(Debug, Clone, PartialEq)]
+enum Observed {
+    Bootstrap {
+        activity: protocol::AgentActivity,
+        phases: Vec<protocol::RestartRecoveryPhase>,
+    },
+    Phase(protocol::RestartRecoveryPhase),
+    Delta(String),
+    Queue(usize),
+    Typing(bool),
+}
+
+#[derive(Default)]
+struct StreamObservation {
+    items: Vec<Observed>,
+}
+
+impl StreamObservation {
+    fn record_chat_event(&mut self, event: ChatEvent) {
+        match event {
+            ChatEvent::RestartRecovery { phase } => self.items.push(Observed::Phase(phase)),
+            ChatEvent::StreamDelta(delta) => self.items.push(Observed::Delta(delta.text)),
+            ChatEvent::TypingStatusChanged(active) => self.items.push(Observed::Typing(active)),
+            _ => {}
+        }
+    }
+
+    /// Recovery phases in the order the client learned them: those carried by
+    /// the bootstrap first, then any streamed live.
+    fn phases(&self) -> Vec<protocol::RestartRecoveryPhase> {
+        self.items
+            .iter()
+            .flat_map(|item| match item {
+                Observed::Bootstrap { phases, .. } => phases.clone(),
+                Observed::Phase(phase) => vec![phase.clone()],
+                _ => Vec::new(),
+            })
+            .collect()
+    }
+
+    fn deltas(&self) -> Vec<String> {
+        self.items
+            .iter()
+            .filter_map(|item| match item {
+                Observed::Delta(text) => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn queue_counts(&self) -> Vec<usize> {
+        self.items
+            .iter()
+            .filter_map(|item| match item {
+                Observed::Queue(count) => Some(*count),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn bootstrap(&self) -> Option<&Observed> {
+        self.items
+            .iter()
+            .find(|item| matches!(item, Observed::Bootstrap { .. }))
+    }
+
+    /// The restart continuation ran to idle, whether the client saw it stream
+    /// or attached only after it finished. An agent's attach waits for its
+    /// startup, so under load its bootstrap can already report the finished
+    /// continuation.
+    fn continuation_finished(&self) -> bool {
+        self.settled_after(CONTINUATION_PREFIX)
+            || matches!(
+                self.bootstrap(),
+                Some(Observed::Bootstrap {
+                    activity: protocol::AgentActivity::Idle,
+                    phases,
+                }) if phases.contains(&protocol::RestartRecoveryPhase::Continuing)
+            )
+    }
+
+    /// The stream went idle after streaming text containing `needle`.
+    fn settled_after(&self, needle: &str) -> bool {
+        let Some(delta) = self
+            .items
+            .iter()
+            .position(|item| matches!(item, Observed::Delta(text) if text.contains(needle)))
+        else {
+            return false;
+        };
+        self.items[delta..].contains(&Observed::Typing(false))
+    }
+}
+
+/// Everything the client saw on `streams`, per stream and as one global
+/// sequence, so a test can assert on ordering across restored agents.
+#[derive(Default)]
+struct Observation {
+    streams: std::collections::HashMap<StreamPath, StreamObservation>,
+    sequence: Vec<(StreamPath, Observed)>,
+}
+
+impl Observation {
+    fn record(&mut self, stream: &StreamPath, item: Observed) {
+        self.streams
+            .entry(stream.clone())
+            .or_default()
+            .items
+            .push(item.clone());
+        self.sequence.push((stream.clone(), item));
+    }
+
+    fn stream(&self, stream: &StreamPath) -> &StreamObservation {
+        self.streams
+            .get(stream)
+            .unwrap_or_else(|| panic!("nothing observed on {stream}"))
+    }
+
+    /// Index in the global sequence at which the client first learned `phase`
+    /// for `stream`, whether inside its bootstrap or as a live event.
+    fn phase_position(&self, stream: &StreamPath, phase: &protocol::RestartRecoveryPhase) -> usize {
+        self.sequence
+            .iter()
+            .position(|(observed_stream, observed)| {
+                observed_stream == stream
+                    && match observed {
+                        Observed::Bootstrap { phases, .. } => phases.contains(phase),
+                        Observed::Phase(observed) => observed == phase,
+                        _ => false,
+                    }
+            })
+            .unwrap_or_else(|| panic!("{phase:?} never observed on {stream}: {:?}", self.sequence))
+    }
+
+    /// Read frames on `streams` until `done`, keeping every frame on those
+    /// streams. Frames on other streams are not needed by a restart test once
+    /// its restored descriptors are known.
+    async fn observe_until(
+        fixture: &mut Fixture,
+        streams: &[StreamPath],
+        done: impl FnMut(&Self) -> bool,
+    ) -> Self {
+        let mut observation = Self::default();
+        for stream in streams {
+            observation.streams.entry(stream.clone()).or_default();
+        }
+        Self::continue_until(observation, fixture, streams, done).await
+    }
+
+    /// Keep reading into this observation until `done`.
+    async fn continue_until(
+        mut observation: Self,
+        fixture: &mut Fixture,
+        streams: &[StreamPath],
+        mut done: impl FnMut(&Self) -> bool,
+    ) -> Self {
+        while !done(&observation) {
+            let env = match tokio::time::timeout(
+                Duration::from_secs(5),
+                fixture::next_frame_matching_on_with_timeout(
+                    &mut fixture.client,
+                    "restored stream activity",
+                    Duration::from_secs(10),
+                    |env| streams.contains(&env.stream),
+                ),
+            )
+            .await
+            {
+                Ok(env) => env,
+                Err(_) => panic!(
+                    "timed out waiting for restored stream activity; observed so far: {:#?}",
+                    observation.sequence
+                ),
+            };
+            match env.kind {
+                FrameKind::AgentBootstrap => {
+                    let payload: AgentBootstrapPayload =
+                        env.parse_payload().expect("parse restored AgentBootstrap");
+                    observation.record(
+                        &env.stream,
+                        Observed::Bootstrap {
+                            activity: payload.activity,
+                            phases: recovery_phases(&payload.events),
+                        },
+                    );
+                    for event in payload.events {
+                        if let AgentBootstrapEvent::QueuedMessages(payload) = event {
+                            observation
+                                .record(&env.stream, Observed::Queue(payload.messages.len()));
+                        }
+                    }
+                }
+                FrameKind::QueuedMessages => {
+                    let payload: protocol::QueuedMessagesPayload =
+                        env.parse_payload().expect("parse QueuedMessages");
+                    observation.record(&env.stream, Observed::Queue(payload.messages.len()));
+                }
+                FrameKind::ChatEvent => {
+                    let mut single = StreamObservation::default();
+                    single.record_chat_event(env.parse_payload().expect("parse ChatEvent"));
+                    for item in single.items {
+                        observation.record(&env.stream, item);
+                    }
+                }
+                _ => {}
+            }
+        }
+        observation
+    }
+}
+
+/// Asserts the provider accepted `child`'s restart continuation before
+/// `parent`'s. Bootstraps arrive whenever each attach is served, so their
+/// order across agents is not the order the continuations were sent in.
+fn assert_continued_before(child: &SessionId, parent: &SessionId) {
+    let accepted = server::backend::mock::accepted_messages_in_order();
+    let position = |session: &SessionId| {
+        accepted
+            .iter()
+            .position(|(accepted_session, message)| {
+                accepted_session == session
+                    && message.origin == Some(protocol::MessageOrigin::HostRestart)
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "no restart continuation was accepted for a restored agent; accepted origins: {:?}",
+                    accepted
+                        .iter()
+                        .map(|(_, message)| message.origin.clone())
+                        .collect::<Vec<_>>()
+                )
+            })
+    };
+    assert!(
+        position(child) < position(parent),
+        "the child's continuation must reach the provider before its parent's"
+    );
+}
+
+fn delta_position(deltas: &[String], needle: &str) -> usize {
+    deltas
+        .iter()
+        .position(|text| text.contains(needle))
+        .unwrap_or_else(|| panic!("no streamed text contained {needle:?}: {deltas:?}"))
+}
+
+const CONTINUATION_PREFIX: &str = "Tyde restarted while you were working";
+
+/// A turn that was running when the host restarts, cleanly or by a hard
+/// kill, comes back on the same agent id, explains the interruption, and is
+/// continued by the host as a live turn ahead of the messages the user had
+/// queued, which then run in their original order. An agent that was idle at
+/// the restart is reopened untouched.
+#[tokio::test]
+async fn interrupted_turns_continue_after_graceful_and_hard_restart() {
+    use protocol::{
+        MessageOrigin, RestartInterruptionCause as Cause, RestartRecoveryPhase as Phase,
+    };
+    for hard in [false, true] {
+        let mut fixture = Fixture::new().await;
+        let (bystander, bystander_session) = spawn_restart_agent(
+            &mut fixture,
+            "idle bystander",
+            "bystander prompt",
+            None,
+            MockScript::one(MockTurn::text("bystander done")),
+        )
+        .await;
+        fixture.finish_turn(&bystander).await;
+        let replay = server::backend::mock::MockResumeReplay::default();
+        let (agent, session) = spawn_restart_agent(
+            &mut fixture,
+            "restart continuation",
+            "unfinished prompt",
+            None,
+            MockScript::one(MockTurn::held_text("unfinished"))
+                .with_controlled_resume_replay(&replay),
+        )
+        .await;
+        fixture
+            .client
+            .send_message(&agent.stream, "queued first".to_owned())
+            .await
+            .expect("queue first");
+        fixture.expect_queued_messages(&agent, 1).await;
+        fixture
+            .client
+            .send_message(&agent.stream, "queued second".to_owned())
+            .await
+            .expect("queue second");
+        fixture.expect_queued_messages(&agent, 2).await;
+        let mut ids_before = fixture.agent_ids().await;
+        ids_before.sort_by(|a, b| a.0.cmp(&b.0));
+
+        let bootstrap = if hard {
+            fixture.relaunch_host_after_kill().await
+        } else {
+            fixture.restart_host().await
+        };
+        let mut restored = RestoredReplay::seed(&bootstrap);
+        let descriptors = restored
+            .agents(&mut fixture, &[session.clone(), bystander_session.clone()])
+            .await;
+        let (held, idle) = (&descriptors[0], &descriptors[1]);
+        assert_eq!(
+            held.agent_id, agent.new_agent.agent_id,
+            "hard={hard}: restoration must keep the persisted agent identity"
+        );
+        assert_eq!(idle.agent_id, bystander.new_agent.agent_id);
+
+        // The idle agent's bootstrap is not gated on anything this test holds,
+        // so take it before releasing the interrupted agent's replay: that
+        // replay is held until the restart descriptor has reached this client,
+        // so its bootstrap is built at the replay boundary and shows exactly
+        // what the host decided there.
+        let idle_bootstrap = restored
+            .bootstrap(&mut fixture, &idle.instance_stream)
+            .await;
+        assert!(
+            recovery_phases(&idle_bootstrap.events).is_empty(),
+            "hard={hard}: an idle agent has nothing to recover: {:?}",
+            idle_bootstrap.events
+        );
+        assert!(
+            idle_bootstrap.activity == protocol::AgentActivity::Idle,
+            "hard={hard}: an idle agent must reopen idle"
+        );
+        replay.wait_until_started().await;
+        replay.complete();
+        let observation = Observation::observe_until(
+            &mut fixture,
+            std::slice::from_ref(&held.instance_stream),
+            |observation| {
+                observation
+                    .stream(&held.instance_stream)
+                    .settled_after("queued second")
+            },
+        )
+        .await;
+        let flow = observation.stream(&held.instance_stream);
+        let expected_cause = if hard {
+            Cause::UnexpectedStop
+        } else {
+            Cause::HostRestart
+        };
+        let Some(Observed::Bootstrap {
+            activity,
+            phases: bootstrap_phases,
+        }) = flow.bootstrap()
+        else {
+            panic!(
+                "hard={hard}: the restored agent must be bootstrapped: {:?}",
+                flow.items
+            );
+        };
+        assert_eq!(
+            *activity,
+            protocol::AgentActivity::Thinking,
+            "hard={hard}: an interrupted turn awaiting its continuation reopens live, not idle"
+        );
+        assert_eq!(
+            bootstrap_phases.first(),
+            Some(&Phase::Interrupted {
+                cause: expected_cause
+            }),
+            "hard={hard}: the bootstrap explains the interruption before anything else: {:?}",
+            flow.items
+        );
+        assert_eq!(
+            flow.phases(),
+            vec![
+                Phase::Interrupted {
+                    cause: expected_cause
+                },
+                Phase::Continuing
+            ],
+            "hard={hard}: restart must explain interruption then admit one continuation: {:?}",
+            flow.items
+        );
+        let deltas = flow.deltas();
+        let continuation = delta_position(&deltas, CONTINUATION_PREFIX);
+        let first = delta_position(&deltas, "queued first");
+        let second = delta_position(&deltas, "queued second");
+        assert!(
+            continuation < first && first < second,
+            "hard={hard}: the continuation runs before the queue, which keeps its order: {deltas:?}"
+        );
+        assert_eq!(
+            flow.queue_counts().last(),
+            Some(&0),
+            "hard={hard}: the queue must drain after the continuation: {:?}",
+            flow.queue_counts()
+        );
+
+        let inputs = mock_inputs(&fixture, &held.agent_id).await;
+        assert_eq!(
+            inputs.len(),
+            3,
+            "hard={hard}: exactly one continuation joins the two queued messages: {inputs:?}"
+        );
+        assert_eq!(
+            inputs[1..]
+                .iter()
+                .map(|input| (input.origin.clone(), input.message.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(None, "queued first"), (None, "queued second")],
+            "hard={hard}: queued messages reach the backend once each, in order"
+        );
+        assert_eq!(inputs[0].origin, Some(MessageOrigin::HostRestart));
+        assert!(
+            inputs[0].message.starts_with(CONTINUATION_PREFIX)
+                && !inputs[0].message.contains("child agents"),
+            "hard={hard}: an agent without children gets the plain continuation: {}",
+            inputs[0].message
+        );
+        assert!(
+            mock_inputs(&fixture, &idle.agent_id).await.is_empty(),
+            "hard={hard}: an idle agent must not be continued"
+        );
+        assert!(
+            stored_turn_recovery(&fixture, &session).is_null(),
+            "hard={hard}: finishing the continued work spends the recovery marker"
+        );
+        let mut ids_after = fixture.agent_ids().await;
+        ids_after.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            ids_after, ids_before,
+            "hard={hard}: restart reopens exactly the same agents"
+        );
+    }
+}
+
+/// An orchestrator parked in `tyde_await_agents` on a child that is mid-turn
+/// gets both back after a restart: the child keeps its id and continues
+/// first, and only then is the parent continued, told that its children were
+/// restored under the same ids, ahead of anything it had queued.
+#[tokio::test]
+async fn parent_continues_after_its_restored_children() {
+    use protocol::{
+        MessageOrigin, RestartInterruptionCause as Cause, RestartRecoveryPhase as Phase,
+    };
+    let mut fixture = Fixture::new().await;
+    let parent_replay = server::backend::mock::MockResumeReplay::default();
+    let (parent, parent_session) = spawn_restart_agent(
+        &mut fixture,
+        "restart orchestrator",
+        "orchestrate",
+        None,
+        MockScript::one(MockTurn::text("parent ready"))
+            .with_controlled_resume_replay(&parent_replay),
+    )
+    .await;
+    fixture.finish_turn(&parent).await;
+    let child_replay = server::backend::mock::MockResumeReplay::default();
+    let (child, child_session) = spawn_restart_agent(
+        &mut fixture,
+        "restart worker",
+        "work",
+        Some(parent.new_agent.agent_id.clone()),
+        MockScript::one(MockTurn::held_text("child unfinished"))
+            .with_controlled_resume_replay(&child_replay),
+    )
+    .await;
+    fixture
+        .next_chat_event_matching(&child, "child held turn streamed", |event| {
+            matches!(event, ChatEvent::StreamEnd(_))
+        })
+        .await;
+    fixture
+        .mock(&parent)
+        .await
+        .enqueue(MockTurn::agent_control_await(vec![
+            child.new_agent.agent_id.clone(),
+        ]))
+        .await;
+    fixture
+        .client
+        .send_message(&parent.stream, "await the worker".to_owned())
+        .await
+        .expect("send parent await prompt");
+    fixture
+        .next_chat_event_matching(&parent, "parent parked in await", |event| {
+            matches!(event, ChatEvent::ToolRequest(request) if fixture::tool_request_name(request) == "tyde_await_agents")
+        })
+        .await;
+    fixture
+        .client
+        .send_message(&parent.stream, "parent queued".to_owned())
+        .await
+        .expect("queue on parent");
+    fixture.expect_queued_messages(&parent, 1).await;
+
+    let bootstrap = fixture.restart_host().await;
+    let mut restored = RestoredReplay::seed(&bootstrap);
+    let descriptors = restored
+        .agents(
+            &mut fixture,
+            &[parent_session.clone(), child_session.clone()],
+        )
+        .await;
+    let (restored_parent, restored_child) = (&descriptors[0], &descriptors[1]);
+    assert_eq!(restored_parent.agent_id, parent.new_agent.agent_id);
+    assert_eq!(restored_child.agent_id, child.new_agent.agent_id);
+    assert_eq!(
+        restored_child.parent_agent_id.as_ref(),
+        Some(&parent.new_agent.agent_id),
+        "the restored child still belongs to the restored parent"
+    );
+
+    child_replay.wait_until_started().await;
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(750),
+            parent_replay.wait_until_started()
+        )
+        .await
+        .is_err(),
+        "the parent is not resumed while its child is still being restored"
+    );
+    child_replay.complete();
+    parent_replay.wait_until_started().await;
+    parent_replay.complete();
+    let child_stream = restored_child.instance_stream.clone();
+    let parent_stream = restored_parent.instance_stream.clone();
+    let observation = Observation::observe_until(
+        &mut fixture,
+        &[child_stream.clone(), parent_stream.clone()],
+        |observation| {
+            observation
+                .stream(&child_stream)
+                .settled_after(CONTINUATION_PREFIX)
+                && observation
+                    .stream(&parent_stream)
+                    .settled_after("parent queued")
+        },
+    )
+    .await;
+    let child_flow = observation.stream(&child_stream);
+    let Some(Observed::Bootstrap {
+        activity: child_activity,
+        phases: child_bootstrap_phases,
+    }) = child_flow.bootstrap()
+    else {
+        panic!(
+            "the restored child must be bootstrapped: {:?}",
+            child_flow.items
+        );
+    };
+    assert_eq!(
+        *child_activity,
+        protocol::AgentActivity::Thinking,
+        "the interrupted child reopens live"
+    );
+    assert_eq!(
+        child_bootstrap_phases.first(),
+        Some(&Phase::Interrupted {
+            cause: Cause::HostRestart
+        }),
+        "{:?}",
+        child_flow.items
+    );
+    assert_eq!(
+        child_flow.phases(),
+        vec![
+            Phase::Interrupted {
+                cause: Cause::HostRestart
+            },
+            Phase::Continuing
+        ]
+    );
+    let parent_flow = observation.stream(&parent_stream);
+    let Some(Observed::Bootstrap {
+        activity: parent_activity,
+        ..
+    }) = parent_flow.bootstrap()
+    else {
+        panic!(
+            "the restored parent must be bootstrapped: {:?}",
+            parent_flow.items
+        );
+    };
+    assert_eq!(
+        *parent_activity,
+        protocol::AgentActivity::Thinking,
+        "a parent holding its continuation is live"
+    );
+    assert_eq!(
+        parent_flow.phases(),
+        vec![
+            Phase::Interrupted {
+                cause: Cause::HostRestart
+            },
+            Phase::Continuing
+        ],
+        "the parent is continued once its child has been: {:?}",
+        parent_flow.items
+    );
+    assert_continued_before(&child_session, &parent_session);
+    let parent_deltas = parent_flow.deltas();
+    assert!(
+        delta_position(&parent_deltas, CONTINUATION_PREFIX)
+            < delta_position(&parent_deltas, "parent queued"),
+        "the parent's continuation runs before its queued message: {parent_deltas:?}"
+    );
+
+    let child_inputs = mock_inputs(&fixture, &restored_child.agent_id).await;
+    assert_eq!(child_inputs.len(), 1, "{child_inputs:?}");
+    assert_eq!(child_inputs[0].origin, Some(MessageOrigin::HostRestart));
+    assert!(!child_inputs[0].message.contains("child agents"));
+    let parent_inputs = mock_inputs(&fixture, &restored_parent.agent_id).await;
+    assert_eq!(parent_inputs.len(), 2, "{parent_inputs:?}");
+    assert_eq!(parent_inputs[0].origin, Some(MessageOrigin::HostRestart));
+    let notice = &parent_inputs[0].message;
+    assert!(
+        notice.starts_with(CONTINUATION_PREFIX)
+            && notice.contains(&child.new_agent.agent_id.0)
+            && notice.contains("tyde_await_agents")
+            && notice.contains("do not spawn replacements"),
+        "the orchestrator is told to reuse its restored children: {notice}"
+    );
+    assert_eq!(parent_inputs[1].message, "parent queued");
+    let mut ids = fixture.agent_ids().await;
+    ids.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut expected = vec![
+        parent.new_agent.agent_id.clone(),
+        child.new_agent.agent_id.clone(),
+    ];
+    expected.sort_by(|a, b| a.0.cmp(&b.0));
+    assert_eq!(ids, expected, "no replacement agent may appear");
+}
+
+/// With automatic restoration off, an interrupted session stays in History
+/// with its recovery marker. Resuming it by hand reports the interruption but
+/// never continues on its own, and spends the marker.
+#[tokio::test]
+async fn manual_resume_reports_interruption_without_continuing() {
+    use protocol::{
+        MessageOrigin, RestartInterruptionCause as Cause, RestartRecoveryPhase as Phase,
+    };
+    let mut fixture = Fixture::new().await;
+    let write_id = protocol::SettingsWriteId("resume-previous-off".to_owned());
+    fixture
+        .client
+        .settings_write(protocol::SettingsWritePayload {
+            write_id: write_id.clone(),
+            ops: vec![protocol::SettingOp::Replace {
+                path: "/resume_previous_agents".to_owned(),
+                value: serde_json::json!(false),
+                expected: protocol::SettingExpectation::Value {
+                    value: serde_json::json!(true),
+                },
+            }],
+        })
+        .await
+        .expect("disable automatic restoration");
+    fixture::expect_settings_write_applied(&mut fixture.client, &write_id, "restoration off").await;
+    let (agent, session) = spawn_restart_agent(
+        &mut fixture,
+        "manual resume",
+        "unfinished prompt",
+        None,
+        MockScript::one(MockTurn::held_text("unfinished")),
+    )
+    .await;
+    fixture
+        .next_chat_event_matching(&agent, "held turn streamed", |event| {
+            matches!(event, ChatEvent::StreamEnd(_))
+        })
+        .await;
+
+    let bootstrap = fixture.restart_host().await;
+    assert!(
+        bootstrap.agents.is_empty(),
+        "restoration off must not reopen agents: {:?}",
+        bootstrap.agents
+    );
+    assert_eq!(
+        stored_turn_recovery(&fixture, &session),
+        serde_json::json!("InterruptedByRestart"),
+        "the interrupted session keeps its marker in History"
+    );
+
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            name: Some("manual resume".to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::Resume {
+                session_id: session.clone(),
+                prompt: None,
+            },
+        })
+        .await
+        .expect("resume from history");
+    let resumed: NewAgentPayload = expect_next_event(&mut fixture.client, "resumed NewAgent")
+        .await
+        .parse_payload()
+        .expect("parse resumed NewAgent");
+    let resumed_bootstrap: AgentBootstrapPayload = expect_raw_event_on_stream(
+        &mut fixture.client,
+        &resumed.instance_stream,
+        FrameKind::AgentBootstrap,
+        "resumed bootstrap",
+    )
+    .await
+    .parse_payload()
+    .expect("parse resumed bootstrap");
+    assert_eq!(
+        recovery_phases(&resumed_bootstrap.events),
+        vec![Phase::Interrupted {
+            cause: Cause::HostRestart
+        }],
+        "a manual resume reports the interruption and nothing more: {:?}",
+        resumed_bootstrap.events
+    );
+    assert!(
+        resumed_bootstrap.activity == protocol::AgentActivity::Idle,
+        "a manual resume does not start a turn"
+    );
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(750);
+    loop {
+        let Ok(Ok(Some(env))) =
+            tokio::time::timeout_at(deadline, fixture.client.next_event()).await
+        else {
+            break;
+        };
+        if env.stream == resumed.instance_stream && env.kind == FrameKind::ChatEvent {
+            let event: ChatEvent = env.parse_payload().expect("parse ChatEvent");
+            assert!(
+                !matches!(
+                    event,
+                    ChatEvent::RestartRecovery { .. } | ChatEvent::TypingStatusChanged(true)
+                ),
+                "a manual resume must never continue on its own: {event:?}"
+            );
+        }
+    }
+    let inputs = mock_inputs(&fixture, &resumed.agent_id).await;
+    assert!(
+        inputs
+            .iter()
+            .all(|input| input.origin != Some(MessageOrigin::HostRestart))
+            && inputs.is_empty(),
+        "no continuation may reach the backend on a manual resume: {inputs:?}"
+    );
+    assert!(
+        stored_turn_recovery(&fixture, &session).is_null(),
+        "reporting the interruption spends the marker"
+    );
+}
+
+/// Wait for the restored descriptor of `session` on the current client.
+async fn restored_descriptor(
+    fixture: &mut Fixture,
+    bootstrap: &settings_model::HostBootstrapPayload,
+    session: &SessionId,
+) -> NewAgentPayload {
+    RestoredReplay::seed(bootstrap)
+        .agents(fixture, std::slice::from_ref(session))
+        .await
+        .remove(0)
+}
+
+/// A turn the host has admitted is interrupted by a restart even when the
+/// restart begins before the provider has accepted it: the turn is durably
+/// in flight from the moment the host commits to it.
+#[tokio::test]
+async fn restart_during_turn_admission_continues_the_admitted_turn() {
+    use protocol::{
+        MessageOrigin, RestartInterruptionCause as Cause, RestartRecoveryPhase as Phase,
+    };
+    let mut fixture = Fixture::new().await;
+    let send_gate = server::backend::mock::MockGateHandle::new();
+    let (agent, session) = spawn_restart_agent(
+        &mut fixture,
+        "restart admission",
+        "first prompt",
+        None,
+        MockScript::one(MockTurn::text("first done"))
+            .then(MockTurn::held_text("admitted"))
+            .with_send_gate(&send_gate),
+    )
+    .await;
+    fixture.finish_turn(&agent).await;
+    fixture
+        .client
+        .send_message(&agent.stream, "admitted prompt".to_owned())
+        .await
+        .expect("send the admitted prompt");
+    send_gate.wait_until_entered().await;
+
+    let stop_gate = fixture.host_for_test().install_restart_stop_test_gate();
+    let host = fixture.host_for_test();
+    let shutdown = tokio::spawn(async move { host.shutdown_for_restart().await });
+    stop_gate.wait_until_entered().await;
+    assert_eq!(
+        stored_turn_recovery(&fixture, &session),
+        serde_json::json!("InterruptedByRestart"),
+        "a turn handed to the provider is interrupted by the restart, accepted or not"
+    );
+    send_gate.release_one();
+    stop_gate.release_one();
+    tokio::time::timeout(Duration::from_secs(27), shutdown)
+        .await
+        .expect("restart stop is bounded")
+        .expect("restart stop");
+
+    let bootstrap = fixture.restart_host().await;
+    let restored = restored_descriptor(&mut fixture, &bootstrap, &session).await;
+    let stream = restored.instance_stream.clone();
+    let observation =
+        Observation::observe_until(&mut fixture, std::slice::from_ref(&stream), |observation| {
+            observation
+                .stream(&stream)
+                .settled_after(CONTINUATION_PREFIX)
+        })
+        .await;
+    assert_eq!(
+        observation.stream(&stream).phases(),
+        vec![
+            Phase::Interrupted {
+                cause: Cause::HostRestart
+            },
+            Phase::Continuing
+        ]
+    );
+    let inputs = mock_inputs(&fixture, &restored.agent_id).await;
+    assert_eq!(inputs.len(), 1, "{inputs:?}");
+    assert_eq!(inputs[0].origin, Some(MessageOrigin::HostRestart));
+}
+
+async fn record_claude_quota(fixture: &Fixture, used: u8) {
+    use protocol::{
+        BackendCapacityState, CapacityBucket, CapacityBucketId, CapacityCoverage, CapacityMeasure,
+        CapacityReport, CapacityReset, CapacityScope, CapacitySource, CapacityWindow,
+        ClaudeLimitType, ValueProvenance,
+    };
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("wall clock")
+        .as_millis() as u64;
+    fixture
+        .host_for_test()
+        .record_backend_capacity_for_test(
+            BackendKind::Claude,
+            BackendCapacityState::Known {
+                report: CapacityReport {
+                    source: CapacitySource::ClaudeControlUsage,
+                    observed_at_ms: None,
+                    plan: None,
+                    buckets: vec![CapacityBucket {
+                        id: CapacityBucketId::Claude {
+                            limit: ClaudeLimitType::FiveHour,
+                        },
+                        label: "Five hour".to_owned(),
+                        measure: CapacityMeasure::UsedPercent {
+                            used_percent: used,
+                            remaining_percent: 100 - used,
+                            provenance: ValueProvenance {
+                                vendor_reported: true,
+                            },
+                        },
+                        scope: CapacityScope::Account,
+                        window: CapacityWindow::Rolling {
+                            duration_minutes: 5 * 60,
+                        },
+                        reset: CapacityReset::At {
+                            at_ms: now_ms + 5 * 60 * 60 * 1000,
+                        },
+                        status: None,
+                    }],
+                    coverage: CapacityCoverage::AllVendorBuckets,
+                },
+            },
+        )
+        .await;
+}
+
+/// A restored turn held by a usage pause is continued when the pause lifts,
+/// before the messages the user had queued behind it.
+#[tokio::test]
+async fn usage_hold_releases_the_restart_continuation_before_the_queue() {
+    use protocol::{
+        MessageOrigin, RestartInterruptionCause as Cause, RestartRecoveryPhase as Phase,
+    };
+    let mut fixture = Fixture::new().await;
+    fixture
+        .client
+        .replace_setting("/usage_limits/enabled", true, false)
+        .await
+        .expect("enable usage limits");
+    fixture
+        .next_frame_matching("usage limits enabled", |env| {
+            env.kind == FrameKind::HostSettings
+        })
+        .await;
+    let replay = server::backend::mock::MockResumeReplay::default();
+    let (agent, session) = spawn_restart_agent(
+        &mut fixture,
+        "usage held restart",
+        "unfinished prompt",
+        None,
+        MockScript::one(MockTurn::held_text("unfinished")).with_controlled_resume_replay(&replay),
+    )
+    .await;
+    for (count, message) in [(1, "queued first"), (2, "queued second")] {
+        fixture
+            .client
+            .send_message(&agent.stream, message.to_owned())
+            .await
+            .expect("queue behind the held turn");
+        fixture.expect_queued_messages(&agent, count).await;
+    }
+
+    let bootstrap = fixture.restart_host().await;
+    let restored = restored_descriptor(&mut fixture, &bootstrap, &session).await;
+    let stream = restored.instance_stream.clone();
+    replay.wait_until_started().await;
+    record_claude_quota(&fixture, 95).await;
+    // The mailbox round trip makes the actor take one more turn of its loop,
+    // which is where it adopts the quota reading and pauses.
+    fixture.mock_by_id(&restored.agent_id).await;
+    replay.complete();
+    let held =
+        Observation::observe_until(&mut fixture, std::slice::from_ref(&stream), |observation| {
+            observation.stream(&stream).bootstrap().is_some()
+        })
+        .await;
+    assert_eq!(
+        held.stream(&stream).phases(),
+        vec![Phase::Interrupted {
+            cause: Cause::HostRestart
+        }],
+        "a paused agent is not continued: {:?}",
+        held.stream(&stream).items
+    );
+    fixture.mock_by_id(&restored.agent_id).await;
+    assert!(
+        mock_inputs(&fixture, &restored.agent_id).await.is_empty(),
+        "the usage pause holds the continuation and the queue"
+    );
+
+    record_claude_quota(&fixture, 2).await;
+    let observation =
+        Observation::observe_until(&mut fixture, std::slice::from_ref(&stream), |observation| {
+            observation.stream(&stream).settled_after("queued second")
+        })
+        .await;
+    let inputs = mock_inputs(&fixture, &restored.agent_id).await;
+    assert_eq!(
+        inputs
+            .iter()
+            .map(|input| (
+                input.origin.clone(),
+                input.message.starts_with(CONTINUATION_PREFIX)
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            (Some(MessageOrigin::HostRestart), true),
+            (None, false),
+            (None, false)
+        ],
+        "the continuation runs before the queue once the pause lifts: {inputs:?}"
+    );
+    assert_eq!(
+        inputs[1..]
+            .iter()
+            .map(|input| input.message.as_str())
+            .collect::<Vec<_>>(),
+        vec!["queued first", "queued second"]
+    );
+    assert_eq!(
+        observation.stream(&stream).phases(),
+        vec![Phase::Continuing],
+        "{:?}",
+        observation.stream(&stream).items
+    );
+}
+
+/// A message the user sends to a restored parent while its child is still
+/// being restored waits behind the parent's continuation, and the parent is
+/// reported as continuing only once the continuation reached its backend.
+#[tokio::test]
+async fn user_message_during_restoration_waits_for_the_continuation() {
+    use protocol::{MessageOrigin, RestartRecoveryPhase as Phase};
+    let mut fixture = Fixture::new().await;
+    let (parent, parent_session) = spawn_restart_agent(
+        &mut fixture,
+        "restart orchestrator",
+        "orchestrate",
+        None,
+        MockScript::one(MockTurn::text("parent ready")),
+    )
+    .await;
+    fixture.finish_turn(&parent).await;
+    let child_replay = server::backend::mock::MockResumeReplay::default();
+    let (child, child_session) = spawn_restart_agent(
+        &mut fixture,
+        "restart worker",
+        "work",
+        Some(parent.new_agent.agent_id.clone()),
+        MockScript::one(MockTurn::held_text("child unfinished"))
+            .with_controlled_resume_replay(&child_replay),
+    )
+    .await;
+    fixture
+        .next_chat_event_matching(&child, "child held turn streamed", |event| {
+            matches!(event, ChatEvent::StreamEnd(_))
+        })
+        .await;
+    fixture
+        .mock(&parent)
+        .await
+        .enqueue(MockTurn::agent_control_await(vec![
+            child.new_agent.agent_id.clone(),
+        ]))
+        .await;
+    fixture
+        .client
+        .send_message(&parent.stream, "await the worker".to_owned())
+        .await
+        .expect("send parent await prompt");
+    fixture
+        .next_chat_event_matching(&parent, "parent parked in await", |event| {
+            matches!(event, ChatEvent::ToolRequest(request) if fixture::tool_request_name(request) == "tyde_await_agents")
+        })
+        .await;
+
+    let bootstrap = fixture.restart_host().await;
+    let mut restored = RestoredReplay::seed(&bootstrap);
+    let descriptors = restored
+        .agents(
+            &mut fixture,
+            &[parent_session.clone(), child_session.clone()],
+        )
+        .await;
+    let (restored_parent, restored_child) = (descriptors[0].clone(), descriptors[1].clone());
+    child_replay.wait_until_started().await;
+    fixture
+        .client
+        .send_message(&restored_parent.instance_stream, "user message".to_owned())
+        .await
+        .expect("message the restored parent");
+    child_replay.complete();
+
+    let parent_stream = restored_parent.instance_stream.clone();
+    let child_stream = restored_child.instance_stream.clone();
+    let mut inputs_at_continuing = None;
+    let mut observation = Observation::default();
+    while !observation
+        .streams
+        .get(&parent_stream)
+        .is_some_and(|flow| flow.settled_after("user message"))
+    {
+        let step = Observation::observe_until(
+            &mut fixture,
+            &[parent_stream.clone(), child_stream.clone()],
+            |step| !step.sequence.is_empty(),
+        )
+        .await;
+        for (stream, item) in step.sequence {
+            observation.record(&stream, item);
+        }
+        if inputs_at_continuing.is_none()
+            && observation
+                .streams
+                .get(&parent_stream)
+                .is_some_and(|flow| flow.phases().contains(&Phase::Continuing))
+        {
+            inputs_at_continuing = Some(mock_inputs(&fixture, &restored_parent.agent_id).await);
+        }
+    }
+    let inputs_at_continuing =
+        inputs_at_continuing.expect("the parent must report its continuation");
+    assert_eq!(
+        inputs_at_continuing
+            .first()
+            .map(|input| input.origin.clone()),
+        Some(Some(MessageOrigin::HostRestart)),
+        "Continuing is reported only once the continuation reached the backend: {inputs_at_continuing:?}"
+    );
+    let inputs = mock_inputs(&fixture, &restored_parent.agent_id).await;
+    assert_eq!(
+        inputs
+            .iter()
+            .map(|input| (
+                input.origin.clone(),
+                input.message.starts_with(CONTINUATION_PREFIX)
+            ))
+            .collect::<Vec<_>>(),
+        vec![(Some(MessageOrigin::HostRestart), true), (None, false)],
+        "the user's message runs after the continuation, which is not dropped: {inputs:?}"
+    );
+    assert_eq!(inputs[1].message, "user message");
+    assert_eq!(
+        observation
+            .stream(&parent_stream)
+            .phases()
+            .iter()
+            .filter(|phase| **phase == Phase::Continuing)
+            .count(),
+        1
+    );
+}
+
+/// A parent whose backend resumes its interrupted turn by itself is not even
+/// resumed until its restored child has been, and its self-started turn is
+/// then reported as the continuation without a second one being sent.
+#[tokio::test]
+async fn self_starting_parent_waits_for_its_gated_child() {
+    use protocol::{
+        MessageOrigin, RestartInterruptionCause as Cause, RestartRecoveryPhase as Phase,
+    };
+    let mut fixture = Fixture::new().await;
+    let parent_replay = server::backend::mock::MockResumeReplay::default();
+    let (parent, parent_session) = spawn_restart_agent(
+        &mut fixture,
+        "self starting parent",
+        "orchestrate",
+        None,
+        MockScript::one(MockTurn::held_text("parent unfinished"))
+            .with_controlled_resume_replay(&parent_replay),
+    )
+    .await;
+    fixture
+        .next_chat_event_matching(&parent, "parent held turn streamed", |event| {
+            matches!(event, ChatEvent::StreamEnd(_))
+        })
+        .await;
+    let child_replay = server::backend::mock::MockResumeReplay::default();
+    let (child, child_session) = spawn_restart_agent(
+        &mut fixture,
+        "gated worker",
+        "work",
+        Some(parent.new_agent.agent_id.clone()),
+        MockScript::one(MockTurn::held_text("child unfinished"))
+            .with_controlled_resume_replay(&child_replay),
+    )
+    .await;
+    fixture
+        .next_chat_event_matching(&child, "child held turn streamed", |event| {
+            matches!(event, ChatEvent::StreamEnd(_))
+        })
+        .await;
+
+    let bootstrap = fixture.restart_host().await;
+    let mut restored = RestoredReplay::seed(&bootstrap);
+    let descriptors = restored
+        .agents(
+            &mut fixture,
+            &[parent_session.clone(), child_session.clone()],
+        )
+        .await;
+    let (restored_parent, restored_child) = (descriptors[0].clone(), descriptors[1].clone());
+    child_replay.wait_until_started().await;
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(750),
+            parent_replay.wait_until_started()
+        )
+        .await
+        .is_err(),
+        "a self-starting parent must not be resumed before its child is restored"
+    );
+    child_replay.complete();
+    parent_replay.wait_until_started().await;
+    parent_replay.start_live_turn("parent resumed itself");
+    parent_replay.complete();
+    parent_replay.finish_live_turn("parent resumed itself");
+    let parent_stream = restored_parent.instance_stream.clone();
+    let child_stream = restored_child.instance_stream.clone();
+    let observation = Observation::observe_until(
+        &mut fixture,
+        &[parent_stream.clone(), child_stream.clone()],
+        |observation| {
+            observation
+                .stream(&child_stream)
+                .settled_after(CONTINUATION_PREFIX)
+                && {
+                    // The self-started turn began before the replay boundary,
+                    // so its text arrives inside the bootstrap, which reports
+                    // it as live; only its end streams afterwards.
+                    let parent = observation.stream(&parent_stream);
+                    parent
+                        .items
+                        .iter()
+                        .position(|item| {
+                            matches!(
+                                item,
+                                Observed::Bootstrap {
+                                    activity: protocol::AgentActivity::Thinking,
+                                    ..
+                                }
+                            )
+                        })
+                        .is_some_and(|bootstrap| {
+                            parent.items[bootstrap..].contains(&Observed::Typing(false))
+                        })
+                }
+        },
+    )
+    .await;
+    assert_eq!(
+        observation.stream(&parent_stream).phases(),
+        vec![
+            Phase::Interrupted {
+                cause: Cause::HostRestart
+            },
+            Phase::Continuing
+        ],
+        "{:?}",
+        observation.stream(&parent_stream).items
+    );
+    assert!(
+        observation.phase_position(&child_stream, &Phase::Continuing)
+            < observation.phase_position(&parent_stream, &Phase::Continuing),
+        "the child continues before its parent: {:?}",
+        observation.sequence
+    );
+    let parent_inputs = mock_inputs(&fixture, &restored_parent.agent_id).await;
+    assert!(
+        parent_inputs
+            .iter()
+            .all(|input| input.origin != Some(MessageOrigin::HostRestart)),
+        "a self-started turn is the continuation; none may be sent on top: {parent_inputs:?}"
+    );
+}
+
+/// One root whose restored child is still replaying does not hold back an
+/// unrelated root: each subtree is released on its own.
+#[tokio::test]
+async fn independent_restored_roots_continue_without_each_other() {
+    use protocol::RestartRecoveryPhase as Phase;
+    let mut fixture = Fixture::new().await;
+    let (blocked_root, blocked_root_session) = spawn_restart_agent(
+        &mut fixture,
+        "blocked root",
+        "orchestrate",
+        None,
+        MockScript::one(MockTurn::held_text("blocked root unfinished")),
+    )
+    .await;
+    fixture
+        .next_chat_event_matching(&blocked_root, "blocked root held", |event| {
+            matches!(event, ChatEvent::StreamEnd(_))
+        })
+        .await;
+    let held_child_replay = server::backend::mock::MockResumeReplay::default();
+    let (held_child, held_child_session) = spawn_restart_agent(
+        &mut fixture,
+        "held child",
+        "work",
+        Some(blocked_root.new_agent.agent_id.clone()),
+        MockScript::one(MockTurn::held_text("held child unfinished"))
+            .with_controlled_resume_replay(&held_child_replay),
+    )
+    .await;
+    fixture
+        .next_chat_event_matching(&held_child, "held child held", |event| {
+            matches!(event, ChatEvent::StreamEnd(_))
+        })
+        .await;
+    let (free_root, free_root_session) = spawn_restart_agent(
+        &mut fixture,
+        "free root",
+        "free work",
+        None,
+        MockScript::one(MockTurn::held_text("free root unfinished")),
+    )
+    .await;
+    fixture
+        .next_chat_event_matching(&free_root, "free root held", |event| {
+            matches!(event, ChatEvent::StreamEnd(_))
+        })
+        .await;
+
+    let bootstrap = fixture.restart_host().await;
+    let mut restored = RestoredReplay::seed(&bootstrap);
+    let descriptors = restored
+        .agents(
+            &mut fixture,
+            &[
+                blocked_root_session.clone(),
+                held_child_session.clone(),
+                free_root_session.clone(),
+            ],
+        )
+        .await;
+    held_child_replay.wait_until_started().await;
+    let free_stream = descriptors[2].instance_stream.clone();
+    let observation = Observation::observe_until(
+        &mut fixture,
+        std::slice::from_ref(&free_stream),
+        |observation| {
+            observation
+                .stream(&free_stream)
+                .settled_after(CONTINUATION_PREFIX)
+        },
+    )
+    .await;
+    assert!(
+        observation
+            .stream(&free_stream)
+            .phases()
+            .contains(&Phase::Continuing),
+        "{:?}",
+        observation.stream(&free_stream).items
+    );
+    held_child_replay.complete();
+}
+
+/// A restored parent the pass skips because it was closed mid-pass leaves its
+/// child to resolve ownership through the resume path, which refuses it. That
+/// must not strand an unrelated root the pass already reconstructed.
+#[tokio::test]
+async fn skipped_restored_parent_does_not_strand_an_unrelated_root() {
+    use protocol::RestartRecoveryPhase as Phase;
+    let mut fixture = Fixture::new().await;
+    let (free_root, free_root_session) = spawn_restart_agent(
+        &mut fixture,
+        "free root",
+        "free work",
+        None,
+        MockScript::one(MockTurn::held_text("free root unfinished")),
+    )
+    .await;
+    fixture
+        .next_chat_event_matching(&free_root, "free root held", |event| {
+            matches!(event, ChatEvent::StreamEnd(_))
+        })
+        .await;
+    let (closed_parent, closed_parent_session) = spawn_restart_agent(
+        &mut fixture,
+        "closed parent",
+        "orchestrate",
+        None,
+        MockScript::one(MockTurn::text("parent done")),
+    )
+    .await;
+    fixture.finish_turn(&closed_parent).await;
+    let (orphaned_child, orphaned_child_session) = spawn_restart_agent(
+        &mut fixture,
+        "orphaned child",
+        "work",
+        Some(closed_parent.new_agent.agent_id.clone()),
+        MockScript::one(MockTurn::held_text("orphaned child unfinished")),
+    )
+    .await;
+    fixture
+        .next_chat_event_matching(&orphaned_child, "orphaned child held", |event| {
+            matches!(event, ChatEvent::StreamEnd(_))
+        })
+        .await;
+
+    let restoration_gate = server::new_spawn_operation_test_gate();
+    let restoration_finished = server::new_spawn_operation_test_gate();
+    let bootstrap = fixture
+        .restart_host_with_runtime_config(|config| {
+            config.restoration_snapshot_test_gate = Some(restoration_gate.shared());
+            config.restoration_complete_test_gate = Some(restoration_finished.shared());
+        })
+        .await;
+    restoration_gate.wait_until_entered().await;
+
+    // Close the parent while the pass holds a snapshot that still marks it,
+    // so the pass skips it with its child still pending.
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            name: None,
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::Resume {
+                session_id: closed_parent_session.clone(),
+                prompt: None,
+            },
+        })
+        .await
+        .expect("resume the parent while restoration is held");
+    let resumed: NewAgentPayload =
+        fixture::next_frame_matching_on(&mut fixture.client, "resumed parent NewAgent", |env| {
+            env.kind == FrameKind::NewAgent
+        })
+        .await
+        .parse_payload()
+        .expect("parse resumed parent NewAgent");
+    expect_agent_start_on_stream(
+        &mut fixture.client,
+        &resumed.instance_stream,
+        "resumed parent start",
+    )
+    .await;
+    fixture
+        .client
+        .close_agent(&resumed.instance_stream)
+        .await
+        .expect("close the resumed parent");
+    fixture::next_frame_matching_on(&mut fixture.client, "resumed parent closed", |env| {
+        env.kind == FrameKind::AgentClosed
+            && env
+                .parse_payload::<protocol::AgentClosedPayload>()
+                .is_ok_and(|payload| payload.agent_id == resumed.agent_id)
+    })
+    .await;
+    restoration_gate.release_one();
+
+    let mut restored = RestoredReplay::seed(&bootstrap);
+    let descriptors = restored
+        .agents(&mut fixture, std::slice::from_ref(&free_root_session))
+        .await;
+    let free_stream = descriptors[0].instance_stream.clone();
+    let observation = Observation::observe_until(
+        &mut fixture,
+        std::slice::from_ref(&free_stream),
+        |observation| {
+            observation
+                .stream(&free_stream)
+                .settled_after(CONTINUATION_PREFIX)
+        },
+    )
+    .await;
+    assert!(
+        observation
+            .stream(&free_stream)
+            .phases()
+            .contains(&Phase::Continuing),
+        "{:?}",
+        observation.stream(&free_stream).items
+    );
+    restoration_finished.wait_until_entered().await;
+    let live_sessions = fixture.host_for_test().live_agent_session_ids().await;
+    assert!(
+        !live_sessions.contains(&closed_parent_session)
+            && !live_sessions.contains(&orphaned_child_session),
+        "a closed parent and the child it owns must not be restored"
+    );
+}
+
+/// A restored child whose startup hangs past the bound fails through the
+/// ordinary startup failure path, reporting its continuation failed, and
+/// releases its parent. No parent waits on a root, so a root whose startup
+/// outlasts the same bound still continues once it starts.
+#[tokio::test]
+async fn hung_restored_child_startup_releases_its_parent() {
+    use protocol::RestartRecoveryPhase as Phase;
+    let mut fixture = Fixture::new().await;
+    let (free_root, free_root_session) = spawn_restart_agent(
+        &mut fixture,
+        "free root",
+        "free work",
+        None,
+        MockScript::one(MockTurn::held_text("free root unfinished")),
+    )
+    .await;
+    fixture
+        .next_chat_event_matching(&free_root, "free root held", |event| {
+            matches!(event, ChatEvent::StreamEnd(_))
+        })
+        .await;
+    let (parent, parent_session) = spawn_restart_agent(
+        &mut fixture,
+        "waiting parent",
+        "orchestrate",
+        None,
+        MockScript::one(MockTurn::held_text("parent unfinished")),
+    )
+    .await;
+    fixture
+        .next_chat_event_matching(&parent, "parent held", |event| {
+            matches!(event, ChatEvent::StreamEnd(_))
+        })
+        .await;
+    let (child, child_session) = spawn_restart_agent(
+        &mut fixture,
+        "hung child",
+        "work",
+        Some(parent.new_agent.agent_id.clone()),
+        MockScript::one(MockTurn::held_text("child unfinished")),
+    )
+    .await;
+    fixture
+        .next_chat_event_matching(&child, "child held", |event| {
+            matches!(event, ChatEvent::StreamEnd(_))
+        })
+        .await;
+
+    let _hung_startup = fixture
+        .host_for_test()
+        .install_agent_startup_completion_test_gate("hung child");
+    let slow_root_startup = fixture
+        .host_for_test()
+        .install_agent_startup_completion_test_gate("free root");
+    let bootstrap = fixture
+        .restart_host_with_runtime_config(|config| {
+            config.restored_agent_startup_timeout = Some(Duration::from_secs(2));
+        })
+        .await;
+    let mut restored = RestoredReplay::seed(&bootstrap);
+    let descriptors = restored
+        .agents(
+            &mut fixture,
+            &[
+                free_root_session.clone(),
+                parent_session.clone(),
+                child_session.clone(),
+            ],
+        )
+        .await;
+    let streams = descriptors
+        .iter()
+        .map(|descriptor| descriptor.instance_stream.clone())
+        .collect::<Vec<_>>();
+    let (free_stream, parent_stream, child_stream) =
+        (streams[0].clone(), streams[1].clone(), streams[2].clone());
+    let child_failed = |observation: &Observation| {
+        observation
+            .stream(&child_stream)
+            .phases()
+            .iter()
+            .any(|phase| matches!(phase, Phase::ContinuationFailed { message } if message.contains("timed out")))
+    };
+    let observation = Observation::observe_until(&mut fixture, &streams, |observation| {
+        observation.stream(&parent_stream).continuation_finished() && child_failed(observation)
+    })
+    .await;
+    assert!(
+        observation
+            .stream(&parent_stream)
+            .phases()
+            .contains(&Phase::Continuing),
+        "{:?}",
+        observation.stream(&parent_stream).items
+    );
+    assert!(
+        !observation
+            .stream(&child_stream)
+            .phases()
+            .contains(&Phase::Continuing),
+        "a child whose startup timed out must not continue: {:?}",
+        observation.stream(&child_stream).items
+    );
+
+    // The root activated alongside the child, so the bound has passed for it
+    // too by the time the child failed.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    slow_root_startup.release_one();
+    let root_resolved = |observation: &Observation| {
+        observation.stream(&free_stream).continuation_finished()
+            || observation
+                .stream(&free_stream)
+                .phases()
+                .iter()
+                .any(|phase| matches!(phase, Phase::ContinuationFailed { .. }))
+    };
+    let observation =
+        Observation::continue_until(observation, &mut fixture, &streams, root_resolved).await;
+    let root_phases = observation.stream(&free_stream).phases();
+    assert!(
+        root_phases.contains(&Phase::Continuing)
+            && !root_phases
+                .iter()
+                .any(|phase| matches!(phase, Phase::ContinuationFailed { .. })),
+        "a slow root startup must continue late instead of failing: {:?}",
+        observation.stream(&free_stream).items
+    );
+}
+
+/// A backend whose startup workers outlive a dropped startup future cannot be
+/// cut off by the restored-child bound: its parent stays held until the
+/// child's startup actually ends, and the child then continues first.
+#[tokio::test]
+async fn non_cancellable_restored_child_startup_holds_its_parent() {
+    use protocol::RestartRecoveryPhase as Phase;
+    let mut fixture = Fixture::new().await;
+    let (parent, parent_session) = spawn_restart_agent(
+        &mut fixture,
+        "held parent",
+        "orchestrate",
+        None,
+        MockScript::one(MockTurn::held_text("parent unfinished")),
+    )
+    .await;
+    fixture
+        .next_chat_event_matching(&parent, "parent held", |event| {
+            matches!(event, ChatEvent::StreamEnd(_))
+        })
+        .await;
+    let (child, child_session) = spawn_restart_agent(
+        &mut fixture,
+        "uncancellable child",
+        "work",
+        Some(parent.new_agent.agent_id.clone()),
+        MockScript::one(MockTurn::held_text("child unfinished")),
+    )
+    .await;
+    fixture
+        .next_chat_event_matching(&child, "child held", |event| {
+            matches!(event, ChatEvent::StreamEnd(_))
+        })
+        .await;
+
+    let host = fixture.host_for_test();
+    host.install_non_cancellable_agent_startup("uncancellable child");
+    let slow_startup = host.install_agent_startup_completion_test_gate("uncancellable child");
+    let bound = Duration::from_secs(1);
+    let bootstrap = fixture
+        .restart_host_with_runtime_config(|config| {
+            config.restored_agent_startup_timeout = Some(bound);
+        })
+        .await;
+    let mut restored = RestoredReplay::seed(&bootstrap);
+    let descriptors = restored
+        .agents(
+            &mut fixture,
+            &[parent_session.clone(), child_session.clone()],
+        )
+        .await;
+    let streams = descriptors
+        .iter()
+        .map(|descriptor| descriptor.instance_stream.clone())
+        .collect::<Vec<_>>();
+    let (parent_stream, child_stream) = (streams[0].clone(), streams[1].clone());
+    slow_startup.wait_until_entered().await;
+    tokio::time::sleep(bound * 3).await;
+    slow_startup.release_one();
+    let observation = Observation::observe_until(&mut fixture, &streams, |observation| {
+        observation.stream(&parent_stream).continuation_finished()
+            && (observation.stream(&child_stream).continuation_finished()
+                || observation
+                    .stream(&child_stream)
+                    .phases()
+                    .iter()
+                    .any(|phase| matches!(phase, Phase::ContinuationFailed { .. })))
+    })
+    .await;
+    let child_phases = observation.stream(&child_stream).phases();
+    assert!(
+        child_phases.contains(&Phase::Continuing)
+            && !child_phases
+                .iter()
+                .any(|phase| matches!(phase, Phase::ContinuationFailed { .. })),
+        "a startup that cannot be cancelled must not be timed out: {:?}",
+        observation.stream(&child_stream).items
+    );
+    assert_continued_before(&child_session, &parent_session);
+}
+
+/// A restored parent whose spawn fails is not resumed under a new identity
+/// behind its children. Its subtree keeps its restoration intent while an
+/// unrelated root continues, and the next launch restores parent and child
+/// under their original identities, child first.
+#[tokio::test]
+async fn failed_restored_parent_keeps_its_subtree_for_a_stable_retry() {
+    use protocol::RestartRecoveryPhase as Phase;
+    let mut fixture = Fixture::new().await;
+    let (free_root, free_root_session) = spawn_restart_agent(
+        &mut fixture,
+        "free root",
+        "free work",
+        None,
+        MockScript::one(MockTurn::held_text("free root unfinished")),
+    )
+    .await;
+    fixture
+        .next_chat_event_matching(&free_root, "free root held", |event| {
+            matches!(event, ChatEvent::StreamEnd(_))
+        })
+        .await;
+    let (parent, parent_session) = spawn_restart_agent(
+        &mut fixture,
+        "failing parent",
+        "orchestrate",
+        None,
+        MockScript::one(MockTurn::held_text("parent unfinished")),
+    )
+    .await;
+    fixture
+        .next_chat_event_matching(&parent, "parent held", |event| {
+            matches!(event, ChatEvent::StreamEnd(_))
+        })
+        .await;
+    let (child, child_session) = spawn_restart_agent(
+        &mut fixture,
+        "stranded child",
+        "work",
+        Some(parent.new_agent.agent_id.clone()),
+        MockScript::one(MockTurn::held_text("child unfinished")),
+    )
+    .await;
+    fixture
+        .next_chat_event_matching(&child, "child held", |event| {
+            matches!(event, ChatEvent::StreamEnd(_))
+        })
+        .await;
+
+    let restoration_started = server::new_spawn_operation_test_gate();
+    let restoration_finished = server::new_spawn_operation_test_gate();
+    let bootstrap = fixture
+        .restart_host_with_runtime_config(|config| {
+            config
+                .rejected_restoration_sessions
+                .insert(parent_session.clone());
+            config.restoration_snapshot_test_gate = Some(restoration_started.shared());
+            config.restoration_complete_test_gate = Some(restoration_finished.shared());
+        })
+        .await;
+    restoration_started.wait_until_entered().await;
+    // Connected while the pass is still running, so it can only learn the
+    // outcome as a live status.
+    let (mut early_client, early_bootstrap) = fixture.connect_with_bootstrap().await;
+    assert!(early_bootstrap.agent_restoration_failures.is_empty());
+    restoration_started.release_one();
+    let mut restored = RestoredReplay::seed(&bootstrap);
+    let descriptors = restored
+        .agents(&mut fixture, std::slice::from_ref(&free_root_session))
+        .await;
+    let free_stream = descriptors[0].instance_stream.clone();
+    let observation = Observation::observe_until(
+        &mut fixture,
+        std::slice::from_ref(&free_stream),
+        |observation| observation.stream(&free_stream).continuation_finished(),
+    )
+    .await;
+    assert!(
+        observation
+            .stream(&free_stream)
+            .phases()
+            .contains(&Phase::Continuing),
+        "{:?}",
+        observation.stream(&free_stream).items
+    );
+    restoration_finished.wait_until_entered().await;
+    assert_eq!(
+        fixture.agent_ids().await,
+        vec![free_root.new_agent.agent_id.clone()],
+        "a parent that failed to restore must not come back under a new identity"
+    );
+    let expected_failure = |failures: &[protocol::AgentRestorationFailure], context: &str| {
+        assert_eq!(
+            failures.len(),
+            1,
+            "{context}: one failed subtree is reported: {failures:?}"
+        );
+        let failure = &failures[0];
+        assert!(
+            matches!(
+                &failure.agent,
+                protocol::RestoredAgentRef::Session { session_id, agent_id, .. }
+                    if session_id == &parent_session
+                        && agent_id.as_ref() == Some(&parent.new_agent.agent_id)
+            ),
+            "{context}: the failed parent is identified: {failure:?}"
+        );
+        assert!(
+            matches!(
+                &failure.reason,
+                protocol::AgentRestorationFailureReason::ReconstructFailed { message }
+                    if message.contains("test rejected this restored spawn")
+            ),
+            "{context}: the reconstruction error is reported: {failure:?}"
+        );
+        assert_eq!(failure.retry, protocol::AgentRestorationRetry::NextLaunch);
+        assert!(
+            matches!(
+                failure.skipped.as_slice(),
+                [protocol::RestoredAgentRef::Session { session_id, agent_id, .. }]
+                    if session_id == &child_session
+                        && agent_id.as_ref() == Some(&child.new_agent.agent_id)
+            ),
+            "{context}: the stranded child is reported as skipped: {failure:?}"
+        );
+    };
+    let (_new_client, new_bootstrap) = fixture.connect_with_bootstrap().await;
+    expected_failure(
+        &new_bootstrap.agent_restoration_failures,
+        "a client connecting after the pass",
+    );
+    let status: protocol::AgentRestorationStatusPayload =
+        fixture::next_frame_matching_on(&mut early_client, "live restoration status", |env| {
+            env.kind == FrameKind::AgentRestorationStatus
+        })
+        .await
+        .parse_payload()
+        .expect("parse AgentRestorationStatus");
+    expected_failure(&status.failures, "a client connected during the pass");
+    restoration_finished.release_one();
+
+    let bootstrap = fixture.restart_host().await;
+    let mut restored = RestoredReplay::seed(&bootstrap);
+    let descriptors = restored
+        .agents(
+            &mut fixture,
+            &[parent_session.clone(), child_session.clone()],
+        )
+        .await;
+    assert_eq!(descriptors[0].agent_id, parent.new_agent.agent_id);
+    assert_eq!(descriptors[1].agent_id, child.new_agent.agent_id);
+    let (parent_stream, child_stream) = (
+        descriptors[0].instance_stream.clone(),
+        descriptors[1].instance_stream.clone(),
+    );
+    let streams = [parent_stream.clone(), child_stream.clone()];
+    Observation::observe_until(&mut fixture, &streams, |observation| {
+        observation.stream(&parent_stream).continuation_finished()
+            && observation.stream(&child_stream).continuation_finished()
+    })
+    .await;
+    assert_continued_before(&child_session, &parent_session);
+    assert!(bootstrap.agent_restoration_failures.is_empty());
+    let (_client, after_retry) = fixture.connect_with_bootstrap().await;
+    assert!(
+        after_retry.agent_restoration_failures.is_empty(),
+        "a successful retry reports no restoration failure: {:?}",
+        after_retry.agent_restoration_failures
+    );
+}
+
+/// Closing an agent in the middle of a turn withdraws it from recovery: a
+/// later restart does not restore it and a resume from History reopens it
+/// idle, reporting no interruption. That holds whether the turn is parked on a
+/// question, the agent is still starting its first turn, or its backend
+/// failed mid turn and left it parked terminal.
+#[tokio::test]
+async fn closing_mid_turn_spends_the_recovery_marker() {
+    let mut fixture = Fixture::new().await;
+    let gate = server::backend::mock::MockGateHandle::new();
+    let (agent, session) = spawn_restart_agent(
+        &mut fixture,
+        "closed mid turn",
+        "first prompt",
+        None,
+        MockScript::one(MockTurn::text("launch response")).then(
+            MockTurn::blocking_question_request("closed-question", &gate),
+        ),
+    )
+    .await;
+    fixture.finish_turn(&agent).await;
+    fixture
+        .client
+        .send_message(&agent.stream, "ask me".to_owned())
+        .await
+        .expect("send the turn that asks");
+    gate.wait_until_entered().await;
+    gate.release_one();
+    fixture
+        .expect_paused_tool_request(&agent, "AskUserQuestion")
+        .await;
+    fixture.mock(&agent).await;
+    assert_eq!(
+        stored_turn_recovery(&fixture, &session),
+        serde_json::json!("InFlight"),
+        "a turn parked on a question is in flight"
+    );
+
+    close_and_expect_no_recovery(
+        &mut fixture,
+        &agent.stream,
+        &agent.new_agent.agent_id,
+        &session,
+        "closed mid turn",
+        None,
+    )
+    .await;
+
+    // A restored agent closed while it is still starting, before it could
+    // continue the turn the restart interrupted.
+    let mut fixture = Fixture::new().await;
+    let name = "closed during startup";
+    let (agent, session) = spawn_restart_agent(
+        &mut fixture,
+        name,
+        "first prompt",
+        None,
+        MockScript::one(MockTurn::held_text("unfinished work")),
+    )
+    .await;
+    fixture
+        .next_chat_event_matching(&agent, "held turn streamed", |event| {
+            matches!(event, ChatEvent::StreamEnd(_))
+        })
+        .await;
+    let ready_gate = fixture
+        .host_for_test()
+        .install_agent_startup_backend_ready_test_gate(name);
+    let bootstrap = fixture.restart_host().await;
+    let restored = match bootstrap
+        .agents
+        .iter()
+        .find(|agent| agent.session_id.as_ref() == Some(&session))
+    {
+        Some(agent) => agent.clone(),
+        None => fixture
+            .next_frame_matching("restored NewAgent", |env| {
+                env.kind == FrameKind::NewAgent
+                    && env
+                        .parse_payload::<NewAgentPayload>()
+                        .is_ok_and(|agent| agent.session_id.as_ref() == Some(&session))
+            })
+            .await
+            .parse_payload()
+            .expect("parse restored NewAgent"),
+    };
+    ready_gate.wait_until_entered().await;
+    assert_eq!(
+        stored_turn_recovery(&fixture, &session),
+        serde_json::json!("InterruptedByRestart"),
+        "the restored agent is still starting, its interrupted turn not yet continued"
+    );
+    close_and_expect_no_recovery(
+        &mut fixture,
+        &restored.instance_stream,
+        &restored.agent_id,
+        &session,
+        name,
+        Some(ready_gate),
+    )
+    .await;
+
+    let mut fixture = Fixture::new().await;
+    let gate = server::backend::mock::MockGateHandle::new();
+    let (agent, session) = spawn_restart_agent(
+        &mut fixture,
+        "closed after failure",
+        "first prompt",
+        None,
+        MockScript::one(MockTurn::text("launch response"))
+            .then(MockTurn::busy_then_close_stream(&gate)),
+    )
+    .await;
+    fixture.finish_turn(&agent).await;
+    fixture
+        .client
+        .send_message(&agent.stream, "fail mid turn".to_owned())
+        .await
+        .expect("send the turn that fails");
+    gate.wait_until_entered().await;
+    gate.release_one();
+    fixture
+        .next_frame_matching("fatal backend failure", |env| {
+            env.stream == agent.stream
+                && env.kind == FrameKind::AgentError
+                && env
+                    .parse_payload::<protocol::AgentErrorPayload>()
+                    .is_ok_and(|payload| payload.fatal)
+        })
+        .await;
+    assert_eq!(
+        stored_turn_recovery(&fixture, &session),
+        serde_json::json!("InFlight"),
+        "a turn its backend failed is left in flight until the agent is closed"
+    );
+    close_and_expect_no_recovery(
+        &mut fixture,
+        &agent.stream,
+        &agent.new_agent.agent_id,
+        &session,
+        "closed after failure",
+        None,
+    )
+    .await;
+
+    // Closed after the host began stopping for a restart: the restart has
+    // already marked the turn interrupted, and the close must still spend it.
+    let mut fixture = Fixture::new().await;
+    let gate = server::backend::mock::MockGateHandle::new();
+    let name = "closed while restarting";
+    let (agent, session) = spawn_restart_agent(
+        &mut fixture,
+        name,
+        "first prompt",
+        None,
+        MockScript::one(MockTurn::text("launch response")).then(
+            MockTurn::blocking_question_request("restarting-question", &gate),
+        ),
+    )
+    .await;
+    fixture.finish_turn(&agent).await;
+    fixture
+        .client
+        .send_message(&agent.stream, "ask me".to_owned())
+        .await
+        .expect("send the turn that asks");
+    gate.wait_until_entered().await;
+    gate.release_one();
+    fixture
+        .expect_paused_tool_request(&agent, "AskUserQuestion")
+        .await;
+    let stop_gate = fixture.host_for_test().install_restart_stop_test_gate();
+    let stopping_host = fixture.host_for_test();
+    let stop = tokio::spawn(async move {
+        stopping_host.shutdown_for_restart().await;
+    });
+    stop_gate.wait_until_entered().await;
+    assert_eq!(
+        stored_turn_recovery(&fixture, &session),
+        serde_json::json!("InterruptedByRestart"),
+        "the stopping host marks the parked turn interrupted before any agent stops"
+    );
+    fixture
+        .client
+        .close_agent(&agent.stream)
+        .await
+        .expect("close the agent while the host is stopping");
+    fixture
+        .next_frame_matching("AgentClosed while restarting", |env| {
+            env.kind == FrameKind::AgentClosed
+                && env
+                    .parse_payload::<protocol::AgentClosedPayload>()
+                    .is_ok_and(|payload| payload.agent_id == agent.new_agent.agent_id)
+        })
+        .await;
+    assert!(
+        stored_turn_recovery(&fixture, &session).is_null(),
+        "{name}: an explicit close withdraws the recovery marker the stopping host wrote"
+    );
+    stop_gate.release_one();
+    stop.await.expect("restart stop task");
+    expect_closed_agent_not_continued(&mut fixture, &session, name).await;
+}
+
+async fn close_and_expect_no_recovery(
+    fixture: &mut Fixture,
+    stream: &protocol::StreamPath,
+    agent_id: &protocol::AgentId,
+    session: &SessionId,
+    name: &str,
+    startup_gate: Option<server::InstalledSpawnOperationTestGate>,
+) {
+    fixture
+        .client
+        .close_agent(stream)
+        .await
+        .expect("close the agent");
+    fixture
+        .next_frame_matching("AgentClosed", |env| {
+            env.kind == FrameKind::AgentClosed
+                && env
+                    .parse_payload::<protocol::AgentClosedPayload>()
+                    .is_ok_and(|payload| &payload.agent_id == agent_id)
+        })
+        .await;
+    // The closed agent's startup never took its release; let later starts
+    // under the same name pass.
+    drop(startup_gate);
+    expect_closed_agent_not_continued(fixture, session, name).await;
+}
+
+async fn expect_closed_agent_not_continued(fixture: &mut Fixture, session: &SessionId, name: &str) {
+    assert!(
+        stored_turn_recovery(fixture, session).is_null(),
+        "{name}: a closed agent is never continued"
+    );
+    let bootstrap = fixture.restart_host().await;
+    assert!(
+        !bootstrap
+            .agents
+            .iter()
+            .any(|agent| agent.session_id.as_ref() == Some(session)),
+        "{name}: a closed agent is not restored by a restart"
+    );
+    assert!(stored_turn_recovery(fixture, session).is_null());
+
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            name: Some(name.to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::Resume {
+                session_id: session.clone(),
+                prompt: None,
+            },
+        })
+        .await
+        .expect("resume from history");
+    let resumed: NewAgentPayload = fixture
+        .next_frame_matching("resumed NewAgent", |env| {
+            env.kind == FrameKind::NewAgent
+                && env
+                    .parse_payload::<NewAgentPayload>()
+                    .is_ok_and(|agent| agent.session_id.as_ref() == Some(session))
+        })
+        .await
+        .parse_payload()
+        .expect("parse resumed NewAgent");
+    let resumed_bootstrap: AgentBootstrapPayload = expect_raw_event_on_stream(
+        &mut fixture.client,
+        &resumed.instance_stream,
+        FrameKind::AgentBootstrap,
+        "resumed bootstrap",
+    )
+    .await
+    .parse_payload()
+    .expect("parse resumed bootstrap");
+    assert!(
+        recovery_phases(&resumed_bootstrap.events).is_empty(),
+        "{name}: a closed turn is not reported as interrupted: {:?}",
+        resumed_bootstrap.events
+    );
+    assert_eq!(resumed_bootstrap.activity, protocol::AgentActivity::Idle);
+    assert!(stored_turn_recovery(fixture, session).is_null());
+}
+
+/// A tool running when the host stops, cleanly or by a hard kill, is closed
+/// with an unknown outcome after the restart, exactly once, instead of being
+/// shown as running forever. That holds wherever the provider reports the
+/// request relative to its response, including inside a response the host
+/// died before seeing end, and the restored transcript shows the call once.
+#[tokio::test]
+async fn tools_running_at_restart_end_with_an_unknown_outcome() {
+    for shape in [
+        RunningCommandShape::RequestAfterResponse,
+        RunningCommandShape::RequestInsideEndedResponse,
+        RunningCommandShape::RequestInsideOpenResponse,
+    ] {
+        for hard in [false, true] {
+            let mut fixture = Fixture::new().await;
+            let tool_call_id = "restart-running-command";
+            let (agent, session) = spawn_restart_agent(
+                &mut fixture,
+                "restart running tool",
+                "run it",
+                None,
+                MockScript::one(MockTurn::text("ready"))
+                    .then(MockTurn::held_running_command(tool_call_id, shape)),
+            )
+            .await;
+            // The first idle makes the transcript authoritative, so the restored
+            // history carries the unfinished tool call the way a provider's own
+            // session log carries a tool use that never got its result.
+            fixture.finish_turn(&agent).await;
+            fixture
+                .client
+                .send_message(&agent.stream, "start the command".to_owned())
+                .await
+                .expect("start the running command");
+            fixture
+                .next_chat_event_matching(&agent, "command started", |event| {
+                    matches!(event, ChatEvent::ToolRequest(request) if request.tool_call_id == tool_call_id)
+                })
+                .await;
+            if matches!(shape, RunningCommandShape::RequestInsideEndedResponse) {
+                fixture
+                    .next_chat_event_matching(
+                        &agent,
+                        "response issuing the command ended",
+                        |event| matches!(event, ChatEvent::StreamEnd(_)),
+                    )
+                    .await;
+            }
+            fixture.mock(&agent).await;
+
+            let bootstrap = if hard {
+                fixture.relaunch_host_after_kill().await
+            } else {
+                fixture.restart_host().await
+            };
+            let restored = restored_descriptor(&mut fixture, &bootstrap, &session).await;
+            let stream = restored.instance_stream.clone();
+            let mut outcomes = Vec::new();
+            let mut requests = 0;
+            let mut flow = StreamObservation::default();
+            while !flow.settled_after(CONTINUATION_PREFIX) {
+                let env = fixture::next_frame_matching_on(
+                    &mut fixture.client,
+                    "restored running-tool activity",
+                    |env| env.stream == stream,
+                )
+                .await;
+                match env.kind {
+                    FrameKind::AgentBootstrap => {
+                        let payload: AgentBootstrapPayload =
+                            env.parse_payload().expect("parse restored bootstrap");
+                        outcomes.extend(restart_expiry_of(&payload.events, tool_call_id));
+                        requests += payload
+                            .events
+                            .iter()
+                            .filter(|event| {
+                                matches!(
+                                    event,
+                                    AgentBootstrapEvent::ChatEvent(ChatEvent::ToolRequest(request))
+                                        if request.tool_call_id == tool_call_id
+                                )
+                            })
+                            .count();
+                    }
+                    FrameKind::ChatEvent => {
+                        let event: ChatEvent = env.parse_payload().expect("parse ChatEvent");
+                        match &event {
+                            ChatEvent::ToolExecutionCompleted(completion)
+                                if completion.tool_call_id == tool_call_id =>
+                            {
+                                outcomes.push(completion.outcome.clone());
+                            }
+                            ChatEvent::ToolRequest(request)
+                                if request.tool_call_id == tool_call_id =>
+                            {
+                                requests += 1;
+                            }
+                            _ => {}
+                        }
+                        flow.record_chat_event(event);
+                    }
+                    _ => {}
+                }
+            }
+            assert_eq!(
+                requests, 1,
+                "{shape:?} hard={hard}: the restored transcript shows the running command once"
+            );
+            assert_eq!(
+                outcomes.len(),
+                1,
+                "{shape:?} hard={hard}: the running tool ends exactly once: {outcomes:?}"
+            );
+            assert!(
+                matches!(
+                    &outcomes[0],
+                    protocol::ToolExecutionOutcome::Cancelled { message }
+                        if message.contains("outcome is unknown")
+                ),
+                "{shape:?} hard={hard}: the tool's outcome is unknown, not failed or succeeded: {:?}",
+                outcomes[0]
+            );
+        }
+    }
+}
+
+/// The tool calls in `events`, in order, as the client would draw them.
+fn tool_trace<'a>(events: impl IntoIterator<Item = &'a ChatEvent>) -> Vec<String> {
+    events
+        .into_iter()
+        .filter_map(|event| match event {
+            ChatEvent::ToolRequest(request) => Some(format!("request {}", request.tool_call_id)),
+            ChatEvent::ToolExecutionCompleted(completion) => {
+                let outcome = match &completion.outcome {
+                    protocol::ToolExecutionOutcome::Cancelled { message }
+                        if message.contains("outcome is unknown") =>
+                    {
+                        "unknown".to_owned()
+                    }
+                    protocol::ToolExecutionOutcome::Succeeded { .. } => "succeeded".to_owned(),
+                    protocol::ToolExecutionOutcome::Failed { .. } => "failed".to_owned(),
+                    other => format!("{other:?}"),
+                };
+                Some(format!("{outcome} {}", completion.tool_call_id))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn bootstrap_chat_events(payload: &AgentBootstrapPayload) -> Vec<ChatEvent> {
+    payload
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            AgentBootstrapEvent::ChatEvent(event) => Some(event.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A response the backend abandons without ending it, by interrupting a tool
+/// or by opening its next response, keeps the commands it issued in history
+/// the way live clients saw them: a reconnecting client sees each call once,
+/// before its completion. After a clean restart or a hard kill the idle
+/// session ends the command that never finished with an unknown outcome, keeps
+/// the reported outcome of the other exactly once, and does not continue on
+/// its own.
+#[tokio::test]
+async fn abandoned_response_commands_stay_in_history_and_end_after_restart() {
+    for (abandon, hard) in [
+        (AbandonedResponse::Interrupted, false),
+        (AbandonedResponse::Interrupted, true),
+        (AbandonedResponse::Replaced, false),
+        (AbandonedResponse::Replaced, true),
+    ] {
+        let mut fixture = Fixture::new().await;
+        let running_id = "abandoned-running-command";
+        let finished_id = "abandoned-finished-command";
+        let (agent, session) =
+            spawn_restart_agent(
+                &mut fixture,
+                "abandoned response",
+                "get ready",
+                None,
+                MockScript::one(MockTurn::text("ready")).then(
+                    MockTurn::abandoned_response_commands(running_id, finished_id, abandon),
+                ),
+            )
+            .await;
+        fixture.finish_turn(&agent).await;
+        fixture
+            .client
+            .send_message(&agent.stream, "abandon a response".to_owned())
+            .await
+            .expect("send the abandoned turn");
+        let live = fixture.finish_turn(&agent).await;
+        let live_events = live
+            .frames
+            .iter()
+            .filter(|env| env.kind == FrameKind::ChatEvent)
+            .map(|env| env.parse_payload::<ChatEvent>().expect("parse ChatEvent"))
+            .collect::<Vec<_>>();
+        let finished_outcome = match abandon {
+            AbandonedResponse::Interrupted => "failed",
+            AbandonedResponse::Replaced => "succeeded",
+        };
+        let history = vec![
+            format!("request {running_id}"),
+            format!("request {finished_id}"),
+            format!("{finished_outcome} {finished_id}"),
+        ];
+        assert_eq!(
+            tool_trace(&live_events),
+            history,
+            "{abandon:?} hard={hard}: the live client saw both commands and one finish"
+        );
+
+        let mut other = fixture.connect().await;
+        let env = fixture::next_frame_matching_on(
+            &mut other,
+            "reconnected bootstrap of the abandoned response",
+            |env| env.kind == FrameKind::AgentBootstrap,
+        )
+        .await;
+        let reconnected: AgentBootstrapPayload =
+            env.parse_payload().expect("parse reconnected bootstrap");
+        assert_eq!(
+            tool_trace(&bootstrap_chat_events(&reconnected)),
+            history,
+            "{abandon:?} hard={hard}: a reconnecting client sees the same commands the live client saw"
+        );
+        drop(other);
+
+        let bootstrap = if hard {
+            fixture.relaunch_host_after_kill().await
+        } else {
+            fixture.restart_host().await
+        };
+        let mut replay = RestoredReplay::seed(&bootstrap);
+        let restored = replay
+            .agents(&mut fixture, std::slice::from_ref(&session))
+            .await
+            .remove(0);
+        let stream = restored.instance_stream.clone();
+        let restored_bootstrap = replay.bootstrap(&mut fixture, &stream).await;
+        let mut events = bootstrap_chat_events(&restored_bootstrap);
+        fixture
+            .client
+            .send_message(&stream, "after restart".to_owned())
+            .await
+            .expect("send after the restart");
+        let mut flow = StreamObservation::default();
+        while !flow.settled_after("after restart") {
+            let env = fixture::next_frame_matching_on(
+                &mut fixture.client,
+                "restored abandoned-response activity",
+                |env| env.stream == stream && env.kind == FrameKind::ChatEvent,
+            )
+            .await;
+            let event: ChatEvent = env.parse_payload().expect("parse ChatEvent");
+            events.push(event.clone());
+            flow.record_chat_event(event);
+        }
+        let mut restored_history = history.clone();
+        restored_history.push(format!("unknown {running_id}"));
+        assert_eq!(
+            tool_trace(&events),
+            restored_history,
+            "{abandon:?} hard={hard}: after the restart each command shows once, the reported \
+             outcome is kept once, and the unfinished command ends with an unknown outcome"
+        );
+        assert!(
+            recovery_phases(&restored_bootstrap.events).is_empty() && flow.phases().is_empty(),
+            "{abandon:?} hard={hard}: an idle session reports no restart recovery: {:?} {:?}",
+            recovery_phases(&restored_bootstrap.events),
+            flow.phases()
+        );
+        let inputs = mock_inputs(&fixture, &restored.agent_id).await;
+        assert_eq!(
+            inputs
+                .iter()
+                .map(|input| input.message.as_str())
+                .collect::<Vec<_>>(),
+            vec!["after restart"],
+            "{abandon:?} hard={hard}: the restored idle session sends the provider only the user's message"
+        );
+        assert!(
+            stored_turn_recovery(&fixture, &session).is_null(),
+            "{abandon:?} hard={hard}: the idle session never carried a recovery marker"
+        );
+    }
+}
+
+fn interrupted_session_under(fixture: &Fixture, workspace_root: &str) -> Option<SessionId> {
+    let store = SessionStore::load(fixture.session_store_path()).expect("load session store");
+    store
+        .list()
+        .expect("list stored sessions")
+        .into_iter()
+        .find(|record| {
+            record
+                .workspace_roots
+                .iter()
+                .any(|root| root == workspace_root)
+                && serde_json::to_value(record.turn_recovery).expect("inspect turn recovery")
+                    == serde_json::json!("InterruptedByRestart")
+        })
+        .map(|record| record.id)
+}
+
+/// A restart that lands while a new agent's first prompt is already with the
+/// provider records that turn as interrupted and continues it on the restored
+/// agent, followed by the message the user sent while it was starting.
+#[tokio::test]
+async fn restart_during_initial_prompt_startup_continues_the_spawned_turn() {
+    use protocol::{
+        MessageOrigin, RestartInterruptionCause as Cause, RestartRecoveryPhase as Phase,
+    };
+    let mut fixture = Fixture::new().await;
+    let name = "startup restart";
+    let workspace_root = "/tmp/startup-restart";
+    let reservation = fixture
+        .reserve_next_mock_launch(name, MockScript::one(MockTurn::held_text("startup work")))
+        .await;
+    let ready_gate = fixture
+        .host_for_test()
+        .install_agent_startup_backend_ready_test_gate(name);
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            name: Some(name.to_owned()),
+            custom_agent_id: None,
+            parent_agent_id: None,
+            project_id: None,
+            params: SpawnAgentParams::New {
+                workspace_roots: vec![workspace_root.to_owned()],
+                prompt: "first prompt".to_owned(),
+                images: None,
+                backend_kind: BackendKind::Claude,
+                launch_profile_id: None,
+                cost_hint: None,
+                access_mode: Default::default(),
+                session_settings: None,
+            },
+        })
+        .await
+        .expect("spawn agent");
+    let spawned: NewAgentPayload = fixture
+        .next_frame_matching("NewAgent", |env| env.kind == FrameKind::NewAgent)
+        .await
+        .parse_payload()
+        .expect("parse NewAgent");
+    ready_gate.wait_until_entered().await;
+    drop(reservation);
+    fixture
+        .client
+        .send_message(&spawned.instance_stream, "sent during startup".to_owned())
+        .await
+        .expect("send while starting");
+    fixture
+        .client
+        .list_sessions(ListSessionsPayload::default())
+        .await
+        .expect("list sessions");
+    fixture
+        .next_frame_matching("SessionList after the startup message", |env| {
+            env.kind == FrameKind::SessionList
+        })
+        .await;
+
+    let stop_gate = fixture.host_for_test().install_restart_stop_test_gate();
+    let host = fixture.host_for_test();
+    let shutdown = tokio::spawn(async move { host.shutdown_for_restart().await });
+    stop_gate.wait_until_entered().await;
+    stop_gate.release_one();
+    ready_gate.release_one();
+    tokio::time::timeout(Duration::from_secs(27), shutdown)
+        .await
+        .expect("restart stop is bounded")
+        .expect("restart stop");
+    let session = interrupted_session_under(&fixture, workspace_root)
+        .expect("the first turn the provider started is recorded as interrupted by the restart");
+
+    let bootstrap = fixture.restart_host().await;
+    let restored = restored_descriptor(&mut fixture, &bootstrap, &session).await;
+    let stream = restored.instance_stream.clone();
+    let observation =
+        Observation::observe_until(&mut fixture, std::slice::from_ref(&stream), |observation| {
+            observation
+                .stream(&stream)
+                .settled_after("sent during startup")
+        })
+        .await;
+    assert_eq!(
+        observation.stream(&stream).phases(),
+        vec![
+            Phase::Interrupted {
+                cause: Cause::HostRestart
+            },
+            Phase::Continuing
+        ]
+    );
+    let inputs = mock_inputs(&fixture, &restored.agent_id).await;
+    assert_eq!(
+        inputs
+            .iter()
+            .map(|input| (
+                input.origin == Some(MessageOrigin::HostRestart),
+                input.message.starts_with(CONTINUATION_PREFIX)
+            ))
+            .collect::<Vec<_>>(),
+        vec![(true, true), (false, false)],
+        "the continuation runs first, then the startup message: {inputs:?}"
+    );
+    assert_eq!(inputs[1].message, "sent during startup");
+}
+
+/// Messages accepted while a restored agent is still replaying survive a
+/// second restart before the replay finishes, and run in order after the
+/// continuation.
+#[tokio::test]
+async fn messages_held_by_replay_survive_a_second_restart() {
+    use protocol::MessageOrigin;
+    let mut fixture = Fixture::new().await;
+    let replay = server::backend::mock::MockResumeReplay::default();
+    let (_agent, session) = spawn_restart_agent(
+        &mut fixture,
+        "replay held restart",
+        "unfinished prompt",
+        None,
+        MockScript::one(MockTurn::held_text("unfinished")).with_controlled_resume_replay(&replay),
+    )
+    .await;
+
+    let bootstrap = fixture.restart_host().await;
+    let restored = restored_descriptor(&mut fixture, &bootstrap, &session).await;
+    replay.wait_until_started().await;
+    for message in ["held first", "held second"] {
+        fixture
+            .client
+            .send_message(&restored.instance_stream, message.to_owned())
+            .await
+            .expect("send while replaying");
+    }
+    fixture
+        .client
+        .list_sessions(ListSessionsPayload::default())
+        .await
+        .expect("list sessions");
+    fixture
+        .next_frame_matching("SessionList after the held messages", |env| {
+            env.kind == FrameKind::SessionList
+        })
+        .await;
+    fixture.mock_by_id(&restored.agent_id).await;
+
+    let bootstrap = fixture.restart_host().await;
+    let restored = restored_descriptor(&mut fixture, &bootstrap, &session).await;
+    let stream = restored.instance_stream.clone();
+    Observation::observe_until(&mut fixture, std::slice::from_ref(&stream), |observation| {
+        observation.stream(&stream).settled_after("held second")
+    })
+    .await;
+    let inputs = mock_inputs(&fixture, &restored.agent_id).await;
+    assert_eq!(
+        inputs
+            .iter()
+            .map(|input| (
+                input.origin == Some(MessageOrigin::HostRestart),
+                input.message.starts_with(CONTINUATION_PREFIX)
+            ))
+            .collect::<Vec<_>>(),
+        vec![(true, true), (false, false), (false, false)],
+        "the held messages survive the second restart behind the continuation: {inputs:?}"
+    );
+    assert_eq!(
+        inputs[1..]
+            .iter()
+            .map(|input| input.message.as_str())
+            .collect::<Vec<_>>(),
+        vec!["held first", "held second"]
+    );
+}
+
+/// Delivers `message` to a child through the parent's agent-control
+/// `tyde_send_agent_message`, the acknowledged delivery path.
+async fn deliver_agent_message(
+    fixture: &Fixture,
+    parent: &protocol::AgentId,
+    child: &protocol::AgentId,
+    message: &str,
+) {
+    let response = agent_control_delivery(fixture, parent, child, message).await;
+    assert_eq!(
+        response["result"]["isError"],
+        serde_json::Value::Bool(false),
+        "agent-control delivery failed: {response}"
+    );
+}
+
+/// The agent-control response to delivering `message` to a child through the
+/// parent's `tyde_send_agent_message`.
+async fn agent_control_delivery(
+    fixture: &Fixture,
+    parent: &protocol::AgentId,
+    child: &protocol::AgentId,
+    message: &str,
+) -> serde_json::Value {
+    let caller = fixture.agent_control_caller(parent).await;
+    let body = reqwest::Client::new()
+        .post(&caller.url)
+        .header("Authorization", &caller.authorization)
+        .header("Accept", "application/json, text/event-stream")
+        .json(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "tyde_send_agent_message",
+                "arguments": { "agent_id": child.0, "message": message }
+            }
+        }))
+        .send()
+        .await
+        .expect("post agent-control request")
+        .text()
+        .await
+        .expect("read agent-control response");
+    serde_json::from_str(
+        body.lines()
+            .find_map(|line| line.strip_prefix("data: "))
+            .expect("agent-control SSE data line"),
+    )
+    .expect("parse agent-control response")
+}
+
+/// A message queued on an idle agent held by its usage quota is not a turn in
+/// flight: a restart redelivers it without continuing anything.
+#[tokio::test]
+async fn quota_queued_message_on_idle_agent_is_not_continued_after_restart() {
+    let mut fixture = Fixture::new().await;
+    fixture
+        .client
+        .replace_setting("/usage_limits/enabled", true, false)
+        .await
+        .expect("enable usage limits");
+    fixture
+        .next_frame_matching("usage limits enabled", |env| {
+            env.kind == FrameKind::HostSettings
+        })
+        .await;
+    let (parent, _parent_session) = spawn_restart_agent(
+        &mut fixture,
+        "quota idle parent",
+        "parent prompt",
+        None,
+        MockScript::one(MockTurn::text("parent done")),
+    )
+    .await;
+    fixture.finish_turn(&parent).await;
+    let (agent, session) = spawn_restart_agent(
+        &mut fixture,
+        "quota idle restart",
+        "first prompt",
+        Some(parent.new_agent.agent_id.clone()),
+        MockScript::one(MockTurn::text("first done")),
+    )
+    .await;
+    fixture.finish_turn(&agent).await;
+    let agent_id = agent.new_agent.agent_id.clone();
+    record_claude_quota(&fixture, 95).await;
+    fixture.mock_by_id(&agent_id).await;
+    deliver_agent_message(
+        &fixture,
+        &parent.new_agent.agent_id,
+        &agent_id,
+        "held by quota",
+    )
+    .await;
+    fixture.expect_queued_messages(&agent, 1).await;
+    fixture.mock_by_id(&agent_id).await;
+
+    fixture.host_for_test().shutdown_for_restart().await;
+    assert_eq!(
+        stored_turn_recovery(&fixture, &session),
+        serde_json::Value::Null,
+        "a queued message on an idle agent is not a turn the restart interrupted"
+    );
+    let bootstrap = fixture.restart_host().await;
+    let restored = restored_descriptor(&mut fixture, &bootstrap, &session).await;
+    let stream = restored.instance_stream.clone();
+    let observation =
+        Observation::observe_until(&mut fixture, std::slice::from_ref(&stream), |observation| {
+            observation.stream(&stream).settled_after("held by quota")
+        })
+        .await;
+    assert_eq!(
+        observation.stream(&stream).phases(),
+        Vec::new(),
+        "{:?}",
+        observation.stream(&stream).items
+    );
+    let inputs = mock_inputs(&fixture, &restored.agent_id).await;
+    assert_eq!(
+        inputs
+            .iter()
+            .map(|input| input.message.as_str())
+            .collect::<Vec<_>>(),
+        vec!["held by quota"]
+    );
+}
+
+/// A continuation the provider refuses because it started a turn of its own
+/// stays owed: it is reported only once accepted, runs before the queue, and
+/// survives a restart that lands after that turn ended but before it is
+/// re-sent.
+#[tokio::test]
+async fn busy_provider_retains_the_restart_continuation() {
+    use protocol::{
+        MessageOrigin, RestartInterruptionCause as Cause, RestartRecoveryPhase as Phase,
+    };
+    for restart_before_resend in [false, true] {
+        let mut fixture = Fixture::new().await;
+        let replay = server::backend::mock::MockResumeReplay::default();
+        let send_gate = server::backend::mock::MockGateHandle::new();
+        replay.gate_sends(&send_gate);
+        let (agent, session) = spawn_restart_agent(
+            &mut fixture,
+            "busy continuation",
+            "unfinished prompt",
+            None,
+            MockScript::one(MockTurn::held_text("unfinished"))
+                .with_controlled_resume_replay(&replay),
+        )
+        .await;
+        fixture
+            .client
+            .send_message(&agent.stream, "queued behind".to_owned())
+            .await
+            .expect("queue behind the held turn");
+        fixture.expect_queued_messages(&agent, 1).await;
+
+        let bootstrap = fixture.restart_host().await;
+        let restored = restored_descriptor(&mut fixture, &bootstrap, &session).await;
+        let stream = restored.instance_stream.clone();
+        replay.wait_until_started().await;
+        let mock = fixture.mock_by_id(&restored.agent_id).await;
+        replay.complete();
+        send_gate.wait_until_entered().await;
+        let resend_gate = fixture
+            .host_for_test()
+            .install_restart_continuation_dispatch_test_gate(&restored.name);
+        send_gate.release_one_busy();
+        let busy = Observation::observe_until(
+            &mut fixture,
+            std::slice::from_ref(&stream),
+            |observation| {
+                observation
+                    .stream(&stream)
+                    .settled_after("self-initiated wakeup")
+            },
+        )
+        .await;
+        assert_eq!(
+            busy.stream(&stream).phases(),
+            vec![Phase::Interrupted {
+                cause: Cause::HostRestart
+            }],
+            "restart_before_resend={restart_before_resend}: a refused continuation is not \
+             continuing: {:?}",
+            busy.stream(&stream).items
+        );
+        resend_gate.wait_until_entered().await;
+
+        let final_agent = if restart_before_resend {
+            let stop_gate = fixture.host_for_test().install_restart_stop_test_gate();
+            let host = fixture.host_for_test();
+            let shutdown = tokio::spawn(async move { host.shutdown_for_restart().await });
+            stop_gate.wait_until_entered().await;
+            assert_eq!(
+                stored_turn_recovery(&fixture, &session),
+                serde_json::json!("InterruptedByRestart"),
+                "the undelivered continuation is still owed when the restart lands"
+            );
+            resend_gate.release_one();
+            stop_gate.release_one();
+            tokio::time::timeout(Duration::from_secs(27), shutdown)
+                .await
+                .expect("restart stop is bounded")
+                .expect("restart stop");
+            let bootstrap = fixture.restart_host().await;
+            restored_descriptor(&mut fixture, &bootstrap, &session).await
+        } else {
+            resend_gate.release_one();
+            send_gate.wait_until_entered().await;
+            assert!(
+                !mock
+                    .requests()
+                    .await
+                    .into_iter()
+                    .any(|request| matches!(request, server::backend::mock::MockRequest::Input(_))),
+                "the queue stays behind the undelivered continuation"
+            );
+            send_gate.release_one();
+            send_gate.wait_until_entered().await;
+            send_gate.release_one();
+            restored
+        };
+        let stream = final_agent.instance_stream.clone();
+        let observation = Observation::observe_until(
+            &mut fixture,
+            std::slice::from_ref(&stream),
+            |observation| observation.stream(&stream).settled_after("queued behind"),
+        )
+        .await;
+        let expected_phases = if restart_before_resend {
+            vec![
+                Phase::Interrupted {
+                    cause: Cause::HostRestart,
+                },
+                Phase::Interrupted {
+                    cause: Cause::HostRestart,
+                },
+                Phase::Continuing,
+            ]
+        } else {
+            vec![Phase::Continuing]
+        };
+        assert_eq!(
+            observation.stream(&stream).phases(),
+            expected_phases,
+            "restart_before_resend={restart_before_resend}: {:?}",
+            observation.stream(&stream).items
+        );
+        let inputs = mock_inputs(&fixture, &final_agent.agent_id).await;
+        assert_eq!(
+            inputs
+                .iter()
+                .map(|input| (
+                    input.origin == Some(MessageOrigin::HostRestart),
+                    input.message.as_str() == "queued behind"
+                ))
+                .collect::<Vec<_>>(),
+            vec![(true, false), (false, true)],
+            "restart_before_resend={restart_before_resend}: the continuation runs before the \
+             queue: {inputs:?}"
+        );
+    }
+}
+
+/// A turn that cannot be durably recorded as in flight is refused, not started
+/// unrecoverably.
+#[tokio::test]
+async fn unrecordable_turn_is_refused() {
+    let mut fixture = Fixture::new().await;
+    let (agent, _session) = spawn_restart_agent(
+        &mut fixture,
+        "unrecordable turn",
+        "first prompt",
+        None,
+        MockScript::one(MockTurn::text("first done")).then(MockTurn::text("never")),
+    )
+    .await;
+    fixture.finish_turn(&agent).await;
+    let agent_id = agent.new_agent.agent_id.clone();
+    fixture.mock_by_id(&agent_id).await;
+    let failure = fixture.fail_next_session_commit();
+    fixture
+        .client
+        .send_message(&agent.stream, "unrecordable".to_owned())
+        .await
+        .expect("send the unrecordable message");
+    let error: AgentErrorPayload = fixture
+        .next_frame_matching("AgentError for the unrecorded turn", |env| {
+            env.stream == agent.stream && env.kind == FrameKind::AgentError
+        })
+        .await
+        .parse_payload()
+        .expect("parse AgentError");
+    drop(failure);
+    assert!(
+        error.message.contains("cannot record the turn") && !error.fatal,
+        "{error:?}"
+    );
+    fixture.mock_by_id(&agent_id).await;
+    assert!(
+        mock_inputs(&fixture, &agent_id)
+            .await
+            .iter()
+            .all(|input| input.message != "unrecordable"),
+        "an unrecorded turn never reaches the provider"
+    );
+}
+
+/// The messages a live agent's provider has received, its launch prompt
+/// first, once there are at least `count` of them.
+async fn wait_for_provider_messages(
+    fixture: &Fixture,
+    agent_id: &protocol::AgentId,
+    count: usize,
+) -> Vec<String> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut messages = Vec::new();
+    while tokio::time::Instant::now() < deadline {
+        if let Some(mock) = fixture.host_for_test().mock_control(agent_id).await {
+            messages = mock
+                .requests()
+                .await
+                .into_iter()
+                .filter_map(|request| match request {
+                    server::backend::mock::MockRequest::Launch { message } => Some(message),
+                    server::backend::mock::MockRequest::Input(input) => Some(input.message),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            if messages.len() >= count {
+                return messages;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!(
+        "the provider received {} of {count} messages: {messages:?}",
+        messages.len()
+    );
+}
+
+/// Spawns `params` under `name` with its backend startup held at the ready
+/// gate, returning the gate and the spawned descriptor once startup is held.
+async fn spawn_held_at_startup(
+    fixture: &mut Fixture,
+    name: &str,
+    parent_agent_id: Option<protocol::AgentId>,
+    params: SpawnAgentParams,
+) -> (server::InstalledSpawnOperationTestGate, NewAgentPayload) {
+    let ready_gate = fixture
+        .host_for_test()
+        .install_agent_startup_backend_ready_test_gate(name);
+    fixture
+        .client
+        .spawn_agent(SpawnAgentPayload {
+            name: Some(name.to_owned()),
+            custom_agent_id: None,
+            parent_agent_id,
+            project_id: None,
+            params,
+        })
+        .await
+        .expect("spawn agent");
+    let spawned: NewAgentPayload = fixture
+        .next_frame_matching("NewAgent for the held startup", |env| {
+            env.kind == FrameKind::NewAgent
+        })
+        .await
+        .parse_payload()
+        .expect("parse NewAgent");
+    ready_gate.wait_until_entered().await;
+    (ready_gate, spawned)
+}
+
+fn new_agent_params(workspace_root: &str, prompt: &str) -> SpawnAgentParams {
+    SpawnAgentParams::New {
+        workspace_roots: vec![workspace_root.to_owned()],
+        prompt: prompt.to_owned(),
+        images: None,
+        backend_kind: BackendKind::Claude,
+        launch_profile_id: None,
+        cost_hint: None,
+        access_mode: Default::default(),
+        session_settings: None,
+    }
+}
+
+/// A host killed while a new agent is still starting, before its provider
+/// session exists, restores that agent: its first prompt runs, followed by the
+/// message acknowledged while it was starting.
+#[tokio::test]
+async fn hard_kill_during_new_agent_startup_restores_its_first_turn() {
+    let mut fixture = Fixture::new().await;
+    let (parent, _parent_session) = spawn_restart_agent(
+        &mut fixture,
+        "startup kill parent",
+        "parent prompt",
+        None,
+        MockScript::one(MockTurn::text("parent done")),
+    )
+    .await;
+    fixture.finish_turn(&parent).await;
+    let parent_id = parent.new_agent.agent_id.clone();
+    let (ready_gate, child) = spawn_held_at_startup(
+        &mut fixture,
+        "startup kill child",
+        Some(parent_id.clone()),
+        new_agent_params("/tmp/startup-kill-child", "first prompt"),
+    )
+    .await;
+    deliver_agent_message(&fixture, &parent_id, &child.agent_id, "sent during startup").await;
+
+    fixture.relaunch_host_after_kill().await;
+    drop(ready_gate);
+    assert_eq!(
+        wait_for_provider_messages(&fixture, &child.agent_id, 2).await,
+        vec!["first prompt", "sent during startup"],
+        "the restored agent runs its first prompt, then the acknowledged message"
+    );
+}
+
+/// A host killed while a fork is still starting restores the fork and runs
+/// its first prompt.
+#[tokio::test]
+async fn hard_kill_during_fork_startup_restores_its_first_turn() {
+    let mut fixture = Fixture::new().await;
+    let (source, source_session) = spawn_restart_agent(
+        &mut fixture,
+        "fork kill source",
+        "source prompt",
+        None,
+        MockScript::one(MockTurn::text("source done")),
+    )
+    .await;
+    fixture.finish_turn(&source).await;
+    let (ready_gate, fork) = spawn_held_at_startup(
+        &mut fixture,
+        "fork kill child",
+        None,
+        SpawnAgentParams::Fork {
+            from_session_id: source_session,
+            prompt: "fork prompt".to_owned(),
+            images: None,
+            access_mode: None,
+        },
+    )
+    .await;
+
+    fixture.relaunch_host_after_kill().await;
+    drop(ready_gate);
+    assert_eq!(
+        wait_for_provider_messages(&fixture, &fork.agent_id, 1).await,
+        vec!["fork prompt"],
+        "the restored fork runs its first prompt"
+    );
+}
+
+/// A message delivered to a starting agent is acknowledged only once it is
+/// durably held; one the store refuses is rejected and never sent.
+#[tokio::test]
+async fn unretained_startup_delivery_is_rejected() {
+    let mut fixture = Fixture::new().await;
+    let (parent, _parent_session) = spawn_restart_agent(
+        &mut fixture,
+        "unretained startup parent",
+        "parent prompt",
+        None,
+        MockScript::one(MockTurn::text("parent done")),
+    )
+    .await;
+    fixture.finish_turn(&parent).await;
+    let parent_id = parent.new_agent.agent_id.clone();
+    let (ready_gate, child) = spawn_held_at_startup(
+        &mut fixture,
+        "unretained startup child",
+        Some(parent_id.clone()),
+        new_agent_params("/tmp/unretained-startup-child", "first prompt"),
+    )
+    .await;
+    let failure = fixture.fail_next_session_commit();
+    let response =
+        agent_control_delivery(&fixture, &parent_id, &child.agent_id, "unretained").await;
+    drop(failure);
+    assert_eq!(
+        response["result"]["isError"],
+        serde_json::Value::Bool(true),
+        "an unretained startup delivery must not be acknowledged: {response}"
+    );
+    assert!(
+        response.to_string().contains("cannot record the turn"),
+        "{response}"
+    );
+    deliver_agent_message(&fixture, &parent_id, &child.agent_id, "retained").await;
+    drop(ready_gate);
+    assert_eq!(
+        wait_for_provider_messages(&fixture, &child.agent_id, 2).await,
+        vec!["first prompt", "retained"],
+        "the rejected message never reaches the provider"
+    );
+}
+
+/// A message sent while a restored agent is replaying is held only once it is
+/// durable; one the store refuses is rejected and never sent.
+#[tokio::test]
+async fn unretained_replay_delivery_is_rejected() {
+    let mut fixture = Fixture::new().await;
+    let replay = server::backend::mock::MockResumeReplay::default();
+    let (_agent, session) = spawn_restart_agent(
+        &mut fixture,
+        "unretained replay",
+        "unfinished prompt",
+        None,
+        MockScript::one(MockTurn::held_text("unfinished")).with_controlled_resume_replay(&replay),
+    )
+    .await;
+
+    let bootstrap = fixture.restart_host().await;
+    let restored = restored_descriptor(&mut fixture, &bootstrap, &session).await;
+    let stream = restored.instance_stream.clone();
+    replay.wait_until_started().await;
+    fixture
+        .client
+        .send_message(&stream, "held first".to_owned())
+        .await
+        .expect("send while replaying");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let store = SessionStore::load(fixture.session_store_path()).expect("load session store");
+        let held = store.get(&session).is_some_and(|record| {
+            record
+                .queued_messages
+                .iter()
+                .any(|entry| entry.message == "held first")
+        });
+        if held {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the first replay message is held durably"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let (consumed_tx, consumed) = tokio::sync::oneshot::channel();
+    let failure = server::store::session::commit_hooks::InstalledHook::install(
+        SessionStore::database_path(&fixture.session_store_path()),
+        Box::new(move || {
+            let _ = consumed_tx.send(());
+            Err("injected session commit failure".to_owned())
+        }),
+    );
+    fixture
+        .client
+        .send_message(&stream, "unretained".to_owned())
+        .await
+        .expect("send while replaying");
+    tokio::time::timeout(Duration::from_secs(10), consumed)
+        .await
+        .expect("the replay message's commit is attempted")
+        .expect("commit hook signal");
+    fixture.mock_by_id(&restored.agent_id).await;
+    replay.complete();
+    // Attachment waits for the replay, so the rejection may arrive inside the
+    // agent's bootstrap or live after it.
+    let env = fixture
+        .next_frame_matching("the unretained message's rejection", |env| {
+            env.stream == stream
+                && (env.kind == FrameKind::AgentError
+                    || env.kind == FrameKind::AgentBootstrap
+                        && env
+                            .parse_payload::<AgentBootstrapPayload>()
+                            .is_ok_and(|payload| {
+                                payload.events.iter().any(|event| {
+                                    matches!(event, AgentBootstrapEvent::AgentError(_))
+                                })
+                            }))
+        })
+        .await;
+    let error = match env.kind {
+        FrameKind::AgentError => env
+            .parse_payload::<AgentErrorPayload>()
+            .expect("parse AgentError"),
+        _ => env
+            .parse_payload::<AgentBootstrapPayload>()
+            .expect("parse AgentBootstrap")
+            .events
+            .into_iter()
+            .find_map(|event| match event {
+                AgentBootstrapEvent::AgentError(error) => Some(error),
+                _ => None,
+            })
+            .expect("bootstrap AgentError"),
+    };
+    assert!(
+        error.message.contains("cannot record the turn") && !error.fatal,
+        "{error:?}"
+    );
+    drop(failure);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let inputs = loop {
+        let inputs = mock_inputs(&fixture, &restored.agent_id).await;
+        if inputs.iter().any(|input| input.message == "held first")
+            || tokio::time::Instant::now() >= deadline
+        {
+            break inputs;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert_eq!(
+        inputs.last().map(|input| input.message.as_str()),
+        Some("held first"),
+        "{inputs:?}"
+    );
+    assert!(
+        inputs.iter().all(|input| input.message != "unretained"),
+        "the rejected message never reaches the provider: {inputs:?}"
+    );
+}
+
+/// An explicit close of a starting agent wins over the restart that is
+/// waiting for its startup: the next launch does not reconstruct it.
+#[tokio::test]
+async fn close_during_startup_with_deferred_restart_is_not_restored() {
+    let mut fixture = Fixture::new().await;
+    let (ready_gate, spawned) = spawn_held_at_startup(
+        &mut fixture,
+        "startup close restart",
+        None,
+        new_agent_params("/tmp/startup-close-restart", "first prompt"),
+    )
+    .await;
+    let stop_gate = fixture.host_for_test().install_restart_stop_test_gate();
+    let host = fixture.host_for_test();
+    let shutdown = tokio::spawn(async move { host.shutdown_for_restart().await });
+    stop_gate.wait_until_entered().await;
+    fixture
+        .client
+        .close_agent(&spawned.instance_stream)
+        .await
+        .expect("close the starting agent");
+    fixture
+        .next_frame_matching("AgentClosed for the starting agent", |env| {
+            env.kind == FrameKind::AgentClosed
+                && env
+                    .parse_payload::<protocol::AgentClosedPayload>()
+                    .is_ok_and(|payload| payload.agent_id == spawned.agent_id)
+        })
+        .await;
+    stop_gate.release_one();
+    tokio::time::timeout(Duration::from_secs(27), shutdown)
+        .await
+        .expect("restart stop is bounded")
+        .expect("restart stop");
+
+    let restoration_finished = server::new_spawn_operation_test_gate();
+    let bootstrap = fixture
+        .restart_host_with_runtime_config(|config| {
+            config.restoration_complete_test_gate = Some(restoration_finished.shared());
+        })
+        .await;
+    restoration_finished.wait_until_entered().await;
+    assert!(
+        bootstrap
+            .agents
+            .iter()
+            .all(|agent| agent.agent_id != spawned.agent_id)
+            && !fixture.agent_ids().await.contains(&spawned.agent_id),
+        "a closed agent must not be restored"
+    );
+    drop(ready_gate);
 }

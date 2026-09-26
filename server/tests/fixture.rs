@@ -287,7 +287,21 @@ impl Fixture {
     ) -> server::store::session::commit_hooks::InstalledHook {
         server::store::session::commit_hooks::InstalledHook::install(
             server::store::session::SessionStore::database_path(&self.session_store_path()),
-            Box::new(hook),
+            Box::new(move || {
+                hook();
+                Ok(())
+            }),
+        )
+    }
+
+    /// Fails the next session-store commit that writes a record, as a full
+    /// disk or I/O error would.
+    // Shared fixture is compiled separately for each integration test binary.
+    #[allow(dead_code)]
+    pub fn fail_next_session_commit(&self) -> server::store::session::commit_hooks::InstalledHook {
+        server::store::session::commit_hooks::InstalledHook::install(
+            server::store::session::SessionStore::database_path(&self.session_store_path()),
+            Box::new(|| Err("injected session commit failure".to_owned())),
         )
     }
 
@@ -551,16 +565,28 @@ impl Fixture {
 
     #[allow(dead_code)]
     pub async fn restart_host(&mut self) -> HostBootstrapPayload {
+        self.restart_host_with_runtime_config(|_| {}).await
+    }
+
+    /// Restarts like [`Fixture::restart_host`], adjusting the replacement
+    /// host's runtime configuration first.
+    #[allow(dead_code)]
+    pub async fn restart_host_with_runtime_config(
+        &mut self,
+        configure: impl FnOnce(&mut server::HostRuntimeConfig),
+    ) -> HostBootstrapPayload {
         let prior_agent_count = self.host.agent_ids().await.len();
         self.host.shutdown_for_restart().await;
         eprintln!(
             "Fixture restart retired old-host agents before replacement; prior_agent_count={prior_agent_count}"
         );
+        let mut runtime_config = self.fresh_host_runtime_config();
+        configure(&mut runtime_config);
         let host = server::spawn_host_with_mock_backend_and_runtime_config(
             self.session_store_path(),
             self.project_store_path(),
             self.settings_store_path(),
-            self.fresh_host_runtime_config(),
+            runtime_config,
         )
         .expect("initialize restarted host with existing stores");
         let (client, bootstrap) = connect_client_with_bootstrap(host.clone()).await;

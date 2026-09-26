@@ -1179,17 +1179,171 @@ async fn spawn_restart_agent(
     (agent, start.session_id.expect("spawned agent session id"))
 }
 
+/// The status a context-compaction frame reports for `agent`, if it is one.
+fn compaction_status_on(env: &protocol::Envelope, agent: &TestAgent) -> Option<String> {
+    (env.stream == agent.stream && env.kind == FrameKind::ContextCompactionNotify).then(|| {
+        let payload: protocol::ContextCompactionNotifyPayload =
+            env.parse_payload().expect("parse ContextCompactionNotify");
+        format!("{:?}", payload.status)
+    })
+}
+
+/// A steer and a send-now the router handed to an agent before a restart
+/// began, but that its actor only reaches after the restart has prepared it,
+/// must neither redirect the provider's turn nor be lost: both stay durably
+/// queued for the host that comes back.
+#[tokio::test]
+async fn restart_stop_holds_redirects_mailboxed_before_the_stop() {
+    let mut fixture = Fixture::new().await;
+    let launch_gate = MockGateHandle::new();
+    let send_gate = MockGateHandle::new();
+    let (agent, session) = spawn_restart_agent(
+        &mut fixture,
+        "restart redirect",
+        None,
+        Some(
+            MockScript::one(MockTurn::gated_text("launch reply", &launch_gate))
+                .then(MockTurn::held_text("drained turn"))
+                .with_send_gate(&send_gate)
+                .with_mid_turn_steering(),
+        ),
+    )
+    .await;
+    let mock = fixture.mock(&agent).await;
+    launch_gate.wait_until_entered().await;
+    fixture
+        .client
+        .send_message(&agent.stream, "queued first".to_owned())
+        .await
+        .expect("queue first");
+    fixture.expect_queued_messages(&agent, 1).await;
+    fixture
+        .client
+        .send_message(&agent.stream, "queued second".to_owned())
+        .await
+        .expect("queue second");
+    let queued = fixture.expect_queued_messages(&agent, 2).await;
+    let second_id = queued.messages[1].id.clone();
+    let (witness, _) = spawn_restart_agent(
+        &mut fixture,
+        "restart redirect witness",
+        None,
+        Some(MockScript::one(MockTurn::held_text("witness held"))),
+    )
+    .await;
+
+    // The launch turn ends and the drain hands "queued first" to the provider,
+    // which holds the actor inside that send.
+    launch_gate.release_one();
+    send_gate.wait_until_entered().await;
+    fixture
+        .client
+        .steer_message_payload(&agent.stream, steer_payload("steer during stop"))
+        .await
+        .expect("steer the held agent");
+    fixture
+        .client
+        .send_queued_message_now(
+            &agent.stream,
+            SendQueuedMessageNowPayload {
+                id: second_id.clone(),
+            },
+        )
+        .await
+        .expect("send the second message now");
+    // The connection routes frames in order, so once the witness has queued
+    // this message both redirects are in the held agent's mailbox.
+    fixture
+        .client
+        .send_message(&witness.stream, "witness queued".to_owned())
+        .await
+        .expect("queue on the witness");
+    fixture.expect_queued_messages(&witness, 1).await;
+
+    let stop_gate = fixture.host_for_test().install_restart_stop_test_gate();
+    let host = fixture.host_for_test();
+    let stop_host = host.clone();
+    let stop = tokio::spawn(async move {
+        stop_host.shutdown_for_restart().await;
+    });
+    stop_gate.wait_until_entered().await;
+    send_gate.release_one();
+    stop_gate.release_one();
+    tokio::time::timeout(std::time::Duration::from_secs(27), stop)
+        .await
+        .expect("restart stop completes")
+        .expect("restart stop task");
+
+    // The restart stop itself interrupts the provider once; nothing else
+    // may redirect it.
+    let requests = mock.requests().await;
+    assert!(
+        !requests
+            .iter()
+            .any(|request| matches!(request, MockRequest::Steer(_))),
+        "a steer reached after the restart began must not reach the provider: {requests:?}"
+    );
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| matches!(request, MockRequest::Interrupt))
+            .count(),
+        1,
+        "a send-now reached after the restart began must not cancel the turn: {requests:?}"
+    );
+    let inputs = requests
+        .iter()
+        .filter_map(|request| match request {
+            MockRequest::Input(payload) => Some(payload.message.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(inputs, vec!["queued first"]);
+    let store = server::store::session::SessionStore::load(fixture.session_store_path())
+        .expect("read durable store");
+    let record = store
+        .list()
+        .expect("list durable records")
+        .into_iter()
+        .find(|record| record.id == session)
+        .expect("durable record for the redirected agent");
+    let record = serde_json::to_value(&record).expect("inspect durable record");
+    let mut kept = record["queued_messages"]
+        .as_array()
+        .expect("queued messages array")
+        .iter()
+        .map(|entry| entry["message"].as_str().expect("queued text").to_owned())
+        .collect::<Vec<_>>();
+    kept.sort();
+    assert_eq!(
+        kept,
+        vec!["queued second".to_owned(), "steer during stop".to_owned()],
+        "redirects refused by the restart stay durably queued"
+    );
+    assert_eq!(
+        record["turn_recovery"],
+        serde_json::json!("InterruptedByRestart")
+    );
+}
+
+/// Once a restart has begun no agent may start work: not a held turn's queue,
+/// not a message sent to an idle agent (it is refused), not a compaction
+/// deferred behind a turn the restart ends, and not
+/// the continuation of a restored turn whose replay finishes while a second
+/// restart is already under way.
 #[tokio::test]
 async fn restart_stop_preserves_durable_turn_and_queue() {
     let mut fixture = Fixture::new().await;
     let shutdown_gate = server::backend::mock::MockGateHandle::new();
+    let durable_replay = server::backend::mock::MockResumeReplay::default();
     let (agent, durable_session) = spawn_restart_agent(
         &mut fixture,
         "restart durable",
         None,
         Some(
             MockScript::one(MockTurn::held_text("held response"))
-                .with_shutdown_gate(&shutdown_gate),
+                .with_shutdown_gate(&shutdown_gate)
+                .with_controlled_resume_replay(&durable_replay),
         ),
     )
     .await;
@@ -1247,11 +1401,68 @@ async fn restart_stop_preserves_durable_turn_and_queue() {
         .await
         .expect("queue on parent");
     fixture.expect_queued_messages(&parent, 1).await;
+    let (bystander, bystander_session) =
+        spawn_restart_agent(&mut fixture, "restart bystander", None, None).await;
+    fixture.finish_turn(&bystander).await;
+
+    // A second orchestrator, parked the same way, with a compaction deferred
+    // behind its await. The restart ends that turn, which is exactly when the
+    // deferred compaction would otherwise start.
+    let (compactor, _) = spawn_restart_agent(&mut fixture, "restart compactor", None, None).await;
+    fixture.finish_turn(&compactor).await;
+    let (compactor_child, _) = spawn_restart_agent(
+        &mut fixture,
+        "restart compactor worker",
+        Some(compactor.new_agent.agent_id.clone()),
+        Some(MockScript::one(MockTurn::held_text(
+            "compactor child unfinished",
+        ))),
+    )
+    .await;
+    fixture
+        .next_chat_event_matching(
+            &compactor_child,
+            "compactor child held turn streamed",
+            |event| matches!(event, ChatEvent::StreamEnd(_)),
+        )
+        .await;
+    fixture
+        .mock(&compactor)
+        .await
+        .enqueue(MockTurn::agent_control_await(vec![
+            compactor_child.new_agent.agent_id.clone(),
+        ]))
+        .await;
+    fixture
+        .client
+        .send_message(&compactor.stream, "await the compactor worker".to_owned())
+        .await
+        .expect("send compactor await prompt");
+    fixture
+        .next_chat_event_matching(&compactor, "compactor parked in await", |event| {
+            matches!(event, ChatEvent::ToolRequest(request) if fixture::tool_request_name(request) == "tyde_await_agents")
+        })
+        .await;
+    fixture
+        .client
+        .compact_agent(&compactor.stream, protocol::AgentCompactPayload::default())
+        .await
+        .expect("request compaction behind the await");
+    let deferred = fixture
+        .next_frame_matching("compaction deferred behind the await", |env| {
+            compaction_status_on(env, &compactor).is_some()
+        })
+        .await;
+    let deferred = compaction_status_on(&deferred, &compactor).expect("compaction status");
+    assert!(
+        deferred.starts_with("Deferred"),
+        "a compaction requested mid-turn waits for idle: {deferred}"
+    );
 
     let store = server::store::session::SessionStore::load(fixture.session_store_path())
         .expect("read durable store");
     let before = store.list().expect("list durable records");
-    assert_eq!(before.len(), 3);
+    assert_eq!(before.len(), 6);
     let record_for = |records: &[server::store::session::SessionRecord],
                       session: &protocol::SessionId|
      -> serde_json::Value {
@@ -1276,15 +1487,66 @@ async fn restart_stop_preserves_durable_turn_and_queue() {
         first_host.shutdown_for_restart().await;
     });
     stop_gate.wait_until_entered().await;
-    // Every agent is prepared for the restart and the orchestrator's await has
-    // been expired, but no agent has received its stop command yet.
+    // Every agent is prepared for the restart and both orchestrators' awaits
+    // have been expired, ending their turns, but no agent has received its
+    // stop command yet.
+    let mut turn_ended = [false, false];
+    while turn_ended != [true, true] {
+        let env = fixture
+            .next_frame_matching(
+                "orchestrator turns end once the restart expires their awaits",
+                |env| {
+                    (env.stream == parent.stream || env.stream == compactor.stream)
+                        && matches!(
+                            env.kind,
+                            FrameKind::ChatEvent | FrameKind::ContextCompactionNotify
+                        )
+                },
+            )
+            .await;
+        if let Some(status) = compaction_status_on(&env, &compactor) {
+            assert!(
+                status.starts_with("Deferred"),
+                "a compaction must not start once a restart has begun: {status}"
+            );
+            continue;
+        }
+        let event: ChatEvent = env.parse_payload().expect("parse ChatEvent");
+        if matches!(event, ChatEvent::TypingStatusChanged(false)) {
+            turn_ended[usize::from(env.stream == compactor.stream)] = true;
+        }
+    }
+    let bystander_requests = fixture.mock(&bystander).await.requests().await.len();
     fixture
-        .next_chat_event_matching(
-            &parent,
-            "orchestrator turn ends once the restart expires its await",
-            |event| matches!(event, ChatEvent::TypingStatusChanged(false)),
-        )
+        .client
+        .send_message(&bystander.stream, "sent during restart".to_owned())
+        .await
+        .expect("message an idle agent during the restart");
+    fixture
+        .next_frame_matching("message refused during the restart", |env| {
+            env.stream == bystander.stream && env.kind == FrameKind::AgentError
+        })
         .await;
+    // The mailbox round trips order these reads after the refused message and
+    // the ended turn were handled, so anything they dispatched is visible.
+    let bystander_after = fixture.mock(&bystander).await.requests().await;
+    assert_eq!(
+        bystander_after.len(),
+        bystander_requests,
+        "a message sent during a restart must not reach the backend: {bystander_after:?}"
+    );
+    fixture.mock(&compactor).await;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(750);
+    while let Ok(Ok(Some(env))) =
+        tokio::time::timeout_at(deadline, fixture.client.next_event()).await
+    {
+        if let Some(status) = compaction_status_on(&env, &compactor) {
+            assert!(
+                status.starts_with("Deferred"),
+                "a compaction must not start once a restart has begun: {status}"
+            );
+        }
+    }
     stop_gate.release_one();
     shutdown_gate.wait_until_entered().await;
     first.abort();
@@ -1345,5 +1607,93 @@ async fn restart_stop_preserves_durable_turn_and_queue() {
     assert_eq!(
         record_for(&after, &child_session)["turn_recovery"],
         serde_json::json!("InterruptedByRestart")
+    );
+    let bystander_after = record_for(&after, &bystander_session);
+    assert!(
+        queued_messages(&bystander_after).is_empty(),
+        "a refused message is not silently kept"
+    );
+    assert!(bystander_after["turn_recovery"].is_null());
+
+    // A restored turn whose replay finishes after the next restart has begun
+    // must not be continued, nor start its queue: it stays interrupted for
+    // the host that comes back.
+    let bootstrap = fixture.restart_host().await;
+    durable_replay.wait_until_started().await;
+    let restored_durable = match bootstrap
+        .agents
+        .iter()
+        .find(|agent| agent.session_id.as_ref() == Some(&durable_session))
+    {
+        Some(agent) => agent.clone(),
+        None => fixture
+            .next_frame_matching("restored durable agent", |env| {
+                env.kind == FrameKind::NewAgent
+                    && env
+                        .parse_payload::<protocol::NewAgentPayload>()
+                        .is_ok_and(|agent| agent.session_id.as_ref() == Some(&durable_session))
+            })
+            .await
+            .parse_payload()
+            .expect("parse restored NewAgent"),
+    };
+    let second_stop_gate = fixture.host_for_test().install_restart_stop_test_gate();
+    let second_host = fixture.host_for_test();
+    let second = tokio::spawn(async move {
+        second_host.shutdown_for_restart().await;
+    });
+    second_stop_gate.wait_until_entered().await;
+    durable_replay.complete();
+    let restored_bootstrap: protocol::AgentBootstrapPayload = fixture
+        .next_frame_matching("restored durable bootstrap", |env| {
+            env.stream == restored_durable.instance_stream && env.kind == FrameKind::AgentBootstrap
+        })
+        .await
+        .parse_payload()
+        .expect("parse restored bootstrap");
+    let phases = restored_bootstrap
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            protocol::AgentBootstrapEvent::ChatEvent(ChatEvent::RestartRecovery { phase }) => {
+                Some(phase.clone())
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        phases,
+        vec![protocol::RestartRecoveryPhase::Interrupted {
+            cause: protocol::RestartInterruptionCause::HostRestart
+        }],
+        "a restart under way must not continue a replayed turn"
+    );
+    let restored_requests = fixture
+        .mock_by_id(&restored_durable.agent_id)
+        .await
+        .requests()
+        .await;
+    assert!(
+        !restored_requests
+            .iter()
+            .any(|request| matches!(request, MockRequest::Input(_))),
+        "neither the continuation nor the queue may reach the backend: {restored_requests:?}"
+    );
+    second_stop_gate.release_one();
+    tokio::time::timeout(std::time::Duration::from_secs(27), second)
+        .await
+        .expect("second restart stop is bounded")
+        .expect("second restart stop");
+    let stopped_again = store.list().expect("list records after the second stop");
+    let durable_again = record_for(&stopped_again, &durable_session);
+    assert_eq!(
+        durable_again["turn_recovery"],
+        serde_json::json!("InterruptedByRestart"),
+        "the uncontinued turn stays interrupted"
+    );
+    assert_eq!(
+        queued_messages(&durable_again),
+        queued_messages(&durable_after),
+        "the uncontinued turn's queue is untouched"
     );
 }

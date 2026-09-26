@@ -589,10 +589,6 @@ impl AgentReplayState {
         self.active_stream = None;
     }
 
-    fn discard_active_stream(&mut self) {
-        self.active_stream = None;
-    }
-
     fn active_stream_events(&self) -> Vec<ChatEvent> {
         let mut events = Vec::new();
         if self.typing {
@@ -1781,6 +1777,31 @@ pub(crate) fn install_startup_backend_ready_test_gate(
 }
 
 #[cfg(feature = "test-support")]
+fn non_cancellable_startup_test_agents() -> &'static std::sync::Mutex<HashSet<String>> {
+    static AGENTS: std::sync::OnceLock<std::sync::Mutex<HashSet<String>>> =
+        std::sync::OnceLock::new();
+    AGENTS.get_or_init(|| std::sync::Mutex::new(HashSet::new()))
+}
+
+/// Starts the named agent as a backend whose startup workers outlive a drop
+/// of the startup future.
+#[cfg(feature = "test-support")]
+pub(crate) fn install_non_cancellable_startup_test_agent(agent_name: String) {
+    non_cancellable_startup_test_agents()
+        .lock()
+        .expect("non-cancellable startup test mutex poisoned")
+        .insert(agent_name);
+}
+
+#[cfg(feature = "test-support")]
+fn startup_is_non_cancellable_for_test(agent_name: &str) -> bool {
+    non_cancellable_startup_test_agents()
+        .lock()
+        .expect("non-cancellable startup test mutex poisoned")
+        .contains(agent_name)
+}
+
+#[cfg(feature = "test-support")]
 async fn wait_for_startup_completion_test_gate(agent_name: &str) {
     let gate = startup_completion_test_gates()
         .lock()
@@ -1871,6 +1892,41 @@ async fn wait_for_resume_queue_dispatch_test_gate(agent_name: &str) {
 
 #[cfg(not(feature = "test-support"))]
 async fn wait_for_resume_queue_dispatch_test_gate(_agent_name: &str) {}
+
+#[cfg(feature = "test-support")]
+fn restart_continuation_dispatch_test_gates() -> &'static ResumeQueueDispatchTestGates {
+    static GATES: std::sync::OnceLock<ResumeQueueDispatchTestGates> = std::sync::OnceLock::new();
+    GATES.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+#[cfg(feature = "test-support")]
+pub(crate) fn install_restart_continuation_dispatch_test_gate(
+    agent_name: String,
+    gate: Arc<crate::host::SpawnOperationTestGateInner>,
+) {
+    let replaced = restart_continuation_dispatch_test_gates()
+        .lock()
+        .expect("restart continuation dispatch test gate mutex poisoned")
+        .insert(agent_name, gate);
+    assert!(
+        replaced.is_none(),
+        "restart continuation dispatch test gate already installed"
+    );
+}
+
+#[cfg(feature = "test-support")]
+async fn wait_for_restart_continuation_dispatch_test_gate(agent_name: &str) {
+    let gate = restart_continuation_dispatch_test_gates()
+        .lock()
+        .expect("restart continuation dispatch test gate mutex poisoned")
+        .remove(agent_name);
+    if let Some(gate) = gate {
+        crate::host::wait_for_spawn_operation_test_gate_inner(&gate).await;
+    }
+}
+
+#[cfg(not(feature = "test-support"))]
+async fn wait_for_restart_continuation_dispatch_test_gate(_agent_name: &str) {}
 
 #[cfg(feature = "test-support")]
 async fn hold_resume_queue_dispatch_boundary(
@@ -2764,6 +2820,7 @@ pub(crate) fn spawn_agent_actor(
         actor_processes.scope(async move {
         let ResolvedSpawnRequest {
             parent_session_id,
+            restoration,
             backend_kind,
             workspace_roots,
             initial_input,
@@ -2844,17 +2901,43 @@ pub(crate) fn spawn_agent_actor(
             Some(session_id) => session_store.get(session_id).await.and_then(|record| record.turn_recovery),
             None => None,
         };
+        let mut startup_failure = startup_failure;
         let persisted_queue = if let Some(session_id) = resume_session_id.as_ref() {
             session_store
                 .get(session_id)
                 .await
                 .map(|record| record.queued_messages)
                 .unwrap_or_default()
+        } else if let (None, Some(first_input)) = (startup_failure.as_ref(), initial_input.as_ref()) {
+            let reservation = startup_reservation(
+                &current_start,
+                first_input,
+                fork_from_session_id.as_ref(),
+                initial_cost_hint,
+                &current_session_settings,
+                &session_resumability_config,
+            );
+            match status_handle
+                .reserve_startup(Arc::clone(&session_store), reservation)
+                .await
+            {
+                Ok(queued) => queued,
+                Err(error) => {
+                    startup_failure = Some(AgentStartupFailure::internal(format!(
+                        "cannot record the agent's startup for restart recovery: {error}"
+                    )));
+                    Vec::new()
+                }
+            }
         } else {
             Vec::new()
         };
         if let Some(session_id) = resume_session_id.as_ref() {
-            status_handle.bind_recovery(Arc::clone(&session_store), session_id.clone()).await;
+            status_handle
+                .bind_recovery(Arc::clone(&session_store), session_id.clone())
+                .await;
+            replay_state.journal = Some(transcript_store.open_session(session_id));
+            replay_state.journal_agent_id = Some(current_start.agent_id.clone());
         }
         let mut queue = persisted_queue
             .into_iter()
@@ -2895,7 +2978,34 @@ pub(crate) fn spawn_agent_actor(
 
         #[cfg(feature = "test-support")]
         let startup_gate_name = current_start.name.clone();
+        let _restoration_guard = restoration.as_ref().map(|admission| {
+            status_handle.bind_restoration(admission.clone(), resume_recovery.is_some())
+        });
+        // Set once the restart barrier admitted the first prompt: from then on
+        // the provider may own the turn, so a restart stop must let startup
+        // finish and record the session instead of dropping it.
+        let initial_turn_admitted = AtomicBool::new(false);
+        let startup_cancellation_supported =
+            crate::backend::startup_drop_cancels_workers(backend_kind);
+        #[cfg(feature = "test-support")]
+        let startup_cancellation_supported = startup_cancellation_supported
+            && !startup_is_non_cancellable_for_test(&startup_gate_name);
         let mut startup_future = Box::pin(async {
+            // A restored parent must not resume until its restored children
+            // have settled, so their continuations reach the provider first.
+            let restored_startup_timeout = match restoration.as_ref() {
+                Some(admission) => {
+                    admission.wait_for_activation().await;
+                    admission.startup_timeout
+                }
+                None => None,
+            };
+            // Timing out drops the startup future. A backend whose startup
+            // workers outlive that drop would keep starting after its parent
+            // was released, so it holds its parent until its startup ends.
+            let restored_startup_timeout =
+                restored_startup_timeout.filter(|_| startup_cancellation_supported);
+            let startup = async {
             #[cfg(feature = "test-support")]
             wait_for_startup_completion_test_gate(&startup_gate_name).await;
             let mcp_config_validation = if use_mock_backend {
@@ -2939,7 +3049,11 @@ pub(crate) fn spawn_agent_actor(
                             .map_err(AgentStartupFailure::backend_failed)
                     }
                     None => {
-                        if let Some(from_session_id) = fork_from_session_id {
+                        if let Err(failure) =
+                            admit_initial_turn(&status_handle, &initial_turn_admitted).await
+                        {
+                            Err(failure)
+                        } else if let Some(from_session_id) = fork_from_session_id {
                             let first_input =
                                 initial_input.expect("fork spawn requires initial_input");
                             let forked = fork_backend(
@@ -2981,14 +3095,37 @@ pub(crate) fn spawn_agent_actor(
                 wait_for_startup_backend_ready_test_gate(&startup_gate_name).await;
             }
             startup_result
+            };
+            // A restored agent's parent waits for it to settle, so its startup
+            // must end within the bound instead of holding the parent forever.
+            match restored_startup_timeout {
+                Some(timeout) => match tokio::time::timeout(timeout, startup).await {
+                    Ok(result) => result,
+                    Err(_) => {
+                        tracing::warn!(
+                            timeout = ?timeout,
+                            "restored agent backend startup timed out"
+                        );
+                        Err(AgentStartupFailure::backend_failed(format!(
+                            "timed out after {timeout:?} waiting for the restored agent to start"
+                        )))
+                    }
+                },
+                None => startup.await,
+            }
         });
-        let startup_cancellation_supported =
-            crate::backend::startup_drop_cancels_workers(backend_kind);
         let mut pending_startup_attaches: Vec<(Stream, oneshot::Sender<bool>)> = Vec::new();
+        let mut restart_deferred = false;
+        let mut deferred_restart_stop: Option<oneshot::Sender<()>> = None;
+        let mut startup_input_rejections: Vec<AgentErrorPayload> = Vec::new();
         let startup_result = loop {
             let startup_event = tokio::select! {
                 biased;
-                _ = status_handle.wait_for_restart() => {
+                _ = status_handle.wait_for_restart(), if !restart_deferred => {
+                    if initial_turn_admitted.load(Ordering::SeqCst) {
+                        restart_deferred = true;
+                        continue;
+                    }
                     tracing::info!("stopping backend startup for host restart");
                     let _ = startup_tx.send(Err("host stopped during startup".to_owned()));
                     return;
@@ -3021,6 +3158,11 @@ pub(crate) fn spawn_agent_actor(
                         AgentCommand::StopForRestart { reply } => {
                             accepting_input_task.store(false, Ordering::SeqCst);
                             status_handle.prepare_restart().await;
+                            if initial_turn_admitted.load(Ordering::SeqCst) {
+                                restart_deferred = true;
+                                deferred_restart_stop = Some(reply);
+                                continue;
+                            }
                             let _ = startup_tx.send(Err("host stopped during startup".to_owned()));
                             let _ = reply.send(());
                             return;
@@ -3032,6 +3174,7 @@ pub(crate) fn spawn_agent_actor(
                                 "closing agent during backend startup"
                             );
                             accepting_input_task.store(false, Ordering::SeqCst);
+                            status_handle.withdraw_recovery().await;
                             status_handle
                                 .update(|status| {
                                     status.terminated = true;
@@ -3134,17 +3277,48 @@ pub(crate) fn spawn_agent_actor(
                             let _ = reply.send(());
                         }
                         AgentCommand::SendInput(input) => {
-                            pending_inputs.push_back(input);
+                            match hold_gated_input(
+                                input,
+                                &mut queue,
+                                &mut next_queue_sequence,
+                                &status_handle,
+                            )
+                            .await
+                            {
+                                Ok(Some(input)) => pending_inputs.push_back(input),
+                                Ok(None) => {}
+                                Err(_) => startup_input_rejections.push(
+                                    unrecorded_input_rejected_payload(&current_start.agent_id),
+                                ),
+                            }
                         }
                         AgentCommand::DeliverMessage { input, reply } => {
                             // Accepted: a starting agent is already active
                             // (`started` is false), and the message is queued
                             // for dispatch once the backend is up. Rejecting it
                             // here would make spawn-then-send racy for no gain.
-                            acknowledged_gated_deliveries =
-                                acknowledged_gated_deliveries.saturating_add(1);
-                            pending_inputs.push_back(input);
-                            let _ = reply.send(Ok(()));
+                            // A message that cannot be held durably is refused
+                            // instead, since a restart would lose it.
+                            match hold_gated_input(
+                                input,
+                                &mut queue,
+                                &mut next_queue_sequence,
+                                &status_handle,
+                            )
+                            .await
+                            {
+                                Ok(held) => {
+                                    acknowledged_gated_deliveries =
+                                        acknowledged_gated_deliveries.saturating_add(1);
+                                    if let Some(input) = held {
+                                        pending_inputs.push_back(input);
+                                    }
+                                    let _ = reply.send(Ok(()));
+                                }
+                                Err(_) => {
+                                    let _ = reply.send(Err(DELIVERY_REJECTED_UNRECORDED.to_owned()));
+                                }
+                            }
                         }
                         #[cfg(feature = "test-support")]
                         AgentCommand::ForceBackendShutdownForConformance { reply } => {
@@ -3168,8 +3342,11 @@ pub(crate) fn spawn_agent_actor(
         for command in pending_name_commands {
             let _ = actor_tx.send(command);
         }
+        if let Some(reply) = deferred_restart_stop {
+            let _ = actor_tx.send(AgentCommand::StopForRestart { reply });
+        }
 
-        let (backend, mut events, actor_session_id, initial_follow_up) = match startup_result {
+        let (backend, mut events, actor_session_id, mut initial_follow_up) = match startup_result {
             Ok(result) => result,
             Err(err) => {
                 eprintln!(
@@ -3193,6 +3370,16 @@ pub(crate) fn spawn_agent_actor(
                     &current_start,
                 )
                 .await;
+            for rejection in startup_input_rejections.drain(..) {
+                append_event(
+                    &canonical_stream,
+                    &mut event_log,
+                    &mut subscribers,
+                    FrameKind::AgentError,
+                    &rejection,
+                )
+                .await;
+            }
                 upsert_activity_stats_snapshot(
                     &canonical_stream,
                     &mut event_log,
@@ -3240,6 +3427,11 @@ pub(crate) fn spawn_agent_actor(
                     &status_handle,
                 )
                 .await;
+                // A startup a restart cut short stays reserved so the next
+                // launch reconstructs it; any other failure is final.
+                if !status_handle.restarting() {
+                    status_handle.withdraw_recovery().await;
+                }
                 park_terminal_agent(
                     &session_store,
                     &transcript_store,
@@ -3252,6 +3444,7 @@ pub(crate) fn spawn_agent_actor(
                     &mut subscribers,
                     &mut pending_inputs,
                     &mut rx,
+                    &status_handle,
                 )
                 .await;
                 return;
@@ -3284,6 +3477,14 @@ pub(crate) fn spawn_agent_actor(
         } else {
             HashSet::new()
         };
+        if status_handle.pending_restart_continuation() {
+            initial_follow_up = Some(SendMessagePayload {
+                message: restart_continuation_message(&[]),
+                origin: Some(MessageOrigin::HostRestart),
+                images: None,
+                tool_response: None,
+            });
+        }
         let mut active_agent_await_ids: HashSet<String> = HashSet::new();
         let mut lifecycle = ActorLifecycle::Running;
         let mut close_reply: Option<oneshot::Sender<()>> = None;
@@ -3303,7 +3504,6 @@ pub(crate) fn spawn_agent_actor(
             VecDeque::new();
         let mut compaction_blocked = false;
         current_session_id = Some(actor_session_id.clone());
-        status_handle.bind_recovery(Arc::clone(&session_store), actor_session_id.clone()).await;
         replay_state.journal = Some(transcript_store.open_session(&actor_session_id));
         replay_state.journal_agent_id = Some(current_start.agent_id.clone());
         current_start.session_id = Some(actor_session_id.clone());
@@ -3317,7 +3517,7 @@ pub(crate) fn spawn_agent_actor(
         if is_resume {
             pending_resume_attaches.append(&mut pending_startup_attaches);
         }
-        if let Err(err) = persist_agent_session(
+        let restore_state = match persist_agent_session(
             &session_store,
             &actor_session_id,
             parent_session_id,
@@ -3328,24 +3528,48 @@ pub(crate) fn spawn_agent_actor(
         )
         .await
         {
-            tracing::error!(
-                agent_id = %current_start.agent_id,
-                session_id = %actor_session_id,
-                error = %err,
-                "failed to persist agent session startup state"
-            );
-        }
+            Ok(restore_state) => restore_state,
+            Err(err) => {
+                tracing::error!(
+                    agent_id = %current_start.agent_id,
+                    session_id = %actor_session_id,
+                    error = %err,
+                    "failed to persist agent session startup state"
+                );
+                None
+            }
+        };
+        // A fresh spawn's first prompt went to the provider during startup,
+        // before its session existed, recorded on its startup reservation;
+        // the session takes that over atomically now that it exists.
+        status_handle
+            .promote_reservation(
+                Arc::clone(&session_store),
+                actor_session_id.clone(),
+                restore_state,
+            )
+            .await;
         let mut persisted_resume_task_list = if is_resume {
             session_store.get_task_list(&actor_session_id).await
         } else {
             None
         };
         let _ = startup_tx.send(Ok(actor_session_id.clone()));
-        accepting_input_task.store(!resume_replay_gate_pending, Ordering::SeqCst);
+        accepting_input_task.store(
+            !resume_replay_gate_pending && !status_handle.restarting(),
+            Ordering::SeqCst,
+        );
         let has_acknowledged_gated_deliveries = acknowledged_gated_deliveries > 0;
+        let continuation_pending = status_handle.pending_restart_continuation();
         status_handle
             .update(|s| {
                 record_agent_started(s, is_resume);
+                if continuation_pending {
+                    // The interrupted turn is being continued by the host; it
+                    // never went idle, so it must not read as ready to await.
+                    s.is_thinking = true;
+                    s.turn_completed = false;
+                }
                 if has_acknowledged_gated_deliveries {
                     // A resume normalizes to completed here. That would publish
                     // Idle for a message this actor already acknowledged as
@@ -3363,6 +3587,16 @@ pub(crate) fn spawn_agent_actor(
             &current_start,
         )
         .await;
+        for rejection in startup_input_rejections.drain(..) {
+            append_event(
+                &canonical_stream,
+                &mut event_log,
+                &mut subscribers,
+                FrameKind::AgentError,
+                &rejection,
+            )
+            .await;
+        }
         if resume_uses_authoritative_transcript
             && let Err(error) = seed_existing_transcript_history(
                 &transcript_store,
@@ -3490,12 +3724,18 @@ pub(crate) fn spawn_agent_actor(
                     })
                 })
         };
-        if initial_usage_hold && let Some(input) = initial_follow_up.take() {
+        if initial_usage_hold
+            && initial_follow_up
+                .as_ref()
+                .is_some_and(|input| input.origin != Some(MessageOrigin::HostRestart))
+            && let Some(input) = initial_follow_up.take()
+        {
             pending_inputs.push_back(AgentInput::SendMessage(input));
         }
         if !resume_replay_gate_pending
             && let Some(input) = initial_follow_up.take()
-            && !send_initial_follow_up_or_park(
+        {
+            match send_initial_follow_up_or_park(
                 input,
                 InitialFollowUpContext {
                     backend: &mut backend,
@@ -3523,8 +3763,11 @@ pub(crate) fn spawn_agent_actor(
                 },
             )
             .await
-        {
-            return;
+            {
+                InitialFollowUpDispatch::Sent => {}
+                InitialFollowUpDispatch::Retained(input) => initial_follow_up = Some(input),
+                InitialFollowUpDispatch::Terminated => return,
+            }
         }
         let mut supervisor_state = supervisor::SupervisorState::new(
             &status_handle.snapshot().await,
@@ -3833,7 +4076,11 @@ pub(crate) fn spawn_agent_actor(
                         ),
                     )
                     .await;
-                    if let Some(input) = initial_follow_up.take() {
+                    if initial_follow_up
+                        .as_ref()
+                        .is_some_and(|input| input.origin != Some(MessageOrigin::HostRestart))
+                        && let Some(input) = initial_follow_up.take()
+                    {
                         pending_inputs.push_front(AgentInput::SendMessage(input));
                     }
                     if !queue.is_empty() && pending_inputs.is_empty() {
@@ -3888,6 +4135,18 @@ pub(crate) fn spawn_agent_actor(
                 }
             }
             let usage_paused = usage_pause.is_some();
+            // The retained restart continuation goes out the first time the
+            // agent is idle and unheld; the dispatch barrier keeps the queue
+            // behind it until then.
+            let restart_continuation_dispatchable = !resume_replay_gate_pending
+                && !usage_paused
+                && !in_turn
+                && context_compaction.is_none()
+                && matches!(lifecycle, ActorLifecycle::Running)
+                && !status_handle.restarting()
+                && initial_follow_up
+                    .as_ref()
+                    .is_some_and(|input| input.origin == Some(MessageOrigin::HostRestart));
             let pause_snapshot = usage_pause
                 .as_ref()
                 .map(|pause| protocol::UsageLimitPauseState {
@@ -4205,6 +4464,45 @@ pub(crate) fn spawn_agent_actor(
                         }
                     }
                 }
+                _ = std::future::ready(()), if restart_continuation_dispatchable => {
+                    wait_for_restart_continuation_dispatch_test_gate(&current_start.name).await;
+                    let Some(input) = initial_follow_up.take() else {
+                        continue;
+                    };
+                    match send_initial_follow_up_or_park(
+                        input,
+                        InitialFollowUpContext {
+                            backend: &mut backend,
+                            in_turn: &mut in_turn,
+                            idle_transition_armed: &mut idle_transition_armed,
+                            session_store: &session_store,
+                            transcript_store: &transcript_store,
+                            current_session_id: current_session_id.as_ref(),
+                            pending_alias: &mut pending_alias,
+                            current_start: &mut current_start,
+                            start_tx: &start_tx,
+                            accepting_input: &accepting_input_task,
+                            status_handle: &status_handle,
+                            canonical_stream: &canonical_stream,
+                            event_log: &mut event_log,
+                            latest_output: &mut latest_output,
+                            latest_slash_commands: latest_slash_commands.as_ref(),
+                            pending_attaches: &mut pending_resume_attaches,
+                            replay_state: &mut replay_state,
+                            subscribers: &mut subscribers,
+                            queue: &mut queue,
+                            next_queue_sequence: &mut next_queue_sequence,
+                            pending_inputs: &mut pending_inputs,
+                            rx: &mut rx,
+                        },
+                    )
+                    .await
+                    {
+                        InitialFollowUpDispatch::Sent => {}
+                        InitialFollowUpDispatch::Retained(input) => initial_follow_up = Some(input),
+                        InitialFollowUpDispatch::Terminated => return,
+                    }
+                }
                 _ = &mut stall_sleep, if stall_deadline.is_some() => {
                     let now = Instant::now();
                     let stalled = !supervisor_status.terminated
@@ -4417,6 +4715,7 @@ pub(crate) fn spawn_agent_actor(
                                 &mut subscribers,
                                 &mut pending_inputs,
                                 &mut rx,
+                                &status_handle,
                             )
                             .await;
                             return;
@@ -4442,7 +4741,7 @@ pub(crate) fn spawn_agent_actor(
                                 "agent closed",
                             )
                             .await;
-                            finish_actor_close(&accepting_input_task, &status_handle, reply).await;
+                            finish_actor_close(&accepting_input_task, &status_handle, reply, ActorFinish::Close).await;
                             return;
                         }
                         let payload = AgentErrorPayload {
@@ -4500,6 +4799,7 @@ pub(crate) fn spawn_agent_actor(
                             &mut subscribers,
                             &mut pending_inputs,
                             &mut rx,
+                            &status_handle,
                         )
                         .await;
                         return;
@@ -4558,6 +4858,23 @@ pub(crate) fn spawn_agent_actor(
                                             &ChatEvent::RestartRecovery { phase: protocol::RestartRecoveryPhase::Interrupted { cause: recovery.cause() } },
                                         ).await;
                                     }
+                                    if resume_live_turn_seen && status_handle.pending_restart_continuation() {
+                                        initial_follow_up = None;
+                                        tracing::info!("adopting the backend's resumed live turn as restart continuation");
+                                        append_chat_event(&canonical_stream, &mut event_log, &mut subscribers, &mut replay_state,
+                                            &ChatEvent::RestartRecovery { phase: protocol::RestartRecoveryPhase::Continuing }).await;
+                                        status_handle
+                                            .admit_dispatch(registry::DispatchClass::RestartContinuation)
+                                            .await;
+                                        status_handle.restart_continuation_delivered();
+                                    } else if resume_recovery.is_some()
+                                        && !resume_live_turn_seen
+                                        && !status_handle.pending_restart_continuation()
+                                    {
+                                        // A manual resume reports the interruption once and
+                                        // never continues on its own, so the marker is spent.
+                                        status_handle.persist_recovery(None).await;
+                                    }
                                     for tool_call_id in unanswered_replayed_user_interactions(&event_log) {
                                         tracing::info!(
                                             tool_call_id,
@@ -4580,6 +4897,37 @@ pub(crate) fn spawn_agent_actor(
                                         )
                                         .await;
                                         completed_tool_call_ids.insert(tool_call_id);
+                                    }
+                                    tracing::debug!(
+                                        agent_id = %current_start.agent_id,
+                                        resume_recovery = ?resume_recovery,
+                                        resume_live_turn_seen,
+                                        resume_uses_authoritative_transcript,
+                                        "reconciling replayed tools at the resume boundary"
+                                    );
+                                    if (resume_recovery.is_some()
+                                        || resume_uses_authoritative_transcript)
+                                        && !resume_live_turn_seen
+                                    {
+                                        for tool_call_id in unfinished_replayed_tool_calls(&event_log) {
+                                            append_chat_event(
+                                                &canonical_stream,
+                                                &mut event_log,
+                                                &mut subscribers,
+                                                &mut replay_state,
+                                                &ChatEvent::ToolExecutionCompleted(
+                                                    protocol::ToolExecutionCompletedData {
+                                                        tool_call_id: tool_call_id.clone(),
+                                                        outcome: protocol::ToolExecutionOutcome::Cancelled {
+                                                            message: UNKNOWN_TOOL_OUTCOME_MESSAGE
+                                                                .to_owned(),
+                                                        },
+                                                    },
+                                                ),
+                                            )
+                                            .await;
+                                            completed_tool_call_ids.insert(tool_call_id);
+                                        }
                                     }
                                     let session_id = current_session_id
                                         .as_ref()
@@ -4636,7 +4984,6 @@ pub(crate) fn spawn_agent_actor(
                                         .await;
                                     }
                                     if initial_follow_up.is_none()
-                                        && acknowledged_gated_deliveries == 0
                                         && !queue.is_empty()
                                         && !in_turn
                                         && !usage_paused
@@ -4751,13 +5098,20 @@ pub(crate) fn spawn_agent_actor(
                                                 &mut subscribers,
                                                 &mut pending_inputs,
                                                 &mut rx,
+                                                &status_handle,
                                             )
                                             .await;
                                             return;
                                         }
                                     }
-                                    if !usage_paused && let Some(input) = initial_follow_up.take()
-                                        && !send_initial_follow_up_or_park(
+                                    if !usage_paused
+                                        && initial_follow_up.as_ref().is_some_and(|input| {
+                                            input.origin != Some(MessageOrigin::HostRestart)
+                                                || !in_turn
+                                        })
+                                        && let Some(input) = initial_follow_up.take()
+                                    {
+                                        match send_initial_follow_up_or_park(
                                             input,
                                             InitialFollowUpContext {
                                                 backend: &mut backend,
@@ -4786,9 +5140,19 @@ pub(crate) fn spawn_agent_actor(
                                             },
                                         )
                                         .await
-                                    {
-                                        return;
+                                        {
+                                            InitialFollowUpDispatch::Sent => {}
+                                            InitialFollowUpDispatch::Retained(input) => {
+                                                initial_follow_up = Some(input);
+                                            }
+                                            InitialFollowUpDispatch::Terminated => return,
+                                        }
                                     }
+                                    // This agent's one continuation attempt is
+                                    // made; its parent may activate even if the
+                                    // continuation is held behind a usage pause
+                                    // or a provider turn.
+                                    status_handle.settle_restoration();
                                     flush_pending_agent_attaches(
                                         &event_log,
                                         Some(&replay_state),
@@ -4880,6 +5244,7 @@ pub(crate) fn spawn_agent_actor(
                                         &mut subscribers,
                                         &mut pending_inputs,
                                         &mut rx,
+                                        &status_handle,
                                     )
                                     .await;
                                     return;
@@ -5240,7 +5605,11 @@ pub(crate) fn spawn_agent_actor(
                             } else if blocked_on_user {
                                 idle_transition_armed = false;
                             } else if in_turn && idle_transition_armed {
-                                status_handle.persist_recovery(None).await;
+                                // A continuation the provider refused as busy is
+                                // still owed; its marker must survive this turn.
+                                if !status_handle.pending_restart_continuation() {
+                                    status_handle.persist_recovery(None).await;
+                                }
                                 real_idle_transition = true;
                                 completed_by_idle = true;
                                 in_turn = false;
@@ -5461,7 +5830,11 @@ pub(crate) fn spawn_agent_actor(
                     )
                     .await;
                     if synthesize_idle_after_error {
-                        replay_state.discard_active_stream();
+                        // The turn is over just as if the backend had gone
+                        // idle, so a restart has nothing left to continue.
+                        if !status_handle.pending_restart_continuation() {
+                            status_handle.persist_recovery(None).await;
+                        }
                         append_chat_event(
                             &canonical_stream,
                             &mut event_log,
@@ -5548,7 +5921,7 @@ pub(crate) fn spawn_agent_actor(
                             "agent closed",
                         )
                         .await;
-                        finish_actor_close(&accepting_input_task, &status_handle, reply).await;
+                        finish_actor_close(&accepting_input_task, &status_handle, reply, ActorFinish::Close).await;
                         return;
                     }
 
@@ -5597,7 +5970,6 @@ pub(crate) fn spawn_agent_actor(
                     if real_idle_transition
                         && !resume_replay_gate_pending
                         && !usage_paused
-                        && !status_handle.restarting()
                         && matches!(lifecycle, ActorLifecycle::Running)
                         && !compaction_blocked
                         && !queue.is_empty()
@@ -5606,13 +5978,17 @@ pub(crate) fn spawn_agent_actor(
                                 flight.admits_queue_sequence(queued.sequence)
                             })
                         })
+                        && status_handle
+                            .admit_dispatch(registry::DispatchClass::Turn)
+                            .await
+                            == registry::DispatchAdmission::Admitted
                     {
                         let queued = queue
                             .pop_front()
                             .expect("queue reported non-empty but pop_front returned None");
                         let review_origin = match queued.origin.as_ref() {
                             Some(MessageOrigin::Review { review_id }) => Some(review_id.clone()),
-                            Some(MessageOrigin::User) | Some(MessageOrigin::Supervisor) | None => None,
+                            Some(MessageOrigin::User) | Some(MessageOrigin::Supervisor) | Some(MessageOrigin::HostRestart) | None => None,
                         };
                         if let Some(review_id) = review_origin.as_ref() {
                             tracing::info!(
@@ -5733,6 +6109,7 @@ pub(crate) fn spawn_agent_actor(
                                     &mut subscribers,
                                     &mut pending_inputs,
                                     &mut rx,
+                                    &status_handle,
                                 )
                                 .await;
                                 return;
@@ -5799,16 +6176,59 @@ pub(crate) fn spawn_agent_actor(
                             if resume_replay_gate_pending {
                                 // Accepted, not rejected: the resume barrier is
                                 // transient and the message is dispatched once
-                                // it lifts. Mark the queued turn active before
+                                // it lifts. Mark the queued work active before
                                 // acknowledging so the caller cannot read Idle,
                                 // and record the acceptance so completing the
                                 // barrier cannot publish Idle back over it.
+                                // A message that cannot be held durably is
+                                // refused, since a restart would lose it.
+                                let held = match hold_gated_input(
+                                    input,
+                                    &mut queue,
+                                    &mut next_queue_sequence,
+                                    &status_handle,
+                                )
+                                .await
+                                {
+                                    Ok(held) => held,
+                                    Err(_) => {
+                                        if !reject_agent_delivery(
+                                            delivery_ack.take(),
+                                            DELIVERY_REJECTED_UNRECORDED,
+                                        ) {
+                                            let payload = unrecorded_input_rejected_payload(
+                                                &current_start.agent_id,
+                                            );
+                                            append_event(
+                                                &canonical_stream,
+                                                &mut event_log,
+                                                &mut subscribers,
+                                                FrameKind::AgentError,
+                                                &payload,
+                                            )
+                                            .await;
+                                        }
+                                        continue;
+                                    }
+                                };
                                 if delivery_ack.is_some() {
-                                    mark_agent_turn_active(&status_handle).await;
+                                    mark_agent_work_pending(&status_handle).await;
                                     acknowledged_gated_deliveries =
                                         acknowledged_gated_deliveries.saturating_add(1);
                                 }
-                                pending_inputs.push_back(input);
+                                if let Some(input) = held {
+                                    pending_inputs.push_back(input);
+                                } else {
+                                    update_queued_messages_snapshot(
+                                        &canonical_stream,
+                                        &mut event_log,
+                                        &mut subscribers,
+                                        &queue,
+                                        &session_store,
+                                        &status_handle,
+                                    )
+                                    .await;
+                                }
                                 if let Some(reply) = delivery_ack.take() {
                                     let _ = reply.send(Ok(()));
                                 }
@@ -5885,13 +6305,13 @@ pub(crate) fn spawn_agent_actor(
                                         Some(MessageOrigin::Review { review_id }) => {
                                             Some(review_id.clone())
                                         }
-                                        Some(MessageOrigin::User) | Some(MessageOrigin::Supervisor) | None => None,
+                                        Some(MessageOrigin::User) | Some(MessageOrigin::Supervisor) | Some(MessageOrigin::HostRestart) | None => None,
                                     };
                                     let message_len = msg.message.len();
                                     let images_count = msg.images.as_ref().map_or(0, Vec::len);
                                     let review_origin_for_queue = match msg.origin.clone() {
                                         Some(MessageOrigin::Review { review_id }) => Some(review_id),
-                                        Some(MessageOrigin::User) | Some(MessageOrigin::Supervisor) | None => None,
+                                        Some(MessageOrigin::User) | Some(MessageOrigin::Supervisor) | Some(MessageOrigin::HostRestart) | None => None,
                                     };
                                     let stale_tool_response = matches!(
                                         msg.tool_response.as_ref(),
@@ -6017,9 +6437,65 @@ pub(crate) fn spawn_agent_actor(
                                             })
                                             .await;
                                     }
-                                    if (usage_paused || in_turn || context_compaction.is_some())
+                                    let admission = if (usage_paused
+                                        || in_turn
+                                        || context_compaction.is_some())
                                         && !is_tool_response
                                     {
+                                        None
+                                    } else {
+                                        Some(
+                                            status_handle
+                                                .admit_dispatch(if is_tool_response {
+                                                    registry::DispatchClass::ToolResponse
+                                                } else {
+                                                    registry::DispatchClass::Turn
+                                                })
+                                                .await,
+                                        )
+                                    };
+                                    if is_tool_response
+                                        && admission
+                                            == Some(registry::DispatchAdmission::HostStopping)
+                                    {
+                                        if !reject_agent_delivery(
+                                            delivery_ack.take(),
+                                            DELIVERY_REJECTED_HOST_STOPPING,
+                                        ) {
+                                            let event = tool_response_rejected_event(
+                                                DELIVERY_REJECTED_HOST_STOPPING,
+                                            );
+                                            append_chat_event(
+                                                &canonical_stream,
+                                                &mut event_log,
+                                                &mut subscribers,
+                                                &mut replay_state,
+                                                &event,
+                                            )
+                                            .await;
+                                        }
+                                        continue;
+                                    }
+                                    if admission == Some(registry::DispatchAdmission::Unrecorded) {
+                                        if !reject_agent_delivery(
+                                            delivery_ack.take(),
+                                            DELIVERY_REJECTED_UNRECORDED,
+                                        ) {
+                                            let payload = unrecorded_input_rejected_payload(
+                                                &current_start.agent_id,
+                                            );
+                                            append_event(
+                                                &canonical_stream,
+                                                &mut event_log,
+                                                &mut subscribers,
+                                                FrameKind::AgentError,
+                                                &payload,
+                                            )
+                                            .await;
+                                        }
+                                        continue;
+                                    }
+                                    if admission != Some(registry::DispatchAdmission::Admitted) {
                                         let queued_message_id =
                                             QueuedMessageId(Uuid::new_v4().to_string());
                                         let sequence = next_queue_sequence;
@@ -6067,7 +6543,7 @@ pub(crate) fn spawn_agent_actor(
                                             // still true, so acknowledging
                                             // without this would leave the agent
                                             // Idle with a message it never ran.
-                                            mark_agent_turn_active(&status_handle).await;
+                                            mark_agent_work_pending(&status_handle).await;
                                             let _ = reply.send(Ok(()));
                                         }
                                     } else {
@@ -6230,6 +6706,7 @@ pub(crate) fn spawn_agent_actor(
                                                 &mut subscribers,
                                                 &mut pending_inputs,
                                                 &mut rx,
+                                                &status_handle,
                                             )
                                             .await;
                                             return;
@@ -6335,7 +6812,7 @@ pub(crate) fn spawn_agent_actor(
                                         Some(MessageOrigin::Review { review_id }) => {
                                             Some(review_id.clone())
                                         }
-                                        Some(MessageOrigin::User) | Some(MessageOrigin::Supervisor) | None => None,
+                                        Some(MessageOrigin::User) | Some(MessageOrigin::Supervisor) | Some(MessageOrigin::HostRestart) | None => None,
                                     };
                                     status_handle
                                         .update(|status| {
@@ -6343,6 +6820,32 @@ pub(crate) fn spawn_agent_actor(
                                                 status.activity_counter.saturating_add(1);
                                         })
                                         .await;
+                                    if status_handle
+                                        .admit_dispatch(registry::DispatchClass::Redirect)
+                                        .await
+                                        != registry::DispatchAdmission::Admitted
+                                    {
+                                        let sequence = next_queue_sequence;
+                                        next_queue_sequence = next_queue_sequence.saturating_add(1);
+                                        queue.push_back(SequencedQueuedMessage {
+                                            sequence,
+                                            entry: queued_entry_from_send_payload(msg),
+                                        });
+                                        update_queued_messages_snapshot(
+                                            &canonical_stream,
+                                            &mut event_log,
+                                            &mut subscribers,
+                                            &queue,
+                                            &session_store,
+                                            &status_handle,
+                                        )
+                                        .await;
+                                        if let Some(reply) = delivery_ack.take() {
+                                            mark_agent_work_pending(&status_handle).await;
+                                            let _ = reply.send(Ok(()));
+                                        }
+                                        continue;
+                                    }
                                     let outcome = backend
                                         .as_ref()
                                         .expect("backend must exist while actor is running")
@@ -6545,6 +7048,13 @@ pub(crate) fn spawn_agent_actor(
 
                                     if usage_paused { continue; }
                                     if in_turn {
+                                        if status_handle
+                                            .admit_dispatch(registry::DispatchClass::Redirect)
+                                            .await
+                                            != registry::DispatchAdmission::Admitted
+                                        {
+                                            continue;
+                                        }
                                         if !backend
                                             .as_ref()
                                             .expect("backend must exist while actor is running")
@@ -6569,6 +7079,13 @@ pub(crate) fn spawn_agent_actor(
                                         }
                                         continue;
                                     }
+                                    if status_handle
+                                        .admit_dispatch(registry::DispatchClass::Turn)
+                                        .await
+                                        != registry::DispatchAdmission::Admitted
+                                    {
+                                        continue;
+                                    }
 
                                     let queued = queue
                                         .pop_front()
@@ -6577,7 +7094,7 @@ pub(crate) fn spawn_agent_actor(
                                         Some(MessageOrigin::Review { review_id }) => {
                                             Some(review_id.clone())
                                         }
-                                        Some(MessageOrigin::User) | Some(MessageOrigin::Supervisor) | None => None,
+                                        Some(MessageOrigin::User) | Some(MessageOrigin::Supervisor) | Some(MessageOrigin::HostRestart) | None => None,
                                     };
                                     if let Some(review_id) = review_origin.as_ref() {
                                         tracing::info!(
@@ -6694,6 +7211,7 @@ pub(crate) fn spawn_agent_actor(
                                                 &mut subscribers,
                                                 &mut pending_inputs,
                                                 &mut rx,
+                                                &status_handle,
                                             )
                                             .await;
                                             return;
@@ -6736,6 +7254,10 @@ pub(crate) fn spawn_agent_actor(
                                         Some("Usage limit pause blocks starting or resuming a native goal until fresh usage is below the pause threshold".to_owned())
                                     } else if !supported {
                                         Some("This session does not support that native goal control".to_owned())
+                                    } else if matches!(control, protocol::GoalControl::Set { .. } | protocol::GoalControl::Resume)
+                                        && let Some(error) = restart_barrier_rejection(&status_handle, registry::DispatchClass::Turn).await
+                                    {
+                                        Some(error)
                                     } else {
                                         match backend.as_ref().expect("running actor has backend").send_with_outcome(AgentInput::GoalControl(control)).await {
                                             SendOutcome::Accepted => None,
@@ -7739,7 +8261,11 @@ pub(crate) fn spawn_agent_actor(
                             } else if !queue.is_empty() {
                                 Some("agent has queued work".to_owned())
                             } else {
-                                None
+                                restart_barrier_rejection(
+                                    &status_handle,
+                                    registry::DispatchClass::Internal,
+                                )
+                                .await
                             };
                             if let Some(error) = reject {
                                 let _ = accepted.send(Err(error.clone()));
@@ -7822,7 +8348,11 @@ pub(crate) fn spawn_agent_actor(
                             } else if !queue.is_empty() {
                                 Some("agent has queued work".to_owned())
                             } else {
-                                None
+                                restart_barrier_rejection(
+                                    &status_handle,
+                                    registry::DispatchClass::Internal,
+                                )
+                                .await
                             };
                             if let Some(error) = reject {
                                 let _ = reply.send(Err(error));
@@ -8248,6 +8778,7 @@ pub(crate) fn spawn_agent_actor(
                                 &mut subscribers,
                                 &mut pending_inputs,
                                 &mut rx,
+                                &status_handle,
                             )
                             .await;
                             return;
@@ -8259,7 +8790,23 @@ pub(crate) fn spawn_agent_actor(
                                 backend.interrupt().await;
                                 backend.shutdown().await;
                             }
-                            finish_actor_close(&accepting_input_task, &status_handle, reply).await;
+                            let mut terminal_context = LiveActivityTerminalContext {
+                                canonical_stream: &canonical_stream,
+                                event_log: &mut event_log,
+                                replay_state: &mut replay_state,
+                                subscribers: &mut subscribers,
+                                open_tool_call_ids: &mut open_tool_call_ids,
+                                pending_tool_response_ids: &mut pending_tool_response_ids,
+                                active_agent_await_ids: &mut active_agent_await_ids,
+                            };
+                            expire_pending_user_interactions(&mut terminal_context).await;
+                            terminalize_live_activity(
+                                terminal_context,
+                                LiveActivityTerminalStatus::Stopped,
+                                UNKNOWN_TOOL_OUTCOME_MESSAGE,
+                            )
+                            .await;
+                            finish_actor_close(&accepting_input_task, &status_handle, reply, ActorFinish::StopForRestart).await;
                             return;
                         }
                         AgentCommand::Close { reply } => {
@@ -8349,7 +8896,7 @@ pub(crate) fn spawn_agent_actor(
                                     "agent closed",
                                 )
                                 .await;
-                                finish_actor_close(&accepting_input_task, &status_handle, reply).await;
+                                finish_actor_close(&accepting_input_task, &status_handle, reply, ActorFinish::Close).await;
                                 return;
                             }
                             // Closing a busy agent has to end its turn, not
@@ -8430,7 +8977,7 @@ pub(crate) fn spawn_agent_actor(
                         "agent closed",
                     )
                     .await;
-                    finish_actor_close(&accepting_input_task, &status_handle, reply).await;
+                    finish_actor_close(&accepting_input_task, &status_handle, reply, ActorFinish::Close).await;
                     return;
                 }
             }
@@ -8677,7 +9224,7 @@ pub(crate) fn spawn_relay_agent_actor(
                                 "agent closed",
                             )
                             .await;
-                            finish_actor_close(&accepting_input_task, &status_handle, reply).await;
+                            finish_actor_close(&accepting_input_task, &status_handle, reply, ActorFinish::Close).await;
                             return;
                         }
                         if status_handle.snapshot().await.is_active() {
@@ -8892,7 +9439,7 @@ pub(crate) fn spawn_relay_agent_actor(
                             "agent closed",
                         )
                         .await;
-                        finish_actor_close(&accepting_input_task, &status_handle, reply).await;
+                        finish_actor_close(&accepting_input_task, &status_handle, reply, ActorFinish::Close).await;
                         return;
                     }
                 }
@@ -9071,7 +9618,7 @@ pub(crate) fn spawn_relay_agent_actor(
                         }
                         AgentCommand::StopForRestart { reply } => {
                             status_handle.prepare_restart().await;
-                            finish_actor_close(&accepting_input_task, &status_handle, reply).await;
+                            finish_actor_close(&accepting_input_task, &status_handle, reply, ActorFinish::StopForRestart).await;
                             return;
                         }
                         AgentCommand::Close { reply } => {
@@ -9104,7 +9651,7 @@ pub(crate) fn spawn_relay_agent_actor(
                                     "agent closed",
                                 )
                                 .await;
-                                finish_actor_close(&accepting_input_task, &status_handle, reply).await;
+                                finish_actor_close(&accepting_input_task, &status_handle, reply, ActorFinish::Close).await;
                                 return;
                             }
                             // A relay mirrors a backend-native child and owns no
@@ -9194,7 +9741,7 @@ pub(crate) fn spawn_relay_agent_actor(
                         "agent closed",
                     )
                     .await;
-                    finish_actor_close(&accepting_input_task, &status_handle, reply).await;
+                    finish_actor_close(&accepting_input_task, &status_handle, reply, ActorFinish::Close).await;
                     return;
                 }
             }
@@ -9411,12 +9958,27 @@ async fn close_grace_elapsed(deadline: &Option<tokio::time::Instant>) {
     }
 }
 
+/// Why an actor is finishing. A restart stop keeps the recovery state the
+/// stop recorded so the next launch continues the agent; an explicit close
+/// withdraws it, even while the host is restarting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActorFinish {
+    Close,
+    StopForRestart,
+}
+
 async fn finish_actor_close(
     accepting_input: &Arc<AtomicBool>,
     status_handle: &registry::AgentStatusHandle,
     reply: oneshot::Sender<()>,
+    finish: ActorFinish,
 ) {
     accepting_input.store(false, Ordering::SeqCst);
+    match finish {
+        // A closed agent is never continued, whatever turn it was in.
+        ActorFinish::Close => status_handle.withdraw_recovery().await,
+        ActorFinish::StopForRestart => {}
+    }
     status_handle
         .update(|s| {
             s.terminated = true;
@@ -9441,6 +10003,12 @@ async fn finish_actor_close(
 const DELIVERY_REJECTED_RELAY: &str = "backend-native relay agents do not accept direct input";
 const DELIVERY_REJECTED_COMPACTING: &str = "agent compaction is in progress";
 const DELIVERY_REJECTED_CLOSING: &str = "agent is closing";
+const DELIVERY_REJECTED_HOST_STOPPING: &str =
+    "Tyde is restarting; answer again after the host restarts";
+const DELIVERY_REJECTED_RECOVERY_PENDING: &str =
+    "agent is continuing the turn a host restart interrupted";
+const DELIVERY_REJECTED_UNRECORDED: &str =
+    "cannot record the turn for restart recovery; the message was not sent";
 const DELIVERY_REJECTED_TERMINAL: &str = "agent not running";
 const DELIVERY_REJECTED_BACKEND_CLOSED: &str = "agent backend closed";
 const DELIVERY_REJECTED_MAILBOX_CLOSED: &str = "agent backend is closed";
@@ -9486,6 +10054,15 @@ fn closing_input_rejected_payload(agent_id: &AgentId) -> AgentErrorPayload {
     }
 }
 
+fn unrecorded_input_rejected_payload(agent_id: &AgentId) -> AgentErrorPayload {
+    AgentErrorPayload {
+        agent_id: agent_id.clone(),
+        code: AgentErrorCode::Internal,
+        message: DELIVERY_REJECTED_UNRECORDED.to_owned(),
+        fatal: false,
+    }
+}
+
 fn compaction_input_rejected_payload(agent_id: &AgentId) -> AgentErrorPayload {
     AgentErrorPayload {
         agent_id: agent_id.clone(),
@@ -9493,6 +10070,32 @@ fn compaction_input_rejected_payload(agent_id: &AgentId) -> AgentErrorPayload {
         message: "agent compaction is in progress".to_owned(),
         fatal: false,
     }
+}
+
+const UNKNOWN_TOOL_OUTCOME_MESSAGE: &str =
+    "The session stopped before this tool reported a result; its outcome is unknown.";
+
+/// A hard stop leaves no chance to retire running tools, and no backend
+/// process survives to report the outcome of a call Tyde's own transcript
+/// shows unfinished, so such a resume retires every replayed tool call that
+/// never completed, whether or not the interrupted turn continues.
+fn unfinished_replayed_tool_calls(event_log: &[Envelope]) -> Vec<String> {
+    let mut open = Vec::new();
+    for envelope in event_log
+        .iter()
+        .filter(|envelope| envelope.kind == FrameKind::ChatEvent)
+    {
+        match envelope.parse_payload::<ChatEvent>() {
+            Ok(ChatEvent::ToolRequest(request)) if !open.contains(&request.tool_call_id) => {
+                open.push(request.tool_call_id);
+            }
+            Ok(ChatEvent::ToolExecutionCompleted(completion)) => {
+                open.retain(|id| id != &completion.tool_call_id);
+            }
+            _ => {}
+        }
+    }
+    open
 }
 
 const EXPIRED_USER_INTERACTION_MESSAGE: &str =
@@ -9671,6 +10274,23 @@ async fn enter_terminal_failure(
         )
         .await;
     }
+    let recovery_failed = context.status_handle.pending_restart_continuation();
+    if recovery_failed {
+        append_chat_event(
+            context.canonical_stream,
+            context.event_log,
+            context.subscribers,
+            context.replay_state,
+            &ChatEvent::RestartRecovery {
+                phase: protocol::RestartRecoveryPhase::ContinuationFailed {
+                    message: payload.message.clone(),
+                },
+            },
+        )
+        .await;
+        context.status_handle.persist_recovery(None).await;
+    }
+    context.status_handle.abandon_restart_continuation();
     context.accepting_input.store(false, Ordering::SeqCst);
     context.replay_state.clear_active_stream();
     context.queue.clear();
@@ -9763,6 +10383,73 @@ struct LiveActivityTerminalContext<'a> {
     active_agent_await_ids: &'a mut HashSet<String>,
 }
 
+/// A restart stop expires the questions and plan approvals still awaiting the
+/// user, exactly as the restored agent would, before it retires the remaining
+/// tools as having an unknown outcome.
+async fn expire_pending_user_interactions(context: &mut LiveActivityTerminalContext<'_>) {
+    let pending = context
+        .pending_tool_response_ids
+        .drain()
+        .filter(|tool_call_id| context.open_tool_call_ids.remove(tool_call_id))
+        .collect::<Vec<_>>();
+    for tool_call_id in pending {
+        terminalize_open_tool(
+            context.canonical_stream,
+            context.event_log,
+            context.replay_state,
+            context.subscribers,
+            tool_call_id,
+            LiveActivityTerminalStatus::Stopped,
+            EXPIRED_USER_INTERACTION_MESSAGE,
+        )
+        .await;
+    }
+}
+
+async fn terminalize_open_tool(
+    canonical_stream: &str,
+    event_log: &mut Vec<Envelope>,
+    replay_state: &mut AgentReplayState,
+    subscribers: &mut Vec<Stream>,
+    tool_call_id: String,
+    status: LiveActivityTerminalStatus,
+    message: &str,
+) {
+    if let Some(progress) = replay_state.active_tool_progress.get(&tool_call_id)
+        && let Some(terminal) = terminal_progress_for_live_activity(progress, status, message)
+    {
+        append_chat_event(
+            canonical_stream,
+            event_log,
+            subscribers,
+            replay_state,
+            &ChatEvent::ToolProgress(terminal),
+        )
+        .await;
+    }
+    let outcome = match status {
+        LiveActivityTerminalStatus::Failed => ToolExecutionOutcome::Failed {
+            message: message.to_owned(),
+            details: Some(message.to_owned()),
+            normalization_failure: None,
+        },
+        LiveActivityTerminalStatus::Stopped => ToolExecutionOutcome::Cancelled {
+            message: message.to_owned(),
+        },
+    };
+    append_chat_event(
+        canonical_stream,
+        event_log,
+        subscribers,
+        replay_state,
+        &ChatEvent::ToolExecutionCompleted(ToolExecutionCompletedData {
+            tool_call_id,
+            outcome,
+        }),
+    )
+    .await;
+}
+
 async fn terminalize_live_activity(
     mut context: LiveActivityTerminalContext<'_>,
     status: LiveActivityTerminalStatus,
@@ -9779,37 +10466,14 @@ async fn terminalize_live_activity(
     let open_tools = open_tool_call_ids.drain().collect::<Vec<_>>();
     for tool_call_id in open_tools {
         pending_tool_response_ids.remove(&tool_call_id);
-        if let Some(progress) = replay_state.active_tool_progress.get(&tool_call_id)
-            && let Some(terminal) = terminal_progress_for_live_activity(progress, status, message)
-        {
-            append_chat_event(
-                canonical_stream,
-                event_log,
-                subscribers,
-                replay_state,
-                &ChatEvent::ToolProgress(terminal),
-            )
-            .await;
-        }
-        let outcome = match status {
-            LiveActivityTerminalStatus::Failed => ToolExecutionOutcome::Failed {
-                message: message.to_owned(),
-                details: Some(message.to_owned()),
-                normalization_failure: None,
-            },
-            LiveActivityTerminalStatus::Stopped => ToolExecutionOutcome::Cancelled {
-                message: message.to_owned(),
-            },
-        };
-        append_chat_event(
+        terminalize_open_tool(
             canonical_stream,
             event_log,
-            subscribers,
             replay_state,
-            &ChatEvent::ToolExecutionCompleted(ToolExecutionCompletedData {
-                tool_call_id,
-                outcome,
-            }),
+            subscribers,
+            tool_call_id,
+            status,
+            message,
         )
         .await;
     }
@@ -9864,6 +10528,7 @@ async fn park_terminal_agent(
     subscribers: &mut Vec<Stream>,
     pending_inputs: &mut VecDeque<AgentInput>,
     rx: &mut mpsc::UnboundedReceiver<AgentCommand>,
+    status_handle: &registry::AgentStatusHandle,
 ) {
     loop {
         latest_output
@@ -9978,7 +10643,12 @@ async fn park_terminal_agent(
                 );
                 let _ = reply.send(attached);
             }
-            AgentCommand::Close { reply } | AgentCommand::StopForRestart { reply } => {
+            AgentCommand::Close { reply } => {
+                status_handle.withdraw_recovery().await;
+                let _ = reply.send(());
+                break;
+            }
+            AgentCommand::StopForRestart { reply } => {
                 let _ = reply.send(());
                 break;
             }
@@ -10168,8 +10838,18 @@ async fn park_relay_terminal_agent(
                 );
                 let _ = reply.send(attached);
             }
-            AgentCommand::Close { reply } | AgentCommand::StopForRestart { reply } => {
-                finish_actor_close(accepting_input, status_handle, reply).await;
+            AgentCommand::Close { reply } => {
+                finish_actor_close(accepting_input, status_handle, reply, ActorFinish::Close).await;
+                break;
+            }
+            AgentCommand::StopForRestart { reply } => {
+                finish_actor_close(
+                    accepting_input,
+                    status_handle,
+                    reply,
+                    ActorFinish::StopForRestart,
+                )
+                .await;
                 break;
             }
             AgentCommand::Compact { reply, .. } => {
@@ -10464,6 +11144,116 @@ fn resolved_compaction_terminal_method(
     terminal_method.or(flight_method)
 }
 
+/// Holds an accepted message in the durable queue while the agent cannot take
+/// it yet, so a restart redelivers it in order. Anything else is returned.
+fn queue_gated_input(
+    input: AgentInput,
+    queue: &mut VecDeque<SequencedQueuedMessage>,
+    next_queue_sequence: &mut u64,
+) -> Option<AgentInput> {
+    let payload = match input {
+        AgentInput::SendMessage(payload) | AgentInput::SteerMessage(payload)
+            if payload.tool_response.is_none() =>
+        {
+            payload
+        }
+        input => return Some(input),
+    };
+    let sequence = *next_queue_sequence;
+    *next_queue_sequence = next_queue_sequence.saturating_add(1);
+    queue.push_back(SequencedQueuedMessage {
+        sequence,
+        entry: queued_entry_from_send_payload(payload),
+    });
+    None
+}
+
+/// [`queue_gated_input`], acknowledged only once the queue holding it is
+/// durable: a message that cannot be retained is taken back out and the
+/// error returned, so the caller refuses it instead of losing it on restart.
+async fn hold_gated_input(
+    input: AgentInput,
+    queue: &mut VecDeque<SequencedQueuedMessage>,
+    next_queue_sequence: &mut u64,
+    status_handle: &registry::AgentStatusHandle,
+) -> Result<Option<AgentInput>, String> {
+    if let Some(input) = queue_gated_input(input, queue, next_queue_sequence) {
+        return Ok(Some(input));
+    }
+    let messages = queue.iter().map(|queued| queued.entry.clone()).collect();
+    if let Err(error) = status_handle.persist_queued_messages(messages).await {
+        queue.pop_back();
+        return Err(error);
+    }
+    Ok(None)
+}
+
+async fn admit_initial_turn(
+    status_handle: &registry::AgentStatusHandle,
+    admitted: &AtomicBool,
+) -> Result<(), AgentStartupFailure> {
+    let reason = match status_handle
+        .admit_dispatch(registry::DispatchClass::Turn)
+        .await
+    {
+        registry::DispatchAdmission::Admitted => {
+            admitted.store(true, Ordering::SeqCst);
+            return Ok(());
+        }
+        registry::DispatchAdmission::HostStopping => DELIVERY_REJECTED_HOST_STOPPING,
+        registry::DispatchAdmission::RecoveryPending => DELIVERY_REJECTED_RECOVERY_PENDING,
+        registry::DispatchAdmission::Unrecorded => DELIVERY_REJECTED_UNRECORDED,
+    };
+    Err(AgentStartupFailure::internal(reason))
+}
+
+/// The durable record of a new or forked agent before its provider session
+/// exists: the spawn that re-issues its first prompt if the host dies first.
+fn startup_reservation(
+    start: &AgentStartPayload,
+    first_input: &SendMessagePayload,
+    fork_from_session_id: Option<&SessionId>,
+    cost_hint: Option<SpawnCostHint>,
+    session_settings: &SessionSettingsValues,
+    resolved_spawn_config: &customization::ResolvedSpawnConfig,
+) -> crate::store::session::StartupReservation {
+    let access_mode = resolved_spawn_config.access_mode;
+    let params = match fork_from_session_id {
+        Some(from_session_id) => protocol::SpawnAgentParams::Fork {
+            from_session_id: from_session_id.clone(),
+            prompt: first_input.message.clone(),
+            images: first_input.images.clone(),
+            access_mode: Some(access_mode),
+        },
+        None => protocol::SpawnAgentParams::New {
+            workspace_roots: start.workspace_roots.clone(),
+            prompt: first_input.message.clone(),
+            images: first_input.images.clone(),
+            backend_kind: start.backend_kind,
+            launch_profile_id: start.launch_profile_id.clone(),
+            cost_hint,
+            access_mode,
+            session_settings: Some(session_settings.clone()),
+        },
+    };
+    crate::store::session::StartupReservation {
+        agent_id: start.agent_id.clone(),
+        spawn: protocol::SpawnAgentPayload {
+            name: Some(start.name.clone()),
+            custom_agent_id: start.custom_agent_id.clone(),
+            parent_agent_id: start.parent_agent_id.clone(),
+            project_id: start.project_id.clone(),
+            params,
+        },
+        origin: start.origin,
+        workflow: start.workflow.clone(),
+        restorable: start.origin != AgentOrigin::BackendNative
+            && resolved_spawn_config.is_rebuilt_by_resume(),
+        turn_recovery: None,
+        queued_messages: Vec::new(),
+    }
+}
+
 /// Rebuild a queue entry from a payload the backend handed back with
 /// `SendOutcome::Busy`, so it can be requeued at the front.
 fn queued_entry_from_send_payload(payload: SendMessagePayload) -> QueuedMessageEntry {
@@ -10579,7 +11369,7 @@ async fn persist_agent_session(
     current_session_settings: &SessionSettingsValues,
     resolved_spawn_config: &customization::ResolvedSpawnConfig,
     pending_alias: &mut Option<InitialAgentAlias>,
-) -> Result<(), String> {
+) -> Result<Option<SessionRestoreState>, String> {
     let session = BackendSession {
         id: session_id.clone(),
         backend_kind: current_start.backend_kind,
@@ -10614,24 +11404,6 @@ async fn persist_agent_session(
         store
             .set_session_settings(session_id, current_session_settings.clone())
             .await?;
-        // Only a session that can actually be resumed earns a marker. Marking
-        // one that cannot means the next launch reconstructs it through the
-        // resume path, which rejects it and leaves the user a failed card to
-        // dismiss on every start. The same argument excludes a configuration
-        // resume cannot rebuild: an AI reviewer would come back as a plain user
-        // agent with none of its restrictions, which is worse than not coming
-        // back at all.
-        if session.resumable && resolved_spawn_config.is_rebuilt_by_resume() {
-            store
-                .set_restore_state(
-                    session_id,
-                    SessionRestoreState {
-                        origin: current_start.origin,
-                        workflow: current_start.workflow.clone(),
-                    },
-                )
-                .await?;
-        }
         if let Some(alias) = pending_alias.take() {
             match alias.persistence {
                 InitialAgentAliasPersistence::GeneratedIfNoUserAlias => {
@@ -10646,7 +11418,21 @@ async fn persist_agent_session(
         }
     }
 
-    Ok(())
+    // Only a session that can actually be resumed earns a marker. Marking one
+    // that cannot means the next launch reconstructs it through the resume
+    // path, which rejects it and leaves the user a failed card to dismiss on
+    // every start. The same argument excludes a configuration resume cannot
+    // rebuild: an AI reviewer would come back as a plain user agent with none
+    // of its restrictions, which is worse than not coming back at all.
+    Ok(
+        (session.resumable && resolved_spawn_config.is_rebuilt_by_resume()).then(|| {
+            SessionRestoreState {
+                agent_id: Some(current_start.agent_id.clone()),
+                origin: current_start.origin,
+                workflow: current_start.workflow.clone(),
+            }
+        }),
+    )
 }
 
 fn interrupted_tool_completion(completion: &ToolExecutionCompletedData) -> bool {
@@ -10872,6 +11658,13 @@ async fn append_chat_event_with_transcript_metadata(
     let replay_len_before = event_log.len();
     record_chat_event_for_replay(canonical_stream, event_log, replay_state, event);
     let persistence = if event_log.len() == replay_len_before
+        && replay_state.active_stream.is_some()
+        && matches!(
+            event,
+            ChatEvent::ToolRequest(_) | ChatEvent::ToolExecutionCompleted(_)
+        ) {
+        journal_open_stream_tool_event(replay_state.journal.as_ref(), event).await
+    } else if event_log.len() == replay_len_before
         && replay_state.active_stream.is_none()
         && matches!(event, ChatEvent::ToolProgress(_))
     {
@@ -11012,21 +11805,79 @@ async fn seed_existing_transcript_history(
     let records = tokio::task::spawn_blocking(move || store_for_load.load(&session_for_load))
         .await
         .map_err(|error| format!("resume transcript load task failed: {error}"))??;
-    for record in records.into_iter().filter(|record| {
-        matches!(
-            record.visibility,
+    let mut visible_tool_calls = HashSet::new();
+    let mut open_stream_events = Vec::new();
+    for record in records {
+        match record.visibility {
             crate::store::transcript::TranscriptVisibility::Visible
-                | crate::store::transcript::TranscriptVisibility::TimelineMarker
-        )
-    }) {
+            | crate::store::transcript::TranscriptVisibility::TimelineMarker => {
+                match &record.event {
+                    ChatEvent::ToolRequest(request) => {
+                        visible_tool_calls.insert(request.tool_call_id.clone());
+                    }
+                    ChatEvent::ToolExecutionCompleted(completion) => {
+                        visible_tool_calls.insert(completion.tool_call_id.clone());
+                    }
+                    _ => {}
+                }
+                event_log.push(replay_envelope(
+                    canonical_stream,
+                    event_log.len() as u64,
+                    FrameKind::ChatEvent,
+                    &record.event,
+                ));
+            }
+            crate::store::transcript::TranscriptVisibility::OpenStreamToolEvent => {
+                open_stream_events.push(record.event);
+            }
+            crate::store::transcript::TranscriptVisibility::InternalCompactionSeed
+            | crate::store::transcript::TranscriptVisibility::ProviderMetadata => {}
+        }
+    }
+    // The host stopped inside a response that never ended, so replay never
+    // materialized the tool calls it had already issued. Publish them now, in
+    // issue order, so the resume boundary sees every call the backend began.
+    let interrupted_calls = open_stream_events
+        .iter()
+        .filter_map(|event| match event {
+            ChatEvent::ToolRequest(request)
+                if !visible_tool_calls.contains(&request.tool_call_id) =>
+            {
+                Some(request.tool_call_id.clone())
+            }
+            _ => None,
+        })
+        .collect::<HashSet<_>>();
+    let interrupted_events = open_stream_events
+        .into_iter()
+        .filter(|event| match event {
+            ChatEvent::ToolRequest(request) => interrupted_calls.contains(&request.tool_call_id),
+            ChatEvent::ToolExecutionCompleted(completion) => {
+                interrupted_calls.contains(&completion.tool_call_id)
+            }
+            _ => false,
+        })
+        .collect::<Vec<_>>();
+    if interrupted_events.is_empty() {
+        return Ok(());
+    }
+    let start = event_log.len();
+    for event in &interrupted_events {
         event_log.push(replay_envelope(
             canonical_stream,
             event_log.len() as u64,
             FrameKind::ChatEvent,
-            &record.event,
+            event,
         ));
     }
-    Ok(())
+    journal_new_replay_records(
+        Some(&store.open_session(session_id)),
+        event_log,
+        start,
+        HashMap::new(),
+    )
+    .await
+    .map(|_| ())
 }
 
 async fn load_authoritative_completed_tool_call_ids(
@@ -11056,6 +11907,47 @@ async fn load_authoritative_completed_tool_call_ids(
         }
     }
     completed_tool_call_ids
+}
+
+/// Persist a tool event that replay is still holding inside an open response.
+/// The response's end, or its discard, journals it again as history; this
+/// hidden copy only matters when the host stops before either happens.
+async fn journal_open_stream_tool_event(
+    journal: Option<&Arc<SessionJournal>>,
+    event: &ChatEvent,
+) -> Result<Option<crate::store::transcript::TranscriptAppend>, String> {
+    let Some(journal) = journal.cloned() else {
+        return Ok(None);
+    };
+    let session_id = journal.session_id().clone();
+    let record = crate::store::transcript::TranscriptRecord {
+        logical_session_id: session_id.clone(),
+        sequence: 0,
+        event_id: uuid::Uuid::new_v4().to_string(),
+        visibility: crate::store::transcript::TranscriptVisibility::OpenStreamToolEvent,
+        provider_identity: None,
+        event: event.clone(),
+        timestamp_ms: now_ms(),
+    };
+    match tokio::task::spawn_blocking(move || journal.append_live_records(vec![record])).await {
+        Ok(Ok(outcome)) => Ok(Some(outcome)),
+        Ok(Err(error)) => {
+            tracing::warn!(
+                session_id = %session_id,
+                %error,
+                "failed to append open-response tool record"
+            );
+            Err(error)
+        }
+        Err(error) => {
+            tracing::warn!(
+                session_id = %session_id,
+                %error,
+                "open-response tool persistence task failed"
+            );
+            Err(error.to_string())
+        }
+    }
 }
 
 async fn journal_new_replay_records(
@@ -11313,10 +12205,121 @@ async fn flush_pending_agent_attaches(
     }
 }
 
+fn restart_continuation_message(children: &[AgentId]) -> String {
+    let mut message = String::from(
+        "Tyde restarted while you were working. Continue from where you stopped; if the task was already complete, say so briefly.",
+    );
+    if !children.is_empty() {
+        let ids = children
+            .iter()
+            .map(|id| id.0.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        message.push_str(&format!(
+            " Your child agents were restored with the same agent ids ({ids}): reuse them through tyde_list_agents and tyde_await_agents, and do not spawn replacements."
+        ));
+    }
+    message.push_str(
+        " Tools you called before the restart may already have completed even though their results were lost, so inspect results and current state before repeating any side effects. This is a host recovery notice, not a user answer or approval: if you were waiting on a user answer or approval, ask again and wait.",
+    );
+    message
+}
+
+enum InitialFollowUpDispatch {
+    Sent,
+    /// Not delivered; the restart continuation stays pending with its origin.
+    Retained(SendMessagePayload),
+    Terminated,
+}
+
 async fn send_initial_follow_up_or_park(
     input: SendMessagePayload,
     context: InitialFollowUpContext<'_>,
-) -> bool {
+) -> InitialFollowUpDispatch {
+    let host_restart = input.origin == Some(MessageOrigin::HostRestart);
+    let admission = context
+        .status_handle
+        .admit_dispatch(if host_restart {
+            registry::DispatchClass::RestartContinuation
+        } else {
+            registry::DispatchClass::Turn
+        })
+        .await;
+    if admission == registry::DispatchAdmission::Unrecorded {
+        tracing::error!(
+            agent_id = %context.current_start.agent_id,
+            host_restart,
+            "initial follow-up could not be recorded in flight; not sending it"
+        );
+        if host_restart {
+            append_chat_event(
+                context.canonical_stream,
+                context.event_log,
+                context.subscribers,
+                context.replay_state,
+                &ChatEvent::RestartRecovery {
+                    phase: protocol::RestartRecoveryPhase::ContinuationFailed {
+                        message: DELIVERY_REJECTED_UNRECORDED.to_owned(),
+                    },
+                },
+            )
+            .await;
+            context.status_handle.abandon_restart_continuation();
+        } else {
+            append_event(
+                context.canonical_stream,
+                context.event_log,
+                context.subscribers,
+                FrameKind::AgentError,
+                &unrecorded_input_rejected_payload(&context.current_start.agent_id),
+            )
+            .await;
+        }
+        context
+            .status_handle
+            .update(|status| {
+                status.is_thinking = false;
+                status.turn_completed = true;
+                status.activity_counter = status.activity_counter.saturating_add(1);
+            })
+            .await;
+        return InitialFollowUpDispatch::Sent;
+    }
+    if admission != registry::DispatchAdmission::Admitted {
+        tracing::info!(
+            agent_id = %context.current_start.agent_id,
+            ?admission,
+            "restart dispatch barrier held the initial follow-up"
+        );
+        if host_restart {
+            return InitialFollowUpDispatch::Retained(input);
+        }
+        let sequence = *context.next_queue_sequence;
+        *context.next_queue_sequence = (*context.next_queue_sequence).saturating_add(1);
+        context.queue.push_front(SequencedQueuedMessage {
+            sequence,
+            entry: queued_entry_from_send_payload(input),
+        });
+        update_queued_messages_snapshot(
+            context.canonical_stream,
+            context.event_log,
+            context.subscribers,
+            context.queue,
+            context.session_store,
+            context.status_handle,
+        )
+        .await;
+        return InitialFollowUpDispatch::Sent;
+    }
+    let restart_template = host_restart.then(|| input.clone());
+    let input = if host_restart {
+        SendMessagePayload {
+            message: restart_continuation_message(&context.status_handle.restored_children()),
+            ..input
+        }
+    } else {
+        input
+    };
     tracing::info!(
         agent_id = %context.current_start.agent_id,
         "dispatching initial resumed-session follow-up"
@@ -11339,10 +12342,33 @@ async fn send_initial_follow_up_or_park(
                 "initial resumed-session follow-up accepted by backend"
             );
             mark_agent_turn_active(context.status_handle).await;
-            return true;
+            if host_restart {
+                append_chat_event(
+                    context.canonical_stream,
+                    context.event_log,
+                    context.subscribers,
+                    context.replay_state,
+                    &ChatEvent::RestartRecovery {
+                        phase: protocol::RestartRecoveryPhase::Continuing,
+                    },
+                )
+                .await;
+                context.status_handle.restart_continuation_delivered();
+            }
+            return InitialFollowUpDispatch::Sent;
         }
         SendOutcome::Busy(input) => {
             mark_agent_turn_active(context.status_handle).await;
+            if let Some(template) = restart_template {
+                // The provider is running a turn of its own. The continuation
+                // was not delivered, so it stays pending and is sent once
+                // that turn ends.
+                tracing::info!(
+                    agent_id = %context.current_start.agent_id,
+                    "backend busy; restart continuation retained until it is idle"
+                );
+                return InitialFollowUpDispatch::Retained(template);
+            }
             if let AgentInput::SendMessage(payload) = input {
                 tracing::info!(
                     agent_id = %context.current_start.agent_id,
@@ -11369,7 +12395,7 @@ async fn send_initial_follow_up_or_park(
                     "backend handed back a non-message input as Busy"
                 );
             }
-            return true;
+            return InitialFollowUpDispatch::Sent;
         }
         SendOutcome::Closed => {}
     }
@@ -11417,9 +12443,10 @@ async fn send_initial_follow_up_or_park(
         context.subscribers,
         context.pending_inputs,
         context.rx,
+        context.status_handle,
     )
     .await;
-    false
+    InitialFollowUpDispatch::Terminated
 }
 
 async fn terminalize_closed_queue_dispatch(context: QueueDispatchTerminalContext<'_>) {
@@ -11478,6 +12505,7 @@ async fn terminalize_closed_queue_dispatch(context: QueueDispatchTerminalContext
         context.subscribers,
         context.pending_inputs,
         context.rx,
+        context.status_handle,
     )
     .await;
 }
@@ -11520,6 +12548,20 @@ fn remember_slash_commands(latest: &mut Option<protocol::SlashCommandCatalog>, e
     }
 }
 
+async fn restart_barrier_rejection(
+    status_handle: &registry::AgentStatusHandle,
+    class: registry::DispatchClass,
+) -> Option<String> {
+    match status_handle.admit_dispatch(class).await {
+        registry::DispatchAdmission::Admitted => None,
+        registry::DispatchAdmission::HostStopping => Some("Tyde is restarting".to_owned()),
+        registry::DispatchAdmission::RecoveryPending => {
+            Some(DELIVERY_REJECTED_RECOVERY_PENDING.to_owned())
+        }
+        registry::DispatchAdmission::Unrecorded => Some(DELIVERY_REJECTED_UNRECORDED.to_owned()),
+    }
+}
+
 async fn mark_agent_turn_active(status_handle: &registry::AgentStatusHandle) {
     status_handle
         .update(|status| status.last_error = None)
@@ -11527,8 +12569,15 @@ async fn mark_agent_turn_active(status_handle: &registry::AgentStatusHandle) {
     status_handle
         .persist_recovery(Some(crate::store::session::TurnRecovery::InFlight))
         .await;
+    mark_agent_work_pending(status_handle).await;
+}
+
+/// Shows accepted work as active without recording a turn in flight: the work
+/// is only queued, so a restart must redeliver it rather than continue it.
+async fn mark_agent_work_pending(status_handle: &registry::AgentStatusHandle) {
     status_handle
         .update(|status| {
+            status.last_error = None;
             status.is_thinking = true;
             status.turn_completed = false;
             status.activity_counter = status.activity_counter.saturating_add(1);
@@ -11644,8 +12693,14 @@ fn record_chat_event_for_replay(
 ) {
     match event {
         ChatEvent::StreamStart(start) => {
-            if replay_state.active_stream.take().is_some() {
+            if let Some(stream) = replay_state.active_stream.take() {
                 tracing::warn!("replacing an unterminated response with a new StreamStart");
+                push_stream_tool_events_to_replay_log(
+                    canonical_stream,
+                    event_log,
+                    replay_state,
+                    stream.tool_events,
+                );
             }
             replay_state.active_stream = Some(ReplayActiveStream {
                 start: start.clone(),
@@ -11695,19 +12750,12 @@ fn record_chat_event_for_replay(
                     &ChatEvent::StreamDelta(StreamTextDeltaData { text: stream.text }),
                 );
             }
-            for tool_event in stream.tool_events {
-                if let ChatEvent::ToolProgress(progress) = &tool_event {
-                    coalesce_progress_into_replay_log(
-                        canonical_stream,
-                        event_log,
-                        replay_state,
-                        progress.tool_call_id.clone(),
-                        &tool_event,
-                    );
-                } else {
-                    push_chat_event_to_replay_log(canonical_stream, event_log, &tool_event);
-                }
-            }
+            push_stream_tool_events_to_replay_log(
+                canonical_stream,
+                event_log,
+                replay_state,
+                stream.tool_events,
+            );
             push_chat_event_to_replay_log(
                 canonical_stream,
                 event_log,
@@ -11819,8 +12867,14 @@ fn record_chat_event_for_replay(
             if *typing {
                 replay_state.operation_cancelled = false;
                 replay_state.resume_history_settled_idle = false;
-            } else if replay_state.active_stream.take().is_some() {
+            } else if let Some(stream) = replay_state.active_stream.take() {
                 tracing::warn!("discarding an unterminated response when the agent became idle");
+                push_stream_tool_events_to_replay_log(
+                    canonical_stream,
+                    event_log,
+                    replay_state,
+                    stream.tool_events,
+                );
             }
             push_chat_event_to_replay_log(canonical_stream, event_log, event);
         }
@@ -11837,6 +12891,30 @@ fn record_chat_event_for_replay(
         | ChatEvent::Orchestration(_)
         | ChatEvent::ContextCompaction(_) => {
             push_chat_event_to_replay_log(canonical_stream, event_log, event);
+        }
+    }
+}
+
+/// Tool calls a response issued already reached live subscribers and the
+/// journal, so they stay in history even when the response's text is
+/// discarded; replay then shows the same calls a live client saw.
+fn push_stream_tool_events_to_replay_log(
+    canonical_stream: &str,
+    event_log: &mut Vec<Envelope>,
+    replay_state: &mut AgentReplayState,
+    tool_events: Vec<ChatEvent>,
+) {
+    for tool_event in tool_events {
+        if let ChatEvent::ToolProgress(progress) = &tool_event {
+            coalesce_progress_into_replay_log(
+                canonical_stream,
+                event_log,
+                replay_state,
+                progress.tool_call_id.clone(),
+                &tool_event,
+            );
+        } else {
+            push_chat_event_to_replay_log(canonical_stream, event_log, &tool_event);
         }
     }
 }
@@ -12535,7 +13613,7 @@ async fn release_context_compaction_barrier(
     review_registry: &ReviewRegistryHandle,
     usage_paused: bool,
 ) -> QueuedMessageDispatchOutcome {
-    if *in_turn || usage_paused || status_handle.restarting() {
+    if *in_turn || usage_paused {
         return QueuedMessageDispatchOutcome::Empty;
     }
     dispatch_queued_message(QueuedMessageDispatchContext {
@@ -12557,6 +13635,8 @@ async fn release_context_compaction_barrier(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum QueuedMessageDispatchOutcome {
     Empty,
+    /// The restart dispatch barrier kept the queue in place.
+    Held,
     Accepted,
     Busy,
     Closed,
@@ -12579,6 +13659,17 @@ struct QueuedMessageDispatchContext<'a> {
 async fn dispatch_queued_message(
     context: QueuedMessageDispatchContext<'_>,
 ) -> QueuedMessageDispatchOutcome {
+    if context.queue.is_empty() {
+        return QueuedMessageDispatchOutcome::Empty;
+    }
+    if context
+        .status_handle
+        .admit_dispatch(registry::DispatchClass::Turn)
+        .await
+        != registry::DispatchAdmission::Admitted
+    {
+        return QueuedMessageDispatchOutcome::Held;
+    }
     let Some(queued) = context.queue.pop_front() else {
         return QueuedMessageDispatchOutcome::Empty;
     };
@@ -12756,6 +13847,14 @@ async fn try_dispatch_context_compaction(
         readiness.pending_tool_response_ids,
         readiness.background_mutation_active,
     ) {
+        return;
+    }
+    if context
+        .status_handle
+        .admit_dispatch(registry::DispatchClass::Internal)
+        .await
+        != registry::DispatchAdmission::Admitted
+    {
         return;
     }
 

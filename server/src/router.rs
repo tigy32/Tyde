@@ -594,6 +594,12 @@ pub(crate) async fn route_client_envelope(
                 let stream_path = envelope.stream.clone();
                 let agent_id = parse_agent_id(&stream_path)?;
                 let payload: SendMessagePayload = parse_payload(&envelope, "send_message")?;
+                if payload.origin == Some(protocol::MessageOrigin::HostRestart) {
+                    return Err(AppError::invalid(
+                        "send_message",
+                        "host restart origin is reserved for the server",
+                    ));
+                }
                 validate_message_images("send_message", payload.images.as_deref())?;
 
                 deliver_agent_input(
@@ -609,6 +615,12 @@ pub(crate) async fn route_client_envelope(
                 let stream_path = envelope.stream.clone();
                 let agent_id = parse_agent_id(&stream_path)?;
                 let payload: SendMessagePayload = parse_payload(&envelope, "steer_message")?;
+                if payload.origin == Some(protocol::MessageOrigin::HostRestart) {
+                    return Err(AppError::invalid(
+                        "steer_message",
+                        "host restart origin is reserved for the server",
+                    ));
+                }
                 validate_message_images("steer_message", payload.images.as_deref())?;
 
                 deliver_agent_input(

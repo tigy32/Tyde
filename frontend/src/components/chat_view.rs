@@ -1918,44 +1918,133 @@ mod wasm_tests {
     }
 
     #[wasm_bindgen_test]
-    async fn restart_notices_render_each_server_phase() {
+    async fn restart_recovery_renders_ordered_notices_without_user_bubbles() {
         use protocol::{RestartInterruptionCause as Cause, RestartRecoveryPhase as Phase};
+        ensure_styles_loaded();
         let container = make_container();
-        let notice = ArcRwSignal::new(ChatNotice::RestartRecovery(Phase::Interrupted {
-            cause: Cause::HostRestart,
+        let state_handle = std::rc::Rc::new(std::cell::RefCell::new(None::<AppState>));
+        let setup_handle = state_handle.clone();
+        let agent_id = AgentId("agent-restart-recovery".to_owned());
+        let bound = ActiveAgentRef {
+            host_id: "host-restart-recovery".to_owned(),
+            agent_id: agent_id.clone(),
+        };
+        let bound_for_mount = bound.clone();
+        let handle = mount_to(container.clone(), move || {
+            let state = AppState::new();
+            *setup_handle.borrow_mut() = Some(state.clone());
+            provide_context(state);
+            view! {
+                <ChatView
+                    tab_id=TabId(10_006)
+                    agent_ref=Signal::derive(move || Some(bound_for_mount.clone()))
+                    is_active=Signal::derive(|| true)
+                />
+            }
+        });
+        next_tick().await;
+        let state = state_handle.borrow().clone().expect("mounted state");
+        let dispatch = |event| {
+            crate::dispatch::apply_chat_event(&state, &bound.host_id, &agent_id, event);
+        };
+        let assistant = |text: &str| {
+            let mut message = mk_user_msg(text).message;
+            message.sender = MessageSender::Assistant {
+                agent: "claude".to_owned(),
+            };
+            message
+        };
+
+        dispatch(ChatEvent::MessageAdded(
+            mk_user_msg("Fix the failing build").message,
+        ));
+        dispatch(ChatEvent::MessageAdded(assistant("Reading the build log")));
+        dispatch(ChatEvent::RestartRecovery {
+            phase: Phase::Interrupted {
+                cause: Cause::HostRestart,
+            },
+        });
+        dispatch(ChatEvent::RestartRecovery {
+            phase: Phase::Continuing,
+        });
+        dispatch(ChatEvent::StreamStart(protocol::StreamStartData {
+            agent: "claude".to_owned(),
+            model: None,
         }));
-        let for_view = notice.clone();
-        let handle = mount_to(
-            container.clone(),
-            move || view! { <ChatNoticeView notice=for_view /> },
+        dispatch(ChatEvent::StreamDelta(protocol::StreamTextDeltaData {
+            text: "The build is fixed.".to_owned(),
+        }));
+        dispatch(ChatEvent::StreamEnd(protocol::StreamEndData {
+            message: assistant("The build is fixed."),
+        }));
+        dispatch(ChatEvent::RestartRecovery {
+            phase: Phase::Interrupted {
+                cause: Cause::UnexpectedStop,
+            },
+        });
+        dispatch(ChatEvent::RestartRecovery {
+            phase: Phase::ContinuationFailed {
+                message: "Backend unavailable".to_owned(),
+            },
+        });
+        next_tick().await;
+        next_animation_frame().await;
+
+        let rows = message_rows(&container);
+        let texts = rows
+            .iter()
+            .map(|row| row.text_content().unwrap_or_default())
+            .collect::<Vec<_>>();
+        console_log!("Restart recovery transcript rows: {texts:?}");
+        assert_eq!(
+            rows.len(),
+            7,
+            "each message and each server recovery phase is exactly one row: {texts:?}"
         );
-        for (phase, expected) in [
-            (
-                Phase::Interrupted {
-                    cause: Cause::HostRestart,
-                },
-                "This turn was interrupted because the host restarted.",
-            ),
-            (
-                Phase::Interrupted {
-                    cause: Cause::UnexpectedStop,
-                },
-                "This turn was interrupted because the host stopped unexpectedly.",
-            ),
-            (
-                Phase::Continuing,
-                "Continuing the interrupted turn after restart.",
-            ),
-            (
-                Phase::ContinuationFailed {
-                    message: "Backend unavailable".to_owned(),
-                },
-                "Could not continue the interrupted turn: Backend unavailable",
-            ),
-        ] {
-            notice.set(ChatNotice::RestartRecovery(phase));
-            next_tick().await;
-            assert_eq!(container.text_content().unwrap().trim(), expected);
+        assert!(texts[0].contains("Fix the failing build"), "{texts:?}");
+        assert!(texts[1].contains("Reading the build log"), "{texts:?}");
+        assert_eq!(
+            texts[2].trim(),
+            "This turn was interrupted because the host restarted."
+        );
+        assert_eq!(
+            texts[3].trim(),
+            "Continuing the interrupted turn after restart."
+        );
+        assert!(texts[4].contains("The build is fixed."), "{texts:?}");
+        assert_eq!(
+            texts[5].trim(),
+            "This turn was interrupted because the host stopped unexpectedly."
+        );
+        assert_eq!(
+            texts[6].trim(),
+            "Could not continue the interrupted turn: Backend unavailable"
+        );
+
+        let senders = rows
+            .iter()
+            .map(|row| {
+                row.query_selector(".chat-card-sender")
+                    .unwrap()
+                    .and_then(|label| label.text_content())
+                    .unwrap_or_default()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            senders
+                .iter()
+                .filter(|sender| sender.trim() == "You")
+                .count(),
+            1,
+            "only the real user message renders as a user bubble; the server-composed \
+             continuation must never appear as one: {senders:?}"
+        );
+        assert_eq!(senders[0].trim(), "You");
+        for index in [2, 3, 5, 6] {
+            assert!(
+                senders[index].is_empty(),
+                "recovery notice row {index} carries no sender label: {senders:?}"
+            );
         }
         drop(handle);
         container.remove();

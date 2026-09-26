@@ -139,11 +139,80 @@ pub fn AgentsView() -> impl IntoView {
                     if segment.get() == AgentsSegment::Teams {
                         return view! { <TeamsView /> }.into_any();
                     }
-                    render_agents_body(&state, hide_sub_agents, collapsed_parents)
+                    view! {
+                        <AgentRestorationNotice />
+                        {render_agents_body(&state, hide_sub_agents, collapsed_parents)}
+                    }
+                    .into_any()
                 }}
                 </div>
             </div>
         </div>
+    }
+}
+
+fn restored_agent_label(agent: &protocol::RestoredAgentRef) -> String {
+    match agent {
+        protocol::RestoredAgentRef::Session {
+            session_id, name, ..
+        } => name
+            .clone()
+            .unwrap_or_else(|| format!("session {}", session_id.0)),
+        protocol::RestoredAgentRef::StartupReservation { agent_id, name } => {
+            name.clone().unwrap_or_else(|| format!("agent {agent_id}"))
+        }
+    }
+}
+
+fn restoration_failure_text(failure: &protocol::AgentRestorationFailure) -> String {
+    let reason = match &failure.reason {
+        protocol::AgentRestorationFailureReason::ReconstructFailed { message } => message.clone(),
+        protocol::AgentRestorationFailureReason::ParentNotRestored => {
+            "its parent agent was not restored".to_owned()
+        }
+    };
+    let mut text = format!("{}: {reason}.", restored_agent_label(&failure.agent));
+    if !failure.skipped.is_empty() {
+        let skipped = failure
+            .skipped
+            .iter()
+            .map(restored_agent_label)
+            .collect::<Vec<_>>()
+            .join(", ");
+        text.push_str(&format!(" Also not restored: {skipped}."));
+    }
+    text.push_str(match failure.retry {
+        protocol::AgentRestorationRetry::NextLaunch => " Restore will be retried on next launch.",
+        protocol::AgentRestorationRetry::Abandoned => " It will not be restored.",
+    });
+    text
+}
+
+#[component]
+fn AgentRestorationNotice() -> impl IntoView {
+    let state = use_context::<AppState>().unwrap();
+    move || {
+        let host = state.active_local_host_id.get()?;
+        let failures = state
+            .agent_restoration_failures_by_host
+            .with(|map| map.get(&host).cloned())?;
+        Some(view! {
+            <div
+                class="agent-restoration-notice"
+                role="alert"
+                data-mobile-test="agent-restoration-notice"
+            >
+                <p class="agent-restoration-notice-title">
+                    "Some open agents could not be restored."
+                </p>
+                <ul class="agent-restoration-notice-list">
+                    {failures
+                        .iter()
+                        .map(|failure| view! { <li>{restoration_failure_text(failure)}</li> })
+                        .collect_view()}
+                </ul>
+            </div>
+        })
     }
 }
 
@@ -932,6 +1001,87 @@ mod wasm_tests {
             status_text(),
             "Idle",
             "answering or cancelling settles the row back to idle"
+        );
+    }
+
+    /// A restoration pass that could not bring an agent back is announced on
+    /// the agents list, naming the failed agent, its skipped children and the
+    /// deferred retry, whether the host reports it in its bootstrap or as a
+    /// live status, and the notice disappears when the host reports no
+    /// failures.
+    #[wasm_bindgen_test]
+    async fn agents_restoration_failures_name_the_skipped_subtree_until_cleared() {
+        let host = LocalHostId("host-restore".to_owned());
+        let failure = protocol::AgentRestorationFailure {
+            agent: protocol::RestoredAgentRef::Session {
+                session_id: protocol::SessionId("parent-session".to_owned()),
+                agent_id: Some(AgentId("parent-agent".to_owned())),
+                name: Some("failing parent".to_owned()),
+            },
+            reason: protocol::AgentRestorationFailureReason::ReconstructFailed {
+                message: "backend refused the resume".to_owned(),
+            },
+            retry: protocol::AgentRestorationRetry::NextLaunch,
+            skipped: vec![protocol::RestoredAgentRef::Session {
+                session_id: protocol::SessionId("child-session".to_owned()),
+                agent_id: None,
+                name: None,
+            }],
+        };
+        let state = AppState::new();
+        state.active_local_host_id.set(Some(host.clone()));
+        let bootstrap_failure = failure.clone();
+        crate::dispatch::prime_host_with_bootstrap_for_tests(&state, &host, move |bootstrap| {
+            bootstrap.agent_restoration_failures = vec![bootstrap_failure];
+        });
+
+        let container = make_container();
+        let state_for_mount = state.clone();
+        let _h = mount_to(container.clone(), move || {
+            provide_context(state_for_mount.clone());
+            view! { <AgentsView /> }
+        });
+        next_tick().await;
+
+        let expected = "Some open agents could not be restored.\
+             failing parent: backend refused the resume. \
+             Also not restored: session child-session. \
+             Restore will be retried on next launch.";
+        let notice_text = || {
+            container
+                .query_selector("[role='alert']")
+                .unwrap()
+                .map(|alert| alert.text_content().unwrap_or_default())
+        };
+        assert_eq!(
+            notice_text().as_deref(),
+            Some(expected),
+            "the bootstrap's restoration failure is announced"
+        );
+
+        let restoration_status = |failures, seq| {
+            crate::dispatch::dispatch_envelope(
+                &state,
+                &host,
+                protocol::Envelope::from_payload(
+                    StreamPath(format!("/host/{}", host.0)),
+                    protocol::FrameKind::AgentRestorationStatus,
+                    seq,
+                    &protocol::AgentRestorationStatusPayload { failures },
+                )
+                .unwrap(),
+            );
+        };
+        restoration_status(vec![], 0);
+        next_tick().await;
+        assert_eq!(notice_text(), None, "a cleared status removes the notice");
+
+        restoration_status(vec![failure], 1);
+        next_tick().await;
+        assert_eq!(
+            notice_text().as_deref(),
+            Some(expected),
+            "a live restoration status is announced"
         );
     }
 

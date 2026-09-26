@@ -173,6 +173,7 @@ impl CodexCommandHandle {
         let Some(tool_call_id) = tool_call_id else {
             return self
                 .execute(SessionCommand::SendMessage {
+                    origin: payload.origin,
                     message: payload.message,
                     images: protocol_images_to_attachments(payload.images),
                 })
@@ -8198,13 +8199,21 @@ impl CodexInner {
 
     async fn execute(&self, command: SessionCommand) -> Result<(), String> {
         match command {
-            SessionCommand::SendMessage { message, images } => {
-                self.emit_user_message_added(&message, images.as_deref());
+            SessionCommand::SendMessage {
+                message,
+                images,
+                origin,
+            } => {
+                if origin != Some(protocol::MessageOrigin::HostRestart) {
+                    self.emit_user_message_added(&message, images.as_deref());
+                }
                 // UI contract: show typing immediately when a user turn is submitted,
                 // without waiting for Codex to acknowledge turn/started.
                 self.emitter.typing_status_changed(true);
 
-                if self.respond_pending_request(&message).await? {
+                if origin != Some(protocol::MessageOrigin::HostRestart)
+                    && self.respond_pending_request(&message).await?
+                {
                     return Ok(());
                 }
                 if let Some(command) = codex_slash_commands().invoked_by(&message) {
@@ -20158,6 +20167,7 @@ impl CodexBackend {
                 crate::backend::subprocess::spawn(async move {
                     let result = initial_turn_handle
                         .execute(SessionCommand::SendMessage {
+                            origin: None,
                             message: initial_input.message,
                             images,
                         })
@@ -21664,6 +21674,7 @@ impl Backend for CodexBackend {
 
             let images = protocol_images_to_attachments(initial_input.images);
             let initial_prompt = handle.execute(SessionCommand::SendMessage {
+                origin: None,
                 message: initial_input.message,
                 images,
             });

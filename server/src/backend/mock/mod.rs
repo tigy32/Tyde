@@ -35,7 +35,10 @@ use emit::{MockEventSender, WeakMockEventSender};
 
 pub use control::{MockControl, MockRequest, MockViolation};
 pub use gate::MockGateHandle;
-pub use script::{MockCompactionFailure, MockLaunch, MockResumeReplay, MockScript, MockTurn};
+pub use script::{
+    AbandonedResponse, MockCompactionFailure, MockLaunch, MockResumeReplay, MockScript, MockTurn,
+    RunningCommandShape,
+};
 
 #[cfg(any(test, feature = "test-support"))]
 #[derive(Debug, Clone)]
@@ -90,6 +93,22 @@ struct MockSessionRecord {
     updated_at_ms: u64,
 }
 
+#[cfg(any(test, feature = "test-support"))]
+fn accepted_messages() -> &'static Mutex<Vec<(SessionId, protocol::SendMessagePayload)>> {
+    static LOG: OnceLock<Mutex<Vec<(SessionId, protocol::SendMessagePayload)>>> = OnceLock::new();
+    LOG.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Every message a mock backend in this process accepted from the server,
+/// across all sessions, in the order the server handed them over.
+#[cfg(any(test, feature = "test-support"))]
+pub fn accepted_messages_in_order() -> Vec<(SessionId, protocol::SendMessagePayload)> {
+    accepted_messages()
+        .lock()
+        .expect("mock accepted message log mutex poisoned")
+        .clone()
+}
+
 fn session_store() -> &'static Mutex<HashMap<String, MockSessionRecord>> {
     static STORE: OnceLock<Mutex<HashMap<String, MockSessionRecord>>> = OnceLock::new();
     STORE.get_or_init(|| Mutex::new(HashMap::new()))
@@ -110,6 +129,7 @@ pub struct MockBackend {
     controlled_resume_replay: Option<MockResumeReplay>,
     mid_turn_steering: bool,
     shutdown_gate: Option<gate::MockGate>,
+    send_gate: Option<gate::MockGate>,
     compaction_observation_gates: Option<(gate::MockGate, gate::MockGate)>,
     compaction_failure: Mutex<Option<MockCompactionFailure>>,
 }
@@ -142,6 +162,7 @@ impl MockBackend {
         let scripted_busy_self_turn = launch_script.busy_self_turn_once;
         let mid_turn_steering = launch_script.mid_turn_steering;
         let shutdown_gate = launch_script.shutdown_gate.clone();
+        let send_gate = launch_script.send_gate.clone();
         let compaction_observation_gates = launch_script.compaction_observation_gates.clone();
         let compaction_failure = Mutex::new(launch_script.compaction_failure);
         let initial_message = initial_input.message;
@@ -220,6 +241,7 @@ impl MockBackend {
                 controlled_resume_replay: None,
                 mid_turn_steering,
                 shutdown_gate: shutdown_gate.clone(),
+                send_gate: send_gate.clone(),
                 compaction_observation_gates: compaction_observation_gates.clone(),
                 compaction_failure,
             },
@@ -243,6 +265,7 @@ impl MockBackend {
         let scripted_busy_self_turn = launch_script.busy_self_turn_once;
         let mid_turn_steering = launch_script.mid_turn_steering;
         let shutdown_gate = launch_script.shutdown_gate.clone();
+        let send_gate = launch_script.send_gate.clone();
         let compaction_observation_gates = launch_script.compaction_observation_gates.clone();
         let compaction_failure = Mutex::new(launch_script.compaction_failure);
         let agent_control_await_mcp = emit::agent_control_await_mcp(&config.startup_mcp_servers);
@@ -291,6 +314,8 @@ impl MockBackend {
         if let Some(replay) = &resume_replay {
             replay.bind(backend_events_tx.clone());
         }
+        let send_gate =
+            send_gate.or_else(|| resume_replay.as_ref().and_then(MockResumeReplay::send_gate));
         let events_tx = MockEventSender::new(backend_events_tx);
         let subagent_emitter = config.subagent_emitter.clone();
         let (control, control_rx, terminal_report) = MockControl::channel();
@@ -310,6 +335,7 @@ impl MockBackend {
                     controlled_resume_replay: resume_replay.clone(),
                     mid_turn_steering,
                     shutdown_gate: shutdown_gate.clone(),
+                    send_gate: send_gate.clone(),
                     compaction_observation_gates: compaction_observation_gates.clone(),
                     compaction_failure,
                 },
@@ -383,6 +409,7 @@ impl MockBackend {
                 controlled_resume_replay,
                 mid_turn_steering,
                 shutdown_gate: shutdown_gate.clone(),
+                send_gate: send_gate.clone(),
                 compaction_observation_gates: compaction_observation_gates.clone(),
                 compaction_failure,
             },
@@ -410,6 +437,7 @@ impl MockBackend {
         let scripted_busy_self_turn = launch_script.busy_self_turn_once;
         let mid_turn_steering = launch_script.mid_turn_steering;
         let shutdown_gate = launch_script.shutdown_gate.clone();
+        let send_gate = launch_script.send_gate.clone();
         let compaction_observation_gates = launch_script.compaction_observation_gates.clone();
         let compaction_failure = Mutex::new(launch_script.compaction_failure);
         let initial_message = initial_input.message;
@@ -491,6 +519,7 @@ impl MockBackend {
                 controlled_resume_replay: None,
                 mid_turn_steering,
                 shutdown_gate: shutdown_gate.clone(),
+                send_gate: send_gate.clone(),
                 compaction_observation_gates: compaction_observation_gates.clone(),
                 compaction_failure,
             },
@@ -814,7 +843,20 @@ impl Backend for MockBackend {
         {
             return false;
         }
-        self.command_tx.send(MockCommand::Input(input)).is_ok()
+        #[cfg(any(test, feature = "test-support"))]
+        let accepted_message = match &input {
+            AgentInput::SendMessage(payload) => Some(payload.clone()),
+            _ => None,
+        };
+        let accepted = self.command_tx.send(MockCommand::Input(input)).is_ok();
+        #[cfg(any(test, feature = "test-support"))]
+        if accepted && let Some(payload) = accepted_message {
+            accepted_messages()
+                .lock()
+                .expect("mock accepted message log mutex poisoned")
+                .push((self.session_id.clone(), payload));
+        }
+        accepted
     }
 
     async fn send_with_outcome(&self, input: AgentInput) -> crate::backend::SendOutcome {
@@ -841,6 +883,13 @@ impl Backend for MockBackend {
             && !self
                 .busy_self_turn_fired
                 .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            let _ = self.command_tx.send(MockCommand::EmitBusySelfTurn);
+            return SendOutcome::Busy(input);
+        }
+        if matches!(input, AgentInput::SendMessage(_))
+            && let Some(gate) = self.send_gate.as_ref()
+            && gate.wait().await
         {
             let _ = self.command_tx.send(MockCommand::EmitBusySelfTurn);
             return SendOutcome::Busy(input);

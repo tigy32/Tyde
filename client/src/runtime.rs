@@ -155,6 +155,7 @@ pub enum HostEvent {
     MobilePairingOffer(MobilePairingOfferPayload),
     TeamNotify(TeamNotifyPayload),
     TeamsStoreStatusNotify(protocol::TeamsStoreStatusNotifyPayload),
+    AgentRestorationStatus(protocol::AgentRestorationStatusPayload),
     TeamMemberNotify(TeamMemberNotifyPayload),
     TeamMemberBindingNotify(TeamMemberBindingNotifyPayload),
     TeamPresetCatalogNotify(TeamPresetCatalogNotifyPayload),
@@ -1146,6 +1147,16 @@ async fn handle_host_envelope(
             };
             let _ = host_tx
                 .send(HostEvent::TeamsStoreStatusNotify(payload))
+                .await;
+            true
+        }
+        FrameKind::AgentRestorationStatus => {
+            let payload: protocol::AgentRestorationStatusPayload = match envelope.parse_payload() {
+                Ok(payload) => payload,
+                Err(_) => return false,
+            };
+            let _ = host_tx
+                .send(HostEvent::AgentRestorationStatus(payload))
                 .await;
             true
         }
