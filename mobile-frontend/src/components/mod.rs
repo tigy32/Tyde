@@ -72,3 +72,5 @@ pub(crate) mod test_styles {
             .unwrap();
     }
 }
+
+pub(crate) use chat_input::{SendDiagnosticsSurface, initialize_send_diagnostics};

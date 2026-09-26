@@ -3285,6 +3285,9 @@ class WasmToolScriptTests(unittest.TestCase):
         driver = binaries / "chromedriver"
         runner = binaries / "wasm-bindgen-test-runner"
         cargo = binaries / "cargo"
+        npm = binaries / "npm"
+        npm.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+        npm.chmod(0o755)
         record = root / "cargo-invocations.txt"
         chrome.write_text(
             "#!/usr/bin/env bash\necho 'Google Chrome 150.0.7871.102'\n",

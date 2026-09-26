@@ -739,6 +739,9 @@ mod wasm_tests {
     /// move a running chat off whatever model it was spawned on.
     #[wasm_bindgen_test]
     async fn editing_a_live_agents_setting_sends_it_to_that_agent() {
+        // Previously mounted flows can still have queued error sends. Settle
+        // those before this edit flow takes ownership of outbound capture.
+        next_tick().await;
         let _guard = crate::bridge::test_capture_sends();
         let container = make_container();
         let state = AppState::new();
@@ -785,7 +788,7 @@ mod wasm_tests {
         next_tick().await;
 
         let lines = crate::bridge::test_sent_lines();
-        assert_eq!(lines.len(), 1, "one edit is one frame, got: {lines:?}");
+        assert_eq!(lines.len(), 1, "one edit is one frame");
         let envelope: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
         assert_eq!(envelope["kind"], "set_session_settings");
         assert_eq!(

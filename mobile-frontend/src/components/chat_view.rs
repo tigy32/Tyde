@@ -2570,6 +2570,73 @@ mod wasm_tests {
     /// the difference between "haven't picked a chat" and "picked but
     /// empty."
     #[wasm_bindgen_test]
+    async fn send_diagnostics_preserve_draft_and_observe_late_cancellation() {
+        let window = web_sys::window().unwrap();
+        let url = window.location().href().unwrap();
+        let history = window.history().unwrap();
+        let enabled = web_sys::Url::new(&url).unwrap();
+        enabled.search_params().set("tyde-send-diagnostics", "1");
+        history
+            .replace_state_with_url(&wasm_bindgen::JsValue::NULL, "", Some(&enabled.href()))
+            .unwrap();
+        let container = make_container();
+        let handle = mount_to(container.clone(), move || {
+            provide_context(AppState::new());
+            view! { <ChatView /><crate::components::MobileShellErrorBanner /> }
+        });
+        history
+            .replace_state_with_url(&wasm_bindgen::JsValue::NULL, "", Some(&url))
+            .unwrap();
+        next_tick().await;
+        let field = container
+            .query_selector("[data-mobile-test='chat-input']")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<web_sys::HtmlTextAreaElement>()
+            .unwrap();
+        field.set_value("Retain this draft");
+        field
+            .dispatch_event(&web_sys::Event::new("input").unwrap())
+            .unwrap();
+        next_tick().await;
+        let button = container
+            .query_selector("[data-mobile-test='chat-send']")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<web_sys::HtmlElement>()
+            .unwrap();
+        let cancel = wasm_bindgen::closure::Closure::<dyn Fn(web_sys::Event)>::new(
+            |event: web_sys::Event| event.prevent_default(),
+        );
+        button
+            .add_event_listener_with_callback("click", cancel.as_ref().unchecked_ref())
+            .unwrap();
+        button.click();
+        next_tick().await;
+        assert_eq!(field.value(), "Retain this draft");
+        assert!(container.text_content().unwrap().contains("no active host"));
+        let observed = js_sys::eval(
+            r#"(() => {
+                const events = window.__TYDE_SEND_DIAGNOSTICS__.events;
+                const click = events.find(e => e.phase === 'click');
+                return events.some(e => e.phase === 'guard-missing-host') &&
+                    click.defaultPrevented === false &&
+                    events.some(e => e.phase === 'click:post-dispatch' &&
+                        e.sequence === click.sequence && e.defaultPrevented === true) &&
+                    !events.some(e => e.phase === 'clear-before') &&
+                    !JSON.stringify(events).includes('Retain this draft');
+            })()"#,
+        )
+        .unwrap();
+        assert_eq!(observed.as_bool(), Some(true));
+        button
+            .remove_event_listener_with_callback("click", cancel.as_ref().unchecked_ref())
+            .unwrap();
+        drop(handle);
+        container.remove();
+    }
+
+    #[wasm_bindgen_test]
     async fn chat_empty_new_when_no_active_agent() {
         let host = LocalHostId("host-1".to_owned());
         let host_for_mount = host.clone();

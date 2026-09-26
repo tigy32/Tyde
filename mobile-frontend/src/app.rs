@@ -61,8 +61,13 @@ pub fn FixtureApp() -> impl IntoView {
     view! { <AppSurface /> }
 }
 
+#[cfg(any(test, all(feature = "ui-fixtures", debug_assertions)))]
+#[derive(Clone, Copy)]
+pub(crate) struct DiagnosticBuildChannel(pub bool);
+
 #[component]
 fn AppSurface() -> impl IntoView {
+    crate::components::initialize_send_diagnostics();
     let state = use_context::<AppState>().unwrap();
     crate::bundle::install(state.clone());
     mirror_theme_to_document(state.clone());
@@ -85,6 +90,7 @@ fn AppSurface() -> impl IntoView {
             // Mounted in every app mode so a paste-failed-during-pairing or
             // listener-registration failure stays visible. (Phase C HIGH 4.)
             <components::MobileShellErrorBanner />
+            <components::SendDiagnosticsSurface />
             {move || {
                 let mode = state.app_mode.get();
                 match mode {
@@ -1228,6 +1234,12 @@ mod wasm_tests {
     use wasm_bindgen_test::*;
     use web_sys::HtmlElement;
 
+    #[wasm_bindgen::prelude::wasm_bindgen(module = "/send-diagnostics.js")]
+    extern "C" {
+        #[wasm_bindgen::prelude::wasm_bindgen(js_name = configureSendDiagnostics)]
+        fn configure_diagnostic_gate(beta: bool) -> js_sys::Function;
+    }
+
     wasm_bindgen_test_configure!(run_in_browser);
 
     fn make_container() -> HtmlElement {
@@ -1614,6 +1626,17 @@ mod wasm_tests {
         drop(handle);
         container.remove();
         restore_loader_boundary();
+    }
+
+    struct BrowserOverride(wasm_bindgen::JsValue);
+
+    impl Drop for BrowserOverride {
+        fn drop(&mut self) {
+            self.0
+                .unchecked_ref::<js_sys::Function>()
+                .call0(&wasm_bindgen::JsValue::NULL)
+                .unwrap();
+        }
     }
 
     async fn next_tick() {
@@ -2158,6 +2181,398 @@ mod wasm_tests {
                     .is_same_node(Some(&input))
             );
         }
+        // Synthetic contacts exercise mounted behavior and hit geometry, not native click delivery.
+        let performance_now = js_sys::Function::new_no_args("return performance.now()");
+        let now = || {
+            performance_now
+                .call0(&wasm_bindgen::JsValue::NULL)
+                .unwrap()
+                .as_f64()
+                .unwrap()
+        };
+        let set_input = js_sys::Function::new_with_args(
+            "input,value",
+            r#"
+            input.value = value;
+            input.dispatchEvent(new InputEvent('input', {bubbles:true, inputType:'insertText'}));
+        "#,
+        );
+        let contact = js_sys::Function::new_with_args(
+            "button,type,x,y",
+            r#"
+            button.dispatchEvent(new PointerEvent(type, {
+                bubbles:true, pointerType:'touch', clientX:x, clientY:y, pointerId:1
+            }));
+        "#,
+        );
+        let center = || {
+            let r = send.get_bounding_client_rect();
+            (r.x() + r.width() / 2.0, r.y() + r.height() / 2.0)
+        };
+        let hit_at = |point: (f64, f64)| {
+            frame_document
+                .element_from_point(point.0 as f32, point.1 as f32)
+                .unwrap()
+        };
+        let down_or_up = |kind: &str, point: (f64, f64)| {
+            contact
+                .call4(
+                    &wasm_bindgen::JsValue::NULL,
+                    &send,
+                    &kind.into(),
+                    &point.0.into(),
+                    &point.1.into(),
+                )
+                .unwrap();
+        };
+        let contact_guard = crate::bridge::test_defer_sends();
+        for resize_during_contact in [false, true] {
+            for delay in [0_u64, 50, 250] {
+                for (shape, draft) in [
+                    ("wrap", "a wrapped composing draft ".repeat(10)),
+                    ("shrink", "short".to_owned()),
+                    ("newline", "one\ntwo\nthree\nfour\nfive\nsix".to_owned()),
+                    ("maxheight", "line\n".repeat(40)),
+                    ("shrink", "short".to_owned()),
+                ] {
+                    let attempts_before = crate::bridge::test_send_attempts();
+                    let original_height = input.get_bounding_client_rect().height();
+                    let original_point = center();
+                    if resize_during_contact {
+                        down_or_up("pointerdown", original_point);
+                    }
+                    let started = now();
+                    set_input
+                        .call2(&wasm_bindgen::JsValue::NULL, &input, &draft.clone().into())
+                        .unwrap();
+                    if delay != 0 {
+                        sleep(Duration::from_millis(delay)).await;
+                    }
+                    let point = if resize_during_contact {
+                        original_point
+                    } else {
+                        center()
+                    };
+                    if !resize_during_contact {
+                        down_or_up("pointerdown", point);
+                    }
+                    let elapsed = now() - started;
+                    let height = input.get_bounding_client_rect().height();
+                    assert!(
+                        elapsed < 300.0,
+                        "resize contact missed timing coverage: {elapsed}ms"
+                    );
+                    if shape == "shrink" {
+                        assert!(height < original_height, "short draft must shrink");
+                    } else {
+                        assert!(height > original_height, "multiline draft must grow");
+                    }
+                    if shape == "maxheight" {
+                        let max = frame
+                            .content_window()
+                            .unwrap()
+                            .get_computed_style(&input)
+                            .unwrap()
+                            .unwrap()
+                            .get_property_value("max-height")
+                            .unwrap()
+                            .trim_end_matches("px")
+                            .parse::<f64>()
+                            .unwrap();
+                        assert!(
+                            (height - max).abs() <= 1.0,
+                            "long draft reaches the CSS cap"
+                        );
+                        assert!(
+                            f64::from(input.scroll_height()) > height,
+                            "capped draft scrolls internally"
+                        );
+                    }
+                    assert!(send.is_connected());
+                    assert!(
+                        send.is_same_node(
+                            container
+                                .query_selector("[data-mobile-test='chat-send']")
+                                .unwrap()
+                                .as_ref()
+                                .map(|element| element.as_ref())
+                        )
+                    );
+                    assert!(!send.has_attribute("disabled"));
+                    assert!(
+                        reachable(),
+                        "current Send center remains reachable during resize"
+                    );
+                    assert!(
+                        send.contains(Some(&hit_at(point))),
+                        "original contact stays on Send during resize"
+                    );
+                    assert!(input.value() == draft && state.chat_input.get_untracked() == draft);
+                    down_or_up("pointerup", point);
+                    let release_elapsed = now() - started;
+                    assert!(
+                        release_elapsed < 300.0,
+                        "contact release missed timing coverage: {release_elapsed}ms"
+                    );
+                    send.unchecked_ref::<HtmlElement>().click();
+                    next_tick().await;
+                    assert_eq!(crate::bridge::test_send_attempts(), attempts_before + 1);
+                    let lines = crate::bridge::test_sent_lines();
+                    assert_eq!(lines.len(), attempts_before + 1);
+                    let sent: serde_json::Value =
+                        serde_json::from_str(lines.last().unwrap()).unwrap();
+                    assert_eq!(sent["kind"], "send_message");
+                    assert!(
+                        sent["payload"]["message"] == draft.trim(),
+                        "resized draft reaches local admission"
+                    );
+                    crate::bridge::test_resolve_next_send();
+                    next_tick().await;
+                    next_tick().await;
+                    assert!(input.value().is_empty());
+                    // Restore the shape for the next grow/shrink contact, outside its timing window.
+                    set_input
+                        .call2(&wasm_bindgen::JsValue::NULL, &input, &draft.into())
+                        .unwrap();
+                    next_tick().await;
+                    wasm_bindgen_test::console_log!(
+                        "RESIZE_CONTACT shape={} during_contact={} requested_ms={} down_or_sample_ms={} release_ms={} height={} center_hit=true original_hit=true",
+                        shape,
+                        resize_during_contact,
+                        delay,
+                        elapsed,
+                        release_elapsed,
+                        height
+                    );
+                }
+            }
+        }
+        set_input
+            .call2(
+                &wasm_bindgen::JsValue::NULL,
+                &input,
+                &"preserved draft".into(),
+            )
+            .unwrap();
+        next_tick().await;
+        crate::dispatch::reset_inbound_seq_for_host(&agent_ref.local_host_id);
+        for (seq, activity) in [
+            protocol::AgentActivity::Thinking,
+            protocol::AgentActivity::Idle,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let attempts_before = crate::bridge::test_send_attempts();
+            let point = center();
+            down_or_up("pointerdown", point);
+            crate::dispatch::dispatch_envelope(
+                &state,
+                &agent_ref.local_host_id,
+                protocol::Envelope::from_payload(
+                    protocol::StreamPath("/agent/composer-agent/instance".to_owned()),
+                    protocol::FrameKind::AgentActivityChanged,
+                    seq as u64,
+                    &protocol::AgentActivityChangedPayload { activity },
+                )
+                .unwrap(),
+            );
+            crate::dispatch::apply_chat_event(
+                &state,
+                &agent_ref,
+                protocol::ChatEvent::StreamStart(protocol::StreamStartData {
+                    agent: "fixture".to_owned(),
+                    model: None,
+                }),
+            );
+            crate::dispatch::apply_chat_event(
+                &state,
+                &agent_ref,
+                protocol::ChatEvent::StreamDelta(protocol::StreamTextDeltaData {
+                    text: "streamed output".to_owned(),
+                }),
+            );
+            next_tick().await;
+            assert!(
+                container
+                    .query_selector("[data-mobile-test='chat-streaming']")
+                    .unwrap()
+                    .unwrap()
+                    .text_content()
+                    .unwrap()
+                    .contains("streamed output")
+            );
+            assert!(send.is_connected());
+            assert!(
+                send.is_same_node(
+                    container
+                        .query_selector("[data-mobile-test='chat-send']")
+                        .unwrap()
+                        .as_ref()
+                        .map(|element| element.as_ref())
+                )
+            );
+            assert_eq!(
+                send.text_content().unwrap().trim(),
+                if activity == protocol::AgentActivity::Thinking {
+                    "Queue"
+                } else {
+                    "Send"
+                }
+            );
+            assert!(!send.has_attribute("disabled"));
+            assert!(reachable() && send.contains(Some(&hit_at(point))));
+            let ring = container
+                .query_selector("[data-mobile-test='chat-thinking-ring']")
+                .unwrap();
+            assert_eq!(
+                ring.is_some(),
+                activity == protocol::AgentActivity::Thinking
+            );
+            if let Some(ring) = ring {
+                let style = frame
+                    .content_window()
+                    .unwrap()
+                    .get_computed_style(&ring)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(style.get_property_value("pointer-events").unwrap(), "none");
+            }
+            down_or_up("pointerup", point);
+            send.unchecked_ref::<HtmlElement>().click();
+            next_tick().await;
+            assert_eq!(crate::bridge::test_send_attempts(), attempts_before + 1);
+            let lines = crate::bridge::test_sent_lines();
+            assert_eq!(lines.len(), attempts_before + 1);
+            let sent: serde_json::Value = serde_json::from_str(lines.last().unwrap()).unwrap();
+            assert_eq!(
+                sent["kind"], "send_message",
+                "lifecycle must not turn a draft tap into Interrupt"
+            );
+            crate::bridge::test_resolve_next_send();
+            next_tick().await;
+            next_tick().await;
+            set_input
+                .call2(
+                    &wasm_bindgen::JsValue::NULL,
+                    &input,
+                    &"preserved draft".into(),
+                )
+                .unwrap();
+            next_tick().await;
+            wasm_bindgen_test::console_log!(
+                "LIFECYCLE_CONTACT activity={:?} node_same=true center_hit=true original_hit=true send_message=1",
+                activity
+            );
+        }
+        let attempts_before_overlays = crate::bridge::test_send_attempts();
+        // A menu intentionally catches the first outside tap. Closing it must remove interception.
+        let toggle = container
+            .query_selector("[data-mobile-test='chat-send-menu-toggle']")
+            .unwrap()
+            .unwrap();
+        for iteration in 0..2 {
+            let point = center();
+            toggle.unchecked_ref::<HtmlElement>().click();
+            next_tick().await;
+            for (edge, activity) in [
+                protocol::AgentActivity::Thinking,
+                protocol::AgentActivity::Idle,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                crate::dispatch::dispatch_envelope(
+                    &state,
+                    &agent_ref.local_host_id,
+                    protocol::Envelope::from_payload(
+                        protocol::StreamPath("/agent/composer-agent/instance".to_owned()),
+                        protocol::FrameKind::AgentActivityChanged,
+                        2 + iteration * 2 + edge as u64,
+                        &protocol::AgentActivityChangedPayload { activity },
+                    )
+                    .unwrap(),
+                );
+                next_tick().await;
+                assert_eq!(
+                    container
+                        .query_selector("[data-mobile-test='chat-send-menu-steer']")
+                        .unwrap()
+                        .is_some(),
+                    activity == protocol::AgentActivity::Thinking,
+                    "Steer is a lifecycle-dependent menu item, not the stable primary"
+                );
+                assert!(send.is_connected());
+                assert!(
+                    send.is_same_node(Some(
+                        &container
+                            .query_selector("[data-mobile-test='chat-send']")
+                            .unwrap()
+                            .unwrap()
+                    ))
+                );
+            }
+            let backdrop = container
+                .query_selector("[data-mobile-test='chat-send-menu-backdrop']")
+                .unwrap()
+                .unwrap();
+            assert!(
+                backdrop.is_same_node(Some(&hit_at(point))),
+                "open menu deliberately intercepts original Send contact"
+            );
+            assert!(backdrop.is_same_node(Some(&hit_at(center()))));
+            hit_at(point).unchecked_ref::<HtmlElement>().click();
+            next_tick().await;
+            assert!(!backdrop.is_connected());
+            assert!(
+                reachable() && send.contains(Some(&hit_at(point))),
+                "closed menu must leave no stale interceptor"
+            );
+        }
+        crate::dispatch::apply_chat_event(
+            &state,
+            &agent_ref,
+            protocol::ChatEvent::ToolProgress(protocol::ToolProgressData {
+                tool_call_id: "contact-background".to_owned(),
+                execution_mode: protocol::ToolExecutionMode::Background,
+                cancellable: false,
+                update: protocol::ToolProgressUpdate::Other {
+                    payload: serde_json::json!({"description":"Background task"}),
+                },
+            }),
+        );
+        next_tick().await;
+        let drawer_toggle = container
+            .query_selector("[data-mobile-test='activity-toggle']")
+            .unwrap()
+            .unwrap();
+        let point = center();
+        for open in [true, false] {
+            drawer_toggle.unchecked_ref::<HtmlElement>().click();
+            next_tick().await;
+            assert_eq!(
+                drawer_toggle.get_attribute("aria-expanded").as_deref(),
+                Some(if open { "true" } else { "false" })
+            );
+            assert!(
+                reachable() && send.contains(Some(&hit_at(point))),
+                "drawer transition must not intercept Send"
+            );
+            sleep(Duration::from_millis(250)).await;
+            assert!(
+                reachable() && send.contains(Some(&hit_at(point))),
+                "settled drawer must not intercept Send"
+            );
+        }
+        wasm_bindgen_test::console_log!(
+            "OVERLAY_CONTACT menu_open=intercept menu_closed=reachable drawer_open_closed=reachable"
+        );
+        assert_eq!(
+            crate::bridge::test_send_attempts(),
+            attempts_before_overlays,
+            "overlay disclosure and dismissal do not submit"
+        );
+        drop(contact_guard);
         input.blur().unwrap();
         state.viewing_chat.set(false);
         safe_area.set_text_content(Some(".mobile-app { --tws-safe-bottom: 34px; }"));
@@ -2217,6 +2632,415 @@ mod wasm_tests {
             "unmount releases document ownership"
         );
         frame.remove();
+        let platform_override = BrowserOverride(js_sys::Function::new_no_args(r#"
+            const p=Object.getOwnPropertyDescriptor(navigator,'platform');
+            const s=Object.getOwnPropertyDescriptor(navigator,'standalone');
+            Object.defineProperty(navigator,'platform',{configurable:true,value:'iPhone'});
+            Object.defineProperty(navigator,'standalone',{configurable:true,value:true});
+            return () => {
+                if(p)Object.defineProperty(navigator,'platform',p);else delete navigator.platform;
+                if(s)Object.defineProperty(navigator,'standalone',s);else delete navigator.standalone;
+            };
+        "#).call0(&wasm_bindgen::JsValue::NULL).unwrap());
+        let diagnostics_container = make_container();
+        let diagnostic_state = AppState::new();
+        let diagnostic_host = LocalHostId("diagnostic-host".to_owned());
+        diagnostic_state
+            .active_local_host_id
+            .set(Some(diagnostic_host.clone()));
+        diagnostic_state.connection_statuses.update(|statuses| {
+            statuses.insert(diagnostic_host, ConnectionStatus::Connected);
+        });
+        let mount_diagnostic_app = |channel: Option<bool>| {
+            let state = diagnostic_state.clone();
+            mount_to(diagnostics_container.clone(), move || {
+                if let Some(beta) = channel {
+                    provide_context(DiagnosticBuildChannel(beta));
+                }
+                state.app_mode.set(AppMode::Workspace);
+                state.active_tab.set(MobileTab::Settings);
+                provide_context(state);
+                view! { <AppSurface /> }
+            })
+        };
+        let mut diagnostics_mount = mount_diagnostic_app(None);
+        next_tick().await;
+        let manifest: serde_json::Value =
+            serde_json::from_str(include_str!("../../package.json")).unwrap();
+        let compiled_beta = manifest["version"].as_str().unwrap().contains("-beta.");
+        let status = diagnostics_container
+            .query_selector("[data-mobile-test='send-diagnostics-status']")
+            .unwrap()
+            .unwrap();
+        // Stable production deliberately has no automatic session. Only the
+        // test-owned remount below forces beta for the full recorder flow.
+        if compiled_beta {
+            assert!(
+                status.text_content().unwrap().contains("Recording"),
+                "iOS standalone beta must capture automatically and visibly without query parameters"
+            );
+        } else {
+            assert!(
+                status.has_attribute("hidden"),
+                "compiled stable app must not show automatic capture"
+            );
+            assert_eq!(
+                js_sys::eval("typeof window.__TYDE_SEND_DIAGNOSTICS__")
+                    .unwrap()
+                    .as_string()
+                    .as_deref(),
+                Some("undefined"),
+                "compiled stable app must not create a recorder"
+            );
+            drop(diagnostics_mount);
+            diagnostics_mount = mount_diagnostic_app(Some(true));
+            next_tick().await;
+            assert!(
+                diagnostics_container
+                    .query_selector("[data-mobile-test='send-diagnostics-status']")
+                    .unwrap()
+                    .unwrap()
+                    .text_content()
+                    .unwrap()
+                    .contains("Recording"),
+                "explicit test-owned beta mount exercises recorder on stable builds"
+            );
+        }
+        let global_control = |name: &str| {
+            let buttons = diagnostics_container
+                .query_selector_all("[data-mobile-test='send-diagnostics-global-panel'] button")
+                .unwrap();
+            (0..buttons.length())
+                .filter_map(|index| buttons.get(index))
+                .find(|button| button.text_content().as_deref() == Some(name))
+                .expect("global diagnostic control")
+                .unchecked_into::<HtmlElement>()
+        };
+        let disclosure = diagnostics_container
+            .query_selector("[data-mobile-test='send-diagnostics-status'] details")
+            .unwrap()
+            .unwrap();
+        diagnostics_container
+            .query_selector("[aria-label='Send diagnostics controls']")
+            .unwrap()
+            .unwrap()
+            .unchecked_into::<HtmlElement>()
+            .click();
+        assert!(disclosure.has_attribute("open"));
+        global_control("Stop").click();
+        global_control("Clear").click();
+        diagnostic_state.active_local_host_id.set(None);
+        for mode in [
+            AppMode::Onboarding,
+            AppMode::Pairing(crate::state::PairingScreen::ManualPaste),
+            AppMode::Workspace,
+        ] {
+            diagnostic_state.app_mode.set(mode);
+            next_tick().await;
+            assert!(
+                global_control("Start new capture")
+                    .get_bounding_client_rect()
+                    .height()
+                    > 0.0,
+                "controls remain visible without a host in every app mode"
+            );
+            assert!(
+                diagnostics_container
+                    .query_selector("[data-mobile-test='send-diagnostics-status']")
+                    .unwrap()
+                    .unwrap()
+                    .text_content()
+                    .unwrap()
+                    .contains("Stopped"),
+                "navigation must not restart stopped capture"
+            );
+            assert_eq!(
+                js_sys::eval("window.__TYDE_SEND_DIAGNOSTICS__.events.length")
+                    .unwrap()
+                    .as_f64(),
+                Some(0.0)
+            );
+        }
+        let host = LocalHostId("diagnostic-host".to_owned());
+        diagnostic_state
+            .active_local_host_id
+            .set(Some(host.clone()));
+        for status in [
+            ConnectionStatus::Disconnected,
+            ConnectionStatus::Connecting,
+            ConnectionStatus::Bootstrapping,
+            ConnectionStatus::Error("fixture connection failure".to_owned()),
+            ConnectionStatus::Connected,
+            ConnectionStatus::UpdateRequired {
+                host_protocol: 1,
+                app_protocol: 2,
+                release_version: None,
+            },
+            ConnectionStatus::NeedsAction {
+                code: protocol::MobileAccessErrorCode::RepairRequired,
+                message: "fixture action required".to_owned(),
+            },
+        ] {
+            diagnostic_state.connection_statuses.update(|statuses| {
+                statuses.insert(host.clone(), status);
+            });
+            next_tick().await;
+            assert!(
+                global_control("Start new capture")
+                    .get_bounding_client_rect()
+                    .height()
+                    > 0.0,
+                "connection transitions do not hide controls"
+            );
+            assert_eq!(
+                js_sys::eval("window.__TYDE_SEND_DIAGNOSTICS__.events.length")
+                    .unwrap()
+                    .as_f64(),
+                Some(0.0),
+                "Stop and Clear persist across connection transitions"
+            );
+        }
+        diagnostic_state.connection_statuses.update(|statuses| {
+            statuses.insert(host.clone(), ConnectionStatus::Connected);
+        });
+        global_control("Start new capture").click();
+        diagnostics_container
+            .query_selector("[aria-label='Send diagnostics controls']")
+            .unwrap()
+            .unwrap()
+            .unchecked_into::<HtmlElement>()
+            .click();
+        assert!(!disclosure.has_attribute("open"));
+        let export_override = BrowserOverride(js_sys::Function::new_no_args(r#"
+            const share=Object.getOwnPropertyDescriptor(navigator,'share');
+            const can=Object.getOwnPropertyDescriptor(navigator,'canShare');
+            Object.defineProperty(navigator,'canShare',{configurable:true,value:()=>true});
+            Object.defineProperty(navigator,'share',{configurable:true,value:async ({files})=>{window.__diagnosticExport=await files[0].text();}});
+            return ()=>{
+                if(share)Object.defineProperty(navigator,'share',share);else delete navigator.share;
+                if(can)Object.defineProperty(navigator,'canShare',can);else delete navigator.canShare;
+                delete window.__diagnosticExport;
+            };
+        "#).call0(&wasm_bindgen::JsValue::NULL).unwrap());
+        diagnostic_state.viewing_chat.set(true);
+        next_tick().await;
+        let diagnostic_field = diagnostics_container
+            .query_selector("[data-mobile-test='chat-input']")
+            .unwrap()
+            .unwrap();
+        js_sys::Function::new_with_args("field",r#"
+            const sentinel='PRIVATE-DIAGNOSTIC-SENTINEL';
+            field.value=sentinel;field.setAttribute('aria-label',sentinel);
+            field.dispatchEvent(new CompositionEvent('compositionstart',{bubbles:true,data:sentinel}));
+            for(let i=0;i<3000;i++)field.dispatchEvent(new InputEvent('input',{bubbles:true,isComposing:true,inputType:sentinel,data:sentinel}));
+            field.dispatchEvent(new KeyboardEvent('keydown',{bubbles:true,key:sentinel}));
+            const button=field.closest('.chat-bottom-dock').querySelector('[data-mobile-test=chat-send]');
+            const r=button.getBoundingClientRect();
+            button.dispatchEvent(new PointerEvent('pointerdown',{bubbles:true,clientX:r.x+r.width/2,clientY:r.y+r.height/2,pointerType:'touch'}));
+            button.dispatchEvent(new PointerEvent('pointerup',{bubbles:true,clientX:r.x+r.width/2,clientY:r.y+r.height/2,pointerType:'touch'}));
+        "#).call1(&wasm_bindgen::JsValue::NULL,&diagnostic_field).unwrap();
+        next_tick().await;
+        diagnostic_state.viewing_chat.set(false);
+        next_tick().await;
+        let control = |name: &str| {
+            let buttons = diagnostics_container
+                .query_selector_all("[data-mobile-test='send-diagnostics-panel'] button")
+                .unwrap();
+            (0..buttons.length())
+                .filter_map(|index| buttons.get(index))
+                .find(|button| button.text_content().as_deref() == Some(name))
+                .expect("diagnostic control")
+                .unchecked_into::<HtmlElement>()
+        };
+        control("Stop").click();
+        next_tick().await;
+        let stopped_count = js_sys::eval("window.__TYDE_SEND_DIAGNOSTICS__.events.length").unwrap();
+        web_sys::window()
+            .unwrap()
+            .document()
+            .unwrap()
+            .dispatch_event(&web_sys::MouseEvent::new("click").unwrap())
+            .unwrap();
+        next_tick().await;
+        assert_eq!(
+            js_sys::eval("window.__TYDE_SEND_DIAGNOSTICS__.events.length").unwrap(),
+            stopped_count,
+            "stopped observers retain no new events"
+        );
+        control("Export").click();
+        next_tick().await;
+        next_tick().await;
+        let private_and_bounded=js_sys::eval(r#"(() => {
+            const json=window.__diagnosticExport, data=JSON.parse(json), rows=data.records;
+            const permitted=['schema','status','dropped','records'];
+            return data.schema===3 && data.status==='Stopped' && data.dropped>0 && rows.length>0 && rows.length<=2048 &&
+                new TextEncoder().encode(json).length<=256*1024 && !json.includes('PRIVATE-DIAGNOSTIC-SENTINEL') &&
+                Object.keys(data).every(key=>permitted.includes(key)) && rows.every((row,index)=>!index||row.at>=rows[index-1].at) &&
+                rows.some(row=>row.phase==='geometry'&&row.ageMs!==null) &&
+                rows.some(row=>row.phase==='pointerdown'&&row.compositionOpen===true) &&
+                rows.some(row=>row.inputType==='other') &&
+                rows.every(row=>!('data' in row)&&!('key' in row)&&!('url' in row)&&!('eventId' in row));
+        })()"#).unwrap();
+        assert_eq!(
+            private_and_bounded.as_bool(),
+            Some(true),
+            "export must retain bounded useful observations without private input or raw objects"
+        );
+        control("Clear").click();
+        next_tick().await;
+        assert_eq!(
+            js_sys::eval("window.__TYDE_SEND_DIAGNOSTICS__.events.length")
+                .unwrap()
+                .as_f64(),
+            Some(0.0)
+        );
+        control("Start new capture").click();
+        next_tick().await;
+        assert!(
+            diagnostics_container
+                .text_content()
+                .unwrap()
+                .contains("Recording")
+        );
+        diagnostic_field
+            .dispatch_event(&web_sys::Event::new("input").unwrap())
+            .unwrap();
+        control("Clear").click();
+        next_tick().await;
+        assert_eq!(
+            js_sys::eval("window.__TYDE_SEND_DIAGNOSTICS__.events.length")
+                .unwrap()
+                .as_f64(),
+            Some(0.0),
+            "Clear cancels scheduled samples as well as existing records"
+        );
+        assert!(
+            diagnostics_container
+                .query_selector("[data-mobile-test='send-diagnostics-status']")
+                .unwrap()
+                .unwrap()
+                .text_content()
+                .unwrap()
+                .contains("Stopped"),
+            "Clear stops until an explicit Start"
+        );
+        web_sys::window()
+            .unwrap()
+            .document()
+            .unwrap()
+            .dispatch_event(&web_sys::MouseEvent::new("click").unwrap())
+            .unwrap();
+        next_tick().await;
+        assert_eq!(
+            js_sys::eval("window.__TYDE_SEND_DIAGNOSTICS__.events.length")
+                .unwrap()
+                .as_f64(),
+            Some(0.0),
+            "Clear must not silently restart capture"
+        );
+
+        let clock_override=BrowserOverride(js_sys::Function::new_no_args(r#"
+            const original=Object.getOwnPropertyDescriptor(performance,'now'), now=performance.now.bind(performance);
+            Object.defineProperty(performance,'now',{configurable:true,value:()=>now()+900001});
+            return ()=>{if(original)Object.defineProperty(performance,'now',original);else delete performance.now;};
+        "#).call0(&wasm_bindgen::JsValue::NULL).unwrap());
+        web_sys::window()
+            .unwrap()
+            .document()
+            .unwrap()
+            .dispatch_event(&web_sys::Event::new("visibilitychange").unwrap())
+            .unwrap();
+        next_tick().await;
+        assert!(
+            diagnostics_container
+                .text_content()
+                .unwrap()
+                .contains("Expired")
+        );
+        assert_eq!(
+            js_sys::eval("window.__TYDE_SEND_DIAGNOSTICS__.events.length")
+                .unwrap()
+                .as_f64(),
+            Some(0.0)
+        );
+        drop(clock_override);
+        diagnostic_state.viewing_chat.set(true);
+        next_tick().await;
+        assert!(
+            diagnostics_container
+                .text_content()
+                .unwrap()
+                .contains("Expired"),
+            "navigation must not silently re-enable expired capture"
+        );
+        diagnostic_state.viewing_chat.set(false);
+        next_tick().await;
+        control("Start new capture").click();
+        next_tick().await;
+        assert!(
+            diagnostics_container
+                .text_content()
+                .unwrap()
+                .contains("Recording")
+        );
+        drop(export_override);
+        drop(diagnostics_mount);
+        diagnostics_container.remove();
+        next_tick().await;
+        assert_eq!(
+            js_sys::eval("typeof window.__TYDE_SEND_DIAGNOSTICS__")
+                .unwrap()
+                .as_string()
+                .as_deref(),
+            Some("undefined"),
+            "unmount removes capture and pending observers"
+        );
+
+        let stable_container = make_container();
+        let stable_mount = mount_to(stable_container.clone(), move || {
+            provide_context(DiagnosticBuildChannel(false));
+            provide_context(AppState::new());
+            view! { <AppSurface /> }
+        });
+        next_tick().await;
+        assert!(
+            stable_container
+                .query_selector("[data-mobile-test='send-diagnostics-status']")
+                .unwrap()
+                .unwrap()
+                .has_attribute("hidden"),
+            "stable build gate must not automatically capture even on iOS standalone"
+        );
+        assert_eq!(
+            js_sys::eval("typeof window.__TYDE_SEND_DIAGNOSTICS__")
+                .unwrap()
+                .as_string()
+                .as_deref(),
+            Some("undefined"),
+            "stable channel through the full AppSurface must create no recorder"
+        );
+        drop(stable_mount);
+        stable_container.remove();
+        drop(platform_override);
+        let browser_container = make_container();
+        let browser_mount = mount_to(browser_container.clone(), move || {
+            let cleanup = send_wrapper::SendWrapper::new(configure_diagnostic_gate(true));
+            on_cleanup(move || {
+                cleanup.take().call0(&wasm_bindgen::JsValue::NULL).unwrap();
+            });
+            view! { <components::SendDiagnosticsSurface settings=true /> }
+        });
+        next_tick().await;
+        assert!(
+            browser_container
+                .query_selector("[data-mobile-test='send-diagnostics-panel']")
+                .unwrap()
+                .unwrap()
+                .has_attribute("hidden"),
+            "ordinary non-iOS browser must not automatically capture"
+        );
+        drop(browser_mount);
+        browser_container.remove();
     }
 
     /// **The real disconnect lifecycle must leave the user somewhere they can act.**

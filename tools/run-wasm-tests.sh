@@ -723,3 +723,9 @@ fi
 cd "$repo_root/mobile-frontend"
 log "running: cargo test --target wasm32-unknown-unknown $* (mobile-frontend)"
 cargo test --target wasm32-unknown-unknown "$@"
+
+# The existing fixture harness mounts the production mobile composer in WebKit.
+cd "$repo_root"
+npm ci --ignore-scripts --no-audit --no-fund
+npm exec -- playwright install webkit
+npm exec -- playwright test --config playwright.mobile.config.mjs --project composer-webkit

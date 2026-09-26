@@ -5075,6 +5075,7 @@ enum Observed {
         phases: Vec<protocol::RestartRecoveryPhase>,
     },
     Phase(protocol::RestartRecoveryPhase),
+    Activity(protocol::AgentActivity),
     Delta(String),
     Queue(usize),
     Typing(bool),
@@ -5134,19 +5135,18 @@ impl StreamObservation {
             .find(|item| matches!(item, Observed::Bootstrap { .. }))
     }
 
-    /// The restart continuation ran to idle, whether the client saw it stream
-    /// or attached only after it finished. An agent's attach waits for its
-    /// startup, so under load its bootstrap can already report the finished
-    /// continuation.
+    /// Attach can land after the continuation text but before its idle edge.
+    /// Requiring a live delta misses that valid bootstrap/live split. Observe
+    /// the server's activity instead; history is not live lifecycle authority.
     fn continuation_finished(&self) -> bool {
-        self.settled_after(CONTINUATION_PREFIX)
-            || matches!(
-                self.bootstrap(),
-                Some(Observed::Bootstrap {
-                    activity: protocol::AgentActivity::Idle,
-                    phases,
-                }) if phases.contains(&protocol::RestartRecoveryPhase::Continuing)
-            )
+        self.phases()
+            .contains(&protocol::RestartRecoveryPhase::Continuing)
+            && self.items.iter().rev().find_map(|item| match item {
+                Observed::Bootstrap { activity, .. } | Observed::Activity(activity) => {
+                    Some(*activity)
+                }
+                _ => None,
+            }) == Some(protocol::AgentActivity::Idle)
     }
 
     /// The stream went idle after streaming text containing `needle`.
@@ -5259,6 +5259,12 @@ impl Observation {
                                 .record(&env.stream, Observed::Queue(payload.messages.len()));
                         }
                     }
+                }
+                FrameKind::AgentActivityChanged => {
+                    let payload: protocol::AgentActivityChangedPayload = env
+                        .parse_payload()
+                        .expect("parse restored AgentActivityChanged");
+                    observation.record(&env.stream, Observed::Activity(payload.activity));
                 }
                 FrameKind::QueuedMessages => {
                     let payload: protocol::QueuedMessagesPayload =

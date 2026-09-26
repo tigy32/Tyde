@@ -18,10 +18,14 @@ export default defineConfig({
     trace: "retain-on-failure",
     video: "retain-on-failure",
   },
+  projects: [
+    { name: "mobile", testIgnore: "composer-webkit.spec.mjs" },
+    { name: "composer-webkit", testMatch: "composer-webkit.spec.mjs", use: { browserName: "webkit", screenshot: "off", trace: "off", video: "off" } },
+  ],
   webServer: {
-    command: "npm run mobile:ui:serve",
+    command: "(cd mobile-frontend && NO_COLOR=true trunk build --features ui-fixtures) && npm run mobile:ui:serve",
     url: "http://127.0.0.1:4173/?tyde-fixture=onboarding",
-    reuseExistingServer: !process.env.CI,
+    reuseExistingServer: false,
     timeout: 120_000,
     stdout: "pipe",
     stderr: "pipe",

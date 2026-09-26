@@ -10,6 +10,24 @@ use crate::state::{
     AgentRef, AppState, LocalHostId, PendingSubmission, PendingSubmissionState, SubmissionTarget,
 };
 
+#[wasm_bindgen::prelude::wasm_bindgen(module = "/send-diagnostics.js")]
+extern "C" {
+    #[wasm_bindgen(js_name = sendDiagnosticsEnabled)]
+    fn send_diagnostics_enabled() -> bool;
+    #[wasm_bindgen::prelude::wasm_bindgen(js_name = configureSendDiagnostics)]
+    fn configure_send_diagnostics(beta: bool) -> js_sys::Function;
+    #[wasm_bindgen::prelude::wasm_bindgen(js_name = installSendDiagnosticsSurface)]
+    fn install_send_diagnostics_surface(
+        root: &web_sys::HtmlElement,
+        settings: bool,
+    ) -> js_sys::Function;
+
+    #[wasm_bindgen(js_name = installSendDiagnostics)]
+    fn install_send_diagnostics(reader: &js_sys::Function) -> js_sys::Function;
+    #[wasm_bindgen(js_name = markSendDiagnostic)]
+    fn mark_send_diagnostic(phase: &str);
+}
+
 const QUEUED_EDIT_MIN_HEIGHT_PX: i32 = 39;
 const QUEUED_EDIT_MAX_HEIGHT_PX: i32 = 240;
 
@@ -255,6 +273,7 @@ impl Composer {
     /// Empty the composer. Called only from [`settle_submission`], and only once
     /// the complete submission has a holder.
     fn clear(&self, state: &AppState) {
+        mark_send_diagnostic("clear-before");
         state.chat_input.set(String::new());
         self.images.set(Vec::new());
         self.attachment_error.set(None);
@@ -262,6 +281,7 @@ impl Composer {
             textarea.set_value("");
             resize_chat_input(&textarea);
         }
+        mark_send_diagnostic("clear-after");
     }
 
     fn image_payload(&self) -> Vec<protocol::ImageData> {
@@ -1138,6 +1158,49 @@ fn NewChatOptions() -> impl IntoView {
     }
 }
 
+pub(crate) fn initialize_send_diagnostics() {
+    #[derive(serde::Deserialize)]
+    struct BuildManifest {
+        version: host_config::TydeReleaseVersion,
+    }
+    let manifest: BuildManifest = serde_json::from_str(include_str!("../../../package.json"))
+        .expect("release manifest checked at build validation");
+    let beta = manifest
+        .version
+        .as_str()
+        .split_once('-')
+        .is_some_and(|(_, suffix)| suffix.starts_with("beta."));
+    #[cfg(any(test, all(feature = "ui-fixtures", debug_assertions)))]
+    let beta =
+        use_context::<crate::app::DiagnosticBuildChannel>().map_or(beta, |channel| channel.0);
+    let cleanup = send_wrapper::SendWrapper::new(configure_send_diagnostics(beta));
+    on_cleanup(move || {
+        cleanup
+            .take()
+            .call0(&wasm_bindgen::JsValue::NULL)
+            .expect("diagnostic session cleanup");
+    });
+}
+
+#[component]
+pub(crate) fn SendDiagnosticsSurface(#[prop(default = false)] settings: bool) -> impl IntoView {
+    let root = NodeRef::<leptos::html::Div>::new();
+    Effect::new(move |_| {
+        if let Some(root) = root.get() {
+            let cleanup =
+                send_wrapper::SendWrapper::new(install_send_diagnostics_surface(&root, settings));
+            on_cleanup(move || {
+                cleanup
+                    .take()
+                    .call0(&wasm_bindgen::JsValue::NULL)
+                    .expect("diagnostic surface cleanup");
+            });
+        }
+    });
+    view! { <div node_ref=root class=if settings { "settings-group send-diagnostics-controls" } else { "send-diagnostics-badge" }
+    data-mobile-test=if settings { "send-diagnostics-panel" } else { "send-diagnostics-status" } /> }
+}
+
 /// Mobile chat composer.
 ///
 /// Primary button label follows the state matrix: "Send" when idle, "Queue"
@@ -1157,9 +1220,80 @@ pub fn ChatInput() -> impl IntoView {
     let queued_edit = RwSignal::new(None::<QueuedEditDraft>);
     let queued_edit_focus_return = RwSignal::new(None::<QueuedRowRef>);
 
+    if send_diagnostics_enabled() {
+        let probe_state = state.clone();
+        let reader = Closure::<dyn Fn() -> js_sys::Array>::new(move || {
+            let draft = probe_state.chat_input.get_untracked();
+            let native_equal = composer
+                .textarea
+                .get_untracked()
+                .map(|field| field.value() == draft);
+            let values = js_sys::Array::new();
+            values.push(&wasm_bindgen::JsValue::from_f64(
+                draft.encode_utf16().count() as f64,
+            ));
+            values.push(
+                &native_equal
+                    .map(wasm_bindgen::JsValue::from_bool)
+                    .unwrap_or(wasm_bindgen::JsValue::NULL),
+            );
+            values.push(&wasm_bindgen::JsValue::from_bool(composer.is_busy()));
+            values.push(&wasm_bindgen::JsValue::from_bool(
+                loading_photos.get_untracked(),
+            ));
+            values.push(&wasm_bindgen::JsValue::from_bool(
+                active_agent_is_terminated(&probe_state),
+            ));
+            values.push(&wasm_bindgen::JsValue::from_f64(
+                composer.images.with_untracked(|images| images.len()) as f64,
+            ));
+            values.push(
+                &composer
+                    .textarea
+                    .get_untracked()
+                    .map(|field| wasm_bindgen::JsValue::from((*field).clone()))
+                    .unwrap_or(wasm_bindgen::JsValue::NULL),
+            );
+            let activity = probe_state
+                .active_agent
+                .get_untracked()
+                .map(|agent| {
+                    let owner = agent.as_agent_ref();
+                    if active_agent_is_terminated(&probe_state) {
+                        "terminated"
+                    } else if probe_state
+                        .agent_awaiting_user
+                        .with_untracked(|agents| agents.contains(&owner))
+                    {
+                        "awaiting-user"
+                    } else if probe_state
+                        .agent_turn_active
+                        .with_untracked(|agents| agents.get(&owner).copied().unwrap_or(false))
+                    {
+                        "thinking"
+                    } else {
+                        "idle"
+                    }
+                })
+                .unwrap_or("none");
+            values.push(&wasm_bindgen::JsValue::from_str(activity));
+            values
+        });
+        let cleanup = install_send_diagnostics(reader.as_ref().unchecked_ref());
+        let held = send_wrapper::SendWrapper::new((cleanup, reader));
+        on_cleanup(move || {
+            let (cleanup, reader) = held.take();
+            if cleanup.call0(&wasm_bindgen::JsValue::NULL).is_err() {
+                web_sys::console::error_1(&"Send diagnostic cleanup failed".into());
+            }
+            drop(reader);
+        });
+    }
+
     let do_send = {
         let state = state.clone();
         move || {
+            mark_send_diagnostic("send-handler");
             // The composer now *keeps* the user's text for the whole in-flight
             // window — that is the entire point of the fix. It also means the old
             // double-send guard is gone: clearing the box early used to make a
@@ -1167,6 +1301,7 @@ pub fn ChatInput() -> impl IntoView {
             // guard, it was a side effect, and a second `SpawnAgent` costs a
             // second agent and a second paid turn. Guard it explicitly.
             if composer.is_busy() || loading_photos.get_untracked() {
+                mark_send_diagnostic("guard-busy-or-photos");
                 return;
             }
             // A terminated agent is a deliberate block, not a lookup failure.
@@ -1175,11 +1310,13 @@ pub fn ChatInput() -> impl IntoView {
             // nothing about what to do instead. The draft survives either way —
             // it is the payload for Fork + send.
             if active_agent_is_terminated(&state) {
+                mark_send_diagnostic("guard-terminated");
                 return;
             }
             let text = state.chat_input.get_untracked().trim().to_string();
             let images = composer.image_payload();
             if text.is_empty() && images.is_empty() {
+                mark_send_diagnostic("guard-empty");
                 return;
             }
 
@@ -1189,6 +1326,7 @@ pub fn ChatInput() -> impl IntoView {
             let active_target = match state.active_agent.get_untracked() {
                 Some(active) => {
                     let Some(stream) = active_agent_stream(&state, &active) else {
+                        mark_send_diagnostic("guard-missing-stream");
                         report_send_error(
                             &state,
                             "Failed to send message: agent stream not found".into(),
@@ -1205,16 +1343,19 @@ pub fn ChatInput() -> impl IntoView {
                 None => match state.active_local_host_id.get_untracked() {
                     Some(host) => host,
                     None => {
+                        mark_send_diagnostic("guard-missing-host");
                         report_send_error(&state, "Failed to send message: no active host".into());
                         return;
                     }
                 },
             };
             if refuse_unholdable(&state, &host) {
+                mark_send_diagnostic("guard-custody-cap");
                 return;
             }
 
             composer.begin();
+            mark_send_diagnostic("submission-begin");
             spawn_local(async move {
                 // The composer still holds the text through this await. It is
                 // cleared only inside `settle_submission`, and only once the
@@ -1984,9 +2125,11 @@ pub fn ChatInput() -> impl IntoView {
                     on:input=move |ev| {
                         let textarea = event_target::<web_sys::HtmlTextAreaElement>(&ev);
                         let val = textarea.value();
+                        mark_send_diagnostic("input-handler-before");
                         if s_input.chat_input.get_untracked() != val {
                             s_input.chat_input.set(val);
                         }
+                        mark_send_diagnostic("input-handler-after");
                     }
                     on:keydown=on_keydown
                 />
@@ -2014,10 +2157,13 @@ pub fn ChatInput() -> impl IntoView {
                             let do_interrupt = interrupt_for_menu.clone();
                             let do_send = send_for_menu.clone();
                             move |_| {
+                                mark_send_diagnostic("primary-click-handler");
                                 if is_terminated.get_untracked() {
+                                    mark_send_diagnostic("primary-guard-terminated");
                                     return;
                                 }
                                 if can_cancel.get_untracked() && !has_input.get_untracked() {
+                                    mark_send_diagnostic("primary-interrupt");
                                     do_interrupt();
                                 } else {
                                     do_send();
@@ -2208,6 +2354,19 @@ fn settle_submission(
         text,
         images,
     } = submission;
+    mark_send_diagnostic(match &outcome {
+        Ok(_) => "admitted-locally",
+        Err(SendFrameError::Encoding(_)) => "admission-encoding-failed",
+        Err(SendFrameError::Rejected(crate::bridge::SendRejected::NotConnected)) => {
+            "admission-not-connected"
+        }
+        Err(SendFrameError::Rejected(crate::bridge::SendRejected::QueueFull)) => {
+            "admission-queue-full"
+        }
+        Err(SendFrameError::Rejected(crate::bridge::SendRejected::ConnectionClosed)) => {
+            "admission-connection-closed"
+        }
+    });
     match outcome {
         Ok(accepted) => {
             state.hold_submission(PendingSubmission {
@@ -3205,8 +3364,10 @@ mod wasm_tests {
         let container = make_container();
         let host = LocalHostId("host-1".to_owned());
         let host_for_mount = host.clone();
+        let state = AppState::new();
+        let mount_state = state.clone();
         let _h = mount_to(container.clone(), move || {
-            let state = AppState::new();
+            let state = mount_state;
             state.active_local_host_id.set(Some(host_for_mount.clone()));
             state.agents.set(vec![AgentInfo {
                 local_host_id: host_for_mount.clone(),
@@ -3255,6 +3416,143 @@ mod wasm_tests {
             1,
             "an impatient double-tap must not send the message twice"
         );
+        crate::bridge::test_resolve_next_send();
+        next_tick().await;
+        next_tick().await;
+        let input = container
+            .query_selector("[data-mobile-test='chat-input']")
+            .unwrap()
+            .unwrap()
+            .dyn_into::<web_sys::HtmlTextAreaElement>()
+            .unwrap();
+        let composing_input = js_sys::Function::new_with_args(
+            "field,value,type,composing",
+            r#"
+            field.value = value;
+            field.dispatchEvent(new InputEvent('input', {
+                bubbles:true, inputType:type, isComposing:composing
+            }));
+        "#,
+        );
+        // Constructed composition events exercise Leptos, not an iOS keyboard.
+        for (wait_before_tap, replace_during_contact, reject, from_empty) in [
+            (false, false, false, false),
+            (true, false, false, false),
+            (false, true, false, false),
+            (true, false, false, true),
+            (true, true, true, false),
+        ] {
+            // Keep the original admission fixture: resetting it reuses local IDs
+            // and replaces custody records rather than modeling another submission.
+            let rejection_guard = reject.then(crate::bridge::test_reject_sends);
+            let attempts_before = crate::bridge::test_send_attempts();
+            let pending_before = state.pending_submissions.get_untracked().len();
+            type_text(&container, if from_empty { "" } else { "existing draft" });
+            next_tick().await;
+            js_sys::Function::new_with_args(
+                "input",
+                "input.dispatchEvent(new CompositionEvent('compositionstart', {bubbles:true}))",
+            )
+            .call1(&wasm_bindgen::JsValue::NULL, &input)
+            .unwrap();
+            composing_input
+                .call4(
+                    &wasm_bindgen::JsValue::NULL,
+                    &input,
+                    &"composing draft".into(),
+                    &"insertCompositionText".into(),
+                    &wasm_bindgen::JsValue::TRUE,
+                )
+                .unwrap();
+            assert!(
+                state.chat_input.get_untracked() == input.value(),
+                "composing input reaches the signal synchronously"
+            );
+            if wait_before_tap {
+                next_tick().await;
+            }
+            send.dispatch_event(&web_sys::Event::new("pointerdown").unwrap())
+                .unwrap();
+            let expected = if replace_during_contact {
+                composing_input
+                    .call4(
+                        &wasm_bindgen::JsValue::NULL,
+                        &input,
+                        &"replacement draft".into(),
+                        &"insertReplacementText".into(),
+                        &wasm_bindgen::JsValue::TRUE,
+                    )
+                    .unwrap();
+                "replacement draft"
+            } else {
+                "composing draft"
+            };
+            assert!(send.is_connected());
+            assert!(send.is_same_node(Some(&primary(&container))));
+            assert!(!send.has_attribute("disabled"));
+            send.dispatch_event(&web_sys::Event::new("pointerup").unwrap())
+                .unwrap();
+            send.click();
+            next_tick().await;
+            assert_eq!(crate::bridge::test_send_attempts(), attempts_before + 1);
+            assert!(
+                input.value() == expected,
+                "draft retained until local admission"
+            );
+            if !reject {
+                assert!(send.has_attribute("disabled"));
+                send.click();
+                next_tick().await;
+                assert_eq!(crate::bridge::test_send_attempts(), attempts_before + 1);
+                let frames = crate::bridge::test_sent_lines();
+                assert_eq!(frames.len(), attempts_before + 1);
+                let frame: serde_json::Value =
+                    serde_json::from_str(frames.last().unwrap()).unwrap();
+                assert_eq!(frame["kind"], "send_message");
+                assert!(
+                    frame["payload"]["message"] == expected,
+                    "the final observed replacement is submitted"
+                );
+                crate::bridge::test_resolve_next_send();
+                next_tick().await;
+                next_tick().await;
+                assert!(
+                    input.value().is_empty(),
+                    "admission clears the native draft"
+                );
+                assert!(state.chat_input.get_untracked().is_empty());
+            }
+            js_sys::Function::new_with_args("input", "input.dispatchEvent(new CompositionEvent('compositionend', {bubbles:true})); input.dispatchEvent(new InputEvent('input', {bubbles:true, inputType:'insertFromComposition', isComposing:false}))")
+                .call1(&wasm_bindgen::JsValue::NULL, &input).unwrap();
+            next_tick().await;
+            assert_eq!(
+                crate::bridge::test_send_attempts(),
+                attempts_before + 1,
+                "composition completion must not submit again"
+            );
+            assert!(input.value() == state.chat_input.get_untracked());
+            assert_eq!(
+                state.pending_submissions.get_untracked().len(),
+                pending_before + usize::from(!reject),
+                "admission creates exactly one holder; rejection creates none"
+            );
+            if reject {
+                assert!(
+                    input.value() == expected,
+                    "rejection preserves the draft after composition ends"
+                );
+            }
+            console_log!(
+                "COMPOSITION wait_tick={} mid_contact_replacement={} rejected={} from_empty={} attempts=1 native_signal_equal=true",
+                wait_before_tap,
+                replace_during_contact,
+                reject,
+                from_empty
+            );
+            drop(rejection_guard);
+        }
+        drop(_h);
+        container.remove();
     }
 
     // ── State matrix row 1: Idle + empty ─────────────────────────────────────

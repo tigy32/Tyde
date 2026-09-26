@@ -75,6 +75,18 @@ pub fn capture_send(line: &str) -> Accepted {
 }
 
 pub fn seed_state(state: &AppState) {
+    let channel = web_sys::window()
+        .and_then(|window| window.location().search().ok())
+        .and_then(|search| web_sys::UrlSearchParams::new_with_str(&search).ok())
+        .and_then(|params| params.get("tyde-fixture-diagnostics-channel"));
+    if let Some(channel) = channel {
+        let beta = match channel.as_str() {
+            "beta" => true,
+            "stable" => false,
+            _ => panic!("invalid fixture diagnostic channel"),
+        };
+        provide_context(crate::app::DiagnosticBuildChannel(beta));
+    }
     let name = fixture_name();
     if name == "onboarding" {
         state.app_mode.set(AppMode::Onboarding);
@@ -245,6 +257,83 @@ pub fn seed_state(state: &AppState) {
                 ..Default::default()
             },
         );
+    });
+
+    let probe_state = state.clone();
+    let probe_host = host.clone();
+    let sequence = Cell::new(0_u64);
+    let activity = wasm_bindgen::closure::Closure::<dyn Fn(bool)>::new(move |thinking| {
+        let owner = probe_state
+            .active_agent
+            .get_untracked()
+            .expect("fixture agent")
+            .as_agent_ref();
+        let seq = sequence.get();
+        sequence.set(seq + 1);
+        crate::dispatch::dispatch_envelope(
+            &probe_state,
+            &probe_host,
+            protocol::Envelope::from_payload(
+                StreamPath("/agent/fixture-agent/fixture".to_owned()),
+                protocol::FrameKind::AgentActivityChanged,
+                seq,
+                &protocol::AgentActivityChangedPayload {
+                    activity: if thinking {
+                        protocol::AgentActivity::Thinking
+                    } else {
+                        protocol::AgentActivity::Idle
+                    },
+                },
+            )
+            .expect("fixture activity"),
+        );
+        crate::dispatch::apply_chat_event(
+            &probe_state,
+            &owner,
+            protocol::ChatEvent::StreamStart(protocol::StreamStartData {
+                agent: "fixture".to_owned(),
+                model: None,
+            }),
+        );
+        crate::dispatch::apply_chat_event(
+            &probe_state,
+            &owner,
+            protocol::ChatEvent::StreamDelta(protocol::StreamTextDeltaData {
+                text: "Streaming fixture output".to_owned(),
+            }),
+        );
+    });
+    js_sys::Reflect::set(
+        &js_sys::global(),
+        &"__TYDE_FIXTURE_ACTIVITY__".into(),
+        activity.as_ref(),
+    )
+    .expect("fixture hook");
+    let activity = send_wrapper::SendWrapper::new(activity);
+    on_cleanup(move || {
+        js_sys::Reflect::delete_property(&js_sys::global(), &"__TYDE_FIXTURE_ACTIVITY__".into())
+            .expect("remove fixture hook");
+        drop(activity.take());
+    });
+
+    let navigation_state = state.clone();
+    let navigation = wasm_bindgen::closure::Closure::<dyn Fn(bool)>::new(move |connected: bool| {
+        navigation_state
+            .active_local_host_id
+            .set(connected.then(|| LocalHostId("fixture-host".to_owned())));
+        navigation_state.viewing_chat.set(connected);
+    });
+    js_sys::Reflect::set(
+        &js_sys::global(),
+        &"__TYDE_FIXTURE_HOST__".into(),
+        navigation.as_ref(),
+    )
+    .expect("fixture navigation hook");
+    let navigation = send_wrapper::SendWrapper::new(navigation);
+    on_cleanup(move || {
+        js_sys::Reflect::delete_property(&js_sys::global(), &"__TYDE_FIXTURE_HOST__".into())
+            .expect("remove fixture navigation hook");
+        drop(navigation.take());
     });
 
     match name.as_str() {
