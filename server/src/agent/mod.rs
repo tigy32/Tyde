@@ -6460,35 +6460,12 @@ pub(crate) fn spawn_agent_actor(
                                             "moved review-origin bundle to front of queue"
                                         );
                                     }
-                                    if in_turn && !usage_paused && context_compaction.is_none() {
-                                        let outcome = backend
-                                            .as_ref()
-                                            .expect("backend must exist while actor is running")
-                                            .steer(queued.clone().into_send_payload())
-                                            .await;
-                                        if matches!(outcome, SteerOutcome::Accepted) {
-                                            update_queued_messages_snapshot(
-                                                &canonical_stream,
-                                                &mut event_log,
-                                                &mut subscribers,
-                                                &queue,
-                                                &session_store,
-                                                &status_handle,
-                                            )
-                                            .await;
-                                            if let Some(MessageOrigin::Review { review_id }) =
-                                                queued.origin.clone()
-                                            {
-                                                notify_review_bundle_consumed(
-                                                    &review_registry,
-                                                    review_id,
-                                                    &current_start.agent_id,
-                                                )
-                                                .await;
-                                            }
-                                            continue;
-                                        }
-                                    }
+                                    tracing::debug!(
+                                        in_turn,
+                                        usage_paused,
+                                        queue_len = queue.len(),
+                                        "processing queued send-now request"
+                                    );
                                     queue.push_front(queued);
                                     update_queued_messages_snapshot(
                                         &canonical_stream,

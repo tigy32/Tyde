@@ -866,17 +866,17 @@ fn is_user_message(event: &ChatEvent, content: &str) -> bool {
     )
 }
 
-/// A steer, and a queued message sent "now", join the running turn on a
-/// backend that can take input mid-turn: the turn is never interrupted and
-/// nothing waits in the queue. Once idle, a steer is an ordinary send.
+/// Explicit steering joins the running turn, but sending a queued message
+/// now cancels it and starts a new turn, even when steering is supported.
+/// Once idle, a steer remains an ordinary send.
 #[tokio::test(start_paused = true)]
-async fn steer_message_joins_running_turn_without_interrupt() {
+async fn steer_and_send_now_use_distinct_delivery_modes() {
     let mut fixture = Fixture::new().await;
-    let gate = MockGateHandle::new();
     let agent = fixture
         .spawn_scripted(
             "queue-steer",
-            MockScript::one(MockTurn::gated_text("launch reply", &gate))
+            MockScript::one(MockTurn::held_text("launch reply"))
+                .then(MockTurn::text("send-now reply"))
                 .then(MockTurn::text("idle steer reply"))
                 .with_user_bubbles()
                 .with_mid_turn_steering(),
@@ -887,7 +887,6 @@ async fn steer_message_joins_running_turn_without_interrupt() {
             matches!(event, ChatEvent::TypingStatusChanged(true))
         })
         .await;
-    gate.wait_until_entered().await;
 
     fixture
         .client
@@ -932,15 +931,15 @@ async fn steer_message_joins_running_turn_without_interrupt() {
             [
                 MockRequest::Launch { .. },
                 MockRequest::Steer(first),
-                MockRequest::Steer(second),
+                MockRequest::Interrupt,
+                MockRequest::Input(second),
             ] if first.message == "steer into the turn" && second.message == "queued behind the turn"
         ),
-        "both messages must reach the running turn as steers, with no interrupt: {requests:?}"
+        "send-now must interrupt and send, while explicit steering must not interrupt"
     );
 
-    gate.release_one();
     fixture
-        .next_chat_event_matching(&agent, "launch turn idle", |event| {
+        .next_chat_event_matching(&agent, "send-now turn idle", |event| {
             matches!(event, ChatEvent::TypingStatusChanged(false))
         })
         .await;
@@ -961,7 +960,7 @@ async fn steer_message_joins_running_turn_without_interrupt() {
             requests.last(),
             Some(MockRequest::Input(payload)) if payload.message == "steer while idle"
         ),
-        "an idle steer must be delivered as an ordinary send: {requests:?}"
+        "an idle steer must be delivered as an ordinary send"
     );
     mock.assert_clean().await;
 }
