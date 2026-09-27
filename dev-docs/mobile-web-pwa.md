@@ -101,7 +101,9 @@ in `./dev.sh check`.
 
 The Rust/Leptos UI imports Tyggs Web Shell through `wasm-bindgen`; it does not
 copy the viewport algorithm. The pinned revision is
-`b7b25b117b379c49e0419c612e3a8fbeef060241`, from Tychat's checked-in archive.
+`3b3fa78d7e56fa5dc6d4aa4f5fdca4564edaaf5c`, published on the shell
+repository's upstream `main`. The unmodified archive was produced locally with
+`npm pack --ignore-scripts` from that clean committed checkout.
 `mobile-frontend/vendor/web-shell/PROVENANCE.md` records its checksum. The
 unmodified JS is a local wasm-bindgen module, so Trunk includes it under each
 versioned bundle and the existing executable-integrity manifest covers it.
@@ -195,10 +197,11 @@ Loading beta.10 in the same installed beta.4 icon, without reinstalling,
 retained native y=0 and 47px safe-top despite the new document's `default`
 status-bar metadata. Its capsule bottom moved up 8px (physical gap 81px), and
 its top moved up 16px because the capsule also grew from 48px to 56px tall.
-Restoring the inset repairs that 8px regression; it does **not** claim to remove
-iOS's separate retained 47px installation strip. Expanding the shell to
-`screen.height` would violate its 797px paintable cap, so no such recovery is
-added. Keep `status-bar-style=default`; fresh-install evidence supports it.
+Restoring the inset repaired only the 8px spacing regression. The earlier
+conclusion that the retained 47px strip could not be painted was incorrect:
+client/visual height alone does not establish the paintable edge of a legacy
+translucent icon. The standalone recovery below supersedes that conclusion.
+Keep `status-bar-style=default`; fresh-install evidence supports it.
 
 Served beta.9 and beta.10 app CSS, shell CSS and shell JS were byte-identical.
 The manifest protocol version changed from 63 to 64 at beta.10. The loader
@@ -222,8 +225,7 @@ CSS switch within the legacy icon. Closed and dismissed composer/tab gaps were
 and 468px with the keyboard open; the client cap stayed 797px. Capsule/input
 heights stayed 56px/44px. The physical legacy-icon gap returned from 81px to
 73px, not to 26px: the retained 47px status-bar strip is explicitly unresolved.
-All temporary cloud resources were deleted after four allocations (42.81
-reported device-minutes; trial balance 809.08 to 799.52).
+All temporary cloud resources were deleted after four allocations.
 
 The repository gate also exposed an unrelated descriptor-exhaustion test race:
 `WatcherInitialize` exhausted the process descriptors while initial review-store
@@ -247,6 +249,72 @@ visibility assertion reproduced the fixture error: the capsule was at
 area. The flow now anchors its fixture to the viewport bottom, keeps that new
 visibility assertion, and retains every existing transition/geometry check and
 timeout. No production animation or layout behavior was changed for this case.
+
+### Retained translucent-icon status-bar recovery
+
+Older Home Screen icons can retain the full-screen translucent webview origin
+even after the document switches to default status-bar metadata. The measured
+client/visual viewport can then omit exactly safe-top, leaving a dead bottom
+band and content behind the clock. The shared shell, not a Tyde viewport owner,
+initiates recovery only at unit scale, standalone, keyboard closed and no
+editable focus, with positive safe-top and a screen shortfall within 3px of
+that inset (at most 120px). Recovery is capped by both screen height and layout
+height plus safe-top
+minus the viewport offset. Fresh default-mode icons with zero safe-top keep
+their shorter viewport and below-status-bar native origin. The shared scroller
+is clipped below safe-top; header/flow clearance is still applied once. Recovery
+also temporarily grows html and body: enlarging only the fixed shell still clips
+its controls. That validated document paint surface is retained during typing;
+only the shell contracts with the visual viewport. Original heights are restored
+when the legacy layout signature disappears or on cleanup; overflow stays hidden.
+No document recovery is initiated while an editable control is already focused.
+Once recovery is validated, focus without viewport contraction preserves the
+full shell height and 26px bottom gap. Actual contraction still follows the
+visual viewport, including its transition before keyboard classification.
+
+The app-surface DOM flow supplies the recorded 852/793/59px readings to mounted
+components, asserts composer and all tab bottoms at 826px with a 34px bottom
+inset even while focused without contraction, checks status-bar clipping and
+reachability, and keeps the zero-safe-top composer at 767px. These supplied readings test the integration, not native iOS.
+Only versioned shell assets change: root loader logic, service-worker precache,
+selected-host switching, pairings and draft/send ownership are unchanged, so no
+LOADER_CACHE bump is required.
+
+On iPhone 14 Pro Max / iOS 26.5 (59px safe-top), the first height-only candidate
+reported a 932px shell but visibly clipped its controls at 873px. Explicitly
+growing html/body, with overflow still hidden, restored both pixels and
+hit-testing at the bottom; changing overflow alone did not. This is why the
+regression now checks document surfaces, not just capsule rectangles. The
+private HTTPS Tyde fixtures retain beta.10 release/fixture WASM and swap only
+the shell; current integration is covered by the mounted app flow. These runs
+do not certify production-origin worker upgrades, pairing or the owner's exact
+phone. Original images, runtime hashes and bounded-run reports are retained at
+`/home/tyggs/Tyde/status-bar-band-evidence/`.
+
+Keyboard follow-up reproduced a separate failure in the first recovery candidate:
+restoring the shorter document during UIKit's pan put the header under the clock
+and the composer 59px above its proper position. DOM Send center remained at 508px
+while painted center was 449px; elementFromPoint at the painted center missed,
+and two native taps submitted nothing. The unchanged beta.11 shell baseline had
+matching 508px centers and one successful native Send, so that baseline did not
+reproduce the owner's intermittent report. This demonstrates the offset failure
+mechanism, not proof of the historical user's exact failure.
+
+The shell now retains the validated document surface through focus/keyboard
+transitions while keeping the same viewport offsets and contraction algorithm.
+The mounted flow checks retained surfaces, legacy/fresh keyboard docking and
+Send hit-testing without changing Tyde's send path, draft or backend ownership.
+The physical harness derives tap coordinates from screenshot marker pixels,
+not accessibility rectangles or DOM geometry alone; exact final device results
+remain in the evidence directory alongside the rejected candidates.
+
+The focus-retention follow-up failed in all three shell browser engines and
+the mounted Tyde flow before correction. One bounded legacy-icon recheck on
+iPhone 14 Pro Max / iOS 26.5 captured uncontracted focused frames at full height,
+four software-keyboard openings and four successful native Send taps with
+aligned painted/DOM centers. Closed spacing remained 26px and keyboard spacing
+10px. The zero-safe-top path is unchanged and remains covered by the desktop
+flow; this follow-up did not repeat the earlier fresh-icon device run.
 
 ## Exact selected-host release synchronization
 

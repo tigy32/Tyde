@@ -49,7 +49,9 @@ export function attachShell(root, options = {}) {
     if (![header, content, bottom, flow].every(element => root.contains(element)))
         throw new Error("Shell regions must belong to its root");
     const html = document.documentElement;
+    const documentHeights = [html, document.body].map(element => preserveStyle(element, ["height"]));
     const restore = [preserveStyle(root, geometryProperties), preserveAttribute(root, "data-tws-keyboard"), preserveAttribute(root, "data-tws-title-hidden"), preserveAttribute(html, "data-tws-document")];
+    restore.push(...documentHeights);
     const viewport = window.visualViewport;
     const keyboard = window.navigator.virtualKeyboard;
     if (keyboard) {
@@ -62,6 +64,7 @@ export function attachShell(root, options = {}) {
     const following = options.followEnd === true;
     let pinned = options.initialScroll === "end";
     let stopped = false;
+    let documentRecovered = false;
     let dirty = true;
     let frame = 0;
     let settleUntil = 0;
@@ -96,9 +99,23 @@ export function attachShell(root, options = {}) {
         if (!focused && !state.keyboard)
             browserChrome = Math.max(0, window.outerHeight - layoutHeight);
         const referenceHeight = keyboard && coarsePointer.matches ? Math.max(layoutHeight, window.outerHeight - browserChrome) : layoutHeight;
-        const height = Math.max(1, Math.min(viewport?.height ?? layoutHeight, layoutHeight - top));
-        return { top, left, width, height, scale,
-            keyboard: (focused || state.keyboard) && referenceHeight - (viewport?.height ?? layoutHeight) > 80 };
+        const keyboardOpen = (focused || state.keyboard) && referenceHeight - (viewport?.height ?? layoutHeight) > 80;
+        const measuredHeight = Math.max(1, Math.min(viewport?.height ?? layoutHeight, layoutHeight - top));
+        let height = measuredHeight;
+        const standalone = window.navigator.standalone === true || window.matchMedia("(display-mode: standalone)").matches;
+        const safeTop = standalone ? parseFloat(window.getComputedStyle(root).getPropertyValue("--tws-safe-top")) || 0 : 0;
+        const legacyShortfall = (measured) => {
+            const shortfall = window.screen.height - measured;
+            return safeTop > 0 && shortfall > 0 && shortfall <= 120 && Math.abs(shortfall - safeTop) <= 3;
+        };
+        // Shrinking the document during UIKit's keyboard pan separates paint from hit-testing.
+        let documentHeight = documentRecovered && legacyShortfall(layoutHeight)
+            ? Math.min(window.screen.height, layoutHeight + safeTop) : null;
+        if (!keyboardOpen && (!focused || documentHeight !== null) && legacyShortfall(measuredHeight)) {
+            height = Math.min(window.screen.height, layoutHeight + safeTop - top);
+            documentHeight = top + height;
+        }
+        return { top, left, width, height, scale, keyboard: keyboardOpen, documentHeight };
     };
     const reveal = () => {
         const active = document.activeElement;
@@ -114,14 +131,28 @@ export function attachShell(root, options = {}) {
             content.scrollTop += Math.min(bounds.bottom - lower, bounds.top - upper);
     };
     const apply = () => {
-        const next = read();
-        if (!next)
+        const reading = read();
+        if (!reading)
             return;
-        const changed = next.top !== state.top || next.left !== state.left || next.width !== state.width || next.height !== state.height || next.keyboard !== state.keyboard;
+        const { documentHeight, ...next } = reading;
+        const recovered = documentHeight !== null;
+        const changed = recovered !== documentRecovered || next.top !== state.top || next.left !== state.left || next.width !== state.width || next.height !== state.height || next.keyboard !== state.keyboard;
         if (!dirty && !changed)
             return;
         dirty = false;
         state = next;
+        if (documentHeight !== null) {
+            const height = `${documentHeight}px`;
+            for (const element of [html, document.body]) {
+                if (element.style.height !== height)
+                    element.style.setProperty("height", height);
+            }
+        }
+        else if (documentRecovered) {
+            for (const reset of documentHeights)
+                reset();
+        }
+        documentRecovered = recovered;
         write("--tws-top", next.top);
         write("--tws-left", next.left);
         write("--tws-width", next.width);

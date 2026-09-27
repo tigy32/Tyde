@@ -70,6 +70,7 @@ html[data-tws-document] body {
 }
 
 .tws-content {
+  margin-top: var(--tws-safe-top);
   z-index: 0;
   overflow: auto;
   overscroll-behavior: contain;

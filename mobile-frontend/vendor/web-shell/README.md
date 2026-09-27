@@ -157,14 +157,25 @@ retain their 44px minimum and multiline text scrolls inside the same textarea.
 
 Chrome uses `interactive-widget=resizes-content`; the shell temporarily disables
 VirtualKeyboard overlay mode and restores its previous value on detach. Safari
-uses VisualViewport. Keyboard classification controls tabs/safe areas only and
-is a documented viewport-contraction heuristic, never a guessed composer offset.
-The actual shell rectangle always comes from current browser viewport geometry.
-Use the standard iOS system status bar, not legacy `black-translucent`: the
-physical sample shows the latter can leave an extra bottom strip. The app bars
-remain floating glass; content still scrolls underneath them. Verify metadata and
-service-worker updates on existing Home Screen installations during app migration;
-the farm sample used fresh installations.
+uses VisualViewport. Keyboard classification controls tabs/safe areas and blocks
+legacy standalone recovery; it is a viewport-contraction heuristic, never a
+subtracted keyboard height. The shell normally follows current viewport geometry.
+For retained translucent Home Screen icons only, a closed, unfocused unit-scale
+shortfall matching positive safe-top (within 3px, at most 120px) recovers up to
+the screen/layout-plus-inset cap. Once validated, the shell keeps that height
+across focus changes until the viewport actually contracts; focus alone is not
+a keyboard resize. The owner grows html/body with the shell so
+its bottom is paintable. That validated document size remains while typing,
+even as the shell contracts, so UIKit does not separate painting from hit-testing.
+It restores authored heights when the legacy layout signature disappears
+and on detach. The scroller clips at safe-top to keep text out of the clock.
+Fresh default-style icons have zero safe-top and retain the normal cap.
+Use the standard iOS system status bar for new installations rather than
+`black-translucent`. Existing icons can retain translucent mode even after a
+metadata update; the guarded recovery above handles their measured shortfall.
+The app bars remain floating glass, with content scrolling underneath them.
+Verify metadata and service-worker updates separately during app migration;
+layout coverage does not certify production update delivery.
 At non-unit pinch zoom, shell geometry freezes to preserve browser zoom/pan.
 
 ## Rust / Leptos

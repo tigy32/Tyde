@@ -2077,6 +2077,152 @@ mod wasm_tests {
             .unwrap();
         sleep(Duration::from_millis(100)).await;
         assert_bottom_gap(&dock, 26.0);
+        let standalone_readings = || {
+            BrowserOverride(js_sys::Function::new_with_args("w", r#"
+                const entries = [[w.navigator, 'standalone', true],
+                    [w.screen, 'height', 852],
+                    [w.document.documentElement, 'clientHeight', 793],
+                    [w.visualViewport, 'height', 793]];
+                const clipStyle = w.document.createElement('style');
+                clipStyle.textContent = 'html[data-tws-document], html[data-tws-document] body {height:793px}';
+                w.document.body.append(clipStyle);
+                const saved = entries.map(([object, key]) => Object.getOwnPropertyDescriptor(object, key));
+                entries.forEach(([object, key, value]) => Object.defineProperty(object, key, {configurable:true, value}));
+                w.dispatchEvent(new w.Event('resize'));
+                return () => {
+                    clipStyle.remove();
+                    entries.forEach(([object, key], i) => {
+                        if (saved[i]) Object.defineProperty(object, key, saved[i]);
+                        else delete object[key];
+                    });
+                    w.dispatchEvent(new w.Event('resize'));
+                };
+            "#).call1(&wasm_bindgen::JsValue::NULL, &frame.content_window().unwrap()).unwrap())
+        };
+        let assert_physical_bottom = |element: &web_sys::Element, expected: f64| {
+            let bottom = element.get_bounding_client_rect().bottom();
+            wasm_bindgen_test::console_log!(
+                "Standalone chrome bottom={bottom}, expected={expected}"
+            );
+            assert!(
+                (bottom - expected).abs() <= 1.0,
+                "standalone chrome reaches the physical edge: expected={expected}, actual={bottom}"
+            );
+        };
+        let readings = standalone_readings();
+        safe_area.set_text_content(Some(
+            ".mobile-app { --tws-safe-top: 59px; --tws-safe-bottom: 34px; }",
+        ));
+        sleep(Duration::from_millis(100)).await;
+        assert_physical_bottom(&dock, 852.0 - 26.0);
+        for element in [
+            frame_document.document_element().unwrap(),
+            frame_document.body().unwrap().into(),
+        ] {
+            assert!(
+                (element.get_bounding_client_rect().height() - 852.0).abs() <= 1.0,
+                "the document paint surface must grow with the recovered shell"
+            );
+        }
+        scroller.set_scroll_top(100);
+        assert!(scroller.get_bounding_client_rect().top() >= 59.0);
+        assert!(
+            !frame_document
+                .element_from_point(100.0, 30.0)
+                .is_some_and(|hit| scroller.contains(Some(&hit))),
+            "transcript is clipped below the status-bar clock"
+        );
+        assert!(
+            reachable(),
+            "recovered composer remains inside the paintable viewport"
+        );
+        input.focus().unwrap();
+        sleep(Duration::from_millis(100)).await;
+        assert_physical_bottom(&dock, 852.0 - 26.0);
+        assert!(reachable(), "uncontracted focused Send remains reachable");
+        assert!(
+            (frame_document
+                .document_element()
+                .unwrap()
+                .get_bounding_client_rect()
+                .height()
+                - 852.0)
+                .abs()
+                <= 1.0,
+            "focus must retain the recovered document paint surface"
+        );
+        let keyboard_readings = BrowserOverride(js_sys::Function::new_with_args("w", r#"
+            const entries = [[w.screen, 'height', 932], [w.document.documentElement, 'clientHeight', 873],
+                [w.visualViewport, 'height', 546], [w.visualViewport, 'offsetTop', 327],
+                [w.visualViewport, 'pageTop', 386], [w, 'scrollY', 386]];
+            const saved = entries.map(([object, key]) => Object.getOwnPropertyDescriptor(object, key));
+            entries.forEach(([object, key, value]) => Object.defineProperty(object, key, {configurable:true, value}));
+            const root = w.document.querySelector('.mobile-app');
+            const transform = root.style.transform;
+            root.style.transform = 'translateY(-327px)';
+            w.dispatchEvent(new w.Event('resize'));
+            return () => {
+                root.style.transform = transform;
+                entries.forEach(([object, key], i) => {
+                    if (saved[i]) Object.defineProperty(object, key, saved[i]);
+                    else delete object[key];
+                });
+                w.dispatchEvent(new w.Event('resize'));
+            };
+        "#).call1(&wasm_bindgen::JsValue::NULL, &frame.content_window().unwrap()).unwrap());
+        sleep(Duration::from_millis(100)).await;
+        wasm_bindgen_test::console_log!(
+            "Legacy keyboard shell top={}, composer bottom={}",
+            shell.get_bounding_client_rect().top(),
+            dock.get_bounding_client_rect().bottom()
+        );
+        assert!(
+            shell.get_bounding_client_rect().top().abs() <= 1.0,
+            "legacy keyboard pan must not shift the shell under the clock"
+        );
+        let header = container.query_selector(".chat-header").unwrap().unwrap();
+        assert!(header.get_bounding_client_rect().top() >= 59.0);
+        assert!(scroller.get_bounding_client_rect().top() >= 59.0);
+        assert_physical_bottom(&dock, 546.0 - 10.0);
+        assert!(
+            reachable(),
+            "keyboard-open visual Send center must hit Send"
+        );
+        assert_eq!(input.value(), "preserved draft");
+        safe_area.set_text_content(Some(
+            ".mobile-app { --tws-safe-top: 0px; --tws-safe-bottom: 34px; }",
+        ));
+        js_sys::Function::new_with_args(
+            "w",
+            r#"
+            Object.defineProperty(w.visualViewport, 'height', {configurable:true, value:487});
+            Object.defineProperty(w.visualViewport, 'offsetTop', {configurable:true, value:386});
+            w.document.querySelector('.mobile-app').style.transform = 'translateY(-386px)';
+            w.dispatchEvent(new w.Event('resize'));
+        "#,
+        )
+        .call1(
+            &wasm_bindgen::JsValue::NULL,
+            &frame.content_window().unwrap(),
+        )
+        .unwrap();
+        sleep(Duration::from_millis(100)).await;
+        assert_physical_bottom(&dock, 487.0 - 10.0);
+        assert!(reachable(), "fresh keyboard Send remains reachable");
+        assert_eq!(input.value(), "preserved draft");
+        drop(keyboard_readings);
+        safe_area.set_text_content(Some(
+            ".mobile-app { --tws-safe-top: 59px; --tws-safe-bottom: 34px; }",
+        ));
+        input.blur().unwrap();
+        sleep(Duration::from_millis(100)).await;
+        assert_physical_bottom(&dock, 852.0 - 26.0);
+        safe_area.set_text_content(Some(
+            ".mobile-app { --tws-safe-top: 0px; --tws-safe-bottom: 34px; }",
+        ));
+        sleep(Duration::from_millis(100)).await;
+        assert_physical_bottom(&dock, 793.0 - 26.0);
+        drop(readings);
         safe_area.set_text_content(Some(".mobile-app { --tws-safe-bottom: 0px; }"));
         sleep(Duration::from_millis(100)).await;
         assert_bottom_gap(&dock, 8.0);
@@ -2575,7 +2721,10 @@ mod wasm_tests {
         drop(contact_guard);
         input.blur().unwrap();
         state.viewing_chat.set(false);
-        safe_area.set_text_content(Some(".mobile-app { --tws-safe-bottom: 34px; }"));
+        let readings = standalone_readings();
+        safe_area.set_text_content(Some(
+            ".mobile-app { --tws-safe-top: 59px; --tws-safe-bottom: 34px; }",
+        ));
         for tab in [
             MobileTab::Home,
             MobileTab::Agents,
@@ -2591,6 +2740,9 @@ mod wasm_tests {
             let bounds = nav.get_bounding_client_rect();
             assert!(bounds.height() >= 44.0);
             assert_bottom_gap(&nav, 26.0);
+            assert_physical_bottom(&nav, 852.0 - 26.0);
+            let pane = container.query_selector(".tws-content").unwrap().unwrap();
+            assert!(pane.get_bounding_client_rect().top() >= 59.0);
             assert!(
                 frame_document
                     .element_from_point(
@@ -2599,7 +2751,16 @@ mod wasm_tests {
                     )
                     .is_some_and(|hit| nav.contains(Some(&hit)))
             );
+            safe_area.set_text_content(Some(
+                ".mobile-app { --tws-safe-top: 0px; --tws-safe-bottom: 34px; }",
+            ));
+            sleep(Duration::from_millis(100)).await;
+            assert_physical_bottom(&nav, 793.0 - 26.0);
+            safe_area.set_text_content(Some(
+                ".mobile-app { --tws-safe-top: 59px; --tws-safe-bottom: 34px; }",
+            ));
         }
+        drop(readings);
         safe_area.set_text_content(Some(".mobile-app { --tws-safe-bottom: 0px; }"));
         frame
             .set_attribute("style", "width:852px;height:130px;border:0")
