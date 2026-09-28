@@ -283,7 +283,13 @@ pub struct ProjectFileListPayload {
 
 pub struct ProjectRootListing {
     pub root: ProjectRootPath,
+    pub status: ProjectRootStatus,
     pub entries: Vec<ProjectFileEntry>,
+}
+
+pub enum ProjectRootStatus {
+    Available,
+    Unavailable { message: String },
 }
 
 pub struct ProjectFileEntry {
@@ -670,7 +676,15 @@ Failed watchers are recreated with a five-second retry delay, including watch
 limit failures. Failed scans retain their pending updates and retry after five
 seconds without requiring another filesystem event. Git refresh retries on its
 normal five-second poll. File reads remain independently available whenever the
-OS permits them. A definitively missing project root remains a fatal failure.
+OS permits them. A project root that is missing, not a directory, or cannot be
+statted is not a subscription failure: it is listed with
+`ProjectRootStatus::Unavailable { message }` and no entries, is excluded from
+watching and omitted from Git status, while the project's other roots load
+and stay live. The client renders the message and
+keeps the root's remove control. The periodic Git poll re-checks which roots
+are watchable, so a root that reappears is watched and rescanned; a watcher
+error caused by a root disappearing re-registers the watcher on the remaining
+roots instead of warning.
 
 After watching recovers, the server rescans and invalidates previously observed
 files so clients and code-intelligence listeners re-read edits made during the

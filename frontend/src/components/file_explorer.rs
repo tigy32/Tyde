@@ -11,7 +11,7 @@ use crate::state::{AppState, OpenTarget, display_path_name, root_display_name};
 use protocol::{
     CodeIntelOverviewHeadline, CodeIntelOverviewSummary, CodeIntelState, FrameKind,
     ProjectFileEntry, ProjectFileKind, ProjectId, ProjectListDirPayload, ProjectPath,
-    ProjectRootPath, StreamPath,
+    ProjectRootPath, ProjectRootStatus, StreamPath,
 };
 
 /// A node in the file tree built from the flat entry list.
@@ -113,7 +113,11 @@ pub fn FileExplorer() -> impl IntoView {
         Some(
             roots
                 .iter()
-                .map(|root| (root.root.clone(), build_tree(&root.entries)))
+                .map(|root| RootTree {
+                    root: root.root.clone(),
+                    status: root.status.clone(),
+                    nodes: build_tree(&root.entries),
+                })
                 .collect::<Vec<_>>(),
         )
     });
@@ -244,10 +248,9 @@ pub fn FileExplorer() -> impl IntoView {
                             });
                             root_trees
                                 .into_iter()
-                                .flat_map(|(root, nodes)| {
+                                .flat_map(|root_tree| {
                                     render_root_section(
-                                        root,
-                                        nodes,
+                                        root_tree,
                                         &filter_val,
                                         hidden,
                                         expanded_dirs,
@@ -505,15 +508,30 @@ fn request_dir_listing(state: &AppState, root: ProjectRootPath, dir_relative_pat
     });
 }
 
-fn render_root_section(
+#[derive(Clone, PartialEq)]
+struct RootTree {
     root: ProjectRootPath,
+    status: ProjectRootStatus,
     nodes: Vec<TreeNode>,
+}
+
+fn render_root_section(
+    root_tree: RootTree,
     filter: &str,
     show_hidden: bool,
     expanded_dirs: RwSignal<HashSet<String>>,
     collapsed_roots: RwSignal<HashSet<String>>,
     project_ref: Option<(String, ProjectId)>,
 ) -> Vec<AnyView> {
+    let RootTree {
+        root,
+        status,
+        nodes,
+    } = root_tree;
+    let unavailable = match status {
+        ProjectRootStatus::Available => None,
+        ProjectRootStatus::Unavailable { message } => Some(message),
+    };
     let mut views = Vec::new();
     let root_label = root_display_name(&root);
     let root_title = root.0.clone();
@@ -546,7 +564,11 @@ fn render_root_section(
     });
     views.push(
         view! {
-            <div class="fe-root-header" title=root_title>
+            <div
+                class="fe-root-header"
+                class:fe-root-header-unavailable=unavailable.is_some()
+                title=root_title
+            >
                 <button
                     class="fe-root-toggle"
                     data-test="fe-root-toggle"
@@ -572,6 +594,11 @@ fn render_root_section(
         }
         .into_any(),
     );
+    if let Some(message) = unavailable {
+        views.push(
+            view! { <div class="fe-root-unavailable" role="alert">{message}</div> }.into_any(),
+        );
+    }
     let filter_for_nodes = filter.to_owned();
     views.push(
         view! {
@@ -956,6 +983,7 @@ mod wasm_tests {
                     ProjectId(PROJECT.to_owned()),
                     vec![protocol::ProjectRootListing {
                         root: ProjectRootPath(ROOT.to_owned()),
+                        status: protocol::ProjectRootStatus::Available,
                         entries: entries.clone(),
                     }],
                 );
@@ -1511,5 +1539,119 @@ mod wasm_tests {
         });
         next_tick().await;
         assert_eq!(label_text(&container), "Code Intel: Not started");
+    }
+
+    /// A root the server cannot read renders its reason and a visible remove
+    /// control, while the project's readable roots still list their files.
+    #[wasm_bindgen_test]
+    async fn unavailable_root_shows_reason_and_remove_control_beside_live_roots() {
+        // Priming leaves this host connected; keep it off the shared test host.
+        const HOST: &str = "fe-unavailable-root";
+        const MISSING: &str = "/work/moved-away";
+        const MESSAGE: &str = "Failed to stat project root '/work/moved-away': No such file or directory (os error 2)";
+        ensure_styles_loaded();
+        let container = make_container();
+        let holder: Rc<RefCell<Option<AppState>>> = Rc::new(RefCell::new(None));
+        let holder_for_mount = holder.clone();
+        let _mounted = Mounted::new(
+            mount_to(container.clone(), move || {
+                let state = AppState::new();
+                crate::dispatch::prime_host_for_tests(&state, HOST);
+                state.active_project.set(Some(ActiveProjectRef {
+                    host_id: HOST.to_owned(),
+                    project_id: ProjectId(PROJECT.to_owned()),
+                }));
+                *holder_for_mount.borrow_mut() = Some(state.clone());
+                provide_context(state);
+                view! { <FileExplorer /> }
+            }),
+            (),
+        );
+        let state = holder.borrow().clone().expect("state provided");
+        let bootstrap = protocol::ProjectBootstrapPayload {
+            project: protocol::Project {
+                id: ProjectId(PROJECT.to_owned()),
+                name: "Two roots".to_owned(),
+                sort_order: 0,
+                source: protocol::ProjectSource::Standalone {
+                    roots: vec![
+                        ProjectRootPath(ROOT.to_owned()),
+                        ProjectRootPath(MISSING.to_owned()),
+                    ],
+                },
+            },
+            file_list: protocol::ProjectFileListPayload {
+                incremental: false,
+                roots: vec![
+                    protocol::ProjectRootListing {
+                        root: ProjectRootPath(ROOT.to_owned()),
+                        status: ProjectRootStatus::Available,
+                        entries: vec![ProjectFileEntry {
+                            relative_path: "main.rs".to_owned(),
+                            kind: ProjectFileKind::File,
+                            op: protocol::FileEntryOp::Add,
+                        }],
+                    },
+                    protocol::ProjectRootListing {
+                        root: ProjectRootPath(MISSING.to_owned()),
+                        status: ProjectRootStatus::Unavailable {
+                            message: MESSAGE.to_owned(),
+                        },
+                        entries: Vec::new(),
+                    },
+                ],
+            },
+            git_status: protocol::ProjectGitStatusPayload { roots: Vec::new() },
+            review_summaries: Vec::new(),
+        };
+        crate::dispatch::dispatch_envelope(
+            &state,
+            HOST,
+            protocol::Envelope::from_payload(
+                StreamPath(format!("/project/{PROJECT}")),
+                FrameKind::ProjectBootstrap,
+                0,
+                &bootstrap,
+            )
+            .unwrap(),
+        );
+        next_tick().await;
+
+        let rows = file_rows(&container);
+        assert_eq!(rows.len(), 1, "the readable root still lists its file");
+        let row_text = rows[0].text_content().unwrap_or_default();
+        assert!(
+            row_text.trim().ends_with("main.rs"),
+            "the readable root's row names its file: {row_text:?}"
+        );
+        let alerts = container.query_selector_all("[role='alert']").unwrap();
+        assert_eq!(
+            alerts.length(),
+            1,
+            "only the unreadable root reports a problem"
+        );
+        assert_eq!(
+            alerts.item(0).unwrap().text_content().as_deref(),
+            Some(MESSAGE)
+        );
+
+        let missing_remove = container
+            .query_selector(&format!("[title='{MISSING}'] button[title='Remove root']"))
+            .unwrap()
+            .expect("the unreadable root keeps its remove control")
+            .dyn_into::<HtmlElement>()
+            .unwrap();
+        let opacity = web_sys::window()
+            .unwrap()
+            .get_computed_style(&missing_remove)
+            .unwrap()
+            .unwrap()
+            .get_property_value("opacity")
+            .unwrap();
+        assert_eq!(
+            opacity, "1",
+            "the remove control is visible without hovering"
+        );
+        assert!(missing_remove.get_bounding_client_rect().width() > 0.0);
     }
 }

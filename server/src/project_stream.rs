@@ -20,7 +20,8 @@ use protocol::{
     ProjectGitDiffPayload, ProjectGitFileStatus, ProjectGitStatusPayload, ProjectId,
     ProjectOpenPathAction, ProjectOpenPathPayload, ProjectPath, ProjectReadDiffPayload,
     ProjectReadFilePayload, ProjectRootGitStatus, ProjectRootListing, ProjectRootPath,
-    ProjectSearchFileResult, ProjectSearchMatch, ProjectSearchPayload, ReviewSummary, StreamPath,
+    ProjectRootStatus, ProjectSearchFileResult, ProjectSearchMatch, ProjectSearchPayload,
+    ReviewSummary, StreamPath,
 };
 use serde_json::Value;
 use tokio::sync::{Mutex, mpsc, oneshot};
@@ -91,6 +92,14 @@ impl ProjectWatcherFailure {
 /// A (relative_path, kind) pair used for comparing file listings between snapshots.
 pub(crate) type RawFileEntry = (String, ProjectFileKind);
 
+/// One root's scan result. An unreadable root is reported per root instead of
+/// failing the scan, so the project's other roots keep loading.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RootScan {
+    Available(BTreeSet<RawFileEntry>),
+    Unavailable(String),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum GitAccessMode {
     ReadOnly,
@@ -100,7 +109,7 @@ pub(crate) enum GitAccessMode {
 #[derive(Debug)]
 pub(crate) struct ProjectSnapshotState {
     /// Previous file entries per root, used to decide whether a new full snapshot is needed.
-    pub file_entries: BTreeMap<ProjectRootPath, BTreeSet<RawFileEntry>>,
+    pub file_entries: BTreeMap<ProjectRootPath, RootScan>,
     pub git_status: Option<Value>,
     diff_context_modes: HashMap<(StreamPath, ProjectDiffRequestKey), RememberedDiffContext>,
     pub code_intel_overview: CodeIntelOverviewPayload,
@@ -411,8 +420,8 @@ pub(crate) async fn spawn_project_subscription(
 ) -> Result<ProjectStreamSubscription, String> {
     let project = load_subscription_project(&project_store, &project_id).await?;
     let (watch_tx, watch_rx) = mpsc::unbounded_channel();
-    let watched_roots = project.root_paths();
     let snapshot = background_project_read(&project, "initialize", initialize_snapshot).await?;
+    let watched_roots = watchable_roots(&project);
     let (command_tx, command_rx) = mpsc::unbounded_channel();
     let handle = ProjectStreamHandle { tx: command_tx };
 
@@ -439,20 +448,19 @@ pub(crate) async fn spawn_project_subscription(
 
 fn start_project_watcher(
     shared_watcher: SharedProjectWatcher,
-    project: &Project,
+    roots: Vec<ProjectRootPath>,
     watch_tx: mpsc::UnboundedSender<notify::Result<Event>>,
     force_watch_limit: bool,
 ) -> mpsc::UnboundedReceiver<Result<ProjectWatcher, ProjectWatcherFailure>> {
     let (watcher_ready_tx, watcher_ready_rx) = mpsc::unbounded_channel();
     {
-        let project = project.clone();
         let watch_tx = watch_tx.clone();
         let tx = watcher_ready_tx.clone();
         if let Err(error) = std::thread::Builder::new()
             .name("tyde-project-watch-init".to_owned())
             .spawn(move || {
                 let result =
-                    create_project_watcher(shared_watcher, &project, watch_tx, force_watch_limit);
+                    create_project_watcher(shared_watcher, &roots, watch_tx, force_watch_limit);
                 let _ = tx.send(result);
             })
         {
@@ -482,23 +490,34 @@ async fn load_subscription_project(
 
 fn create_project_watcher(
     shared_watcher: SharedProjectWatcher,
-    project: &Project,
+    roots: &[ProjectRootPath],
     watch_tx: mpsc::UnboundedSender<notify::Result<Event>>,
     force_watch_limit: bool,
 ) -> Result<ProjectWatcher, ProjectWatcherFailure> {
-    if force_watch_limit && let Some(root) = project.root_paths().first() {
+    if force_watch_limit && let Some(root) = roots.first() {
         return Err(ProjectWatcherFailure::forced_limit(root));
     }
-    tracing::debug!(project_id = %project.id, "registering project filesystem watches");
-    ProjectWatcher::new(shared_watcher, project, watch_tx).map_err(|error| {
+    tracing::debug!(
+        roots = roots.len(),
+        "registering project filesystem watches"
+    );
+    ProjectWatcher::new(shared_watcher, roots, watch_tx).map_err(|error| {
         ProjectWatcherFailure::from_notify(
-            format!(
-                "failed to create project filesystem watcher for roots {:?}",
-                project.root_paths()
-            ),
+            format!("failed to create project filesystem watcher for roots {roots:?}"),
             error,
         )
     })
+}
+
+/// Roots the watcher can register: unavailable roots are listed with their
+/// status instead, and picked up again by `ensure_watched_roots` once they
+/// reappear.
+fn watchable_roots(project: &Project) -> Vec<ProjectRootPath> {
+    project
+        .root_paths()
+        .into_iter()
+        .filter(|root| root_unavailable_reason(root).is_none())
+        .collect()
 }
 
 async fn background_project_read<T: Send + 'static>(
@@ -569,7 +588,7 @@ async fn run_project_subscription(
     let mut pending_update = PendingProjectUpdate::default();
     let mut watcher_ready_rx = start_project_watcher(
         shared_watcher.clone(),
-        &project,
+        watched_roots.clone(),
         watch_tx.clone(),
         force_watch_limit,
     );
@@ -759,7 +778,8 @@ async fn run_project_subscription(
             }
             _ = sleep_until(watcher_retry), if watcher.is_none() && !watcher_initializing => {
                 tracing::debug!(%project_id, "retrying project filesystem watcher initialization");
-                watcher_ready_rx = start_project_watcher(shared_watcher.clone(), &project, watch_tx.clone(), force_watch_limit);
+                watched_roots = watchable_roots(&project);
+                watcher_ready_rx = start_project_watcher(shared_watcher.clone(), watched_roots.clone(), watch_tx.clone(), force_watch_limit);
                 watcher_initializing = true;
             }
             maybe_watcher = watcher_ready_rx.recv(), if watcher_initializing => {
@@ -842,13 +862,24 @@ async fn run_project_subscription(
                         }
                     }
                     Err(error) => {
+                        watcher = None;
+                        if watched_roots != watchable_roots(&project) {
+                            // A watched root vanished or returned; the file listing reports it.
+                            tracing::info!(%project_id, %error, "project root availability changed; re-registering watcher");
+                            watcher_retry = Instant::now();
+                            pending_update.merge(PendingProjectUpdate { files: true, git: true });
+                            if !debounce_active {
+                                debounce_active = true;
+                                debounce_sleep.as_mut().reset(Instant::now() + PROJECT_REFRESH_DEBOUNCE);
+                            }
+                            continue;
+                        }
                         let message = format!("project filesystem watcher failed: {error}");
                         let message = if matches!(error.kind, notify::ErrorKind::MaxFilesWatch) {
                             project_watch_limit_guidance(&message)
                         } else {
                             message
                         };
-                        watcher = None;
                         watcher_retry = Instant::now() + PROJECT_RETRY_INTERVAL;
                         warn_project_retry(&project_id, &mut subscribers, "project_watch", message, &mut watcher_warning).await;
                     }
@@ -870,11 +901,6 @@ async fn run_project_subscription(
                         &mut subscribers,
                         full,
                     ).await {
-                        if project.root_paths().iter().any(|root| matches!(Path::new(&root.0).try_exists(), Ok(false))) {
-                            tracing::warn!(%project_id, %error, "stopping project subscription after project root disappeared");
-                            emit_fatal_project_stream_error(&mut subscribers, "project_watch", error).await;
-                            return;
-                        }
                         warn_project_retry(&project_id, &mut subscribers, "project_watch", error, &mut file_warning).await;
                         pending_update.merge(refresh);
                         debounce_active = true;
@@ -926,8 +952,15 @@ async fn run_project_subscription(
             }), if pending_git.requested && git_tasks.is_empty() => {
                 let metadata_result = async {
                     let latest_project = load_subscription_project(&project_store, &project_id).await?;
-                    if let Some(watcher) = watcher.as_mut() {
-                        ensure_watched_roots(&latest_project, watcher, &mut watched_roots, watch_tx.clone()).await?;
+                    if let Some(watcher) = watcher.as_mut()
+                        && ensure_watched_roots(watchable_roots(&latest_project), watcher, &mut watched_roots, watch_tx.clone()).await?
+                    {
+                        // A root became (un)available; its listing status changed too.
+                        pending_update.merge(PendingProjectUpdate { files: true, git: false });
+                        if !debounce_active {
+                            debounce_active = true;
+                            debounce_sleep.as_mut().reset(Instant::now() + PROJECT_REFRESH_DEBOUNCE);
+                        }
                     }
                     project = latest_project;
                     if sync_code_intel_overview_roots(&mut snapshot.code_intel_overview, project.root_paths()) {
@@ -1019,7 +1052,13 @@ async fn refresh_project_files(
 ) -> Result<(), String> {
     let latest_project = load_subscription_project(project_store, project_id).await?;
     if let Some(watcher) = watcher {
-        ensure_watched_roots(&latest_project, watcher, watched_roots, watch_tx).await?;
+        ensure_watched_roots(
+            watchable_roots(&latest_project),
+            watcher,
+            watched_roots,
+            watch_tx,
+        )
+        .await?;
     }
     *project = latest_project;
     let current_raw = background_project_read(project, "files", scan_raw_entries).await?;
@@ -1146,22 +1185,23 @@ async fn apply_git_refresh(
     Ok(())
 }
 
+/// Re-registers the watcher when the watchable roots changed; returns whether
+/// it did.
 async fn ensure_watched_roots(
-    project: &Project,
+    roots: Vec<ProjectRootPath>,
     watcher: &mut ProjectWatcher,
     watched_roots: &mut Vec<ProjectRootPath>,
     watch_tx: mpsc::UnboundedSender<notify::Result<Event>>,
-) -> Result<(), String> {
-    let roots = project.root_paths();
+) -> Result<bool, String> {
     if *watched_roots == roots {
-        return Ok(());
+        return Ok(false);
     }
 
     let shared_watcher = watcher.shared.clone();
     let observed = watcher.observed.clone();
-    let project = project.clone();
+    let replacement_roots = roots.clone();
     let mut replacement = tokio::task::spawn_blocking(move || {
-        create_project_watcher(shared_watcher, &project, watch_tx, false)
+        create_project_watcher(shared_watcher, &replacement_roots, watch_tx, false)
     })
     .await
     .map_err(|error| error.to_string())?
@@ -1176,7 +1216,7 @@ async fn ensure_watched_roots(
     }
     *watcher = replacement;
     *watched_roots = roots;
-    Ok(())
+    Ok(true)
 }
 
 fn initial_code_intel_overview(roots: Vec<ProjectRootPath>) -> CodeIntelOverviewPayload {
@@ -1609,23 +1649,36 @@ fn is_git_head_or_index(path: &Path) -> bool {
 
 fn full_file_list_from_raw(
     project: &Project,
-    raw_entries: &BTreeMap<ProjectRootPath, BTreeSet<RawFileEntry>>,
+    raw_entries: &BTreeMap<ProjectRootPath, RootScan>,
 ) -> ProjectFileListPayload {
     let roots = project
         .root_paths()
         .into_iter()
-        .map(|root| {
-            let entries = raw_entries
-                .get(&root)
-                .into_iter()
-                .flat_map(|entries| entries.iter())
-                .map(|(path, kind)| ProjectFileEntry {
-                    relative_path: path.clone(),
-                    kind: *kind,
-                    op: FileEntryOp::Add,
-                })
-                .collect();
-            ProjectRootListing { root, entries }
+        .map(|root| match raw_entries.get(&root) {
+            Some(RootScan::Unavailable(message)) => ProjectRootListing {
+                root,
+                status: ProjectRootStatus::Unavailable {
+                    message: message.clone(),
+                },
+                entries: Vec::new(),
+            },
+            Some(RootScan::Available(entries)) => ProjectRootListing {
+                root,
+                status: ProjectRootStatus::Available,
+                entries: entries
+                    .iter()
+                    .map(|(path, kind)| ProjectFileEntry {
+                        relative_path: path.clone(),
+                        kind: *kind,
+                        op: FileEntryOp::Add,
+                    })
+                    .collect(),
+            },
+            None => ProjectRootListing {
+                root,
+                status: ProjectRootStatus::Available,
+                entries: Vec::new(),
+            },
         })
         .collect();
     ProjectFileListPayload {
@@ -1843,28 +1896,6 @@ async fn warn_project_retry(
     *warning = Some(message);
 }
 
-async fn emit_fatal_project_stream_error(
-    subscribers: &mut HashMap<StreamPath, ProjectSubscriber>,
-    operation: &str,
-    message: String,
-) {
-    let streams = subscribers
-        .values()
-        .map(|subscriber| subscriber.stream.clone())
-        .collect::<Vec<_>>();
-    for stream in streams {
-        emit_project_command_error(
-            &stream,
-            FrameKind::ProjectFileList,
-            operation,
-            message.clone(),
-            true,
-        )
-        .await;
-    }
-    subscribers.clear();
-}
-
 fn project_watch_limit_guidance(error: &str) -> String {
     format!(
         "{error} Live project file updates are disabled, but the project remains available. For best results, configure each project root as the root of its Git repository instead of a broader parent directory. On Linux, you can also increase fs.inotify.max_user_watches. Watching will resume automatically after correcting the root or system limit."
@@ -1929,27 +1960,45 @@ const DEFAULT_FILE_LIST_DEPTH: usize = 2;
 /// Scan the filesystem and return raw (path, kind) entries per root at the default depth.
 pub(crate) fn scan_raw_entries(
     project: &Project,
-) -> Result<BTreeMap<ProjectRootPath, BTreeSet<RawFileEntry>>, String> {
+) -> Result<BTreeMap<ProjectRootPath, RootScan>, String> {
     scan_raw_entries_with_depth(project, DEFAULT_FILE_LIST_DEPTH)
 }
 
 fn scan_raw_entries_with_depth(
     project: &Project,
     max_depth: usize,
-) -> Result<BTreeMap<ProjectRootPath, BTreeSet<RawFileEntry>>, String> {
+) -> Result<BTreeMap<ProjectRootPath, RootScan>, String> {
     let mut result = BTreeMap::new();
     for root in project.root_paths() {
-        let root_path = Path::new(&root.0);
-        let metadata = fs::metadata(root_path)
-            .map_err(|err| format!("Failed to stat project root '{}': {err}", root))?;
-        if !metadata.is_dir() {
-            return Err(format!("Project root '{}' is not a directory", root));
+        let scan = match root_unavailable_reason(&root) {
+            Some(message) => RootScan::Unavailable(message),
+            None => {
+                let root_path = Path::new(&root.0);
+                let mut raw = Vec::new();
+                match collect_raw_entries(root_path, root_path, &mut raw, 0, max_depth) {
+                    Ok(_) => RootScan::Available(raw.into_iter().collect()),
+                    // The root itself disappeared while it was being scanned.
+                    Err(error) => match root_unavailable_reason(&root) {
+                        Some(message) => RootScan::Unavailable(message),
+                        None => return Err(error),
+                    },
+                }
+            }
+        };
+        if let RootScan::Unavailable(message) = &scan {
+            tracing::debug!(%root, %message, "project root is unavailable");
         }
-        let mut raw = Vec::new();
-        collect_raw_entries(root_path, root_path, &mut raw, 0, max_depth)?;
-        result.insert(root, raw.into_iter().collect());
+        result.insert(root, scan);
     }
     Ok(result)
+}
+
+fn root_unavailable_reason(root: &ProjectRootPath) -> Option<String> {
+    match fs::metadata(&root.0) {
+        Ok(metadata) if metadata.is_dir() => None,
+        Ok(_) => Some(format!("Project root '{root}' is not a directory")),
+        Err(err) => Some(format!("Failed to stat project root '{root}': {err}")),
+    }
 }
 
 /// List entries within a specific subdirectory of a root (all Add ops).
@@ -1992,6 +2041,7 @@ pub(crate) fn build_dir_listing(
         incremental: true,
         roots: vec![ProjectRootListing {
             root: root.clone(),
+            status: ProjectRootStatus::Available,
             entries,
         }],
     })
@@ -2029,6 +2079,10 @@ where
     let mut roots = Vec::with_capacity(project_roots.len());
 
     for root in project_roots {
+        // Reported by the file listing; a status entry would misreport it clean.
+        if root_unavailable_reason(&root).is_some() {
+            continue;
+        }
         let output = match run_git(
             &root.0,
             &["status", "--porcelain=v2", "--branch"],

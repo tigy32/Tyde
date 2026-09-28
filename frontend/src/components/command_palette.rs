@@ -1163,6 +1163,7 @@ mod wasm_tests {
             tree.insert(
                 ProjectId("proj-1".to_owned()),
                 vec![ProjectRootListing {
+                    status: protocol::ProjectRootStatus::Available,
                     root: ProjectRootPath("/repo".to_owned()),
                     // The shape the server actually emits: one entry per path,
                     // `Add` for a path present in the listing

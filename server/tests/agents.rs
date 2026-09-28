@@ -58,6 +58,7 @@ async fn expect_next_event(client: &mut client::Connection, context: &str) -> En
                     | FrameKind::ContextCompactionNotify
                     | FrameKind::ContextCompactionCapability
             )
+            || env.stream.0.starts_with("/project/")
         {
             continue;
         }
@@ -165,7 +166,7 @@ async fn expect_no_event(client: &mut client::Connection, duration: Duration, co
                 | FrameKind::TaskTokenUsage
                 | FrameKind::ContextCompactionNotify
                 | FrameKind::ContextCompactionCapability
-        )
+        ) || env.stream.0.starts_with("/project/")
     })
     .await;
 }

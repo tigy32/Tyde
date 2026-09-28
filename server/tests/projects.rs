@@ -1,19 +1,19 @@
 mod fixture;
 
-use fixture::{Fixture, next_frame_matching_on};
+use fixture::{Fixture, next_frame_matching_on, next_frame_matching_on_with_timeout};
 use protocol::{
     BrowseBootstrapListing, BrowseBootstrapPayload, CommandErrorCode, CommandErrorPayload,
     DiffContextMode, Envelope, FileEntryOp, FrameKind, GitBranchName, HostAbsPath,
     HostBrowseEntriesPayload, HostBrowseInitial, HostBrowseOpenedPayload, HostBrowseStartPayload,
     Project, ProjectAddRootPayload, ProjectBootstrapPayload, ProjectCreatePayload,
-    ProjectDeletePayload, ProjectDiffScope, ProjectFileContentsPayload, ProjectFileListPayload,
-    ProjectGitDiffLineKind, ProjectGitDiffPayload, ProjectGitStatusPayload, ProjectId,
-    ProjectListDirPayload, ProjectNotifyPayload, ProjectOpenPathAction, ProjectOpenPathPayload,
-    ProjectPath, ProjectReadDiffPayload, ProjectReadFilePayload, ProjectRenamePayload,
-    ProjectReorderPayload, ProjectReorderScope, ProjectRootPath, ProjectStageFilePayload,
-    ProjectStageHunkPayload, ReviewStatus, ReviewSummaryScope, Steering, SteeringId,
-    SteeringNotifyPayload, SteeringScope, SteeringUpsertPayload, StreamPath,
-    WorkbenchCreatePayload,
+    ProjectDeletePayload, ProjectDeleteRootPayload, ProjectDiffScope, ProjectFileContentsPayload,
+    ProjectFileListPayload, ProjectGitDiffLineKind, ProjectGitDiffPayload, ProjectGitStatusPayload,
+    ProjectId, ProjectListDirPayload, ProjectNotifyPayload, ProjectOpenPathAction,
+    ProjectOpenPathPayload, ProjectPath, ProjectReadDiffPayload, ProjectReadFilePayload,
+    ProjectRenamePayload, ProjectReorderPayload, ProjectReorderScope, ProjectRootPath,
+    ProjectRootStatus, ProjectStageFilePayload, ProjectStageHunkPayload, ReviewStatus,
+    ReviewSummaryScope, Steering, SteeringId, SteeringNotifyPayload, SteeringScope,
+    SteeringUpsertPayload, StreamPath, WorkbenchCreatePayload,
 };
 use server::store::project::ProjectStore;
 use std::fs;
@@ -126,7 +126,10 @@ async fn expect_project_response(
         }
         if matches!(
             env.kind,
-            FrameKind::ProjectFileList | FrameKind::ProjectGitStatus | FrameKind::CodeIntelOverview
+            FrameKind::ProjectBootstrap
+                | FrameKind::ProjectFileList
+                | FrameKind::ProjectGitStatus
+                | FrameKind::CodeIntelOverview
         ) {
             continue;
         }
@@ -1051,7 +1054,12 @@ async fn delete_project_removes_project_scoped_steering() {
         })
         .await
         .expect("steering_upsert failed");
-    let env = expect_next_event(&mut fixture.client, "steering upsert").await;
+    let env = expect_project_response(
+        &mut fixture.client,
+        FrameKind::SteeringNotify,
+        "steering upsert",
+    )
+    .await;
     assert_eq!(env.kind, FrameKind::SteeringNotify);
     assert_eq!(
         env.parse_payload::<SteeringNotifyPayload>()
@@ -1068,7 +1076,12 @@ async fn delete_project_removes_project_scoped_steering() {
         })
         .await
         .expect("project_delete failed");
-    let env = expect_next_event(&mut fixture.client, "steering delete").await;
+    let env = expect_project_response(
+        &mut fixture.client,
+        FrameKind::SteeringNotify,
+        "steering delete",
+    )
+    .await;
     assert_eq!(env.kind, FrameKind::SteeringNotify);
     assert_eq!(
         env.parse_payload::<SteeringNotifyPayload>()
@@ -1506,6 +1519,163 @@ async fn project_create_pushes_file_list_and_git_status_for_all_roots() {
     assert_eq!(review_summaries.len(), 1);
     assert_eq!(review_summaries[0].scope, ReviewSummaryScope::Workspace);
     assert!(matches!(review_summaries[0].status, ReviewStatus::Draft));
+}
+
+fn root_listing<'a>(
+    file_list: &'a ProjectFileListPayload,
+    root: &Path,
+) -> &'a protocol::ProjectRootListing {
+    file_list
+        .roots
+        .iter()
+        .find(|listing| Path::new(&listing.root.0) == root)
+        .unwrap_or_else(|| panic!("root {} missing from file list", root.display()))
+}
+
+fn root_unavailable_message(file_list: &ProjectFileListPayload, root: &Path) -> Option<String> {
+    match &root_listing(file_list, root).status {
+        ProjectRootStatus::Available => None,
+        ProjectRootStatus::Unavailable { message } => Some(message.clone()),
+    }
+}
+
+fn root_lists(file_list: &ProjectFileListPayload, root: &Path, relative_path: &str) -> bool {
+    let listing = root_listing(file_list, root);
+    listing.status == ProjectRootStatus::Available
+        && listing
+            .entries
+            .iter()
+            .any(|entry| entry.relative_path == relative_path)
+}
+
+/// One unreadable root must not take down the project: the healthy roots load
+/// and stay live, the bad root is reported per root, and it can be removed.
+#[tokio::test]
+async fn unavailable_project_root_keeps_other_roots_live() {
+    let mut fixture = Fixture::new().await;
+    let repo_a = init_git_repo("healthy-a", &[("src/lib.rs", "pub fn a() {}\n")]);
+    let repo_b = init_git_repo("healthy-b", &[("app/main.rs", "fn main() {}\n")]);
+    let parent = tempfile::tempdir().unwrap();
+    let missing = parent.path().join("moved-away");
+
+    let project = create_project(
+        &mut fixture.client,
+        "Missing Root",
+        vec![
+            repo_a.path().to_string_lossy().into_owned(),
+            missing.to_string_lossy().into_owned(),
+            repo_b.path().to_string_lossy().into_owned(),
+        ],
+    )
+    .await;
+    let ProjectBootstrapPayload {
+        file_list,
+        git_status,
+        ..
+    } = expect_project_bootstrap(&mut fixture.client, "bootstrap with a missing root").await;
+    assert_eq!(file_list.roots.len(), 3, "every configured root is listed");
+    assert!(root_lists(&file_list, repo_a.path(), "src/lib.rs"));
+    assert!(root_lists(&file_list, repo_b.path(), "app/main.rs"));
+    let message = root_unavailable_message(&file_list, &missing)
+        .expect("the missing root is reported unavailable");
+    assert!(message.contains(missing.to_str().unwrap()));
+    assert!(message.contains("No such file or directory"));
+    assert!(root_listing(&file_list, &missing).entries.is_empty());
+    let git_roots = git_status
+        .roots
+        .iter()
+        .map(|root| root.root.0.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        git_roots,
+        vec![project_root(&project, 0), project_root(&project, 2)],
+        "Git status covers the readable roots only"
+    );
+
+    fixture
+        .client
+        .project_read_file(
+            &project.id,
+            ProjectReadFilePayload {
+                path: ProjectPath {
+                    root: ProjectRootPath(project_root(&project, 0)),
+                    relative_path: "src/lib.rs".to_owned(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+    let contents = expect_project_file_contents(&mut fixture.client, "healthy root read").await;
+    assert_eq!(contents.contents.as_deref(), Some("pub fn a() {}\n"));
+
+    write_file(&repo_a.path().join("src/added.rs"), "// added\n");
+    expect_project_file_list_matching(&mut fixture.client, "healthy root stays watched", |list| {
+        root_lists(list, repo_a.path(), "src/added.rs")
+    })
+    .await;
+
+    fs::create_dir_all(missing.join("docs")).unwrap();
+    fs::write(missing.join("docs/readme.md"), "back\n").unwrap();
+    next_frame_matching_on_with_timeout(
+        &mut fixture.client,
+        "restored root is picked up",
+        Duration::from_secs(15),
+        |env| {
+            assert_ne!(env.kind, FrameKind::CommandError, "{env:?}");
+            env.kind == FrameKind::ProjectFileList
+                && root_lists(&env.parse_payload().unwrap(), &missing, "docs/readme.md")
+        },
+    )
+    .await;
+    write_file(&missing.join("docs/later.md"), "watched\n");
+    expect_project_file_list_matching(&mut fixture.client, "restored root is watched", |list| {
+        root_lists(list, &missing, "docs/later.md")
+    })
+    .await;
+
+    fs::remove_dir_all(repo_b.path()).unwrap();
+    let file_list =
+        expect_project_file_list_matching(&mut fixture.client, "root deleted while live", |list| {
+            root_unavailable_message(list, repo_b.path()).is_some()
+        })
+        .await;
+    assert!(root_lists(&file_list, repo_a.path(), "src/added.rs"));
+    write_file(&repo_a.path().join("src/after.rs"), "// after\n");
+    expect_project_file_list_matching(
+        &mut fixture.client,
+        "healthy root survives another root's deletion",
+        |list| root_lists(list, repo_a.path(), "src/after.rs"),
+    )
+    .await;
+
+    fixture
+        .client
+        .project_delete_root(ProjectDeleteRootPayload {
+            id: project.id.clone(),
+            root: ProjectRootPath(project_root(&project, 2)),
+        })
+        .await
+        .unwrap();
+    let file_list =
+        next_frame_matching_on(&mut fixture.client, "unavailable root removed", |env| {
+            assert_ne!(env.kind, FrameKind::CommandError, "{env:?}");
+            env.kind == FrameKind::ProjectFileList
+                && env
+                    .parse_payload::<ProjectFileListPayload>()
+                    .unwrap()
+                    .roots
+                    .len()
+                    == 2
+        })
+        .await
+        .parse_payload::<ProjectFileListPayload>()
+        .unwrap();
+    assert!(
+        file_list
+            .roots
+            .iter()
+            .all(|listing| listing.status == ProjectRootStatus::Available)
+    );
 }
 
 #[tokio::test]
@@ -4993,12 +5163,18 @@ async fn live_watcher_refreshes_files_during_continuous_activity() {
         .await
         .expect("root scan must run")
         .expect("root removed");
-    let error = expect_command_error(&mut fixture.client, "missing project root is fatal").await;
-    assert_eq!(error.operation, "project_watch");
-    assert_eq!(error.code, CommandErrorCode::Internal);
-    assert!(error.fatal);
-    assert!(error.message.contains("Failed to read directory"));
-    assert!(error.message.contains(root.to_str().unwrap()));
+    // A root that vanishes mid-scan is reported on that root, not by failing
+    // the subscription; any CommandError here fails the match.
+    let file_list = expect_project_file_list_matching(
+        &mut fixture.client,
+        "root removed during scan is reported unavailable",
+        |list| root_unavailable_message(list, &root).is_some(),
+    )
+    .await;
+    let message = root_unavailable_message(&file_list, &root).unwrap();
+    assert!(message.contains(root.to_str().unwrap()));
+    assert!(message.contains("No such file or directory"));
+    assert!(root_listing(&file_list, &root).entries.is_empty());
     drop(root_hook);
 }
 

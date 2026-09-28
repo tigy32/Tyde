@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 
 use ignore::WalkBuilder;
 use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
-use protocol::{Project, ProjectPath};
+use protocol::{ProjectPath, ProjectRootPath};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::project_stream::{GitAccessMode, root_is_git_repository, run_git_mode};
@@ -179,7 +179,7 @@ impl SharedProjectWatcher {
         }
     }
 
-    fn subscribe(&self, project: &Project, sink: EventSink) -> notify::Result<WatchLease> {
+    fn subscribe(&self, roots: &[ProjectRootPath], sink: EventSink) -> notify::Result<WatchLease> {
         let mut state = self.inner.lock().unwrap();
         let failed = state.routes.lock().unwrap().failed;
         if failed {
@@ -196,14 +196,14 @@ impl SharedProjectWatcher {
             let routes = Arc::clone(&state.routes);
             let generation = routes.lock().unwrap().generation;
             #[cfg(feature = "test-support")]
-            for root in project.root_paths() {
+            for root in roots {
                 crate::project_stream::scan_test_support::run(
                     Path::new(&root.0),
                     crate::project_stream::scan_test_support::ScanPoint::WatcherInitialize,
                 );
             }
             tracing::debug!(
-                roots = project.root_paths().len(),
+                roots = roots.len(),
                 "creating shared project filesystem watcher"
             );
             let watcher = RecommendedWatcher::new(
@@ -211,7 +211,7 @@ impl SharedProjectWatcher {
                 Config::default().with_follow_symlinks(false),
             );
             #[cfg(feature = "test-support")]
-            for root in project.root_paths() {
+            for root in roots {
                 crate::project_stream::scan_test_support::run(
                     Path::new(&root.0),
                     crate::project_stream::scan_test_support::ScanPoint::WatcherInitialized,
@@ -355,7 +355,7 @@ impl Drop for ProjectWatcher {
 impl ProjectWatcher {
     pub(crate) fn new(
         shared: SharedProjectWatcher,
-        project: &Project,
+        project_roots: &[ProjectRootPath],
         events: mpsc::UnboundedSender<notify::Result<Event>>,
     ) -> notify::Result<Self> {
         let shared = shared.for_watcher();
@@ -365,19 +365,17 @@ impl ProjectWatcher {
             pending: Arc::default(),
             rescan: Arc::default(),
             #[cfg(feature = "test-support")]
-            roots: project
-                .root_paths()
-                .into_iter()
-                .map(|root| PathBuf::from(root.0))
+            roots: project_roots
+                .iter()
+                .map(|root| PathBuf::from(&root.0))
                 .collect(),
         };
-        let watcher = shared.subscribe(project, sink.clone())?;
-        let roots = project
-            .root_paths()
-            .into_iter()
+        let watcher = shared.subscribe(project_roots, sink.clone())?;
+        let roots = project_roots
+            .iter()
             .map(|root| {
                 fs::canonicalize(&root.0)
-                    .map_err(|error| notify::Error::io(error).add_path(PathBuf::from(root.0)))
+                    .map_err(|error| notify::Error::io(error).add_path(PathBuf::from(&root.0)))
             })
             .collect::<notify::Result<Vec<_>>>()?;
         let mut state = WatchState {

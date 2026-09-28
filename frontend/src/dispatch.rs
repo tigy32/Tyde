@@ -4093,6 +4093,7 @@ fn apply_project_file_list(
             .unwrap_or_else(|| {
                 existing_roots.push(protocol::ProjectRootListing {
                     root: incoming_root.root.clone(),
+                    status: incoming_root.status.clone(),
                     entries: Vec::new(),
                 });
                 existing_roots.len() - 1

@@ -5719,7 +5719,22 @@ pub struct ProjectFileListPayload {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProjectRootListing {
     pub root: ProjectRootPath,
+    #[serde(default)]
+    pub status: ProjectRootStatus,
     pub entries: Vec<ProjectFileEntry>,
+}
+
+/// Whether the server could read a project root. An unavailable root (missing,
+/// not a directory, or unreadable) is reported per root so the project's other
+/// roots keep loading and the client can offer to remove it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum ProjectRootStatus {
+    #[default]
+    Available,
+    Unavailable {
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

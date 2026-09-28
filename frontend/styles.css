@@ -7236,8 +7236,16 @@ math merror {
 }
 
 .fe-root-header:hover .fe-root-remove,
+.fe-root-header-unavailable .fe-root-remove,
 .fe-root-remove:focus-visible {
     opacity: 1;
+}
+
+.fe-root-unavailable {
+    padding: 0 var(--space-3) var(--space-1);
+    color: var(--error);
+    font-size: 0.769rem;
+    overflow-wrap: anywhere;
 }
 
 .fe-root-remove:hover {
