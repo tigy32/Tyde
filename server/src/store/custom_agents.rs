@@ -934,9 +934,10 @@ fn help_instructions() -> String {
          server-owned status. Use `tyde_config_list_projects` and\n\
          `tyde_config_list_launch_options` before `tyde_config_spawn_agent`.\n\
          Created agents are independent top-level agents, not your children.\n\
-         `tyde_config_send_agent_message` queues by default; set interrupt=true only\n\
-         when the user wants to redirect active work. `tyde_config_close_agent` stops\n\
-         the target and closes its descendants, but preserves saved session history.\n\
+         `tyde_config_send_agent_message` steers into running work by default; set\n\
+         interrupt=true only when the user wants to cancel active work.\n\
+         `tyde_config_close_agent` stops the target and closes its descendants, but\n\
+         preserves saved session history.\n\
          Confirm the intended target before closing. Do not close yourself.\n\
          Ordinary tyde-agent-control tools remain restricted to direct children.\n\
          Global means this host, not every connected remote host.",

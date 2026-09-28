@@ -31,7 +31,7 @@ use rmcp::{
     },
 };
 use serde_json::{Value, json};
-use server::backend::mock::{MockGateHandle, MockScript, MockTurn};
+use server::backend::mock::{MockGateHandle, MockRequest, MockScript, MockTurn};
 use settings_model::HostLaunchProfileConfig;
 use settings_model::{HostBootstrapPayload, HostSettingsPayload};
 use std::future::{self, Future};
@@ -5843,29 +5843,33 @@ async fn agent_control_await_tool_call_emits_correlated_completion_when_child_be
     )));
 }
 
+/// A default follow-up joins the running turn through native steering and
+/// never interrupts it; without steering it queues behind the turn instead.
+/// `interrupt: true` always cancels the running turn and sends next, even when
+/// the backend could steer, without losing queued messages.
 #[tokio::test]
-async fn agent_control_interrupt_redirects_without_losing_queued_messages() {
+async fn agent_control_send_message_steers_by_default_and_interrupt_cancels() {
     for native_steering in [false, true] {
         let mut fixture = Fixture::new().await;
         let parent = spawn_agent_control_parent(&mut fixture, "interrupt-parent").await;
         let caller = fixture.agent_control_caller(&parent.agent_id).await;
-        let active_gate = MockGateHandle::new();
         let redirect_gate = MockGateHandle::new();
         let idle_gate = MockGateHandle::new();
-        // A gate services fixture controls, not backend interrupt commands.
-        // The fallback needs an interruptible held turn, as in the UI steer flow.
-        let script = if native_steering {
-            MockScript::one(MockTurn::gated_text("initial reply", &active_gate))
-                .with_mid_turn_steering()
-        } else {
-            MockScript::one(MockTurn::held_text("initial reply"))
-                .then(MockTurn::gated_text("redirect reply", &redirect_gate))
-        };
-        let script = script
-            .then(MockTurn::text("default queued reply"))
-            .then(MockTurn::text("explicit queued reply"))
+        // A gate services fixture controls, not backend interrupt commands, so
+        // the turn the redirect cancels is a held one.
+        let mut script = MockScript::one(MockTurn::held_text("initial reply"))
+            .then(MockTurn::gated_text("redirect reply", &redirect_gate));
+        if !native_steering {
+            script = script
+                .then(MockTurn::text("first follow-up reply"))
+                .then(MockTurn::text("second follow-up reply"));
+        }
+        let mut script = script
             .then(MockTurn::gated_text("idle redirect reply", &idle_gate))
             .with_user_bubbles();
+        if native_steering {
+            script = script.with_mid_turn_steering();
+        }
         let reservation = fixture
             .reserve_next_mock_launch("interrupt-child", script)
             .await;
@@ -5880,37 +5884,74 @@ async fn agent_control_interrupt_redirects_without_losing_queued_messages() {
         )
         .await;
         drop(reservation);
-        if native_steering {
-            active_gate.wait_until_entered().await;
-        }
         let child_new =
             expect_replayed_new_agent(&mut fixture.client, &child, "interrupt child").await;
         let stream = &child_new.instance_stream;
+        fixture::next_chat_event_matching_on(
+            &mut fixture.client,
+            stream,
+            "held initial turn",
+            |event| matches!(event, ChatEvent::StreamEnd(end) if end.message.content == "initial reply"),
+        )
+        .await;
 
         for arguments in [
-            json!({ "agent_id": child.0, "message": "default queued" }),
-            json!({ "agent_id": child.0, "message": "explicit queued", "interrupt": false }),
+            json!({ "agent_id": child.0, "message": "first follow-up" }),
+            json!({ "agent_id": child.0, "message": "second follow-up", "interrupt": false }),
         ] {
             let response =
                 mcp_tool_call_as(&caller, false, "tyde_send_agent_message", arguments).await;
             assert!(
                 !mcp_result_is_error(&response),
-                "queued delivery must be accepted"
+                "default delivery must be accepted"
             );
         }
-        let queued =
-            fixture::next_frame_matching_on(&mut fixture.client, "both messages queued", |env| {
-                env.stream == *stream
-                    && env.kind == FrameKind::QueuedMessages
-                    && env
-                        .parse_payload::<protocol::QueuedMessagesPayload>()
-                        .is_ok_and(|payload| payload.messages.len() == 2)
-            })
+        if native_steering {
+            for expected in ["first follow-up", "second follow-up"] {
+                fixture::next_chat_event_matching_on(
+                    &mut fixture.client,
+                    stream,
+                    "steered input",
+                    |event| {
+                        matches!(event, ChatEvent::MessageAdded(message)
+                        if matches!(message.sender, MessageSender::User) && message.content == expected)
+                    },
+                )
+                .await;
+            }
+        } else {
+            let queued = fixture::next_frame_matching_on(
+                &mut fixture.client,
+                "both messages queued",
+                |env| {
+                    env.stream == *stream
+                        && env.kind == FrameKind::QueuedMessages
+                        && env
+                            .parse_payload::<protocol::QueuedMessagesPayload>()
+                            .is_ok_and(|payload| payload.messages.len() == 2)
+                },
+            )
             .await;
-        let queued: protocol::QueuedMessagesPayload =
-            queued.parse_payload().expect("queue snapshot");
-        assert!(queued.messages[0].message == "default queued");
-        assert!(queued.messages[1].message == "explicit queued");
+            let queued: protocol::QueuedMessagesPayload =
+                queued.parse_payload().expect("queue snapshot");
+            assert!(queued.messages[0].message == "first follow-up");
+            assert!(queued.messages[1].message == "second follow-up");
+        }
+        let requests = fixture.mock_by_id(&child).await.requests().await;
+        let default_delivery_ok = if native_steering {
+            matches!(
+                requests.as_slice(),
+                [MockRequest::Launch { .. }, MockRequest::Steer(first), MockRequest::Steer(second)]
+                    if first.message == "first follow-up" && second.message == "second follow-up"
+            )
+        } else {
+            matches!(requests.as_slice(), [MockRequest::Launch { .. }])
+        };
+        assert!(
+            default_delivery_ok,
+            "default delivery must steer or queue, never interrupt (native_steering={native_steering}, requests={})",
+            requests.len()
+        );
 
         let redirected = mcp_tool_call_as(
             &caller,
@@ -5925,16 +5966,14 @@ async fn agent_control_interrupt_redirects_without_losing_queued_messages() {
             !mcp_result_is_error(&redirected),
             "interrupt delivery must be accepted"
         );
-        if !native_steering {
-            fixture::next_chat_event_matching_on(
-                &mut fixture.client,
-                stream,
-                "interrupt cancellation",
-                |event| matches!(event, ChatEvent::OperationCancelled(_)),
-            )
-            .await;
-            redirect_gate.wait_until_entered().await;
-        }
+        fixture::next_chat_event_matching_on(
+            &mut fixture.client,
+            stream,
+            "interrupt cancellation",
+            |event| matches!(event, ChatEvent::OperationCancelled(_)),
+        )
+        .await;
+        redirect_gate.wait_until_entered().await;
         fixture::next_chat_event_matching_on(
             &mut fixture.client,
             stream,
@@ -5945,6 +5984,16 @@ async fn agent_control_interrupt_redirects_without_losing_queued_messages() {
             },
         )
         .await;
+        let requests = fixture.mock_by_id(&child).await.requests().await;
+        assert!(
+            matches!(
+                requests.as_slice(),
+                [.., MockRequest::Interrupt, MockRequest::Input(redirect)]
+                    if redirect.message == "redirect now"
+            ),
+            "interrupt delivery must cancel the turn and send next, never steer (native_steering={native_steering}, requests={})",
+            requests.len()
+        );
 
         let await_redirect = mcp_await_agent(&caller, &child);
         tokio::pin!(await_redirect);
@@ -5954,47 +6003,42 @@ async fn agent_control_interrupt_redirects_without_losing_queued_messages() {
                 .is_err(),
             "await must not report idle while the redirected turn is held"
         );
-        if native_steering {
-            active_gate.release_one();
-        } else {
-            redirect_gate.release_one();
-        }
+        redirect_gate.release_one();
         let ready = await_redirect.await;
         assert_await_result_ready(&ready, &child, "idle");
-        for expected in ["default queued", "explicit queued"] {
-            fixture::next_chat_event_matching_on(
-                &mut fixture.client,
-                stream,
-                "preserved queued input",
-                |event| {
-                    matches!(event, ChatEvent::MessageAdded(message)
-                    if matches!(message.sender, MessageSender::User) && message.content == expected)
-                },
-            )
-            .await;
-        }
-        // The failed run read before the final queued reply: observing its
-        // user bubble only proves admission, not completion of that turn.
+        let final_reply = if native_steering {
+            "redirect reply"
+        } else {
+            for expected in ["first follow-up", "second follow-up"] {
+                fixture::next_chat_event_matching_on(
+                    &mut fixture.client,
+                    stream,
+                    "preserved queued input",
+                    |event| {
+                        matches!(event, ChatEvent::MessageAdded(message)
+                        if matches!(message.sender, MessageSender::User) && message.content == expected)
+                    },
+                )
+                .await;
+            }
+            "second follow-up reply"
+        };
+        // Observing a user bubble only proves admission, not completion of
+        // that turn, so read after the final reply and idle.
         fixture::next_chat_event_matching_on(
             &mut fixture.client,
             stream,
-            "final preserved queued reply",
-            |event| {
-                matches!(event, ChatEvent::StreamEnd(end)
-                    if end.message.content == "explicit queued reply")
-            },
+            "final reply",
+            |event| matches!(event, ChatEvent::StreamEnd(end) if end.message.content == final_reply),
         )
         .await;
         fixture::next_chat_event_matching_on(
             &mut fixture.client,
             stream,
-            "final preserved queued turn idle",
+            "final turn idle",
             |event| matches!(event, ChatEvent::TypingStatusChanged(false)),
         )
         .await;
-        eprintln!(
-            "Interrupt queue read boundary: native_steering={native_steering}, queued_inputs=2, final_reply_observed=true, terminal_idle_observed=true"
-        );
         let read = mcp_tool_call_as(
             &caller,
             false,
@@ -6003,7 +6047,7 @@ async fn agent_control_interrupt_redirects_without_losing_queued_messages() {
         )
         .await;
         let read = mcp_success_json(&read);
-        assert!(read["output"]["text"].as_str() == Some("explicit queued reply"));
+        assert!(read["output"]["text"].as_str() == Some(final_reply));
 
         let idle = mcp_tool_call_as(
             &caller,

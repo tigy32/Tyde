@@ -66,8 +66,8 @@ pub const AGENT_CONTROL_SPAWN_STEERING: &str = concat!(
     "Use Tyde MCP for cross-backend delegation, never shell CLIs unless explicitly requested. ",
     "For your own backend, native subagents or Tyde are both fine; native agent-count limits ",
     "don't apply to Tyde. Check `tyde_list_launch_options`, then spawn tasks. ",
-    "`tyde_send_agent_message` queues by default; use `interrupt: true` to interrupt and ",
-    "redirect active work. Call `tyde_await_agents` with all pending child IDs: like select, ",
+    "`tyde_send_agent_message` steers into the child's running turn by default (queued ",
+    "when its backend can't steer); `interrupt: true` cancels that turn and sends next. Call `tyde_await_agents` with all pending child IDs: like select, ",
     "it returns when any is ready. Read ready children with `tyde_read_agent`, act on their ",
     "output, then await remaining work. Don't poll or expect injected results.\n",
     "Close your agents when you no longer need them."

@@ -422,8 +422,8 @@ struct SendAgentMessageToolInput {
     agent_id: String,
     #[schemars(length(min = 1))]
     message: String,
-    /// Redirect active work through native steering, or interrupt and send next
-    /// when steering is unsupported. False queues until the current turn ends.
+    /// Interrupt active work and send next. False steers into the running turn
+    /// natively, or queues until it ends when steering is unsupported.
     #[serde(default)]
     interrupt: bool,
 }
@@ -1216,7 +1216,7 @@ impl TydeAgentControlMcpServer {
     }
 
     #[tool(
-        description = "Send a follow-up to a direct child. Queues by default; interrupt=true redirects active work using native steering or interrupt-and-send fallback. Idle children start immediately. Await then read to collect output."
+        description = "Send a follow-up to a direct child. By default steers into the running turn, or queues behind it when the backend cannot steer; interrupt=true cancels the running turn and sends next. Idle children start immediately. Await then read to collect output."
     )]
     async fn tyde_send_agent_message(
         &self,
@@ -1965,9 +1965,9 @@ pub(crate) async fn do_send_message(
         tool_response: None,
     };
     if interrupt {
-        handle.deliver_steer_message(payload).await
+        handle.deliver_interrupt_message(payload).await
     } else {
-        handle.deliver_message(payload).await
+        handle.deliver_steer_message(payload).await
     }
 }
 

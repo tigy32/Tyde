@@ -354,11 +354,12 @@ finished one.
 #### `tyde_send_agent_message`
 
 Sends a follow-up message to an existing agent. This does not return agent
-output. By default, a busy child queues the message until its current turn ends.
-With `interrupt: true`, Tyde redirects active work through the same path as the
-UI's steer action: native in-turn steering when supported, otherwise queue at
-the front and interrupt the current turn. An idle child starts immediately in
-either mode. Existing queued messages are preserved. Acceptance is acknowledged
+output. By default, a busy child takes the message into its running turn
+through native in-turn steering; when the backend cannot steer, the message
+queues behind that turn and is never an interrupt. With `interrupt: true`, Tyde
+always cancels the running turn and sends the message next, even when the
+backend could steer, like the UI's Cancel + send action. An idle child starts
+immediately in either mode. Existing queued messages are preserved. Acceptance is acknowledged
 by the actor before the tool returns, so an immediate await sees pending work.
 
 Input:

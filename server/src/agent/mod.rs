@@ -262,6 +262,18 @@ impl AgentActorRuntimeResources {
     }
 }
 
+/// How a steer message treats the turn that is running when it arrives.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RunningTurnRedirect {
+    /// Join the turn natively; interrupt it and send next when the backend
+    /// cannot take the message mid-turn. The chat input's Steer action.
+    SteerElseInterrupt,
+    /// Join the turn natively; otherwise queue behind it like a plain send.
+    SteerElseQueue,
+    /// Always interrupt the turn and send the message next.
+    Interrupt,
+}
+
 enum AgentCommand {
     SendInput(AgentInput),
     /// Agent-control follow-up whose acceptance the actor acknowledges itself.
@@ -269,6 +281,7 @@ enum AgentCommand {
     /// accepting this command is deliberately *not* the commit point.
     DeliverMessage {
         input: AgentInput,
+        redirect: RunningTurnRedirect,
         reply: oneshot::Sender<Result<(), String>>,
     },
     Compact {
@@ -1290,17 +1303,44 @@ impl AgentHandle {
     /// without touching the target's status and without appending a second
     /// transcript error for a message that was never seen.
     pub(crate) async fn deliver_message(&self, payload: SendMessagePayload) -> Result<(), String> {
-        self.deliver_input(AgentInput::SendMessage(payload)).await
+        self.deliver_input(
+            AgentInput::SendMessage(payload),
+            RunningTurnRedirect::SteerElseInterrupt,
+        )
+        .await
     }
 
+    /// [`Self::deliver_message`] that steers into a running turn when the
+    /// backend supports it, and otherwise queues behind that turn.
     pub(crate) async fn deliver_steer_message(
         &self,
         payload: SendMessagePayload,
     ) -> Result<(), String> {
-        self.deliver_input(AgentInput::SteerMessage(payload)).await
+        self.deliver_input(
+            AgentInput::SteerMessage(payload),
+            RunningTurnRedirect::SteerElseQueue,
+        )
+        .await
     }
 
-    async fn deliver_input(&self, input: AgentInput) -> Result<(), String> {
+    /// [`Self::deliver_message`] that interrupts a running turn and sends
+    /// next, without steering even when the backend supports it.
+    pub(crate) async fn deliver_interrupt_message(
+        &self,
+        payload: SendMessagePayload,
+    ) -> Result<(), String> {
+        self.deliver_input(
+            AgentInput::SteerMessage(payload),
+            RunningTurnRedirect::Interrupt,
+        )
+        .await
+    }
+
+    async fn deliver_input(
+        &self,
+        input: AgentInput,
+        redirect: RunningTurnRedirect,
+    ) -> Result<(), String> {
         if self.closing.load(Ordering::SeqCst) {
             return Err(DELIVERY_REJECTED_CLOSING.to_owned());
         }
@@ -1309,6 +1349,7 @@ impl AgentHandle {
             .tx
             .send(AgentCommand::DeliverMessage {
                 input,
+                redirect,
                 reply: reply_tx,
             })
             .is_err()
@@ -3303,7 +3344,7 @@ pub(crate) fn spawn_agent_actor(
                                 ),
                             }
                         }
-                        AgentCommand::DeliverMessage { input, reply } => {
+                        AgentCommand::DeliverMessage { input, reply, .. } => {
                             // Accepted: a starting agent is already active
                             // (`started` is false), and the message is queued
                             // for dispatch once the backend is up. Rejecting it
@@ -6168,9 +6209,15 @@ pub(crate) fn spawn_agent_actor(
                     // An unresolved acknowledgement drops with this iteration,
                     // which the caller reads as a failed delivery.
                     let mut delivery_ack: Option<oneshot::Sender<Result<(), String>>> = None;
+                    let mut redirect = RunningTurnRedirect::SteerElseInterrupt;
                     let command = match command {
-                        AgentCommand::DeliverMessage { input, reply } => {
+                        AgentCommand::DeliverMessage {
+                            input,
+                            redirect: delivery_redirect,
+                            reply,
+                        } => {
                             delivery_ack = Some(reply);
+                            redirect = delivery_redirect;
                             AgentCommand::SendInput(input)
                         }
                         command => command,
@@ -6882,12 +6929,17 @@ pub(crate) fn spawn_agent_actor(
                                         }
                                         continue;
                                     }
-                                    let outcome = backend
-                                        .as_ref()
-                                        .expect("backend must exist while actor is running")
-                                        .steer(msg)
-                                        .await;
-                                    let (payload, interrupt_turn) = match outcome {
+                                    let (payload, interrupt_turn) = if redirect
+                                        == RunningTurnRedirect::Interrupt
+                                    {
+                                        (msg, true)
+                                    } else {
+                                        match backend
+                                            .as_ref()
+                                            .expect("backend must exist while actor is running")
+                                            .steer(msg)
+                                            .await
+                                        {
                                         SteerOutcome::Accepted => {
                                             if let Some(reply) = delivery_ack.take() {
                                                 mark_agent_turn_active(&status_handle).await;
@@ -6916,14 +6968,25 @@ pub(crate) fn spawn_agent_actor(
                                         // The turn ended under the steer: the
                                         // idle drain sends it next.
                                         SteerOutcome::NoActiveTurn(payload) => (payload, false),
-                                        SteerOutcome::Unsupported(payload) => (payload, true),
+                                        SteerOutcome::Unsupported(payload) => (
+                                            payload,
+                                            redirect != RunningTurnRedirect::SteerElseQueue,
+                                        ),
+                                        }
                                     };
                                     let sequence = next_queue_sequence;
                                     next_queue_sequence = next_queue_sequence.saturating_add(1);
-                                    queue.push_front(SequencedQueuedMessage {
+                                    let queued = SequencedQueuedMessage {
                                         sequence,
                                         entry: queued_entry_from_send_payload(payload),
-                                    });
+                                    };
+                                    // A message that declined to interrupt
+                                    // waits its turn behind earlier sends.
+                                    if redirect == RunningTurnRedirect::SteerElseQueue {
+                                        queue.push_back(queued);
+                                    } else {
+                                        queue.push_front(queued);
+                                    }
                                     update_queued_messages_snapshot(
                                         &canonical_stream,
                                         &mut event_log,
