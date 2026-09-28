@@ -3924,7 +3924,10 @@ async fn project_watch_failures_keep_other_projects_live() {
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     let mut fixture = Fixture::new().await;
     let removed_repo = init_git_repo("stale-watch", &[("src/file.rs", "before\n")]);
-    let healthy_repo = init_git_repo("healthy-watch", &[("src/file.rs", "before\n")]);
+    let healthy_repo = init_git_repo(
+        "healthy-watch",
+        &[("src/file.rs", "before\n"), ("src/unread.rs", "unread\n")],
+    );
     let mut projects = Vec::new();
     for (name, repo) in [("Removed", &removed_repo), ("Healthy", &healthy_repo)] {
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
@@ -4110,6 +4113,14 @@ async fn project_watch_failures_keep_other_projects_live() {
                 && let protocol::ProjectEventPayload::FilesChanged { files } =
                     event.parse_payload().unwrap()
             {
+                // A rescan cannot know what changed; reporting every visible
+                // file produced frames larger than the whole output queue.
+                assert!(
+                    !files
+                        .iter()
+                        .any(|file| file.path.relative_path == "src/unread.rs"),
+                    "rescan must report only files a client has read"
+                );
                 changed |= files
                     .iter()
                     .any(|file| file.path == before.path && file.version > before.version);

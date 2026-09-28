@@ -827,9 +827,12 @@ impl WatchState {
             );
         }
         if event.need_rescan() {
-            relevant.extend(self.inventory.visible.iter().cloned());
-            relevant.extend(self.inventory.tracked.iter().cloned());
+            // Lost events cannot say which files changed. Only files a client
+            // has read carry versions worth invalidating; listing the whole
+            // inventory produced frames larger than the connection's queue.
+            // The roots still schedule a listing refresh.
             relevant.extend(self.explicit.iter().cloned());
+            relevant.extend(self.roots.iter().cloned());
             relevant.extend(self.roots.iter().map(|root| root.join(".git/index")));
         }
         relevant.sort();
