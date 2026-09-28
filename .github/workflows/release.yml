@@ -330,10 +330,6 @@ jobs:
           TYDE_MOBILE_BUNDLE_DIR: ${{ github.workspace }}/target/mobile-web
         run: cargo build --release --target ${{ matrix.server-target }} -p tyde-server --bin tyde-server
 
-      # This shared smoke path is also used by the non-publishing pre-tag matrix.
-      - name: Smoke test headless binary
-        run: python tools/smoke_headless_release.py --target ${{ matrix.server-target }} --expected-version "${{ env.RELEASE_TAG }}"
-
       - name: Build macOS app with Tauri
         if: startsWith(matrix.platform, 'macos')
         uses: tauri-apps/tauri-action@v0
@@ -613,14 +609,6 @@ jobs:
         uses: taiki-e/install-action@v2
         with:
           tool: trunk@0.21.14
-
-      - name: Test web release tooling
-        run: |
-          node --test web/deploy/*.test.mjs
-          python3 -m unittest tools/test_check_mobile_web_manifest.py
-          bash -n web/deploy/deploy.sh
-          cd web/loader
-          node --test
 
       - name: Validate AWS deploy role
         env:

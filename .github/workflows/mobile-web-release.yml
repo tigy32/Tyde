@@ -89,15 +89,6 @@ jobs:
             exit 1
           }
 
-      - name: Test web release tooling
-        working-directory: deploy-tools
-        run: |
-          node --test web/deploy/*.test.mjs
-          python3 -m unittest tools/test_check_mobile_web_manifest.py
-          bash -n web/deploy/deploy.sh
-          cd web/loader
-          node --test
-
       - name: Validate AWS deploy role
         env:
           AWS_DEPLOY_ROLE_ARN: ${{ secrets.AWS_TYDE_WEB_DEPLOY_ROLE_ARN || vars.AWS_TYDE_WEB_DEPLOY_ROLE_ARN }}

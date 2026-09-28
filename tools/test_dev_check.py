@@ -967,7 +967,7 @@ class PreTagReleaseBuildContractTests(unittest.TestCase):
             ],
         )
 
-    def test_uses_release_equivalent_build_setup_and_shared_smoke(self) -> None:
+    def test_uses_release_equivalent_build_setup_and_pretag_smoke(self) -> None:
         shared_fragments = (
             "tools/provision-native-build-tools.py",
             '--github-path "$GITHUB_PATH" --github-env "$GITHUB_ENV"',
@@ -977,11 +977,16 @@ class PreTagReleaseBuildContractTests(unittest.TestCase):
             "uses: taiki-e/install-action@v2",
             "tool: trunk@0.21.14",
             "cargo build --release --target ${{ matrix.server-target }} -p tyde-server --bin tyde-server",
-            "python tools/smoke_headless_release.py --target ${{ matrix.server-target }}",
         )
         for fragment in shared_fragments:
             self.assertIn(fragment, self.workflow)
             self.assertIn(fragment, self.release_workflow)
+        # Smoke execution belongs to the pre-tag gate, not publication.
+        self.assertIn(
+            "python tools/smoke_headless_release.py --target ${{ matrix.server-target }}",
+            self.workflow,
+        )
+        self.assertNotIn("smoke_headless_release.py", self.release_workflow)
         self.assertIn(
             "npx --prefix ../.. tauri build --target ${{ matrix.rust-target }} --no-bundle",
             self.workflow,
@@ -2049,7 +2054,15 @@ exec "$DEV_CHECK_REAL_PYTHON" "$@"
         release_workflow = (
             REPO_ROOT / ".github" / "workflows" / "release.yml"
         ).read_text(encoding="utf-8")
-        self.assertNotIn("run: ./dev.sh check", release_workflow)
+        for workflow_name in ("release.yml", "mobile-web-release.yml"):
+            workflow = (REPO_ROOT / ".github/workflows" / workflow_name).read_text(
+                encoding="utf-8"
+            )
+            for test_command in (
+                "./dev.sh check", "node --test", "-m unittest",
+                "cargo test", "cargo nextest", "smoke_headless_release.py",
+            ):
+                self.assertNotIn(test_command, workflow, workflow_name)
         check_workflow = (
             REPO_ROOT / ".github" / "workflows" / "check.yml"
         ).read_text(encoding="utf-8")

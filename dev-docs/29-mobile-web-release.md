@@ -158,7 +158,10 @@ network/tool error.
 
 Use the canonical local guard before release builds. It runs the cached full
 repository suite and release-specific coherence tests. The GitHub release
-workflow does not repeat these tests:
+and mobile-web publication workflows do not run test suites or headless
+smoke tests. Headless smoke testing remains in the pre-tag build gate;
+publication retains version, signing, packaging, and deployed-manifest
+integrity checks:
 
 ```sh
 tools/release_check.sh [v<release>]
