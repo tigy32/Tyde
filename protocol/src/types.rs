@@ -13,7 +13,7 @@ use serde_json::Value;
 /// `protocol::TydeReleaseVersion`.
 pub use host_config::{LOCAL_HOST_ID, TydeReleaseVersion};
 
-pub const PROTOCOL_VERSION: u32 = 67;
+pub const PROTOCOL_VERSION: u32 = 68;
 
 // Exported verbatim to TydeMobileService by tools/export-mobile-rtc.py.
 pub mod mobile_rtc {
@@ -3493,6 +3493,7 @@ pub struct SendMessagePayload {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum MessageOrigin {
     User,
+    AgentControl,
     Review {
         review_id: ReviewId,
     },
@@ -4740,6 +4741,12 @@ pub struct CustomAgent {
     #[serde(default)]
     pub mcp_server_ids: Vec<McpServerId>,
     pub tool_policy: ToolPolicy,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolCategory {
+    AskUser,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

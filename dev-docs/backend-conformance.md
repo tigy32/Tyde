@@ -48,6 +48,71 @@ Server-only guarantees remain in `server/tests/session_resume.rs`: history pagin
 
 Normal validation is `./dev.sh check`; it builds the test binary and MCP bridge without running paid cases. Real cases are ignored and additionally require `TYDE_RUN_REAL_AI_TESTS=1`; `TYDE_REAL_BACKENDS` selects providers. Follow the authorization rules in `AGENTS.md` before running them.
 
+## Child user-question policy and superseding input
+
+The server applies `ToolCategory::AskUser` exclusion to child agents, including
+children resumed from durable parent-session ownership. Root agents retain
+questions. `Backend::validate_tool_categories` rejects unsupported exclusions
+before spawn, resume, or fork; adapters enforce them natively rather than
+hiding interactive cards. Existing allow/deny tool policies still apply.
+
+- Claude uses native `--disallowedTools`.
+- Codex disables the blocking tool and removes both asynchronous aliases from
+  a private copy of the native model catalogue, preserving other tools and
+  model metadata.
+- Hermes disables its `clarify` toolset and detaches the native callback so
+  calls copied from older history cannot bypass the catalogue restriction.
+- Antigravity installs a private native `PreToolUse` deny hook for
+  `ask_question`. The tool may still appear in the model's catalogue, but
+  execution is denied before a question can reach the user. Rejected attempts
+  retain their ordinary failed-tool diagnostics, not answer controls.
+
+The host-local adapters also run on remote Tyde hosts. The legacy direct-SSH
+Codex/Hermes launch paths reject category exclusions rather than silently
+launching unrestricted children.
+
+`real_excludes_ask_user_tools` is mandatory for every backend declaring
+`UserQuestionRequests`. Its resume/fork companions additionally require the
+corresponding lifecycle capability. Each scenario proves that an unrestricted
+root can ask, then that an excluded session cannot ask and can still read a
+real file with ordinary tools. There is no optional exclusion capability that
+would let a question-capable backend skip this contract.
+
+Codex runs this same oracle with both its asynchronous Astra profile and a
+blocking Luna Plan profile. `blocking_question_profile.py` configures the real
+CLI and forwards all native responses unchanged; it requires an actual native
+blocking request as positive-control evidence. No events are fabricated.
+
+Ordinary human messages supersede unanswered questions; typed tool answers
+remain answers. The server interrupts a blocking question before dispatching
+the queued follow-up. Async adapters cancel only questions already pending
+when the accepted human message arrived. Automated agent-control, supervisor,
+and review messages do not dismiss questions on the user's behalf.
+`MessageOrigin::AgentControl` is a wire addition (protocol 68).
+
+`real_new_message_withdraws_async_question` requires exactly one cancelled
+completion and a successful unrelated follow-up on every asynchronous-question
+backend. It failed on Codex and Antigravity before the fix and passes on both.
+Server protocol regressions cover blocking and async follow-ups, reconnect
+state, automated-message queueing, and root-versus-child policy. Existing DOM
+tests cover the live attention label and cancelled question answer controls.
+
+Validation on 2026-09-28 (UTC): fresh/resume exclusion passed on Claude,
+Codex, Hermes, and Antigravity; fork exclusion passed on Claude and Codex
+(the other two do not declare fork). Codex passed both native question
+profiles. The root question/answer/cancel/recovery scenario passed on all
+four. Removing Antigravity's native hook made the exclusion oracle fail;
+re-enabling Codex's blocking native tool likewise failed its Plan-profile
+oracle. Removing central child policy made the server agent-control flow fail.
+
+An isolated desktop instance also exercised the reported Codex UI flow with
+`gpt-6-astra`, low reasoning: the rendered root question had active choices
+and both chat/sidebar showed `Needs your answer`. An unrelated message sent
+with Enter produced the new reply, a cancelled question with no answer
+controls, and `Idle` without the attention label. The instance attested
+`storesEphemeral: true` and was stopped afterward. This is targeted DOM QA,
+not a screenshot, multi-client, or full-backend certification claim.
+
 ## Antigravity questions are nonblocking
 
 Headless `agy` (checked on 1.2.11) cannot hold `ask_question` for a human:

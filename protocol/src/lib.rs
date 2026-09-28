@@ -160,7 +160,7 @@ pub use types::{
     TerminalClosePayload, TerminalCreatePayload, TerminalErrorCode, TerminalErrorPayload,
     TerminalExitPayload, TerminalId, TerminalLaunchTarget, TerminalOutputPayload,
     TerminalResizePayload, TerminalSendPayload, TerminalStartPayload, TokenUsage, TokenUsageScope,
-    TokenUsageUnavailableReason, ToolExecutionCompletedData, ToolExecutionMode,
+    TokenUsageUnavailableReason, ToolCategory, ToolExecutionCompletedData, ToolExecutionMode,
     ToolExecutionNormalizationFailure, ToolExecutionOutcome, ToolExecutionResult, ToolPolicy,
     ToolProgressData, ToolProgressUpdate, ToolRequest, ToolRequestType, ToolUseData,
     TriggerSurface, TriggerWorkflowPayload, TycodeModel, TydeAgentWaitStatus,

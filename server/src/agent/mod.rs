@@ -2705,6 +2705,7 @@ async fn spawn_through_trait<B: Backend>(
     config: BackendSpawnConfig,
     initial_input: SendMessagePayload,
 ) -> BackendSpawnResult {
+    B::validate_tool_categories(&config.resolved_spawn_config.excluded_tool_categories)?;
     let (backend, events) = B::spawn(workspace_roots, config, initial_input).await?;
     let session_id = Backend::session_id(&backend);
     Ok((Box::new(backend), events, session_id))
@@ -2732,6 +2733,7 @@ async fn resume_through_trait<B: Backend>(
     config: BackendSpawnConfig,
     session_id: SessionId,
 ) -> BackendResumeResult {
+    B::validate_tool_categories(&config.resolved_spawn_config.excluded_tool_categories)?;
     let (backend, events) = B::resume(workspace_roots, config, session_id).await?;
     Ok((Box::new(backend), events))
 }
@@ -2768,6 +2770,8 @@ async fn fork_through_trait<B: Backend>(
     from_session_id: SessionId,
     initial_input: SendMessagePayload,
 ) -> BackendForkResult {
+    B::validate_tool_categories(&config.resolved_spawn_config.excluded_tool_categories)
+        .map_err(BackendStartupError::backend_failed)?;
     let (backend, events) =
         B::fork(workspace_roots, config, from_session_id, initial_input).await?;
     let session_id = Backend::session_id(&backend);
@@ -2829,7 +2833,7 @@ pub(crate) fn spawn_agent_actor(
             session_settings_schema,
             backend_config,
             acp_agent,
-            resolved_spawn_config,
+            mut resolved_spawn_config,
             resume_session_id,
             fork_from_session_id,
             startup_warning,
@@ -2839,6 +2843,13 @@ pub(crate) fn spawn_agent_actor(
             mock_launch,
             ..
         } = request;
+        if (start.parent_agent_id.is_some() || parent_session_id.is_some())
+            && crate::backend::capabilities_for_backend_kind(backend_kind)
+                .contains(tyde_agent_adapter::BackendCapability::UserQuestionRequests)
+            && !resolved_spawn_config.excluded_tool_categories.contains(&protocol::ToolCategory::AskUser)
+        {
+            resolved_spawn_config.excluded_tool_categories.push(protocol::ToolCategory::AskUser);
+        }
         resolved_spawn_config.assert_session_policy(startup_failure.is_some());
         let startup_mcp_servers =
             customization::protocol_mcp_servers_to_startup(&resolved_spawn_config.mcp_servers);
@@ -5988,7 +5999,7 @@ pub(crate) fn spawn_agent_actor(
                             .expect("queue reported non-empty but pop_front returned None");
                         let review_origin = match queued.origin.as_ref() {
                             Some(MessageOrigin::Review { review_id }) => Some(review_id.clone()),
-                            Some(MessageOrigin::User) | Some(MessageOrigin::Supervisor) | Some(MessageOrigin::HostRestart) | None => None,
+                            Some(MessageOrigin::User) | Some(MessageOrigin::AgentControl) | Some(MessageOrigin::Supervisor) | Some(MessageOrigin::HostRestart) | None => None,
                         };
                         if let Some(review_id) = review_origin.as_ref() {
                             tracing::info!(
@@ -6305,13 +6316,13 @@ pub(crate) fn spawn_agent_actor(
                                         Some(MessageOrigin::Review { review_id }) => {
                                             Some(review_id.clone())
                                         }
-                                        Some(MessageOrigin::User) | Some(MessageOrigin::Supervisor) | Some(MessageOrigin::HostRestart) | None => None,
+                                        Some(MessageOrigin::User) | Some(MessageOrigin::AgentControl) | Some(MessageOrigin::Supervisor) | Some(MessageOrigin::HostRestart) | None => None,
                                     };
                                     let message_len = msg.message.len();
                                     let images_count = msg.images.as_ref().map_or(0, Vec::len);
                                     let review_origin_for_queue = match msg.origin.clone() {
                                         Some(MessageOrigin::Review { review_id }) => Some(review_id),
-                                        Some(MessageOrigin::User) | Some(MessageOrigin::Supervisor) | Some(MessageOrigin::HostRestart) | None => None,
+                                        Some(MessageOrigin::User) | Some(MessageOrigin::AgentControl) | Some(MessageOrigin::Supervisor) | Some(MessageOrigin::HostRestart) | None => None,
                                     };
                                     let stale_tool_response = matches!(
                                         msg.tool_response.as_ref(),
@@ -6409,6 +6420,19 @@ pub(crate) fn spawn_agent_actor(
                                         continue;
                                     }
                                     let is_tool_response = msg.tool_response.is_some();
+                                    let supersedes_blocking_question = !is_tool_response
+                                        && matches!(msg.origin, None | Some(MessageOrigin::User))
+                                        && !usage_paused
+                                        && context_compaction.is_none()
+                                        && pending_tool_response_ids.iter().any(|id| {
+                                            open_tool_requests.get(id).is_some_and(|request| matches!(
+                                                request.tool_type,
+                                                protocol::ToolRequestType::AskUserQuestion {
+                                                    mode: protocol::UserQuestionMode::Blocking,
+                                                    ..
+                                                }
+                                            ))
+                                        });
                                     let clear_pending_response = match msg.tool_response.as_ref() {
                                         Some(protocol::SendMessageToolResponse::ExitPlanMode {
                                             tool_call_id,
@@ -6545,6 +6569,18 @@ pub(crate) fn spawn_agent_actor(
                                             // Idle with a message it never ran.
                                             mark_agent_work_pending(&status_handle).await;
                                             let _ = reply.send(Ok(()));
+                                        }
+                                        if supersedes_blocking_question {
+                                            tracing::info!("Withdrawing a blocking question superseded by user input");
+                                            if !backend.as_ref().expect("backend must exist while actor is running").interrupt().await {
+                                                let payload = AgentErrorPayload {
+                                                    agent_id: current_start.agent_id.clone(),
+                                                    code: AgentErrorCode::Internal,
+                                                    message: "agent backend could not cancel the superseded question".to_owned(),
+                                                    fatal: false,
+                                                };
+                                                append_event(&canonical_stream, &mut event_log, &mut subscribers, FrameKind::AgentError, &payload).await;
+                                            }
                                         }
                                     } else {
                                         if !in_turn {
@@ -6812,7 +6848,7 @@ pub(crate) fn spawn_agent_actor(
                                         Some(MessageOrigin::Review { review_id }) => {
                                             Some(review_id.clone())
                                         }
-                                        Some(MessageOrigin::User) | Some(MessageOrigin::Supervisor) | Some(MessageOrigin::HostRestart) | None => None,
+                                        Some(MessageOrigin::User) | Some(MessageOrigin::AgentControl) | Some(MessageOrigin::Supervisor) | Some(MessageOrigin::HostRestart) | None => None,
                                     };
                                     status_handle
                                         .update(|status| {
@@ -7094,7 +7130,7 @@ pub(crate) fn spawn_agent_actor(
                                         Some(MessageOrigin::Review { review_id }) => {
                                             Some(review_id.clone())
                                         }
-                                        Some(MessageOrigin::User) | Some(MessageOrigin::Supervisor) | Some(MessageOrigin::HostRestart) | None => None,
+                                        Some(MessageOrigin::User) | Some(MessageOrigin::AgentControl) | Some(MessageOrigin::Supervisor) | Some(MessageOrigin::HostRestart) | None => None,
                                     };
                                     if let Some(review_id) = review_origin.as_ref() {
                                         tracing::info!(

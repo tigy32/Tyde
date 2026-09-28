@@ -536,6 +536,7 @@ impl ClaudeSession {
                 steering_content: mode.steering_content.map(|s| s.to_string()),
                 agent_identity: mode.agent_identity.cloned(),
                 tool_policy: mode.tool_policy,
+                excluded_tool_categories: Vec::new(),
                 skill_plugin,
                 // Populated by `arm_skill_verification` below.
                 expected_skills: Vec::new(),
@@ -750,6 +751,7 @@ struct ClaudeState {
     steering_content: Option<String>,
     agent_identity: Option<AgentIdentity>,
     tool_policy: ToolPolicy,
+    excluded_tool_categories: Vec<protocol::ToolCategory>,
     /// This session's inline skill plugin, owned for the whole session so a
     /// respawn or a post-turn restart reuses the same root. Dropping the state
     /// unlinks it.
@@ -825,6 +827,7 @@ impl Default for ClaudeState {
             steering_content: None,
             agent_identity: None,
             tool_policy: ToolPolicy::Unrestricted,
+            excluded_tool_categories: Vec::new(),
             skill_plugin: None,
             expected_skills: Vec::new(),
             skill_verification_generation: 0,
@@ -1765,6 +1768,7 @@ struct ClaudeProcessSpawnConfig {
     steering_content: Option<String>,
     agent_identity: Option<AgentIdentity>,
     tool_policy: ToolPolicy,
+    excluded_tool_categories: Vec<protocol::ToolCategory>,
     /// Root of this session's inline skill plugin. Rebuilt into every process
     /// config from `ClaudeState`, so a respawned or forked process points at
     /// the same root the session already materialized. `None` for SSH sessions
@@ -3384,6 +3388,7 @@ impl ClaudeInner {
                 steering_content: state.steering_content.clone(),
                 agent_identity: state.agent_identity.clone(),
                 tool_policy: state.tool_policy.clone(),
+                excluded_tool_categories: state.excluded_tool_categories.clone(),
                 // Rebuilt from session state on every process start, so a
                 // respawn after a crash or a post-turn restart points at the
                 // root this session already materialized.
@@ -5773,28 +5778,33 @@ fn build_claude_cli_args(config: &ClaudeProcessSpawnConfig) -> Vec<String> {
     // announces that on the stream, so from then on Tyde looks in a directory
     // the session has left. `ExitWorktree` is deliberately left alone: it can
     // only move a session back toward where Tyde expects it.
-    match &config.tool_policy {
-        ToolPolicy::Unrestricted => {
-            cli_args.push("--disallowedTools".to_string());
-            cli_args.push(SESSION_RELOCATING_TOOL.to_string());
+    let mut disallowed_tools = vec![SESSION_RELOCATING_TOOL.to_string()];
+    for category in &config.excluded_tool_categories {
+        match category {
+            protocol::ToolCategory::AskUser => disallowed_tools.push("AskUserQuestion".to_owned()),
         }
+    }
+    match &config.tool_policy {
+        ToolPolicy::Unrestricted => {}
         ToolPolicy::AllowList { tools } => {
             cli_args.push("--allowedTools".to_string());
             cli_args.extend(
                 tools
                     .iter()
-                    .filter(|tool| tool.as_str() != SESSION_RELOCATING_TOOL)
+                    .filter(|tool| !disallowed_tools.contains(tool))
                     .cloned(),
             );
         }
         ToolPolicy::DenyList { tools } => {
-            cli_args.push("--disallowedTools".to_string());
-            cli_args.extend(tools.iter().cloned());
-            if !tools.iter().any(|tool| tool == SESSION_RELOCATING_TOOL) {
-                cli_args.push(SESSION_RELOCATING_TOOL.to_string());
+            for tool in tools {
+                if !disallowed_tools.contains(tool) {
+                    disallowed_tools.push(tool.clone());
+                }
             }
         }
     }
+    cli_args.push("--disallowedTools".to_string());
+    cli_args.extend(disallowed_tools);
 
     if let Some(identity) = &config.agent_identity {
         let agents_json = json!({
@@ -7165,18 +7175,6 @@ fn ensure_ask_user_question_tool_request_emitted(
     }
 
     if !emitted {
-        inner.emit_stream_end(
-            String::new(),
-            None,
-            ClaudeMessageUsage::default(),
-            None,
-            vec![json!({
-                "id": tool_call.id,
-                "name": tool_call.name,
-                "arguments": tool_call.arguments,
-            })],
-            None,
-        );
         let _ = inner.emit_tool_request(&tool_call, None);
     }
 
@@ -10035,6 +10033,26 @@ fn consume_user_tool_result(
             );
             continue;
         }
+        if claude_is_ask_user_question_tool_name(&completion.tool_name)
+            && !inner
+                .emitter
+                .has_known_tool_request(&completion.tool_call_id)
+            && !summary
+                .unresolved_tool_requests
+                .contains_key(&completion.tool_call_id)
+            && let Some(tool_call) = summary.tool_call_by_id.get(&completion.tool_call_id)
+            && inner.emitter.tool_request(
+                &tool_call.id,
+                ToolRequestType::Other {
+                    args: tool_call.arguments.clone(),
+                },
+            )
+        {
+            tracing::info!("Claude question attempt completed without requesting user input");
+            summary
+                .unresolved_tool_requests
+                .insert(tool_call.id.clone(), tool_call.name.clone());
+        }
         if !summary
             .unresolved_tool_requests
             .contains_key(&completion.tool_call_id)
@@ -10336,6 +10354,11 @@ fn emit_tool_request_with_tracking(
     inner: &ClaudeInner,
     tool_call: &ClaudeToolCall,
 ) {
+    // A model can repeat a disabled tool from history. Only the native
+    // can_use_tool request proves there is an answerable question.
+    if claude_is_ask_user_question_tool_name(&tool_call.name) {
+        return;
+    }
     let preview = summary
         .tool_modify_preview_by_id
         .get(&tool_call.id)
@@ -13844,6 +13867,10 @@ impl ClaudeBackend {
                     return;
                 }
             };
+            session.inner.state.lock().await.excluded_tool_categories = config
+                .resolved_spawn_config
+                .excluded_tool_categories
+                .clone();
             session
                 .seed_installed_provider_version(config.provider_version.clone())
                 .await;
@@ -14730,6 +14757,15 @@ pub(crate) fn forward_passive_rate_limit_event(
 }
 
 impl Backend for ClaudeBackend {
+    fn validate_tool_categories(categories: &[protocol::ToolCategory]) -> Result<(), String> {
+        for category in categories {
+            match category {
+                protocol::ToolCategory::AskUser => {}
+            }
+        }
+        Ok(())
+    }
+
     fn validate_tool_policy(_policy: &protocol::ToolPolicy) -> Result<(), String> {
         Ok(())
     }
@@ -14889,6 +14925,10 @@ impl Backend for ClaudeBackend {
         )
         .await
         .map_err(|err| format!("Failed to spawn Claude resume session: {err}"))?;
+        session.inner.state.lock().await.excluded_tool_categories = config
+            .resolved_spawn_config
+            .excluded_tool_categories
+            .clone();
         session
             .seed_installed_provider_version(config.provider_version.clone())
             .await;

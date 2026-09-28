@@ -218,6 +218,45 @@ fn prepare_antigravity_skills(
     })
 }
 
+fn prepare_antigravity_tool_policy(
+    categories: &[protocol::ToolCategory],
+) -> Result<Option<tempfile::TempDir>, String> {
+    if categories.is_empty() {
+        return Ok(None);
+    }
+    let root = create_private_root(None, "tyde-antigravity-tool-policy-")?;
+    let customization_dir = root.path().join(".agents");
+    create_private_dir(&customization_dir)?;
+    let mut handlers = Vec::new();
+    for category in categories {
+        let tool = match category {
+            protocol::ToolCategory::AskUser => "ask_question",
+        };
+        let response = json!({
+            "decision": "deny",
+            "reason": "This tool is unavailable because the session excludes user questions.",
+        })
+        .to_string();
+        #[cfg(not(windows))]
+        let command = format!("printf '%s' {}", crate::remote::shell_quote_arg(&response));
+        #[cfg(windows)]
+        let command = format!("echo {response}");
+        handlers.push(json!({
+            "matcher": tool,
+            "hooks": [{"type": "command", "command": command, "timeout": 10}],
+        }));
+    }
+    crate::backend::skill_projection::write_private_file(
+        &customization_dir.join("hooks.json"),
+        &json!({"tyde-tool-category-policy": {"PreToolUse": handlers}}).to_string(),
+    )?;
+    tracing::info!(
+        category_count = categories.len(),
+        "Installed Antigravity native tool-category deny hooks"
+    );
+    Ok(Some(root))
+}
+
 impl AgyLaunch {
     fn native_roots(&self) -> Vec<String> {
         std::iter::once(self.primary_root.clone())
@@ -791,6 +830,17 @@ impl TurnMapper {
         // normalized type. The normalized form already rides on the request;
         // copying it here would discard the only record of what the model
         // actually passed.
+        // A native pre-tool denial is a failed attempt, not an answerable card.
+        let tool_type = if step.state == STATE_ERROR
+            && matches!(tool_type, ToolRequestType::AskUserQuestion { .. })
+        {
+            tracing::info!("Antigravity question attempt rejected before requesting user input");
+            ToolRequestType::Other {
+                args: provider_arguments.clone(),
+            }
+        } else {
+            tool_type
+        };
         let arguments = provider_arguments;
         let declaration = ToolUseData {
             tool_call_id: tool_call_id.clone(),
@@ -959,6 +1009,7 @@ struct Supervisor {
     /// Keeps the native `.agents/skills` tree alive across every turn and
     /// process restart in this session.
     skill_projection: Option<AntigravitySkillProjection>,
+    tool_policy_projection: Option<tempfile::TempDir>,
     mapper: Option<TurnMapper>,
     cumulative: AgyUsage,
     turn_counter: u64,
@@ -1187,6 +1238,21 @@ impl Supervisor {
     async fn handle_input(&mut self, process: &mut AgyProcess, input: AgentInput) -> bool {
         match input {
             AgentInput::SendMessage(payload) => {
+                let superseded = if payload.tool_response.is_none()
+                    && matches!(payload.origin, None | Some(protocol::MessageOrigin::User))
+                {
+                    self.pending_questions
+                        .iter()
+                        .chain(
+                            self.mapper
+                                .iter()
+                                .flat_map(|mapper| mapper.pending_questions.iter()),
+                        )
+                        .cloned()
+                        .collect::<Vec<_>>()
+                } else {
+                    Vec::new()
+                };
                 if let Some(response) = payload.tool_response.clone() {
                     if !self.answer_question(response).await {
                         return true;
@@ -1200,14 +1266,22 @@ impl Supervisor {
                     && let Some(catalog) = self.slash_commands.as_ref()
                     && catalog.invoked_by(&payload.message).is_some()
                 {
-                    return self.run_cli_command(&payload.message).await;
+                    let accepted = self.run_cli_command(&payload.message).await;
+                    if accepted {
+                        self.withdraw_questions(&superseded);
+                    }
+                    return accepted;
                 }
                 // A tool response is not a chat message, so it produces no user
                 // bubble — the card the user acted on is the record of it.
                 let echo = payload.tool_response.is_none()
                     && payload.origin != Some(protocol::MessageOrigin::HostRestart);
                 let echoed = echo.then_some(payload.message.as_str());
-                self.start_turn(process, &payload.message, echoed).await
+                let accepted = self.start_turn(process, &payload.message, echoed).await;
+                if accepted {
+                    self.withdraw_questions(&superseded);
+                }
+                accepted
             }
             AgentInput::UpdateSessionSettings(payload) => {
                 match self.apply_settings(process, payload.values).await {
@@ -1228,6 +1302,26 @@ impl Supervisor {
                      backend"
                 );
             }
+        }
+    }
+
+    fn withdraw_questions(&mut self, superseded: &[String]) {
+        if !superseded.is_empty() {
+            tracing::info!(
+                question_count = superseded.len(),
+                "Antigravity withdrawing questions superseded by user input"
+            );
+        }
+        self.pending_questions.retain(|id| !superseded.contains(id));
+        if let Some(mapper) = self.mapper.as_mut() {
+            mapper
+                .pending_questions
+                .retain(|id| !superseded.contains(id));
+        }
+        for tool_call_id in superseded {
+            self.inner
+                .emitter
+                .cancel_pending_tool(tool_call_id, "Question superseded by a new user message");
         }
     }
 
@@ -1557,6 +1651,15 @@ impl Supervisor {
                     .path()
                     .to_str()
                     .ok_or("Antigravity skill projection path is not UTF-8")?
+                    .to_owned(),
+            );
+        }
+        if let Some(projection) = self.tool_policy_projection.as_ref() {
+            launch.extra_roots.push(
+                projection
+                    .path()
+                    .to_str()
+                    .ok_or("Antigravity tool policy path is not UTF-8")?
                     .to_owned(),
             );
         }
@@ -2534,6 +2637,15 @@ impl Backend for AntigravityBackend {
         read_capacity_out_of_band().await
     }
 
+    fn validate_tool_categories(categories: &[protocol::ToolCategory]) -> Result<(), String> {
+        for category in categories {
+            match category {
+                protocol::ToolCategory::AskUser => {}
+            }
+        }
+        Ok(())
+    }
+
     /// What this backend measurably emits, and nothing else.
     ///
     /// Several capabilities are deliberately absent because headless `agy`
@@ -2810,6 +2922,9 @@ impl AntigravityBackend {
         let combined_instructions =
             render_combined_spawn_instructions(&config.resolved_spawn_config);
         let mut skill_setup = prepare_antigravity_skills(&config.resolved_spawn_config.skills)?;
+        let tool_policy_projection = prepare_antigravity_tool_policy(
+            &config.resolved_spawn_config.excluded_tool_categories,
+        )?;
 
         // Private to this session and removed with it. The descriptor holds the
         // endpoints and bearer credentials that must never reach the config
@@ -2836,6 +2951,15 @@ impl AntigravityBackend {
                 )
             })?;
             extra_roots.push(root.to_string());
+        }
+        if let Some(projection) = tool_policy_projection.as_ref() {
+            extra_roots.push(
+                projection
+                    .path()
+                    .to_str()
+                    .ok_or("Antigravity tool policy path is not UTF-8")?
+                    .to_owned(),
+            );
         }
         let launch = AgyLaunch {
             workspace_roots,
@@ -2944,6 +3068,7 @@ impl AntigravityBackend {
             conversation_db: antigravity_conversation_db_path(&session_id, conversations_dir),
             descriptor_dir: Some(descriptor_dir),
             skill_projection: skill_setup.projection,
+            tool_policy_projection,
             mapper: None,
             cumulative: AgyUsage::default(),
             turn_counter: 0,

@@ -171,13 +171,26 @@ impl CodexCommandHandle {
             _ => None,
         };
         let Some(tool_call_id) = tool_call_id else {
-            return self
-                .execute(SessionCommand::SendMessage {
-                    origin: payload.origin,
-                    message: payload.message,
-                    images: protocol_images_to_attachments(payload.images),
-                })
-                .await;
+            let superseded = if payload.tool_response.is_none()
+                && matches!(payload.origin, None | Some(protocol::MessageOrigin::User))
+            {
+                self.inner
+                    .state
+                    .lock()
+                    .await
+                    .pending_async_questions
+                    .clone()
+            } else {
+                HashSet::new()
+            };
+            self.execute(SessionCommand::SendMessage {
+                origin: payload.origin,
+                message: payload.message,
+                images: protocol_images_to_attachments(payload.images),
+            })
+            .await?;
+            self.inner.withdraw_async_questions(superseded).await;
+            return Ok(());
         };
         // The actor persists typed answers; only plain messages echo from the backend.
         payload.tool_response = None;
@@ -1627,6 +1640,7 @@ struct CodexSelectedSkillContext<'a> {
     skills: &'a [ResolvedSkill],
     selection: SkillSelection,
     installed_provider_version: Option<&'a str>,
+    excluded_tool_categories: &'a [protocol::ToolCategory],
 }
 
 impl CodexSelectedSkillContext<'_> {
@@ -1635,6 +1649,7 @@ impl CodexSelectedSkillContext<'_> {
             skills: &[],
             selection: SkillSelection::Explicit,
             installed_provider_version: None,
+            excluded_tool_categories: &[],
         }
     }
 }
@@ -1653,6 +1668,7 @@ struct CodexSessionSpawnOptions<'a> {
     installed_provider_version: Option<&'a str>,
     selected_skills: &'a [ResolvedSkill],
     skill_selection: SkillSelection,
+    excluded_tool_categories: &'a [protocol::ToolCategory],
 }
 
 impl CodexSession {
@@ -1674,6 +1690,7 @@ impl CodexSession {
                 subagent_emitter: None,
                 execution_mode: BackendExecutionMode::Agent,
                 installed_provider_version: None,
+                excluded_tool_categories: &[],
                 selected_skills: &[],
                 skill_selection: SkillSelection::Explicit,
             },
@@ -1699,6 +1716,7 @@ impl CodexSession {
                 subagent_emitter: None,
                 execution_mode: BackendExecutionMode::Agent,
                 installed_provider_version: None,
+                excluded_tool_categories: &[],
                 selected_skills: &[],
                 skill_selection: SkillSelection::Explicit,
             },
@@ -1724,6 +1742,7 @@ impl CodexSession {
                 subagent_emitter: None,
                 execution_mode: BackendExecutionMode::Agent,
                 installed_provider_version: None,
+                excluded_tool_categories: &[],
                 selected_skills: &[],
                 skill_selection: SkillSelection::Explicit,
             },
@@ -1744,6 +1763,7 @@ impl CodexSession {
             subagent_emitter,
             execution_mode,
             installed_provider_version,
+            excluded_tool_categories,
             selected_skills,
             skill_selection,
         } = options;
@@ -1798,6 +1818,7 @@ impl CodexSession {
             steering_tempfile.as_deref(),
             access_mode,
             execution_mode,
+            excluded_tool_categories,
         )
         .await
         {
@@ -1999,6 +2020,7 @@ impl CodexSession {
             skills: selected_skills,
             selection: skill_selection,
             installed_provider_version,
+            excluded_tool_categories,
         } = selected_skill_context;
         // A session that cannot reach Tyde's skills runs without them. Dropping
         // the selection here — rather than refusing the spawn — is what keeps a
@@ -2033,6 +2055,7 @@ impl CodexSession {
             steering_tempfile.as_deref(),
             access_mode,
             BackendExecutionMode::Agent,
+            excluded_tool_categories,
         )
         .await
         {
@@ -2718,6 +2741,7 @@ pub(crate) async fn read_capacity_out_of_band(
         BackendAccessMode::Unrestricted,
         BackendExecutionMode::Agent,
         program,
+        &[],
     )
     .await
     {
@@ -2784,6 +2808,7 @@ pub(crate) async fn probe_session_settings_schema(
         BackendAccessMode::Unrestricted,
         BackendExecutionMode::Agent,
         program,
+        &[],
     )
     .await
     .map_err(|err| format!("Codex model discovery failed to spawn app-server: {err}"))?;
@@ -8057,6 +8082,27 @@ impl CodexInner {
         }
     }
 
+    async fn withdraw_async_questions(&self, superseded: HashSet<String>) {
+        let withdrawn = {
+            let mut state = self.state.lock().await;
+            superseded
+                .into_iter()
+                .filter(|id| state.pending_async_questions.remove(id))
+                .collect::<Vec<_>>()
+        };
+        if !withdrawn.is_empty() {
+            tracing::info!(
+                question_count = withdrawn.len(),
+                "Codex withdrawing questions superseded by user input"
+            );
+        }
+        for tool_call_id in withdrawn {
+            self.emitter
+                .cancel_pending_tool(&tool_call_id, "Question superseded by a new user message");
+            self.mark_tool_completed(&tool_call_id).await;
+        }
+    }
+
     async fn steer(&self, payload: protocol::SendMessagePayload) -> SteerOutcome {
         // A slash command is run by this backend rather than read by the
         // model, so it goes back to the caller for the ordinary send path.
@@ -8067,10 +8113,16 @@ impl CodexInner {
         {
             return SteerOutcome::Unsupported(payload);
         }
+        let superseded = if matches!(payload.origin, None | Some(protocol::MessageOrigin::User)) {
+            self.state.lock().await.pending_async_questions.clone()
+        } else {
+            HashSet::new()
+        };
         let message = payload.message.clone();
         let images = protocol_images_to_attachments(payload.images.clone());
         let outcome = self.steer_user_message(payload).await;
         if matches!(outcome, SteerOutcome::Accepted) {
+            self.withdraw_async_questions(superseded).await;
             self.emit_user_message_added(&message, images.as_deref());
         }
         outcome
@@ -14152,25 +14204,55 @@ impl CodexInner {
                 .await;
             }
             "item/tool/requestUserInput" => {
-                let item_id = params
-                    .get("itemId")
-                    .and_then(Value::as_str)
-                    .unwrap_or("request-user-input")
-                    .to_string();
+                #[derive(serde::Deserialize)]
+                struct Question {
+                    id: String,
+                    header: String,
+                    question: String,
+                    options: Option<Vec<protocol::AskUserQuestionOption>>,
+                }
+                #[derive(serde::Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct Request {
+                    item_id: String,
+                    is_blocking: bool,
+                    questions: Vec<Question>,
+                }
+                let Ok(request) = serde_json::from_value::<Request>(params.clone()) else {
+                    self.emitter
+                        .backend_error("Codex sent malformed user-input questions");
+                    return;
+                };
                 let tool_call_id = format!(
                     "request-user-input-{}",
-                    codex_scoped_tool_call_id(params, &item_id)
+                    codex_scoped_tool_call_id(params, &request.item_id)
                 );
-                let questions = params
-                    .get("questions")
-                    .and_then(Value::as_array)
-                    .cloned()
-                    .unwrap_or_default();
-                let question_ids = questions
+                let question_ids = request
+                    .questions
                     .iter()
-                    .filter_map(|q| q.get("id").and_then(Value::as_str).map(|s| s.to_string()))
+                    .map(|question| question.id.clone())
+                    .collect();
+                let questions = request
+                    .questions
+                    .into_iter()
+                    .map(|question| protocol::AskUserQuestion {
+                        id: Some(question.id),
+                        header: Some(question.header),
+                        question: question.question,
+                        options: question.options.unwrap_or_default(),
+                        multi_select: false,
+                    })
                     .collect::<Vec<_>>();
-
+                let mode = if request.is_blocking {
+                    protocol::UserQuestionMode::Blocking
+                } else {
+                    protocol::UserQuestionMode::NonBlocking
+                };
+                tracing::info!(
+                    question_count = questions.len(),
+                    blocking = request.is_blocking,
+                    "Codex projecting native user-input questions"
+                );
                 {
                     let mut state = self.state.lock().await;
                     state.pending_request = Some(PendingRequest {
@@ -14187,11 +14269,11 @@ impl CodexInner {
                     .await;
                 self.emit_tool_request(
                     &tool_call_id,
-                    "ask_user_question",
-                    CodexToolRequest::other(json!({
-                        "questions": questions,
-                        "type": "request_user_input"
-                    })),
+                    "request_user_input",
+                    CodexToolRequest::typed(
+                        json!({ "questions": params["questions"] }),
+                        json!(protocol::ToolRequestType::AskUserQuestion { questions, mode }),
+                    ),
                 )
                 .await;
             }
@@ -19400,6 +19482,70 @@ fn cache_codex_manual_trigger_absent(
     true
 }
 
+async fn prepare_codex_tool_catalog(
+    local_program: Option<&str>,
+    categories: &[protocol::ToolCategory],
+) -> Result<Option<tempfile::NamedTempFile>, String> {
+    if categories.is_empty() {
+        return Ok(None);
+    }
+    let mut command = match local_program {
+        Some(program) => crate::process_env::command(program)?,
+        None => codex_command()?,
+    };
+    command.args(["debug", "models"]).kill_on_drop(true);
+    let output = tokio::time::timeout(Duration::from_secs(30), command.output())
+        .await
+        .map_err(|_| "Codex tool filtering model catalogue probe timed out".to_owned())?
+        .map_err(|error| format!("Codex tool filtering model catalogue probe failed: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "Codex tool filtering model catalogue probe exited {}",
+            output.status
+        ));
+    }
+    let mut catalogue: Value = serde_json::from_slice(&output.stdout)
+        .map_err(|error| format!("Codex model catalogue is not valid JSON: {error}"))?;
+    let models = catalogue
+        .get_mut("models")
+        .and_then(Value::as_array_mut)
+        .ok_or("Codex model catalogue is missing its models array")?;
+    let mut removed = 0;
+    for model in models.iter_mut() {
+        let tools = model
+            .get_mut("experimental_supported_tools")
+            .and_then(Value::as_array_mut)
+            .ok_or("Codex model catalogue is missing experimental_supported_tools")?;
+        for category in categories {
+            match category {
+                protocol::ToolCategory::AskUser => {
+                    let before = tools.len();
+                    tools.retain(|tool| {
+                        !matches!(
+                            tool.as_str(),
+                            Some("send_user_message_async" | "request_user_input_async")
+                        )
+                    });
+                    removed += before - tools.len();
+                }
+            }
+        }
+    }
+    tracing::info!(
+        model_count = models.len(),
+        removed_tool_count = removed,
+        "Projecting Codex tool category exclusions into the native model catalogue"
+    );
+    let mut file = tempfile::Builder::new()
+        .prefix("tyde-codex-tool-catalog-")
+        .suffix(".json")
+        .tempfile()
+        .map_err(|error| format!("Failed to create private Codex tool catalogue: {error}"))?;
+    serde_json::to_writer(file.as_file_mut(), &catalogue)
+        .map_err(|error| format!("Failed to write private Codex tool catalogue: {error}"))?;
+    Ok(Some(file))
+}
+
 struct CodexRpc {
     /// `None` once teardown has closed it. Closing stdin is how we ask the
     /// app-server to leave, so the handle has to be droppable, not just
@@ -19412,11 +19558,15 @@ struct CodexRpc {
     stderr_task: JoinHandle<()>,
     rollout_trace_task: Option<JoinHandle<()>>,
     rollout_trace_root: Option<tempfile::TempDir>,
+    tool_catalog: Option<tempfile::NamedTempFile>,
     compaction_capability: Arc<std::sync::Mutex<BackendCompactionCapability>>,
 }
 
 impl CodexRpc {
     fn abort_readers(&self) {
+        if self.tool_catalog.is_some() {
+            tracing::debug!("Releasing the private Codex tool catalogue");
+        }
         self.stdout_task.abort();
         self.stderr_task.abort();
         if let Some(task) = &self.rollout_trace_task {
@@ -19436,6 +19586,7 @@ impl CodexRpc {
         steering_tempfile: Option<&std::path::Path>,
         access_mode: BackendAccessMode,
         execution_mode: BackendExecutionMode,
+        excluded_tool_categories: &[protocol::ToolCategory],
     ) -> Result<(Self, mpsc::UnboundedReceiver<CodexInbound>), String> {
         Self::spawn_with_local_program(
             ssh_host,
@@ -19444,6 +19595,7 @@ impl CodexRpc {
             access_mode,
             execution_mode,
             None,
+            excluded_tool_categories,
         )
         .await
     }
@@ -19455,6 +19607,7 @@ impl CodexRpc {
         access_mode: BackendAccessMode,
         execution_mode: BackendExecutionMode,
         local_program: Option<&str>,
+        excluded_tool_categories: &[protocol::ToolCategory],
     ) -> Result<(Self, mpsc::UnboundedReceiver<CodexInbound>), String> {
         if execution_mode == BackendExecutionMode::InferenceOnly && ssh_host.is_some() {
             return Err("Codex transient inference requires a local Codex process".to_owned());
@@ -19467,6 +19620,25 @@ impl CodexRpc {
         }
         if execution_mode == BackendExecutionMode::InferenceOnly {
             config_overrides.extend(codex_inference_config_overrides());
+        }
+        if ssh_host.is_some() && !excluded_tool_categories.is_empty() {
+            return Err("Codex tool category exclusions require a host-local runtime".to_owned());
+        }
+        let tool_catalog =
+            prepare_codex_tool_catalog(local_program, excluded_tool_categories).await?;
+        if let Some(catalogue) = &tool_catalog {
+            config_overrides.push(format!(
+                "model_catalog_json={}",
+                toml_quoted(&catalogue.path().display().to_string())
+            ));
+        }
+        for category in excluded_tool_categories {
+            match category {
+                protocol::ToolCategory::AskUser => {
+                    config_overrides
+                        .push("tools.experimental_request_user_input.enabled=false".to_owned());
+                }
+            }
         }
         if let Some(path) = steering_tempfile {
             config_overrides.push(format!(
@@ -19610,6 +19782,7 @@ impl CodexRpc {
                 stderr_task,
                 rollout_trace_task,
                 rollout_trace_root,
+                tool_catalog,
                 compaction_capability: Arc::new(std::sync::Mutex::new(
                     BackendCompactionCapability::unknown(
                         BackendCompactionUnknownReason::ProcessNotInitialized,
@@ -19993,6 +20166,9 @@ impl CodexBackend {
                     subagent_emitter: initial_emitter,
                     execution_mode: config.execution_mode,
                     installed_provider_version: config.provider_version.as_deref(),
+                    excluded_tool_categories: &config
+                        .resolved_spawn_config
+                        .excluded_tool_categories,
                     selected_skills,
                     skill_selection: if inference_only {
                         SkillSelection::Explicit
@@ -21345,6 +21521,15 @@ impl Backend for CodexBackend {
         .into()
     }
 
+    fn validate_tool_categories(categories: &[protocol::ToolCategory]) -> Result<(), String> {
+        for category in categories {
+            match category {
+                protocol::ToolCategory::AskUser => {}
+            }
+        }
+        Ok(())
+    }
+
     fn session_settings_schema() -> SessionSettingsSchema {
         codex_session_settings_schema(Vec::new())
     }
@@ -21395,6 +21580,9 @@ impl Backend for CodexBackend {
                     subagent_emitter: None,
                     execution_mode: BackendExecutionMode::Agent,
                     installed_provider_version: config.provider_version.as_deref(),
+                    excluded_tool_categories: &config
+                        .resolved_spawn_config
+                        .excluded_tool_categories,
                     selected_skills: &config.resolved_spawn_config.skills,
                     skill_selection: config.resolved_spawn_config.skill_selection,
                 },
@@ -21585,6 +21773,9 @@ impl Backend for CodexBackend {
                     skills: &config.resolved_spawn_config.skills,
                     selection: config.resolved_spawn_config.skill_selection,
                     installed_provider_version: config.provider_version.as_deref(),
+                    excluded_tool_categories: &config
+                        .resolved_spawn_config
+                        .excluded_tool_categories,
                 },
             )
             .await
@@ -21831,6 +22022,7 @@ impl Backend for CodexBackend {
             BackendAccessMode::Unrestricted,
             BackendExecutionMode::Agent,
             context.program.as_deref(),
+            &[],
         )
         .await?;
         let listed = tokio::time::timeout(CODEX_CAPACITY_PROBE_TIMEOUT, async {

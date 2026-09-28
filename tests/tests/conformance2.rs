@@ -98,9 +98,14 @@ macro_rules! conformance2_scenario {
                                         use futures_util::FutureExt;
                                         let mut harness =
                                             Harness::<$backend>::new($profile, test_name);
-                                        let result = std::panic::AssertUnwindSafe(
-                                            super::$scenario(&mut harness),
-                                        )
+                                        let result = std::panic::AssertUnwindSafe(async {
+                                            super::$scenario(&mut harness).await;
+                                            if stringify!($name) == "codex"
+                                                && stringify!($scenario).starts_with("real_excludes_ask_user_tools")
+                                            {
+                                                real_blocking_question_profile_child(&harness).await;
+                                            }
+                                        })
                                         .catch_unwind()
                                         .await;
                                         harness.finish().await;
@@ -133,7 +138,10 @@ macro_rules! conformance2_scenario {
                 } else if stringify!($scenario) == "real_generated_image_preserves_tool_ownership" {
                     // Luna missed the race; Astra reproduced the captured empty-reasoning interleaving.
                     Profile::new(&["gpt-6-astra"], &[("model", "gpt-6-astra"), ("reasoning_effort", "low")])
-                } else if matches!(stringify!($scenario), "real_async_user_question" | "real_user_question") {
+                } else if stringify!($scenario).starts_with("real_excludes_ask_user_tools") {
+                    let model = std::env::var("TYDE_CODEX_TEST_MODEL").unwrap_or_else(|_| "gpt-6-astra".to_owned());
+                    Profile::new(&[&model], &[("model", &model), ("reasoning_effort", "low")])
+                } else if matches!(stringify!($scenario), "real_async_user_question" | "real_user_question" | "real_new_message_withdraws_async_question") {
                     // Luna exposes only the blocking tool; Astra exposes async questions.
                     Profile::new(&["gpt-6-astra"], &[("model", "gpt-6-astra"), ("reasoning_effort", "low")])
                 } else { Profile::codex() }
@@ -146,9 +154,9 @@ macro_rules! conformance2_scenario {
             provider!(
                 antigravity,
                 server::backend::antigravity::AntigravityBackend,
-                if matches!(
+                if stringify!($scenario).starts_with("real_excludes_ask_user_tools") || matches!(
                     stringify!($scenario),
-                    "real_async_user_question" | "real_user_question" | "real_immediate_message_after_uncooperative_stop" | "real_interrupt_shutdown_kills_process_group"
+                    "real_async_user_question" | "real_user_question" | "real_new_message_withdraws_async_question" | "real_immediate_message_after_uncooperative_stop" | "real_interrupt_shutdown_kills_process_group"
                 ) {
                     Profile::new(&["gemini-3.8-flash-low"], &[("model", "gemini-3.8-flash-low")])
                 } else {
@@ -2907,12 +2915,138 @@ async fn real_running_command_survives_response_retry<B: Backend>(host: &mut Har
     assert_universal_contract(&[follow_up]);
 }
 
+fn excluded_question_prompt<B: Backend>() -> &'static str {
+    if B::session_settings_schema().backend_kind == BackendKind::Hermes {
+        return "Call the native clarify tool directly with question Choose ALPHA or BETA and choices ALPHA, BETA. Do not use tool_call or tool_search. If clarify is unavailable, reply QUESTION_TOOL_UNAVAILABLE. Do not ask in plain text or use another tool.";
+    }
+    "Use your user-question tool to ask me to choose ALPHA or BETA. \
+    Use the blocking or asynchronous version, whichever is available. \
+    If neither tool is available, reply QUESTION_TOOL_UNAVAILABLE. \
+    Do not use any other tool or ask the question in plain text."
+}
+
+async fn prepare_question_exclusion<B: Backend>(host: &mut Harness<B>) -> protocol::SessionId {
+    B::validate_tool_categories(&[protocol::ToolCategory::AskUser])
+        .expect("every backend exposing Ask User must support excluding it");
+    let agent = spawn_agent(host, &launch_prompt()).await;
+    let launched = collect_turn(host, &agent, &launch_prompt()).await;
+    assert_ready_handshake(&launched);
+    let asked = ask_question(host, &agent, excluded_question_prompt::<B>()).await;
+    assert_question_shape(&asked);
+    let cancelled = cancel_question(host).await;
+    assert_no_error_message("cancel unrestricted question", &cancelled);
+    let session_id = agent.session_id.clone();
+    close_agent(host, &agent).await;
+    host.config.resolved_spawn_config.excluded_tool_categories =
+        vec![protocol::ToolCategory::AskUser];
+    session_id
+}
+
+fn assert_question_excluded(turn: &Turn) {
+    assert_no_error_message("restricted question", turn.events());
+    assert!(turn.events().iter().all(|event| !matches!(event,
+        ChatEvent::ToolRequest(request) if matches!(request.tool_type, ToolRequestType::AskUserQuestion { .. })
+    )), "excluded question tool must not reach the user");
+    assert_final_text_contains(turn, "QUESTION_TOOL_UNAVAILABLE");
+}
+
+async fn assert_ordinary_tools_preserved<B: Backend>(host: &mut Harness<B>, agent: &Agent) {
+    let turn = ask(
+        host,
+        agent,
+        "Read README.txt with a file or shell tool and report its complete contents.",
+    )
+    .await;
+    assert_no_error_message("ordinary tools remain available", turn.events());
+    assert!(
+        turn.tool_requests().next().is_some(),
+        "excluding questions must preserve ordinary tools"
+    );
+    assert_final_text_contains(&turn, "tyde conformance workspace");
+}
+
+async fn real_excludes_ask_user_tools<B: Backend>(host: &mut Harness<B>) {
+    prepare_question_exclusion(host).await;
+    let agent = spawn_agent(host, excluded_question_prompt::<B>()).await;
+    let turn = collect_turn(host, &agent, excluded_question_prompt::<B>()).await;
+    assert_question_excluded(&turn);
+    assert_ordinary_tools_preserved(host, &agent).await;
+}
+conformance2_scenario!(
+    real_excludes_ask_user_tools,
+    [BackendCapability::UserQuestionRequests]
+);
+
+async fn real_excludes_ask_user_tools_after_resume<B: Backend>(host: &mut Harness<B>) {
+    let session_id = prepare_question_exclusion(host).await;
+    let agent = resume_agent(host, &session_id).await;
+    let turn = ask(host, &agent, excluded_question_prompt::<B>()).await;
+    assert_question_excluded(&turn);
+    assert_ordinary_tools_preserved(host, &agent).await;
+}
+conformance2_scenario!(
+    real_excludes_ask_user_tools_after_resume,
+    [
+        BackendCapability::UserQuestionRequests,
+        BackendCapability::ResumeSession
+    ]
+);
+
+async fn real_excludes_ask_user_tools_after_fork<B: Backend>(host: &mut Harness<B>) {
+    let session_id = prepare_question_exclusion(host).await;
+    let agent = fork_agent(host, &session_id, excluded_question_prompt::<B>()).await;
+    let turn = collect_turn(host, &agent, excluded_question_prompt::<B>()).await;
+    assert_question_excluded(&turn);
+    assert_ordinary_tools_preserved(host, &agent).await;
+}
+conformance2_scenario!(
+    real_excludes_ask_user_tools_after_fork,
+    [
+        BackendCapability::UserQuestionRequests,
+        BackendCapability::ForkSession
+    ]
+);
+
+async fn real_new_message_withdraws_async_question<B: Backend>(host: &mut Harness<B>) {
+    let agent = spawn_agent(host, &launch_prompt()).await;
+    let launched = collect_turn(host, &agent, &launch_prompt()).await;
+    assert_ready_handshake(&launched);
+    let mut question = ask_question(host, &agent,
+        "Use your asynchronous user-question tool to ask me to choose ALPHA or BETA. After posting the question, finish this turn without waiting for my answer.").await;
+    wait_for_unanswered_question_idle(host, &mut question).await;
+    assert_question_shape(&question);
+    assert_question_waits_for_an_answer(&question);
+    let next = ask_expecting_delivery(host, &agent, &launch_prompt()).await;
+    assert_ready_handshake(&next);
+    let completions = next
+        .tool_completions()
+        .filter(|completion| completion.tool_call_id == question.tool_call_id())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        completions.len(),
+        1,
+        "ordinary user input must withdraw the unanswered question exactly once"
+    );
+    assert!(
+        matches!(
+            completions[0].outcome,
+            ToolExecutionOutcome::Cancelled { .. }
+        ),
+        "an unrelated chat message must cancel the question, not answer it"
+    );
+    assert_clean_close(host, &agent).await;
+}
+conformance2_scenario!(
+    real_new_message_withdraws_async_question,
+    [BackendCapability::AsyncUserQuestionRequests]
+);
+
 async fn real_user_question<B: Backend>(host: &mut Harness<B>) {
     let agent = spawn_agent(host, &launch_prompt()).await;
     let launched = collect_turn(host, &agent, &launch_prompt()).await;
     assert_ready_handshake(&launched);
 
-    let asked = ask_question(host, &agent, &question_prompt()).await;
+    let asked = ask_question(host, &agent, &question_prompt::<B>()).await;
     assert_question_shape(&asked);
     assert_question_waits_for_an_answer(&asked);
     assert_eq!(
@@ -2941,7 +3075,7 @@ async fn real_user_question<B: Backend>(host: &mut Harness<B>) {
     // Second question, abandoned rather than answered. Cancelling is
     // the user's escape hatch from an interactive tool, and it is the
     // one path where a card and a turn can be terminalized out of step.
-    let abandoned = ask_question(host, &agent, &question_prompt()).await;
+    let abandoned = ask_question(host, &agent, &question_prompt::<B>()).await;
     assert_question_shape(&abandoned);
     let cancelled = cancel_question(host).await;
     assert_no_error_message(&format!("{:?} question cancel", host.backend()), &cancelled);
@@ -3150,10 +3284,14 @@ fn wait_prompt() -> String {
     )
 }
 
-fn question_prompt() -> String {
-    "I want you to name a file, but only I know which name is right. Ask me to choose between \
-     exactly two options, ALPHA and BETA, using your question tool. Ask, and then stop and wait \
-     for my answer — do not guess, do not pick one yourself, and do not create any file yet."
+fn question_prompt<B: Backend>() -> String {
+    if B::session_settings_schema().backend_kind == BackendKind::Hermes {
+        return "This is a new independent choice; previous answers do not apply. Call clarify directly with questions=[{question:'Which label?',choices:['ALPHA','BETA']}]. Put choices inside the question object, exactly as in the native schema; do not use top-level choices or an options parameter. Do not use tool_call or any other tool. Wait for my answer, then repeat my complete selected label verbatim.".to_owned();
+    }
+    "This is a new independent choice; previous answers do not apply. Use your native user-question \
+     tool to ask Which label? with exactly two option labels ALPHA and BETA. Do not append any \
+     descriptions to the labels. Ask once, then wait for my answer without guessing or running \
+     other tools. After I answer, reply with my complete selected label verbatim. Do not create a file."
         .to_owned()
 }
 

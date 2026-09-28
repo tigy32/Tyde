@@ -30,6 +30,7 @@ pub struct ResolvedSpawnConfig {
     pub skill_delivery: SkillDelivery,
     pub mcp_servers: Vec<McpServerConfig>,
     pub tool_policy: ToolPolicy,
+    pub excluded_tool_categories: Vec<protocol::ToolCategory>,
     pub access_mode: BackendAccessMode,
 }
 
@@ -54,6 +55,7 @@ impl ResolvedSpawnConfig {
             skill_delivery: SkillDelivery::NamesOnly,
             mcp_servers: Vec::new(),
             tool_policy: ToolPolicy::Unrestricted,
+            excluded_tool_categories: Vec::new(),
             access_mode: BackendAccessMode::Unrestricted,
         }
     }

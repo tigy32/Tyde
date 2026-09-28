@@ -1322,6 +1322,22 @@ pub trait Backend: Send + Sync + 'static {
         }
     }
 
+    /// Category exclusions intersect with the native tool policy. Accepting
+    /// one promises provider-side exclusion, not merely hiding its events.
+    fn validate_tool_categories(categories: &[protocol::ToolCategory]) -> Result<(), String>
+    where
+        Self: Sized,
+    {
+        if categories.is_empty() {
+            Ok(())
+        } else {
+            Err(format!(
+                "backend {:?} cannot exclude tool categories {categories:?}",
+                Self::session_settings_schema().backend_kind
+            ))
+        }
+    }
+
     fn terminal_errors_are_retryable() -> bool
     where
         Self: Sized,

@@ -225,7 +225,16 @@ async fn exit_plan_mode_tool_response_resumes_and_drains_queue() {
     ));
     fixture
         .client
-        .send_message(&question.stream, "queued question follow-up".to_owned())
+        // Automatic follow-ups must not dismiss a question on the user's behalf.
+        .send_message_payload(
+            &question.stream,
+            SendMessagePayload {
+                message: "queued question follow-up".to_owned(),
+                images: None,
+                origin: Some(MessageOrigin::Supervisor),
+                tool_response: None,
+            },
+        )
         .await
         .expect("send during blocking question");
     fixture.expect_queued_messages(&question, 1).await;
@@ -362,6 +371,133 @@ async fn exit_plan_mode_tool_response_resumes_and_drains_queue() {
         );
     }
     fixture.mock(&question).await.assert_clean().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn ordinary_message_withdraws_blocking_question_before_dispatching_followup() {
+    let mut fixture = Fixture::new().await;
+    let gate = MockGateHandle::new();
+    let agent = fixture
+        .spawn_scripted(
+            "superseded-blocking-question",
+            MockScript::one(MockTurn::blocking_question_request(
+                "superseded-blocking-question",
+                &gate,
+            ))
+            .then(MockTurn::text("new message handled")),
+        )
+        .await;
+    gate.wait_until_entered().await;
+    gate.release_one();
+    let question = expect_live_question_awaiting_user(&mut fixture, &agent).await;
+    fixture
+        .client
+        .send_message(&agent.stream, "Tell me something else".to_owned())
+        .await
+        .expect("send unrelated message");
+    let mut cancelled = 0;
+    let mut replied = false;
+    loop {
+        let env = fixture
+            .next_frame_matching("new message after blocking question", |env| {
+                env.stream == agent.stream
+            })
+            .await;
+        if activity_edge(&env, &agent) == Some(AgentActivity::Idle) && replied {
+            break;
+        }
+        if env.kind != FrameKind::ChatEvent {
+            continue;
+        }
+        match env.parse_payload::<ChatEvent>().expect("chat event") {
+            ChatEvent::ToolExecutionCompleted(completion)
+                if completion.tool_call_id == question.tool_call_id =>
+            {
+                assert!(
+                    matches!(
+                        completion.outcome,
+                        protocol::ToolExecutionOutcome::Cancelled { .. }
+                    ),
+                    "ordinary text must not be treated as the answer"
+                );
+                cancelled += 1;
+            }
+            ChatEvent::StreamEnd(end) if end.message.content == "new message handled" => {
+                assert_eq!(
+                    cancelled, 1,
+                    "the previous question must be cancelled before the new response"
+                );
+                replied = true;
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(cancelled, 1);
+    fixture.mock(&agent).await.assert_clean().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn ordinary_message_withdraws_async_question_in_live_and_replayed_state() {
+    let mut fixture = Fixture::new().await;
+    let gate = MockGateHandle::new();
+    let agent = fixture
+        .spawn_scripted(
+            "superseded-question",
+            MockScript::one(MockTurn::async_question_request(
+                "superseded-question",
+                &gate,
+            ))
+            .then(MockTurn::text("new message handled")),
+        )
+        .await;
+    gate.wait_until_entered().await;
+    gate.release_one();
+    let question = expect_live_question_awaiting_user(&mut fixture, &agent).await;
+    fixture
+        .client
+        .send_message(&agent.stream, "Tell me something else".to_owned())
+        .await
+        .expect("send unrelated message");
+    let turn = fixture.finish_turn(&agent).await;
+    turn.assert_stream_end_contains("new message handled");
+    let cancelled = turn.chat_events().iter().filter(|event| matches!(event,
+        ChatEvent::ToolExecutionCompleted(completion) if completion.tool_call_id == question.tool_call_id
+            && matches!(completion.outcome, protocol::ToolExecutionOutcome::Cancelled { .. })
+    )).count();
+    assert_eq!(
+        cancelled, 1,
+        "new chat input must cancel the unanswered question exactly once"
+    );
+    let (mut late, bootstrap) = fixture::connect_mobile_client_with_bootstrap(
+        fixture.host_for_test(),
+        "superseded-question-phone",
+    )
+    .await;
+    let descriptor = bootstrap
+        .agents
+        .iter()
+        .find(|entry| entry.agent_id == agent.new_agent.agent_id)
+        .expect("agent descriptor");
+    assert_eq!(
+        descriptor.activity,
+        AgentActivity::Idle,
+        "the question must not keep the Needs your answer status after the new turn"
+    );
+    let stream = descriptor.instance_stream.clone();
+    fixture::send_load_agent_on(&mut late, &stream).await;
+    let replay: protocol::AgentBootstrapPayload =
+        fixture::next_frame_matching_on(&mut late, "withdrawn question replay", |env| {
+            env.kind == FrameKind::AgentBootstrap && env.stream == stream
+        })
+        .await
+        .parse_payload()
+        .expect("agent bootstrap");
+    assert_eq!(replay.activity, AgentActivity::Idle);
+    assert_eq!(replay.events.iter().filter(|event| matches!(event,
+        protocol::AgentBootstrapEvent::ChatEvent(ChatEvent::ToolExecutionCompleted(completion)) if completion.tool_call_id == question.tool_call_id
+            && matches!(completion.outcome, protocol::ToolExecutionOutcome::Cancelled { .. })
+    )).count(), 1, "reattaching must replay one terminal cancellation, not resurrect the question");
+    fixture.mock(&agent).await.assert_clean().await;
 }
 
 #[tokio::test(start_paused = true)]

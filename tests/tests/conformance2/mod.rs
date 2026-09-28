@@ -16,6 +16,23 @@ use tyde_agent_adapter::BackendCapability;
 
 pub const SCRATCH_DIR: &str = "scratch";
 
+pub async fn real_blocking_question_profile_child<B: Backend>(host: &Harness<B>) {
+    if std::env::var_os("TYDE_BLOCKING_QUESTION_PROOF").is_some() {
+        return;
+    }
+    let script = host.workspace().join("blocking_question_profile.py");
+    std::fs::write(&script, include_str!("blocking_question_profile.py"))
+        .expect("write real provider blocking-question profile");
+    let status = tokio::process::Command::new("python3")
+        .arg(script)
+        .arg(std::env::current_exe().expect("conformance executable"))
+        .arg(&host.test_name)
+        .status()
+        .await
+        .expect("run real provider blocking-question profile");
+    assert!(status.success(), "real blocking-question profile failed");
+}
+
 pub async fn real_resume_start_race_child<B: Backend>(host: &Harness<B>) -> bool {
     if std::env::var_os("TYDE_RESUME_RACE_PROOF").is_some() {
         return true;
@@ -626,6 +643,33 @@ pub async fn spawn_agent_at_roots<B: Backend>(
     let (backend, events) = B::spawn(roots, host.config.clone(), user_message(prompt))
         .await
         .expect("spawn through Backend trait");
+    let session_id = backend.session_id();
+    host.last_session_id = Some(session_id.clone());
+    host.backend = Some(backend);
+    host.events = Some(events);
+    Agent {
+        session_id,
+        replayed_history: Vec::new(),
+    }
+}
+
+pub async fn fork_agent<B: Backend>(
+    host: &mut Harness<B>,
+    source: &SessionId,
+    prompt: &str,
+) -> Agent {
+    assert!(
+        host.backend.is_none(),
+        "close the previous session before forking"
+    );
+    let (backend, events) = B::fork(
+        host.workspace_roots(),
+        host.config.clone(),
+        source.clone(),
+        user_message(prompt),
+    )
+    .await
+    .expect("fork through Backend trait");
     let session_id = backend.session_id();
     host.last_session_id = Some(session_id.clone());
     host.backend = Some(backend);

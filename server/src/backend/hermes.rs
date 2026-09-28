@@ -97,6 +97,25 @@ print(
 )
 from tui_gateway import server as _tyde_gateway_server
 
+import json
+_tyde_excluded_toolsets = json.loads(os.environ["TYDE_HERMES_EXCLUDED_TOOLSETS"])
+if _tyde_excluded_toolsets:
+    import run_agent as _tyde_run_agent
+    class _TydeToolPolicyAgent(_tyde_run_agent.AIAgent):
+        def __init__(self, *args, **kwargs):
+            kwargs["disabled_toolsets"] = list(dict.fromkeys([
+                *(kwargs.get("disabled_toolsets") or []), *_tyde_excluded_toolsets,
+            ]))
+            # Clarify is also an inline executor: old transcript calls can
+            # bypass the advertised tool catalogue unless its UI is detached.
+            kwargs["clarify_callback"] = None
+            super().__init__(*args, **kwargs)
+            print(
+                f"TYDE HERMES TOOL POLICY excluded_toolsets={len(_tyde_excluded_toolsets)} tools={len(self.tools)}",
+                file=sys.stderr, flush=True,
+            )
+    _tyde_run_agent.AIAgent = _TydeToolPolicyAgent
+
 _tyde_original_emit = _tyde_gateway_server._emit
 _tyde_original_get_usage = _tyde_gateway_server._get_usage
 _tyde_original_make_agent = _tyde_gateway_server._make_agent
@@ -357,6 +376,13 @@ def _tyde_emit(event_type, session_id, payload=None):
         if isinstance(args, dict):
             payload = dict(payload)
             payload["args"] = args
+    if event_type == "clarify.request" and isinstance(payload, dict):
+        questions = payload.get("questions", [payload])
+        print(
+            f"TYDE HERMES QUESTION WIRE questions={len(questions)} "
+            f"choices={[len(q.get('choices') or []) for q in questions]}",
+            file=sys.stderr, flush=True,
+        )
     if event_type == "status.update" and isinstance(payload, dict) and payload.get("kind") == "process":
         text = str(payload.get("text") or "")
         with _tyde_background_completion_lock:
@@ -378,6 +404,13 @@ def _tyde_emit(event_type, session_id, payload=None):
 _tyde_original_tool_start = _tyde_gateway_server._on_tool_start
 
 def _tyde_on_tool_start(session_id, tool_call_id, name, args):
+    if name == "clarify" and isinstance(args, dict):
+        questions = args.get("questions", [args])
+        print(
+            f"TYDE HERMES QUESTION CALL questions={len(questions)} "
+            f"choices={[len(q.get('choices') or []) for q in questions]}",
+            file=sys.stderr, flush=True,
+        )
     if isinstance(args, dict):
         _tyde_tool_start_args[(session_id, str(tool_call_id))] = args
     _tyde_original_tool_start(session_id, tool_call_id, name, args)
@@ -1132,6 +1165,15 @@ fn hermes_base_session_fields() -> Vec<SessionSettingField> {
 }
 
 impl Backend for HermesBackend {
+    fn validate_tool_categories(categories: &[protocol::ToolCategory]) -> Result<(), String> {
+        for category in categories {
+            match category {
+                protocol::ToolCategory::AskUser => {}
+            }
+        }
+        Ok(())
+    }
+
     fn reserved_launch_profile_error(id: &protocol::LaunchProfileId) -> Option<String> {
         id.0.starts_with(HERMES_PROFILE_LAUNCH_ID_PREFIX).then(|| {
             format!(
@@ -4035,6 +4077,21 @@ impl HermesGatewayHandle {
         expose_skills: bool,
     ) -> Result<(Self, mpsc::UnboundedReceiver<HermesGatewayEvent>), String> {
         let mut target = resolve_gateway_spawn_target(workspace_roots).await?;
+        let excluded_toolsets = resolved
+            .excluded_tool_categories
+            .iter()
+            .map(|category| match category {
+                protocol::ToolCategory::AskUser => "clarify",
+            })
+            .collect::<Vec<_>>();
+        if target.remote_host.is_some() && !excluded_toolsets.is_empty() {
+            return Err("Hermes tool category exclusions require a host-local runtime".to_owned());
+        }
+        target.env.insert(
+            "TYDE_HERMES_EXCLUDED_TOOLSETS".to_owned(),
+            serde_json::to_string(&excluded_toolsets)
+                .map_err(|error| format!("Failed to encode Hermes tool exclusions: {error}"))?,
+        );
         // A named profile is selected by pointing HERMES_HOME at its
         // directory. Remote spawns run over SSH without env forwarding, so a
         // named profile there would silently run against the wrong home —
@@ -6007,11 +6064,11 @@ impl HermesEventMapper {
                 "Hermes tool.complete name mismatch for {tool_call_id}: expected {expected_name}, got {tool_name}"
             ));
         }
-        if self
+        let question_was_presented = self
             .pending_clarify
             .as_ref()
-            .is_some_and(|pending| pending.tool_call_id == tool_call_id)
-        {
+            .is_some_and(|pending| pending.tool_call_id == tool_call_id);
+        if question_was_presented {
             self.pending_clarify = None;
         }
         self.pending_tools.remove(&tool_call_id);
@@ -6038,6 +6095,16 @@ impl HermesEventMapper {
             .or(provider_error);
         let completion_tool_call_id = tool_call_id.clone();
         let mut events = Vec::new();
+        if normalized_hermes_tool_name(&tool_name) == "clarify" && !question_was_presented {
+            tracing::info!("Hermes question attempt completed without requesting user input");
+            events.push(ChatEvent::ToolRequest(ToolRequest {
+                tool_call_id: tool_call_id.clone(),
+                tool_name: tool_name.clone(),
+                tool_type: ToolRequestType::Other {
+                    args: arguments.clone(),
+                },
+            }));
+        }
         self.opaque_progress_tools.remove(&completion_tool_call_id);
         let outcome = if success {
             let tool_result = normalized_mcp

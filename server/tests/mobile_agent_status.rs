@@ -520,7 +520,15 @@ async fn lazy_client_learns_agent_liveness_from_the_host_stream() {
 
     fixture
         .client
-        .send_message(&question_agent.stream, "independent follow-up".to_owned())
+        .send_message_payload(
+            &question_agent.stream,
+            protocol::SendMessagePayload {
+                message: "independent follow-up".to_owned(),
+                images: None,
+                origin: Some(protocol::MessageOrigin::Supervisor),
+                tool_response: None,
+            },
+        )
         .await
         .expect("send follow-up without answering");
     question_follow_up.wait_until_entered().await;

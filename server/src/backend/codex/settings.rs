@@ -335,6 +335,7 @@ async fn open_config() -> Result<CodexRpc, String> {
         BackendAccessMode::Unrestricted,
         BackendExecutionMode::Agent,
         None,
+        &[],
     )
     .await?;
     let initialized = tokio::time::timeout(CODEX_CAPACITY_PROBE_TIMEOUT, rpc.request("initialize", json!({

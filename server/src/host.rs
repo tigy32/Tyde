@@ -7415,9 +7415,19 @@ impl HostHandle {
         match plan.activation.clone() {
             TeamMemberActivation::Reuse { agent_id } => {
                 if let Some(prompt) = prompt {
-                    self.message_bound_team_member(&registry, &plan, agent_id, prompt, images)
-                        .await
-                        .map_err(|error| team_member_activation_error(OPERATION, error))
+                    self.message_bound_team_member(
+                        &registry,
+                        &plan,
+                        agent_id,
+                        SendMessagePayload {
+                            message: prompt,
+                            images,
+                            origin: Some(protocol::MessageOrigin::User),
+                            tool_response: None,
+                        },
+                    )
+                    .await
+                    .map_err(|error| team_member_activation_error(OPERATION, error))
                 } else {
                     Ok(TeamMemberMessageOutcome {
                         member_id: plan.member.id.clone(),
@@ -7520,8 +7530,18 @@ impl HostHandle {
             .await?;
         match plan.activation.clone() {
             TeamMemberActivation::Reuse { agent_id } => {
-                self.message_bound_team_member(&registry, &plan, agent_id, message, images)
-                    .await
+                self.message_bound_team_member(
+                    &registry,
+                    &plan,
+                    agent_id,
+                    SendMessagePayload {
+                        message,
+                        images,
+                        origin: Some(protocol::MessageOrigin::AgentControl),
+                        tool_response: None,
+                    },
+                )
+                .await
             }
             TeamMemberActivation::Resume { session_id } => {
                 if let Err(err) = self.ensure_team_resume_session(&session_id).await {
@@ -7591,8 +7611,7 @@ impl HostHandle {
         registry: &TeamRegistryHandle,
         plan: &TeamMessagePlan,
         agent_id: AgentId,
-        message: String,
-        images: Option<Vec<ImageData>>,
+        payload: SendMessagePayload,
     ) -> Result<TeamMemberMessageOutcome, String> {
         let handle = self.agent_handle(&agent_id).await.ok_or_else(|| {
             format!(
@@ -7609,14 +7628,7 @@ impl HostHandle {
             .record_member_activity(plan.member.id.clone(), AgentControlStatus::Thinking)
             .await?;
         self.fan_out_team_registry_events(events).await;
-        let sent = handle
-            .send_input(AgentInput::SendMessage(SendMessagePayload {
-                message,
-                images,
-                origin: None,
-                tool_response: None,
-            }))
-            .await;
+        let sent = handle.send_input(AgentInput::SendMessage(payload)).await;
         if !sent {
             let events = registry
                 .record_binding_failure(plan.member.id.clone())

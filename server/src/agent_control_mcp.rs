@@ -1961,7 +1961,7 @@ pub(crate) async fn do_send_message(
     let payload = SendMessagePayload {
         message,
         images: None,
-        origin: None,
+        origin: Some(protocol::MessageOrigin::AgentControl),
         tool_response: None,
     };
     if interrupt {

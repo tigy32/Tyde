@@ -87,6 +87,7 @@ struct MockSessionRecord {
     builtin_steering: String,
     skills: Vec<String>,
     tool_policy: ToolPolicy,
+    excluded_tool_categories: Vec<protocol::ToolCategory>,
     access_mode: BackendAccessMode,
     compaction_capability: BackendCompactionCapability,
     created_at_ms: u64,
@@ -198,6 +199,7 @@ impl MockBackend {
                         .map(|skill| summarize_skill(&skill))
                         .collect(),
                     tool_policy: resolved_spawn_config.tool_policy,
+                    excluded_tool_categories: resolved_spawn_config.excluded_tool_categories,
                     access_mode: resolved_spawn_config.access_mode,
                     compaction_capability: compaction_capability.clone(),
                     created_at_ms: now,
@@ -298,6 +300,7 @@ impl MockBackend {
                 .map(|skill| summarize_skill(&skill))
                 .collect();
             record.tool_policy = resolved_spawn_config.tool_policy;
+            record.excluded_tool_categories = resolved_spawn_config.excluded_tool_categories;
             record.access_mode = resolved_spawn_config.access_mode;
             record.updated_at_ms = now_ms();
             (
@@ -476,6 +479,7 @@ impl MockBackend {
                         .map(|skill| summarize_skill(&skill))
                         .collect(),
                     tool_policy: resolved_spawn_config.tool_policy,
+                    excluded_tool_categories: resolved_spawn_config.excluded_tool_categories,
                     access_mode: resolved_spawn_config.access_mode,
                     compaction_capability: compaction_capability.clone(),
                     created_at_ms: now,
@@ -545,6 +549,15 @@ fn default_mock_script() -> MockScript {
 }
 
 impl Backend for MockBackend {
+    fn validate_tool_categories(categories: &[protocol::ToolCategory]) -> Result<(), String> {
+        for category in categories {
+            match category {
+                protocol::ToolCategory::AskUser => {}
+            }
+        }
+        Ok(())
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     async fn discover(
         context: &super::BackendProbeContext,
@@ -1019,6 +1032,12 @@ fn startup_mcp_response_prefix(session_id: &SessionId) -> String {
     }
     if !matches!(record.tool_policy, ToolPolicy::Unrestricted) {
         parts.push(format!("[tool_policy: {:?}]", record.tool_policy));
+    }
+    if !record.excluded_tool_categories.is_empty() {
+        parts.push(format!(
+            "[excluded_tool_categories: {:?}]",
+            record.excluded_tool_categories
+        ));
     }
     if record.access_mode != BackendAccessMode::Unrestricted {
         parts.push(format!("[access_mode: {:?}]", record.access_mode));

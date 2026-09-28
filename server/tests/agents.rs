@@ -3747,6 +3747,44 @@ async fn agent_control_end_to_end_flow_uses_full_stack() {
     let listed_after_follow_up = control.list_agents().await;
     assert_eq!(listed_after_follow_up.len(), 1);
     assert_eq!(listed_after_follow_up[0].status, AgentControlStatus::Idle);
+    let root = control
+        .read_agent_debug(
+            protocol::AgentId(spawned.agent_id.clone()),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("read root tool configuration");
+    assert!(
+        root.events
+            .iter()
+            .all(|event| !chat_event_contains(event, "excluded_tool_categories")),
+        "a root keeps its user-question tools"
+    );
+    let child = control
+        .spawn_agent(SpawnRequest {
+            workspace_roots: vec!["/tmp/test".to_owned()],
+            prompt: "Report inherited tool policy".to_owned(),
+            backend_kind: BackendKind::Claude,
+            launch_profile_id: Some(LaunchProfileId("claude:default".to_owned())),
+            session_settings: None,
+            parent_agent_id: Some(protocol::AgentId(spawned.agent_id.clone())),
+            project_id: None,
+            name: Some("policy-child".to_owned()),
+            cost_hint: None,
+            access_mode: Default::default(),
+        })
+        .await
+        .expect("spawn child with server-owned tool policy");
+    await_dev_driver_agent_ready(&control, &child.agent_id, "child policy turn").await;
+    assert_read_agent_contains(
+        &control,
+        &child.agent_id,
+        None,
+        "[excluded_tool_categories: [AskUser]]",
+    )
+    .await;
 }
 
 #[tokio::test]

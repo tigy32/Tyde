@@ -315,7 +315,28 @@ impl MockActor {
                 }
             }
         };
+        if matches!(payload.origin, None | Some(protocol::MessageOrigin::User))
+            && !self.withdraw_async_questions()
+        {
+            return false;
+        }
         self.run_turn(turn, &payload.message, control).await
+    }
+
+    fn withdraw_async_questions(&mut self) -> bool {
+        for tool_call_id in std::mem::take(&mut self.pending_async_questions) {
+            if !self.events_tx.send_event(emit::tool_completed(
+                protocol::ToolExecutionCompletedData {
+                    tool_call_id,
+                    outcome: protocol::ToolExecutionOutcome::Cancelled {
+                        message: "Question superseded by a new user message".to_owned(),
+                    },
+                },
+            )) {
+                return false;
+            }
+        }
+        true
     }
 
     async fn handle_busy_self_turn(&mut self, control: &mut ControlPlane) -> bool {
