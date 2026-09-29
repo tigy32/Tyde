@@ -1,12 +1,24 @@
 # Mobile Send investigation and beta diagnostics
 
-Status: scoped diagnostics implementation for review, 2026-09-26.
-The owner sent the conditional design to the user and authorized automatic
-capture in iOS standalone betas. No original native Send root is established.
-This is observational diagnostics, not a Send fix or delivery guarantee.
+Status: historical investigation; device diagnostics removed 2026-09-29.
 
-User-owned workbench: `mobile-send-tap-keyboard`, base `0f3b4b38`.
-Keep the workbench. No landing, push, release or tag is authorized.
+Tyde does not collect device telemetry for its maintainers. The automatic
+beta recorder, legacy query opt-in, composer observation hooks, app/Settings
+controls, and file-sharing/download export have been removed. The evidence
+below describes the former implementation, not current behavior.
+
+The mounted Chrome and WebKit flows now require no recorder or diagnostic
+controls, including on iOS standalone and with the former query opt-in.
+Draft retention, ordinary Send/Queue behavior, shell geometry, header reachability,
+and connection/navigation behavior remain covered. Assertions that demanded
+Recording or exported captures certified the removed feature and contradicted
+the new privacy contract; they are replaced with absence assertions rather
+than assertions about a hidden or stopped recorder. The removal regression
+failed before the fix: editing/rejected sends created a recorder object, and
+AppSurface rendered the diagnostic status surface. Retained red-run evidence:
+`target/dev-check-logs/run-20260929T211938Z-2039879/12-wasm-browser-tests.log`.
+
+## Historical evidence
 
 ## Mounted Chrome investigation
 

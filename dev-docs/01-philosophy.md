@@ -63,6 +63,12 @@ is wrong.
    fields are runtime-only transport details (channels/handles) that cannot be
    serialized on the wire.
 
+10. **No device telemetry to Tyde maintainers.**
+    Shipped clients must not record user-interaction diagnostics or offer
+    diagnostic collection/export workflows for maintainers. Communication with
+    the user's selected hosts and agent providers remains part of normal
+    operation, not telemetry to us.
+
 ### Bug-Fix Philosophy
 
 1. A real bug fix starts with root cause.

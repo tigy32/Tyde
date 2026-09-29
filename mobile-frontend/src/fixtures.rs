@@ -75,18 +75,6 @@ pub fn capture_send(line: &str) -> Accepted {
 }
 
 pub fn seed_state(state: &AppState) {
-    let channel = web_sys::window()
-        .and_then(|window| window.location().search().ok())
-        .and_then(|search| web_sys::UrlSearchParams::new_with_str(&search).ok())
-        .and_then(|params| params.get("tyde-fixture-diagnostics-channel"));
-    if let Some(channel) = channel {
-        let beta = match channel.as_str() {
-            "beta" => true,
-            "stable" => false,
-            _ => panic!("invalid fixture diagnostic channel"),
-        };
-        provide_context(crate::app::DiagnosticBuildChannel(beta));
-    }
     let name = fixture_name();
     if name == "onboarding" {
         state.app_mode.set(AppMode::Onboarding);

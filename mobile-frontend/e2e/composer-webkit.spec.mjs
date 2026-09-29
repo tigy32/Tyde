@@ -1,7 +1,5 @@
 import {expect, test} from '@playwright/test';
-import {readFile, writeFile} from 'node:fs/promises';
-const {version:compiledVersion}=JSON.parse(await readFile(new URL('../../package.json',import.meta.url),'utf8'));
-const compiledBeta=compiledVersion.includes('-beta.');
+import {writeFile} from 'node:fs/promises';
 import {preflightScreenshotOutput} from '../../tools/devicefarm-output.mjs';
 
 test('actual Tyde composer: synthetic composition, lifecycle, resize and hit roles', async ({page}, testInfo) => {
@@ -83,136 +81,60 @@ test('actual Tyde composer: synthetic composition, lifecycle, resize and hit rol
 });
 
 
-test('iOS standalone beta diagnostics capture by default and export a bounded private file', async ({page}, testInfo) => {
+test('iOS standalone has no device recorder or diagnostics export', async ({page}) => {
   await page.setViewportSize({width:430,height:873});
   await page.addInitScript(() => {
     Object.defineProperty(navigator,'platform',{configurable:true,value:'iPhone'});
     Object.defineProperty(navigator,'standalone',{configurable:true,value:true});
   });
-  await page.goto('/?tyde-fixture=chat');
-  await page.waitForFunction(() => window.__TYDE_FIXTURE_READY__ === true);
-  if(compiledBeta) {
-    await expect(page.locator('[data-mobile-test=send-diagnostics-status]')).toContainText('Recording');
-  } else {
-    await expect(page.locator('[data-mobile-test=send-diagnostics-status]')).toBeHidden();
+  const noCapture=async()=>{
+    await expect(page.locator('[data-mobile-test=send-diagnostics-status], [data-mobile-test=send-diagnostics-panel]')).toHaveCount(0);
+    await expect(page.getByLabel('Send diagnostics controls',{exact:true})).toHaveCount(0);
     expect(await page.evaluate(()=>typeof window.__TYDE_SEND_DIAGNOSTICS__)).toBe('undefined');
-  }
-  // Full mounted app, not a direct false-configuration call on a leaf surface.
-  await page.goto('/?tyde-fixture=chat&tyde-fixture-diagnostics-channel=stable');
-  await page.waitForFunction(()=>window.__TYDE_FIXTURE_READY__===true);
-  await expect(page.locator('[data-mobile-test=send-diagnostics-status]')).toBeHidden();
-  expect(await page.evaluate(()=>typeof window.__TYDE_SEND_DIAGNOSTICS__)).toBe('undefined');
-  await page.goto(compiledBeta?'/?tyde-fixture=chat':'/?tyde-fixture=chat&tyde-fixture-diagnostics-channel=beta');
-  await page.waitForFunction(()=>window.__TYDE_FIXTURE_READY__===true);
-  await expect(page.locator('[data-mobile-test=send-diagnostics-status]')).toContainText('Recording');
-  await writeFile(testInfo.outputPath('diagnostic-channel-probe.json'),JSON.stringify({compiledBeta,automaticExpected:compiledBeta,forcedStableOff:true,testOwnedBetaForRecorder:!compiledBeta}));
-  const headerResults=[];
-  const headerAccessible=async(label,renaming=false)=>{
-    await page.evaluate(()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve))));
-    const result=await page.evaluate(({label,renaming})=>{
-      const panel=document.querySelector('[data-mobile-test=send-diagnostics-status]').getBoundingClientRect();
-      const header=document.querySelector('.chat-header'),r=header.getBoundingClientRect();
-      const hit=selector=>{
-        const e=document.querySelector(selector);if(!e)return false;const b=e.getBoundingClientRect();
-        return b.width>0&&b.height>0&&getComputedStyle(e).visibility==='visible'&&e.contains(document.elementFromPoint(b.x+b.width/2,b.y+b.height/2));
-      };
-      const selectors=renaming?['chat-rename-input','chat-rename-save','chat-rename-cancel']:['chat-title','chat-subtitle','chat-back','chat-more'];
-      return {label,nonoverlap:panel.bottom<=r.top||r.bottom<=panel.top,headerHeight:r.height,panelBottom:panel.bottom,headerTop:r.top,
-        readableAndHittable:selectors.every(name=>hit(`[data-mobile-test=${name}]`))};
-    },{label,renaming});
-    headerResults.push(result);
-    await writeFile(testInfo.outputPath('diagnostic-header-probe.json'),JSON.stringify(headerResults,null,2));
-    expect(result.nonoverlap&&result.readableAndHittable,'diagnostics must not obstruct title, subtitle or rename controls').toBe(true);
   };
-  await headerAccessible('recording-closed');
-
-  const disclosure=page.locator('[data-mobile-test=send-diagnostics-status] details');
-  await page.getByLabel('Send diagnostics controls',{exact:true}).click();
-  const globalPanel=page.locator('[data-mobile-test=send-diagnostics-global-panel]');
-  await headerAccessible('recording-open');
-  await globalPanel.getByRole('button',{name:'Stop',exact:true}).click();
-  await headerAccessible('stopped-open');
-  await globalPanel.getByRole('button',{name:'Clear',exact:true}).click();
-  await page.evaluate(()=>window.__TYDE_FIXTURE_HOST__(false));
-  await expect(globalPanel).toBeVisible();
-  await expect(globalPanel).toContainText('Stopped');
-  expect(await page.evaluate(()=>window.__TYDE_SEND_DIAGNOSTICS__.events.length)).toBe(0);
-  await globalPanel.getByRole('button',{name:'Start new capture',exact:true}).click();
-  await expect(globalPanel).toContainText('Recording');
-  await page.evaluate(()=>window.__TYDE_FIXTURE_HOST__(true));
-  await page.getByLabel('Send diagnostics controls',{exact:true}).click();
-  await expect(disclosure).not.toHaveAttribute('open','');
-  const field=page.locator('[data-mobile-test=chat-input]');
-  await field.focus();
-  // Replay the measured device viewport projection, not a native keyboard.
-  await page.evaluate(()=>{
-    const viewport=visualViewport;
-    const top=Object.getOwnPropertyDescriptor(viewport,'offsetTop'),height=Object.getOwnPropertyDescriptor(viewport,'height');
-    Object.defineProperty(viewport,'offsetTop',{configurable:true,value:386});
-    Object.defineProperty(viewport,'height',{configurable:true,value:487});
-    window.__restoreDiagnosticViewport=()=>{
-      if(top)Object.defineProperty(viewport,'offsetTop',top);else delete viewport.offsetTop;
-      if(height)Object.defineProperty(viewport,'height',height);else delete viewport.height;
-      viewport.dispatchEvent(new Event('resize'));
-      delete window.__restoreDiagnosticViewport;
+  for(const legacyOptIn of [false,true]) {
+    await page.goto('/?tyde-fixture=chat'+(legacyOptIn?'&tyde-send-diagnostics=1':''));
+    await page.waitForFunction(()=>window.__TYDE_FIXTURE_READY__===true);
+    await noCapture();
+    const headerAccessible=async(renaming=false)=>{
+      const result=await page.evaluate(renaming=>{
+        const hit=selector=>{
+          const element=document.querySelector(selector),r=element.getBoundingClientRect();
+          return r.width>0 && r.height>0 && element.contains(document.elementFromPoint(r.x+r.width/2,r.y+r.height/2));
+        };
+        return renaming
+          ? hit('[data-mobile-test=chat-rename-input]') && hit('[data-mobile-test=chat-rename-cancel]')
+          : hit('[data-mobile-test=chat-more]') && hit('[aria-label="Back to Agents"]');
+      },renaming);
+      expect(result,'chat header controls remain reachable without a diagnostics row').toBe(true);
     };
-    viewport.dispatchEvent(new Event('resize'));
-  });
-  await expect.poll(()=>page.evaluate(()=>Math.round(document.querySelector('.mobile-app').getBoundingClientRect().height))).toBe(487);
-  const projected=await page.evaluate(()=>{
-    const shell=document.querySelector('.mobile-app').getBoundingClientRect();
-    const summary=document.querySelector('[aria-label="Send diagnostics controls"]'),r=summary.getBoundingClientRect();
-    return {inside:r.top>=shell.top&&r.bottom<=shell.bottom,hit:summary.contains(document.elementFromPoint(r.x+r.width/2,r.y+r.height/2)),shellHeight:shell.height,offset:r.top-shell.top};
-  });
-  await writeFile(testInfo.outputPath('diagnostic-viewport-probe.json'),JSON.stringify(projected));
-  expect(projected.inside && projected.hit,'diagnostic controls must stay in the projected shell after keyboard viewport shift').toBe(true);
-  await headerAccessible('keyboard-recording-closed');
-  await page.locator('[data-mobile-test=chat-more]').click();
-  await page.locator('[data-mobile-test=chat-menu-rename]').click();
-  await headerAccessible('keyboard-rename',true);
-  await page.locator('[data-mobile-test=chat-rename-input]').fill('fixture rename draft');
-  await page.locator('[data-mobile-test=chat-rename-cancel]').click();
-  await headerAccessible('keyboard-rename-canceled');
-
-  await page.getByLabel('Send diagnostics controls',{exact:true}).click();
-  await globalPanel.getByRole('button',{name:'Stop',exact:true}).click();
-  await globalPanel.getByRole('button',{name:'Start new capture',exact:true}).click();
-  await page.getByLabel('Send diagnostics controls',{exact:true}).click();
-  await page.evaluate(()=>{
-    const original=Object.getOwnPropertyDescriptor(performance,'now'),now=performance.now.bind(performance);
-    Object.defineProperty(performance,'now',{configurable:true,value:()=>now()+900001});
-    document.dispatchEvent(new Event('visibilitychange'));
-    if(original)Object.defineProperty(performance,'now',original);else delete performance.now;
-  });
-  await expect(page.locator('[data-mobile-test=send-diagnostics-status]')).toContainText('Expired');
-  await headerAccessible('keyboard-expired-closed');
-  await page.getByLabel('Send diagnostics controls',{exact:true}).click();
-  await headerAccessible('keyboard-expired-open');
-  await globalPanel.getByRole('button',{name:'Start new capture',exact:true}).click();
-  await page.getByLabel('Send diagnostics controls',{exact:true}).click();
-  await page.evaluate(()=>window.__restoreDiagnosticViewport());
-  await field.fill('private sentinel that must not export');
-  await page.locator('[data-mobile-test=chat-send]').click();
-  await expect.poll(()=>field.evaluate(element=>element.value.length===0)).toBe(true);
-  expect(await page.evaluate(()=>window.__TYDE_FIXTURE_SENT_LINES__.length)).toBe(1);
-  await page.getByRole('button',{name:'Back to Agents',exact:true}).click();
-  await page.getByRole('tab',{name:'Settings',exact:true}).click();
-  const panel=page.locator('[data-mobile-test=send-diagnostics-panel]');
-  await expect(panel).toContainText('Recording');
-  const downloaded=page.waitForEvent('download');
-  await panel.getByRole('button',{name:'Export',exact:true}).click();
-  const file=await downloaded;
-  const stream=await file.createReadStream();let text='';for await(const chunk of stream)text+=chunk;
-  const exported=JSON.parse(text);
-  expect(exported.schema).toBe(3);
-  expect(exported.records.some(record=>record.phase==='admitted-locally')).toBe(true);
-  await writeFile(testInfo.outputPath('sanitized-diagnostic-export.json'),text);
-  expect(Buffer.byteLength(text)).toBeLessThanOrEqual(256*1024);
-  expect(text.includes('private sentinel')).toBe(false);
-  await panel.getByRole('button',{name:'Stop',exact:true}).click();
-  await expect(panel).toContainText('Stopped');
-  await panel.getByRole('button',{name:'Clear',exact:true}).click();
-  expect(await page.evaluate(()=>window.__TYDE_SEND_DIAGNOSTICS__.events.length)).toBe(0);
-  await panel.getByRole('button',{name:'Start new capture',exact:true}).click();
-  await expect(panel).toContainText('Recording');
+    await headerAccessible();
+    const field=page.locator('[data-mobile-test=chat-input]');
+    await field.focus();
+    await page.evaluate(()=>{
+      Object.defineProperty(visualViewport,'offsetTop',{configurable:true,value:386});
+      Object.defineProperty(visualViewport,'height',{configurable:true,value:487});
+      visualViewport.dispatchEvent(new Event('resize'));
+    });
+    await expect.poll(()=>page.evaluate(()=>Math.round(document.querySelector('.mobile-app').getBoundingClientRect().height))).toBe(487);
+    await headerAccessible();
+    await page.locator('[data-mobile-test=chat-more]').click();
+    await page.locator('[data-mobile-test=chat-menu-rename]').click();
+    await headerAccessible(true);
+    await page.locator('[data-mobile-test=chat-rename-cancel]').click();
+    await headerAccessible();
+    await field.fill('Private draft');
+    await noCapture();
+    await page.locator('[data-mobile-test=chat-send]').click();
+    await expect(field).toHaveValue('');
+    expect(await page.evaluate(()=>window.__TYDE_FIXTURE_SENT_LINES__.length)).toBe(1);
+    await noCapture();
+    await page.getByRole('button',{name:'Back to Agents',exact:true}).click();
+    await page.getByRole('tab',{name:'Settings',exact:true}).click();
+    await noCapture();
+    await expect(page.getByRole('button',{name:'Start new capture',exact:true})).toHaveCount(0);
+    await expect(page.getByRole('button',{name:'Export',exact:true})).toHaveCount(0);
+    await page.evaluate(()=>window.__TYDE_FIXTURE_HOST__(false));
+    await noCapture();
+  }
 });

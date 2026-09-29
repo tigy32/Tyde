@@ -2565,12 +2565,8 @@ mod wasm_tests {
         el.scroll_height() - el.scroll_top() - el.client_height()
     }
 
-    /// With no active agent, the "Start a new chat" empty state appears
-    /// — distinct from the "Conversation is empty" state so users know
-    /// the difference between "haven't picked a chat" and "picked but
-    /// empty."
     #[wasm_bindgen_test]
-    async fn send_diagnostics_preserve_draft_and_observe_late_cancellation() {
+    async fn missing_host_preserves_draft_without_device_capture() {
         let window = web_sys::window().unwrap();
         let url = window.location().href().unwrap();
         let history = window.history().unwrap();
@@ -2615,20 +2611,14 @@ mod wasm_tests {
         next_tick().await;
         assert_eq!(field.value(), "Retain this draft");
         assert!(container.text_content().unwrap().contains("no active host"));
-        let observed = js_sys::eval(
-            r#"(() => {
-                const events = window.__TYDE_SEND_DIAGNOSTICS__.events;
-                const click = events.find(e => e.phase === 'click');
-                return events.some(e => e.phase === 'guard-missing-host') &&
-                    click.defaultPrevented === false &&
-                    events.some(e => e.phase === 'click:post-dispatch' &&
-                        e.sequence === click.sequence && e.defaultPrevented === true) &&
-                    !events.some(e => e.phase === 'clear-before') &&
-                    !JSON.stringify(events).includes('Retain this draft');
-            })()"#,
-        )
-        .unwrap();
-        assert_eq!(observed.as_bool(), Some(true));
+        assert_eq!(
+            js_sys::eval("typeof window.__TYDE_SEND_DIAGNOSTICS__")
+                .unwrap()
+                .as_string()
+                .as_deref(),
+            Some("undefined"),
+            "editing and rejected sends must not create a device recorder"
+        );
         button
             .remove_event_listener_with_callback("click", cancel.as_ref().unchecked_ref())
             .unwrap();

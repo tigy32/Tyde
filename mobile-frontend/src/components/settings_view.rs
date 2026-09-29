@@ -264,7 +264,6 @@ pub fn SettingsView() -> impl IntoView {
             </div>
             <div class="view-body settings-body">
                 <div class="shell-flow">
-                <crate::components::SendDiagnosticsSurface settings=true />
                 <section class="settings-section" data-mobile-test="settings-appearance">
                     <h2 class="settings-section-title">"Appearance"</h2>
                     <div class="settings-group">
