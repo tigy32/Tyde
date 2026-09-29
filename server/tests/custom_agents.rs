@@ -81,6 +81,7 @@ fn assert_orchestrator_uses_tyde_agent_control(orchestrator: &CustomAgent) {
         "tyde_await_agents",
         "tyde_read_agent",
         "tyde_send_agent_message",
+        "tyde_close_agent",
     ] {
         assert!(
             instructions.contains(&format!("`{suffix}`")),
@@ -88,7 +89,8 @@ fn assert_orchestrator_uses_tyde_agent_control(orchestrator: &CustomAgent) {
         );
     }
     assert!(
-        normalized.contains("profiles in its returned preference order"),
+        normalized.contains("follow its launch-profile preference")
+            && normalized.contains("unless the user selected a backend or profile"),
         "Orchestrator should follow the live list-options preference: {instructions}"
     );
     assert!(
@@ -119,7 +121,11 @@ fn assert_orchestrator_uses_tyde_agent_control(orchestrator: &CustomAgent) {
     assert!(
         normalized.contains("Await returns status only")
             && normalized.contains("read each ready result")
-            && normalized.contains("message only idle agents")
+            && normalized.contains("`tyde_send_agent_message` steers running agents by default")
+            && normalized.contains("queues the message when steering is unsupported")
+            && normalized.contains("`interrupt: true` cancels the running turn and sends next")
+            && normalized
+                .contains("Read needed results before closing agents with `tyde_close_agent`")
             && normalized.contains(
                 "Repeat `tyde_await_agents` and `tyde_read_agent` until no delegated work remains"
             )
@@ -129,14 +135,36 @@ fn assert_orchestrator_uses_tyde_agent_control(orchestrator: &CustomAgent) {
     );
     assert!(
         normalized.contains("Call `tyde_list_launch_options` first")
-            && normalized.contains("User-selected backends or profiles remain authoritative")
-            && normalized.contains("independent sessions and disclose reduced diversity")
+            && normalized.contains("follow its launch-profile preference")
+            && normalized.contains("unless the user selected a backend or profile")
+            && normalized.contains("Treat reported limits as advisory")
+            && normalized.contains(
+                "Keep independent investigations and competing plans isolated until results return"
+            )
             && normalized.contains("Present the plan before implementation if requested")
-            && !normalized.contains("Present the plan before implementation only if requested")
+            && !normalized.contains("Present the plan before implementation only if requested"),
+        "Orchestrator should preserve launch preferences, independent planning, and plan presentation"
+    );
+    assert!(
+        normalized.contains("Use one Implementer per cohesive change")
+            && normalized.contains("when uncertainty or risk justifies the overhead")
+            && normalized.contains("The Implementer is the sole editor and owns every revision")
+            && normalized.contains("Required validation and review gates always apply")
+            && normalized.contains("Reviewer approval does not replace executable validation")
+            && normalized.contains("supported blockers are resolved"),
+        "Orchestrator must delegate selectively without waiving ownership or gates"
+    );
+    assert!(
+        normalized.contains("roughly every 30 minutes")
+            && normalized.contains("Update before a long await")
+            && normalized.contains(
+                "Run as much useful work concurrently as dependencies and editing ownership allow"
+            )
             && normalized
-                .contains("Choose the Implementer from the returned launch-profile preference")
-            && normalized.contains("unless the user selected a backend or profile"),
-        "Orchestrator should state backend, planning, and implementation preferences: {instructions}"
+                .contains("request independent read-only plans against the same requirements")
+            && normalized
+                .contains("Compare their evidence and trade-offs and choose the approach yourself"),
+        "Orchestrator must report progress, maximize useful concurrency, and adjudicate competing plans"
     );
 }
 
@@ -582,48 +610,53 @@ async fn superseded_orchestrator_v7_upgrades_on_restart() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn superseded_orchestrator_v8_upgrades_on_restart() {
+async fn superseded_orchestrator_v8_and_v9_upgrade_on_restart() {
     let mut fixture = Fixture::new().await;
     let orchestrator_id = CustomAgentId("tyde-team-lead".to_owned());
     let active = collect_builtin_team_custom_agents_from_bootstrap(&fixture.bootstrap)
         .remove(&orchestrator_id)
         .expect("built-in Orchestrator should be seeded");
 
-    let mut v8 = active.clone();
-    v8.instructions = Some(
+    for instructions in [
         server::store::custom_agents::SUPERSEDED_ORCHESTRATOR_V8_INSTRUCTIONS
             .trim()
             .to_owned(),
-    );
-    fixture
-        .client
-        .custom_agent_upsert(CustomAgentUpsertPayload { custom_agent: v8 })
-        .await
-        .expect("install superseded Orchestrator V8 failed");
-    fixture
-        .next_frame_matching("superseded Orchestrator V8 upsert", |env| {
-            env.kind == FrameKind::CustomAgentNotify
-                && env
-                    .parse_payload::<CustomAgentNotifyPayload>()
-                    .is_ok_and(|payload| {
-                        matches!(
-                            payload,
-                            CustomAgentNotifyPayload::Upsert { custom_agent }
-                                if custom_agent.id == orchestrator_id
-                        )
-                    })
-        })
-        .await;
+        server::store::custom_agents::superseded_orchestrator_v9_instructions(),
+    ] {
+        let mut previous = active.clone();
+        previous.instructions = Some(instructions);
+        fixture
+            .client
+            .custom_agent_upsert(CustomAgentUpsertPayload {
+                custom_agent: previous,
+            })
+            .await
+            .expect("install superseded Orchestrator failed");
+        fixture
+            .next_frame_matching("superseded Orchestrator upsert", |env| {
+                env.kind == FrameKind::CustomAgentNotify
+                    && env
+                        .parse_payload::<CustomAgentNotifyPayload>()
+                        .is_ok_and(|payload| {
+                            matches!(
+                                payload,
+                                CustomAgentNotifyPayload::Upsert { custom_agent }
+                                    if custom_agent.id == orchestrator_id
+                            )
+                        })
+            })
+            .await;
 
-    let (_fresh, bootstrap) = fixture.connect_fresh_host_with_bootstrap().await;
-    let upgraded = collect_builtin_team_custom_agents_from_bootstrap(&bootstrap)
-        .remove(&orchestrator_id)
-        .expect("upgraded Orchestrator should be replayed");
-    assert_eq!(
-        upgraded, active,
-        "an unedited published V8 record should upgrade to the active prompt"
-    );
-    assert_orchestrator_uses_tyde_agent_control(&upgraded);
+        let (_fresh, bootstrap) = fixture.connect_fresh_host_with_bootstrap().await;
+        let upgraded = collect_builtin_team_custom_agents_from_bootstrap(&bootstrap)
+            .remove(&orchestrator_id)
+            .expect("upgraded Orchestrator should be replayed");
+        assert_eq!(
+            upgraded, active,
+            "an unedited published record should upgrade to the active prompt"
+        );
+        assert_orchestrator_uses_tyde_agent_control(&upgraded);
+    }
 }
 
 #[tokio::test(start_paused = true)]
