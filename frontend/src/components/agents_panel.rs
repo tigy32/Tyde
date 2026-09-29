@@ -1600,15 +1600,10 @@ fn render_agent_tree_group(
 /// belongs to, then open (and activate) its chat tab. Agent-control children
 /// created before project inheritance was added can have no project of their
 /// own; for those records the parent agent's project is authoritative. A
-/// genuinely unscoped agent opens in the current center zone rather than
-/// treating missing ownership metadata as an instruction to switch Home.
-/// Ordering is
-/// load-bearing: `switch_active_project` replaces `center_zone`, so it MUST
-/// run before `open_tab` or the new tab lands in the old project's zone and is
-/// discarded. An agent with no resolvable project stays in the current center
-/// zone; the chat tab still carries the agent's `host_id` so host context stays
-/// correct. Switching to the already-active project is a no-op (early-returns
-/// inside `switch_active_project`).
+/// genuinely unscoped agent opens in Home. Ordering is load-bearing:
+/// `switch_active_project` replaces `center_zone`, so it MUST run before
+/// `open_tab` or the new tab lands in the old project's zone and is discarded.
+/// Switching to the already-active project (including Home) is a no-op.
 ///
 /// Shared with the tool cards' "Open agent" action so every surface that opens
 /// an agent chat uses the same project-switch-then-open ordering.
@@ -1622,9 +1617,7 @@ pub(crate) fn open_agent_chat(state: &AppState, agent: &AgentInfo) {
         project,
         state.active_project.get_untracked(),
     );
-    if let Some(project) = project {
-        state.switch_active_project(Some(project));
-    }
+    state.switch_active_project(project);
     let opened = state.open_tab(
         TabContent::chat_with_agent(agent_chat_ref(agent)),
         agent.name.clone(),
@@ -6533,6 +6526,117 @@ mod wasm_tests {
             vec!["/project/abc".to_owned()],
             "exactly one ProjectAccessed, targeting the agent's project stream"
         );
+    }
+
+    #[wasm_bindgen_test]
+    async fn clicking_unscoped_agent_opens_home_without_changing_project_tabs() {
+        use crate::components::center_zone::CenterZone;
+
+        let calls = install_send_stub_with_dialog_ok();
+        let container = make_container();
+        let state = make_app_state("local");
+        state
+            .configured_hosts
+            .set(vec![configured_host("local", "Local Host")]);
+        state
+            .projects
+            .set(vec![project_info("local", "abc", "ABC Project", 0)]);
+        push_agent_with_scope(
+            &state,
+            "local",
+            "agent-abc",
+            "ABC Agent",
+            true,
+            Some("abc"),
+            None,
+        );
+        push_agent(&state, "local", "agent-home", "Home Agent", true);
+        push_agent(&state, "local", "agent-home-two", "Second Home Agent", true);
+        apply_show_all_projects(&state);
+        CenterWorkspaceWidth::forget_measurement();
+        let mounted_state = state.clone();
+        let _handle = mount_to(container.clone(), move || {
+            provide_context(mounted_state.clone());
+            view! { <AgentsPanel /> <CenterZone /> }
+        });
+        for _ in 0..4 {
+            next_tick().await;
+        }
+        agent_card_el(&container, "agent-abc").click();
+        for _ in 0..8 {
+            next_tick().await;
+        }
+        assert!(
+            container
+                .query_selector("[role='tab'][aria-selected='true'][aria-label='ABC Agent']")
+                .unwrap()
+                .is_some()
+        );
+
+        agent_card_el(&container, "agent-home").click();
+        for _ in 0..8 {
+            next_tick().await;
+        }
+        assert!(
+            state.active_project.get_untracked().is_none(),
+            "a no-project agent must switch to Home before its chat opens"
+        );
+        assert!(
+            container
+                .query_selector("[role='tab'][aria-selected='true'][aria-label='Home Agent']")
+                .unwrap()
+                .is_some(),
+            "the no-project chat must be selected in Home"
+        );
+        assert!(
+            container
+                .query_selector("[role='tab'][aria-label='ABC Agent']")
+                .unwrap()
+                .is_none(),
+            "project tabs must not remain in the Home workspace"
+        );
+        assert_eq!(project_accessed_streams(&calls), vec!["/project/abc"]);
+
+        dispatch_key(&agent_card_el(&container, "agent-home-two"), "Enter");
+        for _ in 0..8 {
+            next_tick().await;
+        }
+        assert!(
+            container
+                .query_selector(
+                    "[role='tab'][aria-selected='true'][aria-label='Second Home Agent']"
+                )
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            container
+                .query_selector("[role='tab'][aria-label='Home Agent']")
+                .unwrap()
+                .is_some(),
+            "opening another unscoped chat in Home must preserve its existing tabs"
+        );
+
+        agent_card_el(&container, "agent-abc").click();
+        for _ in 0..8 {
+            next_tick().await;
+        }
+        assert!(
+            container
+                .query_selector("[role='tab'][aria-selected='true'][aria-label='ABC Agent']")
+                .unwrap()
+                .is_some(),
+            "returning to the project must restore its chat"
+        );
+        for label in ["Home Agent", "Second Home Agent"] {
+            assert!(
+                container
+                    .query_selector(&format!("[role='tab'][aria-label='{label}']"))
+                    .unwrap()
+                    .is_none(),
+                "Home chats must not leak into the project's saved tabs"
+            );
+        }
     }
 
     /// A sub-agent / cross-host click switches BOTH the active host and project
