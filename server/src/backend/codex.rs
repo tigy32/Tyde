@@ -21497,6 +21497,7 @@ impl Backend for CodexBackend {
             tyde_agent_adapter::BackendCapability::BackgroundTasks,
             tyde_agent_adapter::BackendCapability::CancelsBackgroundTasks,
             tyde_agent_adapter::BackendCapability::YieldsRunningCommands,
+            tyde_agent_adapter::BackendCapability::MovesTimedOutCommandsToBackground,
             tyde_agent_adapter::BackendCapability::NativeGoals,
             tyde_agent_adapter::BackendCapability::AgentInitiatedTurns,
             tyde_agent_adapter::BackendCapability::MidTurnSteering,

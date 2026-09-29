@@ -129,7 +129,9 @@ exhaustive_capabilities! {
     // background instead of killed, and the runtime starts a turn of its own
     // when it finishes. Measured on Claude Code 2.1.283: a Bash call with a
     // 3000 ms timeout reports `task_started {is_backgrounded: true}` and a
-    // tool result naming the background task id.
+    // tool result naming the background task id. Codex yields an
+    // `exec_command` at its `yield_time_ms` and keeps the process running.
+    // Hermes kills a foreground command at its timeout.
     MovesTimedOutCommandsToBackground,
     NativeGoals,
     // The runtime advertises the slash commands its session accepts and runs
