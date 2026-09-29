@@ -1175,8 +1175,12 @@ struct ClaudeSystemFrame {
     path: Option<String>,
     #[serde(default)]
     workflow_name: Option<String>,
-    /// Partial-update object on `task_updated` frames. Only `status` is
-    /// consumed; the CLI also sends fields like `end_time`.
+    /// On `task_started`: whether the task was registered in the background
+    /// or with its tool call blocking on it.
+    #[serde(default)]
+    is_backgrounded: Option<bool>,
+    /// Partial-update object on `task_updated` frames. The CLI also sends
+    /// fields like `end_time`.
     #[serde(default)]
     patch: Option<ClaudeTaskPatch>,
     /// Aggregate usage on `task_progress` frames.
@@ -1204,6 +1208,10 @@ struct ClaudeSystemFrame {
 struct ClaudeTaskPatch {
     #[serde(default)]
     status: Option<String>,
+    /// The CLI moved a running foreground task to the background: its
+    /// timeout expired, or a queued message needed the model's attention.
+    #[serde(default)]
+    is_backgrounded: Option<bool>,
     #[serde(default)]
     output_file: Option<String>,
     #[serde(default)]
@@ -5083,6 +5091,12 @@ impl ClaudeInner {
                 ToolExecutionMode::Foreground
             }
         });
+        // The CLI can move a foreground command to the background before its
+        // request is declared here; that move outranks what the model asked for.
+        let requested_mode = match registry.command_modes.get(&tool_call.id) {
+            Some(ToolExecutionMode::Background) => Some(ToolExecutionMode::Background),
+            _ => requested_mode,
+        };
         if let Some(mode) = requested_mode {
             registry.command_modes.insert(tool_call.id.clone(), mode);
         }
@@ -8357,6 +8371,31 @@ fn background_task_execution_mode(
     })
 }
 
+/// Record that a task runs in the background from here on, wherever its
+/// command mode is looked up: the root registry, and the owning sub-agent's
+/// when a sub-agent launched it.
+fn move_background_task_to_background(
+    entry: &mut BackgroundTaskEntry,
+    command_modes: &mut HashMap<String, ToolExecutionMode>,
+    subagent_streams: &HashMap<String, SubAgentStream>,
+) {
+    entry.execution_mode = Some(ToolExecutionMode::Background);
+    command_modes.insert(entry.tool_use_id.clone(), ToolExecutionMode::Background);
+    if let Some(stream) = entry
+        .parent_tool_use_id
+        .as_deref()
+        .and_then(|parent_tool_use_id| subagent_streams.get(parent_tool_use_id))
+    {
+        stream
+            .inner
+            .background_tasks
+            .lock()
+            .expect("Claude child background task mutex poisoned")
+            .command_modes
+            .insert(entry.tool_use_id.clone(), ToolExecutionMode::Background);
+    }
+}
+
 fn forget_background_task_execution_mode(
     entry: &BackgroundTaskEntry,
     command_modes: &mut HashMap<String, ToolExecutionMode>,
@@ -8795,6 +8834,9 @@ fn handle_background_bash_task_frame_with_owners(
             };
             entry.execution_mode =
                 background_task_execution_mode(&entry, command_modes, subagent_streams);
+            if system.is_backgrounded == Some(true) {
+                move_background_task_to_background(&mut entry, command_modes, subagent_streams);
+            }
             tracing::debug!(
                 task_id,
                 tool_use_id = entry.tool_use_id,
@@ -8821,6 +8863,21 @@ fn handle_background_bash_task_frame_with_owners(
                 .execution_mode
                 .or_else(|| background_task_execution_mode(entry, command_modes, subagent_streams));
             let patch = system.patch.as_ref();
+            if patch.and_then(|patch| patch.is_backgrounded) == Some(true)
+                && entry.execution_mode != Some(ToolExecutionMode::Background)
+            {
+                move_background_task_to_background(entry, command_modes, subagent_streams);
+                tracing::debug!(
+                    task_id,
+                    tool_use_id = entry.tool_use_id,
+                    "Claude moved a foreground Bash task to the background"
+                );
+                if entry.state.status == BackgroundTaskStatus::Running
+                    && let Some(owner) = entry.owner.as_deref()
+                {
+                    emit_background_task_snapshot(owner, entry);
+                }
+            }
             if let Some(path) = patch
                 .and_then(|patch| patch.output_file.as_ref().or(patch.path.as_ref()))
                 .map(String::as_str)
@@ -10076,22 +10133,32 @@ fn consume_user_tool_result(
 
         // A background Bash tool_result only acknowledges launch. Its process
         // remains live and is completed from task_notification below, where
-        // the CLI reports the authoritative terminal state.
-        let background_launch = summary
-            .tool_call_by_id
+        // the CLI reports the authoritative terminal state. That includes a
+        // foreground command the CLI moved to the background, which its task
+        // frames report before this result.
+        let moved_to_background = inner
+            .background_tasks
+            .lock()
+            .expect("Claude background task mutex poisoned")
+            .command_modes
             .get(&completion.tool_call_id)
-            .is_some_and(|tool| {
-                if is_subagent_tool_name(&tool.name) {
-                    claude_subagent_execution(claude_argument_bool(
-                        &tool.arguments,
-                        &["run_in_background"],
-                    )) == SubAgentExecution::Background
-                } else {
-                    claude_is_run_command_tool_name(&tool.name)
-                        && claude_argument_bool(&tool.arguments, &["run_in_background"])
-                            .unwrap_or(false)
-                }
-            });
+            == Some(&ToolExecutionMode::Background);
+        let background_launch = moved_to_background
+            || summary
+                .tool_call_by_id
+                .get(&completion.tool_call_id)
+                .is_some_and(|tool| {
+                    if is_subagent_tool_name(&tool.name) {
+                        claude_subagent_execution(claude_argument_bool(
+                            &tool.arguments,
+                            &["run_in_background"],
+                        )) == SubAgentExecution::Background
+                    } else {
+                        claude_is_run_command_tool_name(&tool.name)
+                            && claude_argument_bool(&tool.arguments, &["run_in_background"])
+                                .unwrap_or(false)
+                    }
+                });
         if background_launch {
             continue;
         }
@@ -14812,6 +14879,7 @@ impl Backend for ClaudeBackend {
             tyde_agent_adapter::BackendCapability::BackgroundSubagents,
             tyde_agent_adapter::BackendCapability::BackgroundTasks,
             tyde_agent_adapter::BackendCapability::CancelsBackgroundTasks,
+            tyde_agent_adapter::BackendCapability::MovesTimedOutCommandsToBackground,
             tyde_agent_adapter::BackendCapability::AgentInitiatedTurns,
             tyde_agent_adapter::BackendCapability::ReasoningDeltas,
             tyde_agent_adapter::BackendCapability::TaskUpdates,

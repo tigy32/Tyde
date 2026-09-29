@@ -2305,6 +2305,9 @@ const INTERRUPT_PROOF_FILE: &str = "interrupt_proof.txt";
 const BG_SETTLE: Duration = Duration::from_secs(60);
 const BG_SECONDS: u64 = 20;
 const BG_SECONDS_FOR_INTERRUPT: u64 = 45;
+const TIMED_OUT_FILE: &str = "timed_out.txt";
+const TIMED_OUT_COMMAND_SECONDS: u64 = 20;
+const TIMED_OUT_COMMAND_TIMEOUT_MS: u64 = 5000;
 const SLOW_COMMAND_SECONDS: u64 = 25;
 const KILL_SETTLE: Duration = Duration::from_secs(30);
 const CANCEL_COMMAND_SECONDS: u64 = 25;
@@ -2412,6 +2415,89 @@ async fn real_background_task_outlives_its_turn<B: Backend>(host: &mut Harness<B
             .chain(waited.events().iter())
             .chain(settled.iter())
             .chain(reported.events().iter()),
+    );
+
+    assert_clean_close(host, &agent).await;
+}
+
+/// A foreground command that outlives its timeout keeps running in the
+/// background, and the runtime starts a turn of its own when it finishes.
+/// Tyde classified such a command by the arguments the model sent, so it
+/// stayed "foreground" forever: the launch acknowledgement closed its card, the
+/// finished output reached no card, and the turn the runtime started to report
+/// it was discarded, so the user never saw anything the agent did next.
+async fn real_timed_out_command_moves_to_background<B: Backend>(host: &mut Harness<B>) {
+    let workspace = host.workspace().to_path_buf();
+    let prompt = timed_out_command_prompt(&workspace);
+    let bg_path = workspace.join(TIMED_OUT_FILE);
+    let agent = spawn_agent(host, &prompt).await;
+    let started = collect_turn(host, &agent, &prompt).await;
+
+    assert_no_error_message(&started.label(), started.events());
+    assert_streams_are_balanced(&started);
+    assert_reached_idle(&started);
+    assert_final_text_contains(&started, BG_MARKER);
+    assert!(
+        started.tool_requests().next().is_some(),
+        "{}: emitted zero tool requests, so no command was ever started and this test \
+         asserted nothing",
+        started.label()
+    );
+    assert!(
+        !bg_path.is_file(),
+        "{}: found {} already written when the turn ended, so the command finished inside \
+         its timeout and was never moved to the background",
+        started.label(),
+        bg_path.display()
+    );
+    // The launch acknowledgement is not the command's result: the card has to
+    // stay open for the output that is still to come.
+    let requests = started.tool_requests().count();
+    let completions = started.tool_completions().count();
+    assert!(
+        requests > completions,
+        "{}: all {requests} tool request(s) completed inside the turn that started them. The \
+         runtime only acknowledged moving the command to the background, and that \
+         acknowledgement closed the card its output belongs on.",
+        started.label()
+    );
+
+    let settled = drain_events_for(host, BG_SETTLE).await;
+    assert!(
+        bg_path.is_file(),
+        "{}: waited {}s and {} was still not written, so the moved command never finished",
+        started.label(),
+        BG_SETTLE.as_secs(),
+        bg_path.display()
+    );
+    let settle_label = format!("{:?} timed-out command settle", host.backend());
+    assert_no_error_message(&settle_label, &settled);
+    assert_no_empty_responses(&settle_label, &settled);
+
+    let watched: Vec<String> = started
+        .tool_requests()
+        .map(|request| request.tool_call_id.clone())
+        .filter(|tool_call_id| {
+            !started
+                .tool_completions()
+                .any(|completion| &completion.tool_call_id == tool_call_id)
+        })
+        .collect();
+    assert_background_output_reached_its_card(
+        &started.label(),
+        &watched,
+        started.events().iter().chain(settled.iter()),
+    );
+
+    let woke = settled
+        .iter()
+        .filter(|event| matches!(event, ChatEvent::StreamStart(_)))
+        .count();
+    assert!(
+        woke >= 1,
+        "{settle_label}: the command finished and the agent was told, but no response reached \
+         the chat afterwards. The turn the runtime started on its own to report the finished \
+         command was dropped, so the user never saw what the agent did next."
     );
 
     assert_clean_close(host, &agent).await;
@@ -3250,6 +3336,20 @@ fn background_prompt(
     format!("{launch} As soon as it is started, reply with exactly {BG_MARKER} and nothing else.")
 }
 
+fn timed_out_command_prompt(workspace: &Path) -> String {
+    let file = workspace.join(TIMED_OUT_FILE);
+    format!(
+        "Run this exact shell command once, as an ordinary foreground command with a timeout of \
+         {TIMED_OUT_COMMAND_TIMEOUT_MS} milliseconds. Do not ask for it to run in the background \
+         and do not change the command: python3 -c \"import time; \
+         time.sleep({TIMED_OUT_COMMAND_SECONDS})\"; echo DONE > {}; echo {BG_OUTPUT_MARKER}\n\
+         It will outlive its timeout and keep running in the background. Do not wait for it, poll \
+         it, or read its output. As soon as the tool returns, reply with exactly {BG_MARKER} and \
+         nothing else.",
+        file.display()
+    )
+}
+
 fn long_answer_prompt() -> String {
     format!(
         "Count from 1 to 400, writing each number on its own line with no other text. Do not use \
@@ -3850,6 +3950,10 @@ fn assert_question_answer_reached_the_model(question: &Question, answered: &Turn
 conformance2_scenario!(
     real_background_task_outlives_its_turn,
     [BackendCapability::BackgroundTasks]
+);
+conformance2_scenario!(
+    real_timed_out_command_moves_to_background,
+    [BackendCapability::MovesTimedOutCommandsToBackground]
 );
 conformance2_scenario!(
     real_background_task_cancel,

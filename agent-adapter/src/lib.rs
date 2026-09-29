@@ -125,6 +125,12 @@ exhaustive_capabilities! {
     // Hermes background work and check on it, but a foreground command blocks
     // them, so "continuing a command is a second action" asserts nothing there.
     YieldsRunningCommands,
+    // A foreground command that outlives its timeout is moved to the
+    // background instead of killed, and the runtime starts a turn of its own
+    // when it finishes. Measured on Claude Code 2.1.283: a Bash call with a
+    // 3000 ms timeout reports `task_started {is_backgrounded: true}` and a
+    // tool result naming the background task id.
+    MovesTimedOutCommandsToBackground,
     NativeGoals,
     // The runtime advertises the slash commands its session accepts and runs
     // one when a user message starts with its `/name`. Measured: Claude lists
@@ -229,6 +235,14 @@ impl BackendCapabilities {
         self.require(
             BackendCapability::CancelsBackgroundTasks,
             BackendCapability::BackgroundTasks,
+        )?;
+        self.require(
+            BackendCapability::MovesTimedOutCommandsToBackground,
+            BackendCapability::BackgroundTasks,
+        )?;
+        self.require(
+            BackendCapability::MovesTimedOutCommandsToBackground,
+            BackendCapability::AgentInitiatedTurns,
         )?;
         self.require(
             BackendCapability::OutOfBandCapacity,
